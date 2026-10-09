@@ -1281,7 +1281,6 @@ def _run_nvfp4_routing_rounds(
     input_scale=1.0,
     num_experts=None,
     balanced_routing=False,
-    boundary_tokens=None,
     boundary_token_counts=(),
     graph_rounds=(),
 ):
@@ -1403,8 +1402,6 @@ def _run_nvfp4_routing_rounds(
                 ("all_empty", 0, False),
                 ("refill", 9, False),
             )
-        if boundary_tokens is not None:
-            rounds += (("tile_boundary", boundary_tokens, False),)
         rounds += tuple(
             (f"tile_boundary_{count}", count, False) for count in boundary_token_counts
         )
@@ -1428,7 +1425,7 @@ def _run_nvfp4_routing_rounds(
                     )
                     % num_experts
                 )
-            if name == "tile_boundary" or name.startswith("tile_boundary_"):
+            if name.startswith("tile_boundary_"):
                 # One remote source per expert: the routed count is exactly n,
                 # including the requested token-tile and MMA-width boundaries.
                 remote_expert = ((rank + 1) % world_size) * local_experts
@@ -1644,17 +1641,6 @@ def test_nvfp4_w4a16_epilogue_contract(
         ("w4a16", "reuse_dispatch_warps", False, "runtime", None),
         ("w4a16", "reuse_dispatch_warps", True, "runtime", None),
         pytest.param(
-            "w4a16", "epi_warps", False, "config", (256, 64, 256), id="prefix-n64"
-        ),
-        pytest.param(
-            "w4a16",
-            "reuse_dispatch_warps",
-            False,
-            "runtime",
-            (256, 128, 256),
-            id="prefix-n128",
-        ),
-        pytest.param(
             "w4a16", "epi_warps", False, "config", (256, 32, 256), id="n32-swiglu-epi"
         ),
         pytest.param(
@@ -1697,7 +1683,7 @@ def test_nvfp4_mega_uneven_sources_and_empty_refill(
         world_size,
         mode=mode,
         hidden=288 if tile_n == 32 else 256,
-        intermediate=448 if tile_n == 32 else 384 if tile_n is not None else 256,
+        intermediate=448 if tile_n == 32 else 256,
         knobs={
             "token_back_mode": token_back_mode,
             "load_balance_mode": load_balance_mode,
@@ -1716,19 +1702,13 @@ def test_nvfp4_mega_uneven_sources_and_empty_refill(
         alpha_source=alpha_source,
         num_experts=16 if tile_n is not None else None,
         balanced_routing=tile_n is not None,
-        boundary_tokens=tile_n + 1 if tile_n in (64, 128) else None,
         boundary_token_counts=(15, 16, 17, 31, 32, 33, 63, 64, 65)
         if tile_n == 32
         else (),
-        graph_rounds=("tile_boundary_33", "refill")
-        if tile_n == 32
-        else ("tile_boundary", "refill")
-        if tile_n is not None
-        else (),
+        graph_rounds=("tile_boundary_33", "refill") if tile_n == 32 else (),
         activation_params=(
             {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0}
-            if tile_n == 128
-            or (tile_n == 32 and token_back_mode == "reuse_dispatch_warps")
+            if tile_n == 32 and token_back_mode == "reuse_dispatch_warps"
             else None
         ),
     )

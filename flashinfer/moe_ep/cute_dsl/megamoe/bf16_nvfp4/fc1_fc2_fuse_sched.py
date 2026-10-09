@@ -738,48 +738,28 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         params = self.params
         cluster_tile_m = params.cluster_tile_m
 
-        if const_expr(
-            params.token_padding_block == params.cluster_tile_m
-            and isinstance(self._num_fc1_intermediate_blocks, int)
-            and self._num_fc1_intermediate_blocks > 0
-        ):
-            # Group construction already accumulated F1 * ceil(tokens / tile).
-            # Equal padding makes that prefix sufficient for both cursors.
-            boundary_token_blocks = (
-                state.cumulative_fc1_tiles_at_group_end
-                // cute.fast_divmod_create_divisor(
-                    self._num_fc1_intermediate_blocks, loc=loc, ip=ip
-                )
-            )
-            state.current_token_block_cumul = boundary_token_blocks
-            state.current_data_cumul = boundary_token_blocks * Int32(
-                params.token_padding_block
-            )
-        else:
-            # Push residual experts from the just-finished group into cumul state.
+        # Push residual experts from the just-finished group into cumul state.
+        residual_expert_idx = state.current_expert_idx
+        residual_group_last_expert_exclusive = state.current_group_last_expert_exclusive
+        while residual_expert_idx + Int32(1) < residual_group_last_expert_exclusive:
+            self._advance_expert_within_phase(loc=loc, ip=ip)
+            self._fused_state = self._fused_state
+            state = self._fused_state
             residual_expert_idx = state.current_expert_idx
             residual_group_last_expert_exclusive = (
                 state.current_group_last_expert_exclusive
             )
-            while residual_expert_idx + Int32(1) < residual_group_last_expert_exclusive:
-                self._advance_expert_within_phase(loc=loc, ip=ip)
-                self._fused_state = self._fused_state
-                state = self._fused_state
-                residual_expert_idx = state.current_expert_idx
-                residual_group_last_expert_exclusive = (
-                    state.current_group_last_expert_exclusive
-                )
-            state = self._fused_state
+        state = self._fused_state
 
-            # Final push; cumul now reflects the next group's first expert start.
-            token_padding = params.token_padding_block
-            prev_valid = state.current_this_expert_token_cnt
-            state.current_data_cumul = state.current_data_cumul + (
-                (prev_valid + Int32(token_padding - 1)) // Int32(token_padding)
-            ) * Int32(token_padding)
-            state.current_token_block_cumul = (
-                state.current_token_block_cumul + state.current_token_block_count
-            )
+        # Final push; cumul now reflects the next group's first expert start.
+        token_padding = params.token_padding_block
+        prev_valid = state.current_this_expert_token_cnt
+        state.current_data_cumul = state.current_data_cumul + (
+            (prev_valid + Int32(token_padding - 1)) // Int32(token_padding)
+        ) * Int32(token_padding)
+        state.current_token_block_cumul = (
+            state.current_token_block_cumul + state.current_token_block_count
+        )
 
         # --- Step 3: snapshot new group_start cumul checkpoint.
         state.group_start_data_cumul = state.current_data_cumul
