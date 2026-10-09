@@ -1,0 +1,16 @@
+check for added large files..............................................Passed
+check for case conflicts.................................................Passed
+check for merge conflicts................................................Passed
+check for broken symlinks............................(no files to check)Skipped
+fix end of files.........................................................Passed
+mixed line ending........................................................Passed
+fix requirements.txt.....................................................Passed
+trim trailing whitespace.................................................Passed
+Tabs remover.............................................................Passed
+CRLF end-lines remover...................................................Passed
+clang-format.............................................................Passed
+mypy.....................................................................Passed
+ruff check...............................................................Passed
+ruff check (SM12x import order)..........................................Passed
+ruff format..............................................................Passed
+experimental test scope selftest.........................................Passed

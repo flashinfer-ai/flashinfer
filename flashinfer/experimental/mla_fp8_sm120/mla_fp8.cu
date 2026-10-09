@@ -21,10 +21,14 @@
 #ifndef D_GROUPS
 #define D_GROUPS 2
 #endif
+#ifndef SHARE_P
+#define SHARE_P 0
+#endif
 
 namespace flashinfer {
 namespace mla_fp8 {
 constexpr int BM = TILE_Q, BN = TILE_KV, NS = STAGES, DG = D_GROUPS;
+constexpr bool SP = SHARE_P;
 constexpr int NT = (BM / 16) * DG * 32, OD = 512 / DG, NF = OD / 16;
 using Base = MLAParams<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16, int>;
 struct Params {
@@ -40,6 +44,12 @@ struct alignas(16) Shared {
   uint8_t qc[BM * 512], qr[BM * 64];
   uint8_t kc[NS][BN * 512], kr[NS][BN * 64];
   float ks[NS][BN];
+#if SHARE_P
+  // One producer group computes QK/softmax and packs P once. All output
+  // dimension groups consume the same register-layout fragments after a CTA barrier.
+  uint4 pp[BN / 32][BM / 16][32];
+  float factor[BM], scale[BM], row_m[BM], row_d[BM];
+#endif
 };
 
 // Keep FlashInfer's merge metadata and stable state_t algebra, but parallelize
@@ -178,17 +188,25 @@ __device__ __forceinline__ void pack_p(const float* lo, const float* hi, const f
   }
 }
 
-__device__ __forceinline__ void pv(uint8_t* k, int dg, float (&p)[BN / 16][8],
+__device__ __forceinline__ void pv(Shared& sm, int slot, int wq, int dg, float (&p)[BN / 16][8],
                                    const float (&scale)[2], float (&o)[NF][8]) {
   int lane = threadIdx.x % 32;
 #pragma unroll
   for (int n = 0; n < BN; n += 32) {
     uint32_t a[4];
+#if SHARE_P
+    uint4 packed = sm.pp[n / 32][wq][lane];
+    a[0] = packed.x;
+    a[1] = packed.y;
+    a[2] = packed.z;
+    a[3] = packed.w;
+#else
     pack_p(p[n / 16], p[n / 16 + 1], scale, a);
+#endif
 #pragma unroll
     for (int d = 0; d < NF; ++d) {
       uint32_t t[4], b[4];
-      uint32_t addr = __cvta_generic_to_shared(at<512>(k, n + lane, dg * OD + d * 16));
+      uint32_t addr = __cvta_generic_to_shared(at<512>(sm.kc[slot], n + lane, dg * OD + d * 16));
       // SM120 byte transpose. A b16 transpose would mix FP8 element pairs.
       asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared::cta.b8 {%0,%1,%2,%3},[%4];"
                    : "=r"(t[0]), "=r"(t[1]), "=r"(t[2]), "=r"(t[3])
@@ -234,56 +252,102 @@ __global__ __launch_bounds__(NT) void BatchMLAPagedAttentionFP8SM120(
       __syncthreads();
       int slot = iter % NS;
       float scores[BN / 16][8] = {};
-      qk<64>(sm.qr, sm.kr[slot], wq, scores);
-      qk<512>(sm.qc, sm.kc[slot], wq, scores);
-      float sp[2];
+      float sp[2], factors[2];
+      if (!SP || dg == 0) {
+        qk<64>(sm.qr, sm.kr[slot], wq, scores);
+        qk<512>(sm.qc, sm.kc[slot], wq, scores);
+
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          int row = packed + wq * 16 + lane / 4 + 8 * j;
+          int qidx = uint32_t(row) / p.num_heads;
+          float mx = -INFINITY;
+#pragma unroll
+          for (int n = 0; n < BN / 16; ++n) {
+#pragma unroll
+            for (int col = 0; col < 4; ++col) {
+              int reg = j * 2 + (col / 2) * 4 + col % 2;
+              int k = n * 16 + 2 * (lane % 4) + 8 * (col / 2) + col % 2;
+              float x = scores[n][reg] * (qs[j] * sm.ks[slot][k] * p.sm_scale * math::log2e);
+              bool valid = base + k < end && (!CAUSAL || base + k <= kl - ql + qidx);
+              scores[n][reg] = valid ? x : -INFINITY;
+              mx = fmaxf(mx, scores[n][reg]);
+            }
+          }
+          mx = fmaxf(m[j], rowmax(mx));
+          float alpha = isfinite(m[j]) ? exp2f(m[j] - mx) : 0.f;
+          float sum = 0.f, pm = 0.f;
+#pragma unroll
+          for (int n = 0; n < BN / 16; ++n) {
+#pragma unroll
+            for (int col = 0; col < 4; ++col) {
+              int reg = j * 2 + (col / 2) * 4 + col % 2;
+              int k = n * 16 + 2 * (lane % 4) + 8 * (col / 2) + col % 2;
+              float v = isfinite(mx) ? exp2f(scores[n][reg] - mx) : 0.f;
+              sum += v;
+              v *= sm.ks[slot][k];
+              scores[n][reg] = v;
+              pm = fmaxf(pm, v);
+            }
+          }
+          den[j] = den[j] * alpha + rowsum(sum);
+          sp[j] = fmaxf(rowmax(pm), 1e-12f) / 448.f;
+          float rescale = alpha * (oldscale[j] / sp[j]);
+#if SHARE_P
+          factors[j] = rescale;
+#else
+#pragma unroll
+          for (int d = 0; d < NF; ++d) {
+            out[d][j * 2] *= rescale;
+            out[d][j * 2 + 1] *= rescale;
+            out[d][j * 2 + 4] *= rescale;
+            out[d][j * 2 + 5] *= rescale;
+          }
+#endif
+          oldscale[j] = sp[j];
+          m[j] = mx;
+#if SHARE_P
+          if (lane % 4 == 0) {
+            int local = wq * 16 + lane / 4 + 8 * j;
+            sm.factor[local] = factors[j];
+            sm.scale[local] = sp[j];
+            sm.row_m[local] = m[j];
+            sm.row_d[local] = den[j];
+          }
+#endif
+        }
+#if SHARE_P
+#pragma unroll
+        for (int n = 0; n < BN; n += 32) {
+          uint32_t packed_p[4];
+          pack_p(scores[n / 16], scores[n / 16 + 1], sp, packed_p);
+          sm.pp[n / 32][wq][lane] = make_uint4(packed_p[0], packed_p[1], packed_p[2], packed_p[3]);
+        }
+#endif
+      }
+#if SHARE_P
+      __syncthreads();
 #pragma unroll
       for (int j = 0; j < 2; ++j) {
-        int row = packed + wq * 16 + lane / 4 + 8 * j;
-        int qidx = uint32_t(row) / p.num_heads;
-        float mx = -INFINITY;
+        int local = wq * 16 + lane / 4 + 8 * j;
+        factors[j] = sm.factor[local];
+        sp[j] = sm.scale[local];
+        m[j] = sm.row_m[local];
+        den[j] = sm.row_d[local];
+        oldscale[j] = sp[j];
+      }
 #pragma unroll
-        for (int n = 0; n < BN / 16; ++n) {
-#pragma unroll
-          for (int col = 0; col < 4; ++col) {
-            int reg = j * 2 + (col / 2) * 4 + col % 2;
-            int k = n * 16 + 2 * (lane % 4) + 8 * (col / 2) + col % 2;
-            float x = scores[n][reg] * (qs[j] * sm.ks[slot][k] * p.sm_scale * math::log2e);
-            bool valid = base + k < end && (!CAUSAL || base + k <= kl - ql + qidx);
-            scores[n][reg] = valid ? x : -INFINITY;
-            mx = fmaxf(mx, scores[n][reg]);
-          }
-        }
-        mx = fmaxf(m[j], rowmax(mx));
-        float alpha = isfinite(m[j]) ? exp2f(m[j] - mx) : 0.f;
-        float sum = 0.f, pm = 0.f;
-#pragma unroll
-        for (int n = 0; n < BN / 16; ++n) {
-#pragma unroll
-          for (int col = 0; col < 4; ++col) {
-            int reg = j * 2 + (col / 2) * 4 + col % 2;
-            int k = n * 16 + 2 * (lane % 4) + 8 * (col / 2) + col % 2;
-            float v = isfinite(mx) ? exp2f(scores[n][reg] - mx) : 0.f;
-            sum += v;
-            v *= sm.ks[slot][k];
-            scores[n][reg] = v;
-            pm = fmaxf(pm, v);
-          }
-        }
-        den[j] = den[j] * alpha + rowsum(sum);
-        sp[j] = fmaxf(rowmax(pm), 1e-12f) / 448.f;
-        float rescale = alpha * (oldscale[j] / sp[j]);
+      for (int j = 0; j < 2; ++j) {
 #pragma unroll
         for (int d = 0; d < NF; ++d) {
-          out[d][j * 2] *= rescale;
-          out[d][j * 2 + 1] *= rescale;
-          out[d][j * 2 + 4] *= rescale;
-          out[d][j * 2 + 5] *= rescale;
+          out[d][j * 2] *= factors[j];
+          out[d][j * 2 + 1] *= factors[j];
+          out[d][j * 2 + 4] *= factors[j];
+          out[d][j * 2 + 5] *= factors[j];
         }
-        oldscale[j] = sp[j];
-        m[j] = mx;
       }
-      pv(sm.kc[slot], dg, scores, sp, out);
+#endif
+      pv(sm, slot, wq, dg, scores, sp, out);
       __syncthreads();
       load_kv(sm, a, slot, base + NS * BN, end, p.kv_indptr[work]);
       cp_async::commit_group();

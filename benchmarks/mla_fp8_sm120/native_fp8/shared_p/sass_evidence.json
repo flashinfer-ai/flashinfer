@@ -1,0 +1,17 @@
+{
+  "binary_sha256": "9e2957e2b78ea4135490345c6c5e8ebbf1b66957cad53331f84d27b20962acfc",
+  "config": {
+    "bm": 64,
+    "bn": 64,
+    "stages": 1,
+    "groups": 4,
+    "share_p": true
+  },
+  "instruction_count_across_four_causal_fused_specializations": 704,
+  "examples": [
+    "/*1600*/                   QMMA.16832.F32.E4M3.E4M3 R24, R16, R32, RZ ;                    /* 0x000000201018727a */",
+    "/*16a0*/                   QMMA.16832.F32.E4M3.E4M3 R32, R16, R34, RZ ;                    /* 0x000000221020727a */",
+    "/*16f0*/                   QMMA.16832.F32.E4M3.E4M3 R24, R20, R28, R24 ;                   /* 0x0000001c1418727a */",
+    "/*1710*/                   QMMA.16832.F32.E4M3.E4M3 R28, R20, R30, R32 ;                   /* 0x0000001e141c727a */"
+  ]
+}

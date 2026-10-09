@@ -24,12 +24,13 @@ def main():
     parser.add_argument("--stages", type=int, default=1)
     parser.add_argument("--groups", type=int, default=2)
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--share-p", action="store_true")
     parser.add_argument(
         "--output", type=Path, default=Path("/tmp/mla_fp8_sm120_correctness.json")
     )
     parser.add_argument("--only", nargs="+")
     args = parser.parse_args()
-    config = {k: getattr(args, k) for k in ("bm", "bn", "stages", "groups")}
+    config = {k: getattr(args, k) for k in ("bm", "bn", "stages", "groups", "share_p")}
     print("BUILD", str(build(**config)), flush=True)
     wait_idle(700 * 1024**2)
     torch.manual_seed(490)
@@ -43,6 +44,7 @@ def main():
         ("prefill_noncausal", 20, [7, 13], [49, 129], 16, False),
         ("tp2_heads", 10, [1, 3], [1025, 129], 1, True),
         ("tp4_heads", 5, [9], [79], 32, True),
+        ("prefill_tiles", 20, [257], [257], 16, True),
         ("empty_kv", 20, [1, 1], [0, 33], 16, False),
     ]
     if args.quick:

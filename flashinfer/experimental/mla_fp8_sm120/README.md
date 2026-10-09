@@ -16,6 +16,7 @@ From the repository root:
 
 ```bash
 python benchmarks/mla_fp8_sm120/native_fp8/example.py
+python benchmarks/mla_fp8_sm120/native_fp8/example.py --prefill
 python tests/experimental/mla_fp8_sm120/check.py --output /tmp/mla-check.json
 python benchmarks/mla_fp8_sm120/native_fp8/bench.py --output /tmp/mla-bench.json
 ```
@@ -55,6 +56,20 @@ The native CUDA algorithm reuses FlashInfer's paged persistent work format,
 `MLAParams`, `cp.async`, swizzle, FP8 MMA, and stable `state_t` merge algebra.
 The local scheduler parameterizes query/KV tiles and worker count; the merge
 parallelizes split reads across warps. FP32 KV scales enter both QK and PV.
+
+`NativeMLA(..., share_p=True)` enables a second kernel variant: one warp group
+computes QK, online softmax and FP8 P packing, then all output dimension groups
+consume the packed P from shared memory. The existing path remains the default
+because the extra barrier and shared reads can outweigh reuse for decode.
+Neither path materializes a BF16 KV cache. `groups=4` distributes the 512 output
+dimensions across more warps, reducing each thread's accumulator storage.
+
+For 2K/4K full prefill on the measured GPU, use `bm=64, bn=64, stages=1,
+groups=4, fused=False, share_p=True`, with `workers=110` for 2K and `220` for 4K.
+These are measured settings,
+not a general dispatch rule. See the [paired revision study](../../../benchmarks/mla_fp8_sm120/native_fp8/shared_p/README.zh.md)
+for before/after timings, other shapes, profiling and validation. Reproduce with
+`python benchmarks/mla_fp8_sm120/native_fp8/bench_revision.py --cases prefill_2048 prefill_4096`.
 
 This research ABI uses ctypes to keep the installed baseline separate while
 iterating. Its compiler writes only to a locked user JIT cache, fingerprints

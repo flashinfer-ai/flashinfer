@@ -21,7 +21,7 @@ import subprocess
 ROOT = Path(__file__).resolve().parent
 
 
-def build(bm=32, bn=32, stages=1, groups=2):
+def build(bm=32, bn=32, stages=1, groups=2, share_p=False):
     """Compile the research ABI into a locked user cache, never into the package.
 
     Source checkouts use their own FlashInfer headers. The explicit include
@@ -72,6 +72,7 @@ def build(bm=32, bn=32, stages=1, groups=2):
         f"-DTILE_KV={bn}",
         f"-DSTAGES={stages}",
         f"-DD_GROUPS={groups}",
+        f"-DSHARE_P={int(share_p)}",
     ]
     compiler = subprocess.check_output([nvcc, "--version"], text=True)
     fingerprint = hashlib.sha256()
@@ -85,7 +86,7 @@ def build(bm=32, bn=32, stages=1, groups=2):
         json.dumps([nvcc, compiler, flags, list(map(str, includes))]).encode()
     )
     digest = fingerprint.hexdigest()[:16]
-    name = f"mla_q{bm}_k{bn}_s{stages}_d{groups}_{digest}"
+    name = f"mla_q{bm}_k{bn}_s{stages}_d{groups}_p{int(share_p)}_{digest}"
     base = Path(os.environ.get("FLASHINFER_WORKSPACE_BASE", Path.home()))
     cache = base / ".cache/flashinfer/experimental/mla_fp8_sm120"
     cache.mkdir(parents=True, exist_ok=True)
@@ -129,8 +130,8 @@ def build(bm=32, bn=32, stages=1, groups=2):
 
 
 @lru_cache(None)
-def module(bm, bn, stages, groups):
-    lib = C.CDLL(str(build(bm, bn, stages, groups)))
+def module(bm, bn, stages, groups, share_p):
+    lib = C.CDLL(str(build(bm, bn, stages, groups, share_p)))
     P, I, Z = C.c_void_p, C.c_int, C.c_size_t
     lib.fp8_plan.argtypes = [P, Z, P, P, Z, P, P, P, I, I, I, I, P, P]
     lib.fp8_run.argtypes = [P, P, P, P, P, P, P, P, P, P, I, I, I, C.c_float, I, P]
@@ -159,6 +160,7 @@ class NativeMLA:
         workers=None,
         fused=True,
         sm_scale=1 / 16,
+        share_p=False,
     ):
         import torch
 
@@ -179,6 +181,7 @@ class NativeMLA:
                 workers=workers,
                 fused=fused,
                 sm_scale=sm_scale,
+                share_p=share_p,
             )
 
     def _initialize(
@@ -199,6 +202,7 @@ class NativeMLA:
         workers,
         fused,
         sm_scale,
+        share_p,
     ):
         import torch
 
@@ -216,8 +220,10 @@ class NativeMLA:
             raise ValueError("Expected positive heads and page size 1/16/32/64/128.")
         if torch.cuda.get_device_capability(workspace.device) != (12, 0):
             raise ValueError("This experimental binary targets SM120.")
-        self.lib = module(bm, bn, stages, groups)
-        self.config = dict(bm=bm, bn=bn, stages=stages, groups=groups, fused=fused)
+        self.lib = module(bm, bn, stages, groups, share_p)
+        self.config = dict(
+            bm=bm, bn=bn, stages=stages, groups=groups, fused=fused, share_p=share_p
+        )
         self.heads, self.page_size, self.causal, self.scale = (
             heads,
             page_size,

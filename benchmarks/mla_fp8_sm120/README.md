@@ -4,6 +4,7 @@ GLM-4.7-Flash MLA kernel study and experimental FP8×FP8 CUDA implementation,
 tested on an NVIDIA RTX PRO 5000 72GB Blackwell (SM120).
 
 - [新增 FlashInfer 派生 CUDA FP8：decode 与 prefill](native_fp8/README.zh.md)
+- [共享 P 优化：与上一提交的成对性能和精度验证](native_fp8/shared_p/README.zh.md)
 - [原 BatchMLAPagedAttentionKernel、GLM head 配置与精度支持](README.zh.md)
 - [前期 Triton FP8 KV 实验](fp8_kv_performance.zh.md)
 - [FlashMLA 与 FlashInfer 的区别及本机兼容性](flashmla_vs_flashinfer.zh.md)
@@ -51,8 +52,10 @@ FlashInfer-derived source is covered by the included
 FlashInfer/SGLang source refer to the original test machine; reproducible source
 hashes are retained in the provenance JSON. The original source snapshots can be obtained from the FlashInfer 0.6.15.post1 wheel.
 
-The latency tables are the original 0.6.15.post1 measurements, **not measurements
-of the current 0.7.2 branch**. By default the submitted backend compiles against
+The initial latency tables are the original 0.6.15.post1 measurements, **not measurements
+of the current 0.7.2 branch**. The shared-P revision study separately compares both
+native revisions using checkout headers, retaining the installed BF16 baseline.
+By default the submitted backend compiles against
 the headers in this checkout. Set `FLASHINFER_MLA_FP8_INCLUDE_DIR` to the 0.6.15.post1
 wheel's `flashinfer/data/include` directory to reproduce the earlier header
 selection. Final checkout verification is recorded separately in

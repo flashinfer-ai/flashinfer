@@ -1,5 +1,7 @@
 这是在 FlashInfer 基础上新增的 SM120 FP8×FP8 CUDA 分支，支持 decode、causal/noncausal prefill 和增量 prefill。代码位于 `flashinfer/experimental/mla_fp8_sm120/`；没有修改已安装的 FlashInfer，也没有接入或停止现有服务。
 
+后续共享 P 优化及与上一提交的成对比较见 [shared_p/README.zh.md](shared_p/README.zh.md)。下文保留初版数据。
+
 性能表来自 FlashInfer 0.6.15.post1 环境；当前目标分支为 0.7.2。提交版使用仓库头文件的验证单独记录在 [checkout_validation.json](checkout_validation.json)，不能把旧版计时当成新版性能。
 
 与 FlashInfer 的关系：复用 MLAPlan 的分页、变长请求和 work/merge 元数据格式；在本地副本中参数化 Q tile、worker 数及 KV 分段粒度。QK/PV 调用 FlashInfer 的 FP8 MMA helper，加载使用其 cp.async/swizzle 工具，合并沿用 state_t 的稳定归约公式并改为跨 warp 并行读取 KV 分段。它是实验性新增实现，不是官方现成后端，也不是对 Triton 实验改名。
