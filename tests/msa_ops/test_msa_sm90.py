@@ -141,8 +141,11 @@ def _topk_reference(scores, nvp, fb, fe):
     hq, tiles, total_q = scores.shape
     out = torch.full((total_q, hq, TOPK), -1, dtype=torch.int32, device=scores.device)
     for t in range(total_q):
-        valid = tiles if nvp is None else int(nvp[t])
-        forced = sorted(set(range(fb)) | set(range(max(valid - fe, 0), valid)))
+        # the token's extent is clamp(num_valid_pages[t], 0, tiles) and both forced regions are fitted inside it
+        valid = tiles if nvp is None else max(0, min(int(nvp[t]), tiles))
+        forced = sorted(
+            set(range(min(fb, valid))) | set(range(max(valid - fe, 0), valid))
+        )
         for h in range(hq):
             column = scores[h, :valid, t]
             finite = torch.isfinite(column)
@@ -436,6 +439,64 @@ def test_topk_select_matches_reference_with_valid_pages_and_forced_blocks():
         scores, TOPK, num_valid_pages=nvp, force_begin_blocks=1, force_end_blocks=2
     )
     assert torch.equal(out, _topk_reference(scores, nvp, 1, 2))
+
+
+@sm90_only
+@pytest.mark.parametrize("tiles,total_q", [(64, 256), (512, 256), (2048, 32)])
+def test_topk_select_per_token_extent_below_forced_region(tiles, total_q):
+    """Tokens shorter than the forced regions select exactly their own extent:
+    the forced prefix and suffix are fitted inside clamp(num_valid_pages[t], 0,
+    max_k_tiles), so no selected index exceeds the token's extent and -1 is only
+    a tail pad (the docstring's contract; the CuTe SM90 kernels and the Cake
+    programs agree on it)."""
+    hq = 1
+    g = torch.Generator(device="cuda").manual_seed(tiles + total_q)
+    scores = (
+        torch.randperm(hq * tiles * total_q, generator=g, device="cuda")
+        .to(torch.float32)
+        .reshape(hq, tiles, total_q)
+    )
+    for fb, fe in ((2, 2), (3, 0), (0, 2)):
+        short = torch.randint(
+            0, fb + fe + 2, (total_q,), generator=g, device="cuda", dtype=torch.int32
+        )
+        full = torch.randint(
+            17, tiles + 1, (total_q,), generator=g, device="cuda", dtype=torch.int32
+        )
+        nvp = torch.where(
+            torch.rand(total_q, generator=g, device="cuda") < 0.5, short, full
+        )
+        nvp[0] = 0  # an empty extent yields an all -1 row
+        out = msa_topk_select(
+            scores,
+            TOPK,
+            num_valid_pages=nvp,
+            force_begin_blocks=fb,
+            force_end_blocks=fe,
+        )
+        assert torch.equal(out, _topk_reference(scores, nvp, fb, fe))
+        rows, extents = out.cpu(), nvp.cpu()
+        for t in range(total_q):
+            n = int(extents[t])
+            for h in range(hq):
+                row = rows[t, h]
+                valid = row[row >= 0]
+                assert len(valid) == min(TOPK, n), (fb, fe, t, h, row.tolist())
+                assert bool((valid < n).all()), (fb, fe, t, h, row.tolist())
+                assert bool((valid[1:] > valid[:-1]).all()), (
+                    fb,
+                    fe,
+                    t,
+                    h,
+                    row.tolist(),
+                )
+                assert bool((row[len(valid) :] == -1).all()), (
+                    fb,
+                    fe,
+                    t,
+                    h,
+                    row.tolist(),
+                )
 
 
 @sm90_only
