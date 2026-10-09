@@ -413,7 +413,15 @@ def is_valid_bf16_nvfp4(knobs: Dict[str, Any]) -> bool:
     cluster = tuple(knobs.get("cluster_shape_mnk", (2, 1, 1)))
     token_back = knobs.get("token_back_mode", "epi_warps")
     return (
-        tile in ((128, 64, 256), (128, 128, 256), (256, 64, 256), (256, 128, 256))
+        tile
+        in (
+            (128, 32, 256),
+            (128, 64, 256),
+            (128, 128, 256),
+            (256, 32, 256),
+            (256, 64, 256),
+            (256, 128, 256),
+        )
         and (cluster == (2, 1, 1) or (cluster == (1, 1, 1) and tile == (128, 64, 256)))
         and knobs.get("use_2cta_instrs", tile[0] == 256) == (tile[0] == 256)
         and knobs.get("load_balance_mode", "static") in ("static", "atomic_counter")

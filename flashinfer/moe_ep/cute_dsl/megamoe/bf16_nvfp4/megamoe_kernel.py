@@ -5,7 +5,7 @@
 
 The local W4A16 helpers load packed weights and block scales, then decode
 BF16 tiles directly into the TMEM operand pipeline. Both GEMMs use
-dynamic routed-token widths with M128/M256, N64/N128 and K256 allocation.
+dynamic routed-token widths with M128/M256, N32/N64/N128 and K256 allocation.
 Static and atomic schedulers fuse BF16 dispatch, both GEMMs, and combine.
 """
 
@@ -81,8 +81,10 @@ class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
         use_clc_scheduler,
     ):
         assert mma_tiler_mnk in (
+            (128, 32, 256),
             (128, 64, 256),
             (128, 128, 256),
+            (256, 32, 256),
             (256, 64, 256),
             (256, 128, 256),
         )
@@ -93,7 +95,7 @@ class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
         cols_per_a = cute.round_up(cta_tile_shape_mnk[2] // 2, 4)
         assert cols_per_acc == mma_tiler_mnk[1] and cols_per_a == 128
         # Reuse the local W4A16 TMEM-capacity rule: after two accumulator
-        # stages, N64 fits three decoded K256 tiles; N128 still fits two.
+        # stages, N32/N64 fit three decoded K256 tiles; N128 still fits two.
         max_tmem_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
         transform_stages = (max_tmem_cols - 2 * cols_per_acc) // cols_per_a
         assert transform_stages in (2, 3)
@@ -172,13 +174,15 @@ class Sm100W4A16MegaMoEKernel:
         if self.in_kernel_fc2_reduce and not by_dispatch:
             raise ValueError("W4A16 in-kernel FC2 reduction requires dispatch return.")
         if mma_tiler_mnk not in (
+            (128, 32, 256),
             (128, 64, 256),
             (128, 128, 256),
+            (256, 32, 256),
             (256, 64, 256),
             (256, 128, 256),
         ):
             raise ValueError(
-                "W4A16 MegaMoE requires mma_tiler_mnk=M128/M256, N64/N128, K256."
+                "W4A16 MegaMoE requires M128/N32,N64,N128 or M256/N32,N64,N128, K256."
             )
         if cluster_shape_mnk != (2, 1, 1) and not (
             cluster_shape_mnk == (1, 1, 1) and mma_tiler_mnk == (128, 64, 256)
