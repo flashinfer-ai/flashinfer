@@ -129,8 +129,7 @@ def parse_sampling_args(line, parser):
         "--per_row_top_k",
         action="store_true",
         default=False,
-        help="Pass top_k as a per-row tensor (filled with --top_k) instead of a scalar. "
-        "Used by top_k_top_p_sampling_from_probs/logits.",
+        help="Pass top_k as a per-row tensor (filled with --top_k) instead of a scalar.",
     )
     parser.add_argument(
         "--max_top_k",

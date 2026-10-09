@@ -1635,7 +1635,7 @@ def _top_k_first_fast_path(
     values = values.float()
     if not isinstance(top_k, int):
         # Clamp so every row keeps at least one candidate.
-        row_k = top_k.int().clamp(1, select_k).unsqueeze(-1)
+        row_k = top_k.int().clamp(min=1).unsqueeze(-1)
         cols = torch.arange(select_k, device=x.device)
         values = values.masked_fill(
             cols >= row_k, float("-inf") if from_logits else 0.0
@@ -1753,11 +1753,9 @@ def top_k_top_p_sampling_from_logits(
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
     max_top_k: Optional[int]
-        Upper bound on the entries of a ``top_k`` tensor, letting it take the
-        ``"top_k_first"`` fast path; its cost grows with the bound, so keep it tight.
-        Not checked (that would need a host sync): rows above it, including
-        ``top_k >= vocab_size``, are sampled as if ``top_k == max_top_k``.
-        Default is ``None``.
+        Unchecked upper bound on a ``top_k`` tensor that enables the ``"top_k_first"``
+        fast path; keep it tight, as cost grows with it. Rows above it may be sampled
+        with ``top_k = max_top_k``. Default is ``None``.
 
     Returns
     -------
@@ -1934,11 +1932,9 @@ def top_k_top_p_sampling_from_probs(
         indicating which rows had a valid (non-degenerate) distribution
         after the renormalization step.  Defaults to ``False``.
     max_top_k: Optional[int]
-        Upper bound on the entries of a ``top_k`` tensor, letting it take the
-        ``"top_k_first"`` fast path; its cost grows with the bound, so keep it tight.
-        Not checked (that would need a host sync): rows above it, including
-        ``top_k >= vocab_size``, are sampled as if ``top_k == max_top_k``.
-        Default is ``None``.
+        Unchecked upper bound on a ``top_k`` tensor that enables the ``"top_k_first"``
+        fast path; keep it tight, as cost grows with it. Rows above it may be sampled
+        with ``top_k = max_top_k``. Default is ``None``.
 
     Returns
     -------
