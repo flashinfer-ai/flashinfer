@@ -22,6 +22,7 @@ from flashinfer.autotune_cache import (
 )
 from flashinfer.autotuner import (
     AutoTuner,
+    DynamicTensorSpec,
     TuningConfig,
     autotune,
 )
@@ -413,6 +414,35 @@ def test_measure_policy_overrides_profiling_config(cache_root, monkeypatch):
     with autotune_v2(persistent_cache=False):
         AutoTuner.get().choose_one(_OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)])
     assert seen3 and all(c is _CONFIG for c in seen3)
+
+
+@pytest.mark.parametrize("cold_l2, expect_cold", [(None, False), (True, True)])
+def test_measure_policy_cold_l2_overrides_hot_l2_max_bucket(
+    cache_root, monkeypatch, cold_l2, expect_cold
+):
+    """An explicit MeasurementPolicy(cold_l2=...) applies to every bucket,
+    including the small ones hot_l2_max_bucket would otherwise time hot."""
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8,),
+                map_to_tuning_buckets=lambda x: 8,
+            ),
+        ),
+        use_cold_l2_cache=True,
+        hot_l2_max_bucket=8,
+    )
+    seen = []
+    _install_fake_profile(
+        monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0}, record_configs=seen
+    )
+    with autotune_v2(
+        persistent_cache=False, measurement_policy=MeasurementPolicy(cold_l2=cold_l2)
+    ):
+        AutoTuner.get().choose_one(_OP, [DummyRunner()], config, [torch.zeros(8, 16)])
+    assert seen and all(c.use_cold_l2_cache is expect_cold for c in seen)
 
 
 def test_measure_policy_isolates_store_identity(cache_root, monkeypatch):

@@ -39,6 +39,8 @@ from flashinfer.autotuner import (
     AutoTuner,
     ConstraintSpec,
     DynamicTensorSpec,
+    OptimizationProfile,
+    StaticDim,
     TuningConfig,
     TunableRunner,
     make_bucket_mapper,
@@ -1304,6 +1306,158 @@ def test_tuning_overrides_preserve_tensor_initializers():
 
     assert overridden.tensor_initializers == config.tensor_initializers
     assert overridden.profiling_repeat == 100
+
+
+def _token_bucket_config(**kwargs) -> TuningConfig:
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(1, 8, 64),
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        ),
+        **kwargs,
+    )
+
+
+def test_hot_l2_max_bucket_profiles_small_buckets_hot(monkeypatch):
+    """Buckets at or below hot_l2_max_bucket are timed hot-L2, larger ones
+    cold-L2; every winner is recorded under the configured policy."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((64, 32), dtype=torch.float32)]
+    config = _token_bucket_config(
+        use_cold_l2_cache=True, use_cuda_graph=True, hot_l2_max_bucket=8
+    )
+    cold_by_bucket = {}
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        cold_by_bucket[prof_inputs[0].shape[0]] = tuning_config.use_cold_l2_cache
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        tuner.choose_one("dummy_hot_small", [runner], config, inputs)
+
+    assert cold_by_bucket == {1: False, 8: False, 64: True}
+    assert set(tuner._profiling_cache_policies.values()) == {
+        tuner._profiling_policy(config)
+    }
+
+
+def test_hot_l2_max_bucket_ignored_without_cold_l2():
+    profile = OptimizationProfile([[StaticDim(1), StaticDim(32)]], [None])
+    hot = _token_bucket_config(hot_l2_max_bucket=8)
+    assert AutoTuner._profile_tuning_config(hot, profile) is hot
+    cold = _token_bucket_config(use_cold_l2_cache=True, use_cold_l2_graph_replay=True)
+    assert AutoTuner._profile_tuning_config(cold, profile) is cold
+
+
+@pytest.mark.parametrize(
+    "tie_tolerance, expected_large", [(0.0, 2), (0.02, 0), (0.005, 2)]
+)
+def test_tie_tolerance_keeps_previous_bucket_winner(
+    monkeypatch, tie_tolerance, expected_large
+):
+    """A larger bucket keeps the smaller bucket's winner when it is within the
+    tolerance of the fastest; 0 keeps the strict argmin."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2, 3))
+    inputs = [torch.empty((64, 32), dtype=torch.float32)]
+    config = _token_bucket_config(tie_tolerance=tie_tolerance)
+    times = {
+        1: {0: 1.00, 1: 1.05, 2: 1.20, 3: float("inf")},
+        8: {0: 1.10, 1: 1.30, 2: 1.20, 3: float("inf")},
+        64: {0: 1.01, 1: 1.30, 2: 1.00, 3: float("inf")},
+    }
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        return times[prof_inputs[0].shape[0]][tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        tuner.choose_one("dummy_tie", [runner], config, inputs)
+    with autotune(tune_mode=False):
+        picks = {
+            m: tuner.choose_one("dummy_tie", [runner], config, [torch.empty((m, 32))])[
+                1
+            ]
+            for m in (1, 8, 64)
+        }
+    # Bucket 1 has no incumbent; bucket 8's argmin is the incumbent anyway.
+    assert picks == {1: 0, 8: 0, 64: expected_large}
+
+
+def test_profiling_policy_records_hot_l2_bucket_and_tie_tolerance():
+    cold = TuningConfig(use_cold_l2_cache=True)
+    tuned = TuningConfig(
+        use_cold_l2_cache=True, hot_l2_max_bucket=128, tie_tolerance=0.01
+    )
+    assert AutoTuner._profiling_policy(tuned) == AutoTuner._profiling_policy(cold) + (
+        "hot_l2_max_bucket",
+        128,
+        "tie_tolerance",
+        0.01,
+    )
+    # The bucket threshold changes nothing without cold L2, so it is not recorded.
+    assert AutoTuner._profiling_policy(
+        TuningConfig(hot_l2_max_bucket=128)
+    ) == AutoTuner._profiling_policy(TuningConfig())
+
+
+def test_tuning_overrides_preserve_hot_l2_bucket_and_tie_tolerance():
+    tuner = reset_autotuner()
+    config = _token_bucket_config(
+        use_cold_l2_cache=True, hot_l2_max_bucket=128, tie_tolerance=0.01
+    )
+    with autotune(tune_mode=False, tuning_buckets=(1, 2, 4)):
+        overridden = tuner._apply_tuning_overrides(config)
+    assert overridden.dynamic_tensor_specs[0].gen_tuning_buckets == (1, 2, 4)
+    assert overridden.hot_l2_max_bucket == 128
+    assert overridden.tie_tolerance == 0.01
+
+
+def test_trtllm_moe_tuning_config_times_decode_buckets_hot():
+    from flashinfer.fused_moe.backends.trtllm import MoERunner as TrtllmMoERunner
+    from flashinfer.fused_moe.backends.trtllm import sm100_runner
+
+    runner = TrtllmMoERunner(
+        MagicMock(),
+        top_k=8,
+        num_local_experts=128,
+        dtype_act=DtypeTrtllmGen.Bfloat16,
+        dtype_weights=DtypeTrtllmGen.Bfloat16,
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        hidden_size=4096,
+        intermediate_size=14336,
+        num_experts=128,
+    )
+    moe_inputs = MoeRunnerInputs(
+        output=torch.empty((8, 4096)),
+        routing_logits=None,
+        topk_ids=torch.zeros((8, 8), dtype=torch.int32),
+        expert_weights=None,
+        hidden_states=torch.empty((8, 4096)),
+        hidden_states_scale=None,
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    )
+    config = runner._make_tuning_config(
+        moe_inputs, use_cold_l2_cache=True, use_cuda_graph=True
+    )
+    assert config.hot_l2_max_bucket == sm100_runner._HOT_L2_MAX_BUCKET > 0
+    assert config.tie_tolerance == sm100_runner._TIE_TOLERANCE > 0
+    explicit = runner._make_tuning_config(
+        moe_inputs, use_cold_l2_cache=True, hot_l2_max_bucket=0, tie_tolerance=0.0
+    )
+    assert explicit.hot_l2_max_bucket == 0
+    assert explicit.tie_tolerance == 0.0
 
 
 def test_tuning_config_profiling_repeat_override(monkeypatch):
