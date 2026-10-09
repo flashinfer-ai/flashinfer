@@ -58,6 +58,97 @@ def _assert_close(actual, expected):
     torch.testing.assert_close(actual[1], expected[1], rtol=0.015625, atol=0.03125)
 
 
+@pytest.mark.parametrize("rows", [0, 33, 128])
+@pytest.mark.parametrize("post_input_scale", [False, True])
+@pytest.mark.parametrize("alpha_scalar", [None, 1.0])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_router_destination_retains_unrounded_fp32(
+    rows, post_input_scale, alpha_scalar, enable_pdl
+):
+    from flashinfer.norm.kernels.gated_residual_next_rmsnorm import run
+
+    torch.manual_seed(1000 + rows)
+    inputs = _inputs(rows)
+    if not supports_gated_residual_next_rmsnorm(*inputs):
+        pytest.skip("dual norm requires SM100 or SM103")
+    branch, residual, weight, alpha, beta = inputs
+    residual_out = torch.empty_like(residual)
+    ffn_input = torch.empty_like(branch)
+    router_input = torch.empty_like(residual)
+    args = (
+        branch,
+        residual,
+        alpha,
+        beta,
+        weight,
+        POST_EPS,
+        NEXT_EPS,
+        NEXT_GAIN_CENTER,
+        residual_out,
+        ffn_input,
+    )
+    kwargs = dict(
+        post_weight=weight if post_input_scale else None,
+        post_gain_center=1.0,
+        alpha_scalar=alpha_scalar,
+        enable_pdl=enable_pdl,
+    )
+    run(*args, **kwargs)
+    expected = residual_out.clone(), ffn_input.clone()
+    run(*args, **kwargs, router_input=router_input)
+    torch.testing.assert_close((residual_out, ffn_input), expected, rtol=0, atol=0)
+    ref = residual_out.double()
+    ref = ref * torch.rsqrt(ref.square().mean(-1, keepdim=True) + NEXT_EPS)
+    ref = ref * (weight.double() + NEXT_GAIN_CENTER)
+    torch.testing.assert_close(router_input.double(), ref, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(router_input.bfloat16(), ffn_input, rtol=0, atol=0)
+    if rows:
+        assert not torch.equal(router_input, ffn_input.float())
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_router_destination_graph_reads_changed_inputs(enable_pdl):
+    from flashinfer.norm.kernels.gated_residual_next_rmsnorm import run
+
+    torch.manual_seed(2000)
+    inputs = _inputs(64)
+    if not supports_gated_residual_next_rmsnorm(*inputs):
+        pytest.skip("dual norm requires SM100 or SM103")
+    branch, residual, weight, alpha, beta = inputs
+    residual_out = torch.empty_like(residual)
+    ffn_input = torch.empty_like(branch)
+    router_input = torch.empty_like(residual)
+
+    def call():
+        run(
+            branch,
+            residual,
+            alpha,
+            beta,
+            weight,
+            POST_EPS,
+            NEXT_EPS,
+            NEXT_GAIN_CENTER,
+            residual_out,
+            ffn_input,
+            enable_pdl=enable_pdl,
+            router_input=router_input,
+        )
+
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    branch.normal_()
+    residual.normal_()
+    graph.replay()
+    actual = residual_out.clone(), ffn_input.clone(), router_input.clone()
+    call()
+    torch.testing.assert_close(
+        actual, (residual_out, ffn_input, router_input), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("alpha", [1, 1.0, 0.5, -1.0])
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
 def test_scalar_alpha_support_and_dispatch(monkeypatch, alpha, capability):

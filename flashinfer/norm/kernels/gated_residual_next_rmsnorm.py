@@ -121,6 +121,7 @@ def _dual_norm_kernel(
     gRo: cute.Tensor,
     gFo: cute.Tensor,
     gPw: cute.Tensor,
+    gRouter: cute.Tensor,
     post_eps: cutlass.Constexpr,
     next_eps: cutlass.Constexpr,
     gain: cutlass.Constexpr,
@@ -128,6 +129,7 @@ def _dual_norm_kernel(
     post_gain: cutlass.Constexpr,
     alpha_scalar: cutlass.Constexpr,
     enable_pdl: cutlass.Constexpr[bool],
+    has_router: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, cy, _ = cute.arch.block_idx()
@@ -219,6 +221,11 @@ def _dual_norm_kernel(
     out = (res * r2) * (w + gain)
     fFo.store(out.to(gFo.element_type))
     cute.autovec_copy(fFo, tFo)
+    if const_expr(has_router):
+        tRouter = gRouter[rc]
+        fRouter = cute.make_fragment_like(tRouter)
+        fRouter.store(out)
+        cute.autovec_copy(fRouter, tRouter)
 
     if enable_pdl:
         cute.arch.griddepcontrol_launch_dependents()
@@ -234,6 +241,7 @@ def _launch(
     mRo: cute.Tensor,
     mFo: cute.Tensor,
     mPw: cute.Tensor,
+    mRouter: cute.Tensor,
     post_eps: cutlass.Constexpr,
     next_eps: cutlass.Constexpr,
     gain: cutlass.Constexpr,
@@ -241,6 +249,7 @@ def _launch(
     post_gain: cutlass.Constexpr,
     alpha_scalar: cutlass.Constexpr,
     enable_pdl: cutlass.Constexpr[bool],
+    has_router: cutlass.Constexpr,
     stream: cuda_driver.CUstream,
 ):
     tiler = (1, VEC)
@@ -252,6 +261,7 @@ def _launch(
     gRo = cute.zipped_divide(mRo, tiler)
     gFo = cute.zipped_divide(mFo, tiler)
     gPw = cute.zipped_divide(mPw, tiler)
+    gRouter = cute.zipped_divide(mRouter, tiler)
 
     _dual_norm_kernel(
         gBr,
@@ -262,6 +272,7 @@ def _launch(
         gRo,
         gFo,
         gPw,
+        gRouter,
         post_eps,
         next_eps,
         gain,
@@ -269,6 +280,7 @@ def _launch(
         post_gain,
         alpha_scalar,
         enable_pdl,
+        has_router,
     ).launch(
         grid=[mBr.shape[0], CLUSTER_N, 1],
         block=[THREADS, 1, 1],
@@ -292,6 +304,7 @@ def _get_compiled(
     post_gain_center: float,
     alpha_scalar: float | None = None,
     enable_pdl: bool = False,
+    has_router: bool = False,
 ):
     sym_m = cute.sym_int()
     branch = cute.runtime.make_fake_compact_tensor(
@@ -336,6 +349,7 @@ def _get_compiled(
             if alpha_scalar is None
             else f"alpha{_float_key(alpha_scalar)}",
             f"pdl{int(enable_pdl)}",
+            f"router{int(has_router)}",
         )
     )
     return build_and_load_cute_dsl_kernel(
@@ -351,6 +365,7 @@ def _get_compiled(
             residual,
             ffn_input,
             next_weight,
+            residual,
             post_eps,
             next_eps,
             next_gain_center,
@@ -358,6 +373,7 @@ def _get_compiled(
             post_gain_center,
             alpha_scalar,
             enable_pdl,
+            has_router,
             cuda_stream,
             options="--enable-tvm-ffi",
         ),
@@ -380,7 +396,17 @@ def run(
     post_gain_center: float = 0.0,
     alpha_scalar: float | None = None,
     enable_pdl: bool = False,
+    router_input: torch.Tensor | None = None,
 ) -> None:
+    """Optionally write the next norm's unrounded FP32 result to router_input."""
+    if router_input is not None and (
+        router_input.dtype != torch.float32
+        or router_input.shape != branch.shape
+        or router_input.device != branch.device
+        or not router_input.is_contiguous()
+        or router_input.data_ptr() % 32
+    ):
+        raise ValueError("router_input must be aligned contiguous FP32 like branch")
     if branch.shape[0] == 0:
         return
     fn = _get_compiled(
@@ -391,6 +417,7 @@ def run(
         float(post_gain_center) if post_weight is not None else 0.0,
         alpha_scalar,
         enable_pdl,
+        router_input is not None,
     )
     fn(
         branch,
@@ -401,6 +428,7 @@ def run(
         residual_out,
         ffn_input,
         (post_weight if post_weight is not None else next_weight).unsqueeze(0),
+        router_input if router_input is not None else residual_out,
     )
 
 
@@ -419,8 +447,9 @@ def gated_residual_next_rmsnorm(
     post_gain_center: float = 0.0,
     enable_pdl: bool = False,
     alpha_scalar: float | None = None,
+    router_input: torch.Tensor | None = None,
 ) -> None:
-    """Run the fixed-width fused gated-residual plus next-RMSNorm kernel."""
+    """Run dual norm with an optional unrounded FP32 router destination."""
     run(
         branch,
         residual,
@@ -436,4 +465,5 @@ def gated_residual_next_rmsnorm(
         post_gain_center,
         alpha_scalar,
         enable_pdl,
+        router_input=router_input,
     )
