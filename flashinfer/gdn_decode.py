@@ -1117,6 +1117,7 @@ def gated_delta_rule_mtp(
     disable_state_update: Optional[bool] = None,
     use_qk_l2norm: bool = True,
     output_state_indices: Optional[torch.Tensor] = None,
+    num_householder: int = 1,
     cache_replayssm: bool = False,
     replayssm_rawv: Optional[torch.Tensor] = None,
     replayssm_rawk: Optional[torch.Tensor] = None,
@@ -1228,6 +1229,11 @@ def gated_delta_rule_mtp(
     replayssm_beta : torch.Tensor, optional
         FP32 sigmoid-beta window of shape ``[pool_size, HV, T]``.
 
+    num_householder : int
+        Householder updates per real token (Gated DeltaProduct).  ``k``, ``v``
+        and ``b`` carry ``T * num_householder`` rows while ``q``, ``a`` and the
+        output carry one per real token.  Default 1, which is plain GDN.
+
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor]
@@ -1253,7 +1259,15 @@ def gated_delta_rule_mtp(
         disable_state_update = True
 
     # Validate input shapes
-    B, T, H, K = q.shape
+    # Gated DeltaProduct: k/v/b carry num_householder micro-steps per real
+    # token while q, a and the output carry one row each.
+    B, T_real, H, K = q.shape
+    T = k.shape[1]
+    if T_real * num_householder != T:
+        raise ValueError(
+            f"k has {T} tokens; expected T_real={T_real} * "
+            f"num_householder={num_householder}"
+        )
     _, _, HV, V = v.shape
     pool_size = initial_state.shape[0]
 
@@ -1309,7 +1323,7 @@ def gated_delta_rule_mtp(
     target_dtype = output.dtype if output_provided else q.dtype
 
     if output is None:
-        output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
+        output = torch.zeros((B, T_real, HV, V), dtype=torch.bfloat16, device=q.device)
 
     # Build h0_source for the kernel.
     # - Contiguous 4D pool: `.reshape()` returns a free 3D view, kernel takes
@@ -1381,9 +1395,16 @@ def gated_delta_rule_mtp(
             "ssm_state_indices requires state writes; disable_state_update must be False"
         )
         assert T >= 2, f"ssm_state_indices requires T >= 2 (got T={T})"
-        assert ssm_state_indices.shape == (B, T), (
-            f"ssm_state_indices must have shape [B={B}, T={T}], "
+        assert ssm_state_indices.shape == (B, T_real), (
+            f"ssm_state_indices must have shape [B={B}, T={T_real}], "
             f"got {tuple(ssm_state_indices.shape)}"
+        )
+        # The kernel names dim 1 as the leading one rather than deducing it,
+        # which a [1, 1] tensor cannot support.  That asserts T-contiguity, so
+        # a strided view would be read wrongly and silently.
+        assert ssm_state_indices.stride(1) == 1, (
+            "ssm_state_indices must be contiguous along T, got strides "
+            f"{tuple(ssm_state_indices.stride())}"
         )
         assert ssm_state_indices.dtype == torch.int32, (
             f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
@@ -1519,6 +1540,7 @@ def gated_delta_rule_mtp(
         ssm_state_indices=ssm_state_indices,
         output_state_indices=output_state_indices,
         use_pool_indexing=pool_use_pool_indexing,
+        n_h=num_householder,
         cache_replayssm=cache_replayssm,
         replayssm_rawv=replayssm_rawv,
         replayssm_rawk=replayssm_rawk,

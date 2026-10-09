@@ -2046,6 +2046,11 @@ def run_flashinfer_only_benchmark(args, dtype, use_qk_l2norm):
             print("-" * 100)
             print(
                 f"{'batch':>6} {'seq_len':>8} {'time(us)':>10} {'TFLOPS':>10} {'TB/s':>10}"
+                + (
+                    f" {'unchunked':>10} {'speedup':>8} {'CHUNK':>6}"
+                    if args.compare_chunking
+                    else ""
+                )
             )
             print("-" * 100)
 
@@ -2071,9 +2076,49 @@ def run_flashinfer_only_benchmark(args, dtype, use_qk_l2norm):
 
                     kernel_time_us = result["kernel_median_us"]
 
+                    chunk_cols = ""
+                    if args.compare_chunking:
+                        # Re-run with chunking disabled by forcing CHUNK == T,
+                        # which is the pre-chunking code path.
+                        import flashinfer.gdn_kernels.gdn_decode_mtp as _mtp
+
+                        tile_v, _, ilp_rows, _ = _mtp.get_mtp_config(
+                            batch_size, seq_len, args.num_v_heads, args.head_size
+                        )
+                        _chosen = _mtp.choose_stage_rows(
+                            seq_len, args.head_size, tile_v, ilp_rows
+                        )
+                        _orig = _mtp.choose_stage_rows
+                        _mtp.choose_stage_rows = lambda T, *a, **kw: T
+                        try:
+                            flat = bench_gdn_mtp(
+                                batch_size=batch_size,
+                                seq_len=seq_len,
+                                num_q_heads=args.num_q_heads,
+                                num_k_heads=args.num_k_heads,
+                                num_v_heads=args.num_v_heads,
+                                head_size=args.head_size,
+                                dtype=dtype,
+                                use_qk_l2norm=use_qk_l2norm,
+                                cache_intermediate_states=args.cache_intermediate_states,
+                                disable_state_update=not args.update_state,
+                                warmup_iters=args.warmup,
+                                bench_iters=args.iters,
+                                ssm_state_indices_mode=getattr(
+                                    args, "ssm_state_indices", "none"
+                                ),
+                            )["kernel_median_us"]
+                        finally:
+                            _mtp.choose_stage_rows = _orig
+                        tag = str(_chosen) if _chosen < seq_len else f"{seq_len}(off)"
+                        chunk_cols = (
+                            f" {flat:>10.2f} {flat / kernel_time_us:>7.2f}x {tag:>6}"
+                        )
+
                     print(
                         f"{result['batch_size']:>6} {result['seq_len']:>8} {kernel_time_us:>10.2f} "
                         f"{result['kernel_tflops']:>10.2f} {result['kernel_tb_per_sec']:>10.2f}"
+                        + chunk_cols
                     )
 
             print("-" * 100)
@@ -2342,6 +2387,14 @@ Examples:
     parser.add_argument("--num-k-heads", type=int, default=16)
     parser.add_argument("--num-v-heads", type=int, default=32)
     parser.add_argument("--head-size", type=int, default=128)
+    parser.add_argument(
+        "--compare-chunking",
+        action="store_true",
+        help="For --version mtp: time each shape again with CHUNK forced to T "
+        "(the pre-chunking path) and report the speedup SMEM chunking buys. "
+        "CHUNK shows the staged rows chosen, or T(off) where the config "
+        "re-sweeps the token range and chunking is declined.",
+    )
     parser.add_argument(
         "--dtype", type=str, choices=["float16", "bfloat16"], default="bfloat16"
     )

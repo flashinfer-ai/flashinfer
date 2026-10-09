@@ -194,6 +194,9 @@ files when ``FLASHINFER_TRACE_DUMP=1``:
    * - ``flashinfer.gdn2_prefill``
      - ``chunk_gated_delta_rule2``
      - ``gdn2``
+   * - ``flashinfer.gdp_decode``
+     - ``gated_delta_product_mtp``
+     - ``gdp``
    * - ``flashinfer.gdp_prefill``
      - ``chunk_gated_delta_product``
      - ``gdp``

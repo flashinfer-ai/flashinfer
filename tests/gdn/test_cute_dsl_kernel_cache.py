@@ -151,7 +151,7 @@ MTP_BASELINE = {
     "cache_steps": 0,
     "disable_state_update": False,
     "use_pool_indexing": False,
-    "pool_strides_key": None,
+    "pool_layout_key": None,
     "scale": 0.08838834764831845,
     "use_qk_l2norm": True,
     "tile_v": 64,
@@ -162,6 +162,8 @@ MTP_BASELINE = {
     "use_packed_fma": True,
     "per_token_pool_scatter": False,
     "cache_replayssm": False,
+    "n_h": 1,
+    "chunk_rows": 0,
 }
 
 PREFILL_BASELINE = {
@@ -363,7 +365,7 @@ def test_pretranspose_name_varies_with_every_argument(param, alternate):
         ("cache_steps", 2),
         ("disable_state_update", True),
         ("use_pool_indexing", True),
-        ("pool_strides_key", (262144, 16384, 128, 1)),
+        ("pool_layout_key", (262144, 16384, 128, 1)),
         ("scale", 0.0625),
         ("use_qk_l2norm", False),
         ("tile_v", 128),
@@ -374,6 +376,8 @@ def test_pretranspose_name_varies_with_every_argument(param, alternate):
         ("use_packed_fma", False),
         ("per_token_pool_scatter", True),
         ("cache_replayssm", True),
+        ("n_h", 3),
+        ("chunk_rows", 4),
     ],
 )
 def test_mtp_name_varies_with_every_argument(param, alternate):
@@ -510,7 +514,7 @@ def test_all_baseline_names_are_symbol_safe():
             for variant, key in BF16_STATE_BASELINES.items()
         ),
         _mtp_kernel_name(
-            **{**MTP_BASELINE, "pool_strides_key": (262144, 16384, 128, 1)}
+            **{**MTP_BASELINE, "pool_layout_key": (262144, 16384, 128, 1)}
         ),
         _prefill_kernel_name(
             **{**PREFILL_BASELINE, "initial_state_inner_strides": (16384, 128, 1)}
