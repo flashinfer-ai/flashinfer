@@ -225,8 +225,9 @@ Persistence and orchestration stay separate responsibilities.
   ensure matching op/profile/candidate order and skip lists across the group.
 - **In-session rank consistency**: ranks may still hold divergent locally-measured winners until
   `autotune_v2_reload()` runs — a finalize step (tune → barrier → reload) that drops in-process
-  winners, bulk re-hydrates the attached store's final published state into memory, and thereby
-  makes shared keys use the store's final tactics (no lazy per-key disk reads afterwards).
+  winners and ephemeral tactic shortlists, bulk re-hydrates the attached store's final
+  published state into memory, and thereby makes shared keys use the store's final tactics
+  (no lazy per-key disk reads afterwards). Later tuning rebuilds shortlists by profiling.
   Rank-specific keys remain distinct, and independent deployments must not keep publishing
   into the store while another group finalizes if identical snapshots are required.
   Composes with [#3187](https://github.com/flashinfer-ai/flashinfer/pull/3187), which fixes the

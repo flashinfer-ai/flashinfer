@@ -569,6 +569,7 @@ def autotune_v2_reload() -> None:
     tuner = AutoTuner.get()
     with tuner._lock:
         tuner.profiling_cache.clear()
+        tuner._ranked_tactics_cache.clear()
         tuner._winner_partitions.clear()
         tuner._profiling_cache_policies.clear()
         tuner._managed_decoded.clear()
