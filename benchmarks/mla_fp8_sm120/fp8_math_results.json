@@ -1,0 +1,31 @@
+{
+  "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell",
+  "capability": [
+    12,
+    0
+  ],
+  "torch": "2.11.0+cu129",
+  "shapes": {
+    "heads": 20,
+    "padded_heads": 32,
+    "kv_len": 1024,
+    "qk_dim": 576,
+    "v_dim": 512
+  },
+  "operand_dtype": "float8_e4m3fn",
+  "accum_output_dtype": "float32",
+  "scale_policy": "per-tensor absmax/448; FP32 softmax; independent P scale",
+  "q_scale": 0.00906808115541935,
+  "kv_scale": 0.010951451025903225,
+  "p_scale": 0.00015835808881092817,
+  "qk_max_abs_error": 0.23515258100815117,
+  "qk_only_output_relative_l2": 0.05574447845479396,
+  "both_gemms_fp8_output_max_abs_error": 0.04195271168696968,
+  "both_gemms_fp8_output_relative_l2": 0.06294853407807478,
+  "all_finite": true,
+  "cuda_gemm_kernel_names": [
+    "sm89_xmma_gemm_e4m3f32_e4m3f32_f32_tn_n_tilesize32x64x64_stage5_warpsize2x2x1_tensor16x8x32_execute_kernel__5x_cublas",
+    "sm89_xmma_gemm_e4m3f32_e4m3f32_f32_tn_n_tilesize32x64x64_stage5_warpsize2x2x1_tensor16x8x32_execute_split_k_kernel__5x_cublas"
+  ],
+  "scope": "Feasibility on synthetic BF16-origin inputs; not model accuracy or fused-kernel performance."
+}

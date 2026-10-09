@@ -1,0 +1,569 @@
+{
+  "environment": {
+    "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell",
+    "capability": [
+      12,
+      0
+    ],
+    "sms": 110,
+    "shared_memory_per_sm": 102400,
+    "shared_memory_per_block_optin": 101376,
+    "torch": "2.11.0+cu129",
+    "cuda": "12.9",
+    "flashinfer": "0.6.15.post1",
+    "auto_backend": "fa2",
+    "seed": 47,
+    "free_vram_at_start": 3458859008,
+    "source_sha256": {
+      "data/include/flashinfer/attention/mla.cuh": "b13080c8c1625d60da21077f1af287399f4a94ced8ff5fe9eeb6628e45b405b2",
+      "mla/_core.py": "482b785d669dc68dab6cfe3934f19ae58b3450d25235f3de4908b871c72aee6e",
+      "data/csrc/batch_mla_run.cu": "d4b749962c79596d10f3ed99dfc43b15daf7700c4728ab4a4cdcaa5c56c12a01",
+      "jit/attention/modules.py": "0eaabbdea8f68b54765249792457f7ac38a1ab84e439cd48478d371af9ae0f91"
+    }
+  },
+  "cases": [
+    {
+      "name": "decode_single",
+      "dtype": "torch.bfloat16",
+      "heads": 20,
+      "qlens": [
+        1
+      ],
+      "kv_lens": [
+        1024
+      ],
+      "page_size": 1,
+      "causal": false,
+      "backend": "fa2",
+      "out_shape": [
+        1,
+        20,
+        512
+      ],
+      "max_abs_error": 0.0014114904445772236,
+      "relative_l2_error": 0.0022800322335735828,
+      "lse_max_abs_error": 0.00016452563813018628,
+      "median_run_us": 24.608000181615353,
+      "plan_and_first_run_ms": 4.058314021676779,
+      "plan_info": [
+        1,
+        110,
+        0,
+        65536,
+        131072,
+        196608,
+        197056,
+        197504,
+        197952,
+        198400,
+        198848,
+        264384,
+        329920,
+        395456,
+        460992,
+        526528,
+        0,
+        14417920
+      ],
+      "atol": 0.008,
+      "rtol": 0.02,
+      "passed": true,
+      "cuda_kernel_names": [
+        "void flashinfer::mla::BatchMLAPagedAttentionKernel<flashinfer::mla::KernelTraits<false, 1u, false, 512u, 64u, 64u, 16u, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, int>, flashinfer::MLAParams<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, int> >(flashinfer::MLAParams<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, int>)"
+      ]
+    },
+    {
+      "name": "decode_ragged",
+      "dtype": "torch.bfloat16",
+      "heads": 20,
+      "qlens": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "kv_lens": [
+        63,
+        127,
+        1024,
+        4097
+      ],
+      "page_size": 16,
+      "causal": false,
+      "backend": "fa2",
+      "out_shape": [
+        4,
+        20,
+        512
+      ],
+      "max_abs_error": 0.0038732361366546897,
+      "relative_l2_error": 0.0018889960895358763,
+      "lse_max_abs_error": 0.0006093880442294974,
+      "median_run_us": 45.98399996757507,
+      "plan_and_first_run_ms": 0.2927579917013645,
+      "plan_info": [
+        1,
+        110,
+        0,
+        65536,
+        131072,
+        196608,
+        197056,
+        197504,
+        197952,
+        198400,
+        198848,
+        264384,
+        329920,
+        395456,
+        460992,
+        526528,
+        0,
+        14417920
+      ],
+      "atol": 0.008,
+      "rtol": 0.02,
+      "passed": true
+    },
+    {
+      "name": "extend_causal",
+      "dtype": "torch.bfloat16",
+      "heads": 20,
+      "qlens": [
+        3,
+        5
+      ],
+      "kv_lens": [
+        129,
+        257
+      ],
+      "page_size": 16,
+      "causal": true,
+      "backend": "fa2",
+      "out_shape": [
+        8,
+        20,
+        512
+      ],
+      "max_abs_error": 0.005931503792215187,
+      "relative_l2_error": 0.002412864700798101,
+      "lse_max_abs_error": 0.0004498542279609552,
+      "median_run_us": 26.52799990028143,
+      "plan_and_first_run_ms": 0.3173351287841797,
+      "plan_info": [
+        2,
+        55,
+        0,
+        65536,
+        131072,
+        196608,
+        197056,
+        197504,
+        197952,
+        198400,
+        198848,
+        264384,
+        329920,
+        395456,
+        460992,
+        526528,
+        0,
+        14417920
+      ],
+      "atol": 0.008,
+      "rtol": 0.02,
+      "passed": true
+    },
+    {
+      "name": "decode_tp2_shape",
+      "dtype": "torch.bfloat16",
+      "heads": 10,
+      "qlens": [
+        1
+      ],
+      "kv_lens": [
+        1024
+      ],
+      "page_size": 16,
+      "causal": false,
+      "backend": "fa2",
+      "out_shape": [
+        1,
+        10,
+        512
+      ],
+      "max_abs_error": 0.00193712021258996,
+      "relative_l2_error": 0.0023061426842922806,
+      "lse_max_abs_error": 0.00010148842814849957,
+      "median_run_us": 28.543999418616295,
+      "plan_and_first_run_ms": 0.20926003344357014,
+      "plan_info": [
+        1,
+        110,
+        0,
+        65536,
+        131072,
+        196608,
+        197056,
+        197504,
+        197952,
+        198400,
+        198848,
+        264384,
+        329920,
+        395456,
+        460992,
+        526528,
+        0,
+        14417920
+      ],
+      "atol": 0.008,
+      "rtol": 0.02,
+      "passed": true
+    },
+    {
+      "name": "decode_tp4_shape",
+      "dtype": "torch.bfloat16",
+      "heads": 5,
+      "qlens": [
+        1
+      ],
+      "kv_lens": [
+        1024
+      ],
+      "page_size": 16,
+      "causal": false,
+      "backend": "fa2",
+      "out_shape": [
+        1,
+        5,
+        512
+      ],
+      "max_abs_error": 0.0013777297208724115,
+      "relative_l2_error": 0.0023211683393812295,
+      "lse_max_abs_error": 9.499739157270426e-05,
+      "median_run_us": 28.495999984443188,
+      "plan_and_first_run_ms": 0.17948495224118233,
+      "plan_info": [
+        1,
+        110,
+        0,
+        65536,
+        131072,
+        196608,
+        197056,
+        197504,
+        197952,
+        198400,
+        198848,
+        264384,
+        329920,
+        395456,
+        460992,
+        526528,
+        0,
+        14417920
+      ],
+      "atol": 0.008,
+      "rtol": 0.02,
+      "passed": true
+    },
+    {
+      "name": "decode_single",
+      "dtype": "torch.float16",
+      "heads": 20,
+      "qlens": [
+        1
+      ],
+      "kv_lens": [
+        1024
+      ],
+      "page_size": 1,
+      "causal": false,
+      "backend": "fa2",
+      "out_shape": [
+        1,
+        20,
+        512
+      ],
+      "max_abs_error": 0.0003634781543290222,
+      "relative_l2_error": 0.00028943266131398746,
+      "lse_max_abs_error": 1.9632460180218914e-05,
+      "median_run_us": 28.783999383449554,
+      "plan_and_first_run_ms": 3.512630006298423,
+      "plan_info": [
+        1,
+        110,
+        0,
+        65536,
+        131072,
+        196608,
+        197056,
+        197504,
+        197952,
+        198400,
+        198848,
+        264384,
+        329920,
+        395456,
+        460992,
+        526528,
+        0,
+        14417920
+      ],
+      "atol": 0.002,
+      "rtol": 0.005,
+      "passed": true,
+      "cuda_kernel_names": [
+        "void flashinfer::mla::BatchMLAPagedAttentionKernel<flashinfer::mla::KernelTraits<false, 1u, false, 512u, 64u, 64u, 16u, __half, __half, __half, int>, flashinfer::MLAParams<__half, __half, __half, int> >(flashinfer::MLAParams<__half, __half, __half, int>)"
+      ]
+    },
+    {
+      "name": "decode_ragged",
+      "dtype": "torch.float16",
+      "heads": 20,
+      "qlens": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "kv_lens": [
+        63,
+        127,
+        1024,
+        4097
+      ],
+      "page_size": 16,
+      "causal": false,
+      "backend": "fa2",
+      "out_shape": [
+        4,
+        20,
+        512
+      ],
+      "max_abs_error": 0.0005504033857002266,
+      "relative_l2_error": 0.00023672642084273188,
+      "lse_max_abs_error": 5.6004125218223066e-05,
+      "median_run_us": 45.35999894142151,
+      "plan_and_first_run_ms": 0.203792005777359,
+      "plan_info": [
+        1,
+        110,
+        0,
+        65536,
+        131072,
+        196608,
+        197056,
+        197504,
+        197952,
+        198400,
+        198848,
+        264384,
+        329920,
+        395456,
+        460992,
+        526528,
+        0,
+        14417920
+      ],
+      "atol": 0.002,
+      "rtol": 0.005,
+      "passed": true
+    },
+    {
+      "name": "extend_causal",
+      "dtype": "torch.float16",
+      "heads": 20,
+      "qlens": [
+        3,
+        5
+      ],
+      "kv_lens": [
+        129,
+        257
+      ],
+      "page_size": 16,
+      "causal": true,
+      "backend": "fa2",
+      "out_shape": [
+        8,
+        20,
+        512
+      ],
+      "max_abs_error": 0.0006114674514927643,
+      "relative_l2_error": 0.0003035104999851208,
+      "lse_max_abs_error": 5.3303930599213345e-05,
+      "median_run_us": 21.776000037789345,
+      "plan_and_first_run_ms": 0.31767599284648895,
+      "plan_info": [
+        2,
+        55,
+        0,
+        65536,
+        131072,
+        196608,
+        197056,
+        197504,
+        197952,
+        198400,
+        198848,
+        264384,
+        329920,
+        395456,
+        460992,
+        526528,
+        0,
+        14417920
+      ],
+      "atol": 0.002,
+      "rtol": 0.005,
+      "passed": true
+    },
+    {
+      "name": "decode_tp2_shape",
+      "dtype": "torch.float16",
+      "heads": 10,
+      "qlens": [
+        1
+      ],
+      "kv_lens": [
+        1024
+      ],
+      "page_size": 16,
+      "causal": false,
+      "backend": "fa2",
+      "out_shape": [
+        1,
+        10,
+        512
+      ],
+      "max_abs_error": 0.00014426374112269658,
+      "relative_l2_error": 0.0002787365034273878,
+      "lse_max_abs_error": 8.497638438242916e-06,
+      "median_run_us": 23.856000043451786,
+      "plan_and_first_run_ms": 0.14177686534821987,
+      "plan_info": [
+        1,
+        110,
+        0,
+        65536,
+        131072,
+        196608,
+        197056,
+        197504,
+        197952,
+        198400,
+        198848,
+        264384,
+        329920,
+        395456,
+        460992,
+        526528,
+        0,
+        14417920
+      ],
+      "atol": 0.002,
+      "rtol": 0.005,
+      "passed": true
+    },
+    {
+      "name": "decode_tp4_shape",
+      "dtype": "torch.float16",
+      "heads": 5,
+      "qlens": [
+        1
+      ],
+      "kv_lens": [
+        1024
+      ],
+      "page_size": 16,
+      "causal": false,
+      "backend": "fa2",
+      "out_shape": [
+        1,
+        5,
+        512
+      ],
+      "max_abs_error": 0.0001512496342549463,
+      "relative_l2_error": 0.00029235082036038545,
+      "lse_max_abs_error": 9.923270303247023e-06,
+      "median_run_us": 23.903999477624893,
+      "plan_and_first_run_ms": 0.13063987717032433,
+      "plan_info": [
+        1,
+        110,
+        0,
+        65536,
+        131072,
+        196608,
+        197056,
+        197504,
+        197952,
+        198400,
+        198848,
+        264384,
+        329920,
+        395456,
+        460992,
+        526528,
+        0,
+        14417920
+      ],
+      "atol": 0.002,
+      "rtol": 0.005,
+      "passed": true
+    }
+  ],
+  "rejected_dtypes": [
+    {
+      "backend": "fa2",
+      "qdtype": "torch.bfloat16",
+      "kvdtype": "torch.float8_e4m3fn",
+      "error_type": "ValueError",
+      "error": "FP8 kv_data_type for MLA is only supported with the fa3 backend on SM90, got backend='fa2'."
+    },
+    {
+      "backend": "fa3",
+      "qdtype": "torch.bfloat16",
+      "kvdtype": "torch.float8_e4m3fn",
+      "error_type": "ValueError",
+      "error": "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, got SM120."
+    },
+    {
+      "backend": "fa2",
+      "qdtype": "torch.float8_e4m3fn",
+      "kvdtype": "torch.float8_e4m3fn",
+      "error_type": "ValueError",
+      "error": "FP8 kv_data_type for MLA is only supported with the fa3 backend on SM90, got backend='fa2'."
+    },
+    {
+      "backend": "fa2",
+      "qdtype": "torch.bfloat16",
+      "kvdtype": "torch.float8_e5m2",
+      "error_type": "ValueError",
+      "error": "MLA kv_data_type torch.float8_e5m2 is not supported. Supported dtypes: [torch.float16, torch.bfloat16, torch.float8_e4m3fn]."
+    },
+    {
+      "backend": "fa2",
+      "qdtype": "torch.float32",
+      "kvdtype": "torch.float32",
+      "error_type": "ValueError",
+      "error": "MLA kv_data_type torch.float32 is not supported. Supported dtypes: [torch.float16, torch.bfloat16, torch.float8_e4m3fn]."
+    },
+    {
+      "backend": "fa2",
+      "qdtype": "torch.bfloat16",
+      "kvdtype": "torch.uint8",
+      "error_type": "ValueError",
+      "error": "MLA kv_data_type torch.uint8 is not supported. Supported dtypes: [torch.float16, torch.bfloat16, torch.float8_e4m3fn]."
+    },
+    {
+      "backend": "fa2",
+      "qdtype": "torch.bfloat16",
+      "kvdtype": "torch.int8",
+      "error_type": "ValueError",
+      "error": "MLA kv_data_type torch.int8 is not supported. Supported dtypes: [torch.float16, torch.bfloat16, torch.float8_e4m3fn]."
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.so
+*.cubin
+*.ptx
+*.sass
+*.log
+*.ncu-rep
+.cache/
+nvidia_blackwell_tuning_guide.html
+native_fp8/baseline/v1_*
+native_fp8/baseline/v2_*
+native_fp8/quick_results.json
+native_fp8/tuning_v2_results.json

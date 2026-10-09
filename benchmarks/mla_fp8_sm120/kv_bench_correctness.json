@@ -1,0 +1,29 @@
+[
+  {
+    "mode": 0,
+    "bn": 16,
+    "max_abs_error_vs_original": 0.0037843472255141286,
+    "relative_l2_vs_original": 0.0018372397244602726,
+    "relative_l2_vs_quantized_reference": 0.0018372397244602726,
+    "shared_memory": 69632,
+    "registers": 196
+  },
+  {
+    "mode": 1,
+    "bn": 16,
+    "max_abs_error_vs_original": 0.07089626225704881,
+    "relative_l2_vs_original": 0.040605472655029805,
+    "relative_l2_vs_quantized_reference": 0.0018253879931787679,
+    "shared_memory": 53248,
+    "registers": 220
+  },
+  {
+    "mode": 2,
+    "bn": 64,
+    "max_abs_error_vs_original": 0.09592080040991302,
+    "relative_l2_vs_original": 0.05414626839423516,
+    "relative_l2_vs_quantized_reference": 0.01594384753343667,
+    "shared_memory": 83968,
+    "registers": 172
+  }
+]
