@@ -38,6 +38,8 @@ from ..._block_sparse.common import (
 from ...split_kv_mode_policy import select_split_kv_modes
 from ..tcgen05_compat import ldtm_stat_supported
 from .fmha_decode_constants import (
+    E4M3_MAX,
+    SOFTMAX_RESCALE_THRESHOLD_LOG2,
     AUTO_LAUNCH_TILE_SIZE_KV,
     BITS_PER_BYTE,
     BYTES_PER_KIB,
@@ -1380,6 +1382,10 @@ class FmhaDecodeConfig:
     sage_k_block_size: int = 0
     sage_k_summary_block_size: int = 0
     sage_v_mean: bool = False
+    # Binades a deferred exponent anchor may lag the row maximum, at most
+    # ``SOFTMAX_RESCALE_THRESHOLD_LOG2``; 0 keeps exact anchors and None the
+    # P dtype's default. See ``softmax_anchor_headroom_log2``.
+    softmax_rescale_threshold_log2: float | None = None
     # Nonzero means each K/V stage covers only this many head-dim columns.
     # H256 SwapsMmaAb uses 128-column stages to keep TMA and TMEM layouts valid.
     head_dim_per_stage_kv: int = 0
@@ -2418,18 +2424,48 @@ class FmhaDecodeConfig:
 
         Keeps correction skips the in-place O rescale whenever the anchor is
         unchanged, so keeping the prior anchor within
-        ``SOFTMAX_RESCALE_THRESHOLD_LOG2`` trades a bounded 16-bit P range
-        (2**8) for fewer TMEM rescales. The profiles listed here are the ones
-        where that trade was measured to pay: KV256 tiles and block-sparse
-        routes, whose row maximum moves often but rarely by much. FP8 P uses
-        the static 448 scale, which needs ``p <= 1``, so it always anchors on
+        ``softmax_anchor_headroom_log2`` binades trades a bounded P range for
+        fewer TMEM rescales. The profiles listed here are the ones where that
+        trade was measured to pay: KV256 tiles and block-sparse routes, whose
+        row maximum moves often but rarely by much. A zero headroom anchors on
         the exact row maximum.
         """
         return (
             self.use_keeps_mma_ab
-            and not self.use_fp8_pv
             and (self.tile_size_kv == 256 or self.use_block_sparse)
+            and self.softmax_anchor_headroom_log2 > 0
         )
+
+    @property
+    def softmax_anchor_headroom_log2(self) -> float:
+        """Binades a deferred exponent anchor may lag the row maximum.
+
+        A probability is ``2**(s - anchor)`` times its scale with ``s - anchor``
+        at most this headroom. ``softmax_rescale_threshold_log2`` sets it.
+        Otherwise 16-bit P allows ``SOFTMAX_RESCALE_THRESHOLD_LOG2``, far
+        inside its range, and FP8 P keeps exact anchors: FP8 headroom lowers
+        the E4M3 scale by the same number of binades (``fp8_p_quant_scale``).
+        """
+        if self.softmax_rescale_threshold_log2 is not None:
+            return self.softmax_rescale_threshold_log2
+        return 0.0 if self.use_fp8_pv else SOFTMAX_RESCALE_THRESHOLD_LOG2
+
+    @property
+    def fp8_p_quant_scale(self) -> float:
+        """Scale ``c`` of FP8 probabilities, which are quantized to E4M3 as ``c * p``.
+
+        A deferred anchor lets ``p`` reach ``2**softmax_anchor_headroom_log2``,
+        so ``c`` is the E4M3 maximum divided by that bound; an exact anchor
+        keeps ``p <= 1`` and uses the whole range.
+        """
+        if self.defers_softmax_anchor_updates:
+            return E4M3_MAX * 2.0**-self.softmax_anchor_headroom_log2
+        return E4M3_MAX
+
+    @property
+    def fp8_p_quant_log2_scale(self) -> float:
+        """``log2(fp8_p_quant_scale)``, the exponent addend of FP8 probabilities."""
+        return math.log2(self.fp8_p_quant_scale)
 
     @property
     def use_sage_attention(self) -> bool:
@@ -4655,6 +4691,12 @@ def _validate_profile_support(
             "heads_q_per_kv metadata must equal num_heads_q / num_heads_kv"
         )
     cfg.validate_sage_profile()
+    threshold = cfg.softmax_rescale_threshold_log2
+    if threshold is not None and not 0.0 <= threshold <= SOFTMAX_RESCALE_THRESHOLD_LOG2:
+        raise ValueError(
+            "softmax_rescale_threshold_log2 must lie in "
+            f"[0, {SOFTMAX_RESCALE_THRESHOLD_LOG2:g}], got {threshold}"
+        )
     cfg.validate_block_sparse_profile(heads_q_per_kv=heads_q_per_kv)
     if use_groups_tokens_heads_q:
         make_q_tile_geometry(

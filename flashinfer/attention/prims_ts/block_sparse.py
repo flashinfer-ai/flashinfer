@@ -80,6 +80,7 @@ from .decode import (
     _resolve_kv_dtypes,
     _validate_runtime_device,
 )
+from .kernels.fmha_decode.fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
 from .sage import SageAttentionConfig, SageAttentionParams
 
 
@@ -167,6 +168,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         kv_data_type: torch.dtype | None = None,
         o_data_type: torch.dtype | None = None,
         sage_config: SageAttentionConfig | None = None,
+        softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
     ) -> None:
         """Choose a legal profile and allocate reusable routing capacity.
 
@@ -232,6 +234,17 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``v_data_type``), and the output is ``torch.bfloat16`` (default) or
         ``torch.float16``. Every :meth:`run` then supplies the scale tensors as
         :class:`SageAttentionParams`.
+
+        ``softmax_rescale_threshold_log2`` (0 to 8, default 8) applies to
+        block-sparse plans on the Q64/KV256 and Q128/KV128 profiles and to
+        dense Q64/KV256 plans: a row keeps its softmax exponent anchor while a
+        tile raises the row maximum by at most this many binades, which skips
+        the rescale of the accumulated output. Probabilities then reach
+        ``2**threshold``, so Sage FP8 P is quantized at ``448 * 2**-threshold``
+        and probabilities far below the anchor lose E4M3 precision; rows whose
+        largest scores come first, such as attention sinks in the first
+        blocks, are the most exposed. 0 rescales on every new row maximum and
+        quantizes FP8 P at 448.
         """
 
         if use_block_sparse:
@@ -278,6 +291,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             ),
             sage=sage_config,
             use_block_sparse=use_block_sparse,
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
         )
         if use_proxy_routes and static.mask_type != "dense":
             raise ValueError("block-sparse proxy routes require mask_type='dense'")
@@ -456,6 +470,7 @@ def block_sparse_attention(
     out: torch.Tensor | None = None,
     sage: SageAttentionParams | None = None,
     sage_config: SageAttentionConfig | None = None,
+    softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
 ) -> torch.Tensor:
     """Plan and run one compact-BSHD block-sparse or dense attention launch.
 
@@ -519,6 +534,9 @@ def block_sparse_attention(
     sage_config : SageAttentionConfig, optional
         The Sage recipe to plan. Defaults to :class:`SageAttentionConfig` with
         ``v_mean`` set when ``sage.v_mean`` is present.
+    softmax_rescale_threshold_log2 : float, optional
+        Binades a row maximum may rise before the output is rescaled, 0 to 8
+        (default 8); see :meth:`BlockSparseTSWrapper.plan`.
 
     share_pattern_across_kv_heads : bool
         False (default) uses one pattern per KV head. True requires a singleton
@@ -630,6 +648,7 @@ def block_sparse_attention(
         o_data_type=static.output_dtype,
         share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
         sage_config=sage_config,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
     )
     return wrapper.run(
         q,
@@ -671,6 +690,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         q_data_type: torch.dtype = torch.float16,
         kv_data_type: torch.dtype | None = None,
         o_data_type: torch.dtype | None = None,
+        softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
     ) -> None:
         """Plan fixed-Q geometry and a maximum variable-K capacity.
 
@@ -689,6 +709,11 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         every physical Q tile within exactly one logical BSR row.
         ``kv_block_size`` remains restricted to 8, 16, 32, or a positive
         multiple of 64.
+
+        ``softmax_rescale_threshold_log2`` (0 to 8, default 8) is the number of
+        binades a row maximum may rise on the Q64/KV256 and Q128/KV128
+        profiles before the output is rescaled; see
+        :meth:`BlockSparseTSWrapper.plan`.
         """
 
         static = _validate_block_sparse_static_profile(
@@ -708,6 +733,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             kv_dtype=kv_data_type,
             output_dtype=o_data_type,
             max_blocks_per_row=max_blocks_per_row,
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
         )
         assert static.page_size is not None
         device, device_index = _resolve_cuda_device(device)
@@ -867,6 +893,7 @@ def block_sparse_attention_with_paged_kv_cache(
     share_pattern_across_kv_heads: bool = False,
     sm_scale: float | None = None,
     out: torch.Tensor | None = None,
+    softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
 ) -> torch.Tensor:
     """Plan and run one fixed-Q paged block-sparse attention launch.
 
@@ -915,6 +942,9 @@ def block_sparse_attention_with_paged_kv_cache(
     out : torch.Tensor, optional
         Caller-owned compact output buffer ``[B, Sq, Hq, D]``.
         Must not overlap any live input; storage overlap is not checked.
+    softmax_rescale_threshold_log2 : float, optional
+        Binades a row maximum may rise before the output is rescaled, 0 to 8
+        (default 8); see :meth:`BlockSparseTSWrapper.plan`.
 
     share_pattern_across_kv_heads : bool
         False (default) uses one pattern per KV head. True requires a singleton
@@ -1017,6 +1047,7 @@ def block_sparse_attention_with_paged_kv_cache(
         kv_data_type=static.kv_dtype,
         o_data_type=static.output_dtype,
         share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
     )
     return wrapper.run(
         q,

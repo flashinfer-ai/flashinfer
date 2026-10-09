@@ -43,7 +43,6 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from ..fmha_decode_config import FmhaDecodeConfig
 from ..fmha_decode_constants import (
-    FP8_P_QUANT_LOG2_SCALE,
     INT32_SCORE_BIAS,
 )
 from ...placeholder_helpers import _placeholder_smem_array
@@ -330,7 +329,8 @@ class SmemPResource(DecodeGenResourceBase):
           maximum) anchors on zero so its scores exponentiate to zero, not NaN.
           Callers whose masked rows are skipped or discarded downstream pass
           ``guards_masked_rows=False``.
-        - Byte-wide P adds ``log2(448)``, its static FP8 quantization scale.
+        - Byte-wide P adds the log2 of its quantization scale
+          (``fp8_p_quant_scale``).
         - A proxy route adds ``log2`` of its block mass, as the max pass does,
           so each summary probability carries the tokens it stands for.
         """
@@ -342,7 +342,7 @@ class SmemPResource(DecodeGenResourceBase):
         # Not ``cute.math.fma``: the fused form makes ptxas spill in the callers.
         addend = Float32(-self.scale_softmax_log2 * safe_new_max)
         if cutlass.const_expr(self.cfg.use_fp8_pv):
-            addend += Float32(FP8_P_QUANT_LOG2_SCALE)
+            addend += Float32(cfg.fp8_p_quant_log2_scale)
         if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
             if route_is_proxy:
                 addend += Float32(cfg.proxy_log2_block_mass)

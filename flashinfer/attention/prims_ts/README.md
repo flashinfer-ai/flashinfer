@@ -263,6 +263,12 @@ proxy summaries or their represented mass.
 the whole contiguous K/V sequence with the same Q-tile selection. A dense plan
 owns no route workspace, and its `run` takes Q/K/V only.
 
+Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
+Q64/KV256 and Q128/KV128 tiles of block-sparse plans, and on dense Q64/KV256
+plans, a row keeps its softmax exponent anchor while a tile raises the row
+maximum by at most that many binades, so the accumulated output is not
+rescaled; 0 rescales on every new maximum.
+
 ## Sage attention
 
 Sage attention runs the contiguous decode kernel on 8-bit Q, K and V with
@@ -273,9 +279,12 @@ with `sage_config=SageAttentionConfig(...)`; every run supplies the scales as
 
 ```text
 S[r][c] = sfQ[blkQ(r)] * sfK[blkK(c)] * (Q8 . K8^T)[r][c]
-P       = softmax_row(S), quantized to E4M3 as 448 * p
-O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (448 * l[r])  (+ v_mean[d])
+P       = softmax_row(S), quantized to E4M3 as C * p with C = 448 * 2**-h
+O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (C * l[r])  (+ v_mean[d])
 ```
+
+`h` is the plan's `softmax_rescale_threshold_log2` (default 8) on Q64/KV256
+tiles and block-sparse plans, and 0 elsewhere.
 
 FlashInfer does not quantize: the 8-bit tensors and scales come from the
 caller, for example TensorRT-LLM's `sageQuant`. `v_mean` adds a per-channel
@@ -296,6 +305,13 @@ scale must be finite and positive; the kernel does not check the values.
 The block-size fields belong to `SageAttentionConfig`; the defaults are
 TensorRT-LLM's production recipe. Masks and scheduling follow the 16-bit
 plans. The paged block-sparse APIs do not support Sage attention.
+
+With the default threshold, FP8 P is quantized at `C = 448 * 2**-8 = 1.75`:
+the E4M3 grid of P moves down by the threshold, so probabilities far below the
+anchor round to subnormals or zero. Rows whose largest scores arrive first,
+such as an attention sink in the leading blocks, lose the most. A smaller
+threshold trades rescales back for range; 0 keeps exact anchors and
+`C = 448`.
 
 ### Scale tensors
 

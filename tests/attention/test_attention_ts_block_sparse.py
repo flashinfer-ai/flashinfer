@@ -2007,16 +2007,19 @@ def test_q8_b8_parallel_load_tasks_partition_resources() -> None:
         pytest.param(64, torch.float16, 256, id="kv256-fp16"),
     ),
 )
+@pytest.mark.parametrize("threshold", (8.0, 0.0), ids=("threshold8", "threshold0"))
 @torch.no_grad()
 def test_block_sparse_keeps_rescale_threshold_gpu_edges(
     q_block_size: int,
     dtype: torch.dtype,
     route_size: int,
+    threshold: float,
 ) -> None:
     """Exercise one deferred anchor, one re-anchor, and an all-masked replay."""
 
     # The two KV instructions own alternating routes. Instruction 0 therefore
-    # observes route maxima 0 -> 7.5log2 -> 9log2: defer once, then re-anchor.
+    # observes route maxima 0 -> 7.5log2 -> 9log2: the default threshold defers
+    # once, then re-anchors; threshold 0 re-anchors on both rises.
     route_scores = (
         0.0,
         0.0,
@@ -2081,6 +2084,7 @@ def test_block_sparse_keeps_rescale_threshold_gpu_edges(
         max_blocks_per_row=num_kv_blocks,
         use_kv_valid_bits=True,
         q_data_type=dtype,
+        softmax_rescale_threshold_log2=threshold,
     )
     state = wrapper._published_state()
     policy = dict(state.policy)
