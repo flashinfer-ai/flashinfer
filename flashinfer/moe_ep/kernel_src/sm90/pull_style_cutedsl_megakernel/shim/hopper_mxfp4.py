@@ -970,7 +970,9 @@ def _resolve_hopper_mxfp4_mega_moe_config(
             False if fc1_early_done_publish is None else fc1_early_done_publish
         ),
         fold_producer_warps=(
-            True if fold_producer_warps is None else fold_producer_warps
+            active_dispatch_warps in (None, 1)
+            if fold_producer_warps is None
+            else fold_producer_warps
         ),
         apply_topk_in_fc1=apply_topk_in_fc1,
         group_hint=group_hint,

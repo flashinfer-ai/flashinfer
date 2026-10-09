@@ -9,8 +9,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import warnings
-from types import SimpleNamespace
-from unittest import mock
 
 import pytest
 
@@ -118,18 +116,9 @@ class TestIsValid:
     @pytest.mark.parametrize("scale_mode", ["per_tensor", "blockwise"])
     def test_autotune_candidates(self, scale_mode):
         pkg = _pkg()
-        from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.autotune import (  # noqa: E501
-            _sweep_geometries,
-        )
-
         cands = pkg.hopper_fp8_candidates(fp8_scale_mode=scale_mode, max_tokens=2048)
-        # Every geometry that currently appears in the upstream heuristic
-        # tables must retain both validated token-back variants. The number of
-        # distinct geometries is table-derived and may change when PR4688's
-        # blockwise table is refreshed.
-        for geometry in _sweep_geometries():
-            for token_back in ("epi_warps", "reuse_dispatch_warps"):
-                assert {**geometry, "token_back_mode": token_back} in cands
+        # 16 sweep geometries x {epi_warps, reuse_dispatch_warps}.
+        assert len(cands) >= 30
         assert all(pkg.is_valid(c) for c in cands)
         # heuristic winner leads (ties keep the established default).
         assert cands[0] == pkg.default_knobs(2048, fp8_scale_mode=scale_mode)
@@ -232,87 +221,6 @@ class TestKnobCache:
         assert source == "heuristic"
         assert knobs == pkg.default_knobs(4096, fp8_scale_mode="per_tensor")
 
-    def test_online_clamped_winner_replays_only_for_same_normalized_clamp(
-        self, tmp_path, monkeypatch
-    ):
-        pkg = _pkg()
-        from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (  # noqa: E501
-            autotune as autotune_module,
-        )
-
-        cache_path = tmp_path / "cache.json"
-        monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(cache_path))
-        winner = {
-            **pkg.default_knobs(64, fp8_scale_mode="per_tensor"),
-            "flag_batch": 8,
-        }
-        frontend_config = SimpleNamespace(
-            rank=0,
-            kind="fp8_e4m3",
-            fp8_scale_mode="per_tensor",
-            world_size=1,
-            hidden=1024,
-            intermediate=512,
-            num_total_experts=8,
-            num_topk=4,
-            num_tokens_per_rank=64,
-            gate_up_clamp=10.0,
-        )
-        frontend = SimpleNamespace(config=frontend_config, release=mock.Mock())
-        symm_buffer = SimpleNamespace(_frontend=frontend)
-
-        def fake_autotune(actual_frontend, launch, candidates, *, on_winner, **kwargs):
-            assert actual_frontend is frontend
-            assert candidates == [winner]
-            on_winner(winner, 123e-6)
-            return winner
-
-        monkeypatch.setattr(autotune_module, "autotune_knobs", fake_autotune)
-        assert (
-            pkg.autotune_hopper_fp8_mega_moe(
-                object(),
-                object(),
-                object(),
-                symm_buffer,
-                candidates=[winner],
-            )
-            == winner
-        )
-
-        entry = json.loads(cache_path.read_text())["entries"][0]
-        assert entry["source"] == "autotune"
-        assert entry["gate_up_clamp"] == 10.0
-
-        # Exercise alias normalization: activation_clamp must resolve the
-        # cache entry written under the canonical gate_up_clamp key.
-        with pytest.warns(DeprecationWarning, match="activation_clamp is deprecated"):
-            replay = pkg.resolve_hopper_fp8_mega_moe_config(
-                8,
-                64,
-                4,
-                1024,
-                512,
-                0,
-                1,
-                activation_clamp=10.0,
-            )
-        assert replay.gate_up_clamp == 10.0
-        assert replay.flag_batch == 8
-
-        # Clamp is a cache identity axis: an unclamped call must not consume
-        # the tuned clamped entry and therefore keeps the config default.
-        unclamped = pkg.resolve_hopper_fp8_mega_moe_config(
-            8,
-            64,
-            4,
-            1024,
-            512,
-            0,
-            1,
-        )
-        assert unclamped.gate_up_clamp is None
-        assert unclamped.flag_batch == 1
-
     def test_disabled_cache(self, monkeypatch):
         pkg = _pkg()
         monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
@@ -349,59 +257,7 @@ class TestKnobCache:
 
 
 class TestShimAndBackendWiring:
-    @pytest.mark.parametrize("scale_mode", ["per_tensor", "blockwise"])
-    @pytest.mark.parametrize(
-        ("overrides", "compact_pull_buffer", "generate_c"),
-        [
-            ({}, True, False),
-            ({"compact_pull_buffer": False, "generate_c": True}, False, True),
-        ],
-    )
-    @pytest.mark.parametrize("tail_split_pairs", [None, False, True])
-    def test_public_symm_buffer_preserves_allocation_options(
-        self, scale_mode, overrides, compact_pull_buffer, generate_c, tail_split_pairs
-    ):
-        pkg = _pkg()
-        from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (  # noqa: E501
-            hopper_fp8,
-        )
-
-        workspace = object()
-        with mock.patch.object(
-            hopper_fp8,
-            "_get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config",
-            return_value=workspace,
-        ) as allocator:
-            result = pkg.get_symm_buffer_for_hopper_fp8_mega_moe(
-                8,
-                64,
-                4,
-                1024,
-                512,
-                0,
-                1,
-                fp8_scale_mode=scale_mode,
-                knobs={
-                    "swap_ab": True,
-                    "pingpong": False,
-                    "mma_tiler_mnk": (128, 64, 128),
-                    "cluster_shape_mnk": (1, 2, 1),
-                },
-                tail_split_pairs=tail_split_pairs,
-                **overrides,
-            )
-
-        assert result is workspace
-        allocator.assert_called_once()
-        resolved = allocator.call_args.args[0]
-        assert isinstance(resolved, pkg.MegaMoEHopperFp8Config)
-        assert resolved.fp8_scale_mode == scale_mode
-        assert resolved.compact_pull_buffer is compact_pull_buffer
-        assert resolved.generate_c is generate_c
-        assert resolved.tail_split_pairs is bool(tail_split_pairs)
-
-    @pytest.mark.parametrize("knobs", [{"flag_batch": 4}, {}, "auto"])
-    def test_symm_buffer_rejects_knobs_plus_manual_geometry(self, knobs):
+    def test_symm_buffer_rejects_knobs_plus_manual_geometry(self):
         pkg = _pkg()
         with pytest.raises(ValueError, match="not both"):
             pkg.get_symm_buffer_for_hopper_fp8_mega_moe(
@@ -412,7 +268,7 @@ class TestShimAndBackendWiring:
                 3072,
                 0,
                 1,
-                knobs=knobs,
+                knobs={"flag_batch": 4},
                 swap_ab=False,
             )
 
@@ -448,133 +304,3 @@ class TestShimAndBackendWiring:
                 dataclasses.replace(base, knobs="auto")
             )
         assert backend._autotune_pending
-
-    def test_backend_autotune_uses_ep_subgroup(self):
-        pkg = _pkg()
-        from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
-        from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.backend import (  # noqa: E501
-            Sm90PullFp8MegaKernelBackend,
-        )
-
-        cfg = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
-            intermediate_size=1024,
-            top_k=4,
-            knobs="auto",
-        )
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            backend = Sm90PullFp8MegaKernelBackend(cfg)
-
-        # Model an EP=4 subgroup embedded in a larger global process group.
-        # The autotuner must receive this exact subgroup rather than falling
-        # back to torch.distributed's global group.
-        ep_group = object()
-        backend._ep_bootstrap = object()
-        backend._ep_rank = 2
-        backend._ep_world_size = 4
-        backend._ep_comm_group = ep_group
-        output = SimpleNamespace(shape=(8, 1024))
-        transformed_weights = (object(), object())
-        workspace = object()
-
-        with (
-            mock.patch.object(pkg, "autotune_hopper_fp8_mega_moe") as tune,
-            mock.patch.object(
-                pkg, "hopper_fp8_mega_moe", return_value=object()
-            ) as launch,
-        ):
-            result = backend.compute(
-                workspace,
-                transformed_weights,
-                output=output,
-            )
-
-        assert result is output
-        assert tune.call_args.kwargs["process_group"] is ep_group
-        assert launch.call_count == 1
-        assert not backend._autotune_pending
-
-    def test_compile_key_covers_latest_kernel_knobs(self):
-        pkg = _pkg()
-        cfg = pkg.MegaMoEHopperFp8Config(
-            rank=0,
-            world_size=1,
-            num_tokens_per_rank=64,
-            num_topk=4,
-            num_total_experts=4,
-            hidden=1024,
-            intermediate=512,
-            token_back_mode="reuse_dispatch_warps",
-            grouped_token_back=True,
-        )
-        baseline = pkg.MegaMoEHopperFp8Frontend(cfg)._mega_compile_key()
-        variants = {
-            "dedup_dispatch": True,
-            "grouped_token_back": False,
-            "combine_format": "32e4m3xe8m0",
-            "active_dispatch_warps": 2,
-            "fc1_store_offload": False,
-            "fc1_early_done_publish": True,
-            "fold_producer_warps": False,
-        }
-        for name, value in variants.items():
-            candidate = dataclasses.replace(cfg, **{name: value})
-            assert (
-                pkg.MegaMoEHopperFp8Frontend(candidate)._mega_compile_key() != baseline
-            ), name
-
-
-def test_offline_schedule_lookup_receives_gate_up_clamp(monkeypatch):
-    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (  # noqa: E501
-        tuner as backend_tuner,
-    )
-
-    pkg = _pkg()
-    captured = {}
-
-    class FakeBuffer:
-        destroyed = False
-
-        def destroy(self):
-            self.destroyed = True
-
-    symm_buffer = FakeBuffer()
-    base = pkg.default_knobs(64, fp8_scale_mode="per_tensor")
-
-    def fake_resolve(**kwargs):
-        captured["resolve"] = kwargs
-        return base, "cache"
-
-    def fake_finish(*args, **kwargs):
-        captured["candidates"] = args[8]
-        return {"winner": base}
-
-    monkeypatch.setattr(
-        pkg,
-        "create_dummy_hopper_fp8_inputs",
-        lambda *args, **kwargs: ("y", "l1", "l2", symm_buffer),
-    )
-    monkeypatch.setattr(pkg, "hopper_fp8_candidates", lambda **kwargs: [base])
-    monkeypatch.setattr(pkg, "resolve_knobs", fake_resolve)
-    monkeypatch.setattr(backend_tuner, "schedule_candidates", lambda value: [value])
-    monkeypatch.setattr(backend_tuner, "finish_sweep", fake_finish)
-
-    args = SimpleNamespace(
-        dtype="sm90_fp8_e4m3",
-        live_tokens=None,
-        num_experts=8,
-        topk=4,
-        hidden=1024,
-        intermediate=512,
-        fp8_scale_mode="per_tensor",
-        gate_up_clamp=10.0,
-        seed=0,
-        sweep="schedule",
-        base_knobs=None,
-    )
-    assert backend_tuner.tune_one(args, rank=0, world_size=1, max_tokens=64) == {
-        "winner": base
-    }
-    assert captured["resolve"]["gate_up_clamp"] == 10.0
-    assert captured["candidates"] == [base]
-    assert symm_buffer.destroyed

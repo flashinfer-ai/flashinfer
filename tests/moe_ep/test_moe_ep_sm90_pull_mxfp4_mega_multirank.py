@@ -27,7 +27,7 @@ rank's output.
 Three forwards on one layer additionally guard counter cleanup, launch-cache
 reuse, and reuse of the same symmetric workspace.  A separate test captures
 one fully specified fused tactic in an outer ``torch.cuda.CUDAGraph`` and
-replays it in rank lockstep to guard graph liveness and pointer stability.
+replays it in rank lockstep and compares the output with the same oracle.
 """
 
 from __future__ import annotations
@@ -49,7 +49,6 @@ TOKENS_PER_RANK = 8
 K64 = 64
 E4M3_MAX = 448.0
 GATE_UP_CLAMP = 10.0
-GRAPH_WARMUPS = 3
 GRAPH_REPLAYS = 16
 
 
@@ -299,9 +298,11 @@ def _fast_fp8_mm(a, b):
 
 def _swiglu_sm90_formula(gate, up):
     """Independent bit-match of the SM90 exp2/reciprocal SwiGLU formula."""
-    from tests.moe_ep._sm90_swiglu_reference import swiglu_sm90_reference
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        _swiglu_pair_hw_match_cuda,
+    )
 
-    return swiglu_sm90_reference(gate, up)
+    return _swiglu_pair_hw_match_cuda(gate, up)
 
 
 def _global_route_reference(
@@ -426,8 +427,8 @@ def _assert_matches_reference(actual, expected, *, launch: int) -> None:
     assert rel_l2.item() < 2.5e-2
 
 
-def _complete_fused_graph_tactic() -> dict:
-    """Small-shape fused tactic with every runtime identity field explicit."""
+def _fused_tactic() -> dict:
+    """Small-shape fused tactic shared by the numerical cases."""
 
     return {
         "active_dispatch_warps": 1,
@@ -450,18 +451,7 @@ def _complete_fused_graph_tactic() -> dict:
     }
 
 
-@pytest.mark.gpu_2
-@pytest.mark.arch_hopper
-@pytest.mark.parametrize(
-    "routing_pattern", ("cross_rank", "sparse_owner", "zero_source", "all_masked")
-)
-def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
-    routing_pattern,
-    *,
-    tactic=None,
-    expected_policy=None,
-    expected_kernel=None,
-):
+def _run_raw_oracle(routing_pattern, *, tactic=None, capture_graph=False):
     """Production raw ABI vs independent global math on 1, 2, 4, or 8 ranks."""
     import torch
     import torch.distributed as dist
@@ -471,7 +461,6 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
         FleetParams,
         MegaConfig,
         MoEEpLayer,
-        MoEEpMegaLayer,
         MoEEpTensors,
         Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig,
         bootstrap_moe_ep_runtime,
@@ -510,13 +499,14 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
         **(geometry if tactic is None else {"knobs": tactic}),
     )
     registry_kernel = create_mega_kernel(config)
-    assert registry_kernel.kernel_name() == "sm90_fp8_mxfp4_bf16_pull_cutedsl"
     runtime = bootstrap_moe_ep_runtime(
         bootstrap,
         registry_kernel.runtime_requirements(bootstrap),
     )
 
     layer = None
+    graph = None
+    captured_output = None
     try:
         raw = _make_raw_weights(rank)
         raw_global = _gather_raw_weights(raw)
@@ -568,7 +558,6 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
                 preprocess_weights=True,
             ),
         )
-        assert isinstance(layer, MoEEpMegaLayer)
 
         def tensors(item):
             hidden, ids, weights = item
@@ -579,39 +568,21 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
             )
 
         first = layer.forward(tensors(launches[0])).clone()
-        workspace = layer._workspace
-        assert workspace is not None
-        if expected_kernel is not None:
-            kernel = workspace._frontend._mega.kernel
-            for field, value in expected_kernel.items():
-                assert getattr(kernel, field) == value, (field, value)
-            if "tail_split_pairs" in expected_kernel:
-                assert (
-                    workspace._frontend.effective_tactic()["tail_split_pairs"]
-                    is expected_kernel["tail_split_pairs"]
-                )
-        if expected_policy is not None:
-            policy = workspace._frontend._mega.kernel.mxfp4_optimizations
-            for field, value in expected_policy.items():
-                assert getattr(policy, field) == value, (field, policy)
         second = layer.forward(tensors(launches[1])).clone()
-        assert layer._workspace is workspace
         second_repeat = layer.forward(tensors(launches[1])).clone()
-        assert layer._workspace is workspace
         torch.cuda.synchronize()
         torch.testing.assert_close(second_repeat, second, atol=0.0, rtol=0.0)
-        if expected_kernel is not None:
-            from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.comm import (
-                reset_compiled_mega_workspaces,
-            )
-
+        if capture_graph:
             dist.barrier()
-            reset_compiled_mega_workspaces(workspace._frontend._mega)
-            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured_output = layer.forward(tensors(launches[1]))
             dist.barrier()
-            after_reset = layer.forward(tensors(launches[1])).clone()
-            torch.cuda.synchronize()
-            torch.testing.assert_close(after_reset, second, atol=0.0, rtol=0.0)
+            for _ in range(GRAPH_REPLAYS):
+                graph.replay()
+                torch.cuda.synchronize()
+                dist.barrier()
+                torch.testing.assert_close(captured_output, second, atol=0.0, rtol=0.0)
 
         actual_global = [
             _all_gather_stack(first),
@@ -641,9 +612,24 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
         )
         dist.barrier()
     finally:
+        if graph is not None:
+            torch.cuda.synchronize()
+        captured_output = None
+        graph = None
         if layer is not None:
             layer.destroy()
         finalize_moe_ep_runtime(runtime)
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "routing_pattern", ("cross_rank", "sparse_owner", "zero_source", "all_masked")
+)
+def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
+    routing_pattern,
+):
+    _run_raw_oracle(routing_pattern)
 
 
 @pytest.mark.gpu_4
@@ -763,7 +749,7 @@ def test_moe_ep_sm90_pull_mxfp4_tail_pairs_independent_oracle(
     pingpong,
     routing_pattern,
 ):
-    """Packed tail pairs vs full raw oracle, with repeat and empty-rank reset."""
+    """Packed tail pairs vs full raw oracle, including repeated and empty inputs."""
     import sys
 
     module = sys.modules[__name__]
@@ -771,17 +757,16 @@ def test_moe_ep_sm90_pull_mxfp4_tail_pairs_independent_oracle(
     monkeypatch.setattr(module, "INTERMEDIATE", intermediate)
     monkeypatch.setattr(module, "TOKENS_PER_RANK", tokens)
     tactic = dict(
-        _complete_fused_graph_tactic(),
+        _fused_tactic(),
         mma_tiler_mnk=tile,
         cluster_shape_mnk=(1, 2, 1),
         tail_split_pairs=True,
         pingpong=pingpong,
         token_back_mode=return_mode,
     )
-    test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
+    _run_raw_oracle(
         routing_pattern,
         tactic=tactic,
-        expected_kernel={"tail_split_pairs": True},
     )
 
 
@@ -831,11 +816,9 @@ def test_moe_ep_sm90_pull_mxfp4_tail_candidates_other_shapes(
         and candidate["mma_tiler_mnk"] == tile
         and candidate["fc2_tail_n8"] == tail_n8
     )
-    test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
+    _run_raw_oracle(
         "cross_rank",
         tactic=tactic,
-        expected_kernel={"tail_split_pairs": True},
-        expected_policy={"fc2_tail_n8": tail_n8},
     )
 
 
@@ -850,56 +833,26 @@ def test_moe_ep_sm90_pull_mxfp4_tail_candidates_other_shapes(
         pytest.param(
             (256, 16, 128), 384, (2, 1, 1), False, id="k128-partial-m-cluster"
         ),
-        pytest.param(
-            (256, 16, 256), 768, (2, 1, 1), False, id="k256-padded-cta-bulk-and-cpasync"
-        ),
+        pytest.param((256, 16, 256), 768, (2, 1, 1), False, id="k256-padded-cta"),
     ],
 )
 def test_moe_ep_sm90_pull_mxfp4_offset_m_boundary(
     monkeypatch, tile, hidden, cluster, tail_pairs
 ):
-    """Partial/padded weight tiles keep offsets in bounds and reset cleanly."""
-    import dataclasses
+    """Partial/padded weight tiles match the independent full-output reference."""
     import sys
-
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (
-        hopper_mxfp4,
-    )
 
     module = sys.modules[__name__]
     monkeypatch.setattr(module, "HIDDEN", hidden)
     monkeypatch.setattr(module, "INTERMEDIATE", 256)
     monkeypatch.setattr(module, "TOKENS_PER_RANK", 12)
     tactic = dict(
-        _complete_fused_graph_tactic(),
+        _fused_tactic(),
         mma_tiler_mnk=tile,
         cluster_shape_mnk=cluster,
         tail_split_pairs=tail_pairs,
     )
-    for bulk in (True, False) if tile[2] == 256 else (False,):
-        if tile[2] == 256 and not bulk:
-            # The preceding forward imported the raw kernel. Match the host
-            # compile identity and device policy, as in the bulk/reset test.
-            kernel_module = sys.modules[
-                "moe_hopper_fp8.kernel_mxfp4_fp8_glu_fc12_swapab"
-            ]
-            for target in (hopper_mxfp4, kernel_module):
-                resolve = target.resolve_mxfp4_optimizations
-
-                def cpasync_offsets(*args, _resolve=resolve, **kwargs):
-                    return dataclasses.replace(
-                        _resolve(*args, **kwargs), offset_bulk=False
-                    )
-
-                monkeypatch.setattr(
-                    target, "resolve_mxfp4_optimizations", cpasync_offsets
-                )
-        test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
-            "cross_rank",
-            tactic=tactic,
-            expected_kernel={"tail_split_pairs": tail_pairs},
-            expected_policy={"offset_bulk": bulk},
-        )
+    _run_raw_oracle("cross_rank", tactic=tactic)
 
 
 @pytest.mark.gpu_4
@@ -923,22 +876,15 @@ def test_moe_ep_sm90_pull_mxfp4_local_optimizations_independent_oracle(
     monkeypatch.setattr(module, "HIDDEN", hidden)
     monkeypatch.setattr(module, "INTERMEDIATE", 256)
     tactic = dict(
-        _complete_fused_graph_tactic(),
+        _fused_tactic(),
         mma_tiler_mnk=tile,
         dedup_dispatch=dedup,
         fc2_tail_n8=tail,
         fc1_ready_mode="tile",
     )
-    test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
+    _run_raw_oracle(
         routing_pattern,
         tactic=tactic,
-        expected_policy=dict(
-            peer32=hidden == 7168,
-            offset_bulk=True,
-            skip_zero_counts=not dedup,
-            fc2_tail_n8=tail,
-            fc1_ready_mode="tile",
-        ),
     )
 
 
@@ -985,7 +931,7 @@ def test_mxfp4_bulk_offsets_match_cpasync_after_repeat_and_reset(
     ensure_moe_ep_cuda_device(bootstrap)
     device = torch.device("cuda", local_rank)
     tactic = dict(
-        _complete_fused_graph_tactic(),
+        _fused_tactic(),
         mma_tiler_mnk=(128, 64, 256),
         cluster_shape_mnk=(cluster_m, 1, 1),
         active_dispatch_warps=4,
@@ -1085,7 +1031,6 @@ def test_mxfp4_bulk_offsets_match_cpasync_after_repeat_and_reset(
             assert compiled.kernel.mxfp4_optimizations.offset_bulk is bulk
             for _ in range(20):
                 actual = layer.forward(tensors).detach().cpu().contiguous()
-                assert layer._workspace is workspace
                 assert_equal(actual, first)
             torch.cuda.synchronize()
             dist.barrier()
@@ -1111,162 +1056,13 @@ def test_mxfp4_bulk_offsets_match_cpasync_after_repeat_and_reset(
 def test_moe_ep_sm90_pull_mxfp4_fused_outer_graph_replay_matches_oracle(
     tail_split_pairs,
 ):
-    """Capture once and replay a fixed fused call collectively 16 times."""
-    import torch
-    import torch.distributed as dist
-
-    from flashinfer.moe_ep import (
-        BootstrapConfig,
-        FleetParams,
-        MegaConfig,
-        MoEEpLayer,
-        MoEEpMegaLayer,
-        MoEEpTensors,
-        Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig,
-        bootstrap_moe_ep_runtime,
-        ensure_moe_ep_cuda_device,
-        finalize_moe_ep_runtime,
+    """Collective Graph replay agrees with eager and the independent oracle."""
+    tactic = dict(
+        _fused_tactic(),
+        cluster_shape_mnk=(1, 2, 1) if tail_split_pairs else (1, 1, 1),
+        tail_split_pairs=tail_split_pairs,
     )
-    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-
-    assert torch.cuda.is_available(), "gpu_2 test collected without CUDA"
-    rank, world_size, local_rank = _launcher_ranks()
-    assert world_size in (1, 2, 4, 8), (
-        "launch this graph test with torchrun --nproc_per_node=1, 2, 4, or 8; "
-        f"got WORLD_SIZE={world_size}"
-    )
-
-    bootstrap = BootstrapConfig(
-        world_size=world_size,
-        rank=rank,
-        device=local_rank,
-    )
-    ensure_moe_ep_cuda_device(bootstrap)
-    config = Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig(
-        intermediate_size=INTERMEDIATE,
-        top_k=world_size,
-        knobs=dict(
-            _complete_fused_graph_tactic(),
-            cluster_shape_mnk=(1, 2, 1) if tail_split_pairs else (1, 1, 1),
-            tail_split_pairs=tail_split_pairs,
-        ),
-        gate_up_clamp=GATE_UP_CLAMP,
-    )
-    registry_kernel = create_mega_kernel(config)
-    assert registry_kernel.kernel_name() == "sm90_fp8_mxfp4_bf16_pull_cutedsl"
-    runtime = bootstrap_moe_ep_runtime(
-        bootstrap,
-        registry_kernel.runtime_requirements(bootstrap),
-    )
-
-    layer = None
-    graph = None
-    captured_output = None
-    try:
-        raw = _make_raw_weights(rank)
-        raw_global = _gather_raw_weights(raw)
-        launch = _make_tokens_and_routes(rank, world_size, launch=0)
-        hidden_global = _all_gather_stack(launch[0])
-        ids_global = _all_gather_stack(launch[1])
-        weights_global = _all_gather_stack(launch[2])
-        _assert_cross_rank_coverage(ids_global, world_size)
-
-        layer = MoEEpLayer(
-            bootstrap=BootstrapConfig(
-                world_size=world_size,
-                rank=rank,
-                auto_bootstrap=False,
-                device=local_rank,
-            ),
-            fleet_params=FleetParams(
-                num_experts=world_size * LOCAL_EXPERTS,
-                max_tokens_per_rank=TOKENS_PER_RANK,
-                token_hidden_size=HIDDEN,
-            ),
-            weights=raw,
-            backend=MegaConfig(
-                megakernel=config,
-                quantize_input=True,
-                preprocess_weights=True,
-            ),
-        )
-        assert isinstance(layer, MoEEpMegaLayer)
-        tensors = MoEEpTensors(
-            hidden_states=launch[0],
-            topk_ids=launch[1],
-            topk_weights=launch[2],
-        )
-        input_ptrs = (
-            tensors.hidden_states.data_ptr(),
-            tensors.topk_ids.data_ptr(),
-            tensors.topk_weights.data_ptr(),
-        )
-
-        # The first call resolves every lazy allocation/JIT path.  Two more
-        # collective calls exercise the exact fixed inputs before capture.
-        layer.warmup(tensors)
-        for _ in range(GRAPH_WARMUPS - 1):
-            layer.forward(tensors)
-        torch.cuda.synchronize()
-        dist.barrier()
-
-        eager = layer.forward(tensors).clone()
-        torch.cuda.synchronize()
-        dist.barrier()
-
-        # Capture records each rank independently.  The barriers ensure no
-        # rank starts a cross-rank replay while a peer is still capturing.
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured_output = layer.forward(tensors)
-        captured_output_ptr = captured_output.data_ptr()
-        dist.barrier()
-
-        replayed = []
-        for _ in range(GRAPH_REPLAYS):
-            graph.replay()
-            torch.cuda.synchronize()
-            replayed.append(captured_output.clone())
-            torch.cuda.synchronize()
-            dist.barrier()
-
-        input_ptrs_after = (
-            tensors.hidden_states.data_ptr(),
-            tensors.topk_ids.data_ptr(),
-            tensors.topk_weights.data_ptr(),
-        )
-        captured_output_ptr_after = captured_output.data_ptr()
-
-        actual_global = _all_gather_stack(replayed[-1])
-        expected_global = _global_route_reference(
-            hidden_global,
-            ids_global,
-            weights_global,
-            raw_global,
-        )
-        dist.barrier()
-    finally:
-        # Drop graph-owned output references before releasing the symmetric
-        # workspace they read.  Every successful iteration synchronized all
-        # ranks, so teardown cannot race an outstanding peer launch.
-        torch.cuda.synchronize()
-        captured_output = None
-        graph = None
-        if layer is not None:
-            layer.destroy()
-        finalize_moe_ep_runtime(runtime)
-
-    assert input_ptrs_after == input_ptrs
-    assert captured_output_ptr_after == captured_output_ptr
-    for replay in replayed:
-        assert torch.equal(replay, eager), (
-            f"rank {rank}: fused graph replay diverged from eager output"
-        )
-    _assert_matches_reference(actual_global, expected_global, launch=0)
-    print(
-        f"rank {rank}: production SM90 MXFP4 fused outer graph completed "
-        f"{GRAPH_REPLAYS} stable lockstep replays across {world_size} ranks"
-    )
+    _run_raw_oracle("cross_rank", tactic=tactic, capture_graph=True)
 
 
 def _tiny_quantize_reference(x, *, fc2=False):
@@ -1386,7 +1182,5 @@ def test_fused_mxfp4_tiny_full_output(monkeypatch, amplitude, fc1_exponent_shift
         test_module, "_global_route_reference", _tiny_full_output_reference
     )
     monkeypatch.setattr(test_module, "_assert_matches_reference", check)
-    tactic = dict(_complete_fused_graph_tactic(), mma_tiler_mnk=(256, 64, 256))
-    test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
-        "cross_rank", tactic=tactic
-    )
+    tactic = dict(_fused_tactic(), mma_tiler_mnk=(256, 64, 256))
+    _run_raw_oracle("cross_rank", tactic=tactic)

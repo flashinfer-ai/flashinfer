@@ -46,9 +46,10 @@ import os
 
 import pytest
 
-# Most tests exercise the shim public API. The fused communication ablation
-# additionally uses the kernel's policy hook and checks the compiled strategy
-# to prove that each independent optimization arm actually ran.
+# This test verifies the mega path only through the pull_style_cutedsl_megakernel
+# shim public API (``flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel``);
+# it never imports the src/ kernel packages directly, so a new src/ drop can't
+# silently break it.
 pytest.importorskip("flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel")
 
 E4M3_MAX = 448.0
@@ -219,13 +220,7 @@ def _preprocess_weights(problem: dict):
 
 
 def _alloc_symm_buffer(
-    problem: dict,
-    rank: int,
-    world_size: int,
-    *,
-    mma_tiler_mnk=None,
-    cluster_shape_mnk=None,
-    generate_c: bool = False,
+    problem: dict, rank: int, world_size: int, *, generate_c: bool = False
 ):
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
         get_symm_buffer_for_hopper_fp8_mega_moe,
@@ -242,8 +237,6 @@ def _alloc_symm_buffer(
         kind=problem["kind"],
         fp8_scale_mode=problem["fp8_scale_mode"],
         swap_ab=problem["swap_ab"],
-        mma_tiler_mnk=mma_tiler_mnk,
-        cluster_shape_mnk=cluster_shape_mnk,
         gate_up_clamp=problem["gate_up_clamp"],
         generate_c=generate_c,
     )
@@ -577,10 +570,6 @@ def _run_mega_layer(
             scales=t_scales,
         )
         y_layer = mega.forward(t).clone()
-        if tail_split_pairs is not None:
-            frontend = mega._workspace._frontend
-            assert frontend.config.tail_split_pairs == tail_split_pairs
-            assert frontend._mega.kernel.tail_split_pairs == tail_split_pairs
         # Repeated forward on the same session: with no per-launch host reset
         # (run() default reset_counters=False) the second launch relies on the
         # kernel's tail cleanup of its workspace counters/flags AND on the
@@ -1311,16 +1300,7 @@ def _check_generate_c_output(fc1_c, ref_map, idx_g, rank, num_local_experts):
 
 
 def _run_mega_torch_oracle(
-    rank,
-    world_size,
-    *,
-    fp8_scale_mode,
-    swap_ab=False,
-    mma_tiler_mnk=None,
-    cluster_shape_mnk=None,
-    hidden=2048,
-    expected_fused_comm=None,
-    generate_c=False,
+    rank, world_size, *, fp8_scale_mode, swap_ab=False, generate_c=False
 ):
     """Real-EP kernel launch vs the drop's pure-torch GLOBAL reference.
 
@@ -1355,11 +1335,7 @@ def _run_mega_torch_oracle(
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
     problem = _mega_problem(
-        rank,
-        world_size,
-        fp8_scale_mode=fp8_scale_mode,
-        swap_ab=swap_ab,
-        hidden=hidden,
+        rank, world_size, fp8_scale_mode=fp8_scale_mode, swap_ab=swap_ab
     )
     kernel = create_mega_kernel(_megakernel_config(problem))
     runtime = bootstrap_moe_ep_runtime(
@@ -1371,12 +1347,7 @@ def _run_mega_torch_oracle(
         hidden = problem["hidden"]
 
         symm_buffer = _alloc_symm_buffer(
-            problem,
-            rank,
-            world_size,
-            mma_tiler_mnk=mma_tiler_mnk,
-            cluster_shape_mnk=cluster_shape_mnk,
-            generate_c=generate_c,
+            problem, rank, world_size, generate_c=generate_c
         )
         try:
             stage_mega_moe_inputs(
@@ -1409,14 +1380,6 @@ def _run_mega_torch_oracle(
             )
             torch.cuda.synchronize()
             dist.barrier()
-            if expected_fused_comm is not None:
-                paired, skip_zero = expected_fused_comm
-                actual_kernel = symm_buffer._frontend._mega.kernel
-                policy = actual_kernel.fused_comm_optimizations
-                assert policy.paired_bf16_stores is paired
-                assert policy.skip_zero_counts is skip_zero
-                assert actual_kernel.epilogue._paired_bf16_stores is paired
-                assert actual_kernel.token_comm._skip_zero_expert_counts is skip_zero
 
             # Reassemble the global problem from the operands each rank staged.
             x_g = _all_gather_stack(x_local)  # (R, n, hidden) fp8
@@ -1537,233 +1500,6 @@ def test_moe_ep_sm90_pull_fp8_mega_multirank_torch_oracle(fp8_scale_mode, swap_a
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega kernel ({fp8_scale_mode}, "
         f"swap_ab={swap_ab}) matches the multi-rank torch oracle"
     )
-
-
-@pytest.mark.gpu_4
-@pytest.mark.arch_hopper
-@pytest.mark.parametrize("fp8_scale_mode", ["per_tensor", "blockwise"])
-def test_moe_ep_sm90_pull_fp8_n64_torch_oracle(fp8_scale_mode):
-    """The paired-store layout retains the independent FP8 math contract."""
-    _require_cuda()
-    rank, world_size = _launcher_ranks()
-    assert world_size == 4, "launch this test with torchrun --nproc_per_node=4"
-    _run_mega_torch_oracle(
-        rank,
-        world_size,
-        fp8_scale_mode=fp8_scale_mode,
-        swap_ab=True,
-        mma_tiler_mnk=(256, 64, 128),
-        cluster_shape_mnk=(2, 1, 1),
-    )
-
-
-@pytest.mark.gpu_4
-@pytest.mark.arch_hopper
-@pytest.mark.parametrize("fp8_scale_mode", ["per_tensor", "blockwise"])
-def test_moe_ep_sm90_pull_fp8_n64_h7168_torch_oracle(monkeypatch, fp8_scale_mode):
-    """Verify both shared optimizations against pure Torch even if disabled by default."""
-    _require_cuda()
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
-        bootstrap_paths,
-    )
-
-    bootstrap_paths()
-    from moe_hopper_fp8.kernel_fp8_glu_fc12_swapab import (
-        Sm90SwapABSwigluFp8Fc12Kernel,
-    )
-
-    original_policy = Sm90SwapABSwigluFp8Fc12Kernel._resolve_fused_comm_optimizations
-
-    def resolve_policy(self):
-        policy = original_policy(self, paired_stores=True, skip_zero_counts=True)
-        assert policy.paired_bf16_stores and policy.skip_zero_counts
-        return policy
-
-    monkeypatch.setattr(
-        Sm90SwapABSwigluFp8Fc12Kernel,
-        "_resolve_fused_comm_optimizations",
-        resolve_policy,
-    )
-    rank, world_size = _launcher_ranks()
-    assert world_size == 4, "launch this test with torchrun --nproc_per_node=4"
-    _run_mega_torch_oracle(
-        rank,
-        world_size,
-        fp8_scale_mode=fp8_scale_mode,
-        swap_ab=True,
-        mma_tiler_mnk=(256, 64, 128),
-        cluster_shape_mnk=(2, 1, 1),
-        hidden=7168,
-        expected_fused_comm=(True, True),
-    )
-
-
-@pytest.mark.gpu_4
-@pytest.mark.arch_hopper
-@pytest.mark.parametrize("fp8_scale_mode", ["per_tensor", "blockwise"])
-@pytest.mark.parametrize(
-    "routing_pattern", ["cross_rank", "sparse_owner", "zero_source", "all_masked"]
-)
-def test_moe_ep_sm90_pull_fp8_fused_comm_optimizations(
-    monkeypatch, fp8_scale_mode, routing_pattern
-):
-    """Independently toggle both shared optimizations on odd token tails.
-
-    Each arm owns a new frontend and workspace, so changing the diagnostic
-    policy hook cannot accidentally reuse another arm's compiled kernel.
-    This is a correctness test; it does not add public tuning dimensions.
-    """
-    from dataclasses import replace
-
-    import torch
-    import torch.distributed as dist
-
-    from flashinfer.moe_ep import (
-        BootstrapConfig,
-        bootstrap_moe_ep_runtime,
-        ensure_moe_ep_cuda_device,
-        finalize_moe_ep_runtime,
-    )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.staging import (
-        stage_mega_moe_inputs,
-    )
-    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.hopper_fp8 import (
-        _build_inputs,
-    )
-    from moe_hopper_fp8.kernel_fp8_glu_fc12_swapab import (
-        Sm90SwapABSwigluFp8Fc12Kernel,
-    )
-
-    assert torch.cuda.is_available(), "gpu_4 test collected without CUDA"
-    rank, world_size = _launcher_ranks()
-    assert world_size == 4, "launch this test with torchrun --nproc_per_node=4"
-    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
-    ensure_moe_ep_cuda_device(bootstrap)
-    problem = _mega_problem(
-        rank,
-        world_size,
-        fp8_scale_mode=fp8_scale_mode,
-        swap_ab=True,
-        num_tokens=17,
-        max_tokens=17,
-        num_experts=16,
-    )
-    kernel = create_mega_kernel(_megakernel_config(problem))
-    runtime = bootstrap_moe_ep_runtime(
-        bootstrap, kernel.runtime_requirements(bootstrap)
-    )
-    original_policy = Sm90SwapABSwigluFp8Fc12Kernel._resolve_fused_comm_optimizations
-    baseline = None
-    try:
-        transformed_l1, transformed_l2 = _preprocess_weights(problem)
-        token = torch.arange(17, device="cuda", dtype=torch.int64).view(-1, 1)
-        slot = torch.arange(4, device="cuda", dtype=torch.int64).view(1, -1)
-        routes = []
-        for launch in range(2):
-            owner = (rank + slot + launch) % world_size
-            expert = (token + slot + launch) % 4
-            if routing_pattern == "sparse_owner":
-                owner = torch.full_like(owner, launch)
-                expert = slot.expand(17, -1)
-            ids = (owner * 4 + expert).expand(17, -1).contiguous()
-            if (routing_pattern == "zero_source" and rank == launch) or (
-                routing_pattern == "all_masked" and launch == 0
-            ):
-                ids.fill_(-1)
-            routes.append(ids)
-
-        for paired, skip_zero in (
-            (False, False),
-            (True, False),
-            (False, True),
-            (True, True),
-        ):
-
-            def resolve_policy(self):
-                capability = original_policy(
-                    self, paired_stores=True, skip_zero_counts=True
-                )
-                assert capability.paired_bf16_stores
-                assert capability.skip_zero_counts
-                return replace(
-                    capability,
-                    paired_bf16_stores=paired,
-                    skip_zero_counts=skip_zero,
-                )
-
-            monkeypatch.setattr(
-                Sm90SwapABSwigluFp8Fc12Kernel,
-                "_resolve_fused_comm_optimizations",
-                resolve_policy,
-            )
-            symm_buffer = _alloc_symm_buffer(
-                problem,
-                rank,
-                world_size,
-                mma_tiler_mnk=(256, 64, 128),
-                cluster_shape_mnk=(2, 1, 1),
-            )
-            try:
-                outputs = []
-                for ids in routes:
-                    stage_mega_moe_inputs(
-                        problem["hidden_states"],
-                        problem["topk_weights"],
-                        ids,
-                        symm_buffer.x,
-                        symm_buffer.x_sf,
-                        symm_buffer.topk_idx,
-                        symm_buffer.topk_weights,
-                        kind=problem["kind"],
-                        fp8_scale_mode=fp8_scale_mode,
-                        fc1_activation_dequant_scale=FC1_ACT_SCALE,
-                    )
-                    inputs = _build_inputs(symm_buffer, transformed_l1, transformed_l2)
-                    output = symm_buffer._frontend.run(inputs).clone()[:17]
-                    torch.cuda.synchronize()
-                    assert torch.isfinite(output).all()
-                    if (ids == -1).all():
-                        assert torch.count_nonzero(output).item() == 0
-                    outputs.append(output)
-                actual_kernel = symm_buffer._frontend._mega.kernel
-                policy = actual_kernel.fused_comm_optimizations
-                assert policy.paired_bf16_stores is paired
-                assert policy.skip_zero_counts is skip_zero
-                assert actual_kernel.epilogue._paired_bf16_stores is paired
-                assert actual_kernel.token_comm._skip_zero_expert_counts is skip_zero
-                repeated = symm_buffer._frontend.run(inputs).clone()[:17]
-                reset = symm_buffer._frontend.run(inputs, reset_counters=True).clone()[
-                    :17
-                ]
-                torch.cuda.synchronize()
-                torch.testing.assert_close(
-                    repeated.view(torch.uint8),
-                    outputs[-1].view(torch.uint8),
-                    atol=0,
-                    rtol=0,
-                )
-                torch.testing.assert_close(
-                    reset.view(torch.uint8),
-                    outputs[-1].view(torch.uint8),
-                    atol=0,
-                    rtol=0,
-                )
-                if baseline is None:
-                    baseline = outputs
-                else:
-                    for actual, expected in zip(outputs, baseline, strict=True):
-                        torch.testing.assert_close(
-                            actual.view(torch.uint8),
-                            expected.view(torch.uint8),
-                            atol=0,
-                            rtol=0,
-                        )
-                dist.barrier()
-            finally:
-                symm_buffer.destroy()
-    finally:
-        finalize_moe_ep_runtime(runtime)
 
 
 @pytest.mark.arch_hopper

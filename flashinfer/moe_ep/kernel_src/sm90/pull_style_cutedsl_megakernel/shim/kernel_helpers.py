@@ -61,6 +61,10 @@ _LAZY = {
         "moe_hopper_fp8.hopper_moe_utils",
         "quantize_fp8_weight_block_nk",
     ),
+    "_swiglu_pair_hw_match_cuda": (
+        "moe_nvfp4_swapab.runner_common",
+        "_swiglu_pair_hw_match_cuda",
+    ),
     # ground-truth torch reference (moe_hopper_fp8/mega_reference_fp8.py)
     "compute_megamoe_reference_fp8": (
         "moe_hopper_fp8.mega_reference_fp8",
