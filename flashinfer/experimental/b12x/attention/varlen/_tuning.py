@@ -30,6 +30,7 @@ class VarlenAttentionQuery:
     kv_rows: int
     max_seqlen_q: int
     max_seqlen_k: int
+    math_mode: str = "flash"
     block_sparse: bool = False
     per_segment_tiles: bool = False
     block_tile_m: int = 0
@@ -82,6 +83,15 @@ def _validate_query(
     query: VarlenAttentionQuery,
     _device: DeviceIdentity | None,
 ) -> None:
+    if query.math_mode not in ("flash", "eager_bf16"):
+        raise ValueError(f"unsupported attention math mode {query.math_mode!r}")
+    if query.math_mode == "eager_bf16" and (
+        query.variant != "varlen" or query.dtype != "bfloat16"
+        or query.causal or query.block_sparse or query.per_segment_tiles
+        or query.q_heads != query.kv_heads
+        or query.query_rows <= 0 or query.kv_rows <= 0 or query.batch_size <= 0
+    ):
+        raise ValueError("eager_bf16 requires dense noncausal BF16 varlen attention with equal Q/KV heads")
     if query.variant not in ("batched", "varlen"):
         raise ValueError(f"unsupported attention variant {query.variant!r}")
     if query.dtype not in ("bfloat16", "float16"):
@@ -175,7 +185,7 @@ def _materialize_tuning(
 
 TUNING = TuningContract(
     component_id="attention.varlen",
-    query_schema_version=22,
+    query_schema_version=23,
     config_schema_version=22,
     query_fields=frozenset(VarlenAttentionQuery.__dataclass_fields__),
     config_fields=frozenset(VarlenAttentionConfig.__dataclass_fields__),

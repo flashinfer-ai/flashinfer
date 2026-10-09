@@ -7,6 +7,7 @@ import cutlass.cute as cute
 from cutlass import Float32
 
 from b12x.attention._shared.contiguous import layout_utils
+from b12x._lib.intrinsics import div_rn_f32
 from b12x.attention._shared.cute import ops as cute_ops
 from b12x.attention._shared.contiguous.cute_dsl_utils import (
     ParamsBase,
@@ -21,6 +22,7 @@ class Softmax(ParamsBase):
     row_sum: cute.Tensor
     arch: cutlass.Constexpr[int] = 80
     softmax_scale: Float32 | None = None
+    prescaled: cutlass.Constexpr[bool] = False
 
     @staticmethod
     def create(
@@ -28,10 +30,11 @@ class Softmax(ParamsBase):
         num_rows: cutlass.Constexpr[int],
         arch: cutlass.Constexpr[int] = 80,
         softmax_scale: Float32 | None = None,
+        prescaled: cutlass.Constexpr[bool] = False,
     ):
         row_max = cute.make_rmem_tensor(num_rows, Float32)
         row_sum = cute.make_rmem_tensor(num_rows, Float32)
-        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale)
+        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale, prescaled)
 
     def _row_layout(self) -> cute.Layout:
         return cute.make_layout((self.num_rows,), stride=(1,))
@@ -74,20 +77,26 @@ class Softmax(ParamsBase):
                     cutlass.select_(row_max_cur == -Float32.inf, 0.0, row_max_cur)
                 )
             row_max_cur_scaled = row_max_cur * self.scale_log2
-            acc_S_row_exp = cute.math.exp2(
-                acc_S_row * self.scale_log2 - row_max_cur_scaled,
-                fastmath=True,
-            )
+            if cutlass.const_expr(self.prescaled):
+                acc_S_row_exp = cute.math.exp(acc_S_row - row_max_cur, fastmath=False)
+            else:
+                acc_S_row_exp = cute.math.exp2(
+                    acc_S_row * self.scale_log2 - row_max_cur_scaled,
+                    fastmath=True,
+                )
             if cutlass.const_expr(is_first):
                 acc_S_row_sum = cute_ops.fadd_reduce(
                     acc_S_row_exp, init_val=None, arch=self.arch
                 )
                 row_scale[r] = 1.0
             else:
-                row_scale[r] = cute.math.exp2(
-                    (row_max_prev - row_max_cur) * self.scale_log2,
-                    fastmath=True,
-                )
+                if cutlass.const_expr(self.prescaled):
+                    row_scale[r] = cute.math.exp(row_max_prev - row_max_cur, fastmath=False)
+                else:
+                    row_scale[r] = cute.math.exp2(
+                        (row_max_prev - row_max_cur) * self.scale_log2,
+                        fastmath=True,
+                    )
                 acc_S_row_sum = cute_ops.fadd_reduce(
                     acc_S_row_exp,
                     init_val=self.row_sum[r] * row_scale[r],
@@ -98,6 +107,14 @@ class Softmax(ParamsBase):
             acc_S_mn[r, None].store(acc_S_row_exp)
 
         return row_scale
+
+    def normalized_probabilities(self, acc_S: cute.Tensor) -> None:
+        """Apply retained row maxima and inverse sums before the BF16 PV cast."""
+        scores = layout_utils.reshape_acc_to_mn(acc_S)
+        for r in range(int(self.num_rows)):
+            maximum = cutlass.select_(self.row_max[r] == -Float32.inf, 0.0, self.row_max[r])
+            probabilities = cute.math.exp(scores[r, None].load() - maximum, fastmath=False)
+            scores[r, None].store(probabilities * self.row_sum[r])
 
     def finalize(
         self, final_scale: Float32 = 1.0, sink_val: Float32 | cute.Tensor | None = None
@@ -137,8 +154,13 @@ class Softmax(ParamsBase):
             safe_row_sum = Float32(
                 cutlass.select_(row_sum_is_zero_or_nan, 1.0, row_sum_cur)
             )
-            row_scale[r] = cute.arch.rcp_approx(safe_row_sum) * final_scale
-            if cutlass.const_expr(self.softmax_scale is not None):
+            if cutlass.const_expr(self.prescaled):
+                row_scale[r] = div_rn_f32(Float32(1), safe_row_sum) * final_scale
+            else:
+                row_scale[r] = cute.arch.rcp_approx(safe_row_sum) * final_scale
+            if cutlass.const_expr(self.prescaled):
+                row_lse = self.row_max[r] + cute.math.log(safe_row_sum, fastmath=False)
+            elif cutlass.const_expr(self.softmax_scale is not None):
                 # Retain the original scale: a log2 -> natural-log round trip
                 # needlessly changes the normalization of merged attention.
                 row_lse = self.row_max[r] * self.softmax_scale + cute.math.log(

@@ -181,6 +181,7 @@ class ContiguousAttentionForwardKernel:
         mma_pv_is_rs: bool = True,
         is_block_sparse: bool = False,
         per_segment_tiles: bool = False,
+        math_phase: str = "flash",
     ):
         self.dtype = dtype
         hdim_multiple_of = 16
@@ -202,6 +203,9 @@ class ContiguousAttentionForwardKernel:
         self.num_stages = num_stages
         self.is_block_sparse = is_block_sparse
         self.per_segment_tiles = per_segment_tiles
+        if math_phase not in ("flash", "statistics", "normalized"):
+            raise ValueError(f"unsupported attention math phase {math_phase!r}")
+        self.math_phase = math_phase
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         self.qk_acc_dtype = Float32
@@ -1050,16 +1054,18 @@ class ContiguousAttentionForwardKernel:
                     )
                     pipeline_k.producer_acquire(kv_producer_state)
                     load_K(src_idx=list_n_block, producer_state=kv_producer_state)
-                    pipeline_v.producer_acquire(kv_producer_state)
-                    load_V(src_idx=list_n_block, producer_state=kv_producer_state)
+                    if const_expr(self.math_phase != "statistics"):
+                        pipeline_v.producer_acquire(kv_producer_state)
+                        load_V(src_idx=list_n_block, producer_state=kv_producer_state)
                     kv_producer_state.advance()
             else:
                 for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
                     n_block = n_block_max - 1 - n_tile
                     pipeline_k.producer_acquire(kv_producer_state)
                     load_K(src_idx=n_block, producer_state=kv_producer_state)
-                    pipeline_v.producer_acquire(kv_producer_state)
-                    load_V(src_idx=n_block, producer_state=kv_producer_state)
+                    if const_expr(self.math_phase != "statistics"):
+                        pipeline_v.producer_acquire(kv_producer_state)
+                        load_V(src_idx=n_block, producer_state=kv_producer_state)
                     kv_producer_state.advance()
 
             cute.arch.barrier(
@@ -1070,7 +1076,8 @@ class ContiguousAttentionForwardKernel:
             work_tile = tile_scheduler.get_current_work()
 
         pipeline_k.producer_tail(kv_producer_state.clone())
-        pipeline_v.producer_tail(kv_producer_state.clone())
+        if const_expr(self.math_phase != "statistics"):
+            pipeline_v.producer_tail(kv_producer_state.clone())
 
     @cute.jit
     def mma_one_n_block(
@@ -1124,39 +1131,47 @@ class ContiguousAttentionForwardKernel:
         )
         pipeline_k.consumer_release(kv_consumer_state)
 
+        if const_expr(self.math_phase != "flash"):
+            rounded = acc_S.load().to(self.dtype).to(Float32)
+            acc_S.store((rounded * softmax.softmax_scale).to(self.dtype).to(Float32))
         mask_fn(acc_S, n_block=n_block)
-        row_scale = softmax.online_softmax(
-            acc_S, is_first=is_first_n_block, check_inf=True
-        )
-        softmax.rescale_O(acc_O, row_scale)
-
-        rP = cute.make_fragment_like(acc_S, self.dtype)
-        rP.store(acc_S.load().to(self.dtype))
-        tOrP = layout_utils.reshape_acc_to_frgA(rP)
-
-        pipeline_v.consumer_wait(
-            kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state)
-        )
-        warp_mma_gemm_rs(
-            thr_mma_pv,
-            acc_O,
-            tOrP,
-            tOrVt,
-            tOsVt[
-                None,
-                None,
-                None,
-                kv_consumer_state.index if const_expr(self.num_stages > 1) else 0,
-            ],
-            smem_thr_copy_V,
-            tCcB=thr_mma_pv.partition_B(
-                cute.make_identity_tensor((self.tile_hdimv, self.tile_n))
+        if const_expr(self.math_phase == "normalized"):
+            softmax.normalized_probabilities(acc_S)
+        else:
+            row_scale = softmax.online_softmax(
+                acc_S, is_first=is_first_n_block, check_inf=True
             )
-            if const_expr(is_first_n_block or self.is_block_sparse)
-            else None,
-            valid_k=seqlen.seqlen_k - n_block * self.tile_n,
-        )
-        pipeline_v.consumer_release(kv_consumer_state)
+            if const_expr(self.math_phase == "flash"):
+                softmax.rescale_O(acc_O, row_scale)
+
+        if const_expr(self.math_phase != "statistics"):
+            rP = cute.make_fragment_like(acc_S, self.dtype)
+            rP.store(acc_S.load().to(self.dtype))
+            tOrP = layout_utils.reshape_acc_to_frgA(rP)
+
+            pipeline_v.consumer_wait(
+                kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state)
+            )
+            warp_mma_gemm_rs(
+                thr_mma_pv,
+                acc_O,
+                tOrP,
+                tOrVt,
+                tOsVt[
+                    None,
+                    None,
+                    None,
+                    kv_consumer_state.index if const_expr(self.num_stages > 1) else 0,
+                ],
+                smem_thr_copy_V,
+                tCcB=thr_mma_pv.partition_B(
+                    cute.make_identity_tensor((self.tile_hdimv, self.tile_n))
+                )
+                if const_expr(is_first_n_block or self.is_block_sparse)
+                else None,
+                valid_k=seqlen.seqlen_k - n_block * self.tile_n,
+            )
+            pipeline_v.consumer_release(kv_consumer_state)
         kv_consumer_state.advance()
         return kv_consumer_state
 
@@ -1228,6 +1243,7 @@ class ContiguousAttentionForwardKernel:
             softmax_scale_log2,
             num_rows=softmax_num_rows,
             softmax_scale=softmax_scale,
+            prescaled=self.math_phase != "flash",
         )
         q_consumer_phase = Int32(0)
         while work_tile.is_valid_tile:
@@ -1238,6 +1254,12 @@ class ContiguousAttentionForwardKernel:
             q_consumer_phase ^= 1
 
             softmax.reset()
+            if const_expr(self.math_phase == "normalized"):
+                for r in cutlass.range_constexpr(softmax.num_rows):
+                    normalization_row = m_block * self.tile_m + taccOcO_mn[r, 0][0]
+                    if normalization_row < seqlen.seqlen_q:
+                        softmax.row_max[r] = aux_tensors[0][head_idx, seqlen.offset_q + normalization_row]
+                        softmax.row_sum[r] = aux_tensors[1][head_idx, seqlen.offset_q + normalization_row]
             acc_O.fill(0.0)
             kv_consumer_state = cute_pipeline.make_pipeline_state(
                 cutlass.pipeline.PipelineUserType.Consumer, self.num_stages
@@ -1448,23 +1470,35 @@ class ContiguousAttentionForwardKernel:
                     else:
                         q_head_idx = head_idx
                     sink_val[r] = mAttentionSinkBias[q_head_idx]
-            row_scale = softmax.finalize(sink_val=sink_val)
-            softmax.rescale_O(acc_O, row_scale)
-            self.epilogue(
-                acc_O,
-                softmax.row_sum,
-                mO,
-                mLSE,
-                sO,
-                seqlen,
-                gmem_tiled_copy_O,
-                tma_atom_O,
-                tiled_mma_pv,
-                tidx,
-                m_block,
-                head_idx,
-                batch_idx,
-            )
+            if const_expr(self.math_phase == "statistics"):
+                row_inverse_sum = softmax.finalize()
+                if taccOcO_mn[0, 0][1] == 0:
+                    for r in cutlass.range_constexpr(softmax.num_rows):
+                        statistics_row = m_block * self.tile_m + taccOcO_mn[r, 0][0]
+                        if statistics_row < seqlen.seqlen_q:
+                            absolute_row = seqlen.offset_q + statistics_row
+                            aux_tensors[0][head_idx, absolute_row] = softmax.row_max[r]
+                            aux_tensors[1][head_idx, absolute_row] = row_inverse_sum[r]
+                            mLSE[absolute_row, head_idx] = softmax.row_sum[r]
+            else:
+                if const_expr(self.math_phase == "flash"):
+                    row_scale = softmax.finalize(sink_val=sink_val)
+                    softmax.rescale_O(acc_O, row_scale)
+                self.epilogue(
+                    acc_O,
+                    softmax.row_sum,
+                    mO,
+                    mLSE if const_expr(self.math_phase == "flash") else None,
+                    sO,
+                    seqlen,
+                    gmem_tiled_copy_O,
+                    tma_atom_O,
+                    tiled_mma_pv,
+                    tidx,
+                    m_block,
+                    head_idx,
+                    batch_idx,
+                )
 
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwd.PFull),
