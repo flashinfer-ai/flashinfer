@@ -1,7 +1,7 @@
 # Copyright 2026 Cursor Research
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Caller-owned symmetric memory and metadata for BF16 MoK.
+"""Caller-owned symmetric memory and metadata for MoK training.
 
 Adapted from cursor/mixture-of-kittens caeb2963f855c7ad53bb50c8bbf211086405cb98.
 Modified: standalone host-only dependency closure and device admission.
@@ -142,7 +142,8 @@ def validate_workspace_args(
         raise ValueError("hidden_size must be divisible by 256")
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
-    fwd_epilogue_smem_bytes = 2 * ((topk + 1) * 2048 + topk * 4) + 1024
+    # Six-stage ring of (top-k + 1) 1024-column BF16 rows, plus barriers.
+    fwd_epilogue_smem_bytes = 6 * (topk + 1) * 2048 + 1024
     if fwd_epilogue_smem_bytes > device_properties.shared_memory_per_block_optin:
         raise ValueError(
             "topk requires more dynamic shared memory than the device supports"

@@ -1,6 +1,14 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""JIT-only loader for the standalone BF16 MoK CUDA sources."""
+"""JIT-only loader for the standalone MoK CUDA sources.
+
+``sources.json`` maps every kernel role to one or more source variants. A
+variant lists the exact targets it was generated for: kernels whose generated
+code does not depend on the target share one variant, while kernels with
+target-specific schedules (for example the MXFP8 tile width, which follows
+the tensor-memory capacity) carry one variant per target group. The variant
+is selected by the device compute capability and compiled for that target.
+"""
 
 from __future__ import annotations
 
@@ -20,10 +28,10 @@ from ...jit.core import (
 )
 
 _PACKAGE = Path(__file__).resolve().parent
-_ARCH_FLAGS = {
-    (10, 0): sm100a_nvcc_flags,
-    (10, 3): sm103a_nvcc_flags,
-    (10, 7): sm107a_nvcc_flags,
+_TARGETS = {
+    (10, 0): ("sm_100a", sm100a_nvcc_flags),
+    (10, 3): ("sm_103a", sm103a_nvcc_flags),
+    (10, 7): ("sm_107a", sm107a_nvcc_flags),
 }
 
 
@@ -50,19 +58,37 @@ class _Kernel:
         return self._run(*(arguments[name] for name in self._arguments))
 
 
+def _target(capability):
+    if capability not in _TARGETS:
+        raise RuntimeError("MoK requires an SM100a, SM103a or SM107a device")
+    return _TARGETS[capability]
+
+
+def target_arch(device=None):
+    """Exact generated target (``sm_100a``, ``sm_103a`` or ``sm_107a``) for a device."""
+    return _target(torch.cuda.get_device_capability(device))[0]
+
+
+@functools.cache
+def _registry():
+    return json.loads((_PACKAGE / "sources.json").read_text())
+
+
 def kernel_spec(role, capability):
     """Return one content-addressed CUDA build specification."""
-    if capability not in _ARCH_FLAGS:
-        raise RuntimeError("BF16 MoK requires an SM100a-compatible device")
-    registry = json.loads((_PACKAGE / "sources.json").read_text())
-    record = registry[role]
+    arch, arch_flags = _target(capability)
+    record = next(
+        (v for v in _registry()[role]["variants"] if arch in v["arches"]), None
+    )
+    if record is None:
+        raise RuntimeError(f"MoK kernel {role!r} has no generated {arch} variant")
     sources = [_PACKAGE / "csrc" / name for name in record["sources"]]
     for source, digest in zip(sources, record["sha256"], strict=True):
         if hashlib.sha256(source.read_bytes()).hexdigest() != digest:
             raise RuntimeError(f"MoK source checksum mismatch: {source.name}")
-    flags = [*_ARCH_FLAGS[capability], *record["flags"]]
+    flags = [*arch_flags, *record["flags"]]
     identity = hashlib.sha256(
-        json.dumps([record, flags], sort_keys=True).encode()
+        json.dumps([role, record, flags], sort_keys=True).encode()
     ).hexdigest()
     spec = gen_jit_spec(
         f"cake_mok_{role}_{identity}",

@@ -18,6 +18,7 @@ Copyright (c) 2026 KDA Team, under the MIT License (licenses/LICENSE.kda-for-kda
 The split kernel also retains its original Apache-2.0 TIRx-author attribution.
 Source: https://github.com/NVlabs/kda/tree/260927-kda-for-kda
 
-The experimental BF16 MoK training adapter and CUDA schedules are adapted from
-cursor/mixture-of-kittens, Copyright 2026 Cursor Research, under Apache-2.0.
+The experimental MoK training adapter (BF16 and MXFP8 routed experts) and CUDA
+schedules are adapted from cursor/mixture-of-kittens, Copyright 2026 Cursor
+Research, under Apache-2.0.
 Source: https://github.com/cursor/mixture-of-kittens/tree/caeb2963f855c7ad53bb50c8bbf211086405cb98

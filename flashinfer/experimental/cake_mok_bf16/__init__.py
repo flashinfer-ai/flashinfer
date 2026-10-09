@@ -1,2 +1,2 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental BF16 MoK training backend (explicit opt-in only)."""
+"""Experimental MoK training backend: BF16 or MXFP8 routed experts (explicit opt-in only)."""

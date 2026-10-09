@@ -18,10 +18,10 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap x_routed, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wd_shared, const __grid_constant__ CUtensorMap wg_routed, const __grid_constant__ CUtensorMap wu_routed, const __grid_constant__ CUtensorMap wd_routed, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap gate_shared_in, const __grid_constant__ CUtensorMap up_shared_in, const __grid_constant__ CUtensorMap gate_routed_in, const __grid_constant__ CUtensorMap up_routed_in, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_routed_out, const __grid_constant__ CUtensorMap hidden_shared_in, const __grid_constant__ CUtensorMap hidden_routed_in, const __grid_constant__ CUtensorMap y_shared, const __grid_constant__ CUtensorMap y_routed, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ y_routed_ptr, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ y_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ gate_ready, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int* __restrict__ y_ready, int* __restrict__ y_done, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size);
+extern "C" __global__ void kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap x_routed, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wd_shared, const __grid_constant__ CUtensorMap wg_routed, const __grid_constant__ CUtensorMap wu_routed, const __grid_constant__ CUtensorMap wd_routed, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_routed_out, const __grid_constant__ CUtensorMap hidden_shared_in, const __grid_constant__ CUtensorMap hidden_routed_in, const __grid_constant__ CUtensorMap y_shared, const __grid_constant__ CUtensorMap y_routed, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ y_routed_ptr, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ y_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int* __restrict__ y_ready, int* __restrict__ y_done, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit);
 
 
-namespace cake_host_shim_6265aba560ae3188 {
+namespace cake_host_shim_c785b7e8eb49c6e0 {
 
 using tvm::ffi::TensorView;
 
@@ -882,282 +882,6 @@ inline CUtensorMap EncodeTma_up_routed_out(const TensorView& t) {
   return tm;
 }
 
-// 5D TMA descriptor for buffer 'gate_shared_in' — compiled from the
-// descriptor's std.Expr global_dim/global_strides/checks record.
-inline CUtensorMap EncodeTma_gate_shared_in(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() == 2, ValueError)
-      << "TMA source 'gate_shared_in' must have exactly 2 dimensions, got ndim=" << t.ndim();
-  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
-      << "TMA source 'gate_shared_in' must have unit innermost stride, got " << t.stride(-1);
-  int64_t d1 = t.size(t.ndim() - 1);
-  int64_t d2 = t.size(t.ndim() - 2);
-  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
-      << "TMA source 'gate_shared_in' trailing dims must be positive";
-  int64_t s2 = t.stride(t.ndim() - 2) * 1;
-  TVM_FFI_CHECK(s2 > 0, ValueError)
-      << "TMA source 'gate_shared_in' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'gate_shared_in' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
-      << "TMA descriptor for 'gate_shared_in' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
-      << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'gate_shared_in'";
-  int64_t carrier_stride_0 = s2;
-  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
-      << "TMA descriptor for 'gate_shared_in' resolved global stride 1 negative";
-  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
-      << "TMA descriptor for 'gate_shared_in' resolved global stride 1 zero while global dimension 1 is not 1";
-  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'gate_shared_in' resolved global stride 1 to a non-whole-byte offset";
-  int64_t carrier_stride_1 = 64;
-  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
-      << "TMA descriptor for 'gate_shared_in' resolved global stride 2 negative";
-  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
-      << "TMA descriptor for 'gate_shared_in' resolved global stride 2 zero while global dimension 2 is not 1";
-  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'gate_shared_in' resolved global stride 2 to a non-whole-byte offset";
-  int64_t carrier_stride_2 = (d2 * s2);
-  TVM_FFI_CHECK(carrier_stride_2 >= 0, ValueError)
-      << "TMA descriptor for 'gate_shared_in' resolved global stride 3 negative";
-  TVM_FFI_CHECK(carrier_stride_2 != 0 || global_dim[3] == 1, ValueError)
-      << "TMA descriptor for 'gate_shared_in' resolved global stride 3 zero while global dimension 3 is not 1";
-  TVM_FFI_CHECK((carrier_stride_2 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'gate_shared_in' resolved global stride 3 to a non-whole-byte offset";
-  int64_t carrier_stride_3 = (d2 * s2);
-  TVM_FFI_CHECK(carrier_stride_3 >= 0, ValueError)
-      << "TMA descriptor for 'gate_shared_in' resolved global stride 4 negative";
-  TVM_FFI_CHECK(carrier_stride_3 != 0 || global_dim[4] == 1, ValueError)
-      << "TMA descriptor for 'gate_shared_in' resolved global stride 4 zero while global dimension 4 is not 1";
-  TVM_FFI_CHECK((carrier_stride_3 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'gate_shared_in' resolved global stride 4 to a non-whole-byte offset";
-  uint64_t global_strides[4] = {
-      (uint64_t)((carrier_stride_0 * 16) / 8),
-      (uint64_t)((carrier_stride_1 * 16) / 8),
-      (uint64_t)((carrier_stride_2 * 16) / 8),
-      (uint64_t)((carrier_stride_3 * 16) / 8),
-  };
-  uint32_t box_dim[5] = {64u, 128u, 2u, 1u, 1u};
-  uint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
-  CUtensorMap tm{};
-  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
-  CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (5D, 'gate_shared_in') failed: CUresult=" << (int)r;
-  return tm;
-}
-
-// 5D TMA descriptor for buffer 'up_shared_in' — compiled from the
-// descriptor's std.Expr global_dim/global_strides/checks record.
-inline CUtensorMap EncodeTma_up_shared_in(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() == 2, ValueError)
-      << "TMA source 'up_shared_in' must have exactly 2 dimensions, got ndim=" << t.ndim();
-  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
-      << "TMA source 'up_shared_in' must have unit innermost stride, got " << t.stride(-1);
-  int64_t d1 = t.size(t.ndim() - 1);
-  int64_t d2 = t.size(t.ndim() - 2);
-  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
-      << "TMA source 'up_shared_in' trailing dims must be positive";
-  int64_t s2 = t.stride(t.ndim() - 2) * 1;
-  TVM_FFI_CHECK(s2 > 0, ValueError)
-      << "TMA source 'up_shared_in' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'up_shared_in' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
-      << "TMA descriptor for 'up_shared_in' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
-      << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'up_shared_in'";
-  int64_t carrier_stride_0 = s2;
-  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
-      << "TMA descriptor for 'up_shared_in' resolved global stride 1 negative";
-  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
-      << "TMA descriptor for 'up_shared_in' resolved global stride 1 zero while global dimension 1 is not 1";
-  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'up_shared_in' resolved global stride 1 to a non-whole-byte offset";
-  int64_t carrier_stride_1 = 64;
-  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
-      << "TMA descriptor for 'up_shared_in' resolved global stride 2 negative";
-  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
-      << "TMA descriptor for 'up_shared_in' resolved global stride 2 zero while global dimension 2 is not 1";
-  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'up_shared_in' resolved global stride 2 to a non-whole-byte offset";
-  int64_t carrier_stride_2 = (d2 * s2);
-  TVM_FFI_CHECK(carrier_stride_2 >= 0, ValueError)
-      << "TMA descriptor for 'up_shared_in' resolved global stride 3 negative";
-  TVM_FFI_CHECK(carrier_stride_2 != 0 || global_dim[3] == 1, ValueError)
-      << "TMA descriptor for 'up_shared_in' resolved global stride 3 zero while global dimension 3 is not 1";
-  TVM_FFI_CHECK((carrier_stride_2 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'up_shared_in' resolved global stride 3 to a non-whole-byte offset";
-  int64_t carrier_stride_3 = (d2 * s2);
-  TVM_FFI_CHECK(carrier_stride_3 >= 0, ValueError)
-      << "TMA descriptor for 'up_shared_in' resolved global stride 4 negative";
-  TVM_FFI_CHECK(carrier_stride_3 != 0 || global_dim[4] == 1, ValueError)
-      << "TMA descriptor for 'up_shared_in' resolved global stride 4 zero while global dimension 4 is not 1";
-  TVM_FFI_CHECK((carrier_stride_3 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'up_shared_in' resolved global stride 4 to a non-whole-byte offset";
-  uint64_t global_strides[4] = {
-      (uint64_t)((carrier_stride_0 * 16) / 8),
-      (uint64_t)((carrier_stride_1 * 16) / 8),
-      (uint64_t)((carrier_stride_2 * 16) / 8),
-      (uint64_t)((carrier_stride_3 * 16) / 8),
-  };
-  uint32_t box_dim[5] = {64u, 128u, 2u, 1u, 1u};
-  uint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
-  CUtensorMap tm{};
-  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
-  CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (5D, 'up_shared_in') failed: CUresult=" << (int)r;
-  return tm;
-}
-
-// 5D TMA descriptor for buffer 'gate_routed_in' — compiled from the
-// descriptor's std.Expr global_dim/global_strides/checks record.
-inline CUtensorMap EncodeTma_gate_routed_in(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() == 2, ValueError)
-      << "TMA source 'gate_routed_in' must have exactly 2 dimensions, got ndim=" << t.ndim();
-  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
-      << "TMA source 'gate_routed_in' must have unit innermost stride, got " << t.stride(-1);
-  int64_t d1 = t.size(t.ndim() - 1);
-  int64_t d2 = t.size(t.ndim() - 2);
-  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
-      << "TMA source 'gate_routed_in' trailing dims must be positive";
-  int64_t s2 = t.stride(t.ndim() - 2) * 1;
-  TVM_FFI_CHECK(s2 > 0, ValueError)
-      << "TMA source 'gate_routed_in' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'gate_routed_in' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
-      << "TMA descriptor for 'gate_routed_in' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
-      << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'gate_routed_in'";
-  int64_t carrier_stride_0 = s2;
-  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
-      << "TMA descriptor for 'gate_routed_in' resolved global stride 1 negative";
-  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
-      << "TMA descriptor for 'gate_routed_in' resolved global stride 1 zero while global dimension 1 is not 1";
-  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'gate_routed_in' resolved global stride 1 to a non-whole-byte offset";
-  int64_t carrier_stride_1 = 64;
-  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
-      << "TMA descriptor for 'gate_routed_in' resolved global stride 2 negative";
-  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
-      << "TMA descriptor for 'gate_routed_in' resolved global stride 2 zero while global dimension 2 is not 1";
-  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'gate_routed_in' resolved global stride 2 to a non-whole-byte offset";
-  int64_t carrier_stride_2 = (d2 * s2);
-  TVM_FFI_CHECK(carrier_stride_2 >= 0, ValueError)
-      << "TMA descriptor for 'gate_routed_in' resolved global stride 3 negative";
-  TVM_FFI_CHECK(carrier_stride_2 != 0 || global_dim[3] == 1, ValueError)
-      << "TMA descriptor for 'gate_routed_in' resolved global stride 3 zero while global dimension 3 is not 1";
-  TVM_FFI_CHECK((carrier_stride_2 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'gate_routed_in' resolved global stride 3 to a non-whole-byte offset";
-  int64_t carrier_stride_3 = (d2 * s2);
-  TVM_FFI_CHECK(carrier_stride_3 >= 0, ValueError)
-      << "TMA descriptor for 'gate_routed_in' resolved global stride 4 negative";
-  TVM_FFI_CHECK(carrier_stride_3 != 0 || global_dim[4] == 1, ValueError)
-      << "TMA descriptor for 'gate_routed_in' resolved global stride 4 zero while global dimension 4 is not 1";
-  TVM_FFI_CHECK((carrier_stride_3 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'gate_routed_in' resolved global stride 4 to a non-whole-byte offset";
-  uint64_t global_strides[4] = {
-      (uint64_t)((carrier_stride_0 * 16) / 8),
-      (uint64_t)((carrier_stride_1 * 16) / 8),
-      (uint64_t)((carrier_stride_2 * 16) / 8),
-      (uint64_t)((carrier_stride_3 * 16) / 8),
-  };
-  uint32_t box_dim[5] = {64u, 128u, 2u, 1u, 1u};
-  uint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
-  CUtensorMap tm{};
-  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
-  CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (5D, 'gate_routed_in') failed: CUresult=" << (int)r;
-  return tm;
-}
-
-// 5D TMA descriptor for buffer 'up_routed_in' — compiled from the
-// descriptor's std.Expr global_dim/global_strides/checks record.
-inline CUtensorMap EncodeTma_up_routed_in(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() == 2, ValueError)
-      << "TMA source 'up_routed_in' must have exactly 2 dimensions, got ndim=" << t.ndim();
-  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
-      << "TMA source 'up_routed_in' must have unit innermost stride, got " << t.stride(-1);
-  int64_t d1 = t.size(t.ndim() - 1);
-  int64_t d2 = t.size(t.ndim() - 2);
-  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
-      << "TMA source 'up_routed_in' trailing dims must be positive";
-  int64_t s2 = t.stride(t.ndim() - 2) * 1;
-  TVM_FFI_CHECK(s2 > 0, ValueError)
-      << "TMA source 'up_routed_in' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'up_routed_in' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
-      << "TMA descriptor for 'up_routed_in' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
-      << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'up_routed_in'";
-  int64_t carrier_stride_0 = s2;
-  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
-      << "TMA descriptor for 'up_routed_in' resolved global stride 1 negative";
-  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
-      << "TMA descriptor for 'up_routed_in' resolved global stride 1 zero while global dimension 1 is not 1";
-  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'up_routed_in' resolved global stride 1 to a non-whole-byte offset";
-  int64_t carrier_stride_1 = 64;
-  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
-      << "TMA descriptor for 'up_routed_in' resolved global stride 2 negative";
-  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
-      << "TMA descriptor for 'up_routed_in' resolved global stride 2 zero while global dimension 2 is not 1";
-  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'up_routed_in' resolved global stride 2 to a non-whole-byte offset";
-  int64_t carrier_stride_2 = (d2 * s2);
-  TVM_FFI_CHECK(carrier_stride_2 >= 0, ValueError)
-      << "TMA descriptor for 'up_routed_in' resolved global stride 3 negative";
-  TVM_FFI_CHECK(carrier_stride_2 != 0 || global_dim[3] == 1, ValueError)
-      << "TMA descriptor for 'up_routed_in' resolved global stride 3 zero while global dimension 3 is not 1";
-  TVM_FFI_CHECK((carrier_stride_2 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'up_routed_in' resolved global stride 3 to a non-whole-byte offset";
-  int64_t carrier_stride_3 = (d2 * s2);
-  TVM_FFI_CHECK(carrier_stride_3 >= 0, ValueError)
-      << "TMA descriptor for 'up_routed_in' resolved global stride 4 negative";
-  TVM_FFI_CHECK(carrier_stride_3 != 0 || global_dim[4] == 1, ValueError)
-      << "TMA descriptor for 'up_routed_in' resolved global stride 4 zero while global dimension 4 is not 1";
-  TVM_FFI_CHECK((carrier_stride_3 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'up_routed_in' resolved global stride 4 to a non-whole-byte offset";
-  uint64_t global_strides[4] = {
-      (uint64_t)((carrier_stride_0 * 16) / 8),
-      (uint64_t)((carrier_stride_1 * 16) / 8),
-      (uint64_t)((carrier_stride_2 * 16) / 8),
-      (uint64_t)((carrier_stride_3 * 16) / 8),
-  };
-  uint32_t box_dim[5] = {64u, 128u, 2u, 1u, 1u};
-  uint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
-  CUtensorMap tm{};
-  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
-  CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (5D, 'up_routed_in') failed: CUresult=" << (int)r;
-  return tm;
-}
-
 // 5D TMA descriptor for buffer 'hidden_shared_out' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_hidden_shared_out(const TensorView& t) {
@@ -1172,14 +896,14 @@ inline CUtensorMap EncodeTma_hidden_shared_out(const TensorView& t) {
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'hidden_shared_out' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
+  TVM_FFI_CHECK(d1 % 32 == 0, ValueError)
       << "TMA source 'hidden_shared_out' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
+      << " must divide exactly by " << 32;
+  uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'hidden_shared_out' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
-      << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'hidden_shared_out'";
+  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+      << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'hidden_shared_out'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
       << "TMA descriptor for 'hidden_shared_out' resolved global stride 1 negative";
@@ -1187,7 +911,7 @@ inline CUtensorMap EncodeTma_hidden_shared_out(const TensorView& t) {
       << "TMA descriptor for 'hidden_shared_out' resolved global stride 1 zero while global dimension 1 is not 1";
   TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
       << "TMA descriptor for 'hidden_shared_out' resolved global stride 1 to a non-whole-byte offset";
-  int64_t carrier_stride_1 = 64;
+  int64_t carrier_stride_1 = 32;
   TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
       << "TMA descriptor for 'hidden_shared_out' resolved global stride 2 negative";
   TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
@@ -1214,13 +938,13 @@ inline CUtensorMap EncodeTma_hidden_shared_out(const TensorView& t) {
       (uint64_t)((carrier_stride_2 * 16) / 8),
       (uint64_t)((carrier_stride_3 * 16) / 8),
   };
-  uint32_t box_dim[5] = {64u, 128u, 2u, 1u, 1u};
+  uint32_t box_dim[5] = {32u, 128u, 1u, 1u, 1u};
   uint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
   CUtensorMap tm{};
   const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (5D, 'hidden_shared_out') failed: CUresult=" << (int)r;
@@ -1241,14 +965,14 @@ inline CUtensorMap EncodeTma_hidden_routed_out(const TensorView& t) {
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'hidden_routed_out' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
+  TVM_FFI_CHECK(d1 % 32 == 0, ValueError)
       << "TMA source 'hidden_routed_out' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
+      << " must divide exactly by " << 32;
+  uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'hidden_routed_out' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
-      << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'hidden_routed_out'";
+  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+      << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'hidden_routed_out'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
       << "TMA descriptor for 'hidden_routed_out' resolved global stride 1 negative";
@@ -1256,7 +980,7 @@ inline CUtensorMap EncodeTma_hidden_routed_out(const TensorView& t) {
       << "TMA descriptor for 'hidden_routed_out' resolved global stride 1 zero while global dimension 1 is not 1";
   TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
       << "TMA descriptor for 'hidden_routed_out' resolved global stride 1 to a non-whole-byte offset";
-  int64_t carrier_stride_1 = 64;
+  int64_t carrier_stride_1 = 32;
   TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
       << "TMA descriptor for 'hidden_routed_out' resolved global stride 2 negative";
   TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
@@ -1283,13 +1007,13 @@ inline CUtensorMap EncodeTma_hidden_routed_out(const TensorView& t) {
       (uint64_t)((carrier_stride_2 * 16) / 8),
       (uint64_t)((carrier_stride_3 * 16) / 8),
   };
-  uint32_t box_dim[5] = {64u, 128u, 2u, 1u, 1u};
+  uint32_t box_dim[5] = {32u, 128u, 1u, 1u, 1u};
   uint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
   CUtensorMap tm{};
   const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
   CUresult r = cuTensorMapEncodeTiled(
       &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (5D, 'hidden_routed_out') failed: CUresult=" << (int)r;
@@ -1572,7 +1296,7 @@ inline CUtensorMap EncodeTma_y_routed(const TensorView& t) {
   return tm;
 }
 
-void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_shared, TensorView arg_wu_shared, TensorView arg_wd_shared, TensorView arg_wg_routed, TensorView arg_wu_routed, TensorView arg_wd_routed, TensorView arg_gate_shared_out, TensorView arg_up_shared_out, TensorView arg_gate_routed_out, TensorView arg_up_routed_out, TensorView arg_gate_shared_in, TensorView arg_up_shared_in, TensorView arg_gate_routed_in, TensorView arg_up_routed_in, TensorView arg_hidden_shared_out, TensorView arg_hidden_routed_out, TensorView arg_hidden_shared_in, TensorView arg_hidden_routed_in, TensorView arg_y_shared, TensorView arg_y_routed, TensorView arg_x_routed_ptr, TensorView arg_y_routed_ptr, TensorView arg_x_peers, TensorView arg_y_peers, TensorView arg_schedule_rank, TensorView arg_schedule_token, TensorView arg_num_tokens, TensorView arg_counts, TensorView arg_gate_ready, TensorView arg_hidden_ready, TensorView arg_x_ready, TensorView arg_y_ready, TensorView arg_y_done, int64_t arg_local_tokens, int64_t arg_hidden, int64_t arg_intermediate, int64_t arg_experts, int64_t arg_topk, int64_t arg_comm_sms, int64_t arg_macro_size, int64_t arg_mini_size, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_shared, TensorView arg_wu_shared, TensorView arg_wd_shared, TensorView arg_wg_routed, TensorView arg_wu_routed, TensorView arg_wd_routed, TensorView arg_gate_shared_out, TensorView arg_up_shared_out, TensorView arg_gate_routed_out, TensorView arg_up_routed_out, TensorView arg_hidden_shared_out, TensorView arg_hidden_routed_out, TensorView arg_hidden_shared_in, TensorView arg_hidden_routed_in, TensorView arg_y_shared, TensorView arg_y_routed, TensorView arg_x_routed_ptr, TensorView arg_y_routed_ptr, TensorView arg_x_peers, TensorView arg_y_peers, TensorView arg_schedule_rank, TensorView arg_schedule_token, TensorView arg_num_tokens, TensorView arg_counts, TensorView arg_hidden_ready, TensorView arg_x_ready, TensorView arg_y_ready, TensorView arg_y_done, int64_t arg_local_tokens, int64_t arg_hidden, int64_t arg_intermediate, int64_t arg_experts, int64_t arg_topk, int64_t arg_comm_sms, int64_t arg_macro_size, int64_t arg_mini_size, double arg_swiglu_limit, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = arg_x_shared.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));  // binds the context for the encoders
@@ -1600,14 +1324,6 @@ void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_sha
   check_dtype(arg_gate_routed_out, DLDataType{kDLBfloat, 16, 1}, "gate_routed_out");
   check_cuda_tensor(arg_up_routed_out, "up_routed_out");
   check_dtype(arg_up_routed_out, DLDataType{kDLBfloat, 16, 1}, "up_routed_out");
-  check_cuda_tensor(arg_gate_shared_in, "gate_shared_in");
-  check_dtype(arg_gate_shared_in, DLDataType{kDLBfloat, 16, 1}, "gate_shared_in");
-  check_cuda_tensor(arg_up_shared_in, "up_shared_in");
-  check_dtype(arg_up_shared_in, DLDataType{kDLBfloat, 16, 1}, "up_shared_in");
-  check_cuda_tensor(arg_gate_routed_in, "gate_routed_in");
-  check_dtype(arg_gate_routed_in, DLDataType{kDLBfloat, 16, 1}, "gate_routed_in");
-  check_cuda_tensor(arg_up_routed_in, "up_routed_in");
-  check_dtype(arg_up_routed_in, DLDataType{kDLBfloat, 16, 1}, "up_routed_in");
   check_cuda_tensor(arg_hidden_shared_out, "hidden_shared_out");
   check_dtype(arg_hidden_shared_out, DLDataType{kDLBfloat, 16, 1}, "hidden_shared_out");
   check_cuda_tensor(arg_hidden_routed_out, "hidden_routed_out");
@@ -1644,9 +1360,6 @@ void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_sha
   check_cuda_tensor(arg_counts, "counts");
   check_dtype(arg_counts, DLDataType{kDLInt, 32, 1}, "counts");
   check_contiguous(arg_counts, "counts");
-  check_cuda_tensor(arg_gate_ready, "gate_ready");
-  check_dtype(arg_gate_ready, DLDataType{kDLInt, 32, 1}, "gate_ready");
-  check_contiguous(arg_gate_ready, "gate_ready");
   check_cuda_tensor(arg_hidden_ready, "hidden_ready");
   check_dtype(arg_hidden_ready, DLDataType{kDLInt, 32, 1}, "hidden_ready");
   check_contiguous(arg_hidden_ready, "hidden_ready");
@@ -1694,10 +1407,6 @@ void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_sha
   check_same_device(arg_up_shared_out, arg_x_shared, "up_shared_out", "x_shared");
   check_same_device(arg_gate_routed_out, arg_x_shared, "gate_routed_out", "x_shared");
   check_same_device(arg_up_routed_out, arg_x_shared, "up_routed_out", "x_shared");
-  check_same_device(arg_gate_shared_in, arg_x_shared, "gate_shared_in", "x_shared");
-  check_same_device(arg_up_shared_in, arg_x_shared, "up_shared_in", "x_shared");
-  check_same_device(arg_gate_routed_in, arg_x_shared, "gate_routed_in", "x_shared");
-  check_same_device(arg_up_routed_in, arg_x_shared, "up_routed_in", "x_shared");
   check_same_device(arg_hidden_shared_out, arg_x_shared, "hidden_shared_out", "x_shared");
   check_same_device(arg_hidden_routed_out, arg_x_shared, "hidden_routed_out", "x_shared");
   check_same_device(arg_hidden_shared_in, arg_x_shared, "hidden_shared_in", "x_shared");
@@ -1712,7 +1421,6 @@ void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_sha
   check_same_device(arg_schedule_token, arg_x_shared, "schedule_token", "x_shared");
   check_same_device(arg_num_tokens, arg_x_shared, "num_tokens", "x_shared");
   check_same_device(arg_counts, arg_x_shared, "counts", "x_shared");
-  check_same_device(arg_gate_ready, arg_x_shared, "gate_ready", "x_shared");
   check_same_device(arg_hidden_ready, arg_x_shared, "hidden_ready", "x_shared");
   check_same_device(arg_x_ready, arg_x_shared, "x_ready", "x_shared");
   check_same_device(arg_y_ready, arg_x_shared, "y_ready", "x_shared");
@@ -1737,10 +1445,6 @@ void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_sha
   CUtensorMap p_up_shared_out = EncodeTma_up_shared_out(arg_up_shared_out);
   CUtensorMap p_gate_routed_out = EncodeTma_gate_routed_out(arg_gate_routed_out);
   CUtensorMap p_up_routed_out = EncodeTma_up_routed_out(arg_up_routed_out);
-  CUtensorMap p_gate_shared_in = EncodeTma_gate_shared_in(arg_gate_shared_in);
-  CUtensorMap p_up_shared_in = EncodeTma_up_shared_in(arg_up_shared_in);
-  CUtensorMap p_gate_routed_in = EncodeTma_gate_routed_in(arg_gate_routed_in);
-  CUtensorMap p_up_routed_in = EncodeTma_up_routed_in(arg_up_routed_in);
   CUtensorMap p_hidden_shared_out = EncodeTma_hidden_shared_out(arg_hidden_shared_out);
   CUtensorMap p_hidden_routed_out = EncodeTma_hidden_routed_out(arg_hidden_routed_out);
   CUtensorMap p_hidden_shared_in = EncodeTma_hidden_shared_in(arg_hidden_shared_in);
@@ -1755,7 +1459,6 @@ void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_sha
   int* p_schedule_token = static_cast<int*>(arg_schedule_token.data_ptr());
   int* p_num_tokens = static_cast<int*>(arg_num_tokens.data_ptr());
   int* p_counts = static_cast<int*>(arg_counts.data_ptr());
-  int* p_gate_ready = static_cast<int*>(arg_gate_ready.data_ptr());
   int* p_hidden_ready = static_cast<int*>(arg_hidden_ready.data_ptr());
   int* p_x_ready = static_cast<int*>(arg_x_ready.data_ptr());
   int* p_y_ready = static_cast<int*>(arg_y_ready.data_ptr());
@@ -1768,7 +1471,8 @@ void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_sha
   int32_t v_comm_sms = (int32_t)arg_comm_sms;
   int32_t v_macro_size = (int32_t)arg_macro_size;
   int32_t v_mini_size = (int32_t)arg_mini_size;
-  void* kargs[] = {&p_x_shared, &p_x_routed, &p_wg_shared, &p_wu_shared, &p_wd_shared, &p_wg_routed, &p_wu_routed, &p_wd_routed, &p_gate_shared_out, &p_up_shared_out, &p_gate_routed_out, &p_up_routed_out, &p_gate_shared_in, &p_up_shared_in, &p_gate_routed_in, &p_up_routed_in, &p_hidden_shared_out, &p_hidden_routed_out, &p_hidden_shared_in, &p_hidden_routed_in, &p_y_shared, &p_y_routed, &p_x_routed_ptr, &p_y_routed_ptr, &p_x_peers, &p_y_peers, &p_schedule_rank, &p_schedule_token, &p_num_tokens, &p_counts, &p_gate_ready, &p_hidden_ready, &p_x_ready, &p_y_ready, &p_y_done, &v_local_tokens, &v_hidden, &v_intermediate, &v_experts, &v_topk, &v_comm_sms, &v_macro_size, &v_mini_size};
+  float v_swiglu_limit = (float)arg_swiglu_limit;
+  void* kargs[] = {&p_x_shared, &p_x_routed, &p_wg_shared, &p_wu_shared, &p_wd_shared, &p_wg_routed, &p_wu_routed, &p_wd_routed, &p_gate_shared_out, &p_up_shared_out, &p_gate_routed_out, &p_up_routed_out, &p_hidden_shared_out, &p_hidden_routed_out, &p_hidden_shared_in, &p_hidden_routed_in, &p_y_shared, &p_y_routed, &p_x_routed_ptr, &p_y_routed_ptr, &p_x_peers, &p_y_peers, &p_schedule_rank, &p_schedule_token, &p_num_tokens, &p_counts, &p_hidden_ready, &p_x_ready, &p_y_ready, &p_y_done, &v_local_tokens, &v_hidden, &v_intermediate, &v_experts, &v_topk, &v_comm_sms, &v_macro_size, &v_mini_size, &v_swiglu_limit};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
       reinterpret_cast<const void*>(kernel_cake_mok_forward), 232448);
@@ -1801,6 +1505,6 @@ void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_sha
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_6265aba560ae3188
+}  // namespace cake_host_shim_c785b7e8eb49c6e0
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_6265aba560ae3188::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_c785b7e8eb49c6e0::Run);
