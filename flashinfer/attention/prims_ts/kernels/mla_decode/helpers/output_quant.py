@@ -208,7 +208,7 @@ class MlaOutputQuant:
                             (col // 128) * 8192 + (Int32(head) & 63) * 128 + (col & 127)
                         )
                         # TMA 128B swizzle XORs byte bits [4:7] with [7:10].
-                        # The stage base is 1024B aligned, so its bits are zero.
+                        # The 1024B-aligned base leaves these swizzle bits unchanged.
                         swizzled = smem_offset ^ ((smem_offset >> 3) & 0x70)
                         destination = cutlass.inttoptr(
                             shared_output + swizzled, mem_space=3, dtype=Int32

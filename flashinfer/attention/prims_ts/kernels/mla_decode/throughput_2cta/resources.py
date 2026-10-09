@@ -3684,7 +3684,6 @@ class GmemOResource(HighThroughputMlaResource):
         flat_row,
         batch_idx,
         column,
-        rotary: cutlass.Constexpr[bool],
         stage_idx=0,
     ):
         row = Int64(flat_row)
@@ -3700,7 +3699,7 @@ class GmemOResource(HighThroughputMlaResource):
             values,
             row,
             column,
-            rotary=rotary,
+            rotary=False,
             shared_output=shared_output,
         )
         if cutlass.const_expr(self.cfg.use_tma_output):
@@ -3712,7 +3711,7 @@ class GmemOResource(HighThroughputMlaResource):
         self, stage_info: StageInfo, *, iter_n: cutlass.Constexpr[int]
     ):
         # Sparse launch flattens queries into batch rows; each CTA owns 64 heads.
-        cluster, _, token, _ = stage_info.work_tile.tile_idx
+        head_tile_idx, _, token, _ = stage_info.work_tile.tile_idx
         if prims.elect_sync():
             for half in cutlass.range_constexpr(2):
                 prims.cp_async_bulk_tensor_global_shared_cta(
@@ -3720,7 +3719,7 @@ class GmemOResource(HighThroughputMlaResource):
                     self.smem_o.subview(
                         stage_info.stage_idx * OUTPUT_TMA_STAGE_BYTES + half * 8192
                     ),
-                    (iter_n * 256 + half * 128, cluster * 64, token),
+                    (iter_n * 256 + half * 128, head_tile_idx * 64, token),
                 )
         prims.cp_async_bulk_commit_group()
         # Release the stage only after TMA has consumed its shared source.
@@ -3944,10 +3943,6 @@ class GmemOResource(HighThroughputMlaResource):
                         storage_flat_query_row,
                         batch_idx,
                         iter_n * tile_d + g_j,
-                        False,
-                        stage_idx=stage_info.stage_idx
-                        if cutlass.const_expr(cfg.use_tma_output)
-                        else 0,
                     )
                 else:
                     # 16-bit output (split_kv == 1, direct output)
@@ -4229,7 +4224,6 @@ class GmemOResource(HighThroughputMlaResource):
                     storage_flat_query_row,
                     batch_idx,
                     iter_n * tile_d + g_j,
-                    False,
                     stage_idx=stage_info.stage_idx
                     if cutlass.const_expr(cfg.use_tma_output)
                     else 0,
