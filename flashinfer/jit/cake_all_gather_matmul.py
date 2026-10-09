@@ -41,151 +41,151 @@ from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 # Filled mechanically from the program bundle.
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_all_gather_matmul_13e1bef6b9040aa44ad9": {
+    "cake_all_gather_matmul_0207fc52f60d8009b335": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_13e1bef6b9040aa44ad9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0207fc52f60d8009b335_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_1a649d1fcaec779cf0ac": {
+    "cake_all_gather_matmul_215935905975bd30dda9": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1a649d1fcaec779cf0ac_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_215935905975bd30dda9_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_1bd5b97815fc495406bf": {
+    "cake_all_gather_matmul_40242e9c64d6e66af6f5": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1bd5b97815fc495406bf_kernel.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_20f67c65dd961ad23452": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_20f67c65dd961ad23452_kernel.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_2bc5d1ac8974f6e151c4": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2bc5d1ac8974f6e151c4_kernel.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_2c2bf0fb27cecb51201d": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2c2bf0fb27cecb51201d_kernel.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_57b670500d63c6a7e797": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [128, 1, 1],
         "dynamic_smem_bytes": 0,
     },
-    "cake_all_gather_matmul_66bf264ce60ee61be996": {
+    "cake_all_gather_matmul_72c819bc06bbde0de32b": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_66bf264ce60ee61be996_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72c819bc06bbde0de32b_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_67203a6ea118cbcc3afa": {
+    "cake_all_gather_matmul_7c66e75c60a4879c3f59": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_67203a6ea118cbcc3afa_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_7c66e75c60a4879c3f59_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_8479166503e0eafc0b90": {
+    "cake_all_gather_matmul_847f7684f2820f90b306": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8479166503e0eafc0b90_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_847f7684f2820f90b306_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_b3396250cf374f2591ca": {
+    "cake_all_gather_matmul_8dea171063652cd775f8": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b3396250cf374f2591ca_kernel.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_b382d28d5e0d0e2ce174": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b382d28d5e0d0e2ce174_kernel.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_c085eacc7dfe656a7c9f": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [32, 1, 1],
         "dynamic_smem_bytes": 0,
     },
-    "cake_all_gather_matmul_de2bf795698105385a3d": {
+    "cake_all_gather_matmul_a0eff3774e45c89deb2d": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_de2bf795698105385a3d_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a0eff3774e45c89deb2d_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_ffe749098469b859325c": {
+    "cake_all_gather_matmul_a80780ede8a1e951deef": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a80780ede8a1e951deef_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_ad1e36214ed76b888e8a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ad1e36214ed76b888e8a_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [32, 1, 1],
         "dynamic_smem_bytes": 0,
+    },
+    "cake_all_gather_matmul_bede04b43f0bd85c421d": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bede04b43f0bd85c421d_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_d3c3aacffd5b8472985d": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_d3c3aacffd5b8472985d_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_e485eef2b19e8858c4ea": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e485eef2b19e8858c4ea_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_fc5668c3f1fb4c1881e9": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fc5668c3f1fb4c1881e9_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
     },
 }
 ROUTES: dict[str, str] = {
-    "barrier_p0": "cake_all_gather_matmul_ffe749098469b859325c",
-    "barrier_p1": "cake_all_gather_matmul_c085eacc7dfe656a7c9f",
-    "main_bfloat16_ws2_k_major": "cake_all_gather_matmul_13e1bef6b9040aa44ad9",
-    "main_bfloat16_ws2_n_major": "cake_all_gather_matmul_8479166503e0eafc0b90",
-    "main_bfloat16_ws4_k_major": "cake_all_gather_matmul_b382d28d5e0d0e2ce174",
-    "main_bfloat16_ws4_n_major": "cake_all_gather_matmul_2bc5d1ac8974f6e151c4",
-    "main_bfloat16_ws8_k_major": "cake_all_gather_matmul_2c2bf0fb27cecb51201d",
-    "main_bfloat16_ws8_n_major": "cake_all_gather_matmul_20f67c65dd961ad23452",
-    "main_float16_ws2_k_major": "cake_all_gather_matmul_1bd5b97815fc495406bf",
-    "main_float16_ws2_n_major": "cake_all_gather_matmul_66bf264ce60ee61be996",
-    "main_float16_ws4_k_major": "cake_all_gather_matmul_b3396250cf374f2591ca",
-    "main_float16_ws4_n_major": "cake_all_gather_matmul_67203a6ea118cbcc3afa",
-    "main_float16_ws8_k_major": "cake_all_gather_matmul_1a649d1fcaec779cf0ac",
-    "main_float16_ws8_n_major": "cake_all_gather_matmul_de2bf795698105385a3d",
-    "peer_push": "cake_all_gather_matmul_57b670500d63c6a7e797",
+    "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+    "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+    "main_bfloat16_ws2_k_major": "cake_all_gather_matmul_0207fc52f60d8009b335",
+    "main_bfloat16_ws2_n_major": "cake_all_gather_matmul_72c819bc06bbde0de32b",
+    "main_bfloat16_ws4_k_major": "cake_all_gather_matmul_e485eef2b19e8858c4ea",
+    "main_bfloat16_ws4_n_major": "cake_all_gather_matmul_a80780ede8a1e951deef",
+    "main_bfloat16_ws8_k_major": "cake_all_gather_matmul_847f7684f2820f90b306",
+    "main_bfloat16_ws8_n_major": "cake_all_gather_matmul_ad1e36214ed76b888e8a",
+    "main_float16_ws2_k_major": "cake_all_gather_matmul_d3c3aacffd5b8472985d",
+    "main_float16_ws2_n_major": "cake_all_gather_matmul_bede04b43f0bd85c421d",
+    "main_float16_ws4_k_major": "cake_all_gather_matmul_fc5668c3f1fb4c1881e9",
+    "main_float16_ws4_n_major": "cake_all_gather_matmul_7c66e75c60a4879c3f59",
+    "main_float16_ws8_k_major": "cake_all_gather_matmul_215935905975bd30dda9",
+    "main_float16_ws8_n_major": "cake_all_gather_matmul_a0eff3774e45c89deb2d",
+    "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
 }
 SEQUENCES: dict[str, dict[str, Any]] = {
     "bfloat16_ws2_k_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_13e1bef6b9040aa44ad9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0207fc52f60d8009b335_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -195,10 +195,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "bfloat16_ws2_k_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_13e1bef6b9040aa44ad9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0207fc52f60d8009b335_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -208,10 +208,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "bfloat16_ws2_n_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8479166503e0eafc0b90_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72c819bc06bbde0de32b_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -221,10 +221,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "bfloat16_ws2_n_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8479166503e0eafc0b90_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72c819bc06bbde0de32b_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -234,10 +234,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "bfloat16_ws4_k_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b382d28d5e0d0e2ce174_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e485eef2b19e8858c4ea_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -247,10 +247,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "bfloat16_ws4_k_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b382d28d5e0d0e2ce174_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e485eef2b19e8858c4ea_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -260,10 +260,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "bfloat16_ws4_n_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2bc5d1ac8974f6e151c4_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a80780ede8a1e951deef_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -273,10 +273,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "bfloat16_ws4_n_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2bc5d1ac8974f6e151c4_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a80780ede8a1e951deef_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -286,10 +286,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "bfloat16_ws8_k_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2c2bf0fb27cecb51201d_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_847f7684f2820f90b306_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -299,10 +299,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "bfloat16_ws8_k_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2c2bf0fb27cecb51201d_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_847f7684f2820f90b306_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -312,10 +312,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "bfloat16_ws8_n_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_20f67c65dd961ad23452_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ad1e36214ed76b888e8a_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -325,10 +325,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "bfloat16_ws8_n_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_20f67c65dd961ad23452_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ad1e36214ed76b888e8a_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -338,10 +338,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "float16_ws2_k_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1bd5b97815fc495406bf_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_d3c3aacffd5b8472985d_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -351,10 +351,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "float16_ws2_k_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1bd5b97815fc495406bf_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_d3c3aacffd5b8472985d_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -364,10 +364,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "float16_ws2_n_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_66bf264ce60ee61be996_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bede04b43f0bd85c421d_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -377,10 +377,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "float16_ws2_n_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_66bf264ce60ee61be996_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bede04b43f0bd85c421d_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -390,10 +390,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "float16_ws4_k_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b3396250cf374f2591ca_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fc5668c3f1fb4c1881e9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -403,10 +403,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "float16_ws4_k_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b3396250cf374f2591ca_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fc5668c3f1fb4c1881e9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -416,10 +416,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "float16_ws4_n_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_67203a6ea118cbcc3afa_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_7c66e75c60a4879c3f59_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -429,10 +429,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "float16_ws4_n_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_67203a6ea118cbcc3afa_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_7c66e75c60a4879c3f59_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -442,10 +442,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "float16_ws8_k_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1a649d1fcaec779cf0ac_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_215935905975bd30dda9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -455,10 +455,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "float16_ws8_k_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1a649d1fcaec779cf0ac_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_215935905975bd30dda9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -468,10 +468,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "float16_ws8_n_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_de2bf795698105385a3d_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a0eff3774e45c89deb2d_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -481,10 +481,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
     },
     "float16_ws8_n_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ffe749098469b859325c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c085eacc7dfe656a7c9f_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_57b670500d63c6a7e797_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_de2bf795698105385a3d_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a0eff3774e45c89deb2d_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -574,16 +574,19 @@ def chunk_plan(rows: int) -> tuple[int, int, int]:
 
 
 def main_grid(
-    rows: int, n: int, *, world_size: int, sm_count: int
+    rows: int,
+    n: int,
+    *,
+    world_size: int,
+    sm_count: int,
 ) -> tuple[int, int, int]:
     """Launch grid of the persistent main kernel: one CTA per SM, bounded by the
     total output tile count (``world_size * ceil128(rows) / 128 * N / 256``), each
     CTA striding over the arrival-ordered tile list."""
 
     if int(world_size) <= 0 or int(sm_count) <= 0:
-        raise ValueError(
-            "the persistent main grid needs a positive world_size and sm_count"
-        )
+        message = "the persistent main grid needs a positive world_size and sm_count"
+        raise ValueError(message)
     total_tiles = int(world_size) * (padded_rows(rows) // BLOCK_M) * (int(n) // BLOCK_N)
     return (max(1, min(total_tiles, int(sm_count))), 1, 1)
 
@@ -601,11 +604,9 @@ def uses_sm_push(*, rows: int, world_size: int, cols: int) -> bool:
     the SM push; the copy engine wins in both cases)."""
 
     padded = padded_rows(rows)
-    return (
-        int(world_size) >= 4
-        and padded <= SM_PUSH_MAX_ROWS
-        and int(cols) <= sm_push_max_cols(padded)
-    )
+    if int(world_size) < 4 or padded > SM_PUSH_MAX_ROWS:
+        return False
+    return int(cols) <= sm_push_max_cols(padded)
 
 
 def weight_layout(w: torch.Tensor) -> str:

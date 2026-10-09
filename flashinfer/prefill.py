@@ -8059,15 +8059,19 @@ def minimax_h3_varlen_attention(
         Optional caller-owned contiguous BF16 ``[T, H, 128]`` output.
     cu_seqlens_host : Optional[Sequence[int]]
         Host copy of ``cu_seqlens``; when omitted the values are read back
-        from the device once to build the segment plan.
+        from the device once to resolve the segment plan.
     backend : str
         Only ``"cake"`` is supported.
 
     Returns
     -------
     torch.Tensor
-        The contiguous BF16 ``[T, H, 128]`` output (``out`` when given).  For
-        repeated launches or CUDA Graph capture use
+        The contiguous BF16 ``[T, H, 128]`` output (``out`` when given).  The
+        segment plan is cached per ``(cu_seqlens, num_heads, device, stream)``
+        (most recent 256 layouts): the first call of a layout builds and
+        uploads the plan tables, every later call re-launches with them (no
+        planning, no host-to-device copies, no allocation when ``out`` is
+        given).  For CUDA Graph capture use
         ``flashinfer.experimental.minimax_h3_varlen_attention.cake_backend.prepare_minimax_h3_varlen_attention``,
         whose runner launches with no allocation or synchronization.  See
         ``flashinfer/experimental/minimax_h3_varlen_attention/README.md``.

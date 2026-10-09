@@ -132,9 +132,9 @@ if [ "${BUILD_TARGET}" = "provider" ]; then
     --timeout-seconds "${JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS}" \
     --term-grace-seconds "${JIT_CACHE_WATCHDOG_TERM_GRACE_SECONDS}" \
     --diagnostics-file "${WATCHDOG_DIAGNOSTICS_FILE}" \
-    -- python -m build --wheel
+    -- python "${SCRIPT_DIR}/build_jit_cache_wheel.py"
 else
-  python -m build --wheel
+  python "${SCRIPT_DIR}/build_jit_cache_wheel.py"
 fi
 
 echo ""
