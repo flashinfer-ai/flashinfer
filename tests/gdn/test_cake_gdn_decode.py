@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -630,6 +631,57 @@ def test_decode_resolver_admits_every_qwen35_bf16_t1_geometry_at_any_batch(
             assert record["specializations"].get("T_STEPS", 1) == 1
             assert record["specializations"].get("UPDATE_STATE", 1) == 1
             assert arch in record["architectures"]
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+def test_decode_resolver_routes_the_bf16_verify_tile16_body_per_architecture(
+    arch,
+) -> None:
+    # Rubin (sm_107a) runs the v-prefetch / unrolled `tile16_vpre` schedule of the
+    # full-warp tile-v16 verify kernel; B200 / B300 keep the shipped body.  The
+    # route id (grid tile) is the same on every architecture.
+    assert cake_gdn.CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES == {"sm_107a": "tile16_vpre"}
+    body = "tile16_vpre" if arch == "sm_107a" else "tile16"
+    rows = [
+        *(
+            dict(
+                batch_size=batch_size,
+                seq_len=seq_len,
+                num_k_heads=8,
+                num_q_heads=8,
+                num_v_heads=16,
+                cache_steps=seq_len,
+            )
+            for batch_size, seq_len in ((1, 7), (2, 7), (3, 7), (4, 7), (1, 8))
+        ),
+        *(
+            dict(
+                batch_size=batch_size,
+                seq_len=4,
+                num_k_heads=4,
+                num_q_heads=4,
+                num_v_heads=8,
+                cache_steps=4,
+            )
+            for batch_size in range(1, 9)
+        ),
+    ]
+    for overrides in rows:
+        route = _decode(
+            arch=arch,
+            state_dtype="bfloat16",
+            layout="pretranspose",
+            strided_inputs=True,
+            disable_state_update=True,
+            cache_intermediate_states=True,
+            **overrides,
+        )
+        assert route.route_id.endswith(".tile16_fullwarp")
+        assert re.search(rf"_t4_bf16state_{body}_[0-9a-f]{{12}}$", route.variant_name), (
+            arch,
+            overrides,
+            route.variant_name,
+        )
 
 
 def test_decode_resolver_fails_closed_for_unlisted_bf16_t1_geometry_and_controls() -> (

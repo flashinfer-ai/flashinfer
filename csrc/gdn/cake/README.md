@@ -57,6 +57,13 @@ rows (H=8 / HV=16, BF16 state pool, seven-step BF16 checkpoint cache,
 specialized to `T_STEPS=7` and `T_STEPS=8` for B<=4 and
 `gdn_decode_pretranspose_mtp_t4_bf16state_wide128` with `T_STEPS=7`,
 `TILE_V_WIDE=32` for B>=5 (H=8/HV=16) and TP=1 (H=16/HV=32).
+On SM107a (Rubin R200) the tile16 rows (and the Qwen3-Next TP=4 H=4/HV=8
+T=4 rows) resolve to `gdn_decode_pretranspose_t4_bf16state_tile16_vpre`
+instead: the same kernel contract and arithmetic (bitwise-identical output)
+with every draft token's v values staged in shared memory ahead of the serial
+recurrence and the token loop unrolled; its records are exported for `sm_107a`
+only, while SM100a/SM103a keep the shipped tile16 body
+(`cake_gdn_bf16_verify_tile16_schedule` in `flashinfer/jit/cake_gdn.py`).
 
 Single-token BF16-state decode admits every Qwen3.5 per-rank linear-attention
 geometry at any batch: H/HV = 16/32, 8/16, 4/8 (Qwen3.5-35B-A3B TP1/TP2/TP4)

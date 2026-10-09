@@ -616,6 +616,20 @@ def cake_gdn_bf16_t1_route(
     raise AssertionError("BF16 T=1 route band tables must end with an open band")
 
 
+# The full-warp tile-v16 BF16 verify body per architecture: Rubin (sm_107a) runs the
+# `tile16_vpre` schedule (every draft token's v values staged in shared memory ahead
+# of the serial recurrence, fully unrolled token loop; bitwise-identical output),
+# B200/B300 keep the shipped body.  Mirrors
+# loom.examples.weave.gdn_decode_pretranspose.select_bf16_verify_tile16_body.
+CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES: dict[str, str] = {"sm_107a": "tile16_vpre"}
+
+
+def cake_gdn_bf16_verify_tile16_schedule(arch: CakeGDNArch) -> str:
+    """Schedule attribute of the full-warp tile-v16 BF16 verify kernel on ``arch``."""
+    body = CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES.get(arch, "tile16")
+    return f"gdn_decode_pretranspose_t4_bf16state_{body}"
+
+
 def cake_gdn_bf16_route_tile_v(route_id: str) -> int:
     """The grid tile a BF16 decode route id carries (``.vec8_t<N>``, ``.vec8r56_t<N>``, ``.vec8occ_t<N>``, ``.wide<N>`` or ``.tile16_fullwarp``)."""
 
@@ -782,10 +796,11 @@ def select_cake_gdn_decode_variant(
         if num_q_heads == 8 and num_v_heads == 16 and batch_size <= 4:
             # Qwen3.5-35B-A3B TP=2 per-rank verify (speculative_num_draft_tokens=7
             # verifies T=7; T=8 is the adjacent window): B<=4 runs the full-warp
-            # tile-v16 kernel with T_STEPS specialized, B>=5 falls through to wide32.
+            # tile-v16 kernel with T_STEPS specialized (the `tile16_vpre` body on
+            # sm_107a), B>=5 falls through to wide32.
             record = _variant_for(
                 domain="decode",
-                schedule_attr="gdn_decode_pretranspose_t4_bf16state_tile16",
+                schedule_attr=cake_gdn_bf16_verify_tile16_schedule(arch),
                 specializations={
                     "H": num_q_heads,
                     "HV": num_v_heads,
@@ -801,7 +816,7 @@ def select_cake_gdn_decode_variant(
                 record["name"],
             )
         if num_q_heads == 4 and num_v_heads == 8:
-            schedule_attr = "gdn_decode_pretranspose_t4_bf16state_tile16"
+            schedule_attr = cake_gdn_bf16_verify_tile16_schedule(arch)
             specializations = {
                 "H": num_q_heads,
                 "HV": num_v_heads,
