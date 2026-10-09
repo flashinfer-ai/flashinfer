@@ -1234,3 +1234,72 @@ print("NO_DSL_OK")
     assert r.returncode == 0 and "NO_DSL_OK" in r.stdout, (
         r.stdout[-2000:] + r.stderr[-4000:]
     )
+
+
+@requires_gvr2
+@pytest.mark.parametrize("hinted", [False, True], ids=["slab", "rung"])
+@pytest.mark.parametrize("lead", [0, 1, 2, 3], ids=lambda x: f"lead{x}")
+@pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
+def test_prefill_plus_inf_inside_window(top_k, lead, hinted):
+    """A literal +inf INSIDE the window is a valid candidate and must be
+    selected (the decode engine once omitted +inf; the windowed engines rank it
+    like any value): planted at the window's first and last lane, a middle
+    lane, around the K-th boundary and on a stride, under every lead class, on
+    both engine families, with the usual +inf poison in the lead lanes."""
+    nv = top_k + 700
+    ks1 = 40 + lead
+    ncols = ks1 + nv + (0 if hinted else 8192)
+    rows = 6
+    lg, rs, le = _make_case(rows, ncols, [ks1] * rows, [nv] * rows, seed=top_k + lead)
+    planted = {
+        0: [0],
+        1: [nv - 1],
+        2: [nv // 2],
+        3: [0, nv - 1, 7, nv // 3],
+        4: [top_k - 1, top_k],
+        5: list(range(0, nv, 97)),
+    }
+    for r, cols in planted.items():
+        for p in cols:
+            lg[r, ks1 + p] = float("inf")
+    out = _run(lg, rs, le, top_k, **({"max_seq_len": nv} if hinted else {}))
+    _check_windowed(lg, out, rs, le, top_k)
+    for r, cols in planted.items():
+        sel = set(out[r][out[r] >= 0].tolist())
+        assert set(cols) <= sel, (
+            f"row {r}: +inf candidates omitted {sorted(set(cols) - sel)[:4]}"
+        )
+
+
+@requires_gvr2
+@pytest.mark.parametrize("hinted", [False, True], ids=["slab", "rung"])
+@pytest.mark.parametrize("lead", [0, 1, 2, 3], ids=lambda x: f"lead{x}")
+@pytest.mark.parametrize("top_k", [512, 1024], ids=lambda k: f"k{k}")
+def test_prefill_all_neginf_window(top_k, lead, hinted):
+    """A window holding only -inf (every candidate masked, as SGLang's masks can
+    produce) with more candidates than K: K distinct in-window indices, values
+    all -inf, no -1 pad and nothing from outside the window -- a -1 pad and a
+    valid -inf must stay distinguishable on both engine families."""
+    nv = top_k + 300
+    ks1 = 24 + lead
+    ncols = ks1 + nv + (0 if hinted else 8192)
+    rows = 4
+    stride = ((ncols + 256 + 255) // 256) * 256
+    full = torch.full((rows, stride), 3e38, dtype=torch.float32, device=_DEV)
+    full[:, :ks1] = float("inf")  # lead lanes / previous request: a leak is top-1
+    full[:, ks1 : ks1 + nv] = float("-inf")
+    lg = full[:, :ncols]
+    rs = torch.tensor([ks1] * rows, dtype=torch.int32, device=_DEV)
+    le = torch.tensor([nv] * rows, dtype=torch.int32, device=_DEV)
+    out, vals = flashinfer.top_k_varlen(
+        lg,
+        le,
+        top_k,
+        row_starts=rs,
+        backend="gvr_2",
+        return_values=True,
+        **({"max_seq_len": nv} if hinted else {}),
+    )
+    torch.cuda.synchronize()
+    _check_windowed(lg, out, rs, le, top_k)
+    assert bool((vals == float("-inf")).all())
