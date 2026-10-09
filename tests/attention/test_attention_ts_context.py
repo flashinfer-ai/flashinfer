@@ -1445,7 +1445,8 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
         variable_window_cta_starts=empty_i32,
         compiled=lambda *_args: None,
         policy=(),
-        empty_vc_mu=empty_i32,
+        empty_vc_mu=torch.empty(1),
+        empty_vc_scale=torch.empty(1),
     )
 
     with pytest.raises(

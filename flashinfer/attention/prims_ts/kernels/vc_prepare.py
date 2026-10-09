@@ -50,11 +50,65 @@ _COL_GROUPS = _D // _COLS_PER_THREAD
 _ROW_GROUPS = _THREADS // _COL_GROUPS
 _ROWS_PER_THREAD = _TILE // _ROW_GROUPS
 _MU_ELEMS = math.prod(vc_mean_operand_shape(_D))
+_HADAMARD_NORM = 1.0 / math.sqrt(_D)
 
 
 @cute.jit
 def _abs_f32(x: Float32) -> Float32:
     return cute.arch.fmax(x, -x)
+
+
+@cute.jit
+def _hadamard128_row(vals, base: cutlass.Constexpr[int], cg: Int32):
+    """In-place normalised 128-point Walsh-Hadamard transform of one row whose
+    16 columns ``vals[base : base + 16]`` live in this thread and whose other
+    112 columns live in the 7 neighbouring lanes ``cg ^ {1, 2, 4}``."""
+    for h in (1, 2, 4, 8):
+        for i in cutlass.range_constexpr(_COLS_PER_THREAD):
+            if (i & h) == 0:
+                a = vals[base + i]
+                b = vals[base + (i ^ h)]
+                vals[base + i] = a + b
+                vals[base + (i ^ h)] = a - b
+    for sbit in cutlass.range_constexpr(3):
+        stride = 1 << sbit
+        # Lanes with the bit clear take (mine + other); lanes with it set take (other - mine).
+        sign = Float32(1.0) - Float32(2.0) * Float32((cg >> sbit) & 1)
+        for j in cutlass.range_constexpr(_COLS_PER_THREAD):
+            mine = vals[base + j]
+            other = cute.arch.shuffle_sync_bfly(mine, stride)
+            vals[base + j] = sign * mine + other
+    for j in cutlass.range_constexpr(_COLS_PER_THREAD):
+        vals[base + j] = vals[base + j] * Float32(_HADAMARD_NORM)
+
+
+@cute.jit
+def _block_max(v: Float32, red_smem, tidx: Int32) -> Float32:
+    """Max over the 128 threads of the CTA (4 warps)."""
+    for shift in cutlass.range_constexpr(5):
+        v = cute.arch.fmax(v, cute.arch.shuffle_sync_bfly(v, 1 << shift))
+    if tidx % 32 == 0:
+        red_smem[tidx // 32] = v
+    cute.arch.sync_threads()
+    r = red_smem[0]
+    for w in cutlass.range_constexpr(1, 4):
+        r = cute.arch.fmax(r, red_smem[w])
+    cute.arch.sync_threads()
+    return r
+
+
+@cute.jit
+def _flat_scale_offset(
+    bh: Int32, num_heads: Int32, num_batch_heads: Int32, seq_len: Int32, block: Int32
+) -> Int64:
+    """Element offset of block ``block`` of sequence ``bh // num_heads`` in the flat
+    ``[H, ceil(B*S / 128) + B - 1]`` scale layout (``sage.flat_scale_slot``)."""
+    b_idx = bh // num_heads
+    h_idx = bh % num_heads
+    n_batch = num_batch_heads // num_heads
+    numel = ((n_batch * seq_len + _TILE - 1) // _TILE) + n_batch - 1
+    slot = ((b_idx * seq_len) // _TILE) + b_idx + block
+    return Int64(h_idx) * Int64(numel) + Int64(slot)
 
 
 @cute.jit
@@ -84,6 +138,13 @@ def _store_row16_fp8(base_addr: Int64, vals, scale_inv: Float32):
     )
 
 
+@cute.jit
+def _load_row16_f32(base_addr: Int64):
+    return cutlass.inttoptr(base_addr, mem_space=1, dtype=Float32).load(
+        count=16, alignment=64
+    )
+
+
 class VcKvPass1:
     def __init__(self, is_bf16: bool):
         self.is_bf16 = is_bf16
@@ -97,10 +158,15 @@ class VcKvPass1:
         mKPerm: cute.Tensor,
         mMean: cute.Tensor,
         mVAmax: cute.Tensor,
+        mKMean: cute.Tensor,
+        mK8: cute.Tensor,
+        mKScale: cute.Tensor,
         seq_len: Int32,
         num_heads: Int32,
         num_tiles: Int32,
+        num_batch_heads: Int32,
         demean: cutlass.Constexpr[bool],
+        qk_fp8: cutlass.Constexpr[bool],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         t, bh, _ = cute.arch.block_idx()
@@ -112,6 +178,7 @@ class VcKvPass1:
 
         smem = cutlass.utils.SmemAllocator()
         col_sums = smem.allocate_array(Float32, _ROW_GROUPS * _TILE)
+        red = smem.allocate_array(Float32, 4)
 
         k_base = mK.iterator.toint()
         v_base = mV.iterator.toint()
@@ -129,26 +196,92 @@ class VcKvPass1:
                 ).load()
             toks[i] = tok
 
-        # K, copy the permuted rows.
-        for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
-            pos = t * _TILE + rg + _ROW_GROUPS * i
-            if pos < seq_len:
-                src = (
-                    k_base
-                    + (Int64(b) * Int64(seq_len) + Int64(toks[i])) * row_bytes
-                    + (Int64(h) * _D + col0) * 2
-                )
-                dst = (
-                    kp_base
-                    + (Int64(b) * Int64(seq_len) + Int64(pos)) * row_bytes
-                    + (Int64(h) * _D + col0) * 2
-                )
-                regs = cutlass.inttoptr(src, mem_space=1, dtype=Int32).load(
-                    count=8, alignment=32
-                )
-                cutlass.inttoptr(dst, mem_space=1, dtype=Int32).store(
-                    regs, alignment=32
-                )
+        if cutlass.const_expr(qk_fp8):
+            # K, VC-Attention-QK8: centre by the per-head channel mean, rotate the
+            # permuted rows by the Hadamard matrix, quantize to E4M3 with one
+            # scale per tile in the flat scale layout.
+            kmean = _load_row16_f32(
+                mKMean.iterator.toint() + (Int64(bh) * _D + col0) * 4
+            )
+            kvals = cutlass.Array(
+                Float32,
+                _ROWS_PER_THREAD * _COLS_PER_THREAD,
+                space=cutlass.AddressSpace.rmem,
+            )
+            kmax = Float32(0.0)
+            for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
+                pos = t * _TILE + rg + _ROW_GROUPS * i
+                if pos < seq_len:
+                    addr = (
+                        k_base
+                        + (Int64(b) * Int64(seq_len) + Int64(toks[i])) * row_bytes
+                        + (Int64(h) * _D + col0) * 2
+                    )
+                    row = _load_row16(addr, self.is_bf16)
+                    for j in cutlass.range_constexpr(_COLS_PER_THREAD):
+                        kvals[i * _COLS_PER_THREAD + j] = row[j] - kmean[j]
+                else:
+                    for j in cutlass.range_constexpr(_COLS_PER_THREAD):
+                        kvals[i * _COLS_PER_THREAD + j] = Float32(0.0)
+            # The rotation needs all 8 lanes of a row, also for padded rows.
+            for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
+                _hadamard128_row(kvals, i * _COLS_PER_THREAD, cg)
+            for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
+                pos = t * _TILE + rg + _ROW_GROUPS * i
+                if pos < seq_len:
+                    for j in cutlass.range_constexpr(_COLS_PER_THREAD):
+                        kmax = cute.arch.fmax(
+                            kmax, _abs_f32(kvals[i * _COLS_PER_THREAD + j])
+                        )
+            kmax = _block_max(kmax, red, tidx)
+            kscale = cute.arch.fmax(kmax / E4M3_MAX, Float32(1e-12))
+            kscale_inv = Float32(1.0) / kscale
+            if tidx == 0:
+                cutlass.inttoptr(
+                    mKScale.iterator.toint()
+                    + _flat_scale_offset(bh, num_heads, num_batch_heads, seq_len, t)
+                    * 4,
+                    mem_space=1,
+                    dtype=Float32,
+                ).store(kscale)
+            for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
+                pos = t * _TILE + rg + _ROW_GROUPS * i
+                if pos < seq_len:
+                    addr = (
+                        mK8.iterator.toint()
+                        + (Int64(b) * Int64(seq_len) + Int64(pos))
+                        * Int64(num_heads)
+                        * _D
+                        + Int64(h) * _D
+                        + col0
+                    )
+                    sub = cutlass.Array(
+                        Float32, _COLS_PER_THREAD, space=cutlass.AddressSpace.rmem
+                    )
+                    for j in cutlass.range_constexpr(_COLS_PER_THREAD):
+                        sub[j] = kvals[i * _COLS_PER_THREAD + j]
+                    _store_row16_fp8(addr, sub, kscale_inv)
+        else:
+            # K, copy the permuted rows.
+            for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
+                pos = t * _TILE + rg + _ROW_GROUPS * i
+                if pos < seq_len:
+                    src = (
+                        k_base
+                        + (Int64(b) * Int64(seq_len) + Int64(toks[i])) * row_bytes
+                        + (Int64(h) * _D + col0) * 2
+                    )
+                    dst = (
+                        kp_base
+                        + (Int64(b) * Int64(seq_len) + Int64(pos)) * row_bytes
+                        + (Int64(h) * _D + col0) * 2
+                    )
+                    regs = cutlass.inttoptr(src, mem_space=1, dtype=Int32).load(
+                        count=8, alignment=32
+                    )
+                    cutlass.inttoptr(dst, mem_space=1, dtype=Int32).store(
+                        regs, alignment=32
+                    )
 
         # V, tile mean and residual amax.
         vvals = cutlass.Array(
@@ -235,28 +368,39 @@ class VcKvPass1:
         mKPerm: cute.Tensor,
         mMean: cute.Tensor,
         mVAmax: cute.Tensor,
+        mKMean: cute.Tensor,
+        mK8: cute.Tensor,
+        mKScale: cute.Tensor,
         seq_len: Int32,
         num_heads: Int32,
         num_tiles: Int32,
         num_batch_heads: Int32,
         demean: cutlass.Constexpr[bool],
+        qk_fp8: cutlass.Constexpr[bool],
         stream,
     ):
         self.kernel(
-            mK, mV, mPerm, mKPerm, mMean, mVAmax, seq_len, num_heads, num_tiles, demean
+            mK,
+            mV,
+            mPerm,
+            mKPerm,
+            mMean,
+            mVAmax,
+            mKMean,
+            mK8,
+            mKScale,
+            seq_len,
+            num_heads,
+            num_tiles,
+            num_batch_heads,
+            demean,
+            qk_fp8,
         ).launch(
             grid=[num_tiles, num_batch_heads, 1],
             block=[_THREADS, 1, 1],
-            smem=_ROW_GROUPS * _TILE * 4,
+            smem=(_ROW_GROUPS * _TILE + 4) * 4,
             stream=stream,
         )
-
-
-@cute.jit
-def _load_row16_f32(base_addr: Int64):
-    return cutlass.inttoptr(base_addr, mem_space=1, dtype=Float32).load(
-        count=16, alignment=64
-    )
 
 
 class VcKvPass2:
@@ -397,6 +541,109 @@ class VcKvPass2:
         )
 
 
+class VcQPass:
+    """VC-Attention-QK8 Q pass: rotate each 128-token block by the Hadamard matrix
+    and quantize it to E4M3 with one scale per block in the flat scale layout."""
+
+    def __init__(self, is_bf16: bool):
+        self.is_bf16 = is_bf16
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQ: cute.Tensor,
+        mQ8: cute.Tensor,
+        mQScale: cute.Tensor,
+        seq_len: Int32,
+        num_heads: Int32,
+        num_batch_heads: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        nb, bh, _ = cute.arch.block_idx()
+        b = bh // num_heads
+        h = bh % num_heads
+        cg = tidx % _COL_GROUPS
+        rg = tidx // _COL_GROUPS
+        col0 = cg * _COLS_PER_THREAD
+        smem = cutlass.utils.SmemAllocator()
+        red = smem.allocate_array(Float32, 4)
+        q_base = mQ.iterator.toint()
+        row_bytes = Int64(num_heads) * (_D * 2)
+        qvals = cutlass.Array(
+            Float32,
+            _ROWS_PER_THREAD * _COLS_PER_THREAD,
+            space=cutlass.AddressSpace.rmem,
+        )
+        qmax = Float32(0.0)
+        for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
+            pos = nb * _TILE + rg + _ROW_GROUPS * i
+            if pos < seq_len:
+                addr = (
+                    q_base
+                    + (Int64(b) * Int64(seq_len) + Int64(pos)) * row_bytes
+                    + (Int64(h) * _D + col0) * 2
+                )
+                row = _load_row16(addr, self.is_bf16)
+                for j in cutlass.range_constexpr(_COLS_PER_THREAD):
+                    qvals[i * _COLS_PER_THREAD + j] = row[j]
+            else:
+                for j in cutlass.range_constexpr(_COLS_PER_THREAD):
+                    qvals[i * _COLS_PER_THREAD + j] = Float32(0.0)
+        for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
+            _hadamard128_row(qvals, i * _COLS_PER_THREAD, cg)
+        for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
+            pos = nb * _TILE + rg + _ROW_GROUPS * i
+            if pos < seq_len:
+                for j in cutlass.range_constexpr(_COLS_PER_THREAD):
+                    qmax = cute.arch.fmax(
+                        qmax, _abs_f32(qvals[i * _COLS_PER_THREAD + j])
+                    )
+        qmax = _block_max(qmax, red, tidx)
+        qscale = cute.arch.fmax(qmax / E4M3_MAX, Float32(1e-12))
+        qscale_inv = Float32(1.0) / qscale
+        if tidx == 0:
+            cutlass.inttoptr(
+                mQScale.iterator.toint()
+                + _flat_scale_offset(bh, num_heads, num_batch_heads, seq_len, nb) * 4,
+                mem_space=1,
+                dtype=Float32,
+            ).store(qscale)
+        for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
+            pos = nb * _TILE + rg + _ROW_GROUPS * i
+            if pos < seq_len:
+                addr = (
+                    mQ8.iterator.toint()
+                    + (Int64(b) * Int64(seq_len) + Int64(pos)) * Int64(num_heads) * _D
+                    + Int64(h) * _D
+                    + col0
+                )
+                sub = cutlass.Array(
+                    Float32, _COLS_PER_THREAD, space=cutlass.AddressSpace.rmem
+                )
+                for j in cutlass.range_constexpr(_COLS_PER_THREAD):
+                    sub[j] = qvals[i * _COLS_PER_THREAD + j]
+                _store_row16_fp8(addr, sub, qscale_inv)
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,
+        mQ8: cute.Tensor,
+        mQScale: cute.Tensor,
+        seq_len: Int32,
+        num_heads: Int32,
+        num_blocks: Int32,
+        num_batch_heads: Int32,
+        stream,
+    ):
+        self.kernel(mQ, mQ8, mQScale, seq_len, num_heads, num_batch_heads).launch(
+            grid=[num_blocks, num_batch_heads, 1],
+            block=[_THREADS, 1, 1],
+            smem=16,
+            stream=stream,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Compilation cache (TVM-FFI entry points taking torch tensors directly)
 # ---------------------------------------------------------------------------
@@ -415,7 +662,7 @@ def _in_dtype(dtype: torch.dtype):
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled(dtype: torch.dtype, demean: bool):
+def _compiled(dtype: torch.dtype, demean: bool, qk_fp8: bool = False):
     cdt, is_bf16 = _in_dtype(dtype)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     f32 = lambda: _fake1d(Float32, 64)  # noqa: E731
@@ -429,14 +676,32 @@ def _compiled(dtype: torch.dtype, demean: bool):
         _fake1d(cdt),
         f32(),
         f32(),
+        f32(),
+        e4m3(),
+        f32(),
         Int32(1),
         Int32(1),
         Int32(1),
         Int32(1),
         demean,
+        qk_fp8,
         stream,
         options=_COMPILE_OPTIONS,
     )
+    pq = None
+    if qk_fp8:
+        pq = cute.compile(
+            VcQPass(is_bf16),
+            _fake1d(cdt),
+            e4m3(),
+            f32(),
+            Int32(1),
+            Int32(1),
+            Int32(1),
+            Int32(1),
+            stream,
+            options=_COMPILE_OPTIONS,
+        )
     p2 = cute.compile(
         VcKvPass2(is_bf16),
         _fake1d(cdt),
@@ -452,7 +717,7 @@ def _compiled(dtype: torch.dtype, demean: bool):
         stream,
         options=_COMPILE_OPTIONS,
     )
-    return p1, p2
+    return p1, p2, pq
 
 
 @torch.no_grad()
@@ -471,6 +736,44 @@ def vc_prepare(
     mean, mu)`` in the ``VCAttentionOperands`` layouts; ``v_scale`` is
     ``[B, H, D]``.
     """
+    return _prepare(None, k, v, perm, demean=demean)[:5]
+
+
+@torch.no_grad()
+def vc_prepare_fp8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    perm: torch.Tensor,
+    *,
+    demean: bool = True,
+) -> tuple[torch.Tensor, ...]:
+    """Run the three VC-Attention-QK8 preparation kernels.
+
+    ``q``, ``k``, ``v``: contiguous ``[B, S, H, D]`` bf16/fp16 (one Q block scale
+    per 128 tokens); ``perm``: ``[B, H, S_k]`` int32/int64. Returns ``(q8, k8,
+    v8, q_scale, k_scale, v_scale, mean, mu)`` in the ``VCAttentionOperands``
+    layouts, the Q/K scales in the flat scale layout.
+    """
+    if q.shape[-1] != _D or not q.is_contiguous():
+        raise ValueError(f"VC fused preparation needs contiguous head_dim {_D} Q")
+    k8, v8, v_scale, mean, mu, q8, q_scale, k_scale = _prepare(
+        q, k, v, perm, demean=demean
+    )
+    return q8, k8, v8, q_scale, k_scale, v_scale, mean, mu
+
+
+def _prepare(
+    q: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    perm: torch.Tensor,
+    *,
+    demean: bool,
+) -> tuple[torch.Tensor, ...]:
+    """Run the passes; ``q`` selects the QK8 recipe. Returns ``(k_out, v8,
+    v_scale, mean, mu, q8, q_scale, k_scale)`` with the QK8 outputs ``None``
+    under QK16."""
     b, s_k, h, d = k.shape
     if d != _D:
         raise ValueError(f"VC fused preparation supports head_dim {_D} only")
@@ -479,9 +782,23 @@ def vc_prepare(
     dev = k.device
     t = (s_k + _TILE - 1) // _TILE
     bh = b * h
-    p1, p2 = _compiled(k.dtype, bool(demean))
+    qk_fp8 = q is not None
+    p1, p2, pq = _compiled(k.dtype, bool(demean), qk_fp8)
     perm32 = perm.to(torch.int32).contiguous()
-    k_perm = torch.empty_like(k)
+    dummy = torch.zeros((1,), dtype=torch.float32, device=dev)
+    if qk_fp8:
+        k_perm = torch.empty((1,), dtype=k.dtype, device=dev)
+        k_mean = k.float().mean(dim=1).contiguous()  # [B, H, D]
+        k8 = torch.empty((b, s_k, h, d), dtype=torch.float8_e4m3fn, device=dev)
+        # Flat scale layout (sage.flat_scale_numel), [H, ceil(B*S / 128) + B - 1].
+        k_scale = torch.ones(
+            (h, (b * s_k + _TILE - 1) // _TILE + b - 1), dtype=torch.float32, device=dev
+        )
+    else:
+        k_perm = torch.empty_like(k)
+        k_mean = dummy
+        k8 = torch.empty((1,), dtype=torch.float8_e4m3fn, device=dev)
+        k_scale = dummy
     v8 = torch.empty((b, s_k, h, d), dtype=torch.float8_e4m3fn, device=dev)
     mean = torch.empty((b, h, t, d), dtype=torch.float32, device=dev)
     vamax = torch.empty((b, h, t, d), dtype=torch.float32, device=dev)
@@ -502,6 +819,9 @@ def vc_prepare(
         k_perm.view(-1),
         mean.view(-1),
         vamax.view(-1),
+        k_mean.view(-1),
+        k8.view(-1),
+        k_scale.view(-1),
         s_k,
         h,
         t,
@@ -520,4 +840,20 @@ def vc_prepare(
         t,
         bh,
     )
-    return k_perm, v8, v_scale, mean, mu
+    if not qk_fp8:
+        return k_perm, v8, v_scale, mean, mu, None, None, None
+    s_q = q.shape[1]
+    q8 = torch.empty((b, s_q, h, d), dtype=torch.float8_e4m3fn, device=dev)
+    q_scale = torch.ones(
+        (h, (b * s_q + _TILE - 1) // _TILE + b - 1), dtype=torch.float32, device=dev
+    )
+    pq(
+        q.view(-1),
+        q8.view(-1),
+        q_scale.view(-1),
+        s_q,
+        h,
+        (s_q + _TILE - 1) // _TILE,
+        bh,
+    )
+    return k8, v8, v_scale, mean, mu, q8, q_scale, k_scale

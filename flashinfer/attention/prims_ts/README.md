@@ -23,7 +23,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 
 | Kernel | Guide | Public APIs |
 | --- | --- | --- |
-| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md), [VC-Attention-QK16](#vc-attention-qk16) below | `BatchPrefillTSWrapper`, `batch_prefill`, `VCAttentionConfig`, `VCAttentionParams`, `VCAttentionPreprocessor`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
+| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md), [VC-Attention](#vc-attention) below | `BatchPrefillTSWrapper`, `batch_prefill`, `VCAttentionConfig`, `VCAttentionParams`, `VCAttentionPreprocessor`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
 | FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prepare_prims_ts_batch_decode_with_kv_cache` |
 | QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
 | Block-sparse FMHA | [Sage attention](#sage-attention) below | `BlockSparseTSWrapper`, `block_sparse_attention`, `SageAttentionConfig`, `SageAttentionParams`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
@@ -416,38 +416,50 @@ out = wrapper.run(
 its recipe is `sage_config` or, when omitted, the default recipe with a V mean
 exactly when `sage.v_mean` is set.
 
-## VC-Attention-QK16
+## VC-Attention
 
-VC-Attention-QK16, a bf16 Q/K adaptation of
-[Li et al., 2026](https://arxiv.org/html/2609.15810v1), runs the dense
-fixed-length context kernel (`BatchPrefillTSWrapper` and `batch_prefill`) with
-bf16 Q and K, E4M3 V with value smoothing, and a direct probability cast.
-The plan selects the recipe at compile time with
-`vc_config=VCAttentionConfig(...)`. Every run passes the permuted K, the E4M3 V
-residuals and `vc=VCAttentionParams(...)`:
+VC-Attention ([Li et al., 2026](https://arxiv.org/html/2609.15810v1)) runs the
+dense fixed-length context kernel (`BatchPrefillTSWrapper` and `batch_prefill`)
+with E4M3 V stored as residuals around per-128-token-tile means that the kernel
+restores inside the online softmax, and a direct probability cast (ExpCast). The
+plan selects the recipe at compile time with `vc_config=VCAttentionConfig(...)`;
+the plan's Q/K dtype selects the Q/K side:
+
+* **VC-Attention-QK16** (`q_dtype`/`k_dtype` bf16 or fp16): Q and K stay 16-bit.
+* **VC-Attention-QK8** (`q_dtype`/`k_dtype` `torch.float8_e4m3fn`): the paper's
+  low-bit Q/K. K is centred by its per-head channel mean, Q and K are rotated by
+  the normalised 128-point Hadamard matrix and quantized to E4M3 with one scale
+  per `q_block_size` Q tokens and per 128-token K tile.
+
+Every run passes the (permuted) K, the E4M3 V residuals and
+`vc=VCAttentionParams(...)`; QK8 runs pass the E4M3 Q and the Q/K scales too:
 
 ```text
-S[r][c] = (Q . K[perm]^T)[r][c]
-P8      = softmax_row(S), quantized to E4M3
+K'      = (K - mean_tokens(K)) H,  Q' = Q H              (QK8 only; H: 128-point Hadamard)
+S[r][c] = sfQ[blkQ(r)] * sfK[tileK(c)] * (Q8 . K8[perm]^T)[r][c]   (QK16: Q . K[perm]^T)
+P8      = ExpCast(S - rowmax(S))                                      (E4M3)
 O[r][d] = sfV[b, h, d] * (sum_c P8[r][c] * V8[perm(c)][d] + sum_t rowsum_t(P8[r]) * mu_t[d]) / l[r]
 ```
 
 `V8` holds the E4M3 residuals of the k-means-permuted values around their
 128-token tile means `mu_t` (stored in bf16, divided by `sfV`); the kernel adds
 the mean terms back inside the online softmax recurrence, two K=16 UMMA steps per
-group of 16 tiles, so the row-max correction covers them. `VCAttentionPreprocessor` turns bf16 K/V into the
-operands with the paper's V-Smooth schedule: grouping and demeaning run on the
-first `smooth_step_fraction` of the denoising steps, the permutation is
-refreshed every `perm_refresh_every` steps inside that window and kept
-afterwards. `vc_quantize` is the torch reference of the same preparation.
+group of 16 tiles, so the row-max correction covers them. `VCAttentionPreprocessor`
+turns bf16 K/V (and Q under QK8) into the operands with the paper's V-Smooth
+schedule: grouping and demeaning run on the first `smooth_step_fraction` of the
+denoising steps, the permutation is refreshed every `perm_refresh_every` steps
+inside that window and kept afterwards. `vc_quantize` and `vc_quantize_fp8` are
+the torch references of the two preparations, `vc_quantize_fused` and
+`vc_quantize_fp8_fused` the CuTe DSL kernels.
 
 | Input | Supported values |
 | --- | --- |
-| Q/K dtype | `torch.bfloat16` |
+| Q/K dtype | `torch.bfloat16`, `torch.float16` (QK16) or `torch.float8_e4m3fn` (QK8) |
 | V dtype | `torch.float8_e4m3fn` |
 | Output dtype | `torch.bfloat16` or `torch.float16` |
-| `k_block_size` | 128 (the K/V tile whose mean is restored) |
-| Geometry | `head_dim=128`, `num_qo_heads == num_kv_heads`, `packed=False`, `mask_type="dense"`; runs the two-CTA UMMA form |
+| `k_block_size` | 128 (the K/V tile whose mean is restored, and the K scale block) |
+| `q_block_size` | Power of two in [1, 256]; default 128 (QK8 Q scale block) |
+| Geometry | `head_dim=128`, `num_qo_heads == num_kv_heads`, `packed=False`, `mask_type="dense"`; QK16 runs the two-CTA UMMA form, QK8 follows the device default |
 
 ### Operand tensors
 
@@ -456,9 +468,12 @@ afterwards. `vc_quantize` is the torch reference of the same preparation.
 from `pack_vc_tile_means`; both are contiguous and 16-byte aligned on the run
 device, and a validating `run()` checks them against the plan. `demean` says
 whether the run restores the means (`False` after the V-Smooth window, when
-they are zero). `VCAttentionPreprocessor.prepare`, `vc_quantize_fused` (CuTe
-DSL) and `vc_quantize` (torch) return them with the permuted K and the E4M3 V
-as `VCAttentionOperands`, whose `.params` is the run-time object.
+they are zero). QK8 plans add `q_scale` `[Hq, flat_scale_numel(B, Sq, q_block_size)]`
+and `k_scale` `[Hkv, flat_scale_numel(B, Skv, 128)]`, fp32 in the flat scale
+layout of `flashinfer.attention.prims_ts.sage` (`flat_block_scales` packs them).
+`VCAttentionPreprocessor.prepare`, `vc_quantize_fused` and `vc_quantize_fp8_fused`
+return everything with the permuted K and the E4M3 V (and Q) as
+`VCAttentionOperands`, whose `.params` is the run-time object.
 
 ### Example
 
@@ -477,6 +492,17 @@ wrapper.plan(
 prep = VCAttentionPreprocessor()
 ops = prep.prepare(k_bf16, v_bf16, denoise_step=(step, num_steps))
 out = wrapper.run(q_bf16, ops.k, ops.v, vc=ops.params)
+
+# VC-Attention-QK8: plan with E4M3 Q/K and pass Q to the preprocessor.
+wrapper8 = BatchPrefillTSWrapper()
+wrapper8.plan(
+    device="cuda", batch_size=1, max_seq_len_q=S, max_kv_len=S,
+    num_qo_heads=H, num_kv_heads=H, head_dim=128,
+    q_dtype=torch.float8_e4m3fn, k_dtype=torch.float8_e4m3fn, v_dtype=torch.float8_e4m3fn,
+    out_dtype=torch.bfloat16, vc_config=VCAttentionConfig(q_block_size=128),
+)
+ops8 = prep.prepare(k_bf16, v_bf16, q=q_bf16, denoise_step=(step, num_steps))
+out8 = wrapper8.run(ops8.q, ops8.k, ops8.v, vc=ops8.params)
 ```
 
 The one-shot `batch_prefill(..., vc=ops.params)` plans the recipe from the
