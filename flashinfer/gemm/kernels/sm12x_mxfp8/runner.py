@@ -8,6 +8,7 @@ scales in the F8_128x4 layout. The output is BF16 or FP16.
 """
 
 import functools
+import os
 import threading
 
 import torch
@@ -110,11 +111,11 @@ def _workspace_need(tactic, m, n, k, dev):
     return 0, 0
 
 
-def _compile(n, k, tactic, dev, out_f16):
+def _kernel_spec(n, k, tactic, dev, out_f16):
+    """(module, kernel name, compile function, key files) of one kernel."""
     import cutlass
     import cutlass.cute as cute
 
-    from ....jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from . import common, gemv, persistent, pingpong, ptx, skinny
 
     family = tactic[0]
@@ -183,18 +184,19 @@ def _compile(n, k, tactic, dev, out_f16):
         source = pingpong
 
     name = "_".join(str(int(x)) if isinstance(x, bool) else str(x) for x in tactic[1:])
-    return build_and_load_cute_dsl_kernel(
+    return (
         f"{policy.VERSION}_{family}",
         f"n{n}_k{k}_{name}_g{grid}_{'f16' if out_f16 else 'bf16'}",
         lambda: cute.compile(op, *args, options="--enable-tvm-ffi"),
-        extra_key_files=(
-            __file__,
-            policy.__file__,
-            common.__file__,
-            ptx.__file__,
-            source.__file__,
-        ),
+        (__file__, policy.__file__, common.__file__, ptx.__file__, source.__file__),
     )
+
+
+def _compile(n, k, tactic, dev, out_f16):
+    from ....jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
+    module, name, compile_fn, key_files = _kernel_spec(n, k, tactic, dev, out_f16)
+    return build_and_load_cute_dsl_kernel(module, name, compile_fn, key_files)
 
 
 def _get_compiled(index, n, k, tactic, out_f16):
@@ -213,6 +215,45 @@ def _get_compiled(index, n, k, tactic, out_f16):
                     fn = _compile(n, k, tactic, _device(index), out_f16)
                 _COMPILED[key] = fn
     return fn
+
+
+def _prepare(index, n, k, tactics, out_f16):
+    """Load ``tactics``, compiling the uncached ones in worker subprocesses."""
+    from ....jit.cute_dsl_core import (
+        JitSpecCuteDsl,
+        _hash_source_files,
+        cute_dsl_cache_disabled,
+    )
+    from . import compile_pool
+
+    pending = [t for t in tactics if (index, n, k, t, out_f16) not in _COMPILED]
+    if (
+        len(pending) > 1
+        and compile_pool.num_workers() > 1
+        and not cute_dsl_cache_disabled()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        dev = _device(index)
+        jobs = []
+        for t in pending:
+            module, name, compile_fn, key_files = _kernel_spec(n, k, t, dev, out_f16)
+            spec = JitSpecCuteDsl(
+                module, name, compile_fn, _hash_source_files(key_files)
+            )
+            if not spec.is_compiled:
+                jobs.append([n, k, list(t), dev.sms, dev.l2_bytes, out_f16])
+        if len(jobs) > 1:
+            major, minor = get_compute_capability(torch.device("cuda", index))
+            arch = os.environ.get("CUTE_DSL_ARCH") or f"sm_{major}{minor}a"
+
+            def load(job, err):
+                if err is not None:
+                    compile_pool.logger.debug(f"SM12x mxfp8 compile worker: {err}")
+                _get_compiled(index, n, k, tuple(job[2]), out_f16)
+
+            compile_pool.compile_all(jobs, arch, load)
+    for t in tactics:
+        _get_compiled(index, n, k, t, out_f16)
 
 
 def launch(tactic, a, b, a_descale, b_descale, out):
@@ -261,13 +302,14 @@ class Sm12xMxfp8GemmRunner(TunableRunner):
         index = get_device_index(a.device)
         dev = _device(index)
         if do_preparation:
+            tactics = []
             for choice in policy.valid_tactics(m, n, k, dev):
-                _get_compiled(index, n, k, choice, out.dtype == torch.float16)
+                tactics.append(choice)
                 _workspace(index).get(*_workspace_need(choice, m, n, k, dev))
                 if choice[0] == "pingpong" and choice[7]:
                     # The 128-row fallback of policy.resolve for smaller M.
-                    fallback = policy.resolve(choice, 1)
-                    _get_compiled(index, n, k, fallback, out.dtype == torch.float16)
+                    tactics.append(policy.resolve(choice, 1))
+            _prepare(index, n, k, tactics, out.dtype == torch.float16)
             return out
         if tactic is None or tactic == -1 or not policy.supports_m(tactic, m):
             tactic = policy.default_tactic(m, n, k, dev)
