@@ -102,12 +102,12 @@ class _Program:
 # (``exact_*``) and the chunk-parallel program (``chunkpar_*``).
 _SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_ff8a998f8c"
 _SCAN_MODULES = {
-    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_b5a5ed3d3f",
-    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_cb6a595e62",
-    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_344bb057f0",
-    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_c8af7851d8",
-    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_0e178eeaf6",
-    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_d78d883300",
+    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_eba19916b3",
+    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_b56612c764",
+    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_dac68e5ef1",
+    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_5332560192",
+    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_dd75c0cd47",
+    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_70e1bc6bef",
 }
 _CHUNKPAR_MODULES = {
     "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_b5e0c1cc35",
@@ -139,7 +139,7 @@ _STATE_DTYPE_KEYS = {
 }
 # Dynamic shared memory (bytes) of each family's main kernel; refreshed by the
 # Cake export.  0 is the unfilled placeholder: the program refuses to build.
-_EXACT_SMEM_BYTES = 231936
+_EXACT_SMEM_BYTES = 232448
 _CHUNKPAR_SMEM_BYTES = 231936
 
 

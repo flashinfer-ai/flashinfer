@@ -57,15 +57,15 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_STATE_STAGE_BYTES 16384
 #define SMEM_SMEM_STATE_STRIDE 16384
 #define SMEM_SMEM_DELTA_ALL_OFF 230400
-#define SMEM_SMEM_DELTA_ALL_STAGE_BYTES 512
-#define SMEM_SMEM_DELTA_ALL_STRIDE 512
-#define SMEM_SMEM_CUMSUM_ALL_OFF 230912
+#define SMEM_SMEM_DELTA_ALL_STAGE_BYTES 1024
+#define SMEM_SMEM_DELTA_ALL_STRIDE 1024
+#define SMEM_SMEM_CUMSUM_ALL_OFF 231424
 #define SMEM_SMEM_CUMSUM_ALL_STAGE_BYTES 1024
 #define SMEM_SMEM_CUMSUM_ALL_STRIDE 1024
 #define SMEM_SMEM_Y_OFF 197632
 #define SMEM_SMEM_Y_STAGE_BYTES 16384
 #define SMEM_SMEM_Y_STRIDE 16384
-#define SMEM_TOTAL 231936
+#define SMEM_TOTAL 232448
 #define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
@@ -235,7 +235,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_mamba_ssd_q_tmem_alias_f32_batched(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, float* __restrict__ initial_states, float* __restrict__ final_states, float* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count)
+kernel_mamba_ssd_q_tmem_alias_f16_batched(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __half* __restrict__ initial_states, __half* __restrict__ final_states, __half* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -287,7 +287,7 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched(const __grid_constant__ CUtensorMap x_
     const int smem_x_addr = smem + SMEM_SMEM_X_OFF;
     __nv_bfloat16* smem_state = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_STATE_OFF);
     const int smem_state_addr = smem + SMEM_SMEM_STATE_OFF;
-    __half* smem_delta_all = reinterpret_cast<__half*>(smem_raw + SMEM_SMEM_DELTA_ALL_OFF);
+    float* smem_delta_all = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_DELTA_ALL_OFF);
     const int smem_delta_all_addr = smem + SMEM_SMEM_DELTA_ALL_OFF;
     float* smem_cumsum_all = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_CUMSUM_ALL_OFF);
     const int smem_cumsum_all_addr = smem + SMEM_SMEM_CUMSUM_ALL_OFF;
@@ -731,14 +731,15 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched(const __grid_constant__ CUtensorMap x_
                         int physical_token = group_start + local;
                         int factor_token = physical_token - segment_offset_1;
                         float cumsum_value = 0.0f;
-                        __half delta_value = (__half)0.0f;
+                        float delta_value = 0.0f;
                         int source_token = physical_token;
                         if (source_token >= chunk_tokens_1) {
                             source_token = chunk_tokens_1 - 1;
                         }
                         cumsum_value = cumsum_precomputed[tile * 128 + source_token];
                         if (physical_token < chunk_tokens_1) {
-                            delta_value = delta_precomputed[tile * 128 + physical_token];
+                            float _cvt_f32_0 = __half2float(delta_precomputed[tile * 128 + physical_token]);
+                            delta_value = _cvt_f32_0;
                         }
                         smem_cumsum_all[input_stage_3 * 128 + (unsigned int)physical_token] = cumsum_value;
                         smem_delta_all[input_stage_3 * 128 + (unsigned int)physical_token] = delta_value;
@@ -787,7 +788,7 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched(const __grid_constant__ CUtensorMap x_
                             int dim = dim_chunk * 32 + state_repeat * 8 + lane % 4 * 2 + state_reg % 2;
                             float initial_value = 0.0f;
                             if (has_initial != 0) {
-                                initial_value = initial_states[state_head_base + dim * 128 + state_row];
+                                initial_value = (float)initial_states[state_head_base + dim * 128 + state_row];
                             }
                             state_values[state_fragment_offset + state_local] = initial_value;
                         }
@@ -875,8 +876,7 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched(const __grid_constant__ CUtensorMap x_
                                 }
                                 float _exp2_1 = approx_exp2((last_cumsum - smem_cumsum_all[input_stage_4 * 128 + (unsigned int)col]) * 1.4426950408889634f);
                                 float b_scale = _exp2_1;
-                                float _cvt_f32_1 = __half2float(smem_delta_all[input_stage_4 * 128 + (unsigned int)col]);
-                                b_scale *= _cvt_f32_1;
+                                b_scale *= smem_delta_all[input_stage_4 * 128 + (unsigned int)col];
                                 #if __CUDA_ARCH__ >= 1000
                                 const float2 _scale2_1 = {b_scale, b_scale};
                                 #pragma unroll
@@ -1045,7 +1045,7 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched(const __grid_constant__ CUtensorMap x_
                         if (segment_offset_3 > 0) {
                             segment_base_1 = smem_cumsum_all[input_stage_5 * 128 + (unsigned int)(segment_offset_3 - 1)];
                         }
-                        #pragma unroll
+                        #pragma unroll 1
                         for (int col_chunk = 0; col_chunk < 4; col_chunk++) {
                             float _tmem_load_0[32];
                             asm volatile(
@@ -1054,16 +1054,27 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched(const __grid_constant__ CUtensorMap x_
                                 : "=f"(_tmem_load_0[0]), "=f"(_tmem_load_0[1]), "=f"(_tmem_load_0[2]), "=f"(_tmem_load_0[3]), "=f"(_tmem_load_0[4]), "=f"(_tmem_load_0[5]), "=f"(_tmem_load_0[6]), "=f"(_tmem_load_0[7]), "=f"(_tmem_load_0[8]), "=f"(_tmem_load_0[9]), "=f"(_tmem_load_0[10]), "=f"(_tmem_load_0[11]), "=f"(_tmem_load_0[12]), "=f"(_tmem_load_0[13]), "=f"(_tmem_load_0[14]), "=f"(_tmem_load_0[15]), "=f"(_tmem_load_0[16]), "=f"(_tmem_load_0[17]), "=f"(_tmem_load_0[18]), "=f"(_tmem_load_0[19]), "=f"(_tmem_load_0[20]), "=f"(_tmem_load_0[21]), "=f"(_tmem_load_0[22]), "=f"(_tmem_load_0[23]), "=f"(_tmem_load_0[24]), "=f"(_tmem_load_0[25]), "=f"(_tmem_load_0[26]), "=f"(_tmem_load_0[27]), "=f"(_tmem_load_0[28]), "=f"(_tmem_load_0[29]), "=f"(_tmem_load_0[30]), "=f"(_tmem_load_0[31])
                                 : "r"((unsigned int)(taddr_0_1 + row_tmem_base) + acc_stage_2 * 128 + (unsigned int)(col_chunk * 32)));
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
+                            int chunk_elem = input_stage_5 * 128 + (unsigned int)(col_chunk * 32);
+                            float cumsum_values[32];
+                            float delta_values[32];
+                            #pragma unroll
+                            for (int quad = 0; quad < 8; quad++) {
+                                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&cumsum_values[4 * quad])), "=r"(*reinterpret_cast<uint32_t*>(&cumsum_values[(4 * quad) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&cumsum_values[(4 * quad) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&cumsum_values[(4 * quad) + 3]))
+                                    : "r"(smem_cumsum_all_addr + (unsigned int)((chunk_elem + 4 * quad) * 4)));
+                                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&delta_values[4 * quad])), "=r"(*reinterpret_cast<uint32_t*>(&delta_values[(4 * quad) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&delta_values[(4 * quad) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&delta_values[(4 * quad) + 3]))
+                                    : "r"(smem_delta_all_addr + (unsigned int)((chunk_elem + 4 * quad) * 4)));
+                            }
                             float q_values[32];
                             #pragma unroll
                             for (int local_col = 0; local_col < 32; local_col++) {
                                 int col_1 = col_chunk * 32 + local_col;
                                 float q_value = 0.0f;
                                 if (row >= segment_offset_3 && row < segment_limit_3 && col_1 >= segment_offset_3 && col_1 <= row) {
-                                    float _exp2_0 = approx_exp2((row_cumsum - smem_cumsum_all[input_stage_5 * 128 + (unsigned int)col_1]) * 1.4426950408889634f);
+                                    float _exp2_0 = approx_exp2((row_cumsum - cumsum_values[local_col]) * 1.4426950408889634f);
                                     float decay = _exp2_0;
-                                    float _cvt_f32_0 = __half2float(smem_delta_all[input_stage_5 * 128 + (unsigned int)col_1]);
-                                    q_value = decay * _cvt_f32_0;
+                                    q_value = decay * delta_values[local_col];
                                     q_value *= _tmem_load_0[local_col];
                                 }
                                 q_values[local_col] = q_value;
