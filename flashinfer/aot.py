@@ -303,6 +303,7 @@ def gen_attention(
     has_sm90: bool,
     has_sm100: bool,
     has_sm103: bool,
+    has_sm110: bool,
     add_gemma: bool,
     add_oai_oss: bool,
 ) -> Iterator[JitSpec]:
@@ -448,7 +449,7 @@ def gen_attention(
 
     # fmha_cutlass_sm100a
     # NOTE: currently there's only one uri.
-    if has_sm100 or has_sm103:
+    if has_sm100 or has_sm103 or has_sm110:
         yield gen_fmha_cutlass_sm100a_module(
             dtype_q=torch.bfloat16,
             dtype_kv=torch.bfloat16,
@@ -461,7 +462,8 @@ def gen_attention(
             use_logits_soft_cap=False,
         )
 
-        # trtllm_gen_fmha
+    if has_sm100 or has_sm103:
+        # trtllm_gen_fmha loads prebuilt SM10x cubins, so SM110 cannot share it.
         yield gen_trtllm_gen_fmha_module()
 
     # MLA
@@ -480,8 +482,8 @@ def gen_attention(
                 use_profiler=False,
             )
 
-    # MLA SM100
-    if has_sm100 or has_sm103:
+    # MLA SM100 (also builds for SM110)
+    if has_sm100 or has_sm103 or has_sm110:
         yield gen_mla_module()
 
 
@@ -668,6 +670,7 @@ def gen_all_modules(
             has_sm90,
             has_sm100,
             has_sm103,
+            has_sm110,
             add_gemma,
             add_oai_oss,
         )
@@ -897,11 +900,13 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_low_latency_gemm_module())
             jit_specs.append(gen_gemm_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_nvfp4_svdquant())
+            jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
+            jit_specs.append(gen_trtllm_gen_routing_module())
+        if has_sm100 or has_sm103 or has_sm110:
+            # These SM100-named modules also build for SM110, which loads them at runtime.
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
             jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
             jit_specs.append(gen_mxfp8_quantization_sm100_module())
-            jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
-            jit_specs.append(gen_trtllm_gen_routing_module())
         if has_sm100f or has_sm103:
             # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16
             jit_specs.append(
@@ -936,9 +941,11 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
-            # fused_moe_100 also targets SM110 and must ship in its provider.
+            # fused_moe_100 and fp4_gemm_cutlass also target SM110 and must ship in
+            # its provider.
             if not has_sm100:
                 jit_specs.append(gen_cutlass_fused_moe_sm100_module())
+                jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
         if has_sm120:
             jit_specs.append(gen_cudnn_frost_moe_module("bf16", "sm_120a"))
             jit_specs.append(gen_fp4_quantization_sm120_module())
@@ -983,9 +990,11 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_comm_module())
         if has_sm100 or has_sm103:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
+        if has_sm100 or has_sm103 or has_sm110:
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
             # a known state-space inference bug on cp.async.bulk that aborts
-            # compilation. has_sm100/has_sm103 imply CUDA >= 12.8, which avoids the bug.
+            # compilation. has_sm100/has_sm103 imply CUDA >= 12.8 and has_sm110
+            # implies CUDA >= 13.0, which avoids the bug.
             # SM90/SM12x users still get this via JIT.
             jit_specs.append(gen_dcp_alltoall_module())
         if (
