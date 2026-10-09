@@ -520,6 +520,7 @@ class MoERunner(TunableRunner):
                     list(da_routing_metadata),
                     list(da_body_workspace),
                     prepare_da_body,
+                    kwargs.get("gemm1_clamp_limit"),
                 )
                 if routing_logits is None:
                     # FP8 per tensor scale, pre-computed routing.

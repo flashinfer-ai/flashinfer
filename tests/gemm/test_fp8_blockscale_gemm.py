@@ -27,6 +27,10 @@ from flashinfer.utils import (
     is_sm90a_supported,
 )
 from flashinfer.jit.gemm import gen_fp8_blockscale_gemm_sm90_module
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 
 
 @pytest.fixture(
@@ -41,11 +45,16 @@ def warmup_jit():
     yield
 
 
-@pytest.mark.parametrize("m", [1, 16, 32, 64, 128])
-@pytest.mark.parametrize("n", [128, 256, 512, 1024, 4096])
-@pytest.mark.parametrize("k", [256, 512, 1024, 4096])
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("weight_dtype", [torch.bfloat16])
+@parametrize_product(
+    {
+        "m": [1, 16, 32, 64, 128],
+        "n": [128, 256, 512, 1024, 4096],
+        "k": [256, 512, 1024, 4096],
+        "input_dtype": [torch.bfloat16],
+        "weight_dtype": [torch.bfloat16],
+    },
+    regular=pairwise_product_cases,
+)
 def test_fp8_blockscale_gemm_sm90(m, n, k, input_dtype, weight_dtype):
     """Test FP8 block-scale GEMM with swapAB optimization.
 

@@ -661,7 +661,11 @@ def test_paged_prefill_plan_stages_device_lengths_without_sync(
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
-def test_paged_single_token_gqa_rejects_incomplete_lse():
+def test_paged_single_token_gqa_writes_every_lse_head():
+    """cuDNN < 9.27 mis-stores a ragged Stats tensor for single-token GQA
+    (NVBug 6783545); the plan then binds the packed LSE through the unragged
+    (b, h, 1, 1) Stats declaration, so every head is written on every
+    supported cuDNN."""
     q, k, v, _, ip, ix, last = _paged_inputs()
     q = q[:2]
     qo = torch.tensor([0, 1, 2], dtype=torch.int32)
@@ -671,11 +675,14 @@ def test_paged_single_token_gqa_rejects_incomplete_lse():
         backend="cudnn",
     )
     w.plan(qo, ip, ix, last, 8, 2, 128, 16, q_data_type=q.dtype)
+    ref, stats = _reference(q, k, v, qo, ip, ix, last, causal=False, scale=128**-0.5)
     out = w.run(q, (k, v))
-    ref, _ = _reference(q, k, v, qo, ip, ix, last, causal=False, scale=128**-0.5)
     torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
-    with pytest.raises(NotImplementedError, match="LSE"):
-        w.run(q, (k, v), return_lse=True)
+    lse = torch.full((q.shape[0], q.shape[1]), float("nan"), device=q.device)
+    out, lse = w.run(q, (k, v), lse=lse, return_lse=True)
+    assert not lse.isnan().any(), "some LSE heads were never written"
+    torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+    torch.testing.assert_close(lse, stats * math.log2(math.e), atol=0.003, rtol=0.003)
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")

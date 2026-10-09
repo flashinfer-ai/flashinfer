@@ -185,6 +185,17 @@ struct TmaWarpSpecializedGroupedGemmInput {
   ElementSF const** fpX_block_scaling_factors_act = nullptr;
   ElementSF const** fpX_block_scaling_factors_weight = nullptr;
 
+  struct FusedActivationEpilogue {
+    // Per-group output scale-factor pointers consumed by the SM100 EVT.
+    ElementSF** ptr_block_scaling_factors = nullptr;
+    // MXFP8 uses a matrix-wide normalization constant of one.
+    float* norm_constant = nullptr;
+    // The bounded ReLU2 scale is model-wide and represented by one float.
+    float const* clamp_limit = nullptr;
+  };
+
+  FusedActivationEpilogue fused_activation_epilogue;
+
   void* fpX_block_scaling_factors_stride_act = nullptr;
   void* fpX_block_scaling_factors_stride_weight = nullptr;
 
@@ -223,7 +234,7 @@ struct TmaWarpSpecializedGroupedGemmInput {
   // Whether to enable PDL (Programmatic Dependent Launch).
   bool enable_pdl{};
 
-  static std::array<size_t, 20> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
+  static std::array<size_t, 22> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
 
   static size_t workspaceSize(int num_experts, FpXBlockScalingType scaling_type);
 

@@ -83,7 +83,7 @@ def _activation_param_view(
     activation, num_expert_rows: int, device: torch.device
 ) -> Dict[str, torch.Tensor]:
     """Expand typed scalar semantics into the existing per-expert launcher ABI."""
-    from .api import SiTU, SwiGLU
+    from .api import SiTU, SwiGLU, SwiGLUStep
 
     activation = _normalize_activation(activation)
     values: Dict[str, torch.Tensor] = {}
@@ -100,6 +100,8 @@ def _activation_param_view(
             ("gemm1_beta", activation.linear_scale),
             ("gemm1_clamp_limit", activation.clamp_limit),
         )
+    elif isinstance(activation, SwiGLUStep) and activation != SwiGLUStep():
+        params = (("gemm1_clamp_limit", activation.limit),)
     else:
         params = ()
     for name, value in params:
@@ -659,7 +661,9 @@ def prepare_trtllm_fp4_weights(
         "output1_scale_gate_scalar": ones,
         "output2_scale_scalar": ones,
     }
-    if not is_mxfp4 and activation.is_gated:
+    from .api import SwiGLUStep
+
+    if not is_mxfp4 and activation.is_gated and not isinstance(activation, SwiGLUStep):
         # NVFP4 gated kernels consume a per-expert gate alpha; non-gated
         # activations do not, so ReLU2 must not receive this placeholder.
         result["gemm1_alpha"] = ones
@@ -1065,7 +1069,7 @@ def prepare_trtllm_fp8_per_tensor_weights(
         if activation.is_gated
         else torch.ones_like(w1_scale) * intermediate_scale
     )
-    return {
+    result = {
         "gemm1_weights": torch.stack(w1_shuffled),
         "gemm2_weights": torch.stack(w2_shuffled),
         "output1_scales_scalar": output1_scale.contiguous(),
@@ -1076,6 +1080,15 @@ def prepare_trtllm_fp8_per_tensor_weights(
         "hidden_states_scale_global": input_scale,
         "intermediate_scale_global": intermediate_scale,
     }
+    from .api import SwiGLUStep
+
+    if isinstance(activation, SwiGLUStep) and activation != SwiGLUStep():
+        # The exported BMM ABI clamps raw GEMM accumulators. Gate scale is the
+        # FC1 dequant scale, so convert the typed physical limit per expert.
+        result["gemm1_clamp_limit"] = (
+            activation.limit / result["output1_scales_gate_scalar"]
+        ).contiguous()
+    return result
 
 
 def prepare_trtllm_fp8_per_tensor_activations(
