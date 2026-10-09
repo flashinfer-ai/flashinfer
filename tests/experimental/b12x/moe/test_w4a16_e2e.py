@@ -1089,6 +1089,116 @@ def test_w4a16_fp4_e8m0_k32_kernel_matches_raw_e8m0_oracle(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("scratch_fill", ["nan", "zero"])
+@pytest.mark.parametrize("m", [16, 64])
+def test_w4a16_route_packed_topk_sum_skips_unrouted_routes(
+    m: int,
+    scratch_fill: str,
+    route_ids_dtype: torch.dtype,
+) -> None:
+    """Negative top-k ids are unrouted: route packing drops them, so FC2 never
+    writes their rows and the top-k sum must not read those rows."""
+    experts, hidden_size, intermediate_size = 8, 256, 256
+    rows = 2 * intermediate_size
+    # m > 8 takes the route-packed path (smaller m uses direct top-k routes).
+    topk, valid_routes = 6, 2
+    activation = "silu"
+    torch.manual_seed(20261008)
+    w13 = torch.randint(
+        0,
+        256,
+        (experts, rows, hidden_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_scale = _pattern_e8m0((experts, rows, hidden_size // 32))
+    w2_scale = _pattern_e8m0((experts, hidden_size, intermediate_size // 32), offset=1)
+    global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    prepared = prepare_w4a16_packed_weights(
+        w13,
+        w13_scale,
+        global_scale,
+        w2,
+        w2_scale,
+        global_scale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        source_format="fp4_e8m0_k32",
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    x = torch.randn(m, hidden_size, dtype=torch.bfloat16, device="cuda")
+    tokens = torch.arange(m, device="cuda")
+    topk_ids = torch.full((m, topk), -1, dtype=route_ids_dtype, device="cuda")
+    topk_weights = torch.zeros(m, topk, dtype=torch.float32, device="cuda")
+    for route in range(valid_routes):
+        topk_ids[:, route] = ((tokens * 3 + route * 5) % experts).to(route_ids_dtype)
+        topk_weights[:, route] = 1.0 / valid_routes
+    # The weights of unrouted slots are left nonzero on purpose.
+    topk_weights[:, valid_routes:] = 0.25
+    reference_ids = topk_ids.clamp_min(0)
+    reference_weights = torch.where(
+        topk_ids >= 0, topk_weights, torch.zeros_like(topk_weights)
+    )
+    expected = moe_reference_w4a16_fp4_e8m0_k32(
+        x,
+        w13,
+        w13_scale,
+        global_scale,
+        w2,
+        w2_scale,
+        global_scale,
+        reference_ids,
+        reference_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+        w13_layout="w13",
+    )
+
+    # Stale scratch: NaN bytes make every unwritten row poison the sum.
+    if scratch_fill == "nan":
+        buffers.intermediate_cache13.view(torch.uint8).fill_(0xFF)
+    else:
+        buffers.intermediate_cache13.zero_()
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation=activation,
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
+        expert_counts=buffers.expert_counts,
+    )
+    torch.cuda.synchronize()
+
+    assert bool(torch.isfinite(actual).all().item())
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("tc_decode", [False, True], ids=["route-packed", "tc-decode"])
 def test_w4a16_packed_runtime_expert_count_reuses_compiled_kernel(
     tc_decode: bool,
