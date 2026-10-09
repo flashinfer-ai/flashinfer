@@ -40,6 +40,11 @@ _SMOKE_CASES = [
     (8, 768, 8320, torch.bfloat16, False, False, "cute-dsl", False),
     (33, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
     (64, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
+    # Persistent kernel (M > 32, no bias): default tactic with PDL, autotuned
+    # tactics, and M / N tails smaller than every tile.
+    (64, 2048, 1024, torch.bfloat16, False, True, "cute-dsl", False),
+    (1024, 4096, 2048, torch.bfloat16, False, False, "cute-dsl", True),
+    (333, 1000, 520, torch.bfloat16, False, False, "cute-dsl", False),
     (64, 4096, 2048, torch.bfloat16, False, False, "auto", True),
     (1, 2048, 3072, torch.float16, False, False, "auto", False),
 ]
@@ -274,6 +279,35 @@ def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
     reference = F.linear(a, b, bias)
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
     assert cos_sim > 0.99
+
+
+@pytest.mark.parametrize("enable_bias", [False, True])
+def test_mm_bf16_cute_dsl_large_m_default_runner(enable_bias: bool):
+    """M > 32 defaults to the persistent kernel, and to cuBLASLt with bias."""
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("CuTeDSL backend requires SM100/SM103/SM107.")
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available.")
+
+    from flashinfer.gemm.gemm_base import _cute_dsl_bf16_runners
+
+    m, n, k = 256, 1024, 1024
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    bias = (
+        torch.randn((n,), device="cuda", dtype=torch.bfloat16) if enable_bias else None
+    )
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    runner = _cute_dsl_bf16_runners([a, b.T, bias, False, out, None])[0]
+    expected = (
+        "CuteDSLCublasltFallbackBf16Runner"
+        if enable_bias
+        else ("CuteDSLPersistentBf16Runner")
+    )
+    assert type(runner).__name__ == expected
 
 
 if __name__ == "__main__":

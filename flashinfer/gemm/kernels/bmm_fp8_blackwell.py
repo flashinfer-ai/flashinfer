@@ -49,6 +49,7 @@ from cutlass.cute.runtime import from_dlpack
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 # Custom epilogue utilities with optimized output scaling
@@ -150,6 +151,8 @@ class PersistentDenseGemmKernel:
     :type cluster_shape_mn: Tuple[int, int]
     :param use_tma_store: Whether to use Tensor Memory Access (TMA) for storing results
     :type use_tma_store: bool
+    :param use_pdl: Whether to launch with Programmatic Dependent Launch
+    :type use_pdl: bool
     """
 
     def __init__(
@@ -161,6 +164,7 @@ class PersistentDenseGemmKernel:
         use_tma_store: bool,
         swizzle_size: int = 1,
         raster_along: Literal["m", "n"] = "m",
+        use_pdl: bool = False,
     ):
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
@@ -171,6 +175,7 @@ class PersistentDenseGemmKernel:
         self.mma_tiler_mn = mma_tiler_mn
         self.mma_tiler = (*mma_tiler_mn, 1)
         self.use_tma_store = use_tma_store
+        self.use_pdl = use_pdl
         self.arch = "sm_100"
 
         self.cta_group = (
@@ -397,6 +402,7 @@ class PersistentDenseGemmKernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
+            use_pdl=self.use_pdl,
         )
         return
 
@@ -421,8 +427,6 @@ class PersistentDenseGemmKernel:
         output_scale_tensor: cute.Tensor,
     ):
         """GPU device kernel performing the Persistent batched GEMM computation."""
-        output_scale = output_scale_tensor[0]
-
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
@@ -591,6 +595,11 @@ class PersistentDenseGemmKernel:
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
+        # PDL: the prologue above overlaps the previous grid; global reads start here
+        if cutlass.const_expr(self.use_pdl):
+            griddepcontrol_wait()
+        output_scale = output_scale_tensor[0]
+
         # Specialized TMA load warp
         if warp_idx == self.tma_warp_id:
             tile_sched = utils.StaticPersistentTileScheduler.create(
@@ -758,6 +767,9 @@ class PersistentDenseGemmKernel:
 
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
+
+        if cutlass.const_expr(self.use_pdl):
+            griddepcontrol_launch_dependents()
 
     @staticmethod
     def _compute_grid(
