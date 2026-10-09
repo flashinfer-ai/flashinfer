@@ -70,12 +70,31 @@ FLASHINFER_BASE_DIR: pathlib.Path = pathlib.Path(
 FLASHINFER_CACHE_DIR: pathlib.Path = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
 _package_root: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 
+_VERSION_MISMATCH_HINT = (
+    "Run `flashinfer download-kernels` to install matching kernel wheels, or set "
+    "FLASHINFER_DISABLE_VERSION_CHECK=1 to use the installed version anyway."
+)
+
+
+def _check_cubin_version(package_version: str) -> None:
+    # NOTE(yiyang): skip version check for editable/source installs where
+    # flashinfer_version falls back to "0.0.0+unknown" (no _build_meta.py).
+    if (
+        not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
+        and flashinfer_version != "0.0.0+unknown"
+        and package_version != flashinfer_version
+    ):
+        raise RuntimeError(
+            f"flashinfer-cubin version ({package_version}) does not match "
+            f"flashinfer version ({flashinfer_version}). {_VERSION_MISMATCH_HINT}"
+        )
+
 
 def _get_cubin_dir():
     """
     Get the cubin directory path with the following priority:
     1. Environment variable FLASHINFER_CUBIN_DIR
-    2. flashinfer-cubin package if installed
+    2. flashinfer-cubin package if installed and its version matches
     3. Default cache directory
     """
     # First check environment variable
@@ -93,23 +112,21 @@ def _get_cubin_dir():
     if has_flashinfer_cubin():
         import flashinfer_cubin
 
-        flashinfer_cubin_version = flashinfer_cubin.__version__
-        # Allow bypassing version check with environment variable
-        # NOTE(yiyang): skip version check for editable/source installs where
-        # flashinfer_version falls back to "0.0.0+unknown" (no _build_meta.py).
-        if (
-            not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
-            and flashinfer_version != "0.0.0+unknown"
-            and flashinfer_version != flashinfer_cubin_version
-        ):
-            raise RuntimeError(
-                f"flashinfer-cubin version ({flashinfer_cubin_version}) does not match "
-                f"flashinfer version ({flashinfer_version}). "
-                "Please install the same version of both packages. "
-                "Set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass this check."
+        # NOTE: a mismatched wheel is ignored instead of failing the import. It
+        # is usually left behind by a flashinfer-python upgrade, and the CLI
+        # command that replaces it (`flashinfer download-kernels`) must import
+        # this module first.
+        try:
+            _check_cubin_version(flashinfer_cubin.__version__)
+        except RuntimeError as error:
+            logger.warning(
+                "Ignoring incompatible flashinfer-cubin package (cubins will be "
+                "downloaded on demand to %s): %s",
+                FLASHINFER_CACHE_DIR / "cubins",
+                error,
             )
-
-        return pathlib.Path(flashinfer_cubin.get_cubin_dir())
+        else:
+            return pathlib.Path(flashinfer_cubin.get_cubin_dir())
 
     # Fall back to default cache directory
     return FLASHINFER_CACHE_DIR / "cubins"
@@ -150,9 +167,7 @@ def _check_jit_cache_version(distribution: str, package_version: str) -> None:
     ):
         raise RuntimeError(
             f"{distribution} version ({package_version}) does not match "
-            f"flashinfer version ({flashinfer_version}). "
-            "Please install the same version of both packages. "
-            "Set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass this check."
+            f"flashinfer version ({flashinfer_version}). {_VERSION_MISMATCH_HINT}"
         )
 
 
@@ -179,7 +194,19 @@ def _get_aot_providers() -> Tuple[AOTProvider, ...]:
 
     import flashinfer_jit_cache
 
-    _check_jit_cache_version("flashinfer-jit-cache", flashinfer_jit_cache.__version__)
+    # NOTE: like a mismatched flashinfer-cubin, a mismatched shim is ignored so
+    # that `flashinfer download-kernels` can still import FlashInfer to replace it.
+    try:
+        _check_jit_cache_version(
+            "flashinfer-jit-cache", flashinfer_jit_cache.__version__
+        )
+    except RuntimeError as error:
+        logger.warning(
+            "Ignoring incompatible flashinfer-jit-cache package (kernels will be "
+            "JIT-compiled instead): %s",
+            error,
+        )
+        return ()
     providers = []
     for provider in flashinfer_jit_cache.get_jit_cache_providers():
         try:

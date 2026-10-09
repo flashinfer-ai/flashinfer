@@ -15,6 +15,8 @@
 """TraceTemplates for Gated Delta Net (GDN) operations."""
 
 import math
+from copy import deepcopy
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -400,7 +402,7 @@ def _gdn_prefill_init(
     return {"q": q, "k": k, "v": v, "g": g, "beta": beta, "cu_seqlens": cu_seqlens}
 
 
-gdn_prefill_trace = TraceTemplate(
+_gdn_prefill_default_trace = TraceTemplate(
     op_type="gdn",
     name_prefix="gdn_prefill",
     description=(
@@ -499,6 +501,221 @@ gdn_prefill_trace = TraceTemplate(
     reference=_gdn_prefill_reference,
     init=_gdn_prefill_init,
 )
+
+
+@torch.no_grad()
+def _gdn_prefill_gates_reference(
+    q,
+    k,
+    v,
+    state,
+    A_log,
+    a,
+    dt_bias,
+    b,
+    cu_seqlens,
+    scale,
+    gate_domain="linear",
+    use_gate_in_kernel=False,
+    beta_is_logit=False,
+    use_qk_l2norm_in_kernel=False,
+    output_final_state=False,
+    state_indices=None,
+    output_state=None,
+):
+    """Independent token recurrence for transformed GDN gate inputs."""
+    if beta_is_logit and b is None:
+        raise ValueError("beta_is_logit requires beta")
+    heads, dim = max(q.shape[1], v.shape[1]), q.shape[-1]
+    scale = scale or dim**-0.5
+    if use_qk_l2norm_in_kernel:
+        qf, kf = q.float(), k.float()
+        q = (qf * torch.rsqrt(qf.square().sum(-1, keepdim=True) + 1e-6)).to(q.dtype)
+        k = (kf * torch.rsqrt(kf.square().sum(-1, keepdim=True) + 1e-6)).to(k.dtype)
+    qf = q.float().repeat_interleave(heads // q.shape[1], dim=1)
+    kf = k.float().repeat_interleave(heads // k.shape[1], dim=1)
+    vf = v.float().repeat_interleave(heads // v.shape[1], dim=1)
+    if use_gate_in_kernel:
+        alpha = torch.exp(
+            -torch.exp(A_log.float())
+            * torch.nn.functional.softplus(a.float() + dt_bias.float())
+        )
+    elif a is None:
+        alpha = torch.ones(q.shape[0], heads, device=q.device)
+    elif gate_domain == "log":
+        alpha = a.float().exp()
+    else:
+        alpha = a.float()
+    beta = torch.ones_like(alpha) if b is None else b.float()
+    if beta_is_logit:
+        beta = beta.sigmoid().to(b.dtype).float()
+    output = torch.empty(q.shape[0], heads, v.shape[-1], dtype=q.dtype, device=q.device)
+    if output_state is not None:
+        final = output_state.clone()
+    elif state_indices is not None:
+        final = state.clone()
+    else:
+        final = torch.empty(
+            cu_seqlens.numel() - 1,
+            heads,
+            v.shape[-1],
+            dim,
+            dtype=state.dtype if state is not None else torch.float32,
+            device=q.device,
+        )
+    for seq in range(cu_seqlens.numel() - 1):
+        slot = seq if state_indices is None else int(state_indices[seq])
+        hidden = (
+            state[slot].float().clone()
+            if state is not None
+            else torch.zeros_like(final[slot], dtype=torch.float32)
+        )
+        for token in range(int(cu_seqlens[seq]), int(cu_seqlens[seq + 1])):
+            hidden *= alpha[token, :, None, None]
+            delta = beta[token, :, None] * (
+                vf[token] - torch.einsum("hvk,hk->hv", hidden, kf[token])
+            )
+            hidden += delta[:, :, None] * kf[token, :, None, :]
+            output[token] = (scale * torch.einsum("hvk,hk->hv", hidden, qf[token])).to(
+                q.dtype
+            )
+        final[slot] = hidden
+    return output, final if output_final_state else None
+
+
+def _gdn_prefill_gates_init(
+    *,
+    total_seq_len: int,
+    num_seqs: int = 4,
+    state_pool_rows: int = 0,
+    len_cu_seqlens: int = 0,
+    num_q_heads: int = 4,
+    num_k_heads: int = 4,
+    num_v_heads: int = 8,
+    head_size: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    inputs = _gdn_prefill_init(
+        total_seq_len=total_seq_len,
+        num_seqs=num_seqs,
+        len_cu_seqlens=len_cu_seqlens,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_size=head_size,
+        device=device,
+        seed=seed,
+    )
+    heads = max(num_q_heads, num_v_heads)
+    rows = state_pool_rows or num_seqs
+    if rows < num_seqs:
+        raise ValueError("state_pool_rows must be at least num_seqs")
+    inputs.update(
+        g=torch.randn(total_seq_len, heads, device=device),
+        beta=torch.randn(total_seq_len, heads, dtype=torch.bfloat16, device=device),
+        A_log=torch.zeros(heads, device=device),
+        dt_bias=torch.full((heads,), -2.0, device=device),
+        use_gate_in_kernel=True,
+        beta_is_logit=True,
+        output_final_state=True,
+        initial_state=torch.zeros(rows, heads, head_size, head_size, device=device),
+        output_state=torch.zeros(rows, heads, head_size, head_size, device=device),
+        state_indices=(
+            torch.arange(num_seqs, device=device, dtype=torch.int32)
+            if rows != num_seqs
+            else None
+        ),
+    )
+    return inputs
+
+
+_gdn_prefill_gates_init._trace_init_dependencies = (_gdn_prefill_init,)  # type: ignore[attr-defined]
+_gdn_prefill_gates_trace = deepcopy(_gdn_prefill_default_trace)
+_gdn_prefill_gates_trace.name_prefix = "gdn_prefill_gates"
+_gdn_prefill_gates_trace.description = (
+    "GDN prefill with explicit raw/log gate semantics and optional fused sigmoid."
+)
+_gdn_prefill_gates_trace.reference = _gdn_prefill_gates_reference
+_gdn_prefill_gates_trace.init = _gdn_prefill_gates_init
+_gdn_prefill_gates_trace.axes["state_pool_rows"] = Var(
+    description="Rows in the recurrent state pool or compact state."
+)
+_gdn_prefill_gates_trace.axes["num_o_heads"] = Const(
+    description="max(num_q_heads, num_v_heads).", abbrev=""
+)
+cast(Const, _gdn_prefill_gates_trace.axes["num_q_heads"]).abbrev = "q"
+cast(Const, _gdn_prefill_gates_trace.axes["num_k_heads"]).abbrev = "k"
+for _name in ("a", "b"):
+    cast(Tensor, _gdn_prefill_gates_trace.inputs[_name]).dim_names = [
+        "total_seq_len",
+        "num_o_heads",
+    ]
+for _name in ("A_log", "dt_bias"):
+    cast(Tensor, _gdn_prefill_gates_trace.inputs[_name]).dim_names = ["num_o_heads"]
+cast(Tensor, _gdn_prefill_gates_trace.inputs["state"]).dim_names = [
+    "state_pool_rows",
+    "num_o_heads",
+    "head_size",
+    "head_size",
+]
+cast(Tensor, _gdn_prefill_gates_trace.outputs["output"]).dim_names = [
+    "total_seq_len",
+    "num_o_heads",
+    "head_size",
+]
+cast(Tensor, _gdn_prefill_gates_trace.outputs["output"]).dtype_from = "q"
+_gdn_prefill_gates_trace.outputs["new_state"] = Tensor(
+    ["state_pool_rows", "num_o_heads", "head_size", "head_size"],
+    optional=True,
+    dtype_from="output_state",
+    dtype="float32",
+)
+_gdn_prefill_gates_trace.constraints = [
+    "num_o_heads == max(num_q_heads, num_v_heads)",
+    "num_o_heads % num_q_heads == 0",
+    "num_o_heads % num_v_heads == 0",
+    "num_k_heads in (num_q_heads, num_v_heads)",
+    "len_cu_seqlens == num_seqs + 1",
+    "total_seq_len == cu_seqlens[-1].item()",
+]
+_gdn_prefill_gates_trace.inputs[
+    "a"
+].description = (
+    "Gate inputs in gate_domain, or raw logits when use_gate_in_kernel is set."
+)
+_gdn_prefill_gates_trace.inputs[
+    "b"
+].description = "Precomputed beta, or sigmoid logits when beta_is_logit is set."
+_gdn_prefill_gates_trace.inputs[
+    "A_log"
+].description = "Per-head log decay parameter for raw gates."
+_gdn_prefill_gates_trace.inputs["dt_bias"].description = "Per-head bias for raw gates."
+_gdn_prefill_gates_trace.inputs.update(
+    gate_domain=Scalar("str", optional=True),
+    use_gate_in_kernel=Scalar("int32", optional=True),
+    beta_is_logit=Scalar("int32", optional=True),
+    use_qk_l2norm_in_kernel=Scalar("int32", optional=True),
+    output_final_state=Scalar("int32", optional=True),
+    state_indices=Tensor(["num_seqs"], optional=True),
+    output_state=Tensor(
+        ["state_pool_rows", "num_o_heads", "head_size", "head_size"], optional=True
+    ),
+)
+
+
+def gdn_prefill_trace(**kwargs):
+    if (
+        kwargs.get("gate_domain", "linear") != "linear"
+        or kwargs.get("use_gate_in_kernel", False)
+        or kwargs.get("beta_is_logit", False)
+        or kwargs.get("state_indices") is not None
+    ):
+        return _gdn_prefill_gates_trace
+    return _gdn_prefill_default_trace
+
+
+gdn_prefill_trace.templates = [_gdn_prefill_default_trace, _gdn_prefill_gates_trace]  # type: ignore[attr-defined]
 
 # ── GDN MTP (Multi-Token Prediction) ─────────────────────────────────────────
 
