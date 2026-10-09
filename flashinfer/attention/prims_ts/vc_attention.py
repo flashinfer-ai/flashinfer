@@ -28,16 +28,17 @@ E4M3 through the ExpCast path in both recipes of the Q/K side:
   quantizes them to E4M3 with one scale per ``q_block_size`` Q tokens and per
   128-token K tile, as the paper does.
 
-This module provides the reference preprocessing:
+This module provides the preprocessing:
 
 * ``vc_token_permutation`` -- online k-means over value rows, one
   permutation per (batch, head), applied to K and V (attention is invariant to
   a common key/value permutation);
 * ``vc_quantize`` -- K permutation, V tile-mean subtraction, per-channel
-  E4M3 residual quantization, and the packed kernel operands;
+  E4M3 residual quantization, and the packed kernel operands (CuTe DSL
+  kernels in ``kernels/vc_prepare.py``);
 * ``vc_quantize_fp8`` -- the same plus the E4M3 Q/K operands and scales;
 * ``VCAttentionPreprocessor`` -- the paper's V-Smooth schedule over the
-  denoising steps on top of ``vc_quantize_fused`` and ``vc_quantize_fp8_fused``;
+  denoising steps on top of the two;
 * ``pack_vc_tile_means`` -- the bf16 mean operand layout the kernel's
   unswizzled K-major descriptor expects;
 * ``vc_reference`` -- the fp32 attention over the dequantized operands.
@@ -312,33 +313,9 @@ def hadamard_matrix(d: int, device: torch.device) -> torch.Tensor:
     return _hadamard_matrix_cached(d, str(device))
 
 
-def _block_amax_scale(x: torch.Tensor, block: int) -> torch.Tensor:
-    """Per-(batch, head, token block) E4M3 scale of ``[B, S, H, D]``: amax / 448."""
-    b, s, h, d = x.shape
-    xp = _pad_tokens(x.float().abs(), block)
-    nb = xp.shape[1] // block
-    amax = xp.view(b, nb, block, h, d).amax(dim=(2, 4))  # [B, nb, H]
-    return (amax / E4M3_MAX).clamp_min(1e-12).permute(0, 2, 1).contiguous()
-
-
 def _per_token_scales(scale: torch.Tensor, s: int, block: int) -> torch.Tensor:
     """Expand ``[B, H, nb]`` block scales to ``[B, S, H]``."""
     return scale.permute(0, 2, 1).repeat_interleave(block, dim=1)[:, :s]
-
-
-def _quantize_blocks(x: torch.Tensor, scale: torch.Tensor, block: int) -> torch.Tensor:
-    """Divide ``[B, S, H, D]`` by its ``[B, H, nb]`` block scale and round to E4M3."""
-    b, s, h, d = x.shape
-    per_token = _per_token_scales(scale, s, block)  # [B, S, H]
-    return (x.float() / per_token.unsqueeze(-1)).to(torch.float8_e4m3fn)
-
-
-def _pad_tokens(x: torch.Tensor, block: int) -> torch.Tensor:
-    """Zero-pad the token axis (dim 1) of ``[B, S, H, D]`` up to a block multiple."""
-    pad = _blocks(x.shape[1], block) * block - x.shape[1]
-    if pad == 0:
-        return x
-    return torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad))
 
 
 @torch.no_grad()
@@ -487,6 +464,21 @@ def pack_vc_tile_means(
     return tile.reshape(b, h, g, *vc_mean_group_shape(d)).contiguous()
 
 
+# ---------------------------------------------------------------------------
+# Preprocessing (CuTe DSL kernels in kernels/vc_prepare.py)
+# ---------------------------------------------------------------------------
+def _check_prepare_inputs(x: torch.Tensor) -> None:
+    if (
+        x.shape[-1] != 128
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or not x.is_cuda
+    ):
+        raise ValueError(
+            "VC-Attention preparation needs CUDA bf16/fp16 inputs with head_dim 128, "
+            f"got {x.dtype} {tuple(x.shape)} on {x.device}"
+        )
+
+
 @torch.no_grad()
 def vc_quantize(
     k: torch.Tensor,
@@ -497,97 +489,21 @@ def vc_quantize(
     generator: torch.Generator | None = None,
     demean: bool = True,
 ) -> VCAttentionOperands:
-    """Turn ``[B, S, H, D]`` K/V into VC-Attention-QK16 kernel operands.
+    """Turn ``[B, S, H, D]`` bf16/fp16 K/V into VC-Attention-QK16 kernel
+    operands with two CuTe DSL kernels (``kernels/vc_prepare.py``).
 
     Keys are permuted with the values and kept in their dtype. Values are
     permuted, split into 128-token tile means and residuals (``demean=False``
     keeps the means at zero), and the residuals are quantized to E4M3 with one
     scale per (batch, head, channel), returned as ``v_scale`` for the run's
-    ``vc`` operands.
+    ``vc`` operands. Pass 1 gathers each permuted tile once, writes the
+    permuted K rows, the V tile mean and residual amax; pass 2 writes the E4M3
+    residuals and the packed bf16 mean operand. Requires CUDA bf16/fp16 inputs
+    with head_dim 128.
     """
     if k.dim() != 4 or k.shape != v.shape:
         raise ValueError("k and v must be [B, S, H, D] with matching shapes")
-    b, s_k, h, d = k.shape
-    if perm is None:
-        perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)
-    gather_idx = (
-        perm.permute(0, 2, 1).unsqueeze(-1).expand(-1, -1, -1, d)
-    )  # [B, S, H, D]
-    k_p = torch.gather(k, 1, gather_idx)
-    v_p = torch.gather(v.float(), 1, gather_idx)
-
-    num_kv_tiles = _blocks(s_k, VC_K_BLOCK_SIZE)
-    v_pad = _pad_tokens(v_p, VC_K_BLOCK_SIZE).view(
-        b, num_kv_tiles, VC_K_BLOCK_SIZE, h, d
-    )
-    valid = torch.zeros(
-        num_kv_tiles, VC_K_BLOCK_SIZE, device=v.device, dtype=torch.float32
-    )
-    valid.view(-1)[:s_k] = 1.0
-    counts = valid.sum(dim=1).clamp_min(1.0)  # [T]
-    mean = (v_pad * valid.view(1, num_kv_tiles, VC_K_BLOCK_SIZE, 1, 1)).sum(
-        dim=2
-    ) / counts.view(1, num_kv_tiles, 1, 1)  # [B, T, H, D]
-    if not demean:
-        mean = torch.zeros_like(mean)
-    residual = (v_pad - mean.unsqueeze(2)) * valid.view(
-        1, num_kv_tiles, VC_K_BLOCK_SIZE, 1, 1
-    )
-    residual = residual.view(b, num_kv_tiles * VC_K_BLOCK_SIZE, h, d)[:, :s_k]
-    # One E4M3 scale per (batch, head, channel) over all tokens (paper).
-    v_scale = (
-        (residual.abs().amax(dim=1) / E4M3_MAX).clamp_min(1e-12).float()
-    )  # [B, H, D]
-    v8 = (residual / v_scale.unsqueeze(1)).to(torch.float8_e4m3fn)
-    mean = mean.permute(0, 2, 1, 3).contiguous()  # [B, H, T, D]
-    return VCAttentionOperands(
-        k=k_p.contiguous(),
-        v=v8.contiguous(),
-        v_scale=v_scale,
-        mean=mean,
-        mu=pack_vc_tile_means(mean, v_scale),
-        perm=perm,
-        demean=demean,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Fused preprocessing (CuTe DSL kernels in kernels/vc_prepare.py)
-# ---------------------------------------------------------------------------
-@torch.no_grad()
-def vc_quantize_fused(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    perm: torch.Tensor | None = None,
-    kmeans_iters: int = VC_KMEANS_ITERS,
-    generator: torch.Generator | None = None,
-    demean: bool = True,
-) -> VCAttentionOperands:
-    """Same contract as ``vc_quantize``, computed by two CuTe DSL kernels
-    (``flashinfer.attention.prims_ts.kernels.vc_prepare``).
-
-    Pass 1 gathers each permuted 128-token K/V tile once, writes the permuted
-    K rows, and writes the V tile mean and residual amax. A reduction over the
-    tile amaxes gives the per-channel V scale. Pass 2 writes the E4M3 residuals
-    and the packed bf16 mean operand. Requires head_dim 128 and bf16/fp16
-    inputs; other cases fall back to ``vc_quantize``.
-    """
-    if k.dim() != 4 or k.shape != v.shape:
-        raise ValueError("k and v must be [B, S, H, D] with matching shapes")
-    if (
-        k.shape[-1] != 128
-        or k.dtype not in (torch.bfloat16, torch.float16)
-        or not k.is_cuda
-    ):
-        return vc_quantize(
-            k,
-            v,
-            perm=perm,
-            kmeans_iters=kmeans_iters,
-            generator=generator,
-            demean=demean,
-        )
+    _check_prepare_inputs(k)
     from .kernels.vc_prepare import vc_prepare
 
     if perm is None:
@@ -621,109 +537,25 @@ def vc_quantize_fp8(
     generator: torch.Generator | None = None,
     demean: bool = True,
 ) -> VCAttentionOperands:
-    """Turn ``[B, S, H, D]`` Q/K/V into VC-Attention-QK8 kernel operands.
+    """Turn ``[B, S, H, D]`` bf16/fp16 Q/K/V into VC-Attention-QK8 kernel
+    operands with four CuTe DSL kernels (``kernels/vc_prepare.py``).
 
     Keys are centred by their per-(batch, head) channel mean over tokens
     (softmax-invariant), permuted with the values, rotated with Q by the
     normalised Hadamard matrix and quantized to E4M3 with one scale per
-    128-token tile; queries take one E4M3 scale per ``q_block_size`` tokens.
-    Values are prepared as in ``vc_quantize``.
+    128-token tile; queries take one E4M3 scale per 128-token block
+    (``q_block_size`` must be 128 here; the kernel itself accepts any power
+    of two in [1, 256] through ``VCAttentionConfig``). Values are prepared as
+    in ``vc_quantize``. Requires CUDA bf16/fp16 inputs with head_dim 128.
     """
     if q.dim() != 4 or k.shape != v.shape or q.shape[0] != k.shape[0]:
         raise ValueError("q, k, v must be [B, S, H, D] with matching batch and heads")
-    if q_block_size not in _VC_Q_BLOCK_SIZES:
+    if q_block_size != VC_K_BLOCK_SIZE:
         raise ValueError(
-            f"q_block_size must be a power of two in [1, 256], got {q_block_size}"
+            f"vc_quantize_fp8 quantizes Q per {VC_K_BLOCK_SIZE}-token block, "
+            f"got q_block_size={q_block_size}"
         )
-    b, s_k, h, d = k.shape
-    if perm is None:
-        perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)
-    gather_idx = perm.permute(0, 2, 1).unsqueeze(-1).expand(-1, -1, -1, d)
-    k_smooth = k.float() - k.float().mean(dim=1, keepdim=True)
-    k_p = torch.gather(k_smooth, 1, gather_idx)
-    v_p = torch.gather(v.float(), 1, gather_idx)
-    hm = hadamard_matrix(d, q.device)
-    q_f = q.float() @ hm
-    k_p = k_p @ hm
-    q_scale = _block_amax_scale(q_f, q_block_size)
-    k_scale = _block_amax_scale(k_p, VC_K_BLOCK_SIZE)
-    q8 = _quantize_blocks(q_f, q_scale, q_block_size)
-    k8 = _quantize_blocks(k_p, k_scale, VC_K_BLOCK_SIZE)
-    num_kv_tiles = _blocks(s_k, VC_K_BLOCK_SIZE)
-    v_pad = _pad_tokens(v_p, VC_K_BLOCK_SIZE).view(
-        b, num_kv_tiles, VC_K_BLOCK_SIZE, h, d
-    )
-    valid = torch.zeros(
-        num_kv_tiles, VC_K_BLOCK_SIZE, device=v.device, dtype=torch.float32
-    )
-    valid.view(-1)[:s_k] = 1.0
-    counts = valid.sum(dim=1).clamp_min(1.0)
-    mean = (v_pad * valid.view(1, num_kv_tiles, VC_K_BLOCK_SIZE, 1, 1)).sum(
-        dim=2
-    ) / counts.view(1, num_kv_tiles, 1, 1)  # [B, T, H, D]
-    if not demean:
-        mean = torch.zeros_like(mean)
-    residual = (v_pad - mean.unsqueeze(2)) * valid.view(
-        1, num_kv_tiles, VC_K_BLOCK_SIZE, 1, 1
-    )
-    residual = residual.view(b, num_kv_tiles * VC_K_BLOCK_SIZE, h, d)[:, :s_k]
-    v_scale = (residual.abs().amax(dim=1) / E4M3_MAX).clamp_min(1e-12).float()
-    v8 = (residual / v_scale.unsqueeze(1)).to(torch.float8_e4m3fn)
-    mean = mean.permute(0, 2, 1, 3).contiguous()  # [B, H, T, D]
-    return VCAttentionOperands(
-        k=k8.contiguous(),
-        v=v8.contiguous(),
-        v_scale=v_scale,
-        mean=mean,
-        mu=pack_vc_tile_means(mean, v_scale),
-        perm=perm,
-        demean=demean,
-        q=q8.contiguous(),
-        q_scale=flat_block_scales(q_scale, q.shape[1], q_block_size),
-        k_scale=flat_block_scales(k_scale, s_k, VC_K_BLOCK_SIZE),
-        q_block_size=q_block_size,
-    )
-
-
-@torch.no_grad()
-def vc_quantize_fp8_fused(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    q_block_size: int = VC_K_BLOCK_SIZE,
-    perm: torch.Tensor | None = None,
-    kmeans_iters: int = VC_KMEANS_ITERS,
-    generator: torch.Generator | None = None,
-    demean: bool = True,
-) -> VCAttentionOperands:
-    """Same contract as ``vc_quantize_fp8``, computed by three CuTe DSL kernels.
-
-    Pass 1 gathers each permuted 128-token K/V tile once, centres, rotates and
-    quantizes K with one scale per tile, and writes the V tile mean and residual
-    amax; pass 2 writes the E4M3 V residuals and the packed bf16 mean operand;
-    the Q pass rotates and quantizes Q per 128-token block. Requires head_dim
-    128, bf16/fp16 inputs and ``q_block_size`` 128; other cases fall back to
-    ``vc_quantize_fp8``.
-    """
-    if q.dim() != 4 or k.shape != v.shape or q.shape[0] != k.shape[0]:
-        raise ValueError("q, k, v must be [B, S, H, D] with matching batch and heads")
-    if (
-        q.shape[-1] != 128
-        or q_block_size != VC_K_BLOCK_SIZE
-        or q.dtype not in (torch.bfloat16, torch.float16)
-        or not q.is_cuda
-    ):
-        return vc_quantize_fp8(
-            q,
-            k,
-            v,
-            q_block_size=q_block_size,
-            perm=perm,
-            kmeans_iters=kmeans_iters,
-            generator=generator,
-            demean=demean,
-        )
+    _check_prepare_inputs(q)
     from .kernels.vc_prepare import vc_prepare_fp8
 
     if perm is None:
@@ -756,8 +588,7 @@ class VCAttentionPreprocessor:
     E4M3 V runs with zero tile means. ``kmeans_clusters`` (``None`` = 64) and
     ``kmeans_iters`` parametrize the online k-means. Without a denoise step
     the grouping is computed once per K/V geometry and kept. With ``q`` the
-    preparation is the VC-Attention-QK8 one, with ``q_block_size`` Q tokens per
-    E4M3 Q scale.
+    preparation is the VC-Attention-QK8 one (one E4M3 Q scale per 128 tokens).
     """
 
     def __init__(
@@ -767,12 +598,7 @@ class VCAttentionPreprocessor:
         perm_refresh_every: int = VC_PERM_REFRESH_EVERY,
         kmeans_clusters: int | None = None,
         kmeans_iters: int = VC_KMEANS_ITERS,
-        q_block_size: int = VC_K_BLOCK_SIZE,
     ) -> None:
-        if q_block_size not in _VC_Q_BLOCK_SIZES:
-            raise ValueError(
-                f"q_block_size must be a power of two in [1, 256], got {q_block_size}"
-            )
         if not (0.0 <= smooth_step_fraction <= 1.0):
             raise ValueError("smooth_step_fraction must be in [0, 1]")
         if perm_refresh_every < 1:
@@ -785,7 +611,6 @@ class VCAttentionPreprocessor:
         self.perm_refresh_every = perm_refresh_every
         self.kmeans_clusters = kmeans_clusters
         self.kmeans_iters = kmeans_iters
-        self.q_block_size = q_block_size
         # Per (batch, seq_len_k, num_kv_heads): perm, centroids, step of the last refresh.
         self._groupings: dict[tuple[int, int, int], dict[str, object]] = {}
 
@@ -845,10 +670,8 @@ class VCAttentionPreprocessor:
             perm = torch.arange(k.shape[1], device=k.device, dtype=torch.int64)
             perm = perm.view(1, 1, -1).expand(k.shape[0], k.shape[2], -1).contiguous()
         if q is not None:
-            return vc_quantize_fp8_fused(
-                q, k, v, q_block_size=self.q_block_size, perm=perm, demean=smooth
-            )
-        return vc_quantize_fused(k, v, perm=perm, demean=smooth)
+            return vc_quantize_fp8(q, k, v, perm=perm, demean=smooth)
+        return vc_quantize(k, v, perm=perm, demean=smooth)
 
 
 @torch.no_grad()
@@ -906,12 +729,10 @@ __all__ = [
     "validate_vc_params",
     "vc_quantize",
     "vc_quantize_fp8",
-    "vc_quantize_fp8_fused",
     "vc_mean_group_shape",
     "vc_mean_operand_shape",
     "VC_MEAN_GROUP_TILES",
     "VC_MEAN_OPERANDS",
-    "vc_quantize_fused",
     "vc_reference",
     "vc_scale_shapes",
     "vc_token_permutation",

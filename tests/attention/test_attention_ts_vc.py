@@ -55,6 +55,174 @@ def _exact_fp32_matmul():
     torch.backends.cuda.matmul.allow_tf32 = prev_tf32
 
 
+# ---------------------------------------------------------------------------
+# Torch references of the two preparations (the library ships only the CuTe
+# DSL kernels); the fused-vs-reference tests compare against these.
+# ---------------------------------------------------------------------------
+def _block_amax_scale(x: torch.Tensor, block: int) -> torch.Tensor:
+    """Per-(batch, head, token block) E4M3 scale of ``[B, S, H, D]``: amax / 448."""
+    b, s, h, d = x.shape
+    xp = _pad_tokens(x.float().abs(), block)
+    nb = xp.shape[1] // block
+    amax = xp.view(b, nb, block, h, d).amax(dim=(2, 4))  # [B, nb, H]
+    return (amax / vca.E4M3_MAX).clamp_min(1e-12).permute(0, 2, 1).contiguous()
+
+
+def _quantize_blocks(x: torch.Tensor, scale: torch.Tensor, block: int) -> torch.Tensor:
+    """Divide ``[B, S, H, D]`` by its ``[B, H, nb]`` block scale and round to E4M3."""
+    b, s, h, d = x.shape
+    per_token = vca._per_token_scales(scale, s, block)  # [B, S, H]
+    return (x.float() / per_token.unsqueeze(-1)).to(torch.float8_e4m3fn)
+
+
+def _pad_tokens(x: torch.Tensor, block: int) -> torch.Tensor:
+    """Zero-pad the token axis (dim 1) of ``[B, S, H, D]`` up to a block multiple."""
+    pad = vca._blocks(x.shape[1], block) * block - x.shape[1]
+    if pad == 0:
+        return x
+    return torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad))
+
+
+@torch.no_grad()
+def _reference_quantize(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    perm: torch.Tensor | None = None,
+    kmeans_iters: int = vca.VC_KMEANS_ITERS,
+    generator: torch.Generator | None = None,
+    demean: bool = True,
+) -> vca.VCAttentionOperands:
+    """Turn ``[B, S, H, D]`` K/V into VC-Attention-QK16 kernel operands.
+
+    Keys are permuted with the values and kept in their dtype. Values are
+    permuted, split into 128-token tile means and residuals (``demean=False``
+    keeps the means at zero), and the residuals are quantized to E4M3 with one
+    scale per (batch, head, channel), returned as ``v_scale`` for the run's
+    ``vc`` operands.
+    """
+    if k.dim() != 4 or k.shape != v.shape:
+        raise ValueError("k and v must be [B, S, H, D] with matching shapes")
+    b, s_k, h, d = k.shape
+    if perm is None:
+        perm = vca.vc_token_permutation(v, iters=kmeans_iters, generator=generator)
+    gather_idx = (
+        perm.permute(0, 2, 1).unsqueeze(-1).expand(-1, -1, -1, d)
+    )  # [B, S, H, D]
+    k_p = torch.gather(k, 1, gather_idx)
+    v_p = torch.gather(v.float(), 1, gather_idx)
+
+    num_kv_tiles = vca._blocks(s_k, vca.VC_K_BLOCK_SIZE)
+    v_pad = _pad_tokens(v_p, vca.VC_K_BLOCK_SIZE).view(
+        b, num_kv_tiles, vca.VC_K_BLOCK_SIZE, h, d
+    )
+    valid = torch.zeros(
+        num_kv_tiles, vca.VC_K_BLOCK_SIZE, device=v.device, dtype=torch.float32
+    )
+    valid.view(-1)[:s_k] = 1.0
+    counts = valid.sum(dim=1).clamp_min(1.0)  # [T]
+    mean = (v_pad * valid.view(1, num_kv_tiles, vca.VC_K_BLOCK_SIZE, 1, 1)).sum(
+        dim=2
+    ) / counts.view(1, num_kv_tiles, 1, 1)  # [B, T, H, D]
+    if not demean:
+        mean = torch.zeros_like(mean)
+    residual = (v_pad - mean.unsqueeze(2)) * valid.view(
+        1, num_kv_tiles, vca.VC_K_BLOCK_SIZE, 1, 1
+    )
+    residual = residual.view(b, num_kv_tiles * vca.VC_K_BLOCK_SIZE, h, d)[:, :s_k]
+    # One E4M3 scale per (batch, head, channel) over all tokens (paper).
+    v_scale = (
+        (residual.abs().amax(dim=1) / vca.E4M3_MAX).clamp_min(1e-12).float()
+    )  # [B, H, D]
+    v8 = (residual / v_scale.unsqueeze(1)).to(torch.float8_e4m3fn)
+    mean = mean.permute(0, 2, 1, 3).contiguous()  # [B, H, T, D]
+    return vca.VCAttentionOperands(
+        k=k_p.contiguous(),
+        v=v8.contiguous(),
+        v_scale=v_scale,
+        mean=mean,
+        mu=vca.pack_vc_tile_means(mean, v_scale),
+        perm=perm,
+        demean=demean,
+    )
+
+
+@torch.no_grad()
+def _reference_quantize_fp8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    q_block_size: int = vca.VC_K_BLOCK_SIZE,
+    perm: torch.Tensor | None = None,
+    kmeans_iters: int = vca.VC_KMEANS_ITERS,
+    generator: torch.Generator | None = None,
+    demean: bool = True,
+) -> vca.VCAttentionOperands:
+    """Turn ``[B, S, H, D]`` Q/K/V into VC-Attention-QK8 kernel operands.
+
+    Keys are centred by their per-(batch, head) channel mean over tokens
+    (softmax-invariant), permuted with the values, rotated with Q by the
+    normalised Hadamard matrix and quantized to E4M3 with one scale per
+    128-token tile; queries take one E4M3 scale per ``q_block_size`` tokens.
+    Values are prepared as in ``_reference_quantize``.
+    """
+    if q.dim() != 4 or k.shape != v.shape or q.shape[0] != k.shape[0]:
+        raise ValueError("q, k, v must be [B, S, H, D] with matching batch and heads")
+    if q_block_size not in vca._VC_Q_BLOCK_SIZES:
+        raise ValueError(
+            f"q_block_size must be a power of two in [1, 256], got {q_block_size}"
+        )
+    b, s_k, h, d = k.shape
+    if perm is None:
+        perm = vca.vc_token_permutation(v, iters=kmeans_iters, generator=generator)
+    gather_idx = perm.permute(0, 2, 1).unsqueeze(-1).expand(-1, -1, -1, d)
+    k_smooth = k.float() - k.float().mean(dim=1, keepdim=True)
+    k_p = torch.gather(k_smooth, 1, gather_idx)
+    v_p = torch.gather(v.float(), 1, gather_idx)
+    hm = vca.hadamard_matrix(d, q.device)
+    q_f = q.float() @ hm
+    k_p = k_p @ hm
+    q_scale = _block_amax_scale(q_f, q_block_size)
+    k_scale = _block_amax_scale(k_p, vca.VC_K_BLOCK_SIZE)
+    q8 = _quantize_blocks(q_f, q_scale, q_block_size)
+    k8 = _quantize_blocks(k_p, k_scale, vca.VC_K_BLOCK_SIZE)
+    num_kv_tiles = vca._blocks(s_k, vca.VC_K_BLOCK_SIZE)
+    v_pad = _pad_tokens(v_p, vca.VC_K_BLOCK_SIZE).view(
+        b, num_kv_tiles, vca.VC_K_BLOCK_SIZE, h, d
+    )
+    valid = torch.zeros(
+        num_kv_tiles, vca.VC_K_BLOCK_SIZE, device=v.device, dtype=torch.float32
+    )
+    valid.view(-1)[:s_k] = 1.0
+    counts = valid.sum(dim=1).clamp_min(1.0)
+    mean = (v_pad * valid.view(1, num_kv_tiles, vca.VC_K_BLOCK_SIZE, 1, 1)).sum(
+        dim=2
+    ) / counts.view(1, num_kv_tiles, 1, 1)  # [B, T, H, D]
+    if not demean:
+        mean = torch.zeros_like(mean)
+    residual = (v_pad - mean.unsqueeze(2)) * valid.view(
+        1, num_kv_tiles, vca.VC_K_BLOCK_SIZE, 1, 1
+    )
+    residual = residual.view(b, num_kv_tiles * vca.VC_K_BLOCK_SIZE, h, d)[:, :s_k]
+    v_scale = (residual.abs().amax(dim=1) / vca.E4M3_MAX).clamp_min(1e-12).float()
+    v8 = (residual / v_scale.unsqueeze(1)).to(torch.float8_e4m3fn)
+    mean = mean.permute(0, 2, 1, 3).contiguous()  # [B, H, T, D]
+    return vca.VCAttentionOperands(
+        k=k8.contiguous(),
+        v=v8.contiguous(),
+        v_scale=v_scale,
+        mean=mean,
+        mu=vca.pack_vc_tile_means(mean, v_scale),
+        perm=perm,
+        demean=demean,
+        q=q8.contiguous(),
+        q_scale=vca.flat_block_scales(q_scale, q.shape[1], q_block_size),
+        k_scale=vca.flat_block_scales(k_scale, s_k, vca.VC_K_BLOCK_SIZE),
+        q_block_size=q_block_size,
+    )
+
+
 @dataclass(frozen=True)
 class _VCCase:
     """One VC problem: geometry and launch path."""
@@ -133,7 +301,11 @@ def _plan(
 
 def _quantize(case: _VCCase, q, k, v):
     if case.qk_dtype == _FP8:
-        return vca.vc_quantize_fp8(q, k, v, q_block_size=case.q_block_size)
+        if case.q_block_size != 128:
+            # The fused preparation quantizes Q per 128-token block; other Q
+            # block sizes exercise the kernel through the torch reference.
+            return _reference_quantize_fp8(q, k, v, q_block_size=case.q_block_size)
+        return vca.vc_quantize_fp8(q, k, v)
     return vca.vc_quantize(k, v)
 
 
@@ -359,8 +531,8 @@ def test_one_shot_vc_config_requires_the_operands():
 def test_vc_quantize_fused_matches_reference(batch, seq_len, heads):
     _, k, v = _random_inputs(batch, seq_len, heads)
     perm = vca.vc_token_permutation(v)
-    ref = vca.vc_quantize(k, v, perm=perm)
-    fused = vca.vc_quantize_fused(k, v, perm=perm)
+    ref = _reference_quantize(k, v, perm=perm)
+    fused = vca.vc_quantize(k, v, perm=perm)
     assert torch.equal(fused.k, ref.k)
     torch.testing.assert_close(fused.v_scale, ref.v_scale, rtol=1e-6, atol=0)
     torch.testing.assert_close(fused.mean, ref.mean, rtol=1e-5, atol=1e-6)
@@ -375,8 +547,8 @@ def test_vc_quantize_fused_matches_reference(batch, seq_len, heads):
 def test_vc_quantize_fp8_fused_matches_reference(batch, seq_len, heads):
     q, k, v = _random_inputs(batch, seq_len, heads)
     perm = vca.vc_token_permutation(v)
-    ref = vca.vc_quantize_fp8(q, k, v, perm=perm)
-    fused = vca.vc_quantize_fp8_fused(q, k, v, perm=perm)
+    ref = _reference_quantize_fp8(q, k, v, perm=perm)
+    fused = vca.vc_quantize_fp8(q, k, v, perm=perm)
     torch.testing.assert_close(fused.q_scale, ref.q_scale, rtol=1e-6, atol=0)
     torch.testing.assert_close(fused.k_scale, ref.k_scale, rtol=1e-6, atol=0)
     torch.testing.assert_close(fused.v_scale, ref.v_scale, rtol=1e-6, atol=0)

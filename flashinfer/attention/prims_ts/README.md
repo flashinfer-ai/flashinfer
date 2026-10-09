@@ -449,8 +449,8 @@ turns bf16 K/V (and Q under QK8) into the operands with the paper's V-Smooth
 schedule: grouping and demeaning run on the first `smooth_step_fraction` of the
 denoising steps, the permutation is refreshed every `perm_refresh_every` steps
 inside that window and kept afterwards. `vc_quantize` and `vc_quantize_fp8` are
-the torch references of the two preparations, `vc_quantize_fused` and
-`vc_quantize_fp8_fused` the CuTe DSL kernels.
+the two preparations (CuTe DSL kernels in `kernels/vc_prepare.py`; bf16/fp16
+inputs with `head_dim=128`).
 
 | Input | Supported values |
 | --- | --- |
@@ -471,7 +471,7 @@ whether the run restores the means (`False` after the V-Smooth window, when
 they are zero). QK8 plans add `q_scale` `[Hq, flat_scale_numel(B, Sq, q_block_size)]`
 and `k_scale` `[Hkv, flat_scale_numel(B, Skv, 128)]`, fp32 in the flat scale
 layout of `flashinfer.attention.prims_ts.sage` (`flat_block_scales` packs them).
-`VCAttentionPreprocessor.prepare`, `vc_quantize_fused` and `vc_quantize_fp8_fused`
+`VCAttentionPreprocessor.prepare`, `vc_quantize` and `vc_quantize_fp8`
 return everything with the permuted K and the E4M3 V (and Q) as
 `VCAttentionOperands`, whose `.params` is the run-time object.
 
