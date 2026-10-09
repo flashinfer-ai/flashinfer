@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <optional>
 
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
@@ -309,6 +310,17 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
   return isValid;
 }
 
+bool Runner::isRedundantSplitKConfig(int32_t configIndex, int32_t topK, int32_t hiddenSize,
+                                     int32_t intermediateSize, int32_t numExperts,
+                                     int32_t numTokens) const {
+  auto maxNumCtasInBatchDim =
+      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
+  return mRunner.isRedundantSplitKConfig(configIndex, numTokens,
+                                         intermediateSizeFactor * intermediateSize, hiddenSize, {},
+                                         numTokens, numExperts, maxNumCtasInBatchDim);
+}
+
 std::vector<int64_t> Runner::getPassingConfigIndices() const {
   return mRunner.getPassingConfigIndices();
 }
@@ -410,6 +422,15 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
                                  numTokens, numExperts, maxNumCtasInBatchDim);
 
   return isValid;
+}
+
+bool Runner::isRedundantSplitKConfig(int32_t configIndex, int32_t topK, int32_t hiddenSize,
+                                     int32_t intermediateSize, int32_t numExperts,
+                                     int32_t numTokens) const {
+  auto const maxNumCtasInBatchDim =
+      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  return mRunner.isRedundantSplitKConfig(configIndex, numTokens, hiddenSize, intermediateSize, {},
+                                         numTokens, numExperts, maxNumCtasInBatchDim);
 }
 
 std::vector<int64_t> Runner::getPassingConfigIndices() const {
@@ -614,16 +635,35 @@ std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenS
                                                    int32_t hiddenSizeOutput) const {
   std::vector<int64_t> validIndices;
   hiddenSizeOutput = hiddenSizeOutput > 0 ? hiddenSizeOutput : hiddenSize;
+  std::optional<int64_t> defaultIndex;
 
   for (int i = 0; i < mPassingConfigs.size(); ++i) {
     auto const& config = mPassingConfigs[i];
 
-    if (mPermuteGemm1.isValidConfigIndex(config.gemm1Config, topK, hiddenSize, intermediateSize,
-                                         numLocalExperts, numTokens) &&
-        mGemm2.isValidConfigIndex(config.gemm2Config, topK, hiddenSizeOutput, intermediateSize,
-                                  numLocalExperts, numTokens)) {
-      validIndices.push_back(i);
+    if (!mPermuteGemm1.isValidConfigIndex(config.gemm1Config, topK, hiddenSize, intermediateSize,
+                                          numLocalExperts, numTokens) ||
+        !mGemm2.isValidConfigIndex(config.gemm2Config, topK, hiddenSizeOutput, intermediateSize,
+                                   numLocalExperts, numTokens)) {
+      continue;
     }
+    // These indices are the autotuner's search space, and it profiles every FC1 x FC2 pair, so
+    // each split-K variant multiplies the tuning time. Leave out the ones that cannot pay off at
+    // this token count; isValidConfigIndex still accepts them, so cached tactics keep working.
+    // The untuned default is always kept: it is the fallback tactic and the factorized tuner's
+    // per-tile anchor.
+    if (mPermuteGemm1.isRedundantSplitKConfig(config.gemm1Config, topK, hiddenSize,
+                                              intermediateSize, numLocalExperts, numTokens) ||
+        mGemm2.isRedundantSplitKConfig(config.gemm2Config, topK, hiddenSizeOutput, intermediateSize,
+                                       numLocalExperts, numTokens)) {
+      if (!defaultIndex.has_value()) {
+        defaultIndex = getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize,
+                                                  numLocalExperts, numTokens, hiddenSizeOutput);
+      }
+      if (i != *defaultIndex) {
+        continue;
+      }
+    }
+    validIndices.push_back(i);
   }
 
   return validIndices;
