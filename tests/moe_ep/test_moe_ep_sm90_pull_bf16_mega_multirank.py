@@ -206,7 +206,12 @@ def _preprocess_weights(problem: dict):
 
 
 def _alloc_symm_buffer(
-    problem: dict, rank: int, world_size: int, *, generate_c: bool = False
+    problem: dict,
+    rank: int,
+    world_size: int,
+    *,
+    generate_c: bool = False,
+    in_kernel_fc2_reduce: bool = False,
 ):
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
         get_symm_buffer_for_hopper_bf16_mega_moe,
@@ -223,6 +228,7 @@ def _alloc_symm_buffer(
         swap_ab=problem["swap_ab"],
         gate_up_clamp=problem["gate_up_clamp"],
         generate_c=generate_c,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
     )
 
 
@@ -863,6 +869,124 @@ def test_moe_ep_sm90_pull_bf16_mega_layer_zero_token_rank(in_kernel_fc2_reduce):
         f"rank {rank}: sm90_bf16_bf16_bf16_pull_cutedsl mega layer with an "
         f"empty rank 0 (in_kernel_fc2_reduce={in_kernel_fc2_reduce}) matches "
         "reference"
+    )
+
+
+def _run_frontend_direct_zero_token_rank(rank, world_size, *, in_kernel_fc2_reduce):
+    """Drive ``MegaMoEHopperBf16Frontend`` directly (``run`` / ``warmup`` /
+    ``make_launch_thunk``) with ``num_tokens=0`` on rank 0 and the full batch
+    elsewhere; the non-empty ranks' outputs must match the staged reference.
+
+    Rank 0's routing plane is deliberately POISONED with live-looking expert
+    ids before every empty launch: the frontend owns the all-pad mask for an
+    empty batch, so the peers must never see those rows.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        bootstrap_moe_ep_runtime,
+        ensure_moe_ep_cuda_device,
+        finalize_moe_ep_runtime,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.bf16_bf16_bf16_pull_cutedsl.staging import (
+        stage_mega_moe_inputs,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (
+        hopper_bf16 as shim,
+    )
+
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
+    problem = _mega_problem(rank, world_size, num_tokens=0 if rank == 0 else 64)
+    kernel = create_mega_kernel(
+        _megakernel_config(problem, in_kernel_fc2_reduce=in_kernel_fc2_reduce)
+    )
+    runtime = bootstrap_moe_ep_runtime(
+        bootstrap, kernel.runtime_requirements(bootstrap)
+    )
+    try:
+        n = problem["num_tokens"]
+        symm_buffer = _alloc_symm_buffer(
+            problem, rank, world_size, in_kernel_fc2_reduce=in_kernel_fc2_reduce
+        )
+        try:
+            stage_mega_moe_inputs(
+                problem["hidden_states"],
+                problem["topk_weights"],
+                problem["topk_ids"],
+                symm_buffer.x,
+                symm_buffer.topk_idx,
+                symm_buffer.topk_weights,
+            )
+            l1, l2 = _preprocess_weights(problem)
+            inputs = shim._build_inputs(symm_buffer, l1, l2)
+            frontend = symm_buffer._frontend
+
+            def poison_empty_rank():
+                if n == 0:
+                    # Stale, valid-looking routing to a REMOTE rank's expert.
+                    symm_buffer.topk_idx.fill_(problem["num_experts"] - 1)
+                    symm_buffer.topk_weights.fill_(1.0)
+
+            # Reference once (own session, separate reduce); every variant
+            # below is compared against it.
+            y_ref = _reference_sm90_bf16_mega_moe_staged(problem)
+            dist.barrier()
+
+            def compare(y, tag):
+                torch.cuda.synchronize()
+                dist.barrier()
+                assert y.shape == (n, problem["hidden"]), (tag, tuple(y.shape))
+                if in_kernel_fc2_reduce:
+                    _assert_ikr_close(y, y_ref, topk=problem["topk"])
+                else:
+                    torch.testing.assert_close(y, y_ref, atol=0.0, rtol=0.0)
+
+            # 1) warmup + run (cold launch-kwargs cache).
+            poison_empty_rank()
+            frontend.warmup(inputs, num_tokens=n)
+            poison_empty_rank()
+            out = frontend.run(inputs, num_tokens=n, sync=True)
+            assert out is not None, "run() must launch (never a no-op) on an empty rank"
+            compare(out[:n].clone(), "run cold")
+            # 2) run again (launch-kwargs cache hit) with re-poisoned routing.
+            poison_empty_rank()
+            out = frontend.run(inputs, num_tokens=n, sync=True)
+            compare(out[:n].clone(), "run cached")
+            # 3) prebuilt thunk, called twice with re-poisoned routing.
+            thunk = frontend.make_launch_thunk(inputs, num_tokens=n)
+            for i in range(2):
+                poison_empty_rank()
+                thunk()
+                compare(symm_buffer.output_activation[:n].clone(), f"thunk {i}")
+            return rank
+        finally:
+            symm_buffer.destroy()
+    finally:
+        finalize_moe_ep_runtime(runtime)
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("in_kernel_fc2_reduce", [False, True])
+def test_moe_ep_sm90_pull_bf16_frontend_direct_zero_token_rank(in_kernel_fc2_reduce):
+    """Frontend-level twin of the empty-rank test: ``run`` / ``warmup`` /
+    ``make_launch_thunk`` with ``num_tokens=0`` must still launch the
+    collective kernel (the former early return / no-op thunk hung the
+    peers), and the empty rank's stale routing rows must be masked."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_frontend_direct_zero_token_rank(
+        rank, world_size, in_kernel_fc2_reduce=in_kernel_fc2_reduce
+    )
+    print(
+        f"rank {rank}: sm90 bf16 frontend run/warmup/thunk with an empty rank 0 "
+        f"(in_kernel_fc2_reduce={in_kernel_fc2_reduce}) matches reference"
     )
 
 

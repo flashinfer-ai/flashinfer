@@ -635,8 +635,12 @@ What differs from FP8:
 - **Host-side launch contracts** (review fixes, 2026-10-09): an empty rank
   (0 local tokens) still launches the collective kernel with every
   `topk_idx == -1` — it serves its experts to the peers' pulls and must
-  reach every cross-rank barrier (the former `num_tokens == 0` early return
-  under `in_kernel_fc2_reduce` hung the non-empty ranks).  With
+  reach every cross-rank barrier (the former `num_tokens == 0` early
+  returns in `hopper_bf16_mega_moe` and in the frontend's `run` /
+  `warmup` / `make_launch_thunk` hung the non-empty ranks).  The frontend
+  owns that pad mask: for `num_tokens == 0` it launches the full buffer and
+  fills the routing plane with -1 before every launch, so stale rows a
+  caller left behind are never routed.  With
   `generate_c` the shim zeroes `fc1_c` before every launch (`run` and the
   launch thunk), since the kernel writes only live rows and an expert whose
   count shrinks between launches would otherwise leave stale activations in

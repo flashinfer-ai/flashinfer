@@ -376,9 +376,7 @@ class MegaMoEHopperBf16Frontend:
         *,
         num_tokens: Optional[int] = None,
     ) -> None:
-        launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
-        if launch_inputs is None:
-            return None
+        self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         self._ensure_mega_compiled(inputs)
 
     def run(
@@ -388,7 +386,7 @@ class MegaMoEHopperBf16Frontend:
         num_tokens: Optional[int] = None,
         sync: bool = True,
         reset_counters: bool = False,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor:
         """Launch SM90 BF16 MegaMoE and return the 2D ``(T, hidden)`` bf16 output.
 
         Same contract as ``MegaMoEHopperFp8Frontend.run``: the kernel reduces
@@ -396,20 +394,24 @@ class MegaMoEHopperBf16Frontend:
         kernel tail-cleans its own counters/flags (``reset_counters=True``
         only to recover after an aborted launch), and steady state is a
         validated-once launch-kwargs fast path.
+
+        ``num_tokens == 0`` (empty local batch) is NOT skipped: the launch is
+        collective, so the rank launches its full buffer with every row
+        marked pad and returns the full output view (no live rows).
         """
         resolved = self._resolve_num_tokens(inputs, num_tokens)
-        if resolved == 0:
-            return None
         key = self._launch_cache_key(inputs, resolved)
         mega = self._mega
         if mega is None or mega.compiled is None or mega.launch_key != key:
             launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
-            if launch_inputs is None:
-                return None
             mega = self._ensure_mega_compiled(inputs)
             mega.launch_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
             mega.launch_key = key
             mega.launch_output = launch_inputs.output_activation
+        elif resolved == 0:
+            # Cache hit on an empty batch: the caller may have re-staged
+            # routing rows since the last launch, so re-apply the pad mask.
+            self._mask_empty_batch(inputs)
         if reset_counters:
             reset_compiled_mega_workspaces(mega)
         if self.config.in_kernel_fc2_reduce:
@@ -441,26 +443,29 @@ class MegaMoEHopperBf16Frontend:
         Steady-state fast path for timing loops and tuners; see the FP8
         frontend for the contract.  With ``in_kernel_fc2_reduce`` the thunk
         is two stream-ordered nodes (output zero + launch); ``generate_c``
-        adds the per-launch ``fc1_c`` zero (pad-rows-zero contract).
+        adds the per-launch ``fc1_c`` zero (pad-rows-zero contract); an
+        empty batch (``num_tokens == 0``) re-applies the all-pad routing mask
+        before every launch (full-buffer collective launch, never a no-op).
         """
+        resolved = self._resolve_num_tokens(inputs, num_tokens)
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
-        if launch_inputs is None:
-            return lambda: None
         mega = self._ensure_mega_compiled(inputs)
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
         compiled = mega.compiled
 
-        pre_zero: list[torch.Tensor] = []
+        pre_launch: list[Callable[[], None]] = []
+        if resolved == 0:
+            pre_launch.append(lambda: self._mask_empty_batch(inputs))
         if self.config.in_kernel_fc2_reduce:
-            pre_zero.append(inputs.output_activation)
+            pre_launch.append(inputs.output_activation.zero_)
         if mega.fc1_c is not None:
-            pre_zero.append(mega.fc1_c)
+            pre_launch.append(mega.fc1_c.zero_)
 
-        if pre_zero:
+        if pre_launch:
 
             def thunk() -> None:
-                for t in pre_zero:
-                    t.zero_()
+                for op in pre_launch:
+                    op()
                 compiled(**runtime_kwargs)
 
         else:
@@ -676,17 +681,35 @@ class MegaMoEHopperBf16Frontend:
             )
         return num_tokens
 
+    @staticmethod
+    def _mask_empty_batch(inputs: MegaMoEHopperBf16Inputs) -> None:
+        """Mark the whole routing plane as pad for an empty local batch.
+
+        ``num_tokens == 0`` is still a collective launch (peers pull this
+        rank's experts and wait at every cross-rank barrier), so the rank
+        launches its FULL buffer; with no live rows every row must carry
+        the ``topk_idx == -1`` pad mask or the peers would route stale
+        entries.  The caller's routing rows are meaningless for an empty
+        batch, so overwriting them is the pad mask, not data loss.
+        """
+        inputs.topk_idx.fill_(-1)
+
     def _prepare_launch_inputs(
         self,
         inputs: MegaMoEHopperBf16Inputs,
         *,
         num_tokens: Optional[int],
-    ) -> Optional[MegaMoEHopperBf16Inputs]:
+    ) -> MegaMoEHopperBf16Inputs:
         resolved = self._resolve_num_tokens(inputs, num_tokens)
-        if resolved == 0:
-            return None
-        self._validate_inputs(inputs, num_tokens=resolved)
         buf_tokens = inputs.activation.shape[0]
+        if resolved == 0:
+            # Empty local batch: full-buffer launch, all rows pad (see
+            # _mask_empty_batch).  Never an early return -- skipping the
+            # launch on one rank hangs the peers.
+            self._validate_inputs(inputs, num_tokens=buf_tokens)
+            self._mask_empty_batch(inputs)
+            return inputs
+        self._validate_inputs(inputs, num_tokens=resolved)
         if not self.config.in_kernel_fc2_reduce and resolved < buf_tokens:
             raise ValueError(
                 "Partial num_tokens is not supported when in_kernel_fc2_reduce=False "
@@ -1288,11 +1311,10 @@ def hopper_bf16_mega_moe(
     if y is None:
         # Zero-copy: the caller consumes the workspace view under stream
         # ordering (valid until the next launch on this session's buffers).
-        result = out[:n] if out is not None else symm_buffer.output_activation[:0]
+        result = out[:n]
     else:
         result = None
-        if out is not None:
-            y.copy_(out[:n])
+        y.copy_(out[:n])
     if sync and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
     return result
