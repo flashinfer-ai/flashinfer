@@ -29,12 +29,18 @@ public alpha is linear space and cuDNN's GDN engine takes a log gate, so the
 wrapper runs a .log() inside the timed call. Every column passes
 output_state=None so no backend is charged a state copy another avoids.
 
+On SM12x, FLASHINFER_GDN_FP16_ACCUM_MMA=1 selects the FP16-accumulate MMA mode
+of the FlashInfer kernels; the table header reports whether it is on.
+
 Usage:
   python bench_gdn_prefill.py
   python bench_gdn_prefill.py --warmup 10 --iters 100
+  python bench_gdn_prefill.py --dtype bfloat16
+  FLASHINFER_GDN_FP16_ACCUM_MMA=1 python bench_gdn_prefill.py --dtype bfloat16
 """
 
 import argparse
+import os
 import sys
 import time
 import gc
@@ -130,7 +136,7 @@ def get_num_rotating_buffers(num_iters: int, q, k, v) -> int:
 def bench_fi(args, endpoints, h_qk, h_v, d, backend="auto"):
     """Benchmark FlashInfer GDN prefill on the given public API backend."""
     device = "cuda"
-    dtype = torch.float16
+    dtype = getattr(torch, args.dtype)
     N = len(endpoints)
     T = endpoints[-1]
     cu_seqlens = torch.tensor([0] + list(endpoints), dtype=torch.int64, device=device)
@@ -189,7 +195,7 @@ def bench_fi(args, endpoints, h_qk, h_v, d, backend="auto"):
 def bench_fla(args, endpoints, h_qk, h_v, d):
     """Benchmark FLA baseline."""
     device = "cuda"
-    dtype = torch.float16
+    dtype = getattr(torch, args.dtype)
     N = len(endpoints)
     T = endpoints[-1]
     cu_seqlens = torch.tensor([0] + list(endpoints), dtype=torch.int32, device=device)
@@ -248,6 +254,12 @@ def main():
     parser.add_argument("--use-cupti", action="store_true")
     parser.add_argument("--use-cuda-graph", action="store_true")
     parser.add_argument(
+        "--dtype",
+        choices=["float16", "bfloat16"],
+        default="float16",
+        help="Dtype of q/k/v (and the output) for every backend",
+    )
+    parser.add_argument(
         "--skip-cudnn",
         action="store_true",
         help="Do not measure the cuDNN backend column",
@@ -277,6 +289,16 @@ def main():
 
     print(f"\nGPU: {torch.cuda.get_device_name(0)} [{arch_label}]")
     print("Models: Qwen3.5 family (397B, 122B, 35B, 27B, 9B, 4B, 2B, 0.8B), d=128")
+    # Only SM12x acts on the variable; elsewhere it is ignored.
+    fp16_accum_mma = (
+        "on"
+        if os.environ.get("FLASHINFER_GDN_FP16_ACCUM_MMA") == "1" and major == 12
+        else "off"
+    )
+    print(
+        f"dtype: {args.dtype}, "
+        f"FP16-accumulate MMA (FlashInfer column): {fp16_accum_mma}"
+    )
     print()
     fi_col = f"FI {arch_label}"
     header = (

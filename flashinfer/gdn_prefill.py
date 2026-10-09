@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import math
+import os
 import warnings
 import collections
 import functools
@@ -62,6 +63,16 @@ _GDN_CP_STATE_DTYPES: tuple[torch.dtype, ...] = (
     torch.bfloat16,
     torch.float16,
 )
+
+# Opt-in FP16-accumulate MMA mode of the SM12x delta-rule prefill kernels.
+_GDN_FP16_ACCUM_MMA_ENV = "FLASHINFER_GDN_FP16_ACCUM_MMA"
+
+
+def _fp16_accum_mma_requested(override: Optional[bool]) -> bool:
+    """Resolve the opt-in FP16-accumulate MMA mode from the override or the environment."""
+    if override is not None:
+        return bool(override)
+    return os.environ.get(_GDN_FP16_ACCUM_MMA_ENV) == "1"
 
 
 # Resolved cu_seqlens / metadata ints keyed by tensor identity; bounded LRU so
@@ -653,6 +664,7 @@ def chunk_gated_delta_rule(
     _cp_chunk_len: Optional[int] = None,
     backend: Literal["auto", "flashinfer", "cake_gdn", "cudnn"] = "auto",
     max_seqlen: Optional[int] = None,
+    _fp16_accum_mma: Optional[bool] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -782,6 +794,13 @@ def chunk_gated_delta_rule(
         back from the GPU. When omitted, CP uses ``total_seq_len``, which is
         correct for any batch; passing the exact maximum of a batched call
         lets CP launch smaller grids.
+    _fp16_accum_mma : bool, optional
+        Internal override of the ``FLASHINFER_GDN_FP16_ACCUM_MMA`` environment
+        variable that selects the FP16-accumulate MMA mode of the SM12x
+        kernels (see Notes), used for testing and tuning. ``None`` reads the
+        environment variable (only the value ``"1"`` enables the mode). Ignored
+        on other architectures and for backends other than ``"auto"`` and
+        ``"flashinfer"``.
 
     Returns
     -------
@@ -806,6 +825,20 @@ def chunk_gated_delta_rule(
       Other SM100 CP DSL routes require CUDA 13 and
       ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
       flashinfer-python[cu13]``).
+    - On SM12x, setting the environment variable
+      ``FLASHINFER_GDN_FP16_ACCUM_MMA=1`` (default off) switches the CuTe-DSL
+      delta-rule prefill kernels (non-CP and CP) to FP16-accumulate tensor-core
+      MMAs: partial sums of a few ``m16n8k16`` steps are accumulated in FP16 and
+      carried into FP32. GeForce Blackwell issues FP32-accumulate MMAs at half
+      the FP16-accumulate rate. The operands of every matrix multiply, including
+      the intermediates (recurrent state, ``V - S K``, the in-chunk inverse and
+      attention weights), are rounded to FP16 (BF16 inputs are converted on the
+      fly), so inputs and intermediates must stay within the FP16 range
+      (``|x| <= 65504``). The recurrent state,
+      the output accumulation and the dtypes and layouts of the output, final
+      state and checkpoints are unchanged. The variable is ignored on other
+      architectures and for ``backend`` other than ``"auto"`` and
+      ``"flashinfer"``.
     """
     if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
@@ -968,6 +1001,15 @@ def chunk_gated_delta_rule(
     _device_capability = get_compute_capability(device)
     _arch_major = _device_capability[0]
     _device_name = get_device_name(device)
+    # Opt-in FP16-accumulate MMA mode: SM12x kernels only. The kwarg is passed
+    # only when the mode is on, so every other call keeps its exact arguments.
+    sm12x_mode_kwargs = (
+        {"fp16_accum_mma": True}
+        if _arch_major == 12
+        and backend in ("auto", "flashinfer")
+        and _fp16_accum_mma_requested(_fp16_accum_mma)
+        else {}
+    )
     cp_heuristic_matches = _arch_major in (9, 10, 12) and should_use_cp_host(
         num_seqs * num_sab_heads,
         _sm_count,
@@ -1149,6 +1191,7 @@ def chunk_gated_delta_rule(
                 cp_chunk_len=_cp_chunk_len,
                 **state_indices_kwargs,
                 **checkpoint_kwargs,
+                **sm12x_mode_kwargs,
             )
             if output_final_state:
                 return output, output_state
@@ -1258,6 +1301,7 @@ def chunk_gated_delta_rule(
             checkpoint_cu_starts,
             checkpoint_every_n_tokens,
             state_indices=state_indices,
+            **sm12x_mode_kwargs,
         )
     elif _arch_major == 9:
         # SM90 Hopper path (CuTe DSL kernel)

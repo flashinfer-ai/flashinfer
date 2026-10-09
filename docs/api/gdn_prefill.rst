@@ -14,6 +14,25 @@ before the decode loop takes over.
 
     chunk_gated_delta_rule
 
+SM12x FP16-accumulate MMA mode
+------------------------------
+
+On GeForce Blackwell (SM12x, for example the RTX 5090) FP32-accumulate tensor-core
+``mma.sync`` instructions issue at half the rate of FP16-accumulate ones. Setting
+``FLASHINFER_GDN_FP16_ACCUM_MMA=1`` (default off) switches the CuTe-DSL SM120
+prefill kernels, that is the non-CP kernel and the CP T precompute, MN precompute
+and prefill stages (the state fixup is unchanged), to FP16-accumulate
+``m16n8k16`` MMAs: a few K steps accumulate in FP16 and the partial sum is carried
+into an FP32 accumulator. The recurrent state, the output accumulation and the
+dtypes and layouts of the output, the final state and the checkpoints are
+unchanged.
+
+Every matrix-multiply operand, including the intermediates (recurrent state,
+``V - S K``, the in-chunk inverse and the attention weights), is rounded to FP16 and
+BF16 inputs are converted on the fly, so inputs and intermediates must stay within
+the FP16 range (``|x| <= 65504``). The variable is ignored on other architectures
+and for ``backend`` other than ``"auto"`` and ``"flashinfer"``.
+
 Cake GDN CP context-parallel backend
 ------------------------------------
 
