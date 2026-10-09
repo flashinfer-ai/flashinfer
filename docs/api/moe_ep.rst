@@ -27,9 +27,21 @@ Quick start
 -----------
 
 The following example shows the common split path with NCCL-EP and a local
-identity kernel. Initialize the process group before running this code and
-launch one process per EP rank. Replace ``IdentityConfig`` with a supported
-local MoE kernel configuration for production use.
+identity kernel. It assumes the EP world is ``dist.group.WORLD`` (so
+``dist.get_rank()`` / ``dist.get_world_size()`` match the EP group). Initialize
+the process group before running this code and launch one process per EP rank.
+Replace ``IdentityConfig`` with a supported local MoE kernel configuration for
+production use.
+
+When the EP group is a subgroup of ``WORLD`` (for example expert parallel within
+a pipeline stage), pass that group explicitly::
+
+   bootstrap = BootstrapConfig(
+       world_size=ep_group.size(),
+       rank=ep_group.rank(),
+       device=device.index,
+       process_group=ep_group,
+   )
 
 .. code-block:: python
 
@@ -175,7 +187,10 @@ For CUDA Graph capture, warm up every EP rank before capture. For workloads
 with multiple token capacities, create reusable profiles with
 ``create_workspace(max_tokens_per_rank)`` before capture. Workspace creation
 and destruction are collectives and must be called in the same order on all
-ranks.
+ranks. ``create_workspace()`` raises ``MoEEpConfigError`` when the megakernel uses
+``knobs="auto"``; reusable capacity profiles require fixed or offline-tuned
+knobs. Before destroying a workspace handle, synchronize
+outstanding CUDA work and retire every CUDA graph that references it.
 
 .. autoclass:: MegaConfig
    :members:
@@ -211,7 +226,8 @@ provide both scale planes.
 .. autoclass:: PrequantizedMoEWeights
    :members:
 
-.. autofunction:: dummy_moe_weights
+Use ``dummy_moe_weights`` to build placeholder unquantized weights for
+identity or communication-only split paths during bring-up.
 
 Bootstrap and configuration
 ---------------------------
@@ -239,30 +255,50 @@ Layer factory
 Backend availability
 --------------------
 
-Use these probes before selecting an optional transport. They return false
-when the corresponding extension is not installed or cannot be loaded.
+Use these probes before selecting an optional transport.
 
-.. autofunction:: available_backends
-
-.. autofunction:: have_nccl_ep
-
-.. autofunction:: have_nixl_ep
-
-.. autofunction:: supports_fault_tolerance
+* ``available_backends()`` returns a ``list`` of installed transport names
+  (for example ``"nccl_ep"`` / ``"nixl_ep"``).
+* ``have_nccl_ep()`` and ``have_nixl_ep()`` only check whether that extension
+  is present and loadable; they return ``False`` when it is missing.
+* ``supports_fault_tolerance(backend)`` takes a backend name and reports
+  whether that backend can serve the fleet fault-tolerance API on this host
+  (presence alone is not enough for every transport).
 
 Lifecycle helpers
 -----------------
 
 These helpers are useful when a host framework owns process-group and runtime
 lifecycle. Automatic bootstrap is enabled by default; set
-``BootstrapConfig(auto_bootstrap=False)`` when the host will call the runtime
-helpers explicitly.
+``auto_bootstrap=False`` when the host will call the runtime helpers
+explicitly. ``BootstrapConfig`` still requires ``world_size`` and ``rank``
+(and ``process_group`` when the EP group is not ``WORLD``)::
 
-.. autofunction:: bootstrap_moe_ep_runtime
+   from flashinfer.moe_ep import (
+       BootstrapConfig,
+       bootstrap_moe_ep_runtime,
+       ensure_moe_ep_cuda_device,
+       finalize_moe_ep_runtime,
+   )
 
-.. autofunction:: finalize_moe_ep_runtime
+   bootstrap = BootstrapConfig(
+       world_size=world_size,
+       rank=rank,
+       device=device.index,
+       process_group=ep_group,  # omit when EP == WORLD
+       auto_bootstrap=False,
+   )
+   ensure_moe_ep_cuda_device(bootstrap)
+   runtime = bootstrap_moe_ep_runtime(bootstrap, requirements)
+   try:
+       ...
+   finally:
+       finalize_moe_ep_runtime(runtime)
 
-.. autofunction:: ensure_moe_ep_cuda_device
+``ensure_moe_ep_cuda_device`` binds the process to the rank's CUDA device
+before allocations. ``bootstrap_moe_ep_runtime`` acquires shared runtime
+resources described by ``requirements``; pair it with
+``finalize_moe_ep_runtime`` on shutdown.
 
 Further reading
 ---------------
