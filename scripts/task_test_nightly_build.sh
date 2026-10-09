@@ -51,6 +51,7 @@ pip install --no-deps "${DIST_PYTHON_DIR}"/*.tar.gz
 # Verify installation
 echo "Verifying installation..."
 # Run from /tmp to avoid importing local flashinfer/ source directory
+(cd /tmp && python "${SOURCE_WORKSPACE}/scripts/validate_nightly_packages.py")
 (cd /tmp && python -m flashinfer show-config)
 
 # Copy test sources and their benchmark fixtures into an isolated directory so
