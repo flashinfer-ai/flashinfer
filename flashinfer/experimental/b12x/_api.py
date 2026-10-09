@@ -33,6 +33,7 @@ from ._lib.runtime_control import (
 _OPS: tuple[str, ...] = (
     "attention.paged",
     "attention.paged_decode",
+    "attention.paged_kv_write",
     "attention.dense_mla",
     "attention.sparse_mla",
     "attention.compressed_sparse_mla",
@@ -62,6 +63,7 @@ _OPS: tuple[str, ...] = (
     "sequence.ple_hash",
     "sequence.ple_embedding",
     "sequence.ple",
+    "sequence.short_conv",
     "sequence.engram",
     "sequence.embedding",
     "sequence.gdn_decode",

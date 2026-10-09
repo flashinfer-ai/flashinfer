@@ -4,6 +4,7 @@
   block-sparse variant) with on-device graph-replay metadata staging.
 - ``paged_decode``: warp-specialized split-KV paged decode/verify (192/128 or
   128/128 heads, FP8 KV, sinks, windows, non-causal, ragged verify).
+- ``paged_kv_write``: prepared BF16/FP8 cache writes with independent head dimensions.
 - ``dense_mla``: dense compressed-cache MLA with strided physical records and
   optional causal sliding-window masking.
 - ``sparse_mla``: top-k-selected MLA, including strided physical records.
@@ -24,6 +25,7 @@ from typing import Any
 _OP_MODULES = (
     "paged",
     "paged_decode",
+    "paged_kv_write",
     "dense_mla",
     "sparse_mla",
     "compressed_sparse_mla",
