@@ -173,6 +173,7 @@ from .fmha_resources import (
     SmemQResource,
     TmemOResource,
     TmemPResource,
+    SmemPResource,
     TmemSPResource,
     TmemStatsResource,
     TmemStatsDoneResource,
@@ -1141,6 +1142,28 @@ def build_context_task_manager(
         else:
             work_queue = WorkQueue(**work_queue_kwargs)
 
+    # p_in_smem: one SMEM P tile per query group; softmax produces, UMMA consumes.
+    smem_p_resources: list[SmemPResource | None] = [None, None]
+    if cfg.p_in_smem:
+        smem_p_resources = [
+            SmemPResource(
+                # Under two-CTA UMMA the leader's M=256 PV reads both CTAs' P
+                # tiles, so both softmax groups signal the leader's barrier and
+                # the UMMA commit releases both.
+                pipeline_config=PipelineConfig.create_async_umma_pipeline_cfg(
+                    num_stages=1,
+                    producer_group=softmax_group_umma if two_cta else softmax_group,
+                    consumer_group=umma_hw_group,
+                    cta_layout_vmnk=cluster_shape_vmnk,
+                    **tma_umma_leader_kwargs,
+                ),
+                cfg=cfg,
+                group_idx=index,
+                name=f"smem_p{index}",
+            )
+            for index in range(cfg.num_qkv_instances)
+        ]
+    smem_p0, smem_p1 = smem_p_resources
     tmem_sp0 = TmemSPResource(
         pipeline_config=tmem_sp0_pipeline_cfg,
         cfg=cfg,
@@ -1156,6 +1179,7 @@ def build_context_task_manager(
         variable_window_cta_starts=variable_window_cta_starts,
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
+        smem_p=smem_p0,
         name="tmem_sp0",
     )
     tmem_p0: TmemPResource | None = None
@@ -1248,6 +1272,7 @@ def build_context_task_manager(
             variable_window_cta_starts=variable_window_cta_starts,
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
+            smem_p=smem_p1,
             name="tmem_sp1",
         )
         tmem_vec1 = TmemStatsResource(
@@ -1291,6 +1316,8 @@ def build_context_task_manager(
         tmem_o1_offset=cfg.tmem_o1_offset,
         tmem_vec0_resource=tmem_vec0,
         tmem_vec1_resource=tmem_vec1,
+        smem_p0_resource=smem_p0,
+        smem_p1_resource=smem_p1,
         name="tmem_o",
         **tmem_o_kwargs,
     )
@@ -1344,6 +1371,8 @@ def build_context_task_manager(
         work_queue,
         tmem_p_prefix_ready_0=tmem_p_prefix_ready_0,
         tmem_p_prefix_ready_1=tmem_p_prefix_ready_1,
+        smem_p0=smem_p0,
+        smem_p1=smem_p1,
         **mma_domain_kwargs,
     )
 
@@ -1357,6 +1386,7 @@ def build_context_task_manager(
         s0s1_seq,
         work_queue,
         tmem_p_prefix_ready=tmem_p_prefix_ready_0,
+        smem_p=smem_p0,
         **softmax0_domain_kwargs,
     )
     softmax1_task: Task | None = None
@@ -1371,6 +1401,7 @@ def build_context_task_manager(
             s0s1_seq,
             work_queue,
             tmem_p_prefix_ready=tmem_p_prefix_ready_1,
+            smem_p=smem_p1,
             **softmax1_domain_kwargs,
         )
     correction_task = create_correction_task(
@@ -1471,7 +1502,11 @@ def build_context_task_manager(
             or tmem_stats_done_1 is None
         ):
             raise ValueError("paired resource graph requires peer-1 resources")
-        tmem_o_dependencies = scheduler_deps(tmem_sp0, tmem_sp1)
+        tmem_o_dependencies = scheduler_deps(
+            tmem_sp0,
+            tmem_sp1,
+            *([smem_p0, smem_p1] if cfg.p_in_smem else []),
+        )
 
     smem_kv_deps: list[MemoryResource] = [gmem_qkv]
     if smem_page_offsets_kv is not None:
@@ -1506,6 +1541,10 @@ def build_context_task_manager(
         resource_dependency_graph[tmem_stats_done_0] = [tmem_vec0]
     if tmem_p0 is not None:
         resource_dependency_graph[tmem_p0] = scheduler_deps(tmem_sp0)
+    if smem_p0 is not None:
+        resource_dependency_graph[smem_p0] = scheduler_deps(tmem_sp0)
+    if smem_p1 is not None and tmem_sp1 is not None:
+        resource_dependency_graph[smem_p1] = scheduler_deps(tmem_sp1)
     if not single_qkv_instance:
         resource_dependency_graph.update(
             {
@@ -1559,6 +1598,10 @@ def build_context_task_manager(
     add_smem_resource(tmem_sp0)
     if tmem_p0 is not None:
         add_smem_resource(tmem_p0)
+    if smem_p0 is not None:
+        add_smem_resource(smem_p0)
+    if smem_p1 is not None:
+        add_smem_resource(smem_p1)
     add_smem_resource(tmem_vec0)
     add_smem_resource(tmem_o)
     if not cfg.stats_via_smem:
@@ -1750,6 +1793,7 @@ def _context_pipeline_stage_counts(
         "smem_o": cfg.num_qkv_instances,
         "s0s1_seq": 0 if cfg.single_qkv_instance else 1,
         "tmem_p_prefix_ready": 2 if cfg.pv_half_overlap else 0,
+        "smem_p": cfg.num_qkv_instances if cfg.p_in_smem else 0,
         "tmem_stats_done": 0 if cfg.stats_via_smem else cfg.num_qkv_instances,
         "work_queue": 1 if is_clc_dynamic else 0,
     }
@@ -1806,8 +1850,13 @@ def _kv_ring_smem_budget_bytes(
 
     # The TS allocator bump-allocates each data block at its own alignment
     # (largest first), so a buffer-aligned block costs its size rounded up to
-    # cfg.buffer_align_bytes; the 4-32 byte records follow, then barriers.
+    # cfg.buffer_align_bytes. The 4-32 byte records follow, then barriers.
     align = cfg.buffer_align_bytes
+    smem_p_bytes = 0
+    if cfg.p_in_smem:
+        smem_p_bytes = (
+            (cfg.smem_p_bytes + align - 1) // align * align * cfg.num_qkv_instances
+        )
     control_bytes = (2 * cutlass.Int32.width + cutlass.Int64.width) // 8
     if is_clc_dynamic:
         control_bytes = (control_bytes + 15) // 16 * 16 + cutlass.Int128.width // 8
@@ -1821,6 +1870,7 @@ def _kv_ring_smem_budget_bytes(
     fixed_smem_bytes = (
         (q_tile_bytes * cfg.q_stage + align - 1) // align * align
         + (o_stage_bytes + align - 1) // align * align * cfg.num_qkv_instances
+        + smem_p_bytes
         + (stats_bytes + 15) // 16 * 16
         + (page_offsets_bytes + 15) // 16 * 16
         + (control_bytes + 7) // 8 * 8
@@ -2077,6 +2127,24 @@ def _configure_single_instance_warp_layout(cfg: FmhaConfig) -> None:
     cfg.num_regs_other = 112
 
 
+def _uses_smem_p(cfg: FmhaConfig, *, has_variable_window: bool) -> bool:
+    """Stage fp8 P in SMEM for the dense query-paired D128 schedule with a 16-bit
+    output. It needs a 128-byte P row, one SW128 atom, and an O tile stored in
+    64-wide halves. The 192/128 path keeps 128-wide K/V staging instead, and an
+    8-bit output has no 64-wide TMA store granule. Under two-CTA UMMA the
+    P-ready barrier is cluster-level like the P-prefix one."""
+    return (
+        not cfg.single_qkv_instance
+        and cfg.logical_head_dim_qk == 128
+        and cfg.v_dtype.width == 8
+        and cfg.o_dtype.width == 16
+        and cfg.qk_mma_tiler[1] * cfg.v_dtype.width // 8 == 128
+        and cfg.epi_tile[1] % 64 == 0
+        and not has_variable_window
+        and not cfg.causal_single_kv_tile
+    )
+
+
 def _configure_head_dim_staging(cfg: FmhaConfig) -> None:
     """Stage K/V in 128-wide slices and size O staging to the paired footprint."""
     cfg.head_dim_per_stage_kv = 0
@@ -2085,6 +2153,12 @@ def _configure_head_dim_staging(cfg: FmhaConfig) -> None:
     cfg.num_o_head_dim_stages = 1
     cfg.stage_kv_by_head_dim = False
     cfg.stage_o_by_head_dim = False
+    if cfg.p_in_smem:
+        # Stage O in 64-wide halves to free 32 KB of SMEM for the two P tiles.
+        cfg.head_dim_per_stage_o = 64
+        cfg.num_o_head_dim_stages = cfg.epi_tile[1] // cfg.head_dim_per_stage_o
+        cfg.stage_o_by_head_dim = True
+        return
     if cfg.num_qkv_instances != 1 and cfg.logical_head_dim_qk != 192:
         return
     cfg.head_dim_per_stage_kv = 128
@@ -2657,7 +2731,7 @@ class FmhaTs:
     two_cta_umma : bool, optional
         Issue the QK and PV UMMAs in ``cta_group::2`` across a 2-CTA cluster, each
         CTA staging half of every K/V tile. Dense contiguous query-paired D128 with
-        bf16 QK only, launched non-persistently.
+        bf16 or E4M3 QK, launched non-persistently.
     use_paged_kv : bool, optional
         Read K/V from a physical page pool through a fixed block table.
     num_tokens_per_page : int, optional
@@ -2690,6 +2764,7 @@ class FmhaTs:
         h_r: int = 1,
         enable_skip_correction: bool = True,
         uses_ldtm_stat: bool = False,
+        fp8_psmem_early_token: bool = False,
         two_cta_umma: bool = False,
         use_paged_kv: bool = False,
         num_tokens_per_page: int = 32,
@@ -2768,11 +2843,11 @@ class FmhaTs:
             or use_paged_kv
             or d != 128
             or d_v != 128
-            or q_dtype.width != 16
+            or q_dtype.width not in (8, 16)
         ):
             raise ValueError(
                 "two-CTA UMMA requires the non-persistent dense contiguous "
-                "query-paired D128 context kernel with 16-bit QK"
+                "query-paired D128 context kernel with 16-bit or E4M3 QK"
             )
         cfg.two_cta_umma = two_cta_umma
         if two_cta_umma:
@@ -2807,9 +2882,10 @@ class FmhaTs:
             cfg.num_regs_correction = 88
             cfg.num_regs_other = 56
         cfg.enable_skip_correction = enable_skip_correction
-        if enable_skip_correction and v_dtype.width == 16:
+        if enable_skip_correction:
             cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
         cfg.uses_ldtm_stat = uses_ldtm_stat
+        cfg.fp8_psmem_early_token = fp8_psmem_early_token
         cfg.qk_acc_dtype = qk_acc_dtype or cutlass.Float32
         cfg.pv_acc_dtype = pv_acc_dtype or cutlass.Float32
 
@@ -2858,6 +2934,7 @@ class FmhaTs:
         cfg.qk_mma_tiler = mma_tiler
         cfg.pv_mma_tiler = (mma_tiler[0], d_v, mma_tiler[1])
         cfg.epi_tile = cfg.pv_mma_tiler[:2]
+        cfg.p_in_smem = _uses_smem_p(cfg, has_variable_window=has_variable_window)
         _configure_head_dim_staging(cfg)
         _configure_pipeline_stages(
             cfg, is_clc_dynamic=is_clc_dynamic, is_persistent=is_persistent
