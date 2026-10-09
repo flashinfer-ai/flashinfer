@@ -81,18 +81,19 @@ def _cudnn_supports_direct_seqlens(dtype: torch.dtype, *, mixed: bool = False) -
 
 @functools.cache
 def _cudnn_supports_paged_auto() -> bool:
-    """The qualified paged prefill selection requires FE 1.31 / cuDNN 9.27."""
+    """The qualified paged prefill selection requires FE 1.32 / cuDNN 9.27."""
     if not CUDNN_AVAILABLE:
         return False
     try:
         from packaging.version import Version
 
-        # Nightly wheels can expose the native capability before the required
-        # selector fix lands. A 1.31.dev build is older than the 1.31 release.
+        # FE 1.31 still excludes shape overrides from paged split selection.
+        # The floor must include the bounded-paged selector fixes; native
+        # support alone is insufficient. Prereleases stay below that floor.
         version = Version(cudnn.__version__)
         binder = getattr(getattr(cudnn, "_pybind_module", None), "_SdpaThdBinder", None)
         return (
-            version >= Version("1.31.0")
+            version >= Version("1.32.0")
             and cudnn_frontend_frost_runtime_available()
             and cudnn.backend_version() >= 92700
             and bool(getattr(binder, "supports_paged_packed_split", False))
