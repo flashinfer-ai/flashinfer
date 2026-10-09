@@ -64,6 +64,12 @@ with every draft token's v values staged in shared memory ahead of the serial
 recurrence and the token loop unrolled; its records are exported for `sm_107a`
 only, while SM100a/SM103a keep the shipped tile16 body
 (`cake_gdn_bf16_verify_tile16_schedule` in `flashinfer/jit/cake_gdn.py`).
+The same two schedule changes are applied to the wide multi-token body on
+SM107a: every other BF16-state T>=2 row (verify / update / checkpoint flavours
+at `TILE_V_WIDE` 32 and 64, including the TP=2 B>=5 and TP=1 verify rows)
+resolves to `gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre` there
+(`cake_gdn_bf16_wide_schedule`), again bitwise-identical to the shipped body;
+the single-token band rows keep `..._wide128` on every architecture.
 
 Single-token BF16-state decode admits every Qwen3.5 per-rank linear-attention
 geometry at any batch: H/HV = 16/32, 8/16, 4/8 (Qwen3.5-35B-A3B TP1/TP2/TP4)

@@ -630,6 +630,22 @@ def cake_gdn_bf16_verify_tile16_schedule(arch: CakeGDNArch) -> str:
     return f"gdn_decode_pretranspose_t4_bf16state_{body}"
 
 
+# The wide (TILE_V_WIDE 32/64/128) BF16-state MTP body of the multi-token
+# verify / update / checkpoint rows, per architecture: sm_107a routes the
+# `wide128_vpre` schedule (the draft window's v values prefetched before the
+# barrier, token loop unrolled; bitwise-identical output), every other
+# architecture and every T=1 band row the shipped wide body.  Mirrors
+# `BF16_WIDE_ARCH_BODIES` / `select_bf16_wide_body` of the Cake exporter.
+CAKE_GDN_BF16_WIDE_ARCH_BODIES: dict[str, str] = {"sm_107a": "wide128_vpre"}
+
+
+def cake_gdn_bf16_wide_schedule(arch: CakeGDNArch, seq_len: int) -> str:
+    if int(seq_len) <= 1:
+        return "gdn_decode_pretranspose_mtp_t4_bf16state_wide128"
+    body = CAKE_GDN_BF16_WIDE_ARCH_BODIES.get(arch, "wide128")
+    return f"gdn_decode_pretranspose_mtp_t4_bf16state_{body}"
+
+
 def cake_gdn_bf16_route_tile_v(route_id: str) -> int:
     """The grid tile a BF16 decode route id carries (``.vec8_t<N>``, ``.vec8r56_t<N>``, ``.vec8occ_t<N>``, ``.wide<N>`` or ``.tile16_fullwarp``)."""
 
@@ -838,7 +854,7 @@ def select_cake_gdn_decode_variant(
         update_state = not cache_intermediate_states
         record = _variant_for(
             domain="decode",
-            schedule_attr="gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+            schedule_attr=cake_gdn_bf16_wide_schedule(arch, seq_len),
             specializations={
                 "CACHE_INTERMEDIATE_STATES": int(cache_intermediate_states),
                 "H": num_q_heads,

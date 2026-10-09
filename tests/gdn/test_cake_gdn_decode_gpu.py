@@ -1131,6 +1131,9 @@ def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
         (1, 8, 16, False, 7),
         (4, 8, 16, False, 7),
         (1, 8, 16, False, 8),
+        # wide rows (TILE_V_WIDE 32 / 64; the `wide128_vpre` records on sm_107a)
+        (5, 8, 16, False, 7),
+        (8, 16, 64, True, 3),
     ],
 )
 def test_exported_bf16_verify_is_cuda_graph_safe(

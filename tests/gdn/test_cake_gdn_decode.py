@@ -640,7 +640,9 @@ def test_decode_resolver_routes_the_bf16_verify_tile16_body_per_architecture(
     # Rubin (sm_107a) runs the v-prefetch / unrolled `tile16_vpre` schedule of the
     # full-warp tile-v16 verify kernel; B200 / B300 keep the shipped body.  The
     # route id (grid tile) is the same on every architecture.
-    assert cake_gdn.CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES == {"sm_107a": "tile16_vpre"}
+    assert cake_gdn.CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES == {
+        "sm_107a": "tile16_vpre"
+    }
     body = "tile16_vpre" if arch == "sm_107a" else "tile16"
     rows = [
         *(
@@ -677,10 +679,153 @@ def test_decode_resolver_routes_the_bf16_verify_tile16_body_per_architecture(
             **overrides,
         )
         assert route.route_id.endswith(".tile16_fullwarp")
-        assert re.search(rf"_t4_bf16state_{body}_[0-9a-f]{{12}}$", route.variant_name), (
+        assert re.search(
+            rf"_t4_bf16state_{body}_[0-9a-f]{{12}}$", route.variant_name
+        ), (
             arch,
             overrides,
             route.variant_name,
+        )
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_decode_resolver_routes_the_bf16_wide_body_per_architecture(arch) -> None:
+    # The multi-token rows outside the tile16 verify kernel run the wide
+    # (TILE_V_WIDE 32/64) MTP body; Rubin (sm_107a) takes its v-prefetch /
+    # unrolled `wide128_vpre` schedule, B200 / B300 keep the shipped body.  The
+    # route id (flavour + grid tile) is the same on every architecture, and the
+    # T=1 band rows keep the shipped wide body everywhere.
+    assert cake_gdn.CAKE_GDN_BF16_WIDE_ARCH_BODIES == {"sm_107a": "wide128_vpre"}
+    body = "wide128_vpre" if arch == "sm_107a" else "wide128"
+    rows = [
+        # (overrides, expected route id)
+        (
+            dict(
+                batch_size=5,
+                seq_len=7,
+                num_k_heads=8,
+                num_q_heads=8,
+                num_v_heads=16,
+                cache_steps=7,
+                strided_inputs=True,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+        ),
+        (
+            dict(
+                batch_size=1,
+                seq_len=7,
+                num_k_heads=16,
+                num_q_heads=16,
+                num_v_heads=32,
+                cache_steps=7,
+                strided_inputs=True,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+        ),
+        (
+            dict(
+                batch_size=8,
+                seq_len=4,
+                num_k_heads=16,
+                num_q_heads=16,
+                num_v_heads=32,
+                cache_steps=4,
+                strided_inputs=True,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_verify_t4.wide32",
+        ),
+        (
+            dict(
+                batch_size=4,
+                seq_len=2,
+                num_k_heads=16,
+                num_q_heads=16,
+                num_v_heads=32,
+                cache_steps=4,
+                strided_inputs=False,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_verify_t2.wide32",
+        ),
+        (
+            dict(
+                batch_size=8,
+                seq_len=3,
+                num_k_heads=16,
+                num_q_heads=16,
+                num_v_heads=64,
+                cache_steps=3,
+                strided_inputs=True,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_verify_t3.wide64",
+        ),
+        (
+            dict(
+                batch_size=8,
+                seq_len=2,
+                num_k_heads=16,
+                num_q_heads=16,
+                num_v_heads=64,
+                cache_steps=0,
+                strided_inputs=True,
+                disable_state_update=False,
+                cache_intermediate_states=False,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_update_t2.wide64",
+        ),
+        (
+            dict(
+                batch_size=8,
+                seq_len=4,
+                num_k_heads=16,
+                num_q_heads=16,
+                num_v_heads=64,
+                cache_steps=5,
+                strided_inputs=True,
+                disable_state_update=False,
+                cache_intermediate_states=True,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_checkpoint_t4.wide64",
+        ),
+    ]
+    for overrides, route_id in rows:
+        route = _decode(
+            arch=arch, state_dtype="bfloat16", layout="pretranspose", **overrides
+        )
+        assert route.route_id == route_id, (arch, overrides, route.route_id)
+        assert re.search(
+            rf"_mtp_t4_bf16state_{body}_[0-9a-f]{{12}}$", route.variant_name
+        ), (
+            arch,
+            overrides,
+            route.variant_name,
+        )
+    # T=1 rows that the band table sends to the wide body keep the shipped body on every arch.
+    t1 = _decode(
+        arch=arch,
+        state_dtype="bfloat16",
+        layout="pretranspose",
+        batch_size=256,
+        seq_len=1,
+        num_k_heads=16,
+        num_q_heads=16,
+        num_v_heads=32,
+        strided_inputs=True,
+    )
+    if t1.route_id.startswith("flashinfer.gdn_decode.indexed_bf16_t1.wide"):
+        assert re.search(r"_mtp_t4_bf16state_wide128_[0-9a-f]{12}$", t1.variant_name), (
+            arch,
+            t1.variant_name,
         )
 
 
