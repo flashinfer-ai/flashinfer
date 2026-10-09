@@ -57,8 +57,8 @@ def test_aligned_selector_matches_qualified_batch_bands(
     [
         (1, "register_tile16"),
         (18, "register_tile16"),
-        (19, "cpasync_tile64_register_pipeline"),
-        (63, "cpasync_tile64_register_pipeline"),
+        (19, "cpasync_tile64_register_pipeline_early_publish"),
+        (63, "cpasync_tile64_register_pipeline_early_publish"),
         (64, "cpasync_tile128_register_pipeline"),
         (65535, "cpasync_tile128_register_pipeline"),
     ],

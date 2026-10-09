@@ -34,6 +34,7 @@ CakeKDAPackedT1Variant = Literal[
     "cpasync_tile64",
     "cpasync_tile128_ilp4",
     "cpasync_tile64_register_pipeline",
+    "cpasync_tile64_register_pipeline_early_publish",
     "cpasync_tile128_packed_state_v_private_prefetch",
     "cpasync_tile128_v_private_prefetch",
     "cpasync_tile128_paired_row_pipeline",
@@ -49,6 +50,7 @@ CAKE_KDA_PACKED_T1_VARIANTS: tuple[CakeKDAPackedT1Variant, ...] = (
     "cpasync_tile64",
     "cpasync_tile128_ilp4",
     "cpasync_tile64_register_pipeline",
+    "cpasync_tile64_register_pipeline_early_publish",
     "cpasync_tile128_packed_state_v_private_prefetch",
     "cpasync_tile128_v_private_prefetch",
     "cpasync_tile128_paired_row_pipeline",
@@ -133,6 +135,14 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
         smem_bytes=16384,
         requires_aux_vec4=True,
     ),
+    "cpasync_tile64_register_pipeline_early_publish": CakeKDAPackedT1VariantMetadata(
+        body="cake_kda_packed_t1_cpasync_tile64_register_pipeline_early_publish.cu",
+        symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile64_register_pipeline_early_publish",
+        value_tiles=2,
+        threads=128,
+        smem_bytes=16384,
+        requires_aux_vec4=True,
+    ),
     "cpasync_tile128_packed_state_v_private_prefetch": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_cpasync_tile128_packed_state_v_private_prefetch.cu",
         symbol=(
@@ -176,8 +186,14 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
 # B200.  SM107 (10.7, 212 SMs) is re-banded from the R200 variant
 # sweep: the register tile-16 kernel stays ahead through B18, the
 # cp.async tile-64 register pipeline carries the mid batches, and the tile-128
-# register pipeline takes over from B64, where the two tie.  Every variant is
-# an exact kernel; the selector only moves the batch bands.
+# register pipeline takes over from B64, where the two tie.  The mid band
+# runs the early-publish build of the tile-64 register pipeline: the same
+# schedule with the output row published before the state write-back and
+# the state stored with an evict-last L2 hint, which is bitwise identical to
+# the tile-64 register pipeline and 1-3 % faster across B19-B63 on R200
+# (band geomean 0.987 of the plain pipeline's time, no row slower).  No
+# SM100 band selects it.  Every variant is an exact kernel; the selector only
+# moves the batch bands.
 _CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM100: tuple[
     tuple[Optional[int], CakeKDAPackedT1Variant], ...
 ] = (
@@ -194,7 +210,7 @@ _CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM107: tuple[
     tuple[Optional[int], CakeKDAPackedT1Variant], ...
 ] = (
     (18, "register_tile16"),
-    (63, "cpasync_tile64_register_pipeline"),
+    (63, "cpasync_tile64_register_pipeline_early_publish"),
     (None, "cpasync_tile128_register_pipeline"),
 )
 CAKE_KDA_PACKED_T1_ALIGNED_BANDS: dict[
