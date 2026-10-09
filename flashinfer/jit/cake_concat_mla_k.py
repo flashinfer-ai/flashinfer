@@ -35,7 +35,7 @@ _SCHEMA = "cake.library_export.v5"
 _RENDER_ARCH = "sm_103a"
 _MODULE_NAME_RE = re.compile(r"cake_concat_mla_k_[0-9a-f]{20}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
-_EXPECTED_CONTRACT = {
+_EXPECTED_CONTRACT: dict[str, Any] = {
     "arches": [_RENDER_ARCH],
     "backend": "cake",
     "correctness": "byte_exact_copy_and_broadcast",
@@ -103,7 +103,7 @@ _EXPECTED_ARG_PLAN = [
     ["grid", "grid_y"],
     ["grid", "grid_z"],
 ]
-_EXPECTED_LAUNCH = {
+_EXPECTED_LAUNCH: dict[str, Any] = {
     "block": [512, 1, 1],
     "cluster": [1, 1, 1],
     "cluster_scheduling_policy": "spread",
