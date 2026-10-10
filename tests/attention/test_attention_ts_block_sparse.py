@@ -605,7 +605,9 @@ _PROXY_ROUTE_CASES = (
 
 def _stub_block_sparse_config(_key):
     """Stand in for the decode config where only the launch policy matters."""
-    return SimpleNamespace(uses_prepared_score_keep_words=False)
+    return SimpleNamespace(
+        uses_prepared_score_keep_words=False, use_sage_attention=False
+    )
 
 
 def _make_patterns(case: _Case) -> _Patterns:
@@ -2898,6 +2900,7 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
         use_proxy_routes=False,
         row_route_offsets=object(),
         route_workspace=object(),
+        sage_k_scale_image=None,
         max_blocks_per_row=3,
         compiled=lambda *args: calls.append(args),
     )
@@ -2942,6 +2945,7 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
             run_args.kv_valid_bits,
             state.row_route_offsets,
             state.route_workspace,
+            None,  # sage_k_scale_image
             3,
             None,  # q_scale
             None,  # k_scale

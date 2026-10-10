@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared layout of the route records produced before sparse attention."""
+"""Shared layouts of the route records and Sage K-scale image prepared before attention."""
 
 from dataclasses import dataclass
 
-from flashinfer.utils import round_up
+from flashinfer.utils import ceil_div, round_up
 
 from .common import _SIGNED_INT32_MAX, _block_sparse_kv_atom_size
 
@@ -25,6 +25,11 @@ _PREPARED_ROUTE_IS_FULL_FLAG = 1 << 0
 _PREPARED_ROUTE_IS_PROXY_FLAG = 1 << 1
 _SUPPORTED_KV_ROUTE_SIZES = (128, 256)
 _SUPPORTED_PAGED_KV_PAGE_SIZES = (16, 32, 64, 128)
+# A Sage route atom is one Keeps layout atom: two K32 score fragments. The
+# attention load warp copies the image in 16-byte pieces of four words.
+_SAGE_IMAGE_ATOM_TOKENS = 64
+_SAGE_IMAGE_FRAGMENT_TOKENS = 32
+_SAGE_IMAGE_PIECE_WORDS = 4
 
 
 def _validate_int(value: object, name: str, *, allow_zero: bool) -> int:
@@ -262,8 +267,144 @@ class _BlockSparseRouteLayout:
         ) // self.route_metadata_stride_words
 
 
+@dataclass(frozen=True)
+class _SageKScaleImageKind:
+    """One route kind's chunks within a sequence's ``sfK`` image words.
+
+    The kind's ``length`` tokens (K tokens, or block summaries) take one
+    chunk per 64-token atom from word ``word_offset`` of the sequence. The
+    chunk words hold one scale per ``block_size`` tokens, read from the
+    kind's flat source tensor of one scale per ``source_block_size`` tokens.
+    """
+
+    length: int
+    block_size: int
+    source_block_size: int
+    word_offset: int
+
+    @property
+    def groups(self) -> int:
+        """Return the scale groups of one K32 fragment, at least one."""
+
+        return max(1, _SAGE_IMAGE_FRAGMENT_TOKENS // self.block_size)
+
+    @property
+    def group_tokens(self) -> int:
+        """Return the tokens from one group's token to the next group's."""
+
+        return _SAGE_IMAGE_FRAGMENT_TOKENS // self.groups
+
+    @property
+    def used_words(self) -> int:
+        """Return the words of one chunk that hold scales."""
+
+        return _SAGE_IMAGE_ATOM_TOKENS // _SAGE_IMAGE_FRAGMENT_TOKENS * self.groups
+
+    @property
+    def chunk_words(self) -> int:
+        """Return the words of one chunk: ``used_words`` padded to whole pieces."""
+
+        return round_up(self.used_words, _SAGE_IMAGE_PIECE_WORDS)
+
+    @property
+    def atoms(self) -> int:
+        """Return the kind's 64-token atoms, the last one possibly partial."""
+
+        return ceil_div(self.length, _SAGE_IMAGE_ATOM_TOKENS)
+
+    @property
+    def words(self) -> int:
+        """Return the words of the kind's chunks."""
+
+        return self.atoms * self.chunk_words
+
+
+@dataclass(frozen=True)
+class _SageKScaleImageLayout:
+    """Word layout of the ``sfK`` image a Sage plan prepares before attention.
+
+    The image is ``image[b * Hkv + h][kind][atom][word]`` in FP32 words: KV
+    head ``h`` of sequence ``b`` owns ``sequence_words`` consecutive words
+    holding its K-token chunks (the exact kind) and then, for a proxy plan,
+    its block-summary chunks (the summary kind). A kind has one chunk per
+    64-token atom of its tokens, padded to whole 16-byte pieces because the
+    attention load warp copies the image in pieces. Word ``word = fragment *
+    groups + group`` of a chunk is the scale of the atom's token ``atom * 64 +
+    word * (32 / groups)``: scale group ``group`` of the atom's K32 fragment
+    ``fragment``, in the order the softmax reads them; words from ``2 *
+    groups`` on pad the chunk and are zero. A token past the kind's length
+    takes the last scale, so masked scores keep a finite positive scale.
+
+    ``groups`` is ``32 / block_size`` of the block size the kind reads
+    (``exact_block_size``, ``summary_block_size``, resolved by
+    ``FmhaDecodeConfig.sage_k_scale_block_size``), at least one. With
+    16-token K blocks a chunk has two groups per fragment and four words, the
+    ``sfK`` of the atom's tokens 0, 16, 32 and 48; with one-token K scales it
+    has 64 words, one per token; with 64-token or coarser blocks it has two
+    words, the scale of tokens 0 and 32, padded to one piece. A kind whose
+    source scales (``k_block_size``, ``k_summary_block_size``) are coarser
+    than the block size it reads repeats them.
+    """
+
+    seq_len_kv: int
+    k_block_size: int
+    # Summary sequence length of a proxy plan, else zero.
+    num_summaries: int
+    k_summary_block_size: int
+    exact_block_size: int
+    summary_block_size: int
+
+    @property
+    def exact(self) -> _SageKScaleImageKind:
+        """Return the K-token kind, which starts a sequence's words."""
+
+        return _SageKScaleImageKind(
+            length=self.seq_len_kv,
+            block_size=self.exact_block_size,
+            source_block_size=self.k_block_size,
+            word_offset=0,
+        )
+
+    @property
+    def summary(self) -> _SageKScaleImageKind | None:
+        """Return a proxy plan's summary kind, which follows the K-token chunks."""
+
+        if self.num_summaries == 0:
+            return None
+        return _SageKScaleImageKind(
+            length=self.num_summaries,
+            block_size=self.summary_block_size,
+            source_block_size=self.k_summary_block_size,
+            word_offset=self.exact.words,
+        )
+
+    @property
+    def kinds(self) -> tuple[_SageKScaleImageKind, ...]:
+        """Return the kinds in image order, paired with ``k_scale`` then ``k_summary_scale``."""
+
+        summary = self.summary
+        return (self.exact,) if summary is None else (self.exact, summary)
+
+    @property
+    def sequence_words(self) -> int:
+        """Return the words of one sequence and KV head: K tokens, then summaries."""
+
+        return sum(kind.words for kind in self.kinds)
+
+    def shape(self, num_sequences: int) -> tuple[int, int]:
+        """Return the image shape ``[num_sequences, sequence_words]`` for ``batch * Hkv`` sequences."""
+
+        _validate_i32_address(
+            num_sequences * self.sequence_words,
+            "sage_k_scale_image_words",
+        )
+        return num_sequences, self.sequence_words
+
+
 __all__ = [
     "_PREPARED_ROUTE_IS_FULL_FLAG",
     "_PREPARED_ROUTE_IS_PROXY_FLAG",
     "_BlockSparseRouteLayout",
+    "_SageKScaleImageKind",
+    "_SageKScaleImageLayout",
 ]

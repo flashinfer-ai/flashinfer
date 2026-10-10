@@ -1,0 +1,207 @@
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Prepare the Sage K-scale image of a dense or block-sparse plan.
+
+Sage attention reads ``sfK`` from the ``_SageKScaleImageLayout`` image
+alone: per sequence and KV head, one chunk per 64-token atom holding the
+atom's scale groups in the order the softmax reads them, first for the K
+tokens, then for a proxy plan's block summaries. This kernel writes the image
+from the flat ``k_scale`` and ``k_summary_scale`` tensors ahead of the
+attention launch (and of a block-sparse plan's route prepare); one thread
+writes one 16-byte piece.
+"""
+
+from dataclasses import dataclass
+
+import cutlass
+import cutlass.cute as cute
+from cuda.bindings import driver as cuda_drv
+
+from flashinfer.utils import ceil_div
+
+from ..._block_sparse.prepared import (
+    _SAGE_IMAGE_ATOM_TOKENS,
+    _SAGE_IMAGE_PIECE_WORDS,
+    _SageKScaleImageKind,
+    _SageKScaleImageLayout,
+)
+from ...sage import log2_block_size
+from .fmha_decode_resources.sage_scales import load_flat_scale
+
+_THREADS_PER_CTA = 128
+
+
+@dataclass
+class _KindSource:
+    """One route kind's chunk geometry and source scales, as a piece writer reads them.
+
+    The dataclass is not frozen because the writer selects one of the two
+    kinds inside a traced branch, where the DSL rebuilds a frozen dataclass as
+    a proxy.
+    """
+
+    # Pieces of one atom's chunk.
+    chunk_pieces: cutlass.Int32
+    # Tokens from one scale group's token to the next group's.
+    group_tokens: cutlass.Int32
+    # Words of a chunk that hold scales; the rest are zero padding.
+    used_words: cutlass.Int32
+    # log2 of the source tensor's block size.
+    log2_block: cutlass.Int32
+    # Base address and per-head slot count of the flat source tensor.
+    scale_addr: cutlass.Int64
+    head_stride: cutlass.Int32
+    # Tokens of the kind: K tokens, or block summaries.
+    length: cutlass.Int32
+
+    @staticmethod
+    def create(kind: _SageKScaleImageKind, scales: cute.Tensor) -> "_KindSource":
+        return _KindSource(
+            chunk_pieces=cutlass.Int32(kind.chunk_words // _SAGE_IMAGE_PIECE_WORDS),
+            group_tokens=cutlass.Int32(kind.group_tokens),
+            used_words=cutlass.Int32(kind.used_words),
+            log2_block=cutlass.Int32(log2_block_size(kind.source_block_size)),
+            scale_addr=scales.iterator.toint(),
+            head_stride=cutlass.Int32(scales.shape[1]),
+            length=cutlass.Int32(kind.length),
+        )
+
+
+@cute.jit
+def _write_image_piece(
+    k_scale: cute.Tensor,
+    k_summary_scale: cute.Tensor | None,
+    k_scale_image: cute.Tensor,
+    piece_idx: cutlass.Int32,
+    image: cutlass.Constexpr[_SageKScaleImageLayout],
+    num_kv_heads: cutlass.Constexpr[int],
+) -> None:
+    """Write 16-byte piece ``piece_idx`` of the image: four words of one atom's chunk.
+
+    The piece lies in sequence ``b * Hkv + h`` of the image, in the chunks of
+    the kind its position selects: the K tokens from ``k_scale``, or the
+    block summaries from ``k_summary_scale`` past the sequence's K-token
+    chunks. Word ``w`` of a chunk is the kind's scale of the atom's token ``w
+    * group_tokens``; a token past the kind's length takes the last scale,
+    and padding words are zero.
+    """
+
+    sequence_pieces = image.sequence_words // _SAGE_IMAGE_PIECE_WORDS
+    sequence_idx = piece_idx // cutlass.Int32(sequence_pieces)
+    piece_in_sequence = piece_idx - sequence_idx * cutlass.Int32(sequence_pieces)
+    batch_idx = sequence_idx // cutlass.Int32(num_kv_heads)
+    head_idx = sequence_idx - batch_idx * cutlass.Int32(num_kv_heads)
+
+    kind = _KindSource.create(image.exact, k_scale)
+    piece_in_kind = piece_in_sequence
+    if cutlass.const_expr(image.summary is not None):
+        summary_first_piece = image.summary.word_offset // _SAGE_IMAGE_PIECE_WORDS
+        if piece_in_sequence >= cutlass.Int32(summary_first_piece):
+            kind = _KindSource.create(image.summary, k_summary_scale)
+            piece_in_kind = piece_in_sequence - cutlass.Int32(summary_first_piece)
+    atom_idx = piece_in_kind // kind.chunk_pieces
+    first_word = (piece_in_kind - atom_idx * kind.chunk_pieces) * cutlass.Int32(
+        _SAGE_IMAGE_PIECE_WORDS
+    )
+
+    words = cutlass.Array(
+        cutlass.Float32, _SAGE_IMAGE_PIECE_WORDS, space=cutlass.AddressSpace.rmem
+    )
+    for elem in cutlass.range_constexpr(_SAGE_IMAGE_PIECE_WORDS):
+        word = first_word + cutlass.Int32(elem)
+        words[elem] = cutlass.Float32(0.0)
+        # Only a one-group chunk pads, and it is a single piece.
+        if word < kind.used_words:
+            words[elem] = load_flat_scale(
+                kind.scale_addr,
+                kind.head_stride,
+                head_idx=head_idx,
+                batch_idx=batch_idx,
+                seq_len=kind.length,
+                token_idx=atom_idx * cutlass.Int32(_SAGE_IMAGE_ATOM_TOKENS)
+                + word * kind.group_tokens,
+                log2_block=kind.log2_block,
+            )
+    piece_ptr = cutlass.inttoptr(
+        k_scale_image.iterator.toint()
+        + cutlass.Int64(piece_idx) * cutlass.Int64(_SAGE_IMAGE_PIECE_WORDS * 4),
+        mem_space=1,
+        dtype=cutlass.Float32,
+    )
+    piece_ptr.store(
+        words.data_ptr().load(count=_SAGE_IMAGE_PIECE_WORDS, alignment=4),
+        alignment=_SAGE_IMAGE_PIECE_WORDS * 4,
+    )
+
+
+class _PrepareSageKScaleImage:
+    """Write a Sage plan's ``sfK`` image from its flat scale tensors.
+
+    The image covers ``batch_size * num_kv_heads`` sequences; the grid gives
+    each of its 16-byte pieces one thread. The kernel is an ordinary launch
+    on the plan's stream: a block-sparse plan's route prepare and the
+    attention launch follow it in stream order.
+    """
+
+    def __init__(
+        self,
+        *,
+        image: _SageKScaleImageLayout,
+        batch_size: int,
+        num_kv_heads: int,
+    ) -> None:
+        self.image = image
+        self.num_kv_heads = num_kv_heads
+        num_sequences, sequence_words = image.shape(batch_size * num_kv_heads)
+        self.num_pieces = num_sequences * sequence_words // _SAGE_IMAGE_PIECE_WORDS
+
+    @cute.jit
+    def __call__(
+        self,
+        k_scale: cute.Tensor,
+        k_summary_scale: cute.Tensor | None,
+        k_scale_image: cute.Tensor,
+        stream: cuda_drv.CUstream,
+    ) -> None:
+        self.kernel(k_scale, k_summary_scale, k_scale_image).launch(
+            grid=[ceil_div(self.num_pieces, _THREADS_PER_CTA), 1, 1],
+            block=[_THREADS_PER_CTA, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        k_scale: cute.Tensor,
+        k_summary_scale: cute.Tensor | None,
+        k_scale_image: cute.Tensor,
+    ) -> None:
+        """Write this thread's piece of the image, if any."""
+
+        thread_idx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        piece_idx = block_idx * cutlass.Int32(_THREADS_PER_CTA) + thread_idx
+        if piece_idx < cutlass.Int32(self.num_pieces):
+            _write_image_piece(
+                k_scale,
+                k_summary_scale,
+                k_scale_image,
+                piece_idx,
+                self.image,
+                self.num_kv_heads,
+            )
+
+
+__all__ = ["_PrepareSageKScaleImage"]

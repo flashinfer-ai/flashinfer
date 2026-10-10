@@ -29,6 +29,7 @@ import cutlass.utils as utils
 from cutlass import BFloat16, Float16, Float32, Float4E2M1FN, Float8E4M3FN, Int8
 
 from ...sage import SAGE_K_BLOCK_SIZES, is_power_of_two
+from ..._block_sparse.prepared import _SageKScaleImageLayout
 from ..._block_sparse.common import (
     _block_sparse_kv_atom_size,
     _block_sparse_proxy_summary_geometry,
@@ -2480,6 +2481,41 @@ class FmhaDecodeConfig:
     def softmax_num_warps(self, inst_id: int) -> int:
         """Return the warps of one softmax instance."""
         return self.softmax0_num_warps if inst_id == 0 else self.softmax1_num_warps
+
+    def sage_k_scale_block_size(self, proxy: bool = False) -> int:
+        """Return the K block size of the ``sfK`` words one route kind reads.
+
+        A plan's route kinds read one geometry wherever both read words in
+        the P pass: the finer of the K and summary block sizes, and the
+        prepared image repeats the coarser kind's scales
+        (``_SageKScaleImageLayout``). A P loop per kind would cost more than
+        the repeated words: its second copy of the loop spills the softmax
+        warps' registers. One-token summary scales are the exception: the
+        max pass dequantizes a proxy route's scores, so the P pass reads
+        exact words only and each kind keeps its own block size.
+        """
+        if not self.use_block_sparse_proxy_routes:
+            return self.sage_k_block_size
+        if self.sage_k_summary_block_size == 1:
+            return 1 if proxy else self.sage_k_block_size
+        return min(self.sage_k_block_size, self.sage_k_summary_block_size)
+
+    def sage_k_scale_image(self, seq_len_kv: int) -> _SageKScaleImageLayout:
+        """Return the layout of a Sage plan's prepared ``sfK`` image."""
+        assert self.use_sage_attention
+        num_summaries = 0
+        if self.use_block_sparse_proxy_routes:
+            num_summaries, _ = _block_sparse_proxy_summary_geometry(
+                seq_len_kv, self.kv_block_size
+            )
+        return _SageKScaleImageLayout(
+            seq_len_kv=seq_len_kv,
+            k_block_size=self.sage_k_block_size,
+            num_summaries=num_summaries,
+            k_summary_block_size=self.sage_k_summary_block_size,
+            exact_block_size=self.sage_k_scale_block_size(),
+            summary_block_size=self.sage_k_scale_block_size(proxy=True),
+        )
 
     def sage_k_groups_for_block(self, k_block_size: int) -> int:
         """Return the K scale groups inside one streamed K32 score fragment."""

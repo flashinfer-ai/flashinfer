@@ -105,10 +105,16 @@ class _SageCase:
     # Batch 1 takes Q scales near zero: masked INT8 lanes must still carry no
     # mass when ``sfQ * sfK`` is tiny.
     tiny_q_scales: bool = False
+    # One routing pattern serves every KV head.
+    share_pattern_across_kv_heads: bool = False
 
     @property
     def num_kv_blocks(self) -> int:
         return -(-self.seq_len_kv // self.kv_block_size)
+
+    @property
+    def num_pattern_heads(self) -> int:
+        return 1 if self.share_pattern_across_kv_heads else self.num_kv_heads
 
 
 _KV256 = dict(
@@ -225,7 +231,17 @@ _SPARSE_CASES = (
         routes="proxy",
         persistent=True,
     ),
+    # Summary scales finer than the K scales: both kinds read 4-token words
+    # and the image repeats each K scale; one pattern serves both KV heads.
+    _SageCase(
+        "kv256_proxy_fp8_k16_s4_shared_pattern",
+        **_KV256,
+        sage=SageAttentionConfig(k_block_size=16, k_summary_block_size=4),
+        routes="proxy",
+        share_pattern_across_kv_heads=True,
+    ),
 )
+_CASES_BY_NAME = {case.name: case for case in _DENSE_CASES + _SPARSE_CASES}
 
 
 def _scale_slots(batch_size: int, seq_len: int, block_size: int) -> torch.Tensor:
@@ -295,7 +311,7 @@ def _random_inputs(case: _SageCase):
 
 
 def _random_patterns(case: _SageCase, generator: torch.Generator):
-    """Exact blocks per (batch, KV head, Q row).
+    """Exact blocks per (batch, pattern head, Q row).
 
     Odd rows keep the ragged final block; the first row of an exact case has
     no route, so its output stays zero despite a V mean.
@@ -315,7 +331,7 @@ def _random_patterns(case: _SageCase, generator: torch.Generator):
     return tuple(
         tuple(
             tuple(row(batch_idx, head_idx, row_idx) for row_idx in range(num_rows))
-            for head_idx in range(case.num_kv_heads)
+            for head_idx in range(case.num_pattern_heads)
         )
         for batch_idx in range(case.batch_size)
     )
@@ -367,6 +383,7 @@ def _plan(case: _SageCase, *, max_blocks_per_row: int | None = None):
             use_kv_valid_bits=case.use_token_mask,
             sparse_format=case.sparse_format,
             use_proxy_routes=case.routes == "proxy",
+            share_pattern_across_kv_heads=case.share_pattern_across_kv_heads,
         )
     select_scheduler = sparse_config._select_block_sparse_scheduler
     sparse_config._resolve_block_sparse_launch_spec.cache_clear()
@@ -573,7 +590,7 @@ def _reference(
                 exact_blocks = (
                     range(case.num_kv_blocks)
                     if patterns is None
-                    else patterns[batch_idx][head_idx][row_idx]
+                    else patterns[batch_idx][head_idx % case.num_pattern_heads][row_idx]
                 )
                 streams = {}
                 for stream, source, index in _row_folds(case, exact_blocks):
@@ -662,6 +679,76 @@ def test_sage_matches_dequantized_reference(case: _SageCase) -> None:
 
     torch.manual_seed(20260908)
     _check_case(case, *_random_inputs(case))
+
+
+def _reference_k_scale_image(layout, case: _SageCase, params) -> torch.Tensor:
+    """Build the ``sfK`` image from the flat scales as ``_SageKScaleImageLayout`` describes it.
+
+    Per sequence and KV head, each kind's chunks hold each atom's scale
+    groups in fragment-major order, a token past the kind's length taking
+    its last scale; padding words are zero.
+    """
+
+    image = torch.zeros(
+        (case.batch_size, case.num_kv_heads, layout.sequence_words), device="cuda"
+    )
+    sources = (params.k_scale, params.k_summary_scale)[: len(layout.kinds)]
+    for kind, scales in zip(layout.kinds, sources, strict=True):
+        atoms = torch.arange(kind.atoms, device="cuda")[:, None]
+        words = torch.arange(kind.used_words, device="cuda")
+        tokens = (atoms * 64 + words * kind.group_tokens).clamp(max=kind.length - 1)
+        slots = _scale_slots(case.batch_size, kind.length, kind.source_block_size)
+        columns = kind.word_offset + atoms * kind.chunk_words + words
+        image[:, :, columns] = scales[:, slots[:, tokens]].permute(1, 0, 2, 3)
+    return image.flatten(0, 1)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            _CASES_BY_NAME[name],
+            id=name,
+            marks=(
+                _REQUIRES_INT8_QK_GPU
+                if _CASES_BY_NAME[name].qk_dtype == torch.int8
+                else ()
+            ),
+        )
+        for name in (
+            # Dense plans, one-token and 16-token K scales, two sequences.
+            "kv256_fp8_k1_one_shot",
+            "kv256_fp8_k16_exact_anchors_persistent",
+            # Exact routes; proxy routes with one-token summary scales; both
+            # mixed geometries, one with a shared pattern.
+            "q128_exact_fp8_k16_mean_token_mask",
+            "kv256_proxy_fp8_k16_s1_mean_bitmask",
+            "q128_proxy_int8_k4_s16_persistent",
+            "kv256_proxy_fp8_k16_s4_shared_pattern",
+        )
+    ],
+)
+@torch.no_grad()
+def test_sage_k_scale_image_matches_flat_scales(case: _SageCase) -> None:
+    """The prepared ``sfK`` image holds the flat scales of every kind in the softmax's read order."""
+
+    torch.manual_seed(20260908)
+    q, k, v, params, summaries = _random_inputs(case)
+    patterns = None
+    if case.routes != "dense":
+        patterns = _random_patterns(case, torch.Generator().manual_seed(20260908))
+    valid = _token_mask(case) if case.use_token_mask else None
+    wrapper = _plan(
+        case, max_blocks_per_row=None if patterns is None else _widest_row(patterns)
+    )
+    wrapper.run(q, k, v, sage=params, **_routing(case, patterns, summaries, valid))
+    torch.cuda.synchronize()
+    state = wrapper._plan_state
+    expected = _reference_k_scale_image(state.sage_k_scale_image_layout, case, params)
+    assert state.sage_k_scale_image.shape == expected.shape
+    assert torch.equal(state.sage_k_scale_image, expected)
 
 
 @_REQUIRES_PRIMTS_GPU

@@ -31,7 +31,7 @@ from .common import (
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
-from .prepared import _BlockSparseRouteLayout
+from .prepared import _BlockSparseRouteLayout, _SageKScaleImageLayout
 
 if TYPE_CHECKING:
     from ..kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
@@ -105,6 +105,9 @@ class _BlockSparseLaunchSpec:
     # Whether prepared routes carry K32 score-validity words; the decode
     # config owns this rule and the plan sizes its route storage from it.
     prepares_score_words: bool
+    # A Sage plan's prepared K-scale image, which the plan allocates and the
+    # Sage prepare writes before every attention launch; ``None`` otherwise.
+    sage_k_scale_image: _SageKScaleImageLayout | None = None
 
 
 _CAPACITY_UNSET = object()
@@ -747,6 +750,9 @@ def _resolve_block_sparse_launch_spec(
         policy=tuple(policy_entries),
         compile_key=compile_key,
         prepares_score_words=config.uses_prepared_score_keep_words,
+        sage_k_scale_image=(
+            config.sage_k_scale_image(seq_len_kv) if config.use_sage_attention else None
+        ),
     )
 
 
