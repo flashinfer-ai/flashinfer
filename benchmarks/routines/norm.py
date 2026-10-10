@@ -1115,6 +1115,19 @@ def testLayernormQuant(args):
 
     def run_backend(backend, out_tensor, input_tensor, gamma, beta):
         if backend == "cuda":
+            # Call the CUDA JIT module directly: the public API dispatches to
+            # the CuTe-DSL kernel by default, so both arms can be timed in
+            # one process.
+            flashinfer.norm.get_norm_module().layernorm_quant(
+                out_tensor,
+                input_tensor,
+                gamma,
+                beta,
+                scale,
+                eps,
+            )
+            return out_tensor
+        elif backend == "cute-dsl":
             flashinfer.norm.layernorm_quant(
                 out_tensor,
                 input_tensor,
@@ -1133,17 +1146,23 @@ def testLayernormQuant(args):
         layernorm_output = torch.nn.functional.layer_norm(
             input_tensor.float(), (hidden_size,), weight=gamma, bias=beta, eps=eps
         )
-        # The kernel rounds the normalized value to bf16 before scaling and
-        # casting to fp8; mirror that so 1-ulp fp8 differences do not trip the
-        # tight refcheck tolerance.
-        layernorm_output = layernorm_output.to(input_dtype).float()
-        reference_output = (
-            (layernorm_output / scale)
+        # The CUDA kernel rounds the normalized value to bf16 before scaling
+        # and again before casting to fp8; the CuTe-DSL kernel stays in fp32.
+        # Mirror each so a backend's own rounding does not inflate the
+        # adjacent-fp8-code tie count.
+        cuda_ref = (
+            (layernorm_output.to(input_dtype).float() / scale)
             .to(input_dtype)
             .float()
             .clamp(torch.finfo(out_dtype).min, torch.finfo(out_dtype).max)
             .to(out_dtype)
         )
+        cute_ref = (
+            (layernorm_output / scale)
+            .clamp(torch.finfo(out_dtype).min, torch.finfo(out_dtype).max)
+            .to(out_dtype)
+        )
+        reference_outputs = {"cuda": cuda_ref, "cute-dsl": cute_ref}
         has_reference_output = True
 
     # Storage for timing results and outputs
@@ -1177,7 +1196,9 @@ def testLayernormQuant(args):
                     num_elements,
                     num_different_elements_percentage,
                     num_one_ulp_ties,
-                ) = _fp8_code_stats(reference_output, tested_outputs[i])
+                ) = _fp8_code_stats(
+                    reference_outputs[tested_backends[i]], tested_outputs[i]
+                )
                 if num_one_ulp_ties > 0 and args.verbose >= 1:
                     print(
                         f"[INFO] Backend {tested_backends[i]}: {num_one_ulp_ties}/{num_elements} "
