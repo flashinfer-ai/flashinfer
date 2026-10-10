@@ -33,6 +33,16 @@ _MAX_COMPACT_BLOCKS = 64
 _MAX_DIRECT_TOPK = 32
 _MAX_LONGSEQ_BLOCKS = 192
 _BLK64_ORDINARY_MAX_AVERAGE_SELECTED_BLOCKS = 24
+_BLK64_WS_PROFILE = "blk64_persistent_ws_m64n256"
+_BLK64_BALANCED_PROFILE = "blk64_balanced"
+# The balanced block-64 profile reorders the persistent tile stream on device;
+# it needs at least this many full waves (MB * heads >= waves * SM count).
+_BLK64_BALANCED_MIN_WAVES = 2
+# Per-arch upper bound on the selected blocks per row for the balanced profile.
+# On sm_100a the queue-ordered tile stream loses to the static stripe once rows
+# select more than 64 blocks (k = 96..192 read 0.93..0.99 of the weight-stationary
+# profile); sm_103a gains across the measured band (k = 28..192: 1.06..1.33).
+_BLK64_BALANCED_MAX_SELECTED_BLOCKS = {"sm_100a": 64}
 _FP16_DIRECT_Q_TILE = 256
 
 
@@ -130,6 +140,23 @@ def _shared_bsr(
         # otherwise non-packed BSR rows before making that metadata launchable.
     cols = shared.nonzero(as_tuple=False)[:, 1].to(torch.int32).contiguous()
     return ptr, cols
+
+
+def _blk64_dense_from_q2k(
+    q2k_indices: torch.Tensor, q2k_num: torch.Tensor, *, nb: int
+) -> torch.Tensor:
+    """Dense ``[heads, MB, NB]`` block mask of validated direct block-64 selections."""
+    heads, mb, topk = q2k_indices.shape
+    active = (
+        torch.arange(topk, device=q2k_indices.device) < q2k_num.unsqueeze(-1)
+    ).view(heads * mb, topk)
+    rows = torch.arange(heads * mb, device=q2k_indices.device).unsqueeze(-1)
+    dense = torch.zeros((heads * mb, nb), dtype=torch.bool, device=q2k_indices.device)
+    dense[
+        rows.expand(heads * mb, topk)[active],
+        q2k_indices.view(heads * mb, topk)[active].to(torch.int64),
+    ] = True
+    return dense.view(heads, mb, nb)
 
 
 def _fp16_direct_metadata(
@@ -405,13 +432,42 @@ def plan_cake_vsa(
                 ).item()
             )
         blk64_profile = (
-            "blk64_persistent_ws_m64n256"
+            _BLK64_WS_PROFILE
             if full_kv_groups
             and blk64_selected_blocks_total
             > _BLK64_ORDINARY_MAX_AVERAGE_SELECTED_BLOCKS * row_counts.numel()
             else "blk64_persistent"
         )
     shared_indptr = shared_indices = None
+    balanced_max_blocks = _BLK64_BALANCED_MAX_SELECTED_BLOCKS.get(
+        _arch_for_device(device)
+    )
+    if (
+        blk64_profile == _BLK64_WS_PROFILE
+        and mb * num_qo_heads
+        >= _BLK64_BALANCED_MIN_WAVES * _sm_count(_device_index(device))
+        and (
+            balanced_max_blocks is None
+            or int(row_counts.max().item()) <= balanced_max_blocks
+        )
+    ):
+        # Inside the weight-stationary band (full groups, more than 24 selected
+        # blocks per row on average, at most the per-arch bound), a selection
+        # shared by every head over at least two persistent waves runs the
+        # balanced profile: the same M64N256
+        # datapath with an on-device ticket queue that hands the tiles out in
+        # descending size order.  Host metadata only, so the choice and the
+        # launch below are CUDA-graph safe.
+        blk64_dense = (
+            dense
+            if dense is not None
+            else _blk64_dense_from_q2k(q2k_indices, q2k_num, nb=nb)
+        )
+        if torch.equal(blk64_dense, blk64_dense[:1].expand_as(blk64_dense)):
+            blk64_profile = _BLK64_BALANCED_PROFILE
+            shared_indptr, shared_indices = _shared_bsr(
+                blk64_dense, indptr, indices, trust_bsr=block_mask is None
+            )
     if R != 64 and dense is not None and torch.equal(dense, dense[:1].expand_as(dense)):
         shared_indptr, shared_indices = _shared_bsr(
             dense,
@@ -437,6 +493,20 @@ def plan_cake_vsa(
             num_kv_heads=num_kv_heads,
             device=device,
         )
+    workspace: dict[str, Any] = {}
+    if blk64_profile == _BLK64_BALANCED_PROFILE:
+        # Plan-owned launch workspaces of the balanced profile: the ticket-queue
+        # counters start at zero and are reset on device by every launch; the
+        # order / trace sinks are one-element placeholders (debug_order = 0).
+        workspace["blk64_queue_counters"] = torch.zeros(
+            (4,), dtype=torch.uint32, device=device
+        )
+        workspace["blk64_order_debug"] = torch.zeros(
+            (1,), dtype=torch.int32, device=device
+        )
+        workspace["blk64_trace_out"] = torch.zeros(
+            (1,), dtype=torch.uint32, device=device
+        )
     return {
         "M": M,
         "N": N,
@@ -461,7 +531,7 @@ def plan_cake_vsa(
         "blk64_profile": blk64_profile,
         "blk64_selected_blocks_total": blk64_selected_blocks_total,
         "fp16_direct": fp16_direct,
-        "workspace": {},
+        "workspace": workspace,
     }
 
 
@@ -614,9 +684,47 @@ def _run_blk64(
 ) -> None:
     import tvm_ffi
 
-    module = _module(plan["blk64_profile"], q.device)
+    profile = plan["blk64_profile"]
+    module = _module(profile, q.device)
     total_tiles = plan["mb"] * plan["num_qo_heads"]
     persistent_ctas = min(total_tiles, _sm_count(_device_index(q.device)))
+    if profile == _BLK64_BALANCED_PROFILE:
+        workspace = plan["workspace"]
+        queue_counters = workspace.get("blk64_queue_counters")
+        order_debug = workspace.get("blk64_order_debug")
+        trace_out = workspace.get("blk64_trace_out")
+        if (
+            plan["indptr"] is None
+            or plan["indices"] is None
+            or queue_counters is None
+            or order_debug is None
+            or trace_out is None
+        ):
+            raise RuntimeError("the Cake balanced blk64 route was not planned")
+        with tvm_ffi.use_torch_stream():
+            module.run(
+                q,
+                k,
+                v,
+                out,
+                stats,
+                plan["indptr"],
+                plan["indices"],
+                queue_counters,
+                order_debug,
+                trace_out,
+                plan["M"],
+                plan["mb"],
+                total_tiles,
+                plan["num_qo_heads"],
+                _softmax_scale_log2(plan),
+                int(return_lse),
+                0,
+                persistent_ctas,
+                1,
+                1,
+            )
+        return
     tiles_per_cta = (total_tiles + persistent_ctas - 1) // persistent_ctas
     with tvm_ffi.use_torch_stream():
         module.run(
