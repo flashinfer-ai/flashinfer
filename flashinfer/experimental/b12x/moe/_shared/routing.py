@@ -48,6 +48,8 @@ def _route_topk_kernel(
         scores = tl.sqrt(
             tl.maximum(logits, 0.0) + libdevice.log1p(tl.exp(-tl.abs(logits)))
         )
+    elif SCORE_FUNC == "sigmoid":
+        scores = tl.sigmoid(logits)
     elif HAS_CORRECTION_BIAS or HAS_IMAGE_BIAS:
         exp_logits = tl.exp(logits - tl.max(logits, axis=0))
         scores = exp_logits / tl.sum(exp_logits, axis=0)
@@ -83,9 +85,9 @@ def _route_topk_kernel(
         remaining = tl.where(eligible, remaining, neg_inf)
 
     topk_logits = tl.gather(logits, topk_ids, axis=0)
-    if SCORE_FUNC == "sqrtsoftplus":
+    if SCORE_FUNC == "sqrtsoftplus" or SCORE_FUNC == "sigmoid":
         topk_weights = tl.where(topk_mask, tl.gather(scores, topk_ids, axis=0), 0.0)
-        if RENORMALIZE and TOP_K > 1:
+        if RENORMALIZE and (TOP_K > 1 or SCORE_FUNC == "sigmoid"):
             topk_weights /= tl.sum(topk_weights, axis=0) + 1e-20
     elif RENORMALIZE:
         masked_logits = tl.where(topk_mask, topk_logits, neg_inf)
@@ -125,7 +127,7 @@ def route_topk(
     """Select experts into caller-owned buffers, breaking ties by larger expert ID.
 
     Correction tensors steer selection but do not alter selected logits. The
-    selected softmax or sqrt-softplus weights receive the scale last.
+    Selected softmax, sigmoid, or sqrt-softplus weights receive the scale last.
     """
     if router_logits.ndim != 2:
         raise ValueError(
@@ -236,7 +238,7 @@ def _validate_score_options(
     image_correction_bias: torch.Tensor | None,
     image_mask: torch.Tensor | None,
 ) -> None:
-    if score_func not in ("softmax", "sqrtsoftplus"):
+    if score_func not in ("softmax", "sqrtsoftplus", "sigmoid"):
         raise ValueError(f"unsupported router score_func: {score_func!r}")
     for name, bias in (
         ("correction_bias", correction_bias),

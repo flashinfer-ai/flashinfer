@@ -10,6 +10,83 @@ import torch
 from b12x.moe._shared import routing
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("top_k,renormalize", [(1, True), (8, True), (8, False)])
+def test_sigmoid_fp32_router_selection_and_weights(top_k, renormalize):
+    from b12x.moe import fused_moe
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    logits = torch.randn((65, 288), device="cuda", dtype=torch.float32) * 3
+    bias = torch.linspace(-0.5, 0.5, 288, device="cuda")
+    selected = torch.empty((65, top_k), device="cuda")
+    ids = torch.empty((65, top_k), device="cuda", dtype=torch.int32)
+    weights = torch.empty_like(selected)
+    plan = fused_moe.plan_route_topk(
+        fused_moe.RouteTopKInvocation(
+            num_tokens=65,
+            num_experts=288,
+            top_k=top_k,
+            logits_dtype="float32",
+            score_func="sigmoid",
+            renormalize=renormalize,
+            has_correction_bias=True,
+            routed_scaling_factor=2.5,
+        )
+    )
+    with PreparationSession(
+        device="cuda:0", autotune=False, compile_workers=0
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="sigmoid",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.run(
+                            logits, selected, ids, weights, correction_bias=bias
+                        )
+                    ),
+                ),
+            )
+        )
+        run = torch.compile(
+            lambda: fused_moe.route_topk(
+                plan, logits, selected, ids, weights, correction_bias=bias
+            ),
+            fullgraph=True,
+        )
+        run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            run()
+        session.freeze()
+        for offset in (-2.0, 2.0):
+            logits.add_(offset)
+            logits[0].fill_(-1000)
+            graph.replay()
+            torch.cuda.synchronize()
+            scores = logits.sigmoid()
+            choice = scores + bias
+            expected_ids = (
+                287
+                - choice.flip(-1).argsort(dim=-1, descending=True, stable=True)[
+                    :, :top_k
+                ]
+            )
+            expected_weights = scores.gather(1, expected_ids)
+            if renormalize:
+                expected_weights /= expected_weights.sum(-1, keepdim=True) + 1e-20
+            expected_weights *= 2.5
+            torch.testing.assert_close(
+                ids, expected_ids.to(torch.int32), rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                selected, logits.gather(1, expected_ids), rtol=0, atol=0
+            )
+            torch.testing.assert_close(weights, expected_weights, rtol=2e-6, atol=1e-7)
+        graph.reset()
+
+
 @dataclass(frozen=True)
 class _TensorMetadata:
     shape: tuple[int, ...]
@@ -37,7 +114,7 @@ class _CompiledLauncher:
         return run
 
 
-@pytest.mark.parametrize("score_func", ["softmax", "sqrtsoftplus"])
+@pytest.mark.parametrize("score_func", ["softmax", "sqrtsoftplus", "sigmoid"])
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_prepared_route_uses_complete_positional_abi(score_func, with_bias):
     logits = _TensorMetadata((7, 384), torch.bfloat16, (400, 1))
@@ -124,7 +201,7 @@ def test_unprepared_route_preserves_jit_arguments(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("compile_workers", [0, 2])
-@pytest.mark.parametrize("score_func", ["softmax", "sqrtsoftplus"])
+@pytest.mark.parametrize("score_func", ["softmax", "sqrtsoftplus", "sigmoid"])
 @pytest.mark.parametrize("compile_forward", [False, True])
 def test_public_prepared_route_graph_replays_inputs_and_modality(
     compile_workers,
@@ -232,6 +309,8 @@ def test_public_prepared_route_graph_replays_inputs_and_modality(
                 scores = (
                     values.float().softmax(-1)
                     if score_func == "softmax"
+                    else values.float().sigmoid()
+                    if score_func == "sigmoid"
                     else torch.nn.functional.softplus(values.float()).sqrt()
                 )
                 selection = scores + torch.where(
@@ -249,7 +328,7 @@ def test_public_prepared_route_graph_replays_inputs_and_modality(
                     if score_func == "softmax"
                     else scores.gather(1, expected_ids)
                 )
-                if score_func == "sqrtsoftplus":
+                if score_func in ("sqrtsoftplus", "sigmoid"):
                     expected_weights /= expected_weights.sum(1, keepdim=True) + 1e-20
                 expected_weights *= 1.5
                 assert torch.equal(ids.cpu(), expected_ids.int())

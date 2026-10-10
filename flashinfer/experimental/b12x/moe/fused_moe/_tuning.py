@@ -776,7 +776,7 @@ def _validate_route_query(query: MoeRouteQuery, _device) -> None:
         raise ValueError("native route preparation supports top-k within 1024 experts")
     if query.logits_dtype not in {"float16", "bfloat16", "float32"}:
         raise TypeError("router logits must be float16, bfloat16, or float32")
-    if query.score_func not in {"softmax", "sqrtsoftplus"}:
+    if query.score_func not in {"softmax", "sqrtsoftplus", "sigmoid"}:
         raise ValueError("unsupported router score function")
     if query.has_image_correction_bias != query.has_image_mask:
         raise ValueError(
