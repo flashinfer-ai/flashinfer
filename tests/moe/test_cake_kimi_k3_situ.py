@@ -64,6 +64,9 @@ LARGE_TOKENS = (8192, 16384)
 # SM count of the B200 and B300 parts the FC2 pools were sized on.
 REFERENCE_SM_COUNT = 148
 
+# Architectures whose single-token route is the fused quantization + routing
+# FC1 (three kernels); the others run the separate quantization + router kernel.
+FUSED_M1_ARCHES = ("sm_103a",)
 # Token counts with a route of their own; every other count runs the generic
 # pipeline of its tile-N bucket (8 / 16 / 32 / 128).
 ROUTED = {
@@ -93,6 +96,7 @@ GENERIC_STAGES = [
 ]
 STAGES_BY_SELECTOR = {
     "m1": ["quant_route", "fc1", "fc2", "finalize"],
+    "m1_s2a": ["fc1", "fc2", "finalize"],
     "n8_feature": ["quant_route", "fc1", "fc2", "finalize"],
     "n8_w2a_m16": ["quant_route", "fc1", "fc2", "finalize"],
     "m64_claim8": ["quant", "fused_router", "fc1", "fc2", "finalize"],
@@ -112,7 +116,9 @@ def _tile_bucket(num_tokens):
     return 128
 
 
-def _expected_selector(num_tokens):
+def _expected_selector(arch, num_tokens):
+    if num_tokens == 1 and arch in FUSED_M1_ARCHES:
+        return "m1_s2a"
     return ROUTED.get(num_tokens, _tile_bucket(num_tokens))
 
 
@@ -208,7 +214,7 @@ def test_cake_situ_route_table(arch):
     # and the documented FC2 device-workfeed pool.
     for num_tokens in range(1, 16385):
         selector = _selector(arch, num_tokens)
-        assert selector == _expected_selector(num_tokens), num_tokens
+        assert selector == _expected_selector(arch, num_tokens), num_tokens
         stages, kernels = _route(arch, num_tokens)
         assert stages == STAGES_BY_SELECTOR.get(selector, GENERIC_STAGES), num_tokens
         assert list(kernels) == stages
@@ -522,7 +528,7 @@ def _options(x, ids, route_weights, output, weights, workspace):
 def _check_prepared_shape(prepared, arch, num_tokens, device):
     # The prepared shape binds the documented route: its selector, stage list,
     # the registered program of every stage and the FC2 device-workfeed pool.
-    selector = _expected_selector(num_tokens)
+    selector = _expected_selector(arch, num_tokens)
     stages, kernels = _route(arch, num_tokens)
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     assert prepared["selector"] == selector
@@ -667,6 +673,31 @@ def test_cake_situ_every_route_eager_and_external_graph(
         )
         assert bindings["fused_router"]["grid"] == (_ROUTE_MC_CLUSTER, 1, 1)
         assert bindings["fused_router"]["fc2_pool_ctas"] == 196
+    if num_tokens == 1:
+        # The single-token route quantizes and routes inside the FC1 prologue on
+        # the fused architectures (three launches; the FC1 binding carries the
+        # activations, the activation scale and the expert ids) and through the
+        # separate quantization + router kernel elsewhere (four launches).
+        options = _options(x, ids, route_weights, output, weights, workspace)
+        bindings = _cake_situ_stage_bindings(options, prepared)
+        fused = arch in FUSED_M1_ARCHES
+        assert prepared["selector"] == ("m1_s2a" if fused else "m1")
+        assert list(bindings) == STAGES_BY_SELECTOR[prepared["selector"]]
+        assert ("x" in bindings["fc1"]) == fused
+        if fused:
+            assert bindings["fc1"]["x"].data_ptr() == x.data_ptr()
+            assert bindings["fc1"]["topk_ids"].data_ptr() == ids.data_ptr()
+            assert (
+                bindings["fc1"]["qx"].data_ptr()
+                == options["quant_scales"][0].data_ptr()
+            )
+            assert bindings["fc1"]["grid"] == (
+                INTERMEDIATE // 64,
+                prepared["max_tiles"],
+                1,
+            )
+        else:
+            assert bindings["quant_route"]["x"] is x
 
     expected = _trtllm_reference(x, ids, route_weights, weights)
     # Ensure an all-zero output could not satisfy the FP4 absolute tolerance.
