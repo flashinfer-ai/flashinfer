@@ -257,26 +257,6 @@ class TrtllmDaBodyCaptureStream:
 
 
 @functools.cache
-def _device_support_moe_pdl(device: torch.device) -> bool:
-    """PDL gate for the trtllm-gen fused-MoE pipeline.
-
-    On SM107 (Rubin), PDL in this pipeline intermittently fails with
-    "unspecified launch failure" and occasional hangs. A/B stress runs on Rubin
-    hardware isolated the trigger: with PDL enabled the renormalize-routing
-    tests crash across routing modes (split-topK on/off), dtypes
-    (BF16/MxFP4/MxInt4) and autotune on/off -- 4 crashes in ~21 full-file runs
-    -- while the same loop with PDL fully disabled ran clean.
-
-    Disable PDL here until the launch-dependency chain is audited for Rubin
-    timing. The CUTLASS MoE path is deliberately left alone: it has soaked with
-    PDL enabled on Rubin for 9+ nights without a crash.
-    """
-    if get_compute_capability(device) == (10, 7):
-        return False
-    return device_support_pdl(device)
-
-
-@functools.cache
 def _get_trtllm_da_body_capture_stream(
     device_index: int,
 ) -> TrtllmDaBodyCaptureStream:
@@ -2110,8 +2090,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
-        if not _device_support_moe_pdl(hidden_states.device):
-            enable_pdl = False
 
         tuner = AutoTuner.get()
         num_tokens = hidden_states.shape[0]
@@ -2389,8 +2367,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
-        if not _device_support_moe_pdl(hidden_states.device):
-            enable_pdl = False
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
 
@@ -2641,8 +2617,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
-        if not _device_support_moe_pdl(hidden_states.device):
-            enable_pdl = False
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
 
@@ -3129,8 +3103,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
-        if not _device_support_moe_pdl(hidden_states.device):
-            enable_pdl = False
 
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
@@ -3573,8 +3545,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
-        if not _device_support_moe_pdl(hidden_states.device):
-            enable_pdl = False
         if output is None:
             output = _alloc_trtllm_moe_output(
                 num_tokens, output_width, do_finalize, hidden_states.device
@@ -3940,8 +3910,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
-        if not _device_support_moe_pdl(hidden_states.device):
-            enable_pdl = False
         if output is None:
             output = _alloc_trtllm_moe_output(
                 num_tokens, output_width, do_finalize, hidden_states.device
