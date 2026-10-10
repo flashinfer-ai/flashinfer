@@ -76,15 +76,16 @@ def gen_moe_utils_module() -> JitSpec:
 
     # SM107 (Rubin) must be built for the sm100f family target: no public CUDA
     # toolkit (13.0 or 13.2) accepts ``compute_107a``, so without this mapping
-    # nvcc aborts with "Unsupported gpu architecture 'compute_107a'". Every other
-    # MoE JitSpec already opts in; this one was missed. Because these flags are
-    # passed as ``extra_cuda_cflags`` they override the correctly-mapped global
-    # flags, so omitting it here is not merely redundant -- it breaks the build.
-    # SM90 is included for the Hopper CuTe-DSL MoE path: every kernel in this
-    # module only requires __CUDA_ARCH__ >= 900 (PDL guards), and moe_sort's
-    # routing kernels are documented as SM90+ (grid-sync).
+    # nvcc aborts with "Unsupported gpu architecture 'compute_107a'". These flags
+    # are passed as ``extra_cuda_cflags`` and override the global flags, so the
+    # mapping must be requested here.
+    # Built for every grouped_mm architecture (SM80 to SM121), where the cuDNN
+    # grouped-GEMM MoE runners sort, permute, activate and finalize with these kernels.
+    # Their SM90+ instructions (PDL) sit behind __CUDA_ARCH__ >= 900, and
+    # moe_sort launches its cluster and cooperative routing kernels only on SM90+
+    # devices, using the block and multi-kernel routing paths below that.
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10], map_sm107_to_100f=True
+        supported_major_versions=[8, 9, 10, 11, 12], map_sm107_to_100f=True
     )
 
     return gen_jit_spec(

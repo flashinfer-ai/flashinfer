@@ -856,6 +856,22 @@ def gen_all_modules(
             jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm100a"))
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
+        # For cuDNN grouped_mm unified MoE API
+        if any(
+            (
+                has_sm80,
+                has_sm90,
+                has_sm100,
+                has_sm100f,
+                has_sm103,
+                has_sm107,
+                has_sm110,
+                has_sm120,
+                has_sm120f,
+                has_sm121,
+            )
+        ):
+            jit_specs.append(gen_moe_utils_module())
         if has_cake_megamoe_topk_reduce_sm100a:
             jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_100a"))
         if has_cake_megamoe_topk_reduce_sm103a:
@@ -908,7 +924,6 @@ def gen_all_modules(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=True)
             )
             jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
-            jit_specs.append(gen_moe_utils_module())
         if has_sm100a_exact or has_sm103a_exact:
             jit_specs.append(gen_alphamoe_fused_router_module())
         if has_sm100 or has_sm103:

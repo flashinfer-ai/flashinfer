@@ -50,7 +50,7 @@ from flashinfer.fused_moe.api import (
     ALL_BACKEND_CONFIGS,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
-from flashinfer.fused_moe.runners import _MOE_UTILS_ARCHS, MoERunner
+from flashinfer.fused_moe.runners import MoERunner
 from flashinfer.grouped_mm.core import (
     _check_grouped_mm_bf16,
     _check_grouped_mm_fp4,
@@ -67,20 +67,15 @@ from flashinfer.utils import get_compute_capability
 
 from .utils import compute_reference_moe, fp8_per_tensor_global_scale
 
-# SwiGLU with default scalars, the fused silu_and_mul kernel.
-_ACTIVATIONS = (SwiGLU(),)
+# The activations with a moe_activation kernel (SwiGLU with default scalars).
+_ACTIVATIONS = (SwiGLU(), GeGLU(), GELU(), ReLU(), SiLU(), Identity())
 # Everything else the unified API can express is rejected by check_support.
 _UNSUPPORTED_ACTIVATIONS = (
     SwiGLU(alpha=1.7, beta=0.25, limit=6.0),
-    GeGLU(),
     GeGLUTanh(),
     SwiGLUStep(),
     SiTU(),
     ReLU2(),
-    Identity(),
-    GELU(),
-    ReLU(),
-    SiLU(),
 )
 _BF16_KEY = "cudnn_grouped_gemm_bf16"
 _FP8_KEY = "cudnn_grouped_gemm_fp8_per_tensor"
@@ -234,10 +229,6 @@ cudnn_nvfp4_required = pytest.mark.skipif(
         else "requires cuDNN >= 9.21 with moe_grouped_matmul on a grouped_mm_fp4 arch"
     ),
 )
-moe_utils_required = pytest.mark.skipif(
-    _device_arch() not in _MOE_UTILS_ARCHS,
-    reason="the moe_utils kernels sort, permute and finalize on SM90/SM100/SM103/SM107",
-)
 _REQUIRED = {
     _BF16_KEY: cudnn_bf16_required,
     _FP8_KEY: cudnn_fp8_required,
@@ -253,9 +244,15 @@ _FAMILY_ACTIVATION_PARAMS = tuple(
     for key in _FAMILY_KEYS
     for activation in _FAMILIES[key].activations
 )
-_PERMUTE_PATHS = (
-    pytest.param(True, marks=moe_utils_required, id="moe_utils"),
-    pytest.param(False, id="torch"),
+# Token counts at the edges of moe_sort's routing kernels: block (<= 4 tokens),
+# dynamic block (<= 16), single cluster (<= 8192, SM90+) and cooperative (SM90+);
+# before SM90 everything above the dynamic-block limit takes the multi-kernel path.
+_ROUTING_TIER_TOKENS = (
+    pytest.param(1, id="block-1"),
+    pytest.param(4, id="block-4"),
+    pytest.param(16, id="dyn_block-16"),
+    pytest.param(300, id="cluster_or_multi_kernel-300"),
+    pytest.param(8193, id="coop_or_multi_kernel-8193"),
 )
 
 
@@ -274,11 +271,6 @@ def _config(
     )
     values.update(overrides)
     return MoEConfig(**values)
-
-
-def _swap_halves(w1: torch.Tensor, intermediate_size: int) -> torch.Tensor:
-    """``[up, gate]`` <-> ``[gate, up]`` fc1 row order (the views store ``[gate, up]``)."""
-    return torch.cat((w1[:, intermediate_size:], w1[:, :intermediate_size]), dim=1)
 
 
 def _experts(num_experts, hidden_size, intermediate_size, activation, device):
@@ -376,22 +368,20 @@ def test_cudnn_runner_capability_declarations():
                 assert not runner_cls.supports_quant(other.quant)
 
 
-def _detached_runner(key: str, config: MoEConfig, *, use_moe_utils: bool = True):
+def _detached_runner(key: str, config: MoEConfig):
     """A runner object for ``_check_support`` without a device."""
     runner_cls = _RUNNERS[key]
     runner = runner_cls.__new__(runner_cls)
     runner.config = config
     runner._device_arch = 100
-    runner._use_moe_utils = use_moe_utils
     return runner
 
 
 def test_cudnn_check_support_rejects_unsupported_options():
     if _cudnn_moe_available():
-        # Finalize runs on every arch: torch ops where the moe_utils kernels are missing.
         for key in _FAMILY_KEYS:
             _detached_runner(
-                key, _config(key, finalize=MoEFinalizeConfig()), use_moe_utils=False
+                key, _config(key, finalize=MoEFinalizeConfig())
             )._check_support()
     with pytest.raises(NotImplementedError, match="does not support PDL"):
         _detached_runner(
@@ -411,6 +401,10 @@ def test_cudnn_check_support_rejects_unsupported_options():
                     key, _config(key, experts=ExpertConfig(intermediate_size=96))
                 )._check_support()
     for key in _FAMILY_KEYS:
+        with pytest.raises(NotImplementedError, match="intermediate_size divisible"):
+            _detached_runner(
+                key, _config(key, experts=ExpertConfig(intermediate_size=100))
+            )._check_support()
         quant = _FAMILIES[key].quant
         with pytest.raises(NotImplementedError, match="per_token_scale"):
             _detached_runner(
@@ -482,9 +476,8 @@ def test_cudnn_block_scale_check_support_requires_cudnn_9_22_on_sm12x(monkeypatc
 
 
 @pytest.mark.skipif(not _cudnn_moe_available(), reason="requires cuDNN >= 9.21")
-def test_cudnn_check_support_requires_triton(monkeypatch):
-    """Without Triton the activation kernel is missing: the backend is rejected at
-    selection instead of failing in build."""
+def test_cudnn_check_support_does_not_need_triton(monkeypatch):
+    """Every kernel of the pipeline is cuDNN or moe_utils: no Triton required."""
     import importlib.util
 
     find_spec = importlib.util.find_spec
@@ -496,23 +489,22 @@ def test_cudnn_check_support_requires_triton(monkeypatch):
         ),
     )
     for key in _FAMILY_KEYS:
-        with pytest.raises(RuntimeError, match="requires Triton"):
-            _detached_runner(key, _config(key))._check_support()
+        _detached_runner(key, _config(key))._check_support()
 
 
-def test_cudnn_build_falls_back_to_torch_when_moe_utils_fail_to_load(monkeypatch):
-    """Any failure to load the moe_utils kernels (e.g. a missing downloaded header)
-    leaves the torch permute and finalize path in use."""
+@cudnn_bf16_required
+def test_cudnn_backend_is_rejected_when_moe_utils_fails_to_load(monkeypatch):
+    """A moe_utils build or load failure rejects the backend during selection
+    instead of aborting the layer."""
     import flashinfer.fused_moe.cute_dsl.moe_utils as moe_utils
 
     def unavailable():
-        raise AssertionError("trtllmGen_bmm_export header not found")
+        raise RuntimeError("Ninja build failed.")
 
     monkeypatch.setattr(moe_utils, "_get_moe_utils_module", unavailable)
-    runner = _detached_runner(_BF16_KEY, _config(_BF16_KEY), use_moe_utils=True)
-    with pytest.warns(UserWarning, match="moe_utils kernels are unavailable"):
-        runner._build()
-    assert runner._use_moe_utils is False
+    with pytest.raises(RuntimeError, match="rejected this configuration") as info:
+        MoELayer(_config(_BF16_KEY), torch.device("cuda"))
+    assert "CudnnGroupedGemmBf16Runner: Ninja build failed." in str(info.value)
 
 
 @pytest.mark.parametrize("key", _FAMILY_KEYS)
@@ -715,10 +707,7 @@ def _make_case(
         # The reference sees what the runner sees: the dequantized local shard
         # (non-local experts carry zero routing weight).
         w1_ref, w2_ref = w1.clone(), w2.clone()
-        fc1 = _dequant_experts(family, view, "fc1")
-        w1_ref[offset : offset + count] = (
-            _swap_halves(fc1, intermediate_size) if activation.is_gated else fc1
-        )
+        w1_ref[offset : offset + count] = _dequant_experts(family, view, "fc1")
         w2_ref[offset : offset + count] = _dequant_experts(family, view, "fc2")
     else:
         weights, w1_ref, w2_ref = shared.weights, shared.w1_ref, shared.w2_ref
@@ -795,9 +784,7 @@ def _assert_matches_reference(actual: torch.Tensor, case: _Case) -> None:
     assert cosine.item() > 0.98, f"cosine similarity {cosine.item():.4f}"
 
 
-def _layer(
-    case: _Case, *, finalize: bool = False, use_moe_utils: Optional[bool] = None
-):
+def _layer(case: _Case, *, finalize: bool = False):
     config = case.config
     if finalize:
         config = dataclasses.replace(
@@ -805,8 +792,6 @@ def _layer(
         )
     layer = MoELayer(config, torch.device("cuda"))
     assert [r.backend_key for r in layer.runners] == [case.family.key]
-    if use_moe_utils is not None:
-        layer.runners[0]._use_moe_utils = use_moe_utils
     return layer
 
 
@@ -865,7 +850,7 @@ def _shape_id(shape) -> str:
 @pytest.mark.parametrize("key, activation", _FAMILY_ACTIVATION_PARAMS)
 @pytest.mark.parametrize("shape", _SHAPES, ids=_shape_id)
 def test_cudnn_problem_sizes(key, activation, shape):
-    """Every family and fused activation over the shape matrix, against the reference."""
+    """Every family and activation over the shape matrix, against the reference."""
     family = _FAMILIES[key]
     torch.manual_seed(hash(shape) % 2**31)
     case = _make_case(family, *shape, activation)
@@ -966,20 +951,21 @@ def test_cudnn_expert_parallel_shard(key, local):
 
 
 @pytest.mark.parametrize("key", _FAMILY_PARAMS)
-@pytest.mark.parametrize("use_moe_utils", _PERMUTE_PATHS)
-def test_cudnn_permute_paths_match_reference(key, use_moe_utils):
-    """The kernel and torch permute paths both reproduce the reference."""
+@pytest.mark.parametrize("num_tokens", _ROUTING_TIER_TOKENS)
+def test_cudnn_routing_tiers_match_reference(key, num_tokens):
+    """Every moe_sort routing kernel the device launches reproduces the reference,
+    unfinalized and finalized."""
     family = _FAMILIES[key]
     torch.manual_seed(30)
-    case = _make_case(family, 100, 8, 3, 256, 256)
-    result = _forward(case, use_moe_utils=use_moe_utils)
+    case = _make_case(family, num_tokens, 8, 3, 256, 256)
+    result = _forward(case)
     _assert_matches_reference(_check_unfinalized(result, case), case)
+    _assert_matches_reference(_forward(case, finalize=True), case)
 
 
 @pytest.mark.parametrize("key", _FAMILY_PARAMS)
-@pytest.mark.parametrize("use_moe_utils", _PERMUTE_PATHS)
-def test_cudnn_finalize_matches_reference_and_replays(key, use_moe_utils):
-    """``do_finalize=True`` returns the combined ``[T, H]`` rows on both finalize paths.
+def test_cudnn_finalize_matches_reference_and_replays(key):
+    """``do_finalize=True`` returns the combined ``[T, H]`` rows.
 
     The finalized output agrees with the reference and with the caller-side
     combine of the unfinalized triple up to BF16 rounding, and a CUDA graph of
@@ -995,12 +981,12 @@ def test_cudnn_finalize_matches_reference_and_replays(key, use_moe_utils):
         case.act.topk_weights,
         routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
     )
-    finalized = _layer(case, finalize=True, use_moe_utils=use_moe_utils)
+    finalized = _layer(case, finalize=True)
     out = finalized(unpacked, case.weights)
     assert isinstance(out, torch.Tensor)
     assert out.shape == case.expected.shape and out.dtype is torch.bfloat16
     _assert_matches_reference(out, case)
-    unfinalized = _layer(case, use_moe_utils=use_moe_utils)(unpacked, case.weights)
+    unfinalized = _layer(case)(unpacked, case.weights)
     torch.testing.assert_close(
         out, _combine(unfinalized, case.num_tokens, case.top_k), rtol=1e-2, atol=1e-2
     )
@@ -1187,8 +1173,8 @@ def test_cudnn_prepare_weights_and_activations_contract(key):
                     dequant.shape == (num_experts,) and dequant.dtype is torch.float32
                 )
                 assert (dequant > 0).all()
-    # fc1 rows come back as [gate, up], the fused activation kernels' operand order.
-    fc1 = _swap_halves(_dequant_experts(family, view, "fc1"), intermediate_size)
+    # fc1 rows keep the canonical [up, gate] order, moe_swiglu's operand order.
+    fc1 = _dequant_experts(family, view, "fc1")
     fc2 = _dequant_experts(family, view, "fc2")
     frac = {_BF16_KEY: 0.0, _FP8_KEY: 0.1, _MXFP8_KEY: 0.1, _NVFP4_KEY: 0.3}[key]
     for actual, source in ((fc1, w1), (fc2, w2)):
