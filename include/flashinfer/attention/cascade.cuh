@@ -647,7 +647,9 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeO* v_merged, float* s_merged,
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
-    if (num_index_sets >= seq_len) {
+    // MergeStatesKernel puts all heads of a row in one block, which exceeds the 1024-thread
+    // limit for many heads (e.g. more than 64 heads of dim 128).
+    if (num_index_sets >= seq_len || bdx * num_heads > 1024) {
       constexpr uint32_t num_threads = 128;
       constexpr uint32_t bdy = num_threads / bdx;
       dim3 nblks(seq_len, num_heads);

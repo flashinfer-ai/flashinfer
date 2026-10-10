@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <flashinfer/attention/cascade.cuh>
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/layout.cuh>
@@ -42,13 +43,62 @@ using namespace flashinfer;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
+namespace flashinfer {
+
+// The merge kernels in cascade.cuh vectorize over CUDA half types, not cutlass ones.
+template <typename T>
+struct SplitKVMergeDType {
+  using type = T;
+};
+template <>
+struct SplitKVMergeDType<cutlass::half_t> {
+  using type = half;
+};
+template <>
+struct SplitKVMergeDType<cutlass::bfloat16_t> {
+  using type = nv_bfloat16;
+};
+
+// Wire the split-KV plan into the kernel params and check the output layout the merge expects.
+template <typename Params>
+void SetSplitKVParams(Params& params, const PrefillPlanSM90Info& plan_info, void* float_buffer_ptr,
+                      void* int_buffer_ptr, ffi::TensorView o, int64_t head_dim_vo) {
+  params.num_kv_chunks = plan_info.num_kv_chunks;
+  if (plan_info.num_kv_chunks > 1) {
+    using IdType = typename Params::IdType;
+    using DTypeO = typename Params::DTypeO;
+    params.kv_chunk_indices =
+        GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_chunk_indices_offset);
+    params.tmp_o = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.tmp_o_offset);
+    params.tmp_lse = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.tmp_lse_offset);
+    TVM_FFI_ICHECK(o.stride(1) == head_dim_vo && o.stride(0) == o.size(1) * head_dim_vo)
+        << "split-KV prefill requires a contiguous output tensor";
+  }
+}
+
+// Merge the per-chunk partial outputs written by a split-KV launch into o / lse.
+template <typename Params>
+cudaError_t MergeSplitKVStates(const Params& params, int64_t head_dim_vo, cudaStream_t stream) {
+  if (params.num_kv_chunks <= 1) {
+    return cudaSuccess;
+  }
+  using DTypeO = typename SplitKVMergeDType<typename Params::DTypeO>::type;
+  return MergeStates(
+      reinterpret_cast<DTypeO*>(params.tmp_o), params.tmp_lse,
+      reinterpret_cast<DTypeO*>(params.o_ptr), params.lse_ptr,
+      static_cast<uint32_t>(params.num_kv_chunks), static_cast<uint32_t>(params.nnz_qo),
+      static_cast<uint32_t>(params.num_qo_heads), static_cast<uint32_t>(head_dim_vo), stream);
+}
+
+}  // namespace flashinfer
+
 Array<int64_t> BatchPrefillWithKVCacheSM90Plan(
     ffi::TensorView float_workspace_buffer, ffi::TensorView int_workspace_buffer,
     ffi::TensorView page_locked_int_workspace_buffer, ffi::TensorView qo_indptr,
     ffi::TensorView kv_indptr, ffi::TensorView kv_len_arr, int64_t total_num_rows,
     int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
     bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo, bool causal,
-    int64_t window_left) {
+    int64_t window_left, bool disable_split_kv) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -66,7 +116,8 @@ Array<int64_t> BatchPrefillWithKVCacheSM90Plan(
       static_cast<IdType*>(kv_indptr.data_ptr()), static_cast<IdType*>(kv_len_arr.data_ptr()),
       total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
       causal, enable_cuda_graph,
-      /*sizeof_dtype_o=*/2, stream);
+      /*sizeof_dtype_o=*/sizeof(DTypeO), stream,
+      /*allow_split_kv=*/!disable_split_kv && window_left < 0);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "PrefillSM90Plan failed with error: " << cudaGetErrorString(status);
@@ -148,6 +199,7 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.batch_indices_offset);
 
         ADDITIONAL_PARAMS_SETTER
+        SetSplitKVParams(params, plan_info, float_buffer_ptr, int_buffer_ptr, o, head_dim_vo);
 
         bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
@@ -160,6 +212,10 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
               << cudaGetErrorString(status);
           return true;
         });
+        cudaError_t merge_status = MergeSplitKVStates(params, head_dim_vo, stream);
+        TVM_FFI_ICHECK(merge_status == cudaSuccess)
+            << "BatchPrefillWithRaggedKVCacheSM90Run merge failed with error: "
+            << cudaGetErrorString(merge_status);
       });
 }
 
@@ -258,6 +314,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
         params.kv_indices = static_cast<IdType*>(paged_kv_indices.data_ptr());
 
         ADDITIONAL_PARAMS_SETTER
+        SetSplitKVParams(params, plan_info, float_buffer_ptr, int_buffer_ptr, o, head_dim_vo);
 
         bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
@@ -270,5 +327,9 @@ void BatchPrefillWithPagedKVCacheSM90Run(
               << cudaGetErrorString(status);
           return true;
         });
+        cudaError_t merge_status = MergeSplitKVStates(params, head_dim_vo, stream);
+        TVM_FFI_ICHECK(merge_status == cudaSuccess)
+            << "BatchPrefillWithPagedKVCacheSM90Run merge failed with error: "
+            << cudaGetErrorString(merge_status);
       });
 }

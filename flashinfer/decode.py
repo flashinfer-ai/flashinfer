@@ -2490,6 +2490,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 args.append(disable_split_kv)
                 args.append(0)  # num_colocated_ctas
                 args.append(q_len_per_req if q_len_per_req > 1 else 0)  # uniform_q_len
+            else:
+                # The FA3 prefill split-KV path is not tuned for decode.
+                args.append(True)  # disable_split_kv
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -5061,7 +5064,7 @@ def fast_decode_plan(
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
 
             try:
-                # Make sure we pass exactly 19 arguments for fa2 backend and 16 arguments for fa3 backend
+                # Make sure we pass exactly 19 arguments for fa2 backend and 17 arguments for fa3 backend
                 args = [
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
@@ -5087,6 +5090,9 @@ def fast_decode_plan(
                     args.append(
                         q_len_per_req if q_len_per_req > 1 else 0
                     )  # uniform_q_len
+                else:
+                    # The FA3 prefill split-KV path is not tuned for decode.
+                    args.append(True)  # disable_split_kv
                 self._plan_info = self._cached_module.plan(
                     *args,
                 )
