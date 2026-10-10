@@ -320,9 +320,8 @@ def prepare_balanced_batch_decode_with_kv_cache(
         ``(k_cache, v_cache)``, each BF16 ``[num_pages, num_kv_heads, 16, 128]``
         (``HND`` pages of 16 tokens).
     block_tables : torch.Tensor
-        int32 ``[batch, max_pages]`` page ids per request.  A width that is a
-        multiple of eight pages is read in place; other widths are copied
-        into a padded table inside ``workspace_buffer`` at preparation.
+        int32 ``[batch, max_pages]`` page ids per request, read on device
+        at every launch (any width).
     seq_lens : torch.Tensor
         int32 ``[batch]`` KV lengths including the ``q_len_per_req`` new
         tokens.  Read on device at every launch.
