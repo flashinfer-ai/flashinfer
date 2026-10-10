@@ -101,10 +101,13 @@ ARMS = {
     ),
     # the fp16_state arm served by the UMMA (tcgen05 / TMEM) backend (SM100 only)
     "umma": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
+    # the same arm with an fp16 u ring next to the bf16 k ring (vLLM's u-cache dtype)
+    "umma_u16": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
 }
 # Backend pinned per arm: the dtype arms test the HMMA kernel (on SM100 the fp16_state
 # arm would otherwise auto-route to UMMA), "umma" the UMMA kernel through the same API.
-_ARM_BACKEND = {"umma": "umma"}
+_ARM_BACKEND = {"umma": "umma", "umma_u16": "umma"}
+_U_DTYPE = {"umma_u16": torch.float16}  # u ring dtype where it differs from the k ring
 
 
 class _WithBackend:
@@ -211,8 +214,11 @@ def _ref_fp32(q, k, v, a, b, A_log, dt_bias, S0, kc, uc, gc, P):
 # ---------------------------------------------------------------------------
 # Case builder: consistent inputs + rings for B requests.
 # ---------------------------------------------------------------------------
-def _make_case(B, hist_lens, io_dtype, state_dtype, seed, ring_dtype=None, bases=None):
+def _make_case(
+    B, hist_lens, io_dtype, state_dtype, seed, ring_dtype=None, bases=None, u_dtype=None
+):
     ring_dtype = ring_dtype or io_dtype
+    u_dtype = u_dtype or ring_dtype
     g = torch.Generator(device=DEV).manual_seed(seed)
 
     def rn(*s, sc=1.0):
@@ -227,7 +233,7 @@ def _make_case(B, hist_lens, io_dtype, state_dtype, seed, ring_dtype=None, bases
     dt_bias = rn(HV, sc=0.5)
     pool = (torch.randn(B, HV, V, K, generator=g, device=DEV) * 0.5).to(state_dtype)
     kc = torch.zeros(B, H, RING, K, dtype=ring_dtype, device=DEV)
-    uc = torch.zeros(B, HV, RING, V, dtype=ring_dtype, device=DEV)
+    uc = torch.zeros(B, HV, RING, V, dtype=u_dtype, device=DEV)
     gc = torch.zeros(B, HV, RING, dtype=torch.float32, device=DEV)
     hl = torch.tensor(hist_lens, dtype=torch.int32, device=DEV)
     bases = bases or [0] * B
@@ -243,7 +249,7 @@ def _make_case(B, hist_lens, io_dtype, state_dtype, seed, ring_dtype=None, bases
         kh = torch.randn(H, P, K, generator=g, device=DEV)
         kc[r, :, rows] = F.normalize(kh, dim=-1).to(ring_dtype)
         uc[r, :, rows] = (torch.randn(HV, P, V, generator=g, device=DEV) * 0.3).to(
-            ring_dtype
+            u_dtype
         )
         la = -(torch.rand(HV, P, generator=g, device=DEV) * 0.3 + 0.003)
         gc[r, :, rows] = torch.cumsum(la, dim=-1)
@@ -295,6 +301,7 @@ def test_output_matches_fp32_reference(arm, history, basecase):
         seed=1234,
         ring_dtype=ring_dtype,
         bases=bases,
+        u_dtype=_U_DTYPE.get(arm),
     )
     pool_before = pool.clone()  # fold rows mutate the pool; ref needs the old state
 
@@ -357,6 +364,7 @@ def test_folded_state_matches_fp32_reference(arm, basecase):
         seed=99,
         ring_dtype=ring_dtype,
         bases=bases,
+        u_dtype=_U_DTYPE.get(arm),
     )
     pool_before = pool.clone()
 
@@ -836,4 +844,41 @@ def test_verify_only_rejects_non_bf16_activations():
             g_cache=gc,
             hist_len=hl.clone(),
             scale=SCALE,
+        )
+
+
+def test_fp16_u_ring_is_umma_only():
+    """An fp16 u_cache next to the bf16 k ring is the UMMA backend's arm: the parametrized
+    tests above run it through "auto" / "umma"; forcing the HMMA kernel raises instead of
+    reading fp16 bits as bf16."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush("umma_u16")
+    _, _, _, io_dtype, state_dtype, ring_dtype = ARMS["umma_u16"]
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _make_case(
+        2,
+        [13, 5],
+        io_dtype,
+        state_dtype,
+        seed=5,
+        ring_dtype=ring_dtype,
+        u_dtype=torch.float16,
+    )
+    with pytest.raises(ValueError, match="UMMA backend only"):
+        mod._mod.gated_delta_rule_mtp_ucache_flush(
+            A_log,
+            a,
+            dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=pool,
+            initial_state_indices=idx,
+            k_cache=kc,
+            u_cache=uc,
+            g_cache=gc,
+            hist_len=hl,
+            cache_base=cb,
+            flush_min=13,
+            backend="hmma",
         )

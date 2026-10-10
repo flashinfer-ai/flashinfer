@@ -3332,8 +3332,12 @@ def gated_delta_rule_mtp_ucache_flush(
     call — an SM100-class GPU, the fp16-state arm (bf16 IO and rings,
     ``GDN_UCACHE_STATE_DTYPE=fp16``), 1 <= T <= 8, HV == 4 H, contiguous
     pools, no ``pdl_trigger`` — and the HMMA kernel otherwise (any SM90+,
-    T in {4, 8}). ``"umma"`` / ``"hmma"`` force one of them (``"umma"`` raises
-    ``ValueError`` when unavailable). Both implement the same contract; they
+    T in {4, 8}). With bf16 rings the UMMA backend also takes an fp16
+    ``u_cache`` (vLLM's u-cache dtype) next to the bf16 ``k_cache``; the HMMA
+    kernel does not, so such a call raises ``ValueError`` when the UMMA
+    backend cannot serve it. ``"umma"`` / ``"hmma"`` force one of them
+    (``"umma"`` raises ``ValueError`` when unavailable). Both implement the
+    same contract; they
     differ in rounding only (fp32 accumulation in both, different summation
     orders). ``stochastic_rounding`` (``"philox"`` / ``"lcg"``, with
     ``rand_seed`` and ``philox_rounds``; off unless set) rounds the fp16
@@ -3459,10 +3463,15 @@ def gated_delta_rule_mtp_ucache_flush(
         f"k_cache must be [pool={_pool}, H={HK}, {RING_SLOTS}, K={K_dim}]; "
         f"got {tuple(k_cache.shape)}"
     )
-    assert u_cache.dtype == RING_TORCH, (
+    # an fp16 u ring next to bf16 rings is the UMMA backend's mixed arm (vLLM's u-cache
+    # dtype); the HMMA kernel reads both rings in the module RING dtype
+    _u_mixed = u_cache.dtype != RING_TORCH
+    assert not _u_mixed or (
+        u_cache.dtype == torch.float16 and RING_TORCH is torch.bfloat16
+    ), (
         f"u_cache must be {RING_TORCH} (module RING dtype, see "
-        f"GDN_UCACHE_RING_DTYPE; f32 rings remain a documented extension "
-        f"point); got {u_cache.dtype}."
+        f"GDN_UCACHE_RING_DTYPE) or, with bf16 rings, fp16 (UMMA backend only); "
+        f"got {u_cache.dtype}."
     )
     _pools_contig &= _inner_dense(u_cache, "u_cache")
     assert tuple(u_cache.shape) == (_pool, HV, RING_SLOTS, V_dim)
@@ -3523,6 +3532,7 @@ def gated_delta_rule_mtp_ucache_flush(
             f"gated_delta_rule_mtp_ucache_flush: backend={backend!r}; use 'auto', "
             "'umma' or 'hmma'."
         )
+    _why = "backend='hmma' was requested"
     if backend != "hmma":
         _why = _umma_unavailable_reason(
             device, T, H, HK, HV, _pools_contig, pdl_trigger
@@ -3558,6 +3568,12 @@ def gated_delta_rule_mtp_ucache_flush(
             raise ValueError(
                 f"gated_delta_rule_mtp_ucache_flush: backend='umma' unavailable: {_why}."
             )
+    if _u_mixed:
+        raise ValueError(
+            "gated_delta_rule_mtp_ucache_flush: an fp16 u_cache with bf16 k_cache is "
+            f"served by the UMMA backend only ({_why}); the HMMA kernel needs both "
+            f"rings in {RING_TORCH}."
+        )
     if stochastic_rounding not in (None, "none"):
         raise NotImplementedError(
             "gated_delta_rule_mtp_ucache_flush: stochastic rounding of the flushed state "
