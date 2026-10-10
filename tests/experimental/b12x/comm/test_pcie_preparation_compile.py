@@ -16,6 +16,51 @@ from b12x.comm.pcie._tuning import PcieQuery, TUNING
 from b12x.preparation import FrozenMapping
 
 
+@pytest.mark.parametrize(
+    "factory,args",
+    [
+        ("get_oneshot_launcher", ("bfloat16", 2, 0, True, False, 0, "pull", 256, 0)),
+        (
+            "get_fused_oneshot_launcher",
+            ("bfloat16", 2, 0, "stage_pull", False, False, False, 0, 256, 0),
+        ),
+    ],
+)
+def test_oneshot_planning_memo_is_evicted_before_in_process_compile(
+    monkeypatch, factory, args
+):
+    from b12x._lib.compile_plan import (
+        DeferredCuTeKernel,
+        ProgramKey,
+        evict_planning_artifacts,
+    )
+    from b12x.comm.pcie import _oneshot_cute as kernels
+
+    program = ProgramKey("cute", f"test-{factory}")
+    deferred = DeferredCuTeKernel(program, ("test", factory))
+    compiled = Mock(__b12x_programs__=(program,), __b12x_dependencies__=())
+    compile_kernel = Mock(side_effect=(deferred, compiled))
+    monkeypatch.setattr(kernels, "b12x_compile", compile_kernel)
+    monkeypatch.setattr(kernels, "make_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "current_cuda_stream", lambda: 0)
+    monkeypatch.setattr(
+        kernels, "raise_if_kernel_resolution_frozen", lambda *args, **kwargs: None
+    )
+    launcher = getattr(kernels, factory)
+    launcher.cache_clear()
+    try:
+        planned = launcher(*args)
+        assert launcher(*args) is planned
+        assert compile_kernel.call_count == 1
+        evict_planning_artifacts((program,))
+        ready = launcher(*args)
+        assert ready is not planned
+        assert ready.__b12x_dependencies__ == (compiled,)
+        assert compile_kernel.call_count == 2
+    finally:
+        launcher.cache_clear()
+
+
 @pytest.mark.parametrize("world", [9, 10, 12])
 @pytest.mark.parametrize("owner", ["DcpAllToAll", "DcpAllToAllPool"])
 @pytest.mark.parametrize("operation", ["all_gather_heads", "lse_reduce_scatter"])

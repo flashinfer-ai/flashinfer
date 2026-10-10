@@ -8,7 +8,6 @@ atomic operation.
 
 from __future__ import annotations
 
-import functools
 import os
 from collections.abc import Callable
 
@@ -20,6 +19,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
+from b12x._lib.program_cache import program_cache
 from b12x._lib.intrinsics import (
     ld_global_v4_u32,
     st_global_v4_f32,
@@ -1221,7 +1221,7 @@ def is_oneshot_launcher_prepared(
     )
 
 
-@functools.cache
+@program_cache
 def get_oneshot_launcher(
     dtype_name: str,
     world_size: int,
@@ -1244,7 +1244,7 @@ def get_oneshot_launcher(
         threads,
         device_index,
     )
-    del device_index  # retained in the functools and preparation keys
+    del device_index  # Retained in the launcher and preparation keys.
     slot_bias = int(slot_bias) & 1 if device_slot_selection else 0
     launch = _OneshotLaunch(
         dtype_name,
@@ -1399,7 +1399,7 @@ def is_fused_oneshot_launcher_prepared(
     )
 
 
-@functools.cache
+@program_cache
 def get_fused_oneshot_launcher(
     dtype_name: str,
     world_size: int,
