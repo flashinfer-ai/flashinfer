@@ -43,6 +43,7 @@ CANDIDATES = {
     "trtllm-gen",
     "fa2",
     "cute-dsl-modular",
+    "cute-dsl-rubin-mtp",
     "cutile",
     "cutlass",
     "fa3",
@@ -64,6 +65,9 @@ def _request(q_lens, kv_lens, *, heads=32, graph=False, lse_mode="none", causal=
         _use_cuda_graph=graph,
         lse_mode=lse_mode,
         causal=causal,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        output_dtype=torch.bfloat16,
     )
     return args, csr
 
@@ -293,6 +297,7 @@ _CONCRETE_BACKENDS = (
     "trtllm-gen",
     "cute-dsl-monolithic",
     "cute-dsl-modular",
+    "cute-dsl-rubin-mtp",
     "fa3",
     "xqa",
 )
@@ -445,6 +450,311 @@ def _cpu_run(wrapper):
     )
     assert result is out
     return out
+
+
+@pytest.fixture
+def _cpu_sm107_cute_planners(_cpu_planners, monkeypatch):
+    """Use real plan arguments while modeling the FP8 CuTe overlap."""
+    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: (10, 7))
+    monkeypatch.setattr(_wrapper, "_get_compute_capability", lambda _: (10, 7))
+    state = _cpu_planners
+
+    def support(name, args):
+        state.args = args
+        if name not in ("cute-dsl-monolithic", "cute-dsl-rubin-mtp"):
+            _reject(name, args)
+
+    state.handler = support
+    return state
+
+
+def _cpu_mtp_request(
+    *,
+    batch=64,
+    q_len=4,
+    kv_len=8192,
+    capacity=None,
+    page_size=128,
+    graph=False,
+    q_lens=None,
+    kv_lens=None,
+    csr=False,
+    **changes,
+):
+    q_lens = [q_len] * batch if q_lens is None else q_lens
+    kv_lens = [kv_len] * batch if kv_lens is None else kv_lens
+    capacity = ((max(kv_lens) + 127) // 128) * 128 if capacity is None else capacity
+    offsets = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], dtype=torch.int32
+    )
+    lengths = torch.tensor(kv_lens, dtype=torch.int32)
+    pages = capacity // page_size
+    tables = torch.arange(batch * pages, dtype=torch.int32).reshape(batch, pages)
+    if csr:
+        live_pages = (lengths + page_size - 1) // page_size
+        indptr = torch.cat(
+            (torch.zeros(1, dtype=torch.int32), live_pages.cumsum(0))
+        ).int()
+        metadata = MLAPlanMetadata.csr(
+            qo_indptr=offsets,
+            kv_indptr=indptr,
+            kv_indices=torch.cat(
+                [row[:count] for row, count in zip(tables, live_pages, strict=True)]
+            ),
+            kv_len_arr=lengths,
+        )
+    else:
+        metadata = MLAPlanMetadata.dense(
+            offsets, tables, lengths, max_q_len=max(q_lens)
+        )
+    wrapper = BatchMLAPagedAttentionWrapper(
+        torch.empty(64, dtype=torch.uint8), backend="auto", use_cuda_graph=graph
+    )
+    kwargs = dict(
+        metadata=metadata,
+        num_heads=128,
+        head_dim_ckv=512,
+        head_dim_kpe=64,
+        page_size=page_size,
+        causal=True,
+        sm_scale=1 / 24,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        output_dtype=torch.float8_e4m3fn,
+        query_layout="packed",
+        kv_cache_layout="packed",
+        scale_mode="default",
+        lse_mode="base2",
+    )
+    kwargs.update(changes)
+    return wrapper, kwargs, lengths
+
+
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize(
+    "graph,batch,q_len,kv_len,capacity,promoted",
+    [
+        (False, 31, 4, 32768, 32768, False),
+        (False, 32, 2, 32768, 32768, False),
+        (False, 32, 4, 32767, 32768, False),
+        (False, 32, 4, 32768, 32768, True),
+        (False, 33, 4, 33001, 33152, True),
+        (False, 64, 2, 32768, 65536, True),
+        (False, 63, 4, 8192, 8192, False),
+        (False, 64, 4, 8191, 8192, False),
+        (False, 64, 4, 8192, 8192, True),
+        (False, 64, 4, 8192, 16384, True),
+        (False, 64, 4, 8192, 16512, False),
+        (False, 128, 2, 8192, 8192, True),
+        (False, 129, 2, 8192, 8192, False),
+        (False, 128, 4, 65536, 65536, True),
+        (False, 128, 4, 65537, 65664, False),
+        (True, 63, 4, 128, 128, False),
+        (True, 64, 4, 128, 128, True),
+        (True, 65, 4, 129, 256, True),
+        (True, 128, 2, 129, 256, True),
+        (True, 128, 4, 2048, 2048, True),
+        (True, 64, 4, 2049, 2176, False),
+        (True, 64, 4, 128, 256, False),
+        (True, 64, 4, 2000, 2048, True),
+        (True, 64, 4, 1900, 2048, False),
+        (True, 64, 4, 3, 128, False),
+    ],
+)
+def test_cpu_sm107_mtp_preference_boundaries(
+    _cpu_sm107_cute_planners, page_size, graph, batch, q_len, kv_len, capacity, promoted
+):
+    state = _cpu_sm107_cute_planners
+    wrapper, kwargs, _ = _cpu_mtp_request(
+        batch=batch,
+        q_len=q_len,
+        kv_len=kv_len,
+        capacity=capacity,
+        page_size=page_size,
+        graph=graph,
+    )
+    wrapper.plan(**kwargs)
+    expected = "cute-dsl-rubin-mtp" if promoted else "cute-dsl-monolithic"
+    assert wrapper._planned_backend_name == expected
+    baseline = ordered_sm100_backends(state.args)
+    order = _auto_policy._ordered_sm107_backends(state.args)
+    assert set(order) == CANDIDATES and len(order) == len(CANDIDATES)
+    if promoted:
+        assert order[order.index("cute-dsl-monolithic") - 1] == "cute-dsl-rubin-mtp"
+        assert tuple(b for b in order if b != "cute-dsl-rubin-mtp") == tuple(
+            b for b in baseline if b != "cute-dsl-rubin-mtp"
+        )
+    else:
+        assert order == baseline
+
+
+def test_cpu_sm107_mtp_dense_capacity_includes_prepared_alignment(
+    _cpu_sm107_cute_planners,
+):
+    state = _cpu_sm107_cute_planners
+    wrapper, kwargs, _ = _cpu_mtp_request(kv_len=8225, capacity=257 * 64, page_size=64)
+    assert kwargs["metadata"].block_tables.shape[1] == 257
+    # Preparation pads 257 page-64 columns to 258: 16512 exceeds 2 * 8225.
+    wrapper.plan(**kwargs)
+    assert wrapper._planned_backend_name == "cute-dsl-monolithic"
+    assert _auto_policy._ordered_sm107_backends(state.args) == ordered_sm100_backends(
+        state.args
+    )
+
+
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("lse_mode", ["none", "base2", "basee"])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
+def test_cpu_mtp_preference_is_sm107_only(
+    _cpu_sm107_cute_planners, monkeypatch, graph, lse_mode, capability
+):
+    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: capability)
+    monkeypatch.setattr(_wrapper, "_get_compute_capability", lambda _: capability)
+    wrapper, kwargs, _ = _cpu_mtp_request(
+        graph=graph, kv_len=128 if graph else 8192, lse_mode=lse_mode
+    )
+    wrapper.plan(**kwargs)
+    assert wrapper._planned_backend_name == (
+        "cute-dsl-rubin-mtp" if capability == (10, 7) else "cute-dsl-monolithic"
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        dict(q_data_type=torch.bfloat16),
+        dict(kv_data_type=torch.bfloat16),
+        dict(output_dtype=torch.bfloat16),
+        dict(num_heads=64),
+        dict(head_dim_ckv=256),
+        dict(head_dim_kpe=32),
+        dict(causal=False),
+        dict(page_size=32),
+        dict(page_size=256),
+        dict(q_len=1),
+        dict(q_len=3),
+        dict(q_len=5),
+        dict(query_layout="split"),
+        dict(kv_cache_layout="split"),
+        dict(scale_mode="bmm-scalar"),
+        dict(scale_mode="bmm-tensor"),
+        dict(scale_mode="kv-per-tensor"),
+        dict(sm_scale=0.0),
+        dict(sm_scale=-0.125),
+        dict(use_sinks=True),
+        dict(use_profiler=True),
+        dict(skip_softmax=True),
+        dict(output_scale="per-tensor"),
+        dict(enable_pdl=True),
+    ],
+)
+def test_cpu_sm107_mtp_preference_exclusions(_cpu_sm107_cute_planners, changes):
+    state = _cpu_sm107_cute_planners
+    wrapper, kwargs, _ = _cpu_mtp_request(**changes)
+    wrapper.plan(**kwargs)
+    assert wrapper._planned_backend_name == "cute-dsl-monolithic"
+    assert _auto_policy._ordered_sm107_backends(state.args) == ordered_sm100_backends(
+        state.args
+    )
+
+
+@pytest.mark.parametrize(
+    "graph,kv_lens,capacity,promoted",
+    [
+        (False, [8192] * 63 + [8193], 8320, False),
+        (True, [4] * 63 + [129], 256, True),
+        (True, [4] * 63 + [257], 384, False),
+        (True, [3] * 63 + [129], 256, False),
+    ],
+)
+def test_cpu_sm107_mtp_unequal_live_lengths(
+    _cpu_sm107_cute_planners, graph, kv_lens, capacity, promoted
+):
+    wrapper, kwargs, _ = _cpu_mtp_request(
+        graph=graph, kv_lens=kv_lens, capacity=capacity
+    )
+    wrapper.plan(**kwargs)
+    assert wrapper._planned_backend_name == (
+        "cute-dsl-rubin-mtp" if promoted else "cute-dsl-monolithic"
+    )
+
+
+def test_cpu_sm107_mtp_requires_uniform_query_lengths(_cpu_sm107_cute_planners):
+    wrapper, kwargs, _ = _cpu_mtp_request(batch=128, q_lens=[2] + [4] * 127)
+    wrapper.plan(**kwargs)
+    assert wrapper._planned_backend_name == "cute-dsl-monolithic"
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_cpu_sm107_mtp_csr_capacity_and_graph_dense_requirement(
+    _cpu_sm107_cute_planners, graph
+):
+    wrapper, kwargs, _ = _cpu_mtp_request(
+        csr=True, graph=graph, kv_len=129 if graph else 8193
+    )
+    wrapper.plan(**kwargs)
+    assert wrapper._planned_backend_name == (
+        "cute-dsl-monolithic" if graph else "cute-dsl-rubin-mtp"
+    )
+
+
+def test_cpu_sm107_mtp_typed_refusal_preserves_fallback_order(
+    _cpu_planners, monkeypatch
+):
+    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: (10, 7))
+    _cpu_planners.handler = _reject
+    wrapper, kwargs, _ = _cpu_mtp_request()
+    with pytest.raises(
+        _BackendPlanUnsupportedError, match="No supported planned MLA backend"
+    ):
+        wrapper.plan(**kwargs)
+    assert _cpu_planners.calls == [
+        "trtllm-gen",
+        "cute-dsl-rubin-mtp",
+        "cute-dsl-monolithic",
+        "cute-dsl-modular",
+        "fa2",
+        "fa3",
+        "cutlass",
+        "xqa",
+        "cutile",
+    ]
+
+
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("start_promoted", [False, True])
+def test_cpu_sm107_mtp_replans_use_live_lengths_and_retain_graph_family(
+    _cpu_sm107_cute_planners, monkeypatch, graph, start_promoted
+):
+    state = _cpu_sm107_cute_planners
+    inside, outside, capacity = (129, 128, 256) if graph else (8192, 8191, 8192)
+    initial = inside if start_promoted else outside
+    wrapper, kwargs, lengths = _cpu_mtp_request(
+        graph=graph, kv_len=initial, capacity=capacity
+    )
+    wrapper.plan(**kwargs)
+    first = "cute-dsl-rubin-mtp" if start_promoted else "cute-dsl-monolithic"
+    assert wrapper._planned_backend_name == first
+    pointer = lengths.data_ptr()
+    lengths.fill_(outside if start_promoted else inside)
+    state.calls.clear()
+    if graph:
+
+        def forbidden_order(args):
+            pytest.fail("Graph replan must retain its family after live lengths change")
+
+        monkeypatch.setattr(_auto_policy, "_ordered_sm107_backends", forbidden_order)
+    wrapper.plan(**kwargs)
+    expected = (
+        first
+        if graph
+        else ("cute-dsl-monolithic" if start_promoted else "cute-dsl-rubin-mtp")
+    )
+    assert wrapper._planned_backend_name == expected
+    assert state.args.csr().kv_len_arr.tolist() == lengths.tolist()
+    assert lengths.data_ptr() == pointer
+    if graph:
+        assert state.calls == [first]
 
 
 def _reject(name, args):
@@ -1256,6 +1566,65 @@ def test_cpu_monolithic_grid_boundary_rejects_before_compile(
         assert calls == [True]
 
 
+@pytest.mark.parametrize("q_len", [65535, 65536])
+def test_cpu_monolithic_tactics_respect_reducer_grid_boundary(
+    _cpu_planners, monkeypatch, q_len
+):
+    from flashinfer.cute_dsl import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL is unavailable")
+
+    from flashinfer.cute_dsl.attention.monolithic import mla_decode as native
+    from flashinfer.mla._batch_mla._backends.cute_dsl_monolithic_backend import (
+        _BatchMLAPagedAttentionCuteDslMonolithicBackend,
+    )
+
+    # Real sizing and tensor validation, without allocating the GiB of scratch
+    # needed to keep split budgets 2 and 4 below the workspace capacity.
+    workspace = torch.empty(1 << 30, dtype=torch.uint8, device="meta")
+    query = torch.empty((q_len, 1, 576), dtype=torch.bfloat16, device="meta")
+    cache = torch.empty((512, 128, 576), dtype=torch.bfloat16, device="meta")
+    out = torch.empty((q_len, 1, 512), dtype=torch.bfloat16, device="meta")
+    inputs = (query, cache, out, None, None)
+    backend = _BatchMLAPagedAttentionCuteDslMonolithicBackend(workspace)
+    backend._execution_state = SimpleNamespace(
+        batch_size=1,
+        q_len=q_len,
+        num_heads=1,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=torch.empty((1, 512), dtype=torch.int32, device="meta"),
+        page_size=128,
+        device=workspace.device,
+        cum_seq_lens_q=None,
+        total_q=q_len,
+        q_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(native, "get_num_sm", lambda _: 148)
+
+    # The main grid fits and native split=1 needs no reducer at both lengths.
+    _, tiles, _ = native.compute_q_tile_layout(1, q_len)
+    native._validate_nonpersistent_grid_y(1, tiles, False)
+    assert backend._split_workspace(inputs, -1) == (1, 0)
+    for splits in (2, 4):
+        effective, size = native._get_split_kv_and_workspace_size(
+            1, q_len, 1, 512, 148, max_seq_len=65536, num_kv_splits=splits
+        )
+        assert effective == splits and 0 < size <= workspace.numel()
+
+    tactics = backend.get_valid_tactics(inputs, None)
+    if q_len == 65535:
+        assert {-1, 1, 2, 4}.issubset(tactics)
+        assert backend.validate_tactic(inputs, 2)
+    else:
+        assert tactics == [-1, 1]
+        assert not backend.validate_tactic(inputs, 2)
+        with pytest.raises(ValueError, match="Unsupported.*tactic"):
+            backend.precompile_tactics(inputs, [2], None)
+
+
 @pytest.mark.parametrize("scale", [1, 1.0])
 def test_cpu_numeric_scale_normalized_before_candidate_planning(_cpu_planners, scale):
     def check(name, args):
@@ -1622,6 +1991,205 @@ def test_monolithic_fp16_adapter_matches_reference(q_lens, kv_lens, capacity):
     _check_case(
         "cute-dsl-monolithic", q_lens, kv_lens, capacity, torch.float16, causal=True
     )
+
+
+@pytest.mark.usefixtures("_mla_reference_precision")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_monolithic_explicit_split_tactics_match_reference(dtype):
+    kv_lens = (1024, 897)
+    metadata, query, cache, table, offsets = _inputs((2, 2), kv_lens, dtype, 2)
+    expected, expected_lse = _reference(
+        query, cache, table, offsets, kv_lens, causal=True
+    )
+    wrapper = _plan(
+        "cute-dsl-monolithic", metadata, dtype, causal=True, lse_mode="basee"
+    )
+    runner = wrapper._planned_backend
+    original_state = runner._execution_state
+    out = torch.empty_like(expected, dtype=dtype)
+    lse = torch.empty_like(expected_lse)
+    inputs = [query, cache, out, lse, None]
+    runner.configure_tuning(
+        cache_key=("monolithic-split-reference",),
+        run_options=dict(
+            return_lse=True,
+            return_lse_base_on_e=True,
+            o_scale=None,
+            ckv_scale=None,
+            kpe_scale=None,
+            skip_softmax_threshold_scale_factor=None,
+            bmm1_scale=None,
+            bmm2_scale=None,
+        ),
+    )
+    assert {2, 4}.issubset(runner.get_valid_tactics(inputs, None))
+    runner.precompile_tactics(inputs, [2, 4], None)
+
+    for tactic in (2, 4):
+        assert runner._tactic_states[tactic].split_kv == tactic
+        result = runner.forward(inputs, tactic=tactic)
+        assert result[0] is out and result[1] is lse
+        assert runner._execution_state is original_state
+        torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(lse, expected_lse, rtol=1e-2, atol=1e-2)
+
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            runner.forward(inputs, tactic=tactic)
+        torch.cuda.current_stream().wait_stream(side_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            runner.forward(inputs, tactic=tactic)
+        out.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        graph.replay()
+        assert runner._execution_state is original_state
+        torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(lse, expected_lse, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.usefixtures("_mla_reference_precision")
+@pytest.mark.parametrize(
+    "backend,dtype",
+    [
+        pytest.param("cute-dsl-rubin-mtp", torch.float8_e4m3fn, id="mtp-fp8"),
+        pytest.param("cute-dsl-monolithic", torch.float8_e4m3fn, id="monolithic-fp8"),
+        pytest.param("cute-dsl-monolithic", torch.bfloat16, id="monolithic-bf16"),
+        pytest.param("cute-dsl-monolithic", torch.float16, id="monolithic-fp16"),
+    ],
+)
+def test_cute_dsl_split_workspace_above_2gib_matches_reference(backend, dtype):
+    if backend == "cute-dsl-rubin-mtp" and torch.cuda.get_device_capability() != (
+        10,
+        7,
+    ):
+        pytest.skip("Rubin MTP requires SM107")
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < 4 << 30:
+        pytest.skip(
+            "Large split-workspace regression requires 4 GiB of free GPU memory"
+        )
+
+    batch, q_len, heads, page_size, kv_len, tactic = 128, 4, 128, 128, 2048, 16
+    # The kernel indexes FP32 scratch elements, but its FFI tensor is byte-sized.
+    # This admitted shape crosses the signed 32-bit byte bound, not the element bound.
+    workspace_size = batch * q_len * heads * tactic * (_CKV + 1) * 4
+    assert workspace_size == 2_151_677_952
+    assert workspace_size // 4 < 1 << 31 < workspace_size
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device="cuda")
+    assert workspace.numel() * workspace.element_size() == workspace_size
+
+    torch.manual_seed(4031)
+    query = (torch.randn(batch * q_len, heads, _CKV + _KPE, device="cuda") * 0.3).to(
+        dtype
+    )
+    # Share the same small KV pool across requests, retaining distinct queries.
+    pages = kv_len // page_size
+    cache = (torch.randn(pages, page_size, _CKV + _KPE, device="cuda") * 0.3).to(dtype)
+    table = (
+        torch.randperm(pages, dtype=torch.int32, device="cuda")
+        .expand(batch, -1)
+        .contiguous()
+    )
+    metadata = MLAPlanMetadata.dense(
+        cum_seq_lens_q=torch.arange(
+            0, (batch + 1) * q_len, q_len, dtype=torch.int32, device="cuda"
+        ),
+        block_tables=table,
+        seq_lens=torch.full((batch,), kv_len, dtype=torch.int32, device="cuda"),
+        max_q_len=q_len,
+    )
+    wrapper = BatchMLAPagedAttentionWrapper(
+        workspace, backend=backend, use_cuda_graph=True
+    )
+    wrapper.plan(
+        metadata=metadata,
+        num_heads=heads,
+        head_dim_ckv=_CKV,
+        head_dim_kpe=_KPE,
+        page_size=page_size,
+        causal=True,
+        sm_scale=_SCALE,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        output_dtype=dtype,
+        query_layout="packed",
+        kv_cache_layout="packed",
+        lse_mode="basee",
+    )
+    runner = wrapper._planned_backend
+    original_state = runner._execution_state
+    out = torch.empty((batch * q_len, heads, _CKV), dtype=dtype, device="cuda")
+    lse = torch.empty((batch * q_len, heads), dtype=torch.float32, device="cuda")
+    inputs = [query, cache, out, lse, None]
+    runner.configure_tuning(
+        cache_key=("split-workspace-above-2gib", backend, dtype),
+        run_options=dict(
+            return_lse=True,
+            return_lse_base_on_e=True,
+            o_scale=None,
+            ckv_scale=None,
+            kpe_scale=None,
+            skip_softmax_threshold_scale_factor=None,
+            bmm1_scale=None,
+            bmm2_scale=None,
+        ),
+    )
+    assert tactic in runner.get_valid_tactics(inputs, None)
+    assert runner.validate_tactic(inputs, tactic)
+    assert runner._split_workspace(inputs, tactic) == (tactic, workspace_size)
+    runner.precompile_tactics(inputs, [tactic], None)
+    tactic_state = runner._tactic_states[tactic]
+    assert tactic_state.split_kv == tactic
+    assert tactic_state.workspace_bytes.numel() == workspace_size
+
+    # The last request exercises high scratch offsets; use the independent FP32
+    # reference only for these two requests to keep reference work bounded.
+    expected, expected_lse = _reference(
+        torch.cat((query[:q_len], query[-q_len:])),
+        cache,
+        table[[0, batch - 1]],
+        [0, q_len, 2 * q_len],
+        (kv_len, kv_len),
+        causal=True,
+        page_size=page_size,
+    )
+    fp8 = dtype == torch.float8_e4m3fn
+    output_tolerance = dict(rtol=0.12, atol=0.03) if fp8 else dict(rtol=1e-2, atol=1e-2)
+    lse_tolerance = dict(rtol=0.002, atol=0.02) if fp8 else dict(rtol=1e-2, atol=1e-2)
+
+    def check_outputs(result):
+        assert result[0] is out and result[1] is lse
+        assert runner._execution_state is original_state
+        assert torch.isfinite(out.float()).all()
+        assert torch.isfinite(lse).all()
+        for sample, request in enumerate((0, batch - 1)):
+            rows = slice(request * q_len, (request + 1) * q_len)
+            reference_rows = slice(sample * q_len, (sample + 1) * q_len)
+            torch.testing.assert_close(
+                out[rows].float(), expected[reference_rows], **output_tolerance
+            )
+            torch.testing.assert_close(
+                lse[rows], expected_lse[reference_rows], **lse_tolerance
+            )
+
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    check_outputs(runner.forward(inputs, tactic=tactic))
+
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        runner.forward(inputs, tactic=tactic)
+    torch.cuda.current_stream().wait_stream(side_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = runner.forward(inputs, tactic=tactic)
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    check_outputs(captured)
 
 
 @pytest.mark.usefixtures("_mla_reference_precision")
