@@ -644,21 +644,56 @@ def test_prefill_api_validation_and_admission():
     else:
         with pytest.raises(BackendSupportedError):
             flashinfer.top_k_varlen(lg, le, k, row_starts=rs)
-    # mode conflicts (hint, cr) are refused by every checker: the decorator
-    # reports "no suitable backend" for auto and "problem size not supported"
-    # (ValueError) for an explicitly requested backend
+    # decode-mode arguments (hint, next_n, compress_ratio) are refused by the
+    # API body, even at their decode defaults: passing them at all is the
+    # error. The checkers admit the call so that auto and an explicit gvr_2
+    # both report that ValueError (where gvr_2 exists; elsewhere auto has no
+    # backend that admits a windowed call at all)
     hint = torch.zeros(rows, k, dtype=torch.int32, device=_DEV)
-    for kw in ({"pre_idx": hint}, {"compress_ratio": 4}):
-        with pytest.raises(BackendSupportedError):
-            flashinfer.top_k_varlen(lg, le, k, row_starts=rs, **kw)
-        with pytest.raises((ValueError, BackendSupportedError)):
-            flashinfer.top_k_varlen(lg, le, k, row_starts=rs, backend="gvr_2", **kw)
+    for kw in (
+        {"pre_idx": hint},
+        {"compress_ratio": 4},
+        {"compress_ratio": 1},
+        {"compress_ratio": 2},
+        {"next_n": 2},
+        {"next_n": 1},
+        {"next_n": 1, "compress_ratio": 1},
+    ):
+        for extra in ({}, {"backend": "gvr_2"}):
+            if gvr2_here:
+                with pytest.raises(ValueError, match="decode-mode argument"):
+                    flashinfer.top_k_varlen(lg, le, k, row_starts=rs, **kw, **extra)
+            else:
+                with pytest.raises((ValueError, BackendSupportedError)):
+                    flashinfer.top_k_varlen(lg, le, k, row_starts=rs, **kw, **extra)
+
+    # the sentinel defaults: omitted, None and 1 are the same decode call
+    # (radix_cutlass exists on every GPU; full rows, so every slot is a hit and
+    # the sorted selected values are a tie-safe identity of the selection)
+    def _vals(idx):
+        return lg.gather(1, idx.long()).sort(dim=1).values
+
+    plain = flashinfer.top_k_varlen(lg, le, k, backend="radix_cutlass")[0]
+    for kw in (
+        {"next_n": None, "compress_ratio": None},
+        {"next_n": 1, "compress_ratio": 1},
+    ):
+        got = flashinfer.top_k_varlen(lg, le, k, backend="radix_cutlass", **kw)[0]
+        assert torch.equal(_vals(got), _vals(plain)), kw
+    if gvr2_here:
+        # an explicit None is the omitted form in windowed mode too (rs == 0 and
+        # full windows here, so window positions are the columns)
+        plain_w = flashinfer.top_k_varlen(lg, le, k, row_starts=rs)[0]
+        none_w = flashinfer.top_k_varlen(
+            lg, le, k, row_starts=rs, next_n=None, compress_ratio=None, pre_idx=None
+        )[0]
+        assert torch.equal(_vals(none_w), _vals(plain_w))
     # explicit non-gvr_2 backends refuse windowed calls
     for b in ("radix", "radix_cutlass", "radix_filter", "gvr"):
         with pytest.raises((ValueError, BackendSupportedError)):
             flashinfer.top_k_varlen(lg, le, k, row_starts=rs, backend=b)
     # admission: only gvr_2's checker admits row_starts
-    common = dict(pre_idx=None, compress_ratio=1, next_n=1, row_starts=rs)
+    common = dict(row_starts=rs)
     for chk in (
         api._radix_top_k_varlen_check,
         api._radix_cutlass_top_k_varlen_check,
@@ -868,28 +903,21 @@ def test_prefill_skip_check_refuses_other_backends():
             flashinfer.top_k_varlen(
                 lg, le, k, row_starts=rs, backend=b, skip_check=True
             )
+    # decode-mode arguments are refused by the API body before any dispatch;
+    # with the checkers bypassed this holds on every GPU, whatever the backend
+    hint = torch.zeros(rows, k, dtype=torch.int32, device=_DEV)
+    for kw in ({"next_n": 1}, {"compress_ratio": 1}, {"pre_idx": hint}):
+        for b in ("gvr_2", "auto"):
+            with pytest.raises(ValueError, match="decode-mode argument"):
+                flashinfer.top_k_varlen(
+                    lg, le, k, row_starts=rs, backend=b, skip_check=True, **kw
+                )
     if flashinfer.top_k_varlen.is_backend_supported("gvr_2", _cc()):
         out, _ = flashinfer.top_k_varlen(
             lg, le, k, row_starts=rs, backend="gvr_2", skip_check=True
         )
         torch.cuda.synchronize()
         _check_windowed(lg, out, rs, le, k)
-
-
-def test_prefill_next_n_refused():
-    """Windowed mode is one row per request: ``next_n=2`` with ``row_starts``
-    is refused by every checker (auto: no suitable backend; explicit gvr_2:
-    backend validation)."""
-    from flashinfer.utils import BackendSupportedError
-
-    n, reqs, k = 4096, 4, 512
-    lg = torch.randn((2 * reqs, n), dtype=torch.float32, device=_DEV)
-    le = torch.full((reqs,), n, dtype=torch.int32, device=_DEV)
-    rs = torch.zeros((2 * reqs,), dtype=torch.int32, device=_DEV)
-    with pytest.raises(BackendSupportedError):
-        flashinfer.top_k_varlen(lg, le, k, next_n=2, row_starts=rs)
-    with pytest.raises((ValueError, BackendSupportedError)):
-        flashinfer.top_k_varlen(lg, le, k, next_n=2, row_starts=rs, backend="gvr_2")
 
 
 @requires_gvr2

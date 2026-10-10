@@ -157,6 +157,22 @@ def _cute_dsl_ready(device: torch.device) -> bool:
     return _cute_dsl_supports_arch(major, minor)
 
 
+def _decode_defaults(
+    next_n: Optional[int], compress_ratio: Optional[int]
+) -> Tuple[int, int]:
+    """Resolve the ``None`` sentinels of the two decode-mode arguments to ``1``.
+
+    Both default to ``None`` so that the API body can tell an explicit value
+    (refused in windowed (prefill) mode, where neither has a meaning) from an
+    omitted one. The checkers and the heuristic see the caller's raw
+    arguments, so they resolve the sentinels the same way before using them.
+    """
+    return (
+        1 if next_n is None else next_n,
+        1 if compress_ratio is None else compress_ratio,
+    )
+
+
 @supported_compute_capability(_ALL_CCS)
 def _radix_cutlass_top_k_varlen_check(
     logits,
@@ -166,8 +182,8 @@ def _radix_cutlass_top_k_varlen_check(
     row_starts=None,
     max_window_len=None,
     absolute_indices=False,
-    compress_ratio=1,
-    next_n=1,
+    compress_ratio=None,
+    next_n=None,
     pre_idx=None,
     return_values=False,
     out_indices=None,
@@ -227,8 +243,8 @@ def _gvr_top_k_varlen_check(
     row_starts=None,
     max_window_len=None,
     absolute_indices=False,
-    compress_ratio=1,
-    next_n=1,
+    compress_ratio=None,
+    next_n=None,
     pre_idx=None,
     return_values=False,
     out_indices=None,
@@ -255,6 +271,7 @@ def _gvr_top_k_varlen_check(
     if top_k not in (512, 1024, 2048):
         return False
     # GvrTopKLBPrepareKernel asserts compress_ratio in (1, 4).
+    _, compress_ratio = _decode_defaults(next_n, compress_ratio)
     if compress_ratio not in (1, 4):
         return False
     # GVR uses 128-bit vectorized loads — each row must be 16-byte aligned.
@@ -278,8 +295,8 @@ def _gvr2_top_k_varlen_check(
     row_starts=None,
     max_window_len=None,
     absolute_indices=False,
-    compress_ratio=1,
-    next_n=1,
+    compress_ratio=None,
+    next_n=None,
     pre_idx=None,
     return_values=False,
     out_indices=None,
@@ -298,12 +315,10 @@ def _gvr2_top_k_varlen_check(
     sample, TRT-LLM #18410) when it is absent — or malformed, in which case the
     API body discards it with a RuntimeWarning first.
     """
-    if row_starts is not None and (
-        pre_idx is not None or next_n != 1 or compress_ratio != 1
-    ):
-        return (
-            False  # windowed mode: hint-free, one row per request, no compression shift
-        )
+    # windowed (prefill) mode takes no pre_idx / next_n / compress_ratio: the
+    # API body refuses them with a ValueError before any launch, and admitting
+    # the call here is what lets ``auto`` report that error (not "no backend")
+    _, compress_ratio = _decode_defaults(next_n, compress_ratio)
     if not _cute_dsl_ready(logits.device):
         return False
     # fp32 only: the upstream self-sampling kernels declare bf16/fp16 a
@@ -313,8 +328,8 @@ def _gvr2_top_k_varlen_check(
     # Validated K domain (matches the upstream dispatch tuning + dsa.py gate).
     if top_k not in (512, 1024, 2048):
         return False
-    if compress_ratio not in (1, 4):
-        return False
+    if row_starts is None and compress_ratio not in (1, 4):
+        return False  # a decode-mode value; in windowed mode the body refuses any value
     # float4 row loads: row stride must be a multiple of 4 and the base
     # 16-byte aligned (fresh torch allocations always are; sliced views may
     # not be). Wider-than-N row strides are accepted (paged arenas); rows that
@@ -341,8 +356,8 @@ def _top_k_varlen_heuristic(
     row_starts=None,
     max_window_len=None,
     absolute_indices=False,
-    compress_ratio: int = 1,
-    next_n: int = 1,
+    compress_ratio: Optional[int] = None,
+    next_n: Optional[int] = None,
     pre_idx=None,
     return_values: bool = False,
     out_indices=None,
@@ -1289,8 +1304,8 @@ def _radix_top_k_varlen_check(
     row_starts=None,
     max_window_len=None,
     absolute_indices=False,
-    compress_ratio=1,
-    next_n=1,
+    compress_ratio=None,
+    next_n=None,
     pre_idx=None,
     return_values=False,
     out_indices=None,
@@ -1434,8 +1449,8 @@ def _radix_filter_top_k_varlen_check(
     row_starts=None,
     max_window_len=None,
     absolute_indices=False,
-    compress_ratio=1,
-    next_n=1,
+    compress_ratio=None,
+    next_n=None,
     pre_idx=None,
     return_values=False,
     out_indices=None,
@@ -1465,7 +1480,7 @@ def _radix_filter_top_k_varlen_check(
     # [1, 16384]; enforce it here so the failure is a backend-validation error.
     if not 1 <= top_k <= 16384:
         return False
-    if compress_ratio != 1:
+    if _decode_defaults(next_n, compress_ratio)[1] != 1:
         return False
     if logits.dtype not in _RADIX_FILTER_DTYPES:
         return False
@@ -1566,8 +1581,8 @@ def top_k_varlen(
     row_starts: Optional[torch.Tensor] = None,
     max_window_len: Optional[int] = None,
     absolute_indices: bool = False,
-    compress_ratio: int = 1,
-    next_n: int = 1,
+    compress_ratio: Optional[int] = None,
+    next_n: Optional[int] = None,
     pre_idx: Optional[torch.Tensor] = None,
     return_values: bool = False,
     out_indices: Optional[torch.Tensor] = None,
@@ -1619,9 +1634,11 @@ def top_k_varlen(
 
     Windowed (prefill) mode
     -----------------------
-    ``row_starts`` switches a call into windowed mode; ``max_window_len`` and
-    ``absolute_indices`` apply only there (a decode call refuses both with
-    ``ValueError``).
+    ``row_starts`` switches a call into windowed (prefill) mode.
+    ``max_window_len`` and ``absolute_indices`` apply only there (a decode
+    call refuses both with ``ValueError``); ``next_n``, ``compress_ratio``
+    and ``pre_idx`` belong to decode mode (a windowed call refuses all three
+    with ``ValueError``, even at their decode defaults).
     The mode exists for the DSA indexer's prefill layout, where two things
     move a row's keys away from column 0: several requests share one packed
     key axis, and chunked prefill or prefix caching puts a request's earlier
@@ -1659,14 +1676,11 @@ def top_k_varlen(
     which keys win.
 
     Rules of the mode: a window shorter than ``top_k`` returns all its
-    positions; a window end past ``num_cols`` is clamped to ``num_cols``. The
-    mode requires ``next_n == 1``, ``compress_ratio == 1`` and no ``pre_idx``.
-    It is served by the ``"gvr_2"`` backend alone, whose limits and CUDA-graph
-    warm-up rule apply (see ``backend``): ``backend="auto"`` resolves to it or
-    raises ``BackendSupportedError``, and any other explicit backend is
-    refused. Under a captured graph the contents of ``row_starts`` and
-    ``seq_lens`` may change between replays while every window stays within
-    ``max_window_len``.
+    positions; a window end past ``num_cols`` is clamped to ``num_cols``.
+    Under a captured graph the contents of ``row_starts`` and ``seq_lens``
+    may change between replays while every window stays within
+    ``max_window_len``. The backends that serve the mode, with their limits
+    and CUDA-graph warm-up rule, are listed under ``backend``.
 
     Parameters
     ----------
@@ -1729,19 +1743,25 @@ def top_k_varlen(
         position through its page table. ``True`` without ``row_starts``
         raises ``ValueError``. Default ``False``.
     compress_ratio : int, optional
-        KV-index compression factor (``1`` for DSv3.2, ``4`` for DSv4): every
-        logit column stands for ``compress_ratio`` consecutive KV tokens. In
-        decode mode it converts the token lengths in ``seq_lens`` into
-        per-row column counts, ``max(0, (seq_len - next_n + t + 1) //
+        Decode mode only: KV-index compression factor (``1`` for DSv3.2, ``4``
+        for DSv4), every logit column standing for ``compress_ratio``
+        consecutive KV tokens. It converts the token lengths in ``seq_lens``
+        into per-row column counts, ``max(0, (seq_len - next_n + t + 1) //
         compress_ratio)`` (see ``seq_lens``); only the kernel can do that
         when one request length serves ``next_n`` rows. The accepted values
-        are backend-specific (see ``backend``). Windowed mode has one length
-        per row and takes it in columns already, so there is nothing to
-        convert: ``compress_ratio`` must stay at its default ``1`` there
-        (any other value raises ``ValueError``), and a compressed layer
-        passes its windows in compressed columns. Default ``1``.
+        are backend-specific (see ``backend``). Passing it with ``row_starts``
+        raises ``ValueError``: windowed (prefill) mode has one length per row
+        and takes it in columns already, so there is nothing to convert, and
+        a compressed layer passes its windows in compressed columns. Default
+        ``None``, meaning ``1``.
     next_n : int, optional
-        Speculative-decode temporal stride.  Default ``1``.
+        Decode mode only: rows per request, the query tokens a request
+        contributes to the current step (``1`` without speculative decoding);
+        row ``r`` belongs to request ``r // next_n`` and the per-row column
+        counts are given under ``seq_lens``. Passing it with ``row_starts``
+        raises ``ValueError``: windowed (prefill) mode has one length per row,
+        so a request's extra tokens are plain rows with their own windows.
+        Default ``None``, meaning ``1``.
     pre_idx : torch.Tensor, optional
         Decode mode only: a hint of each request's top-k indices, a warm
         start for the backends that take one (how each backend consumes or
@@ -1749,8 +1769,8 @@ def top_k_varlen(
         ``int32`` tensor of shape ``[seq_lens.shape[0], top_k]``, one row
         per request. A hint that breaks this is discarded with a
         ``RuntimeWarning`` and the call runs hint-free (an explicit backend
-        that requires one is refused). Not allowed in windowed (prefill)
-        mode. Default ``None``.
+        that requires one is refused). Passing it with ``row_starts`` raises
+        ``ValueError``. Default ``None``.
     return_values : bool, optional
         When ``True`` also return the selected logit values. Padded slots hold
         a backend-specific sentinel (see ``backend``); test ``indices >= 0``
@@ -1927,31 +1947,30 @@ def top_k_varlen(
     Raises
     ------
     BackendSupportedError
-        If ``backend="auto"`` finds no backend whose checks pass; in windowed
-        (prefill) mode that is anything ``"gvr_2"`` cannot run (see
-        ``"gvr_2"`` under ``backend``). If an explicit backend is not
-        registered for the device. Under ``skip_check=True`` only, if
-        ``row_starts`` comes with a backend other than ``"gvr_2"`` or an
-        explicit ``"gvr"`` has no usable ``pre_idx`` (with checks on, both are
-        refused by the backend's checker as ``ValueError``).
+        If ``backend="auto"`` finds no backend whose checks pass for the call
+        (which backends serve each mode, and on which GPUs, is under
+        ``backend``). If an explicit backend is not registered for the device.
+        Under ``skip_check=True`` only, if ``row_starts`` comes with a backend
+        that does not serve windowed (prefill) mode, or an explicit backend
+        lacks the hint it requires (with checks on, both are refused by the
+        backend's checker as ``ValueError``).
     ValueError
         If ``logits`` / ``seq_lens`` / ``next_n`` violate the shape, dtype or
-        grouping contract; if a windowed-mode argument violates its contract
-        (``row_starts`` not a contiguous 1-D ``int32`` tensor with one entry
-        per row, ``row_starts`` with
-        ``next_n != 1``, ``compress_ratio != 1`` or a ``pre_idx``,
-        ``max_window_len`` not a positive ``int``, ``absolute_indices`` not a
-        ``bool``, or either of them given without ``row_starts``); if an
-        ``out_indices`` /
+        grouping contract; if an argument is used outside its mode
+        (``next_n``, ``compress_ratio`` or ``pre_idx`` with ``row_starts``;
+        ``max_window_len`` or ``absolute_indices`` without it); if
+        ``row_starts`` is not a contiguous 1-D ``int32`` tensor with one entry
+        per row, ``max_window_len`` not a positive ``int`` or
+        ``absolute_indices`` not a ``bool``; if an ``out_indices`` /
         ``out_values`` buffer is outside the contract above; or if an explicit
         backend's checker rejects the problem (reported as "Problem size is
         not supported").
     RuntimeError
-        Under CUDA-graph capture, when the ``"gvr_2"`` launcher for the
-        geometry is not compiled yet or the capturing stream has no default
-        workspace slab (warm-up and slab rules under ``"gvr_2"`` in
-        ``backend``); or when a
-        caller-passed ``"gvr2_workspace"`` fails its size or alignment check.
+        Under CUDA-graph capture, when a backend's launcher for the geometry
+        is not compiled yet or the capturing stream has no workspace slab
+        (the warm-up and slab rules are in that backend's entry under
+        ``backend``); or when a caller-passed ``workspace`` buffer fails its
+        size or alignment check.
 
     Warns
     -----
@@ -1996,7 +2015,7 @@ def top_k_varlen(
     Windowed (prefill) mode: one row per query token of a packed chunk, each
     ranking its own window ``[row_starts[r], row_starts[r] + seq_lens[r])``
     given in columns; ``next_n``, ``compress_ratio`` and ``pre_idx`` are not
-    passed. Served by ``"gvr_2"`` (see ``backend``).
+    passed (the backends that serve the mode are listed under ``backend``).
 
     >>> # two requests of L keys each on one packed key axis of 2 * L columns;
     >>> # a request's j-th token (0-based) ranks the request's first j + 1 keys
@@ -2033,6 +2052,28 @@ def top_k_varlen(
             "seq_lens must be a 1-D int32 CUDA tensor"
             + (f", got {seq_lens.dtype}" if isinstance(seq_lens, torch.Tensor) else "")
         )
+    if row_starts is not None:
+        decode_only = [
+            name
+            for name, value in (
+                ("next_n", next_n),
+                ("compress_ratio", compress_ratio),
+                ("pre_idx", pre_idx),
+            )
+            if value is not None
+        ]
+        if decode_only:
+            raise ValueError(
+                f"{', '.join(decode_only)}: decode-mode argument(s) passed with "
+                "row_starts. Windowed (prefill) mode has one length per row, "
+                "already in columns, and takes no hint, so next_n, "
+                "compress_ratio and pre_idx have no meaning there; do not pass "
+                "them, not even at their decode defaults."
+            )
+    # next_n / compress_ratio default to None so that the refusal above can
+    # tell an explicit decode default from an omitted argument; from here on
+    # they are the decode-mode ints (None means 1)
+    next_n, compress_ratio = _decode_defaults(next_n, compress_ratio)
     # Grouped-row ABI, shared by every backend: row r belongs to sequence
     # r // next_n, so seq_lens must hold exactly one entry per group. Validated
     # here (not in the per-backend checkers) because a violation is a silent
@@ -2071,15 +2112,6 @@ def top_k_varlen(
                 f"row_starts has {row_starts.shape[0]} entries, expected one per "
                 f"logits row ({num_rows})"
             )
-        if next_n != 1 or compress_ratio != 1:
-            raise ValueError(
-                "row_starts (windowed mode) requires next_n == 1 and "
-                f"compress_ratio == 1, got {next_n} / {compress_ratio}"
-            )
-        if pre_idx is not None:
-            raise ValueError(
-                "row_starts (windowed mode) is hint-free: pass pre_idx=None"
-            )
         if max_window_len is not None and (
             isinstance(max_window_len, bool)
             or not isinstance(max_window_len, int)
@@ -2094,13 +2126,15 @@ def top_k_varlen(
             )
     elif absolute_indices:
         raise ValueError(
-            "absolute_indices=True requires row_starts (windowed mode): decode "
-            "indices are already columns of logits"
+            "absolute_indices=True requires row_starts: it selects the index "
+            "frame of windowed (prefill) mode, and decode indices are already "
+            "columns of logits"
         )
     elif max_window_len is not None:
         raise ValueError(
-            "max_window_len requires row_starts (windowed mode): in decode every "
-            "row starts at column 0 and num_cols already bounds it"
+            "max_window_len requires row_starts: it bounds the windows of "
+            "windowed (prefill) mode, and in decode every row starts at column "
+            "0 and num_cols already bounds it"
         )
 
     # A malformed hint is discarded, loudly: the call runs hint-free (the
@@ -2175,7 +2209,8 @@ def top_k_varlen(
         # row_starts): refuse BEFORE dispatch -- a radix / gvr run would
         # silently rank the row prefix [0, seq_len) instead of the window
         raise BackendSupportedError(
-            f"backend={backend!r} does not support row_starts (windowed mode); "
+            f"backend={backend!r} does not serve windowed (prefill) mode, which "
+            "row_starts selects; "
             "use backend='gvr_2' or 'auto'"
         )
     if pre_idx is None and backend == "gvr":
