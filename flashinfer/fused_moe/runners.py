@@ -9227,7 +9227,7 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
         assert workspace.sort is not None
         tile = self._segment_alignment
         num_local_experts = self._num_local_experts
-        tile_expert, _, token_to_row, _, _, num_tiles = moe_sort(
+        tile_expert, _, token_to_row, _, _, num_tiles, _ = moe_sort(
             topk_ids,
             topk_weights,
             self.config.routing.num_experts,
@@ -10132,10 +10132,7 @@ class MegaMoeFc12Runner(MoERunner):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
-        if act.routing_input_mode not in self.supported_routing_modes:
-            raise NotImplementedError(
-                f"MegaMOE FC12 does not support {act.routing_input_mode!r}."
-            )
+        self._validate_pack_contract(act)
         routing = self.config.routing
         _validate_prerouted_inputs(
             act,
