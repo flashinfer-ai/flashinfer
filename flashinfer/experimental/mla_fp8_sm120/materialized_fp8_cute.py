@@ -1561,7 +1561,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             acc_S, is_first=is_first_n_block, check_inf=check_inf
         )
         row_scale.store(
-            row_scale.load() * (mma_params.value_scale_state[0] / block_v_scale)
+            row_scale.load()
+            * (mma_params.value_scale_state[0] * cute.arch.rcp_approx(block_v_scale))
         )
         mma_params.value_scale_state[0] = block_v_scale
         softmax.rescale_O(mma_params.acc_O, row_scale)
