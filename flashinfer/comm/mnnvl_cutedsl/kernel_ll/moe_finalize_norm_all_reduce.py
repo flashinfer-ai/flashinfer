@@ -48,6 +48,7 @@ from ..cute_dsl_primitives import (
     VEC_BF16,
     WARP_SIZE,
     bf16x8_to_packed_u32x4,
+    load_bf16x8_as_f32,
     load_volatile_u32,
     sanitize_negative_zero_u32x4,
     stmc_bf16x8,
@@ -59,7 +60,6 @@ from ..runtime import (
     to_cute,
     to_cute_dynamic,
 )
-from .all_gather_dual_norm import _load_bf16x8
 from .device_kernels import (
     ACTIVE_STAGE,
     NEXT_STAGE,
@@ -145,13 +145,12 @@ class _NormFinalizePublishDeviceKernel:
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = cute.arch.lane_idx()
 
-        gamma = cute.make_rmem_tensor(
-            cute.make_layout((self.trips, VEC_BF16), stride=(VEC_BF16, 1)), Float32
-        )
+        frag_layout = cute.make_layout((self.trips, VEC_BF16), stride=(VEC_BF16, 1))
+        gamma = cute.make_rmem_tensor(frag_layout, Float32)
         for trip in cutlass.range_constexpr(self.trips):
             column = Int64(tidx + trip * self.threads) * VEC_BF16
             gamma[trip, None].store(
-                _load_bf16x8(norm_weight, column) + Float32(self.gain_center)
+                load_bf16x8_as_f32(norm_weight, column) + Float32(self.gain_center)
             )
 
         if cutlass.const_expr(self.enable_pdl):
@@ -160,12 +159,8 @@ class _NormFinalizePublishDeviceKernel:
         smem = cutlass.utils.SmemAllocator()
         # One slot set per route avoids a second barrier per route.
         warp_sums = smem.allocate_array(Float32, self.topk * self.warps)
-        scaled = cute.make_rmem_tensor(
-            cute.make_layout((self.trips, VEC_BF16), stride=(VEC_BF16, 1)), Float32
-        )
-        acc = cute.make_rmem_tensor(
-            cute.make_layout((self.trips, VEC_BF16), stride=(VEC_BF16, 1)), Float32
-        )
+        scaled = cute.make_rmem_tensor(frag_layout, Float32)
+        acc = cute.make_rmem_tensor(frag_layout, Float32)
         acc.fill(Float32(0.0))
         for k in cutlass.range_constexpr(self.topk):
             route = Int64(token) * self.topk + k
@@ -175,7 +170,7 @@ class _NormFinalizePublishDeviceKernel:
             if is_local:
                 for trip in cutlass.range_constexpr(self.trips):
                     column = Int64(tidx + trip * self.threads) * VEC_BF16
-                    values = _load_bf16x8(
+                    values = load_bf16x8_as_f32(
                         routed_rows, Int64(row) * self.row_stride + column
                     )
                     if cutlass.const_expr(self.weight_before_norm):
@@ -370,6 +365,7 @@ class LLMoEFinalizeNormAllReduce:
         m = Int32(output.shape[0])
         stream = current_cu_stream()
         weight_align = route_weights.element_size()
+        gamma = to_cute(norm_weight, 16)
         publisher(
             to_cute_dynamic(
                 routed_rows.flatten(), 16, divisibility=routed_rows.shape[1]
@@ -378,7 +374,7 @@ class LLMoEFinalizeNormAllReduce:
                 route_weights.flatten(), weight_align, divisibility=self.topk
             ),
             to_cute_dynamic(permuted_idx.flatten(), 4, divisibility=self.topk),
-            to_cute(norm_weight, 16),
+            gamma,
             self._stage_state,
             self._mailbox_multicast,
             m,
@@ -387,9 +383,10 @@ class LLMoEFinalizeNormAllReduce:
         )
         out = to_cute_dynamic(output.flatten(), 16, divisibility=self.hidden_size)
         self._reduce(
+            # Unused residual source, gamma and norm output with the norm off.
             self._mailbox,
             out,
-            to_cute(norm_weight, 16),
+            gamma,
             out,
             out,
             self._stage_state,

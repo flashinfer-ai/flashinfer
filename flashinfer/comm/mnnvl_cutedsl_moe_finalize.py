@@ -32,7 +32,7 @@ from torch.distributed import ProcessGroup
 from .mnnvl_cutedsl.kernel_ll.moe_finalize_norm_all_reduce import (
     LLMoEFinalizeNormAllReduce,
 )
-from .mnnvl_cutedsl.runtime import require_mnnvl_multicast_device
+from .mnnvl_cutedsl.runtime import is_dense_on, require_mnnvl_multicast_device
 
 __all__ = [
     "MNNVLCuteDSLMoEFinalizeAllReduceWorkspace",
@@ -110,10 +110,6 @@ class MNNVLCuteDSLMoEFinalizeAllReduceWorkspace:
         )
 
 
-def _is_dense(t: torch.Tensor, device: torch.device, alignment: int) -> bool:
-    return t.device == device and t.is_contiguous() and t.data_ptr() % alignment == 0
-
-
 def supports_moe_finalize_rmsnorm_allreduce(
     workspace: MNNVLCuteDSLMoEFinalizeAllReduceWorkspace,
     routed_rows: torch.Tensor,
@@ -131,21 +127,21 @@ def supports_moe_finalize_rmsnorm_allreduce(
         1 <= m <= workspace.max_token_num
         and output.shape[1] == hidden
         and output.dtype == torch.bfloat16
-        and _is_dense(output, device, 16)
+        and is_dense_on(output, device, 16)
         and routed_rows.ndim == 2
         and routed_rows.shape[1] >= hidden
         and routed_rows.shape[1] % 8 == 0
         and routed_rows.dtype == torch.bfloat16
-        and _is_dense(routed_rows, device, 16)
+        and is_dense_on(routed_rows, device, 16)
         and route_weights.shape == routes
         and route_weights.dtype in (torch.bfloat16, torch.float32)
-        and _is_dense(route_weights, device, route_weights.element_size())
+        and is_dense_on(route_weights, device, route_weights.element_size())
         and permuted_idx.shape == routes
         and permuted_idx.dtype == torch.int32
-        and _is_dense(permuted_idx, device, 4)
+        and is_dense_on(permuted_idx, device, 4)
         and norm_weight.shape == (hidden,)
         and norm_weight.dtype == torch.bfloat16
-        and _is_dense(norm_weight, device, 16)
+        and is_dense_on(norm_weight, device, 16)
     )
 
 

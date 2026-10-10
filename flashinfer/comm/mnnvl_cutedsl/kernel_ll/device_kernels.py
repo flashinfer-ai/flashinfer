@@ -842,15 +842,16 @@ class _LamportResidualRMSNormDeviceKernel:
             fragment = base_fragment + trip * self.fragment_stride
             if fragment < self.fragments and rank_lane == 0:
                 gamma_element = Int64(fragment) * VEC_BF16
-                gamma_pointer = cute.make_ptr(
-                    BFloat16,
-                    (gamma.iterator + gamma_element).llvm_ptr,
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                )
-                gamma_fragments[trip, None].store(
-                    packed_u32x4_to_bf16x8(load_global_u32x4(gamma_pointer))
-                )
+                if cutlass.const_expr(self.write_norm_output):
+                    gamma_pointer = cute.make_ptr(
+                        BFloat16,
+                        (gamma.iterator + gamma_element).llvm_ptr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    gamma_fragments[trip, None].store(
+                        packed_u32x4_to_bf16x8(load_global_u32x4(gamma_pointer))
+                    )
                 if cutlass.const_expr(self.add_residual):
                     residual_element = Int64(token) * self.hidden + gamma_element
                     residual_pointer = cute.make_ptr(

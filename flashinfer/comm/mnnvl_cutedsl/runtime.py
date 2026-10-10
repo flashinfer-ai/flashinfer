@@ -77,6 +77,11 @@ def make_fake_dynamic_compact_tensor(
     )
 
 
+def is_dense_on(t: torch.Tensor, device: torch.device, alignment: int) -> bool:
+    """Contiguous, on ``device``, with an ``alignment``-byte base address."""
+    return t.device == device and t.is_contiguous() and t.data_ptr() % alignment == 0
+
+
 def require_mnnvl_multicast_device() -> torch.device:
     """The current device, if it supports the MNNVL multicast kernels."""
     import torch.distributed._symmetric_memory as symm_mem

@@ -51,6 +51,8 @@ from ..cute_dsl_primitives import (
     WARP_SIZE,
     bf16x8_to_packed_u32x4,
     fragment_has_negative_zero,
+    load_bf16x8_as_f32,
+    load_f32x8,
     load_global_u32x4,
     load_volatile_u32,
     map_shared_to_peer,
@@ -59,6 +61,7 @@ from ..cute_dsl_primitives import (
     store_global_u32x4,
     store_lamport_sentinel_u32x4,
     store_shared_cluster_f32,
+    store_f32x8,
 )
 from ..runtime import (
     current_cu_stream,
@@ -86,47 +89,6 @@ class _NormConstants:
     post_gain_center: float
     next_gain_center: float
     has_post_weight: bool
-
-
-@cute.jit
-def _load_f32x8(base: cute.Tensor, offset: Int64):
-    pointer = cute.make_ptr(
-        Float32,
-        (base.iterator + offset).llvm_ptr,
-        cute.AddressSpace.gmem,
-        assumed_align=32,
-    )
-    fragment = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
-    cute.autovec_copy(
-        cute.make_tensor(pointer, cute.make_layout((VEC_BF16,))), fragment
-    )
-    return fragment.load()
-
-
-@cute.jit
-def _store_f32x8(base: cute.Tensor, offset: Int64, values) -> None:
-    pointer = cute.make_ptr(
-        Float32,
-        (base.iterator + offset).llvm_ptr,
-        cute.AddressSpace.gmem,
-        assumed_align=32,
-    )
-    fragment = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
-    fragment.store(values)
-    cute.autovec_copy(
-        fragment, cute.make_tensor(pointer, cute.make_layout((VEC_BF16,)))
-    )
-
-
-@cute.jit
-def _load_bf16x8(base: cute.Tensor, offset: Int64):
-    pointer = cute.make_ptr(
-        BFloat16,
-        (base.iterator + offset).llvm_ptr,
-        cute.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    return packed_u32x4_to_bf16x8(load_global_u32x4(pointer)).to(Float32)
 
 
 @cute.jit
@@ -248,16 +210,16 @@ class _AllGatherDualNormDeviceKernel:
         row_element = Int64(token) * self.hidden + column
 
         # Parameters and the residual stream do not depend on the publisher.
-        alpha_values = _load_f32x8(alpha, column)
-        beta_values = _load_f32x8(beta, column)
-        next_gamma = _load_bf16x8(next_weight, column) + Float32(
+        alpha_values = load_f32x8(alpha, column)
+        beta_values = load_f32x8(beta, column)
+        next_gamma = load_bf16x8_as_f32(next_weight, column) + Float32(
             constants.next_gain_center
         )
         if cutlass.const_expr(constants.has_post_weight):
-            post_gamma = _load_bf16x8(post_weight, column) + Float32(
+            post_gamma = load_bf16x8_as_f32(post_weight, column) + Float32(
                 constants.post_gain_center
             )
-        stream_values = _load_f32x8(residual, row_element)
+        stream_values = load_f32x8(residual, row_element)
 
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
@@ -317,7 +279,7 @@ class _AllGatherDualNormDeviceKernel:
         )
         # Same association as gated_residual_next_rmsnorm: no rounded norm(b).
         updated = alpha_values * stream_values + (beta_values * branch) * post_inv_rms
-        _store_f32x8(residual_output, row_element, updated)
+        store_f32x8(residual_output, row_element, updated)
 
         next_sum = _cluster_row_sum(
             (updated * updated).reduce(

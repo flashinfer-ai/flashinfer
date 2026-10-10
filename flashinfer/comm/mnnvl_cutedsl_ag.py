@@ -28,7 +28,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from .mnnvl_cutedsl.runtime import require_mnnvl_multicast_device
+from .mnnvl_cutedsl.runtime import is_dense_on, require_mnnvl_multicast_device
 from .mnnvl_cutedsl.kernel_ll.all_gather_dual_norm import (
     LLAllGatherDualNorm,
     LLAllGatherDualNormTuning,
@@ -125,10 +125,6 @@ def _norm_constants(
     )
 
 
-def _is_dense(t: torch.Tensor, device: torch.device, alignment: int) -> bool:
-    return t.device == device and t.is_contiguous() and t.data_ptr() % alignment == 0
-
-
 def supports_all_gather_gated_residual_next_rmsnorm(
     workspace: MNNVLCuteDSLAllGatherDualNormWorkspace,
     branch_shard: torch.Tensor,
@@ -150,12 +146,12 @@ def supports_all_gather_gated_residual_next_rmsnorm(
         1 <= m <= workspace.max_token_num
         and branch_shard.shape[1] == hidden // workspace.tp_size
         and branch_shard.dtype == torch.bfloat16
-        and _is_dense(branch_shard, device, 16)
+        and is_dense_on(branch_shard, device, 16)
         and residual.shape == (m, hidden)
         and residual.dtype == torch.float32
-        and _is_dense(residual, device, 32)
+        and is_dense_on(residual, device, 32)
         and all(
-            v.shape == (hidden,) and v.dtype == dtype and _is_dense(v, device, align)
+            v.shape == (hidden,) and v.dtype == dtype and is_dense_on(v, device, align)
             for v, dtype, align in vectors
         )
     )
