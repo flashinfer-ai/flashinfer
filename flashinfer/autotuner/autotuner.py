@@ -48,6 +48,13 @@ from flashinfer.autotuner.initializers import (
 # should also be updated. Currently, this process is manual, but it should be automated in the future.
 _nvfp4_cutlass_version = "0.1"
 
+try:
+    _CUDA_EVENT_SUPPORTS_EXTERNAL = (
+        "external" in inspect.signature(torch.cuda.Event).parameters
+    )
+except (TypeError, ValueError):
+    _CUDA_EVENT_SUPPORTS_EXTERNAL = False
+
 
 def _tactic_to_json(tactic: Any) -> Any:
     """Convert a tactic value to a JSON-compatible format.
@@ -2857,8 +2864,14 @@ class AutoTuner:
                 device=device,
             )
             num_samples = repeat * profile_replays
-            starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
-            ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
+            capture_samples = (
+                tuning_config.use_cuda_graph and _CUDA_EVENT_SUPPORTS_EXTERNAL
+            )
+            event_kwargs = {"enable_timing": True}
+            if capture_samples:
+                event_kwargs["external"] = True
+            starts = [torch.cuda.Event(**event_kwargs) for _ in range(num_samples)]
+            ends = [torch.cuda.Event(**event_kwargs) for _ in range(num_samples)]
             graph = torch.cuda.CUDAGraph() if tuning_config.use_cuda_graph else None
 
             def _run_once(profile_inputs):
@@ -2881,16 +2894,30 @@ class AutoTuner:
                 if delay_kernel_time_usec > 0:
                     delay_kernel(delay_kernel_time_usec)
 
-                for sample_idx in range(num_samples):
-                    flush_buffer.zero_()
-                    starts[sample_idx].record(stream)
-                    if graph is not None:
-                        graph.replay()
-                    else:
-                        _run_once(
-                            input_tensor_batches[sample_idx % len(input_tensor_batches)]
-                        )
-                    ends[sample_idx].record(stream)
+                if capture_samples:
+                    # Submit every sample together. External events keep each
+                    # interval measurable, with eviction outside the interval.
+                    samples_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(samples_graph):
+                        for sample_idx in range(num_samples):
+                            flush_buffer.zero_()
+                            starts[sample_idx].record()
+                            _run_once(input_tensor_batches[-1])
+                            ends[sample_idx].record()
+                    samples_graph.replay()
+                else:
+                    for sample_idx in range(num_samples):
+                        flush_buffer.zero_()
+                        starts[sample_idx].record(stream)
+                        if graph is not None:
+                            graph.replay()
+                        else:
+                            _run_once(
+                                input_tensor_batches[
+                                    sample_idx % len(input_tensor_batches)
+                                ]
+                            )
+                        ends[sample_idx].record(stream)
 
                 # One synchronization after all samples keeps host overhead
                 # out of the per-invocation measurements.
@@ -3399,7 +3426,7 @@ class AutoTuner:
     @staticmethod
     def _profiling_policy(tuning_config: TuningConfig) -> tuple:
         """Return measurement provenance that can change tactic ranking."""
-        return (
+        policy = (
             "cuda_graph_profile_replays",
             (
                 int(tuning_config.cuda_graph_profile_replays)
@@ -3409,6 +3436,13 @@ class AutoTuner:
             "l2_cache_policy",
             "cold" if tuning_config.use_cold_l2_cache else "hot",
         )
+        if (
+            tuning_config.use_cold_l2_cache
+            and tuning_config.use_cuda_graph
+            and _CUDA_EVENT_SUPPORTS_EXTERNAL
+        ):
+            return (*policy, "cold_l2_graph_timer", "flat_v1")
+        return policy
 
     @staticmethod
     def _default_profiling_policy(tuning_config: TuningConfig) -> tuple:

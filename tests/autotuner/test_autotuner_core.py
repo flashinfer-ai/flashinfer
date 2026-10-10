@@ -1,6 +1,7 @@
 import gc
 import json
 import random
+import time
 import tracemalloc
 import weakref
 from unittest.mock import MagicMock, patch
@@ -9,6 +10,7 @@ import pytest
 import torch
 
 import flashinfer.fused_moe.core as core_mod
+import flashinfer.autotuner.autotuner as autotuner_mod
 from flashinfer import autotune
 from flashinfer.autotuner.initializers import autotuner_initializer_randn
 from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
@@ -1456,6 +1458,7 @@ def test_cuda_graph_profile_replay_change_reprofiles(monkeypatch):
 
 
 def test_cold_l2_policy_reprofiles_legacy_hot_cache(monkeypatch):
+    monkeypatch.setattr(autotuner_mod, "_CUDA_EVENT_SUPPORTS_EXTERNAL", True)
     tuner = reset_autotuner()
     runner = DummyRunner(valid_tactics=(0,))
     inputs = [torch.empty((128, 32), dtype=torch.float32)]
@@ -1479,32 +1482,115 @@ def test_cold_l2_policy_reprofiles_legacy_hot_cache(monkeypatch):
 
     assert seen_policies == [
         ("cuda_graph_profile_replays", 1, "l2_cache_policy", "hot"),
-        ("cuda_graph_profile_replays", 1, "l2_cache_policy", "cold"),
+        (
+            "cuda_graph_profile_replays",
+            1,
+            "l2_cache_policy",
+            "cold",
+            "cold_l2_graph_timer",
+            "flat_v1",
+        ),
     ]
 
 
+@pytest.mark.parametrize("supports_external", [False, True])
+def test_cold_l2_graph_timer_reprofiles_previous_event_policy(
+    monkeypatch, supports_external
+):
+    monkeypatch.setattr(
+        autotuner_mod, "_CUDA_EVENT_SUPPORTS_EXTERNAL", supports_external
+    )
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((128, 32), dtype=torch.float32)]
+    config = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
+    key = tuner._get_cache_key(
+        "cold_graph_timer_test", runner, (inputs[0].shape,), config
+    )
+    previous_policy = ("cuda_graph_profile_replays", 1, "l2_cache_policy", "cold")
+    tuner._file_configs[key.file_key] = (runner.__class__.__name__, 0)
+    tuner._file_config_policies[key.file_key] = previous_policy
+    profile = MagicMock(return_value=1.0)
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+
+    with autotune(tune_mode=True):
+        tuner.choose_one("cold_graph_timer_test", [runner], config, inputs)
+        tuner.choose_one("cold_graph_timer_test", [runner], config, inputs)
+
+    if supports_external:
+        profile.assert_called_once()
+        assert tuner._profiling_cache_policies[key] == (
+            *previous_policy,
+            "cold_l2_graph_timer",
+            "flat_v1",
+        )
+    else:
+        profile.assert_not_called()
+        assert tuner._profiling_policy(config) == previous_policy
+    assert tuner._profiling_policy(TuningConfig(use_cold_l2_cache=True)) == (
+        "cuda_graph_profile_replays",
+        None,
+        "l2_cache_policy",
+        "cold",
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
+@pytest.mark.parametrize(
+    "use_cuda_graph,supports_external", [(False, False), (True, False), (True, True)]
+)
+def test_cold_l2_profile_uses_full_flush_buffer(
+    monkeypatch, use_cuda_graph, supports_external
+):
+    if supports_external and not autotuner_mod._CUDA_EVENT_SUPPORTS_EXTERNAL:
+        pytest.skip("external CUDA events require PyTorch 2.8 or newer")
+    monkeypatch.setattr(
+        autotuner_mod, "_CUDA_EVENT_SUPPORTS_EXTERNAL", supports_external
+    )
+    operations = []
+
     class AddRunner(DummyRunner):
         def forward(
             self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs
         ):
-            torch.add(inputs[0], 1, out=inputs[1])
+            assert tactic == 0
+            operations.append("kernel")
+            torch.add(inputs[0], kwargs["bias"], out=inputs[1])
             return inputs[1]
 
     tuner = AutoTuner(warmup=1, repeat=2)
     runner = AddRunner(valid_tactics=(0,))
     inputs = [
         torch.ones(1024, device="cuda"),
-        torch.empty(1024, device="cuda"),
+        torch.full((1024,), float("nan"), device="cuda"),
     ]
+    last_inputs = [inputs[0] * 4, torch.full_like(inputs[1], float("nan"))]
     config = TuningConfig(
-        use_cuda_graph=True,
+        use_cuda_graph=use_cuda_graph,
         use_cold_l2_cache=True,
         cuda_graph_profile_replays=2,
     )
     allocations = []
+    events = []
+    records = []
     original_empty = torch.empty
+    original_event = torch.cuda.Event
+    original_zero = torch.Tensor.zero_
+    original_replay = torch.cuda.CUDAGraph.replay
+
+    class TrackedEvent:
+        def __init__(self, **kwargs):
+            self.event = original_event(**kwargs)
+            self.kind = "start" if len(events) < (4 if use_cuda_graph else 2) else "end"
+            events.append(kwargs)
+
+        def record(self, stream=None):
+            operations.append(self.kind)
+            records.append(torch.cuda.is_current_stream_capturing())
+            self.event.record(stream)
+
+        def elapsed_time(self, other):
+            return self.event.elapsed_time(other.event)
 
     def tracked_empty(*args, **kwargs):
         result = original_empty(*args, **kwargs)
@@ -1512,16 +1598,102 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
             allocations.append((result.numel(), result.device))
         return result
 
+    def tracked_zero(tensor):
+        if tensor.dtype == torch.int8:
+            operations.append("flush")
+        return original_zero(tensor)
+
+    def tracked_replay(graph):
+        if operations and operations[-1] == "start":
+            operations.append("kernel")
+        return original_replay(graph)
+
     monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id: 4096)
     monkeypatch.setattr(torch, "empty", tracked_empty)
+    monkeypatch.setattr(torch.cuda, "Event", TrackedEvent)
+    monkeypatch.setattr(torch.Tensor, "zero_", tracked_zero)
+    monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", tracked_replay)
     monkeypatch.setattr(
         "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
     )
 
-    latency = tuner._profile_single_kernel(runner, inputs, 0, config)
+    latency = tuner._profile_single_kernel(
+        runner,
+        inputs,
+        0,
+        config,
+        input_tensor_batches=[inputs, last_inputs],
+        bias=3,
+    )
 
     assert latency >= 0
     assert allocations == [(8192, inputs[0].device)]
+    sample_count = 4 if use_cuda_graph else 2
+    assert (
+        operations[operations.index("flush") :]
+        == [
+            "flush",
+            "start",
+            "kernel",
+            "end",
+        ]
+        * sample_count
+    )
+    captured = use_cuda_graph and supports_external
+    event_kwargs = {"enable_timing": True}
+    if captured:
+        event_kwargs["external"] = True
+    assert events == [event_kwargs] * (2 * sample_count)
+    assert records == [captured] * (2 * sample_count)
+    torch.testing.assert_close(last_inputs[1], torch.full_like(last_inputs[1], 7))
+    if use_cuda_graph:
+        assert torch.isnan(inputs[1]).all()
+    else:
+        torch.testing.assert_close(inputs[1], torch.full_like(inputs[1], 4))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not autotuner_mod._CUDA_EVENT_SUPPORTS_EXTERNAL,
+    reason="requires CUDA with external events",
+)
+def test_cold_l2_graph_timing_excludes_host_submission_delay(monkeypatch):
+    class AddRunner(DummyRunner):
+        def forward(self, inputs, tactic=0, **kwargs):
+            torch.add(inputs[0], 1, out=inputs[1])
+            return inputs[1]
+
+    tuner = AutoTuner(warmup=1, repeat=2)
+    inputs = [torch.ones(1024, device="cuda"), torch.empty(1024, device="cuda")]
+    config = TuningConfig(
+        use_cuda_graph=True, use_cold_l2_cache=True, cuda_graph_profile_replays=2
+    )
+    runner = AddRunner(valid_tactics=(0,))
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id: 4096)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
+    )
+    control = tuner._profile_single_kernel(runner, inputs, 0, config)
+    original_event = torch.cuda.Event
+    delay_seconds = 0.01
+
+    class DelayedEvent:
+        def __init__(self, **kwargs):
+            self.event = original_event(**kwargs)
+
+        def record(self, stream=None):
+            self.event.record(stream)
+            time.sleep(delay_seconds)
+
+        def elapsed_time(self, other):
+            return self.event.elapsed_time(other.event)
+
+    monkeypatch.setattr(torch.cuda, "Event", DelayedEvent)
+    delayed = tuner._profile_single_kernel(runner, inputs, 0, config)
+
+    # A Python delay after the start event would inflate eager submissions by
+    # 10 ms. Capture must leave both measurements near the device-only interval.
+    assert 0 <= delayed < control + delay_seconds * 1000 / 2
+    torch.testing.assert_close(inputs[1], torch.full_like(inputs[1], 2))
 
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
