@@ -369,6 +369,9 @@ class MoELayer:
         self._winners: OrderedDict[tuple, Tuple[_RunnerT, Any]] = OrderedDict()
         # Backend key selected on the most recent call (introspection hook).
         self._last_winner_backend: Optional[str] = None
+        self._uses_call_preparation = any(
+            getattr(r, "uses_call_preparation", False) for r in self.runners
+        )
 
     @flashinfer_api(trace=moe_layer_trace)
     def __call__(
@@ -408,6 +411,22 @@ class MoELayer:
         NotImplementedError
             If no usable backend supports this pack's ``routing_input_mode``.
         """
+        # Frost admission and packing share immutable compiler metadata and
+        # this call's validated packs. Keep other backends on their direct
+        # path; optional runners are first constructed during autotuning.
+        if (
+            getattr(self, "_uses_call_preparation", False)
+            or getattr(self, "_automatic_runners", None)
+            or self.tuner.is_tuning_mode
+        ):
+            from .backends.cudnn_frost.cache import call_preparation_scope
+
+            with call_preparation_scope(fresh=True):
+                return self._run(act_pack, weight_pack)
+        return self._run(act_pack, weight_pack)
+
+    def _run(self, act_pack, weight_pack):
+        """Dispatch a call, with preparation ownership supplied by __call__."""
         ceiling = self.config.execution.tune_max_num_tokens
         if act_pack.num_tokens > ceiling:
             raise ValueError(

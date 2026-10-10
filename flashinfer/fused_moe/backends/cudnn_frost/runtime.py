@@ -18,6 +18,7 @@ import torch
 _MANIFEST = "cudnn_frost_selected_kernels.json"
 
 
+@functools.cache
 def artifact_root(dtype: str) -> Path:
     """Return the packaged artifact directory for an explicit dtype."""
     return _safe_child(Path(__file__).resolve().parent / "artifacts", dtype)

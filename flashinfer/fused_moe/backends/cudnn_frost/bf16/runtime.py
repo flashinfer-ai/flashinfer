@@ -70,6 +70,11 @@ class CudnnFrostGroupedGemm1Kernel:
 
 
 def _artifact_roots() -> tuple[Path, ...]:
+    return _cached_artifact_roots()
+
+
+@functools.cache
+def _cached_artifact_roots() -> tuple[Path, ...]:
     packaged = artifact_root("bf16")
     return (packaged,) if packaged.is_dir() else ()
 
@@ -151,6 +156,8 @@ def clear_artifact_cache() -> None:
     from .moe import _selected_kernels_cached
 
     _artifact_cache_version += 1
+    artifact_root.cache_clear()
+    _cached_artifact_roots.cache_clear()
     _discover.cache_clear()
     discover_fc2.cache_clear()
     _selected_kernels_cached.cache_clear()

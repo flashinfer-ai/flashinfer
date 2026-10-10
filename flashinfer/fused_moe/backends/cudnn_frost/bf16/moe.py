@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import functools
 from itertools import product
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -20,8 +20,10 @@ from .....utils import get_compute_capability
 from . import fc2, fma, runtime
 from ..cache import (
     LRUCache,
+    call_preparation,
     require_graph_resource_retention,
     retain_graph_resources,
+    reuse_validation,
 )
 from ..capabilities import require_compiler
 from ..activations import ACTIVATIONS, activation_name
@@ -142,6 +144,13 @@ class _Inputs(list):
         self.tuning_config = tuning_config
 
 
+class _PreparationMetadata(NamedTuple):
+    first: tuple
+    second: tuple
+    fma_tactic: Any
+    plan_key: tuple
+
+
 class _Plans:
     def __init__(
         self,
@@ -225,6 +234,7 @@ class CudnnFrostBf16MoeRunner(MoERunner):
     """A full MoE candidate, not a GEMM1 override in another backend."""
 
     requires_exact_shape = True
+    uses_call_preparation = True
     backend_key = "cudnn_frost_bf16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
@@ -238,6 +248,7 @@ class CudnnFrostBf16MoeRunner(MoERunner):
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self._plans = LRUCache()
+        self._preparation_metadata = LRUCache(maxsize=128)
         self._workspace_pool = {}
 
     def _check_support(self):
@@ -281,6 +292,7 @@ class CudnnFrostBf16MoeRunner(MoERunner):
         # Shape-dependent native resources are prepared at pack time, never in capture.
         pass
 
+    @reuse_validation
     def _validate_pack(self, act, weights):
         # SM120 sources do not patch tensor maps, so the SM107 assembler
         # workaround must not exclude their previously supported toolchains.
@@ -332,6 +344,42 @@ class CudnnFrostBf16MoeRunner(MoERunner):
             raise ValueError("cuDNN Frost BF16 MoE requires 16B-aligned data")
         return t, h, i, e, k, w1, w2
 
+    def _prepare_metadata(self, t, h, i, e, k):
+        # Cache sealed selection metadata, never this call's tensors or pointers.
+        # Compiler and artifact changes must qualify native-plan lookups too.
+        selection_key = (
+            runtime._artifact_roots(),
+            runtime._artifact_cache_version,
+            runtime._tactic_digest(_TAG),
+            runtime._arch_for(self.device),
+            t,
+            h,
+            i,
+            e,
+            k,
+            activation_name(self.config.activation),
+        )
+        metadata = self._preparation_metadata.get(selection_key)
+        if metadata is None:
+            first, second = _selected_kernels(
+                t, h, i, e, k, self.device, self.config.activation
+            )
+            fma_tactic = (
+                _fma_tactic(t, h, i, e, k, self.config.activation, self.device)
+                if first and second
+                else None
+            )
+            plan_key = (
+                selection_key,
+                tuple(a.tactic for a in first),
+                tuple(b.tactic for b in second),
+                fma_tactic,
+            )
+            metadata = _PreparationMetadata(first, second, fma_tactic, plan_key)
+            self._preparation_metadata[selection_key] = metadata
+        return metadata
+
+    @call_preparation
     def accepts(self, act, weights):
         """Per-call auto eligibility, including both artifacts and semantic overrides."""
         major, minor = get_compute_capability(self.device)
@@ -346,25 +394,13 @@ class CudnnFrostBf16MoeRunner(MoERunner):
         )
         return bool(first and second)
 
+    @call_preparation
     def pack_inputs(self, act, weights):
         self._require_built()
         t, h, i, e, k, w1, w2 = self._validate_pack(act, weights)
-        first, second = _selected_kernels(
-            t, h, i, e, k, self.device, self.config.activation
-        )
+        first, second, fma_tactic, key = self._prepare_metadata(t, h, i, e, k)
         if not first or not second:
             raise ValueError("No matching cuDNN Frost FC1/FC2 source kernels")
-        fma_tactic = _fma_tactic(t, h, i, e, k, self.config.activation, self.device)
-        key = (
-            t,
-            h,
-            i,
-            e,
-            k,
-            tuple(a.tactic for a in first),
-            tuple(b.tactic for b in second),
-            fma_tactic,
-        )
         if key not in self._plans:
             with torch.cuda.device(self.device):
                 if torch.cuda.is_current_stream_capturing():
