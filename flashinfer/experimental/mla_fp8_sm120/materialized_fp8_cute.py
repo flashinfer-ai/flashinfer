@@ -78,6 +78,37 @@ def pack_halves(low, high, selector, *, loc=None, ip=None):
     )
 
 
+@cute.jit
+def online_block_softmax(
+    softmax, acc_S, scale_log2, is_first: cutlass.Constexpr = False
+):
+    # Keep row maxima in log2-score units. This fuses the per-block FP8
+    # reconstruction scale into the exp2 FMA instead of scaling all scores.
+    acc_mn = layout_utils.reshape_acc_to_mn(acc_S)
+    alpha = cute.make_fragment_like(softmax.row_max, Float32)
+    for r in cutlass.range(cute.size(softmax.row_max), unroll_full=True):
+        x = acc_mn[r, None].load()
+        local_max = utils.fmax_reduce(x, init_val=None, arch=softmax.arch) * scale_log2
+        previous_max = softmax.row_max[r]
+        if const_expr(not is_first):
+            local_max = cutlass.max(local_max, previous_max)
+        current_max = cute.arch.warp_reduction_max(local_max, threads_in_group=4)
+        softmax.row_max[r] = current_max
+        safe_max = 0.0 if current_max == -Float32.inf else current_max
+        probs = cute.math.exp2(x * scale_log2 - safe_max, fastmath=True)
+        if const_expr(is_first):
+            alpha[r] = 1.0
+            total = utils.fadd_reduce(probs, init_val=None, arch=softmax.arch)
+        else:
+            alpha[r] = cute.math.exp2(previous_max - safe_max, fastmath=True)
+            total = utils.fadd_reduce(
+                probs, init_val=softmax.row_sum[r] * alpha[r], arch=softmax.arch
+            )
+        softmax.row_sum[r] = total
+        acc_mn[r, None].store(probs)
+    return alpha
+
+
 class FlashAttentionForwardBase:
 
     def __init__(
@@ -1257,7 +1288,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
 
             # shape: (atom_v_m * rest_m)
             softmax = Softmax.create(
-                softmax_scale_log2,
+                Float32(1.0),
                 num_rows=acc_O.shape[0][0] * acc_O.shape[1],
                 softmax_scale=softmax_scale,
             )
@@ -1268,6 +1299,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # group parameters for compute_one_n_block
             mma_params = SimpleNamespace(
                 value_scale_state=value_scale_state,
+                qk_to_log2=softmax_scale_log2,
                 barriers=barriers,
                 initial_n_block=n_block,
                 query_scale=aux_data.tensors[0][batch_size, num_head, m_block],
@@ -1334,8 +1366,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # ///////////////////////////////////////////////////////////////////////////////
             # Prologue
             # ///////////////////////////////////////////////////////////////////////////////
-            # Enter CuTe TMA copy with a full warp: it elects its issuer internally.
-            # Only barrier arrival uses an explicit single-lane election.
+            # One elected thread issues TMA, all consumer threads wait.
             if tidx < 32:
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
@@ -1524,7 +1555,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         block_v_scale = aux_data.tensors[2][
             batch_idx, head_idx // self.qhead_per_kvhead, n_block
         ]
-        acc_S.store(acc_S.load() * (mma_params.query_scale * block_k_scale))
+        assert self.score_mod is None
+        combined_scale = (
+            mma_params.query_scale * block_k_scale
+        ) * mma_params.qk_to_log2
         if const_expr(score_mod is not None):
             self.apply_score_mod(
                 mma_params.thr_mma_qk,
@@ -1557,8 +1591,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             load_K_next()
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
-        row_scale = softmax.online_softmax(
-            acc_S, is_first=is_first_n_block, check_inf=check_inf
+        row_scale = online_block_softmax(
+            softmax, acc_S, combined_scale, is_first=is_first_n_block
         )
         row_scale.store(
             row_scale.load()
