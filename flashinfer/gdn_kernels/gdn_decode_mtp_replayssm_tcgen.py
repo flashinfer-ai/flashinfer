@@ -21,6 +21,9 @@ tcgen05 TF32 MMAs.  The small low-rank recurrence is evaluated directly
 from the TMEM epilogue, so no intermediate state-dot tensor reaches GMEM.
 """
 
+import os
+from typing import Optional
+
 import torch
 import cutlass
 import cutlass.cute as cute
@@ -87,6 +90,7 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     b: cute.Tensor,
     output: cute.Tensor,
     state_indices: cute.Tensor,
+    verify_parents: cute.Tensor,
     replayssm_rawv: cute.Tensor,
     replayssm_rawk: cute.Tensor,
     replayssm_g: cute.Tensor,
@@ -99,6 +103,7 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     H: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
     HEADS_PER_CTA: cutlass.Constexpr[int],
+    HAS_PATHS: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -148,6 +153,12 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     )
     s_beta = smem.allocate_tensor(_ACC, cute.make_layout((2, 8), stride=(8, 1)), 16)
     s_gram = smem.allocate_tensor(_ACC, cute.make_layout((16, 16), stride=(16, 1)), 16)
+    s_log_path = smem.allocate_tensor(_ACC, cute.make_layout((2, 8), stride=(8, 1)), 16)
+    s_path_decay = smem.allocate_tensor(
+        _ACC, cute.make_layout((2, 8), stride=(8, 1)), 16
+    )
+    s_anc = smem.allocate_tensor(cutlass.Int32, cute.make_layout((8,)), 16)
+    s_w = smem.allocate_tensor(_ACC, cute.make_layout((2, 8, 8), stride=(64, 8, 1)), 16)
 
     tmem_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=_THREADS)
     tmem = utils.TmemAllocator(
@@ -318,6 +329,41 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     cute.arch.fence_view_async_shared()
     cute.arch.barrier()
 
+    # Tree paths: fold the path-cumulative decay and the ancestor set into one
+    # T x T weight matrix, so the epilogue keeps constexpr bounds and no
+    # divergence.  Visibility is covered by the pre-epilogue block barrier.
+    if cutlass.const_expr(HAS_PATHS):
+        if warp == 2:
+            if lane == 0:
+                for i_t in cutlass.range_constexpr(T):
+                    parent = cutlass.Int32(verify_parents[(i_n, i_t)])
+                    mask = cutlass.Int32(0)
+                    if parent >= 0:
+                        mask = s_anc[parent] | (cutlass.Int32(1) << parent)
+                    s_anc[i_t] = mask
+                    for head in cutlass.range_constexpr(HEADS_PER_CTA):
+                        acc = s_log_decay[(head, i_t)]
+                        if parent >= 0:
+                            acc = acc + s_log_path[(head, parent)]
+                        s_log_path[(head, i_t)] = acc
+                        s_path_decay[(head, i_t)] = cute.exp(acc, fastmath=True)
+            cute.arch.sync_warp()
+            # W[j,i] = exp(logG[i] - logG[j]) for ancestors, 0 otherwise.  All
+            # weights land in (0,1], so no reciprocal decay product is formed.
+            for rep in cutlass.range_constexpr((HEADS_PER_CTA * T * T + 31) // 32):
+                flat = lane + rep * 32
+                if flat < HEADS_PER_CTA * T * T:
+                    head = flat // (T * T)
+                    i_t = (flat // T) % T
+                    j = flat % T
+                    weight = cutlass.Float32(0.0)
+                    if j < i_t and ((s_anc[i_t] >> j) & 1) != 0:
+                        weight = cute.exp(
+                            s_log_path[(head, i_t)] - s_log_path[(head, j)],
+                            fastmath=True,
+                        )
+                    s_w[(head, j, i_t)] = weight
+
     # Phase 2: compute the tiny K/K and K/Q Gram matrices while the state
     # transfer is in flight.
     if warp == 2:
@@ -470,25 +516,50 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
         m_idx = t_rc_c[0][0]
         coeff = cute.make_rmem_tensor(cute.make_layout((8,)), _ACC)
         coeff.fill(0.0)
-        state_scale = cutlass.Float32(1.0)
-        for i_t in cutlass.range_constexpr(T):
-            gate = s_decay[(epilogue_head, i_t)]
-            state_scale = state_scale * gate
-            prediction = state_scale * r_base[i_t]
-            for j in cutlass.range_constexpr(i_t):
-                coeff[j] = coeff[j] * gate
-                prediction = prediction + coeff[j] * s_gram[(j, i_t)]
-            delta = (
-                cutlass.Float32(s_values[(epilogue_head, i_t, m_idx)]) - prediction
-            ) * s_beta[(epilogue_head, i_t)]
-            coeff[i_t] = delta
-            result = state_scale * r_base[T + i_t]
-            for j in cutlass.range_constexpr(i_t + 1):
-                result = result + coeff[j] * s_gram[(j, T + i_t)]
-            if valid:
-                output[(i_n, i_t, i_hv0 + epilogue_head, m_idx)] = cutlass.BFloat16(
-                    result
-                )
+        if cutlass.const_expr(HAS_PATHS):
+            # Same loop shape as the chain path: the triangle is now weighted by
+            # W, which is zero off the ancestor set, so no branch is needed.
+            for i_t in cutlass.range_constexpr(T):
+                path_scale = s_path_decay[(epilogue_head, i_t)]
+                prediction = path_scale * r_base[i_t]
+                for j in cutlass.range_constexpr(i_t):
+                    prediction = prediction + (
+                        s_w[(epilogue_head, j, i_t)] * coeff[j] * s_gram[(j, i_t)]
+                    )
+                delta = (
+                    cutlass.Float32(s_values[(epilogue_head, i_t, m_idx)]) - prediction
+                ) * s_beta[(epilogue_head, i_t)]
+                coeff[i_t] = delta
+                result = path_scale * r_base[T + i_t]
+                for j in cutlass.range_constexpr(i_t):
+                    result = result + (
+                        s_w[(epilogue_head, j, i_t)] * coeff[j] * s_gram[(j, T + i_t)]
+                    )
+                result = result + delta * s_gram[(i_t, T + i_t)]
+                if valid:
+                    output[(i_n, i_t, i_hv0 + epilogue_head, m_idx)] = cutlass.BFloat16(
+                        result
+                    )
+        else:
+            state_scale = cutlass.Float32(1.0)
+            for i_t in cutlass.range_constexpr(T):
+                gate = s_decay[(epilogue_head, i_t)]
+                state_scale = state_scale * gate
+                prediction = state_scale * r_base[i_t]
+                for j in cutlass.range_constexpr(i_t):
+                    coeff[j] = coeff[j] * gate
+                    prediction = prediction + coeff[j] * s_gram[(j, i_t)]
+                delta = (
+                    cutlass.Float32(s_values[(epilogue_head, i_t, m_idx)]) - prediction
+                ) * s_beta[(epilogue_head, i_t)]
+                coeff[i_t] = delta
+                result = state_scale * r_base[T + i_t]
+                for j in cutlass.range_constexpr(i_t + 1):
+                    result = result + coeff[j] * s_gram[(j, T + i_t)]
+                if valid:
+                    output[(i_n, i_t, i_hv0 + epilogue_head, m_idx)] = cutlass.BFloat16(
+                        result
+                    )
 
     pipeline.sync(barrier_id=1)
     tmem.free(tmem_ptr)
@@ -506,6 +577,7 @@ def _launch_tcgen(
     b: cute.Tensor,
     output: cute.Tensor,
     state_indices: cute.Tensor,
+    verify_parents: cute.Tensor,
     replayssm_rawv: cute.Tensor,
     replayssm_rawk: cute.Tensor,
     replayssm_g: cute.Tensor,
@@ -515,6 +587,7 @@ def _launch_tcgen(
     H: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
     HEADS_PER_CTA: cutlass.Constexpr[int],
+    HAS_PATHS: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     n_tile = 8 if cutlass.const_expr(T == 4) else 16
@@ -553,6 +626,7 @@ def _launch_tcgen(
         b,
         output,
         state_indices,
+        verify_parents,
         replayssm_rawv,
         replayssm_rawk,
         replayssm_g,
@@ -565,6 +639,7 @@ def _launch_tcgen(
         H,
         HV,
         HEADS_PER_CTA,
+        HAS_PATHS,
     ).launch(
         grid=(q.shape[0] * (HV // HEADS_PER_CTA), 1, 1),
         block=(_THREADS, 1, 1),
@@ -573,6 +648,33 @@ def _launch_tcgen(
 
 
 _CACHE: dict = {}
+_CHAIN_PARENTS: dict = {}
+
+
+def _chain_parents(T: int, device: torch.device) -> torch.Tensor:
+    """Unread placeholder for the chain path; keeps the kernel ABI uniform."""
+    key = (T, device)
+    if key not in _CHAIN_PARENTS:
+        _CHAIN_PARENTS[key] = torch.arange(
+            -1, T - 1, dtype=torch.int32, device=device
+        ).view(1, T)
+    return _CHAIN_PARENTS[key]
+
+
+_VALIDATE_VERIFY_PARENTS = (
+    os.environ.get("FLASHINFER_VALIDATE_VERIFY_PARENTS", "0") == "1"
+)
+
+
+def _assert_verify_parents(parents: torch.Tensor) -> None:
+    """Device-side ``parent[i] < i`` check; FLASHINFER_VALIDATE_VERIFY_PARENTS=1 only."""
+    if not _VALIDATE_VERIFY_PARENTS:
+        return
+    steps = torch.arange(parents.shape[1], device=parents.device, dtype=parents.dtype)
+    torch._assert_async(
+        ((parents >= -1) & (parents < steps)).all(),
+        "verify_parents[:, i] must be in [-1, i)",
+    )
 
 
 def _slot_dynamic(tensor: torch.Tensor):
@@ -602,11 +704,23 @@ def run_gdn_verify_kernel_mtp_replayssm_tcgen(
     H: int,
     HV: int,
     scale: float,
+    verify_parents: Optional[torch.Tensor] = None,
 ) -> None:
     target = gdn_device_target(state.device)
     if target.major != 10:
         raise ValueError("tcgen05 ReplaySSM verify requires SM100/SM103")
     heads_per_cta = 1 if q.shape[0] == 1 else 2
+    has_paths = verify_parents is not None
+    if has_paths:
+        if verify_parents.shape != (q.shape[0], T):
+            raise ValueError("verify_parents must have shape [B, T]")
+        if verify_parents.dtype != torch.int32:
+            raise ValueError("verify_parents must be int32")
+        if verify_parents.device != q.device:
+            raise ValueError("verify_parents must be on the query device")
+        _assert_verify_parents(verify_parents)
+    else:
+        verify_parents = _chain_parents(T, q.device)
     # mark_layout_dynamic preserves the inferred unit-stride dimension.
     # Include it so sliced/transposed views do not reuse an incompatible ABI.
     layout_key = tuple(
@@ -623,6 +737,7 @@ def run_gdn_verify_kernel_mtp_replayssm_tcgen(
         dt_bias.dtype,
         state_indices.dtype,
         heads_per_cta,
+        has_paths,
         layout_key,
     )
     cache = _CACHE.setdefault(key, {})
@@ -649,6 +764,7 @@ def run_gdn_verify_kernel_mtp_replayssm_tcgen(
                 from_dlpack(b, assumed_align=16).mark_layout_dynamic(),
                 from_dlpack(output, assumed_align=16).mark_layout_dynamic(),
                 from_dlpack(state_indices, assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(verify_parents, assumed_align=16).mark_layout_dynamic(),
                 _slot_dynamic(replayssm_rawv),
                 _slot_dynamic(replayssm_rawk),
                 _slot_dynamic(replayssm_g),
@@ -658,6 +774,7 @@ def run_gdn_verify_kernel_mtp_replayssm_tcgen(
                 H=H,
                 HV=HV,
                 HEADS_PER_CTA=heads_per_cta,
+                HAS_PATHS=has_paths,
                 stream=stream,
             ),
             extra_key_files=(__file__,),
@@ -674,6 +791,7 @@ def run_gdn_verify_kernel_mtp_replayssm_tcgen(
         b,
         output,
         state_indices,
+        verify_parents,
         replayssm_rawv,
         replayssm_rawk,
         replayssm_g,
