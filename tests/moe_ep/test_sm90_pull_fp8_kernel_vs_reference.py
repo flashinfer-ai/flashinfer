@@ -111,6 +111,17 @@ def _single_rank_problem(hidden=1024, intermediate=512):
     )
 
 
+def _mxfp8_pack(problem):
+    """MXFP8 (E4M3 + E8M0 1x32) checkpoint-style pack of the problem's weights."""
+    from flashinfer.moe_ep import MoEWeightPack
+
+    from ._mxfp8_reference import mxfp8_quantize_ref
+
+    w13, w13_scale = mxfp8_quantize_ref(problem["w13"])
+    w2, w2_scale = mxfp8_quantize_ref(problem["w2"])
+    return MoEWeightPack(w13=w13, w2=w2, w13_scale=w13_scale, w2_scale=w2_scale)
+
+
 @pytest.mark.arch_hopper
 def test_shim_config_validation():
     """Host-side ``MegaMoEHopperFp8Config`` invariants (no compile needed)."""
@@ -234,16 +245,25 @@ def _reference_reduced(pkg, *, problem, symm_buffer, l1, l2, fp8_scale_mode, s1)
 
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize(
-    "fp8_scale_mode,swap_ab",
+    "fp8_scale_mode,swap_ab,weights",
     [
-        ("per_tensor", False),
-        ("per_tensor", True),
-        ("blockwise", False),
-        ("blockwise", True),
+        ("per_tensor", False, "bf16"),
+        ("per_tensor", True, "bf16"),
+        ("blockwise", False, "bf16"),
+        ("blockwise", True, "bf16"),
+        ("blockwise", False, "mxfp8"),
+        ("blockwise", True, "mxfp8"),
     ],
 )
-def test_sm90_fp8_kernel_matches_drop_reference(monkeypatch, fp8_scale_mode, swap_ab):
-    """Single-rank ``hopper_fp8_mega_moe`` matches ``compute_megamoe_reference_fp8``."""
+def test_sm90_fp8_kernel_matches_drop_reference(
+    monkeypatch, fp8_scale_mode, swap_ab, weights
+):
+    """Single-rank ``hopper_fp8_mega_moe`` matches ``compute_megamoe_reference_fp8``.
+
+    ``weights="mxfp8"`` feeds an MXFP8 checkpoint pack through the backend's
+    one-time conversion; the reference consumes the converted operands, and
+    ``test_sm90_pull_mxfp8_preprocess_is_exact`` pins those to the MXFP8 values.
+    """
     _require_cuda()
 
     import torch
@@ -277,7 +297,10 @@ def test_sm90_fp8_kernel_matches_drop_reference(monkeypatch, fp8_scale_mode, swa
     else:
         s1 = 1.0
 
-    pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
+    if weights == "mxfp8":
+        pack = _mxfp8_pack(problem)
+    else:
+        pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
     l1, l2 = preprocess_mega_weights(
         pack,
         intermediate_size=problem["intermediate"],
@@ -348,7 +371,7 @@ def test_sm90_fp8_kernel_matches_drop_reference(monkeypatch, fp8_scale_mode, swa
         yr = y_ref
         rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
         print(
-            f"[sm90 fp8 oracle {fp8_scale_mode} swap_ab={swap_ab}] "
+            f"[sm90 fp8 oracle {fp8_scale_mode} swap_ab={swap_ab} weights={weights}] "
             f"rel_l2={rel_l2.item():.4g} "
             f"max|d|={(yk - yr).abs().max().item():.4g} "
             f"amax(ref)={yr.abs().max().item():.4g}"
@@ -361,5 +384,187 @@ def test_sm90_fp8_kernel_matches_drop_reference(monkeypatch, fp8_scale_mode, swa
         # real numerical break either way.
         torch.testing.assert_close(yk, yr, atol=1e-2, rtol=1e-2)
         assert rel_l2.item() < 0.02
+    finally:
+        symm_buffer.destroy()
+
+
+@pytest.mark.arch_hopper
+def test_sm90_pull_mxfp8_preprocess_is_exact():
+    """MXFP8 pack -> blockwise kernel layout reproduces the MXFP8 weights.
+
+    The power-of-two 128x128 rescale is a binade shift, so only elements
+    pushed below E4M3's normal range can round (a few per 10^5 for randn
+    weights), and those by at most half a subnormal step.
+    """
+    _require_cuda()
+    _sm90_tree()
+
+    import torch
+
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.common.mxfp8 import (
+        count_inexact_fp8_block128,
+        dequantize_mxfp8,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.weights import (
+        _interleave_gate_up_8,
+        preprocess_mega_weights,
+    )
+    from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+    problem = _single_rank_problem()
+    inter, hidden = problem["intermediate"], problem["hidden"]
+    pack = _mxfp8_pack(problem)
+    l1, l2 = preprocess_mega_weights(
+        pack,
+        intermediate_size=inter,
+        hidden_size=hidden,
+        kind="fp8_e4m3",
+        fp8_scale_mode="blockwise",
+    )
+    # Kernel legs are (E, K, N) K-major views with 128x128 fp32 scales and
+    # no per-tensor dequant scalars (blockwise ABI).
+    assert l1[0].shape == (problem["num_experts"], hidden, 2 * inter)
+    assert l1[0].stride(1) == 1 and l2[0].stride(1) == 1
+    assert l1[2] is None and l1[3] is None and l2[2] is None and l2[3] is None
+
+    want_fc1 = _interleave_gate_up_8(
+        dequantize_mxfp8(pack.w13, pack.w13_scale), intermediate_size=2 * inter
+    )
+    want_fc2 = dequantize_mxfp8(pack.w2, pack.w2_scale)
+    for name, want, (weight, sf, _, _) in (
+        ("fc1", want_fc1, l1),
+        ("fc2", want_fc2, l2),
+    ):
+        got = weight.transpose(1, 2)
+        inexact = count_inexact_fp8_block128(want, got, sf)
+        assert inexact <= want.numel() * 1e-4, (name, inexact)
+        dequant = (
+            got.to(torch.float32).reshape(*sf.shape[:2], 128, sf.shape[2], 128)
+            * sf[:, :, None, :, None]
+        ).reshape(want.shape)
+        bound = 2.0**-10 * sf.repeat_interleave(128, 1).repeat_interleave(128, 2)
+        assert torch.all((dequant - want).abs() <= bound), name
+
+    for kwargs in (
+        dict(kind="fp8_e4m3", fp8_scale_mode="per_tensor"),
+        dict(kind="fp8_e5m2", fp8_scale_mode="blockwise"),
+    ):
+        with pytest.raises(MoEEpConfigError, match="MXFP8"):
+            preprocess_mega_weights(
+                pack, intermediate_size=inter, hidden_size=hidden, **kwargs
+            )
+
+
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("weights", ["bf16", "mxfp8"])
+def test_sm90_fp8_kernel_routing_rounds_on_one_buffer(monkeypatch, swap_ab, weights):
+    """Masked / short / hot / empty routing rounds back to back on ONE symm buffer.
+
+    Each round is checked against the drop reference (masked ``-1`` slots
+    contribute zero there).  Reusing the buffer is the point: a masked slot
+    is never dispatched, so its combine row still holds the previous round's
+    term unless the reduce masks it by the routing.
+    """
+    _require_cuda()
+
+    import torch
+
+    pkg = _sm90_tree()
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.staging import (
+        stage_mega_moe_inputs,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.weights import (
+        preprocess_mega_weights,
+    )
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    problem = _single_rank_problem()
+    full_ids = problem["topk_ids"]
+    masked_ids = full_ids.clone()
+    masked_ids[::3, 0] = -1
+    masked_ids[1::5, 2] = -1
+    masked_ids[7] = -1  # a token with no live route at all
+    hot_ids = torch.arange(problem["topk"], device="cuda").expand_as(full_ids)
+    rounds = [
+        ("full", full_ids),
+        ("masked", masked_ids),
+        ("short", full_ids[:7]),
+        ("hot", hot_ids.contiguous()),
+        ("empty", full_ids[:0]),
+        ("full_again", full_ids),
+    ]
+
+    pack = (
+        _mxfp8_pack(problem)
+        if weights == "mxfp8"
+        else MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
+    )
+    l1, l2 = preprocess_mega_weights(
+        pack,
+        intermediate_size=problem["intermediate"],
+        hidden_size=problem["hidden"],
+        kind="fp8_e4m3",
+        fp8_scale_mode="blockwise",
+    )
+    symm_buffer = pkg.get_symm_buffer_for_hopper_fp8_mega_moe(
+        problem["num_experts"],
+        problem["max_tokens"],
+        problem["topk"],
+        problem["hidden"],
+        problem["intermediate"],
+        0,
+        1,
+        kind="fp8_e4m3",
+        fp8_scale_mode="blockwise",
+        swap_ab=swap_ab,
+        gate_up_clamp=problem["gate_up_clamp"],
+    )
+    try:
+        for name, ids in rounds:
+            n = ids.shape[0]
+            stage_mega_moe_inputs(
+                problem["hidden_states"][:n],
+                problem["topk_weights"][:n],
+                ids,
+                symm_buffer.x,
+                symm_buffer.x_sf,
+                symm_buffer.topk_idx,
+                symm_buffer.topk_weights,
+                kind="fp8_e4m3",
+                fp8_scale_mode="blockwise",
+            )
+            y_kernel = torch.empty(
+                n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
+            )
+            pkg.hopper_fp8_mega_moe(
+                y_kernel,
+                l1,
+                l2,
+                symm_buffer,
+                num_tokens=n,
+                gate_up_clamp=problem["gate_up_clamp"],
+                sync=True,
+            )
+            if n == 0:
+                continue
+            y_ref, _ = _reference_reduced(
+                pkg,
+                problem={**problem, "num_tokens": n},
+                symm_buffer=symm_buffer,
+                l1=l1,
+                l2=l2,
+                fp8_scale_mode="blockwise",
+                s1=1.0,
+            )
+            yk = y_kernel.to(torch.float32)
+            rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
+            assert torch.isfinite(yk).all(), name
+            torch.testing.assert_close(yk, y_ref, atol=1e-2, rtol=1e-2, msg=name)
+            assert rel_l2.item() < 0.02, (name, rel_l2.item())
+            if name == "masked":
+                # The fully masked token reduces to exactly zero.
+                assert torch.all(y_kernel[7] == 0)
     finally:
         symm_buffer.destroy()

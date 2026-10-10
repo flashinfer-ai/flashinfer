@@ -40,14 +40,31 @@ owns dispatch, expert compute, and combine; output is always BF16
 | `sm100_nvfp4_nvfp4_bf16_cutedsl` (`nvfp4_cutedsl`) | NVFP4 (block-16) | NVFP4 (block-16) | BF16 | SM100 family | `knobs=None` → token-count heuristic; `knobs=dict` → pinned; `knobs="auto"` → collective compile+time sweep at first forward (never in serving); winners cacheable via `FLASHINFER_MOE_EP_KNOB_CACHE` |
 | `sm100_mxfp8_mxfp8_bf16_cutedsl` (`mxfp8_cutedsl`) | MXFP8 (block-32 UE8M0) | MXFP8 (block-32 UE8M0) | BF16 | SM100 family | same `knobs` surface as the NVFP4 backend |
 | `sm100_fp8_fp4_bf16_deepgemm` (`deep_gemm_mega`) | FP8 (E4M3, block-32 UE8M0) | FP4 (int8-packed, block-32) | BF16 | SM100 family | — (DeepGEMM selects its own JIT configs internally) |
-| `sm90_fp8_fp8_bf16_pull_cutedsl` (`sm90_pull_fp8`) | FP8 (E4M3/E5M2; per-tensor or DeepGEMM-style blockwise scales) | FP8 (same `fp8_scale_mode`) | BF16 | SM90 exactly | explicit geometry knobs on the config (`swap_ab`, `mma_tiler_mnk`); no tuner/knob-cache yet |
-| `sm90_fp8_fp8_bf16_push_cuda` (`sm90_push_fp8`) | FP8 (E4M3) | FP8 (E4M3) | BF16 | SM90 | — (static dimensions/protocol choices only) |
+| `sm90_fp8_fp8_bf16_pull_cutedsl` (`sm90_pull_fp8`) | FP8 (E4M3/E5M2; per-tensor or DeepGEMM-style blockwise scales) | FP8 (same `fp8_scale_mode`); BF16 or MXFP8 checkpoints (MXFP8: blockwise only) | BF16 | SM90 exactly | `knobs` (knob cache → token-bucket heuristic table; dict; `"auto"`) or the explicit geometry fields (`swap_ab`, `mma_tiler_mnk`, ...) |
+| `sm90_fp8_fp8_bf16_push_cuda` (`sm90_push_fp8`) | FP8 (E4M3) | FP8 (E4M3, 128×128 blockwise); BF16 or MXFP8 checkpoints | BF16 | SM90 | — (static dimensions/protocol choices only) |
 | `sm90_bf16_bf16_bf16_push_cake` | BF16 | BF16 | BF16 | SM90 | — (`capacity_factor`, `dedup_dispatch`, optional `clamp_limit`, `combine_wire` = `prereduced` (default: one pre-reduced bf16 row per (token, source rank), deterministic rank-ordered fp32 sum) or `per_route`; native BF16 end to end: bf16 dispatch payload, Cake-generated WGMMA FC1/FC2 with fp32 accumulation, bf16 combine wire) |
 
 The SM90 pull-style CuTeDSL tree is process-exclusive with the SM100 CuTeDSL
 tree (module names collide). Weight inputs are canonical BF16 `MoEWeightPack`
 by default (the backend quantizes at `preprocess_weights`); kernel-ready
 pre-quantized weights can be supplied instead.
+
+**SM90 MXFP8 weights.** SM90 has no block-scaled tensor-core MMA, so both
+SM90 FP8 backends run MXFP8 checkpoints on their existing FP8 kernels. A
+`PrequantizedMoEWeights` with `float8_e4m3fn` `w13`/`w2` and E8M0 scales
+(`float8_e8m0fnu` or `uint8`, one per 1×32 K block: `(E, 2I, H/32)` /
+`(E, H, I/32)`) is converted once in `preprocess_weights` to the 128×128 FP32
+block-scale layout (`backends/mega/kernel/sm90/common/mxfp8.py`); nothing is
+converted per forward, so latency equals the BF16-checkpoint blockwise path
+(measured on 4× H200 at EP4: within ±0.8% from 8 to 8192 tokens/rank).
+The block scales are powers of two, so the conversion is exact except for
+elements that underflow E4M3 after the rescale (error ≤ half an E4M3
+subnormal step × block scale; a few per 10⁵ for checkpoint-like weights).
+Pull requires `fp8_scale_mode="blockwise"` and `kind="fp8_e4m3"`; both require
+`hidden` and `intermediate_size` to be multiples of 128. There is no
+fallback: E5M2 MXFP8, any other pre-quantized recipe, MXFP8 with
+`fp8_scale_mode="per_tensor"`, and E8M0 NaN scales raise `MoEEpConfigError`
+at layer construction.
 
 ### Split (dispatch → inner kernel → combine)
 
@@ -394,6 +411,11 @@ before the BF16 FC1 handoff, with a different rounding contract.
 **Mega activations:** with `quantize_input=True` (default), bf16 `[T, hidden]` is quantized into symm workspace at forward. Non-bf16 with `quantize_input=True` raises `MoEEpConfigError`; use `quantize_input=False` and pre-quantized activations plus `MoEEpTensors.scales`.
 BF16-activation backends ignore `quantize_input` and copy BF16 inputs.
 
+**Masked routes:** a `topk_ids` entry of `-1` drops that route: it is neither
+dispatched nor reduced, and a token whose routes are all `-1` gets a zero
+output row. The SM90 backends cover this in their single-GPU and multirank
+routing tests.
+
 ## Runtime
 
 Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True` (default), layers acquire a ref-counted process runtime and release it in `destroy()`.
@@ -401,7 +423,7 @@ Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True
 | Requirement | Used by |
 |-------------|---------|
 | `torch_dist` | split comm, all mega kernels |
-| `nvshmem` | `sm100_nvfp4_nvfp4_bf16_cutedsl`, `sm100_mxfp8_mxfp8_bf16_cutedsl`, `sm100_bf16_nvfp4_bf16_cutedsl` (skip with `MEGA_NO_DIST=1`) |
+| `nvshmem` | `sm100_nvfp4_nvfp4_bf16_cutedsl`, `sm100_mxfp8_mxfp8_bf16_cutedsl`, `sm100_bf16_nvfp4_bf16_cutedsl`, `sm90_fp8_fp8_bf16_pull_cutedsl` (skip with `MEGA_NO_DIST=1`) |
 
 **Host framework bootstrap (e.g. vLLM):** when the host already initialized `torch.distributed` and EP uses a subgroup, pass `BootstrapConfig(process_group=ep_group, world_size=ep_size, rank=ep_rank, auto_bootstrap=False)` and call `bootstrap_moe_ep_runtime(bootstrap, reqs)` once per worker after dist init. Mega kernels resolve comm via `bootstrap_comm_group` / `bootstrap_ep_rank_world` (`MegaKernelBackend.bind_ep_bootstrap`).
 
@@ -469,15 +491,15 @@ See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environ
 
 - **unit** — host-only pytest (mocks + single-GPU; no multirank)
 - **oracle** — single-GPU torch-oracle correctness for every SM100 compute path (see **Torch oracles** below)
-- **oracle_sm90** — single-GPU (Hopper) torch oracle for the sm90_fp8_fp8_bf16_pull_cutedsl mega kernel
+- **oracle_sm90** — single-GPU (Hopper) torch oracle for the sm90_fp8_fp8_bf16_pull_cutedsl mega kernel (BF16 and MXFP8 checkpoints; masked/short/hot/empty routing rounds on one buffer) plus layer-level CUDA graph capture/replay
 - **oracle_sm107** — single-GPU (Rubin) torch oracle and boundary tests for NVFP4, MXFP8 E4M3, and MXFP8 E5M2
 - **qualify_sm107** — strict Rubin host, single-GPU, and multirank qualification, rejecting skipped/empty tests and OOMs; see the [qualification runbook](moe_ep_sm107_qualification.md)
 - **multirank** — 4-GPU split path: `test_moe_ep_layer_multirank.py` + `test_split_kernels.py` over NCCL-EP (and NIXL-EP when built)
 - **split_path_correctness_{bf16,nvfp4,ht}** — 4-GPU split-path numerics (LL EXPERT_MAJOR + RANK_MAJOR / NVFP4 / HT FLAT) vs a single-process `MoELayer` reference (Blackwell)
 - **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity **and multi-rank torch oracles**, plus single-rank preprocess/kernel-vs-reference checks (`MEGA_NO_DIST=1`) (Blackwell, sm_100+)
-- **mega_sm90** — 4-GPU (Hopper) sm90_fp8_fp8_bf16_pull_cutedsl mega parity + multi-rank torch oracle; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
+- **mega_sm90** — 4-GPU (Hopper) sm90_fp8_fp8_bf16_pull_cutedsl mega parity + multi-rank torch oracle (BF16 and MXFP8 checkpoints), uneven/zero-token/masked/hot/all-remote routing rounds, and lockstep CUDA graph replay; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
 - **mega_sm107** — Rubin MoEEpLayer vs multirank torch oracle for all three formats, with idle ranks and pooled-layer graph replay; `NPROC_MULTIRANK=2`, `4`, or `8` (default 4), own torchrun process
-- **sm90_push** — 2-GPU (Hopper) sm90_fp8_fp8_bf16_push_cuda kernel + backend; own torchrun process
+- **sm90_push** — 2-GPU (Hopper) sm90_fp8_fp8_bf16_push_cuda kernel + backend (BF16 and MXFP8 checkpoints); own torchrun process
 - **sm90_bf16_push_cake** — 2-GPU (Hopper) sm90_bf16_bf16_bf16_push_cake backend vs an independent bf16 torch reference (single-process `-k ep1` cases, then torchrun EP≥2 routing patterns incl. the pre-reduce cases, uneven tokens, graph replay, combine-wire mismatch; every case under both combine wires); own torchrun process
 - **smoke** — NCCL-EP smoke script (and NIXL-EP when built)
 - **ft** — 4-GPU fault-tolerance (stalled-rank pytest half + dead-rank smoke half)
