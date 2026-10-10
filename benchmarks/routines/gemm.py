@@ -1850,6 +1850,7 @@ def testMmMxfp8(args):
         "cute-dsl",
         "trtllm",
         "cudnn",
+        "b12x",
         "auto",
     ]
     res = []
@@ -1924,7 +1925,7 @@ def testMmMxfp8(args):
         backend: str,
         inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        assert backend in ["cutlass", "trtllm", "cute-dsl", "cudnn", "auto"], (
+        assert backend in ["cutlass", "trtllm", "cute-dsl", "cudnn", "b12x", "auto"], (
             f"Unsupported backend: {backend}"
         )
         input_mxfp8, mat2_mxfp8, input_scale, mat2_scale = inputs

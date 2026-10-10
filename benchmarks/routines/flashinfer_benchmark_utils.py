@@ -626,8 +626,8 @@ routine_cc_to_supported_backends = {
         "10.3": ["cutlass", "cute-dsl", "trtllm", "cudnn"],
         "10.7": ["cutlass", "cute-dsl", "trtllm"],
         "11.0": ["cutlass", "cudnn"],
-        "12.0": ["cutlass", "cudnn"],
-        "12.1": ["cutlass", "cudnn"],
+        "12.0": ["cutlass", "cute-dsl", "cudnn", "b12x"],
+        "12.1": ["cutlass", "cute-dsl", "cudnn", "b12x"],
     },
     "tinygemm_bf16": {
         "7.5": [],
