@@ -100,41 +100,33 @@ def _select_rows(sample, rows):
 
 
 def _assert_rng_reference(sample, actual, seed, offset):
-    # Per-row RNG must match sampling that request alone. Broadcast-only RNG
-    # retains the legacy output-row subsequence and its scalar reference.
+    # Tensor keys identify requests even in singleton or broadcast-only calls.
     seeds = seed.cpu().tolist()
     offsets = offset.cpu().tolist()
     outputs = actual if isinstance(actual, tuple) else (actual,)
     for row in range(4):
-        per_row = len(seeds) > 1 or len(offsets) > 1
-        reference_sample = _select_rows(sample, [row]) if per_row else sample
         seed_row = 0 if len(seeds) == 1 else row
         offset_row = 0 if len(offsets) == 1 else row
-        expected = reference_sample(
-            seed=seed[seed_row : seed_row + 1] if per_row else seeds[seed_row],
-            offset=offset[offset_row : offset_row + 1]
-            if per_row
-            else offsets[offset_row],
+        expected = _select_rows(sample, [row])(
+            seed=seed[seed_row : seed_row + 1],
+            offset=offset[offset_row : offset_row + 1],
         )
         references = expected if isinstance(expected, tuple) else (expected,)
         for output, reference in zip(outputs, references, strict=True):
-            torch.testing.assert_close(
-                output[row], reference[0 if per_row else row], rtol=0, atol=0
-            )
-    if len(seeds) > 1 or len(offsets) > 1:
-        for rows in ([3, 1, 0, 2], [3, 1], [2]):
-            selected = _select_rows(sample, rows)(
-                # PyTorch does not implement CUDA advanced indexing for uint64.
-                seed=seed.view(torch.int64)[rows].view(seed.dtype)
-                if len(seeds) > 1
-                else seed,
-                offset=offset.view(torch.int64)[rows].view(offset.dtype)
-                if len(offsets) > 1
-                else offset,
-            )
-            selected = selected if isinstance(selected, tuple) else (selected,)
-            for output, reordered in zip(outputs, selected, strict=True):
-                torch.testing.assert_close(output[rows], reordered, rtol=0, atol=0)
+            torch.testing.assert_close(output[row], reference[0], rtol=0, atol=0)
+    for rows in ([3, 1, 0, 2], [3, 1], [2]):
+        selected = _select_rows(sample, rows)(
+            # PyTorch does not implement CUDA advanced indexing for uint64.
+            seed=seed.view(torch.int64)[rows].view(seed.dtype)
+            if len(seeds) > 1
+            else seed,
+            offset=offset.view(torch.int64)[rows].view(offset.dtype)
+            if len(offsets) > 1
+            else offset,
+        )
+        selected = selected if isinstance(selected, tuple) else (selected,)
+        for output, reordered in zip(outputs, selected, strict=True):
+            torch.testing.assert_close(output[rows], reordered, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("name", SAMPLERS)
@@ -238,3 +230,33 @@ def test_repeated_request_rng_replays_same_draw(name):
     seed = torch.full((4,), 2**63 + 17, device="cuda", dtype=torch.uint64)
     offset = torch.full((4,), 2**32, device="cuda", dtype=torch.uint64)
     _assert_rng_reference(sample, sample(seed=seed, offset=offset), seed, offset)
+
+
+@pytest.mark.parametrize("name", ["logits", "probs", "top_k", "top_p", "min_p"])
+def test_adjacent_offsets_do_not_share_draws(name):
+    """Neighboring request keys must not be shifted views of one RNG stream."""
+    batch_size, vocab_size = 512, 4096
+    logits = torch.zeros(batch_size, vocab_size, device="cuda")
+    probs = torch.full_like(logits, 1 / vocab_size)
+    functions = {
+        "logits": partial(sampling.sampling_from_logits, logits),
+        "probs": partial(sampling.sampling_from_probs, probs),
+        "top_k": partial(sampling.top_k_sampling_from_probs, probs, 50),
+        "top_p": partial(sampling.top_p_sampling_from_probs, probs, 0.8),
+        "min_p": partial(sampling.min_p_sampling_from_probs, probs, 0.1),
+    }
+    sample = functions[name]
+    seed = torch.tensor([17], device="cuda", dtype=torch.int64)
+    offsets = torch.arange(batch_size, device="cuda", dtype=torch.int64)
+    actual = sample(seed=seed, offset=offsets, deterministic=True)
+    shifted = sample(seed=seed, offset=offsets + 1, deterministic=True)
+    # Identical keys still replay, even when their output row changes.
+    torch.testing.assert_close(shifted[:-1], actual[1:], rtol=0, atol=0)
+    # Uniform top-k has expected duplicate rate 1/50; allow ample margin while
+    # rejecting the excessive duplicates reported for shared rejection draws.
+    assert (actual[1:] == actual[:-1]).float().mean().item() < 0.1
+    if name == "logits":
+        # Gumbel's vectorized draws must not slide across token coordinates.
+        for delta in (1, 2, 3):
+            shifted = sample(seed=seed, offset=offsets + delta, deterministic=True)
+            assert (shifted == actual - delta).float().mean().item() < 0.02
