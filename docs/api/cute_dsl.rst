@@ -81,6 +81,13 @@ Block Sparse Attention
 
 CuTe-DSL block-sparse attention forward kernels.
 
+.. currentmodule:: flashinfer.cute_dsl.sparse.bsa_attn_sm90
+
+.. autosummary::
+    :toctree: ../generated
+
+    bsa_attn_sm90_blk64_fwd
+
 .. currentmodule:: flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk128
 
 .. autosummary::
