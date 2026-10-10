@@ -666,6 +666,8 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     for (uint32_t row = 0; row < qo_len; ++row) {
       merge_indptr.push_back(merge_indptr.back() + num_chunks_kv);
     }
+    // This is the partial-output layout the kernels and the merge both read:
+    // the kernels take the row stride back from o_indptr, so the plan owns it.
     o_indptr.push_back(o_indptr.back() + qo_len * num_chunks_kv);
   }
 
