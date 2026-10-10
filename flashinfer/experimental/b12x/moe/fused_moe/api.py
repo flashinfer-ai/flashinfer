@@ -23,6 +23,7 @@ from ._impl import (
     plan_tp_moe_scratch as plan,
 )
 from .config import TrellisConfig
+from ._routing_ops import route_topk_out
 from ._tuning import MoeDecodeConfig, MoeDecodeQuery
 from ._preparation import (
     FC2Invocation,
@@ -274,7 +275,19 @@ def route_topk(
 ) -> None:
     """Run caller-owned top-k buffers through their retained route launcher."""
     state = require_prepared(plan, "moe.route_topk", router_logits.device)
-    state.run(router_logits, topk_logits, topk_ids, topk_weights, **kwargs)
+    for name in ("renormalize", "score_func", "routed_scaling_factor"):
+        expected = getattr(state.query, name)
+        if kwargs.pop(name, expected) != expected:
+            raise ValueError(f"{name} differs from the prepared route invocation")
+    correction_bias = kwargs.pop("correction_bias", None)
+    image_correction_bias = kwargs.pop("image_correction_bias", None)
+    image_mask = kwargs.pop("image_mask", None)
+    if kwargs:
+        raise TypeError(f"unexpected route_topk arguments: {', '.join(kwargs)}")
+    route_topk_out(
+        router_logits, topk_logits, topk_ids, topk_weights, plan.handle,
+        correction_bias, image_correction_bias, image_mask,
+    )
 
 
 def bind_route(

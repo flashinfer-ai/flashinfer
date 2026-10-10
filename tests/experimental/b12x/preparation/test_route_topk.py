@@ -125,9 +125,11 @@ def test_unprepared_route_preserves_jit_arguments(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("compile_workers", [0, 2])
 @pytest.mark.parametrize("score_func", ["softmax", "sqrtsoftplus"])
+@pytest.mark.parametrize("compile_forward", [False, True])
 def test_public_prepared_route_graph_replays_inputs_and_modality(
     compile_workers,
     score_func,
+    compile_forward,
 ):
     from b12x.moe import fused_moe
     from b12x.preparation import PreparationSession, PreparedCall
@@ -188,12 +190,21 @@ def test_public_prepared_route_graph_replays_inputs_and_modality(
             )
         )
         stream.wait_stream(torch.cuda.current_stream(device))
+
+        def forward():
+            fused_moe.route_topk(plan, logits, selected, ids, weights, **options)
+
+        run = (
+            torch.compile(forward, fullgraph=True, dynamic=False)
+            if compile_forward
+            else forward
+        )
         try:
             with torch.cuda.stream(stream):
-                fused_moe.route_topk(plan, logits, selected, ids, weights, **options)
+                run()
             stream.synchronize()
             with session.capture(), torch.cuda.graph(graph, stream=stream):
-                fused_moe.route_topk(plan, logits, selected, ids, weights, **options)
+                run()
             session.freeze()
             for iteration in range(2):
                 values = (
