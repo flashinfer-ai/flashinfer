@@ -601,20 +601,13 @@ def gdn_verify_kernel_mtp(
 
                 x = r_a + r_dt_bias
                 beta_x = softplus_beta * x
-
-                exp_beta_x = cute.exp(beta_x, fastmath=True)
-                softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + exp_beta_x, fastmath=True
-                )
-                use_softplus = (
-                    cutlass.Float32(1.0)
-                    if beta_x <= softplus_threshold
-                    else cutlass.Float32(0.0)
-                )
-                softplus_x = (
-                    use_softplus * softplus_val
-                    + (cutlass.Float32(1.0) - use_softplus) * x
-                )
+                # A masked 0 * exp(large_x) would still produce NaN.
+                softplus_x = x
+                if beta_x <= softplus_threshold:
+                    softplus_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                        cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=True),
+                        fastmath=True,
+                    )
 
                 r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
                 r_beta = cutlass.Float32(1.0) / (
