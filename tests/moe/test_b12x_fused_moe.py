@@ -221,6 +221,37 @@ def test_w4a16_static_tiler_uses_64_when_intermediate_not_128_aligned():
 
 
 @cute_dsl_available
+def test_w4a16_candidate_tile_accepts_tc_decode_ultra_fc2_tile():
+    """The validator must accept the 512x32 tile selected for SM12x decode."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
+        _candidate_tile_fits,
+    )
+
+    assert _candidate_tile_fits(
+        problem_n=2560,
+        problem_k=640,
+        cta_m_blocks=1,
+        tile_n=512,
+        tile_k=32,
+        cta_threads=256,
+        max_shared_mem=101_376 - 512,
+        scale_format="e4m3_k16",
+        weight_layout="packed",
+    )
+    assert not _candidate_tile_fits(
+        problem_n=2560,
+        problem_k=640,
+        cta_m_blocks=1,
+        tile_n=512,
+        tile_k=16,
+        cta_threads=128,
+        max_shared_mem=101_376 - 512,
+        scale_format="e4m3_k16",
+        weight_layout="packed",
+    )
+
+
+@cute_dsl_available
 def test_w4a16_quant_mode_selects_internal_workspace(monkeypatch):
     """Callers provide quant_mode; dispatch owns the concrete workspace type."""
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
