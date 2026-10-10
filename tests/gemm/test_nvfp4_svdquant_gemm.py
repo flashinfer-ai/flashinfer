@@ -30,6 +30,7 @@ from flashinfer.gemm.gemm_svdquant import (
 )
 from flashinfer.jit.cpp_ext import get_cuda_version
 from flashinfer.utils import device_support_pdl, get_compute_capability
+from tests.test_helpers.pdl import late_store
 
 _RANK = SVDQUANT_LORA_RANK_GRANULARITY  # base rank == the collective's rank granularity
 
@@ -279,6 +280,27 @@ def test_nvfp4_quantize_smooth(m, n):
     assert sf.dtype == torch.uint8 and sf.ndim == 1
     assert torch.equal(xq, xq_ref.view(torch.uint8))
     assert torch.equal(sf, sf_ref.view(torch.uint8).reshape(-1))
+
+
+# n=3072 takes the fast-path kernel; n=4096 the legacy kernel.
+@pytest.mark.parametrize("n", [3072, 4096])
+def test_nvfp4_quantize_smooth_pdl_waits_for_global_scale(n):
+    _skip_unless_sm100()
+    torch.manual_seed(0)
+    x = torch.randn(256, n, dtype=torch.bfloat16, device="cuda")
+    pqs = (1.0 + 0.3 * torch.randn(n, dtype=torch.bfloat16, device="cuda")).abs()
+    global_sf = ((448.0 * 6.0) / (x.float() * pqs.float()).abs().max()).reshape(1)
+    expected_xq, expected_sf = nvfp4_quantize_smooth(
+        x, pqs, global_sf, enable_pdl=False, backend="cutlass"
+    )
+
+    # The scale the previous kernel is still producing, as in a dynamic-scale pipeline.
+    scale = torch.full_like(global_sf, global_sf.item() / 4)
+    late_store(scale, global_sf.item())
+    xq, sf = nvfp4_quantize_smooth(x, pqs, scale, enable_pdl=True, backend="cutlass")
+
+    assert torch.equal(sf, expected_sf)
+    assert torch.equal(xq, expected_xq)
 
 
 # Rank 32 (one storage chunk, the original kernel) and rank 128 (the widest validated
