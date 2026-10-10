@@ -19,6 +19,7 @@ import math
 import pytest
 import torch
 from tests.test_helpers.sink_attention_reference import sink_attention_unified
+from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from tests.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
@@ -28,7 +29,11 @@ import flashinfer
 from flashinfer.jit.utils import filename_safe_dtype_map
 from flashinfer.jit.attention import gen_batch_prefill_attention_sink_module
 from flashinfer.jit.attention.variants import attention_sink_decl
-from flashinfer.utils import has_flashinfer_jit_cache, is_sm90a_supported
+from flashinfer.utils import (
+    get_compute_capability,
+    has_flashinfer_jit_cache,
+    is_sm90a_supported,
+)
 
 pytestmark = pytest.mark.solo
 
@@ -1123,6 +1128,48 @@ def test_attention_sink_varlen(
         f"kv_lens={[kv_indptr[i + 1] - kv_indptr[i] for i in range(batch_size)]}, "
         f"causal={causal}"
     )
+
+
+@pytest.mark.parametrize("window_left", [-1, 128])
+def test_attention_sink_nvfp4_kv(window_left):
+    device = torch.device("cuda:0")
+    if get_compute_capability(device) == (10, 7):
+        pytest.skip("KV Cache NVFP4 is not supported on SM107")
+    torch.manual_seed(42)
+    k, v = (create_nvfp4_kv((99, 8, 16, 64), device) for _ in range(2))
+    kv_ref = tuple(nvfp4_to_float(*x).to(torch.bfloat16) for x in (k, v))
+    sink = torch.rand(16, device=device) * 5
+    qs = {
+        n: torch.randn(3 * n, 16, 128, dtype=torch.bfloat16, device=device)
+        for n in (1, 33)
+    }
+    # kv_lens 37, 513 and 1000 over 99 pages of 16
+    plan_args = (
+        torch.tensor([0, 3, 36, 99], dtype=torch.int32),
+        torch.arange(99, dtype=torch.int32),
+        torch.tensor([5, 1, 8], dtype=torch.int32),
+        *(16, 8, 128, 16),
+    )
+
+    def run(cls, qo_len, kv, kv_cache_sf=None):
+        kw = dict(window_left=window_left, q_data_type=torch.bfloat16)
+        kw.update(kv_data_type=kv[0].dtype)
+        wrapper = cls(torch.empty(128 << 20, dtype=torch.uint8, device=device), "HND",
+                      backend="fa2", head_dim_qk=128, head_dim_vo=128, **kw)  # fmt: skip
+        if cls is flashinfer.BatchDecodeWithAttentionSinkWrapper:
+            wrapper.plan(*plan_args, **kw)
+        else:
+            qo_indptr = torch.arange(4, dtype=torch.int32) * qo_len
+            wrapper.plan(qo_indptr, *plan_args, causal=True, **kw)
+        return wrapper.run(qs[qo_len], kv, sink, 128**-0.5, kv_cache_sf=kv_cache_sf)
+
+    for cls, qo_len in (
+        (flashinfer.BatchDecodeWithAttentionSinkWrapper, 1),
+        (flashinfer.BatchAttentionWithAttentionSinkWrapper, 33),
+    ):
+        out = run(cls, qo_len, (k[0], v[0]), (k[1], v[1]))
+        ref = run(flashinfer.BatchAttentionWithAttentionSinkWrapper, qo_len, kv_ref)
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
