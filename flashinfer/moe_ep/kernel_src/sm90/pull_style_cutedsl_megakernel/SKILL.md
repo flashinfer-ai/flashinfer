@@ -22,6 +22,22 @@ heuristics for Hopper FP8 MegaMoE", 2026-08), **minus commit `4f9c042`**
 regions / token_comm bodies).  Re-exclude that commit's content when
 syncing future drops.
 
+BF16 drop: `moe_hopper_bf16/` from the kernel team's "Support Hopper MegaMoE
+BF16 FWD" drop (2026-09-20), copied verbatim except for the import
+adaptation below.  The shared `common/`, `src/` and
+`moe_nvfp4_swapab/` were NOT re-synced from that drop: the vendored
+FP8-era copies are a functional superset of what the BF16 kernel uses.  The
+drop's vLLM comparison scripts (`benchmark_vllm_hopper_bf16_moe.py`,
+`run_vllm_hopper_bf16_sweep.{py,sh}`, `summarize_vllm_hopper_bf16_sweep.py`)
+and `benchmark_data/` are not copied, matching the FP8 vendoring.
+
+Import adaptation (both kernels; re-apply on every resync): the drop's
+`moe_hopper_fp8/kernel_fp8_glu_fc12.py` and
+`moe_hopper_bf16/kernel_bf16_glu_fc12.py` import
+`GluMxFp8Fc12SchedExtension` from `moe_mxfp8_glu.custom_ext`, which is not
+vendored; the vendored copies import it from `moe_nvfp4_swapab.custom_ext`
+instead (one-line edit each).
+
 Local extensions pending upstream (re-apply when syncing a drop that has
 not picked them up):
 
@@ -122,13 +138,18 @@ kernel_src/sm90/pull_style_cutedsl_megakernel/
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, token_comm, …)
 │   ├── moe_nvfp4_swapab/   ← NVFP4 package (hopper_fp8 reuses its runner_common,
 │   │                          fc1_fc2_fuse_sched, topk_reduce, custom_ext, moe_utils)
-│   └── moe_hopper_fp8/     ← SM90 FP8 kernel implementation
-│       (benchmark_data/ is excluded from the copy — data blobs only)
+│   ├── moe_hopper_fp8/     ← SM90 FP8 kernel implementation
+│   │   (benchmark_data/ is excluded from the copy — data blobs only)
+│   └── moe_hopper_bf16/    ← SM90 BF16 kernel implementation (no vLLM
+│                              comparison scripts, no benchmark_data/)
 ├── __init__.py             ← public API for moe_ep; talks ONLY to shim/ (our code)
 ├── shim/                   ← thin adapters over src/ (our code) — ALL adaptation lives here
 │   ├── _paths.py           ← adds sibling src/ to sys.path + sibling-tree exclusivity guard
 │   ├── comm.py             ← dist/NVSHMEM bootstrap, sym heap, launch-cache state
 │   ├── hopper_fp8.py       ← SM90 FP8 frontend (config, symm buffer, compute entry)
+│   ├── hopper_bf16.py      ← SM90 BF16 frontend (same shape as hopper_fp8.py)
+│   ├── tuner_bf16.py       ← BF16 knob space / heuristic defaults / knob-cache resolve
+│   ├── autotune_bf16.py    ← BF16 collective autotune sweep
 │   └── kernel_helpers.py   ← lazy re-export point for raw-kernel helpers/reference
 ├── SKILL.md                ← this file (drop-update workflow)
 └── TUNING.md               ← measured perf vs the kernel drop's reference sweep,
@@ -137,12 +158,15 @@ kernel_src/sm90/pull_style_cutedsl_megakernel/
 
 The kernel classes are `Sm90MegaMoEFp8Kernel` and `Sm90MegaMoESwapABFp8Kernel`
 in `src/moe_hopper_fp8/megamoe_kernel_fp8.py` (FP8 E4M3/E5M2, per-tensor or
-blockwise scaling, native or swap-A/B layouts).
+blockwise scaling, native or swap-A/B layouts).  The BF16 twins are
+`Sm90MegaMoEBf16Kernel` and `Sm90MegaMoESwapABBf16Kernel` in
+`src/moe_hopper_bf16/megamoe_kernel_bf16.py` (no quantization, tile K=64).
 
-Note: `src/moe_hopper_fp8/mega_runner.py` imports the kernel repo's `tester/`
-package (not vendored) at module scope — it is the drop's standalone test
-driver and must not be imported by shim code. It IS the authoritative template
-for kernel construct/launch kwargs (`run_kernel()`) when writing the shim.
+Note: `src/moe_hopper_fp8/mega_runner.py` and `src/moe_hopper_bf16/mega_runner.py`
+import the kernel repo's `tester/` package (not vendored) at module scope —
+they are the drop's standalone test drivers and must not be imported by shim
+code. They ARE the authoritative templates for kernel construct/launch kwargs
+(`run_kernel()`) when writing the shim.
 
 ## When the kernel team drops a new version of src/
 
@@ -150,12 +174,17 @@ Same workflow as `kernel_src/sm100/cutedsl_megamoe/SKILL.md`, with this tree's
 package set:
 
 ```bash
-rm -rf flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/{common,src,moe_nvfp4_swapab,moe_hopper_fp8}
-cp -r <new_drop>/{common,src,moe_nvfp4_swapab,moe_hopper_fp8} \
+rm -rf flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/{common,src,moe_nvfp4_swapab,moe_hopper_fp8,moe_hopper_bf16}
+cp -r <new_drop>/{common,src,moe_nvfp4_swapab,moe_hopper_fp8,moe_hopper_bf16} \
     flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/
 rm -rf flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/*/__pycache__ \
-    flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/benchmark_data
+    flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_{fp8,bf16}/benchmark_data
+rm -f flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_bf16/{benchmark_vllm_hopper_bf16_moe.py,run_vllm_hopper_bf16_sweep.py,run_vllm_hopper_bf16_sweep.sh,summarize_vllm_hopper_bf16_sweep.py}
 ```
+
+Then re-apply the one-line `custom_ext` import adaptation (see Provenance) in
+`moe_hopper_fp8/kernel_fp8_glu_fc12.py` and
+`moe_hopper_bf16/kernel_bf16_glu_fc12.py`.
 
 Do NOT copy the drop's repo scaffolding (`ci/`, `tester/`, `tests/`,
 `scripts/`, `.git`, `pyproject.toml`, `dispatch_test.py`, `README.md`,
@@ -163,5 +192,6 @@ Do NOT copy the drop's repo scaffolding (`ci/`, `tester/`, `tests/`,
 
 Then audit the shim against the new drop: the highest-churn surface is the
 kernel construct/launch signature (`Sm90MegaMoEFp8Kernel.__init__` /
-`.__call__`) mirrored by the shim's compile/launch path, and the
-`moe_hopper_fp8/mega_runner.py` `run_kernel()` driver it was modeled on.
+`.__call__`, and the BF16 twin's) mirrored by the shim's compile/launch path,
+and the `moe_hopper_{fp8,bf16}/mega_runner.py` `run_kernel()` drivers it was
+modeled on.

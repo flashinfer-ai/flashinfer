@@ -4,7 +4,8 @@ This document collects the performance work on the `sm90_fp8_fp8_bf16_pull_cuted
 backend: the measured microbenchmark results, the benchmark methodology
 behind those numbers, the knob surface as it exists today, and the open
 perf levers.  It is the companion to `SKILL.md` (drop-update workflow) and
-mirrors the structure of the SM100 tree's `TUNING.md`.
+mirrors the structure of the SM100 tree's `TUNING.md`.  The BF16 twin
+(`sm90_bf16_bf16_bf16_pull_cutedsl`) has its own section at the end.
 
 Unless noted otherwise, every measurement comes from a single 4x NVIDIA
 H200 141GB node (EP=4) taken in one session: the two microbenchmark tables
@@ -588,3 +589,144 @@ drop's `*_mega_us` columns are profiler-extracted kernel time only.
 7. **CUDA-graph capture** — the SM100 mega layer's warmup+capture path is
    kernel-agnostic; validate it on sm90_fp8_fp8_bf16_pull_cutedsl (`test_mega_cuda_graph`
    analog) for decode serving.
+
+## SM90 pull-style BF16 (`sm90_bf16_bf16_bf16_pull_cutedsl`)
+
+The native BF16 twin of the FP8 backend, vendored from the kernel repo's
+`moe_hopper_bf16/` (see `SKILL.md` for provenance).  Same tree, shim
+layering, NVSHMEM symmetric-heap model and runtime requirements
+(`sm90_pull_bf16_runtime_requirements` delegates to the FP8 one); config
+class `Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig`, weights via
+`preprocess_sm90_pull_bf16_mega_weights` (gate/up 8-row interleave + K-major
+relayout only; one bf16 tensor per weight leg).
+
+What differs from FP8:
+
+- **No quantization anywhere.**  bf16 dispatch payload (twice the FP8
+  dispatch bytes), BF16 WGMMA FC1/FC2 with fp32 accumulation, bf16 FC1-output
+  staging, bf16 combine wire.  Input staging is a plain copy, so the e2e
+  overhead is validation + copy only.  Shape contract: hidden % 256 == 0,
+  intermediate % 64 == 0.
+- **Tile K = 64** (FP8: 128).  From the drop table's comment: with 2-byte
+  operands a K=128 stage holds two 128 B swizzle atoms and the AB ring gets
+  only half the FP8-era stage count (M64N128: 3 vs 7 stages).  K=64 halves
+  the bytes per stage and doubles the stages, so per-stage WGMMA count,
+  bytes and MMA time match FP8 at K=128, and the N=256 / swap M128N128
+  shapes that only got 2 stages become viable.  The kernel team measured
+  K=64 ahead at 16 / 512 / 1024 tokens and within noise on the
+  padding-bound buckets, and kept the table uniform at K=64.
+- **Heuristic table keyed on tokens only** (`moe_hopper_bf16/heuristic_config.py`,
+  `select_heuristic_config(tokens)`; no scale mode): swap-AB on every
+  bucket, `epi_warps` token-back everywhere, `group_hint` 264 or
+  `ALL_EXPERTS_GROUP` (one scheduler group for all experts) up to 8192, and
+  tail-split pair tasks from 1024 up.  The drop's `BF16_TAIL_SPLIT=1` env
+  turns tail split on for every 2-CTA-token-cluster row.
+- **Knob surface** is the FP8 one minus the FP8-only axes: no `kind`,
+  `fp8_scale_mode`, `fp8_accum_mode`, dequant scales, `dedup_dispatch`,
+  `grouped_token_back` or `combine_format`; `compact_pull_buffer` is not a
+  knob (the BF16 kernel always compacts).  Geometry, `token_back_mode`,
+  `load_balance_mode`, `active_dispatch_warps`, `fc1_store_offload`,
+  `fc1_early_done_publish`, `fold_producer_warps`, `generate_c`,
+  `tail_split_pairs` and the `knobs=` field (dict / `"auto"` / `None`)
+  behave as on FP8 (`shim/tuner_bf16.py`, `shim/autotune_bf16.py`).
+- **Knob cache** is the FP8 tree's `shim/knob_cache.py`; BF16 entries are
+  keyed with `dtype="bf16"` and `fp8_scale_mode="none"`, so they never
+  collide with FP8 or SM100 entries.
+- **Host-side launch contracts** (review fixes, 2026-10-09): an empty rank
+  (0 local tokens) still launches the collective kernel with every
+  `topk_idx == -1` — it serves its experts to the peers' pulls and must
+  reach every cross-rank barrier (the former `num_tokens == 0` early
+  returns in `hopper_bf16_mega_moe` and in the frontend's `run` /
+  `warmup` / `make_launch_thunk` hung the non-empty ranks).  The frontend
+  owns that pad mask: for `num_tokens == 0` it launches the full buffer and
+  fills the routing plane with -1 before every launch, so stale rows a
+  caller left behind are never routed.  With
+  `generate_c` the shim zeroes `fc1_c` before every launch (`run` and the
+  launch thunk), since the kernel writes only live rows and an expert whose
+  count shrinks between launches would otherwise leave stale activations in
+  its pad rows.  The backend checks the two shape bounds separately
+  (hidden % 256, intermediate % 64); intermediate = 64 / 128 / 192 are
+  valid and covered by the single-GPU oracle.
+
+Bench (BF16 twin of the FP8 harness; heuristic launch configs, tokens
+8..32768, drop perf data recipe `--perf-data uniform` = dense positive
+uniform [0, 0.25) bf16, 5 s cooldown; archived to
+`benchmark_data/<date>/<date>_<time>_mega_sm90_bf16_<order>.csv`):
+
+```bash
+torchrun --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_bf16_pull_mega.py
+```
+
+Offline tune (writes the shared knob cache):
+
+```bash
+torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune --dtype sm90_bf16 \
+    --hidden 7168 --intermediate 3072 --num-experts 384 --topk 6 \
+    --max-tokens 8 512 2048
+```
+
+### Microbenchmark results (2026-10-08, heuristic launch configs, max-rank µs)
+
+One 4x NVIDIA H200 141GB node (SM clock locked at 1830 MHz, no other
+tenants), EP=4, DSV4-Pro P03 geometry (384 experts, top-6, hidden
+7168, intermediate 3072, gate_up_clamp 10), `load_balance_mode=atomic_counter`,
+warmup 3 / 20 timed iterations, 5 s cooldown before each series, default
+`--perf-data uniform`.  `compute` is the bare `MegaKernelBackend.compute(output=None)`
+launch (fused kernel + standalone TopkReduce), `e2e` the full `MoEEpLayer.forward`
+(validation + bf16 copy staging + kernel + output copy); both are the slowest
+rank's per-iteration mean.  TFLOPS = FC1+FC2 FLOPs over the slowest rank's
+compute time.  The heuristic config column is the drop table's row
+(`pp` = ping-pong, `tail` = tail-split pair tasks, `grp` = `group_hint`,
+`all` = `ALL_EXPERTS_GROUP`); every row uses swap-AB, K=64 and `epi_warps`.
+The last column is the kernel team's own number for the same row from the
+comments in `moe_hopper_bf16/heuristic_config.py` (their 4x H200 sessions,
+2026-09-09..19, clocks not stated) — a sanity anchor, not a same-session A/B.
+Raw rows: `benchmark_data/20261008/20261008_mega_sm90_bf16_heuristic.csv`
+(local archive, not committed).
+
+| tokens/rank | compute max-rank µs | e2e max-rank µs | TFLOPS (compute) | heuristic config | drop table µs |
+|------------:|--------------------:|----------------:|-----------------:|------------------|--------------:|
+| 8     |  1386.8 |  1441.6 |   4.6 | M128N16 CGA2x1, grp 264 | 1492 |
+| 16    |  2197.8 |  2129.8 |   5.8 | M128N16 CGA1x2, grp 264 | 2173 |
+| 32    |  2613.9 |  2642.4 |   9.7 | M128N8 CGA1x1, grp all | 2859 |
+| 64    |  2932.8 |  2989.2 |  17.3 | M128N8 CGA1x1, grp all | 3300 |
+| 128   |  2964.6 |  3018.6 |  34.2 | M128N8 CGA1x2, grp 264 | 3520 |
+| 256   |  3030.2 |  3089.5 |  67.0 | M128N32 CGA2x1, grp 264 | 3408 |
+| 512   |  3167.8 |  3224.4 | 128.1 | M128N64 CGA1x1, grp all | 3937 |
+| 1024  |  3283.4 |  3343.9 | 247.2 | pp M128N64 CGA1x2, grp 264, tail | 3800 |
+| 2048  |  4082.3 |  4199.1 | 397.7 | pp M128N128 CGA1x2, grp 264, tail | 3983 |
+| 4096  |  6788.8 |  6805.1 | 478.3 | pp M128N128 CGA1x2, grp 264, tail | 6592 |
+| 8192  | 12159.5 | 12256.6 | 534.1 | pp M128N128 CGA1x2, grp 264, tail | 11843 |
+| 16384 | 23476.2 | 23666.5 | 553.2 | pp M128N128 CGA1x2, tail | 22843 |
+| 32768 | 49139.9 | 49379.5 | 528.6 | pp M128N128 CGA1x2, tail | 45576 |
+
+Reading the table: the "drop table µs" column is NOT a same-session
+comparison (different nodes, mostly unlocked 1980 MHz boost clocks, and the
+drop's `mega_us` is the torch-profiler GPU time of the mega kernel alone --
+no TopkReduce, no per-iteration barrier/sync, back-to-back launches -- while
+FI `compute` is a CUDA-event window around `compute()` including the
+standalone TopkReduce and the cute launch path, barrier-aligned per
+iteration).  Re-running the drop's own harness
+(`moe_hopper_bf16/run_token_sweep_benchmark.py`, heuristic mode) on the SAME
+node and clock right after the FI sweep closes the gap:
+
+| tokens/rank | drop `max_mega_us` | drop `topk_us` | drop mega+topk | FI compute max-rank | FI vs drop |
+|------------:|-------------------:|---------------:|---------------:|--------------------:|-----------:|
+| 512   |  3122.6 |  12.8 |  3135.4 |  3167.8 | +1.0% |
+| 2048  |  4092.0 |  48.0 |  4140.0 |  4082.3 | -1.4% |
+| 8192  | 11955.2 | 190.0 | 12145.2 | 12159.5 | +0.1% |
+| 32768 | 47370.3 | 769.2 | 48139.5 | 49139.9 (median 45353.7) | +2.1% |
+
+So the vendored kernel runs at the drop's speed through the FI layer; the
+2-8% deficits against the table comments on 2048+ are the other sessions'
+boost clocks (the drop's own 32768 point measures 47370 µs today versus the
+45576 µs quoted from its 2026-09-17 node).  The 32768 FI mean is lifted by
+a few slow iterations on every rank (median 45354 µs); the e2e minus
+compute gap is 16-240 µs (and within noise at 16 tokens, where e2e came out
+68 µs below compute) — the bf16 staging is a plain copy (the FP8 backend's
+torch-composed quantization staging costs 394 µs at 8192 and 1757 µs at
+32768 tokens), so the staging-kernel lever of the FP8 "Next levers" does not
+apply here.  Against the FP8 per_tensor table above (a different session
+and node, so a ballpark only), BF16 compute is 1.75-2.0x the FP8 time on
+every bucket: twice the operand bytes and half the WGMMA rate on the
+GEMM-bound tail, twice the dispatch bytes on the latency-bound head.
