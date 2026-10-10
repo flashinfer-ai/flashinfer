@@ -26,6 +26,7 @@ class GemvQuery:
 class GemvConfig:
     backend: str
     rows_per_tile: int = 8
+    block_threads: int = 128
 
 
 def validate_query(query):
@@ -145,9 +146,13 @@ def validate_config(query, config, device):
             8,
         ):
             raise ValueError("SIMT projection rows_per_tile must be 1, 2, 4 or 8")
+        if type(config.block_threads) is not int or config.block_threads not in (128, 256):
+            raise ValueError("SIMT projection block_threads must be 128 or 256")
         return
     if config.rows_per_tile != 8:
         raise ValueError("rows_per_tile only configures SIMT projection")
+    if config.block_threads != 128:
+        raise ValueError("block_threads only configures SIMT projection")
     if config.backend == "mma" and _mma_eligible(query):
         return
     if config.backend == "tc" and _tc_eligible(query):
@@ -179,13 +184,15 @@ def _parameters(query, device):
 
 
 def _eligible(choice):
-    return choice["backend"] == "simt" or choice["rows_per_tile"] == 8
+    return choice["backend"] == "simt" or (
+        choice["rows_per_tile"] == 8 and choice["block_threads"] == 128
+    )
 
 
 TUNING = TuningContract(
     component_id="gemm.bf16_gemv",
     query_schema_version=22,
-    config_schema_version=22,
+    config_schema_version=23,
     query_fields=frozenset(field.name for field in fields(GemvQuery)),
     config_fields=frozenset(field.name for field in fields(GemvConfig)),
     encode_query=asdict,
@@ -198,6 +205,9 @@ TUNING = TuningContract(
         Knob(name="backend", values=None, binding=ParameterBinding.COMPILE),
         Knob(
             name="rows_per_tile", values=(1, 2, 4, 8), binding=ParameterBinding.COMPILE
+        ),
+        Knob(
+            name="block_threads", values=(128, 256), binding=ParameterBinding.COMPILE
         ),
     ),
     candidate_contract_version=4,

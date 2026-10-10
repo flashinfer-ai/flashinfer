@@ -5,14 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-
 from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from b12x.preparation.types import plan_from_handle, require_prepared
 
-from ._tuning import GemvConfig, GemvQuery, TUNING
+from ._tuning import TUNING, GemvConfig, GemvQuery
 
 
 def _is_aligned(tensor):
@@ -81,6 +80,7 @@ def compile_gemv(query_payload, config_payload, ordinal):
             query.weight_dtype,
             query.output_dtype,
             query.bias_dtype,
+            config.block_threads,
         )
     return {"gemv": launcher}
 

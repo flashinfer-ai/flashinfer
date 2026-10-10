@@ -8,21 +8,14 @@ types specialize both implementations; live rows and strides never do.
 
 from __future__ import annotations
 
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import torch
-from cutlass import BFloat16, Float32, Int32, Int64, Uint32
-from cutlass.cute.nvgpu import warp, warpgroup
-from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
-
+import torch
 from b12x._lib.compile_plan import attach_programs
-from b12x._lib.program_cache import program_cache
-from b12x._lib.compiler import KernelCompileSpec
+from b12x._lib.compiler import KernelCompileSpec, run_compiled
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.compiler import run_compiled
 from b12x._lib.intrinsics import (
     block_reduce,
     get_ptr_as_int64,
@@ -32,8 +25,12 @@ from b12x._lib.intrinsics import (
     u32_as_f32,
     warp_reduce,
 )
+from b12x._lib.program_cache import program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32
+from cutlass.cute.nvgpu import warp, warpgroup
+from cutlass.utils import LayoutEnum
 
 _THREADS = 128
 SMALL_M_MAX = 8  # Rows sharing a weight load, not a live-row support limit.
@@ -99,6 +96,7 @@ class SmallNGemvKernel:
         bf16_operands: bool,
         has_bias: bool,
         rows_per_tile: int = SMALL_M_MAX,
+        block_threads: int = _THREADS,
     ):
         self.n, self.k = int(n), int(k)
         self.bf16_operands = bool(bf16_operands)
@@ -106,6 +104,9 @@ class SmallNGemvKernel:
         if rows_per_tile not in (1, 2, 4, 8):
             raise ValueError("SIMT projection supports 1, 2, 4, or 8 rows per tile")
         self.rows_per_tile = int(rows_per_tile)
+        if block_threads not in (128, 256):
+            raise ValueError("SIMT projection supports 128 or 256 threads per block")
+        self.block_threads = int(block_threads)
 
     @cute.jit
     def __call__(
@@ -141,7 +142,7 @@ class SmallNGemvKernel:
                 (rows + Int32(self.rows_per_tile - 1)) // Int32(self.rows_per_tile),
                 1,
             ),
-            block=(_THREADS, 1, 1),
+            block=(self.block_threads, 1, 1),
             stream=stream,
         )
 
@@ -182,7 +183,7 @@ class SmallNGemvKernel:
                             acc[r] = _dot_bf16x8(
                                 source, row * x_stride + offset, w0, w1, w2, w3, acc[r]
                             )
-                    index += Int32(_THREADS)
+                    index += Int32(self.block_threads)
             else:
                 self.scalar_dot(
                     source,
@@ -211,7 +212,7 @@ class SmallNGemvKernel:
             )
         allocator = cutlass.utils.SmemAllocator()
         reduction = allocator.allocate_tensor(
-            Float32, cute.make_layout((1, _THREADS // 32)), byte_alignment=16
+            Float32, cute.make_layout((1, self.block_threads // 32)), byte_alignment=16
         )
         for r in cutlass.range_constexpr(self.rows_per_tile):
             row = first_row + Int64(r)
@@ -250,7 +251,7 @@ class SmallNGemvKernel:
                         Float32(source[row * x_stride + Int64(index) * x_column_stride])
                         * value
                     )
-            index += Int32(_THREADS)
+            index += Int32(self.block_threads)
 
 
 class Bf16GemmKernel:
@@ -549,6 +550,7 @@ def compile_projection(
     weight_dtype: str,
     output_dtype: str,
     bias_dtype: str | None,
+    block_threads: int,
 ):
     """Compile one selected concrete kernel from immutable operand metadata."""
     x_type, w_type, y_type = (
@@ -570,6 +572,7 @@ def compile_projection(
             x_type == w_type == torch.bfloat16,
             bias_dtype is not None,
             rows_per_tile,
+            block_threads,
         )
     elif backend == "tc":
         from ._tensor_core import TensorCoreGemvKernel
@@ -587,6 +590,7 @@ def compile_projection(
         ordinal,
         backend,
         rows_per_tile if backend == "simt" else None,
+        block_threads if backend == "simt" else None,
         n,
         k,
         source_dtype,

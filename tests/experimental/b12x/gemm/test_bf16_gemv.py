@@ -15,8 +15,8 @@ cuda_required = pytest.mark.skipif(
 )
 
 
-from b12x.preparation import PreparationSession, PreparedCall
 from b12x.gemm import bf16_gemv
+from b12x.preparation import PreparationSession, PreparedCall
 
 
 @pytest.fixture
@@ -166,21 +166,23 @@ def test_last_element_contributes():
 
 
 @cuda_required
-@pytest.mark.parametrize("n", [32, 384, 512])
+@pytest.mark.parametrize("n,k", [(32, 5120), (384, 5120), (512, 5120), (288, 4096)])
+@pytest.mark.parametrize("block_threads", [128, 256])
 def test_long_k_row_tiles_reuse_graph_and_preserve_fp32_projection(
-    n, projection_session
+    n, k, block_threads, projection_session
 ):
     """Prepared long-K projections retain FP32 output with runtime row counts."""
     from b12x.gemm import bf16_gemv
 
     torch.manual_seed(419132)
-    source = torch.randn(17, 5120, device="cuda").bfloat16() * 0.125
-    weight = torch.randn(n, 5120, device="cuda").bfloat16() * 0.125
+    source = torch.randn(17, k, device="cuda").bfloat16() * 0.125
+    weight = torch.randn(n, k, device="cuda").bfloat16() * 0.125
     bias = torch.linspace(-0.25, 0.25, n, device="cuda")
     storage = torch.full((18, n + 8), 123.0, device="cuda")
     output = storage[:17, :n]
     plan = _prepare_projection(
-        projection_session, source, weight, out=output, bias=bias
+        projection_session, source, weight, out=output, bias=bias,
+        override=bf16_gemv.GemvConfig(backend="simt", block_threads=block_threads),
     )
     projection_session.freeze()
     try:
@@ -230,10 +232,12 @@ def test_noncontiguous_x():
         (torch.float32, torch.float32, torch.bfloat16),
     ],
 )
+@pytest.mark.parametrize("block_threads", [128, 256])
 def test_unquantized_bias_and_live_rows_reuse_native_graph(
     input_dtype,
     weight_dtype,
     output_dtype,
+    block_threads,
     projection_session,
 ):
     from b12x.gemm import bf16_gemv
@@ -248,7 +252,8 @@ def test_unquantized_bias_and_live_rows_reuse_native_graph(
     output = torch.empty(capacity, n + 3, device=device, dtype=output_dtype)
 
     plan = _prepare_projection(
-        projection_session, source, weight, bias=bias, out=output[:, :n]
+        projection_session, source, weight, bias=bias, out=output[:, :n],
+        override=bf16_gemv.GemvConfig(backend="simt", block_threads=block_threads),
     )
 
     def launch(rows):
