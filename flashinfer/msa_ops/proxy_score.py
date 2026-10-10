@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import warnings
 from typing import Optional, Tuple, Union
 
 import torch
@@ -26,6 +27,7 @@ from ..trace.templates.msa import (
     msa_proxy_score_trace,
 )
 from ..utils import get_device_sm_count, is_sm12x_supported
+from ._sm90_dispatch import is_sm90a_device as is_sm90a_supported
 from ._common import _BLK_KV
 
 # NVFP4 scale granularity: one e4m3 block scale per 16 e2m1 elements.
@@ -263,6 +265,32 @@ def _proxy_dummies(device_index: int):
     )
 
 
+_F16_ACC_WARNED = False
+
+
+def _warn_f16_accumulation_once() -> None:
+    """One-time process warning for ``use_fp32_acc=False``: fp32 accumulation is the
+    required numerics; the f16 path exists to match the SM90 CuTe DSL kernel and
+    must be opted into knowingly.  Measured on H100: the f16 accumulator saturates
+    to a sticky +-inf as soon as any 128-term q.k dot or 32-term k-slice partial
+    crosses +-65,520 (-inf reads as the causal mask and the top-k then selects no
+    block), and without overflow it carries 1.6-2.2x the f32 path's error."""
+    global _F16_ACC_WARNED
+    if _F16_ACC_WARNED:
+        return
+    _F16_ACC_WARNED = True
+    warnings.warn(
+        "msa_proxy_score(use_fp32_acc=False): the prefill-regime proxy score "
+        "accumulates fp8 products in fp16 (FI #6140 numerics). Any 128-key dot or "
+        "32-term partial beyond +-65,520 saturates to +-inf and corrupts the block "
+        "selection (-inf is read as the causal mask); without overflow the scores "
+        "carry 1.6-2.2x the fp32 error. Use the default use_fp32_acc=True unless "
+        "|q.k| is bounded. This warning is emitted once per process.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 @flashinfer_api(trace=msa_proxy_score_trace)
 def msa_proxy_score(
     q: torch.Tensor,
@@ -278,9 +306,10 @@ def msa_proxy_score(
     output: Optional[torch.Tensor] = None,
     reduce_heads: bool = False,
     q_offset=None,
+    use_fp32_acc: bool = True,
 ) -> torch.Tensor:
-    """MSA dense proxy pass for SM120/SM121: per-KV-block max attention
-    logits.
+    """MSA dense proxy pass for SM90 and SM120/SM121: per-KV-block max
+    attention logits.
 
     Computes ``max_score[h, t, q]``, the maximum of the unscaled,
     causally-masked ``Q K^T`` logits over the 128 tokens of KV block ``t``,
@@ -342,6 +371,17 @@ def msa_proxy_score(
         future optimization (saves materializing the per-head buffer).
     q_offset : int or torch.Tensor, optional
         Optional query-position offset used by the causal alignment logic.
+    use_fp32_acc : bool, default=True
+        Accumulation precision of the fp8 ``Q K^T`` products in the SM90
+        prefill regime (``max_seqlen_q > 4``). ``True`` accumulates the exact
+        products in f32 (the original MSA numerics); ``False`` accumulates in
+        f16, the numerics of the SM90 CuTe DSL prefill kernel. The SM90 decode
+        regime and the SM120/SM121 kernels accumulate in f32 whichever value is
+        given; ``False`` is accepted there as a request for at most f16
+        precision, which f32 accumulation satisfies. Passing ``False`` emits a
+        ``RuntimeWarning`` once per process: f16 accumulation saturates to
+        +-inf beyond |128-key dot| 65,520 (corrupting the block selection) and
+        carries 1.6-2.2x the f32 error otherwise.
 
     Returns
     -------
@@ -364,11 +404,17 @@ def msa_proxy_score(
         _compile_cache,
         _cutlass_dtype,
         _fake,
+        _q_offset_explicit,
         _q_offset_tensor,
     )
 
-    if not is_sm12x_supported(q.device):
-        raise RuntimeError("msa_proxy_score requires SM120 or SM121 and CUDA >= 12.8")
+    sm90 = is_sm90a_supported(q.device)
+    if not (sm90 or is_sm12x_supported(q.device)):
+        raise RuntimeError(
+            "msa_proxy_score requires SM90, SM120 or SM121 and CUDA >= 12.8"
+        )
+    if not use_fp32_acc:
+        _warn_f16_accumulation_once()
     q_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float16) and not q_fp8:
         raise ValueError(f"q must be bf16, fp16, or fp8 e4m3, got {q.dtype}")
@@ -429,6 +475,38 @@ def msa_proxy_score(
         per_head = torch.empty(per_head_shape, dtype=torch.float32, device=dev)
     else:
         per_head = output
+
+    if sm90:
+        if not paged:
+            raise NotImplementedError("SM90 proxy-score requires the paged KV layout")
+        if not causal:
+            # Every SM90 proxy schedule masks causally with no switch; the flag
+            # used to be ignored, which silently returned causal scores.
+            raise NotImplementedError("SM90 proxy-score is causal only")
+        from ._sm90_dispatch import proxy_score_sm90
+
+        if q_offset is not None and not isinstance(q_offset, torch.Tensor):
+            # The documented integer form: one offset for every sequence.
+            q_offset = _q_offset_explicit(q_offset, batch_size, dev)
+        proxy_score_sm90(
+            q,
+            k,
+            cu_seqlens_q,
+            pt_dev,
+            k_len_or_cu,
+            per_head,
+            max_seqlen_q=max_seqlen_q,
+            batch_size=batch_size,
+            kv_fp8=kv_fp8,
+            q_offset=q_offset,
+            use_fp32_acc=use_fp32_acc,
+        )
+        if not reduce_heads:
+            return per_head
+        if output is None:
+            output = torch.empty(final_shape, dtype=torch.float32, device=dev)
+        torch.amax(per_head, dim=0, keepdim=True, out=output)
+        return output
 
     group_size = num_qo_heads // num_kv_heads
     _PACK_ROWS = 64  # bf16 MMA q-tile rows (== m_block_size)

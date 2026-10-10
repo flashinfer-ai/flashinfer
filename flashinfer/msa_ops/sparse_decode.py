@@ -203,7 +203,8 @@ def msa_sparse_decode_attention(
     KV blocks selected in ``q2k_indices``. Decode tokens are right-aligned:
     token ``i`` of a request sits at position ``seqlen_k - seqlen_q + i``.
     On compute capability 10.0/10.3/10.7, ``topk`` must be 16 and Q1 through
-    multi-token decode use the direct persistent M16 path.
+    multi-token decode use the direct persistent M16 path. On compute capability
+    9.0 (H100/H200) ``q`` must be bf16; fp16 ``q`` raises ``NotImplementedError``.
 
     Parameters
     ----------
@@ -341,22 +342,18 @@ def msa_sparse_decode_attention(
             "MSASparseAttentionWorkspace is only used by the compute "
             "capability 10.0/10.3/10.7 backend"
         )
-    if out is not None:
-        raise NotImplementedError(
-            "out= is implemented by the compute capability 10.0/10.3/10.7 "
-            "packed-NVFP4 paged-KV decode route; the SM120/SM121 backend "
-            "allocates its own output"
-        )
     import cutlass
     import cutlass.cute as cute
 
     from ..utils import is_sm12x_supported
+    from ._sm90_dispatch import is_sm90a_device as is_sm90a_supported
     from .cute_dsl.sparse_decode_sm12x import SparseDecodeForwardSm12x
     from ._common import _q_offset_explicit
 
-    if not is_sm12x_supported(q.device):
+    sm90 = is_sm90a_supported(q.device)
+    if not (sm90 or is_sm12x_supported(q.device)):
         raise RuntimeError(
-            "msa_sparse_decode_attention requires SM120 or SM121 and CUDA >= 12.8"
+            "msa_sparse_decode_attention requires SM90, SM120 or SM121 and CUDA >= 12.8"
         )
     if q.ndim != 3:
         raise ValueError("q must be 3D (total_q, num_qo_heads, head_dim)")
@@ -390,6 +387,91 @@ def msa_sparse_decode_attention(
     # of msa_topk_select's output).
     if not q2k_indices.is_contiguous():
         raise ValueError("q2k_indices must be contiguous")
+
+    if sm90:
+        if return_softmax_lse:
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention does not return an LSE"
+            )
+        if page_table is None or seqused_k is None:
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention requires the paged KV layout"
+            )
+        if k_scale is not None or v_scale is not None or k_global_scale is not None:
+            # Per-tensor k/v scale tensors have no SM90 path; a silently dropped
+            # scale would return plausible, wrong numbers. softmax_scale and
+            # v_global_scale ARE handled -- folded into q and the output below.
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention handles softmax_scale and "
+                "v_global_scale, but not per-tensor k_scale/v_scale/k_global_scale"
+            )
+        if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
+            # The SM90 decode schedule views the cache as raw bytes and declares
+            # them e4m3, so any other dtype is read with both the wrong values and
+            # the wrong element stride -- silent garbage rather than a failure.
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention requires an fp8 e4m3 KV cache, "
+                f"got k={k.dtype} v={v.dtype}"
+            )
+        if not causal:
+            # The SM90 decode program is right-aligned causal with no mask
+            # switch; ignoring the flag would return plausible, wrong numbers.
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention is right-aligned causal; "
+                "causal=False is not supported"
+            )
+        if q_offset is not None:
+            # Query i of a sequence sits at seqused_k - seqlen_q + i; the program
+            # takes no offset input, so an explicit q_offset cannot be honoured.
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention derives query positions as "
+                "seqused_k - seqlen_q + i; q_offset is not supported"
+            )
+        # The paged-metadata checks of the SM120/SM121 path below: the program
+        # derives every query position from seqused_k and seqlen_q, so a
+        # seqused_k or page_table sized for another batch must fail here
+        # instead of shifting every position silently.
+        if seqused_k.dtype != torch.int32 or seqused_k.ndim != 1:
+            raise ValueError("seqused_k must be 1D int32")
+        if seqused_k.numel() != batch_size:
+            raise ValueError(f"seqused_k must have batch_size ({batch_size}) entries")
+        if page_table.ndim != 2:
+            raise ValueError("page_table must be int32 of shape (batch, max_pages)")
+        if page_table.shape[0] != batch_size:
+            raise ValueError("page_table batch dimension must match q batch_size")
+        from ._sm90_dispatch import sparse_decode_sm90
+
+        if out is None:
+            out = torch.empty(
+                (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=q.device
+            )
+        elif (
+            out.shape != q.shape
+            or out.dtype != compute_dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "out must be a contiguous tensor shaped like q in q's dtype on q's device"
+            )
+        return sparse_decode_sm90(
+            q,
+            k,
+            v,
+            q2k_indices,
+            page_table,
+            seqused_k,
+            out,
+            seqlen_q=seqlen_q,
+            softmax_scale=softmax_scale,
+            v_global_scale=v_global_scale,
+        )
+    if out is not None:
+        raise NotImplementedError(
+            "out= is implemented by the compute capability 10.0/10.3/10.7 "
+            "packed-NVFP4 paged-KV decode route and on SM90; the SM120/SM121 "
+            "backend allocates its own output"
+        )
     topk = q2k_indices.shape[2]
     if topk <= 0:
         raise ValueError("q2k_indices topk dimension must be positive")
