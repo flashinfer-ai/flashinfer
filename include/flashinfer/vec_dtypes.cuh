@@ -720,6 +720,37 @@ struct vec_cast<nv_bfloat16, float> {
   }
 };
 
+// Finite values saturate to +-65504 (never inf), NaN stays NaN, -0 stays -0.
+template <>
+struct vec_cast<half, nv_bfloat16> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(half* dst, const nv_bfloat16* src) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    if constexpr (vec_size == 1) {
+      uint16_t y;
+      asm("cvt.rn.satfinite.f16.f32 %0, %1;" : "=h"(y) : "f"(__bfloat162float(src[0])));
+      *(uint16_t*)dst = y;
+    } else {
+#pragma unroll
+      for (size_t i = 0; i < vec_size / 2; ++i) {
+        uint32_t x = ((const uint32_t*)src)[i], y;
+        // bf16 is the high half of an fp32; cvt packs (hi, lo) into one half2.
+        asm("cvt.rn.satfinite.f16x2.f32 %0, %1, %2;"
+            : "=r"(y)
+            : "f"(__uint_as_float(x & 0xffff0000u)), "f"(__uint_as_float(x << 16)));
+        ((uint32_t*)dst)[i] = y;
+      }
+    }
+#else
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      float x = __bfloat162float(src[i]);
+      dst[i] = __float2half_rn(x != x ? x : fminf(fmaxf(x, -65504.f), 65504.f));
+    }
+#endif
+  }
+};
+
 template <typename float_t, size_t vec_size>
 struct vec_t {
   FLASHINFER_INLINE float_t& operator[](size_t i);

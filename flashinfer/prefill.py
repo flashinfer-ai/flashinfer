@@ -439,10 +439,34 @@ def get_trtllm_gen_prefill_module():
     )
 
 
+def _fp16_accum_mma_kwargs(
+    use_fp16_qk_reduction: bool,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    backend: str,
+    device: torch.device,
+) -> Dict[str, bool]:
+    """Module-getter kwargs that select the FA2 FP16-accumulate MMA kernels.
+
+    SM12x runs FP32-accumulate tensor-core MMA at half rate, so there
+    ``use_fp16_qk_reduction`` selects kernels that reduce QK and PV with
+    FP16-accumulate MMAs carried in FP32. Empty (today's module) otherwise.
+    """
+    if (
+        use_fp16_qk_reduction
+        and backend == "fa2"
+        and dtype_q in (torch.float16, torch.bfloat16)
+        and dtype_kv == dtype_q
+        and is_sm12x_supported(device)
+    ):
+        return {"fp16_accum_mma": True}
+    return {}
+
+
 @functools.cache
-def get_single_prefill_module(backend, *args):
-    uri = get_single_prefill_uri(backend, *args)
-    module = gen_single_prefill_module(backend, *args).build_and_load()
+def get_single_prefill_module(backend, *args, **kwargs):
+    uri = get_single_prefill_uri(backend, *args, **kwargs)
+    module = gen_single_prefill_module(backend, *args, **kwargs).build_and_load()
     run_func = module.run
 
     # torch library for single_prefill_with_kv_cache
@@ -565,7 +589,7 @@ class _LazyBatchPrefillIndependentModule(_LazyPagedKVStrideModule):
 
 
 @functools.cache
-def get_batch_prefill_module(backend, *args):
+def get_batch_prefill_module(backend, *args, **kwargs):
     lazy_independent_module: Optional[_LazyBatchPrefillIndependentModule] = None
     if backend == "trtllm-gen":
         uri = "trtllm_gen_context"
@@ -575,18 +599,20 @@ def get_batch_prefill_module(backend, *args):
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     elif backend == "fa2":
-        uri = get_batch_prefill_uri(backend, *args)
-        module = _gen_batch_prefill_primary_module(backend, *args).build_and_load()
+        uri = get_batch_prefill_uri(backend, *args, **kwargs)
+        module = _gen_batch_prefill_primary_module(
+            backend, *args, **kwargs
+        ).build_and_load()
         lazy_independent_module = _LazyBatchPrefillIndependentModule(
-            _gen_batch_prefill_independent_paged_module(backend, *args)
+            _gen_batch_prefill_independent_paged_module(backend, *args, **kwargs)
         )
         plan_func = module.plan
         workspace_size_func = getattr(module, "workspace_size", None)
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
-        uri = get_batch_prefill_uri(backend, *args)
-        module = gen_batch_prefill_module(backend, *args).build_and_load()
+        uri = get_batch_prefill_uri(backend, *args, **kwargs)
+        module = gen_batch_prefill_module(backend, *args, **kwargs).build_and_load()
         plan_func = module.plan
         workspace_size_func = getattr(module, "workspace_size", None)
         ragged_run_func = module.ragged_run
@@ -1396,7 +1422,11 @@ def single_prefill_with_kv_cache(
         Default is ``NONE``.
     use_fp16_qk_reduction : bool
         Whether to use f16 for qk reduction (faster at the cost of slight precision
-        loss).
+        loss). On SM12x with the ``fa2`` backend and fp16/bf16 Q and KV of the same
+        dtype, QK, PV and the softmax row sum are computed with FP16-accumulate
+        tensor-core MMA over short runs and carried in FP32, because FP32-accumulate
+        MMA runs at half rate there; bf16 operands are converted to FP16 (clamped to
+        its finite range).
     window_left : int
         The left (inclusive) window size for the attention window, when set to ``-1``, the window
         size will be set to the full length of the sequence. Defaults to ``-1``.
@@ -1568,6 +1598,9 @@ def single_prefill_with_kv_cache(
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
         use_fp16_qk_reduction,
+        **_fp16_accum_mma_kwargs(
+            use_fp16_qk_reduction, q.dtype, k.dtype, backend, q.device
+        ),
     )
 
     module.run(
@@ -2407,7 +2440,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Defaults to ``NONE``.
         use_fp16_qk_reduction : bool
-            Whether to use fp16 for qk reduction. Defaults to ``False``.
+            Whether to use fp16 for qk reduction. Defaults to ``False``. See
+            :meth:`plan` for what it selects on SM12x.
         sm_scale : Optional[float]
             Softmax scale. If ``None``, defaults to ``1.0 / sqrt(head_dim_qk)``.
         window_left : int
@@ -2566,6 +2600,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 window_left >= 0,
                 logits_soft_cap > 0,
                 use_fp16_qk_reduction,
+                **_fp16_accum_mma_kwargs(
+                    use_fp16_qk_reduction,
+                    q_data_type,
+                    kv_data_type,
+                    backend,
+                    self.device,
+                ),
             )
         if module.workspace_size is None:
             raise NotImplementedError(
@@ -2687,7 +2728,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Default is ``NONE``.
         use_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
-            loss).
+            loss). On SM12x with the ``fa2`` backend and fp16/bf16 Q and KV of the same
+            dtype, QK, PV and the softmax row sum are computed with FP16-accumulate
+            tensor-core MMA over short runs and carried in FP32, because FP32-accumulate
+            MMA runs at half rate there; bf16 operands are converted to FP16 (clamped to
+            its finite range).
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
@@ -3067,7 +3112,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
 
                 self._cached_module = get_batch_prefill_module(
-                    self._backend, *get_module_args
+                    self._backend,
+                    *get_module_args,
+                    **_fp16_accum_mma_kwargs(
+                        use_fp16_qk_reduction,
+                        q_data_type,
+                        kv_data_type,
+                        self._backend,
+                        self.device,
+                    ),
                 )
 
         self._block_tables = block_tables
@@ -4472,7 +4525,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Default is ``NONE``.
         use_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
-            loss).
+            loss). On SM12x with the ``fa2`` backend and fp16/bf16 Q and KV of the same
+            dtype, QK, PV and the softmax row sum are computed with FP16-accumulate
+            tensor-core MMA over short runs and carried in FP32, because FP32-accumulate
+            MMA runs at half rate there; bf16 operands are converted to FP16 (clamped to
+            its finite range).
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
@@ -5028,7 +5085,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module = get_fmha_module(*new_get_module_args)
             elif self._backend != "cudnn":
                 self._cached_module = get_batch_prefill_module(
-                    self._backend, *get_module_args
+                    self._backend,
+                    *get_module_args,
+                    **_fp16_accum_mma_kwargs(
+                        use_fp16_qk_reduction,
+                        q_data_type,
+                        kv_data_type,
+                        self._backend,
+                        self.device,
+                    ),
                 )
 
         if self._backend == "cudnn":

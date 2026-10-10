@@ -177,6 +177,37 @@ constexpr bool use_kv_repack(bool enable_fp4_repack) {
 // kernel does not use, or the reverse.
 constexpr bool kPrefillLauncherRepacksFp4 = true;
 
+// FP16-accumulate MMA mode: the JIT defines FLASHINFER_FP16_ACCUM_MMA when use_fp16_qk_reduction is
+// requested on sm_12x, where the FP32-accumulate warp MMA runs at half the FP16-accumulate rate.
+// QK is accumulated in FP16 over kFp16AccumMmaGroup consecutive mma_d steps and each partial is
+// added into the FP32 logits; P*V and the row sum are accumulated in FP16 per KV tile and added
+// into the FP32 o / d. Logits, softmax and m/d stay FP32. bf16 operands are converted to FP16 in
+// shared memory.
+#ifdef FLASHINFER_FP16_ACCUM_MMA
+constexpr bool kFp16AccumMma = true;
+#else
+constexpr bool kFp16AccumMma = false;
+#endif
+// QK products per FP16 partial = 16 * group. Measured on RTX 5090 (head_dim 128, fp16): 1 / 2 / 4
+// steps give 1.38x / 1.44x / 1.46x over FP32 accumulate; the logit rounding error grows with the
+// group (FP16 rounds each partial at its own magnitude), so 2 is the knee.
+constexpr uint32_t kFp16AccumMmaGroup = 2;
+
+// VO-split head dims (head_dim_vo > 256) keep the default path.
+template <typename DTypeQ, typename DTypeKV, bool USE_FP16_QK_REDUCTION, uint32_t HEAD_DIM_VO>
+constexpr bool use_fp16_accum_mma() {
+  return kFp16AccumMma && USE_FP16_QK_REDUCTION && sizeof(DTypeQ) == 2 &&
+         std::is_same_v<DTypeQ, DTypeKV> && HEAD_DIM_VO <= 256;
+}
+
+// Number of mma_d steps accumulated in one FP16 fragment: kFp16AccumMmaGroup, or the largest
+// divisor of NUM_MMA_D_QK below it.
+constexpr uint32_t fp16_accum_mma_group(uint32_t num_mma_d_qk) {
+  uint32_t f = kFp16AccumMmaGroup;
+  while (num_mma_d_qk % f != 0) --f;
+  return f;
+}
+
 template <typename DTypeQ, typename DTypeKV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV,
           uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, bool ENABLE_FP4_REPACK,
           bool = use_kv_repack<DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>(ENABLE_FP4_REPACK)>
@@ -309,7 +340,9 @@ template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32
           // pass this explicitly; every other instantiation of KernelTraits (pod, batch_pod,
           // persistent) has neither a repack call site nor the staging term in its shared-memory
           // budget, so a default of true would make those paths reserve a buffer they never read.
-          bool ENABLE_FP4_REPACK_ = false>
+          bool ENABLE_FP4_REPACK_ = false,
+          // Set by the FA2 prefill launchers through use_fp16_accum_mma(); see kFp16AccumMma.
+          bool USE_FP16_ACCUM_MMA_ = false>
 struct KernelTraits {
   static constexpr uint32_t NUM_STAGES = 1;  // used for BatchAttention Template
   static constexpr MaskMode MASK_MODE = MASK_MODE_;
@@ -323,6 +356,14 @@ struct KernelTraits {
   static constexpr uint32_t NUM_WARPS = NUM_WARPS_Q * NUM_WARPS_KV;
   static constexpr uint32_t HEAD_DIM_QK = NUM_MMA_D_QK * 16;
   static constexpr uint32_t HEAD_DIM_VO = NUM_MMA_D_VO * 16;
+  static constexpr bool USE_FP16_ACCUM_MMA = USE_FP16_ACCUM_MMA_;
+  static constexpr bool USE_FP16_OPERANDS =
+      USE_FP16_ACCUM_MMA_ && std::is_same_v<DTypeQ_, nv_bfloat16>;
+  static_assert(!USE_FP16_ACCUM_MMA_ ||
+                    (sizeof(DTypeQ_) == 2 && std::is_same_v<DTypeQ_, DTypeKV_> &&
+                     std::is_same_v<DTypeQKAccum_, float> && NUM_MMA_D_VO <= 16),
+                "FP16-accumulate MMA needs same-dtype 16-bit Q/KV, FP32 logits and "
+                "head_dim_vo <= 256");
   static constexpr uint32_t NUM_MMA_D_VO_TILE = NUM_MMA_D_VO > 16 ? 16 : NUM_MMA_D_VO;
   static constexpr uint32_t NUM_D_VO_TILES = NUM_MMA_D_VO / NUM_MMA_D_VO_TILE;
   static_assert(NUM_MMA_D_VO % NUM_MMA_D_VO_TILE == 0,
@@ -1329,8 +1370,92 @@ __device__ __forceinline__ void repack_kv_tile_to_16b(typename KTraits::DTypeKV*
   }
 }
 
+// Converts a bf16 shared-memory tile of NUM_B128 16-byte chunks to FP16 in place. The conversion
+// is element-wise, so the swizzle does not matter. The caller syncs before and after.
+template <uint32_t NUM_THREADS, uint32_t NUM_B128>
+__device__ __forceinline__ void convert_bf16_tile_to_f16(b128_t* smem, const uint32_t thread_id) {
+  // Unrolled by 4 (measured: full unrolling keeps too many chunks live and is slower).
+#pragma unroll 4
+  for (uint32_t idx = thread_id; idx < NUM_B128; idx += NUM_THREADS) {
+    b128_t chunk = smem[idx];
+    vec_cast<half, nv_bfloat16>::cast<8>((half*)&chunk, (const nv_bfloat16*)&chunk);
+    smem[idx] = chunk;
+  }
+}
+
+/*!
+ * \brief Q*K^T with FP16-accumulate MMA. Each group of F consecutive mma_d steps (K = 16 * F
+ *   products) is accumulated in one FP16 fragment, which is then added into the FP32 s_frag. The
+ *   FP16 fragment is transient (one per (mma_q, mma_kv) at a time); the A/B fragments of the F
+ *   steps are loaded ahead so that it can be chained.
+ */
+template <typename KTraits>
+__device__ __forceinline__ void compute_qk_fp16_accum(smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem,
+                                                      uint32_t* q_smem_offset_r,
+                                                      smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem,
+                                                      uint32_t* k_smem_offset_r,
+                                                      float (*s_frag)[KTraits::NUM_MMA_KV][8]) {
+  constexpr uint32_t UPCAST_STRIDE_Q = KTraits::UPCAST_STRIDE_Q;
+  constexpr uint32_t UPCAST_STRIDE_K = KTraits::UPCAST_STRIDE_K;
+  constexpr uint32_t F = fp16_accum_mma_group(KTraits::NUM_MMA_D_QK);
+  uint32_t a_frag[F][KTraits::NUM_MMA_Q][4];
+#pragma unroll
+  for (uint32_t g = 0; g < KTraits::NUM_MMA_D_QK / F; ++g) {
+#pragma unroll
+    for (uint32_t f = 0; f < F; ++f) {
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+        // Moving 16 rows down (mma_q, mma_kv) is a plain add that commutes with the swizzled
+        // column advance, so the offsets are only walked over mma_d.
+        q_smem->ldmatrix_m8n8x4(*q_smem_offset_r + mma_q * 16 * UPCAST_STRIDE_Q, a_frag[f][mma_q]);
+      }
+      *q_smem_offset_r = q_smem->template advance_offset_by_column<2>(*q_smem_offset_r, g * F + f);
+    }
+    uint32_t k_offset[F];
+    k_offset[0] = *k_smem_offset_r;
+#pragma unroll
+    for (uint32_t f = 1; f < F; ++f) {
+      k_offset[f] = k_smem->template advance_offset_by_column<2>(k_offset[f - 1], g * F + f - 1);
+    }
+    *k_smem_offset_r = k_smem->template advance_offset_by_column<2>(k_offset[F - 1], g * F + F - 1);
+
+#pragma unroll
+    for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+      uint32_t b_frag[F][4];
+#pragma unroll
+      for (uint32_t f = 0; f < F; ++f) {
+        k_smem->ldmatrix_m8n8x4(k_offset[f] + mma_kv * 16 * UPCAST_STRIDE_K, b_frag[f]);
+      }
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+        uint32_t s_f16[4];
+#pragma unroll
+        for (uint32_t f = 0; f < F; ++f) {
+          if (f == 0) {
+            mma::mma_sync_m16n16k16_row_col_f16f16f16<MMAMode::kInit>(s_f16, a_frag[f][mma_q],
+                                                                      b_frag[f]);
+          } else {
+            mma::mma_sync_m16n16k16_row_col_f16f16f16(s_f16, a_frag[f][mma_q], b_frag[f]);
+          }
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < 4; ++i) {
+          float* s = &s_frag[mma_q][mma_kv][2 * i];
+          if (g == 0) {
+            s[0] = 0.f;
+            s[1] = 0.f;
+          }
+          mma::add_f16x2_to_f32x2(s, s_f16[i]);
+        }
+      }
+    }
+  }
+  *q_smem_offset_r -= KTraits::NUM_MMA_D_QK * 2;
+  *k_smem_offset_r -= KTraits::NUM_MMA_D_QK * 2;
+}
+
 template <typename KTraits, bool REPACK_BF16 = false>
-__device__ __forceinline__ void compute_qk(
+__device__ __forceinline__ void compute_qk_fp32_acc(
     smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, uint32_t* q_smem_offset_r,
     smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, uint32_t* k_smem_offset_r, uint8_t* k_sf_smem,
     uint32_t lane_idx, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8]) {
@@ -1434,6 +1559,19 @@ __device__ __forceinline__ void compute_qk(
   }
   *q_smem_offset_r -= KTraits::NUM_MMA_D_QK * 2;
   *k_smem_offset_r -= KTraits::NUM_MMA_D_QK * KV_ESIZE;
+}
+
+template <typename KTraits, bool REPACK_BF16 = false>
+__device__ __forceinline__ void compute_qk(
+    smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, uint32_t* q_smem_offset_r,
+    smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, uint32_t* k_smem_offset_r, uint8_t* k_sf_smem,
+    uint32_t lane_idx, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8]) {
+  if constexpr (KTraits::USE_FP16_ACCUM_MMA) {
+    compute_qk_fp16_accum<KTraits>(q_smem, q_smem_offset_r, k_smem, k_smem_offset_r, s_frag);
+  } else {
+    compute_qk_fp32_acc<KTraits, REPACK_BF16>(q_smem, q_smem_offset_r, k_smem, k_smem_offset_r,
+                                              k_sf_smem, lane_idx, s_frag);
+  }
 }
 
 template <typename KTraits>
@@ -1849,7 +1987,7 @@ __device__ __forceinline__ void update_mdo_states(
 }
 
 template <typename KTraits, bool REPACK_BF16 = false>
-__device__ __forceinline__ void compute_sfm_v(
+__device__ __forceinline__ void compute_sfm_v_fp32_acc(
     smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint32_t* v_smem_offset_r, uint8_t* v_sf_smem,
     uint32_t lane_idx, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
     float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8], float (*d)[2], const uint32_t d_base = 0) {
@@ -1959,6 +2097,97 @@ __device__ __forceinline__ void compute_sfm_v(
                        VV_ESIZE * KTraits::NUM_MMA_D_VO;
   }
   *v_smem_offset_r -= 16 * KTraits::NUM_MMA_KV * VV_STRIDE;
+}
+
+/*!
+ * \brief P*V and the row sum of P with FP16-accumulate MMA (see kFp16AccumMma). P (s_frag) is
+ *   FP16. Each (mma_q, mma_d) accumulates a whole KV tile in one FP16 fragment, which is then
+ *   added into the FP32 o_frag, so the FP16 sum never spans more than one tile.
+ */
+template <typename KTraits, bool REPACK_BF16 = false>
+__device__ __forceinline__ void compute_sfm_v_fp16_acc(
+    smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint32_t* v_smem_offset_r,
+    half (*s_frag)[KTraits::NUM_MMA_KV][8], float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8],
+    float (*d)[2], const uint32_t d_base = 0) {
+  constexpr uint32_t VV_STRIDE = REPACK_BF16 ? KTraits::REPACK_STRIDE_VO : KTraits::UPCAST_STRIDE_V;
+  constexpr uint32_t VV_ESIZE =
+      REPACK_BF16 ? sizeof(typename KTraits::DTypeQ) : sizeof(typename KTraits::DTypeKV);
+
+  if constexpr (KTraits::AttentionVariant::use_softmax) {
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+      // Each register holds one row's sum in both halves (rows lane/4 and lane/4 + 8).
+      uint32_t d_f16[2];
+#pragma unroll
+      for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+        if (mma_kv == 0) {
+          mma::m16k16_rowsum_f16f16f16<MMAMode::kInit>(d_f16, (uint32_t*)s_frag[mma_q][mma_kv]);
+        } else {
+          mma::m16k16_rowsum_f16f16f16(d_f16, (uint32_t*)s_frag[mma_q][mma_kv]);
+        }
+      }
+      d[mma_q][0] += __low2float(*(half2*)&d_f16[0]);
+      d[mma_q][1] += __low2float(*(half2*)&d_f16[1]);
+    }
+  }
+
+  // mma_d is the outer loop so that one FP16 accumulator per mma_q spans the whole KV tile.
+#pragma unroll
+  for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
+    if (mma_d >= d_base && mma_d < d_base + KTraits::NUM_MMA_D_VO_TILE) {
+      uint32_t o_f16[KTraits::NUM_MMA_Q][4];
+#pragma unroll
+      for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+        uint32_t b_frag[4];
+        // Moving 16 rows down (mma_kv) is a plain add that commutes with the swizzled column
+        // advance below, so *v_smem_offset_r is walked over mma_d only.
+        v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r + mma_kv * 16 * VV_STRIDE, b_frag);
+#pragma unroll
+        for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+          if (mma_kv == 0) {
+            mma::mma_sync_m16n16k16_row_col_f16f16f16<MMAMode::kInit>(
+                o_f16[mma_q], (uint32_t*)s_frag[mma_q][mma_kv], b_frag);
+          } else {
+            mma::mma_sync_m16n16k16_row_col_f16f16f16(o_f16[mma_q],
+                                                      (uint32_t*)s_frag[mma_q][mma_kv], b_frag);
+          }
+        }
+      }
+      const uint32_t mma_d_local = mma_d - d_base;
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+        for (uint32_t i = 0; i < 4; ++i) {
+          mma::add_f16x2_to_f32x2(&o_frag[mma_q][mma_d_local][2 * i], o_f16[mma_q][i]);
+        }
+      }
+    }
+    *v_smem_offset_r = v_smem->template advance_offset_by_column<2>(*v_smem_offset_r, mma_d);
+  }
+  *v_smem_offset_r -= VV_ESIZE * KTraits::NUM_MMA_D_VO;
+}
+
+template <typename KTraits, bool REPACK_BF16 = false>
+__device__ __forceinline__ void compute_sfm_v(
+    smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint32_t* v_smem_offset_r, uint8_t* v_sf_smem,
+    uint32_t lane_idx, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
+    float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8], float (*d)[2], const uint32_t d_base = 0) {
+  if constexpr (KTraits::USE_FP16_ACCUM_MMA) {
+    // P comes from the FP32 softmax; it is an FP16 operand whatever DTypeQ is (V is FP16 too).
+    half p_frag[KTraits::NUM_MMA_Q][KTraits::NUM_MMA_KV][8];
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+      for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+        vec_cast<half, float>::cast<8>(p_frag[mma_q][mma_kv], s_frag[mma_q][mma_kv]);
+      }
+    }
+    compute_sfm_v_fp16_acc<KTraits, REPACK_BF16>(v_smem, v_smem_offset_r, p_frag, o_frag, d,
+                                                 d_base);
+  } else {
+    compute_sfm_v_fp32_acc<KTraits, REPACK_BF16>(v_smem, v_smem_offset_r, v_sf_smem, lane_idx,
+                                                 s_frag, o_frag, d, d_base);
+  }
 }
 
 template <typename KTraits>
@@ -2544,6 +2773,20 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
           block.sync();
         }
 
+        if constexpr (KTraits::USE_FP16_OPERANDS) {
+          // bf16 -> FP16 in shared memory: K once it has landed (and after RoPE), Q with the first
+          // K tile (after its own RoPE).
+          if (iter == 0) {
+            convert_bf16_tile_to_f16<KTraits::NUM_THREADS,
+                                     KTraits::CTA_TILE_Q * KTraits::UPCAST_STRIDE_Q>(
+                qo_smem.base, warp_idx * WARP_SIZE + lane_idx);
+          }
+          convert_bf16_tile_to_f16<KTraits::NUM_THREADS,
+                                   KTraits::CTA_TILE_KV * KTraits::UPCAST_STRIDE_K>(
+              k_smem.base, warp_idx * WARP_SIZE + lane_idx);
+          block.sync();
+        }
+
         // compute attention score
         if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
                       is_fp4_type_v<DTypeKV>) {
@@ -2606,6 +2849,14 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
           cp_async::wait_group<1>();
         }
         block.sync();
+
+        if constexpr (KTraits::USE_FP16_OPERANDS) {
+          // V has landed (in k_smem when K/V share a buffer).
+          convert_bf16_tile_to_f16<KTraits::NUM_THREADS,
+                                   KTraits::CTA_TILE_KV * KTraits::UPCAST_STRIDE_V>(
+              v_smem.base, warp_idx * WARP_SIZE + lane_idx);
+          block.sync();
+        }
 
         // compute sfm*v
         if constexpr (KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT) {
@@ -2760,9 +3011,12 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     constexpr uint32_t NUM_WARPS_KV = kLargeHeadWarpSplit ? 2 : get_num_warps_kv(CTA_TILE_Q);
     constexpr uint32_t NUM_MMA_Q = kLargeHeadWarpSplit ? 1 : get_num_mma_q(CTA_TILE_Q);
 
-    using DTypeQKAccum =
-        typename std::conditional<USE_FP16_QK_REDUCTION && std::is_same_v<DTypeQ, half>, half,
-                                  float>::type;
+    // With the FP16-accumulate MMA mode compiled in, the logits stay FP32 whether or not this
+    // instantiation qualifies for the mode (the half-logit path is the legacy alternative).
+    constexpr bool kUseFp16AccumMma =
+        use_fp16_accum_mma<DTypeQ, DTypeKV, USE_FP16_QK_REDUCTION, HEAD_DIM_VO>();
+    using DTypeQKAccum = typename std::conditional<
+        USE_FP16_QK_REDUCTION && std::is_same_v<DTypeQ, half> && !kFp16AccumMma, half, float>::type;
 
     int dev_id = 0;
     FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -2818,7 +3072,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
 
     const uint32_t max_num_mma_kv_reg =
         (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
-         !USE_FP16_QK_REDUCTION)
+         (!USE_FP16_QK_REDUCTION || kFp16AccumMma))
             ? 2
             : (8 / NUM_MMA_Q);
     const int max_num_mma_kv_smem = (max_smem_per_threadblock - static_cast<int>(kFixedSmem)) /
@@ -2840,7 +3094,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
               KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                            NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
                            DTypeQKAccum, typename Params::IdType, AttentionVariant,
-                           kPrefillLauncherRepacksFp4>;
+                           kPrefillLauncherRepacksFp4, kUseFp16AccumMma>;
           if constexpr (KTraits::IsInvalid()) {
             // Invalid configuration, skip
             std::ostringstream err_msg;
@@ -3253,6 +3507,20 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
           }
         }
 
+        if constexpr (KTraits::USE_FP16_OPERANDS) {
+          // bf16 -> FP16 in shared memory: K once it has landed (and after RoPE), Q with the first
+          // K tile (after its own RoPE).
+          if (iter == 0) {
+            convert_bf16_tile_to_f16<KTraits::NUM_THREADS,
+                                     KTraits::CTA_TILE_Q * KTraits::UPCAST_STRIDE_Q>(
+                qo_smem.base, warp_idx * WARP_SIZE + lane_idx);
+          }
+          convert_bf16_tile_to_f16<KTraits::NUM_THREADS,
+                                   KTraits::CTA_TILE_KV * KTraits::UPCAST_STRIDE_K>(
+              k_smem.base, warp_idx * WARP_SIZE + lane_idx);
+          block.sync();
+        }
+
         // compute attention score
         if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
                       is_fp4_type_v<DTypeKV>) {
@@ -3317,6 +3585,14 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
           cp_async::wait_group<1>();
         }
         block.sync();
+
+        if constexpr (KTraits::USE_FP16_OPERANDS) {
+          // V has landed (in k_smem when K/V share a buffer).
+          convert_bf16_tile_to_f16<KTraits::NUM_THREADS,
+                                   KTraits::CTA_TILE_KV * KTraits::UPCAST_STRIDE_V>(
+              v_smem.base, warp_idx * WARP_SIZE + lane_idx);
+          block.sync();
+        }
 
         // compute sfm*v
         if constexpr (KTraits::USE_SOFTMAX_VO_SPLIT) {
@@ -4142,6 +4418,20 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           }
         }
 
+        if constexpr (KTraits::USE_FP16_OPERANDS) {
+          // bf16 -> FP16 in shared memory: K once it has landed (and after RoPE), Q with the first
+          // K tile (after its own RoPE).
+          if (iter == 0) {
+            convert_bf16_tile_to_f16<KTraits::NUM_THREADS,
+                                     KTraits::CTA_TILE_Q * KTraits::UPCAST_STRIDE_Q>(
+                qo_smem.base, warp_idx * WARP_SIZE + lane_idx);
+          }
+          convert_bf16_tile_to_f16<KTraits::NUM_THREADS,
+                                   KTraits::CTA_TILE_KV * KTraits::UPCAST_STRIDE_K>(
+              k_smem.base, warp_idx * WARP_SIZE + lane_idx);
+          block.sync();
+        }
+
         // compute attention score
         if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
                       is_fp4_type_v<DTypeKV>) {
@@ -4233,6 +4523,14 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           cp_async::wait_group<1>();
         }
         block.sync();
+
+        if constexpr (KTraits::USE_FP16_OPERANDS) {
+          // V has landed (in k_smem when K/V share a buffer).
+          convert_bf16_tile_to_f16<KTraits::NUM_THREADS,
+                                   KTraits::CTA_TILE_KV * KTraits::UPCAST_STRIDE_V>(
+              v_smem.base, warp_idx * WARP_SIZE + lane_idx);
+          block.sync();
+        }
 
         // compute sfm*v
         if constexpr (KTraits::USE_VO_SPLIT) {
@@ -4397,9 +4695,12 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
-  using DTypeQKAccum =
-      typename std::conditional<USE_FP16_QK_REDUCTION && std::is_same_v<DTypeQ, half>, half,
-                                float>::type;
+  // With the FP16-accumulate MMA mode compiled in, the logits stay FP32 whether or not this
+  // instantiation qualifies for the mode (the half-logit path is the legacy alternative).
+  constexpr bool kUseFp16AccumMma =
+      use_fp16_accum_mma<DTypeQ, DTypeKV, USE_FP16_QK_REDUCTION, HEAD_DIM_VO>();
+  using DTypeQKAccum = typename std::conditional<
+      USE_FP16_QK_REDUCTION && std::is_same_v<DTypeQ, half> && !kFp16AccumMma, half, float>::type;
 
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -4464,7 +4765,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
 
   const uint32_t max_num_mma_kv_reg =
       (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
-       !USE_FP16_QK_REDUCTION)
+       (!USE_FP16_QK_REDUCTION || kFp16AccumMma))
           ? 2
           : (8 / NUM_MMA_Q);
   const int max_num_mma_kv_smem =
@@ -4481,10 +4782,11 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
 
   DISPATCH_NUM_MMA_KV(
       min(static_cast<uint32_t>(max_num_mma_kv_smem), max_num_mma_kv_reg), NUM_MMA_KV, {
-        using KTraits = KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK,
-                                     NUM_MMA_D_VO, NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE,
-                                     DTypeQ, DTypeKV, DTypeO, DTypeQKAccum, typename Params::IdType,
-                                     AttentionVariant, kPrefillLauncherRepacksFp4>;
+        using KTraits =
+            KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
+                         NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
+                         DTypeQKAccum, typename Params::IdType, AttentionVariant,
+                         kPrefillLauncherRepacksFp4, kUseFp16AccumMma>;
         if constexpr (KTraits::IsInvalid()) {
           // Invalid configuration, skip
           std::ostringstream err_msg;
@@ -4600,9 +4902,12 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
 
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
-  using DTypeQKAccum =
-      typename std::conditional<USE_FP16_QK_REDUCTION && std::is_same_v<DTypeQ, half>, half,
-                                float>::type;
+  // With the FP16-accumulate MMA mode compiled in, the logits stay FP32 whether or not this
+  // instantiation qualifies for the mode (the half-logit path is the legacy alternative).
+  constexpr bool kUseFp16AccumMma =
+      use_fp16_accum_mma<DTypeQ, DTypeKV, USE_FP16_QK_REDUCTION, HEAD_DIM_VO>();
+  using DTypeQKAccum = typename std::conditional<
+      USE_FP16_QK_REDUCTION && std::is_same_v<DTypeQ, half> && !kFp16AccumMma, half, float>::type;
 
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -4660,7 +4965,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
 
   const uint32_t max_num_mma_kv_reg =
       (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
-       !USE_FP16_QK_REDUCTION)
+       (!USE_FP16_QK_REDUCTION || kFp16AccumMma))
           ? 2
           : (8 / NUM_MMA_Q);
   const int max_num_mma_kv_smem =
@@ -4677,10 +4982,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
 
   DISPATCH_NUM_MMA_KV(
       min(static_cast<uint32_t>(max_num_mma_kv_smem), max_num_mma_kv_reg), NUM_MMA_KV, {
-        using KTraits = KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK,
-                                     NUM_MMA_D_VO, NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE,
-                                     DTypeQ, DTypeKV, DTypeO, DTypeQKAccum, typename Params::IdType,
-                                     AttentionVariant, kPrefillLauncherRepacksFp4>;
+        using KTraits =
+            KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
+                         NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
+                         DTypeQKAccum, typename Params::IdType, AttentionVariant,
+                         kPrefillLauncherRepacksFp4, kUseFp16AccumMma>;
         if constexpr (KTraits::IsInvalid()) {
           // Invalid configuration, skip
           std::ostringstream err_msg;
