@@ -65,14 +65,6 @@ from .helpers_common import (
 )
 
 
-# Keeps staging uses the low four bits for structural KV64 validity. Bit 4
-# carries the conservative prepared summary that token masking can be skipped;
-# structural, tail, and causal masking remain independent. The streamed Keeps
-# max pass derives its keep words from the token words directly, so the bit is
-# currently staged for the consumer but not read.
-_SOFTMAX_TOKEN_MASK_IS_FULL_FLAG = 1 << 4
-
-
 # SWAP origins are at least eight-token aligned, so their low two bits are free
 # while the route is in Softmax's private staging payload. Reusing them avoids
 # adding a word to every pipeline stage for prepared FULL/PROXY route flags.
@@ -1004,25 +996,10 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
             )
 
         token_word = Uint32(0)
-        route_token_mask_is_full = cutlass.Boolean(False)
         if cutlass.const_expr(self.cfg.uses_prepared_score_keep_words):
             assert self.route_layout.token_words_word_offset is not None
             assert self.route_metadata is not None
             if cutlass.const_expr(not uses_one_warp_transport):
-                gmem_route_flags = Int32(0)
-                if lane_idx == Int32(0) and route_record_is_valid:
-                    gmem_route_flags = Int32(
-                        self.route_metadata[
-                            route_record_word_offset
-                            + Int32(self.route_layout.route_flags_word_offset)
-                        ]
-                    )
-                gmem_route_flags = _warp_broadcast_i32(gmem_route_flags, 0)
-                # Prepared bit 0 summarizes the whole route. Staged low bits
-                # already hold fragment validity, so remap it above them.
-                route_token_mask_is_full = cutlass.Boolean(
-                    (gmem_route_flags & Int32(_PREPARED_ROUTE_IS_FULL_FLAG)) != Int32(0)
-                )
                 if (
                     lane_idx < Int32(self.route_layout.token_words_per_route)
                     and route_record_is_valid
@@ -1045,15 +1022,8 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
 
         if cutlass.const_expr(uses_one_warp_transport):
             if lane_idx == Int32(self.route_layout.route_flags_word_offset):
-                prepared_route_flags = Int32(resolved_record_word)
-                route_flags = route_flags | (
-                    Int32(
-                        (prepared_route_flags & Int32(_PREPARED_ROUTE_IS_FULL_FLAG))
-                        != Int32(0)
-                    )
-                    * Int32(_SOFTMAX_TOKEN_MASK_IS_FULL_FLAG)
-                )
                 if cutlass.const_expr(self.cfg.use_block_sparse_proxy_routes):
+                    prepared_route_flags = Int32(resolved_record_word)
                     route_flags = route_flags | (
                         Int32(
                             (
@@ -1068,11 +1038,6 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                     stage_base + Int32(self.staging_layout.route_flags_word_offset)
                 ] = route_flags
         elif lane_idx == Int32(0):
-            if cutlass.const_expr(self.cfg.uses_prepared_score_keep_words):
-                route_flags = route_flags | (
-                    Int32(route_token_mask_is_full)
-                    * Int32(_SOFTMAX_TOKEN_MASK_IS_FULL_FLAG)
-                )
             self._smem_words[
                 stage_base + Int32(self.staging_layout.route_flags_word_offset)
             ] = route_flags
@@ -1253,10 +1218,6 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
             valid0 = (stored_route_flags >> origin0_idx) & Int32(1)
             valid1 = (stored_route_flags >> origin1_idx) & Int32(1)
             route_flags = valid0 | (valid1 << Int32(1))
-            if cutlass.const_expr(self.cfg.uses_prepared_score_keep_words):
-                route_flags = route_flags | (
-                    stored_route_flags & Int32(_SOFTMAX_TOKEN_MASK_IS_FULL_FLAG)
-                )
             if cutlass.const_expr(self.cfg.use_block_sparse_proxy_routes):
                 route_flags = route_flags | (
                     stored_route_flags & Int32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)

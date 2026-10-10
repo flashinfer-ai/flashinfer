@@ -497,6 +497,15 @@ class TmemSResource(DecodeGenResourceBase):
         return self._stage_slot_offset_from_slot(stage_info.loop_offset % Int32(2))
 
     @cute.jit
+    def _softmax_loop_score_tmem_addr(self, stage_info: StageInfo) -> Int32:
+        """Return the TMEM address of the S slot that LOOP softmax reads."""
+        return (
+            _decode_gen_task_cache(stage_info)[_TASK_CACHE_TMEM_BASE_OFFSET]
+            + Int32(self._alloc.offset)
+            + self._softmax_loop_stage_slot_offset(stage_info)
+        )
+
+    @cute.jit
     def _create_initial_task_locals(
         self, context: ResourceContext | None = None
     ) -> ResourceVars:
@@ -1118,11 +1127,7 @@ class TmemSResource(DecodeGenResourceBase):
         cfg = self.cfg
         task_cache = _decode_gen_task_cache(stage_info)
         num_s_regs = cfg.num_s_regs_per_thread
-        base_addr = (
-            task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
-            + Int32(self._alloc.offset)
-            + self._softmax_loop_stage_slot_offset(stage_info)
-        )
+        base_addr = self._softmax_loop_score_tmem_addr(stage_info)
         for load_atom_idx in cutlass.range_constexpr(num_s_regs // 32):
             atom_col = load_atom_idx * 32
             loaded = _keeps_tcgen05_ld(
@@ -1432,11 +1437,7 @@ class TmemSResource(DecodeGenResourceBase):
             return old_max_arr, sum_arr, new_max_arr, s_arr
 
         if tile_has_valid_scores:
-            base_addr = (
-                task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
-                + Int32(self._alloc.offset)
-                + self._softmax_loop_stage_slot_offset(stage_info)
-            )
+            base_addr = self._softmax_loop_score_tmem_addr(stage_info)
             # Keep each intrinsic result at the native 32-register atom. TQ128
             # uses four consecutive atoms and TQ64 uses two atoms with the same
             # half-split offset, avoiding a monolithic x64/x128 LLVM intrinsic
@@ -1739,11 +1740,7 @@ class TmemSResource(DecodeGenResourceBase):
             # registers. Two TMEM rows cover the two K subtiles. Invalid
             # odd-tail waves intentionally skip the load and leave S at
             # -inf so the later P path contributes zero probability.
-            base_addr = (
-                task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
-                + Int32(self._alloc.offset)
-                + self._softmax_loop_stage_slot_offset(stage_info)
-            )
+            base_addr = self._softmax_loop_score_tmem_addr(stage_info)
 
             shape = "16x256b"
             loaded0 = prims.tcgen05_ld(
@@ -2604,11 +2601,7 @@ class TmemSResource(DecodeGenResourceBase):
                 warp_scores_are_unmasked and not route_is_proxy
             )
 
-        score_tmem_addr = (
-            task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
-            + Int32(self._alloc.offset)
-            + self._softmax_loop_stage_slot_offset(stage_info)
-        )
+        score_tmem_addr = self._softmax_loop_score_tmem_addr(stage_info)
         max_chains = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
         max_identity = _neg_max_f32()
         if cutlass.const_expr(cfg.use_sage_attention):
