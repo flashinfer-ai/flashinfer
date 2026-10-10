@@ -98,3 +98,58 @@ def test_rope_quantize_fp8_append_paged_kv_cache_reference_correctness(shape_kwa
     )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def test_rope_quantize_fp8_append_paged_kv_cache_reference_e5m2_saturation():
+    """e5m2 V appended to the paged cache must saturate at the e5m2 max.
+
+    pos_ids 0 with cos 1 / sin 0 keeps the rotation an identity and the two
+    tokens land in distinct slots of one page, so the values written to
+    v_cache are exactly the quantized v rows below. All inputs are exact
+    in bf16; most lie above the e4m3 max of 448 on both signs.
+    """
+    from flashinfer.trace.templates.rope import (
+        rope_quantize_fp8_append_paged_kv_cache_trace,
+    )
+
+    cos_sin_cache = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    pos_ids = torch.zeros(2, dtype=torch.int32)
+    q_rope = torch.tensor(
+        [[[512.0, 57344.0]], [[2048.0, -59904.0]]], dtype=torch.bfloat16
+    )
+    k_rope = torch.tensor(
+        [[[448.0, 61440.0]], [[28672.0, -512.0]]], dtype=torch.bfloat16
+    )
+    v = torch.tensor(
+        [[500.0, 19968.0, -29952.0, 448.0], [-59904.0, 57344.0, 448.0, -512.0]],
+        dtype=torch.bfloat16,
+    ).reshape(2, 1, 4)
+    k_cache = torch.zeros(1, 2, 1, 2, dtype=torch.float8_e5m2)
+    v_cache = torch.zeros(1, 2, 1, 4, dtype=torch.float8_e5m2)
+    q_r_ref, _ = rope_quantize_fp8_append_paged_kv_cache_trace.reference(
+        q_rope,
+        k_rope,
+        None,
+        None,
+        v,
+        cos_sin_cache,
+        pos_ids,
+        (k_cache, v_cache),
+        kv_indices=torch.tensor([0], dtype=torch.int32),
+        kv_indptr=torch.tensor([0], dtype=torch.int32),
+        batch_indices=torch.tensor([0, 0], dtype=torch.int32),
+        positions=torch.tensor([0, 1], dtype=torch.int32),
+        is_neox=True,
+        quantize_dtype=torch.float8_e5m2,
+        page_size=2,
+        kv_layout="NHD",
+    )
+    expected_v = v.to(torch.float32).clamp(-57344.0, 57344.0).to(torch.float8_e5m2)
+    expected_k = k_rope.to(torch.float32).clamp(-57344.0, 57344.0).to(torch.float8_e5m2)
+    expected_q = q_rope.to(torch.float32).clamp(-57344.0, 57344.0).to(torch.float8_e5m2)
+    assert v_cache.dtype == torch.float8_e5m2
+    assert torch.equal(v_cache[0].reshape(-1).float(), expected_v.reshape(-1).float())
+    assert torch.equal(k_cache[0].reshape(-1).float(), expected_k.reshape(-1).float())
+    assert torch.equal(q_r_ref.reshape(-1).float(), expected_q.reshape(-1).float())
+    # Clamping V at the e4m3 max of 448 would compress the e5m2 range by 128x.
+    assert (v_cache.float().abs() > 448.0).any()
