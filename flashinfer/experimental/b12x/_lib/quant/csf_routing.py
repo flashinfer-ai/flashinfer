@@ -9,12 +9,16 @@ duplicate searches or expanding experts absent from the routed batch.
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass.cutlass_dsl import Int32, Int64
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x._lib.program_cache import program_cache
+from b12x._lib.program_cache import program_cache, register_program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
+
+_LAUNCH_PROGRAMS = {}
+register_program_cache(_LAUNCH_PROGRAMS)
 
 
 class _ActiveExperts:
@@ -74,8 +78,6 @@ def compile_csf_active_experts(ids64=False):
 
 
 def mark_active_experts(ids, active, program):
-    import torch
-
     if (
         ids.dtype not in (torch.int32, torch.int64)
         or not ids.is_contiguous()
@@ -83,6 +85,16 @@ def mark_active_experts(ids, active, program):
         or active.dtype != torch.int32
     ):
         raise ValueError("CSF presence masks require contiguous CUDA integer routes")
+    handle = id(program)
+    _LAUNCH_PROGRAMS[handle] = program
+    _mark_active_experts_op(ids, active, handle)
+
+
+@torch.library.custom_op("b12x::csf_active_experts", mutates_args=("active",))
+def _mark_active_experts_op(
+    ids: torch.Tensor, active: torch.Tensor, program_handle: int
+) -> None:
+    program = _LAUNCH_PROGRAMS[program_handle]
     program(
         make_ptr(
             cutlass.Int64 if ids.dtype == torch.int64 else cutlass.Int32,
@@ -97,3 +109,8 @@ def mark_active_experts(ids, active, program):
         active.numel(),
         current_cuda_stream(),
     )
+
+
+@_mark_active_experts_op.register_fake
+def _mark_active_experts_fake(ids, active, program_handle) -> None:
+    pass

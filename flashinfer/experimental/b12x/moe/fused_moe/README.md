@@ -1,5 +1,11 @@
 # W4A16 with NVFP4 activation prefill
 
+Expert-presence marking, NVFP4-CSF scale expansion, and deterministic dynamic
+route reduction have registered mutating operators. ATen tracing preserves
+these launches and their caller-owned outputs for subsequent compilation and
+CUDA graph capture. Scale expansion retains its supplied prepared CuTe program;
+route reduction uses the current capture stream.
+
 This experimental SM120 path reuses ModelOpt NVFP4 W4A16 weights for
 NVFP4 activation GEMMs during prefill. Activation quantization changes model
 outputs and requires model quality validation before deployment. The default

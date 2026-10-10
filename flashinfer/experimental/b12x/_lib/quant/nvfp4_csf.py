@@ -18,9 +18,12 @@ import torch
 from cutlass.cutlass_dsl import Int32, Int64, Uint32, Uint64
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x._lib.program_cache import program_cache
+from b12x._lib.program_cache import program_cache, register_program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
+
+_LAUNCH_PROGRAMS = {}
+register_program_cache(_LAUNCH_PROGRAMS)
 
 
 @dataclass(frozen=True)
@@ -734,27 +737,74 @@ def decode_nvfp4_csf_pair(
             indexed_scales is not None,
         )
 
+    sources = []
+    for index, batch in enumerate((first, second)):
+        sources.extend(
+            (
+                batch.fixed
+                if indexed_scales is None
+                else indexed_scales[index].storage,
+                batch.exceptions,
+                batch.task_offsets,
+                batch.fixed if batch.value_lut is None else batch.value_lut,
+            )
+        )
+    handle = id(program)
+    _LAUNCH_PROGRAMS[handle] = program
+    _decode_pair_op(
+        sources,
+        ids,
+        out13,
+        out2,
+        None if barriers is None else barriers[0],
+        None if barriers is None else barriers[1],
+        first.num_experts,
+        capacity,
+        mode,
+        handle,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::nvfp4_csf_pair",
+    mutates_args=("out13", "out2", "barrier_count", "barrier_epoch"),
+)
+def _decode_pair_op(
+    sources: list[torch.Tensor],
+    ids: torch.Tensor,
+    out13: torch.Tensor,
+    out2: torch.Tensor,
+    barrier_count: torch.Tensor | None,
+    barrier_epoch: torch.Tensor | None,
+    num_experts: int,
+    capacity: int,
+    routing_mode: int,
+    program_handle: int,
+) -> None:
+    program = _LAUNCH_PROGRAMS[program_handle]
+
     def device_ptr(t, dtype, align):
         return make_ptr(
             dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
         )
 
     args = []
-    for index, (batch, out) in enumerate(((first, out13), (second, out2))):
+    for index, out in enumerate((out13, out2)):
+        fixed, exceptions, task_offsets, value_lut = sources[
+            index * 4 : (index + 1) * 4
+        ]
         args.extend(
             (
                 device_ptr(
-                    batch.fixed
-                    if indexed_scales is None
-                    else indexed_scales[index].storage,
+                    fixed,
                     cutlass.Uint8,
                     16,
                 ),
-                device_ptr(batch.exceptions, cutlass.Uint8, 16),
-                device_ptr(batch.task_offsets, cutlass.Int64, 8),
+                device_ptr(exceptions, cutlass.Uint8, 16),
+                device_ptr(task_offsets, cutlass.Int64, 8),
                 device_ptr(out, cutlass.Uint8, 16),
                 device_ptr(
-                    batch.fixed if batch.value_lut is None else batch.value_lut,
+                    value_lut,
                     cutlass.Uint8,
                     16,
                 ),
@@ -767,20 +817,36 @@ def decode_nvfp4_csf_pair(
             cutlass.Int64 if ids.dtype == torch.int64 else cutlass.Int32,
             8 if ids.dtype == torch.int64 else 4,
         ),
-        first.num_experts,
-        first.exceptions.numel(),
-        second.exceptions.numel(),
+        num_experts,
+        sources[1].numel(),
+        sources[5].numel(),
         capacity,
-        mode,
+        routing_mode,
         device_ptr(
-            first.task_offsets if barriers is None else barriers[0], cutlass.Int32, 4
+            sources[2] if barrier_count is None else barrier_count, cutlass.Int32, 4
         ),
         device_ptr(
-            first.task_offsets if barriers is None else barriers[1], cutlass.Int32, 4
+            sources[2] if barrier_epoch is None else barrier_epoch, cutlass.Int32, 4
         ),
-        0 if barriers is None else barriers[0].numel(),
+        0 if barrier_count is None else barrier_count.numel(),
         current_cuda_stream(),
     )
+
+
+@_decode_pair_op.register_fake
+def _decode_pair_fake(
+    sources,
+    ids,
+    out13,
+    out2,
+    barrier_count,
+    barrier_epoch,
+    num_experts,
+    capacity,
+    routing_mode,
+    program_handle,
+) -> None:
+    pass
 
 
 @dataclass(frozen=True)
