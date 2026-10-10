@@ -13,7 +13,6 @@ from dataclasses import dataclass
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import numpy as np
 import torch
 from cutlass.cutlass_dsl import Int32, Int64, Uint32, Uint64
 
@@ -114,204 +113,49 @@ def make_nvfp4_csf_batch(
     row_rotation=0,
     value_lut=None,
 ):
-    """Upload compressed CPU planes and build immutable exception partitions.
+    """Upload checkpoint planes and convert their compressed layout on CUDA."""
+    from ._nvfp4_csf_prepare import upload_and_convert
 
-    Byte-window planes may have 16-row slabs and k-group pairs that do not
-    fill the native F8_128x4 scale grid (2048/TP6 = 352 channels: 704 gate/up
-    rows, 22 down k-groups). They are stored padded to it, zero rows and
-    base-valued columns, and keep their geometry in ``logical_rows`` and
-    ``logical_columns``. A row rotation rotates the logical rows.
-    """
-    if len(fixed_planes) == 0 or len(fixed_planes) != len(exception_planes):
-        raise ValueError("NVFP4-CSF component lists must be nonempty and equally sized")
-    alignment = 4 if codec == 0 else 8
-    logical_rows, logical_columns = int(rows), int(columns)
-    if codec == 0 and rows > 0 and columns > 0 and rows % 16 == 0 and columns % 2 == 0:
-        rows = -(-logical_rows // 128) * 128
-        columns = -(-logical_columns // 4) * 4
-    if (
-        rows <= 0
-        or rows % 128
-        or columns <= 0
-        or columns % alignment
-        or codec not in (0, 1, 2)
-    ):
-        raise ValueError("Unsupported NVFP4-CSF geometry or codec")
-    padded = (rows, columns) != (logical_rows, logical_columns)
-    position_bits = 19 if codec == 2 else 24
-    if rows * columns > 1 << position_bits:
-        raise ValueError("NVFP4-CSF position field is too small for the matrix")
-    fixed_list, exception_list, partitions = [], [], []
-    cursor = 0
-    for fixed, exceptions in zip(fixed_planes, exception_planes, strict=True):
-        f = np.asarray(fixed, dtype=np.uint8).reshape(
-            logical_rows // 16, 16 * (1 + logical_columns // 2)
-        )
-        e = np.asarray(exceptions).view(np.uint8).reshape(-1)
-        width = 3 if codec == 2 else 4
-        if len(e) % width:
-            raise ValueError("Invalid NVFP4-CSF exception record length")
-        if width == 4:
-            words = e.copy().view("<u4")
-        else:
-            b = e.reshape(-1, 3).astype(np.uint32)
-            words = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
-        positions = words & ((1 << position_bits) - 1)
-        if len(words) and (
-            positions[-1] >= logical_rows * logical_columns
-            or np.any(positions[1:] <= positions[:-1])
-        ):
-            raise ValueError("NVFP4-CSF exceptions must be unique, sorted and in range")
-        if row_rotation:
-            if codec or not 0 < row_rotation < logical_rows:
-                raise ValueError(
-                    "Row rotation requires the byte-window codec and a valid split"
-                )
-            bases = np.roll(f[:, :16].reshape(logical_rows), -row_rotation)
-            codes = np.roll(
-                f[:, 16:].reshape(logical_rows, logical_columns // 2),
-                -row_rotation,
-                axis=0,
-            )
-            f = np.concatenate(
-                (
-                    bases.reshape(logical_rows // 16, 16),
-                    codes.reshape(logical_rows // 16, -1),
-                ),
-                1,
-            )
-            positions = (
-                (positions // logical_columns + logical_rows - row_rotation)
-                % logical_rows
-            ) * logical_columns + positions % logical_columns
-            words = (words & np.uint32(0xFF000000)) | positions
-            order = np.argsort(positions)
-            words, positions = words[order], positions[order]
-            e = words.astype("<u4").view(np.uint8)
-        if padded:
-            bases = np.zeros(rows, dtype=np.uint8)
-            bases[:logical_rows] = f[:, :16].reshape(logical_rows)
-            codes = np.zeros((rows, columns // 2), dtype=np.uint8)
-            codes[:logical_rows, : logical_columns // 2] = f[:, 16:].reshape(
-                logical_rows, logical_columns // 2
-            )
-            f = np.concatenate(
-                (bases.reshape(rows // 16, 16), codes.reshape(rows // 16, -1)), 1
-            )
-            positions = (
-                (positions // logical_columns) * columns + positions % logical_columns
-            ).astype(np.uint32)
-            words = (words & np.uint32(0xFF000000)) | positions
-            e = words.astype("<u4").view(np.uint8)
-        bounds = np.arange(rows // 128 + 1, dtype=np.int64) * (128 * columns)
-        partitions.append(np.searchsorted(positions, bounds).astype(np.int64) + cursor)
-        cursor += len(words)
-        if codec == 0:
-            # Store nibbles in native scale-byte order. This changes only the
-            # resident layout; checkpoint slabs remain TP-independent.
-            bases = f[:, :16].reshape(rows)
-            packed = f[:, 16:].reshape(rows, columns // 2)
-            if layout == 0:
-                bases = bases.reshape(rows // 128, 4, 32).transpose(0, 2, 1)
-                # Native layout preserves each pair of adjacent column nibbles.
-                native = packed.reshape(rows // 128, 4, 32, columns // 4, 2)
-                nibbles = native.transpose(0, 3, 2, 1, 4).reshape(rows // 128, -1)
-            else:
-                # Match W4A16's 64-row scale transpose and adjacent pair swap.
-                logical = np.empty((rows, columns), dtype=np.uint8)
-                logical[:, ::2], logical[:, 1::2] = packed & 15, packed >> 4
-                perm = (
-                    np.arange(64)
-                    .reshape(8, 8)
-                    .T.reshape(-1)
-                    .reshape(-1, 4)[:, [0, 2, 1, 3]]
-                    .reshape(-1)
-                )
-                bases = bases.reshape(rows // 128, 2, 64)[:, :, perm]
-                native = logical.reshape(rows // 128, 2, 64, columns)[:, :, perm, :]
-                native = (
-                    native.reshape(rows // 128, 128, columns)
-                    .transpose(0, 2, 1)
-                    .reshape(rows // 128, -1)
-                )
-                nibbles = native[:, ::2] | (native[:, 1::2] << 4)
-            f = np.concatenate((bases.reshape(rows // 128, 128), nibbles), axis=1)
-        fixed_list.append(f)
-        exception_list.append(e)
-    result = Nvfp4CsfBatch(
-        torch.from_numpy(np.stack(fixed_list)).to(device),
-        torch.from_numpy(np.concatenate(exception_list)).to(device),
-        torch.from_numpy(np.stack(partitions)).to(device),
-        int(rows),
-        int(columns),
-        int(codec),
-        int(layout),
-        value_lut,
-        logical_rows if padded else None,
-        logical_columns if padded else None,
+    return upload_and_convert(
+        fixed_planes,
+        exception_planes,
+        rows=rows,
+        columns=columns,
+        device=device,
+        codec=codec,
+        layout=layout,
+        row_rotation=row_rotation,
+        value_lut=value_lut,
     )
-    result.validate()
-    return result
 
 
 def repack_nvfp4_csf_batch(batch, *, row_rotation, value_lut):
-    """Permute resident compressed slabs for the standard W4A16 scale layout."""
+    """Permute resident compressed slabs for W4A16 entirely on CUDA."""
+    from ._nvfp4_csf_prepare import convert_nvfp4_csf_storage
+
     if batch.codec or batch.layout:
         raise ValueError("MMA repacking requires native byte-window slabs")
+    batch.validate()
     e, r, c = batch.num_experts, batch.rows, batch.columns
-    native = batch.fixed.cpu().numpy()
+    native = batch.fixed
     bases = (
         native[:, :, :128]
         .reshape(e, r // 128, 32, 4)
-        .transpose(0, 1, 3, 2)
+        .transpose(2, 3)
         .reshape(e, r // 16, 16)
     )
-    packed = native[:, :, 128:]
-    offsets = np.empty((e, r // 128, 128 * c), dtype=np.uint8)
-    offsets[:, :, ::2], offsets[:, :, 1::2] = packed & 15, packed >> 4
-    logical = (
-        offsets.reshape(e, r // 128, c // 4, 32, 4, 4)
-        .transpose(0, 1, 4, 3, 2, 5)
-        .reshape(e, r, c)
-    )
-    fixed = np.concatenate(
-        (
-            bases,
-            (logical[:, :, ::2] | (logical[:, :, 1::2] << 4)).reshape(e, r // 16, -1),
-        ),
-        2,
-    )
-    words = batch.exceptions.cpu().numpy().view("<u4")
-    bounds = batch.task_offsets.cpu().numpy()
-    exceptions = [words[start:end] for start, end in bounds[:, [0, -1]]]
-    rows, columns = batch.logical_rows or r, batch.logical_columns or c
-    if (rows, columns) != (r, c):
-        # Drop the padding; the layout-1 batch pads its rotated logical rows.
-        fixed = np.concatenate(
-            (
-                fixed[:, : rows // 16, :16],
-                fixed[:, : rows // 16, 16:]
-                .reshape(e, rows // 16, 16, c // 2)[..., : columns // 2]
-                .reshape(e, rows // 16, -1),
-            ),
-            2,
-        )
-        logical = []
-        for plane in exceptions:
-            positions = plane & np.uint32(0xFFFFFF)
-            row, column = positions // c, positions % c
-            keep = (row < rows) & (column < columns)
-            logical.append(
-                (plane[keep] & np.uint32(0xFF000000))
-                | (row[keep] * columns + column[keep]).astype(np.uint32)
-            )
-        exceptions = logical
-    return make_nvfp4_csf_batch(
+    packed = native[:, :, 128:].reshape(e, r // 128, c // 4, 32, 4, 2)
+    packed = packed.permute(0, 1, 4, 3, 2, 5).reshape(e, r // 16, -1)
+    fixed = torch.cat((bases, packed), dim=2)
+    starts = torch.cat((batch.task_offsets[:, 0], batch.task_offsets[-1:, -1]))
+    return convert_nvfp4_csf_storage(
         fixed,
-        exceptions,
-        rows=rows,
-        columns=columns,
-        device=batch.fixed.device,
+        batch.exceptions,
+        starts,
+        rows=r,
+        columns=c,
+        row_range=(0, batch.logical_rows or r),
+        column_range=(0, batch.logical_columns or c),
         layout=1,
         row_rotation=row_rotation,
         value_lut=value_lut,
