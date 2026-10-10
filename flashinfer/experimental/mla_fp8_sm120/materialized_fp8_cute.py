@@ -63,6 +63,21 @@ def load_v_k32(address, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def pack_halves(low, high, selector, *, loc=None, ip=None):
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Uint32(v).ir_value(loc=loc, ip=ip) for v in (low, high, selector)],
+            "prmt.b32 $0,$1,$2,$3;",
+            "=r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 class FlashAttentionForwardBase:
 
     def __init__(
@@ -1569,9 +1584,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                         packed = x0 | (x1 << 16)
                         low_pair = cute.arch.shuffle_sync(packed, offset=peer)
                         high_pair = cute.arch.shuffle_sync(packed, offset=peer + 1)
-                        lo = (low_pair >> (group * 16)) & cutlass.Uint32(65535)
-                        hi = (high_pair >> (group * 16)) & cutlass.Uint32(65535)
-                        rA32[(0, rr, block), mm, kk] = lo | (hi << 16)
+                        rA32[(0, rr, block), mm, kk] = pack_halves(
+                            low_pair, high_pair, 0x5410 + group * 0x2222
+                        )
         if const_expr(self.num_stages > 1):
             cute.arch.mbarrier_wait(
                 mma_params.barriers + 2,
