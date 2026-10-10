@@ -2433,6 +2433,63 @@ def test_prepare_input_tensors_with_batches_preserves_non_tensor(
     assert batches[0][0][1] is non_tensor
 
 
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("use_cold_l2_cache", [False, True])
+@pytest.mark.parametrize("l2_bytes, expected_replicas", [(4, 2), (1024, 1)])
+def test_retained_profile_schedule_owns_explicit_replicas(
+    monkeypatch, use_cuda_graph, use_cold_l2_cache, l2_bytes, expected_replicas
+):
+    """Explicit replicas isolate exemplar staging and preserve repeated aliases."""
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "repeat", 4)
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: l2_bytes)
+    source = torch.ones(2)
+    config = TuningConfig(
+        use_cold_l2_cache=use_cold_l2_cache,
+        use_cuda_graph=use_cuda_graph,
+        profile_replica_input_indices=(0, 1),
+    )
+
+    effective_config, schedule = tuner.prepare_profile_schedule(
+        [source, source], config
+    )
+
+    if not use_cold_l2_cache:
+        expected_replicas = 1
+    assert len(schedule) == expected_replicas
+    assert effective_config.use_cold_l2_cache is (expected_replicas > 1)
+    assert config.use_cold_l2_cache is use_cold_l2_cache
+    assert len({batch[0].data_ptr() for batch, _ in schedule}) == expected_replicas
+    for batch, _ in schedule:
+        assert batch[0] is batch[1]
+        assert batch[0].data_ptr() != source.data_ptr()
+        batch[0].fill_(7)
+    torch.testing.assert_close(source, torch.ones_like(source))
+
+
+def test_hot_profile_reuses_positional_views_and_owns_keyword_only_tensors():
+    tuner = reset_autotuner()
+    storage = torch.arange(24).reshape(4, 6)
+    view = storage[:, ::2]
+    workspace = torch.empty(8, dtype=torch.uint8)
+    weight = torch.ones(4)
+    config, schedule = tuner._prepare_input_tensors_with_batches(
+        [view, workspace, view],
+        TuningConfig(use_cuda_graph=True),
+        kwargs={"repeated": view, "weight": weight, "flag": True},
+    )
+
+    assert config.use_cold_l2_cache is False
+    assert len(schedule) == 1
+    inputs, kwargs = schedule[0]
+    assert inputs[0] is inputs[2] is kwargs["repeated"] is view
+    assert inputs[1] is workspace
+    assert inputs[0].stride() == (6, 2)
+    assert kwargs["weight"] is not weight
+    torch.testing.assert_close(kwargs["weight"], weight)
+    assert kwargs["flag"] is True
+
+
 def test_prepare_profile_schedule_clones_kwargs_and_preserves_aliases(monkeypatch):
     """The complete arena owns tensor kwargs without duplicating repeated tensors."""
     tuner = reset_autotuner()

@@ -206,12 +206,34 @@ def test_graph_timing_rejects_unbalanced_iteration_counts(iterations: int) -> No
         )
 
 
-def _require_sm100() -> None:
-    """Skip the CLI lifecycle test unless an SM100-family GPU is active."""
+def _require_benchmark_backend(backend: str) -> None:
+    """Skip GPU benchmark tests when their backend does not support the device."""
     if not torch.cuda.is_available():
         pytest.skip("production DA benchmark requires CUDA")
+    if backend == "prims_ts":
+        from flashinfer.prims_ts import is_prims_ts_device_supported
+
+        if not is_prims_ts_device_supported(torch.device("cuda")):
+            pytest.skip("production DA benchmark requires PrimsTS device support")
+        return
     if get_compute_capability(torch.device("cuda"))[0] != 10:
         pytest.skip("production DA benchmark requires an SM100-family GPU")
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_prims_ts_benchmark_gate_uses_device_support(monkeypatch, supported):
+    import flashinfer.prims_ts as prims_ts
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        sys.modules[__name__], "get_compute_capability", lambda _: (10, 7)
+    )
+    monkeypatch.setattr(prims_ts, "is_prims_ts_device_supported", lambda _: supported)
+    if supported:
+        _require_benchmark_backend("prims_ts")
+    else:
+        with pytest.raises(pytest.skip.Exception, match="PrimsTS device support"):
+            _require_benchmark_backend("prims_ts")
 
 
 def test_relu2_benchmark_preparation_uses_non_gated_squared_activation(
@@ -219,7 +241,7 @@ def test_relu2_benchmark_preparation_uses_non_gated_squared_activation(
 ):
     from benchmarks import bench_moe_da as bench
 
-    _require_sm100()
+    _require_benchmark_backend("prims_ts")
     shape = bench.BenchmarkShape(
         num_tokens=8,
         num_experts=32,
@@ -381,7 +403,7 @@ def test_cli_json_cache_restores_in_a_fresh_process(
     tmp_path: Path, backend: str, precision: str, activation: str, swiglu_params
 ) -> None:
     """The public JSON tuning cache must restore DA replay without profiling."""
-    _require_sm100()
+    _require_benchmark_backend(backend)
     cache = tmp_path / "tuning-cache.json"
     tuned = tmp_path / "tuned.json"
     restored = tmp_path / "restored.json"
@@ -545,7 +567,7 @@ def test_mixture_keeps_swiglu_variants_separate(field, value):
 def test_model_swiglu_benchmark_matches_formula(monkeypatch, alpha, beta, limit):
     from benchmarks import bench_moe_da as bench
 
-    _require_sm100()
+    _require_benchmark_backend("prims_ts")
     shape = bench.BenchmarkShape(
         num_tokens=8,
         num_experts=32,

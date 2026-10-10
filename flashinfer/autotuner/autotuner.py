@@ -3336,8 +3336,10 @@ class AutoTuner:
         """Build a retained maximum-profile schedule for explicit profiling.
 
         ``_prepare_input_tensors`` materializes the logical maximum profile;
-        ``_prepare_input_tensors_with_batches`` owns the complete positional and
-        keyword invocation storage.
+        ``_prepare_input_tensors_with_batches`` provisions storage according to
+        the tuning configuration. Callers that restage exemplar values must
+        declare the tensors to clone in ``profile_replica_input_indices``;
+        plain profiles may reuse caller storage.
         The returned configuration supersedes ``tuning_config`` because memory
         or iteration limits may disable cold-L2 profiling. This method does not
         invoke ``inputs_pre_hook``; retained-schedule callers own value restaging
@@ -4165,6 +4167,9 @@ class AutoTuner:
         When profile-replica indices are present, only those positional aliases
         and explicitly retained keyword aliases are cloned; other tensors keep
         their caller-owned addresses.
+        Hot profiling without explicit replicas reuses positional storage,
+        including keyword aliases of those tensors. Keyword-only tensors still
+        receive owned clones; explicitly retained kwargs keep their clone policy.
         """
         profiling_repeat = self._get_profiling_repeat(tuning_config)
         if view_templates is None:
@@ -4255,6 +4260,21 @@ class AutoTuner:
                 "Value-aware inputs must be included in profile-replica inputs"
             )
         selected_aliases: set[int] | None = None
+        if not tuning_config.use_cold_l2_cache and not replica_indices:
+            # Reuse positional tensors so backends can find the workspaces they
+            # prepared before profiling. Clone keyword-only tensors and explicitly
+            # retained kwargs; a kwarg aliasing a positional tensor otherwise reuses it.
+            positional_aliases = {
+                canonical_alias[id(value)]
+                for value in view_templates
+                if isinstance(value, torch.Tensor)
+            }
+            selected_aliases = retained_aliases.union(
+                canonical_alias[id(value)]
+                for value in normalized_kwargs.values()
+                if isinstance(value, torch.Tensor)
+                and canonical_alias[id(value)] not in positional_aliases
+            )
         if replica_indices:
             selected_aliases = set(retained_aliases)
             for input_index in replica_indices:

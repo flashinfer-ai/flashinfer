@@ -217,6 +217,8 @@ def run_mock_da_moe(args: argparse.Namespace) -> dict[str, object]:
         tuning_config=TuningConfig(
             use_cuda_graph=not args.no_cuda_graph,
             use_cold_l2_cache=True,
+            # Exemplar staging needs owned copies of the complete mock invocation.
+            profile_replica_input_indices=(0, 1, 2, 3, 4),
         ),
     )
     inputs = runner.moe_runner.allocate_inputs(
@@ -227,11 +229,16 @@ def run_mock_da_moe(args: argparse.Namespace) -> dict[str, object]:
     )
     concentrated = torch.zeros_like(inputs.expert_ids)
 
+    original_expert_ids = inputs.expert_ids.clone()
+    original_expert_weights = inputs.expert_weights.clone()
     # Public warmup invokes ordinary forward under AutoTuner and automatically publishes the plan.
     with _nvtx_phase("DA_PHASE_AUTOTUNE_WARMUP"):
         with autotune(True):
             runner.forward(inputs.as_list())
         torch.cuda.synchronize()
+    # Exemplar restaging belongs to the retained profile, not the live caller inputs.
+    torch.testing.assert_close(inputs.expert_ids, original_expert_ids)
+    torch.testing.assert_close(inputs.expert_weights, original_expert_weights)
     plan = runner.plan
     if plan is None:
         raise RuntimeError("Warmup did not publish a DA plan")

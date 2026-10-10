@@ -876,6 +876,31 @@ def test_capture_stream_reuses_packed_workspace_claimed_by_warmup(monkeypatch):
     assert list(runner._workspace_cache) == [(202, (7, 2048, 1536, 60, 4))]
 
 
+def test_autotune_profile_keeps_prepared_workspace_for_capture(monkeypatch):
+    from flashinfer.autotuner import AutoTuner
+
+    monkeypatch.setattr("flashinfer.utils.get_compute_capability", lambda _: (10, 0))
+    config = CakeWarpDecodeRunner(_config(), torch.device("cuda:0")).tuning_config
+    runner, module = _runner()
+    current_stream = SimpleNamespace(cuda_stream=101)
+    capturing = False
+    monkeypatch.setattr(runner, "_current_stream", lambda: current_stream)
+    monkeypatch.setattr(runner, "_is_current_stream_capturing", lambda: capturing)
+    inputs = runner.pack_inputs(_activation_pack(), _weight_pack()[0])
+    _, batches = AutoTuner()._prepare_input_tensors_with_batches(inputs, config)
+    profile_inputs, _ = batches[0]
+
+    runner.forward(profile_inputs, do_preparation=True)
+    runner.forward(profile_inputs)
+    current_stream = SimpleNamespace(cuda_stream=202)
+    capturing = True
+    runner.forward(profile_inputs)
+
+    assert profile_inputs[0] is inputs[0]
+    assert profile_inputs[1] is inputs[1]
+    assert module.run_calls[-1][1] is inputs[1]
+
+
 def test_capture_pack_and_forward_reuse_warmed_geometry(monkeypatch):
     runner, module = _runner()
     stream_a = SimpleNamespace(cuda_stream=101)
