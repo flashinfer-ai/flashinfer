@@ -202,6 +202,18 @@ def _output(
     return out, output_quant_scale, allocated_scale
 
 
+def _overlap_epilogue_supported(config: PrimsTsGemmConfig) -> bool:
+    # The SwiGLU store is per 32-column subtile, like the linear one, so it can
+    # retire the first subtile early. Packed NVFP4 output is a direct store.
+    if config.operand_format != "nvfp4_e2m1":
+        return False
+    if config.epilogue == "linear":
+        return config.output_format == "bf16"
+    if config.epilogue == "swiglu":
+        return config.output_format in ("bf16", "nvfp4_e2m1")
+    return False
+
+
 def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
     module = _KERNEL_MODULES.get(config)
     if module is not None:
@@ -235,12 +247,11 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
         module.separate_qkv_output = config.separate_qkv_output
         module.use_block_major_k = False
         module.use_tma_store = config.use_tma_store
-        if config.tmem_overlap and (
-            config.operand_format != "nvfp4_e2m1"
-            or config.output_format != "bf16"
-            or config.epilogue != "linear"
-        ):
-            raise ValueError("tmem_overlap supports NVFP4 BF16 linear epilogues only")
+        if config.tmem_overlap and not _overlap_epilogue_supported(config):
+            raise ValueError(
+                "tmem_overlap supports NVFP4 BF16 linear and BF16/NVFP4 SwiGLU "
+                "epilogues only"
+            )
         module.use_nvfp4_tmem_overlap = config.tmem_overlap
         module._tile_k_override = config.tile_k
         if config.nvfp4_mma_k not in (64, 96):
@@ -904,9 +915,14 @@ def prepare_fp4_linear_swiglu(
     output_quant_scale=None,
     mma_k: int = 64,
     tile_k: int = 256,
+    tmem_overlap: bool = False,
     config: Optional[PrimsTsGemmConfig] = None,
 ) -> PreparedFp4Linear:
-    """Prepare a fixed packed-NVFP4 linear+SwiGLU projection."""
+    """Prepare a fixed packed-NVFP4 linear+SwiGLU projection.
+
+    ``tmem_overlap=True`` alternates two accumulator windows so the next
+    tile's MMA overlaps this tile's SwiGLU epilogue, as for the linear path.
+    """
     return PreparedFp4Linear(
         weight_packed,
         weight_block_scale,
@@ -918,6 +934,7 @@ def prepare_fp4_linear_swiglu(
         bias=bias,
         mma_k=mma_k,
         tile_k=tile_k,
+        tmem_overlap=tmem_overlap,
         config=config,
     )
 
