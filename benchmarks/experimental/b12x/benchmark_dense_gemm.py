@@ -529,7 +529,7 @@ def main():
     parser.add_argument(
         "--evidence",
         type=pathlib.Path,
-        help="JSONL evidence output for A16 comparisons.",
+        help="JSONL output for checkpoint-a16.",
     )
     parser.add_argument(
         "--model-path",
@@ -625,6 +625,8 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.evidence is not None and args.dtype != "checkpoint-a16":
+        parser.error("--evidence requires --dtype checkpoint-a16")
     if args.a16_config is not None and args.dtype not in ("fp4-a16", "fp8-a16"):
         parser.error("--a16-config requires --dtype fp4-a16 or fp8-a16")
     if args.dtype == "checkpoint-a16":
