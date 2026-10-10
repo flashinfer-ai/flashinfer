@@ -406,9 +406,9 @@ def test_generalized_rope_quantize(
         if not is_cuda_tile_available():
             pytest.skip("cuda.tile not available")
         capability = get_compute_capability(torch.device("cuda:0"))
-        if capability < (8, 9):
+        if capability < (9, 0):
             pytest.skip(
-                "cuTile rope_quantize FP8 requires SM89 or newer; "
+                "cuTile rope_quantize FP8 requires SM90 or newer; "
                 f"got SM{capability[0]}{capability[1]}"
             )
         # The cuTile fused rope+quant kernel is MLA-scoped: it addresses the key
@@ -1737,9 +1737,10 @@ def test_mla_rope_quantize(
     )
 
 
-def test_rope_quantize_fp8_cutile_rejects_pre_sm89(monkeypatch):
+@pytest.mark.parametrize("capability", [(8, 6), (8, 9)])
+def test_rope_quantize_fp8_cutile_rejects_pre_sm90(monkeypatch, capability):
     """Reject unsupported FP8 architectures before importing or tuning cuTile."""
-    monkeypatch.setattr(flashinfer.rope, "get_compute_capability", lambda _: (8, 6))
+    monkeypatch.setattr(flashinfer.rope, "get_compute_capability", lambda _: capability)
 
     q_rope = torch.empty(1, 1, 2)
     k_rope = torch.empty(1, 2)
@@ -1748,7 +1749,8 @@ def test_rope_quantize_fp8_cutile_rejects_pre_sm89(monkeypatch):
     cos_sin_cache = torch.empty(1, 2, dtype=torch.float32)
     pos_ids = torch.zeros(1, dtype=torch.int32)
 
-    with pytest.raises(NotImplementedError, match=r"requires SM89 or newer.*got SM86"):
+    expected = rf"requires SM90 or newer.*got SM{capability[0]}{capability[1]}"
+    with pytest.raises(NotImplementedError, match=expected):
         flashinfer.rope.rope_quantize_fp8(
             q_rope,
             k_rope,
