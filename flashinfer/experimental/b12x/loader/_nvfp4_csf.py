@@ -71,6 +71,8 @@ def slice_nvfp4_csf_plane(
         or bool((positions[1:] <= positions[:-1]).any())
     ):
         raise ValueError("NVFP4-CSF exceptions must be unique, sorted and in range")
+    if (r0, r1, c0, c1) == (0, rows, 0, columns):
+        return fixed.clone(), exceptions.clone()
     erows, ecols = positions // columns, positions % columns
     keep = (erows >= r0) & (erows < r1) & (ecols >= c0) & (ecols < c1)
     rebased = (erows[keep] - r0) * (c1 - c0) + ecols[keep] - c0

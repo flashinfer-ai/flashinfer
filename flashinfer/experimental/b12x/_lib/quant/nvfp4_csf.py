@@ -211,14 +211,15 @@ def make_nvfp4_csf_batch(
             # resident layout; checkpoint slabs remain TP-independent.
             bases = f[:, :16].reshape(rows)
             packed = f[:, 16:].reshape(rows, columns // 2)
-            logical = np.empty((rows, columns), dtype=np.uint8)
-            logical[:, ::2], logical[:, 1::2] = packed & 15, packed >> 4
             if layout == 0:
                 bases = bases.reshape(rows // 128, 4, 32).transpose(0, 2, 1)
-                native = logical.reshape(rows // 128, 4, 32, columns // 4, 4)
-                native = native.transpose(0, 3, 2, 1, 4).reshape(rows // 128, -1)
+                # Native layout preserves each pair of adjacent column nibbles.
+                native = packed.reshape(rows // 128, 4, 32, columns // 4, 2)
+                nibbles = native.transpose(0, 3, 2, 1, 4).reshape(rows // 128, -1)
             else:
                 # Match W4A16's 64-row scale transpose and adjacent pair swap.
+                logical = np.empty((rows, columns), dtype=np.uint8)
+                logical[:, ::2], logical[:, 1::2] = packed & 15, packed >> 4
                 perm = (
                     np.arange(64)
                     .reshape(8, 8)
@@ -233,7 +234,7 @@ def make_nvfp4_csf_batch(
                     .transpose(0, 2, 1)
                     .reshape(rows // 128, -1)
                 )
-            nibbles = native[:, ::2] | (native[:, 1::2] << 4)
+                nibbles = native[:, ::2] | (native[:, 1::2] << 4)
             f = np.concatenate((bases.reshape(rows // 128, 128), nibbles), axis=1)
         fixed_list.append(f)
         exception_list.append(e)
