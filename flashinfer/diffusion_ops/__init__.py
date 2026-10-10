@@ -28,6 +28,13 @@ from .minimax_h3_out_proj import (
     prepare_minimax_h3_o_weight_mxfp8,
     prepare_minimax_h3_o_weight_nvfp4,
 )
+from .minimax_h3_mlp import (
+    minimax_h3_mlp,
+    minimax_h3_mlp_mxfp8,
+    minimax_h3_mlp_nvfp4,
+    prepare_minimax_h3_fc2_weight_mxfp8,
+    prepare_minimax_h3_fc2_weight_nvfp4,
+)
 from .cake_minimax_h3_sm120_quant_pre_attention import (
     MiniMaxH3PreAttentionOutput,
     minimax_h3_fp8_pre_attention,
@@ -90,6 +97,11 @@ __all__ = [
     "minimax_h3_out_proj_reference",
     "prepare_minimax_h3_o_weight_mxfp8",
     "prepare_minimax_h3_o_weight_nvfp4",
+    "minimax_h3_mlp",
+    "minimax_h3_mlp_mxfp8",
+    "minimax_h3_mlp_nvfp4",
+    "prepare_minimax_h3_fc2_weight_mxfp8",
+    "prepare_minimax_h3_fc2_weight_nvfp4",
     "MiniMaxH3PreAttentionOutput",
     "minimax_h3_fp8_pre_attention",
     "minimax_h3_nvfp4_pre_attention",
