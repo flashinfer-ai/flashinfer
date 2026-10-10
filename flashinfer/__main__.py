@@ -1026,7 +1026,7 @@ def export_compile_commands_cmd(path, output):
             fg="green",
         )
     except Exception as e:
-        click.secho(f"❌ Failed to write compile commands: {e}", fg="red")
+        raise click.ClickException(f"Failed to write compile commands: {e}") from e
 
 
 @cli.command("generate-tactics-blocklist")
