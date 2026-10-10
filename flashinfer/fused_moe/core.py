@@ -770,22 +770,23 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         def get_cache_key_extras(self, _inputs: List[torch.Tensor]) -> tuple:
             # Stage profiling passes only activation and weight tensors, so the
             # profile key captures their shapes but not constructor-fixed options
-            # such as top-k, parallel ranks, quantization mode, or activation.
+            # such as top-k, parallel sizes, quantization mode, or activation.
             # The in-memory runner hash distinguishes instances, but it is
             # intentionally excluded from persisted file keys. Include those
             # options here to prevent runners with identical tensor profiles from
-            # reusing incompatible saved tactics.
+            # reusing incompatible saved tactics. Rank indices are excluded: ranks
+            # that tune together must share persisted entries, since a cache hit
+            # skips the set_autotune_process_group reduce. Ranks don't change the
+            # valid tactics; they can shift timings (bias only on TP rank 0, each
+            # EP rank profiles its own routing slice), which that reduce averages.
             return (
                 self.x_dtype,
                 self.weight_dtype,
                 self.output_dtype,
                 self.top_k,
                 self.tp_size,
-                self.tp_rank,
                 self.ep_size,
-                self.ep_rank,
                 self.cluster_size,
-                self.cluster_rank,
                 self.enable_alltoall,
                 self.use_deepseek_fp8_block_scale,
                 self.use_w4_group_scaling,
