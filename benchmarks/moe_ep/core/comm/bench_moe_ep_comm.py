@@ -22,6 +22,11 @@ Launch on one node, for example:
         --backend nvlink_one_sided --profile deepseek_v4_pro --perfect_router \\
         --kernel_breakdown --iter_stats -b 1 -e 1024 -f 2 --output_file out.json
 
+    # Pin nvlink_one_sided to its CFT counted-write transport (or "off" for the
+    # fence transport); "auto" leaves the choice to the backend.
+    torchrun --standalone --nproc-per-node=8 benchmarks/moe_ep/core/comm/bench_moe_ep_comm.py \\
+        --backend nvlink_one_sided --profile kimi_k3 --cft on -b 1 -e 1024 -f 2
+
 Omit --backend to benchmark every backend available on all ranks. Multi-node
 runs use the usual torchrun rendezvous flags instead of --standalone.
 """
@@ -48,6 +53,8 @@ DISPATCH_FORMATS = {
     "nvfp4": "NVFP4",
 }
 QUANT_FORMATS = tuple(DISPATCH_FORMATS)
+# NVLinkOneSidedConfig.cft for each --cft choice.
+_CFT_MODES = {"auto": None, "on": True, "off": False}
 
 
 @dataclass(frozen=True)
@@ -96,7 +103,7 @@ def _backend_configs(args: argparse.Namespace) -> Dict[str, Callable[[], Any]]:
     low_precision = bool(args.use_low_precision_combine)
     return {
         "nvlink_one_sided": lambda: NVLinkOneSidedConfig(
-            use_low_precision_combine=low_precision
+            use_low_precision_combine=low_precision, cft=_CFT_MODES[args.cft]
         ),
         "cake": lambda: CakeAlltoAllConfig(use_low_precision_combine=low_precision),
         "nvlink_two_sided": NVLinkTwoSidedConfig,
@@ -751,6 +758,13 @@ def parse_args() -> argparse.Namespace:
         help="Send combine payloads as FP8 (NVLink one-sided backends).",
     )
     parser.add_argument(
+        "--cft",
+        choices=sorted(_CFT_MODES),
+        default="auto",
+        help="CFT counted writes of nvlink_one_sided: auto (where supported, up "
+        "to its token-count limits), on (every supported step) or off.",
+    )
+    parser.add_argument(
         "--no_cuda_graph",
         action="store_true",
         help="Run eagerly instead of replaying one CUDA graph.",
@@ -860,6 +874,7 @@ def main() -> None:
         "max_num_tokens_per_rank": max_num_tokens_per_rank,
         "perfect_router": bool(args.perfect_router),
         "use_low_precision_combine": bool(args.use_low_precision_combine),
+        "cft": args.cft,
         "random_seed": int(args.random_seed),
         "device": torch.cuda.get_device_name(device),
         "cuda_graph": not args.no_cuda_graph,

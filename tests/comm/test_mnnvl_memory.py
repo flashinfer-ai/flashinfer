@@ -20,7 +20,10 @@ import torch
 
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import MnnvlMemory, MpiComm
-from flashinfer.comm.trtllm_alltoall import MnnvlMoe, MoEAlltoallInfo
+from flashinfer.comm.trtllm_alltoall import (
+    get_moe_commworkspace_size_per_rank,
+    moe_comm,
+)
 
 from .conftest import mnnvl_available
 
@@ -243,23 +246,26 @@ class TestMnnvlMemory:
             )
             recv_ids_all_ranks.append(local_recv_ids)
 
-        alltoall_info = MoEAlltoallInfo(
-            None,
-            send_cumsum_all_ranks[self.rank],
-            send_ids_all_ranks[self.rank],
-            recv_cumsum_all_ranks[self.rank],
-            recv_ids_all_ranks[self.rank],
-            None,
-            ref_output_tensors_all_ranks[self.rank].shape[0],
+        workspace_memory = MnnvlMemory(
+            self.mapping, get_moe_commworkspace_size_per_rank(self.world_size)
         )
-
-        alltoall_workspace = MnnvlMoe.get_moe_workspaces(self.mapping)
+        alltoall_workspace = workspace_memory.as_torch_strided_tensor(torch.uint64)
+        output = torch.empty(
+            ref_output_tensors_all_ranks[self.rank].shape[0],
+            vector_dim,
+            dtype=dtype,
+            device=torch.device("cuda"),
+        )
 
         self.comm.Barrier()
 
-        output = MnnvlMoe.mnnvl_moe_alltoallv(
+        moe_comm(
             input_tensors_all_ranks[self.rank],
-            alltoall_info,
+            send_cumsum_all_ranks[self.rank],
+            send_ids_all_ranks[self.rank],
+            output,
+            recv_cumsum_all_ranks[self.rank],
+            recv_ids_all_ranks[self.rank],
             alltoall_workspace,
             self.rank,
             self.world_size,
