@@ -88,7 +88,8 @@ def dense_route_available(num_heads, queries, keys, precision="fp8", *, arch=Non
     """Host-only admission of one ``(precision, H, Q, K)`` point on ``arch``: True when the shipped catalog
     carries its route and the route is admitted there.  This is the table the engine consults before taking
     the Cake route; a 64-head tier the producer withheld on an architecture (``dense_admission(arch)``) is not
-    served there, so the engine keeps its stock kernel.  ``arch`` (:func:`device_arch` of the device, e.g.
+    served there, so the engine keeps its stock kernel (the 64-head ``:short`` one-split routes are the exception: a
+    withheld ``:short`` call is served by its tier route, so this stays True).  ``arch`` (:func:`device_arch` of the device, e.g.
     ``"sm_100a"``) may be omitted only where the architectures agree on the route; otherwise ``ValueError``."""
     from .experimental.deepgemm_dense_mqa.dense_mqa import (
         dense_route_available as _available,
