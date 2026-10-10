@@ -3640,7 +3640,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
 
         if (
-            k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
+            _is_nvfp4_kv_dtype(k_cache.dtype) or _is_nvfp4_kv_dtype(v_cache.dtype)
         ) and kv_cache_sf is None:
             raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
         key_block_scales, value_block_scales = (
@@ -3709,9 +3709,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             else:
                 check_shape_dtype_device(lse, lse_shape, torch.float32, q.device, "lse")
 
-        # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
+        # For NVFP4 KV (packed FP4), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead
-        # For NVFP4 KV (uint8 packed), v_cache last dim is packed bytes
+        # For NVFP4 KV (packed FP4), v_cache last dim is packed bytes
         # (2 values per byte): the unpacked VO width is v_cache.shape[-1]*2,
         # which equals head_dim_vo even for asymmetric (QK, VO) plans.
         # Using q.shape[-1] here assumed head_dim_vo == head_dim_qk and made
@@ -3719,7 +3719,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # output buffer whenever VO < QK.
         out_head_dim = (
             v_cache.shape[-1] * 2
-            if kv_cache_sf is not None and v_cache.dtype == torch.uint8
+            if kv_cache_sf is not None and _is_nvfp4_kv_dtype(v_cache.dtype)
             else v_cache.shape[-1]
         )
         if out is None:
