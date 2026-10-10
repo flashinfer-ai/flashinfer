@@ -764,6 +764,69 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
     )
 
 
+def _top_k_top_p_sample(x, top_k, top_p, from_logits, **kwargs):
+    if from_logits:
+        return flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            x, top_k, top_p, **kwargs
+        )
+    return flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        torch.softmax(x, dim=-1), top_k, top_p, **kwargs
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 99])
+@pytest.mark.parametrize("max_top_k", [64, 256])
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_top_k_top_p_sampling_per_row_k_with_max_top_k(
+    batch_size, max_top_k, from_logits
+):
+    torch.manual_seed(42)
+    vocab_size = 128256
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
+    top_k = torch.randint(1, max_top_k + 1, (batch_size,), device="cuda:0")
+    # Rows above the bound are documented to behave as top_k == max_top_k.
+    top_k[0] = vocab_size
+    expected_k = top_k.clamp(max=max_top_k)
+    sorted_logits, _ = torch.sort(logits, descending=True)
+    pivot = sorted_logits[torch.arange(batch_size), expected_k - 1]
+    mask = logits >= pivot.unsqueeze(-1)
+
+    generator = torch.Generator("cuda:0").manual_seed(0)
+    for _ in range(100):
+        samples = _top_k_top_p_sample(
+            logits, top_k, 0.9, from_logits, max_top_k=max_top_k, generator=generator
+        )
+        assert torch.all(mask[torch.arange(batch_size), samples])
+
+
+@pytest.mark.parametrize("k", [16, 200])
+@pytest.mark.parametrize("p", [0.5, 0.9])
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_top_k_top_p_sampling_per_row_k_with_max_top_k_freq(k, p, from_logits):
+    torch.manual_seed(42)
+    vocab_size, num_rows, num_iters = 128256, 1000, 50
+    logits = torch.randn(1, vocab_size, device="cuda:0") * 2
+    probs = torch.softmax(logits, dim=-1)
+    ref = flashinfer.sampling.top_p_renorm_probs(
+        flashinfer.sampling.top_k_renorm_probs(probs, k), p
+    )[0]
+
+    # The fast path rejects `indices`, so repeat the row instead.
+    x = logits.expand(num_rows, -1).contiguous()
+    top_k = torch.full((num_rows,), k, dtype=torch.int32, device="cuda:0")
+    generator = torch.Generator("cuda:0").manual_seed(0)
+    counter = torch.zeros(vocab_size, dtype=torch.int32, device="cuda:0")
+    for _ in range(num_iters):
+        samples = _top_k_top_p_sample(
+            x, top_k, p, from_logits, max_top_k=256, generator=generator
+        )
+        counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
+    freq = counter.float() / (num_rows * num_iters)
+    assert torch.all(ref[freq > 0] > 0)
+    similarity = torch.cosine_similarity(freq, ref, dim=0)
+    assert similarity > 0.99, f"similarity: {similarity}"
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5])
