@@ -72,8 +72,8 @@ class _AllGatherWorkspace(Generic[_Impl]):
         group: ProcessGroup,
         create: Callable[[], _Impl],
     ) -> None:
-        if tp_size not in (2, 4, 8):
-            raise ValueError("tp_size must be 2, 4, or 8")
+        if tp_size < 2:
+            raise ValueError("tp_size must be at least 2")
         if max_token_num <= 0:
             raise ValueError("max_token_num must be positive")
         self.device = require_mnnvl_multicast_device()
