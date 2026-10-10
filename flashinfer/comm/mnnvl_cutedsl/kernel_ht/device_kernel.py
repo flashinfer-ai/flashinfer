@@ -43,6 +43,7 @@ from ..cute_dsl_primitives import (
     store_global_u32x4,
     store_shared_u32x4,
 )
+from ..static_fp8_epilogue import store_rmsnorm_output
 
 SMEM_ALIGNMENT = 1024
 
@@ -228,6 +229,8 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
         prenorm_mailbox: cute.Tensor,
         residual_output: cute.Tensor,
         norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
         ready_counter_peer_addresses: cute.Tensor,
         ready_counters: cute.Tensor,
         processed_counters: cute.Tensor,
@@ -266,6 +269,8 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
             prenorm_mailbox,
             residual_output,
             norm_output,
+            norm_output_bf16,
+            output_scale,
             ready_counter_peer_addresses,
             ready_counters,
             processed_counters,
@@ -294,6 +299,8 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
         prenorm_mailbox: cute.Tensor,
         residual_output: cute.Tensor,
         norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
         ready_counter_peer_addresses: cute.Tensor,
         ready_counters: cute.Tensor,
         processed_counters: cute.Tensor,
@@ -701,14 +708,12 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                             ):
                                 pack = rms_pack_base + item * rms_pack_stride
                                 linear_pack = token_pack + pack
-                                store_global_u32x4(
-                                    Int64(
-                                        (
-                                            norm_output.iterator
-                                            + linear_pack * VEC_BF16
-                                        ).toint()
-                                    ),
+                                store_rmsnorm_output(
                                     norm_packed[item],
+                                    norm_output,
+                                    Int64(linear_pack * VEC_BF16),
+                                    output_scale,
+                                    norm_output_bf16,
                                 )
                     copy_wave += rms_wave_stride * self.rms_pipeline_stages
                     copy_token = copy_wave * self.tp + cta_slot
@@ -842,11 +847,12 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                     for item in cutlass.range_constexpr(self.rms_vectors_per_thread):
                         pack = rms_pack_base + item * rms_pack_stride
                         linear_pack = token_pack + pack
-                        store_global_u32x4(
-                            Int64(
-                                (norm_output.iterator + linear_pack * VEC_BF16).toint()
-                            ),
+                        store_rmsnorm_output(
                             norm_packed[item],
+                            norm_output,
+                            Int64(linear_pack * VEC_BF16),
+                            output_scale,
+                            norm_output_bf16,
                         )
                     copy_wave += self.cta_groups * self.rms_token_groups
                     copy_token = copy_wave * self.tp + cta_slot
