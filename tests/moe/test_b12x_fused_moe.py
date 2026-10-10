@@ -220,6 +220,92 @@ def test_w4a16_static_tiler_uses_64_when_intermediate_not_128_aligned():
     assert tile_n == 64
 
 
+def _ultra_fc2_tile_fits(**overrides):
+    """Qwen3.6-35B-A3B decode FC2 (N=2048, K=512) with the TC-decode ultra tile."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
+        _candidate_tile_fits,
+    )
+
+    kwargs = dict(
+        problem_n=2048,
+        problem_k=512,
+        cta_m_blocks=1,
+        tile_n=512,
+        tile_k=32,
+        cta_threads=256,
+        max_shared_mem=101_376 - 512,
+        scale_format="e4m3_k16",
+        weight_layout="packed",
+    )
+    kwargs.update(overrides)
+    return _candidate_tile_fits(**kwargs)
+
+
+@cute_dsl_available
+def test_w4a16_forced_tile_validation_accepts_tc_decode_ultra_fc2_tile():
+    """The selector's tile_k=32 ultra FC2 tile sits below the search floor but
+    must survive the force_tile_config re-pin across the custom-op boundary."""
+    assert not _ultra_fc2_tile_fits()
+    assert _ultra_fc2_tile_fits(enforce_search_floor=False)
+
+
+@cute_dsl_available
+def test_w4a16_forced_tile_validation_keeps_correctness_constraints():
+    """Relaxing the search floor must not admit misaligned or oversized tiles."""
+    assert not _ultra_fc2_tile_fits(enforce_search_floor=False, tile_k=8)
+    assert not _ultra_fc2_tile_fits(enforce_search_floor=False, tile_n=768)
+    assert not _ultra_fc2_tile_fits(enforce_search_floor=False, max_shared_mem=1024)
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+def test_w4a16_tc_decode_ultra_fc2_tile_survives_custom_op_repin():
+    """Regression for the W4A16 decode crash on Qwen3.6-35B-A3B shapes: the
+    auto-selected (tile_k=32, tile_n=512) FC2 tile is re-pinned through
+    force_tile_config by the torch custom op and must compile to the same
+    geometry instead of raising ``force_tile_config fc2 tile ... does not fit``.
+    """
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
+        compile_w4a16_fused_moe,
+    )
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    selected_ultra = False
+    for size_m in (1, 2, 4):
+        kwargs = dict(
+            size_m=size_m,
+            hidden_size=2048,
+            intermediate_size=512,
+            num_experts=128,
+            top_k=8,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            moe_block_size=8,
+            max_m_blocks=16,
+            element_dtype="bf16",
+            sms=props.multi_processor_count,
+            max_shared_mem=props.shared_memory_per_block_optin,
+            weight_layout="packed",
+            scale_format="e4m3_k16",
+            w13_layout="packed",
+            direct_topk_routes=True,
+            tc_decode_fused_sum=True,
+        )
+        auto = compile_w4a16_fused_moe(**kwargs)
+        tiles = (auto.fc1_tile_k, auto.fc1_tile_n, auto.fc2_tile_k, auto.fc2_tile_n)
+        selected_ultra |= tiles[2:] == (32, 512)
+        repinned = compile_w4a16_fused_moe(**kwargs, force_tile_config=tiles)
+        assert (
+            repinned.fc1_tile_k,
+            repinned.fc1_tile_n,
+            repinned.fc2_tile_k,
+            repinned.fc2_tile_n,
+        ) == tiles
+    assert selected_ultra, "shape no longer reaches the TC-decode ultra FC2 tile"
+
+
 @cute_dsl_available
 def test_w4a16_quant_mode_selects_internal_workspace(monkeypatch):
     """Callers provide quant_mode; dispatch owns the concrete workspace type."""
