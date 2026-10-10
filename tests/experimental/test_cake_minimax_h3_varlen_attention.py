@@ -413,11 +413,18 @@ def test_bf16_choose_q_splits_policy():
 
 
 def test_bf16_choose_q_splits_min_gain(monkeypatch):
-    # 61 waves: halving the 37 tail units saves 60 of 9333 (0.64 %), below the bar.
-    costs, halves = [153] * (74 * 60 + 37), [93] * (74 * 60 + 37)
-    assert cake_backend.BF16_Q_SPLIT_MIN_GAIN == 0.01
+    # 81 waves: halving the 37 tail units saves 60 of 12393 (0.48 %), below the 0.5 % bar.
+    costs, halves = [153] * (74 * 80 + 37), [93] * (74 * 80 + 37)
+    assert cake_backend.BF16_Q_SPLIT_MIN_GAIN == 0.005
     assert not any(bf16_choose_q_splits(costs, halves, 74))
     monkeypatch.setattr(cake_backend, "BF16_Q_SPLIT_MIN_GAIN", 0.0)
+    flags = bf16_choose_q_splits(costs, halves, 74)
+    assert sum(flags) == 37 and all(flags[74 * 80 :])
+    # 61 waves: the same halving saves 60 of 9333 (0.64 %): whole at the 1 % bar, halved at 0.5 %.
+    costs, halves = [153] * (74 * 60 + 37), [93] * (74 * 60 + 37)
+    monkeypatch.setattr(cake_backend, "BF16_Q_SPLIT_MIN_GAIN", 0.01)
+    assert not any(bf16_choose_q_splits(costs, halves, 74))
+    monkeypatch.setattr(cake_backend, "BF16_Q_SPLIT_MIN_GAIN", 0.005)
     flags = bf16_choose_q_splits(costs, halves, 74)
     assert sum(flags) == 37 and all(flags[74 * 60 :])
 

@@ -153,7 +153,7 @@ cluster (`q_half` `1` / `2` in record word 5: the kernel runs the half at
 `unit_row0 = cluster_in_segment * 512 + (q_half >> 1) * 256` with its second
 Q stage skipped), simulating the slot assignment for `n = 1..idle` halved
 units and keeping the smallest `n` with the lowest makespan when it beats the
-unhalved plan by at least 1 % (`BF16_Q_SPLIT_MIN_GAIN`; `center_5s_p2`, 1064
+unhalved plan by at least 0.5 % (`BF16_Q_SPLIT_MIN_GAIN`, 1 % until round 10; `center_5s_p2`, 1064
 units on 74 clusters: the 28 tail units are halved, 2.6 %). Only the slot ->
 rows mapping changes: each row's arithmetic, K/V range and output path are
 those of the whole unit, so the output is bitwise identical to the plain

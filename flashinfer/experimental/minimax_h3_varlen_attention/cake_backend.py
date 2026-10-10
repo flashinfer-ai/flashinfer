@@ -137,7 +137,7 @@ BF16_SINGLE_STAGE_COST_DEN = 5
 # the Cake ``kernel_for_arch`` retrace traced with ``Q_SPLIT_DECODE``); plans
 # built with ``q_split=False`` are the plain enumeration (word 5 is 0).
 BF16_Q_SPLIT_PLAN = True
-BF16_Q_SPLIT_MIN_GAIN = 0.01
+BF16_Q_SPLIT_MIN_GAIN = 0.005
 # K/V-split planner (mirrors the Cake production planner ``choose_kv_splits``):
 # a unit is split into at most ``MAX_KV_SPLITS`` near-equal K/V block ranges;
 # the cost model is in K/V-block units (combine launch + per-slot traffic) and
