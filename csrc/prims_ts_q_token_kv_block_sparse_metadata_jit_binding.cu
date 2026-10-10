@@ -20,14 +20,36 @@ void PrimsTSQTokenKvBlockSparseMetadataRunFixed(
     TensorView block_indices, TensorView block_table, TensorView token_to_request,
     TensorView query_positions, TensorView q_token_kv_block_sparse_page_indices,
     TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
-    int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl);
+    int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl,
+    int64_t locator_head_multiplier);
 
 void PrimsTSQTokenKvBlockSparseMetadataRunPacked(
     TensorView block_indices, TensorView block_table, TensorView token_to_request,
     TensorView query_positions, TensorView qo_indptr,
     TensorView q_token_kv_block_sparse_page_indices,
     TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
-    int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl);
+    int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl,
+    int64_t locator_head_multiplier);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_fixed, PrimsTSQTokenKvBlockSparseMetadataRunFixed);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_packed, PrimsTSQTokenKvBlockSparseMetadataRunPacked);
+
+void PrimsTSQTokenKvBlockSparseMetadataRunFixedQueryMajor(
+    TensorView block_indices, TensorView block_table, TensorView token_to_request,
+    TensorView query_positions, TensorView q_token_kv_block_sparse_page_indices,
+    TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
+    int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl,
+    int64_t locator_head_multiplier);
+
+void PrimsTSQTokenKvBlockSparseMetadataRunPackedQueryMajor(
+    TensorView block_indices, TensorView block_table, TensorView token_to_request,
+    TensorView query_positions, TensorView qo_indptr,
+    TensorView q_token_kv_block_sparse_page_indices,
+    TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
+    int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl,
+    int64_t locator_head_multiplier);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_fixed_query_major,
+                              PrimsTSQTokenKvBlockSparseMetadataRunFixedQueryMajor);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_packed_query_major,
+                              PrimsTSQTokenKvBlockSparseMetadataRunPackedQueryMajor);
