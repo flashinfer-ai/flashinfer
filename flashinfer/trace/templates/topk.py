@@ -20,23 +20,42 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
 @torch.no_grad()
-def _top_k_varlen_reference(logits, seq_lens, top_k, pre_idx=None, **_unused):
-    """Per-row top-K with seq_lens masking. Reference uses torch.topk on each row."""
+def _top_k_varlen_reference(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    row_starts=None,
+    absolute_indices=False,
+    **_unused,
+):
+    """Per-row top-K with seq_lens masking (window ``[row_starts[r],
+    row_starts[r] + seq_lens[r])`` with window-local indices when
+    ``row_starts`` is given, absolute columns with ``absolute_indices``).
+    Reference uses torch.topk on each row."""
     num_rows, N = logits.shape
     indices = torch.empty(num_rows, top_k, dtype=torch.int32, device=logits.device)
     logits_f32 = logits.to(torch.float32)
     for r in range(num_rows):
-        n = int(seq_lens[r].item())
-        row = logits_f32[r, :n]
+        s = int(row_starts[r].item()) if row_starts is not None else 0
+        n = max(min(s + int(seq_lens[r].item()), N) - s, 0)
+        row = logits_f32[r, s : s + n]
         _, idx = torch.topk(row, min(top_k, n), largest=True, sorted=False)
-        indices[r, : len(idx)] = idx.to(torch.int32)
+        indices[r, : len(idx)] = idx.to(torch.int32) + (s if absolute_indices else 0)
         if len(idx) < top_k:
             indices[r, len(idx) :] = -1
     return indices
 
 
 def _top_k_varlen_check(
-    reference_outputs, actual_outputs, logits=None, seq_lens=None, top_k=None, **_unused
+    reference_outputs,
+    actual_outputs,
+    logits=None,
+    seq_lens=None,
+    top_k=None,
+    row_starts=None,
+    absolute_indices=False,
+    **_unused,
 ):
     """Tie-safe value check: every selected value must be >= the row's K-th largest.
 
@@ -67,14 +86,22 @@ def _top_k_varlen_check(
         return True
 
     logits_f32 = logits.to(torch.float32)
+    N = logits_f32.shape[1]
     for r in range(act.shape[0]):
-        n = int(seq_lens[r].item())
+        s = int(row_starts[r].item()) if row_starts is not None else 0
+        n = max(min(s + int(seq_lens[r].item()), N) - s, 0)
         if n < top_k:
             continue
-        row = logits_f32[r, :n]
+        row = logits_f32[r, s : s + n]
         kth = torch.topk(row, top_k).values[-1].item()
-        sel = act[r].long()
-        if (logits_f32[r][sel] < kth - 1e-5).any():
+        sel = act[r].long()  # window-local indices (absolute: shift back by s)
+        if absolute_indices:
+            sel = sel - s
+        # a -1 pad in a full row, or any index outside the window, is a
+        # failure -- not a wrap-around gather or a device-side index assert
+        if bool((sel < 0).any()) or bool((sel >= n).any()):
+            return False
+        if (row[sel] < kth - 1e-5).any():
             return False
     return True
 
@@ -118,12 +145,15 @@ top_k_varlen_trace = TraceTemplate(
     ),
     axes={
         "batch_size": Var(description="Number of decode requests."),
-        "max_seq_len": Const(abbrev="n", description="Logits row width (padded)."),
+        # the width axis is NOT called max_seq_len: that name is the API's
+        # windowed-mode bound (a scalar input below), and the axis extractor
+        # would read the scalar kwarg ahead of the logits shape
+        "num_cols": Const(abbrev="n", description="Logits row width (padded)."),
         "top_k": Const(abbrev="k", description="Number of top elements per row."),
     },
     inputs={
         "logits": Tensor(
-            ["batch_size", "max_seq_len"],
+            ["batch_size", "num_cols"],
             description="Decode-step attention logits (bfloat16 / float16 / float32).",
         ),
         "seq_lens": Tensor(
@@ -137,6 +167,31 @@ top_k_varlen_trace = TraceTemplate(
             dtype="int32",
             optional=True,
             description="Previous-step top-K indices (GVR warm-start hint).",
+        ),
+        "row_starts": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Windowed (prefill) mode: row r ranks "
+                "logits[r, row_starts[r] : row_starts[r] + seq_lens[r]] and "
+                "returns window-local indices (gvr_2 only; absolute columns "
+                "with absolute_indices=True)."
+            ),
+        ),
+        "absolute_indices": Scalar(
+            "bool",
+            optional=True,
+            description="Windowed mode: return absolute logits columns instead of window-local indices.",
+        ),
+        "max_seq_len": Scalar(
+            "int32",
+            optional=True,
+            description=(
+                "Windowed mode: the caller's bound on the window lengths; selects "
+                "the gvr_2 engine (register rung vs streaming slab) before CUDA-graph "
+                "capture. Ignored without row_starts."
+            ),
         ),
     },
     outputs={
