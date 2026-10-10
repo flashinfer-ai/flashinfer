@@ -4577,7 +4577,7 @@ def test_moe_core_preserves_fc2_output_dtype(
     packed = torch.empty((1, 128, 64), dtype=torch.uint8)
     scale = torch.ones(1)
     indices = torch.zeros(128, dtype=torch.int32)
-    monkeypatch.setattr(module, "moe_sort", lambda **kw: (indices,) * 6)
+    monkeypatch.setattr(module, "moe_sort", lambda **kw: (indices,) * 7)
     monkeypatch.setattr(module, "moe_output_memset_inplace", lambda out: out.zero_())
     monkeypatch.setattr(
         module,
@@ -4723,7 +4723,7 @@ def test_localized_streams_are_joined_on_failure(
 
     memset = Mock()
     finalize = Mock(side_effect=lambda **kw: launch("fc2", **kw))
-    monkeypatch.setattr(module, "moe_sort", lambda **kw: (indices,) * 6)
+    monkeypatch.setattr(module, "moe_sort", lambda **kw: (indices,) * 7)
     monkeypatch.setattr(module, "moe_output_memset_inplace", memset)
     monkeypatch.setattr(
         module,
