@@ -293,7 +293,7 @@ void run_tactic(void* out, void const* A, void const* B, void const* sfa, void c
   st = gemm.initialize(args, ws, stream);
   if (st != cutlass::Status::kSuccess)
     throw std::runtime_error("nvfp4_svdquant_gemm: initialize failed");
-  st = gemm.run(args, ws, stream, nullptr, enable_pdl);
+  st = gemm.run(stream, nullptr, enable_pdl);
   if (st != cutlass::Status::kSuccess) throw std::runtime_error("nvfp4_svdquant_gemm: run failed");
 }
 

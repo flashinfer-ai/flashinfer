@@ -260,7 +260,7 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
       }                                                                                           \
       throw std::runtime_error("[MXFP8 SM120 gemm Runner] " + errMsg);                            \
     }                                                                                             \
-    auto runStatus = gemm.run(args, workspace, stream, nullptr, /*enablePDL=*/true);              \
+    auto runStatus = gemm.run(stream, nullptr, /*enablePDL=*/true);                               \
     if (runStatus != cutlass::Status::kSuccess) {                                                 \
       std::string errMsg = "Failed to run cutlass MXFP8 gemm on sm120. Error: " +                 \
                            std::string(cutlass::cutlassGetStatusString(runStatus));               \
