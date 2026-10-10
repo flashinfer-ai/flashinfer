@@ -440,11 +440,13 @@ def _resolve_prepared_bsr_row(
     if lane_idx == cutlass.Int32(0) and row_is_valid:
         q_block_row_idx = linear_row_idx % cfg.num_q_blocks
         linear_batch_head_idx = linear_row_idx // cfg.num_q_blocks
-        kv_head_idx = linear_batch_head_idx % cfg.num_pattern_heads
+        pattern_head_idx = linear_batch_head_idx % cfg.num_pattern_heads
         batch_idx = linear_batch_head_idx // cfg.num_pattern_heads
-        row_begin = cutlass.Int32(block_indptr[batch_idx, kv_head_idx, q_block_row_idx])
+        row_begin = cutlass.Int32(
+            block_indptr[batch_idx, pattern_head_idx, q_block_row_idx]
+        )
         row_end = cutlass.Int32(
-            block_indptr[batch_idx, kv_head_idx, q_block_row_idx + 1]
+            block_indptr[batch_idx, pattern_head_idx, q_block_row_idx + 1]
         )
         num_indices = cutlass.Int32(cute.size(block_indices))
         runtime_assert(
@@ -624,7 +626,7 @@ def _inclusive_warp_prefix_sum(
 def _load_bitmask_word(
     exact_block_bits: cute.Tensor,
     batch_idx: cutlass.Int32,
-    kv_head_idx: cutlass.Int32,
+    pattern_head_idx: cutlass.Int32,
     q_block_idx: cutlass.Int32,
     logical_word_idx: cutlass.Int32,
     cfg: cutlass.Constexpr[_RouteConfig],
@@ -636,7 +638,7 @@ def _load_bitmask_word(
         cutlass.Int32(cfg.num_kv_blocks) - logical_word_idx * cutlass.Int32(_WARP_SIZE)
     )
     selected_word = cutlass.Uint32(
-        exact_block_bits[batch_idx, kv_head_idx, q_block_idx, logical_word_idx]
+        exact_block_bits[batch_idx, pattern_head_idx, q_block_idx, logical_word_idx]
     )
     if cutlass.const_expr(for_proxy):
         selected_word = ~selected_word
@@ -717,7 +719,7 @@ def _emit_bitmask_exact_routes(
     selected_blocks: cute.Tensor,
     first_exact_word: cutlass.Uint32,
     batch_idx: cutlass.Int32,
-    kv_head_idx: cutlass.Int32,
+    pattern_head_idx: cutlass.Int32,
     q_block_idx: cutlass.Int32,
     row_route_begin: cutlass.Int32,
     exact_atom_count: cutlass.Int32,
@@ -770,7 +772,7 @@ def _emit_bitmask_exact_routes(
                 exact_word = _load_bitmask_word(
                     exact_block_bits,
                     batch_idx,
-                    kv_head_idx,
+                    pattern_head_idx,
                     q_block_idx,
                     word_idx,
                     cfg,
@@ -1303,7 +1305,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
         row_is_valid = linear_row_idx < self.cfg.num_rows
         q_block_idx = linear_row_idx % self.cfg.num_q_blocks
         linear_batch_head_idx = linear_row_idx // self.cfg.num_q_blocks
-        kv_head_idx = linear_batch_head_idx % self.cfg.num_pattern_heads
+        pattern_head_idx = linear_batch_head_idx % self.cfg.num_pattern_heads
         batch_idx = linear_batch_head_idx // self.cfg.num_pattern_heads
         smem = SmemAllocator()
         record_stage = _allocate_warp_words(smem, self.cfg.record_stage_words, warp_idx)
@@ -1323,7 +1325,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
             first_exact_word = _load_bitmask_word(
                 exact_block_bits,
                 batch_idx,
-                kv_head_idx,
+                pattern_head_idx,
                 q_block_idx,
                 lane_idx,
                 self.cfg,
@@ -1336,7 +1338,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
                 exact_word = _load_bitmask_word(
                     exact_block_bits,
                     batch_idx,
-                    kv_head_idx,
+                    pattern_head_idx,
                     q_block_idx,
                     word_idx,
                     self.cfg,
@@ -1375,7 +1377,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
                 selected_blocks,
                 first_exact_word,
                 batch_idx,
-                kv_head_idx,
+                pattern_head_idx,
                 q_block_idx,
                 row_route_begin,
                 exact_atom_count,
@@ -1395,7 +1397,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
                     lambda word_idx: _load_bitmask_word(
                         exact_block_bits,
                         batch_idx,
-                        kv_head_idx,
+                        pattern_head_idx,
                         q_block_idx,
                         word_idx,
                         self.cfg,

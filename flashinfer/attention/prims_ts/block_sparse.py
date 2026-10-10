@@ -18,10 +18,11 @@
 Q8/Q16/Q32 SWAPAB or Q64/Q128 KeepsAB specialization, and atomically publishes
 an immutable revision. ``run()`` validates compact BSHD Q/K/V and caller-owned
 routing tensors, then enqueues route preparation followed by attention in one
-compiled adapter on the caller's CUDA stream. The one-shot entry point retains
-synchronous canonical-BSR inspection to derive its temporary plan capacity.
-A dense plan (``use_block_sparse=False``) keeps the tile selection but attends
-over the whole K/V sequence without route preparation.
+compiled adapter on the caller's CUDA stream; a Sage plan's run first gathers
+its scales into the plan-owned prepared buffer. The one-shot entry point
+retains synchronous canonical-BSR inspection to derive its temporary plan
+capacity. A dense plan (``use_block_sparse=False``) keeps the tile selection
+but attends over the whole K/V sequence without route preparation.
 
 ``BlockSparsePagedTSWrapper`` shares the same scheduling policy and decode
 kernel, but plans only fixed Q geometry and maximum K/V capacity. Page spans,
@@ -128,18 +129,21 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
     """Plan and reuse compact-BSHD block-sparse attention launches.
 
     Q is ``[B, Sq, Hq, D]`` and K/V are ``[B, Skv, Hkv, D]``. Sparse rows are
-    owned per batch, KV head, and query block, so every Q head in one grouped
-    KV head consumes the same sparse row. A plan fixes geometry and a per-row
-    capacity; every run supplies either BSR or a packed exact-block bitmask.
-    Proxy-enabled plans additionally consume caller-owned K/V summaries, while
-    an optional token mask applies only to exact routes. Callers must keep those
-    tensors alive and immutable until the queued run or captured graph finishes
-    using them. CUDA Graph capture pins plan-owned state only, so captured
-    routing storage remains the caller's responsibility.
+    owned per batch, pattern head, and query block, so every Q head in one
+    grouped KV head consumes the same sparse row. A block-sparse plan fixes
+    geometry and a per-row capacity; every run supplies either BSR or a packed
+    exact-block bitmask. Proxy-enabled plans additionally consume caller-owned
+    K/V summaries, while an optional token mask applies only to exact routes.
+    A dense plan's run takes Q/K/V alone, and a Sage plan's run of either kind
+    adds its scale tensors. Callers must keep those tensors alive and immutable
+    until the queued run or captured graph finishes using them. CUDA Graph
+    capture pins plan-owned state only, so captured routing storage remains the
+    caller's responsibility.
 
-    One plan revision owns one mutable route workspace. Its runs must be ordered
-    on one stream or externally synchronized; unordered concurrent runs require
-    distinct wrappers.
+    One block-sparse plan revision owns one mutable route workspace, and one
+    Sage plan revision owns its mutable prepared scales. Its runs must be
+    ordered on one stream or externally synchronized; unordered concurrent runs
+    require distinct wrappers.
     """
 
     @_serialize_plan
@@ -186,7 +190,8 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
 
         ``use_block_sparse=False`` plans dense attention over the whole K/V
         sequence with the same Q-tile selection. Its route arguments must keep
-        their defaults, and :meth:`run` takes Q/K/V only.
+        their defaults, and :meth:`run` takes Q/K/V only, plus the scales of a
+        Sage plan.
 
         ``share_pattern_across_kv_heads=False`` retains independent per-KV-head
         patterns. True uses a singleton head axis in BSR/bitmask inputs and
@@ -604,7 +609,7 @@ def block_sparse_attention(
             batch_size=static.batch_size,
             seq_len_q=static.seq_len_q,
             seq_len_kv=static.seq_len_kv,
-            num_kv_heads=_num_sparse_pattern_heads(
+            num_pattern_heads=_num_sparse_pattern_heads(
                 static.num_kv_heads, static.share_pattern_across_kv_heads
             ),
             q_block_size=static.q_block_size,
@@ -1010,7 +1015,7 @@ def block_sparse_attention_with_paged_kv_cache(
         batch_size=static.batch_size,
         seq_len_q=static.seq_len_q,
         seq_len_kv=static.seq_len_kv,
-        num_kv_heads=_num_sparse_pattern_heads(
+        num_pattern_heads=_num_sparse_pattern_heads(
             static.num_kv_heads, static.share_pattern_across_kv_heads
         ),
         q_block_size=static.q_block_size,

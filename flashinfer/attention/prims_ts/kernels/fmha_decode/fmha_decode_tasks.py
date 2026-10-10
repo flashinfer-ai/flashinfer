@@ -1085,6 +1085,8 @@ class DecodeGenTask(Task):
 #   TAIL:    V(last-1) + V(last)
 # Dense paged-KV consumes page offsets produced by PageTableTask. Sparse
 # paged-KV instead consumes physical page IDs retained with its prepared route.
+# A Sage plan's load warp also fills each instance's ``sfK`` ring with
+# ``cp.async`` copies right after the K tile the words belong to.
 # ======================================================================
 def _prefetch_sparse_route(
     sparse_kv_metadata: MemoryResource | None,
@@ -1237,14 +1239,14 @@ def create_load_task(
         """Build the shared-KV load cadence for HEAD, LOOP, and TAIL."""
         smem_q.init_load_state()
         smem_kv.init_load_state()
-        for sparse_resource in (
+        for resource in (
             sparse_kv_metadata0,
             sparse_kv_metadata1,
             sparse_softmax_metadata0,
             sparse_softmax_metadata1,
         ):
-            if sparse_resource is not None:
-                sparse_resource.init_load_state()
+            if resource is not None:
+                resource.init_load_state()
         cached_page_ids = None
         if smem_page_offsets is not None:
             if cfg.num_head_dim_stages_kv > 1 and not cfg.uses_scattered_page_route:
@@ -1266,18 +1268,22 @@ def create_load_task(
                 cached_page_ids=cached_page_ids,
             )
 
-        route_metadata_by_label = {
+        # The resources that follow each instance's K tile: its route metadata
+        # and Softmax route stage of a block-sparse plan, and its ``sfK`` ring
+        # of a Sage plan.
+        k_resources_by_label = {
             "load_k0": (sparse_kv_metadata0, sparse_softmax_metadata0, sage_k_scales0),
             "load_k1": (sparse_kv_metadata1, sparse_softmax_metadata1, sage_k_scales1),
         }
 
         # HEAD: issue every instance's route-record load before Q, so their
         # global-memory latency overlaps the wait for the previous work tile
-        # to release Q and the Q load itself. Dense profiles have no route
-        # metadata: the prefetch, resolve and publish helpers are no-ops for
-        # ``None`` resources, so one cadence serves dense and block-sparse loads.
+        # to release Q and the Q load itself. One cadence serves dense and
+        # block-sparse loads: the route helpers skip a dense profile's
+        # ``None`` metadata resources, and the K-scale publish fills a Sage
+        # plan's ring from the dense tile or from the route.
         prefetch_by_label = {
-            label: _prefetch_sparse_route(route_metadata_by_label[label][0], "head")
+            label: _prefetch_sparse_route(k_resources_by_label[label][0], "head")
             for label in head_labels
         }
         smem_q.acquire()
@@ -1294,9 +1300,7 @@ def create_load_task(
                 _page_offsets_consume(smem_page_offsets)
         head_routes = []
         for label in head_labels:
-            kv_metadata, softmax_metadata, sage_k_scales = route_metadata_by_label[
-                label
-            ]
+            kv_metadata, softmax_metadata, sage_k_scales = k_resources_by_label[label]
             route = _resolve_and_store_sparse_route(
                 kv_metadata, FmhaStage.Head, prefetch_by_label[label]
             )
@@ -1326,8 +1330,8 @@ def create_load_task(
             # consumer right after its own K issue instead of waiting for the
             # other instance's loads.
             for label in loop_labels:
-                kv_metadata, softmax_metadata, sage_k_scales = (
-                    route_metadata_by_label.get(label, (None, None, None))
+                kv_metadata, softmax_metadata, sage_k_scales = k_resources_by_label.get(
+                    label, (None, None, None)
                 )
                 route = _resolve_and_store_sparse_route(
                     kv_metadata, FmhaStage.Loop, prefetch_by_label.get(label)
@@ -1416,9 +1420,9 @@ def create_load_task(
     if work_queue is not None:
         src.append(work_queue)
     dst = [smem_q, smem_kv]
-    for sparse_resource in (*sparse_resources, sage_k_scales0, sage_k_scales1):
-        if sparse_resource is not None and sparse_resource not in dst:
-            dst.append(sparse_resource)
+    for resource in (*sparse_resources, sage_k_scales0, sage_k_scales1):
+        if resource is not None and resource not in dst:
+            dst.append(resource)
     if schedule_token_throttle is not None:
         dst.append(schedule_token_throttle)
     return task_class(
@@ -2007,7 +2011,7 @@ def create_load_task_split_kv(
         for resource in (smem_q, smem_k0, smem_k1, smem_v0, smem_v1)
         if resource is not None
     ]
-    for sparse_resource in (
+    for resource in (
         sparse_kv_metadata0,
         sparse_kv_metadata1,
         sparse_softmax_metadata0,
@@ -2015,8 +2019,8 @@ def create_load_task_split_kv(
         sage_k_scales0,
         sage_k_scales1,
     ):
-        if sparse_resource is not None:
-            dst.append(sparse_resource)
+        if resource is not None:
+            dst.append(resource)
     if schedule_token_throttle is not None:
         dst.append(schedule_token_throttle)
     q_bound_resources = tuple(

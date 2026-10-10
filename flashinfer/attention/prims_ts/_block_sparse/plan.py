@@ -94,11 +94,12 @@ class _BlockSparsePlanState:
     published together. ``run()`` therefore sees either the complete old state
     or the complete new one, never a mix. Plan-owned row offsets describe
     uniform capacity slices. Mutable route scratch, the optional unmasked-ABI
-    dummy mask, and the event are also state-owned.
-    Policy is immutable after publication; the cached compiled adapter is
-    shared read-only.
+    dummy mask, a Sage state's mutable prepared scales, and the event are also
+    state-owned. Policy is immutable after publication; the cached compiled
+    adapter is shared read-only.
 
-    One revision owns one mutable route workspace. Ordered runs on one
+    One revision owns one mutable route workspace and, for a Sage state, one
+    mutable prepared-scale buffer that every run rewrites. Ordered runs on one
     stream, or externally synchronized cross-stream runs, are valid. Unordered
     concurrent runs of the same revision are unsupported because their prepare
     launches would race. Different wrappers and published revisions own

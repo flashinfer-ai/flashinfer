@@ -392,11 +392,12 @@ def resolve_keeps_tile_context(
 ):
     """Resolve one score tile's logical position and boundary-mask state.
 
-    Every user of a softmax instance's tiles (the S resource, and the load
-    warp copying the tile's Sage K scales) derives the tile's token range
-    from the same sequence-length sources, so the resolution lives outside
-    the S resource. ``local_tile_idx`` defaults to the softmax's tile; a
-    producer passes the tile it loads.
+    Every user of a softmax instance's dense tiles (the S resource, and the
+    load warp copying a dense Sage plan's K scales for the tile) derives the
+    tile's token range from the same sequence-length sources, so the
+    resolution lives outside the S resource; block-sparse routes take their
+    origins from the prepared record instead. ``local_tile_idx`` defaults to
+    the softmax's tile; a producer passes the tile it loads.
     """
     task_cache = _decode_gen_task_cache(stage_info)
     if cutlass.const_expr(seqlens_kv is None):

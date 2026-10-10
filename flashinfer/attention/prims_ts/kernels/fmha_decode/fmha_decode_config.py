@@ -789,6 +789,16 @@ class FmhaDecodeConfig:
         return self.has_storage_subpages or self.use_q_token_kv_block_sparse_route
 
     @property
+    def uses_page_offsets_task(self) -> bool:
+        """Whether a page-table producer task stages page IDs for the load warp.
+
+        Every paged plan that is not block-sparse takes it, the
+        QToken-KvBlock-Sparse paged routes included; a block-sparse paged plan
+        reads each atom's physical page from its prepared route instead.
+        """
+        return self.use_paged_kv and not self.use_block_sparse
+
+    @property
     def shares_sparse_pattern(self) -> bool:
         """Q-block routes default to per-head patterns; token routes share."""
         if self.share_pattern_across_kv_heads is None:
@@ -3459,7 +3469,7 @@ def _active_warp_roles(cfg: FmhaDecodeConfig) -> list[_WarpRole]:
             )
         )
 
-    if cfg.use_paged_kv and not cfg.use_block_sparse:
+    if cfg.uses_page_offsets_task:
         roles.append(
             _WarpRole(
                 "page_offsets",
@@ -4715,7 +4725,7 @@ def _validate_profile_support(
     _validate_kv256_static_config(cfg)
     if cfg.mask_type not in (DENSE, CAUSAL):
         raise ValueError("mask_type must be DENSE or CAUSAL")
-    if cfg.use_paged_kv and not cfg.use_block_sparse:
+    if cfg.uses_page_offsets_task:
         cfg.validate_paged_kv_staging_config()
     if num_heads_q % num_heads_kv != 0:
         raise ValueError("fmha_decode requires num_heads_q divisible by num_heads_kv")

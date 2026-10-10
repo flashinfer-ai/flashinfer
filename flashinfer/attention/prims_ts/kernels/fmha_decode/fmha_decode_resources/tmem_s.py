@@ -2232,9 +2232,9 @@ class TmemSResource(DecodeGenResourceBase):
     def load_sage_q_scale(self, stage_info: StageInfo) -> Float32:
         """Load ``sfQ`` of the lane's Q row, fixed for the whole work tile.
 
-        The word is the lane's row among the work tile's rows of the
-        prepared scales: one coalesced load per lane, with no slot
-        arithmetic or clamping here.
+        The word is row ``row_idx`` of the work tile's words in the prepared
+        ``sfQ`` image, one coalesced load per lane; the Sage prepare resolved
+        the flat scale slot and the last valid row's repeat.
         """
         cfg = self.cfg
         assert cfg.use_sage_attention

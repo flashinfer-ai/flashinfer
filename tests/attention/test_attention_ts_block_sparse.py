@@ -2688,7 +2688,7 @@ def _validate_cpu_routing(
         batch_size=1,
         seq_len_q=1,
         seq_len_kv=1,
-        num_kv_heads=1,
+        num_pattern_heads=1,
         q_block_size=1,
         kv_block_size=8,
         use_kv_valid_bits=use_kv_valid_bits,

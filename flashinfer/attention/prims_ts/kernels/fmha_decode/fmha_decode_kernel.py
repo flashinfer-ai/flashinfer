@@ -524,9 +524,8 @@ def _build_decode_gen_schedule(
     # Leave barrier_ptr unset so SmemAllocator packs every pipeline barrier
     # into the unified block. Separate barrier arrays create an alignment gap
     # before the 1024-byte-aligned data block and overflow near-capacity Q128.
-    use_paged_kv = cfg.use_paged_kv
     use_one_inst_kv = cfg.num_insts_kv == 1
-    use_dense_page_offsets = use_paged_kv and not cfg.use_block_sparse
+    uses_page_offsets_task = cfg.uses_page_offsets_task
     use_one_inst_qkv = cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1
     # K and V of different byte widths take the split-resource paths with one
     # K ring and one V ring, each shared by both K/V instances; equal widths
@@ -627,7 +626,7 @@ def _build_decode_gen_schedule(
     # A held route is published once and retained through the final V issue;
     # only schedules that replace locators per tile need separate K/V state.
     use_separate_kv_page_offset_resources = (
-        use_dense_page_offsets
+        uses_page_offsets_task
         and use_per_inst_kv_resources
         and not use_one_inst_qkv
         and not (
@@ -717,7 +716,7 @@ def _build_decode_gen_schedule(
 
     smem_page_offsets_cfg = None
     smem_page_offsets_v_cfg = None
-    if use_dense_page_offsets:
+    if uses_page_offsets_task:
         page_offsets_stages = (
             3 if use_separate_kv_page_offset_resources else cfg.page_offsets_stages
         )
@@ -959,7 +958,7 @@ def _build_decode_gen_schedule(
     kv_seqlens = seqlens_kv if use_runtime_seqlens_kv else None
     smem_page_offsets = None
     smem_page_offsets_v = None
-    if use_dense_page_offsets:
+    if uses_page_offsets_task:
         smem_page_offsets = SmemPageOffsetsKvResource(
             pipeline_config=smem_page_offsets_cfg,
             cfg=cfg,
@@ -1504,8 +1503,7 @@ def _build_decode_gen_schedule(
     smem_resources.append(smem_p0)
     if not use_one_inst_kv:
         smem_resources.append(smem_p1)
-    # An instance's ``sfK`` ring, in the SMEM form, follows its S resource in
-    # the layout.
+    # An instance's ``sfK`` ring follows its S resource in the layout.
     smem_resources.append(tmem_s0)
     if sage_k_scales0 is not None:
         smem_resources.append(sage_k_scales0)
@@ -1710,7 +1708,7 @@ def _build_decode_gen_schedule(
             ),
         )
     page_offsets_task = None
-    if use_dense_page_offsets:
+    if uses_page_offsets_task:
         page_offsets_warp_idx = cfg.page_offsets_warp_idx
         if use_separate_kv_page_offset_resources:
             page_offsets_task = create_page_offsets_task_split_kv(
