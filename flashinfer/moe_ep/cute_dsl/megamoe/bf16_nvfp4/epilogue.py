@@ -35,6 +35,7 @@ from .tmem_epilogue import (
     Fc2OutputRouter,
     fc2_f2fp,
     fc2_stg_post_f2fp_reorder,
+    fc2_stg_post_f2fp_reorder_n32,
     fc2_stg_store_function,
     make_bf16_fc2_store_mapping,
 )
@@ -82,6 +83,7 @@ class W4A16Epilogue:
         self.cluster_tile_hidden = self._EpilogueFc2HiddenTileSize * cluster_shape_mn[0]
         self.cta_tile_m = self._EpilogueFc2HiddenTileSize
         self.cta_tile_n = mma_tiler_mnk[1]
+        self._EpilogueTokenTileSize = min(64, self.cta_tile_n)
         self.static_expert_shape = static_expert_shape
         self.acc_tmem_cols = self.cta_tile_n
         self.intermediate_downproj = static_expert_shape[1] // 2
@@ -297,11 +299,18 @@ class W4A16Fc2Epilogue(EpilogueContext):
         acc_consumer_state,
         release_after_reorder: cutlass.Constexpr[bool],
     ):
-        loaded = TmemTranspose16x32.load_subtile_raw_acc(tmem_subtile_tensor)
-        casted = fc2_f2fp(*loaded, alpha_val=alpha_val)
-        pre_store = fc2_stg_post_f2fp_reorder(
-            casted=casted, tmem_subtile_view=tmem_subtile_tensor
-        )
+        if cutlass.const_expr(self._EpilogueTokenTileSize == 32):
+            half_loaded = TmemTranspose16x32.load_half_raw_acc(tmem_subtile_tensor)
+            casted = fc2_f2fp(*half_loaded, alpha_val=alpha_val)
+            pre_store = fc2_stg_post_f2fp_reorder_n32(
+                casted=casted, tmem_subtile_view=tmem_subtile_tensor
+            )
+        else:
+            loaded = TmemTranspose16x32.load_subtile_raw_acc(tmem_subtile_tensor)
+            casted = fc2_f2fp(*loaded, alpha_val=alpha_val)
+            pre_store = fc2_stg_post_f2fp_reorder(
+                casted=casted, tmem_subtile_view=tmem_subtile_tensor
+            )
         if cutlass.const_expr(release_after_reorder):
             # Reorder finishes all accumulator-TMEM scratch use; only
             # register packing and STG remain.
@@ -310,8 +319,12 @@ class W4A16Fc2Epilogue(EpilogueContext):
         if cutlass.const_expr(self.in_kernel_fc2_reduce and not self.apply_topk_in_fc1):
             # Preserve FC2's BF16 rounding before weighting; dispatch reduces
             # these weighted BF16 contributions into the source token output.
-            for row in cutlass.range_constexpr(2):
-                token_in_tile = self.tidx % 32 + subtile_idx * 64 + row * 32
+            for row in cutlass.range_constexpr(self._EpilogueTokenTileSize // 32):
+                token_in_tile = (
+                    self.tidx % 32
+                    + subtile_idx * self._EpilogueTokenTileSize
+                    + row * 32
+                )
                 if token_in_tile < fc2_output_router.valid_tokens_this_cta_tile:
                     pool_row = fc2_output_router.token_bases + token_in_tile
                     score = self.token_comm_args.fc1_input_topk_weights_buffer[pool_row]
@@ -526,10 +539,13 @@ class W4A16Fc1Epilogue(EpilogueContext):
             (work_tile_info.phase << 16) | work_tile_info.expert_idx,
         )
         # Keep prior subtiles in the established loop and specialize only the
-        # final one. N64 has no prior subtile; N128 has one.
+        # final one. N32/N64 have no prior subtile; N128 has one.
         if cutlass.const_expr(self.subtile_cnt > 1):
             for subtile_idx in cutlass.range(self.subtile_cnt - 1, unroll=1):
-                if subtile_idx * 64 < work_tile_info.valid_tokens_in_cta_tile:
+                if (
+                    subtile_idx * self._EpilogueTokenTileSize
+                    < work_tile_info.valid_tokens_in_cta_tile
+                ):
                     self._run_fc1_bf16_subtile(
                         tmem_acc_tensor,
                         subtile_idx,
@@ -544,7 +560,10 @@ class W4A16Fc1Epilogue(EpilogueContext):
                         norm_const=norm_const,
                     )
         last_subtile_idx = cutlass.Int32(self.subtile_cnt - 1)
-        if last_subtile_idx * 64 < work_tile_info.valid_tokens_in_cta_tile:
+        if (
+            last_subtile_idx * self._EpilogueTokenTileSize
+            < work_tile_info.valid_tokens_in_cta_tile
+        ):
             self._run_fc1_bf16_subtile(
                 tmem_acc_tensor,
                 last_subtile_idx,
@@ -591,8 +610,8 @@ class W4A16Fc1Epilogue(EpilogueContext):
         store_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=256
         )
-        for half in cutlass.range_constexpr(2):
-            token_col = subtile_idx * 64 + half * 32
+        for half in cutlass.range_constexpr(self._EpilogueTokenTileSize // 32):
+            token_col = subtile_idx * self._EpilogueTokenTileSize + half * 32
             if cutlass.const_expr(self.apply_topk_in_fc1):
                 # The existing accumulator wait also orders the dispatch
                 # weight store. Prefetch while activation and transpose run.
@@ -657,7 +676,9 @@ class W4A16Fc1Epilogue(EpilogueContext):
             transpose.r3_store()
             transpose.r4_load_top()
             transpose.r4_load_bot()
-            if cutlass.const_expr(release_after_scratch and half == 1):
+            if cutlass.const_expr(
+                release_after_scratch and half == self._EpilogueTokenTileSize // 32 - 1
+            ):
                 # Both final scratch reads now feed RMEM. The following
                 # permutation, BF16 conversion and STG do not use TMEM.
                 cute.arch.fence_view_async_tmem_load()
@@ -667,7 +688,7 @@ class W4A16Fc1Epilogue(EpilogueContext):
             # Python transpose helper. Resolve its output before branching.
             transposed_output = transpose.output
 
-            token_in_tile = subtile_idx * 64 + half * 32 + lane
+            token_in_tile = subtile_idx * self._EpilogueTokenTileSize + half * 32 + lane
             output_column = work_tile_info.tile_m_idx * 64 + warp_idx * 16
             in_bound = token_in_tile < work_tile_info.valid_tokens_in_cta_tile
             if cutlass.const_expr(

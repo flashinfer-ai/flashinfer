@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Distributed CuTe DSL DeepSeek-V3 MoE benchmark.
+"""Distributed CuTe DSL NVFP4 MoE benchmark.
 
 Compares two activation contracts over the same routed-MoE workload:
 
@@ -25,6 +25,23 @@ are GLOBAL across the EP group, including empty ranks below eight tokens:
         --timing cupti --cuda-graph --no-fused-finalize --megamoe-knobs auto \\
         --precomputed-routing --warmup 3 --iters 100 \\
         --num-tokens 1,2,4,8,16,32,64,128,256,512,4096,8192,16384
+
+The default ``--model deepseek-v3`` preserves the original workload.
+``--model glm5`` selects D6144/E2048/N256/K8 with SwiGLU.
+``--model kimi-k3 --parallel-modes ep --precomputed-routing`` selects the
+routed latent D3584/E3072/N896/K16 core with SiTU(4,25), using synthetic NVFP4
+weights. K3's outer latent projections, RMSNorm, shared experts, router GEMM,
+and attention are excluded.
+K3 routes use CPU FP32 sigmoid/bias top-k with stable expert-ID tie breaking,
+outside timing; the native grouped router does not support its single-group
+top-16 configuration. Both split and Mega variants use the selected activation.
+
+``--model deepseek-v41-flash --parallel-modes ep --precomputed-routing`` selects
+the routed D5120/E2304/N384/K6 backbone core with SwiGLU (gate upper clamp 10,
+linear clamp [-10,10]) and CPU sqrt-softplus/bias top-k normalized to 1.5.
+It uses synthetic NVFP4 weights; shared experts, DSpark layers, router GEMM,
+and attention are excluded. Routing weights retain the same configurable
+placement as the other presets.
 
 Both timers include routing, staging, communication, compute, output handling,
 and MegaMoE runtime FP32 alpha copies. ``--precomputed-routing`` excludes routing.
@@ -79,7 +96,7 @@ import sys
 import tempfile
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from importlib.metadata import version
 from pathlib import Path
 
@@ -87,10 +104,49 @@ import numpy as np
 import torch
 
 from bench_moe_deepseek import (
-    BASE_INTERMEDIATE_SIZE,
-    CFG,
+    DeepSeekConfig,
     is_sm100_family,
 )
+
+
+@dataclass
+class ModelConfig(DeepSeekConfig):
+    activation: str = "swiglu"
+    gate_up_clamp: float | None = None
+    situ_beta: float | None = None
+    situ_linear_beta: float | None = None
+    routing_backend: str = "fused_deepseek"
+
+
+MODEL_CONFIGS = {
+    "deepseek-v3": ModelConfig(),
+    "glm5": ModelConfig(hidden_size=6144),
+    "deepseek-v41-flash": ModelConfig(
+        hidden_size=5120,
+        intermediate_size=2304,
+        num_experts=384,
+        n_group=1,
+        topk_group=1,
+        top_k=6,
+        routed_scaling_factor=1.5,
+        gate_up_clamp=10.0,
+        routing_backend="cpu_sqrtsoftplus_topk",
+    ),
+    "kimi-k3": ModelConfig(
+        hidden_size=3584,
+        intermediate_size=3072,
+        num_experts=896,
+        n_group=1,
+        topk_group=1,
+        top_k=16,
+        routed_scaling_factor=1.0,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        routing_backend="cpu_sigmoid_topk",
+    ),
+}
+CFG = MODEL_CONFIGS["deepseek-v3"]
 
 DISTRIBUTED_TOKEN_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 _PROFILE_CASE_ENV = "FLASHINFER_CUTE_DSL_MOE_PROFILE_CASE"
@@ -167,6 +223,8 @@ def _profile_cases(args, token_counts):
 
 def _profile_worker_arguments(args, num_tokens):
     arguments = [
+        "--model",
+        args.model,
         "--num-tokens",
         str(num_tokens),
         "--warmup",
@@ -634,9 +692,20 @@ def _distributed_moe_config(
         QuantConfig,
         QuantFormat,
         RoutingConfig,
+        SiTU,
+        SwiGLU,
     )
 
     return MoEConfig(
+        activation=(
+            SiTU(gate_scale=CFG.situ_beta, linear_scale=CFG.situ_linear_beta)
+            if CFG.activation == "situ"
+            else (
+                SwiGLU(limit=CFG.gate_up_clamp)
+                if CFG.gate_up_clamp is not None
+                else SwiGLU()
+            )
+        ),
         routing=RoutingConfig(num_experts=CFG.num_experts, top_k=CFG.top_k),
         quant=QuantConfig(
             weight=QuantFormat.NVFP4,
@@ -738,7 +807,7 @@ def _create_shared_ep_weights(rank, world_size, device):
         )
 
     # MegaMoE's canonical halves are [gate, up]. The split W4A16 epilogue
-    # applies SiLU to the second half of each interleaved pair (up, gate),
+    # applies the gated activation to each interleaved pair (up, gate),
     # so exchange the halves before its 64-row interleave. These are byte
     # permutations only: neither path rounds or re-quantizes the weights.
     def up_gate(tensor):
@@ -797,7 +866,11 @@ def _create_distributed_inputs(num_tokens, rank, world_size, device):
     routing_bias = (
         torch.randn(
             CFG.num_experts,
-            dtype=torch.bfloat16,
+            dtype=(
+                torch.float32
+                if CFG.routing_backend == "cpu_sqrtsoftplus_topk"
+                else torch.bfloat16
+            ),
             device=device,
             generator=bias_generator,
         )
@@ -807,10 +880,35 @@ def _create_distributed_inputs(num_tokens, rank, world_size, device):
 
 
 def _route_tokens(router_logits, routing_bias, topk_values, topk_indices):
-    from flashinfer.fused_moe import fused_topk_deepseek
-
     if router_logits.shape[0] == 0:
         return
+    if CFG.routing_backend in ("cpu_sigmoid_topk", "cpu_sqrtsoftplus_topk"):
+        # These ungrouped routers are not supported by fused_topk_deepseek.
+        # The CLI requires precomputed routes: CPU work and H2D copies must
+        # stay outside timed forwards, CUDA graphs, and profiler ranges.
+        with torch.no_grad():
+            logits = router_logits.detach().to(device="cpu", dtype=torch.float32)
+            scores = (
+                torch.nn.functional.softplus(logits).sqrt()
+                if CFG.routing_backend == "cpu_sqrtsoftplus_topk"
+                else logits.sigmoid()
+            )
+            bias = routing_bias.detach().to(device="cpu", dtype=torch.float32)
+            ids = torch.argsort(scores + bias, dim=-1, descending=True, stable=True)[
+                :, : CFG.top_k
+            ]
+            # Bias changes selection only. Exact ties prefer lower expert IDs.
+            weights = scores.gather(-1, ids)
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+            weights = weights * CFG.routed_scaling_factor
+            topk_indices.copy_(ids.to(device=topk_indices.device, dtype=torch.int32))
+            topk_values.copy_(
+                weights.to(device=topk_values.device, dtype=torch.float32)
+            )
+        return
+
+    from flashinfer.fused_moe import fused_topk_deepseek
+
     fused_topk_deepseek(
         scores=router_logits,
         bias=routing_bias,
@@ -1227,6 +1325,10 @@ def _benchmark_distributed_megamoe(
         weights=weights,
         backend=MegaConfig(
             megakernel=config_type(
+                activation=CFG.activation,
+                situ_beta=CFG.situ_beta,
+                situ_linear_beta=CFG.situ_linear_beta,
+                gate_up_clamp=CFG.gate_up_clamp,
                 intermediate_size=CFG.intermediate_size,
                 top_k=CFG.top_k,
                 knobs=args.megamoe_knobs,
@@ -1427,7 +1529,7 @@ def _run_ncu_compute_profile(args, num_tokens, mode, variant):
         num_local_experts = CFG.num_experts // args.num_gpus
     else:
         rows = num_tokens
-        intermediate_size = BASE_INTERMEDIATE_SIZE // args.num_gpus
+        intermediate_size = CFG.intermediate_size // args.num_gpus
         num_local_experts = CFG.num_experts
 
     layer, weight_pack = _create_distributed_moe_layer(
@@ -1528,7 +1630,7 @@ def _benchmark_distributed_tp(
     )
     from flashinfer.testing.utils import get_l2_cache_size
 
-    intermediate_size = BASE_INTERMEDIATE_SIZE // world_size
+    intermediate_size = CFG.intermediate_size // world_size
     layer, weight_pack = _create_distributed_moe_layer(
         args,
         variant,
@@ -1857,7 +1959,7 @@ def _run_distributed_benchmark(args, token_counts):
                 f"{args.num_gpus}"
             )
         if rank == 0:
-            print("\nDeepSeek-V3 distributed CuTe DSL MoE benchmark")
+            print(f"\n{args.model} distributed CuTe DSL MoE benchmark")
 
         selected_mode = None
         selected_variant_name = None
@@ -1901,16 +2003,36 @@ def _parse_megamoe_knobs(value):
         raise argparse.ArgumentTypeError(
             "--megamoe-knobs must be a JSON object or 'auto'"
         )
+    # Native AUTO uses tuples; JSON arrays must recover that representation
+    # before CuTe consumes shapes or uses tactics as compilation-cache keys.
+    for name in ("mma_tiler_mnk", "cluster_shape_mnk", "epi_flag_batch"):
+        if name in knobs:
+            if name == "epi_flag_batch" and knobs[name] is None:
+                continue
+            if not isinstance(knobs[name], list):
+                raise argparse.ArgumentTypeError(f"{name} must be a JSON array")
+            knobs[name] = tuple(knobs[name])
     return knobs
 
 
 def main():
+    global CFG
+
     warnings.filterwarnings(
         "ignore",
         message="cold_l2_cache=True but no GPU tensors found.*",
         module=r"flashinfer\.testing\.utils",
     )
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model",
+        choices=tuple(MODEL_CONFIGS),
+        default="deepseek-v3",
+        help=(
+            "Synthetic routed-MoE shape/activation preset; kimi-k3 and "
+            "deepseek-v41-flash require EP precomputed routing."
+        ),
+    )
     parser.add_argument(
         "--num-tokens",
         type=str,
@@ -1969,7 +2091,7 @@ def main():
     parser.add_argument(
         "--apply-topk-in-fc1",
         action="store_true",
-        help="Weight MegaMoE FP32 SwiGLU activations before FC1 handoff quantization/casting.",
+        help="Weight MegaMoE FP32 activations before FC1 handoff quantization/casting.",
     )
     parser.add_argument(
         "--refcheck",
@@ -2078,6 +2200,17 @@ def main():
         help="Print distributed setup progress and profiler worker output.",
     )
     args = parser.parse_args()
+    CFG = MODEL_CONFIGS[args.model]
+
+    if (
+        CFG.routing_backend
+        in (
+            "cpu_sigmoid_topk",
+            "cpu_sqrtsoftplus_topk",
+        )
+        and not args.precomputed_routing
+    ):
+        parser.error(f"--model {args.model} requires --precomputed-routing")
 
     variant_names = args.variants.split(",")
     if not set(variant_names) <= _VARIANTS_BY_NAME.keys() or len(
@@ -2123,16 +2256,31 @@ def main():
         parser.error("--num-gpus must be between 1 and 8")
     if CFG.num_experts % args.num_gpus != 0:
         parser.error(f"--num-gpus must divide the expert count ({CFG.num_experts})")
-    if BASE_INTERMEDIATE_SIZE % args.num_gpus != 0:
+    if CFG.intermediate_size % args.num_gpus != 0:
         parser.error(
             "--num-gpus must divide the expert intermediate size "
-            f"({BASE_INTERMEDIATE_SIZE})"
+            f"({CFG.intermediate_size})"
         )
     if args.profile_iters < 1:
         parser.error("--profile-iters must be positive")
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
         return 1
+
+    if int(os.environ.get("RANK", "0")) == 0:
+        _print_json(
+            "DISTRIBUTED_MODEL_JSON",
+            {
+                "model": args.model,
+                **asdict(CFG),
+                "scope": "synthetic_nvfp4_routed_expert_core",
+                "precomputed_routing": args.precomputed_routing,
+                "weight_seed": "1000 + rank",
+                "input_seed": "42 + rank",
+                "router_logit_seed": 137,
+                "routing_bias_seed": 911,
+            },
+        )
 
     if args.num_tokens:
         tokens = [int(value) for value in args.num_tokens.split(",")]
