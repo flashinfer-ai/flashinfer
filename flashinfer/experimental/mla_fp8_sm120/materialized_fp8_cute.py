@@ -788,9 +788,17 @@ class FlashAttentionForwardBase:
 
 class FlashAttentionForwardSm80(FlashAttentionForwardBase):
     def _get_smem_layout_atom(self):
-        sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
+        sQ_layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(3, 4, 3),
+            0,
+            cute.make_ordered_layout((8, 128), order=(1, 0)),
+        )
         sK_layout_atom = sQ_layout_atom
-        sV_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdimv)
+        sV_layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(3, 4, 3),
+            0,
+            cute.make_ordered_layout((8, 128), order=(1, 0)),
+        )
         sO_layout_atom = sm80_utils.get_smem_layout_atom(
             cutlass.BFloat16, self.tile_hdimv
         )
@@ -843,6 +851,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             sV: sV_struct
             sQ: sQ_struct
             sK: sK_struct
+            barriers: cute.struct.MemRange[cutlass.Int64, 3]
 
         @cute.struct
         class SharedStorageSharedQV:
@@ -977,10 +986,32 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors
         )
 
-        self.kernel(
+        tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
             mQ,
+            self.sQ_layout,
+            (self.tile_m, self.tile_hdim),
+            1,
+        )
+        tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
             mK,
+            cute.select(self.sK_layout, mode=[0, 1]),
+            (self.tile_n, self.tile_hdim),
+            1,
+        )
+        tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
             mV,
+            cute.select(self.sV_layout, mode=[0, 1]),
+            (self.tile_n, self.tile_hdimv),
+            1,
+        )
+
+        self.kernel(
+            tma_tensor_Q,
+            tma_tensor_K,
+            tma_tensor_V,
             mO,
             mLSE,
             mCuSeqlensQ,
@@ -1005,6 +1036,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             SharedStorage,
             tile_sched_params,
             TileScheduler,
+            tma_atom_Q,
+            tma_atom_K,
+            tma_atom_V,
             aux_data,
             fastdiv_mods,
         ).launch(
@@ -1044,6 +1078,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr,
         tile_sched_params,
         TileScheduler: cutlass.Constexpr[Callable],
+        tma_atom_Q: cute.CopyAtom,
+        tma_atom_K: cute.CopyAtom,
+        tma_atom_V: cute.CopyAtom,
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
     ):
@@ -1113,6 +1150,11 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # ///////////////////////////////////////////////////////////////////////////////
             smem = cutlass.utils.SmemAllocator()
             storage = smem.allocate(SharedStorage)
+            barriers = storage.barriers.data_ptr()
+            if tidx < 3:
+                cute.arch.mbarrier_init(barriers + tidx, 1)
+            cute.arch.mbarrier_init_fence()
+            cute.arch.barrier()
             sQ = storage.sQ.get_tensor(sQ_layout)
             sK = storage.sK.get_tensor(sK_layout)
             if const_expr(not self.Q_in_regs):
@@ -1211,6 +1253,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # group parameters for compute_one_n_block
             mma_params = SimpleNamespace(
                 value_scale_state=value_scale_state,
+                barriers=barriers,
+                initial_n_block=n_block,
                 query_scale=aux_data.tensors[0][batch_size, num_head, m_block],
                 thr_mma_qk=thr_mma_qk,
                 thr_mma_pv=thr_mma_pv,
@@ -1231,26 +1275,31 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 tSsK=tSsK,
                 tOsVt=tOsVt,
             )
-            load_K = partial(
-                self.load_K,
-                gmem_tiled_copy_K,
-                tKgK,
-                tKsK,
-                tKcK,
-                t0KcK,
-                tKpK,
-                seqlen=seqlen.seqlen_k,
+            copy_Q, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
             )
-            load_V = partial(
-                self.load_V,
-                gmem_tiled_copy_V,
-                tVgV,
-                tVsV,
-                tVcV,
-                t0VcV,
-                tVpV,
-                seqlen=seqlen.seqlen_k,
+            copy_K, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_K, 0, cute.make_layout(1), gK, sK
             )
+            copy_V, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_V, 0, cute.make_layout(1), gV, sV
+            )
+
+            def load_K(n_block, smem_pipe_write, need_predicates):
+                if tidx < 32:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            barriers + 1, self.tile_n * self.tile_hdim
+                        )
+                    copy_K(n_block, 0, tma_bar_ptr=barriers + 1)
+
+            def load_V(n_block, smem_pipe_write, need_predicates):
+                if tidx < 32:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            barriers + 2, self.tile_n * self.tile_hdimv
+                        )
+                    copy_V(n_block, 0, tma_bar_ptr=barriers + 2)
 
             compute_one_n_block = partial(
                 self.compute_one_n_block,
@@ -1270,53 +1319,16 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # ///////////////////////////////////////////////////////////////////////////////
             # Prologue
             # ///////////////////////////////////////////////////////////////////////////////
-            # Start async loads of the last mn-tile, where we take care of the mn residue
-            gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
-            self.load_Q(
-                gmem_thr_copy_Q,
-                gQ,
-                sQ,
-                m_block,
-                seqlen=seqlen.seqlen_q,
-                headdim=mQ.shape[1],
-            )
-            cute.arch.cp_async_commit_group()
-
-            def preprocess_Q():
-                cute.arch.cp_async_wait_group(self.num_stages * 2 - 1)
-                if const_expr(self.Q_in_regs):
-                    cute.arch.barrier()
-                    tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
-                    cute.copy(smem_thr_copy_Q, tSsQ, tSrQ_copy_view)
-
-            # If Q_in_regs, we load Q, then load 1 stage of K, then (optionally) rotate Q and
-            # read from smem_q to registers, then load V.
-            # If !Q_in_regs, we load Q, load all stages of K & V, then (optionally) rotate Q.
-            if const_expr(self.Q_in_regs):
-                load_K(n_block, smem_pipe_write=0, need_predicates=True)
-                cute.arch.cp_async_commit_group()
-                preprocess_Q()
-                cute.arch.barrier()  # Make sure all threads have read smem_q before loading V
-
-            for stage in cutlass.range_constexpr(self.num_stages):
-                if const_expr(not self.Q_in_regs or stage > 0):
-                    if stage == 0 or n_block - stage >= 0:
-                        load_K(
-                            n_block - stage,
-                            smem_pipe_write=stage,
-                            need_predicates=stage == 0,
-                        )
-                    cute.arch.cp_async_commit_group()
-                if const_expr(stage < self.num_stages - 1):
-                    if stage == 0 or n_block - stage >= 0:
-                        load_V(
-                            n_block - stage,
-                            smem_pipe_write=stage,
-                            need_predicates=stage == 0,
-                        )
-                    cute.arch.cp_async_commit_group()
-            if const_expr(not self.Q_in_regs):
-                preprocess_Q()
+            # Enter CuTe TMA copy with a full warp: it elects its issuer internally.
+            # Only barrier arrival uses an explicit single-lane election.
+            if tidx < 32:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        barriers, self.tile_m * self.tile_hdim
+                    )
+                copy_Q(tma_bar_ptr=barriers)
+            load_K(n_block, smem_pipe_write=0, need_predicates=True)
+            cute.arch.mbarrier_wait(barriers, phase=0)
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Mainloop
@@ -1453,17 +1465,16 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         subsequent blocks.
         """
 
-        def sync():
-            cute.arch.cp_async_wait_group(self.num_stages * 2 - 2)
-            cute.arch.barrier()
-
         acc_shape_S = mma_params.thr_mma_qk.partition_shape_C(
             (self.tile_m, self.tile_n)
         )
         acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
         acc_S.fill(0.0)
         # wait for smem tile QK before mma calculation for S
-        sync()
+        cute.arch.mbarrier_wait(
+            mma_params.barriers + 1, phase=(mma_params.initial_n_block - n_block) & 1
+        )
+        cute.arch.barrier()
 
         # need predicates for the first tile
         def load_V_next():
@@ -1473,7 +1484,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     smem_pipe_write,
                     need_predicates=is_first_n_block and self.num_stages == 1,
                 )
-            cute.arch.cp_async_commit_group()
 
         load_V_next()
         sm80_utils.gemm(
@@ -1521,11 +1531,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 load_K(
                     n_block - self.num_stages, smem_pipe_write, need_predicates=False
                 )
-            cute.arch.cp_async_commit_group()
 
         # wait for smem tile V for O
         if const_expr(self.num_stages == 1):
-            sync()
+            cute.arch.mbarrier_wait(
+                mma_params.barriers + 2,
+                phase=(mma_params.initial_n_block - n_block) & 1,
+            )
+            cute.arch.barrier()
             load_K_next()
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
@@ -1560,7 +1573,11 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                         hi = (high_pair >> (group * 16)) & cutlass.Uint32(65535)
                         rA32[(0, rr, block), mm, kk] = lo | (hi << 16)
         if const_expr(self.num_stages > 1):
-            sync()
+            cute.arch.mbarrier_wait(
+                mma_params.barriers + 2,
+                phase=(mma_params.initial_n_block - n_block) & 1,
+            )
+            cute.arch.barrier()
             load_K_next()
         # Explicit SM120 byte-transpose mapping, matching the FlashInfer
         # K32 reference. Generic CuTe B tiling provides 8-byte addresses here.
