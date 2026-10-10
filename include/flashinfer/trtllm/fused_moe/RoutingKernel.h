@@ -371,10 +371,11 @@ void run(Data const& data, void* stream);
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 enum class RoutingPreprocessType {
-  None,         // No preprocessing before topK
-  Softmax,      // Apply softmax on all expert scores before topK
-  Sigmoid,      // Apply sigmoid(score) for topK selection (no bias)
-  SigmoidBias,  // Apply sigmoid(score) + bias for topK selection (DeepSeek-style)
+  None,              // No preprocessing before topK
+  Softmax,           // Apply softmax on all expert scores before topK
+  Sigmoid,           // Apply sigmoid(score) for topK selection (no bias)
+  SigmoidBias,       // Apply sigmoid(score) + bias for topK selection (DeepSeek-style)
+  SqrtSoftplusBias,  // Apply sqrt(softplus(score)) + bias for topK selection (DeepSeek-V4-style)
 };
 
 enum class RoutingPostprocessType {
@@ -382,7 +383,7 @@ enum class RoutingPostprocessType {
   Softmax,             // Apply softmax on top-K scores
   Sigmoid,             // Apply sigmoid on top-K scores (selection ranks the raw logits)
   SumNormalize,        // Normalize top-K scores by their sum
-  ScaledSumNormalize,  // Recover sigmoid scores, normalize by sum and scale (DeepSeek-style)
+  ScaledSumNormalize,  // Recover un-biased scores, normalize by sum and scale (DeepSeek-style)
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
