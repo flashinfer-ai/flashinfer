@@ -24,11 +24,15 @@
 #ifndef SHARE_P
 #define SHARE_P 0
 #endif
+#ifndef SHARD_QK
+#define SHARD_QK 0
+#endif
 
 namespace flashinfer {
 namespace mla_fp8 {
 constexpr int BM = TILE_Q, BN = TILE_KV, NS = STAGES, DG = D_GROUPS;
 constexpr bool SP = SHARE_P;
+static_assert(!SHARD_QK || (SHARE_P && BN % (16 * DG) == 0));
 constexpr int NT = (BM / 16) * DG * 32, OD = 512 / DG, NF = OD / 16;
 using Base = MLAParams<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16, int>;
 struct Params {
@@ -44,7 +48,10 @@ struct alignas(16) Shared {
   uint8_t qc[BM * 512], qr[BM * 64];
   uint8_t kc[NS][BN * 512], kr[NS][BN * 64];
   float ks[NS][BN];
-#if SHARE_P
+#if SHARD_QK
+  uint8_t prob[BM * 64];
+  float qk_max[DG][BM], p_max[DG][BM], p_sum[DG][BM];
+#elif SHARE_P
   // One producer group computes QK/softmax and packs P once. All output
   // dimension groups consume the same register-layout fragments after a CTA barrier.
   uint4 pp[BN / 32][BM / 16][32];
@@ -141,18 +148,18 @@ __device__ __forceinline__ void load_kv(Shared& s, const Params& a, int slot, in
   }
 }
 
-template <int D>
-__device__ __forceinline__ void qk(uint8_t* q, uint8_t* k, int wq, float (&scores)[BN / 16][8]) {
+template <int D, int N>
+__device__ __forceinline__ void qk(uint8_t* q, uint8_t* k, int wq, float (&scores)[N][8], int first_n = 0) {
   int lane = threadIdx.x % 32;
 #pragma unroll
   for (int d = 0; d < D; d += 32) {
     uint32_t qa[4];
     mma::ldmatrix_m8n8x4(qa, at<D>(q, wq * 16 + lane % 16, d + 16 * (lane / 16)));
 #pragma unroll
-    for (int n = 0; n < BN / 16; ++n) {
+    for (int n = 0; n < N; ++n) {
       uint32_t kb[4];
       mma::ldmatrix_m8n8x4(
-          kb, at<D>(k, n * 16 + 8 * (lane / 16) + lane % 8, d + 16 * ((lane % 16) / 8)));
+          kb, at<D>(k, (n + first_n) * 16 + 8 * (lane / 16) + lane % 8, d + 16 * ((lane % 16) / 8)));
       mma::mma_sync_m16n16k32_row_col_f8f8f32<__nv_fp8_e4m3>(scores[n], qa, kb);
     }
   }
@@ -188,13 +195,16 @@ __device__ __forceinline__ void pack_p(const float* lo, const float* hi, const f
   }
 }
 
-__device__ __forceinline__ void pv(Shared& sm, int slot, int wq, int dg, float (&p)[BN / 16][8],
+template <int N>
+__device__ __forceinline__ void pv(Shared& sm, int slot, int wq, int dg, float (&p)[N][8],
                                    const float (&scale)[2], float (&o)[NF][8]) {
   int lane = threadIdx.x % 32;
 #pragma unroll
   for (int n = 0; n < BN; n += 32) {
     uint32_t a[4];
-#if SHARE_P
+#if SHARD_QK
+    mma::ldmatrix_m8n8x4(a, at<64>(sm.prob, wq * 16 + lane % 16, n + 16 * (lane / 16)));
+#elif SHARE_P
     uint4 packed = sm.pp[n / 32][wq][lane];
     a[0] = packed.x;
     a[1] = packed.y;
@@ -251,6 +261,98 @@ __global__ __launch_bounds__(NT) void BatchMLAPagedAttentionFP8SM120(
       cp_async::wait_group<NS - 1>();
       __syncthreads();
       int slot = iter % NS;
+#if SHARD_QK
+      constexpr int NC = BN / (16 * DG);
+      float scores[NC][8] = {}, sp[2], factors[2];
+      qk<64>(sm.qr, sm.kr[slot], wq, scores, dg * NC);
+      qk<512>(sm.qc, sm.kc[slot], wq, scores, dg * NC);
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        int local = wq * 16 + lane / 4 + 8 * j;
+        int qidx = uint32_t(packed + local) / p.num_heads;
+        float mx = -INFINITY;
+#pragma unroll
+        for (int n = 0; n < NC; ++n) {
+#pragma unroll
+          for (int col = 0; col < 4; ++col) {
+            int reg = j * 2 + (col / 2) * 4 + col % 2;
+            int k = (dg * NC + n) * 16 + 2 * (lane % 4) + 8 * (col / 2) + col % 2;
+            float x = scores[n][reg] * (qs[j] * sm.ks[slot][k] * p.sm_scale * math::log2e);
+            bool valid = base + k < end && (!CAUSAL || base + k <= kl - ql + qidx);
+            scores[n][reg] = valid ? x : -INFINITY;
+            mx = fmaxf(mx, scores[n][reg]);
+          }
+        }
+        mx = rowmax(mx);
+        if (lane % 4 == 0) sm.qk_max[dg][local] = mx;
+      }
+      __syncthreads();
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        int local = wq * 16 + lane / 4 + 8 * j;
+        float mx = m[j];
+#pragma unroll
+        for (int g = 0; g < DG; ++g) mx = fmaxf(mx, sm.qk_max[g][local]);
+        factors[j] = isfinite(m[j]) ? exp2f(m[j] - mx) : 0.f;
+        m[j] = mx;
+        float sum = 0.f, pm = 0.f;
+#pragma unroll
+        for (int n = 0; n < NC; ++n) {
+#pragma unroll
+          for (int col = 0; col < 4; ++col) {
+            int reg = j * 2 + (col / 2) * 4 + col % 2;
+            int k = (dg * NC + n) * 16 + 2 * (lane % 4) + 8 * (col / 2) + col % 2;
+            float v = isfinite(mx) ? exp2f(scores[n][reg] - mx) : 0.f;
+            sum += v;
+            v *= sm.ks[slot][k];
+            scores[n][reg] = v;
+            pm = fmaxf(pm, v);
+          }
+        }
+        sum = rowsum(sum);
+        pm = rowmax(pm);
+        if (lane % 4 == 0) {
+          sm.p_sum[dg][local] = sum;
+          sm.p_max[dg][local] = pm;
+        }
+      }
+      __syncthreads();
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        int local = wq * 16 + lane / 4 + 8 * j;
+        float sum = 0.f, pm = 0.f;
+#pragma unroll
+        for (int g = 0; g < DG; ++g) {
+          sum += sm.p_sum[g][local];
+          pm = fmaxf(pm, sm.p_max[g][local]);
+        }
+        den[j] = den[j] * factors[j] + sum;
+        sp[j] = fmaxf(pm, 1e-12f) / 448.f;
+        factors[j] *= oldscale[j] / sp[j];
+        oldscale[j] = sp[j];
+#pragma unroll
+        for (int n = 0; n < NC; ++n) {
+#pragma unroll
+          for (int col = 0; col < 2; ++col) {
+            int reg = j * 2 + col * 4;
+            int k = (dg * NC + n) * 16 + 2 * (lane % 4) + 8 * col;
+            __nv_fp8x2_e4m3 pair(make_float2(scores[n][reg] / sp[j], scores[n][reg + 1] / sp[j]));
+            *reinterpret_cast<uint16_t*>(at<64>(sm.prob, local, k)) = pair.__x;
+          }
+        }
+      }
+      __syncthreads();
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+#pragma unroll
+        for (int d = 0; d < NF; ++d) {
+          out[d][j * 2] *= factors[j];
+          out[d][j * 2 + 1] *= factors[j];
+          out[d][j * 2 + 4] *= factors[j];
+          out[d][j * 2 + 5] *= factors[j];
+        }
+      }
+#else
       float scores[BN / 16][8] = {};
       float sp[2], factors[2];
       if (!SP || dg == 0) {
@@ -346,6 +448,7 @@ __global__ __launch_bounds__(NT) void BatchMLAPagedAttentionFP8SM120(
           out[d][j * 2 + 5] *= factors[j];
         }
       }
+#endif
 #endif
       pv(sm, slot, wq, dg, scores, sp, out);
       __syncthreads();

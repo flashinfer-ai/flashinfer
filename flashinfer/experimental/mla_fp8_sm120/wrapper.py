@@ -21,7 +21,7 @@ import subprocess
 ROOT = Path(__file__).resolve().parent
 
 
-def build(bm=32, bn=32, stages=1, groups=2, share_p=False):
+def build(bm=32, bn=32, stages=1, groups=2, share_p=False, shard_qk=False):
     """Compile the research ABI into a locked user cache, never into the package.
 
     Source checkouts use their own FlashInfer headers. The explicit include
@@ -31,6 +31,8 @@ def build(bm=32, bn=32, stages=1, groups=2, share_p=False):
         raise ValueError("Unsupported Q/KV tile size.")
     if stages not in (1, 2) or groups not in (2, 4):
         raise ValueError("Unsupported stage count or output dimension groups.")
+    if shard_qk and (not share_p or bn % (16 * groups)):
+        raise ValueError("Sharded QK requires share_p and at least 16 KV columns per group.")
     package = Path(importlib.util.find_spec("flashinfer").origin).parent
     checkout = ROOT.parents[2]
     default_include = checkout / "include"
@@ -73,6 +75,7 @@ def build(bm=32, bn=32, stages=1, groups=2, share_p=False):
         f"-DSTAGES={stages}",
         f"-DD_GROUPS={groups}",
         f"-DSHARE_P={int(share_p)}",
+        f"-DSHARD_QK={int(shard_qk)}",
     ]
     compiler = subprocess.check_output([nvcc, "--version"], text=True)
     fingerprint = hashlib.sha256()
@@ -86,7 +89,7 @@ def build(bm=32, bn=32, stages=1, groups=2, share_p=False):
         json.dumps([nvcc, compiler, flags, list(map(str, includes))]).encode()
     )
     digest = fingerprint.hexdigest()[:16]
-    name = f"mla_q{bm}_k{bn}_s{stages}_d{groups}_p{int(share_p)}_{digest}"
+    name = f"mla_q{bm}_k{bn}_s{stages}_d{groups}_p{int(share_p)}_qk{int(shard_qk)}_{digest}"
     base = Path(os.environ.get("FLASHINFER_WORKSPACE_BASE", Path.home()))
     cache = base / ".cache/flashinfer/experimental/mla_fp8_sm120"
     cache.mkdir(parents=True, exist_ok=True)
@@ -130,8 +133,8 @@ def build(bm=32, bn=32, stages=1, groups=2, share_p=False):
 
 
 @lru_cache(None)
-def module(bm, bn, stages, groups, share_p):
-    lib = C.CDLL(str(build(bm, bn, stages, groups, share_p)))
+def module(bm, bn, stages, groups, share_p, shard_qk):
+    lib = C.CDLL(str(build(bm, bn, stages, groups, share_p, shard_qk)))
     P, I, Z = C.c_void_p, C.c_int, C.c_size_t
     lib.fp8_plan.argtypes = [P, Z, P, P, Z, P, P, P, I, I, I, I, P, P]
     lib.fp8_run.argtypes = [P, P, P, P, P, P, P, P, P, P, I, I, I, C.c_float, I, P]
@@ -161,6 +164,7 @@ class NativeMLA:
         fused=True,
         sm_scale=1 / 16,
         share_p=False,
+        shard_qk=False,
     ):
         import torch
 
@@ -182,6 +186,7 @@ class NativeMLA:
                 fused=fused,
                 sm_scale=sm_scale,
                 share_p=share_p,
+                shard_qk=shard_qk,
             )
 
     def _initialize(
@@ -203,6 +208,7 @@ class NativeMLA:
         fused,
         sm_scale,
         share_p,
+        shard_qk,
     ):
         import torch
 
@@ -220,9 +226,9 @@ class NativeMLA:
             raise ValueError("Expected positive heads and page size 1/16/32/64/128.")
         if torch.cuda.get_device_capability(workspace.device) != (12, 0):
             raise ValueError("This experimental binary targets SM120.")
-        self.lib = module(bm, bn, stages, groups, share_p)
+        self.lib = module(bm, bn, stages, groups, share_p, shard_qk)
         self.config = dict(
-            bm=bm, bn=bn, stages=stages, groups=groups, fused=fused, share_p=share_p
+            bm=bm, bn=bn, stages=stages, groups=groups, fused=fused, share_p=share_p, shard_qk=shard_qk
         )
         self.heads, self.page_size, self.causal, self.scale = (
             heads,

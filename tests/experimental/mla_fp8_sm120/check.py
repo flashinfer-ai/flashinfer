@@ -25,12 +25,13 @@ def main():
     parser.add_argument("--groups", type=int, default=2)
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--share-p", action="store_true")
+    parser.add_argument("--shard-qk", action="store_true")
     parser.add_argument(
         "--output", type=Path, default=Path("/tmp/mla_fp8_sm120_correctness.json")
     )
     parser.add_argument("--only", nargs="+")
     args = parser.parse_args()
-    config = {k: getattr(args, k) for k in ("bm", "bn", "stages", "groups", "share_p")}
+    config = {k: getattr(args, k) for k in ("bm", "bn", "stages", "groups", "share_p", "shard_qk")}
     print("BUILD", str(build(**config)), flush=True)
     wait_idle(700 * 1024**2)
     torch.manual_seed(490)
