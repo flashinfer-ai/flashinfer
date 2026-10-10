@@ -289,19 +289,20 @@ def test_split_nvfp4_kernel_matches_torch_reference():
     assert rel_l2.item() < 0.05
 
 
-@pytest.mark.arch_blackwell
-def test_split_w4a8_kernel_matches_direct_runner():
+@pytest.mark.parametrize("compute_backend", ["cute", "trtllm"])
+def test_split_w4a8_kernel_matches_direct_runner(compute_backend):
     import torch
 
     import flashinfer.fused_moe as fm
     import flashinfer.moe_ep as ep
 
-    _require_backend(fm.CuteDslConfig)
-    if torch.cuda.get_device_capability() == (10, 7):
+    config_cls = fm.CuteDslConfig if compute_backend == "cute" else fm.TrtllmFp4Config
+    _require_backend(config_cls)
+    if compute_backend == "cute" and torch.cuda.get_device_capability() == (10, 7):
         pytest.skip("CuTe-DSL W4A8 is not supported on SM107")
     from flashinfer.cute_dsl import is_cute_dsl_available
 
-    if not is_cute_dsl_available():
+    if compute_backend == "cute" and not is_cute_dsl_available():
         pytest.skip("CuTeDSL is not available")
 
     from dataclasses import replace
@@ -312,7 +313,10 @@ def test_split_w4a8_kernel_matches_direct_runner():
     from flashinfer.quantization.fp8_quantization import mxfp8_quantize
 
     x, w13, w2, _, _ = _make_problem()
-    cfg = _build_moe_config("w4a8")
+    cfg = replace(
+        _build_moe_config("w4a8"),
+        backend=fm.BackendOptions(candidates=(config_cls(),)),
+    )
     fleet = ep.FleetParams(
         num_experts=NUM_EXPERTS,
         max_tokens_per_rank=NUM_TOKENS // NUM_EXPERTS,
@@ -333,13 +337,17 @@ def test_split_w4a8_kernel_matches_direct_runner():
             fleet_params=fleet,
         )
     ).reshape(NUM_TOKENS, HIDDEN)
+    expected_backend = "cute_dsl" if compute_backend == "cute" else "trtllm_fp4_routed"
+    assert backend._compute.winner_backend == expected_backend
 
     x_q, x_sf = mxfp8_quantize(x.contiguous(), is_sf_swizzled_layout=False)
     ids = torch.arange(NUM_EXPERTS, device="cuda", dtype=torch.int32)
     ids = ids.repeat_interleave(expert.shape[1]).reshape(-1, 1)
     act = fm.MoEActivationPack(
         hidden_states_q=x_q,
-        hidden_states_scale=x_sf.view(torch.uint8).reshape(NUM_TOKENS, HIDDEN // 32),
+        hidden_states_scale=x_sf.view(torch.float8_e4m3fn).reshape(
+            NUM_TOKENS, HIDDEN // 32
+        ),
         topk_ids=ids,
         topk_weights=torch.ones(NUM_TOKENS, 1, device="cuda"),
     )

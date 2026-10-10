@@ -106,11 +106,15 @@ Fleet transports:
 |---|---|---|---|---|---|
 | `identity` (`IdentityConfig`) | passthrough | none | dispatch tensor unchanged | any | — |
 | `fused_moe` (`FusedMoeKernelConfig`) with `TrtllmBf16Config` | BF16 | BF16 | BF16 | SM100 family | inner `MoELayer` AutoTuner: per-runner tactic search + cross-backend winner per token bucket, up to `ExecutionConfig.tune_max_num_tokens` |
-| `fused_moe` with `TrtllmFp4Config` | NVFP4 (block-16, quantized post-dispatch in the bridge) | NVFP4 (block-16) | BF16 | SM100/SM103/SM107 | same `MoELayer` AutoTuner |
+| `fused_moe` with `TrtllmFp4Config` | NVFP4 (block-16) or MXFP8 (block-32), quantized post-dispatch in the bridge | NVFP4 or MXFP4, respectively | BF16 | SM100/SM103/SM107 | same `MoELayer` AutoTuner |
 | `fused_moe` with `CuteDslConfig` | NVFP4 (W4A4), MXFP8 (W4A8), or BF16 (W4A16); W4A8 may use pre-dispatch packed payloads with `mxfp8_dispatch=True` | NVFP4/MXFP4 | BF16 | SM100/SM103 (W4A4/W4A16 also SM107) | same `MoELayer` AutoTuner |
 
-`fused_moe` accepts exactly one backend candidate per `MoEConfig` (weight
-views are prepared for the first match only). The W4A8 split kernel requires
+`fused_moe` prepares weight views for each configured compute backend. For
+NVFP4×NVFP4 or MXFP4×MXFP8, `BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config()))`
+lets `MoELayer` compare eligible compute backends and cache its winner per
+token-count bucket. A singleton retains explicit backend selection. This
+comparison times local compute, not EP dispatch/combine; warm up each input
+shape before graph capture. The W4A8 split kernel requires
 hidden and intermediate sizes to be multiples of 128.
 
 ## How tuning works

@@ -388,6 +388,10 @@ def _quantize_and_pack(
             hidden_states_scale = hidden_states_scale.view(torch.uint8).reshape(
                 flat.shape[0], flat.shape[1] // 32
             )
+        if pair[0] is QuantFormat.MXFP4:
+            # W4A8 packs carry UE8M0 bytes in float8 storage. CuTe reinterprets
+            # them as uint8; TRT-LLM requires the float8 view.
+            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
     elif activation is QuantFormat.BF16:
         # BF16 and both W4A16 encodings consume the dispatched activations.
         hidden_states_q = flat
