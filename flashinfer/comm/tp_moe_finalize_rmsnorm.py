@@ -42,12 +42,24 @@ squares, exchanged through distributed shared memory with one cluster barrier.
 ``S`` is a launch parameter: small token counts leave most of the machine idle
 with one CTA per token, so S grows until the grid covers the SM array.
 
-The large-token path stages rows to token owners in bounded chunks. Rank
+From ``64 / P`` tokens on, rows are owned by token instead: rank
 ``token % P`` sums every expert's partial rows in rank order, normalizes and
-accumulates the experts in FP32, then multicasts the final BF16 row. Separate
-staging, owner, and copy launches expose more parallelism. The copy waits for
-every owner before input storage is reused; the next owner waits for every
-rank's next stage, so all previous output reads finish before overwrite.
+accumulates the experts in FP32, then multicasts the final BF16 row. This moves
+less data than the expert-owner path (the second hop carries BF16 output rows,
+not FP32 partials).
+
+  single launch (padded token count <= SM count): CTA ``(b, g, d)`` covers H
+      band ``b`` of token ``g * P + d``. It pushes the token's rows to rank
+      ``d``, reduces some experts of the token this rank owns in slot ``g``,
+      and copies rank ``d``'s multicast row out. Both hops are Lamport
+      transfers with their own triple-buffered generations; the owner's
+      experts are spread over ``XP`` CTAs of the slot (combined through a
+      local scratch by the last arriver) or kept in one CTA when that is
+      faster. Every CTA is co-resident and pushes before it polls.
+  chunked (more tokens): separate staging, owner, and copy launches with
+      release/acquire flags. The copy waits for every owner before input
+      storage is reused; the next owner waits for every rank's next stage, so
+      all previous output reads finish before overwrite.
 """
 
 import logging
@@ -98,6 +110,8 @@ VEC = 8
 NSLOT = 256  # >= max CTAs in the grid; one Lamport slot per CTA
 NGEN = 3
 _MAX_SPLIT = 16
+# In-flight 128-bit peer-row loads per thread when an owner batches its loads.
+_PEER_BATCH_VECS = 32
 # packed pair of BF16 negative zeros / one FP32 negative zero
 SENT_A = 0x80008000
 SENT_B = 0x80000000
@@ -427,6 +441,25 @@ def st_release(ptr: Pointer, value: Int32, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def atomic_add_acq_rel(ptr: Pointer, value: Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            MLIR_T.i32(),
+            [
+                ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+                Int32(value).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def map_smem_rank(smem_ptr: Pointer, rank: Int32, *, loc=None, ip=None) -> Int32:
     """Translate a local SMEM address to the same slot in a cluster peer."""
     a = smem_ptr.toint(loc=loc, ip=ip).ir_value()
@@ -458,6 +491,11 @@ def st_smem_remote_f32(addr: Int32, val: Float32, *, loc=None, ip=None) -> None:
     )
 
 
+def _peer_batch(ws):
+    """Experts whose peer rows (ws - 1 vectors each) fit one load batch."""
+    return max(1, min(K_EXPERTS, _PEER_BATCH_VECS // max(1, ws - 1)))
+
+
 def _pick_split(n_tok, nsm):
     """H-split factor: grow the grid until it covers the SM array."""
     if not _HAS_CLUSTER:
@@ -487,6 +525,9 @@ def _make_program(
     addrs,
     my_rank,
     token_owner=False,
+    single=False,
+    xpar=None,
+    push=None,
 ):
     inv_h = 1.0 / float(H_DIM)
     tiles = (n_tok + ws - 1) // ws if token_owner else n_tok
@@ -517,21 +558,42 @@ def _make_program(
     if token_owner:
         A_BYTES = token_slots * K_EXPERTS * ws * H_DIM * 2
     flag_bytes = A_BYTES + token_slots * ws * H_DIM * 2
+    # Token-path owners load this many experts' peer rows in one batch, so the
+    # loads share one memory latency.
+    load_grp = _peer_batch(ws)
+    # Rows pushed per load batch; the chunked path pushes all of them at once.
+    push_grp = K_EXPERTS
+    NS = NSLOT  # slots per Lamport generation
+    if single:
+        # Lamport transport with its own generations: triple-buffered staged
+        # rows, then the owners' output rows; plus local combine scratch.
+        assert xpar is not None and push is not None
+        push_grp = push
+        NS = addrs["tl_slots"]
+        a_lam = addrs["tl_uc"]
+        a_lam_mc = addrs["tl_mc"] if use_mc else a_lam
+        a_lam_peers = addrs["tl_peers"]
+        A_BYTES = NGEN * NS * K_EXPERTS * ws * H_DIM * 2
+        a_gen = addrs["tl_gen"]
+        a_done = addrs["tl_done"]
+        a_y = addrs["tl_y"]
+        a_ycnt = addrs["tl_ycnt"]
 
     def _pin(dt, a, al=16):
         return cute.make_ptr(dt, a, cutlass.AddressSpace.gmem, assumed_align=al)
 
     def a_off(gm, slot, ko, src):
         # BF16 element offset of scattered expert row [gen][slot][ko][src]
-        if token_owner:
+        if token_owner and not single:
             return ((slot * K_EXPERTS + ko) * ws + src) * H_DIM
-        return (((gm * NSLOT + slot) * KO + ko) * ws + src) * H_DIM
+        return (((gm * NS + slot) * KO + ko) * ws + src) * H_DIM
 
     def b_off(gm, slot, src):
-        # FP32 element offset of the partial output row [gen][slot][src]
-        if token_owner:
+        # Element offset of the output row [gen][slot][src]: FP32 partials on
+        # the expert path, BF16 owner rows on the token paths.
+        if token_owner and not single:
             return (slot * ws + src) * H_DIM
-        return ((gm * NSLOT + slot) * ws + src) * H_DIM
+        return ((gm * NS + slot) * ws + src) * H_DIM
 
     def flag_off(slot, phase, src, sx):
         return (slot * 2 + phase) * ws + src
@@ -542,21 +604,38 @@ def _make_program(
         gIdx: cute.Tensor,
         tok: Int32,
         dest: cutlass.Constexpr,
+        gm: Int32,
         slot: Int32,
         h0: Int32,
     ):
         pp = _pin(cutlass.BFloat16, a_lam_peers[dest])
-        for k in cutlass.range_constexpr(K_EXPERTS):
-            idx = cutlass.Int32(gIdx[tok, k])
-            q0, q1, q2, q3 = (
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-            )
-            if idx >= 0 and idx < num_rows:
-                q0, q1, q2, q3 = ld_global_v4(gIn.iterator + idx * row_stride + h0)
-            st_global_v4(pp + a_off(0, slot, k, my_rank) + h0, q0, q1, q2, q3)
+        # Rows are loaded push_grp at a time before their stores: a store waits
+        # for its data, so a larger group overlaps more load latency, at the
+        # cost of burstier fabric traffic when many CTAs push at once. The
+        # index row comes first: the asm stores order memory, so an index load
+        # inside the loop would add a dependent latency per batch.
+        idxs = [cutlass.Int32(gIdx[tok, k]) for k in range(K_EXPERTS)]
+        for k0 in cutlass.range_constexpr(0, K_EXPERTS, push_grp):
+            rows = []
+            for k in cutlass.range_constexpr(k0, k0 + push_grp):
+                idx = idxs[k]
+                q0, q1, q2, q3 = (
+                    cutlass.Int32(0),
+                    cutlass.Int32(0),
+                    cutlass.Int32(0),
+                    cutlass.Int32(0),
+                )
+                if idx >= 0 and idx < num_rows:
+                    q0, q1, q2, q3 = ld_global_v4(gIn.iterator + idx * row_stride + h0)
+                rows.append((q0, q1, q2, q3))
+            for k in cutlass.range_constexpr(k0, k0 + push_grp):
+                q = rows[k - k0]
+                if cutlass.const_expr(single):
+                    # the single launch polls these rows, so scrub the sentinel
+                    q = tuple(scrub_a(w) for w in q)
+                st_global_v4(
+                    pp + a_off(gm, slot, k, my_rank) + h0, q[0], q[1], q[2], q[3]
+                )
 
     @cute.jit
     def wait_phase(
@@ -602,7 +681,7 @@ def _make_program(
         for dest in cutlass.range_constexpr(ws):
             if cutlass.const_expr(dest != my_rank):
                 if tok < n_tok and tok % ws == dest:
-                    push_rows(gIn, gIdx, tok, dest, slot, h0)
+                    push_rows(gIn, gIdx, tok, dest, cutlass.Int32(0), slot, h0)
         cute.arch.barrier()
         if tidx == 0:
             for dest in cutlass.range_constexpr(ws):
@@ -702,6 +781,111 @@ def _make_program(
         while ok == 0:
             ok = lamport_probe_b(pb + b_off(gm, slot, 0) + h0, _pb_off)
 
+    # ---- straight-line math shared by finalize_tile and single_kernel. Plain
+    # Python: they emit into the caller's trace and hold no runtime branches.
+    def decode_gains(nrm, wgt_lo, wgt_hi):
+        """Norm gains (with gain_center) and FP32 routing weights."""
+        nw = []
+        for q in range(4):
+            lo, hi = cvt_bf16x2_to_2xf32(nrm[q])
+            nw.append(lo + gain_center)
+            nw.append(hi + gain_center)
+        ew = []
+        if expert_weights_fp32:
+            ew = [bitcast_i32_f32(w) for w in (*wgt_lo, *wgt_hi)]
+        else:
+            for q in range(4):
+                lo, hi = cvt_bf16x2_to_2xf32(wgt_lo[q])
+                ew.append(lo)
+                ew.append(hi)
+        return nw, ew
+
+    def sum_ranks(rows):
+        """FP32 sum of one expert's BF16 rows, in the given (rank) order."""
+        v = [cutlass.Float32(0.0) for _ in range(8)]
+        for dv in rows:
+            for q in range(4):
+                lo, hi = cvt_bf16x2_to_2xf32(dv[q])
+                v[2 * q] = v[2 * q] + lo
+                v[2 * q + 1] = v[2 * q + 1] + hi
+        return v
+
+    def pack8(v):
+        return tuple(cvt_2xf32_to_bf16x2(v[2 * q], v[2 * q + 1]) for q in range(4))
+
+    def warp_ssq(row, nw):
+        """Warp-reduced sum of squares of one packed BF16 expert row."""
+        s = cutlass.Float32(0.0)
+        for q in range(4):
+            lo, hi = cvt_bf16x2_to_2xf32(row[q])
+            if mode == 1:
+                lo = lo * nw[2 * q]
+                hi = hi * nw[2 * q + 1]
+            s = s + lo * lo + hi * hi
+        for si in range(5):
+            s = s + cute.arch.shuffle_sync_bfly(s, offset=(1 << si))
+        return s
+
+    def norm_row(row, rs, nw):
+        """RMS-normalized, gained FP32 values of one packed BF16 expert row."""
+        y = []
+        for q in range(4):
+            lo, hi = cvt_bf16x2_to_2xf32(row[q])
+            if mode == 1:
+                lo = lo * nw[2 * q]
+                hi = hi * nw[2 * q + 1]
+            lo = lo * rs
+            hi = hi * rs
+            if mode == 0:
+                lo = lo * nw[2 * q]
+                hi = hi * nw[2 * q + 1]
+            y.append(lo)
+            y.append(hi)
+        return y
+
+    @cute.jit
+    def rms_finish(
+        n: cutlass.Constexpr,
+        sred: cute.Tensor,
+        srstd: cute.Tensor,
+        sxch: cute.Tensor,
+        tidx: Int32,
+        sx: Int32,
+    ):
+        """Fold the per-warp sums of squares in ``sred`` into ``srstd``."""
+        if cutlass.const_expr(split == 1):
+            if tidx < 32 * n:
+                kk = tidx // 32
+                ll = tidx % 32
+                v = cutlass.Float32(0.0)
+                if ll < nwarps:
+                    v = sred[kk * nwarps + ll]
+                for si in cutlass.range_constexpr(5):
+                    v = v + cute.arch.shuffle_sync_bfly(v, offset=(1 << si))
+                if ll == 0:
+                    srstd[kk] = cute.rsqrt(v * inv_h + eps)
+            cute.arch.barrier()
+        else:
+            # the per-expert partials fold inside the CTA, then scatter into
+            # every cluster peer's SMEM; one cluster barrier makes the whole
+            # S x n table local everywhere.
+            if tidx < n:
+                v = cutlass.Float32(0.0)
+                for w in cutlass.range_constexpr(nwarps):
+                    v = v + sred[tidx * nwarps + w]
+                slotp = sxch.iterator + (sx * n + tidx)
+                for d in cutlass.range_constexpr(split):
+                    st_smem_remote_f32(map_smem_rank(slotp, cutlass.Int32(d)), v)
+            cute.arch.barrier()
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+            if tidx < n:
+                t = cutlass.Float32(0.0)
+                for d in cutlass.range_constexpr(split):
+                    t = t + sxch[d * n + tidx]
+                srstd[tidx] = cute.rsqrt(t * inv_h + eps)
+            cute.arch.barrier()
+
     @cute.jit
     def finalize_tile(
         gIn: cute.Tensor,
@@ -727,6 +911,7 @@ def _make_program(
         # BF16 path remains one vector.
         nrm = ld_global_v4(gNw.iterator + h0)
         wgt_lo = ld_global_v4(gW.iterator + tok * K_EXPERTS)
+        wgt_hi = None
         if cutlass.const_expr(expert_weights_fp32):
             wgt_hi = ld_global_v4(gW.iterator + tok * K_EXPERTS + 4)
 
@@ -780,35 +965,28 @@ def _make_program(
                 while ok == 0:
                     ok = lamport_probe_a(anchor, _pa_off)
             acc = []
+            pre = {}
             for ko in cutlass.range_constexpr(KO):
-                v = [cutlass.Float32(0.0) for _ in range(2 * 4)]
+                if cutlass.const_expr(token_owner and ko % load_grp == 0):
+                    # Issue a whole group of peer rows before the first use, so
+                    # the loads share one memory latency instead of serializing.
+                    for kk in cutlass.range_constexpr(ko, min(ko + load_grp, KO)):
+                        for r in cutlass.range_constexpr(len(peers)):
+                            pre[(kk, peers[r])] = ld_global_v4_volatile(
+                                pa + (a_off(gm, slot, kk, peers[r]) + h0)
+                            )
+                rows = []
                 for src in cutlass.range_constexpr(ws):
                     if cutlass.const_expr(src == my_rank):
-                        dv = mine[my_experts[ko]]
+                        rows.append(mine[my_experts[ko]])
+                    elif cutlass.const_expr(token_owner):
+                        rows.append(pre[(ko, src)])
                     else:
-                        dv = ld_global_v4_volatile(pa + (a_off(gm, slot, ko, src) + h0))
-                    for j in cutlass.range_constexpr(4):
-                        lo, hi = cvt_bf16x2_to_2xf32(dv[j])
-                        v[2 * j] = v[2 * j] + lo
-                        v[2 * j + 1] = v[2 * j + 1] + hi
-                if cutlass.const_expr(token_owner):
-                    packed.append(
-                        tuple(
-                            cvt_2xf32_to_bf16x2(v[2 * j], v[2 * j + 1])
-                            for j in range(4)
+                        rows.append(
+                            ld_global_v4_volatile(pa + (a_off(gm, slot, ko, src) + h0))
                         )
-                    )
-                else:
-                    acc.append(v)
-
-            if cutlass.const_expr(not token_owner):
-                for ko in cutlass.range_constexpr(KO):
-                    packed.append(
-                        tuple(
-                            cvt_2xf32_to_bf16x2(acc[ko][2 * j], acc[ko][2 * j + 1])
-                            for j in range(4)
-                        )
-                    )
+                acc.append(sum_ranks(rows))
+            packed = [pack8(v) for v in acc]
 
             # every incoming row is now in registers, so the sentinel re-arm can
             # be issued here and drain behind the RMS reduction and the epilogue
@@ -818,96 +996,22 @@ def _make_program(
             for k in cutlass.range_constexpr(K_EXPERTS):
                 packed.append(mine[k])
 
-        nw = []
-        for r2 in cutlass.range_constexpr(4):
-            lo, hi = cvt_bf16x2_to_2xf32(nrm[r2])
-            nw.append(lo + gain_center)
-            nw.append(hi + gain_center)
-        ew = []
-        if cutlass.const_expr(expert_weights_fp32):
-            for r2 in cutlass.range_constexpr(4):
-                ew.append(bitcast_i32_f32(wgt_lo[r2]))
-            for r2 in cutlass.range_constexpr(4):
-                ew.append(bitcast_i32_f32(wgt_hi[r2]))
-        else:
-            for r2 in cutlass.range_constexpr(4):
-                lo, hi = cvt_bf16x2_to_2xf32(wgt_lo[r2])
-                ew.append(lo)
-                ew.append(hi)
-
-        ssq = []
-        for ko in cutlass.range_constexpr(NLOC):
-            q = packed[ko]
-            s = cutlass.Float32(0.0)
-            for j in cutlass.range_constexpr(4):
-                lo, hi = cvt_bf16x2_to_2xf32(q[j])
-                if cutlass.const_expr(mode == 1):
-                    lo = lo * nw[2 * j]
-                    hi = hi * nw[2 * j + 1]
-                s = s + lo * lo + hi * hi
-            ssq.append(s)
-
-        for ko in cutlass.range_constexpr(NLOC):
-            v = ssq[ko]
-            for si in cutlass.range_constexpr(5):
-                v = v + cute.arch.shuffle_sync_bfly(v, offset=(1 << si))
-            ssq[ko] = v
+        nw, ew = decode_gains(nrm, wgt_lo, wgt_hi)
+        ssq = [warp_ssq(packed[ko], nw) for ko in range(NLOC)]
         if lane == 0:
             for ko in cutlass.range_constexpr(NLOC):
                 sred[ko * nwarps + warp] = ssq[ko]
         cute.arch.barrier()
-
-        if cutlass.const_expr(split == 1):
-            if tidx < 32 * NLOC:
-                kk = tidx // 32
-                ll = tidx % 32
-                v = cutlass.Float32(0.0)
-                if ll < nwarps:
-                    v = sred[kk * nwarps + ll]
-                for si in cutlass.range_constexpr(5):
-                    v = v + cute.arch.shuffle_sync_bfly(v, offset=(1 << si))
-                if ll == 0:
-                    srstd[kk] = cute.rsqrt(v * inv_h + eps)
-            cute.arch.barrier()
-        else:
-            # the per-expert partials fold inside the CTA, then scatter into
-            # every cluster peer's SMEM; one cluster barrier makes the whole
-            # S x NLOC table local everywhere.
-            if tidx < NLOC:
-                v = cutlass.Float32(0.0)
-                for w in cutlass.range_constexpr(nwarps):
-                    v = v + sred[tidx * nwarps + w]
-                slotp = sxch.iterator + (sx * NLOC + tidx)
-                for d in cutlass.range_constexpr(split):
-                    st_smem_remote_f32(map_smem_rank(slotp, cutlass.Int32(d)), v)
-            cute.arch.barrier()
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
-            if tidx < NLOC:
-                t = cutlass.Float32(0.0)
-                for d in cutlass.range_constexpr(split):
-                    t = t + sxch[d * NLOC + tidx]
-                srstd[tidx] = cute.rsqrt(t * inv_h + eps)
-            cute.arch.barrier()
+        rms_finish(NLOC, sred, srstd, sxch, tidx, sx)
 
         # ---- routing-weight multiply and ordered accumulation of the experts
         # this rank owns
         accs = [cutlass.Float32(0.0) for _ in range(8)]
         for ko in cutlass.range_constexpr(NLOC):
-            r = srstd[ko]
             wk = ew[my_experts[ko]]
-            for j in cutlass.range_constexpr(4):
-                lo, hi = cvt_bf16x2_to_2xf32(packed[ko][j])
-                if cutlass.const_expr(mode == 1):
-                    lo = lo * nw[2 * j]
-                    hi = hi * nw[2 * j + 1]
-                ylo = lo * r
-                yhi = hi * r
-                if cutlass.const_expr(mode == 0):
-                    ylo = ylo * nw[2 * j]
-                    yhi = yhi * nw[2 * j + 1]
-                accs[2 * j] = accs[2 * j] + ylo * wk
-                accs[2 * j + 1] = accs[2 * j + 1] + yhi * wk
+            y = norm_row(packed[ko], srstd[ko], nw)
+            for i in cutlass.range_constexpr(8):
+                accs[i] = accs[i] + y[i] * wk
 
         if cutlass.const_expr(comm and not token_owner):
             gm = gen % NGEN
@@ -969,10 +1073,7 @@ def _make_program(
                             out[4 * j + i] = out[4 * j + i] + bitcast_i32_f32(dv[i])
             accs = out
 
-        o0 = cvt_2xf32_to_bf16x2(accs[0], accs[1])
-        o1 = cvt_2xf32_to_bf16x2(accs[2], accs[3])
-        o2 = cvt_2xf32_to_bf16x2(accs[4], accs[5])
-        o3 = cvt_2xf32_to_bf16x2(accs[6], accs[7])
+        o0, o1, o2, o3 = pack8(accs)
         if cutlass.const_expr(token_owner):
             pb_mc = _pin(cutlass.BFloat16, a_lam_mc + A_BYTES)
             multimem_st_v4(pb_mc + b_off(0, slot, my_rank) + h0, o0, o1, o2, o3)
@@ -1050,6 +1151,251 @@ def _make_program(
         if cutlass.const_expr(comm and not token_owner) and tidx == 0 and sx == 0:
             st_gen(_pin(cutlass.Int32, a_gen, 4) + cta, g0 + n_iter)
 
+    # The owned token's experts are spread over XP CTAs of its slot: CTA d < XP
+    # reduces experts d, d + XP, ... (NJ of them). XP == 1 keeps every expert in
+    # one CTA and skips the cross-CTA combine; larger XP balances the reduction
+    # across the grid at the cost of that combine.
+    XP = xpar if single else ws
+    NJ = K_EXPERTS // XP
+    JG = min(NJ, load_grp)  # experts per batch of peer loads / sentinel probe
+    _pj_off = [
+        [
+            (a_off(0, 0, jj * XP, peers[r]) - a_off(0, 0, j0 * XP, 0)) * 2
+            for jj in range(j0, min(j0 + JG, NJ))
+            for r in range(len(peers))
+        ]
+        for j0 in range(0, NJ, JG)
+    ]
+
+    @cute.jit
+    def rearm_a1(gen: Int32, slot: Int32, d: Int32, h0: Int32):
+        # Re-arm generation g+2 of the peer rows this CTA consumed.
+        gc = (gen + 2) % NGEN
+        pa = _pin(cutlass.BFloat16, a_lam)
+        sa = cutlass.Int32(SENT_A_I32)
+        for jj in cutlass.range_constexpr(NJ):
+            for r in cutlass.range_constexpr(len(peers)):
+                st_global_v4(
+                    pa + (a_off(gc, slot, d + jj * XP, peers[r]) + h0), sa, sa, sa, sa
+                )
+
+    def publish_row(acc, gOut: cute.Tensor, t_own, gm, slot, h0):
+        """Write the owned token's output row and multicast it to every rank."""
+        o = pack8(acc)
+        st_global_v4(gOut.iterator + (t_own * H_DIM + h0), *o)
+        # Peers poll this copy, so it must never read as the sentinel. No
+        # fence.proxy.alias: this launch never reaches the row through its
+        # unicast alias again (the re-arm targets another generation), and
+        # waiting for the multicast to land cost ~2.5 us per launch.
+        pb_mc = _pin(cutlass.BFloat16, a_lam_mc + A_BYTES)
+        multimem_st_v4(pb_mc + b_off(gm, slot, my_rank) + h0, *(scrub_a(w) for w in o))
+
+    @cute.jit
+    def rearm_o1(gen: Int32, slot: Int32, owner: Int32, h0: Int32):
+        gc = (gen + 2) % NGEN
+        pb = _pin(cutlass.BFloat16, a_lam + A_BYTES)
+        sa = cutlass.Int32(SENT_A_I32)
+        st_global_v4(pb + (b_off(gc, slot, owner) + h0), sa, sa, sa, sa)
+
+    @cute.kernel
+    def single_kernel(
+        gIn: cute.Tensor,
+        gW: cute.Tensor,
+        gIdx: cute.Tensor,
+        gNw: cute.Tensor,
+        gOut: cute.Tensor,
+    ):
+        """Whole token-owner dataflow in one launch.
+
+        Grid ``(split, slots, ws)``: CTA ``(b, g, d)`` covers H band ``b`` of
+        token ``g * ws + d``, which rank ``d`` owns. Each CTA
+
+        A. pushes its token's rows (scrubbed of the sentinel) to rank ``d``;
+        B. if ``d < XP``, for the token this rank owns in slot ``g``, reduces
+           experts ``d, d + XP, ...`` across ranks in rank order and
+           RMS-normalizes them;
+        C. with ``XP == 1`` combines the experts in registers; otherwise stores
+           the weighted FP32 rows to a local scratch, and the last of the
+           ``XP`` CTAs on band ``b`` sums them in expert order. Either way the
+           output row is written and multicast;
+        D. polls rank ``d``'s multicast row and copies it out.
+
+        Spreading the owner's experts over the slot's CTAs balances the
+        reduction across the grid. Both cross-rank hops are flag-free Lamport
+        transfers. All CTAs are co-resident and none polls before it pushed,
+        and C never waits, so the cross-rank waits cannot cycle.
+        """
+        tidx, _, _ = cute.arch.thread_idx()
+        sx, slot, d = cute.arch.block_idx()
+        lane = tidx % 32
+        warp = tidx // 32
+
+        smem = cutlass_utils.SmemAllocator()
+        sred = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=cute.make_layout(nwarps * NJ),
+            byte_alignment=16,
+        )
+        srstd = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=cute.make_layout(NJ),
+            byte_alignment=16,
+        )
+        sxch = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=cute.make_layout(split * NJ),
+            byte_alignment=16,
+        )
+        slast = smem.allocate_tensor(
+            element_type=cutlass.Int32,
+            layout=cute.make_layout(1),
+            byte_alignment=16,
+        )
+        h0 = sx * band + tidx * VEC
+        tok = slot * ws + d
+        t_own = slot * ws + my_rank
+        gen_ptr = _pin(cutlass.Int32, a_gen, 4) + slot
+        gen = ld_gen(gen_ptr)
+        gm = gen % NGEN
+
+        # ---- A: push this CTA's token band to its owner
+        if tok < n_tok:
+            for dest in cutlass.range_constexpr(ws):
+                if cutlass.const_expr(dest != my_rank):
+                    if d == dest:
+                        push_rows(gIn, gIdx, tok, dest, gm, slot, h0)
+
+        pa = _pin(cutlass.BFloat16, a_lam)
+        pb = _pin(cutlass.BFloat16, a_lam + A_BYTES)
+        py = _pin(cutlass.Float32, a_y)
+        if t_own < n_tok and d < XP:
+            # ---- B: experts d, d + XP, ... of the owned token. Issue every
+            # local load before the arrival wait so they overlap it.
+            nrm = ld_global_v4(gNw.iterator + h0)
+            wgt_lo = ld_global_v4(gW.iterator + t_own * K_EXPERTS)
+            wgt_hi = None
+            if cutlass.const_expr(expert_weights_fp32):
+                wgt_hi = ld_global_v4(gW.iterator + t_own * K_EXPERTS + 4)
+            mine = []
+            for jj in cutlass.range_constexpr(NJ):
+                permuted_idx = cutlass.Int32(gIdx[t_own, d + jj * XP])
+                q0 = cutlass.Int32(0)
+                q1 = cutlass.Int32(0)
+                q2 = cutlass.Int32(0)
+                q3 = cutlass.Int32(0)
+                if permuted_idx >= 0 and permuted_idx < num_rows:
+                    q0, q1, q2, q3 = ld_global_v4(
+                        gIn.iterator + (permuted_idx * row_stride + h0)
+                    )
+                mine.append((scrub_a(q0), scrub_a(q1), scrub_a(q2), scrub_a(q3)))
+
+            pre = {}
+            for gi in cutlass.range_constexpr(len(_pj_off)):
+                j0 = gi * JG
+                anchor = pa + (a_off(gm, slot, d + j0 * XP, 0) + h0)
+                ok = lamport_probe_a(anchor, _pj_off[gi])
+                while ok == 0:
+                    ok = lamport_probe_a(anchor, _pj_off[gi])
+                for jj in cutlass.range_constexpr(j0, min(j0 + JG, NJ)):
+                    for r in cutlass.range_constexpr(len(peers)):
+                        pre[(jj, peers[r])] = ld_global_v4_volatile(
+                            pa + (a_off(gm, slot, d + jj * XP, peers[r]) + h0)
+                        )
+            # Statements, not a conditional expression: the DSL rewrites
+            # `a if c else b` inside kernels, which broke this rank-order pick.
+            packed = []
+            for jj in cutlass.range_constexpr(NJ):
+                rows = []
+                for src in cutlass.range_constexpr(ws):
+                    if cutlass.const_expr(src == my_rank):
+                        rows.append(mine[jj])
+                    else:
+                        rows.append(pre[(jj, src)])
+                packed.append(pack8(sum_ranks(rows)))
+
+            nw, ew = decode_gains(nrm, wgt_lo, wgt_hi)
+            ssq = [warp_ssq(packed[jj], nw) for jj in range(NJ)]
+            if lane == 0:
+                for jj in cutlass.range_constexpr(NJ):
+                    sred[jj * nwarps + warp] = ssq[jj]
+            cute.arch.barrier()
+            rms_finish(NJ, sred, srstd, sxch, tidx, sx)
+
+            if cutlass.const_expr(XP == 1):
+                # every expert is in registers: combine in expert order here
+                acc = [cutlass.Float32(0.0) for _ in range(8)]
+                for jj in cutlass.range_constexpr(NJ):
+                    y = norm_row(packed[jj], srstd[jj], nw)
+                    for i in cutlass.range_constexpr(8):
+                        acc[i] = acc[i] + y[i] * ew[jj]
+                publish_row(acc, gOut, t_own, gm, slot, h0)
+            else:
+                for jj in cutlass.range_constexpr(NJ):
+                    k = d + jj * XP
+                    wk = ew[0]
+                    for kk in cutlass.range_constexpr(1, K_EXPERTS):
+                        if k == kk:
+                            wk = ew[kk]
+                    y = [
+                        bitcast_f32_i32(v * wk)
+                        for v in norm_row(packed[jj], srstd[jj], nw)
+                    ]
+                    yp = py + ((slot * K_EXPERTS + k) * H_DIM + h0)
+                    st_global_v4(yp, y[0], y[1], y[2], y[3])
+                    st_global_v4(yp + 4, y[4], y[5], y[6], y[7])
+
+                # ---- C: the slot's last expert CTA on this band combines them
+                cute.arch.fence_acq_rel_gpu()
+                cute.arch.barrier()
+                if tidx == 0:
+                    cnt = _pin(cutlass.Int32, a_ycnt, 4) + (slot * split + sx)
+                    old = atomic_add_acq_rel(cnt, cutlass.Int32(1))
+                    last = cutlass.Int32(0)
+                    if old == XP - 1:
+                        st_gen(cnt, cutlass.Int32(0))
+                        last = cutlass.Int32(1)
+                    slast[0] = last
+                cute.arch.barrier()
+                if slast[0] == 1:
+                    cute.arch.fence_acq_rel_gpu()
+                    acc = [cutlass.Float32(0.0) for _ in range(8)]
+                    for kk in cutlass.range_constexpr(K_EXPERTS):
+                        yrow = py + ((slot * K_EXPERTS + kk) * H_DIM + h0)
+                        ya = ld_global_v4_volatile(yrow)
+                        yb = ld_global_v4_volatile(yrow + 4)
+                        for q in cutlass.range_constexpr(4):
+                            acc[q] = acc[q] + bitcast_i32_f32(ya[q])
+                            acc[4 + q] = acc[4 + q] + bitcast_i32_f32(yb[q])
+                    publish_row(acc, gOut, t_own, gm, slot, h0)
+        # Re-arm generation g+2 of this CTA's incoming rows on every launch,
+        # including launches where this rank owns no token in the slot: the
+        # slot's generation advances regardless, and a buffer left holding an
+        # older launch's rows would pass the next arrival probe immediately.
+        if d < XP:
+            rearm_a1(gen, slot, d, h0)
+
+        # ---- D: copy the row rank d multicast for this CTA's token
+        if tok < n_tok and d != my_rank:
+            arow = pb + (b_off(gm, slot, d) + h0)
+            okd = lamport_probe_a(arow, [0])
+            while okd == 0:
+                okd = lamport_probe_a(arow, [0])
+            qd = ld_global_v4_volatile(arow)
+            st_global_v4(gOut.iterator + tok * H_DIM + h0, qd[0], qd[1], qd[2], qd[3])
+        # Only polled rows need re-arming: this rank's own row receives just its
+        # own multicast and is never polled here.
+        if d != my_rank:
+            rearm_o1(gen, slot, d, h0)
+        cute.arch.barrier()
+
+        # the slot's last CTA publishes the next generation
+        if tidx == 0:
+            done = _pin(cutlass.Int32, a_done, 4) + slot
+            old = atomic_add_acq_rel(done, cutlass.Int32(1))
+            if old == ws * split - 1:
+                st_gen(done, cutlass.Int32(0))
+                st_gen(gen_ptr, gen + 1)
+
     @cute.kernel
     def stage_kernel(gIn: cute.Tensor, gIdx: cute.Tensor, start: Int32):
         tidx, _, _ = cute.arch.thread_idx()
@@ -1084,7 +1430,22 @@ def _make_program(
         gOut: cute.Tensor,
         stream: _drv.CUstream,
     ):
-        if cutlass.const_expr(token_owner):
+        if cutlass.const_expr(single and split > 1):
+            single_kernel(gIn, gW, gIdx, gNw, gOut).launch(
+                grid=(split, tiles, ws),
+                block=(nthr, 1, 1),
+                cluster=(split, 1, 1),
+                min_blocks_per_mp=1,
+                stream=stream,
+            )
+        elif cutlass.const_expr(single):
+            single_kernel(gIn, gW, gIdx, gNw, gOut).launch(
+                grid=(1, tiles, ws),
+                block=(nthr, 1, 1),
+                min_blocks_per_mp=1,
+                stream=stream,
+            )
+        elif cutlass.const_expr(token_owner):
             for chunk in cutlass.range_constexpr(
                 (n_tok + grid_y * ws - 1) // (grid_y * ws)
             ):
@@ -1142,12 +1503,60 @@ def _make_token_program(*args):
     return _make_program(*args, token_owner=True)
 
 
+def _make_token1_program(*args):
+    n_tok = args[0]
+    return _make_program(
+        *args,
+        token_owner=True,
+        single=True,
+        xpar=_single_xpar(n_tok),
+        push=_single_push(n_tok),
+    )
+
+
 def _token_crossover(nsm):
-    return 256
+    # Below about 64 / P tokens the expert-owner path is faster: each owner
+    # reduces only K / P experts, so its single CTA finishes sooner than a token
+    # owner's all-expert reduction. Above it, the token-owner path moves less
+    # data. Measured on GB300 (TP4 crossover 16, TP8 crossover 8).
+    return max(1, 64 // _WS.ws)
 
 
 def _select_path(n_tok, nsm):
-    return "token" if n_tok >= _token_crossover(nsm) else "expert"
+    if n_tok < _token_crossover(nsm):
+        return "expert"
+    # One CTA per token, all co-resident: a single launch with no kernel-boundary
+    # ordering. Larger counts chunk through the three-launch pipeline.
+    if _single_ctas(n_tok) > nsm:
+        return "token"
+    return "token1"
+
+
+def _single_xpar(n_tok):
+    """CTAs that share one owned token's experts in the single launch."""
+    # One CTA per owned token avoids the cross-CTA combine. It wins while all
+    # of a token's peer rows fit one load batch and the per-rank token count is
+    # small (TP4: T <= 48 on GB300); otherwise spreading the experts over the
+    # slot balances the reduction. Measured on 4x/8x GB300, H=4096, top-k 8.
+    ws = _WS.ws
+    if _peer_batch(ws) == K_EXPERTS and n_tok <= 12 * ws:
+        return 1
+    return ws
+
+
+def _single_push(n_tok):
+    """Expert rows a CTA loads before storing them in the single launch."""
+    # Two rows per batch overlap most of the load latency. When one CTA owns
+    # all of a token's experts at mid T, burstier pushes delay that CTA's
+    # inputs, so rows go out one at a time (GB300, TP4 T=32..48).
+    if _single_xpar(n_tok) == 1 and n_tok >= 32:
+        return 1
+    return 2
+
+
+def _single_ctas(n_tok):
+    """Token-sized CTAs of the single launch: one per token, padded to full slots."""
+    return (n_tok + _WS.ws - 1) // _WS.ws * _WS.ws
 
 
 # --------------------------------------------------------------------------- #
@@ -1166,6 +1575,7 @@ class _Ws:
     nsm = 148
     dev_ord = 0
     group = None
+    scratch: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 _WS = _Ws()
@@ -1181,6 +1591,14 @@ class _WorkspaceAddresses(TypedDict):
     token_peers: list[int]
     token_gen: int
     token_slots: int
+    tl_done: int
+    tl_gen: int
+    tl_uc: int
+    tl_mc: int
+    tl_peers: list[int]
+    tl_slots: int
+    tl_y: int
+    tl_ycnt: int
 
 
 _PROGRAMS: dict[tuple[int, int, int, int, int, float, float, str], "_Program"] = {}
@@ -1265,17 +1683,20 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
     b_i32 = NGEN * NSLOT * _WS.ws * H_DIM  # FP32 region, in int32 words
     token_i32 = _WS.nsm * (K_EXPERTS + 1) * _WS.ws * H_DIM // 2
     token_flags_i32 = _WS.nsm * 2 * _WS.ws
+    # The single launch only runs while its padded slots fit the SM count.
+    tl_slots = _WS.nsm // _WS.ws
+    tl_i32 = NGEN * tl_slots * (K_EXPERTS + 1) * _WS.ws * H_DIM // 2
     allocation_flag = torch.empty((1,), dtype=torch.int32, device=device)
     lam = None
     generation = None
     allocation_error = None
     try:
         lam = symm_mem.empty(
-            (a_i32 + b_i32 + token_i32 + token_flags_i32,),
+            (a_i32 + b_i32 + token_i32 + token_flags_i32 + tl_i32,),
             dtype=torch.int32,
             device=device,
         )
-        generation = torch.zeros((2 * NSLOT,), dtype=torch.int32, device=device)
+        generation = torch.zeros((4 * NSLOT,), dtype=torch.int32, device=device)
     except RuntimeError as error:
         allocation_error = error
     if not _group_all(allocation_error is None, device, group, flag=allocation_flag):
@@ -1295,8 +1716,17 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
     assert lam is not None and generation is not None
     lam[:a_i32].fill_(SENT_A_I32)
     lam[a_i32 : a_i32 + b_i32].fill_(SENT_B_I32)
-    lam[a_i32 + b_i32 + token_i32 :].zero_()
+    lam[a_i32 + b_i32 + token_i32 : a_i32 + b_i32 + token_i32 + token_flags_i32].zero_()
+    tl_base = a_i32 + b_i32 + token_i32 + token_flags_i32
+    lam[tl_base:].fill_(SENT_A_I32)
     _WS.gen = generation
+    # Local scratch of the single launch: weighted FP32 expert rows per slot and
+    # one arrival counter per (slot, H band).
+    tl_y = torch.empty(
+        (tl_slots * K_EXPERTS * H_DIM,), dtype=torch.float32, device=device
+    )
+    tl_ycnt = torch.zeros((tl_slots * _MAX_SPLIT,), dtype=torch.int32, device=device)
+    _WS.scratch = (tl_y, tl_ycnt)
     torch.cuda.synchronize()
     hdl = symm_mem.rendezvous(lam, group=group)
     _WS.lam, _WS.hdl = lam, hdl
@@ -1332,6 +1762,17 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
         "token_mc": mc + (a_i32 + b_i32) * 4,
         "token_peers": [p + (a_i32 + b_i32) * 4 for p in peers],
         "token_gen": generation.data_ptr() + NSLOT * 4,
+        "tl_done": generation.data_ptr() + 2 * NSLOT * 4,
+        # The single launch keeps its own generations: the multi-launch token
+        # path advances token_gen per slot, which would desynchronize the
+        # single launch's Lamport buffers from their re-arm schedule.
+        "tl_gen": generation.data_ptr() + 3 * NSLOT * 4,
+        "tl_uc": lam.data_ptr() + tl_base * 4,
+        "tl_mc": mc + tl_base * 4,
+        "tl_peers": [p + tl_base * 4 for p in peers],
+        "tl_slots": tl_slots,
+        "tl_y": tl_y.data_ptr(),
+        "tl_ycnt": tl_ycnt.data_ptr(),
         "token_slots": _WS.nsm,
     }
     torch.accelerator.synchronize(device)
@@ -1368,13 +1809,23 @@ def _build(key, a, b, c, d, e, stream):
     # persistent CuTe-DSL cache, whose objects are reusable across processes.
     n_tok, num_rows, row_stride, expert_weights_fp32, mode, eps, gain_center, path = key
     tiles = (n_tok + _WS.ws - 1) // _WS.ws if path != "expert" else n_tok
-    split = 1 if path == "token" else _pick_split(tiles, _WS.nsm)
+    if path == "token":
+        split = 1
+    elif path == "token1":
+        # every token gets its own cluster; keep the whole grid co-resident
+        split = _pick_split(_single_ctas(n_tok), _WS.nsm)
+    else:
+        split = _pick_split(tiles, _WS.nsm)
     nthr = H_DIM // (VEC * split)
     grid_y = min(tiles, _WS.nsm // split)
     addrs = _WS.addrs
     if addrs is None:
         raise RuntimeError("TP MoE finalize workspace addresses are unavailable")
-    factory = _make_token_program if path == "token" else _make_program
+    factory = {
+        "expert": _make_program,
+        "token": _make_token_program,
+        "token1": _make_token1_program,
+    }[path]
     host = factory(
         n_tok,
         num_rows,

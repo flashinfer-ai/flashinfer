@@ -669,12 +669,17 @@ def _path_worker(
             assert hasattr(module, f"_make_{path}_program"), (
                 "token-owner path is missing"
             )
-        if path != "auto" and selector is not None:
+        crossover_fn = getattr(module, "_token_crossover", None)
+        if path == "token1":
+            # the real selector, with the token-owner path from the first token
+            module._token_crossover = lambda nsm: 1
+        elif path != "auto" and selector is not None:
             module._select_path = lambda *_: path
         assert init_tp_moe_finalize_rmsnorm()
         crossover = 256 if selector is None else module._token_crossover(module._WS.nsm)
         tokens = dict.fromkeys(
-            (
+            n
+            for n in (
                 1,
                 8,
                 32,
@@ -682,12 +687,18 @@ def _path_worker(
                 crossover - 1,
                 crossover,
                 crossover + 1,
+                module._WS.nsm,
+                module._WS.nsm + 1,
                 512,
                 1025,
                 8192,
                 8193,
             )
+            if n > 0
         )
+        # Revisit small counts after the multi-launch sizes: launches of other
+        # sizes advance shared slots, which must not leave stale Lamport data.
+        tokens = [*tokens, 33, 2, module._WS.nsm]
         device = torch.device("cuda", local_rank)
         rank = dist.get_rank()
         for num_tokens in tokens:
@@ -796,12 +807,14 @@ def _path_worker(
     finally:
         if selector is not None:
             module._select_path = selector
+        if crossover_fn is not None:
+            module._token_crossover = crossover_fn
         dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("world_size", [2, 4, 8])
-@pytest.mark.parametrize("path", ["auto", "expert", "token"])
+@pytest.mark.parametrize("path", ["auto", "expert", "token", "token1"])
 @pytest.mark.parametrize("routing_fp32", [False, True])
 @pytest.mark.parametrize("weight_before_norm", [False, True])
 def test_tp_moe_finalize_rmsnorm_paths(
