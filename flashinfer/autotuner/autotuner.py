@@ -507,6 +507,20 @@ class TuningConfig:
             replay starts from a cold L2, and give every launch in the graph its
             own input copy. Requires ``use_cuda_graph``; the eviction also
             requires ``use_cold_l2_cache``.
+        hot_l2_max_bucket (int): Profiles whose first dynamic dimension
+            (``dynamic_tensor_specs[0]``, e.g. the token count) is at most this
+            value are timed hot-L2 even when ``use_cold_l2_cache=True``: the
+            mean of ``profiling_repeat`` back-to-back invocations instead of
+            the median of isolated, flushed ones. Small buckets run in a few
+            microseconds, close to the event-timer resolution, and in serving
+            they overlap their neighbours (PDL), which isolated samples cannot
+            see. ``0`` disables the override.
+        tie_tolerance (float): Relative tolerance for tactic selection.
+            Profiles are tuned in ascending bucket order; if the winner of the
+            previous profile was measured within ``(1 + tie_tolerance)`` of
+            the fastest tactic of this profile, it is kept instead of the
+            strict argmin, so near-ties resolve toward the existing pick
+            rather than by timing noise. ``0`` keeps the strict argmin.
         tensor_initializers (Tuple[Tuple[int, TensorInitializer]]): Per-input-index
             initializer closures used to synthesize profiling tensors. Each entry
             pairs an input tensor index with the closure that fills that input.
@@ -535,6 +549,8 @@ class TuningConfig:
     cuda_graph_profile_replays: int = 1
     profiling_repeat: int | None = None
     use_cold_l2_graph_replay: bool = False
+    hot_l2_max_bucket: int = 0
+    tie_tolerance: float = 0.0
     value_aware_input_indices: tuple[int, ...] = ()
     profile_arena_input_indices: tuple[int, ...] = ()
     # Optional callback invoked once per profile bucket, after dynamic
@@ -1654,7 +1670,7 @@ class AutoTuner:
         # Measure-derived TuningConfig variants, keyed by original config
         # identity (same rationale as _override_config_cache below).
         self._measure_config_cache: weakref.WeakKeyDictionary[
-            TuningConfig, dict[tuple[bool, bool], TuningConfig]
+            TuningConfig, dict[tuple[bool, bool, int], TuningConfig]
         ] = weakref.WeakKeyDictionary()
         # Cache overridden TuningConfig objects to keep stable object identity
         # for the nearest-profile LRU cache.
@@ -1726,14 +1742,20 @@ class AutoTuner:
             if policy.cold_l2 is None
             else policy.cold_l2
         )
+        # An explicit cold_l2 applies to every bucket, including the small
+        # ones hot_l2_max_bucket would otherwise time hot.
+        hot_l2_max_bucket = (
+            tuning_config.hot_l2_max_bucket if policy.cold_l2 is None else 0
+        )
         if (
             use_cuda_graph == tuning_config.use_cuda_graph
             and use_cold_l2 == tuning_config.use_cold_l2_cache
+            and hot_l2_max_bucket == tuning_config.hot_l2_max_bucket
         ):
             return tuning_config
 
         per_config = self._measure_config_cache.get(tuning_config)
-        cache_key = (use_cuda_graph, use_cold_l2)
+        cache_key = (use_cuda_graph, use_cold_l2, hot_l2_max_bucket)
         if per_config is not None and cache_key in per_config:
             return per_config[cache_key]
 
@@ -1741,6 +1763,7 @@ class AutoTuner:
             tuning_config,
             use_cold_l2_cache=use_cold_l2,
             use_cuda_graph=use_cuda_graph,
+            hot_l2_max_bucket=hot_l2_max_bucket,
         )
         self._measure_config_cache.setdefault(tuning_config, {})[cache_key] = new_config
         return new_config
@@ -2140,22 +2163,15 @@ class AutoTuner:
                 )
             )
 
-        new_config = TuningConfig(
+        # replace() carries every other field over unchanged.
+        new_config = replace(
+            tuning_config,
             dynamic_tensor_specs=tuple(new_specs),
-            constraint_specs=tuning_config.constraint_specs,
-            tensor_initializers=tuning_config.tensor_initializers,
-            use_cold_l2_cache=tuning_config.use_cold_l2_cache,
-            use_cuda_graph=tuning_config.use_cuda_graph,
             cuda_graph_profile_replays=(
                 profile_replays
                 if profile_replays is not None
                 else tuning_config.cuda_graph_profile_replays
             ),
-            profiling_repeat=tuning_config.profiling_repeat,
-            use_cold_l2_graph_replay=tuning_config.use_cold_l2_graph_replay,
-            value_aware_input_indices=tuning_config.value_aware_input_indices,
-            profile_arena_input_indices=tuning_config.profile_arena_input_indices,
-            inputs_pre_hook=tuning_config.inputs_pre_hook,
         )
         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
             new_config
@@ -2329,6 +2345,9 @@ class AutoTuner:
             race_default = self._in_v2_context
 
             pbar = None
+            # Winner of the previous (next smaller) profile, kept on near-ties
+            # under tie_tolerance.
+            incumbent: tuple[int, Any] | None = None
             for _step, p in enumerate(profiles):
                 tensors = None
                 prepared_input_batches = None
@@ -2360,6 +2379,9 @@ class AutoTuner:
                         require_profiling_policy=True,
                     )
                     if not is_cache_hit:
+                        # How this bucket is timed; the cache key and the
+                        # recorded profiling policy still use tuning_config.
+                        profile_config = self._profile_tuning_config(tuning_config, p)
                         input_preparation_oom = False
                         try:
                             # Active capture is safe for skipped operations and warm cache hits, but
@@ -2377,7 +2399,7 @@ class AutoTuner:
                                 tensors = list(tuning_config.inputs_pre_hook(tensors))
                             prepared_input_batches = (
                                 self._prepare_input_tensors_with_batches(
-                                    tensors, tuning_config
+                                    tensors, profile_config
                                 )
                             )
                         except (torch.cuda.OutOfMemoryError, MemoryError):
@@ -2408,6 +2430,8 @@ class AutoTuner:
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         runner_id, tactic = None, None
                         skipped_count = 0
+                        # (time, runner_id, tactic), for tie_tolerance.
+                        measured: list[tuple[float, int, Any]] = []
                         for r_id, r in enumerate(runners):
                             runner_preparation_oom = False
                             try:
@@ -2456,7 +2480,7 @@ class AutoTuner:
                                         r,
                                         tensors,
                                         tac,
-                                        tuning_config,
+                                        profile_config,
                                         input_tensor_batches=prepared_input_batches,
                                         **kwargs,
                                     )
@@ -2531,12 +2555,26 @@ class AutoTuner:
                                 if time_measured < min_time:
                                     min_time = time_measured
                                     runner_id, tactic = r_id, tac
+                                measured.append((time_measured, r_id, tac))
 
                         if skipped_count > 0:
                             logger.info(
                                 f"[Autotuner]: Skipped {skipped_count} unsupported tactic(s) for {custom_op} "
                                 f"(enable debug logs to see details)"
                             )
+
+                        if (
+                            runner_id is not None
+                            and incumbent is not None
+                            and tuning_config.tie_tolerance > 0
+                            and self._is_near_tie(
+                                measured,
+                                incumbent,
+                                min_time,
+                                tuning_config.tie_tolerance,
+                            )
+                        ):
+                            runner_id, tactic = incumbent
 
                         if runner_id is not None:
                             # At least one valid (runner, tactic) pair is found
@@ -2581,6 +2619,9 @@ class AutoTuner:
                             logger.debug(
                                 f"[Autotuner]: profiling chosen runner: {runners[runner_id]} {tactic} for {cache_key}"
                             )
+
+                    if runner_id is not None and tactic != -1:
+                        incumbent = (runner_id, tactic)
 
                 except (torch.cuda.OutOfMemoryError, MemoryError):
                     torch.cuda.empty_cache()
@@ -2725,11 +2766,12 @@ class AutoTuner:
             if not valid_tactics:
                 return [-1]
 
+            profile_config = self._profile_tuning_config(tuning_config, profile)
             scored: list[tuple[float, Any]] = []
             for tac in valid_tactics:
                 try:
                     time_measured = self._profile_single_kernel(
-                        runner, tensors, tac, tuning_config, **kwargs
+                        runner, tensors, tac, profile_config, **kwargs
                     )
                 except Exception as e:
                     logger.debug(
@@ -2761,6 +2803,41 @@ class AutoTuner:
             self._dirty_seq += 1
 
             return ranked[:k]
+
+    @staticmethod
+    def _profile_tuning_config(
+        tuning_config: TuningConfig, profile: OptimizationProfile
+    ) -> TuningConfig:
+        """Return the config used to time *profile*.
+
+        Applies ``hot_l2_max_bucket``: a cold-L2 config is timed hot-L2 for
+        profiles whose first dynamic dimension is at most that value.
+        """
+        if not (
+            tuning_config.use_cold_l2_cache
+            and tuning_config.hot_l2_max_bucket > 0
+            and tuning_config.dynamic_tensor_specs
+        ):
+            return tuning_config
+        spec = tuning_config.dynamic_tensor_specs[0]
+        bucket = profile.get_opt_shapes()[spec.input_idx[0]][spec.dim_idx[0]]
+        if bucket > tuning_config.hot_l2_max_bucket:
+            return tuning_config
+        return replace(
+            tuning_config, use_cold_l2_cache=False, use_cold_l2_graph_replay=False
+        )
+
+    @staticmethod
+    def _is_near_tie(
+        measured: list[tuple[float, int, Any]],
+        candidate: tuple[int, Any],
+        min_time: float,
+        tolerance: float,
+    ) -> bool:
+        """Whether *candidate* ``(runner_id, tactic)`` was measured within
+        ``(1 + tolerance) * min_time``."""
+        limit = min_time * (1.0 + tolerance)
+        return any((r_id, tac) == candidate and t <= limit for t, r_id, tac in measured)
 
     def _get_input_sizes(self, inputs: list[Any]) -> tuple[tuple[int, ...], ...]:
         """Return ``torch.Size`` for each input, using ``(0,)`` for non-Tensor values."""
@@ -3399,7 +3476,7 @@ class AutoTuner:
     @staticmethod
     def _profiling_policy(tuning_config: TuningConfig) -> tuple:
         """Return measurement provenance that can change tactic ranking."""
-        return (
+        policy: tuple = (
             "cuda_graph_profile_replays",
             (
                 int(tuning_config.cuda_graph_profile_replays)
@@ -3409,6 +3486,13 @@ class AutoTuner:
             "l2_cache_policy",
             "cold" if tuning_config.use_cold_l2_cache else "hot",
         )
+        # Appended only when set, so the policy of configs that do not use
+        # them (and the entries already recorded under it) is unchanged.
+        if tuning_config.use_cold_l2_cache and tuning_config.hot_l2_max_bucket > 0:
+            policy += ("hot_l2_max_bucket", int(tuning_config.hot_l2_max_bucket))
+        if tuning_config.tie_tolerance > 0:
+            policy += ("tie_tolerance", float(tuning_config.tie_tolerance))
+        return policy
 
     @staticmethod
     def _default_profiling_policy(tuning_config: TuningConfig) -> tuple:

@@ -45,6 +45,19 @@ from flashinfer.tllm_enums import (
     trtllm_gen_dtype_has_scale,
 )
 
+# Decode-sized buckets are timed hot-L2 (mean of back-to-back invocations in
+# one CUDA graph) instead of cold-L2 (median of isolated, flushed invocations).
+# At a few tokens the MoE runs in ~20 us, cold-L2 samples resolve only ~1-2 us
+# steps, and isolated launches cannot see the PDL overlap with neighbouring
+# kernels, so ~20 tactics tie and the winner can be a tactic that is ~15%
+# slower inside a serving CUDA graph.
+_HOT_L2_MAX_BUCKET = 128
+# Keep the previous (smaller) bucket's winner when it is within 0.5% of the
+# fastest tactic, rather than whichever near-tie timing noise favoured.
+# Measured on GB200 (DSv4 Flash/Pro shapes) it never cost more than strict
+# argmin; preferring a fixed tile order did (larger tiles win some T=1 cases).
+_TIE_TOLERANCE = 0.005
+
 
 class MoERunner(TunableRunner):
     """Tactic-aware runner for the TRT-LLM cubin MoE kernels.
@@ -191,6 +204,8 @@ class MoERunner(TunableRunner):
                 self.num_experts,
                 packed=(routing_input_mode != RoutingInputMode.UnpackedPrecomputed),
             )
+        kwargs.setdefault("hot_l2_max_bucket", _HOT_L2_MAX_BUCKET)
+        kwargs.setdefault("tie_tolerance", _TIE_TOLERANCE)
         return make_moe_tuning_config(
             moe_inputs,
             num_experts=self.num_experts,
