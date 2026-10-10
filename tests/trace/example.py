@@ -3008,7 +3008,7 @@ if flashinfer.top_k_varlen.is_backend_supported("gvr_2", _tkv_cc[0] * 10 + _tkv_
         _tkv_lens,
         512,
         row_starts=_tkv_starts,
-        max_seq_len=_tkv_L,
+        max_window_len=_tkv_L,
         absolute_indices=True,
         backend="gvr_2",
     )

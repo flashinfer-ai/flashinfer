@@ -164,7 +164,7 @@ def _radix_cutlass_top_k_varlen_check(
     top_k,
     *,
     row_starts=None,
-    max_seq_len=None,
+    max_window_len=None,
     absolute_indices=False,
     compress_ratio=1,
     next_n=1,
@@ -225,7 +225,7 @@ def _gvr_top_k_varlen_check(
     top_k,
     *,
     row_starts=None,
-    max_seq_len=None,
+    max_window_len=None,
     absolute_indices=False,
     compress_ratio=1,
     next_n=1,
@@ -276,7 +276,7 @@ def _gvr2_top_k_varlen_check(
     top_k,
     *,
     row_starts=None,
-    max_seq_len=None,
+    max_window_len=None,
     absolute_indices=False,
     compress_ratio=1,
     next_n=1,
@@ -339,7 +339,7 @@ def _top_k_varlen_heuristic(
     top_k: int,
     *,
     row_starts=None,
-    max_seq_len=None,
+    max_window_len=None,
     absolute_indices=False,
     compress_ratio: int = 1,
     next_n: int = 1,
@@ -1106,17 +1106,17 @@ def _run_gvr2(
     out_values: Optional[torch.Tensor],
     workspace: Optional[dict] = None,
     row_starts: Optional[torch.Tensor] = None,
-    max_seq_len: Optional[int] = None,
+    max_window_len: Optional[int] = None,
     absolute_indices: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Self-sampling GVR V2: one launch for the whole batch via the per-row
     in-kernel varlen engine (TRT-LLM ``run_varlen`` port). ``row_starts``
     selects the windowed (prefill) engines (TRT-LLM #18702 port);
-    ``max_seq_len`` (windowed only) is the caller's bound on the window
+    ``max_window_len`` (windowed only) is the caller's bound on the window
     lengths, which lets the host pick a register-resident engine for the
     launch; without it the streaming engine serves every row.
 
-    ``max_seq_len`` is derived from the logits row width (in uncompressed
+    ``max_window_len`` is derived from the logits row width (in uncompressed
     token space, hence ``* compress_ratio``), which is capture-stable — the
     call performs NO host reads of device data and is CUDA-graph safe once
     the launcher for this shape has been compiled (warm up before capture).
@@ -1142,8 +1142,8 @@ def _run_gvr2(
         # width in uncompressed token space
         max_seq_len=(
             (
-                min(int(max_seq_len), logits.shape[1])
-                if max_seq_len is not None
+                min(int(max_window_len), logits.shape[1])
+                if max_window_len is not None
                 else None
             )
             if row_starts is not None
@@ -1287,7 +1287,7 @@ def _radix_top_k_varlen_check(
     top_k,
     *,
     row_starts=None,
-    max_seq_len=None,
+    max_window_len=None,
     absolute_indices=False,
     compress_ratio=1,
     next_n=1,
@@ -1432,7 +1432,7 @@ def _radix_filter_top_k_varlen_check(
     top_k,
     *,
     row_starts=None,
-    max_seq_len=None,
+    max_window_len=None,
     absolute_indices=False,
     compress_ratio=1,
     next_n=1,
@@ -1564,7 +1564,7 @@ def top_k_varlen(
     top_k: int,
     *,
     row_starts: Optional[torch.Tensor] = None,
-    max_seq_len: Optional[int] = None,
+    max_window_len: Optional[int] = None,
     absolute_indices: bool = False,
     compress_ratio: int = 1,
     next_n: int = 1,
@@ -1619,9 +1619,9 @@ def top_k_varlen(
 
     Windowed (prefill) mode
     -----------------------
-    ``row_starts`` switches a call into windowed mode; ``max_seq_len`` and
-    ``absolute_indices`` apply only there (a decode call ignores
-    ``max_seq_len`` and refuses ``absolute_indices=True`` with ``ValueError``).
+    ``row_starts`` switches a call into windowed mode; ``max_window_len`` and
+    ``absolute_indices`` apply only there (a decode call refuses both with
+    ``ValueError``).
     The mode exists for the DSA indexer's prefill layout, where two things
     move a row's keys away from column 0: several requests share one packed
     key axis, and chunked prefill or prefix caching puts a request's earlier
@@ -1653,10 +1653,10 @@ def top_k_varlen(
     here) is returned as ``[0, 2]`` (positions inside B, the default: a paged
     consumer maps them through B's page table) or as ``[2, 4]`` (columns of
     ``logits``, ``absolute_indices=True``: the ragged consumer reads the
-    packed KV buffer by column). ``max_seq_len`` (here 4, the longest window)
+    packed KV buffer by column). ``max_window_len`` (here 4, the longest window)
     is only a bound the backend specializes on before the launch and defaults
     to ``num_cols``; while every window stays within it, it never changes
-    which keys win (``max_seq_len`` below says what a violated bound yields).
+    which keys win.
 
     Rules of the mode: a window shorter than ``top_k`` returns all its
     positions; a window end past ``num_cols`` is clamped to ``num_cols``. The
@@ -1666,7 +1666,7 @@ def top_k_varlen(
     raises ``BackendSupportedError``, and any other explicit backend is
     refused. Under a captured graph the contents of ``row_starts`` and
     ``seq_lens`` may change between replays while every window stays within
-    ``max_seq_len``.
+    ``max_window_len``.
 
     Parameters
     ----------
@@ -1710,23 +1710,15 @@ def top_k_varlen(
         ``r`` ranks ``logits[r, row_starts[r] : row_starts[r] + seq_lens[r]]``.
         Starts must lie within the row; they are device data and are not
         validated on the host. Default ``None``.
-    max_seq_len : int, optional
+    max_window_len : int, optional
         Windowed (prefill) mode only: an upper bound on every window length
-        ``seq_lens[r]``, in logits columns. A positive Python ``int`` (a
-        ``bool``, a non-``int`` or a value below 1 raises ``ValueError``),
-        clamped to ``num_cols``; defaults to ``num_cols``, always a valid
-        bound but a loose one for a packed multi-request batch, whose width
-        is the sum of every request's keys. The backend consumes the bound
-        before the launch to pick its engine, and the choice is frozen under
-        CUDA-graph capture (what a bound selects is under ``"gvr_2"`` in
-        ``backend``). The bound is a contract, not a hint: a row whose window
-        exceeds it is not guaranteed a ranking and may be reported as all
-        ``-1``, never as a truncated ranking, so a caller-given bound must
-        hold at every graph replay (the ``num_cols`` default cannot be
-        exceeded). Pass the batch's longest window (``seq_lens.max()``, host
-        knowledge in every serving framework) whenever it is smaller than
-        ``num_cols``: a tighter bound lets the backend specialize further.
-        Ignored when ``row_starts`` is ``None``.
+        ``seq_lens[r]``, in columns; defaults to ``num_cols``. The bound is
+        consumed before the launch and fixed for a captured graph, so it must
+        hold at every replay. Pass the batch's longest window
+        (``seq_lens.max()``) when it is smaller than ``num_cols``; the tighter
+        the bound, the more the backend can specialize. A positive ``int``; a
+        value above ``num_cols`` counts as ``num_cols``. Refused with
+        ``ValueError`` without ``row_starts``.
     absolute_indices : bool, optional
         Windowed (prefill) mode only: write each hit as its column of
         ``logits`` (``window-local index + row_starts[r]``) instead of the
@@ -1734,10 +1726,8 @@ def top_k_varlen(
         layout the column axis is the chunk's packed key sequence, so this is
         the flattened-KV position a ragged sparse-attention kernel consumes
         directly; a paged consumer keeps the default and maps the local
-        position through its page table. Part of the CUDA-graph warm-up
-        geometry (``warmup_prefill(..., absolute_indices=True)``; see
-        ``"gvr_2"`` under ``backend``). ``True`` without ``row_starts`` raises
-        ``ValueError``. Default ``False``.
+        position through its page table. ``True`` without ``row_starts``
+        raises ``ValueError``. Default ``False``.
     compress_ratio : int, optional
         KV-index compression factor (``1`` for DSv3.2, ``4`` for DSv4): every
         logit column stands for ``compress_ratio`` consecutive KV tokens. In
@@ -1834,7 +1824,7 @@ def top_k_varlen(
                               engine ranks rows of any length. In decode the
                               host picks the engine from the row count,
                               ``num_cols``, ``top_k`` and the device. In
-                              windowed mode it picks from the ``max_seq_len``
+                              windowed mode it picks from the ``max_window_len``
                               bound: a register-resident engine only where its
                               routing table admits one (never for a bound at
                               or below ``top_k``; the 8192-column class only
@@ -1875,7 +1865,7 @@ def top_k_varlen(
                               or not) with one eager call on the stream that
                               will capture, and each windowed geometry (row
                               count, ``top_k``, ``absolute_indices`` and the
-                              bound: ``max_seq_len``, else ``num_cols``; width
+                              bound: ``max_window_len``, else ``num_cols``; width
                               and row stride do not matter) with an eager call
                               or ``flashinfer.topk_varlen.warmup_prefill`` on
                               that stream (``flashinfer.topk_varlen.prefill_ready``
@@ -1955,8 +1945,9 @@ def top_k_varlen(
         (``row_starts`` not a contiguous 1-D ``int32`` tensor with one entry
         per row, ``row_starts`` with
         ``next_n != 1``, ``compress_ratio != 1`` or a ``pre_idx``,
-        ``max_seq_len`` not a positive ``int``, ``absolute_indices`` not a
-        ``bool`` or ``True`` without ``row_starts``); if an ``out_indices`` /
+        ``max_window_len`` not a positive ``int``, ``absolute_indices`` not a
+        ``bool``, or either of them given without ``row_starts``); if an
+        ``out_indices`` /
         ``out_values`` buffer is outside the contract above; or if an explicit
         backend's checker rejects the problem (reported as "Problem size is
         not supported").
@@ -2065,13 +2056,13 @@ def top_k_varlen(
             raise ValueError(
                 "row_starts (windowed mode) is hint-free: pass pre_idx=None"
             )
-        if max_seq_len is not None and (
-            isinstance(max_seq_len, bool)
-            or not isinstance(max_seq_len, int)
-            or max_seq_len < 1
+        if max_window_len is not None and (
+            isinstance(max_window_len, bool)
+            or not isinstance(max_window_len, int)
+            or max_window_len < 1
         ):
             raise ValueError(
-                f"max_seq_len must be a positive int (window-length bound), got {max_seq_len!r}"
+                f"max_window_len must be a positive int (window-length bound), got {max_window_len!r}"
             )
         if not isinstance(absolute_indices, bool):
             raise ValueError(
@@ -2081,6 +2072,11 @@ def top_k_varlen(
         raise ValueError(
             "absolute_indices=True requires row_starts (windowed mode): decode "
             "indices are already columns of logits"
+        )
+    elif max_window_len is not None:
+        raise ValueError(
+            "max_window_len requires row_starts (windowed mode): in decode every "
+            "row starts at column 0 and num_cols already bounds it"
         )
 
     # A malformed hint is discarded, loudly: the call runs hint-free (the
@@ -2229,7 +2225,7 @@ def top_k_varlen(
             out_values,
             workspace=workspace,
             row_starts=row_starts,
-            max_seq_len=max_seq_len,
+            max_window_len=max_window_len,
             absolute_indices=absolute_indices,
         )
     elif backend == "radix_cutlass":

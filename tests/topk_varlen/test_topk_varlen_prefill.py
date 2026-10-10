@@ -169,7 +169,7 @@ def test_prefill_packed_misaligned_ks(top_k, lead, hinted):
     poison at [ks-lead, ks): a leaked lead lane would become top-1 and a missed
     frame correction a negative index. slab = no bound and a logits width past
     every register capacity (the width is the bound then); rung = the register
-    rung picked for the ``max_seq_len`` bound."""
+    rung picked for the ``max_window_len`` bound."""
     a = 300
     ks1 = ((a + 3) // 4) * 4 + lead
     n1 = 4096 + 17
@@ -178,7 +178,7 @@ def test_prefill_packed_misaligned_ks(top_k, lead, hinted):
     ks = [0] * a + [ks1] * n1
     lens = list(range(1, a + 1)) + list(range(1, n1 + 1))
     lg, rs, le = _make_case(rows, ncols, ks, lens, seed=top_k * 100 + lead)
-    out = _run(lg, rs, le, top_k, **({"max_seq_len": n1} if hinted else {}))
+    out = _run(lg, rs, le, top_k, **({"max_window_len": n1} if hinted else {}))
     assert int(out.min()) >= -1, (
         "negative index leaked (missed -lead correction / guard)"
     )
@@ -215,7 +215,7 @@ def test_prefill_neginf_masks_in_window(top_k, lead, hinted):
     """Fewer than K finite values in the window (the rest -inf, as SGLang's
     init/local-token masks): the K-th boundary lies in the -inf tie class,
     crossed with a misaligned lead; no negative index may leak. slab = width
-    past every register capacity, no bound; rung = ``max_seq_len`` bound."""
+    past every register capacity, no bound; rung = ``max_window_len`` bound."""
     n_finite = top_k - 100
     nv = top_k + 400
     ks1 = ((37 + 3) // 4) * 4 + lead
@@ -233,7 +233,7 @@ def test_prefill_neginf_masks_in_window(top_k, lead, hinted):
     lg = full[:, :ncols]
     rs = torch.tensor([ks1] * rows, dtype=torch.int32, device=_DEV)
     le = torch.tensor([nv] * rows, dtype=torch.int32, device=_DEV)
-    out = _run(lg, rs, le, top_k, **({"max_seq_len": nv} if hinted else {}))
+    out = _run(lg, rs, le, top_k, **({"max_window_len": nv} if hinted else {}))
     assert int(out.min()) >= -1, "negative index leaked in a -inf tie class"
     _check_windowed(lg, out, rs, le, top_k)
 
@@ -410,7 +410,7 @@ def test_prefill_engine_key_distinct_from_decode():
 )
 @pytest.mark.parametrize("top_k", [512, 1024, 2048], ids=lambda k: f"k{k}")
 def test_prefill_register_rung_hinted(top_k, bound):
-    """With ``max_seq_len`` the launch runs on the register rung the per-part
+    """With ``max_window_len`` the launch runs on the register rung the per-part
     table picks for that bound (or the slab where the table says so): exact on
     every lead with +inf poison, and the launcher the dispatcher resolves for
     this geometry is exactly the one the table names -- its register key is
@@ -445,7 +445,7 @@ def test_prefill_register_rung_hinted(top_k, bound):
         _host._PREFILL_CACHE.pop(key, None)  # the launch below must recreate it
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     flashinfer.top_k_varlen(
-        lg, le, top_k, row_starts=rs, out_indices=out, backend="gvr_2", max_seq_len=L
+        lg, le, top_k, row_starts=rs, out_indices=out, backend="gvr_2", max_window_len=L
     )
     torch.cuda.synchronize()
     # the bound + 3 lead lanes must fit the rung: no row may be skipped
@@ -463,7 +463,7 @@ def test_prefill_register_rung_hinted(top_k, bound):
 @requires_gvr2
 @pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
 def test_prefill_bound_violation_reports_minus_one(top_k):
-    """``max_seq_len`` is a contract: on a register rung, a row whose scan
+    """``max_window_len`` is a contract: on a register rung, a row whose scan
     extent (window + lead lanes) exceeds the rung's capacity + 3-lane tail
     comes out as all -1 — never a truncated ranking — while every conforming
     row, including those exactly at that limit, stays exact at every lead."""
@@ -502,7 +502,7 @@ def test_prefill_bound_violation_reports_minus_one(top_k):
         row_starts=rs,
         out_indices=out,
         backend="gvr_2",
-        max_seq_len=bound,
+        max_window_len=bound,
     )
     torch.cuda.synchronize()
     assert not bool((out == -7).any()), "a row was left unwritten"
@@ -579,7 +579,7 @@ def test_prefill_hinted_cuda_graph_replay():
             row_starts=rs,
             out_indices=out,
             backend="gvr_2",
-            max_seq_len=L,
+            max_window_len=L,
         )
     torch.cuda.synchronize()
     assert _host.prefill_ready(rows, top_k, L, width=R * L)
@@ -593,7 +593,7 @@ def test_prefill_hinted_cuda_graph_replay():
             row_starts=rs,
             out_indices=out,
             backend="gvr_2",
-            max_seq_len=L,
+            max_window_len=L,
         )
     torch.cuda.current_stream().wait_stream(s)
     g.replay()
@@ -609,17 +609,18 @@ def test_prefill_hinted_cuda_graph_replay():
     _check_windowed(lg, out, rs, le, top_k)
 
 
-def test_prefill_max_seq_len_validation():
+def test_prefill_max_window_len_validation():
     n, rows, k = 4096, 8, 512
     lg = torch.randn((rows, n), dtype=torch.float32, device=_DEV)
     le = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
     rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
     if flashinfer.top_k_varlen.is_backend_supported("gvr_2", _cc()):
         for bad in (0, -1, "8", 2.5, True):
-            with pytest.raises(ValueError, match="max_seq_len"):
-                flashinfer.top_k_varlen(lg, le, k, row_starts=rs, max_seq_len=bad)
-    # ignored without row_starts (decode mode), any backend
-    flashinfer.top_k_varlen(lg, le, k, max_seq_len=5)
+            with pytest.raises(ValueError, match="max_window_len"):
+                flashinfer.top_k_varlen(lg, le, k, row_starts=rs, max_window_len=bad)
+    # refused without row_starts (decode mode), any backend
+    with pytest.raises(ValueError, match="max_window_len requires row_starts"):
+        flashinfer.top_k_varlen(lg, le, k, max_window_len=5)
 
 
 def test_prefill_api_validation_and_admission():
@@ -710,14 +711,14 @@ def test_prefill_absolute_indices(top_k, hinted):
     """``absolute_indices=True`` returns logits columns: every hit is the
     window-local index plus ``row_starts[r]``, ``-1`` pads are untouched and
     identity (short) windows are shifted too. Both engine families: the
-    ``max_seq_len`` bound admits the register rung; without a bound the width
+    ``max_window_len`` bound admits the register rung; without a bound the width
     (past every register capacity here) routes to the slab. Values are the
     logits at the absolute columns."""
     rows, ncols = 96, 6144 if hinted else 6144 + 8192
     ks = [(r * 61) % 3000 + (r % 4) for r in range(rows)]  # every lead 0..3
     lens = _abs_lens(rows, ncols, ks, top_k)
     lg, rs, le = _make_case(rows, ncols, ks, lens, seed=11 + top_k)
-    kw = {"max_seq_len": 2048} if hinted else {}
+    kw = {"max_window_len": 2048} if hinted else {}
     loc = _run(lg, rs, le, top_k, **kw)
     _check_windowed(lg, loc, rs, le, top_k)
     ab, vals = flashinfer.top_k_varlen(
@@ -914,7 +915,7 @@ def test_prefill_out_values_through_api(hinted):
     """``return_values`` with caller buffers (2-D and flat): the values are the
     window scores at the selected columns and the pads hold the fp32 sentinel,
     on both engines (slab = no bound, width past the register capacity; rung =
-    ``max_seq_len`` bound)."""
+    ``max_window_len`` bound)."""
     top_k, R, L = 512, 2, 1500
     rows = R * L
     ks = [(r * L) for r in range(R) for _ in range(L)]
@@ -932,7 +933,7 @@ def test_prefill_out_values_through_api(hinted):
             out_indices=out_i,
             out_values=out_v,
             backend="gvr_2",
-            max_seq_len=L if hinted else None,
+            max_window_len=L if hinted else None,
         )
         torch.cuda.synchronize()
         idx = idx.view(rows, top_k)
@@ -1040,7 +1041,7 @@ def test_prefill_hinted_cuda_graph_replay_shifts_starts():
             row_starts=rs,
             out_indices=out,
             backend="gvr_2",
-            max_seq_len=L,
+            max_window_len=L,
         )
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
@@ -1053,7 +1054,7 @@ def test_prefill_hinted_cuda_graph_replay_shifts_starts():
             row_starts=rs,
             out_indices=out,
             backend="gvr_2",
-            max_seq_len=L,
+            max_window_len=L,
         )
     torch.cuda.current_stream().wait_stream(s)
     for shift in (1, 2, 3):
@@ -1105,7 +1106,7 @@ def test_prefill_hinted_capture_on_fresh_stream_needs_no_slab():
             row_starts=rs,
             out_indices=out,
             backend="gvr_2",
-            max_seq_len=L,
+            max_window_len=L,
         )
     torch.cuda.current_stream().wait_stream(s)
     g.replay()
@@ -1280,7 +1281,7 @@ def test_prefill_plus_inf_inside_window(top_k, lead, hinted):
     for r, cols in planted.items():
         for p in cols:
             lg[r, ks1 + p] = float("inf")
-    out = _run(lg, rs, le, top_k, **({"max_seq_len": nv} if hinted else {}))
+    out = _run(lg, rs, le, top_k, **({"max_window_len": nv} if hinted else {}))
     _check_windowed(lg, out, rs, le, top_k)
     for r, cols in planted.items():
         sel = set(out[r][out[r] >= 0].tolist())
@@ -1316,7 +1317,7 @@ def test_prefill_all_neginf_window(top_k, lead, hinted):
         row_starts=rs,
         backend="gvr_2",
         return_values=True,
-        **({"max_seq_len": nv} if hinted else {}),
+        **({"max_window_len": nv} if hinted else {}),
     )
     torch.cuda.synchronize()
     _check_windowed(lg, out, rs, le, top_k)

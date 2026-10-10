@@ -159,9 +159,9 @@ top_k_varlen_trace = TraceTemplate(
     ),
     axes={
         "batch_size": Var(description="Number of decode requests."),
-        # the width axis is NOT called max_seq_len: that name is the API's
-        # windowed-mode bound (a scalar input below), and the axis extractor
-        # would read the scalar kwarg ahead of the logits shape
+        # the width axis is num_cols (the logits shape), distinct from the API's
+        # windowed-mode bound max_window_len (a scalar input below) and from
+        # init()'s max_seq_len, which sizes the example buffer
         "num_cols": Const(abbrev="n", description="Logits row width (padded)."),
         "top_k": Const(abbrev="k", description="Number of top elements per row."),
     },
@@ -201,7 +201,7 @@ top_k_varlen_trace = TraceTemplate(
             optional=True,
             description="Windowed mode: return absolute logits columns instead of window-local indices.",
         ),
-        "max_seq_len": Scalar(
+        "max_window_len": Scalar(
             "int32",
             optional=True,
             description=(

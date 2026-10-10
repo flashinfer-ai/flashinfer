@@ -1054,7 +1054,7 @@ def _prefill_bucket(n_env: int) -> int:
 # kernels (BLK=512, VPT in {1,2,4}: the row is read once into registers) and
 # the streaming `main` slab. The register rungs need the whole scan extent
 # (max window length + up to 3 lead lanes) to fit their capacity, so they are
-# only reachable when the caller's ``max_seq_len`` bounds the windows; without
+# only reachable when the caller's ``max_window_len`` bounds the windows; without
 # it every launch takes the slab. A row that violates the bound on a register
 # rung is reported as all -1 (never a truncated ranking). Table and numbers:
 # _prefill_reg_route.
@@ -1155,7 +1155,7 @@ def _prefill_reg_route(rows: int, k: int, n_hint: int) -> dict | None:
 
 _PREFILL_CLASS_BOUNDS = (2048, 4096, 8192)  # register capacity classes (VPT 1 / 2 / 4)
 # Every windowed call routes by ONE window-length bound: the caller's
-# max_seq_len when given, else the logits width (always a valid bound: no
+# max_window_len when given, else the logits width (always a valid bound: no
 # window is wider than its row). The bound picks a register rung whose capacity
 # covers bound + 3 lead lanes, else the slab tier. A per-row split across two
 # launches (register rung + slab, each skipping the other's rows) was measured
@@ -1165,7 +1165,7 @@ _PREFILL_CLASS_BOUNDS = (2048, 4096, 8192)  # register capacity classes (VPT 1 /
 # kernel for short windows (VPT=4 on 2K windows: slower than the slab itself at
 # K = 2048). The width is a loose bound for a packed multi-request batch (it
 # sums every request's keys), and the tight one is host knowledge in every
-# serving framework, so the API also takes it as max_seq_len.
+# serving framework, so the API also takes it as max_window_len.
 
 
 def _prefill_cache_key(fam: str, tier_or_tpl, k: int, n_bucket: int, abs_out: bool = False):
@@ -1284,7 +1284,7 @@ def _launch_prefill(
     dead x5, kv_lens_slot=window lengths, tuning tail)``; the prefill compile
     reads ks from the pre_idx slot and the window length from the kv_lens slot
     and clamps ke to ``n_clamp`` (the logits width) in the ``n`` slot.
-    ``n_hint`` (the window-length bound: the caller's ``max_seq_len`` or, when
+    ``n_hint`` (the window-length bound: the caller's ``max_window_len`` or, when
     none was given, the logits width; capture-stable either way) selects the
     engine: a register rung whose capacity covers it, else the slab tier and
     envelope bucket. Every engine clamps ``ke`` to the logits width; the slab
@@ -1374,7 +1374,7 @@ def warmup_prefill(
     at once, re-creating the slab if it was released in between.
 
     Coverage: a windowed call routes on its row count, ``top_k``, output
-    frame and window-length bound (``max_seq_len``, else the logits width),
+    frame and window-length bound (``max_window_len``, else the logits width),
     never on the exact width or row stride, and a call of more than 32768
     rows is issued in launches of at most 32768 rows, each routed on its own
     count. For every row count in ``num_rows_list`` and every power-of-two
@@ -1394,7 +1394,7 @@ def warmup_prefill(
         The call's ``top_k`` (512, 1024 or 2048).
     max_cols : int
         The largest window-length bound a covered call will route by: its
-        ``max_seq_len``, or its logits width when it passes none.
+        ``max_window_len``, or its logits width when it passes none.
     num_rows_list : Sequence[int], optional
         Row counts to warm. The engines depend on the count only through a
         few bands, which the default covers for every count; pass the
@@ -1451,7 +1451,7 @@ def warmup_prefill(
                     )
                     reps.setdefault(key, ("reg", plan, n_h))
                 # the slab tier of this width: taken wherever the table admits
-                # no rung for the bound (max_seq_len, or the width itself)
+                # no rung for the bound (max_window_len, or the width itself)
                 tier = _prefill_tier(rows, n_h, k)
                 key = _prefill_cache_key("main", tier, k, bk, absolute_indices)
                 reps.setdefault(key, ("main", (tier, bk), n_h))
@@ -1504,10 +1504,10 @@ def prefill_ready(
     k : int
         Its ``top_k``.
     n_env : int
-        The window-length bound the call routes by: the ``max_seq_len`` it
-        will pass, or the logits width for a call without ``max_seq_len``.
+        The window-length bound the call routes by: the ``max_window_len`` it
+        will pass, or the logits width for a call without ``max_window_len``.
     width : int, optional
-        The logits width when ``n_env`` is a caller-given ``max_seq_len``
+        The logits width when ``n_env`` is a caller-given ``max_window_len``
         (the bound is clamped to it, as the call does); leave ``None`` when
         ``n_env`` is the width itself.
     absolute_indices : bool, optional

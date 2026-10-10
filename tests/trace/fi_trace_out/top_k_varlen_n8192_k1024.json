@@ -66,7 +66,7 @@
       "optional": true,
       "description": "Windowed mode: return absolute logits columns instead of window-local indices."
     },
-    "max_seq_len": {
+    "max_window_len": {
       "shape": null,
       "dtype": "int32",
       "optional": true,
