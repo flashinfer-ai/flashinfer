@@ -521,6 +521,14 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
             real = cute.domain_offset((data_token_offset,), gmem_tensor_in_moe_view)
             return (real, None)
 
+        elif cutlass.const_expr(tensor_name == "fc1_activation_per_token_scale"):
+            # Linear1 epilogue only.  The per-token fp32 activation scale
+            # follows the data-token pool (not the independently padded SF
+            # pool), exactly like ``topk`` above: global ``(data_total_rows,)``
+            # in, expert-local ``(this_expert_padded_rows,)`` view out.
+            real = cute.domain_offset((data_token_offset,), gmem_tensor_in_moe_view)
+            return (real, None)
+
         raise ValueError(f"Unknown tensor_name: {tensor_name!r}.")
 
     # --------------------------------------------------------------
