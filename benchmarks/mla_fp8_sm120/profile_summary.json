@@ -1,0 +1,56 @@
+[
+  {
+    "trace": "trace_bfloat16.json",
+    "name": "void flashinfer::mla::BatchMLAPagedAttentionKernel<flashinfer::mla::KernelTraits<false, 1u, false, 512u, 64u, 64u, 16u, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, int>, flashinfer::MLAParams<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, int> >(flashinfer::MLAParams<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, int>)",
+    "duration_us": 16.064,
+    "args": {
+      "queued": 0,
+      "device": 0,
+      "context": 1,
+      "stream": 7,
+      "correlation": 5,
+      "registers per thread": 196,
+      "shared memory": 92672,
+      "blocks per SM": 1.0,
+      "warps per SM": 8.0,
+      "grid": [
+        1,
+        110,
+        1
+      ],
+      "block": [
+        32,
+        4,
+        2
+      ],
+      "est. achieved occupancy %": 0
+    }
+  },
+  {
+    "trace": "trace_float16.json",
+    "name": "void flashinfer::mla::BatchMLAPagedAttentionKernel<flashinfer::mla::KernelTraits<false, 1u, false, 512u, 64u, 64u, 16u, __half, __half, __half, int>, flashinfer::MLAParams<__half, __half, __half, int> >(flashinfer::MLAParams<__half, __half, __half, int>)",
+    "duration_us": 16.127,
+    "args": {
+      "queued": 0,
+      "device": 0,
+      "context": 1,
+      "stream": 7,
+      "correlation": 4785,
+      "registers per thread": 196,
+      "shared memory": 92672,
+      "blocks per SM": 1.0,
+      "warps per SM": 8.0,
+      "grid": [
+        1,
+        110,
+        1
+      ],
+      "block": [
+        32,
+        4,
+        2
+      ],
+      "est. achieved occupancy %": 0
+    }
+  }
+]

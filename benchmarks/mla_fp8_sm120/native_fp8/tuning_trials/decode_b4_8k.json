@@ -1,0 +1,1338 @@
+[
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "fused": true,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 236,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        55
+      ],
+      "works": 56,
+      "queues_with_work": 55
+    },
+    "tuning_us": 102.39999741315842,
+    "relative_l2_vs_bf16": 0.03771088644862175
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "fused": false,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 242,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        55
+      ],
+      "works": 56,
+      "queues_with_work": 55
+    },
+    "tuning_us": 103.93600165843964,
+    "relative_l2_vs_bf16": 0.03771088644862175
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "fused": true,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 236,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 67.58400052785873,
+    "relative_l2_vs_bf16": 0.037706196308135986
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "fused": false,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 242,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 67.58400052785873,
+    "relative_l2_vs_bf16": 0.037706196308135986
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "fused": true,
+      "workers": 220
+    },
+    "attributes": {
+      "registers": 236,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        220
+      ],
+      "works": 208,
+      "queues_with_work": 208
+    },
+    "tuning_us": 61.43999844789505,
+    "relative_l2_vs_bf16": 0.0376928448677063
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "fused": false,
+      "workers": 220
+    },
+    "attributes": {
+      "registers": 242,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        220
+      ],
+      "works": 208,
+      "queues_with_work": 208
+    },
+    "tuning_us": 52.928000688552856,
+    "relative_l2_vs_bf16": 0.0376928448677063
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "workers": 440,
+      "fused": true
+    },
+    "skipped": "Cooperative grid needs 440 CTAs; residency permits 220."
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "fused": false,
+      "workers": 440
+    },
+    "attributes": {
+      "registers": 242,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        440
+      ],
+      "works": 344,
+      "queues_with_work": 344
+    },
+    "tuning_us": 63.45599889755249,
+    "relative_l2_vs_bf16": 0.03769543766975403
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": true,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 252,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        55
+      ],
+      "works": 52,
+      "queues_with_work": 52
+    },
+    "tuning_us": 102.39999741315842,
+    "relative_l2_vs_bf16": 0.03790510818362236
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": false,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 252,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        55
+      ],
+      "works": 52,
+      "queues_with_work": 52
+    },
+    "tuning_us": 102.39999741315842,
+    "relative_l2_vs_bf16": 0.03790510818362236
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": true,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 252,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 65.5359998345375,
+    "relative_l2_vs_bf16": 0.03790842369198799
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": false,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 252,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 65.5359998345375,
+    "relative_l2_vs_bf16": 0.03790842369198799
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "workers": 220,
+      "fused": true
+    },
+    "skipped": "Cooperative grid needs 220 CTAs; residency permits 110."
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": false,
+      "workers": 220
+    },
+    "attributes": {
+      "registers": 252,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        220
+      ],
+      "works": 172,
+      "queues_with_work": 172
+    },
+    "tuning_us": 77.82399654388428,
+    "relative_l2_vs_bf16": 0.037886328995227814
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "workers": 440,
+      "fused": true
+    },
+    "skipped": "Cooperative grid needs 440 CTAs; residency permits 110."
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": false,
+      "workers": 440
+    },
+    "attributes": {
+      "registers": 252,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        440
+      ],
+      "works": 256,
+      "queues_with_work": 256
+    },
+    "tuning_us": 81.91999793052673,
+    "relative_l2_vs_bf16": 0.03790709748864174
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 2,
+      "groups": 2,
+      "fused": true,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 255,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        55
+      ],
+      "works": 56,
+      "queues_with_work": 55
+    },
+    "tuning_us": 94.2080020904541,
+    "relative_l2_vs_bf16": 0.03771088644862175
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 2,
+      "groups": 2,
+      "fused": false,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 255,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        55
+      ],
+      "works": 56,
+      "queues_with_work": 55
+    },
+    "tuning_us": 96.25600278377533,
+    "relative_l2_vs_bf16": 0.03771088644862175
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 2,
+      "groups": 2,
+      "fused": true,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 255,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 63.48799914121628,
+    "relative_l2_vs_bf16": 0.037706196308135986
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 2,
+      "groups": 2,
+      "fused": false,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 255,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 63.48799914121628,
+    "relative_l2_vs_bf16": 0.037706196308135986
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 2,
+      "groups": 2,
+      "workers": 220,
+      "fused": true
+    },
+    "skipped": "Cooperative grid needs 220 CTAs; residency permits 110."
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 2,
+      "groups": 2,
+      "fused": false,
+      "workers": 220
+    },
+    "attributes": {
+      "registers": 255,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        220
+      ],
+      "works": 208,
+      "queues_with_work": 208
+    },
+    "tuning_us": 71.23199850320816,
+    "relative_l2_vs_bf16": 0.0376928448677063
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 2,
+      "groups": 2,
+      "workers": 440,
+      "fused": true
+    },
+    "skipped": "Cooperative grid needs 440 CTAs; residency permits 110."
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 2,
+      "groups": 2,
+      "fused": false,
+      "workers": 440
+    },
+    "attributes": {
+      "registers": 255,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        440
+      ],
+      "works": 344,
+      "queues_with_work": 344
+    },
+    "tuning_us": 83.96799862384796,
+    "relative_l2_vs_bf16": 0.03769543766975403
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": true,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 254,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 64,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        27
+      ],
+      "works": 28,
+      "queues_with_work": 27
+    },
+    "tuning_us": 288.7679934501648,
+    "relative_l2_vs_bf16": 0.0379176139831543
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": false,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 254,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 64,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        27
+      ],
+      "works": 28,
+      "queues_with_work": 27
+    },
+    "tuning_us": 290.8160090446472,
+    "relative_l2_vs_bf16": 0.0379176139831543
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": true,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 254,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 64,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 52,
+      "queues_with_work": 52
+    },
+    "tuning_us": 120.51200121641159,
+    "relative_l2_vs_bf16": 0.03790538012981415
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": false,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 254,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 64,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 52,
+      "queues_with_work": 52
+    },
+    "tuning_us": 120.83200365304947,
+    "relative_l2_vs_bf16": 0.03790538012981415
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": true,
+      "workers": 220
+    },
+    "attributes": {
+      "registers": 254,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 64,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 141.31200313568115,
+    "relative_l2_vs_bf16": 0.03790842741727829
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": false,
+      "workers": 220
+    },
+    "attributes": {
+      "registers": 254,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 64,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 77.82399654388428,
+    "relative_l2_vs_bf16": 0.03790842741727829
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "workers": 440,
+      "fused": true
+    },
+    "skipped": "Cooperative grid needs 440 CTAs; residency permits 220."
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": false,
+      "workers": 440
+    },
+    "attributes": {
+      "registers": 254,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 64,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        220
+      ],
+      "works": 172,
+      "queues_with_work": 172
+    },
+    "tuning_us": 94.2080020904541,
+    "relative_l2_vs_bf16": 0.037886328995227814
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "fused": true,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 206,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        55
+      ],
+      "works": 52,
+      "queues_with_work": 52
+    },
+    "tuning_us": 98.30400347709656,
+    "relative_l2_vs_bf16": 0.03790513798594475
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "fused": false,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 215,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        55
+      ],
+      "works": 52,
+      "queues_with_work": 52
+    },
+    "tuning_us": 100.35199671983719,
+    "relative_l2_vs_bf16": 0.03790513798594475
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "fused": true,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 206,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 63.48799914121628,
+    "relative_l2_vs_bf16": 0.037908438593149185
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "fused": false,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 215,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 63.48799914121628,
+    "relative_l2_vs_bf16": 0.037908438593149185
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "workers": 220,
+      "fused": true
+    },
+    "skipped": "Cooperative grid needs 220 CTAs; residency permits 110."
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "fused": false,
+      "workers": 220
+    },
+    "attributes": {
+      "registers": 215,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        220
+      ],
+      "works": 172,
+      "queues_with_work": 172
+    },
+    "tuning_us": 73.72800260782242,
+    "relative_l2_vs_bf16": 0.037886615842580795
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "workers": 440,
+      "fused": true
+    },
+    "skipped": "Cooperative grid needs 440 CTAs; residency permits 110."
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "fused": false,
+      "workers": 440
+    },
+    "attributes": {
+      "registers": 215,
+      "shared_bytes": 55552,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        440
+      ],
+      "works": 256,
+      "queues_with_work": 256
+    },
+    "tuning_us": 77.82399654388428,
+    "relative_l2_vs_bf16": 0.03790687024593353
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "fused": true,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 168,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        27
+      ],
+      "works": 28,
+      "queues_with_work": 27
+    },
+    "tuning_us": 227.32800245285034,
+    "relative_l2_vs_bf16": 0.0379176139831543
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "fused": false,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 168,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        27
+      ],
+      "works": 28,
+      "queues_with_work": 27
+    },
+    "tuning_us": 227.32800245285034,
+    "relative_l2_vs_bf16": 0.0379176139831543
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "fused": true,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 168,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 52,
+      "queues_with_work": 52
+    },
+    "tuning_us": 98.30400347709656,
+    "relative_l2_vs_bf16": 0.03790510818362236
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "fused": false,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 168,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 52,
+      "queues_with_work": 52
+    },
+    "tuning_us": 98.30400347709656,
+    "relative_l2_vs_bf16": 0.03790510818362236
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "fused": true,
+      "workers": 220
+    },
+    "attributes": {
+      "registers": 168,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 88.06400001049042,
+    "relative_l2_vs_bf16": 0.03790842369198799
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "fused": false,
+      "workers": 220
+    },
+    "attributes": {
+      "registers": 168,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 69.63200122117996,
+    "relative_l2_vs_bf16": 0.03790842369198799
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "workers": 440,
+      "fused": true
+    },
+    "skipped": "Cooperative grid needs 440 CTAs; residency permits 220."
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "fused": false,
+      "workers": 440
+    },
+    "attributes": {
+      "registers": 168,
+      "shared_bytes": 46336,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        220
+      ],
+      "works": 172,
+      "queues_with_work": 172
+    },
+    "tuning_us": 79.8719972372055,
+    "relative_l2_vs_bf16": 0.037886328995227814
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 4,
+      "fused": true,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 166,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        55
+      ],
+      "works": 56,
+      "queues_with_work": 55
+    },
+    "tuning_us": 102.39999741315842,
+    "relative_l2_vs_bf16": 0.03771080821752548
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 4,
+      "fused": false,
+      "workers": 55
+    },
+    "attributes": {
+      "registers": 166,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        55
+      ],
+      "works": 56,
+      "queues_with_work": 55
+    },
+    "tuning_us": 102.39999741315842,
+    "relative_l2_vs_bf16": 0.03771080821752548
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 4,
+      "fused": true,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 166,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 67.58400052785873,
+    "relative_l2_vs_bf16": 0.03770621120929718
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 4,
+      "fused": false,
+      "workers": 110
+    },
+    "attributes": {
+      "registers": 166,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        110
+      ],
+      "works": 104,
+      "queues_with_work": 104
+    },
+    "tuning_us": 67.58400052785873,
+    "relative_l2_vs_bf16": 0.03770621120929718
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 4,
+      "workers": 220,
+      "fused": true
+    },
+    "skipped": "Cooperative grid needs 220 CTAs; residency permits 110."
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 4,
+      "fused": false,
+      "workers": 220
+    },
+    "attributes": {
+      "registers": 166,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        220
+      ],
+      "works": 208,
+      "queues_with_work": 208
+    },
+    "tuning_us": 71.68000191450119,
+    "relative_l2_vs_bf16": 0.0376928374171257
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 4,
+      "workers": 440,
+      "fused": true
+    },
+    "skipped": "Cooperative grid needs 440 CTAs; residency permits 110."
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 4,
+      "fused": false,
+      "workers": 440
+    },
+    "attributes": {
+      "registers": 166,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        1,
+        440
+      ],
+      "works": 344,
+      "queues_with_work": 344
+    },
+    "tuning_us": 81.91999793052673,
+    "relative_l2_vs_bf16": 0.03769543766975403
+  }
+]

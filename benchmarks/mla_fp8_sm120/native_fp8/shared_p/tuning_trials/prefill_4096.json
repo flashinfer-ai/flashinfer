@@ -1,0 +1,870 @@
+[
+  {
+    "config": {
+      "bm": 64,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "fused": false,
+      "workers": 110,
+      "share_p": false
+    },
+    "attributes": {
+      "registers": 254,
+      "shared_bytes": 73984,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 640,
+      "queues_with_work": 55
+    },
+    "median_us": 2479.840040206909,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "share_p": false,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 242,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 1280,
+      "queues_with_work": 55
+    },
+    "median_us": 4523.007869720459,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "share_p": false,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 242,
+      "shared_bytes": 36992,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 1280,
+      "queues_with_work": 110
+    },
+    "median_us": 2719.7439670562744,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 222,
+      "shared_bytes": 28544,
+      "active_ctas_per_sm": 3,
+      "threads": 64,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 2560,
+      "queues_with_work": 55
+    },
+    "median_us": 11868.160247802734,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 222,
+      "shared_bytes": 28544,
+      "active_ctas_per_sm": 3,
+      "threads": 64,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 2560,
+      "queues_with_work": 110
+    },
+    "median_us": 6203.104019165039,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 234,
+      "shared_bytes": 47616,
+      "active_ctas_per_sm": 2,
+      "threads": 64,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 2560,
+      "queues_with_work": 55
+    },
+    "median_us": 11090.944290161133,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 234,
+      "shared_bytes": 47616,
+      "active_ctas_per_sm": 2,
+      "threads": 64,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 2560,
+      "queues_with_work": 110
+    },
+    "median_us": 5804.031848907471,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 187,
+      "shared_bytes": 47616,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 2560,
+      "queues_with_work": 55
+    },
+    "median_us": 7714.816093444824,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 16,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 187,
+      "shared_bytes": 47616,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 2560,
+      "queues_with_work": 110
+    },
+    "median_us": 4332.255840301514,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 64,
+      "bn": 32,
+      "stages": 1,
+      "groups": 4,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 128,
+      "shared_bytes": 58496,
+      "active_ctas_per_sm": 1,
+      "threads": 512,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 640,
+      "queues_with_work": 55
+    },
+    "median_us": 2084.8639011383057,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 64,
+      "bn": 32,
+      "stages": 1,
+      "groups": 4,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 128,
+      "shared_bytes": 58496,
+      "active_ctas_per_sm": 1,
+      "threads": 512,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 640,
+      "queues_with_work": 110
+    },
+    "median_us": 2103.2960414886475,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 64,
+      "bn": 32,
+      "stages": 2,
+      "groups": 4,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 128,
+      "shared_bytes": 77056,
+      "active_ctas_per_sm": 1,
+      "threads": 512,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 640,
+      "queues_with_work": 55
+    },
+    "median_us": 2067.456007003784,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 64,
+      "bn": 32,
+      "stages": 2,
+      "groups": 4,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 128,
+      "shared_bytes": 77056,
+      "active_ctas_per_sm": 1,
+      "threads": 512,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 640,
+      "queues_with_work": 110
+    },
+    "median_us": 2066.431999206543,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 222,
+      "shared_bytes": 38528,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 1280,
+      "queues_with_work": 55
+    },
+    "median_us": 4656.1279296875,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 2,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 222,
+      "shared_bytes": 38528,
+      "active_ctas_per_sm": 2,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 1280,
+      "queues_with_work": 110
+    },
+    "median_us": 2790.4000282287598,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 4,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 146,
+      "shared_bytes": 38528,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 1280,
+      "queues_with_work": 55
+    },
+    "median_us": 3296.2560653686523,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 32,
+      "stages": 1,
+      "groups": 4,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 146,
+      "shared_bytes": 38528,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 1280,
+      "queues_with_work": 110
+    },
+    "median_us": 3344.383955001831,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 238,
+      "shared_bytes": 58112,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 1280,
+      "queues_with_work": 55
+    },
+    "median_us": 3612.384080886841,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 238,
+      "shared_bytes": 58112,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 1280,
+      "queues_with_work": 110
+    },
+    "median_us": 3659.775972366333,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 191,
+      "shared_bytes": 58112,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 1280,
+      "queues_with_work": 55
+    },
+    "median_us": 2964.479923248291,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 191,
+      "shared_bytes": 58112,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 1280,
+      "queues_with_work": 110
+    },
+    "median_us": 3010.2720260620117,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 2,
+      "groups": 2,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 253,
+      "shared_bytes": 95232,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 1280,
+      "queues_with_work": 55
+    },
+    "median_us": 4237.311840057373,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 2,
+      "groups": 2,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 253,
+      "shared_bytes": 95232,
+      "active_ctas_per_sm": 1,
+      "threads": 128,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 1280,
+      "queues_with_work": 110
+    },
+    "median_us": 4240.384101867676,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 2,
+      "groups": 4,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 175,
+      "shared_bytes": 95232,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 1280,
+      "queues_with_work": 55
+    },
+    "median_us": 3373.055934906006,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 32,
+      "bn": 64,
+      "stages": 2,
+      "groups": 4,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 175,
+      "shared_bytes": 95232,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 1280,
+      "queues_with_work": 110
+    },
+    "median_us": 3379.199981689453,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 64,
+      "bn": 32,
+      "stages": 2,
+      "groups": 2,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 254,
+      "shared_bytes": 77056,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 640,
+      "queues_with_work": 55
+    },
+    "median_us": 2149.3759155273438,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 64,
+      "bn": 32,
+      "stages": 2,
+      "groups": 2,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 254,
+      "shared_bytes": 77056,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 640,
+      "queues_with_work": 110
+    },
+    "median_us": 2150.9439945220947,
+    "relative_l2_vs_previous": 0.009945470839738846
+  },
+  {
+    "config": {
+      "bm": 64,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 238,
+      "shared_bytes": 79104,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 640,
+      "queues_with_work": 55
+    },
+    "median_us": 2082.8158855438232,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 64,
+      "bn": 64,
+      "stages": 1,
+      "groups": 2,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 238,
+      "shared_bytes": 79104,
+      "active_ctas_per_sm": 1,
+      "threads": 256,
+      "local_bytes": 0
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 640,
+      "queues_with_work": 110
+    },
+    "median_us": 2081.376075744629,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 64,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "share_p": true,
+      "workers": 110,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 128,
+      "shared_bytes": 79104,
+      "active_ctas_per_sm": 1,
+      "threads": 512,
+      "local_bytes": 88
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        55
+      ],
+      "works": 640,
+      "queues_with_work": 55
+    },
+    "median_us": 1898.4960317611694,
+    "relative_l2_vs_previous": 0.0
+  },
+  {
+    "config": {
+      "bm": 64,
+      "bn": 64,
+      "stages": 1,
+      "groups": 4,
+      "share_p": true,
+      "workers": 220,
+      "fused": false
+    },
+    "attributes": {
+      "registers": 128,
+      "shared_bytes": 79104,
+      "active_ctas_per_sm": 1,
+      "threads": 512,
+      "local_bytes": 88
+    },
+    "scheduling": {
+      "grid": [
+        2,
+        110
+      ],
+      "works": 640,
+      "queues_with_work": 110
+    },
+    "median_us": 1895.9039449691772,
+    "relative_l2_vs_previous": 0.0
+  }
+]

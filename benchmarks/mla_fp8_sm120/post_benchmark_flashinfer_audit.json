@@ -1,0 +1,34 @@
+{
+  "flashinfer/data/include/flashinfer/attention/mla.cuh": {
+    "unchanged_since_initial_study": true,
+    "sha256_now": "b13080c8c1625d60da21077f1af287399f4a94ced8ff5fe9eeb6628e45b405b2"
+  },
+  "flashinfer/data/include/flashinfer/attention/scheduler.cuh": {
+    "unchanged_since_initial_study": true,
+    "sha256_now": "c11180be56e1292f95990bd144fcdf63bd2ddc81b04258d8abd83c9771f7d402"
+  },
+  "flashinfer/data/include/flashinfer/mma.cuh": {
+    "unchanged_since_initial_study": true,
+    "sha256_now": "f6df5d6475bf2fc33932399b7063894a2a4ed27cfabe45ae7cd239a1c61943e9"
+  },
+  "flashinfer/data/csrc/batch_mla_run.cu": {
+    "unchanged_since_initial_study": true,
+    "sha256_now": "d4b749962c79596d10f3ed99dfc43b15daf7700c4728ab4a4cdcaa5c56c12a01"
+  },
+  "flashinfer/jit/attention/modules.py": {
+    "unchanged_since_initial_study": true,
+    "sha256_now": "0eaabbdea8f68b54765249792457f7ac38a1ab84e439cd48478d371af9ae0f91"
+  },
+  "flashinfer/mla/_core.py": {
+    "unchanged_since_initial_study": true,
+    "sha256_now": "482b785d669dc68dab6cfe3934f19ae58b3450d25235f3de4908b871c72aee6e"
+  },
+  "flashinfer/xqa.py": {
+    "unchanged_since_initial_study": true,
+    "sha256_now": "82e28904f53f5e07b0678707f0b4018c734053418c4cf023af25d67edf09502c"
+  },
+  "flashinfer/jit/xqa.py": {
+    "unchanged_since_initial_study": true,
+    "sha256_now": "d9a4429b0404cabfec0243e9eae771f94eb9fa3e9497ec10ea3a0491e7120c88"
+  }
+}
