@@ -29,11 +29,20 @@ from flashinfer.comm.mnnvl_cutedsl import (
     BT_ONLY_CONFIG,
     HT_ONLY_CONFIG,
     LL_ONLY_CONFIG,
+    KernelTarget,
+    MNNVLCuteDSLConfig,
+    MRangeDispatch,
+    ProtocolKind,
+    StaticProfile,
+)
+from flashinfer.comm.mnnvl_cutedsl.kernel_ll import (
+    LLAllReduceTuning,
+    LLCollectiveTuning,
+    LLFinalizeTuning,
 )
 from flashinfer.comm.mnnvl_cutedsl_ar import (
     MNNVLCuteDSLAllReduceFusionWorkspace,
 )
-from flashinfer.utils import is_sm100a_supported
 
 
 RMS_EPS = 1e-6
@@ -43,7 +52,7 @@ PROTOCOL_CONFIGS = {
     "bt": BT_ONLY_CONFIG,
     "ht": HT_ONLY_CONFIG,
 }
-pytestmark = [pytest.mark.gpu_4, pytest.mark.arch_blackwell]
+pytestmark = pytest.mark.gpu_4
 
 
 @pytest.fixture(scope="module")
@@ -57,8 +66,8 @@ def distributed_group():
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
-    if not is_sm100a_supported(device):
-        pytest.skip("SM100 or newer data-center Blackwell is required")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Data-center Blackwell or Rubin is required")
     owns_group = not dist.is_initialized()
     if owns_group:
         dist.init_process_group("nccl", device_id=device)
@@ -235,6 +244,7 @@ def _workspace(protocol: str, capacity_m: int, group, hidden_size: int, top_k: i
     ],
 )
 @torch.inference_mode()
+@pytest.mark.arch_blackwell
 def test_protocol_numerical_contract(
     distributed_group, protocol, large_bt, hidden_size, top_k
 ):
@@ -335,5 +345,90 @@ def test_protocol_numerical_contract(
         _assert_norm_contract(
             protocol, norm_out, residual_out, reference_prenorm, gamma
         )
+    finally:
+        workspace.destroy()
+
+
+@pytest.mark.parametrize(
+    "cluster_size,threads,enable_pdl",
+    [(8, 128, False), (16, 64, True), (16, 128, False), (16, 128, True)],
+)
+@torch.inference_mode()
+def test_ll_cluster_shared_memory_graph_replay(
+    distributed_group, cluster_size, threads, enable_pdl
+):
+    """Peer shared-memory stores require a rendezvous, even before the first sum."""
+    group = distributed_group
+    m = 256
+    hidden_size = 8192
+    top_k = 10
+    collective = LLCollectiveTuning(
+        cluster_size=cluster_size, threads=threads, rank_lanes=1, enable_pdl=enable_pdl
+    )
+    profile = StaticProfile(
+        tp_size=dist.get_world_size(group),
+        hidden_size=hidden_size,
+        top_k=top_k,
+        dtype=torch.bfloat16,
+        finalize_routes=MRangeDispatch(
+            upper_bounds=(None,),
+            targets=(
+                KernelTarget(ProtocolKind.LL, LLFinalizeTuning(collective=collective)),
+            ),
+        ),
+        all_reduce_routes=MRangeDispatch(
+            upper_bounds=(None,),
+            targets=(
+                KernelTarget(ProtocolKind.LL, LLAllReduceTuning(collective=collective)),
+            ),
+        ),
+    )
+    workspace = MNNVLCuteDSLAllReduceFusionWorkspace(
+        tp_size=dist.get_world_size(group),
+        tp_rank=dist.get_rank(group),
+        max_token_num=m,
+        hidden_dim=hidden_size,
+        dtype=torch.bfloat16,
+        group=group,
+        top_k=top_k,
+        rms_eps=RMS_EPS,
+        weight_bias=WEIGHT_BIAS,
+        config=MNNVLCuteDSLConfig(profiles=(profile,)),
+    )
+    local = torch.empty((m, hidden_size), dtype=torch.bfloat16, device="cuda")
+    residual = torch.ones_like(local)
+    gamma = torch.ones(hidden_size, dtype=local.dtype, device=local.device)
+    prenorm = torch.empty_like(local)
+    norm = torch.empty_like(local)
+
+    try:
+        local.fill_(dist.get_rank(group) + 1)
+        torch.cuda.synchronize()
+        dist.barrier(group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(32):
+                allreduce_fusion(
+                    input=local,
+                    workspace=workspace,
+                    pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+                    launch_with_pdl=enable_pdl,
+                    residual_in=residual,
+                    residual_out=prenorm,
+                    norm_out=norm,
+                    rms_gamma=gamma,
+                    rms_eps=RMS_EPS,
+                    weight_bias=WEIGHT_BIAS,
+                )
+        for seed in range(4):
+            generator = torch.Generator(device="cuda").manual_seed(
+                3400 + seed * dist.get_world_size(group) + dist.get_rank(group)
+            )
+            local.normal_(generator=generator)
+            graph.replay()
+            torch.cuda.synchronize()
+            reference = _protocol_prenorm("ll", local, residual, group, None)
+            _assert_prenorm_contract("ll", prenorm, reference)
+            _assert_norm_contract("ll", norm, prenorm, reference, gamma)
     finally:
         workspace.destroy()
