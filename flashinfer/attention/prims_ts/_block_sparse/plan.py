@@ -35,7 +35,11 @@ from .config import (
     _BlockSparseStaticProfile,
     _resolve_block_sparse_launch_spec,
 )
-from .prepared import _BlockSparseRouteLayout
+from .prepared import (
+    _BlockSparseRouteLayout,
+    _SageKScaleImageLayout,
+    _SageQScaleImageLayout,
+)
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -86,8 +90,9 @@ class _BlockSparsePlanState:
 
     Every block-sparse state executes one ``prepare -> prepared-route
     attention`` adapter, including a pattern whose rows select every KV block;
-    a dense state skips route preparation. Caller BSR and token mask tensors
-    belong to individual runs and are never retained here.
+    a dense state skips route preparation. A Sage state of either kind writes
+    its scale images first. Caller BSR and token mask tensors belong to
+    individual runs and are never retained here.
 
     Runtime geometry, dtypes, the compiled launch, and the readiness event are
     published together. ``run()`` therefore sees either the complete old state
@@ -137,6 +142,12 @@ class _BlockSparsePlanState:
     # Immutable row capacities and mutable per-run route payload.
     row_route_offsets: torch.Tensor | None
     route_workspace: torch.Tensor | None
+    # Mutable per-run Sage K- and Q-scale images of a Sage plan, one row per
+    # sequence and KV head in the layouts the plan compiled.
+    sage_k_scale_image: torch.Tensor | None
+    sage_k_scale_image_layout: _SageKScaleImageLayout | None
+    sage_q_scale_image: torch.Tensor | None
+    sage_q_scale_image_layout: _SageQScaleImageLayout | None
     # Semantic row bound; unlike route capacity, this distinguishes
     # multiple semantic blocks packed into one prepared route.
     max_blocks_per_row: int | None
@@ -296,6 +307,7 @@ def _build_block_sparse_plan_state(
             out_dtype_key=static.out_dtype_key,
             v_dtype_key=static.v_dtype_key,
             sage=static.sage,
+            softmax_rescale_threshold_log2=static.softmax_rescale_threshold_log2,
         )
         policy = (
             *spec.policy,
@@ -305,6 +317,20 @@ def _build_block_sparse_plan_state(
         dummy_kv_valid_bits = None
         row_route_offsets = None
         route_workspace = None
+        sage_k_scale_image = None
+        sage_q_scale_image = None
+        if spec.sage_k_scale_image is not None:
+            num_sequences = static.batch_size * static.num_kv_heads
+            sage_k_scale_image = torch.empty(
+                spec.sage_k_scale_image.shape(num_sequences),
+                dtype=torch.float32,
+                device=device,
+            )
+            sage_q_scale_image = torch.empty(
+                spec.sage_q_scale_image.shape(num_sequences),
+                dtype=torch.float32,
+                device=device,
+            )
         if static.use_block_sparse:
             route_layout = _BlockSparseRouteLayout.create(
                 kv_route_size=static.kv_route_size,
@@ -351,6 +377,10 @@ def _build_block_sparse_plan_state(
         dummy_kv_valid_bits=dummy_kv_valid_bits,
         row_route_offsets=row_route_offsets,
         route_workspace=route_workspace,
+        sage_k_scale_image=sage_k_scale_image,
+        sage_k_scale_image_layout=spec.sage_k_scale_image,
+        sage_q_scale_image=sage_q_scale_image,
+        sage_q_scale_image_layout=spec.sage_q_scale_image,
         max_blocks_per_row=static.max_blocks_per_row,
         policy=policy,
         compiled=compiled,
@@ -377,6 +407,9 @@ def _wait_and_record_block_sparse_plan(
         state.row_route_offsets.record_stream(stream)
     if state.route_workspace is not None:
         state.route_workspace.record_stream(stream)
+    if state.sage_k_scale_image is not None:
+        state.sage_k_scale_image.record_stream(stream)
+        state.sage_q_scale_image.record_stream(stream)
 
 
 __all__ = [
