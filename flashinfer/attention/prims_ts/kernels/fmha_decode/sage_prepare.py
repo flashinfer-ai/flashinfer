@@ -261,8 +261,10 @@ class _PrepareSageScales:
 
     The buffer covers ``batch_size * num_kv_heads`` sequences
     (``_SageScaleLayout``); the grid gives each of its float4s one thread. The kernel is an ordinary launch on the plan's
-    stream: a block-sparse plan's route prepare and the attention launch
-    follow it in stream order.
+    stream. A dense plan's attention launch follows it in stream order; a
+    block-sparse plan's route prepare follows it as a programmatic dependent
+    launch that acquires this grid before exiting, and attention follows the
+    route prepare in stream order.
     """
 
     def __init__(

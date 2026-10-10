@@ -308,8 +308,10 @@ plans. Every run first launches a small kernel that gathers the plan's scales
 into one buffer in the order the attention kernel reads them: the K scales
 per 64-token atom, the Q scales per Q-tile row and the V scales (and means)
 per KV head; attention reads that buffer alone. A block-sparse run's route
-prepare follows it, and attention follows both in stream order. The paged
-block-sparse APIs do not support Sage attention.
+prepare follows it as a programmatic dependent launch, starting while the
+scale kernel drains and acquiring it before exiting, so the attention launch
+that follows in stream order finds both the scales and the routes complete.
+The paged block-sparse APIs do not support Sage attention.
 
 With the default threshold, FP8 P is quantized at `C = 448 * 2**-8 = 1.75`:
 the E4M3 grid of P moves down by the threshold, so probabilities far below the
