@@ -81,7 +81,8 @@ def _prepared(args, dtype):
 
 
 @pytest.mark.parametrize("fp8", [False, True])
-def test_256_head_strided_cache_capture_reuses_changed_slot_mapping(fp8):
+@pytest.mark.parametrize("compiled", [False, True])
+def test_256_head_strided_cache_capture_reuses_changed_slot_mapping(fp8, compiled):
     device = require_b12x()
     dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
     packed = torch.zeros((3, 2, 2, 64, 512), device=device, dtype=dtype)
@@ -110,9 +111,22 @@ def test_256_head_strided_cache_capture_reuses_changed_slot_mapping(fp8):
     )
     updates = [torch.tensor(mapping, device=device) for mapping in mappings]
     with _prepared(args, dtype) as plan:
+
+        def write():
+            paged_kv_write.run(plan, **args)
+
+        if compiled:
+            from torch.fx.experimental.proxy_tensor import make_fx
+
+            traced = make_fx(write)()
+            assert torch.ops.b12x.paged_kv_write.default in {
+                node.target for node in traced.graph.nodes if node.op == "call_function"
+            }
+            write = torch.compile(traced, fullgraph=True, dynamic=False)
+            write()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            paged_kv_write.run(plan, **args)
+            write()
         for mapping, update in zip(mappings, updates):
             packed.zero_()
             expected.zero_()

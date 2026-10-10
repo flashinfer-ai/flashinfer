@@ -6,7 +6,7 @@ import torch
 
 from b12x._lib.gating import default_is_supported
 from b12x.preparation import Plan
-from b12x.preparation.types import require_prepared
+from b12x.preparation.types import plan_from_handle, require_prepared
 
 from . import META
 
@@ -56,7 +56,23 @@ def run(
     scale per K/V cache. Scales must be finite and positive. Their values and
     slot mappings may change between replays. BF16 copies preserve every bit.
     Device metadata values are caller invariants and are not read on the host.
+    A registered mutating operator retains cache writes under full-graph compilation.
     """
+    _write_op(plan.handle, key, value, k_cache, v_cache, slot_mapping, k_scale, v_scale)
+
+
+@torch.library.custom_op("b12x::paged_kv_write", mutates_args=("k_cache", "v_cache"))
+def _write_op(
+    plan_handle: int,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> None:
+    plan = plan_from_handle(plan_handle)
     require_prepared(plan, "attention.paged_kv_write", key.device).run(
         key=key,
         value=value,
@@ -66,6 +82,13 @@ def run(
         k_scale=k_scale,
         v_scale=v_scale,
     )
+
+
+@_write_op.register_fake
+def _write_fake(
+    plan_handle, key, value, k_cache, v_cache, slot_mapping, k_scale, v_scale
+):
+    pass
 
 
 def is_supported(device=None):
