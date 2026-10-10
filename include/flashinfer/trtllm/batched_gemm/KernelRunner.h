@@ -19,6 +19,7 @@
 #include <cuda.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
@@ -112,6 +113,13 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   // whether to apply row-wise scaling factors to the weights
   bool usePerChannelScaling{false};
 };
+
+// Ordinal of the batched-GEMM configuration whose kernel function is named `functionName` (full
+// string comparison) in
+// the metainfo table this module was built with (the FC1 / FC2 coordinate space of the fused-MoE
+// factorized tactics), or -1 when the artifact has no such kernel. Defined in
+// trtllm_batched_gemm_runner.cu so that only that translation unit instantiates the table.
+[[nodiscard]] int64_t getBatchedGemmConfigIndexByName(std::string const& functionName);
 
 class TrtllmGenBatchedGemmRunner {
  public:
