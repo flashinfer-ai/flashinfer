@@ -14,13 +14,16 @@
 
 """Sage attention scale addressing for the decode softmax and epilogue.
 
-``sfQ`` uses the trtllm-gen flat layout (``flat_scale_slot`` of
-:mod:`flashinfer.attention.prims_ts.sage`); Q rows past the valid row count
-clamp to the last valid slot, so masked scores keep a finite scale and
-exponentiate to zero. ``sfK`` reaches the softmax from the scales the Sage
-prepare writes before attention (``_SageScaleLayout``), one atom of words
-per 64 K tokens in the order the softmax reads them, a token past the
-sequence end holding the last valid scale.
+Every scale reaches the kernel from the buffer the Sage prepare writes
+before attention (``_SageScaleLayout``), in the order the kernel reads it:
+``sfQ`` as one word per row of each Q tile, ``sfK`` as one atom of words per
+64 K tokens, ``sfV`` and ``v_mean`` as one row per sequence. The prepare
+resolves the flat layout (``flat_scale_slot`` of
+:mod:`flashinfer.attention.prims_ts.sage`, ``load_flat_scale``) and gives Q
+rows past the valid row count and K tokens past the sequence end the last
+valid scale, so masked scores keep a finite scale and exponentiate to zero.
+Each softmax lane loads its row's ``sfQ`` word once per work tile
+(``load_q_scale``).
 
 :class:`SageKScalesResource` is one softmax instance's ring of ``sfK``
 tiles, which the load warp produces after each K tile with ``cp.async``
@@ -60,7 +63,7 @@ from ...._block_sparse.prepared import (
     _BlockSparseRouteLayout,
     _SageKSection,
 )
-from ....sage import flat_scale_slot, log2_block_size
+from ....sage import flat_scale_slot
 from ...stage import FmhaStage
 from ..fmha_decode_config import FmhaDecodeConfig
 from ..fmha_decode_constants import KV_KIND_K
@@ -79,27 +82,6 @@ from .helpers_kv_tile_idx import (
 )
 
 Constexpr = cutlass.Constexpr
-
-
-@dataclass(eq=False)
-class SageScaleTensors:
-    """The plan's Sage scale tensors, shared by every resource that reads one.
-
-    ``scales_ptr`` is the plan's prepared scales (``_SageScaleLayout``), from
-    which attention reads ``sfK``; ``sfQ`` is a ``[heads, slots]`` FP32 array
-    in the flat layout; the V scales and means are ``[B, Hkv, D]`` FP32
-    (one row per batch entry and KV head),
-    ``v_mean_ptr`` being ``None`` without a channel mean. The dataclass is
-    not frozen because the DSL replaces frozen dataclasses with proxies
-    inside traced dynamic branches, which changes the traced structure of
-    the holding resource.
-    """
-
-    scales_ptr: cute.Pointer
-    q_scale_ptr: cute.Pointer
-    q_scale_head_stride: Int32
-    v_scale_ptr: cute.Pointer
-    v_mean_ptr: cute.Pointer | None
 
 
 @cute.jit
@@ -134,30 +116,43 @@ def load_flat_scale(
 
 
 @cute.jit
+def sage_sequence_words(
+    cfg: Constexpr[FmhaDecodeConfig],
+    *,
+    batch_idx: Int32,
+    kv_head_idx: Int32,
+    num_heads_kv: Int32,
+) -> Int32:
+    """Return the first word of sequence ``b * Hkv + h`` in the prepared scales."""
+    layout = cfg.sage_scale_layout(cfg.static_seq_len_kv)
+    sequence_idx = batch_idx * num_heads_kv + kv_head_idx
+    return sequence_idx * Int32(layout.sequence_words)
+
+
+@cute.jit
 def load_q_scale(
     cfg: Constexpr[FmhaDecodeConfig],
-    q_scale_addr: Int64,
-    q_scale_head_stride: Int32,
+    scales_ptr: cute.Pointer,
     *,
-    kv_head_idx: Int32,
-    local_head_idx: Int32,
-    batch_idx: Int32,
-    q_token_idx: Int32,
+    sequence_words: Int32,
+    q_group_idx: Int32,
+    row_idx: Int32,
 ) -> Float32:
-    """Return ``sfQ`` for one Q row (token and Q head of one KV head group)."""
-    heads_q_per_kv = Int32(cfg.heads_q_per_kv)
-    q_head_idx = kv_head_idx * heads_q_per_kv + cute.math.min(
-        local_head_idx, heads_q_per_kv - Int32(1)
+    """Return ``sfQ`` of row ``row_idx`` of Q tile ``q_group_idx`` from the prepared scales.
+
+    ``sequence_words`` is the first word of the row's sequence
+    (``sage_sequence_words``). The word already holds the scale of the row's
+    token and Q head, the last valid row's for a row past the tile's valid
+    rows (``_SageQSection``).
+    """
+    q_rows = cfg.sage_scale_layout(cfg.static_seq_len_kv).q_rows
+    word = (
+        sequence_words
+        + Int32(q_rows.word_offset)
+        + q_group_idx * Int32(q_rows.tile_size_q)
+        + row_idx
     )
-    return load_flat_scale(
-        q_scale_addr,
-        q_scale_head_stride,
-        head_idx=q_head_idx,
-        batch_idx=batch_idx,
-        seq_len=Int32(cfg.max_seq_len_q),
-        token_idx=q_token_idx,
-        log2_block=log2_block_size(cfg.sage_q_block_size),
-    )
+    return _load_scale(scales_ptr.toint(), word)
 
 
 def sage_k_section(cfg: FmhaDecodeConfig, proxy: bool = False) -> _SageKSection:
@@ -359,29 +354,31 @@ def staged_v_channel_scale_entries(cfg: FmhaDecodeConfig) -> int:
 @cute.jit
 def stage_v_channel_scales(
     cfg: Constexpr[FmhaDecodeConfig],
-    scales: SageScaleTensors,
+    scales_ptr: cute.Pointer,
     staged: cutlass.Array,
     *,
-    sequence_idx: Int32,
+    sequence_words: Int32,
     thread_idx: Int32,
     num_threads: Constexpr[int],
 ) -> None:
     """Copy one sequence's per-channel V scales and means into SMEM.
 
-    ``sequence_idx`` is the row ``b * Hkv + h`` of the ``[B, Hkv, D]``
-    tensors. Each of the ``num_threads`` callers moves ``headdim /
-    num_threads`` channels. Callers order these writes before the epilogue
-    reads, and the next tile's writes after the last read.
+    The sequence's V rows of the prepared scales (``_SageVSection``) have the
+    staged form already: the scales, then the means. Each of the
+    ``num_threads`` callers moves ``headdim / num_threads`` channels of each
+    row. Callers order these writes before the epilogue reads, and the next
+    tile's writes after the last read.
     """
     assert cfg.headdim % num_threads == 0
-    v_scale_addr = scales.v_scale_ptr.toint()
-    row_base = sequence_idx * Int32(cfg.headdim)
+    v_rows = cfg.sage_scale_layout(cfg.static_seq_len_kv).v_rows
+    scales_addr = scales_ptr.toint()
+    rows_base = sequence_words + Int32(v_rows.word_offset)
     for base in cutlass.range_constexpr(0, cfg.headdim, num_threads):
         channel = Int32(base) + thread_idx
-        staged[channel] = _load_scale(v_scale_addr, row_base + channel)
+        staged[channel] = _load_scale(scales_addr, rows_base + channel)
         if cutlass.const_expr(cfg.sage_v_mean):
             staged[channel + Int32(cfg.headdim)] = _load_scale(
-                scales.v_mean_ptr.toint(), row_base + channel
+                scales_addr, rows_base + Int32(v_rows.mean_word_offset) + channel
             )
 
 
@@ -441,7 +438,7 @@ class SageKScalesResource(DecodeGenResourceBase):
     h_k_idx: Int32 | None = None
     b_idx: Int32 | None = None
     num_heads_kv: Int32 | None = None
-    scale_tensors: SageScaleTensors | None = None
+    sage_scales_ptr: cute.Pointer | None = None
     _alloc: Constexpr[SmemAllocation | None] = None
 
     def __post_init__(self) -> None:
@@ -489,13 +486,16 @@ class SageKScalesResource(DecodeGenResourceBase):
 
     @cute.jit
     def _sequence_words(self, stage_info: StageInfo) -> Int32:
-        """Return the first word of the work tile's sequence, ``b * Hkv + h``, in the prepared scales."""
+        """Return the first word of the work tile's sequence in the prepared scales."""
         kv_head_idx, batch_idx = _logical_head_batch(
             stage_info, self.h_k_idx, self.b_idx
         )
-        layout = self.cfg.sage_scale_layout(self.cfg.static_seq_len_kv)
-        sequence_idx = batch_idx * self.num_heads_kv + kv_head_idx
-        return sequence_idx * Int32(layout.sequence_words)
+        return sage_sequence_words(
+            self.cfg,
+            batch_idx=batch_idx,
+            kv_head_idx=kv_head_idx,
+            num_heads_kv=self.num_heads_kv,
+        )
 
     @producer_work
     @cute.jit
@@ -515,7 +515,7 @@ class SageKScalesResource(DecodeGenResourceBase):
         copy_route_k_scales(
             self.cfg,
             self.route_layout,
-            self.scale_tensors.scales_ptr,
+            self.sage_scales_ptr,
             stage_words=self._stage_words(stage_info),
             sequence_words=self._sequence_words(stage_info),
             record_word=resolved_record_word,
@@ -567,7 +567,7 @@ class SageKScalesResource(DecodeGenResourceBase):
         last_atom = Int32(k_tokens.atoms - 1)
         _copy_atom_scales(
             cfg,
-            self.scale_tensors.scales_ptr,
+            self.sage_scales_ptr,
             self._stage_words(stage_info),
             self._sequence_words(stage_info) + Int32(k_tokens.word_offset),
             k_tokens.atom_words,
@@ -654,11 +654,13 @@ class SageKScalesResource(DecodeGenResourceBase):
 class SageVScalesResource(DecodeGenResourceBase):
     """The staged ``sfV`` and ``v_mean`` of the work tile's sequence.
 
-    The pipeline is a one-stage pipeline of the correction warps.
+    The correction warps copy the sequence's V rows of the prepared scales
+    into the block at work-tile start; the pipeline is a one-stage pipeline
+    of those warps.
     """
 
     cfg: Constexpr[FmhaDecodeConfig] = None
-    scale_tensors: SageScaleTensors | None = None
+    sage_scales_ptr: cute.Pointer | None = None
     h_k_idx: Int32 | None = None
     b_idx: Int32 | None = None
     num_heads_kv: Int32 | None = None
@@ -694,9 +696,14 @@ class SageVScalesResource(DecodeGenResourceBase):
         )
         stage_v_channel_scales(
             cfg,
-            self.scale_tensors,
+            self.sage_scales_ptr,
             self.staged(stage_info.context),
-            sequence_idx=batch_idx * self.num_heads_kv + kv_head_idx,
+            sequence_words=sage_sequence_words(
+                cfg,
+                batch_idx=batch_idx,
+                kv_head_idx=kv_head_idx,
+                num_heads_kv=self.num_heads_kv,
+            ),
             thread_idx=task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX],
             num_threads=cfg.correction_barrier_threads,
         )

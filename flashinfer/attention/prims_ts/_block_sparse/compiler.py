@@ -149,22 +149,15 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             Int32(static_seq_len_kv),
             Int32(static_head_dim),
         )
-        # Sage scale tensors are [heads, flat slots]; the head stride is the
-        # flat slot count of one head. A slot the recipe does not use (the V
-        # mean without a mean, the summary K scales without proxy routes) is
-        # ``None`` and stays unbound. Attention reads its K scales from the
-        # buffer the Sage prepare writes first, never ``k_scale``; both
-        # prepares and attention are ordinary launches in stream order.
+        # Sage scale tensors are [heads, flat slots] or [B, Hkv, D]. A slot the
+        # recipe does not use (the V mean without a mean, the summary K
+        # scales without proxy routes) is ``None`` and stays unbound.
+        # Attention reads every scale from the buffer the Sage prepare
+        # writes first, never the caller's tensors; both prepares and
+        # attention are ordinary launches in stream order.
         sage_kwargs = {}
         if cutlass.const_expr(static_config.use_sage_attention):
-            sage_kwargs = {
-                "sage_q_scale_iter": q_scale.iterator,
-                "sage_scales_iter": sage_scales.iterator,
-                "sage_v_scale_iter": v_scale.iterator,
-                "sage_q_scale_head_stride": Int32(q_scale.shape[1]),
-            }
-            if cutlass.const_expr(static_config.sage_v_mean):
-                sage_kwargs["sage_v_mean_iter"] = v_mean.iterator
+            sage_kwargs = {"sage_scales_iter": sage_scales.iterator}
             prepare_sage_scales(
                 q_scale, k_scale, k_summary_scale, v_scale, v_mean, sage_scales, stream
             )
