@@ -261,6 +261,7 @@ _DCP_BALANCED_FAMILY = {
     "fp8_p64_d256": "dcp_spec_bf16_fp8_d256_balanced",
 }
 _DCP_BALANCED_GROUP = {"bf16_p16": 8, "fp8_p64": 8, "fp8_p64_d256": 16}
+_DCP_BALANCED_PAGE_SIZE = {"bf16_p16": 16, "fp8_p64": 64, "fp8_p64_d256": 64}
 _DCP_BALANCED_HEAD_DIM = {
     "bf16_p16": _HEAD_DIM,
     "fp8_p64": _HEAD_DIM,
@@ -286,18 +287,62 @@ DCP_BALANCED_BF16_MIN_Q_LEN = 3  # q_len 1-2 stay static (<= 16 live rows per ti
 DCP_BALANCED_BF16_MAX_Q_LEN = 8
 DCP_BALANCED_BF16_MIN_ITEMS = 128
 DCP_BALANCED_BF16_LONG_TILE_BLOCKS = 16
+# unit 87: a single request within the whole-tile bound of the BF16 family runs its whole-tile static program instead of
+# one static wave, per architecture and packed-row instance (the 32-row instance measured faster on both GPUs, the 64-row
+# instance only on GB300; see the band probe in the design document)
+DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS = {"sm_100a": (32,), "sm_103a": (32, 64)}
 DCP_BALANCED_FP8_MIN_Q_LEN = 3
 DCP_BALANCED_FP8_MAX_Q_LEN = 8
 DCP_BALANCED_FP8_MIN_ITEMS = 160
-DCP_BALANCED_FP8_LONG_TILE_BLOCKS = 24
-# At exactly two static waves the balanced kernel's fixed cost is not yet
-# amortised on sm_100a (prod_b8_s4096_q4_cp4: 320 items, static 5-9 % faster
-# in nine B200 samples) while the same rows win on sm_103a.
-DCP_BALANCED_FP8_TWO_WAVE_MIN_ITEMS = {"sm_100a": 384, "sm_103a": 160}
+# Round-5 programs, long-tile floor per architecture: the round-3 fit of 24
+# left the 17- and 22-block one-wave rows static.  The 22-block row
+# (b1/S32768 cp4) wins on both parts (1.15 GB300 / 1.11 B200 vs the static
+# route); the 17-block rows win on sm_103a (b1/S24576 cp4 1.055, cp1 b1/S8192
+# 1.053) and are a tie band on sm_100a (0.98 / 0.99), so sm_103a admits 17
+# blocks and sm_100a keeps that class static (floor 18, inside the unmeasured
+# window (17, 22]).  The scalar is the default for unmeasured targets.
+DCP_BALANCED_FP8_LONG_TILE_BLOCKS = 18
+DCP_BALANCED_FP8_LONG_TILE_BLOCKS_BY_ARCH = {"sm_100a": 18, "sm_103a": 17}
+# Two-wave floor per architecture.  Round 3 fitted sm_100a to 384 items (the
+# 320-item two-wave row prod_b8_s4096_q4_cp4 ran static 5-9 % faster on B200);
+# the round-5 bodies win that row on both parts (1.29 GB300 / 1.17 B200), so
+# both floors sit at the family's items floor.  The per-architecture form is
+# kept: it is the manifest's and the Cake dispatcher's contract.
+DCP_BALANCED_FP8_TWO_WAVE_MIN_ITEMS = {"sm_100a": 160, "sm_103a": 160}
 DCP_BALANCED_D256_MIN_Q_LEN = 1
 DCP_BALANCED_D256_MAX_Q_LEN = 8
 DCP_BALANCED_D256_MIN_ITEMS = 160
 DCP_BALANCED_D256_LONG_TILE_BLOCKS = 96
+# One-wave row-tile regime of the D256 family (round 5): the static D256 route
+# streams a request's KV once per speculative row (one Q16 tile per (request,
+# row)), the balanced row tile of up to four rows streams it once per tile, so
+# one static wave re-reads every request's KV q_len / ceil(q_len / 4) times and
+# the balanced program wins once the static tile streams enough blocks per CTA
+# for enough rows.  The classes are (blocks per CTA of the static tile, minimum
+# q_len) pairs per architecture; one static wave routes balanced when some
+# class admits it.  The static split family at 64 local blocks is 8 / 4 / 3 / 2
+# / 1 = 8 / 16 / 22 / 32 / 64 blocks per CTA, so nothing sits between 8 and 16
+# or between 16 and 22.  Round-5 band probes (static / forced balanced, GB300 |
+# B200): q4 b12 at 22 blocks 1.11 | 1.14, b16 1.22 | 1.28, b32 1.42 | 1.43; q3
+# b16 at 22 blocks 1.07 | 1.06; q5 / q8 1.45-1.79.  The 16-block class (static
+# split 4), against the static route and against the FlashInfer public path
+# (GB300 / B200): q4 b8 1.138 / 1.100 and 1.037 / 0.999 (10 rounds), q4 b5-b9
+# 1.08-1.16 / 1.11-1.21 and 1.00-1.08 / 1.01-1.11; q3 b9-b12 1.08-1.14 /
+# 1.06-1.12 against the static route but 1.007-1.043 / 0.971-1.020 against the
+# public path -- a tie or a loss at q_len 3 on B200, so sm_100a admits the
+# class from q_len 4 and sm_103a from q_len 3.  At 8 blocks the plan + fold are
+# not amortised (b4 q4 0.91 | 0.88, b1 1.04 | 0.96); q_len 1 reads KV once on
+# both routes (0.92-0.98) and stays static.  The (32 blocks, q_len 2) class:
+# two rows per tile pay off from 32 blocks per CTA on both parts (10 rounds,
+# against the static route and the public path, GB300 / B200: b32 q2 1.112 /
+# 1.082 and 1.057 / 1.026, b64 q2 1.063 / 1.075 and 1.053 / 1.060) and lose at
+# 16 blocks (b16 q2 0.94 | 0.92 against the public path, static).  The scalar
+# tuple is the default for unmeasured targets.
+DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES = ((22, 3),)
+DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH = {
+    "sm_100a": ((32, 2), (22, 3), (16, 4)),
+    "sm_103a": ((32, 2), (16, 3)),
+}
 _DCP_BALANCED_Q_LEN_RANGE = {
     "bf16_p16": (DCP_BALANCED_BF16_MIN_Q_LEN, DCP_BALANCED_BF16_MAX_Q_LEN),
     "fp8_p64": (DCP_BALANCED_FP8_MIN_Q_LEN, DCP_BALANCED_FP8_MAX_Q_LEN),
@@ -387,6 +432,167 @@ def dcp_balanced_n_rows(kind: str, q_len: int) -> int:
     return 32 if rows_per_tile * _DCP_BALANCED_GROUP[kind] <= 32 else 64
 
 
+def dcp_balanced_program(
+    kind: str,
+    *,
+    batch_size: int,
+    num_kv_heads: int,
+    max_pages_per_seq: int,
+    sm_count: int,
+    arch: Optional[str] = None,
+    n_rows: Optional[int] = None,
+    q_len: Optional[int] = None,
+) -> Optional[int]:
+    """The traced program a balanced family's launch runs, or ``None`` for a one-program family.
+
+    The E4M3 head_dim-128 family ships three programs.  At or above the grid
+    (``batch_size * num_kv_heads >= sm_count``: one persistent CTA per
+    multiprocessor and every (request, KV head) pair at least one chunk ticket)
+    the idle-CTA eight-slice fold of split tiles can never be taken, so the
+    launch runs the program without that fold body (``at_or_above_grid``;
+    identical plan and fold order).  Below the grid, a launch whose page-table
+    width (``max_pages_per_seq``, the ``block_tables`` width) bounds every pair
+    to ``n_max >= min_chunks`` chunks of ``chunk_tokens`` and whose
+    ``batch_size * num_kv_heads * (n_max + reduce_tickets_per_tile)`` tickets
+    fit the grid runs the plan-free static one-wave program
+    (``static_one_wave``: ticket = CTA index, no device planner); every other
+    launch runs the default planner program (``below_grid``).  The BF16
+    head_dim-128 family ships two programs under the regime's whole-tile form
+    (``form = whole_tiles``): a single request whose ``block_tables`` width is
+    within ``whole_pages_max[sm_count][num_kv_heads]`` runs the whole-tile
+    static program (one ticket per (request, KV head) tile, no device planner,
+    no partials; the planner itself plans whole tiles for every length within
+    that bound, so the output is bitwise the planner program's), every other
+    launch the planner program.  Where the regime names a ``swapped`` form, a
+    whole-tile launch on one of its architectures (``arch``: the compile
+    target's architecture key, ``sm_100a`` / ``sm_103a``) with one of its
+    packed-row instances (``n_rows``) runs that program instead: the
+    swapped-QK whole-tile program (S^T = K Q^T with the keys on M, lane-per-key
+    softmax, two P^T staging buffers; bitwise the whole-tile program's
+    output).  An unknown architecture or instance keeps the whole-tile
+    program.  Where the regime names an ``early_issue`` block, a whole-tile
+    launch on one of its architectures runs the early-issue form of its
+    program (``programs[program]``: the loader decodes its own ticket in the
+    kernel prologue and issues the first Q / K / V boxes before the
+    scheduler's token; bitwise the program's output).  The E4M3 head_dim-256
+    family ships two programs on its row-tile geometry (one work item per
+    (request, KV head, tile of four speculative rows): ``items_lower_bound =
+    batch_size * num_kv_heads * q_tiles``, so the rule needs ``q_len``): a
+    launch whose page-table width bounds every tile to ``min_chunks <= n_max <=
+    max_chunks`` chunks (the window where the planner's own cost model picks
+    that chunk length) and whose ``tiles * (n_max + reduce_tickets_per_tile)``
+    tickets fit the grid runs the plan-free static one-wave program
+    (``static_one_wave``; bitwise the planner program's output), every other
+    launch the planner program (``below_grid`` = ``at_or_above_grid``).
+    Mirrors the manifest's ``program_variants`` rule from host metadata only.
+    """
+
+    _check_dcp_balanced_kind(kind)
+    from .jit.cake_dcp import dcp_balanced_program_variants
+
+    variants = dcp_balanced_program_variants(_DCP_BALANCED_FAMILY[kind])
+    if variants is None:
+        return None
+    bound = variants.get("items_lower_bound")
+    if bound == "batch_size * num_kv_heads":
+        q_tiles = 1
+    elif bound == "batch_size * num_kv_heads * q_tiles":
+        # the E4M3 head_dim-256 family: one work item per (request, KV head, row tile)
+        if q_len is None:
+            raise ValueError(
+                f"the balanced DCP program rule of {kind} needs q_len (row tiles)"
+            )
+        q_tiles = dcp_balanced_q_tiles(kind, int(q_len))
+    else:
+        raise RuntimeError(
+            f"unsupported balanced DCP program rule for {kind}: {bound!r}"
+        )
+    if int(sm_count) <= 0:
+        raise ValueError(f"sm_count must be positive, got {sm_count}")
+    if int(batch_size) <= 0 or int(num_kv_heads) <= 0:
+        raise ValueError("batch_size and num_kv_heads must be positive")
+    if int(max_pages_per_seq) <= 0:
+        raise ValueError(f"max_pages_per_seq must be positive, got {max_pages_per_seq}")
+    tiles = int(batch_size) * int(num_kv_heads) * q_tiles
+    if tiles >= int(sm_count):
+        return int(variants["at_or_above_grid"])
+    regime = variants["static_one_wave_regime"]
+    if regime.get("form", "split_chunks") == "whole_tiles":
+        # The whole-tile form (the BF16 head_dim-128 family): one request whose
+        # block-table width stays within ``whole_pages_max[sm_count][num_kv_heads]``
+        # (the widest bound for which the planner itself plans every tile whole)
+        # runs the static program; everything else, including SM counts or KV-head
+        # counts outside the table, runs the planner program.
+        limit = (
+            regime["whole_pages_max"]
+            .get(str(int(sm_count)), {})
+            .get(str(int(num_kv_heads)))
+        )
+        if (
+            int(batch_size) == 1
+            and int(regime.get("one_request", 1)) == 1
+            and limit is not None
+            and int(max_pages_per_seq) <= int(limit)
+        ):
+            swapped = regime.get("swapped")
+            program = int(variants["static_one_wave"])
+            if (
+                swapped is not None
+                and arch in swapped["arches"]
+                and n_rows is not None
+                and int(n_rows) in [int(value) for value in swapped["n_rows"]]
+            ):
+                program = int(swapped["program"])
+            early = regime.get("early_issue")
+            if early is not None and arch in early["arches"]:
+                # the early-issue form of the whole-tile program on its architectures (CAKE-685 unit 85e)
+                program = int(early["programs"].get(str(program), program))
+            return program
+        return int(variants["below_grid"])
+    n_max = -(
+        -int(max_pages_per_seq)
+        * int(regime["page_size"])
+        // int(regime["chunk_tokens"])
+    )
+    # ``max_chunks``: the head_dim-256 family's cost-model window; absent on the D128 family
+    max_chunks = regime.get("max_chunks")
+    if (
+        n_max >= int(regime["min_chunks"])
+        and (max_chunks is None or n_max <= int(max_chunks))
+        and tiles * (n_max + int(regime["reduce_tickets_per_tile"])) <= int(sm_count)
+    ):
+        return int(variants["static_one_wave"])
+    return int(variants["below_grid"])
+
+
+def _dcp_whole_tile_one_wave(
+    kind: str, *, num_kv_heads: int, max_pages_per_seq: int, sm_count: int
+) -> bool:
+    """Does a single request with this page-table width run the family's whole-tile
+    static program (manifest regime ``form = whole_tiles``,
+    ``whole_pages_max[sm_count][num_kv_heads]``)?  ``False`` for families without
+    the whole-tile form, SM counts or KV-head counts outside the table."""
+
+    from .jit.cake_dcp import dcp_balanced_program_variants
+
+    variants = dcp_balanced_program_variants(_DCP_BALANCED_FAMILY[kind])
+    if variants is None:
+        return False
+    regime = variants.get("static_one_wave_regime") or {}
+    if regime.get("form", "split_chunks") != "whole_tiles":
+        return False
+    limit = (
+        regime["whole_pages_max"]
+        .get(str(int(sm_count)), {})
+        .get(str(int(num_kv_heads)))
+    )
+    return (
+        limit is not None
+        and int(regime.get("one_request", 1)) == 1
+        and 0 < int(max_pages_per_seq) <= int(limit)
+    )
+
+
 def dcp_balanced_items_bound(
     *, batch_size: int, num_kv_heads: int, max_local_seq_len: int
 ) -> int:
@@ -466,18 +672,29 @@ def dcp_balanced_band(
     cp_world: int,
     sm_count: int,
     arch: str,
+    max_pages_per_seq: Optional[int] = None,
 ) -> DcpBalancedBand:
     """Host-metadata band of the balanced DCP kernels (mirror of the Cake dispatcher).
 
     ``balanced`` requires the kernel's contract (head_dim and query heads per
     KV head of the family, its q_len range, at most ``DCP_BALANCED_MAX_REQUESTS``
-    requests) and one of the two measured regimes: the static route needs a
+    requests) and one of the measured regimes: the static route needs a
     second wave of tiles and the chunk-pair work bound reaches the items floor
     (times the row tiles per request on D256), or one static wave streams the
-    long-tile block count or more per CTA.  On the FP8 D128 family a row at
-    exactly two static waves must reach the ``arch``'s two-wave items floor.
-    ``arch`` is the compile target's architecture key (``sm_100a`` /
-    ``sm_103a``); other keys take the family's items floor.
+    long-tile block count or more per CTA (per ``arch`` on the FP8 D128
+    family), or (D256 only) one static wave whose (blocks per CTA, q_len)
+    reaches one of the ``arch``'s one-wave row-tile classes
+    (``DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH``).  On
+    the FP8 D128 family a row at exactly two static waves must reach the
+    ``arch``'s two-wave items floor.  On the BF16 family one static wave
+    serving a single request whose page-table width (``max_pages_per_seq``,
+    the ``block_tables`` width; the narrowest table for ``max_local_seq_len``
+    when not given) is within the whole-tile bound runs the whole-tile static
+    program when the ``arch`` lists the row's packed-row instance in
+    ``DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS`` (``balanced`` /
+    ``whole_tile_one_wave``).  ``arch`` is the compile target's
+    architecture key (``sm_100a`` / ``sm_103a``); other keys take the scalar
+    defaults.
     """
 
     _check_dcp_balanced_kind(kind)
@@ -515,9 +732,40 @@ def dcp_balanced_band(
         return decide("static", "q_len")
     if batch_size > DCP_BALANCED_MAX_REQUESTS:
         return decide("static", "batch")
-    if blocks_per_cta >= _DCP_BALANCED_LONG_TILE_BLOCKS[kind]:
+    long_tile_blocks = _DCP_BALANCED_LONG_TILE_BLOCKS[kind]
+    if kind == "fp8_p64":
+        long_tile_blocks = DCP_BALANCED_FP8_LONG_TILE_BLOCKS_BY_ARCH.get(
+            arch, long_tile_blocks
+        )
+    if blocks_per_cta >= long_tile_blocks:
         return decide("balanced", "long_tile")
     if waves < 2:
+        if kind == "fp8_p64_d256" and any(
+            blocks_per_cta >= min_blocks and q_len >= min_q_len
+            for min_blocks, min_q_len in DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH.get(
+                arch, DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES
+            )
+        ):
+            return decide("balanced", "one_wave_row_tiles")
+        if (
+            kind == "bf16_p16"
+            and int(batch_size) == 1
+            and dcp_balanced_n_rows(kind, q_len)
+            in DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS.get(arch, ())
+            and _dcp_whole_tile_one_wave(
+                kind,
+                num_kv_heads=num_kv_heads,
+                max_pages_per_seq=(
+                    int(max_pages_per_seq)
+                    if max_pages_per_seq is not None
+                    else max(
+                        1, -(-int(max_local_seq_len) // _DCP_BALANCED_PAGE_SIZE[kind])
+                    )
+                ),
+                sm_count=sm_count,
+            )
+        ):
+            return decide("balanced", "whole_tile_one_wave")
         return decide("static", "one_wave")
     if items < _DCP_BALANCED_MIN_ITEMS[kind]:
         return decide("static", "items")
@@ -543,6 +791,7 @@ def dcp_balanced_route(
     cp_world: int,
     sm_count: int,
     arch: str,
+    max_pages_per_seq: Optional[int] = None,
 ) -> str:
     """``"balanced"`` or ``"static"`` for one DCP row (see :func:`dcp_balanced_band`)."""
 
@@ -557,6 +806,7 @@ def dcp_balanced_route(
         cp_world=cp_world,
         sm_count=sm_count,
         arch=arch,
+        max_pages_per_seq=max_pages_per_seq,
     ).route
 
 
@@ -624,10 +874,21 @@ def _run_dcp_spec_balanced(
 
     _check_workspace_buffer_alignment(workspace_buffer, "workspace_buffer")
     _check_workspace_buffer_alignment(completion_buffer, "multi_ctas_kv_counter_buffer")
+    n_rows = dcp_balanced_n_rows(kind, q_len_per_req)
     module = load_dcp_spec_balanced_module(
         _DCP_BALANCED_FAMILY[kind],
         target,
-        dcp_balanced_n_rows(kind, q_len_per_req),
+        n_rows,
+        dcp_balanced_program(
+            kind,
+            batch_size=batch_size,
+            num_kv_heads=num_kv_heads,
+            max_pages_per_seq=int(block_tables.shape[1]),
+            sm_count=sm_count,
+            arch=_DCP_BALANCED_ARCH.get(target, target),
+            n_rows=n_rows,
+            q_len=q_len_per_req,
+        ),
     )
     if kind == "bf16_p16":
         if float(bmm2_scale) != 1.0:
@@ -936,6 +1197,7 @@ def run_dcp_spec_decode(
             cp_world=cp_world,
             sm_count=sm_count,
             arch=_DCP_BALANCED_ARCH.get(target, target),
+            max_pages_per_seq=max_pages_per_seq,
         )
         if route == "balanced" or band.route == "balanced":
             problem = _dcp_balanced_buffer_problem(
@@ -1140,6 +1402,7 @@ __all__ = [
     "DcpBalancedBand",
     "dcp_balanced_band",
     "dcp_balanced_n_rows",
+    "dcp_balanced_program",
     "dcp_balanced_route",
     "dcp_static_shape",
     "get_dcp_spec_balanced_counter_bytes",

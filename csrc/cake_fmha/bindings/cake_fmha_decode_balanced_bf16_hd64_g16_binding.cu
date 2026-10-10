@@ -5,9 +5,9 @@
 
 #include "../include/cake_fmha.h"
 
-extern "C" __global__ void kernel_cake_fmha_decode_balanced_bf16_hd256_p64(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* O_ptr, int* page_table, int* seq_lens_kv, float* partial_o, float* partial_stats, uint32_t* tile_counters, uint32_t* queue_counters, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads, int group_ratio, int batch_size, int q_len, uint32_t max_items);
+extern "C" __global__ void kernel_cake_fmha_decode_balanced_bf16_hd64_g16(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* O_ptr, int* page_table, int* seq_lens_kv, float* partial_o, float* partial_stats, uint32_t* tile_counters, uint32_t* queue_counters, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads, int group_ratio, int batch_size, int q_len, uint32_t max_items);
 
-extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd256_p64(
+extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd64_g16(
     CUtensorMap const& Qt,
     CUtensorMap const& K,
     CUtensorMap const& V,
@@ -31,9 +31,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd256_p64(
     unsigned int grid_z,
     cudaStream_t stream) {
     cudaError_t status = cudaFuncSetAttribute(
-        reinterpret_cast<const void*>(kernel_cake_fmha_decode_balanced_bf16_hd256_p64),
+        reinterpret_cast<const void*>(kernel_cake_fmha_decode_balanced_bf16_hd64_g16),
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        213504);
+        159616);
     if (status != cudaSuccess) {
         return status;
     }
@@ -58,10 +58,10 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd256_p64(
         const_cast<void*>(reinterpret_cast<const void*>(&max_items))
     };
     return cudaLaunchKernel(
-        reinterpret_cast<const void*>(kernel_cake_fmha_decode_balanced_bf16_hd256_p64),
+        reinterpret_cast<const void*>(kernel_cake_fmha_decode_balanced_bf16_hd64_g16),
         dim3(grid_x, grid_y, grid_z),
         dim3(512, 1, 1),
         kernel_args,
-        213504,
+        159616,
         stream);
 }

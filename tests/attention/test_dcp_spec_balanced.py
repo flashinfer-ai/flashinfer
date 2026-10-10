@@ -13,6 +13,7 @@ import torch
 import flashinfer.cake_dcp as cake_dcp
 from flashinfer.cake_dcp import (
     DCP_BALANCED_BF16_LONG_TILE_BLOCKS,
+    DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS,
     DCP_BALANCED_BF16_MAX_Q_LEN,
     DCP_BALANCED_BF16_MIN_ITEMS,
     DCP_BALANCED_BF16_MIN_Q_LEN,
@@ -21,7 +22,10 @@ from flashinfer.cake_dcp import (
     DCP_BALANCED_D256_MAX_Q_LEN,
     DCP_BALANCED_D256_MIN_ITEMS,
     DCP_BALANCED_D256_MIN_Q_LEN,
+    DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES,
+    DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH,
     DCP_BALANCED_FP8_LONG_TILE_BLOCKS,
+    DCP_BALANCED_FP8_LONG_TILE_BLOCKS_BY_ARCH,
     DCP_BALANCED_FP8_MAX_Q_LEN,
     DCP_BALANCED_FP8_MIN_ITEMS,
     DCP_BALANCED_FP8_MIN_Q_LEN,
@@ -30,6 +34,7 @@ from flashinfer.cake_dcp import (
     DCP_BALANCED_MAX_REQUESTS,
     dcp_balanced_band,
     dcp_balanced_n_rows,
+    dcp_balanced_program,
     dcp_balanced_route,
     dcp_static_shape,
     get_dcp_spec_balanced_counter_bytes,
@@ -40,6 +45,7 @@ from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 from flashinfer.jit.cake_dcp import (
     DCP_BALANCED_FAMILIES,
     DCP_BALANCED_N_ROWS,
+    dcp_balanced_program_variants,
     get_dcp_spec_balanced_uri,
     get_dcp_spec_registry,
 )
@@ -109,13 +115,24 @@ def test_balanced_band_constants_match_the_cake_dispatcher() -> None:
     assert (DCP_BALANCED_BF16_MIN_Q_LEN, DCP_BALANCED_BF16_MAX_Q_LEN) == (3, 8)
     assert DCP_BALANCED_BF16_MIN_ITEMS == 128
     assert DCP_BALANCED_BF16_LONG_TILE_BLOCKS == 16
+    assert DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS == {
+        "sm_100a": (32,),
+        "sm_103a": (32, 64),
+    }
     assert (DCP_BALANCED_FP8_MIN_Q_LEN, DCP_BALANCED_FP8_MAX_Q_LEN) == (3, 8)
     assert DCP_BALANCED_FP8_MIN_ITEMS == 160
-    assert DCP_BALANCED_FP8_LONG_TILE_BLOCKS == 24
-    assert DCP_BALANCED_FP8_TWO_WAVE_MIN_ITEMS == {"sm_100a": 384, "sm_103a": 160}
+    # round 5: 24 -> 17 on sm_103a; the 17-block class is a tie band on sm_100a (floor 18)
+    assert DCP_BALANCED_FP8_LONG_TILE_BLOCKS == 18
+    assert DCP_BALANCED_FP8_LONG_TILE_BLOCKS_BY_ARCH == {"sm_100a": 18, "sm_103a": 17}
+    assert DCP_BALANCED_FP8_TWO_WAVE_MIN_ITEMS == {"sm_100a": 160, "sm_103a": 160}
     assert (DCP_BALANCED_D256_MIN_Q_LEN, DCP_BALANCED_D256_MAX_Q_LEN) == (1, 8)
     assert DCP_BALANCED_D256_MIN_ITEMS == 160
     assert DCP_BALANCED_D256_LONG_TILE_BLOCKS == 96
+    assert DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES == ((22, 3),)
+    assert DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH == {
+        "sm_100a": ((32, 2), (22, 3), (16, 4)),
+        "sm_103a": ((32, 2), (16, 3)),
+    }
 
 
 # (label, kind, batch, q_len, prefix(es), cp_world, cp_rank, expected route)
@@ -124,7 +141,16 @@ def test_balanced_band_constants_match_the_cake_dispatcher() -> None:
 # to its winner on both architectures unless a per-arch dict says otherwise.
 _ROUTE_ROWS = [
     # bf16 / page 16: the 19-row band probe, the three crossover rows and the perf rows
-    ("band_b1_s4096_q8_w4_r0", "bf16_p16", 1, 8, 4096, 4, 0, "static"),
+    (
+        "band_b1_s4096_q8_w4_r0",
+        "bf16_p16",
+        1,
+        8,
+        4096,
+        4,
+        0,
+        {"sm_100a": "static", "sm_103a": "balanced"},
+    ),
     ("band_b2_s4096_q4_w4_r0", "bf16_p16", 2, 4, 4096, 4, 0, "static"),
     ("band_b4_s4096_q4_w4_r0", "bf16_p16", 4, 4, 4096, 4, 0, "static"),
     ("band_b1_s8192_q4_w4_r0", "bf16_p16", 1, 4, 8192, 4, 0, "static"),
@@ -143,10 +169,10 @@ _ROUTE_ROWS = [
     ("band_b8_s4096_q1_w4_r0", "bf16_p16", 8, 1, 4096, 4, 0, "static"),
     ("band_b256_s4096_q4_w4_r0", "bf16_p16", 256, 4, 4096, 4, 0, "balanced"),
     ("band_b128_s16384_q8_w4_r0", "bf16_p16", 128, 8, 16384, 4, 0, "balanced"),
-    ("band_b1_s6144_q4_w4_r0", "bf16_p16", 1, 4, 6144, 4, 0, "static"),
+    ("band_b1_s6144_q4_w4_r0", "bf16_p16", 1, 4, 6144, 4, 0, "balanced"),
     ("band_b1_s7168_q4_w4_r0", "bf16_p16", 1, 4, 7168, 4, 0, "static"),
     ("band_b2_s6144_q8_w4_r0", "bf16_p16", 2, 8, 6144, 4, 0, "static"),
-    ("perf_b1_s4096_q4_w4_r0", "bf16_p16", 1, 4, 4096, 4, 0, "static"),
+    ("perf_b1_s4096_q4_w4_r0", "bf16_p16", 1, 4, 4096, 4, 0, "balanced"),
     ("perf_b8_s4096_q4_w4_r0", "bf16_p16", 8, 4, 4096, 4, 0, "balanced"),
     ("perf_b64_s4096_q4_w4_r0", "bf16_p16", 64, 4, 4096, 4, 0, "balanced"),
     ("perf_b1_s16384_q8_w4_r0", "bf16_p16", 1, 8, 16384, 4, 0, "balanced"),
@@ -155,6 +181,9 @@ _ROUTE_ROWS = [
     ("perf_b8_s16383_q8_w4_r3_tail", "bf16_p16", 8, 8, 16383, 4, 3, "balanced"),
     ("dcp_bf16_agentx_b16_q4_cp4_r0", "bf16_p16", 16, 4, AGENTX, 4, 0, "balanced"),
     ("dcp_bf16_agentx_b16_q8_cp4_r3", "bf16_p16", 16, 8, AGENTX, 4, 3, "balanced"),
+    # unit 87: the single-request one-wave rows within the whole-tile bound (65 / 65 / 97 pages <= 112) route to the
+    # whole-tile static program -- the 64-row instance (band_b1_s4096_q8) only on sm_103a; band_b1_s7168_q4 (113 pages)
+    # and the b2 / b4 one-wave rows stay static
     # fp8 e4m3 / page 64 / D128: the 27-row band probe and production rows
     ("bandfp8_b1_s4096_q8_w4_r0", "fp8_p64", 1, 8, 4096, 4, 0, "static"),
     ("bandfp8_b2_s4096_q4_w4_r0", "fp8_p64", 2, 4, 4096, 4, 0, "static"),
@@ -162,7 +191,16 @@ _ROUTE_ROWS = [
     ("bandfp8_b1_s8192_q4_w4_r0", "fp8_p64", 1, 4, 8192, 4, 0, "static"),
     ("bandfp8_b1_s8192_q8_w4_r0", "fp8_p64", 1, 8, 8192, 4, 0, "static"),
     ("bandfp8_b2_s16384_q8_w4_r0", "fp8_p64", 2, 8, 16384, 4, 0, "balanced"),
-    ("bandfp8_b1_s32768_q4_w4_r0", "fp8_p64", 1, 4, 32768, 4, 0, "static"),
+    (
+        "bandfp8_b1_s32768_q4_w4_r0",
+        "fp8_p64",
+        1,
+        4,
+        32768,
+        4,
+        0,
+        "balanced",
+    ),  # round 5: 22 blocks per CTA, 1.15 / 1.11
     ("bandfp8_b1_s65536_q4_w4_r0", "fp8_p64", 1, 4, 65536, 4, 0, "balanced"),
     ("bandfp8_b8_s512_q4_w4_r0", "fp8_p64", 8, 4, 512, 4, 0, "static"),
     ("bandfp8_b8_s1024_q4_w4_r0", "fp8_p64", 8, 4, 1024, 4, 0, "static"),
@@ -175,8 +213,8 @@ _ROUTE_ROWS = [
         4096,
         4,
         0,
-        {"sm_100a": "static", "sm_103a": "balanced"},
-    ),  # fmt: skip
+        "balanced",
+    ),  # round 5: both parts (320 items, two waves)
     ("bandfp8_b8_s4096_q6_w4_r0", "fp8_p64", 8, 6, 4096, 4, 0, "balanced"),
     ("bandfp8_b8_s4096_q4_w8_r5", "fp8_p64", 8, 4, 4096, 8, 5, "static"),
     ("bandfp8_b8_s4096_q4_w2_r1", "fp8_p64", 8, 4, 4096, 2, 1, "balanced"),
@@ -186,10 +224,28 @@ _ROUTE_ROWS = [
     ("bandfp8_b1_s6144_q4_w4_r0", "fp8_p64", 1, 4, 6144, 4, 0, "static"),
     ("bandfp8_b1_s7168_q4_w4_r0", "fp8_p64", 1, 4, 7168, 4, 0, "static"),
     ("bandfp8_b1_s16384_q4_w4_r0", "fp8_p64", 1, 4, 16384, 4, 0, "static"),
-    ("bandfp8_b1_s24576_q4_w4_r0", "fp8_p64", 1, 4, 24576, 4, 0, "static"),
+    (
+        "bandfp8_b1_s24576_q4_w4_r0",
+        "fp8_p64",
+        1,
+        4,
+        24576,
+        4,
+        0,
+        {"sm_100a": "static", "sm_103a": "balanced"},
+    ),  # round 5: 17 blocks per CTA (1.055 GB300, tie 0.981 B200)
     ("bandfp8_b2_s6144_q8_w4_r0", "fp8_p64", 2, 8, 6144, 4, 0, "static"),
     ("bandfp8_b128_s16384_q8_w4_r0", "fp8_p64", 128, 8, 16384, 4, 0, "balanced"),
-    ("bandfp8_b1_s8192_q4_w1_r0", "fp8_p64", 1, 4, 8192, 1, 0, "static"),
+    (
+        "bandfp8_b1_s8192_q4_w1_r0",
+        "fp8_p64",
+        1,
+        4,
+        8192,
+        1,
+        0,
+        {"sm_100a": "static", "sm_103a": "balanced"},
+    ),  # round 5: cp1, 17 blocks per CTA (1.053 GB300, tie 0.994 B200)
     ("bandfp8_b1_s4096_q4_w1_r0", "fp8_p64", 1, 4, 4096, 1, 0, "static"),
     ("bandfp8_b8_s8192_q4_w1_r0", "fp8_p64", 8, 4, 8192, 1, 0, "balanced"),
     (
@@ -200,8 +256,8 @@ _ROUTE_ROWS = [
         4096,
         4,
         0,
-        {"sm_100a": "static", "sm_103a": "balanced"},
-    ),  # fmt: skip
+        "balanced",
+    ),  # round 5: 1.29 GB300 / 1.17 B200
     ("prod_b1_s8192_q4_cp4_graph", "fp8_p64", 1, 4, 8192, 4, 0, "static"),
     ("prod_b8_s8192_q4_cp4_graph", "fp8_p64", 8, 4, 8192, 4, 0, "balanced"),
     ("prod_b32_s8192_q4_cp4_graph", "fp8_p64", 32, 4, 8192, 4, 0, "balanced"),
@@ -211,13 +267,31 @@ _ROUTE_ROWS = [
     ("prod_b64_s8191_q4_cp4_residue", "fp8_p64", 64, 4, 8191, 4, 0, "balanced"),
     ("prod_b64_s8192_q4_cp2", "fp8_p64", 64, 4, 8192, 2, 0, "balanced"),
     ("prod_b64_s8192_q4_cp8", "fp8_p64", 64, 4, 8192, 8, 0, "balanced"),
-    ("cp1_peer_b1_s8192_q4", "fp8_p64", 1, 4, 8192, 1, 0, "static"),
+    (
+        "cp1_peer_b1_s8192_q4",
+        "fp8_p64",
+        1,
+        4,
+        8192,
+        1,
+        0,
+        {"sm_100a": "static", "sm_103a": "balanced"},
+    ),  # round 5: 17 blocks per CTA (1.053 GB300; B200 tie 0.994 probe / 1.03 bench)
     ("cp1_peer_b8_s8192_q4", "fp8_p64", 8, 4, 8192, 1, 0, "balanced"),
     ("stretch_b384_s8192_q4_cp4", "fp8_p64", 384, 4, 8192, 4, 0, "balanced"),
     ("dcp_fp8_agentx_b16_q4_cp4_r0", "fp8_p64", 16, 4, AGENTX, 4, 0, "balanced"),
     # fp8 e4m3 / page 64 / D256 GQA-16: the 15 production rows and the ragged rows
     ("prod_d256_b1_ctx32768_q4_cp4_graph", "fp8_p64_d256", 1, 4, 32764, 4, 0, "static"),
-    ("prod_d256_b8_ctx32768_q4_cp4_graph", "fp8_p64_d256", 8, 4, 32764, 4, 0, "static"),
+    (
+        "prod_d256_b8_ctx32768_q4_cp4_graph",
+        "fp8_p64_d256",
+        8,
+        4,
+        32764,
+        4,
+        0,
+        "balanced",
+    ),  # 16 blocks per CTA: 1.138 GB300 / 1.100 B200 vs the static route (1.037 / 0.999 vs FlashInfer main, 10 rounds)
     (
         "prod_d256_b16_ctx32768_q4_cp4_graph",
         "fp8_p64_d256",
@@ -226,8 +300,8 @@ _ROUTE_ROWS = [
         32764,
         4,
         0,
-        "static",
-    ),
+        "balanced",
+    ),  # round 5: the one-wave row-tile regime
     (
         "prod_d256_b32_ctx32768_q4_cp4_graph",
         "fp8_p64_d256",
@@ -236,8 +310,8 @@ _ROUTE_ROWS = [
         32764,
         4,
         0,
-        "static",
-    ),
+        "balanced",
+    ),  # round 5: the one-wave row-tile regime
     (
         "prod_d256_b64_ctx32768_q4_cp4_graph",
         "fp8_p64_d256",
@@ -391,8 +465,105 @@ def test_balanced_band_routes_every_measured_row_to_its_winner(row, arch) -> Non
     )
 
 
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+def test_d256_one_wave_row_tile_regime(arch) -> None:
+    # One static wave of the prod_d256 ctx32768 geometry (8192 local tokens, 64 blocks per
+    # tile): the static route streams each request's KV once per speculative row, the
+    # balanced row tile of up to four rows once per tile -- rows at q_len >= 3 whose static
+    # tile streams >= 22 blocks per CTA route balanced (b12 / b16 / b32 at q_len 4, b16 at
+    # q_len 3, b16 at q_len 5 and 8, b8 at q_len 8); the 16-block class (static split 4)
+    # routes balanced from q_len 4 on sm_100a and from q_len 3 on sm_103a; q_len 2 (two rows
+    # per tile) routes balanced from 32 blocks per CTA; b1 and the 8-block class stay static,
+    # q_len 1 (no sharing) and q_len 2 at 16 blocks stay static.
+    def band(batch, q_len):
+        return _band(
+            "fp8_p64_d256",
+            batch=batch,
+            q_len=q_len,
+            prefix=32764,
+            cp_world=4,
+            cp_rank=0,
+            arch=arch,
+        )
+
+    b12, b16, b32 = band(12, 4), band(16, 4), band(32, 4)
+    assert (b12.waves, b12.blocks_per_cta, b12.route, b12.reason) == (
+        1,
+        22,
+        "balanced",
+        "one_wave_row_tiles",
+    )  # 48 tiles, split 3: 1.108 GB300 / 1.142 B200
+    assert (b16.waves, b16.blocks_per_cta, b16.route, b16.reason) == (
+        1,
+        32,
+        "balanced",
+        "one_wave_row_tiles",
+    )
+    assert (b32.waves, b32.blocks_per_cta, b32.route, b32.reason) == (
+        1,
+        64,
+        "balanced",
+        "one_wave_row_tiles",
+    )
+    # the 16-block class (static split 4): 1.138 / 1.100 vs the static route and
+    # 1.037 / 0.999 vs the public path (GB300 / B200, 10 rounds)
+    assert (band(8, 4).blocks_per_cta, band(8, 4).route, band(8, 4).reason) == (
+        16,
+        "balanced",
+        "one_wave_row_tiles",
+    )
+    for batch in (5, 6, 7, 9):
+        assert (band(batch, 4).blocks_per_cta, band(batch, 4).route) == (16, "balanced")
+    for batch in (9, 11, 12):
+        # q_len 3 at 16 blocks: 1.007-1.043 vs the public path on GB300, 0.971-1.020 on B200
+        q3 = band(batch, 3)
+        assert (q3.blocks_per_cta, q3.route, q3.reason) == (
+            (16, "balanced", "one_wave_row_tiles")
+            if arch == "sm_103a"
+            else (16, "static", "one_wave")
+        )
+    assert (band(4, 4).blocks_per_cta, band(4, 4).route, band(4, 4).reason) == (
+        8,
+        "static",
+        "one_wave",
+    )  # 8 blocks per CTA (static split 8): 0.91 / 0.88
+    assert (band(1, 4).route, band(1, 4).reason) == ("static", "one_wave")
+    assert (band(16, 3).blocks_per_cta, band(16, 3).route, band(16, 3).reason) == (
+        22,
+        "balanced",
+        "one_wave_row_tiles",
+    )  # 1.071 / 1.064
+    # q_len 5 / 8: the last speculative row puts 8193 keys on rank 0 (65 blocks; split 1 / split 2)
+    assert (band(16, 5).blocks_per_cta, band(16, 5).route) == (65, "balanced")
+    assert (band(8, 8).blocks_per_cta, band(8, 8).route) == (33, "balanced")
+    assert (band(32, 1).waves, band(32, 1).route) == (
+        1,
+        "static",
+    )  # q_len 1: no row-tile sharing (0.888 / 0.897)
+    # q_len 2 from 32 blocks per CTA: b32 1.057 / 1.026, b64 1.053 / 1.060 vs the public
+    # path (GB300 / B200, 10 rounds); q_len 1 at 32 blocks (b64 q1) stays static
+    assert (band(32, 2).blocks_per_cta, band(32, 2).route, band(32, 2).reason) == (
+        32,
+        "balanced",
+        "one_wave_row_tiles",
+    )
+    assert (band(64, 2).blocks_per_cta, band(64, 2).route) == (64, "balanced")
+    assert (band(64, 1).blocks_per_cta, band(64, 1).route) == (32, "static")
+    assert (band(16, 2).blocks_per_cta, band(16, 2).route) == (
+        16,
+        "static",
+    )  # 0.937 / 0.911
+    assert (band(16, 8).waves, band(16, 8).route, band(16, 8).reason) == (
+        1,
+        "balanced",
+        "one_wave_row_tiles",
+    )
+
+
 def test_two_wave_floor_is_keyed_on_the_architecture() -> None:
-    # prod_b8_s4096_q4_cp4: 320 chunk-pair items at exactly two static waves.
+    # prod_b8_s4096_q4_cp4: 320 chunk-pair items at exactly two static waves.  Round 3 kept
+    # sm_100a static here (floor 384); the round-5 programs win the row on both parts, so both
+    # per-architecture floors sit at the family's items floor and the row routes balanced.
     b200 = _band(
         "fp8_p64", batch=8, q_len=4, prefix=4096, cp_world=4, cp_rank=0, arch="sm_100a"
     )
@@ -411,8 +582,10 @@ def test_two_wave_floor_is_keyed_on_the_architecture() -> None:
         9,
         320,
     )
-    assert (b200.route, b200.reason) == ("static", "two_wave_floor")
+    assert (b200.route, b200.reason) == ("balanced", "two_waves")
     assert (gb300.route, gb300.reason) == ("balanced", "two_waves")
+    # the per-architecture floor still gates a two-wave row below it (the dictionary is the contract)
+    assert DCP_BALANCED_FP8_TWO_WAVE_MIN_ITEMS["sm_100a"] == DCP_BALANCED_FP8_MIN_ITEMS
     # 576 items at two waves clear the sm_100a floor; three waves need no floor.
     assert (
         _band(
@@ -607,23 +780,316 @@ def test_balanced_scratch_sizes_are_shape_independent() -> None:
 
 
 def test_balanced_uri_names_the_family_instance_and_pins() -> None:
-    assert get_dcp_spec_balanced_uri("dcp_spec_bf16_balanced", "sm100a", 32) == (
-        f"cake_fmha_dcp_spec_bf16_balanced_n32_sm100a_{CAKE_FMHA_JIT_TAG}"
+    # the BF16 head_dim-128 family ships two programs (1 planner, 2 whole-tile static): its URI names the program
+    assert get_dcp_spec_balanced_uri("dcp_spec_bf16_balanced", "sm100a", 32, 2) == (
+        f"cake_fmha_dcp_spec_bf16_balanced_n32_program2_sm100a_{CAKE_FMHA_JIT_TAG}"
     )
+    # the E4M3 head_dim-256 family ships two programs (1 planner, 2 static one-wave): its URI names the program
     assert get_dcp_spec_balanced_uri(
-        "dcp_spec_bf16_fp8_d256_balanced", "sm103a", 64
-    ).startswith("cake_fmha_dcp_spec_bf16_fp8_d256_balanced_n64_sm103a_")
+        "dcp_spec_bf16_fp8_d256_balanced", "sm103a", 64, 2
+    ).startswith("cake_fmha_dcp_spec_bf16_fp8_d256_balanced_n64_program2_sm103a_")
     assert (
         tuple(_KIND_FAMILY[kind] for kind in DCP_BALANCED_KINDS)
         == DCP_BALANCED_FAMILIES
     )
     assert DCP_BALANCED_N_ROWS == (32, 64)
+    for family in DCP_BALANCED_FAMILIES:
+        variants = dcp_balanced_program_variants(family)
+        if variants is None:
+            with pytest.raises(ValueError, match="one program"):
+                get_dcp_spec_balanced_uri(family, "sm100a", 32, 0)
+            continue
+        key = variants["key"]
+        for program in variants["values"]:
+            assert get_dcp_spec_balanced_uri(family, "sm100a", 32, program).startswith(
+                f"cake_fmha_{family}_n32_{key}{program}_sm100a_"
+            )
+        with pytest.raises(ValueError, match=key):
+            get_dcp_spec_balanced_uri(family, "sm100a", 32)
+        with pytest.raises(ValueError, match=key):
+            get_dcp_spec_balanced_uri(family, "sm100a", 32, 7)
     with pytest.raises(ValueError, match="n_rows"):
         get_dcp_spec_balanced_uri("dcp_spec_bf16_balanced", "sm100a", 48)
     with pytest.raises(ValueError, match="family"):
         get_dcp_spec_balanced_uri("dcp_spec_bf16_v4", "sm100a", 32)
     with pytest.raises(ValueError, match="target"):
         get_dcp_spec_balanced_uri("dcp_spec_bf16_balanced", "sm90a", 32)
+
+
+def test_balanced_program_rule_mirrors_the_manifest() -> None:
+    """A family without program variants launches ``None``; one with them follows the manifest rule: the items lower
+    bound against the grid, then the static one-wave regime from the page-table width."""
+
+    for kind in DCP_BALANCED_KINDS:
+        variants = dcp_balanced_program_variants(_KIND_FAMILY[kind])
+        if variants is None:
+            for batch in (1, 256):
+                assert (
+                    dcp_balanced_program(
+                        kind,
+                        batch_size=batch,
+                        num_kv_heads=8,
+                        max_pages_per_seq=36,
+                        sm_count=148,
+                    )
+                    is None
+                )
+            continue
+        assert variants["items_lower_bound"] in (
+            "batch_size * num_kv_heads",
+            "batch_size * num_kv_heads * q_tiles",
+        )
+        below, above, static = (
+            int(variants["below_grid"]),
+            int(variants["at_or_above_grid"]),
+            int(variants["static_one_wave"]),
+        )
+        regime = variants["static_one_wave_regime"]
+        # the rule's programs cover the family's values (the BF16 family runs one program below and at or above the grid
+        # and the swapped-QK whole-tile program on the regime's architectures / packed-row instances)
+        rule_values = {below, above, static}
+        if "swapped" in regime:
+            rule_values.add(int(regime["swapped"]["program"]))
+        if "early_issue" in regime:
+            rule_values.update(
+                int(value) for value in regime["early_issue"]["programs"].values()
+            )
+        assert sorted(rule_values) == sorted(int(v) for v in variants["values"])
+
+        def program(batch, hkv, pages, sm, **selection):
+            return dcp_balanced_program(
+                kind,
+                batch_size=batch,
+                num_kv_heads=hkv,
+                max_pages_per_seq=pages,
+                sm_count=sm,
+                **selection,
+            )
+
+        if regime.get("form") == "whole_tiles":
+            # the BF16 head_dim-128 family: planner / whole-tile static, from the export-time regime table
+            assert kind == "bf16_p16" and (below, above, static) == (1, 1, 2)
+            assert regime["page_size"] == 16 and regime["one_request"] == 1
+            table = regime["whole_pages_max"]
+            assert table["148"]["8"] == 112 and table["152"]["8"] == 112
+            for sm in (148, 152):
+                # the b1 s4096 cp4 row (65 pages, 8 KV-head tiles) and the table's bound; 113 pages is the planner
+                assert program(1, 8, 65, sm) == static
+                assert (
+                    program(1, 8, 112, sm) == static and program(1, 8, 113, sm) == below
+                )
+                # the 16k row (257 pages), two and eight requests: the planner program
+                assert program(1, 8, 257, sm) == below
+                assert program(2, 8, 65, sm) == below and program(8, 8, 65, sm) == below
+                # at or above the grid the family keeps its planner body
+                assert program(-(-sm // 8), 8, 65, sm) == above == below
+            # an SM count outside the table keeps the planner program
+            assert program(1, 8, 65, 160) == below
+            # unit 81 lever A'': the swapped-QK whole-tile program on sm_100a for the 32-row instance only; the 64-row
+            # instance, sm_103a, the SM107 family target and unknown selection keep the whole-tile program
+            swapped = regime["swapped"]
+            assert swapped == {"program": 3, "arches": ["sm_100a"], "n_rows": [32]}
+            # unit 85e lever S: on sm_100a the whole-tile programs run in their early-issue forms (program 3 -> 5, 2 -> 4)
+            early = regime["early_issue"]
+            assert early == {"programs": {"2": 4, "3": 5}, "arches": ["sm_100a"]}
+            for sm in (148, 152):
+                assert (
+                    program(1, 8, 65, sm, arch="sm_100a", n_rows=32)
+                    == early["programs"][str(swapped["program"])]
+                    == 5
+                )
+                assert (
+                    program(1, 8, 112, sm, arch="sm_100a", n_rows=32)
+                    == early["programs"][str(swapped["program"])]
+                )
+                assert program(1, 8, 113, sm, arch="sm_100a", n_rows=32) == below
+                assert program(2, 8, 65, sm, arch="sm_100a", n_rows=32) == below
+                assert (
+                    program(1, 8, 65, sm, arch="sm_100a", n_rows=64)
+                    == early["programs"][str(static)]
+                    == 4
+                )
+                assert program(1, 8, 65, sm, arch="sm_103a", n_rows=32) == static
+                assert program(1, 8, 65, sm, arch="sm107a", n_rows=32) == static
+                assert program(1, 8, 65, sm, n_rows=32) == static
+                # an unknown instance on sm_100a keeps the whole-tile program (no swap) in its early-issue form
+                assert (
+                    program(1, 8, 65, sm, arch="sm_100a")
+                    == early["programs"][str(static)]
+                    == 4
+                )
+            continue
+        if kind == "fp8_p64_d256":
+            # planner (1) / plan-free static one-wave (2) on the row-tile geometry; the rule needs q_len
+            assert (
+                variants["items_lower_bound"] == "batch_size * num_kv_heads * q_tiles"
+            )
+            assert (below, above, static) == (1, 1, 2)
+            assert regime == {
+                "page_size": 64,
+                "chunk_tokens": 256,
+                "min_chunks": 5,
+                "max_chunks": 48,
+                "reduce_tickets_per_tile": 16,
+            }
+            with pytest.raises(ValueError, match="q_len"):
+                program(1, 1, 128, 148)
+            for sm in (148, 152):
+                # the b1 ctx32768 q4 cp4 goal row: 128 pages -> 32 chunks, one row tile, 1 x (32 + 16) = 48 tickets
+                assert program(1, 1, 128, sm, q_len=4) == static
+                # q_len 5..8 = two row tiles (96 tickets); b2 (96) and b3 (144) q4 fit the grid, b4 (192) does not
+                assert program(1, 1, 128, sm, q_len=5) == static
+                assert program(1, 1, 128, sm, q_len=8) == static
+                assert program(2, 1, 128, sm, q_len=4) == static
+                assert program(3, 1, 128, sm, q_len=4) == static
+                assert program(4, 1, 128, sm, q_len=4) == below
+                # the chunk-count window: 16 pages -> 4 chunks (below 5), 20 -> 5; 192 -> 48, 196 -> 49 (above 48)
+                assert program(1, 1, 16, sm, q_len=1) == below
+                assert program(1, 1, 20, sm, q_len=1) == static
+                assert program(1, 1, 192, sm, q_len=1) == static
+                assert program(1, 1, 196, sm, q_len=1) == below
+                # at 48 chunks a tile costs 64 tickets: two tiles fit, three do not
+                assert program(2, 1, 192, sm, q_len=1) == static
+                assert program(3, 1, 192, sm, q_len=1) == below
+                # the b128 q1 goal row: 128 tiles never fit one wave with their reduce tickets (planner program)
+                assert program(128, 1, 128, sm, q_len=1) == below == above
+                # at or above the grid (one tile per CTA): the planner program
+                assert program(sm, 1, 20, sm, q_len=1) == above
+            continue
+        assert regime == {
+            "page_size": 64,
+            "chunk_tokens": 256,
+            "min_chunks": 3,
+            "reduce_tickets_per_tile": 8,
+        }
+
+        for sm in (148, 152):
+            # the b1 s8192 cp4 row (36 pages -> 9 chunks per pair; 8 x (9 + 8) = 136 tickets) is the static regime
+            assert program(1, 8, 36, sm) == static
+            # the regime bound: 8 pairs x (n_max + 8) <= grid
+            n_edge = sm // 8 - 8
+            assert program(1, 8, 4 * n_edge, sm) == static
+            assert program(1, 8, 4 * (n_edge + 1), sm) == below
+            # fewer than three chunks per pair: the planner's whole / two-chunk plans
+            assert program(1, 8, 8, sm) == below and program(1, 8, 9, sm) == static
+            # cp1_peer_b1 (132 pages), b2 at 36 pages and b8 at any width: planner program with the fold
+            assert program(1, 8, 132, sm) == below
+            assert program(2, 8, 36, sm) == below
+            assert program(8, 8, 36, sm) == below
+            assert program(8, 8, 20, sm) == below
+            assert program((sm - 1) // 8, 8, 36, sm) == below
+            # at least one chunk ticket per pair fills the grid: the fold can never be taken
+            assert program(-(-sm // 8), 8, 36, sm) == above
+            assert program(64, 8, 36, sm) == above
+            assert program(256, 8, 36, sm) == above
+        assert program(37, 4, 36, 148) == above and program(36, 4, 36, 148) == below
+        # single KV head: nine requests of seven chunks fit (9 x 15 = 135), ten do not
+        assert program(9, 1, 25, 148) == static and program(10, 1, 25, 148) == below
+    with pytest.raises(ValueError, match="sm_count"):
+        dcp_balanced_program(
+            "fp8_p64", batch_size=1, num_kv_heads=8, max_pages_per_seq=36, sm_count=0
+        )
+    with pytest.raises(ValueError, match="max_pages_per_seq"):
+        dcp_balanced_program(
+            "fp8_p64", batch_size=1, num_kv_heads=8, max_pages_per_seq=0, sm_count=148
+        )
+    with pytest.raises(ValueError, match="kind"):
+        dcp_balanced_program(
+            "bf16_p64", batch_size=1, num_kv_heads=8, max_pages_per_seq=36, sm_count=148
+        )
+
+
+def test_fp8_program_row_selection(monkeypatch) -> None:
+    """The b1 one-wave row runs the static one-wave program when the caller forces the balanced route (the
+    ``auto`` band keeps that one-wave row on the static specialization), b8 the planner with the eight-slice
+    fold and the multi-wave uniform rows the planner without that fold body."""
+
+    variants = dcp_balanced_program_variants("dcp_spec_bf16_fp8_balanced")
+    if variants is None:
+        pytest.skip("the shipped E4M3 head_dim-128 family has one program")
+    calls, _launches = _patch_loaders(monkeypatch)
+    for batch, route, expected in (
+        (1, "balanced", variants["static_one_wave"]),
+        (8, "auto", variants["below_grid"]),
+        (64, "auto", variants["at_or_above_grid"]),
+    ):
+        calls["balanced"].clear()
+        calls["static"].clear()
+        inputs = _rank_inputs(
+            "fp8_p64",
+            batch=batch,
+            q_len=4,
+            prefixes=[8192] * batch,
+            cp_world=4,
+            cp_rank=0,
+        )
+        run_dcp_spec_decode(**inputs, route=route)
+        assert calls["balanced"] == [
+            ("dcp_spec_bf16_fp8_balanced", "sm100a", 32, int(expected))
+        ]
+        assert not calls["static"]
+    # ``auto`` routes the one-wave b1 row to the static specialization (band reason ``one_wave``).
+    calls["balanced"].clear()
+    calls["static"].clear()
+    inputs = _rank_inputs(
+        "fp8_p64", batch=1, q_len=4, prefixes=[8192], cp_world=4, cp_rank=0
+    )
+    run_dcp_spec_decode(**inputs)
+    assert not calls["balanced"] and len(calls["static"]) == 1
+
+
+def test_bf16_program_row_selection(monkeypatch) -> None:
+    """The bf16 b1 s4096 cp4 row (one request, 65 pages, eight KV-head tiles) runs the whole-tile static program when
+    the caller forces the balanced route (the ``auto`` band keeps that one-wave row on the static specialization);
+    b8 and the 16k b1 row run the planner program."""
+
+    variants = dcp_balanced_program_variants("dcp_spec_bf16_balanced")
+    if variants is None:
+        pytest.skip("the shipped BF16 head_dim-128 family has one program")
+    regime = variants["static_one_wave_regime"]
+    swapped = regime["swapped"]
+    early = regime["early_issue"]["programs"]
+    for target, batch, prefix, route, q_len, n_rows, expected in (
+        # unit 81 lever A'': on sm_100a the 32-row whole-tile launch runs the swapped-QK program (3), the 64-row instance
+        # (q_len 8) the whole-tile program (2) -- both in their early-issue forms (unit 85e lever S: 5 and 4);
+        # sm_103a runs the whole-tile program (2)
+        ("sm100a", 1, 4096, "balanced", 4, 32, early[str(swapped["program"])]),
+        ("sm100a", 1, 4096, "balanced", 8, 64, early[str(variants["static_one_wave"])]),
+        ("sm103a", 1, 4096, "balanced", 4, 32, variants["static_one_wave"]),
+        ("sm100a", 8, 4096, "auto", 4, 32, variants["below_grid"]),
+        ("sm100a", 1, 16384, "balanced", 4, 32, variants["below_grid"]),
+    ):
+        calls, _launches = _patch_loaders(monkeypatch, target=target)
+        inputs = _rank_inputs(
+            "bf16_p16",
+            batch=batch,
+            q_len=q_len,
+            prefixes=[prefix] * batch,
+            cp_world=4,
+            cp_rank=0,
+        )
+        run_dcp_spec_decode(**inputs, route=route)
+        assert calls["balanced"] == [
+            ("dcp_spec_bf16_balanced", target, n_rows, int(expected))
+        ], (target, batch, prefix, route, q_len)
+        assert not calls["static"]
+    calls, _launches = _patch_loaders(monkeypatch)
+    # ``auto`` routes the one-wave b1 row to the whole-tile program (band reason ``whole_tile_one_wave``, unit 87);
+    # the one-wave b1 row outside the whole-tile bound (129 pages) stays on the static specialization (``one_wave``).
+    calls["balanced"].clear()
+    calls["static"].clear()
+    inputs = _rank_inputs(
+        "bf16_p16", batch=1, q_len=4, prefixes=[4096], cp_world=4, cp_rank=0
+    )
+    run_dcp_spec_decode(**inputs)
+    assert calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, 5)]
+    assert not calls["static"]
+    calls["balanced"].clear()
+    inputs = _rank_inputs(
+        "bf16_p16", batch=1, q_len=4, prefixes=[8192], cp_world=4, cp_rank=0
+    )
+    run_dcp_spec_decode(**inputs)
+    assert not calls["balanced"] and len(calls["static"]) == 1
 
 
 # Launch resources and argument order the export pins per family
@@ -647,27 +1113,78 @@ _KIND_MANIFEST_BAND = {
 }
 
 
-def test_balanced_families_ship_one_program_with_both_packed_instances() -> None:
+# Tokens per Q TMA box of each program: the member define the adapter encodes the Q tensor
+# map from.  The bf16 swapped-QK whole-tile program (3) and its early-issue form (5) load
+# 32-row Q boxes; every other D128 program loads the 64-row tile; the D256 family's 16-head
+# group makes a box two tokens.
+_Q_BOX_TOKENS = {
+    "dcp_spec_bf16_balanced": lambda program: 4 if program in (3, 5) else 8,
+    "dcp_spec_bf16_fp8_balanced": lambda program: 8,
+    "dcp_spec_bf16_fp8_d256_balanced": lambda program: 2,
+}
+
+
+def test_balanced_families_ship_one_program_per_selector_with_both_packed_instances() -> (
+    None
+):
     families = get_dcp_spec_registry()["families"]
     csrc_dir = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha"
     header = (csrc_dir / "include" / "cake_fmha.h").read_text()
     for family in DCP_BALANCED_FAMILIES:
         entry = families[family]
-        selectors = sorted(
-            member["selector"]["n_rows"] for member in entry["source_family"]
-        )
-        assert selectors == [32, 64], family
-        program = f"cuda/dcp_spec/{family}/kernel.cu"
-        assert (csrc_dir / program).is_file(), program
+        variants = dcp_balanced_program_variants(family)
+        if variants is None:
+            # one shape-independent program: the two packed tiles are its -DN_ROWS instances
+            programs = {None: f"cuda/dcp_spec/{family}/kernel.cu"}
+            expected_selectors = [{"n_rows": n_rows} for n_rows in (32, 64)]
+        else:
+            # one such program per value of the program selector; the host picks it from launch metadata
+            key = variants["key"]
+            assert sorted(variants["values"]) == sorted(
+                int(v) for v in variants["bodies"]
+            )
+            assert variants["default"] in variants["values"]
+            programs = {
+                int(value): f"cuda/dcp_spec/{family}/kernel_{key}{int(value)}.cu"
+                for value in variants["values"]
+            }
+            expected_selectors = [
+                {key: int(value), "n_rows": n_rows}
+                for value in sorted(variants["values"])
+                for n_rows in (32, 64)
+            ]
         assert [
+            dict(sorted(member["selector"].items()))
+            for member in entry["source_family"]
+        ] == expected_selectors, family
+        assert sorted(
             path.name for path in (csrc_dir / "cuda" / "dcp_spec" / family).iterdir()
-        ] == ["kernel.cu"]
-        program_text = (csrc_dir / program).read_text()
-        assert program_text.count("#ifndef N_ROWS\n#define N_ROWS 64\n#endif\n") == 1
-        assert "#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)" in program_text
+        ) == sorted(Path(program).name for program in programs.values())
+        texts = {}
+        for value, program in programs.items():
+            assert (csrc_dir / program).is_file(), program
+            program_text = (csrc_dir / program).read_text()
+            assert (
+                program_text.count("#ifndef N_ROWS\n#define N_ROWS 64\n#endif\n") == 1
+            )
+            # one text for both architectures: codegen's device-pass guard selects the sm_100a lowering
+            assert "#if __CUDA_ARCH__ == 1000" in program_text
+            assert "const __grid_constant__ CUtensorMap" in program_text
+            assert "TensorMap const*" not in program_text
+            texts[value] = program_text
+        assert len(set(texts.values())) == len(texts)  # distinct programs
         for member in entry["source_family"]:
+            program = programs[
+                None if variants is None else int(member["selector"][variants["key"]])
+            ]
             assert member["sources"] == {"sm_100a": program, "sm_103a": program}
-            assert member["defines"] == {"N_ROWS": member["selector"]["n_rows"]}
+            program_value = (
+                None if variants is None else int(member["selector"][variants["key"]])
+            )
+            assert member["defines"] == {
+                "N_ROWS": member["selector"]["n_rows"],
+                "Q_BOX_TOKENS": _Q_BOX_TOKENS[family](program_value),
+            }
         assert entry["binding_source"] == f"bindings/cake_fmha_{family}_binding.cu"
         assert (csrc_dir / entry["binding_source"]).is_file()
         assert entry["launch_binding"] == f"cake_fmha_launch_{family}"
@@ -709,6 +1226,30 @@ def test_balanced_route_constants_match_the_shipped_manifest() -> None:
             assert band["band"]["two_wave_min_items_default"] == min_items
         else:
             assert "two_wave_min_items" not in band["band"]
+        if kind == "fp8_p64":
+            assert (
+                band["band"]["long_tile_blocks_by_arch"]
+                == DCP_BALANCED_FP8_LONG_TILE_BLOCKS_BY_ARCH
+            )
+        else:
+            assert "long_tile_blocks_by_arch" not in band["band"]
+        if kind == "bf16_p16":
+            assert band["band"]["whole_tile_one_wave_n_rows"] == {
+                arch: list(n_rows)
+                for arch, n_rows in DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS.items()
+            }
+        else:
+            assert "whole_tile_one_wave_n_rows" not in band["band"]
+        if kind == "fp8_p64_d256":
+            assert band["band"]["one_wave_row_tile_classes"] == [
+                list(c) for c in DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES
+            ]
+            assert band["band"]["one_wave_row_tile_classes_by_arch"] == {
+                arch: [list(c) for c in classes]
+                for arch, classes in DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH.items()
+            }
+        else:
+            assert "one_wave_row_tile_classes" not in band["band"]
         contract = band["contract"]
         assert (contract["min_q_len"], contract["max_q_len"]) == (min_q_len, max_q_len)
         assert contract["max_requests"] == DCP_BALANCED_MAX_REQUESTS
@@ -742,32 +1283,44 @@ def test_balanced_jit_selects_the_packed_instance_and_launch_binding(
     try:
         arch = target.replace("sm", "", 1)
         for family in DCP_BALANCED_FAMILIES:
+            variants = jit_dcp.dcp_balanced_program_variants(family)
+            programs = [None] if variants is None else list(variants["values"])
             for n_rows in DCP_BALANCED_N_ROWS:
-                spec = jit_dcp.gen_dcp_spec_balanced_module(family, target, n_rows)
-                assert (
-                    f"-gencode=arch=compute_{arch},code=sm_{arch}"
-                    in spec.extra_cuda_cflags
-                )
-                assert spec.name == get_dcp_spec_balanced_uri(family, target, n_rows)
-                body, launch_binding, api_binding = (
-                    Path(source) for source in spec.sources
-                )
-                assert body.name == "kernel.cu" and body.parent.name == family
-                assert body.parent.parent.name == "dcp_spec"
-                assert f"-DN_ROWS={n_rows}" in spec.extra_cuda_cflags
-                assert launch_binding.name == f"cake_fmha_{family}_binding.cu"
-                assert launch_binding.parent.name == "bindings"
-                assert api_binding.name == f"cake_fmha_{family}_jit_binding.cu"
-                assert api_binding.parent.name == "jit"
-                assert (
-                    f"-DCAKE_FMHA_DCP_BALANCED_LAUNCH=cake_fmha_launch_{family}"
-                    in spec.extra_cuda_cflags
-                )
-                assert "-lcuda" in spec.extra_ldflags
-                assert not any(
-                    flag.startswith(("-DQ_LEN", "-DBATCH_SIZE", "-DCP_WORLD"))
-                    for flag in spec.extra_cuda_cflags
-                )
+                for program in programs:
+                    spec = jit_dcp.gen_dcp_spec_balanced_module(
+                        family, target, n_rows, program
+                    )
+                    assert (
+                        f"-gencode=arch=compute_{arch},code=sm_{arch}"
+                        in spec.extra_cuda_cflags
+                    )
+                    assert spec.name == get_dcp_spec_balanced_uri(
+                        family, target, n_rows, program
+                    )
+                    body, launch_binding, api_binding = (
+                        Path(source) for source in spec.sources
+                    )
+                    expected_body = (
+                        "kernel.cu"
+                        if variants is None
+                        else f"kernel_{variants['key']}{program}.cu"
+                    )
+                    assert body.name == expected_body and body.parent.name == family
+                    assert body.parent.parent.name == "dcp_spec"
+                    assert f"-DN_ROWS={n_rows}" in spec.extra_cuda_cflags
+                    assert launch_binding.name == f"cake_fmha_{family}_binding.cu"
+                    assert launch_binding.parent.name == "bindings"
+                    assert api_binding.name == f"cake_fmha_{family}_jit_binding.cu"
+                    assert api_binding.parent.name == "jit"
+                    assert (
+                        f"-DCAKE_FMHA_DCP_BALANCED_LAUNCH=cake_fmha_launch_{family}"
+                        in spec.extra_cuda_cflags
+                    )
+                    assert "-lcuda" in spec.extra_ldflags
+                    assert not any(
+                        flag.startswith(("-DQ_LEN", "-DBATCH_SIZE", "-DCP_WORLD"))
+                        for flag in spec.extra_cuda_cflags
+                    )
     finally:
         jit_dcp.gen_dcp_spec_balanced_module.cache_clear()
 
@@ -860,7 +1413,18 @@ def test_bf16_band_row_launches_the_balanced_program(monkeypatch) -> None:
         "bf16_p16", batch=8, q_len=4, prefixes=[4096] * 8, cp_world=4, cp_rank=0
     )
     run_dcp_spec_decode(**inputs)
-    assert calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32)]
+    # eight requests: the planner program (1); the whole-tile static program (2) is the one-request regime
+    assert calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, 1)]
+    assert (
+        dcp_balanced_program(
+            "bf16_p16",
+            batch_size=8,
+            num_kv_heads=8,
+            max_pages_per_seq=int(inputs["block_tables"].shape[1]),
+            sm_count=148,
+        )
+        == 1
+    )
     assert not calls["static"]
     (args,) = launches["balanced"]
     assert (
@@ -886,7 +1450,8 @@ def test_bf16_q8_row_uses_the_64_row_instance(monkeypatch) -> None:
         "bf16_p16", batch=1, q_len=8, prefixes=[16384], cp_world=4, cp_rank=0
     )
     run_dcp_spec_decode(**inputs)
-    assert calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 64)]
+    # 4097 rank-local keys = 257 pages: outside the whole-tile regime, the planner program
+    assert calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 64, 1)]
 
 
 def test_band_row_without_balanced_scratch_keeps_the_static_route(monkeypatch) -> None:
@@ -933,25 +1498,93 @@ def test_forced_static_route_bypasses_the_band(monkeypatch) -> None:
 
 def test_forced_balanced_route_serves_a_row_outside_the_band(monkeypatch) -> None:
     calls, launches = _patch_loaders(monkeypatch)
+    # one request of 129 pages on 148 SMs: one static wave outside the whole-tile bound (whole_pages_max 112), so the
+    # band keeps the static route (``one_wave``) and the forced balanced route runs the planner program (1)
     inputs = _rank_inputs(
-        "bf16_p16", batch=1, q_len=4, prefixes=[4096], cp_world=4, cp_rank=0
+        "bf16_p16", batch=1, q_len=4, prefixes=[8192], cp_world=4, cp_rank=0
     )
-    assert (
-        _band(
-            "bf16_p16",
-            batch=1,
-            q_len=4,
-            prefix=4096,
-            cp_world=4,
-            cp_rank=0,
-            arch="sm_100a",
-        ).route
-        == "static"
+    band = _band(
+        "bf16_p16",
+        batch=1,
+        q_len=4,
+        prefix=8192,
+        cp_world=4,
+        cp_rank=0,
+        arch="sm_100a",
     )
+    assert (band.route, band.reason) == ("static", "one_wave")
     run_dcp_spec_decode(**inputs, route="balanced")
     assert (
-        calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32)]
+        calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, 1)]
         and len(launches["balanced"]) == 1
+    )
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+def test_bf16_whole_tile_one_wave_rows_route_balanced(arch) -> None:
+    """Unit 87: a single request under one static wave within the whole-tile bound routes balanced when the
+    architecture lists its packed-row instance (32 rows on both, 64 rows on sm_103a only); the launch's block-table
+    width decides, and rows outside the bound keep the static route."""
+
+    # the measured rule, stated independently of the implementation: q_len 3-4 (the 32-row instance) route balanced
+    # on both architectures, q_len 5-8 (the 64-row instance) on sm_103a only
+    for prefix in (4096, 6144):
+        for q_len in range(
+            DCP_BALANCED_BF16_MIN_Q_LEN, DCP_BALANCED_BF16_MAX_Q_LEN + 1
+        ):
+            band = _band(
+                "bf16_p16",
+                batch=1,
+                q_len=q_len,
+                prefix=prefix,
+                cp_world=4,
+                cp_rank=0,
+                arch=arch,
+            )
+            expected = (
+                ("balanced", "whole_tile_one_wave")
+                if q_len <= 4 or arch == "sm_103a"
+                else ("static", "one_wave")
+            )
+            assert (band.waves, band.route, band.reason) == (1, *expected), (
+                prefix,
+                q_len,
+                band,
+            )
+    for prefix, batch in ((7168, 1), (8192, 1), (4096, 2), (4096, 4)):
+        band = _band(
+            "bf16_p16",
+            batch=batch,
+            q_len=4,
+            prefix=prefix,
+            cp_world=4,
+            cp_rank=0,
+            arch=arch,
+        )
+        assert (band.waves, band.route, band.reason) == (1, "static", "one_wave"), (
+            prefix,
+            batch,
+            band,
+        )
+    # the block-table width of the launch, not the narrowest table for the length, is what the bound sees
+    kwargs = dict(
+        batch_size=1,
+        q_len=4,
+        num_q_heads=64,
+        num_kv_heads=8,
+        head_dim=128,
+        max_local_seq_len=_max_local([4096], 4, 4, 0),
+        cp_world=4,
+        sm_count=_SM_COUNT[arch],
+        arch=arch,
+    )
+    assert dcp_balanced_route("bf16_p16", **kwargs) == "balanced"
+    assert dcp_balanced_route("bf16_p16", max_pages_per_seq=112, **kwargs) == "balanced"
+    assert dcp_balanced_route("bf16_p16", max_pages_per_seq=113, **kwargs) == "static"
+    assert dcp_balanced_band("bf16_p16", **kwargs).reason == "whole_tile_one_wave"
+    assert (
+        dcp_balanced_band("bf16_p16", max_pages_per_seq=113, **kwargs).reason
+        == "one_wave"
     )
 
 
@@ -973,7 +1606,20 @@ def test_fp8_band_row_launches_the_e4m3_program_with_both_scales(monkeypatch) ->
     inputs["bmm1_scale"] = 0.125
     inputs["bmm2_scale"] = 0.25
     run_dcp_spec_decode(**inputs)
-    assert calls["balanced"] == [("dcp_spec_bf16_fp8_balanced", "sm100a", 32)]
+    assert calls["balanced"] == [
+        (
+            "dcp_spec_bf16_fp8_balanced",
+            "sm100a",
+            32,
+            dcp_balanced_program(
+                "fp8_p64",
+                batch_size=8,
+                num_kv_heads=8,
+                max_pages_per_seq=int(inputs["block_tables"].shape[1]),
+                sm_count=148,
+            ),
+        )
+    ]
     assert not calls["static"]
     (args,) = launches["balanced"]
     assert args[1].dtype == torch.uint8 and args[2].dtype == torch.uint8
@@ -984,14 +1630,32 @@ def test_fp8_band_row_launches_the_e4m3_program_with_both_scales(monkeypatch) ->
 
 
 def test_fp8_two_wave_row_follows_the_architecture_floor(monkeypatch) -> None:
-    # prod_b8_s4096_q4_cp4: static on sm_100a (148 SMs), balanced on sm_103a (152 SMs).
+    # prod_b8_s4096_q4_cp4 (320 items at exactly two static waves): round 3 kept sm_100a
+    # (148 SMs) static behind a 384-item floor; the round-5 programs win the row on both
+    # parts (1.29 GB300 / 1.17 B200), so the per-architecture floor admits it on both.
     calls, _launches = _patch_loaders(monkeypatch, sm_count=148, target="sm100a")
     inputs = _rank_inputs(
         "fp8_p64", batch=8, q_len=4, prefixes=[4096] * 8, cp_world=4, cp_rank=0
     )
     run_dcp_spec_decode(**inputs)
-    assert not calls["balanced"]
-    assert [c[:2] for c in calls["static"]] == [("fp8_d128", "split1_retain1")]
+    assert (
+        calls["balanced"]
+        == [
+            (
+                "dcp_spec_bf16_fp8_balanced",
+                "sm100a",
+                32,
+                dcp_balanced_program(
+                    "fp8_p64",
+                    batch_size=8,
+                    num_kv_heads=8,
+                    max_pages_per_seq=int(inputs["block_tables"].shape[1]),
+                    sm_count=148,
+                ),
+            )
+        ]
+        and not calls["static"]
+    )
     calls, _launches = _patch_loaders(monkeypatch, sm_count=152, target="sm103a")
     inputs = _rank_inputs(
         "fp8_p64",
@@ -1004,7 +1668,21 @@ def test_fp8_two_wave_row_follows_the_architecture_floor(monkeypatch) -> None:
     )
     run_dcp_spec_decode(**inputs)
     assert (
-        calls["balanced"] == [("dcp_spec_bf16_fp8_balanced", "sm103a", 32)]
+        calls["balanced"]
+        == [
+            (
+                "dcp_spec_bf16_fp8_balanced",
+                "sm103a",
+                32,
+                dcp_balanced_program(
+                    "fp8_p64",
+                    batch_size=8,
+                    num_kv_heads=8,
+                    max_pages_per_seq=int(inputs["block_tables"].shape[1]),
+                    sm_count=152,
+                ),
+            )
+        ]
         and not calls["static"]
     )
 
@@ -1016,16 +1694,52 @@ def test_d256_band_row_launches_the_gqa16_program(monkeypatch) -> None:
     )
     inputs["bmm2_scale"] = 0.5
     run_dcp_spec_decode(**inputs)
-    assert calls["balanced"] == [("dcp_spec_bf16_fp8_d256_balanced", "sm100a", 64)]
+    assert calls["balanced"] == [
+        (
+            "dcp_spec_bf16_fp8_d256_balanced",
+            "sm100a",
+            64,
+            dcp_balanced_program(
+                "fp8_p64_d256",
+                batch_size=64,
+                num_kv_heads=1,
+                max_pages_per_seq=int(inputs["block_tables"].shape[1]),
+                sm_count=148,
+                q_len=5,
+            ),
+        )
+    ]
     assert not calls["static"]
     (args,) = launches["balanced"]
     assert args[10] == pytest.approx(0.5) and args[11:] == (0, 4, 16, 1, 64, 5, 148)
-    # b8 q4 at ctx 32768 stays on the static D256 family (one wave of split-4 tiles).
+    # b8 q4 at ctx 32768 (one wave of split-4 tiles, 16 blocks per CTA) routes to the balanced kernel
+    # from q_len 4 on sm_100a: the one-wave row-tile class table.
     inputs = _rank_inputs(
         "fp8_p64_d256", batch=8, q_len=4, prefixes=[32764] * 8, cp_world=4, cp_rank=0
     )
     run_dcp_spec_decode(**inputs)
-    assert len(calls["balanced"]) == 1
+    assert calls["balanced"][1] == (
+        "dcp_spec_bf16_fp8_d256_balanced",
+        "sm100a",
+        dcp_balanced_n_rows("fp8_p64_d256", 4),
+        dcp_balanced_program(
+            "fp8_p64_d256",
+            batch_size=8,
+            num_kv_heads=1,
+            max_pages_per_seq=int(inputs["block_tables"].shape[1]),
+            sm_count=148,
+            q_len=4,
+        ),
+    )
+    assert not calls["static"]
+    assert launches["balanced"][1][11:] == (0, 4, 16, 1, 8, 4, 148)
+    # b16 q2 at ctx 32768 stays on the static D256 family (one wave of split-4 tiles: two rows per
+    # tile at 16 blocks per CTA lose against the public path).
+    inputs = _rank_inputs(
+        "fp8_p64_d256", batch=16, q_len=2, prefixes=[32764] * 16, cp_world=4, cp_rank=0
+    )
+    run_dcp_spec_decode(**inputs)
+    assert len(calls["balanced"]) == 2
     assert calls["static"][0][:2] == ("fp8_d256", "splitn")
     # compile-line split count of the one-wave split-4 launch
     assert calls["static"][0][3]["NUM_SPLIT"] == 4
@@ -1362,6 +2076,9 @@ class _GpuCase:
 _GPU_CASES = {
     "bf16_b8_s4096_q4_cp4_r0_n32": ("bf16_p16", [4096] * 8, 4, 4, 0),
     "bf16_b1_s16384_q8_cp4_r0_n64_longtile": ("bf16_p16", [16384], 8, 4, 0),
+    # one request of 65 pages under one static wave: the whole-tile static program (its early-issue swapped form on
+    # sm_100a), routed by the band's whole_tile_one_wave clause on both architectures
+    "bf16_b1_s4096_q4_cp4_r0_n32_whole_tile": ("bf16_p16", [4096], 4, 4, 0),
     "bf16_b4_ragged_q4_cp4_r1_empty_rows": (
         "bf16_p16",
         [5000, 20000, 0, 12345],
@@ -1436,6 +2153,77 @@ def test_gpu_balanced_route_matches_static_route_and_reference(
     problem.check(expected_o, expected_lse)
     torch.testing.assert_close(problem.out, balanced_o, atol=atol, rtol=rtol)
     torch.testing.assert_close(problem.lse, balanced_lse, atol=atol, rtol=rtol)
+
+
+# (kind, prefixes, q_len, cp_world, cp_rank): single requests inside the whole-tile bound whose packed-row instance
+# the band routes balanced on sm_103a only (the 64-row instance) or on both (the 32-row instance at 97 pages); the
+# balanced route is forced so the whole-tile programs run on every architecture.
+_GPU_WHOLE_TILE_CASES = {
+    "bf16_b1_s4096_q8_cp4_r0_n64_whole_tile": ("bf16_p16", [4096], 8, 4, 0),
+    "bf16_b1_s6144_q4_cp4_r0_n32_whole_tile_97_pages": ("bf16_p16", [6144], 4, 4, 0),
+}
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "case", list(_GPU_WHOLE_TILE_CASES), ids=list(_GPU_WHOLE_TILE_CASES)
+)
+def test_gpu_whole_tile_programs_match_static_route_and_reference(
+    case, monkeypatch
+) -> None:
+    _require_blackwell_dcp()
+    kind, prefixes, q_len, cp_world, cp_rank = _GPU_WHOLE_TILE_CASES[case]
+    problem = _GpuCase(
+        kind,
+        prefixes=prefixes,
+        q_len=q_len,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        seed=685_400 + len(case),
+    )
+    arch = _device_arch()
+    band = problem.band()
+    routed = q_len <= 4 or arch == "sm_103a"
+    assert (band.waves, band.route, band.reason) == (
+        (1, "balanced", "whole_tile_one_wave") if routed else (1, "static", "one_wave")
+    ), band
+    expected_o, expected_lse = problem.reference()
+
+    problem.run("static")
+    torch.cuda.synchronize()
+    problem.check(expected_o, expected_lse)
+    static_o, static_lse = problem.out.clone(), problem.lse.clone()
+
+    problem.out.fill_(float("nan"))
+    problem.lse.fill_(float("nan"))
+    problem.run("balanced")
+    torch.cuda.synchronize()
+    problem.check(expected_o, expected_lse)
+    balanced_o, balanced_lse = problem.out.clone(), problem.lse.clone()
+    atol, rtol = _KIND_TOLERANCE[kind]
+    torch.testing.assert_close(balanced_o, static_o, atol=2 * atol, rtol=2 * rtol)
+    torch.testing.assert_close(balanced_lse, static_lse, atol=2 * atol, rtol=2 * rtol)
+
+    # The public entry point follows the band: the balanced launcher runs exactly when the band routes the row.
+    launched = []
+    real_launch = cake_dcp._run_dcp_spec_balanced
+
+    def observed_launch(**kwargs):
+        launched.append(kwargs["kind"])
+        return real_launch(**kwargs)
+
+    monkeypatch.setattr(cake_dcp, "_run_dcp_spec_balanced", observed_launch)
+    problem.out.fill_(float("nan"))
+    problem.lse.fill_(float("nan"))
+    problem.run_public()
+    torch.cuda.synchronize()
+    assert launched == ([kind] if routed else [])
+    problem.check(expected_o, expected_lse)
+    reference_o, reference_lse = (
+        (balanced_o, balanced_lse) if routed else (static_o, static_lse)
+    )
+    torch.testing.assert_close(problem.out, reference_o, atol=atol, rtol=rtol)
+    torch.testing.assert_close(problem.lse, reference_lse, atol=atol, rtol=rtol)
 
 
 _GRAPH_CASES = {
