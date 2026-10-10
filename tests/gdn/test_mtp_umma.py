@@ -120,7 +120,8 @@ def _flashinfer_fp16_state():
 def _ref_fp32(q, k, v, a, b, A_log, dt_bias, S0, kc, uc, gc, P):
     f = torch.float32
     T = q.shape[0]
-    grp = HV // H
+    hv_ = v.shape[1]
+    grp = hv_ // H
     S = S0.to(f).clone()
     if P > 0:
         GP = gc[:, P - 1].to(f)
@@ -132,10 +133,10 @@ def _ref_fp32(q, k, v, a, b, A_log, dt_bias, S0, kc, uc, gc, P):
     S_after_history = S.clone()
     khat = F.normalize(k.to(f), dim=-1)
     qhat = F.normalize(q.to(f), dim=-1) * SCALE
-    y = torch.zeros(T, HV, V, dtype=f, device=q.device)
-    us = torch.zeros(T, HV, V, dtype=f, device=q.device)
-    gam = torch.zeros(T, HV, dtype=f, device=q.device)
-    acc = torch.zeros(HV, dtype=f, device=q.device)
+    y = torch.zeros(T, hv_, V, dtype=f, device=q.device)
+    us = torch.zeros(T, hv_, V, dtype=f, device=q.device)
+    gam = torch.zeros(T, hv_, dtype=f, device=q.device)
+    acc = torch.zeros(hv_, dtype=f, device=q.device)
     for t in range(T):
         la = -torch.exp(A_log.to(f)) * F.softplus(a[t].to(f) + dt_bias.to(f))
         acc = acc + la
@@ -152,7 +153,7 @@ def _ref_fp32(q, k, v, a, b, A_log, dt_bias, S0, kc, uc, gc, P):
     return y, S_after_history, us, khat, gam
 
 
-def _make_case(B, T, hist_lens, seed, bases=None, poison=True, u_dtype=None):
+def _make_case(B, T, hist_lens, seed, bases=None, poison=True, u_dtype=None, hv=HV):
     io = torch.bfloat16
     g = torch.Generator(device=DEV).manual_seed(seed)
 
@@ -160,17 +161,17 @@ def _make_case(B, T, hist_lens, seed, bases=None, poison=True, u_dtype=None):
         return (torch.randn(*s, generator=g, device=DEV) * sc).to(io)
 
     q, k = rn(B, T, H, K), rn(B, T, H, K)
-    v, a, b = rn(B, T, HV, V, sc=0.5), rn(B, T, HV, sc=0.5), rn(B, T, HV)
+    v, a, b = rn(B, T, hv, V, sc=0.5), rn(B, T, hv, sc=0.5), rn(B, T, hv)
     A_log = (
-        torch.full((HV,), -3.0, device=DEV)
-        + torch.rand(HV, generator=g, device=DEV) * 0.3
+        torch.full((hv,), -3.0, device=DEV)
+        + torch.rand(hv, generator=g, device=DEV) * 0.3
     ).to(io)
-    dt_bias = rn(HV, sc=0.5)
-    pool = (torch.randn(B, HV, V, K, generator=g, device=DEV) * 0.5).to(torch.float16)
+    dt_bias = rn(hv, sc=0.5)
+    pool = (torch.randn(B, hv, V, K, generator=g, device=DEV) * 0.5).to(torch.float16)
     fill = float("nan") if poison else 0.0
     kc = torch.full((B, H, RING, K), fill, dtype=io, device=DEV)
-    uc = torch.full((B, HV, RING, V), fill, dtype=u_dtype or io, device=DEV)
-    gc = torch.full((B, HV, RING), fill, dtype=torch.float32, device=DEV)
+    uc = torch.full((B, hv, RING, V), fill, dtype=u_dtype or io, device=DEV)
+    gc = torch.full((B, hv, RING), fill, dtype=torch.float32, device=DEV)
     hl = torch.tensor(hist_lens, dtype=torch.int32, device=DEV)
     bases = bases or [0] * B
     cb = torch.tensor(bases, dtype=torch.int32, device=DEV)
@@ -183,10 +184,10 @@ def _make_case(B, T, hist_lens, seed, bases=None, poison=True, u_dtype=None):
         )
         kh = torch.randn(H, P, K, generator=g, device=DEV)
         kc[r, :, rows] = F.normalize(kh, dim=-1).to(io)
-        uc[r, :, rows] = (torch.randn(HV, P, V, generator=g, device=DEV) * 0.3).to(
+        uc[r, :, rows] = (torch.randn(hv, P, V, generator=g, device=DEV) * 0.3).to(
             u_dtype or io
         )
-        la = -(torch.rand(HV, P, generator=g, device=DEV) * 0.3 + 0.003)
+        la = -(torch.rand(hv, P, generator=g, device=DEV) * 0.3 + 0.003)
         gc[r, :, rows] = torch.cumsum(la, dim=-1)
     idx = torch.arange(B, dtype=torch.int32, device=DEV)
     return q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx
@@ -236,12 +237,13 @@ def _check_case(
     check_rings=True,
     hpc=None,
     u_dtype=None,
+    hv=HV,
 ):
     fn = _umma()
     if hpc is not None:
         fn = functools.partial(fn, heads_per_cta=hpc)
     B = len(hist)
-    case = _make_case(B, T, hist, seed, bases, u_dtype=u_dtype)
+    case = _make_case(B, T, hist, seed, bases, u_dtype=u_dtype, hv=hv)
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
     pool0, kc0, uc0, gc0 = pool.clone(), kc.clone(), uc.clone(), gc.clone()
     ro = None
@@ -328,6 +330,65 @@ def test_u_ring_fp16_matches_fp32_reference(T, bases):
     hist = [min(x, W) for x in (0, fm - 1, fm, fm, 1, fm - 1, fm, 3)]
     b = [0] * 8 if bases == "base0" else [28, 5, 30, 17, 31, 20, 25, 9]
     _check_case(T, hist, b, fm, seed=400 + T, u_dtype=torch.float16)
+
+
+@pytest.mark.parametrize("hv", [48, 32, 16])
+@pytest.mark.parametrize("T", [1, 4, 6, 8])
+def test_head_ratios_match_fp32_reference(hv, T):
+    """3 / 2 / 1 value heads per key head (HV / H = 3, 2, 1): every row kind against the
+    oracle with the automatic heads per CTA (1 head per CTA at this batch size)."""
+    _skip_if_not_sm100()
+    fm = W - T + 1
+    hist = [min(x, W) for x in (0, fm - 1, fm, fm, 1, fm - 1, fm, 3)]
+    _check_case(T, hist, [28, 5, 30, 17, 31, 20, 25, 9], fm, seed=500 + hv + T, hv=hv)
+
+
+@pytest.mark.parametrize("hv,hpc", [(48, 3), (48, 1), (32, 2), (32, 1), (16, 1)])
+def test_head_ratios_whole_key_head_per_cta(hv, hpc):
+    """One CTA per key head (and the single-head slice) for HV / H = 3, 2, 1 against the
+    oracle at a batch size where the policy would otherwise split."""
+    _skip_if_not_sm100()
+    T = 4
+    fm = W - T + 1
+    hist = [fm, fm - 1, 0, fm, 5, fm, 2, fm - 1] * 3
+    bases = [28, 5, 30, 17, 31, 20, 25, 9] * 3
+    _check_case(T, hist, bases, fm, seed=600 + hv + hpc, hpc=hpc, hv=hv)
+
+
+@pytest.mark.parametrize("hv,hpc", [(48, 1), (32, 1), (64, 2), (64, 1)])
+def test_head_slices_bit_identical(hv, hpc):
+    """Splitting a key head over CTAs does not change the per-head math: outputs, rings
+    and folded state are bit-identical to one CTA per key head."""
+    _skip_if_not_sm100()
+    T = 4
+    fm = W - T + 1
+    hist = [fm, fm - 1, 0, fm, 5, fm, 2, fm - 1]
+    bases = [28, 5, 30, 17, 31, 20, 25, 9]
+    base = _make_case(8, T, hist, seed=650 + hv + hpc, bases=bases, hv=hv)
+    outs = []
+    for h_ in (hv // H, hpc):
+        case = tuple(x.clone() if isinstance(x, torch.Tensor) else x for x in base)
+        y = _run(functools.partial(_umma(), heads_per_cta=h_), case, fm)
+        torch.cuda.synchronize()
+        outs.append((y, case[7], case[8], case[9], case[10]))
+    for a_, b_ in zip(outs[0], outs[1], strict=True):
+        assert torch.equal(a_.nan_to_num(), b_.nan_to_num())
+
+
+def test_auto_heads_per_cta_policy():
+    from flashinfer.gdn_kernels.gdn_replay_mtp_umma import auto_heads_per_cta
+
+    nsm = 148
+    assert [auto_heads_per_cta(b, 16, nsm, 4) for b in (1, 9, 10, 148, 149)] == [
+        1,
+        1,
+        2,
+        2,
+        4,
+    ]
+    assert [auto_heads_per_cta(b, 16, nsm, 3) for b in (1, 12, 13, 512)] == [1, 1, 3, 3]
+    assert [auto_heads_per_cta(b, 16, nsm, 2) for b in (1, 18, 19, 512)] == [1, 1, 2, 2]
+    assert [auto_heads_per_cta(b, 16, nsm, 1) for b in (1, 512)] == [1, 1]
 
 
 def test_k_ring_must_be_bf16():

@@ -357,10 +357,13 @@ def kernel_us_read_flush(runner, iters):
 
 
 def main():
-    global T, FLUSH_MIN, P_VERIFY
+    global T, FLUSH_MIN, P_VERIFY, HV
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--T", type=int, default=4, help="draft tokens (flush_min = 17 - T)"
+    )
+    ap.add_argument(
+        "--hv", type=int, default=64, help="value heads (16 key heads; HV / H = 1..4)"
     )
     ap.add_argument(
         "--l2",
@@ -419,6 +422,7 @@ def main():
     global ROW_ORDER
     ROW_ORDER = args.row_order
     T = args.T
+    HV = args.hv
     FLUSH_MIN = W - T + 1
     P_VERIFY = {"full": FLUSH_MIN - 1, "mid": (FLUSH_MIN - 1) // 2, "zero": 0}[
         args.hist

@@ -23,8 +23,9 @@ Math per (request, value head) with ``X = [k̂_0..k̂_{T-1}; s q̂_0..s q̂_{T-1
     u_t   = b_t v_t - b_t e^{g_t} S_h k̂_t - sum_{s<t} b_t e^{g_t-g_s}(k̂_s.k̂_t) u_s
     y_t   = e^{g_t} S_h q̂_t + sum_{s<=t} e^{g_t-g_s}(k̂_s.q̂_t) u_s
 
-CTA = (key head, request): the key head's value heads in sequence (4, or 2 / 1 for small
-batches, ``heads_per_cta``); grid (H x 4 / heads_per_cta, B), key head fastest; 4 CTAs / SM
+CTA = (key head, request): the key head's value heads in sequence (all HV / H of them, 1 to
+4, or a slice of 1 / 2 for small batches, ``heads_per_cta``); grid (H x (HV / H) /
+heads_per_cta, B), key head fastest; 4 CTAs / SM
 (SMEM ~56 KB, 80 registers, 128 TMEM columns); 192 threads in three roles -- 256 with the
 register split of the builds that would otherwise spill (``_use_regsplit``), where the
 math warps are warps 4-7 and warps 2-3 idle:
@@ -77,11 +78,9 @@ RING_MASK = RING_SLOTS - 1
 W_RING = 16
 K_DIM = 128
 V_DIM = 128
-HPK = 4  # value heads per key head (CTA)
-# TODO(gdn): value:key head ratios other than 4:1 (e.g. 3:1) fall back to the HMMA kernel
-# through gated_delta_rule_mtp_ucache_flush(backend="auto"); supporting them here needs a
-# 3-head CTA variant (the TMEM column map, the SMEM pads, the barrier counts and the
-# heads-per-CTA split all assume four value heads per key head).
+HPK = 4  # most value heads a CTA runs: per-head SMEM / TMEM / barrier arrays are sized for 4
+# The value heads per key head, HV / H, is 1..4 per kernel instance (``self.hpk``); a CTA
+# runs ``heads_per_cta`` of them (a divisor of HV / H) with the per-head arrays sized for 4.
 _EPS = 1e-6
 _TMEM_COLS = 128
 _COEF = 192  # fp32 coefficient words per head (see _CO_*)
@@ -106,14 +105,21 @@ _MIN_BLOCKS_PER_SM = (
 # CTA, round-to-nearest at T >= 5 (T = 8: 20 / 26, +8 % kernel time at B = 512, 0 % fold),
 # LCG at T = 8 (16 / 16) and Philox-10 (T = 4: 3 / 9, T = 8: 27 / 43); with 2 heads per CTA
 # the Philox-5 and LCG builds at T = 8 (1 / 1 each). The 4-head Philox-5 build and every other
-# 1- and 2-head build fit without spilling. The 192-thread layout cannot split: setmaxnreg is
-# warpgroup-wide and a 2-warp warpgroup deadlocks.
+# 1- and 2-head build fit without spilling. With 3 heads per CTA (HV / H = 3) round-to-nearest
+# spills at T = 5 / 6 (16 / 22, 19 / 27; the split measured 1-8 % faster at B = 64..512) and
+# only lightly at T = 7 / 8 (5 / 7, 3 / 5; the split measured 0-2.5 % slower at T = 8), so
+# the 3-head builds split at T = 5 and 6 only; their stochastic-rounding cells were not
+# swept (T = 8: Philox-5 7 / 13, Philox-10 3 / 5, LCG 1 / 1 in the 192-thread layout). The
+# 192-thread layout cannot split: setmaxnreg is warpgroup-wide and a 2-warp warpgroup
+# deadlocks.
 _REGSPLIT = (24, 104)
 
 
 def _use_regsplit(T: int, hpc: int, sr: str, sr_rounds: int) -> bool:
     if hpc == 2:
         return T == 8 and sr != ""
+    if hpc == 3:
+        return sr == "" and T in (5, 6)
     if hpc != HPK:
         return False
     if sr == "philox" and sr_rounds <= 5:
@@ -134,17 +140,20 @@ class GdnReplayMtpUmma:
         hv: int,
         u_bf16: bool = True,
         use_row_order: bool = False,
-        hpc: int = HPK,
+        hpc: Optional[int] = None,
         sr: str = "",
         sr_rounds: int = 0,
     ):
         assert 1 <= T <= 8
-        assert hv % h == 0 and hv // h == HPK
-        # hpc = value heads per CTA (4: one CTA per key head; 2 / 1 split a key head over 2 / 4
-        # CTAs, which repeat the per-key-head prologue but shorten the serial head chain)
-        assert hpc in (1, 2, 4)
+        assert hv % h == 0 and 1 <= hv // h <= HPK, (h, hv)
+        self.hpk = hv // h  # value heads per key head
+        # hpc = value heads per CTA (hpk: one CTA per key head; a smaller divisor of hpk splits
+        # a key head over hpk / hpc CTAs, which repeat the per-key-head prologue but shorten
+        # the serial head chain)
+        hpc = self.hpk if hpc is None else int(hpc)
+        assert 1 <= hpc <= self.hpk and self.hpk % hpc == 0, (hpc, self.hpk)
         self.hpc = hpc
-        self.nsub = HPK // hpc
+        self.nsub = self.hpk // hpc
         self.T = T
         self.h = h
         self.hv = hv
@@ -266,15 +275,19 @@ class GdnReplayMtpUmma:
         tid, _, _ = cute.arch.thread_idx()
         bx, blk_row, _ = cute.arch.block_idx()
         HPC = self.hpc
-        kh = bx >> (self.nsub.bit_length() - 1)  # key head
-        sub = bx & (self.nsub - 1)  # which hpc-head group of it
+        if cutlass.const_expr(self.nsub == 1):
+            kh = bx  # key head
+            sub = Int32(0)
+        else:
+            kh = bx // self.nsub  # key head
+            sub = bx % self.nsub  # which hpc-head slice of it
         warp = cute.arch.make_warp_uniform(tid // 32)
         lane = tid % 32
         if cutlass.const_expr(self.use_row_order):
             brow = Int32(row_order[blk_row])
         else:
             brow = blk_row
-        hv0 = kh * HPK + sub * HPC
+        hv0 = kh * self.hpk + sub * HPC
 
         # ------------------------------------------------------------------ SMEM
         smem = cutlass.utils.SmemAllocator()
@@ -386,7 +399,7 @@ class GdnReplayMtpUmma:
             wo.append(U.ldg_v4_if(is_xt, x_oth + koff))
         ct_e = (tid - 32 * CW0) & 127
         gh = (ct_e >> 3) & 3
-        ghc = gh & (HPC - 1)  # in-range head for loads
+        ghc = gh % HPC  # in-range head for loads
         gt = ct_e & 7
         tt = _sel(gt < T_, gt, 0, Int32)
         ab_off = Int64(cute.crd2idx((brow, tt, hv0 + ghc), a.layout)) * 2
@@ -430,7 +443,7 @@ class GdnReplayMtpUmma:
             wr1_e.append(U.ldg_v4_if(is_rr, ra1_e + koff))
         # window g values (gate threads: G_P of their head; weight threads: g_j)
         wh = ((ct_e - 32) >> 4) & 3
-        whc = wh & (HPC - 1)
+        whc = wh % HPC
         wj = (ct_e - 32) & 15
         gp_g = Float32(g_cache[sidx, hv0 + ghc, (base + P - 1) & RING_MASK])
         gp_w = Float32(g_cache[sidx, hv0 + whc, (base + P - 1) & RING_MASK])
@@ -1216,7 +1229,7 @@ class GdnReplayMtpUmma:
         hv: int,
         u_bf16: bool,
         use_row_order: bool,
-        hpc: int = HPK,
+        hpc: Optional[int] = None,
         sr: str = "",
         sr_rounds: int = 0,
     ):
@@ -1319,22 +1332,27 @@ _CTA_SLOTS_PER_SM = _MIN_BLOCKS_PER_SM
 _HPC2_MAX_WAVES = 8  # hpc = 2 up to this many waves (see auto_heads_per_cta)
 
 
-def auto_heads_per_cta(batch: int, n_key_heads: int, num_sms: int) -> int:
+def auto_heads_per_cta(
+    batch: int, n_key_heads: int, num_sms: int, heads_per_key: int = HPK
+) -> int:
     """Heads per CTA for a batch: 1 while the hpc = 1 grid fits in one wave of CTA slots,
-    2 while the hpc = 2 grid fits in 8 waves, else 4.
+    2 (when it divides ``heads_per_key``) while the hpc = 2 grid fits in 8 waves, else all
+    ``heads_per_key`` value heads of a key head in one CTA.
 
     One CTA runs its value heads one after another, so splitting a key head over 2 or 4
     CTAs (each repeating the small per-key-head prologue) shortens the per-CTA chain and
     gives the scheduler finer-grained work. hpc = 1 only pays off while everything runs in
     one wave; hpc = 2 keeps winning over hpc = 4 well past one wave (5-25% at B = 16..128,
     cold clean L2), and the repeated prologue only catches up around B = 160-192, where
-    the two are within 1.5%. B200 (148 SMs): 1 for B <= 9, 2 for B <= 148, else 4."""
+    the two are within 1.5%. B200 (148 SMs), 4 value heads per key head: 1 for B <= 9, 2
+    for B <= 148, else 4 (3 per key head: 1 for B <= 12, else 3)."""
     slots = _CTA_SLOTS_PER_SM * num_sms
-    if batch * n_key_heads * HPK <= slots:
+    hpk = heads_per_key
+    if batch * n_key_heads * hpk <= slots:
         return 1
-    if batch * n_key_heads * (HPK // 2) <= _HPC2_MAX_WAVES * slots:
+    if hpk % 2 == 0 and batch * n_key_heads * (hpk // 2) <= _HPC2_MAX_WAVES * slots:
         return 2
-    return HPK
+    return hpk
 
 
 def flush_first_row_order(hist_len: torch.Tensor, flush_min: int) -> torch.Tensor:
@@ -1375,7 +1393,8 @@ def gated_delta_rule_mtp_ucache_flush_umma(
     """The UMMA (SM100) kernel behind ``gated_delta_rule_mtp_ucache_flush`` for the fp16-state
     arm, 1 <= T <= 8; callable directly with the same tensors and contract.
 
-    ``heads_per_cta`` (1, 2 or 4; None = by batch size, see ``auto_heads_per_cta``) sets how many
+    ``heads_per_cta`` (a divisor of HV / H; None = by batch size, see ``auto_heads_per_cta``)
+    sets how many
     of a key head's 4 value heads one CTA runs.
 
     ``stochastic_rounding`` rounds the fp16 state written by flush rows stochastically
@@ -1406,7 +1425,10 @@ def gated_delta_rule_mtp_ucache_flush_umma(
     assert h0 is not None and h0.dtype == torch.float16, "fp16 state pool required"
     B, T, H, K_ = q.shape
     HV, V_ = v.shape[2], v.shape[3]
-    assert K_ == K_DIM and V_ == V_DIM and HV // H == HPK and HV % H == 0
+    assert K_ == K_DIM and V_ == V_DIM, f"K == V == {K_DIM} required"
+    assert HV % H == 0 and 1 <= HV // H <= HPK, (
+        f"1 to {HPK} value heads per key head required, got HV={HV}, H={H}"
+    )
     assert 1 <= T <= 8, f"T={T} unsupported (1 <= T <= 8)"
     assert q.dtype == k.dtype == v.dtype == torch.bfloat16
     assert (
@@ -1452,12 +1474,16 @@ def gated_delta_rule_mtp_ucache_flush_umma(
             row_order = torch.arange(B, dtype=torch.int32, device=q.device)
             _ROW_ID[key] = row_order
     target = gdn_device_target(q.device)
+    hpk = HV // H
     hpc = (
-        auto_heads_per_cta(B, H, target.num_sms)
+        auto_heads_per_cta(B, H, target.num_sms, hpk)
         if heads_per_cta is None
         else int(heads_per_cta)
     )
-    assert hpc in (1, 2, 4)
+    if not (1 <= hpc <= hpk and hpk % hpc == 0):
+        raise ValueError(
+            f"heads_per_cta={heads_per_cta!r}: must divide the {hpk} value heads per key head"
+        )
     mode = "none" if stochastic_rounding is None else stochastic_rounding
     if mode not in ("none", "philox", "lcg"):
         raise ValueError(

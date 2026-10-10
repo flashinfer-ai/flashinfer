@@ -3255,8 +3255,8 @@ def _umma_unavailable_reason(
         )
     if not 1 <= T <= 8:
         return f"T={T} (the UMMA kernel takes 1 <= T <= 8)"
-    if HK != H or HV != 4 * H:
-        return "needs q/k with the same head count and HV == 4 H"
+    if HK != H or HV % H != 0 or not 1 <= HV // H <= 4:
+        return "needs q/k with the same head count and 1 to 4 value heads per key head"
     if not pools_contig:
         return "needs contiguous state and ring pools (TMA descriptors)"
     if pdl_trigger:
@@ -3330,7 +3330,7 @@ def gated_delta_rule_mtp_ucache_flush(
     BACKENDS. ``backend="auto"`` (default) runs the UMMA (tcgen05 / TMEM)
     kernel ``gated_delta_rule_mtp_ucache_flush_umma`` when it can serve the
     call — an SM100-class GPU, the fp16-state arm (bf16 IO and rings,
-    ``GDN_UCACHE_STATE_DTYPE=fp16``), 1 <= T <= 8, HV == 4 H, contiguous
+    ``GDN_UCACHE_STATE_DTYPE=fp16``), 1 <= T <= 8, HV / H in 1..4, contiguous
     pools, no ``pdl_trigger`` — and the HMMA kernel otherwise (any SM90+,
     T in {4, 8}). With bf16 rings the UMMA backend also takes an fp16
     ``u_cache`` (vLLM's u-cache dtype) next to the bf16 ``k_cache``; the HMMA
