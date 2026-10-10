@@ -24,6 +24,7 @@ from flashinfer.comm.mnnvl_cutedsl import (
     DEFAULT_CONFIG,
     HT_ONLY_CONFIG,
     LL_ONLY_CONFIG,
+    NO_NORM_CONFIG,
 )
 from flashinfer.comm.mnnvl_cutedsl.config import (
     KernelTarget,
@@ -33,6 +34,14 @@ from flashinfer.comm.mnnvl_cutedsl.config import (
     StaticProfile,
 )
 from flashinfer.comm.mnnvl_cutedsl.kernel_bt import (
+    BT_ALL_REDUCE_B300_TP4_H6144_PRESET_0,
+    BT_ALL_REDUCE_B300_TP4_H6144_PRESET_1,
+    BT_ALL_REDUCE_B300_TP8_H6144_PRESET_0,
+    BT_ALL_REDUCE_B300_TP8_H6144_PRESET_1,
+    BT_FINALIZE_B300_TP4_H6144_K8_PRESET_0,
+    BT_FINALIZE_B300_TP4_H6144_K8_PRESET_1,
+    BT_FINALIZE_B300_TP8_H6144_K8_PRESET_0,
+    BT_FINALIZE_B300_TP8_H6144_K8_PRESET_1,
     BT_ALL_REDUCE_GB300_TP16_H8192_PRESET_0,
     BT_ALL_REDUCE_GB300_TP16_H8192_PRESET_1,
     BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_0,
@@ -274,6 +283,159 @@ def test_only_configs_select_one_protocol(
         tp_size=tp_size,
         hidden_size=8192,
         top_k=10,
+        dtype=torch.bfloat16,
+        capacity_m=capacity_m,
+    )
+
+    for routes in (profile.finalize_routes, profile.all_reduce_routes):
+        assert all(target.protocol is expected_protocol for target in routes.targets)
+
+
+def _assert_routes(config, hidden_size, top_k, expected):
+    for tp_size, routes in expected.items():
+        profile = config.resolve(
+            tp_size=tp_size,
+            hidden_size=hidden_size,
+            top_k=top_k,
+            dtype=torch.bfloat16,
+            capacity_m=8192,
+        )
+        for path, route in (
+            ("finalize", profile.finalize_routes),
+            ("all_reduce", profile.all_reduce_routes),
+        ):
+            for m, protocol, expected_preset in routes[path]:
+                target = route.select(m)
+                assert target.protocol is protocol, (tp_size, path, m)
+                if expected_preset is not None:
+                    assert target.preset is expected_preset, (tp_size, path, m)
+
+
+def test_default_h6144_protocol_and_preset_boundaries():
+    # tp=4 finalize has no PRESET_0 band: PRESET_1 overtakes PRESET_0 inside
+    # LL's range, so BT starts on PRESET_1. HT is reachable at both tp sizes.
+    _assert_routes(
+        DEFAULT_CONFIG,
+        6144,
+        8,
+        {
+            4: {
+                "finalize": (
+                    (28, ProtocolKind.LL, None),
+                    (29, ProtocolKind.BT, BT_FINALIZE_B300_TP4_H6144_K8_PRESET_1),
+                    (768, ProtocolKind.BT, BT_FINALIZE_B300_TP4_H6144_K8_PRESET_1),
+                    (769, ProtocolKind.HT, None),
+                ),
+                "all_reduce": (
+                    (28, ProtocolKind.LL, None),
+                    (29, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP4_H6144_PRESET_0),
+                    (256, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP4_H6144_PRESET_0),
+                    (257, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP4_H6144_PRESET_1),
+                    (1536, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP4_H6144_PRESET_1),
+                    (1537, ProtocolKind.HT, None),
+                ),
+            },
+            8: {
+                "finalize": (
+                    (12, ProtocolKind.LL, None),
+                    (13, ProtocolKind.BT, BT_FINALIZE_B300_TP8_H6144_K8_PRESET_0),
+                    (20, ProtocolKind.BT, BT_FINALIZE_B300_TP8_H6144_K8_PRESET_0),
+                    (21, ProtocolKind.BT, BT_FINALIZE_B300_TP8_H6144_K8_PRESET_1),
+                    (768, ProtocolKind.BT, BT_FINALIZE_B300_TP8_H6144_K8_PRESET_1),
+                    (769, ProtocolKind.HT, None),
+                ),
+                "all_reduce": (
+                    (12, ProtocolKind.LL, None),
+                    (13, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP8_H6144_PRESET_0),
+                    (256, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP8_H6144_PRESET_0),
+                    (257, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP8_H6144_PRESET_1),
+                    (1024, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP8_H6144_PRESET_1),
+                    (1025, ProtocolKind.HT, None),
+                ),
+            },
+        },
+    )
+    tp4 = DEFAULT_CONFIG.resolve(
+        tp_size=4, hidden_size=6144, top_k=8, dtype=torch.bfloat16, capacity_m=8192
+    )
+    assert all(
+        target.preset is not BT_FINALIZE_B300_TP4_H6144_K8_PRESET_0
+        for target in tp4.finalize_routes.targets
+    )
+
+
+def test_no_norm_h6144_protocol_and_preset_boundaries():
+    # HT has no norm-free kernel, so every route ends on BT. The norm-free
+    # finalize has no PRESET_0 band at either tp size.
+    _assert_routes(
+        NO_NORM_CONFIG,
+        6144,
+        8,
+        {
+            4: {
+                "finalize": (
+                    (40, ProtocolKind.LL, None),
+                    (41, ProtocolKind.BT, BT_FINALIZE_B300_TP4_H6144_K8_PRESET_1),
+                    (8192, ProtocolKind.BT, BT_FINALIZE_B300_TP4_H6144_K8_PRESET_1),
+                ),
+                "all_reduce": (
+                    (32, ProtocolKind.LL, None),
+                    (33, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP4_H6144_PRESET_0),
+                    (256, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP4_H6144_PRESET_0),
+                    (257, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP4_H6144_PRESET_1),
+                    (8192, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP4_H6144_PRESET_1),
+                ),
+            },
+            8: {
+                "finalize": (
+                    (16, ProtocolKind.LL, None),
+                    (17, ProtocolKind.BT, BT_FINALIZE_B300_TP8_H6144_K8_PRESET_1),
+                    (8192, ProtocolKind.BT, BT_FINALIZE_B300_TP8_H6144_K8_PRESET_1),
+                ),
+                "all_reduce": (
+                    (16, ProtocolKind.LL, None),
+                    (17, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP8_H6144_PRESET_0),
+                    (256, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP8_H6144_PRESET_0),
+                    (257, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP8_H6144_PRESET_1),
+                    (8192, ProtocolKind.BT, BT_ALL_REDUCE_B300_TP8_H6144_PRESET_1),
+                ),
+            },
+        },
+    )
+
+
+@pytest.mark.parametrize("config", [DEFAULT_CONFIG, NO_NORM_CONFIG])
+@pytest.mark.parametrize("tp_size", [4, 8])
+def test_h6144_finalize_presets_use_safe_shared_expert_ordering(config, tp_size):
+    profile = config.resolve(
+        tp_size=tp_size,
+        hidden_size=6144,
+        top_k=8,
+        dtype=torch.bfloat16,
+        capacity_m=8192,
+    )
+
+    for target in profile.finalize_routes.targets:
+        if target.protocol in (ProtocolKind.LL, ProtocolKind.BT):
+            assert target.preset.load_shared_expert_before_pdl is False
+
+
+@pytest.mark.parametrize(
+    "config,expected_protocol,capacity_m",
+    [
+        (LL_ONLY_CONFIG, ProtocolKind.LL, 8192),
+        (BT_ONLY_CONFIG, ProtocolKind.BT, 1024),
+        (HT_ONLY_CONFIG, ProtocolKind.HT, 8192),
+    ],
+)
+@pytest.mark.parametrize("tp_size", [4, 8])
+def test_h6144_only_configs_select_one_protocol(
+    config, expected_protocol, capacity_m, tp_size
+):
+    profile = config.resolve(
+        tp_size=tp_size,
+        hidden_size=6144,
+        top_k=8,
         dtype=torch.bfloat16,
         capacity_m=capacity_m,
     )
