@@ -15,12 +15,10 @@ limitations under the License.
 """
 
 import math
-
 import re
 
 import pytest
 import torch
-
 from flashinfer.experimental.kimi_k3_fp8_projection import cake_backend as cb
 from flashinfer.experimental.kimi_k3_fp8_projection.cake_backend import (
     AMAX_FLOOR,
@@ -44,6 +42,7 @@ from flashinfer.experimental.kimi_k3_fp8_projection.cake_backend import (
 from flashinfer.experimental.kimi_k3_fp8_projection.cake_jit import (
     KERNELS,
     MODULES,
+    decode_kernel_key,
     kernel_program,
     route_available,
 )
@@ -62,12 +61,8 @@ from flashinfer.gemm import (
 ATOL = 1e-2
 RTOL = 1e-2
 SM_COUNT = 148
-# Measured SM counts of the dispatch tables (round 7, CAKE-985): B200 148, GB300 152 (JHB nodes).
+# Measured SM counts of the dispatch tables (round 7): B200 148, GB300 152.
 SM_COUNTS = {"sm_100a": 148, "sm_103a": 152}
-# Round-6 sm_103a cell whose ordered stream-K window (planned at 148 SMs) never opens at the measured 152: plain GEMM
-# in production (the sealed export measured it so); pruning it is a table-hygiene follow-up.
-STREAM_K_CLOSED_CELLS = {"sm_103a": {"56,48,4096"}}
-
 # Representative rows (tp, module, M): every route of the dispatch (fused decode incl.
 # resident token tiles, quantization launch + decode, quantization launch + GEMM) and
 # the correctness-only row counts of the contract (partial tiles, > 256 rows, padded
@@ -86,6 +81,15 @@ GPU_ROWS = [
     ("tp8", "b_proj", 3, 0),
     ("tp8", "kv_b", 129, 4),
     ("tp1", "kv_b", 256, 0),
+    # Round 8: the tp1 o_proj M = 64 cell ships two TMEM accumulator sets on sm_103a (the ``_a2`` program); its M = 256
+    # cell pins the quantization launch width (4 K blocks per half warp on sm_100a, 2 on sm_103a) where the rule gives 1
+    ("tp1", "o_proj", 64, 0),
+    ("tp1", "o_proj", 256, 0),
+    # Round 8: the bucket-256 GEMM cells route 65 <= M <= 256 to the GEMM; below 128 rows the TMA-store ``OUT``
+    # box (128 rows) is taller than the view and the TMA unit clips the rows >= M (``allow_oob_box`` on the row axis)
+    ("tp1", "kv_b", 100, 0),
+    ("tp1", "q_b", 65, 0),
+    ("tp1", "q_proj", 127, 0),
     ("tp8", "q_proj", 1000, 0),
     # 16-byte row stride (6288) with a column edge (6284) that is not: register epilogue, padding untouched
     ("tp8", "in_proj_qkvgfab", 1000, 4),
@@ -107,6 +111,13 @@ GPU_ROWS = [
     ("tp1", "fused_qkvg", 256, 0),
     ("tp1", "in_proj_qkvgfab", 256, 0),
     ("tp8", "kv_a", 16384, 0),
+    # Round 8: the register-epilogue fallback of TMA-store cells on an 8-byte-aligned output
+    # stride (sm_100a 12,1,512; 96,28,64 on both architectures; no padded-stride contract row
+    # lies in these buckets, so the export covers the fallback programs with correctness-only
+    # coverage shapes). Where the cell is not a TMA-store cell the row is a plain
+    # unaligned-stride decode row.
+    ("tp8", "f_b", 512, 4),
+    ("tp1", "q_proj", 64, 4),
 ]
 
 
@@ -394,8 +405,16 @@ def test_decode_config_rules(arch):
         # Round 7 (lever XP): the parallel-issue DSM exchange closes the key; cluster split-K rows only.
         assert ("_xp" in cfg.kernel_key) == cfg.xp
         assert cfg.xp == (bool(entry.get("xp", False)) and cfg.csplit > 1)
+        # Round 6 (lever Q1; adopted round 8): the tensor-map descriptor prefetch is a table key of any decode row;
+        # ``_dpf`` follows the TMA-store token and precedes ``_pi<N>`` / ``_xp`` (the Cake symbol order).
+        assert cfg.dpf == bool(entry.get("dpf", False))
+        assert ("_dpf" in cfg.kernel_key) == cfg.dpf
+        # Round 8: the epilogue-chunk and cluster split-K tokens (``_c<N>``, ``_cs<N>[a]``) follow ``_q`` as well (the
+        # 14-CTA fused cells adopted narrow lanes), so they are stripped before the ``_q`` suffix check below.
         core_key = re.sub(
-            r"(_mc\d+)?(_pf\d+)?(_px\d+)?(_pi\d+)?(_xp)?$", "", cfg.kernel_key
+            r"(_c\d+)?(_cs\d+a?)?(_mc\d+)?(_pf\d+)?(_px\d+)?(_dpf)?(_pi\d+)?(_xp)?$",
+            "",
+            cfg.kernel_key,
         )
         # Round-3 fused knobs: a decoupled ring only for fused, non-resident rows; narrow units divide evenly.
         if entry.get("xb_stages"):
@@ -470,7 +489,8 @@ def test_decode_config_round3_fused_rows(arch):
     # Round 6 continuation 10 (lever QER): the quantizing warps release each half slot right after their register loads (``_qe``
     # after ``_xh``); same units, arithmetic and stores.
     assert cfg.qer
-    assert cfg.kernel_key == "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_pi2"
+    # Round 8 pass 1 (lever PFX): ``pfx 1`` adopted on this cell on both GPUs (+2.6-3.2 %, bit-exact) -> ``_px1`` after ``_pf4``.
+    assert cfg.kernel_key == "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_pi2"
     # 16-token tiles cannot keep eight 4-lane groups busy per stage: the table's 4 lanes widen to 8, coupled staging.
     # Round 5: the 24-tile M = 256 row moves to a 4-CTA cluster split-K route (each CTA owns a quarter of K, FP32 partials
     # are exchanged through distributed shared memory in one round); the small dedicated inbox is used (no aliasing).
@@ -482,11 +502,23 @@ def test_decode_config_round3_fused_rows(arch):
         False,
         True,
     )
-    # Round 7 (CAKE-1079, lever XR): the 4-slot BF16 ring and the 4-slot FP8 token ring run next to the 4-stage W ring of
+    # Round 7 (lever XR): the 4-slot BF16 ring and the 4-slot FP8 token ring run next to the 4-stage W ring of
     # this instance (4 x 33792 + 4 x 9216 + 4 x 8192 B + the 8 KB epilogue chunk; the 7-line cluster inbox fits beside them);
     # 1.015-1.022x on both GPUs in 7 own-process rounds, bit-exact.
-    assert (cfg.xb_stages, cfg.xq_stages, cfg.module_stages) == (4, 4, 4)
-    assert cfg.kernel_key == "decode:t16_p4_fused_r4_x4_cs4"
+    # Round 8 (convergence passes): the cell runs 8 quantizer lanes on both GPUs (``_q8``); on sm_103a the BF16 ring is a
+    # two-stage half-slot ring with the early release (``_r2_xh_qe``) and the token tile is prefetched one stage ahead
+    # (``_px1`` after ``_cs4``). See the Cake design record, round 8.
+    xb, key = {
+        "sm_100a": (4, "decode:t16_p4_fused_r4_x4_q8_cs4"),
+        "sm_103a": (2, "decode:t16_p4_fused_r2_xh_qe_x4_q8_cs4_px1"),
+    }[arch]
+    assert (cfg.xb_stages, cfg.xq_stages, cfg.module_stages, cfg.qlanes) == (
+        xb,
+        4,
+        4,
+        8,
+    )
+    assert cfg.kernel_key == key
 
 
 @pytest.mark.parametrize("arch", ARCHES)
@@ -550,9 +582,17 @@ def test_decode_config_round6_continuation_rules(arch):
         if cfg.tstore:
             n_tstore += 1
             assert cfg.split == 1 and cfg.csplit == 1 and cfg.tok >= 32
-            assert cfg.kernel_key_for(True) == cfg.kernel_key + "_tso"
+            # ``_tso`` precedes the ``_dpf`` / ``_pi<N>`` / ``_xp`` tail of the key (round 8: the 1,28,16384 cell carries
+            # ``pfi``, the sm_103a 96,1,256 cell ``dpf``).
+            head, tail = re.fullmatch(
+                r"(.*?)((?:_dpf)?(?:_pi\d+)?(?:_xp)?)", cfg.kernel_key
+            ).groups()
+            assert cfg.kernel_key_for(True) == f"{head}_tso{tail}"
         assert cfg.kernel_key_for(False) == cfg.kernel_key
-    assert n_tstore == 17
+    # Round 8 (knob-catalog sweep, passes 1-5) adopted further bit-exact tstore cells on both GPUs, and pass 14 adopted
+    # ``tstore`` on the 24,2,512 cell of both architectures (27 / 29); see the Cake design record, round 8 (R8-14 and
+    # the pass records).
+    assert n_tstore == {"sm_100a": 27, "sm_103a": 29}[arch]
     # Round-6 next loop (lever PX-S): eight small fused buckets per architecture prefetch their BF16 token tile one stage
     # ahead of its TMA load (``pfx: 1`` -> the ``_px1`` program); a prefetch changes no data path and no launch argument.
     n_pfx = 0
@@ -566,10 +606,11 @@ def test_decode_config_round6_continuation_rules(arch):
             cfg.fused
             and not cfg.resident
             and cfg.pfx == 1
-            and re.search(r"_px1(_xp)?$", cfg.kernel_key)
+            and re.search(r"_px1(_tso)?(_dpf)?(_pi\d+)?(_xp)?$", cfg.kernel_key)
         )
         n_pfx += 1
-    assert n_pfx == 8
+    # Round 8 pass 1 added ``pfx 1`` on the 1,28,16384 cell (both GPUs) and on the sm_103a 1,28,64 / 1,28,256 cells.
+    assert n_pfx == {"sm_100a": 9, "sm_103a": 11}[arch]
     assert decode_config(8, 24, 2, arch, SM_COUNT).kernel_key.endswith(
         "_px1"
     )  # tp8 kv_b M = 8: 1.076-1.083x B200 / 1.034-1.042x B300
@@ -579,7 +620,35 @@ def test_decode_config_round6_continuation_rules(arch):
     cfg = decode_config(
         256, 56, 6, arch, SM_COUNT
     )  # tp8 o_proj M = 256: 1.07x on both GPUs
-    assert cfg.tstore and cfg.kernel_key_for(True) == "decode:t128_p3_tso"
+    # Round 8: the sm_100a cell also prefetches its weight stage (``pf: 1`` -> ``_pf1``; 1.03-1.06x B200).
+    assert (
+        cfg.tstore
+        and cfg.kernel_key_for(True)
+        == {
+            "sm_100a": "decode:t128_p3_pf1_tso",
+            "sm_103a": "decode:t128_p3_tso",
+        }[arch]
+    )
+    # Round 8 (pass 14): the tp1 f_b M = 256 cell (96 N tiles, one K iteration: fused, resident, TMA store) adopted the
+    # round-6 descriptor prefetch (lever Q1, table key ``dpf``) on sm_103a alone -- ``_dpf`` follows ``_tso`` in the
+    # TMA-store form and closes the register form; sm_100a keeps the plain pair of the same instance.
+    cfg = decode_config(256, 96, 1, arch, SM_COUNT)
+    assert cfg.fused and cfg.resident and cfg.tstore and cfg.module_stages == 2
+    assert cfg.dpf == (arch == "sm_103a")
+    assert (
+        cfg.kernel_key
+        == {
+            "sm_100a": "decode:t64_p2_fused_res",
+            "sm_103a": "decode:t64_p2_fused_res_dpf",
+        }[arch]
+    )
+    assert (
+        cfg.kernel_key_for(True)
+        == {
+            "sm_100a": "decode:t64_p2_fused_res_tso",
+            "sm_103a": "decode:t64_p2_fused_res_tso_dpf",
+        }[arch]
+    )
     # Lever C16: the M <= 64 rows that used a 12-28-way global split-K now run one cluster per output tile (14 CTAs = two
     # 256-K stages each; non-portable cluster), the 12-tile family a 7-CTA cluster (12 clusters <= capacity 15) and the
     # 17-tile family a 4-CTA cluster; the grid is whole clusters within the measured co-resident capacity.
@@ -600,12 +669,25 @@ def test_decode_config_round6_continuation_rules(arch):
         assert cfg.grid == c * clusters and cfg.total_work == cfg.grid
         assert f"_cs{c}" in cfg.kernel_key and not cfg.tstore
         # the small-inbox exchange of a 7..16-wide cluster gives up one t16 stage (2C - 1 inbox lines next to the ring)
-        assert cfg.module_stages == (3 if c >= 7 else 4), cfg
+        # Round 8: the BF16-ring / narrow-lane levers adopted on some of these cells (``_r<N>[_xh[_qe]]``, ``_q8``) sit
+        # between ``_fused`` and ``_cs``; the 7-CTA cell runs four stages next to its 3-slot ring.
+        assert cfg.module_stages in (3, 4), cfg
+        ring = (
+            f"_r{cfg.xb_stages}"
+            + ("_xh" if cfg.xbh else "")
+            + ("_qe" if cfg.qer else "")
+            if cfg.xb_stages
+            else ""
+        )
+        lanes = f"_q{cfg.qlanes}" if cfg.qlanes != 16 else ""
         # round-6 next loop (lever PX): the M = 8 buckets of this family carry the `_px1` suffix
         # round 7 (lever XP): the 14-CTA cells 1,28,1 / 1,28,64 / 5,28,1 close the key with `_xp` (parallel-issue DSM exchange)
-        assert cfg.kernel_key == f"decode:t16_p{cfg.module_stages}_fused_cs{c}" + (
-            f"_px{cfg.pfx}" if cfg.pfx else ""
-        ) + ("_xp" if cfg.xp else "")
+        assert (
+            cfg.kernel_key
+            == f"decode:t16_p{cfg.module_stages}_fused{ring}{lanes}_cs{c}"
+            + (f"_px{cfg.pfx}" if cfg.pfx else "")
+            + ("_xp" if cfg.xp else "")
+        ), cfg.kernel_key
         assert cfg.xp == ((n_tiles, M) in ((1, 1), (1, 64), (5, 1)))
     assert (
         cb.decode_cluster_capacity(arch, 14) == 7
@@ -613,24 +695,39 @@ def test_decode_config_round6_continuation_rules(arch):
     )
     # The plan carries both programs of every tstore row (the register program is the fallback of unaligned views).
     required = set(cb.required_kernel_keys(arch, SM_COUNT))
-    assert {
-        "decode:t128_p3",
-        "decode:t128_p3_tso",
-        "decode:t16_p3_fused_cs14_xp",
-        "decode:t16_p3_fused_cs14_px1",
-        "decode:t16_p3_fused_cs7",
-    } <= required
+    assert (
+        {
+            "decode:t128_p3",
+            "decode:t128_p3_tso",
+            "decode:t16_p3_fused_cs14_xp",
+            "decode:t16_p3_fused_cs14_px1",
+            "decode:t16_p4_fused_r3_cs7",  # round 8: the 7-CTA M = 1 cell carries the 3-slot BF16 ring
+        }
+        <= required
+    )
     assert not {
         k
         for k in required
         if k.endswith("_tso") and k.removesuffix("_tso") not in required
     }
+    # ... including the TMA-store forms a lever token follows (``_tso_dpf``, ``_tso_pi<N>``): the register twin is the
+    # key without its ``_tso`` token (the grammar-exact rule of the export's ``decode_register_twin``).
+    assert not {
+        k for k in required if "_tso" in k and k.replace("_tso", "", 1) not in required
+    }
     assert "decode:t16_p4_fused_cs14" not in required
+    # Round 8 (pass 14): both programs of the sm_103a dpf cell are in its plan; sm_100a ships the plain pair of that cell
+    # and no ``_dpf`` program at all (the dpf cell is the only 64-token resident instance of sm_103a).
+    dpf_pair = {"decode:t64_p2_fused_res_dpf", "decode:t64_p2_fused_res_tso_dpf"}
+    plain_pair = {"decode:t64_p2_fused_res", "decode:t64_p2_fused_res_tso"}
+    assert (dpf_pair <= required) == (arch == "sm_103a")
+    assert (plain_pair <= required) == (arch == "sm_100a")
+    assert any("_dpf" in k for k in required) == (arch == "sm_103a")
     # Lever L5: the N = 576 kv_a rows at M > 256 (buckets 4096 and 16384) take the 192-wide GEMM N tile: three 192-column
     # tiles stream and multiply no padded columns (1.04-1.09x on both GPUs, bit-exact with the 256-wide output); the
     # fused_qkv_a family (N = 2112) measured slower with it and stays 256-wide, as does every untabulated shape.
     narrow = {k: e for k, e in decode_table(arch).items() if "gemm_bn" in e}
-    # round 7 (CAKE-985) adds measured 192-wide cells on the 512 / 1024 / 2048 buckets; the round-6 kv_a cells stay
+    # round 7 adds measured 192-wide cells on the 512 / 1024 / 2048 buckets; the round-6 kv_a cells stay
     assert {"5,28,16384", "5,28,4096"} <= set(narrow)
     assert all(e["route"] == "gemm" and e["gemm_bn"] == 192 for e in narrow.values())
     for M in (4096, 4097, 16384):
@@ -651,8 +748,11 @@ def test_decode_config_round6_continuation_rules(arch):
     # launch has one full wave of CTA pairs plus at most half a wave of tail tiles: the head pair of each tail tile runs
     # the first K half and hands its FP32 partial to the tail pair, which continues the same accumulation (bit-exact).
     sk_rows = {k: e for k, e in decode_table(arch).items() if "gemm_sk" in e}
-    # round 7 (CAKE-985) adds measured stream-K cells on the 512 / 1024 / 2048 buckets; every cell's window opens at its bucket
-    assert {"12,28,4096", "56,48,4096"} <= set(sk_rows)
+    # round 7 adds measured stream-K cells on the 512 / 1024 / 2048 buckets; every cell's window opens at its bucket.
+    # Round 8 (R8-19): the sm_103a 56,48,4096 selection is pruned -- on the 152-SM part the 448-tile launch leaves a
+    # 68-tile fractional wave (more than half a wave), so the ordered window never opened there; sm_100a keeps the cell.
+    assert {"12,28,4096", "96,28,512"} <= set(sk_rows)
+    assert ("56,48,4096" in sk_rows) == (arch == "sm_100a")
     assert all(e["route"] == "gemm" and e["gemm_sk"] == 1 for e in sk_rows.values())
     sm_count = SM_COUNTS[arch]
     for key in sk_rows:
@@ -666,9 +766,6 @@ def test_decode_config_round6_continuation_rules(arch):
             cb._m_tiles(bucket),
             n_tiles128 // 2,
         )
-        if key in STREAM_K_CLOSED_CELLS.get(arch, ()):
-            assert plan is None
-            continue
         assert (
             plan is not None
             and plan.pairs == sm_count // 2
@@ -696,7 +793,7 @@ def test_decode_config_round6_continuation_rules(arch):
     # into 74 equal K ranges; the pair finishing a tile adds the other contributors' FP32 partials in ordinal order
     # (reduction order of those tiles differs from the plain schedule; accepted by the user, max_abs_err 0.03125).
     skf_rows = {k: e for k, e in decode_table(arch).items() if "gemm_skf" in e}
-    # round 7 (CAKE-985) adds measured fix-up stream-K cells on the 512 / 1024 / 2048 buckets; the round-6 cells stay
+    # round 7 adds measured fix-up stream-K cells on the 512 / 1024 / 2048 buckets; the round-6 cells stay
     assert {"384,28,256", "386,28,256", "5,28,16384"} <= set(skf_rows)
     assert all(
         e["route"] == "gemm" and e["gemm_skf"] == 1 and "gemm_sk" not in e
@@ -755,6 +852,12 @@ def test_decode_config_round6_continuation_rules(arch):
 def test_decode_module_stage_clamp():
     # 128-token unfused: 4 stages of 66 KB do not fit the pool -> 3.
     assert decode_module_stages(128, 4, False, False) == 3
+    # Round 8 (table key ``epi_groups``): a second epilogue warp group doubles the 16 KB staging tile of the 64/128-token
+    # tiles (t128: 2 stages; t64: 3 stages of 50 KB); below 64 tokens the dispatcher keeps one group.
+    assert decode_module_stages(128, 4, False, False, epi_groups=2) == 2
+    assert decode_module_stages(64, 4, False, False) == 4
+    assert decode_module_stages(64, 4, False, False, epi_groups=2) == 3
+    assert decode_module_stages(32, 4, False, False, epi_groups=2) == 4
     # 16-token fused: the smallest instance keeps every requested stage.
     assert decode_module_stages(16, 4, True, False) == 4
     # Resident 64-token tiles: the stages hold only W + scales, four resident slots still fit four.
@@ -767,11 +870,161 @@ def test_decode_module_stage_clamp():
     assert decode_module_stages(64, 3, True, False, 3) == 2
 
 
+def test_decode_kernel_key_round8_suffixes():
+    # Round 8 (levers ACC_BUFS / EPI_GROUPS): ``_a<n>`` / ``_e<n>`` sit right after the ``_fused[_w<n>]`` block and before
+    # ``_res`` / the ring fields (the Cake symbol order) and are omitted at their default of 1, so every earlier key is unchanged.
+    assert (
+        decode_kernel_key(64, 4, False, False, csplit=2, cs_alias=True)
+        == "decode:t64_p4_cs2a"
+    )
+    assert (
+        decode_kernel_key(64, 4, False, False, csplit=2, cs_alias=True, acc_bufs=2)
+        == "decode:t64_p4_a2_cs2a"
+    )
+    assert (
+        decode_kernel_key(64, 3, False, False, csplit=2, cs_alias=True, epi_groups=2)
+        == "decode:t64_p3_e2_cs2a"
+    )
+    assert (
+        decode_kernel_key(128, 2, False, False, acc_bufs=2, epi_groups=2, tstore=True)
+        == "decode:t128_p2_a2_e2_tso"
+    )
+    assert (
+        decode_kernel_key(64, 2, True, True, qwarps=16, acc_bufs=2)
+        == "decode:t64_p2_fused_w16_a2_res"
+    )
+    assert (
+        decode_kernel_key(
+            64, 2, True, False, xb_stages=3, qlanes=4, acc_bufs=2, epi_groups=2
+        )
+        == "decode:t64_p2_fused_a2_e2_r3_q4"
+    )
+    assert (
+        decode_kernel_key(64, 4, False, False, acc_bufs=1, epi_groups=1)
+        == "decode:t64_p4"
+    )
+    # Round 6 (lever Q1; adopted round 8): ``_dpf`` follows ``_tso`` and precedes ``_pi<n>`` / ``_xp`` (the Cake symbol
+    # order); it is omitted when the row does not pin ``dpf``, so every earlier key is unchanged.
+    assert (
+        decode_kernel_key(64, 2, True, True, dpf=True) == "decode:t64_p2_fused_res_dpf"
+    )
+    assert (
+        decode_kernel_key(64, 2, True, True, tstore=True, dpf=True)
+        == "decode:t64_p2_fused_res_tso_dpf"
+    )
+    assert (
+        decode_kernel_key(
+            128, 2, False, False, acc_bufs=2, pf=3, tstore=True, dpf=True, pfi=1
+        )
+        == "decode:t128_p2_a2_pf3_tso_dpf_pi1"
+    )
+    assert (
+        decode_kernel_key(64, 3, False, False, csplit=2, dpf=True, xp=True)
+        == "decode:t64_p3_cs2_dpf_xp"
+    )
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_decode_config_round8_rules(arch):
+    # Round 8 (levers ACC_BUFS / EPI_GROUPS / QUANT_UNITS): every table cell's levers reach the resolved config and the
+    # kernel key; two epilogue groups only on the 64/128-token tiles; the quantization width of a two-launch cell is read
+    # from the cell (decode and GEMM routes) and must divide the K blocks.
+    for key, entry in decode_table(arch).items():
+        n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
+        assert cb.table_quant_units(bucket, n_tiles128, num_k_iters, arch) == int(
+            entry.get("quant_units", 0)
+        )
+        cfg = decode_config(bucket, n_tiles128, num_k_iters, arch, SM_COUNT)
+        if cfg is None:
+            assert entry["route"] == "gemm"
+            continue
+        assert cfg.acc_bufs == int(entry.get("acc_bufs", 1)) and cfg.acc_bufs in (1, 2)
+        assert cfg.epi_groups == (
+            int(entry.get("epi_groups", 1)) if cfg.tok >= 64 else 1
+        )
+        assert cfg.epi_groups in (1, 2)
+        assert cfg.quant_units == int(entry.get("quant_units", 0))
+        head = re.match(
+            r"decode:t\d+_p\d+(?:_fused(?:_w\d+)?)?(_a\d+)?(_e\d+)?", cfg.kernel_key
+        )
+        assert head is not None
+        assert head.group(1) == (f"_a{cfg.acc_bufs}" if cfg.acc_bufs != 1 else None), (
+            cfg.kernel_key
+        )
+        assert head.group(2) == (
+            f"_e{cfg.epi_groups}" if cfg.epi_groups != 1 else None
+        ), cfg.kernel_key
+        assert re.search(r"_[ae]\d", cfg.kernel_key[head.end() :]) is None
+        assert cfg.kernel_key_for(True).startswith(head.group(0))
+    # The tp1 o_proj M = 64 cell (56 N tiles, 48 K iterations): one cluster split-K instance on both GPUs, two TMEM
+    # accumulator sets on sm_103a alone -- a program of its own that the plan of that architecture must carry.
+    cfg = decode_config(64, 56, 48, arch, SM_COUNT)
+    assert (cfg.tok, cfg.split, cfg.csplit, cfg.cs_alias, cfg.module_stages) == (
+        64,
+        2,
+        2,
+        True,
+        4,
+    )
+    assert cfg.acc_bufs == {"sm_100a": 1, "sm_103a": 2}[arch]
+    assert (
+        cfg.kernel_key
+        == {"sm_100a": "decode:t64_p4_cs2a", "sm_103a": "decode:t64_p4_a2_cs2a"}[arch]
+    )
+    assert (
+        cfg.kernel_key_for(True) == cfg.kernel_key
+    )  # cluster split-K rows have no TMA-store epilogue
+    assert cfg.kernel_key in required_kernel_keys(arch, SM_COUNT)
+    assert decode_config(9, 56, 48, arch, SM_COUNT).kernel_key == cfg.kernel_key
+    assert "_a" not in decode_config(1, 56, 48, arch, SM_COUNT).kernel_key
+    # Per-cell quantization width: the tp1 o_proj M = 256 cell (K = 12288: 96 K blocks) pins 4 (sm_100a) / 2 (sm_103a)
+    # K blocks per half warp where the rule gives 1; a width that does not divide the K blocks is a table error.
+    assert cb.table_quant_units(256, 56, 48, arch) == {"sm_100a": 4, "sm_103a": 2}[arch]
+    assert quant_units(256, 96, SM_COUNT) == 1
+    assert (
+        cb.launch_quant_units(
+            256, 96, cb.table_quant_units(256, 56, 48, arch), SM_COUNT
+        )
+        == {"sm_100a": 4, "sm_103a": 2}[arch]
+    )
+    assert cb.launch_quant_units(256, 96, 0, SM_COUNT) == quant_units(256, 96, SM_COUNT)
+    assert cb.launch_quant_units(4096, 96, 0, SM_COUNT) == quant_units(
+        4096, 96, SM_COUNT
+    )
+    with pytest.raises(ValueError, match="does not divide"):
+        cb.launch_quant_units(256, 96, 5, SM_COUNT)
+    # A GEMM-route cell carries the width too (tp8 o_proj M = 2048 on sm_103a: 56 N tiles, 6 K iterations, 12 K blocks).
+    assert cb.table_quant_units(2048, 56, 6, arch) == {"sm_100a": 0, "sm_103a": 2}[arch]
+    if arch == "sm_103a":
+        assert cb.decode_table_entry(2048, 56, 6, arch)["route"] == "gemm"
+        assert decode_config(2048, 56, 6, arch, SM_COUNT) is None
+        assert cb.launch_quant_units(2048, 12, 2, SM_COUNT) == 2
+    # Every width a cell pins is a registered quantization key of that architecture's plan.
+    required = set(required_kernel_keys(arch, SM_COUNT))
+    for entry in decode_table(arch).values():
+        if entry.get("quant_units"):
+            assert f"quant:u{int(entry['quant_units'])}" in required
+
+
 @pytest.mark.parametrize("arch", ARCHES)
 def test_required_kernel_keys_are_registered_when_programs_exist(arch):
     required = required_kernel_keys(arch, SM_COUNT)
     assert "gemm" in required and "quant:u1" in required and "quant:u4" in required
     assert any(key.startswith("decode:") for key in required)
+    # Round 8 (pass 14): a cell that pins ``dpf`` puts both of its ``_dpf`` programs into the plan (the register form
+    # and, on its TMA-store rows, the ``_tso_dpf`` form); three such cells on sm_103a (the pass-14 cell plus the
+    # probe-confirmed round-8 adoptions 96,28,1 and 96,28,8 = tp1 q_proj M 1 / 8), none on sm_100a.
+    dpf_cells = 0
+    for key, entry in decode_table(arch).items():
+        if entry.get("route") != "decode" or not entry.get("dpf"):
+            continue
+        n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
+        cfg = decode_config(bucket, n_tiles128, num_k_iters, arch, SM_COUNT)
+        assert cfg.dpf and "_dpf" in cfg.kernel_key, key
+        assert cfg.kernel_key in required and cfg.kernel_key_for(True) in required
+        dpf_cells += 1
+    assert dpf_cells == {"sm_100a": 0, "sm_103a": 3}[arch]
+    assert any("_dpf" in key for key in required) == (dpf_cells > 0)
     if MODULES:
         missing = sorted(key for key in required if not route_available(arch, (key,)))
         assert not missing, f"{arch} lacks {missing}"
@@ -882,6 +1135,14 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             if aligned
             else 0
         )
+        # Round 8 (lever L8): the tabulated ``gemm_bk`` rows launch the ``_k128`` form (128-K operand hand-off, same output
+        # bits) of the TMA-store / staged-register epilogues; the plain register program has no such form.
+        bk = (
+            cb.gemm_block_k(M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch)
+            if expected_kernel in ("gemm_tstore", "gemm_rstaged")
+            else cb.BLOCK_K
+        )
+        k128 = "_k128" if bk == 128 else ""
         # Round 6 continuation 12 (lever SKO): the tabulated ``gemm_sk`` rows inside the stream-K wave window launch the
         # ``_sk`` instance over 2 x dp CTAs with the hand-off area behind the activation scale tiles.
         sk = cb.gemm_stream_k_plan(
@@ -894,7 +1155,7 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             plan.gemm_n_tiles,
         )
         sk_key = cb.gemm_kernel_key(
-            expected_kernel + ("_n192" if bn == 192 else "") + "_sk", gpf
+            expected_kernel + ("_n192" if bn == 192 else "") + k128 + "_sk", gpf
         )
         if sk is not None and not cb.route_available(plan.arch, (sk_key,)):
             sk = None  # only the TMA-store stream-K program ships: other views keep the plain program
@@ -916,7 +1177,7 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             else None
         )
         skf_key = cb.gemm_kernel_key(
-            expected_kernel + ("_n192" if bn == 192 else "") + "_skf", gpf
+            expected_kernel + ("_n192" if bn == 192 else "") + k128 + "_skf", gpf
         )
         if skf is not None and not cb.route_available(plan.arch, (skf_key,)):
             skf = None
@@ -924,12 +1185,14 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
         assert plan.kernels[-1] == cb.gemm_kernel_key(
             expected_kernel
             + ("_n192" if bn == 192 else "")
+            + k128
             + ("_sk" if sk is not None else "_skf" if skf is not None else ""),
             gpf,
         )
-        assert (plan.gemm_bn, plan.gemm_n_tiles) == (
+        assert (plan.gemm_bn, plan.gemm_n_tiles, plan.gemm_bk) == (
             bn,
             _prepared.n_tiles if bn == 256 else -(-_prepared.n_valid // 192),
+            bk,
         )
         assert plan.grids[-1] == (
             sk.grid
@@ -950,6 +1213,22 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
                 _workspace_sf_numel(runner)
                 >= plan.counters_offset + cb.GEMM_SK_FLAG_BYTES + skf.partial_bytes
             )
+    if plan.route == "decode":
+        # Lever E1 / round 8: the TMA-store program is launched only on a 16-byte-aligned output view of a ``tstore``
+        # cell whose ``_tso`` program is registered; an 8-byte-aligned row stride takes the register-epilogue twin.
+        aligned = cb.gemm_tma_store_eligible(
+            _out.data_ptr(), _out.stride(0), _prepared.n_valid
+        )
+        tso_key = plan.decode.kernel_key_for(True)
+        expected_tma_store = (
+            aligned
+            and tso_key != plan.decode.kernel_key
+            and cb.route_available(plan.arch, (tso_key,))
+        )
+        assert plan.decode_tma_store == expected_tma_store
+        assert plan.kernels[-1] == plan.decode.kernel_key_for(plan.decode_tma_store)
+        if stride_pad:
+            assert not plan.decode_tma_store and not plan.kernels[-1].endswith("_tso")
     if plan.route == "decode" and plan.decode.fused:
         assert runner.launch_count == 1
     else:
@@ -1020,7 +1299,7 @@ def test_graph_replay_follows_device_inputs(tp, module, M, stride_pad):
 
 
 def test_launcher_matches_prepare_path():
-    """Round 7 (CAKE-949 host path): the cached launcher reproduces the prepare() + launch() output bit for bit
+    """Round 7 (host path): the cached launcher reproduces the prepare() + launch() output bit for bit
     for fresh and strided output views, follows new activations, and binds only the call's tensors after the
     first call of an (M, output class)."""
     device = _require_program()
@@ -1106,6 +1385,363 @@ def test_launcher_rejects_bad_bindings():
         launcher(x, out.t())
     with pytest.raises(ValueError, match="max_workspaces"):
         cb.kimi_k3_fp8_projection_launcher(prepared, max_workspaces=0)
+
+
+def test_launcher_receipts_keep_placeholder_output_descriptor():
+    """Round 8 (W4): output views the TMA store cannot address (row stride not a multiple of 16 bytes) run
+    the register-epilogue GEMM programs, whose ``OUT`` descriptor is the per-device placeholder; the receipt launcher
+    must not re-encode it from the caller's view (``cuTensorMapEncodeTiled`` rejects such strides) and stays
+    bit-identical to the one-shot path on the plain and the staged register epilogue."""
+    device = _require_program()
+    for tp, module, M, stride_pad, seed in (
+        ("tp1", "kv_b", 129, 2, 61),  # 4-byte rows: plain register epilogue
+        (
+            "tp8",
+            "in_proj_qkvgfab",
+            512,
+            0,
+            62,
+        ),  # 8-byte rows (n_valid = 6284): staged register epilogue
+    ):
+        weight, scale, x, buf, out, n_valid = _make_case(
+            tp, module, M, stride_pad, device, seed
+        )
+        prepared = prepare_kimi_k3_fp8_projection_weights(weight, scale, n_valid)
+        workspace = allocate_kimi_k3_fp8_projection_workspace(prepared, M)
+        runner = prepare_kimi_k3_fp8_projection(x, prepared, out, workspace)
+        assert not runner.plan.gemm_tma_store and runner.plan.decode is None
+        runner()
+        launcher = cb.kimi_k3_fp8_projection_launcher(prepared)
+        bufs = [torch.full_like(buf, float("nan")) for _ in range(2)]
+        for (
+            b
+        ) in bufs:  # two output addresses of the same alignment class share one receipt
+            launcher(x, b[:, :n_valid])
+        torch.cuda.synchronize()
+        assert launcher.cached_receipts == 1
+        # the register-epilogue GEMM receipt re-binds the flat ``out`` pointer (call tensor 1) but not the ``OUT``
+        # descriptor position, which carries the per-device placeholder map
+        (template,) = launcher._templates.values()
+        gemm_stage = template.stages[-1]
+        assert sum(1 for _pos, src in gemm_stage.rebinds if src == 1) == 1
+        for b in bufs:
+            assert torch.equal(b[:, :n_valid], out)
+            if stride_pad:
+                assert torch.isnan(b[:, n_valid:].float()).all()
+
+
+@pytest.mark.parametrize(
+    "tp,module,M,col_offset",
+    [
+        (
+            "tp8",
+            "q_b",
+            1024,
+            0,
+        ),  # quant:u2 + tabulated decode TMA-store cell (sm_100a) / decode (sm_103a)
+        (
+            "tp8",
+            "q_proj",
+            4096,
+            0,
+        ),  # quant:u4 + ordered stream-K TMA-store GEMM (gemm_sk cell)
+        (
+            "tp8",
+            "kv_a",
+            16384,
+            0,
+        ),  # 192-wide fix-up stream-K TMA-store GEMM (gemm_skf + gemm_bn cell)
+        (
+            "tp1",
+            "fused_qkvg",
+            256,
+            0,
+        ),  # 256-wide fix-up stream-K TMA-store GEMM (gemm_skf cell)
+        ("tp1", "q_proj", 256, 0),  # prefetching TMA-store GEMM (gemm_pf cell)
+        (
+            "tp8",
+            "f_b",
+            256,
+            0,
+        ),  # fused decode TMA-store instance (XB + OUT re-bound from one call)
+        (
+            "tp8",
+            "fused_qkv_a",
+            1025,
+            8,
+        ),  # 16-byte base at column 8 (data_ptr % 32 == 16): TMA-store, 8-byte stores
+    ],
+)
+def test_launcher_matches_one_shot_on_program_classes(tp, module, M, col_offset):
+    """Round 8 (W4): the receipt launcher reproduces the one-shot path bit for bit on every shipped
+    program class the representative rows reach -- the stream-K / fix-up / 192-wide / prefetching TMA-store GEMMs
+    (workspace hand-off areas frozen into the receipt), the fused decode TMA-store instance (four re-bound slots),
+    the two-unit quantization program and an output base of the 16-byte-but-not-32-byte alignment class."""
+    device = _require_program()
+    n_valid, K = PROJECTION_FAMILIES[tp][module]
+    weight, scale = make_weight(n_valid, K, device, 41)
+    x = make_activation(M, K, device, 42)
+    prepared = prepare_kimi_k3_fp8_projection_weights(weight, scale, n_valid)
+    pad = 16 if col_offset else 0
+    buf = torch.full(
+        (M, n_valid + pad), float("nan"), dtype=torch.bfloat16, device=device
+    )
+    out = buf[:, col_offset : col_offset + n_valid]
+    assert out.data_ptr() % 32 == (2 * col_offset) % 32
+    expected = kimi_k3_fp8_projection(x, prepared)
+    launcher = cb.kimi_k3_fp8_projection_launcher(prepared)
+    assert launcher(x, out) is out
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected)
+    assert torch.isnan(buf[:, :col_offset].float()).all()
+    assert torch.isnan(buf[:, col_offset + n_valid :].float()).all()
+    plan = launcher.plan(x, out)
+    assert (
+        plan.kernels
+        == prepare_kimi_k3_fp8_projection(
+            x, prepared, out, launcher.workspace(M)
+        ).plan.kernels
+    )
+    x2 = make_activation(M, K, device, 43)
+    assert torch.equal(launcher(x2, out), kimi_k3_fp8_projection(x2, prepared))
+    assert launcher.cached_receipts == 1
+
+
+def test_misaligned_activation_rejected():
+    """Round 8: an activation whose base is not 16-byte aligned (a contiguous view at an odd 8-byte offset) is
+    refused by the one-shot path and the launcher with a ValueError instead of a driver error at launch."""
+    device = _require_program()
+    n_valid, K = PROJECTION_FAMILIES["tp8"]["q_proj"]
+    weight, scale = make_weight(n_valid, K, device, 51)
+    prepared = prepare_kimi_k3_fp8_projection_weights(weight, scale, n_valid)
+    big = torch.empty(64 * K + 8, dtype=torch.bfloat16, device=device)
+    x = big[4 : 4 + 64 * K].view(64, K)
+    assert x.is_contiguous() and x.data_ptr() % 16 == 8
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        kimi_k3_fp8_projection(x, prepared)
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        cb.kimi_k3_fp8_projection_launcher(prepared)(x)
+
+
+def test_launcher_short_rows_take_tma_store():
+    """Round 8: the bucket-256 GEMM cells route 65 <= M <= 256 to the GEMM; for M < 128 the TMA-store ``OUT``
+    box (128 rows) is taller than the output view and the TMA unit clips the rows >= M (``allow_oob_box`` on the
+    row axis of the descriptor).  The one-shot path and the receipt launcher plan the TMA-store program on a fresh
+    contiguous output and stay bit-identical to the register epilogue of a 4-byte-stride view of the same rows."""
+    device = _require_program()
+    for tp, module, M, seed in (
+        ("tp1", "kv_b", 100, 71),
+        ("tp1", "q_b", 65, 72),
+        ("tp1", "q_proj", 127, 73),
+    ):
+        weight, scale, x, buf, reg_out, n_valid = _make_case(
+            tp, module, M, 2, device, seed
+        )
+        prepared = prepare_kimi_k3_fp8_projection_weights(weight, scale, n_valid)
+        reg_runner = prepare_kimi_k3_fp8_projection(
+            x, prepared, reg_out, allocate_kimi_k3_fp8_projection_workspace(prepared, M)
+        )
+        assert reg_runner.plan.route == "gemm" and not reg_runner.plan.gemm_tma_store
+        reg_runner()
+        out = torch.empty((M, n_valid), dtype=torch.bfloat16, device=device)
+        runner = prepare_kimi_k3_fp8_projection(
+            x, prepared, out, allocate_kimi_k3_fp8_projection_workspace(prepared, M)
+        )
+        assert runner.plan.route == "gemm" and runner.plan.gemm_tma_store, (
+            tp,
+            module,
+            M,
+        )
+        runner()
+        launcher = cb.kimi_k3_fp8_projection_launcher(prepared)
+        got = launcher(x)
+        torch.cuda.synchronize()
+        assert torch.equal(out, reg_out), (tp, module, M)
+        assert torch.equal(got, reg_out), (tp, module, M)
+        assert torch.isnan(buf[:, n_valid:].float()).all()
+        assert_matches(out, reference(x, weight, scale, n_valid))
+
+
+def test_launcher_receipts_follow_output_addresses():
+    """Round 8 (W4): one planned launch receipt per (M, row stride, output address class); every call re-binds
+    its activation and output view into it (new addresses included), the receipt cache is bounded (least recently
+    used first) and the result stays bit-identical to the one-shot path."""
+    device = _require_program()
+    n_valid, K = PROJECTION_FAMILIES["tp8"]["q_proj"]
+    weight, scale = make_weight(n_valid, K, device, 51)
+    prepared = prepare_kimi_k3_fp8_projection_weights(weight, scale, n_valid)
+    launcher = cb.kimi_k3_fp8_projection_launcher(prepared, max_receipts=2)
+    M = 64
+    outs = [
+        torch.empty((M, n_valid), dtype=torch.bfloat16, device=device) for _ in range(3)
+    ]
+    x = make_activation(M, K, device, 7)
+    launcher(x, outs[0])
+    assert launcher.cached_receipts == 1
+    x8 = make_activation(M, K, device, 8)
+    for out in outs[
+        1:
+    ]:  # new output addresses of the same alignment class re-bind into the same receipt
+        launcher(x8, out)
+    assert launcher.cached_receipts == 1
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0], kimi_k3_fp8_projection(x, prepared))
+    for out in outs[1:]:
+        assert torch.equal(out, kimi_k3_fp8_projection(x8, prepared))
+    for m in (
+        256,
+        1024,
+    ):  # other M: more receipts; the third plan evicts the least recently used (M = 64)
+        xm = make_activation(m, K, device, 10 + m)
+        om = torch.empty((m, n_valid), dtype=torch.bfloat16, device=device)
+        launcher(xm, om)
+        torch.cuda.synchronize()
+        assert torch.equal(om, kimi_k3_fp8_projection(xm, prepared))
+    assert launcher.cached_receipts == 2
+    x2 = make_activation(M, K, device, 9)
+    launcher(x2, outs[0])  # re-planned after eviction
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0], kimi_k3_fp8_projection(x2, prepared))
+    launcher.pin(M)
+    assert M in launcher.cached_rows
+    with pytest.raises(ValueError, match="max_receipts"):
+        cb.kimi_k3_fp8_projection_launcher(prepared, max_receipts=0)
+
+
+def _planned_receipt(launcher, x, out):
+    """The one receipt a fresh launcher planned for ``(x, out)`` (after one call)."""
+    (receipt,) = launcher._receipts.values()
+    assert receipt.state is launcher._workspaces[int(x.shape[0])]
+    return receipt
+
+
+def test_launcher_two_launch_rows_take_one_chain_call():
+    """Round 8 (W4, chain): a two-launch row (quantization program + GEMM / decode program) issues ONE FFI call per
+    projection call -- the first program's ``run_chain`` replays both receipts through the callees each receipt names
+    -- and stays bit-identical to the one-shot path eagerly and after a CUDA-graph capture on a side stream; a
+    fused single-launch row keeps ``run_launch``.  Neither path allocates on a repeat call."""
+    device = _require_program()
+    for tp, module, M, two_stage in (
+        ("tp8", "q_b", 1024, True),  # quant:u2 + tabulated decode (two launches)
+        (
+            "tp8",
+            "q_proj",
+            4096,
+            True,
+        ),  # quant:u4 + stream-K TMA-store GEMM (two launches)
+        ("tp8", "f_b", 256, False),  # fused decode TMA-store instance (one launch)
+    ):
+        n_valid, K = PROJECTION_FAMILIES[tp][module]
+        weight, scale = make_weight(n_valid, K, device, 81)
+        prepared = prepare_kimi_k3_fp8_projection_weights(weight, scale, n_valid)
+        x = make_activation(M, K, device, 82)
+        expected = kimi_k3_fp8_projection(x, prepared)
+        launcher = cb.kimi_k3_fp8_projection_launcher(prepared)
+        out = torch.empty((M, n_valid), dtype=torch.bfloat16, device=device)
+        assert launcher(x, out) is out
+        torch.cuda.synchronize()
+        receipt = _planned_receipt(launcher, x, out)
+        assert (len(receipt.stages) == 2) == two_stage, (tp, module, M)
+        assert (receipt.chain is not None) == two_stage, (tp, module, M)
+        assert torch.equal(out, expected), (tp, module, M)
+        if two_stage:
+            entry, record_0, codes_0, record_1, codes_1 = receipt.chain
+            assert record_0 is receipt.stages[0][1] and record_1 is receipt.stages[1][1]
+            assert codes_0 == cb._slot_codes(
+                receipt.stages[0][2]
+            ) and codes_1 == cb._slot_codes(receipt.stages[1][2])
+            assert codes_0 != 0 and codes_1 != 0
+        # repeat call: no allocation, no new receipt
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        launcher(x, out)
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] - before == 0
+        assert launcher.cached_receipts == 1
+        # fresh activation and output addresses re-bind into the same receipt(s)
+        x2 = make_activation(M, K, device, 83)
+        out2 = torch.empty((M, n_valid), dtype=torch.bfloat16, device=device)
+        launcher(x2, out2)
+        torch.cuda.synchronize()
+        assert torch.equal(out2, kimi_k3_fp8_projection(x2, prepared)), (tp, module, M)
+        assert launcher.cached_receipts == 1
+        # side-stream graph capture of the chain / launch call, replayed into a NaN-filled output
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            launcher(x, out)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                launcher(x, out)
+        torch.cuda.synchronize()
+        out.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected), (tp, module, M)
+        assert launcher.cached_receipts == 1
+
+
+def test_chain_entry_propagates_errors_across_modules():
+    """Round 8 (W4, chain): the packed ``run_chain`` entry validates every receipt before it issues anything and
+    returns the error a stage's own callee raised -- a slot code naming a frozen position of the SECOND program is
+    refused by that program's ``ChainRebind`` (another module than the entry's) with the launcher's own message,
+    and the second launch never happens; a truncated or zeroed receipt is refused before any launch."""
+    device = _require_program()
+    n_valid, K = PROJECTION_FAMILIES["tp8"]["q_b"]
+    weight, scale = make_weight(n_valid, K, device, 91)
+    prepared = prepare_kimi_k3_fp8_projection_weights(weight, scale, n_valid)
+    M = 1024
+    x = make_activation(M, K, device, 92)
+    expected = kimi_k3_fp8_projection(x, prepared)
+    launcher = cb.kimi_k3_fp8_projection_launcher(prepared)
+    out = torch.empty((M, n_valid), dtype=torch.bfloat16, device=device)
+    launcher(x, out)
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected)
+    receipt = _planned_receipt(launcher, x, out)
+    assert receipt.chain is not None, "the row must take two launches"
+    entry, record_0, codes_0, record_1, codes_1 = receipt.chain
+    (template,) = launcher._templates.values()
+    stream = torch.cuda.current_stream(device).cuda_stream
+
+    def frozen_code(stage_index):
+        # the trailing ("grid", "grid_z") position of a program's argument plan is never a re-bindable slot
+        position = len(template.stages[stage_index].slots) - 1
+        assert position not in {
+            pos for pos, _src in template.stages[stage_index].rebinds
+        }
+        return 1 + ((position << 1) | 1)
+
+    # the second program refuses the re-bind (cross-module status propagation); the first launch already ran into
+    # the workspace, the second never did: the output stays untouched
+    out.fill_(float("nan"))
+    torch.cuda.synchronize()
+    with pytest.raises(ValueError, match="re-bindable"):
+        entry(stream, x, out, record_0, codes_0, record_1, frozen_code(1))
+    torch.cuda.synchronize()
+    assert torch.isnan(out.float()).all()
+    # the first program refuses its own re-bind before anything is issued
+    with pytest.raises(ValueError, match="re-bindable"):
+        entry(stream, x, out, record_0, frozen_code(0), record_1, codes_1)
+    torch.cuda.synchronize()
+    assert torch.isnan(out.float()).all()
+    # receipts are validated before any launch: a truncated second receipt, a receipt of no launcher at all
+    with pytest.raises(ValueError, match="needs at least"):
+        entry(stream, x, out, record_0, codes_0, record_1[:16].clone(), codes_1)
+    with pytest.raises(ValueError, match="not planned"):
+        entry(stream, x, out, record_0, codes_0, torch.zeros_like(record_1), codes_1)
+    with pytest.raises(ValueError, match="not planned"):
+        entry(stream, x, out, torch.zeros_like(record_0), codes_0, record_1, codes_1)
+    with pytest.raises(TypeError):
+        entry(
+            stream, x, out, record_0, codes_0, record_1
+        )  # a receipt without its slot codes
+    torch.cuda.synchronize()
+    assert torch.isnan(out.float()).all()
+    # the receipts are intact: the next call re-binds and reproduces the one-shot result
+    assert torch.equal(launcher(x, out), expected)
+    assert launcher.cached_receipts == 1
 
 
 def test_launch_makes_no_allocation():
