@@ -473,9 +473,17 @@ class _Combine:
 
 
 class _CombineNorm:
-    def __init__(self, streams: int, hidden_size: int) -> None:
+    def __init__(
+        self,
+        streams: int,
+        hidden_size: int,
+        zero_centered: bool = True,
+        fp32_weight: bool = False,
+    ) -> None:
         self.streams = int(streams)
         self.hidden_size = int(hidden_size)
+        self.zero_centered = bool(zero_centered)
+        self.fp32_weight = bool(fp32_weight)
         self.items = (self.hidden_size + _THREADS - 1) // _THREADS
 
     @cute.jit
@@ -569,9 +577,11 @@ class _CombineNorm:
         for item in cutlass.range_constexpr(self.items):
             column = thread_i + Int32(item * _THREADS)
             if column < Int32(self.hidden_size):
-                learned = Float32(weight[weight_base + column.to(Int64)])
+                gain = Float32(weight[weight_base + column.to(Int64)])
+                if cutlass.const_expr(self.zero_centered):
+                    gain += Float32(1.0)
                 normalized[state_base + column.to(Int64)] = BFloat16(
-                    rounded[item] * inv_rms * (Float32(1.0) + learned)
+                    rounded[item] * inv_rms * gain
                 )
 
 
@@ -580,9 +590,17 @@ class _PackedCombineNorm:
     _THREADS = 256
     _WARPS = _THREADS // 32
 
-    def __init__(self, streams: int, hidden_size: int) -> None:
+    def __init__(
+        self,
+        streams: int,
+        hidden_size: int,
+        zero_centered: bool = True,
+        fp32_weight: bool = False,
+    ) -> None:
         self.streams = int(streams)
         self.hidden_size = int(hidden_size)
+        self.zero_centered = bool(zero_centered)
+        self.fp32_weight = bool(fp32_weight)
         self.packs = self.hidden_size // self._PACK_ELEMENTS
         self.items = (self.packs + self._THREADS - 1) // self._THREADS
 
@@ -659,7 +677,7 @@ class _PackedCombineNorm:
             self.hidden_size * 2
         )
         weight_base = Int64(weight.toint()) + Int64(residual_stream) * Int64(
-            self.hidden_size * 2
+            self.hidden_size * (4 if self.fp32_weight else 2)
         )
         combined_base = Int64(combined.toint()) + (
             (Int64(token) * Int64(self.streams) + Int64(residual_stream))
@@ -722,18 +740,31 @@ class _PackedCombineNorm:
             pack = thread_i + Int32(item * self._THREADS)
             if pack < Int32(self.packs):
                 byte_offset = pack.to(Int64) * Int64(16)
-                weight_words = ld_global_v4_u32(weight_base + byte_offset)
+                gains = cute.make_rmem_tensor((self._PACK_ELEMENTS,), Float32)
+                if cutlass.const_expr(self.fp32_weight):
+                    for half in cutlass.range_constexpr(2):
+                        words = ld_global_v4_u32(
+                            weight_base + byte_offset * Int64(2) + Int64(half * 16)
+                        )
+                        for word in cutlass.range_constexpr(4):
+                            gains[half * 4 + word] = u32_as_f32(words[word])
+                else:
+                    weight_words = ld_global_v4_u32(weight_base + byte_offset)
+                    for word in cutlass.range_constexpr(4):
+                        lo, hi = bfloat2_to_float2_scaled(
+                            weight_words[word], Float32(1.0)
+                        )
+                        gains[word * 2], gains[word * 2 + 1] = lo, hi
                 normalized_words = cute.make_rmem_tensor((4,), Uint32)
                 for word in cutlass.range_constexpr(4):
-                    weight_lo, weight_hi = bfloat2_to_float2_scaled(
-                        weight_words[word], Float32(1.0)
-                    )
                     element = word * 2
+                    weight_lo, weight_hi = gains[element], gains[element + 1]
+                    if cutlass.const_expr(self.zero_centered):
+                        weight_lo += Float32(1.0)
+                        weight_hi += Float32(1.0)
                     normalized_words[word] = pack_f32x2_to_bfloat2(
-                        rounded[item, element] * inv_rms * (Float32(1.0) + weight_lo),
-                        rounded[item, element + 1]
-                        * inv_rms
-                        * (Float32(1.0) + weight_hi),
+                        rounded[item, element] * inv_rms * weight_lo,
+                        rounded[item, element + 1] * inv_rms * weight_hi,
                     )
                 st_global_v4_u32(
                     normalized_base + byte_offset,
@@ -802,7 +833,7 @@ def _compile(
                 *args,
                 compile_spec=KernelCompileSpec.from_key(
                     "norm.hyperconnection.cute",
-                    7,
+                    8,
                     key,
                 ),
             )
@@ -949,6 +980,7 @@ def combine_norm(
     eps: float,
     streams: int,
     hidden_size: int,
+    zero_centered: bool = True,
 ) -> None:
     tokens = int(state.shape[0])
     packed = int(hidden_size) % _PackedCombineNorm._PACK_ELEMENTS == 0
@@ -957,13 +989,19 @@ def combine_norm(
         _device_index(state),
         int(streams),
         int(hidden_size),
+        str(weight.dtype),
+        bool(zero_centered),
     )
     _run(
         key,
         (
-            _PackedCombineNorm(streams, hidden_size)
+            _PackedCombineNorm(
+                streams, hidden_size, zero_centered, weight.dtype == torch.float32
+            )
             if packed
-            else _CombineNorm(streams, hidden_size)
+            else _CombineNorm(
+                streams, hidden_size, zero_centered, weight.dtype == torch.float32
+            )
         ),
         (state, block_output, logits, weight, combined, normalized),
         eps=eps,

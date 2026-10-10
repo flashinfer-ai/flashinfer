@@ -424,3 +424,195 @@ def test_ordinary_rmsnorm_uses_affine_weight_without_offset(hidden, weight_dtype
             torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
             assert torch.isnan(normalized[rows:]).all()
             graph.reset()
+
+
+@pytest.mark.parametrize("tokens", (1, 7, 4096))
+@pytest.mark.parametrize(
+    "weight_dtype,zero_centered",
+    ((torch.bfloat16, True), (torch.bfloat16, False), (torch.float32, False)),
+)
+@pytest.mark.parametrize("provided", (False, True))
+def test_combine_norm_preserves_affine_precision_and_replays(
+    tokens, weight_dtype, zero_centered, provided
+):
+    device = require_b12x()
+    generator = torch.Generator(device=device).manual_seed(5813)
+    state = torch.randn(
+        tokens, 10240, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    block = torch.randn(
+        tokens, 2560, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    logits = torch.randn(
+        tokens, 336, generator=generator, device=device, dtype=torch.bfloat16
+    )[:, 320:324]
+    weight = (
+        torch.randn(10240, generator=generator, device=device, dtype=weight_dtype) * 0.3
+    )
+    if not zero_centered:
+        weight.add_(1)
+    normalized = torch.empty_like(state)
+    combined = torch.empty_like(state)
+    eps = 1e-6
+    plan = hc.plan(
+        hc.Caps(device=device, max_tokens=tokens, hidden_size=2560),
+        invocation=FrozenMapping(
+            {
+                "operation": "combine_norm",
+                "output_mode": "provided" if provided else "functional",
+                "zero_centered": zero_centered,
+                "weight_dtype": str(weight_dtype).removeprefix("torch."),
+                "eps": eps,
+            }
+        ),
+    )
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="combine_norm",
+                    prepare_call=lambda prepared: PreparedCall(
+                        run=lambda: prepared.launch(
+                            state, block, logits, weight, combined, normalized, eps=eps
+                        )
+                    ),
+                ),
+            )
+        )
+
+        def run():
+            return hc.run_combine_norm(
+                state,
+                block,
+                logits,
+                weight,
+                eps=eps,
+                plan=plan,
+                zero_centered=zero_centered,
+                out=(state, normalized) if provided else None,
+            )
+
+        run()
+        with session.capture():
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run()
+        if provided:
+            assert captured[0] is state and captured[1] is normalized
+        for iteration in range(2):
+            state.normal_(generator=generator)
+            block.normal_(generator=generator)
+            logits.normal_(generator=generator)
+            weight.add_(0.0013)
+            residual = state.reshape(tokens, 4, 2560).float()
+            scale = 2 * torch.sigmoid(logits.float() / 4)
+            expected = (residual + scale[..., None] * block[:, None].float()).bfloat16()
+            gain = weight.float() + 1 if zero_centered else weight.float()
+            values = expected.float()
+            expected_norm = (
+                (
+                    values
+                    * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps)
+                    * gain.reshape(4, 2560)
+                )
+                .flatten(1)
+                .bfloat16()
+            )
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            torch.testing.assert_close(
+                captured[0], expected.flatten(1), rtol=0.01, atol=0.016
+            )
+            torch.testing.assert_close(
+                captured[1], expected_norm, rtol=0.01, atol=0.032
+            )
+            if weight_dtype == torch.float32:
+                rounded_norm = (
+                    (
+                        values
+                        * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps)
+                        * gain.bfloat16().float().reshape(4, 2560)
+                    )
+                    .flatten(1)
+                    .bfloat16()
+                )
+                assert (captured[1] != rounded_norm).count_nonzero() > tokens * 100
+        graph.reset()
+
+
+def test_combine_norm_rejects_output_aliases_and_declaration_mismatches():
+    device = require_b12x()
+    owner = torch.zeros(3, 10240, device=device, dtype=torch.bfloat16)
+    state, partial_alias = owner[:2], owner[1:]
+    block = torch.zeros(2, 2560, device=device, dtype=torch.bfloat16)
+    logits = torch.zeros(2, 4, device=device, dtype=torch.bfloat16)
+    weight = torch.ones(10240, device=device)
+    normalized = torch.empty_like(state)
+    plan = hc.plan(
+        hc.Caps(device=device, max_tokens=2, hidden_size=2560),
+        invocation=FrozenMapping(
+            {
+                "operation": "combine_norm",
+                "output_mode": "provided",
+                "zero_centered": False,
+                "weight_dtype": "float32",
+            }
+        ),
+    )
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="combine_norm",
+                    prepare_call=lambda prepared: PreparedCall(
+                        run=lambda: prepared.launch(
+                            state, block, logits, weight, state, normalized, eps=1e-6
+                        )
+                    ),
+                ),
+            )
+        )
+        for out, message in (
+            ((state, state), "normalized must not overlap"),
+            ((partial_alias, normalized), "exact alias"),
+            (None, "output form"),
+        ):
+            with pytest.raises(ValueError, match=message):
+                hc.run_combine_norm(
+                    state,
+                    block,
+                    logits,
+                    weight,
+                    eps=1e-6,
+                    plan=plan,
+                    zero_centered=False,
+                    out=out,
+                )
+        with pytest.raises(ValueError, match="recipe differs"):
+            hc.run_combine_norm(
+                state,
+                block,
+                logits,
+                weight,
+                eps=1e-6,
+                plan=plan,
+                out=(state, normalized),
+            )
+        with pytest.raises(ValueError, match="dtype differs"):
+            hc.run_combine_norm(
+                state,
+                block,
+                logits,
+                weight.bfloat16(),
+                eps=1e-6,
+                plan=plan,
+                zero_centered=False,
+                out=(state, normalized),
+            )

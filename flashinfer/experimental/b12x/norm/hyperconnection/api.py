@@ -70,8 +70,36 @@ def run_combine(state, block_output, injection_logits, *, plan: Plan):
 
 
 def run_combine_norm(
-    state, block_output, injection_logits, next_norm_weight, *, eps, plan: Plan
+    state,
+    block_output,
+    injection_logits,
+    next_norm_weight,
+    *,
+    eps,
+    plan: Plan,
+    zero_centered=True,
+    out=None,
 ):
+    """Inject a block and normalize its BF16 residual across four 2560-wide streams.
+
+    ``zero_centered=False`` accepts direct BF16 or FP32 gains. A plan declared
+    with ``output_mode="provided"`` requires ``out=(combined, normalized)``;
+    ``combined`` may alias ``state`` exactly. All other output aliases are rejected.
+    """
+    if out is not None:
+        if not isinstance(out, tuple) or len(out) != 2:
+            raise ValueError("out must be a (combined, normalized) tensor pair")
+        torch.ops.b12x.hyperconnection_combine_norm_out(
+            state,
+            block_output,
+            injection_logits,
+            next_norm_weight,
+            *out,
+            float(eps),
+            plan.handle,
+            bool(zero_centered),
+        )
+        return out
     return torch.ops.b12x.hyperconnection_combine_norm(
         state,
         block_output,
@@ -79,6 +107,7 @@ def run_combine_norm(
         next_norm_weight,
         float(eps),
         plan.handle,
+        bool(zero_centered),
     )
 
 

@@ -132,7 +132,7 @@ def _validate_query(query, device):
     expected_mode = (
         "functional" if query.operation in ("combine", "combine_norm") else "provided"
     )
-    if query.output_mode != expected_mode:
+    if query.operation != "combine_norm" and query.output_mode != expected_mode:
         raise ValueError("output form is not supported by this operation")
     if query.dtype != "bfloat16":
         raise ValueError("HyperConnection state dtype must be bfloat16")
@@ -158,10 +158,12 @@ def _validate_query(query, device):
         raise TypeError("normalization centering must be a boolean")
     if query.weight_dtype not in ("bfloat16", "float32"):
         raise ValueError("affine weights must be BF16 or FP32")
-    if query.operation != "grouped_rmsnorm" and (
+    if query.operation not in ("grouped_rmsnorm", "combine_norm") and (
         not query.zero_centered or query.weight_dtype != "bfloat16"
     ):
-        raise ValueError("affine normalization controls require grouped RMSNorm")
+        raise ValueError(
+            "affine normalization controls require a normalization operation"
+        )
     if query.zero_centered and query.weight_dtype != "bfloat16":
         raise ValueError("zero-centered grouped RMSNorm requires BF16 weights")
     if query.operation == "sigmoid" and query.right_dtype != query.left_dtype:
@@ -223,7 +225,7 @@ def _materialize_tuning(
 
 TUNING = TuningContract(
     component_id="norm.hyperconnection",
-    query_schema_version=22,
+    query_schema_version=23,
     config_schema_version=22,
     query_fields=frozenset(HyperConnectionQuery.__dataclass_fields__),
     config_fields=frozenset(HyperConnectionConfig.__dataclass_fields__),

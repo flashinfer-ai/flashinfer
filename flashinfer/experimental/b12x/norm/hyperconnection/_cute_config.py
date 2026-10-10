@@ -68,9 +68,14 @@ def require_cute_combine_norm(
             raise ValueError(
                 "Qwen3.8 HyperConnection combine+norm tensors must share a device"
             )
-        if tensor.dtype != torch.bfloat16:
+        valid_dtypes = (
+            (torch.bfloat16, torch.float32)
+            if tensor is next_norm_weight
+            else (torch.bfloat16,)
+        )
+        if tensor.dtype not in valid_dtypes:
             raise ValueError(
-                "Qwen3.8 HyperConnection combine+norm tensors must use BF16"
+                "Qwen3.8 HyperConnection combine+norm requires BF16 activations and BF16 or FP32 weights"
             )
         if tensor is injection_logits:
             if tensor.ndim != 2 or tensor.stride(1) != 1 or tensor.stride(0) < streams:

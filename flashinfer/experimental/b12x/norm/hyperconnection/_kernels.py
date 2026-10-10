@@ -325,6 +325,7 @@ def _combine_norm_op(
     next_norm_weight: torch.Tensor,
     eps: float,
     plan_handle: int,
+    zero_centered: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from ._impl import run_combine_norm_impl
 
@@ -338,6 +339,7 @@ def _combine_norm_op(
         next_norm_weight,
         eps=eps,
         plan=prepared,
+        zero_centered=zero_centered,
     )
 
 
@@ -349,9 +351,56 @@ def _combine_norm_fake(
     next_norm_weight: torch.Tensor,
     eps: float,
     plan_handle: int,
+    zero_centered: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del block_output, injection_logits, next_norm_weight, eps, plan_handle
     return torch.empty_like(state), torch.empty_like(state)
+
+
+@torch.library.custom_op(
+    "b12x::hyperconnection_combine_norm_out", mutates_args=("combined", "normalized")
+)
+def _combine_norm_out_op(
+    state: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
+    next_norm_weight: torch.Tensor,
+    combined: torch.Tensor,
+    normalized: torch.Tensor,
+    eps: float,
+    plan_handle: int,
+    zero_centered: bool = True,
+) -> None:
+    from ._impl import run_combine_norm_impl
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", state.device
+    )
+    run_combine_norm_impl(
+        state,
+        block_output,
+        injection_logits,
+        next_norm_weight,
+        eps=eps,
+        plan=prepared,
+        zero_centered=zero_centered,
+        out=(combined, normalized),
+    )
+
+
+@_combine_norm_out_op.register_fake
+def _combine_norm_out_fake(
+    state: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
+    next_norm_weight: torch.Tensor,
+    combined: torch.Tensor,
+    normalized: torch.Tensor,
+    eps: float,
+    plan_handle: int,
+    zero_centered: bool = True,
+) -> None:
+    return None
 
 
 @torch.library.custom_op("b12x::hyperconnection_engram_mix", mutates_args=("out",))

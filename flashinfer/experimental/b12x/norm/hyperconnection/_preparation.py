@@ -89,19 +89,30 @@ def compile_hyperconnection(query_payload, config_payload, ordinal):
     if role == "combine_norm":
         packed = hidden % native._PackedCombineNorm._PACK_ELEMENTS == 0
         cls = native._PackedCombineNorm if packed else native._CombineNorm
+        weight_dtype = getattr(torch, query.weight_dtype)
         return native._compile(
             (
                 "combine_norm_packed" if packed else "combine_norm",
                 ordinal,
                 streams,
                 hidden,
+                str(weight_dtype),
+                query.zero_centered,
             ),
-            cls(streams, hidden),
+            cls(streams, hidden, query.zero_centered, weight_dtype == torch.float32),
             6,
             device,
             has_eps=True,
             runtime_ints=1,
             runtime_int64s=1,
+            pointer_dtypes=(
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.bfloat16,
+                weight_dtype,
+                torch.bfloat16,
+                torch.bfloat16,
+            ),
         )
     if role == "engram_mix":
         return native._compile(

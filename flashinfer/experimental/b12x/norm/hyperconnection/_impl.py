@@ -421,9 +421,15 @@ def run_combine_norm_impl(
     *,
     eps: float,
     plan: _HyperConnectionState,
+    zero_centered: bool = True,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _require_cuda(plan)
     plan.require_operation("combine_norm", eps=eps)
+    if bool(zero_centered) != plan.query.zero_centered:
+        raise ValueError("normalization recipe differs from preparation")
+    if plan.query.output_mode != ("functional" if out is None else "provided"):
+        raise ValueError("output form differs from preparation")
     caps = plan.caps
     tokens = plan._live_tokens(state.shape[0])
     _validate_combine_inputs(
@@ -433,16 +439,14 @@ def run_combine_norm_impl(
         plan=plan,
         tokens=tokens,
     )
-    _validate_input(
-        next_norm_weight,
-        shape=(caps.streams * caps.hidden_size,),
-        caps=caps,
-        name="next_norm_weight",
-    )
+    if next_norm_weight.dtype != getattr(torch, plan.query.weight_dtype):
+        raise ValueError("affine weight dtype differs from preparation")
     eps = _require_eps(eps)
     from ._cute_config import require_cute_combine_norm
 
-    combined, normalized = torch.empty_like(state), torch.empty_like(state)
+    combined, normalized = (
+        out if out is not None else (torch.empty_like(state), torch.empty_like(state))
+    )
     require_cute_combine_norm(
         state=state,
         block_output=block_output,
@@ -453,6 +457,29 @@ def run_combine_norm_impl(
         streams=caps.streams,
         hidden_size=caps.hidden_size,
     )
+    _validate_output_disjoint(
+        "normalized",
+        normalized,
+        (
+            ("state", state),
+            ("block_output", block_output),
+            ("injection_logits", injection_logits),
+            ("next_norm_weight", next_norm_weight),
+            ("combined", combined),
+        ),
+    )
+    _validate_output_disjoint(
+        "combined",
+        combined,
+        (
+            ("block_output", block_output),
+            ("injection_logits", injection_logits),
+            ("next_norm_weight", next_norm_weight),
+        ),
+    )
+    if not torch.compiler.is_compiling() and _overlaps(combined, state):
+        if _byte_interval(combined) != _byte_interval(state):
+            raise ValueError("combined may only overlap state through an exact alias")
     if tokens:
         plan.launch(
             state,

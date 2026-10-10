@@ -816,7 +816,12 @@ def test_cute_reference_helpers_reuse_binaries_across_live_counts(
     assert keys_by_name["silu"][2:] == (streams, lowrank)
     assert keys_by_name["gate"][2:] == (streams, hidden_size)
     assert keys_by_name["combine"][2:] == (streams, hidden_size)
-    assert keys_by_name["combine_norm"][2:] == (streams, hidden_size)
+    assert keys_by_name["combine_norm"][2:] == (
+        streams,
+        hidden_size,
+        "torch.bfloat16",
+        True,
+    )
 
 
 @pytest.mark.filterwarnings("ignore:The CUDA Graph is empty.*:UserWarning")
@@ -1018,7 +1023,7 @@ def test_combine_norm_reuses_one_cute_binary_across_token_counts(
 
     assert len(compile_keys) == 1
     assert compile_keys[0][0] == "combine_norm_packed"
-    assert compile_keys[0][2:] == (streams, hidden_size)
+    assert compile_keys[0][2:] == (streams, hidden_size, "torch.bfloat16", True)
 
 
 def test_combine_norm_uses_cute_and_rejects_non_qwen_geometry(
