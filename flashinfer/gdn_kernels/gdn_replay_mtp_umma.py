@@ -167,11 +167,10 @@ class GdnReplayMtpUmma:
         self.sr = sr
         self.sr_rounds = sr_rounds if sr == "philox" else 0
         self.sr_lcg = sr in ("lcg", "lcg_clock")
-        self.regsplit = (
-            _REGSPLIT if _use_regsplit(T, hpc, self.sr, self.sr_rounds) else ()
-        )
-        self.cw0 = 4 if self.regsplit else 2  # first consumer warp
-        self.num_threads = 256 if self.regsplit else 192
+        self.split = _use_regsplit(T, hpc, self.sr, self.sr_rounds)  # 256-thread layout
+        self.regsplit = _REGSPLIT  # (dec, inc) register counts, used when self.split
+        self.cw0 = 4 if self.split else 2  # first consumer warp
+        self.num_threads = 256 if self.split else 192
 
     @cute.jit
     def _make_state_tma(self, state: cute.Tensor, op):
@@ -484,7 +483,7 @@ class GdnReplayMtpUmma:
         # Allocation-sensitive: re-check STL / LDL over the (T, heads per CTA, rounding)
         # cells (CUTE_DSL_KEEP=sass) after edits to the math warps' path.
         if warp < CW0:
-            if cutlass.const_expr(self.regsplit):
+            if cutlass.const_expr(self.split):
                 cute.arch.setmaxregister_decrease(self.regsplit[0])
             if warp == 0:
                 # ============================================================ producer
@@ -656,7 +655,7 @@ class GdnReplayMtpUmma:
                 U.fence_after_sync()
                 U.tmem_dealloc(tbase, _TMEM_COLS)
         else:
-            if cutlass.const_expr(self.regsplit):
+            if cutlass.const_expr(self.split):
                 cute.arch.setmaxregister_increase(self.regsplit[1])
             # ============================================================ consumers
             cw = warp - CW0
