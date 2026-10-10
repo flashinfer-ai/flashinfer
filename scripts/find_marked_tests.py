@@ -3,12 +3,12 @@
 
 Used by ``scripts/test_utils.sh`` to derive its CI scheduling buckets
 (``@pytest.mark.long_running`` -> front-load in the parallel queue,
-``@pytest.mark.solo`` -> run alone/sequentially) directly from the test
-sources. Keeping the property on the test file means it travels with the file
-across renames/splits instead of being duplicated in a shell array that can
-silently drift out of sync (see issue #3762, where a rename left the shell
-array pointing at a file that no longer existed, dropping a heavy MoE file from
-the front of the queue and causing GB200 walltime timeouts).
+``@pytest.mark.exclusive_extreme_host_ram`` -> run alone/sequentially) directly
+from the test sources. Keeping the property on the test file means it travels
+with the file across renames/splits instead of being duplicated in a shell
+array that can silently drift out of sync (see issue #3762, where a rename left
+the shell array pointing at a file that no longer existed, dropping a heavy MoE
+file from the front of the queue and causing GB200 walltime timeouts).
 
 Implementation note: this is a pure-``ast`` scan -- it never imports the test
 modules. That keeps it fast and, crucially, immune to a single module that
@@ -18,7 +18,8 @@ scheduling for every other test).
 Usage:
     find_marked_tests.py MARKER [ROOT ...]
 
-MARKER is the marker attribute name, e.g. ``long_running`` or ``solo``.
+MARKER is the marker attribute name, e.g. ``long_running`` or
+``exclusive_extreme_host_ram``.
 ROOT defaults to ``tests``. Output is one unique basename per line, sorted.
 """
 

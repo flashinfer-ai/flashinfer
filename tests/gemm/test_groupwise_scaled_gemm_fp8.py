@@ -33,7 +33,10 @@ from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
 from flashinfer.utils import get_compute_capability
 
-pytestmark = pytest.mark.solo
+# Peak host RSS 124-200 GiB in 9 of 35 flashinfer-ci nightly runs (2026-10),
+# from JIT-building the blockscale GEMM module when no earlier file in the job
+# built it; 2-4 GiB otherwise.
+pytestmark = pytest.mark.exclusive_extreme_host_ram
 
 
 @pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])

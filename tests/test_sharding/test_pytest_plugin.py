@@ -86,15 +86,15 @@ def test_unselected():
     assert properties["pytest_nodeid"] == selected_node
 
 
-def test_plugin_promotes_solo_and_long_running_markers_to_their_sources(
+def test_plugin_promotes_exclusive_and_long_running_markers_to_their_sources(
     tmp_path: Path,
 ) -> None:
-    solo_file = tmp_path / "test_solo.py"
-    solo_file.write_text(
+    heavy_file = tmp_path / "test_heavy.py"
+    heavy_file.write_text(
         """\
 import pytest
 
-@pytest.mark.solo
+@pytest.mark.exclusive_extreme_host_ram
 def test_marked():
     pass
 
@@ -124,24 +124,24 @@ def test_same_source():
         "--strict-markers",
         "--collect-only",
         f"--flashinfer-collection-json={collection_path}",
-        str(solo_file),
+        str(heavy_file),
         str(long_file),
     )
 
     assert collected.returncode == 0, collected.stdout + collected.stderr
     collection = json.loads(collection_path.read_text(encoding="utf-8"))
-    solo_nodes = [
-        node for node in collection["nodes"] if "test_solo.py::" in node["nodeid"]
+    heavy_nodes = [
+        node for node in collection["nodes"] if "test_heavy.py::" in node["nodeid"]
     ]
     long_nodes = [
         node for node in collection["nodes"] if "test_long.py::" in node["nodeid"]
     ]
-    assert len(solo_nodes) == 2
+    assert len(heavy_nodes) == 2
     assert len(long_nodes) == 2
-    assert all(node["solo"] is True for node in solo_nodes)
-    assert all(node["long_running"] is False for node in solo_nodes)
+    assert all(node["exclusive_extreme_host_ram"] is True for node in heavy_nodes)
+    assert all(node["long_running"] is False for node in heavy_nodes)
     assert all(node["long_running"] is True for node in long_nodes)
-    assert all(node["solo"] is False for node in long_nodes)
+    assert all(node["exclusive_extreme_host_ram"] is False for node in long_nodes)
     assert "PytestUnknownMarkWarning" not in collected.stdout + collected.stderr
 
 

@@ -25,13 +25,13 @@ def _node(
     order: int,
     *,
     shard_group: str | None = None,
-    solo: bool = False,
+    exclusive_extreme_host_ram: bool = False,
 ) -> CollectedNode:
     return CollectedNode.from_nodeid(
         nodeid,
         order=order,
         shard_group=shard_group,
-        solo=solo,
+        exclusive_extreme_host_ram=exclusive_extreme_host_ram,
     )
 
 
@@ -116,10 +116,10 @@ def test_shard_group_is_atomic_even_when_it_exceeds_checkpoint() -> None:
     assert grouped_batches[0].oversized is True
 
 
-def test_solo_source_is_one_batch_and_one_logical_unit() -> None:
+def test_exclusive_host_ram_source_is_one_batch_and_one_logical_unit() -> None:
     nodes = [
-        _node("tests/test_solo.py::test_case[0]", 0, solo=True),
-        _node("tests/test_solo.py::test_case[1]", 1, solo=True),
+        _node("tests/test_heavy.py::test_case[0]", 0, exclusive_extreme_host_ram=True),
+        _node("tests/test_heavy.py::test_case[1]", 1, exclusive_extreme_host_ram=True),
         _node("tests/test_regular.py::test_case", 2),
     ]
     plan = build_plan(
@@ -134,23 +134,23 @@ def test_solo_source_is_one_batch_and_one_logical_unit() -> None:
         ),
     )
 
-    solo_units = [
+    exclusive_units = [
         unit
         for unit in plan.units
-        if any(batch.source_file == "tests/test_solo.py" for batch in unit.batches)
+        if any(batch.source_file == "tests/test_heavy.py" for batch in unit.batches)
     ]
-    assert len(solo_units) == 1
-    assert len(solo_units[0].batches) == 1
-    assert solo_units[0].batches[0].nodeids == (
-        "tests/test_solo.py::test_case[0]",
-        "tests/test_solo.py::test_case[1]",
+    assert len(exclusive_units) == 1
+    assert len(exclusive_units[0].batches) == 1
+    assert exclusive_units[0].batches[0].nodeids == (
+        "tests/test_heavy.py::test_case[0]",
+        "tests/test_heavy.py::test_case[1]",
     )
     assert Plan.from_dict(plan.to_dict()) == plan
 
 
-def test_capacity_metrics_account_for_solo_exclusivity() -> None:
+def test_capacity_metrics_account_for_exclusive_host_ram_sources() -> None:
     nodes = [
-        _node("tests/test_solo.py::test_case", 0, solo=True),
+        _node("tests/test_heavy.py::test_case", 0, exclusive_extreme_host_ram=True),
         _node("tests/test_regular_a.py::test_case", 1),
         _node("tests/test_regular_b.py::test_case", 2),
     ]
@@ -598,7 +598,7 @@ def test_plan_serialization_stores_each_nodeid_once() -> None:
     encoded = json.dumps(serialized, sort_keys=True, separators=(",", ":"))
 
     assert Plan.from_dict(serialized) == plan
-    assert serialized["schema_version"] == 4
+    assert serialized["schema_version"] == 5
     assert serialized["nodeids"] == [node.nodeid for node in nodes]
     assert "nodes" not in serialized
     assert "batch_ids" not in encoded

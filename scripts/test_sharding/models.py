@@ -4,7 +4,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-SCHEMA_VERSION = 4
+# 5: the plan's "solo"/"solo_sources" keys became
+# "exclusive_extreme_host_ram"/"exclusive_extreme_host_ram_sources". Resuming a
+# junit dir planned under an older schema is refused by verify_manifest().
+SCHEMA_VERSION = 5
 ALGORITHM_VERSION = "lpt-ms-v4"
 DEFAULT_CHECKPOINT_SECONDS = 1_000_000
 DEFAULT_TARGET_UNIT_SECONDS = 1_000_000
@@ -30,7 +33,11 @@ class CollectedNode:
     base_function: str
     order: int
     shard_group: str | None = None
-    solo: bool = False
+    # Set by @pytest.mark.exclusive_extreme_host_ram. The whole source file then
+    # runs alone, after all parallel work, holding every GPU on the node. Only
+    # for files whose peak host RAM would risk an OOM next to other workers;
+    # any other use serializes the file and badly lengthens the whole suite.
+    exclusive_extreme_host_ram: bool = False
     long_running: bool = False
 
     @classmethod
@@ -40,7 +47,7 @@ class CollectedNode:
         order: int,
         shard_group: str | None = None,
         *,
-        solo: bool = False,
+        exclusive_extreme_host_ram: bool = False,
         long_running: bool = False,
     ) -> "CollectedNode":
         return cls(
@@ -49,7 +56,7 @@ class CollectedNode:
             base_function=base_function_for_nodeid(nodeid),
             order=order,
             shard_group=shard_group,
-            solo=solo,
+            exclusive_extreme_host_ram=exclusive_extreme_host_ram,
             long_running=long_running,
         )
 
@@ -60,7 +67,7 @@ class CollectedNode:
             "base_function": self.base_function,
             "order": self.order,
             "shard_group": self.shard_group,
-            "solo": self.solo,
+            "exclusive_extreme_host_ram": self.exclusive_extreme_host_ram,
             "long_running": self.long_running,
         }
 
@@ -188,8 +195,12 @@ class Plan:
             for index, node in enumerate(self.nodes)
             if node.shard_group is not None
         }
-        solo_sources = sorted(
-            {node.source_file for node in self.nodes if node.solo},
+        exclusive_extreme_host_ram_sources = sorted(
+            {
+                node.source_file
+                for node in self.nodes
+                if node.exclusive_extreme_host_ram
+            },
             key=lambda value: value.encode("utf-8"),
         )
         long_running_sources = sorted(
@@ -206,7 +217,7 @@ class Plan:
                 for path, indexes in sorted(source_file_groups.items())
             ],
             "shard_groups": shard_groups,
-            "solo_sources": solo_sources,
+            "exclusive_extreme_host_ram_sources": exclusive_extreme_host_ram_sources,
             "long_running_sources": long_running_sources,
             "units": [
                 {
@@ -265,7 +276,9 @@ class Plan:
                         base_function=node["base_function"],
                         order=int(node["order"]),
                         shard_group=node.get("shard_group"),
-                        solo=bool(node.get("solo", False)),
+                        exclusive_extreme_host_ram=bool(
+                            node.get("exclusive_extreme_host_ram", False)
+                        ),
                         long_running=bool(node.get("long_running", False)),
                     )
                     for node in value["nodes"]
@@ -290,7 +303,10 @@ class Plan:
             for group in value.get("source_files", [])
             for index in group["node_indexes"]
         }
-        solo_sources = {str(source) for source in value.get("solo_sources", [])}
+        exclusive_extreme_host_ram_sources = {
+            str(source)
+            for source in value.get("exclusive_extreme_host_ram_sources", [])
+        }
         long_running_sources = {
             str(source) for source in value.get("long_running_sources", [])
         }
@@ -301,7 +317,8 @@ class Plan:
                 base_function_for_nodeid(nodeid),
                 index,
                 shard_groups.get(index),
-                source_files.get(index, source_file_for_nodeid(nodeid)) in solo_sources,
+                source_files.get(index, source_file_for_nodeid(nodeid))
+                in exclusive_extreme_host_ram_sources,
                 source_files.get(index, source_file_for_nodeid(nodeid))
                 in long_running_sources,
             )

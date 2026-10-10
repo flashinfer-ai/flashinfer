@@ -1572,14 +1572,14 @@ execute_dry_run() {
 }
 
 # Main execution function for actual test run
-# Tests that are too memory-heavy to run in parallel.
-# These get pulled out and run sequentially (one at a time, full GPU) after
-# the parallel batch finishes.
-SOLO_TEST_PATTERNS=(
+# Fallback list of files marked @pytest.mark.exclusive_extreme_host_ram. These
+# run sequentially (one at a time, all GPUs) after the parallel batch finishes,
+# so only files whose peak host RAM would risk an OOM next to other workers
+# belong here; anything else badly lengthens the whole run.
+EXCLUSIVE_HOST_RAM_TEST_PATTERNS=(
     "test_attention_sink.py"
     "test_groupwise_scaled_gemm_fp8.py"
     "test_trtllm_cutlass_fused_moe.py"
-    "test_trtllm_gen_routed_fused_moe.py"
     "test_cutlass_fused_moe_reference_correctness.py"
 )
 
@@ -1596,13 +1596,13 @@ LONG_RUNNING_TEST_PATTERNS=(
     "test_fp4_quantize.py"
 )
 
-is_solo_test() {
+is_exclusive_host_ram_test() {
     local test_file=$1
     local basename
-    local solo_pattern
+    local exclusive_pattern
     basename=$(basename "$test_file")
-    for solo_pattern in "${SOLO_TEST_PATTERNS[@]}"; do
-        if [ "$basename" = "$solo_pattern" ]; then
+    for exclusive_pattern in "${EXCLUSIVE_HOST_RAM_TEST_PATTERNS[@]}"; do
+        if [ "$basename" = "$exclusive_pattern" ]; then
             return 0
         fi
     done
@@ -1628,7 +1628,7 @@ derive_scheduling_patterns_from_markers() {
     SCHEDULING_PATTERNS_DERIVED=true
 
     # scripts/test_utils.sh -> repo root is one level up.
-    local repo_root scanner py tests_root long_list solo_list
+    local repo_root scanner py tests_root long_list exclusive_list
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     scanner="${repo_root}/scripts/find_marked_tests.py"
     tests_root="${repo_root}/tests"
@@ -1643,7 +1643,7 @@ derive_scheduling_patterns_from_markers() {
     }
 
     long_list="$("$py" "$scanner" long_running "$tests_root" 2>/dev/null)"
-    solo_list="$("$py" "$scanner" solo "$tests_root" 2>/dev/null)"
+    exclusive_list="$("$py" "$scanner" exclusive_extreme_host_ram "$tests_root" 2>/dev/null)"
 
     if [ -n "$long_list" ]; then
         mapfile -t LONG_RUNNING_TEST_PATTERNS <<< "$long_list"
@@ -1651,11 +1651,11 @@ derive_scheduling_patterns_from_markers() {
     else
         echo "NOTE: no @pytest.mark.long_running files found; keeping built-in long-running defaults."
     fi
-    if [ -n "$solo_list" ]; then
-        mapfile -t SOLO_TEST_PATTERNS <<< "$solo_list"
-        echo "Derived ${#SOLO_TEST_PATTERNS[@]} solo test pattern(s) from @pytest.mark.solo."
+    if [ -n "$exclusive_list" ]; then
+        mapfile -t EXCLUSIVE_HOST_RAM_TEST_PATTERNS <<< "$exclusive_list"
+        echo "Derived ${#EXCLUSIVE_HOST_RAM_TEST_PATTERNS[@]} exclusive host-RAM test pattern(s) from @pytest.mark.exclusive_extreme_host_ram."
     else
-        echo "NOTE: no @pytest.mark.solo files found; keeping built-in solo defaults."
+        echo "NOTE: no @pytest.mark.exclusive_extreme_host_ram files found; keeping built-in exclusive host-RAM defaults."
     fi
 }
 
@@ -1674,14 +1674,15 @@ execute_tests() {
     # Check if parallel execution is enabled
     if [ "$PARALLEL_TESTS" == "true" ]; then
         # Split tests into front-loaded long-running, normal parallel-safe, and
-        # solo memory-heavy groups. Solo wins if a test appears in both lists.
+        # exclusive extreme-host-RAM groups. Exclusive wins if a test appears in
+        # both lists.
         local long_running_files=""
         local parallel_files=""
-        local solo_files=""
+        local exclusive_files=""
         local priority_pattern
         for priority_pattern in "${LONG_RUNNING_TEST_PATTERNS[@]}"; do
             for test_file in $test_files; do
-                if is_solo_test "$test_file"; then
+                if is_exclusive_host_ram_test "$test_file"; then
                     continue
                 fi
                 if [ "$(basename "$test_file")" = "$priority_pattern" ]; then
@@ -1690,8 +1691,8 @@ execute_tests() {
             done
         done
         for test_file in $test_files; do
-            if is_solo_test "$test_file"; then
-                solo_files="$solo_files $test_file"
+            if is_exclusive_host_ram_test "$test_file"; then
+                exclusive_files="$exclusive_files $test_file"
             elif ! is_long_running_test "$test_file"; then
                 parallel_files="$parallel_files $test_file"
             fi
@@ -1699,7 +1700,7 @@ execute_tests() {
         # Trim leading spaces
         long_running_files="${long_running_files# }"
         parallel_files="${parallel_files# }"
-        solo_files="${solo_files# }"
+        exclusive_files="${exclusive_files# }"
         local scheduled_parallel_files="${long_running_files} ${parallel_files}"
         scheduled_parallel_files="${scheduled_parallel_files# }"
 
@@ -1719,27 +1720,27 @@ execute_tests() {
             fi
         fi
 
-        # Run memory-heavy tests sequentially (one at a time, full GPU access)
-        if [ -n "$solo_files" ]; then
+        # Run extreme-host-RAM tests sequentially (one at a time, all GPUs)
+        if [ -n "$exclusive_files" ]; then
             echo ""
             echo "=========================================="
-            echo "SEQUENTIAL EXECUTION (memory-heavy tests)"
+            echo "SEQUENTIAL EXECUTION (extreme host-RAM tests)"
             echo "=========================================="
-            local solo_count=0
-            for test_file in $solo_files; do
-                solo_count=$((solo_count + 1))
+            local exclusive_count=0
+            for test_file in $exclusive_files; do
+                exclusive_count=$((exclusive_count + 1))
             done
-            echo "Running $solo_count test file(s) sequentially to avoid OOM"
+            echo "Running $exclusive_count test file(s) sequentially to avoid host OOM"
             echo ""
 
             if [ "$SANITY_TEST" == "true" ]; then
                 FILE_COUNT=$((FILE_COUNT + 0))  # continue from parallel count
-                for test_file in $solo_files; do
+                for test_file in $exclusive_files; do
                     FILE_COUNT=$((FILE_COUNT + 1))
                     run_sanity_test_file "$test_file" "$FILE_COUNT"
                 done
             else
-                for test_file in $solo_files; do
+                for test_file in $exclusive_files; do
                     run_full_test_file "$test_file"
                 done
             fi

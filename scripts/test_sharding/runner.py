@@ -520,7 +520,9 @@ def _selected_nodes(
             base_function=node["base_function"],
             order=int(node["order"]),
             shard_group=node.get("shard_group"),
-            solo=bool(node.get("solo", False)),
+            exclusive_extreme_host_ram=bool(
+                node.get("exclusive_extreme_host_ram", False)
+            ),
             long_running=bool(node.get("long_running", False)),
         )
         for node in raw_nodes
@@ -1092,22 +1094,22 @@ class _ShardExecutor:
     attempt: AttemptRecord
     devices: list[str | None]
     heartbeat: _LeaseHeartbeat
-    solo_sources: frozenset[str]
+    exclusive_sources: frozenset[str]
     long_running_sources: frozenset[str]
     progress: _ShardProgress
     long_work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
     normal_work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
-    solo_units: list[Unit] = field(default_factory=list)
-    non_solo_units: list[Unit] = field(default_factory=list)
-    all_non_solo_units: list[Unit] = field(default_factory=list)
+    exclusive_units: list[Unit] = field(default_factory=list)
+    parallel_units: list[Unit] = field(default_factory=list)
+    all_parallel_units: list[Unit] = field(default_factory=list)
     infrastructure_errors: list[str] = field(default_factory=list)
     interruption_reasons: set[str] = field(default_factory=set)
     errors_lock: threading.Lock = field(default_factory=threading.Lock)
     stop_workers: threading.Event = field(default_factory=threading.Event)
 
     def add_units(self, units: list[Unit]) -> None:
-        self.all_non_solo_units = [
-            unit for unit in units if not self._unit_is_solo(unit)
+        self.all_parallel_units = [
+            unit for unit in units if not self._unit_is_exclusive(unit)
         ]
         pending = []
         for unit in units:
@@ -1117,15 +1119,17 @@ class _ShardExecutor:
                 for batch in unit.batches
             ):
                 pending.append(unit)
-        self.solo_units = sorted(
-            (unit for unit in pending if self._unit_is_solo(unit)),
+        self.exclusive_units = sorted(
+            (unit for unit in pending if self._unit_is_exclusive(unit)),
             key=lambda item: (-item.estimated_ms, item.id.encode("utf-8")),
         )
-        self.non_solo_units = [unit for unit in pending if not self._unit_is_solo(unit)]
+        self.parallel_units = [
+            unit for unit in pending if not self._unit_is_exclusive(unit)
+        ]
         self.long_work_by_worker = []
         self.normal_work_by_worker = []
         for worker_units in source_affine_unit_bins(
-            self.non_solo_units, self.execution.workers
+            self.parallel_units, self.execution.workers
         ):
             long_work: queue.Queue[Unit] = queue.Queue()
             normal_work: queue.Queue[Unit] = queue.Queue()
@@ -1158,9 +1162,9 @@ class _ShardExecutor:
                         self._record_infrastructure_error(
                             f"worker-{index}: {type(error).__name__}: {error}"
                         )
-            if self.stop_workers.is_set() or not self._non_solo_finalized():
+            if self.stop_workers.is_set() or not self._parallel_units_finalized():
                 return
-            self._run_solo_phase()
+            self._run_exclusive_phase()
         finally:
             self.progress.close()
 
@@ -1197,25 +1201,31 @@ class _ShardExecutor:
                     for batch in unit.batches
                     if batch.id not in before
                 )
-                self._report_worker_task(index, unit, pending_nodes, solo=False)
+                self._report_worker_task(index, unit, pending_nodes, exclusive=False)
                 try:
-                    self._execute_unit(index, unit, solo=False)
+                    self._execute_unit(index, unit, exclusive=False)
                     stats.update(self._new_unit_outcomes(unit, before))
                 finally:
                     work.task_done()
         finally:
-            self._report_worker_end(index, started, stats, solo=False)
+            self._report_worker_end(index, started, stats, exclusive=False)
 
-    def _run_solo_phase(self) -> None:
-        if not self.solo_units:
+    def _run_exclusive_phase(self) -> None:
+        # Units from @pytest.mark.exclusive_extreme_host_ram sources run one at
+        # a time, after all parallel work, with every GPU visible while the
+        # other workers sit idle. The marker is only for files whose peak host
+        # RAM would risk an OOM next to other workers; any other use serializes
+        # the file and badly lengthens the whole suite.
+        if not self.exclusive_units:
             return
         started = time.monotonic()
         stats: Counter[str] = Counter()
         write_console(
-            f"WORKER START worker=solo-0 time={_timestamp()} device=all-visible-gpus"
+            f"WORKER START worker=exclusive-0 time={_timestamp()} "
+            "device=all-visible-gpus marker=exclusive_extreme_host_ram"
         )
         try:
-            for unit in self.solo_units:
+            for unit in self.exclusive_units:
                 if self.stop_workers.is_set():
                     return
                 before = {
@@ -1228,19 +1238,22 @@ class _ShardExecutor:
                     for batch in unit.batches
                     if batch.id not in before
                 )
-                self._report_worker_task("solo-0", unit, pending_nodes, solo=True)
-                self._execute_unit(0, unit, solo=True)
+                self._report_worker_task(
+                    "exclusive-0", unit, pending_nodes, exclusive=True
+                )
+                self._execute_unit(0, unit, exclusive=True)
                 stats.update(self._new_unit_outcomes(unit, before))
         finally:
-            self._report_worker_end("solo-0", started, stats, solo=True)
+            self._report_worker_end("exclusive-0", started, stats, exclusive=True)
 
     def _report_worker_task(
-        self, worker: int | str, unit: Unit, node_count: int, *, solo: bool
+        self, worker: int | str, unit: Unit, node_count: int, *, exclusive: bool
     ) -> None:
         source = unit.batches[0].source_file if unit.batches else "unknown"
         first_node = unit.batches[0].nodeids[0] if unit.batches else "unknown"
         write_console(
-            f"WORKER TASK worker={worker} time={_timestamp()} solo={str(solo).lower()} "
+            f"WORKER TASK worker={worker} time={_timestamp()} "
+            f"exclusive={str(exclusive).lower()} "
             f"source={source} unit={unit.id} nodes={node_count} first_node={first_node}"
         )
 
@@ -1250,11 +1263,12 @@ class _ShardExecutor:
         started: float,
         outcomes: Counter[str],
         *,
-        solo: bool,
+        exclusive: bool,
     ) -> None:
         handled = sum(outcomes.values())
         write_console(
-            f"WORKER END worker={worker} time={_timestamp()} solo={str(solo).lower()} "
+            f"WORKER END worker={worker} time={_timestamp()} "
+            f"exclusive={str(exclusive).lower()} "
             f"elapsed={time.monotonic() - started:.3f}s handled={handled} "
             f"passed={outcomes['passed']} failed={outcomes['failed']} "
             f"skipped={outcomes['skipped']} unknown={outcomes['unknown']}"
@@ -1275,22 +1289,24 @@ class _ShardExecutor:
             outcomes.update(batch_outcomes)
         return outcomes
 
-    def _unit_is_solo(self, unit: Unit) -> bool:
-        return any(batch.source_file in self.solo_sources for batch in unit.batches)
+    def _unit_is_exclusive(self, unit: Unit) -> bool:
+        return any(
+            batch.source_file in self.exclusive_sources for batch in unit.batches
+        )
 
     def _unit_is_long_running(self, unit: Unit) -> bool:
         return any(
             batch.source_file in self.long_running_sources for batch in unit.batches
         )
 
-    def _non_solo_finalized(self) -> bool:
+    def _parallel_units_finalized(self) -> bool:
         return all(
             batch_is_final(self.junit_dir, unit, batch)
-            for unit in self.all_non_solo_units
+            for unit in self.all_parallel_units
             for batch in unit.batches
         )
 
-    def _execute_unit(self, worker_index: int, unit: Unit, *, solo: bool) -> None:
+    def _execute_unit(self, worker_index: int, unit: Unit, *, exclusive: bool) -> None:
         claim_path = claims_dir(self.junit_dir) / f"{unit.id}.json"
         prior_elapsed = recover_unit_elapsed(
             self.attempt_path,
@@ -1306,7 +1322,9 @@ class _ShardExecutor:
             active_started_at=time.time(),
         )
         try:
-            completed = self._execute_unit_batches(worker_index, unit, timer, solo=solo)
+            completed = self._execute_unit_batches(
+                worker_index, unit, timer, exclusive=exclusive
+            )
             if completed:
                 self._report_unit_complete(worker_index, unit)
         finally:
@@ -1324,7 +1342,7 @@ class _ShardExecutor:
         unit: Unit,
         timer: _UnitTimer,
         *,
-        solo: bool,
+        exclusive: bool,
     ) -> bool:
         for batch_position, batch in enumerate(unit.batches):
             if batch_is_final(self.junit_dir, unit, batch):
@@ -1346,7 +1364,7 @@ class _ShardExecutor:
                         timeout_reason=timeout_reason,
                         grace_seconds=self.execution.attempt.timeout_grace_seconds,
                         worker_index=worker_index,
-                        device=None if solo else self.devices[worker_index],
+                        device=None if exclusive else self.devices[worker_index],
                         monitor_memory=self.execution.monitor_memory,
                         memory_interval=self.execution.memory_interval,
                         pytest_command_prefix=self.execution.pytest_command_prefix,
@@ -1666,8 +1684,10 @@ def execute_shard(
             attempt=attempt,
             devices=devices,
             heartbeat=lease_heartbeat,
-            solo_sources=frozenset(
-                node.source_file for node in plan.nodes if node.solo
+            exclusive_sources=frozenset(
+                node.source_file
+                for node in plan.nodes
+                if node.exclusive_extreme_host_ram
             ),
             long_running_sources=frozenset(
                 node.source_file for node in plan.nodes if node.long_running
