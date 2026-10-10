@@ -158,7 +158,12 @@ top_k_varlen_trace = TraceTemplate(
         "each one's GPU list) and the masked-radix radix_cutlass fallback (every GPU)."
     ),
     axes={
-        "batch_size": Var(description="Number of decode requests."),
+        "batch_size": Var(
+            description=(
+                "Number of rows: requests in decode mode, query tokens in windowed "
+                "(prefill) mode."
+            )
+        ),
         # the width axis is num_cols (the logits shape), distinct from the API's
         # windowed-mode bound max_window_len (a scalar input below) and from
         # init()'s max_seq_len, which sizes the example buffer
@@ -174,8 +179,8 @@ top_k_varlen_trace = TraceTemplate(
             ["batch_size"],
             dtype="int32",
             description=(
-                "Effective KV-cache length per request; the window length of each row "
-                "when row_starts is given."
+                "Decode mode: each request's KV length in tokens. Windowed (prefill) "
+                "mode: each row's window length in columns."
             ),
         ),
         "top_k": Scalar("int32", description="K — number of top elements to select."),
@@ -183,7 +188,10 @@ top_k_varlen_trace = TraceTemplate(
             ["batch_size", "top_k"],
             dtype="int32",
             optional=True,
-            description="Previous-step top-K indices (GVR warm-start hint).",
+            description=(
+                "Decode mode only: a hint of each request's top-k indices, a warm "
+                "start for the backends that take one."
+            ),
         ),
         "row_starts": Tensor(
             ["batch_size"],
@@ -192,23 +200,26 @@ top_k_varlen_trace = TraceTemplate(
             description=(
                 "Windowed (prefill) mode: row r ranks "
                 "logits[r, row_starts[r] : row_starts[r] + seq_lens[r]] and "
-                "returns window-local indices (gvr_2 only; absolute columns "
-                "with absolute_indices=True)."
+                "returns window positions (logits columns with "
+                "absolute_indices=True)."
             ),
         ),
         "absolute_indices": Scalar(
             "bool",
             optional=True,
-            description="Windowed mode: return absolute logits columns instead of window-local indices.",
+            description=(
+                "Windowed (prefill) mode: return logits columns instead of window "
+                "positions."
+            ),
         ),
         "max_window_len": Scalar(
             "int32",
             optional=True,
             description=(
-                "Windowed mode: upper bound on the window lengths, in columns (defaults "
-                "to the logits width); selects the gvr_2 engine (register-resident vs "
-                "streaming) before CUDA-graph capture and must hold at every replay. "
-                "Ignored without row_starts."
+                "Windowed (prefill) mode: upper bound on every window length, in "
+                "columns (defaults to the logits width); fixed for a captured graph, "
+                "so it must hold at every replay. Refused with ValueError without "
+                "row_starts."
             ),
         ),
     },
