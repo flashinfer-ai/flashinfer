@@ -393,6 +393,10 @@ runtime tensors alive until every graph using that plan is destroyed.
 - Attention sinks and custom masks are not exposed. Q and K must share one
   dtype; the only mixed combination is `torch.bfloat16` Q/K with
   `torch.float8_e4m3fn` V.
+- VC-Attention-QK16 (bf16 Q/K with E4M3 V tile residuals and restored tile
+  means) runs only through the dense contiguous `BatchPrefillTSWrapper` and
+  `batch_prefill` at `head_dim=128`; see
+  [VC-Attention-QK16](../../README.md#vc-attention-qk16).
 - Re-plan either wrapper after changing a static capacity, head or dtype
   geometry, mask, window, or default scale; page size and explicit metadata
   promises are also static for paged plans. Request tensors and metadata may
