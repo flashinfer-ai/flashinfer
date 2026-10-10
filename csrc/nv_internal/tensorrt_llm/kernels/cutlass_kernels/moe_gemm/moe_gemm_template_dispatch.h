@@ -881,6 +881,9 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Af
                   T, WeightType, OutputType, EpilogueTag,
                   TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>;
             case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION:
+              return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<
+                  T, WeightType, OutputType, EpilogueTag,
+                  TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION>;
             case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::GATED_ACTIVATION:
             default:
               TLLM_THROW("Unimplemented fusion %d requested", (int)hopper_inputs.fusion);
@@ -1019,6 +1022,10 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
   } while (0)
 
       CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE);
+      if constexpr (use_mxfp8 || (std::is_same_v<T, __nv_bfloat16> &&
+                                  std::is_same_v<WeightType, __nv_bfloat16>)) {
+        CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION);
+      }
       if (sm_ == 90) {
         CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE);
       }

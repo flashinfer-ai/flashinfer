@@ -1009,6 +1009,15 @@ inline bool hasOptionalGemm1ActivationParams(Optional<TensorView> const& gemm1_a
   return gemm1_alpha.has_value() || gemm1_beta.has_value() || gemm1_clamp_limit.has_value();
 }
 
+inline void validateStepGemm1ActivationParams(Optional<TensorView> const& gemm1_alpha,
+                                              Optional<TensorView> const& gemm1_beta,
+                                              ActivationType activation_type) {
+  if (activation_type == ActivationType::SwigluStep) {
+    TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value())
+        << "SwigluStep accepts gemm1_clamp_limit only; gemm1_alpha and gemm1_beta must be absent.";
+  }
+}
+
 // MxFp8 applies these in the fused FC1 epilogue of the trtllm-gen cubins; DeepSeekFp8 has no
 // fused activation and applies them in the separate activation kernel
 // (moe::dev::activation::run). Both consume the values as-is: FP8 block scaling carries no
@@ -1017,6 +1026,10 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
     Optional<TensorView> const& gemm1_alpha, Optional<TensorView> const& gemm1_beta,
     Optional<TensorView> const& gemm1_clamp_limit, Fp8QuantizationType quantization_type,
     ActivationType activation_type) {
+  validateStepGemm1ActivationParams(gemm1_alpha, gemm1_beta, activation_type);
+  TVM_FFI_ICHECK(activation_type != ActivationType::SwigluStep ||
+                 quantization_type == Fp8QuantizationType::MxFp8)
+      << "SwigluStep requires the fused MxFp8 GEMM1 epilogue.";
   if (!hasOptionalGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit)) {
     return;
   }
@@ -1026,9 +1039,12 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
          "Fp8QuantizationType::MxFp8 and Fp8QuantizationType::DeepSeekFp8 in FP8 block scale "
          "MoE, got "
       << fp8QuantizationTypeToString(quantization_type) << ".";
-  TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu)
+  TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu ||
+                 (activation_type == ActivationType::SwigluStep &&
+                  quantization_type == Fp8QuantizationType::MxFp8))
       << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
-         "ActivationType::Swiglu.";
+         "ActivationType::Swiglu, or gemm1_clamp_limit alone for "
+         "ActivationType::SwigluStep with MxFp8.";
 }
 
 std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_tile_nums,
@@ -1829,10 +1845,13 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     check_optional_per_expert_float_tensor(gemm1_alpha, "gemm1_alpha");
     check_optional_per_expert_float_tensor(gemm1_beta, "gemm1_beta");
     check_optional_per_expert_float_tensor(gemm1_clamp_limit, "gemm1_clamp_limit");
+    validateStepGemm1ActivationParams(gemm1_alpha, gemm1_beta, activation_type);
     if (gemm1_alpha.has_value() || gemm1_beta.has_value() || gemm1_clamp_limit.has_value()) {
-      TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu)
+      TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu ||
+                     activation_type == ActivationType::SwigluStep)
           << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
-             "ActivationType::Swiglu.";
+             "ActivationType::Swiglu, or gemm1_clamp_limit alone for "
+             "ActivationType::SwigluStep.";
     }
 
     TVM_FFI_ICHECK_EQ(args->intermediate_size % 128, 0)
@@ -1910,9 +1929,13 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
                                                                              : btg::Dtype::Bfloat16;
     prepare_moe_runner(moe_tactic);
     prepared.bind(workspace);
-    args->gemm1_alpha = nullptr;
-    args->gemm1_beta = nullptr;
-    args->gemm1_clamp_limit = nullptr;
+    args->gemm1_alpha =
+        gemm1_alpha.has_value() ? static_cast<float*>(gemm1_alpha.value().data_ptr()) : nullptr;
+    args->gemm1_beta =
+        gemm1_beta.has_value() ? static_cast<float*>(gemm1_beta.value().data_ptr()) : nullptr;
+    args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
+                                  ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
+                                  : nullptr;
     cudaStream_t stream = get_stream(hidden_states.device());
     moe_runner->run(*args, workspace, hidden_states.device().device_id, stream, moe_tactic,
                     enable_pdl);
@@ -3346,6 +3369,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
                        TensorView const& gemm1_weights, TensorView const& output1_scales_scalar,
                        TensorView const& output1_scales_gate_scalar,
                        TensorView const& gemm2_weights, TensorView const& output2_scales_scalar,
+                       Optional<TensorView> const& gemm1_clamp_limit,
                        Optional<TensorView> const& expert_indices = Optional<TensorView>(),
                        Optional<TensorView> const& expert_weights = Optional<TensorView>(),
                        RoutingInputMode routing_input_mode = RoutingInputMode::FromLogits)
@@ -3356,6 +3380,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
                          routing_input_mode),
         expert_indices(expert_indices),
         expert_weights(expert_weights),
+        gemm1_clamp_limit(gemm1_clamp_limit),
         use_routing_scales_on_input(false) {}
 
   bool has_precomputed_routing() const {
@@ -3474,6 +3499,10 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
   void check_moe() const override {
     FusedMoeLauncher::check_moe_common();
 
+    check_optional_per_expert_float_tensor(gemm1_clamp_limit, "gemm1_clamp_limit");
+    TVM_FFI_ICHECK(!gemm1_clamp_limit.has_value() || activation_type == ActivationType::SwigluStep)
+        << "FP8 per-tensor gemm1_clamp_limit is supported for SwigluStep only.";
+
     TVM_FFI_ICHECK(output1_scales_scalar.has_value())
         << "output1_scales_scalar is required for FP8 MoE";
     TVM_FFI_ICHECK_EQ(output1_scales_scalar.value().dtype(), dl_float32)
@@ -3556,6 +3585,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     args->output1_scales_gate_scalar =
         static_cast<float*>(output1_scales_gate_scalar.value().data_ptr());
     args->output2_scales_scalar = static_cast<float*>(output2_scales_scalar.value().data_ptr());
+    args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
+                                  ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
+                                  : nullptr;
   }
 
   /** Allocate graph-stable FP8 per-tensor buffers for one exact routed body. */
@@ -3591,6 +3623,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     args->output1_scales_gate_scalar =
         static_cast<float*>(output1_scales_gate_scalar.value().data_ptr());
     args->output2_scales_scalar = static_cast<float*>(output2_scales_scalar.value().data_ptr());
+    args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
+                                  ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
+                                  : nullptr;
     // Preserve Llama4's routing-scale convention while launching through the typed FP8 ABI.
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
       workspace.token_scales = workspace.expert_weights;
@@ -3603,6 +3638,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
  private:
   Optional<TensorView> expert_indices;
   Optional<TensorView> expert_weights;
+  Optional<TensorView> gemm1_clamp_limit;
   bool use_routing_scales_on_input;
   Tensor gemm1_output_scale;
   Tensor activation_output_scale;
@@ -4364,9 +4400,13 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     workspace.gemm2_output_scale = nullptr;
     args->hidden_states_scale = static_cast<float*>(hidden_states_scale.data_ptr());
     args->gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale.data_ptr());
-    args->gemm1_alpha = nullptr;
-    args->gemm1_beta = nullptr;
-    args->gemm1_clamp_limit = nullptr;
+    args->gemm1_alpha =
+        gemm1_alpha.has_value() ? static_cast<float*>(gemm1_alpha.value().data_ptr()) : nullptr;
+    args->gemm1_beta =
+        gemm1_beta.has_value() ? static_cast<float*>(gemm1_beta.value().data_ptr()) : nullptr;
+    args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
+                                  ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
+                                  : nullptr;
     args->gemm2_weights_scale = static_cast<float*>(gemm2_weights_scale.data_ptr());
     // Launch the complete body after every dtype-specific scale pointer is bound.
     cudaStream_t stream = get_stream(hidden_states.device());
@@ -4850,6 +4890,10 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   }
 
   void check_moe() const override {
+    validateStepGemm1ActivationParams(gemm1_alpha, gemm1_beta, activation_type);
+    TVM_FFI_ICHECK(activation_type != ActivationType::SwigluStep ||
+                   (mDtypeAct == btg::Dtype::E2m1 && mDtypeWeights == btg::Dtype::E2m1))
+        << "FP4 SwigluStep requires NVFP4 activations and weights.";
     TVM_FFI_ICHECK(mDtypeAct == btg::Dtype::E2m1 || mDtypeAct == btg::Dtype::Bfloat16 ||
                    mDtypeAct == btg::Dtype::E4m3 || mDtypeAct == btg::Dtype::MxE4m3)
         << "Only E2m1, Bfloat16, MxE4m3 and E4m3 are supported by Fp4 block scale MoE";
@@ -4888,6 +4932,10 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_float8_e4m3fn)
         << "gemm2_weights_scale must be fp8.";
     // FP4 packs two 4-bit weights per byte along K, so only the M extent is checked.
+
+    if (activation_type == ActivationType::SwigluStep) {
+      check_optional_per_expert_float_tensor(gemm1_clamp_limit, "gemm1_clamp_limit");
+    }
 
     if (args->num_fused_shared_experts > 0) {
       int64_t const totalLocalExperts = args->local_num_experts + args->num_fused_shared_experts;
@@ -5312,7 +5360,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     bool use_routing_scales_on_input, int64_t routing_method_type, bool do_finalize,
     bool enable_pdl, Array<int64_t> config_index, int64_t activation_type, bool norm_topk_prob,
     Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
-    Array<Tensor> da_body_workspace, bool is_da_body_preparation) {
+    Array<Tensor> da_body_workspace, bool is_da_body_preparation,
+    Optional<TensorView> gemm1_clamp_limit) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
   auto activation = validateAndCastActivationType(activation_type);
@@ -5372,7 +5421,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Fp8PerTensorLauncher>(
         Optional<TensorView>(routing_logits), routing_bias, hidden_states, gemm1_weights,
-        output1_scales_scalar, output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar);
+        output1_scales_scalar, output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar,
+        gemm1_clamp_limit);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
                    weight_layout, use_routing_scales_on_input, activation, norm_topk_prob);
     launcher->set_routing_replay_out(routing_replay_out);
@@ -5418,8 +5468,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
     Optional<double> routed_scaling_factor, bool use_routing_scales_on_input,
     int64_t routing_method_type, bool do_finalize, bool enable_pdl, Array<int64_t> config_index,
     int64_t activation_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
-    Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace,
-    bool is_da_body_preparation) {
+    Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace, bool is_da_body_preparation,
+    Optional<TensorView> gemm1_clamp_limit) {
   // Basic type validation
   auto const dtype = hidden_states.dtype();
   auto const activation = validateAndCastActivationType(activation_type);
@@ -5488,7 +5538,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
 
     auto launcher = std::make_unique<Fp8PerTensorLauncher>(
         Optional<TensorView>(), routing_bias, hidden_states, gemm1_weights, output1_scales_scalar,
-        output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar,
+        output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar, gemm1_clamp_limit,
         Optional<TensorView>(expert_indices), Optional<TensorView>(expert_weights),
         static_cast<RoutingInputMode>(routing_input_mode));
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
