@@ -39,11 +39,12 @@ struct SharedStorageQKVO {
   };
 };
 
-template <bool USE_TMA_LOAD_KV, int HEAD_DIM_QK_, int HEAD_DIM_VO_, int CTA_Q_, int CTA_KV_,
+template <bool USE_TMA_LOAD_KV_, int HEAD_DIM_QK_, int HEAD_DIM_VO_, int CTA_Q_, int CTA_KV_,
           int NUM_STAGES_, typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_,
           typename AttentionVariant_>
 struct AttentionKernelTraits {
   using AttentionVariant = AttentionVariant_;
+  static constexpr bool USE_TMA_LOAD_KV = USE_TMA_LOAD_KV_;
 
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;
