@@ -190,6 +190,17 @@ __device__ __forceinline__ uint16_t cvt_rs_f16_sw(float x, uint32_t rand13) {
   uint32_t sign = bits & 0x80000000u;
   uint32_t abs_bits = bits & 0x7FFFFFFFu;
 
+  if (abs_bits < 0x38800000u) {  // Below the smallest normal fp16 value (2^-14).
+    uint32_t exp = abs_bits >> 23;
+    // Values below 2^-37 cannot round up with only 13 bits of random noise.
+    if (exp < 90) return static_cast<uint16_t>(sign >> 16);
+    uint32_t shift = 126 - exp;  // fp16 subnormal spacing is fixed at 2^-24.
+    uint64_t mantissa = (abs_bits & 0x7FFFFFu) | 0x800000u;
+    uint64_t noise = static_cast<uint64_t>(rand13 & 0x1FFFu) << (shift - 13);
+    // The carry may produce 0x400: the smallest normal fp16 value.
+    return static_cast<uint16_t>(sign >> 16) | static_cast<uint16_t>((mantissa + noise) >> shift);
+  }
+
   // fp32 has 23 mantissa bits, fp16 has 10. The 13 LSBs are the remainder.
   // Add 13-bit random noise at bits [12:0]. Carry into bit 13 → round up.
   abs_bits += (rand13 & 0x1FFFu);
