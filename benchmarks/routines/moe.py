@@ -871,7 +871,7 @@ def testTrtllmFp4BlockScaleMoe(args):
 
 def testCutlassFusedMoe(args):
     """
-    Benchmark cutlass_fused_moe (CUTLASS MoE) with variants mirroring tests in tests/moe/test_trtllm_cutlass_fused_moe.py
+    Benchmark cutlass_fused_moe (CUTLASS MoE) with variants mirroring tests in tests/moe/cutlass/test_trtllm_cutlass_fused_moe.py
     Variants:
       - base: no quantization
       - fp8: per-tensor fp8 for weights and activation scale
@@ -3287,7 +3287,7 @@ def testUnifiedNvfp4Moe(args):
     )
     if _repo_root not in sys.path:
         sys.path.insert(0, _repo_root)
-    from tests.moe.test_cute_dsl_fused_moe import (
+    from tests.moe.cute_dsl.test_cute_dsl_fused_moe import (
         check_accuracy,
         compute_reference_moe_fp4,
         create_moe_tensors,

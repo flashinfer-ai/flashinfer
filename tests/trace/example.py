@@ -606,7 +606,7 @@ with contextlib.suppress(Exception):
 # ── GEMM fp8 nt groupwise (DeepSeek-V3 q_proj trtllm path: M×7168 @ [1536, 7168]) ─
 # trtllm canonical layout: a_scale = [M, K//bs], b_scale = [N//bs, K//bs]; bs=128.
 # (b_scale is transposed vs flashinfer's gemm_base.py docstring — see
-# tests/gemm/test_groupwise_scaled_gemm_fp8.py:128-129 which does
+# tests/gemm/grouped/test_groupwise_scaled_gemm_fp8.py:128-129 which does
 # `b_scale.t().contiguous()` for the trtllm path.)
 # Trace is dumped before kernel launch; suppress SM-specific runtime failures.
 with contextlib.suppress(Exception):

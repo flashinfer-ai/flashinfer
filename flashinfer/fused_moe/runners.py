@@ -5798,7 +5798,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             # Pre-routed: pack the host selection into (GLOBAL expert_id << 16) | bf16(weight).
             # The kernel expects GLOBAL ids and filters/maps them via the separately
             # passed ``local_expert_offset`` (mirrors trtllm_bf16_routed_moe in
-            # tests/moe/test_trtllm_gen_routed_fused_moe.py). Do NOT pre-subtract the
+            # tests/moe/trtllm_gen/test_trtllm_gen_routed_fused_moe.py). Do NOT pre-subtract the
             # offset: on ranks with local_expert_offset>0 that yields a local id below
             # the offset, which the kernel treats as non-local and skips → zero output.
             _validate_prerouted_inputs(

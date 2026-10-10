@@ -64,7 +64,7 @@ def test_cutlass_fused_moe_reference_correctness(shape_kwargs):
     if isinstance(api_out, list):
         api_out = api_out[0]
     ref_out = cutlass_fused_moe_trace.reference(x, token_sel, token_scales, w1, w2)
-    # Matches tests/moe/test_trtllm_cutlass_fused_moe.py.
+    # Matches tests/moe/cutlass/test_trtllm_cutlass_fused_moe.py.
     _check(
         cutlass_fused_moe_trace,
         ref_out.to(api_out.dtype),

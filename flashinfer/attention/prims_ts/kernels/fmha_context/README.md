@@ -417,6 +417,6 @@ conversion coverage spans all nine pairings of FP16, BF16, and FP8 input and
 output state.
 
 ```bash
-pytest -q tests/attention/test_attention_ts_context.py
-pytest -q tests/attention/test_attention_ts_mask.py
+pytest -q tests/attention/prims_ts/test_attention_ts_context.py
+pytest -q tests/attention/prims_ts/test_attention_ts_mask.py
 ```

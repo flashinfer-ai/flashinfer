@@ -1,6 +1,6 @@
 {
   "name": "trtllm_gen_routing_e256_k8_t8",
-  "description": "Standalone trtllm-gen MoE routing stage: expert selection plus the permutation/padding bookkeeping the fused MoE kernels consume. topk_ids is reconstructed from the permutation (the kernels emit no direct id output in from-logits mode) and is -1 for slots whose expert falls outside the local expert-parallel shard. The permutation outputs are sized by upper bounds; entries beyond total_num_padded_tokens are undefined. No reference is attached: the kernel's ordering within an expert's padded segment is not part of the contract, so the outputs are only defined up to a per-expert permutation (tests/moe/test_trtllm_gen_routing.py checks them by invariant instead).",
+  "description": "Standalone trtllm-gen MoE routing stage: expert selection plus the permutation/padding bookkeeping the fused MoE kernels consume. topk_ids is reconstructed from the permutation (the kernels emit no direct id output in from-logits mode) and is -1 for slots whose expert falls outside the local expert-parallel shard. The permutation outputs are sized by upper bounds; entries beyond total_num_padded_tokens are undefined. No reference is attached: the kernel's ordering within an expert's padded segment is not part of the contract, so the outputs are only defined up to a per-expert permutation (tests/moe/trtllm_gen/test_trtllm_gen_routing.py checks them by invariant instead).",
   "op_type": "moe_routing",
   "tags": [
     "fi_api:flashinfer.fused_moe.trtllm_gen_routing.trtllm_gen_routing",

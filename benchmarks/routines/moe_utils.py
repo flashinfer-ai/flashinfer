@@ -169,7 +169,7 @@ def quantize_fp4_batched(
     )
 
 
-# Adapted from tests/moe/test_trtllm_cutlass_fused_moe.py
+# Adapted from tests/moe/cutlass/test_trtllm_cutlass_fused_moe.py
 def dequantize_nvfp4(
     tensor_fp4: torch.Tensor,
     tensor_sf: torch.Tensor,

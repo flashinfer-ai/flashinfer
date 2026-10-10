@@ -39,7 +39,7 @@ from flashinfer.attention.prims_ts._block_sparse.plan import (
     _INT8_QK_COMPUTE_CAPABILITIES,
 )
 
-from tests.attention.test_attention_ts_block_sparse import (
+from tests.attention.prims_ts.test_attention_ts_block_sparse import (
     _HEAD_DIM,
     _REQUIRES_PRIMTS_GPU,
     _make_bsr,

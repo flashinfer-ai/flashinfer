@@ -1672,7 +1672,7 @@ def _fp8_blockscale_gemm_sm90_init(
     """Build inputs for SM90 FP8 block-scale GEMM.
 
     Sourced from ``tests/gemm/test_fp8_blockscale_gemm.py`` /
-    ``tests/gemm/test_groupwise_scaled_gemm_fp8.py``: ``input`` and
+    ``tests/gemm/grouped/test_groupwise_scaled_gemm_fp8.py``: ``input`` and
     ``weight`` are ``randn`` bf16 passed through the same
     ``fp8_block_quant_*`` helpers as MoE (1×128 input scale, 128×128
     weight scale).
@@ -1751,7 +1751,7 @@ def _gemm_fp8_nt_groupwise_reference(
     Note on layout: flashinfer's docstring at ``gemm_base.py:5681-5683``
     describes b_scale as ``(k // block_size, n // block_size)`` for the
     trtllm path, but the kernel actually expects the transposed form —
-    this matches ``tests/gemm/test_groupwise_scaled_gemm_fp8.py:128-129``
+    this matches ``tests/gemm/grouped/test_groupwise_scaled_gemm_fp8.py:128-129``
     which does ``b_scale.t().contiguous()`` before calling with
     ``backend="trtllm"``. sglang's
     ``layers/quantization/fp8_utils.py`` produces the same transposed
@@ -1835,7 +1835,7 @@ gemm_fp8_nt_groupwise_trace = TraceTemplate(
         "``b_scale=[N//bk, K//bk]`` (note: this is the transposed form "
         "of the layout described in flashinfer's gemm_base.py docstring; "
         "the kernel actually expects the transpose, matching "
-        "tests/gemm/test_groupwise_scaled_gemm_fp8.py:128-129 which "
+        "tests/gemm/grouped/test_groupwise_scaled_gemm_fp8.py:128-129 which "
         "does ``b_scale.t().contiguous()`` for the trtllm path). The "
         "cutlass scale layouts differ; their calls won't axis-match "
         "this template and will be skipped by the auto-dump."
@@ -1910,7 +1910,7 @@ def _grouped_gemm_nt_masked_init(
 ):
     """Build inputs for ``grouped_gemm_nt_masked`` (Blackwell MoE FC2).
 
-    Sourced from ``tests/gemm/test_groupwise_scaled_gemm_fp8.py``:
+    Sourced from ``tests/gemm/grouped/test_groupwise_scaled_gemm_fp8.py``:
     per-group ``randn`` bf16 lhs/rhs quantized via the same
     1×128 / 128×128 block scheme as ``fp8_blockscale_gemm_sm90``.
     """
@@ -2111,7 +2111,7 @@ def _batch_deepgemm_fp8_nt_groupwise_init(
 ):
     """Build inputs for batched DeepGEMM FP8 group-wise GEMM.
 
-    Sourced from ``tests/gemm/test_groupwise_scaled_gemm_fp8.py`` (DeepGEMM
+    Sourced from ``tests/gemm/grouped/test_groupwise_scaled_gemm_fp8.py`` (DeepGEMM
     backend): per-batch ``randn`` bf16 a/b passed through the 1×128 / 128×128
     block-quantization helpers (same scheme as MoE / SM90 block-scale).
     """

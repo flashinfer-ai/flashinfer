@@ -152,6 +152,8 @@ Internal CI runs an extended test matrix across NVIDIA GPU architectures. It is 
 | `/bot status` | Allowed users | Check current pipeline status |
 | `/bot stop` | Allowed users | Cancel a running pipeline |
 
+Prefer the narrowest scope that exercises your change: the test files you touched, or a backend sub-folder such as `tests/attention/trtllm_gen`, `tests/moe/trtllm_gen`, or `tests/gemm/grouped` (a full run is roughly 270 GPU-hours; a typical scoped run is about 25). Full-suite and oversized requests still run, but the bot adds a cost estimate and, when the PR changes test files, a suggested scoped command.
+
 > **Note:** Access to the NVIDIA internal CI is limited to NVIDIA employees and approved collaborators. To request access, please reach out to @yongwww, @dierksen, @yzh119, or @sricketts.
 
 **Internal CI test matrix:**
