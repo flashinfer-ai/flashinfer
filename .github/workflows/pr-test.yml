@@ -502,8 +502,26 @@ jobs:
             junit/**/*.telemetry.json
             junit/**/*.meta.json
             junit/**/*.memory.csv
+            junit/run-summary.json
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Make shard JUnit XML readable
+        if: ${{ always() && matrix.kind == 'gpu' }}
+        run: |
+          if [ -d junit-shard ]; then
+            sudo chmod -R a+rX junit-shard
+          fi
+
+      - name: Upload shard JUnit XML
+        if: ${{ always() && matrix.kind == 'gpu' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-shard-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            junit-shard/**/*.xml
+          if-no-files-found: warn
+          retention-days: 14
 
 
   # ---------------------------------------------------------------------------
@@ -650,6 +668,126 @@ jobs:
           echo "::warning::CI skipped — pending authorization"
           exit 1
 
+      - name: Checkout (for skip-all analysis)
+        if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download H100 JUnit artifacts
+        if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-h100-*
+          path: junit-h100
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Download shard JUnit artifacts (A10G/T4)
+        if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-shard-*
+          path: junit-shards
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Check skip-all test files
+        id: skip-all
+        if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          SUMMARY_ARGS=""
+          if [ -f junit-h100/run-summary.json ]; then
+            SUMMARY_ARGS="--summary junit-h100/run-summary.json"
+          fi
+
+          # A10G/T4 shard lanes produce raw JUnit XML (no run-summary.json).
+          # Discover them from the merged download directory.
+          SHARD_ARGS=""
+          if [ -d junit-shards ]; then
+            # The merged artifact flattens all shard uploads into one tree.
+            # Infer lane names from the XML paths: the shard scripts write
+            # junit-shard/tests/..., so after merge we get
+            # junit-shards/tests/... from each lane.  Since the download
+            # merges all lanes into one directory, we label the combined
+            # tree as "A10G+T4" — individual lane attribution would require
+            # per-lane artifact naming, which the shard scripts don't do.
+            SHARD_ARGS="--junit-xml-lane A10G+T4 junit-shards"
+          fi
+
+          if [ -z "$SUMMARY_ARGS" ] && [ -z "$SHARD_ARGS" ]; then
+            echo "No JUnit artifacts found; skipping skip-all check"
+            echo "skip_all_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          FAIL_FLAG=""
+          if [ "$ENFORCE_SKIP_ALL" == "true" ]; then
+            FAIL_FLAG="--fail"
+          fi
+
+          # Run the check. Passes --fail only when ENFORCE_SKIP_ALL is 'true'.
+          REPORT=$(python3 scripts/pr_checks/check_skip_all.py \
+            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            $SUMMARY_ARGS \
+            $SHARD_ARGS \
+            --junit-dir junit-h100 \
+            --github-actions $FAIL_FLAG 2>&1)
+          SKIP_ALL_EXIT=$?
+          echo "$REPORT"
+
+          if echo "$REPORT" | grep -q "skip-all"; then
+            echo "skip_all_found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_all_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$SKIP_ALL_EXIT" -ne 0 ]; then
+            echo "skip_all_failed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_all_failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Append to step summary.
+          {
+            echo ""
+            echo "$REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check trace reference coverage
+        id: trace-coverage
+        if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
+        run: |
+          TRACE_FAIL_FLAG=""
+          if [ "$ENFORCE_TRACE_COVERAGE" == "true" ]; then
+            TRACE_FAIL_FLAG="--fail"
+          fi
+
+          REPORT=$(python3 scripts/pr_checks/check_trace_coverage.py \
+            --github-actions $TRACE_FAIL_FLAG 2>&1)
+          TRACE_EXIT=$?
+          echo "$REPORT"
+          {
+            echo ""
+            echo "$REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if echo "$REPORT" | grep -q "gap"; then
+            echo "trace_gaps=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "trace_gaps=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$TRACE_EXIT" -ne 0 ]; then
+            echo "trace_failed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "trace_failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check Results
         if: needs.gate.outputs.authorized == 'true'
         env:
@@ -658,6 +796,10 @@ jobs:
           # TARGET_RE happens to exclude quotes and backticks, but that guarantee lives
           # in another file and must not be what keeps this step from being injectable.
           TEST_SCOPE: ${{ needs.setup.outputs.test_scope }}
+          SKIP_ALL_FOUND: ${{ steps.skip-all.outputs.skip_all_found }}
+          SKIP_ALL_FAILED: ${{ steps.skip-all.outputs.skip_all_failed }}
+          TRACE_GAPS: ${{ steps.trace-coverage.outputs.trace_gaps }}
+          TRACE_FAILED: ${{ steps.trace-coverage.outputs.trace_failed }}
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -695,7 +837,40 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
+          if [ "$SKIP_ALL_FOUND" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⚠️ **Some changed test files had all nodes skipped on every lane.**" >> $GITHUB_STEP_SUMMARY
+            echo "> See the skip-all report above for details." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$TRACE_GAPS" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⚠️ **Some GDN/KDA trace definitions are missing numerical coverage.**" >> $GITHUB_STEP_SUMMARY
+            echo "> See the trace coverage report above for details." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Hard-fail on enforced quality checks before declaring success.
+          QUALITY_FAILED=false
+          if [ "$SKIP_ALL_FAILED" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⛔ **Skip-all check failed (enforcement is active).** Changed test files had zero executed tests on all CI lanes." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            QUALITY_FAILED=true
+          fi
+          if [ "$TRACE_FAILED" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⛔ **Trace coverage check failed (enforcement is active).** Verified GDN/KDA definitions are missing numerical coverage." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            QUALITY_FAILED=true
+          fi
+
           if [ "$RESULT" == "success" ] || [ "$RESULT" == "skipped" ]; then
+            if [ "$QUALITY_FAILED" == "true" ]; then
+              echo "Result: Quality Checks Failed" >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
             echo "Result: Tests Passed" >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
@@ -704,3 +879,4 @@ jobs:
           # cancelled test means "stopped early", not "flaky".
           echo "Result: Tests Failed" >> $GITHUB_STEP_SUMMARY
           exit 1
+

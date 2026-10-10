@@ -92,6 +92,7 @@ class SourceSummary(TypedDict):
 class RunSummary(TypedDict):
     schema_version: int
     complete: bool
+    gpu_name: str
     planned_nodes: int
     finalized_nodes: int
     pending_nodes: list[str]
@@ -579,6 +580,7 @@ def publish_summary_under_lock(junit_dir: Path, plan: Plan) -> RunSummary:
     summary: RunSummary = {
         "schema_version": 3,
         "complete": not scan.pending,
+        "gpu_name": _detect_gpu_name(),
         "planned_nodes": len(plan.nodes),
         "finalized_nodes": len(scan.rows),
         "pending_nodes": sorted(scan.pending, key=lambda value: value.encode("utf-8")),
@@ -710,6 +712,23 @@ def _cudnn_backend_version() -> str:
 
 
 @lru_cache(maxsize=1)
+def _detect_gpu_name() -> str:
+    """Return a short GPU name like 'H100' or 'A10G', or 'unknown'."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            full = torch.cuda.get_device_name(0)
+            # Normalize common names: "NVIDIA H100 80GB HBM3" → "H100"
+            for short in ("H100", "H200", "A100", "A10G", "A10", "T4",
+                          "L4", "L40", "V100", "B100", "B200", "GB200"):
+                if short in full:
+                    return short
+            return full
+    except Exception:
+        pass
+    return "unknown"
+
+
 def _runtime_version_line() -> str:
     versions = [
         ("python", sys.version.split()[0]),
