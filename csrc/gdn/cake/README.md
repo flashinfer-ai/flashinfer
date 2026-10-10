@@ -70,6 +70,12 @@ at `TILE_V_WIDE` 32 and 64, including the TP=2 B>=5 and TP=1 verify rows)
 resolves to `gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre` there
 (`cake_gdn_bf16_wide_schedule`), again bitwise-identical to the shipped body;
 the single-token band rows keep `..._wide128` on every architecture.
+The promoted fp32-state MTP update row (B=4 T=4 with the intermediate-state
+cache) resolves on SM107a to `gdn_decode_pretranspose_mtp_t4_splitv8_pro`
+(`CAKE_GDN_FP32_MTP_ARCH_BODIES`): the producer phase runs one warp per draft
+token and every independent global load is issued before the first reduction;
+bitwise-identical to the shipped body, which SM100a/SM103a keep.  The fp32
+verify row (B=1 T=2, `..._mtp_t2_inline_tile8`) keeps one body everywhere.
 
 Single-token BF16-state decode admits every Qwen3.5 per-rank linear-attention
 geometry at any batch: H/HV = 16/32, 8/16, 4/8 (Qwen3.5-35B-A3B TP1/TP2/TP4)

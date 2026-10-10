@@ -689,6 +689,50 @@ def test_decode_resolver_routes_the_bf16_verify_tile16_body_per_architecture(
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_decode_resolver_routes_the_fp32_mtp_bodies_per_architecture(arch) -> None:
+    # The promoted fp32-state MTP update row (B4 T4, cache) runs the `_pro` twin of
+    # `mtp_t4_splitv8` on Rubin (sm_107a): same kernel contract, bitwise-identical
+    # output, only the schedule of the producer phase differs.  The verify row
+    # (B1 T2, `mtp_t2_inline_tile8`) keeps one body everywhere; route ids never change.
+    assert cake_gdn.CAKE_GDN_FP32_MTP_ARCH_BODIES == {
+        "sm_107a": "gdn_decode_pretranspose_mtp_t4_splitv8_pro"
+    }
+    suffix = "_pro" if arch == "sm_107a" else ""
+    rows = [
+        (
+            dict(batch_size=1, seq_len=2, disable_state_update=True, cache_steps=2),
+            "flashinfer.gdn_decode.indexed_fp32_mtp_t2.inline_tile8_verify_cache",
+            "_mtp_t2_inline_tile8",
+            "",
+        ),
+        (
+            dict(batch_size=4, seq_len=4, disable_state_update=False, cache_steps=4),
+            "flashinfer.gdn_decode.indexed_fp32_mtp_t4.splitv8_update_cache",
+            "_mtp_t4_splitv8",
+            suffix,
+        ),
+    ]
+    for overrides, route_id, body, body_suffix in rows:
+        route = _decode(
+            arch=arch,
+            state_dtype="float32",
+            layout="pretranspose",
+            strided_inputs=True,
+            cache_intermediate_states=True,
+            num_k_heads=16,
+            num_q_heads=16,
+            num_v_heads=32,
+            **overrides,
+        )
+        assert route.route_id == route_id, (arch, overrides, route.route_id)
+        assert re.search(rf"{body}{body_suffix}_[0-9a-f]{{12}}$", route.variant_name), (
+            arch,
+            overrides,
+            route.variant_name,
+        )
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_decode_resolver_routes_the_bf16_wide_body_per_architecture(arch) -> None:
     # The multi-token rows outside the tile16 verify kernel run the wide
     # (TILE_V_WIDE 32/64) MTP body; Rubin (sm_107a) takes its v-prefetch /

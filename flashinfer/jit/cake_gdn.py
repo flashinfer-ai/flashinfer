@@ -637,6 +637,17 @@ def cake_gdn_bf16_verify_tile16_schedule(arch: CakeGDNArch) -> str:
 # architecture and every T=1 band row the shipped wide body.  Mirrors
 # `BF16_WIDE_ARCH_BODIES` / `select_bf16_wide_body` of the Cake exporter.
 CAKE_GDN_BF16_WIDE_ARCH_BODIES: dict[str, str] = {"sm_107a": "wide128_vpre"}
+# The promoted fp32-state MTP update body (B4 T4 with the intermediate-state cache,
+# `..._mtp_t4_splitv8`) is routed per architecture as well: Rubin (sm_107a) runs its
+# `_pro` twin (producer phase parallel over the draft tokens, every independent global
+# load issued before the first reduction; bitwise-identical output), B200 / B300 keep
+# the shipped body.  The verify body `..._mtp_t2_inline_tile8` is the same everywhere.
+# Mirrors the splitv8 entry of `FP32_MTP_ARCH_BODIES` / `select_fp32_mtp_body` in
+# loom.examples.weave.gdn_decode_pretranspose; keyed by architecture here because the
+# table applies to that one base (the resolver consults it for the splitv8 row only).
+CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[str, str] = {
+    "sm_107a": "gdn_decode_pretranspose_mtp_t4_splitv8_pro"
+}
 
 
 def cake_gdn_bf16_wide_schedule(arch: CakeGDNArch, seq_len: int) -> str:
@@ -921,7 +932,10 @@ def select_cake_gdn_decode_variant(
                 "FP32 MTP decode is limited to promoted B1/T2 verify and "
                 "B4/B16/B64 T4 update rows"
             )
-        schedule_attr, route = selected
+        base_attr, route = selected
+        schedule_attr = base_attr
+        if base_attr == "gdn_decode_pretranspose_mtp_t4_splitv8":
+            schedule_attr = CAKE_GDN_FP32_MTP_ARCH_BODIES.get(arch, base_attr)
         mtp_specializations: dict[str, int | float] = {
             "H": num_q_heads,
             "HV": num_v_heads,
@@ -930,7 +944,7 @@ def select_cake_gdn_decode_variant(
             "SCALE": scale,
             "STRIDED_INPUTS": 1,
         }
-        if schedule_attr != "gdn_decode_pretranspose_mtp_t2_inline_tile8":
+        if base_attr != "gdn_decode_pretranspose_mtp_t2_inline_tile8":
             mtp_specializations.update(
                 {
                     "CACHE_INTERMEDIATE_STATES": 1,
