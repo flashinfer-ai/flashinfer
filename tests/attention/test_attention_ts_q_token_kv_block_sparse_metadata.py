@@ -767,7 +767,6 @@ def _make_case(group_size: int, block_topk: int, storage_page_size: int = 16):
     return blocks, block_table, requests, positions, storage_page_size
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
 def test_q1_page_prefix_and_causal_tail_graph(dtype):
