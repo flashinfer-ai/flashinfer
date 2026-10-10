@@ -302,6 +302,18 @@ class JitSpec(abc.ABC):
         """Paths of all on-disk artifacts used by this spec."""
         return (self.get_library_path(),)
 
+    def get_built_library_path(self) -> Path:
+        """Path of the artifact this spec's own build writes.
+
+        ``get_library_path`` answers "what should a runtime consumer load" and
+        may therefore prefer a prebuilt AOT artifact. Packaging asks a
+        different question -- "what did the build just produce" -- so it must
+        not inherit that preference: with ``skip_prebuilt=False`` a freshly
+        rebuilt library would otherwise be packaged as the stale AOT copy.
+        Specs with no prebuilt artifact simply build where they load.
+        """
+        return self.get_library_path()
+
     @abc.abstractmethod
     def try_load(self) -> Optional[Any]:
         """Return the cached artifact, or None when absent or not known-valid.
@@ -453,23 +465,33 @@ class JitSpecNvcc(JitSpec):
     needs_device_linking: bool = False
     post_load_adapter: Optional[Callable[[Any], Any]] = None
     embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None
+    # Version of the external artifact whose exported headers this module
+    # compiles against. Modules that compile against downloaded headers set it
+    # so that the on-disk build is keyed on the artifact as well as on the
+    # module name.
+    artifact_version: Optional[str] = None
     extra_cuda_cflags_by_source: Optional[Mapping[Path, List[str]]] = None
 
     @property
-    def ninja_path(self) -> Path:
-        return jit_env.FLASHINFER_JIT_DIR / self.name / "build.ninja"
+    def build_dir(self) -> Path:
+        if self.artifact_version is None:
+            return jit_env.FLASHINFER_JIT_DIR / self.name
+        return jit_env.FLASHINFER_JIT_DIR / f"{self.name}-{self.artifact_version}"
 
     @property
-    def build_dir(self) -> Path:
-        return jit_env.FLASHINFER_JIT_DIR / self.name
+    def ninja_path(self) -> Path:
+        return self.build_dir / "build.ninja"
 
     @property
     def jit_library_path(self) -> Path:
-        return jit_env.FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
+        return self.build_dir / f"{self.name}.so"
 
     def get_library_path(self) -> Path:
         if self.is_aot:
             return self.aot_path
+        return self.jit_library_path
+
+    def get_built_library_path(self) -> Path:
         return self.jit_library_path
 
     def get_library_paths(self) -> tuple[Path, ...]:
@@ -506,7 +528,7 @@ class JitSpecNvcc(JitSpec):
 
     @property
     def lock_path(self) -> Path:
-        return get_tmpdir() / f"{self.name}.lock"
+        return get_tmpdir() / f"{self.build_dir.name}.lock"
 
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
@@ -525,6 +547,7 @@ class JitSpecNvcc(JitSpec):
             extra_include_dirs=self.extra_include_dirs,
             needs_device_linking=self.needs_device_linking,
             embedded_cubins=embedded_cubins,
+            build_dir=self.build_dir,
             extra_cuda_cflags_by_source=self.extra_cuda_cflags_by_source,
         )
         write_if_different(ninja_path, content)
@@ -706,6 +729,7 @@ def gen_jit_spec(
     post_load_adapter: Optional[Callable[[Any], Any]] = None,
     embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None,
     use_fast_math: bool = True,
+    artifact_version: Optional[str] = None,
     extra_cuda_cflags_by_source: Optional[Mapping[Union[str, Path], List[str]]] = None,
 ) -> JitSpec:
     """Create a CUDA build specification.
@@ -806,6 +830,7 @@ def gen_jit_spec(
         needs_device_linking=needs_device_linking,
         post_load_adapter=post_load_adapter,
         embedded_cubin_factory=embedded_cubin_factory,
+        artifact_version=artifact_version,
         extra_cuda_cflags_by_source=cuda_cflags_by_source,
     )
 
