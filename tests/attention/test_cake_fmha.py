@@ -864,10 +864,6 @@ def test_cake_fmha_optimized_context_adapters_require_signed_seq_lens(
         ("jit/cake_fmha_context_fp8_jit_binding.cu", 5),
         ("jit/cake_fmha_context_hd256_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_bf16_jit_binding.cu", 3),
-        ("jit/cake_fmha_decode_balanced_jit_binding.cu", 3),
-        ("jit/cake_fmha_decode_balanced_fp8_jit_binding.cu", 3),
-        ("jit/cake_fmha_decode_balanced_hd64_jit_binding.cu", 3),
-        ("jit/cake_fmha_decode_balanced_hd256_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_quant_bf16q_jit_binding.cu", 2),
@@ -882,6 +878,32 @@ def test_cake_fmha_typed_launch_adapters_use_typed_tensor_maps(
     assert adapter.count("reinterpret_cast<CakeFmhaTensorMap const*>") == (
         descriptor_count
     )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "jit/cake_fmha_decode_balanced_jit_binding.cu",
+        "jit/cake_fmha_decode_balanced_fp8_jit_binding.cu",
+        "jit/cake_fmha_decode_balanced_hd64_jit_binding.cu",
+        "jit/cake_fmha_decode_balanced_hd256_jit_binding.cu",
+        "jit/cake_fmha_dcp_spec_bf16_balanced_jit_binding.cu",
+        "jit/cake_fmha_dcp_spec_bf16_fp8_balanced_jit_binding.cu",
+        "jit/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_jit_binding.cu",
+    ],
+)
+def test_cake_fmha_balanced_launch_adapters_pass_descriptors_by_value(
+    relative_path,
+) -> None:
+    # The balanced kernels take their TMA descriptors as ``__grid_constant__``
+    # parameters: the adapter encodes each descriptor on the host and hands it
+    # to the launch binding by reference, with no device descriptor slots.
+    adapter = (get_cake_fmha_csrc_dir() / relative_path).read_text(encoding="utf-8")
+    assert adapter.count("CUtensorMap const& p_") == 3
+    assert "CakeFmhaTensorMap" not in adapter
+    assert "TmaDeviceSlot" not in adapter
+    assert "RecordTmaDeviceSlotUses" not in adapter
+    assert "cuMemAlloc" not in adapter
 
 
 @pytest.mark.parametrize(
@@ -904,22 +926,6 @@ def test_cake_fmha_typed_launch_adapters_use_typed_tensor_maps(
         ),
         (
             "jit/cake_fmha_decode_native_bf16_jit_binding.cu",
-            ("{q_slot, k_slot, v_slot}",),
-        ),
-        (
-            "jit/cake_fmha_decode_balanced_jit_binding.cu",
-            ("{q_slot, k_slot, v_slot}",),
-        ),
-        (
-            "jit/cake_fmha_decode_balanced_fp8_jit_binding.cu",
-            ("{q_slot, k_slot, v_slot}", "{k_slot, v_slot}"),
-        ),
-        (
-            "jit/cake_fmha_decode_balanced_hd64_jit_binding.cu",
-            ("{q_slot, k_slot, v_slot}",),
-        ),
-        (
-            "jit/cake_fmha_decode_balanced_hd256_jit_binding.cu",
             ("{q_slot, k_slot, v_slot}",),
         ),
         (
@@ -3415,7 +3421,12 @@ def test_cake_fmha_balanced_hd64_route_owns_bf16_gqa_decode(monkeypatch) -> None
         page_size=16,
     )
     assert cake_api.cake_fmha_route_is_optimized(route)
-    assert cake_api._route_components(route) == (component,)
+    # Two structural instances of one body: eight softmax columns for head
+    # groups 1..8, sixteen for 9..16 (selected by the host from the group).
+    assert cake_api._route_components(route) == (
+        component,
+        "decode_balanced_bf16_hd64_g16",
+    )
 
     # One to sixteen query heads per KV head, at every KV length and tile count.
     for group, batch_size, seq_lens in (
@@ -3689,13 +3700,20 @@ def test_cake_fmha_decode_balanced_fp8_family_jit_selects_the_q_dtype_component(
             cake_fmha_balanced_fp8_component_name(bad_q_dtype)
 
 
-def test_cake_fmha_decode_balanced_hd64_jit_selects_the_component(monkeypatch) -> None:
+@pytest.mark.parametrize("max_group", [8, 16])
+def test_cake_fmha_decode_balanced_hd64_jit_selects_the_component(
+    monkeypatch, max_group
+) -> None:
     import flashinfer.jit.core as jit_core
 
     monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
-    component = "decode_balanced_bf16_hd64"
-    spec = gen_cake_fmha_decode_balanced_hd64_module("sm100a")
-    assert spec.name == get_cake_fmha_decode_balanced_hd64_uri("sm100a")
+    component = (
+        "decode_balanced_bf16_hd64"
+        if max_group == 8
+        else "decode_balanced_bf16_hd64_g16"
+    )
+    spec = gen_cake_fmha_decode_balanced_hd64_module("sm100a", max_group)
+    assert spec.name == get_cake_fmha_decode_balanced_hd64_uri("sm100a", max_group)
     assert spec.name.startswith(f"cake_fmha_{component}_sm100a_")
     assert {Path(source).name for source in spec.sources} == {
         "default.cu",

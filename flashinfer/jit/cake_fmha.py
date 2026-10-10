@@ -1346,28 +1346,69 @@ def load_cake_fmha_decode_balanced_fp8_module(target: CakeFmhaTarget, q_dtype: s
     return module
 
 
-def get_cake_fmha_decode_balanced_hd64_uri(target: CakeFmhaTarget) -> str:
+# Structural instances of the BF16 head_dim-64 balanced decode body: the kernel of
+# record processes eight softmax columns and serves 1..8 query heads per KV head;
+# the ``_g16`` instance processes sixteen and serves 9..16 (Cake round 5, unit 37).
+CAKE_FMHA_BALANCED_HD64_MAX_GROUPS = (8, 16)
+
+
+def cake_fmha_balanced_hd64_component_name(max_group: int = 8) -> str:
+    """Manifest component of the BF16 head_dim-64 balanced decode kernel for ``max_group``."""
+
+    if max_group not in CAKE_FMHA_BALANCED_HD64_MAX_GROUPS:
+        raise ValueError(
+            "the BF16 head_dim-64 balanced decode serves the head-group bounds "
+            f"{CAKE_FMHA_BALANCED_HD64_MAX_GROUPS}, got {max_group!r}"
+        )
+    return (
+        "decode_balanced_bf16_hd64"
+        if max_group == 8
+        else f"decode_balanced_bf16_hd64_g{max_group}"
+    )
+
+
+def cake_fmha_balanced_hd64_max_group(num_qo_heads: int, num_kv_heads: int) -> int:
+    """Head-group bound of the instance serving ``num_qo_heads // num_kv_heads`` heads per KV head."""
+
+    if (
+        num_kv_heads <= 0
+        or num_qo_heads % num_kv_heads
+        or not 1 <= num_qo_heads // num_kv_heads <= 16
+    ):
+        raise ValueError(
+            "the BF16 head_dim-64 balanced decode serves 1..16 query heads per KV head"
+        )
+    return 8 if num_qo_heads // num_kv_heads <= 8 else 16
+
+
+def get_cake_fmha_decode_balanced_hd64_uri(
+    target: CakeFmhaTarget, max_group: int = 8
+) -> str:
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake FMHA target: {target}")
-    return f"cake_fmha_decode_balanced_bf16_hd64_{target}_{CAKE_FMHA_JIT_TAG}"
+    component = cake_fmha_balanced_hd64_component_name(max_group)
+    return f"cake_fmha_{component}_{target}_{CAKE_FMHA_JIT_TAG}"
 
 
 @functools.cache
-def gen_cake_fmha_decode_balanced_hd64_module(target: CakeFmhaTarget) -> JitSpec:
+def gen_cake_fmha_decode_balanced_hd64_module(
+    target: CakeFmhaTarget, max_group: int = 8
+) -> JitSpec:
     """Build the on-device load-balanced BF16 head_dim-64 decode module.
 
-    One program (Q16Kv128 ForGen body, 1..16 query heads per KV head, page 16,
-    ``q_len == 1``) serves every shape: batch, heads and KV lengths are runtime
-    kernel arguments.
+    One body (Q16Kv128 ForGen, page 16, ``q_len == 1``) in two structural
+    instances: ``max_group`` 8 (eight softmax columns, 1..8 query heads per KV
+    head -- the kernel of record) and 16 (sixteen columns, 9..16); batch, heads
+    and KV lengths are runtime kernel arguments.
     """
 
-    component = "decode_balanced_bf16_hd64"
+    component = cake_fmha_balanced_hd64_component_name(max_group)
     manifest_component = get_cake_fmha_manifest()["components"][component]
     sources = _get_component_sources(
         component, target, {}, _DECODE_BALANCED_HD64_JIT_BINDING
     )
     spec = gen_jit_spec(
-        name=get_cake_fmha_decode_balanced_hd64_uri(target),
+        name=get_cake_fmha_decode_balanced_hd64_uri(target, max_group),
         sources=list(sources),
         extra_cuda_cflags=[
             *_TARGET_FLAGS[target],
@@ -1381,9 +1422,17 @@ def gen_cake_fmha_decode_balanced_hd64_module(target: CakeFmhaTarget) -> JitSpec
 
 
 @functools.cache
-def load_cake_fmha_decode_balanced_hd64_module(target: CakeFmhaTarget):
-    module = gen_cake_fmha_decode_balanced_hd64_module(target).build_and_load()
-    logger.info("Loaded Cake FMHA balanced BF16 hd64 decode module: %s", module)
+def load_cake_fmha_decode_balanced_hd64_module(
+    target: CakeFmhaTarget, max_group: int = 8
+):
+    module = gen_cake_fmha_decode_balanced_hd64_module(
+        target, max_group
+    ).build_and_load()
+    logger.info(
+        "Loaded Cake FMHA balanced BF16 hd64 decode module (max_group %d): %s",
+        max_group,
+        module,
+    )
     return module
 
 
@@ -2155,6 +2204,9 @@ __all__ = [
     "gen_cake_fmha_decode_balanced_fp8_module",
     "gen_cake_fmha_decode_balanced_hd256_module",
     "gen_cake_fmha_decode_balanced_hd64_module",
+    "cake_fmha_balanced_hd64_component_name",
+    "cake_fmha_balanced_hd64_max_group",
+    "CAKE_FMHA_BALANCED_HD64_MAX_GROUPS",
     "gen_cake_fmha_decode_balanced_module",
     "gen_cake_fmha_decode_native_bf16_module",
     "gen_cake_fmha_decode_native_fp16_hd512_module",
