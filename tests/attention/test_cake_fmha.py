@@ -2098,6 +2098,7 @@ def test_cake_public_context_route_miss_canonicalizes_only_pinned_noop_skip(
         batch_size=2,
         cum_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
         cum_seq_lens_kv=torch.tensor([0, 16, 32], dtype=torch.int32),
+        window_right=0,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
     )
 

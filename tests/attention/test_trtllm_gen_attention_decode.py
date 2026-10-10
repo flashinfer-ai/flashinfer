@@ -1272,6 +1272,30 @@ def test_trtllm_batch_decode(
     )
 
 
+@pytest.mark.parametrize(
+    "max_in_kv_len", [64, 256], ids=["window-does-not-bind", "window-binds"]
+)
+def test_trtllm_batch_decode_window_selection(max_in_kv_len: int) -> None:
+    """Exercise both sides of the causal-window kernel-selection boundary."""
+    _test_trtllm_batch_decode(
+        backend="trtllm-gen",
+        kv_layout="HND",
+        batch_size=2,
+        q_len_per_req=1,
+        page_size=16,
+        num_kv_heads=2,
+        head_grp_size=1,
+        window_left=127,
+        q_dtype="bf16",
+        o_dtype="bf16",
+        kv_dtype="bf16",
+        enable_pdl=False,
+        enable_sink=False,
+        max_in_kv_len=max_in_kv_len,
+        head_dim=128,
+    )
+
+
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("provide_lse", [False, True])
 def test_trtllm_batch_decode_lse_contract(return_lse, provide_lse):
