@@ -230,6 +230,22 @@ def test_prepare_fills_plans_in_place_and_release_runs_closers(tmp_path):
     assert b.plan.prepared is None
 
 
+def test_reprepared_plan_closes_in_reverse_acquisition_order(tmp_path):
+    closed = []
+    requests = tuple(
+        request(name=name, close=lambda name=name: closed.append(name))
+        for name in ("a", "b", "c")
+    )
+    with session(tmp_path) as engine:
+        engine.prepare(requests)
+        engine.release(requests[1].plan)
+        assert closed == ["b"]
+        engine.prepare(requests[:2])
+        engine.prepare(requests)
+    assert closed == ["b", "b", "c", "a"]
+    assert all(item.plan.prepared is None for item in requests)
+
+
 def test_job_bundle_memo_ends_at_completion_but_plan_programs_survive(tmp_path):
     import weakref
     from b12x._lib import compile_plan, program_cache

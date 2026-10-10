@@ -400,7 +400,7 @@ class PreparationSession:
         self._pool = None
         self._job = None
         self._pending_collective_barrier = None
-        self._plans = []
+        self._plans = {}
         self._shared = {}
         self._guard = None
         self._tuning_rank = 0
@@ -646,8 +646,8 @@ class PreparationSession:
             prepared.users.remove(plan)
         if plan._prepared is prepared:
             plan._clear()
-        if plan in self._plans and plan._prepared is None:
-            self._plans.remove(plan)
+        if plan._prepared is None:
+            self._plans.pop(plan, None)
         if plan.shared:
             key = _declaration_key(plan)
             if self._shared.get(key) is plan and plan.prepared is not prepared:
@@ -1203,8 +1203,7 @@ class PreparationJob:
         plan._install(prepared)
         if previous is not None and previous is not prepared:
             self.session._release_payload(plan, previous)
-        if plan not in self.session._plans:
-            self.session._plans.append(plan)
+        self.session._plans[plan] = None
         self._new_plans.append(plan)
         obligation.selection = prepared.selection
         obligation.ready = True
@@ -1865,8 +1864,7 @@ class PreparationJob:
         prepared.users.append(plan)
         previous = plan._prepared
         plan._install(prepared)
-        if plan not in self.session._plans:
-            self.session._plans.append(plan)
+        self.session._plans[plan] = None
         if plan.shared:
             self.session._shared[_declaration_key(plan)] = plan
         self._new_plans.append(plan)
