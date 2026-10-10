@@ -274,6 +274,9 @@ def _make_wrapper(
             template_idx = template_indices.get(id(template))
             if template_idx is None:
                 return original(*args, **kwargs)
+            normalize_kwargs = getattr(template, "normalize_kwargs", None)
+            if normalize_kwargs is not None:
+                namespace = normalize_kwargs(namespace)
             extractor_map = extractor_maps[template_idx]
             if extractor_map is None:
                 return original(*args, **kwargs)
