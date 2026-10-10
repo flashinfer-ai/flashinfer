@@ -341,7 +341,10 @@ def test_prefill_match_uses_complete_build_metadata(monkeypatch):
     )
 
     monkeypatch.setattr(
-        prefill, "_build_prefill_graph", lambda **kw: (object(), []), raising=False
+        prefill,
+        "_build_prefill_graph",
+        lambda **kw: (SimpleNamespace(get_workspace_size=lambda: 0), []),
+        raising=False,
     )
     prepared = prefill.prepare_cudnn_batch_prefill(
         q, kv, kv, 0.5, torch.empty(0), metadata=metadata
