@@ -3372,6 +3372,15 @@ def batch_prefill(
         )
     if vc_config is not None and vc is None:
         raise ValueError("vc_config requires the vc operands of this call")
+    if (vc_config is not None and vc_config.repair_tiles) or (
+        vc is not None and vc.tile_means is None
+    ):
+        # The K/V rows of V repair operands include the repair tiles, so the
+        # plan bounds cannot be derived from the operands alone.
+        raise NotImplementedError(
+            "batch_prefill does not run V repair operands; plan "
+            "BatchPrefillTSWrapper with VCAttentionConfig(repair_tiles=...)"
+        )
     if vc is not None and vc_config is None:
         vc_config = VCAttentionConfig()
     geometry = _resolve_geometry(

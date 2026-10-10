@@ -278,6 +278,17 @@ def test_vc_run_rejects_mismatched_operands():
         plain.run(q, ops.k, ops.v, vc=good)
     with pytest.raises(ValueError, match="vc_config requires"):
         batch_prefill(q, k, v.to(_FP8), vc_config=VCAttentionConfig())
+    repair = vca.vc_quantize_repair(k, v, budget=0.02)
+    with pytest.raises(NotImplementedError, match="does not run V repair"):
+        batch_prefill(q, repair.k, repair.v, vc=repair.params)
+    with pytest.raises(NotImplementedError, match="does not run V repair"):
+        batch_prefill(
+            q,
+            repair.k,
+            repair.v,
+            vc=repair.params,
+            vc_config=VCAttentionConfig(repair_tiles=repair.repair_tiles),
+        )
 
 
 @_REQUIRES_CONTEXT_GPU

@@ -430,41 +430,44 @@ class VcKvPass2:
         operand = tile_in_group // k_per_core
         slot = 2 * (tile_in_group % k_per_core)
         c_slot = slot // k_per_core
-        m0 = cutlass.inttoptr(
-            mean_base + Int64(d0) * 4, mem_space=1, dtype=Float32
-        ).load()
-        m1 = cutlass.inttoptr(
-            mean_base + Int64(d0 + 1) * 4, mem_space=1, dtype=Float32
-        ).load()
-        s0 = cutlass.inttoptr(
-            vscale_base + Int64(d0) * 4, mem_space=1, dtype=Float32
-        ).load()
-        s1 = cutlass.inttoptr(
-            vscale_base + Int64(d0 + 1) * 4, mem_space=1, dtype=Float32
-        ).load()
-        if cutlass.const_expr(not repair) and c == c_slot and tidx < 128:
-            # Means are stored divided by the per-channel value scale (paper, Appendix B).
-            num_groups = (num_tiles + VC_MEAN_GROUP_TILES - 1) // VC_MEAN_GROUP_TILES
-            dst = (
-                mMu.iterator.toint()
-                + (
-                    (
-                        (Int64(bh) * Int64(num_groups) + t // VC_MEAN_GROUP_TILES)
-                        * VC_MEAN_OPERANDS
-                        + operand
+        if cutlass.const_expr(not repair) and tidx < 128:
+            m0 = cutlass.inttoptr(
+                mean_base + Int64(d0) * 4, mem_space=1, dtype=Float32
+            ).load()
+            m1 = cutlass.inttoptr(
+                mean_base + Int64(d0 + 1) * 4, mem_space=1, dtype=Float32
+            ).load()
+            s0 = cutlass.inttoptr(
+                vscale_base + Int64(d0) * 4, mem_space=1, dtype=Float32
+            ).load()
+            s1 = cutlass.inttoptr(
+                vscale_base + Int64(d0 + 1) * 4, mem_space=1, dtype=Float32
+            ).load()
+            if c == c_slot:
+                # Means are stored divided by the per-channel value scale (paper, Appendix B).
+                num_groups = (
+                    num_tiles + VC_MEAN_GROUP_TILES - 1
+                ) // VC_MEAN_GROUP_TILES
+                dst = (
+                    mMu.iterator.toint()
+                    + (
+                        (
+                            (Int64(bh) * Int64(num_groups) + t // VC_MEAN_GROUP_TILES)
+                            * VC_MEAN_OPERANDS
+                            + operand
+                        )
+                        * _MU_ELEMS
+                        + idx0
+                        + slot % k_per_core
                     )
-                    * _MU_ELEMS
-                    + idx0
-                    + slot % k_per_core
+                    * 2
                 )
-                * 2
-            )
-            cutlass.inttoptr(dst, mem_space=1, dtype=Int32).store(
-                _pack_float2_to_bf16(m0 / s0, m0 / s0)
-            )
-            cutlass.inttoptr(dst + k_per_core * 2, mem_space=1, dtype=Int32).store(
-                _pack_float2_to_bf16(m1 / s1, m1 / s1)
-            )
+                cutlass.inttoptr(dst, mem_space=1, dtype=Int32).store(
+                    _pack_float2_to_bf16(m0 / s0, m0 / s0)
+                )
+                cutlass.inttoptr(dst + k_per_core * 2, mem_space=1, dtype=Int32).store(
+                    _pack_float2_to_bf16(m1 / s1, m1 / s1)
+                )
 
     @cute.jit
     def __call__(
