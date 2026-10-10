@@ -16,7 +16,8 @@ import cutlass.cute as cute
 import cutlass.utils as utils_basic
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
-from cutlass.cutlass_dsl import BaseDSL
+from cutlass.cutlass_dsl import BaseDSL, T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 from quack import copy_utils, layout_utils
 
 from sglang.kernels.ops.attention.flash_attn.cute import ampere_helpers as sm80_utils
@@ -42,6 +43,24 @@ from sglang.kernels.ops.attention.flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
 )
 from sglang.kernels.ops.attention.flash_attn.cute.utils import AuxData
+
+
+@dsl_user_op
+def load_v_k32(address, *, loc=None, ip=None):
+    # Each lane supplies one 16-byte-aligned row; lane 0..31 covers K32.
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [cutlass.Uint32(address).ir_value(loc=loc, ip=ip)],
+        "ldmatrix.sync.aligned.m16n16.x2.trans.shared::cta.b8 {$0,$1,$2,$3},[$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(
+        cutlass.Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+        for i in range(4)
+    )
 
 
 class FlashAttentionForwardBase:
@@ -206,7 +225,9 @@ class FlashAttentionForwardBase:
                 raise TypeError("Q/K/V must have the same data type")
             if const_expr(mO_type != Float32):
                 raise TypeError("SplitKV partial output (mO) must be Float32")
-        elif const_expr(not (mQ_type == mK_type == mV_type and mO_type == cutlass.BFloat16)):
+        elif const_expr(
+            not (mQ_type == mK_type == mV_type and mO_type == cutlass.BFloat16)
+        ):
             raise TypeError("All tensors must have the same data type")
         if const_expr(mQ_type not in [cutlass.Float8E4M3FN]):
             raise TypeError("Only Float16 or BFloat16 is supported")
@@ -306,7 +327,10 @@ class FlashAttentionForwardBase:
         # TODO: need a different layout for O if O dtype is not the same as V dtype
         # tO_layout: thread layout for O store
         tO_layout = cute.make_ordered_layout(
-            (self.num_epilogue_threads // (sO_layout_atom.outer.shape[1] // 8), sO_layout_atom.outer.shape[1] // 8),
+            (
+                self.num_epilogue_threads // (sO_layout_atom.outer.shape[1] // 8),
+                sO_layout_atom.outer.shape[1] // 8,
+            ),
             order=(1, 0),
         )
         # So that we don't have to check if we overshoot kBlockM when we store O
@@ -767,7 +791,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
         sK_layout_atom = sQ_layout_atom
         sV_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdimv)
-        sO_layout_atom = sm80_utils.get_smem_layout_atom(cutlass.BFloat16, self.tile_hdimv)
+        sO_layout_atom = sm80_utils.get_smem_layout_atom(
+            cutlass.BFloat16, self.tile_hdimv
+        )
         sP_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_n)
         return (
             sQ_layout_atom,
@@ -784,9 +810,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             permutation_mnk=(self.num_threads // 32 * 16, 16, 32),
         )
         tiled_mma_pv = cute.make_tiled_mma(
-            warp.MmaFP8Op(self.dtype, Float32, (16, 8, 16)),
+            warp.MmaFP8Op(self.dtype, Float32, (16, 8, 32)),
             (self.num_threads // 32, 1, 1),
-            permutation_mnk=(self.num_threads // 32 * 16, 16, 16),
+            permutation_mnk=(self.num_threads // 32 * 16, 16, 32),
         )
         return tiled_mma_qk, tiled_mma_pv
 
@@ -794,12 +820,18 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         assert not self.Q_in_regs and self.num_stages == 1
         # Q/K/V storage is dead after the epilogue barrier. O reuses the
         # whole allocation, beginning at sV, instead of doubling Q storage.
-        assert sum(cute.cosize(x) for x in (self.sQ_layout, self.sK_layout, self.sV_layout)) >= 2 * cute.cosize(self.sO_layout)
+        assert sum(
+            cute.cosize(x) for x in (self.sQ_layout, self.sK_layout, self.sV_layout)
+        ) >= 2 * cute.cosize(self.sO_layout)
         sQ_struct, sK_struct, sV_struct = [
             cute.struct.Align[
                 cute.struct.MemRange[self.dtype, cute.cosize(layout) * factor], 1024
             ]
-            for layout, factor in ((self.sQ_layout, 1), (self.sK_layout, 1), (self.sV_layout, 1))
+            for layout, factor in (
+                (self.sQ_layout, 1),
+                (self.sK_layout, 1),
+                (self.sV_layout, 1),
+            )
         ]
         cosize_sQV = max(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
         sQV_struct = cute.struct.Align[
@@ -1125,7 +1157,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 self.dtype,
             )
             smem_copy_atom_V = cute.make_copy_atom(
-                warp.LdMatrix16x16x8bOp(transpose=True, num_matrices=1),
+                warp.LdMatrix16x16x8bOp(transpose=True, num_matrices=2),
                 self.dtype,
             )
             smem_thr_copy_Q = utils.make_tiled_copy_A(
@@ -1185,6 +1217,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 tSrQ=tSrQ,
                 tSrK=tSrK,
                 tOrVt=tOrVt,
+                sV=sV,
                 acc_O=acc_O,
                 sP=cute.make_tensor(sQ.iterator + cute.cosize(sQ_layout), sP_layout),
                 tiled_mma_pv=tiled_mma_pv,
@@ -1373,7 +1406,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # Epilogue
             # ///////////////////////////////////////////////////////////////////////////////
             # reuse sQ's data iterator
-            sO = cute.make_tensor(cute.recast_ptr(sV.iterator, dtype=cutlass.BFloat16), sO_layout)
+            sO = cute.make_tensor(
+                cute.recast_ptr(sV.iterator, dtype=cutlass.BFloat16), sO_layout
+            )
             self.epilogue(
                 acc_O,
                 softmax.row_sum,
@@ -1458,8 +1493,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # hook_fn=load_V_next,
             A_in_regs=self.Q_in_regs,
         )
-        block_k_scale = aux_data.tensors[1][batch_idx, head_idx // self.qhead_per_kvhead, n_block]
-        block_v_scale = aux_data.tensors[2][batch_idx, head_idx // self.qhead_per_kvhead, n_block]
+        block_k_scale = aux_data.tensors[1][
+            batch_idx, head_idx // self.qhead_per_kvhead, n_block
+        ]
+        block_v_scale = aux_data.tensors[2][
+            batch_idx, head_idx // self.qhead_per_kvhead, n_block
+        ]
         acc_S.store(acc_S.load() * (mma_params.query_scale * block_k_scale))
         if const_expr(score_mod is not None):
             self.apply_score_mod(
@@ -1493,12 +1532,16 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         row_scale = softmax.online_softmax(
             acc_S, is_first=is_first_n_block, check_inf=check_inf
         )
-        row_scale.store(row_scale.load() * (mma_params.value_scale_state[0] / block_v_scale))
+        row_scale.store(
+            row_scale.load() * (mma_params.value_scale_state[0] / block_v_scale)
+        )
         mma_params.value_scale_state[0] = block_v_scale
         softmax.rescale_O(mma_params.acc_O, row_scale)
         rP = cute.make_fragment_like(acc_S, self.dtype)
         rP.store((acc_S.load() * 448.0).to(self.dtype))
-        tOrP = mma_params.thr_mma_pv.make_fragment_A(mma_params.thr_mma_pv.partition_A(mma_params.sP))
+        tOrP = mma_params.thr_mma_pv.make_fragment_A(
+            mma_params.thr_mma_pv.partition_A(mma_params.sP)
+        )
         rP16 = cute.recast_tensor(rP, dtype=cutlass.Uint16)
         rA32 = cute.recast_tensor(tOrP, dtype=cutlass.Uint32)
         lane = mma_params.tidx % 32
@@ -1506,28 +1549,38 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         group = (lane % 4) // 2
         for mm in cutlass.range_constexpr(cute.size(tOrP, mode=[1])):
             for kk in cutlass.range_constexpr(cute.size(tOrP, mode=[2])):
-                for rr in cutlass.range_constexpr(2):
-                    x0 = cutlass.Uint32(rP16[(0, rr), mm, 2 * kk])
-                    x1 = cutlass.Uint32(rP16[(0, rr), mm, 2 * kk + 1])
-                    packed = x0 | (x1 << 16)
-                    low_pair = cute.arch.shuffle_sync(packed, offset=peer)
-                    high_pair = cute.arch.shuffle_sync(packed, offset=peer + 1)
-                    lo = (low_pair >> (group * 16)) & cutlass.Uint32(65535)
-                    hi = (high_pair >> (group * 16)) & cutlass.Uint32(65535)
-                    rA32[(0, rr), mm, kk] = lo | (hi << 16)
+                for block in cutlass.range_constexpr(2):
+                    for rr in cutlass.range_constexpr(2):
+                        x0 = cutlass.Uint32(rP16[(0, rr), mm, 4 * kk + 2 * block])
+                        x1 = cutlass.Uint32(rP16[(0, rr), mm, 4 * kk + 2 * block + 1])
+                        packed = x0 | (x1 << 16)
+                        low_pair = cute.arch.shuffle_sync(packed, offset=peer)
+                        high_pair = cute.arch.shuffle_sync(packed, offset=peer + 1)
+                        lo = (low_pair >> (group * 16)) & cutlass.Uint32(65535)
+                        hi = (high_pair >> (group * 16)) & cutlass.Uint32(65535)
+                        rA32[(0, rr, block), mm, kk] = lo | (hi << 16)
         if const_expr(self.num_stages > 1):
             sync()
             load_K_next()
-        sm80_utils.gemm_rs(
-            mma_params.thr_mma_pv,
-            mma_params.acc_O,
-            tOrP,
-            mma_params.tOrVt,
-            smem_copy_params.tOsVt[None, None, None, smem_pipe_read if const_expr(self.num_stages > 1) else 0],
-            smem_copy_params.smem_thr_copy_V,
-        )
-        # if const_expr(self.num_stages > 1):
-        #     load_K_next()
+        # Explicit SM120 byte-transpose mapping, matching the FlashInfer
+        # K32 reference. Generic CuTe B tiling provides 8-byte addresses here.
+        # N16-aligned source columns preserve 16-byte alignment under swizzle.
+        rB32 = cute.recast_tensor(mma_params.tOrVt, dtype=cutlass.Uint32)
+        for kk in cutlass.range_constexpr(self.tile_n // 32):
+            for dd in cutlass.range_constexpr(self.tile_hdimv // 16):
+                ptr = utils.elem_pointer(mma_params.sV, (kk * 32 + lane, dd * 16, 0))
+                b0, b1, b2, b3 = load_v_k32(ptr.toint())
+                rB32[(0, 0), 2 * dd, kk] = b0
+                rB32[(0, 1), 2 * dd, kk] = b2
+                rB32[(0, 0), 2 * dd + 1, kk] = b1
+                rB32[(0, 1), 2 * dd + 1, kk] = b3
+            cute.gemm(
+                mma_params.thr_mma_pv,
+                mma_params.acc_O,
+                tOrP[None, None, kk],
+                mma_params.tOrVt[None, None, kk],
+                mma_params.acc_O,
+            )
 
     @cute.jit
     def apply_score_mod(

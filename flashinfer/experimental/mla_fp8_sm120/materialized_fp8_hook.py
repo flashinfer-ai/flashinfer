@@ -67,7 +67,7 @@ def create_hook(config):
             scales,
         )
         if layer.layer_id == 0:
-            print("SM120_K16_PREFILL", q8.shape[0], k8.shape[0], flush=True)
+            print("SM120_K32_PREFILL", q8.shape[0], k8.shape[0], flush=True)
         return q8, k8, v8
 
     def forward_extend(
@@ -110,7 +110,7 @@ def create_hook(config):
 
     HybridAttnBackend.prepare_prefill_qkv = prepare_prefill_qkv
     FlashAttentionBackend.forward_extend = forward_extend
-    print("SM120_K16_PREFILL_INSTALLED", threshold, flush=True)
+    print("SM120_K32_PREFILL_INSTALLED", threshold, flush=True)
 
     def hook(module, inputs, output):
         pass
