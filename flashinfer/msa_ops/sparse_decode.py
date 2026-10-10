@@ -350,13 +350,14 @@ def msa_sparse_decode_attention(
     import cutlass
     import cutlass.cute as cute
 
-    from ..utils import is_sm12x_supported
+    from ..utils import is_sm12x_supported, is_sm90a_supported
     from .cute_dsl.sparse_decode_sm12x import SparseDecodeForwardSm12x
     from ._common import _q_offset_explicit
 
-    if not is_sm12x_supported(q.device):
+    sm90 = is_sm90a_supported(q.device)
+    if not (sm90 or is_sm12x_supported(q.device)):
         raise RuntimeError(
-            "msa_sparse_decode_attention requires SM120 or SM121 and CUDA >= 12.8"
+            "msa_sparse_decode_attention requires SM90, SM120 or SM121 and CUDA >= 12.8"
         )
     if q.ndim != 3:
         raise ValueError("q must be 3D (total_q, num_qo_heads, head_dim)")
@@ -390,6 +391,71 @@ def msa_sparse_decode_attention(
     # of msa_topk_select's output).
     if not q2k_indices.is_contiguous():
         raise ValueError("q2k_indices must be contiguous")
+
+    if sm90:
+        if return_softmax_lse:
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention does not return an LSE"
+            )
+        if page_table is None or seqused_k is None:
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention requires the paged KV layout"
+            )
+        if k_scale is not None or v_scale is not None or k_global_scale is not None:
+            # Per-tensor k/v scale tensors have no SM90 path; a silently dropped
+            # scale would return plausible, wrong numbers. softmax_scale and
+            # v_global_scale ARE handled -- folded into q and the output below.
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention handles softmax_scale and "
+                "v_global_scale, but not per-tensor k_scale/v_scale/k_global_scale"
+            )
+        if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
+            # The SM90 decode schedule views the cache as raw bytes and declares
+            # them e4m3, so any other dtype is read with both the wrong values and
+            # the wrong element stride -- silent garbage rather than a failure.
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention requires an fp8 e4m3 KV cache, "
+                f"got k={k.dtype} v={v.dtype}"
+            )
+        if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            # The SM90 schedule folds scales into a bf16 q; fp16 would be read as
+            # bf16 and return wrong numbers rather than failing.
+            raise NotImplementedError(
+                f"SM90 msa_sparse_decode_attention requires bf16 or fp8 q, got {q.dtype}"
+            )
+        if q2k_indices.shape[-1] != 16:
+            raise NotImplementedError(
+                f"SM90 msa_sparse_decode_attention supports topk=16 only, got "
+                f"{q2k_indices.shape[-1]}"
+            )
+        if seqused_k.dtype != torch.int32 or seqused_k.ndim != 1:
+            raise ValueError("SM90 seqused_k must be 1D int32")
+        if seqused_k.numel() != batch_size:
+            raise ValueError(
+                f"SM90 seqused_k must have batch_size ({batch_size}) entries, got "
+                f"{seqused_k.numel()}"
+            )
+        if page_table.ndim != 2 or page_table.shape[0] != batch_size:
+            raise ValueError(
+                f"SM90 page_table must be (batch_size={batch_size}, max_pages), got "
+                f"{tuple(page_table.shape)}"
+            )
+        from ._sm90_dispatch import sparse_decode_sm90
+
+        out = torch.empty(
+            (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=q.device
+        )
+        return sparse_decode_sm90(
+            q,
+            k,
+            v,
+            q2k_indices,
+            page_table,
+            seqused_k,
+            out,
+            softmax_scale=softmax_scale,
+            v_global_scale=v_global_scale,
+        )
     topk = q2k_indices.shape[2]
     if topk <= 0:
         raise ValueError("q2k_indices topk dimension must be positive")

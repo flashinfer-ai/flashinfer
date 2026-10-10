@@ -20,7 +20,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_attention_trace
-from ..utils import is_sm12x_supported
+from ..utils import is_sm12x_supported, is_sm90a_supported
 from ._blackwell_sm100 import (
     MSASparseAttentionWorkspace,
     blackwell_msa_sparse_attention,
@@ -202,9 +202,10 @@ def msa_sparse_attention(
             "MSASparseAttentionWorkspace is only used by the compute "
             "capability 10.0/10.3 backend"
         )
-    if not is_sm12x_supported(q.device):
+    sm90 = is_sm90a_supported(q.device)
+    if not (sm90 or is_sm12x_supported(q.device)):
         raise RuntimeError(
-            "msa_sparse_attention requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
+            "msa_sparse_attention requires SM90, SM120 or SM121 and CUDA >= 12.8"
         )
     compute_dtype = q.dtype
     if q.dtype not in (torch.bfloat16, torch.float16):
@@ -227,6 +228,67 @@ def msa_sparse_attention(
     topk = q2k_indices.shape[2]
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
+
+    if sm90:
+        if return_softmax_lse or return_temperature_lse:
+            raise NotImplementedError(
+                "SM90 msa_sparse_attention does not return an LSE"
+            )
+        if page_table is None or seqused_k is None:
+            raise NotImplementedError(
+                "SM90 msa_sparse_attention requires the paged KV layout"
+            )
+        if k_scale is not None or v_scale is not None or k_global_scale is not None:
+            # softmax_scale and v_global_scale ARE handled (folded into q and the
+            # output); per-tensor scale tensors have no SM90 path and dropping one
+            # silently would return plausible, wrong numbers.
+            raise NotImplementedError(
+                "SM90 msa_sparse_attention handles softmax_scale and v_global_scale, "
+                "but not per-tensor k_scale/v_scale/k_global_scale"
+            )
+        if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
+            # _views() builds the paged pointers as e4m3; any other dtype is read
+            # with the wrong element stride and returns silent garbage.
+            raise NotImplementedError(
+                "SM90 msa_sparse_attention requires an fp8 e4m3 KV cache, "
+                f"got k={k.dtype} v={v.dtype}"
+            )
+        if q.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                f"SM90 msa_sparse_attention requires bf16 q, got {q.dtype}"
+            )
+        if q2k_indices.shape[-1] != 16:
+            raise NotImplementedError(
+                f"SM90 msa_sparse_attention supports topk=16 only, got "
+                f"{q2k_indices.shape[-1]}"
+            )
+        if group_size not in (8, 16):
+            raise NotImplementedError(
+                f"SM90 msa_sparse_attention supports GQA group 8 or 16, got {group_size}"
+            )
+        if not causal:
+            # The SM90 schedule always applies the causal mask; honouring
+            # causal=False would need a separate kernel, and silently ignoring it
+            # would return wrong numbers.
+            raise NotImplementedError("SM90 msa_sparse_attention is causal-only")
+        from ._sm90_dispatch import sparse_prefill_sm90
+
+        out = torch.zeros(
+            (total_q, num_qo_heads, head_dim), dtype=q.dtype, device=q.device
+        )
+        return sparse_prefill_sm90(
+            q,
+            k,
+            v,
+            q2k_indices,
+            cu_seqlens_q,
+            page_table,
+            seqused_k,
+            out,
+            q_offset=q_offset if isinstance(q_offset, torch.Tensor) else None,
+            softmax_scale=softmax_scale,
+            v_global_scale=v_global_scale,
+        )
 
     kv_fp8 = k.dtype == torch.float8_e4m3fn
     kv_nvfp4 = k.dtype == torch.uint8
