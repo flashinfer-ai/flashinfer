@@ -270,6 +270,7 @@ def test_decision_served_rows_outside_the_executable_chain(layout, T, path, laun
                 decision.gemm2.m_group,
                 late_dep_wait=decision.gemm2.late_dep_wait,
                 weight_l2_hint=decision.gemm2.weight_l2_hint is not None,
+                sched_chunk_major=decision.gemm2.sched_chunk_major,
             ).stage,
         }
     else:
@@ -302,33 +303,59 @@ def test_decision_served_rows_outside_the_executable_chain(layout, T, path, laun
         )
 
 
-@pytest.mark.parametrize(
-    "layout, T, needle",
-    [
-        (TP8, 8192, "mixed192"),
-        (TP8, 16384, "mixed192"),
-    ],
-)
-def test_refused_rows_carry_the_hand_written_reason(layout, T, needle):
-    runner = _runner(layout)
-    decision = runner.decide(T)
-    assert not decision.supported
-    assert needle in decision.reason
-    # The refused row still carries the hand-written launch plan.  Either a launch has no traced form and names
-    # the missing IR form (never substituted), or every launch is traced and the chain itself is named missing
-    # (the dense two-stage finalize: traced, not enqueued by the Cake runner); ``plan`` refuses with the reason.
-    assert decision.path != "plain" and decision.launches and decision.missing_forms
-    untraced = [launch for launch in decision.launch_plan if not launch.traced]
-    assert all(launch.missing for launch in untraced)
-    if not untraced:
-        assert (
-            decision.path == "dense"
-            and decision.dense is not None
-            and decision.dense.two_stage
+@pytest.mark.parametrize("T", [8192, 16384, 32768])
+def test_long_prefill_rows_are_served_by_the_mixed192_chain(T):
+    """The MoE-TP rows of 8192 tokens and above run the two-stream ``mixed192`` chain: every launch traced, the
+    dense GEMM1 pair zero-fills the output (no K1 clear), the 192-row 2-CTA window forms on the side stream, the
+    dense finalize pair over the wide lists below 16384 tokens and over every group with the raster vote from 16384."""
+    decision = _runner(TP8).decide(T)
+    assert decision.supported and decision.path == "mixed192" and decision.reason == ""
+    assert (
+        "mixed192" in plan.EXECUTABLE_PATHS and _executed_chain(decision) == "mixed192"
+    )
+    assert (
+        not decision.clear_output
+        and decision.group_rows == 128
+        and decision.tile == 192
+    )
+    forms = [launch.form for launch in decision.launch_plan]
+    assert "gemm1_swapab_situ_n192_2cta_rowgroup" in forms
+    assert ("gemm2_swapab_finalize_n192_2cta_cm4" in forms) == (T < 16384)
+    assert ("gemm2_dense_finalize_n256_c12_rg_rauto" in forms) == (T < 16384)
+    assert ("gemm2_dense_finalize_n192_c12_rauto" in forms) == (T >= 16384)
+    assert {
+        launch.step for launch in decision.launch_plan if launch.stream == "side"
+    } == (
+        {"gemm1_swapab_situ", "gemm2_swapab_finalize"}
+        if T < 16384
+        else {"gemm1_swapab_situ"}
+    )
+    # The dense GEMM1 pair loads its weights without the EVICT_FIRST weight-stream hint from the plan's
+    # MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS tokens (the ``_nol2`` modules; the hint-on pair below): the
+    # launch config resolves the 7-tuple and the package carries both variants.
+    hint_on = T < plan.MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS
+    nol2 = "" if hint_on else "_nol2"
+    assert [form for form in forms if form.startswith("gemm1_dense_situ_m")] == [
+        "gemm1_dense_situ_m128_n256_rowgroup_zero_fill" + nol2,
+        "gemm1_dense_situ_m256_n256_2cta_rowgroup_zero_fill_secondary" + nol2,
+    ]
+    cfg = plan.mixed192_launch_config(_runner(TP8).policy, decision)
+    for args in (cfg["gemm1_dense"], cfg["gemm1_alt"]):
+        tile_m, n1, zero_fill, secondary, row_group, early, l2_hint = args
+        assert l2_hint is hint_on and zero_fill and row_group and not early
+        item = kernels.find_form(
+            kind="gemm1_dense",
+            tile_m=tile_m,
+            n_tile=n1,
+            zero_fill=zero_fill,
+            zero_fill_secondary=secondary,
+            row_group_list=row_group,
+            pdl_trigger_early=early,
+            weight_l2_hint=l2_hint,
+            use_pdl=decision.pdl,
         )
-        assert decision.missing_forms == (plan.DENSE_TWO_STAGE_CHAIN_MISSING,)
-        assert plan.DENSE_CHAIN_EXECUTABLE is True
-    assert "missing IR forms" in decision.reason
+        assert item["route"]["stage"].endswith("_nol2") is (not hint_on)
+        assert item["route"]["form"]["weight_l2_hint"] is hint_on
 
 
 @pytest.mark.parametrize("enable_pdl", [False, True])
@@ -348,7 +375,8 @@ def test_dense_chain_kernels_are_rendered_for_both_launch_attributes(enable_pdl)
     served = set(contract["forms"]) | set(contract["sibling_backend_forms"])
     for name in (plan.init_form_name(sort), plan.coop_form_name(sort)):
         assert plan._k6_stage(name, sort.pdl) in served, name
-    tile_m, n1, zero_fill, secondary, row_group, early = cfg["gemm1"]
+    tile_m, n1, zero_fill, secondary, row_group, early, l2_hint = cfg["gemm1"]
+    assert l2_hint is True  # the dense chain keeps the EVICT_FIRST weight-stream hint
     gemm1 = kernels.find_form(
         kind="gemm1_dense",
         tile_m=tile_m,
@@ -357,6 +385,7 @@ def test_dense_chain_kernels_are_rendered_for_both_launch_attributes(enable_pdl)
         zero_fill_secondary=secondary,
         row_group_list=row_group,
         pdl_trigger_early=early,
+        weight_l2_hint=l2_hint,
         use_pdl=enable_pdl,
     )
     n2, cluster_n = cfg["gemm2"]
@@ -537,6 +566,7 @@ def test_every_plan_selection_resolves_to_a_module():
                     g2.m_group,
                     late_dep_wait=g2.late_dep_wait,
                     weight_l2_hint=g2.weight_l2_hint is not None,
+                    sched_chunk_major=g2.sched_chunk_major,
                 ).stage
             )
         for mode in MODES:
@@ -547,6 +577,18 @@ def test_every_plan_selection_resolves_to_a_module():
     assert "separate_bf16" in MODES and len(seen) >= 9 + 10 * len(MODES)
     with pytest.raises(KeyError, match="not in this package"):
         kernels.select_gemm2(192, 4, 7)
+    # The n192 2-CTA finalize exists under both scheduler rasters: the row-group-major form (the default
+    # selection) and the blocked chunk-major ``_cm4`` form the mixed192 rows launch at 8192 tokens.
+    plain = kernels.select_gemm2(192, 4, 1)
+    cm4 = kernels.select_gemm2(192, 4, 1, sched_chunk_major=4)
+    assert (
+        plain.stage == "gemm2_swapab_finalize_n192_2cta"
+        and cm4.stage == plain.stage + "_cm4"
+    )
+    assert plain.form["sched_chunk_major"] is False and plain.form["sched_m_block"] == 1
+    assert cm4.form["sched_chunk_major"] is True and cm4.form["sched_m_block"] == 4
+    with pytest.raises(KeyError, match="not in this package"):
+        kernels.select_gemm2(192, 4, 1, sched_chunk_major=2)
 
 
 def test_gemm_forms_carry_the_trace_time_constants():
@@ -1057,13 +1099,14 @@ CLASS_ROWS = ["ep8_1", "ep8_16", "ep8_128", "ep8_512", "ep8_512_skew"]
 # Canonical rows of the hand-written paths beyond the plain chain (``decide`` serves them; the chain runs them
 # only when its path is in ``EXECUTABLE_PATHS`` at the pinned revision, otherwise ``plan`` refuses by name):
 # EP8 rank 3 dense rows (T 2048 / 4096: the single-tile dense chain), TP8 rank 0 split_two_stage rows
-# (T 128 / 512: the split two-stage chain, or the plain chain while ``SPLIT_CHAIN_EXECUTABLE`` is off); same
-# contract seeds.
+# (T 128 / 512: the split two-stage chain, or the plain chain while ``SPLIT_CHAIN_EXECUTABLE`` is off) and the
+# TP8 rank 0 T = 8192 row (the two-stream mixed192 chain); same contract seeds.
 PATH_ROWS = {
     "ep8_2048": (EP8, 2048, "uniform_cycle", 120481),
     "ep8_4096_skew": (EP8, 4096, "hotset_skew", 140962),
     "tp8_128": (TP8, 128, "uniform_cycle", 201281),
     "tp8_512_skew": (TP8, 512, "hotset_skew", 205122),
+    "tp8_8192": (TP8, 8192, "uniform_cycle", 281921),
 }
 
 
@@ -1206,6 +1249,24 @@ def test_executable_path_rows_match_the_gate_oracle(row, record_property):
         assert stages[4].startswith("gemm2_swapab_partial_n")
         assert stages[5].startswith("finalize_top") and stages[5].endswith("_split")
         assert p.executed_chain["chain"] == "split_two_stage"
+    elif chain == "mixed192":
+        # Hand-written enqueue order below 16384 tokens: route preprocess (no clear), K6 pair (dual padding, mixed
+        # lists), swap-AB 192-row 2-CTA SiTU GEMM1 over the windows (side stream), dense GEMM1 zero-fill pair over
+        # the wide lists, swap-AB finalize over the windows (side; blocked chunk-major raster), dense finalize pair
+        # over the wide lists (raster vote).
+        assert len(stages) == 9 and stages[0].startswith("route_preprocess_")
+        assert stages[1].startswith("moe_sort_init_t") and stages[2].endswith(
+            "_dual_mixed"
+        )
+        assert stages[3] == "gemm1_swapab_situ_n192_2cta_rowgroup"
+        assert stages[4].endswith("_rowgroup_zero_fill") and stages[5].endswith(
+            "_rowgroup_zero_fill_secondary"
+        )
+        assert stages[6] == "gemm2_swapab_finalize_n192_2cta_cm4"
+        assert stages[7].endswith("_c12_rg_rauto") and stages[8].endswith(
+            "_2cta_rg_rauto"
+        )
+        assert p.executed_chain["chain"] == "mixed192"
     else:
         raise AssertionError(f"unexpected executed chain {chain!r}")
     # Every launch is sized by the device's SM count the plan was decided for: the cooperative moe_sort grid
