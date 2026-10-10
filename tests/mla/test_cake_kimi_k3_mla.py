@@ -4,6 +4,8 @@ Covers the three call families against an FP32 reference: low-head paged decode 
 packed variable-Q / MTP (cum_seq_lens_q) and incremental prefill on the paged FP8 cache (prefix
 reuse, ragged KV), plus CUDA-Graph replay with a changed page table, row-strided query / cache
 views on a row-tile route and on the wide route, the route selection and the split planners.
+The ``backend="auto"`` cases check that the public dispatcher selects these programs for the
+qualified 12-head one-token decode and that the result matches the explicit route's tolerance.
 """
 
 import math
@@ -110,7 +112,7 @@ def _reference(case) -> torch.Tensor:
     return (out * case["bmm2_scale"]).to(torch.bfloat16)
 
 
-def _run(case, *, fixed_q_len=None, graph=False):
+def _run(case, *, fixed_q_len=None, graph=False, backend="cake"):
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
     from flashinfer.mla.cake_kimi_k3_mla import workspace_bytes
 
@@ -134,7 +136,7 @@ def _run(case, *, fixed_q_len=None, graph=False):
         max_seq_len=int(case["block_tables"].shape[1]) * PAGE,
         bmm1_scale=case["bmm1_scale"],
         bmm2_scale=case["bmm2_scale"],
-        backend="cake",
+        backend=backend,
     )
     if fixed_q_len is not None:
         batch = len(case["q_lens"])
@@ -168,6 +170,48 @@ def _run(case, *, fixed_q_len=None, graph=False):
 def _check(out, ref, *, atol, rtol):
     assert torch.isfinite(out.float()).all()
     torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
+
+
+def _auto_decline_reason(case):
+    """Why backend="auto" would decline the fixed q_len=1 request ``_run`` builds, or None."""
+    from flashinfer.mla.cake_kimi_k3_mla import (
+        cake_kimi_k3_mla_auto_prepare,
+        cake_kimi_k3_mla_auto_reason,
+        workspace_bytes,
+    )
+    from flashinfer.utils import get_device_sm_count
+
+    device = case["query"].device
+    batch = len(case["q_lens"])
+    num_heads = case["num_heads"]
+    compute_capability = get_compute_capability(device)
+    sm_count = get_device_sm_count(device)
+    query = case["query"].reshape(batch, 1, num_heads, QK_DIM)
+    max_seq_len = int(case["block_tables"].shape[1]) * PAGE
+    reason = cake_kimi_k3_mla_auto_reason(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        query=query,
+        kv_cache=case["kv_cache"],
+        block_tables=case["block_tables"],
+        seq_lens=case["seq_lens"],
+        workspace_buffer=torch.zeros(
+            workspace_bytes(batch * num_heads, 256), dtype=torch.uint8, device=device
+        ),
+        max_seq_len=max_seq_len,
+        kv_lora_rank=LATENT,
+        qk_rope_head_dim=ROPE,
+        bmm1_scale=case["bmm1_scale"],
+        bmm2_scale=case["bmm2_scale"],
+    )
+    if reason is not None:
+        return reason
+    return cake_kimi_k3_mla_auto_prepare(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        query=query,
+        max_seq_len=max_seq_len,
+    )
 
 
 @pytest.mark.parametrize("num_heads", [12, 96])
@@ -239,6 +283,135 @@ def test_decode_sink_key_rows(num_heads, kv_lens):
         case
     ).float().norm(dim=-1).clamp_min(1e-6)
     assert float(rel.max()) <= 0.05
+
+
+@pytest.fixture
+def cake_auto_calls(monkeypatch):
+    """Count the calls ``backend="auto"`` makes into the real Kimi-K3 launcher."""
+    import flashinfer.mla.cake_kimi_k3_mla as cake_kimi
+
+    monkeypatch.delenv(cake_kimi.AUTO_DISABLE_ENV, raising=False)
+    # A build failure remembered by an earlier test must not decide this one.
+    cake_kimi.reset_auto_build_failures()
+    real = cake_kimi.run_cake_kimi_k3_mla_fp8_paged_attention
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cake_kimi, "run_cake_kimi_k3_mla_fp8_paged_attention", counting)
+    return calls
+
+
+@pytest.mark.parametrize("kv_lens", [[1, 200, 64], [4096, 777, 65]])
+def test_decode_q1_auto_selects_cake(cake_auto_calls, kv_lens):
+    """backend="auto" routes the qualified 12-head decode here and matches the explicit tolerance."""
+    _skip_unless_sm100_family()
+    device = torch.device("cuda")
+    case = _make_case(
+        len(kv_lens), [1] * len(kv_lens), kv_lens, 12, seed=645001, device=device
+    )
+    out = _run(case, fixed_q_len=1, backend="auto")
+    assert len(cake_auto_calls) == 1, (
+        f"auto did not select Cake: {_auto_decline_reason(case)}"
+    )
+    _check(out, _reference(case), atol=1e-2, rtol=1e-2)
+
+
+def test_decode_sink_key_rows_auto(cake_auto_calls):
+    """The sink-row case of test_decode_sink_key_rows reached through backend="auto"."""
+    _skip_unless_sm100_family()
+    device = torch.device("cuda")
+    kv_lens = [770, 768, 785, 802, 812, 738, 889, 741]
+    num_heads = 12
+    case = _make_case(
+        len(kv_lens), [1] * len(kv_lens), kv_lens, num_heads, seed=645011, device=device
+    )
+    sink_heads = [h for h in range(num_heads) if h % 4 != 3]
+    for b in range(len(kv_lens)):
+        page = int(case["block_tables"][b, 0].item())
+        case["kv_cache"][page, 0] = _fp8(torch.full((QK_DIM,), 2.0, device=device))
+        case["query"][b, sink_heads] = _fp8(torch.full((QK_DIM,), 1.25, device=device))
+    out = _run(case, fixed_q_len=1, backend="auto")
+    assert len(cake_auto_calls) == 1, (
+        f"auto did not select Cake: {_auto_decline_reason(case)}"
+    )
+    ref = _reference(case)
+    _check(out, ref, atol=0.1, rtol=0.1)
+    rel = (out.float() - ref.float()).norm(dim=-1) / ref.float().norm(dim=-1).clamp_min(
+        1e-6
+    )
+    assert float(rel.max()) <= 0.05
+
+
+def test_auto_admission_matches_the_launcher_contract(cake_auto_calls):
+    """The predicate mirrors the launcher: strided query rows pass; non-dense output rows, a short workspace and an
+    odd page-table width (which the incumbent dispatch rejected before this route existed) do not."""
+    _skip_unless_sm100_family()
+    from flashinfer.mla.cake_kimi_k3_mla import (
+        cake_kimi_k3_mla_auto_reason,
+        cake_kimi_k3_mla_is_available,
+        workspace_bytes,
+    )
+
+    assert cake_kimi_k3_mla_is_available()
+    device = torch.device("cuda")
+    # 32-page table (even width): admitted. The 33-page variant below is declined.
+    case = _make_case(3, [1, 1, 1], [500, 2048, 64], 12, seed=645008, device=device)
+    major, minor = get_compute_capability(device)
+    request = dict(
+        compute_capability=(major, minor),
+        sm_count=torch.cuda.get_device_properties(device).multi_processor_count,
+        query=case["query"].reshape(3, 1, 12, QK_DIM),
+        kv_cache=case["kv_cache"],
+        block_tables=case["block_tables"],
+        seq_lens=case["seq_lens"],
+        workspace_buffer=torch.zeros(
+            workspace_bytes(3 * 12, 256), dtype=torch.uint8, device=device
+        ),
+        max_seq_len=int(case["block_tables"].shape[1]) * PAGE,
+        kv_lora_rank=LATENT,
+        qk_rope_head_dim=ROPE,
+        bmm1_scale=case["bmm1_scale"],
+        bmm2_scale=case["bmm2_scale"],
+    )
+    assert cake_kimi_k3_mla_auto_reason(**request) is None
+    # Row-strided query rows (640-element rows) are addressed through the TMA row stride by
+    # the launcher, so the predicate admits them too.
+    wide_q = torch.zeros(
+        (3, 1, 12, QK_DIM + 64), dtype=torch.float8_e4m3fn, device=device
+    )
+    wide_q[..., :QK_DIM] = request["query"]
+    assert (
+        cake_kimi_k3_mla_auto_reason(**{**request, "query": wide_q[..., :QK_DIM]})
+        is None
+    )
+    # Output rows must be dense, exactly as the launcher requires.
+    wide_out = torch.empty((3, 1, 12, LATENT + 64), dtype=torch.bfloat16, device=device)
+    assert "out rows must be dense" in cake_kimi_k3_mla_auto_reason(
+        **{**request, "out": wide_out[..., :LATENT]}
+    )
+    assert "workspace_buffer" in cake_kimi_k3_mla_auto_reason(
+        **{
+            **request,
+            "workspace_buffer": torch.zeros(16, dtype=torch.uint8, device=device),
+        }
+    )
+    # An odd page-table width (33 pages) is declined so that the call keeps raising in the
+    # incumbent dispatch exactly as it did before the Cake route was admitted under auto.
+    odd = _make_case(3, [1, 1, 1], [500, 2100, 64], 12, seed=645009, device=device)
+    assert int(odd["block_tables"].shape[1]) == 33
+    assert "multiple of 2" in cake_kimi_k3_mla_auto_reason(
+        **{
+            **request,
+            "kv_cache": odd["kv_cache"],
+            "block_tables": odd["block_tables"],
+            "seq_lens": odd["seq_lens"],
+            "max_seq_len": int(odd["block_tables"].shape[1]) * PAGE,
+        }
+    )
+    assert not cake_auto_calls
 
 
 def test_incremental_prefill_prefix_reuse():

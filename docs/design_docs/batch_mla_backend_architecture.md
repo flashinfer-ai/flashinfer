@@ -831,7 +831,7 @@ Backend capability checks remain separate. The backend-local
 primitives with the wrapper's narrower dimensions and positive-width contract.
 The dispatcher performs shared validation, resolves architecture policy and
 backend eligibility, then executes one resolved route in this order: `autotune`,
-TRTLLM-GEN, CuTe DSL, XQA, and packed sparse. The internal `autotune` route also
+TRTLLM-GEN, CuTe DSL, XQA, Cake, and packed sparse. The internal `autotune` route also
 handles explicit uniform TRT/CuTe requests with one candidate; it is not a new
 functional backend argument. Explicit TRT inference skips selection because it
 has only tactic `-1`, while tuning-enabled calls still profile it. `auto` and
@@ -840,6 +840,44 @@ probe CuTe eligibility.
 Ragged TRT/CuTe requests execute directly, and CuTe eligibility remains lazy for
 ragged TRT requests. Native TRT sparse requests use the TRT runner routes;
 the final sparse branch is exclusively for packed SM120/SM121 execution.
+
+The Cake route serves two source-level MLA families. Explicit `backend="cake"`
+reaches both: the generated TRT-LLM-style Blackwell programs for their dimension
+tuples, then the Kimi-K3 FP8 paged-cache route for everything else in its
+contract, raising `ValueError` on a contract miss. `backend="auto"` additionally
+admits the Kimi-K3 FP8 paged decode programs on SM100/SM103 for their qualified
+contract only: `float8_e4m3fn` query and cache, `kv_lora_rank=512` with
+`qk_rope_head_dim=64`, page size 64, 12 heads, one query token per request
+(a dense `[batch, 1, 12, 576]` query; neither `cum_seq_lens_q` nor `max_q_len`
+passed), shared paged-KV indices with the aligned table width the previous `auto`
+dispatch requires (so the inputs it rejected still raise the same error),
+host-float scales, and none of sparse top-k, sinks, LSE, DCP, skip-softmax, FP16
+softmax or `enable_pdl=True`; the trtllm-gen `multi_ctas_kv_counter_buffer`
+hint, best-effort under `auto` already (unused whenever the tuner picks CuTe
+DSL), does not disqualify a call and stays unused. `enable_pdl=None` (the
+auto-detect default) is admitted and the Cake programs then run without PDL: an
+intentional difference, since the generated programs have no PDL variant while
+the previous dispatch auto-enabled PDL on trtllm-gen; pass `enable_pdl=True` or
+set the kill switch to keep PDL. Admission is a pure host predicate
+(`flashinfer.mla.cake_kimi_k3_mla.cake_kimi_k3_mla_auto_reason`) evaluated after
+the architecture policy and before the TRT/CuTe candidates are built; the strict
+route and the admission share one contract checker
+(`cake_kimi_k3_mla_contract_reason`) so they cannot drift. An admitted call then
+builds the programs its plan launches (`cake_kimi_k3_mla_auto_prepare`) inside
+the same guard, so the launch that follows cannot fail on a toolchain that
+cannot target the device or on a broken build; such a failure is remembered for
+the process and architecture (also for a transient cause). Because programs are
+built lazily per plan kind, a later shape whose program fails to build also moves
+shapes Cake had already served on that architecture back to the previous
+dispatch; `auto` never retries and never raises (`reset_auto_build_failures()`
+clears the memo). The admission never raises under `auto`: an ordinary contract or
+availability miss is reported at DEBUG on each call and the previous dispatch
+proceeds; a build failure, or an exception escaping the probe, admission check
+or build, is logged once (WARNING) with the same fallback; the selection itself
+is logged once per process (INFO). `FLASHINFER_DISABLE_CAKE_AUTO=1` disables the
+automatic admission without affecting the explicit route. Other head counts,
+packed variable-Q and prefill stay explicit until they are measured against the
+incumbent.
 
 Functional dispatch and wrapper planning both use
 `_BatchMLAPagedAttentionTrtllmGenBackend`. The `from_functional(...)` factory
