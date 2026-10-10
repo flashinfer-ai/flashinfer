@@ -3245,6 +3245,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     batch_offsets_q=self._qo_indptr_buf,
                     batch_offsets_o=self._qo_indptr_buf,
                     batch_offsets_stats=self._qo_indptr_buf,
+                    max_total_num_rows=self._max_total_num_rows,
                 ).resolve_from_plan(
                     q_data_type, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo
                 )
@@ -5092,6 +5093,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     batch_offsets_k=self._kv_indptr_buf,
                     batch_offsets_v=self._v_indptr_buf,
                     batch_offsets_stats=self._cudnn_stats_offsets,
+                    max_total_num_rows=self._max_total_num_rows,
                 ).resolve_from_plan(
                     q_data_type, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo
                 )

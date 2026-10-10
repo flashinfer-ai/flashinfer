@@ -37,6 +37,68 @@ def test_ordered_execution_feature_detection():
     assert supports_ordered_cudnn_execution(Ordered)
 
 
+@pytest.mark.parametrize(
+    "version,features,mla,d128",
+    [
+        (
+            "1.30.0",
+            {
+                "supports_nonpaged_packed_split": True,
+                "supports_nonpaged_d128_packed_split": True,
+            },
+            False,
+            False,
+        ),
+        ("1.31.0", {}, False, False),
+        ("1.31.0", {"supports_nonpaged_packed_split": True}, True, False),
+        ("1.31.0", {"supports_nonpaged_d128_packed_split": True}, False, True),
+        (
+            "1.31.0",
+            {
+                "supports_nonpaged_packed_split": True,
+                "supports_nonpaged_d128_packed_split": True,
+            },
+            True,
+            True,
+        ),
+    ],
+)
+def test_bounded_ragged_requires_matching_native_feature(
+    monkeypatch, version, features, mla, d128
+):
+    """A native MLA executor does not establish D128 packed-split support."""
+    monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
+    monkeypatch.setattr(
+        prefill,
+        "cudnn",
+        SimpleNamespace(
+            __version__=version,
+            _pybind_module=SimpleNamespace(_SdpaThdBinder=SimpleNamespace(**features)),
+        ),
+    )
+    prefill._cudnn_supports_bounded_ragged.cache_clear()
+    try:
+        assert prefill._cudnn_supports_bounded_ragged() is mla
+        assert prefill._cudnn_supports_bounded_ragged(d128=True) is d128
+        monkeypatch.setattr(
+            prefill, "_cudnn_supports_direct_seqlens", lambda *a, **kw: True
+        )
+        indptr = torch.tensor([0, 16], dtype=torch.int32)
+        for head_dim, supported in ((192, mla), (128, d128)):
+            metadata = prefill._PrefillMetadata(
+                16,
+                2048,
+                True,
+                False,
+                batch_offsets_q=indptr,
+                batch_offsets_k=indptr,
+                max_total_num_rows=64,
+            ).resolve_from_plan(torch.bfloat16, 8, 8, head_dim, 128)
+            assert metadata.max_total_num_rows == (64 if supported else None)
+    finally:
+        prefill._cudnn_supports_bounded_ragged.cache_clear()
+
+
 def test_ordered_execution_errors_are_not_retried(monkeypatch):
     calls = []
 
@@ -341,7 +403,10 @@ def test_prefill_match_uses_complete_build_metadata(monkeypatch):
     )
 
     monkeypatch.setattr(
-        prefill, "_build_prefill_graph", lambda **kw: (object(), []), raising=False
+        prefill,
+        "_build_prefill_graph",
+        lambda **kw: (SimpleNamespace(get_workspace_size=lambda: 0), []),
+        raising=False,
     )
     prepared = prefill.prepare_cudnn_batch_prefill(
         q, kv, kv, 0.5, torch.empty(0), metadata=metadata
@@ -543,3 +608,55 @@ def test_prefill_hn_same_plan_rebinds_current_output_stride(monkeypatch):
         at = call["override_uids"].index(prefill.UIDs.STATS_UID.value)
         assert call["override_strides"][at] == [4 * tokens, tokens, 1, 1]
     assert calls[0]["override_strides"] is not calls[1]["override_strides"]
+
+
+@pytest.mark.parametrize("supported", [False, True])
+@pytest.mark.parametrize("shape_override", [False, True])
+def test_prefill_capacity_is_a_plan_descriptor(monkeypatch, supported, shape_override):
+    """A larger lifetime capacity must not reuse a smaller compiled graph."""
+    monkeypatch.setattr(
+        prefill, "_cudnn_supports_bounded_ragged", lambda **kw: supported
+    )
+    monkeypatch.setattr(prefill, "_cudnn_supports_direct_seqlens", lambda *a, **k: True)
+    monkeypatch.setattr(
+        prefill, "_cudnn_supports_shape_override", lambda: shape_override
+    )
+    monkeypatch.setattr(
+        prefill,
+        "_build_prefill_graph",
+        lambda **kw: (SimpleNamespace(get_workspace_size=lambda: 0), []),
+        raising=False,
+    )
+    indptr = torch.tensor([0, 128, 129, 130], dtype=torch.int32)
+    q = torch.empty(130, 16, 128, dtype=torch.bfloat16)
+    kv = torch.empty(3 * 2048, 4, 128, dtype=q.dtype)
+
+    def metadata(capacity):
+        resolved = prefill._PrefillMetadata(
+            128,
+            2048,
+            False,
+            False,
+            batch_offsets_q=indptr,
+            batch_offsets_k=indptr,
+            max_total_num_rows=capacity,
+        ).resolve_from_plan(q.dtype, 16, 4, 128, 128)
+        resolved._bounded_ragged = supported
+        return resolved
+
+    first = metadata(130)
+    plan = prefill._CudnnPrefillPlan.prepare(first, q.dtype, q.device)
+    prepared = prefill.prepare_cudnn_batch_prefill(
+        q, kv, kv, 0.5, torch.empty(0), metadata=first
+    )
+    same = prefill._CudnnPrefillPlan.prepare(metadata(130), q.dtype, q.device, plan)
+    larger = prefill._CudnnPrefillPlan.prepare(metadata(384), q.dtype, q.device, plan)
+    assert same is plan
+    assert prepared.matches_plan(q, kv, kv, 0.5, same, False)
+    assert prepared.matches_plan(q, kv, kv, 0.5, larger, False) is not supported
+    assert plan.execution_shape == (3, 128, 2048)
+    if supported:
+        assert first.max_total_num_rows == 130
+        assert larger.metadata.max_total_num_rows >= 384
+    else:
+        assert first.max_total_num_rows is None
