@@ -31,6 +31,13 @@ CASES = [
     (64, 64, 2, 16, 4096),
     (64, 64, 4, 3, 2048),
     (64, 64, 1, 256, 1024),
+    (
+        64,
+        64,
+        1,
+        512,
+        1024,
+    ),  # batch > dynamic_scheduler.max_batch: the static program of a single-atom geometry
     (32, 64, 1, 16, 4096),
     (64, 32, 1, 16, 4096),
 ]
@@ -62,7 +69,7 @@ def _admitted(q, ctx_2d, max_len, heads, page, next_n):
     arch = _runtime._resolve_device(q, None)[0]
     return _runtime.paged_route_admitted(
         arch,
-        _runtime.paged_route_name(heads, page, next_n),
+        _runtime.paged_route_name(heads, page, next_n, batch=int(ctx_2d.shape[0])),
         int(ctx_2d.shape[0]),
         int(max_len),
     )
@@ -299,7 +306,9 @@ def test_paged_mqa_logits(heads, page, next_n, batch, avg_ctx):
         with pytest.raises(ValueError, match="is not admitted on"):
             prepare_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, max_len)
         plan = _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len)
-    assert plan.route_name == _runtime.paged_route_name(heads, page, next_n)
+    assert plan.route_name == _runtime.paged_route_name(
+        heads, page, next_n, batch=batch
+    )
     num_sms = plan.num_sms
     plan.output.fill_(float("nan"))
     stream = torch.cuda.Stream()
@@ -540,6 +549,7 @@ def test_paged_bindings_cover_every_program_argument():
     device = torch.device("cuda")
     num_sms, batch, pages, max_len = 4, 2, 4, 100
     checked = 0
+    counters = torch.zeros(2, dtype=torch.uint32, device=device)
     for route_name, route in catalog["paged_routes"].items():
         fields = {field[0]: int(field[1:]) for field in route_name.split(":")[2:5]}
         heads, page, next_n = fields["h"], fields["p"], fields["n"]
@@ -561,7 +571,14 @@ def test_paged_bindings_cover_every_program_argument():
         )
         bindings = {
             "logits": _runtime.logits_bindings(
-                q, kv_cache, weights, ctx_2d, block_table, output, num_sms=num_sms
+                q,
+                kv_cache,
+                weights,
+                ctx_2d,
+                block_table,
+                output,
+                num_sms=num_sms,
+                sched_counters=counters,
             ),
         }
         assert [stage for stage, _program in route["stages"]] == ["logits"], route_name
@@ -576,6 +593,57 @@ def test_paged_bindings_cover_every_program_argument():
             )
             checked += 1
     assert checked > 0
+
+
+def test_paged_dynamic_scheduler_routes():
+    """``policy.paged.dynamic_scheduler`` maps single-atom static routes to their ``:dyn`` routes, both in the
+    catalog with one logits stage whose programs differ; ``paged_route_name(..., batch=)`` selects the dynamic
+    route up to ``max_batch`` and the static route above it (and without a batch); every program of a dynamic
+    route binds the scheduler state ``sched_counters``."""
+    from flashinfer.experimental.deepgemm_dense_mqa.dense_mqa import _catalog
+
+    catalog = _catalog()
+    dynamic = _runtime.paged_dynamic_scheduler()
+    if not dynamic["routes"]:
+        pytest.skip("catalog ships no dynamic-scheduler program")
+    assert dynamic["max_batch"] >= 1
+    for static, dyn in dynamic["routes"].items():
+        assert static in catalog["paged_routes"] and dyn in catalog["paged_routes"]
+        assert dyn == f"{static}:dyn"
+        static_program = catalog["paged_routes"][static]["stages"][0][1]
+        dyn_program = catalog["paged_routes"][dyn]["stages"][0][1]
+        # Program ids are content hashes of the generated text: the two routes serve distinct programs, and only
+        # the dynamic one binds the scheduler state.
+        assert dyn_program != static_program
+        assert (
+            catalog["programs"][dyn_program]["role"]
+            == catalog["programs"][static_program]["role"]
+        )
+        assert "sched_counters" in {
+            name for _kind, name in catalog["programs"][dyn_program]["arg_plan"]
+        }
+        fields = {field[0]: int(field[1:]) for field in static.split(":")[2:5]}
+        heads, page, next_n = fields["h"], fields["p"], fields["n"]
+        assert _runtime.paged_route_name(heads, page, next_n) == static
+        assert _runtime.paged_route_name(heads, page, next_n, batch=1) == dyn
+        assert (
+            _runtime.paged_route_name(heads, page, next_n, batch=dynamic["max_batch"])
+            == dyn
+        )
+        assert (
+            _runtime.paged_route_name(
+                heads, page, next_n, batch=dynamic["max_batch"] + 1
+            )
+            == static
+        )
+    for route_name in catalog["paged_routes"]:
+        if route_name.endswith(":dyn") or route_name in dynamic["routes"]:
+            continue
+        fields = {field[0]: int(field[1:]) for field in route_name.split(":")[2:5]}
+        assert (
+            _runtime.paged_route_name(fields["h"], fields["p"], fields["n"], batch=1)
+            == route_name
+        )
 
 
 def test_paged_admission_rules_are_applied_per_arch(monkeypatch):
@@ -614,8 +682,11 @@ def test_paged_admission_rules_are_applied_per_arch(monkeypatch):
     # Rule semantics on a patched policy.
     patched = dict(real)
     patched["policy"] = dict(real["policy"])
+    # The rules are exercised on the static route: the patched policy ships no dynamic-scheduler map, so the
+    # batch-aware route resolution of ``paged_route_available`` selects ``route_n2`` at every batch.
     patched["policy"]["paged"] = dict(
         paged,
+        dynamic_scheduler={},
         admission={"sm_100a": {route_n2: [[16, None], [64, 32768], [None, 8192]]}},
     )
     monkeypatch.setattr(dense_mqa, "_catalog", lambda: patched)
@@ -648,22 +719,23 @@ def test_paged_admission_rules_are_applied_per_arch(monkeypatch):
     monkeypatch.undo()
     if not torch.cuda.is_available():
         return
-    # Live refusal under the shipped rules of this device's architecture (and the export bypass).
+    # Live refusal under the shipped rules of this device's architecture (and the export bypass). The plan
+    # resolves the route from the call's batch (the dynamic-scheduler route up to its max_batch, the static
+    # route above it), so every probe is judged on the route the plan would select.
     arch = dense_mqa.device_arch(torch.device("cuda"))
-    rules = _runtime.paged_admission_rules(arch, route_n2)
-    if rules is None:
+    probes = ((17, 1024), (17, 32769), (65, 8448), (129, 8448), (4096, 131072))
+    route_for = lambda b: _runtime.paged_route_name(heads, page, 2, batch=b)
+    rules = {
+        route_for(b): _runtime.paged_admission_rules(arch, route_for(b))
+        for b, _c in probes
+    }
+    if all(r is None for r in rules.values()):
         return
     withheld = next(
         (
             (b, c)
-            for b, c in (
-                (17, 1024),
-                (17, 32769),
-                (65, 8448),
-                (129, 8448),
-                (4096, 131072),
-            )
-            if not _runtime.paged_route_admitted(arch, route_n2, b, c)
+            for b, c in probes
+            if not _runtime.paged_route_admitted(arch, route_for(b), b, c)
         ),
         None,
     )
