@@ -708,6 +708,13 @@ def _get_rmsnorm_silu_sm_count(device_id: int):
 
 
 @functools.cache
+def _get_rmsnorm_silu_max_threads_per_sm(device_id: int):
+    """Cache the resident-thread limit per SM (2048 on SM100/SM103, 1024 on SM107)."""
+    props = torch.cuda.get_device_properties(device_id)
+    return props.max_threads_per_multi_processor
+
+
+@functools.cache
 def _get_rmsnorm_silu_module(
     C, output_dtype, warps_m, ctas_per_row, bytes_per_ldg, kernel_cfg, occupancy
 ):
@@ -878,6 +885,10 @@ def fused_rmsnorm_silu(
         )
 
     warps_m, split_cols, kernel_cfg, occupancy, bytes_per_ldg = knobs
+    # The LUT is tuned for 2048 threads/SM; cap occupancy on SM107 (1024).
+    max_threads_per_sm = _get_rmsnorm_silu_max_threads_per_sm(input.device.index)
+    if max_threads_per_sm <= 1024:
+        occupancy = max(1, min(occupancy, max_threads_per_sm // (warps_m * 32)))
     ctas_per_row = _estimate_ctas_per_row(C, split_cols, kernel_cfg, bytes_per_ldg)
     sm_count = _get_rmsnorm_silu_sm_count(input.device.index)
 
