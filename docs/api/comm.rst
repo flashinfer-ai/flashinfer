@@ -623,12 +623,13 @@ DCP All-to-All (Context-Parallel Attention Reduction)
     decode_cp_a2a_init_workspace
     decode_cp_a2a_alltoall
 
-NCCL LSA DCP All-to-All + LSE Reduce
--------------------------------------
+Fused DCP All-to-All + LSE Reduce
+---------------------------------
 
-The fused path uses PyTorch NCCL symmetric memory and requires every context-
-parallel rank to be in one load/store-accessible NVLink domain. It does not use
-the MNNVL workspace accepted by ``decode_cp_a2a_alltoall``.
+The fused path writes into every rank's workspace through PyTorch symmetric
+memory, on whichever backend the process uses, and requires every
+context-parallel rank to share one NVLink domain. It does not use the MNNVL
+workspace accepted by ``decode_cp_a2a_alltoall``.
 
 .. autosummary::
     :toctree: ../generated
