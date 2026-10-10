@@ -152,7 +152,7 @@ def _ref_fp32(q, k, v, a, b, A_log, dt_bias, S0, kc, uc, gc, P):
     return y, S_after_history, us, khat, gam
 
 
-def _make_case(B, T, hist_lens, seed, bases=None, poison=True):
+def _make_case(B, T, hist_lens, seed, bases=None, poison=True, u_dtype=None):
     io = torch.bfloat16
     g = torch.Generator(device=DEV).manual_seed(seed)
 
@@ -169,7 +169,7 @@ def _make_case(B, T, hist_lens, seed, bases=None, poison=True):
     pool = (torch.randn(B, HV, V, K, generator=g, device=DEV) * 0.5).to(torch.float16)
     fill = float("nan") if poison else 0.0
     kc = torch.full((B, H, RING, K), fill, dtype=io, device=DEV)
-    uc = torch.full((B, HV, RING, V), fill, dtype=io, device=DEV)
+    uc = torch.full((B, HV, RING, V), fill, dtype=u_dtype or io, device=DEV)
     gc = torch.full((B, HV, RING), fill, dtype=torch.float32, device=DEV)
     hl = torch.tensor(hist_lens, dtype=torch.int32, device=DEV)
     bases = bases or [0] * B
@@ -183,7 +183,9 @@ def _make_case(B, T, hist_lens, seed, bases=None, poison=True):
         )
         kh = torch.randn(H, P, K, generator=g, device=DEV)
         kc[r, :, rows] = F.normalize(kh, dim=-1).to(io)
-        uc[r, :, rows] = (torch.randn(HV, P, V, generator=g, device=DEV) * 0.3).to(io)
+        uc[r, :, rows] = (torch.randn(HV, P, V, generator=g, device=DEV) * 0.3).to(
+            u_dtype or io
+        )
         la = -(torch.rand(HV, P, generator=g, device=DEV) * 0.3 + 0.003)
         gc[r, :, rows] = torch.cumsum(la, dim=-1)
     idx = torch.arange(B, dtype=torch.int32, device=DEV)
@@ -225,13 +227,21 @@ def _run(fn, case, flush_min, row_order=None, restart=False):
 
 
 def _check_case(
-    T, hist, bases, flush_min, seed, row_order=None, check_rings=True, hpc=None
+    T,
+    hist,
+    bases,
+    flush_min,
+    seed,
+    row_order=None,
+    check_rings=True,
+    hpc=None,
+    u_dtype=None,
 ):
     fn = _umma()
     if hpc is not None:
         fn = functools.partial(fn, heads_per_cta=hpc)
     B = len(hist)
-    case = _make_case(B, T, hist, seed, bases)
+    case = _make_case(B, T, hist, seed, bases, u_dtype=u_dtype)
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
     pool0, kc0, uc0, gc0 = pool.clone(), kc.clone(), uc.clone(), gc.clone()
     ro = None
@@ -305,6 +315,27 @@ def test_matches_fp32_reference_any_T(T, bases):
     hist = [min(x, W) for x in hist]
     b = [0] * 8 if bases == "base0" else [28, 5, 30, 17, 31, 20, 25, 9]
     _check_case(T, hist, b, fm, seed=100 + T)
+
+
+@pytest.mark.parametrize("T", [1, 4, 8])
+@pytest.mark.parametrize("bases", ["base0", "wrap"])
+def test_u_ring_fp16_matches_fp32_reference(T, bases):
+    """fp16 u ring (vLLM's u-cache dtype) next to the bf16 k ring: a separate kernel build
+    whose u reads and appends convert from / to fp16; outputs, appends and folded state
+    against the oracle."""
+    _skip_if_not_sm100()
+    fm = W - T + 1
+    hist = [min(x, W) for x in (0, fm - 1, fm, fm, 1, fm - 1, fm, 3)]
+    b = [0] * 8 if bases == "base0" else [28, 5, 30, 17, 31, 20, 25, 9]
+    _check_case(T, hist, b, fm, seed=400 + T, u_dtype=torch.float16)
+
+
+def test_k_ring_must_be_bf16():
+    _skip_if_not_sm100()
+    case = list(_make_case(2, 4, [3, 13], seed=9))
+    case[8] = case[8].to(torch.float16)  # k ring
+    with pytest.raises(AssertionError):
+        _run(_umma(), tuple(case), 13)
 
 
 @pytest.mark.parametrize("T", [4, 8])

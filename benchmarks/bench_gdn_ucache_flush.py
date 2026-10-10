@@ -90,6 +90,8 @@ ARMS = {
     # UMMA (tcgen05 / TMEM) drop-in for the fp16_state arm: same tensors and contract
     # (flashinfer/gdn_kernels/gdn_replay_mtp_umma.py)
     "umma": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
+    # ... with an fp16 u ring (vLLM's u-cache dtype; the k ring stays bf16)
+    "umma_u16": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
     # ... with stochastic rounding of the flushed state (fixed seed; the bits do not
     # change the work): Philox 5 / 10 rounds, LCG
     "umma_ph5": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
@@ -98,6 +100,7 @@ ARMS = {
 }
 _UMMA_SR = {
     "umma": {},
+    "umma_u16": {},
     "umma_ph5": dict(stochastic_rounding="philox", philox_rounds=5),
     "umma_ph10": dict(stochastic_rounding="philox", philox_rounds=10),
     "umma_lcg": dict(stochastic_rounding="lcg"),
@@ -200,6 +203,7 @@ def make_case(
     io_dtype=torch.bfloat16,
     state_dtype=torch.bfloat16,
     ring_dtype=torch.bfloat16,
+    u_dtype=None,
 ):
     g = torch.Generator(device=DEV).manual_seed(seed)
 
@@ -218,7 +222,9 @@ def make_case(
     # are masked by the kernel; values just need to be finite).
     kh = torch.randn(B, H, RING, K, generator=g, device=DEV)
     kc = (kh / kh.norm(dim=-1, keepdim=True).clamp_min(1e-6)).to(ring_dtype)
-    uc = (torch.randn(B, HV, RING, V, generator=g, device=DEV) * 0.3).to(ring_dtype)
+    uc = (torch.randn(B, HV, RING, V, generator=g, device=DEV) * 0.3).to(
+        u_dtype or ring_dtype
+    )
     la = -(torch.rand(B, HV, RING, generator=g, device=DEV) * 0.3 + 0.003)
     gc = torch.cumsum(la, dim=-1).float().contiguous()
     idx = torch.arange(B, dtype=torch.int32, device=DEV)
@@ -237,9 +243,10 @@ def bench_point(
     base=0,
     no_commit=False,
     l2="zero",
+    u_dtype=None,
 ):
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, idx = make_case(
-        B, seed, io_dtype, state_dtype, ring_dtype
+        B, seed, io_dtype, state_dtype, ring_dtype, u_dtype
     )
     nf = 0 if rate_pct == 0 else max(1, round(B * rate_pct / 100))
     mask = torch.zeros(B, dtype=torch.bool, device=DEV)
@@ -380,7 +387,8 @@ def main():
         choices=list(ARMS),
         default="bf16",
         help="dtype config: bf16 | fp16_state | fp16_io | ring_fp16 | fp16_state_cache | umma (UMMA kernel, "
-        "fp16 state) | umma_ph5 / umma_ph10 / umma_lcg (UMMA with stochastic rounding)",
+        "fp16 state) | umma_u16 (UMMA, fp16 u ring) | umma_ph5 / umma_ph10 / umma_lcg (UMMA with "
+        "stochastic rounding)",
     )
     ap.add_argument(
         "--no-commit",
@@ -444,6 +452,7 @@ def main():
                 base=args.base,
                 no_commit=args.no_commit,
                 l2=args.l2,
+                u_dtype=torch.float16 if args.arm == "umma_u16" else None,
             )
             for r in args.rates
         ]

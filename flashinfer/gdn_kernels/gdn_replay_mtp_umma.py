@@ -2,7 +2,8 @@
 """GDN ReplaySSM MTP decode step (1 <= T <= 8) on the UMMA / TMEM design (Blackwell).
 
 The SM100 backend of ``gated_delta_rule_mtp_ucache_flush`` (fp16-state arm: bf16 q/k/v/a/b and
-outputs, fp16 state pool, bf16 k/u rings, fp32 g ring), same 32-slot ring contract:
+outputs, fp16 state pool, bf16 k ring, bf16 or fp16 u ring, fp32 g ring), same 32-slot
+ring contract:
 
 * live window ``[cache_base, cache_base + hist_len) mod 32``, P = hist_len <= 16,
   g ring = window-relative cumulative log-decay, ``w_j = e^{G_P - g_j}``;
@@ -131,7 +132,7 @@ class GdnReplayMtpUmma:
         T: int,
         h: int,
         hv: int,
-        ring_bf16: bool = True,
+        u_bf16: bool = True,
         use_row_order: bool = False,
         hpc: int = HPK,
         sr: str = "",
@@ -147,7 +148,9 @@ class GdnReplayMtpUmma:
         self.T = T
         self.h = h
         self.hv = hv
-        self.ring_bf16 = ring_bf16
+        # u ring dtype (bf16 / fp16): read and appended through dtype-aware conversions.
+        # The k ring is bf16 by construction (the Gram runs bf16 mma.sync on it).
+        self.u_bf16 = u_bf16
         self.use_row_order = use_row_order
         # stochastic rounding of the flush store: "" (round-to-nearest), "philox" (sr_rounds
         # rounds), "lcg" (seeded by rand_seed) or "lcg_clock" (seeded by %clock)
@@ -994,13 +997,13 @@ class GdnReplayMtpUmma:
         for c in range(8):
             lo = _sel(
                 2 * c < P,
-                U.u16_as_f32(uv[2 * c], self.ring_bf16) * s_coef[cb + _CO_W + 2 * c],
+                U.u16_as_f32(uv[2 * c], self.u_bf16) * s_coef[cb + _CO_W + 2 * c],
                 0.0,
                 Float32,
             )
             hi = _sel(
                 2 * c + 1 < P,
-                U.u16_as_f32(uv[2 * c + 1], self.ring_bf16)
+                U.u16_as_f32(uv[2 * c + 1], self.u_bf16)
                 * s_coef[cb + _CO_W + 2 * c + 1],
                 0.0,
                 Float32,
@@ -1016,7 +1019,7 @@ class GdnReplayMtpUmma:
         """Outputs and u appends of head hh from the readout R (cols rcol..) and history Y
         (cols rcol + 16..) TMEM columns; arrives epi_done[hh] once its TMEM reads are done."""
         T = self.T
-        ring_t = BFloat16 if self.ring_bf16 else Float16
+        ring_t = BFloat16 if self.u_bf16 else Float16  # u ring element type
         sidx, base, P, brow, hv0 = (
             ctx["sidx"],
             ctx["base"],
@@ -1082,9 +1085,7 @@ class GdnReplayMtpUmma:
                 u_cache[sidx, hv, (base + P + t) & RING_MASK, row] = ring_t(uu[t])
             else:
                 ua = _sel(s0 + t < RING_SLOTS, u_a, u_b, Int64)
-                U.stg_u16(
-                    ua + Int64(t * V_DIM * 2), U.f32_to_u16(uu[t], self.ring_bf16)
-                )
+                U.stg_u16(ua + Int64(t * V_DIM * 2), U.f32_to_u16(uu[t], self.u_bf16))
 
     def _load_seed(self, ctx, rand_seed):
         """SR variants, flush rows only: the Philox key / LCG mixing key (verify rows never
@@ -1213,7 +1214,7 @@ class GdnReplayMtpUmma:
         T: int,
         h: int,
         hv: int,
-        ring_bf16: bool,
+        u_bf16: bool,
         use_row_order: bool,
         hpc: int = HPK,
         sr: str = "",
@@ -1223,7 +1224,7 @@ class GdnReplayMtpUmma:
         batch = cute.sym_int()
         pool = cute.sym_int()
         ft = U.make_fake_tensor_lead_dyn
-        ring = BFloat16 if ring_bf16 else Float16
+        uring = BFloat16 if u_bf16 else Float16
         args = [
             ft(BFloat16, (batch, T, h, K_DIM), 8),  # q
             ft(BFloat16, (batch, T, h, K_DIM), 8),  # k
@@ -1234,8 +1235,8 @@ class GdnReplayMtpUmma:
             ft(Float32, (hv,), 1),  # dt_bias (fp32)
             ft(Float16, (pool, hv, V_DIM, K_DIM), 8),  # state
             ft(Int32, (batch,), 1),  # state indices
-            ft(ring, (pool, h, RING_SLOTS, K_DIM), 8),  # k ring
-            ft(ring, (pool, hv, RING_SLOTS, V_DIM), 8),  # u ring
+            ft(BFloat16, (pool, h, RING_SLOTS, K_DIM), 8),  # k ring (bf16)
+            ft(uring, (pool, hv, RING_SLOTS, V_DIM), 8),  # u ring (bf16 / fp16)
             ft(Float32, (pool, hv, RING_SLOTS), 1),  # g ring
             ft(Int32, (batch,), 1),  # hist_len
             ft(Int32, (batch,), 1),  # cache_base
@@ -1245,7 +1246,7 @@ class GdnReplayMtpUmma:
         ]
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile[gdn_compile_options(device, cute.EnableTVMFFI(True))](
-            GdnReplayMtpUmma(T, h, hv, ring_bf16, use_row_order, hpc, sr, sr_rounds),
+            GdnReplayMtpUmma(T, h, hv, u_bf16, use_row_order, hpc, sr, sr_rounds),
             *args,
             Float32(1.0),
             Int32(1),
@@ -1261,7 +1262,7 @@ def _get_kernel(
     T: int,
     h: int,
     hv: int,
-    ring_bf16: bool,
+    u_bf16: bool,
     use_row_order: bool,
     hpc: int,
     sr: str,
@@ -1274,7 +1275,7 @@ def _get_kernel(
         T,
         h,
         hv,
-        ring_bf16,
+        u_bf16,
         use_row_order,
         hpc,
         sr,
@@ -1283,7 +1284,7 @@ def _get_kernel(
     fn = _KERNELS.get(key)
     if fn is None:
         fn = GdnReplayMtpUmma.compile(
-            device, T, h, hv, ring_bf16, use_row_order, hpc, sr, sr_rounds
+            device, T, h, hv, u_bf16, use_row_order, hpc, sr, sr_rounds
         )
         _KERNELS[key] = fn
     return fn
@@ -1414,8 +1415,12 @@ def gated_delta_rule_mtp_ucache_flush_umma(
         and g_cache is not None
         and hist_len is not None
     )
-    # the per-CTA Gram runs bf16 mma.sync on raw ring keys and q/k: bf16 rings only
-    assert k_cache.dtype == u_cache.dtype == torch.bfloat16, "bf16 k/u rings required"
+    # the per-CTA Gram runs bf16 mma.sync on the ring keys and q/k: bf16 k ring. The u
+    # ring is only read and appended through dtype-aware conversions: bf16 or fp16.
+    assert k_cache.dtype == torch.bfloat16, "bf16 k ring required"
+    assert u_cache.dtype in (torch.bfloat16, torch.float16), (
+        "bf16 or fp16 u ring required"
+    )
     pool = h0.shape[0]
     assert tuple(k_cache.shape) == (pool, H, RING_SLOTS, K_DIM)
     assert tuple(u_cache.shape) == (pool, HV, RING_SLOTS, V_DIM)
@@ -1490,7 +1495,7 @@ def gated_delta_rule_mtp_ucache_flush_umma(
             )  # unread placeholder
             _ROW_ID[key] = rand_seed
     fn = _get_kernel(
-        q.device, T, H, HV, k_cache.dtype == torch.bfloat16, use_ro, hpc, sr, sr_rounds
+        q.device, T, H, HV, u_cache.dtype == torch.bfloat16, use_ro, hpc, sr, sr_rounds
     )
     fn(
         q,
