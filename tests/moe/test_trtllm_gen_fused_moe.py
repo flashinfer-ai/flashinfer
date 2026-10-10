@@ -29,6 +29,8 @@ from flashinfer.fused_moe import (
     prims_ts_fp4_block_scale_routed_moe,
     fill_w_ptr,
 )
+from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+from flashinfer.fused_moe.trtllm_gen_routing import trtllm_gen_routing
 
 from tests.moe.trtllm_gen_fused_moe_utils import (
     ActivationType,
@@ -489,6 +491,163 @@ def test_deepseekv3_routing(
         gemm1_clamp_limit=gemm1_clamp_limit,
         moe_gemm_backend=moe_gemm_backend,
     )
+
+
+@pytest.mark.parametrize(
+    "num_tokens,has_local_work",
+    [
+        pytest.param(8, True, id="sparse_decode"),
+        pytest.param(64, True, id="sparse_batch"),
+        pytest.param(1024, True, id="sparse_prefill"),
+        pytest.param(8, False, id="empty_shard"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_deepseek_fp8_activation_routing_workset(
+    num_tokens, has_local_work, enable_pdl
+):
+    """Compare sparse and empty EP worksets with a block-scaled SwiGLU reference."""
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("Requires TRTLLM FP8 MoE and standalone routing on SM100 or SM103.")
+
+    num_experts, local_experts, local_offset = 64, 8, 24
+    top_k, tile_tokens, intermediate_size = 8, 64, 512
+    logits = torch.full((num_tokens, num_experts), -100.0, device="cuda")
+    logits[:, :top_k] = torch.arange(top_k, device="cuda") + 10.0
+    if has_local_work:
+        # One local assignment per token; all other selected experts are remote.
+        # Seven singleton experts leave partial activation groups and padded tiles.
+        local_ids = torch.full(
+            (num_tokens, 1), local_offset, device="cuda", dtype=torch.int64
+        )
+        local_ids[: local_experts - 1, 0] += torch.arange(
+            1, local_experts, device="cuda"
+        )
+        logits.scatter_(1, local_ids, 20.0)
+    routing = trtllm_gen_routing(
+        logits,
+        None,
+        RoutingMethodType.Renormalize,
+        top_k,
+        local_expert_offset=local_offset,
+        local_num_experts=local_experts,
+        tile_tokens_dim=tile_tokens,
+        enable_pdl=enable_pdl,
+    )
+
+    # Keep nonempty sentinel storage even when the device workset is empty.
+    padded_rows = max(1, int(routing.total_num_padded_tokens.item()))
+    input_values = (
+        torch.arange(padded_rows * 2 * intermediate_size, device="cuda") % 31 - 15
+    ).float() / 4
+    gemm1_output = input_values.reshape(padded_rows, -1).to(torch.float8_e4m3fn)
+    input_scales = (
+        torch.arange(padded_rows * 2 * intermediate_size // 128, device="cuda") % 5 + 1
+    ).float().reshape(-1, padded_rows) / 4
+    activation_output = torch.full(
+        (padded_rows, intermediate_size), 0xA5, device="cuda", dtype=torch.uint8
+    )
+    output_scales = torch.full(
+        (intermediate_size // 128, padded_rows), -1.0, device="cuda"
+    )
+    get_trtllm_moe_sm100_module().moe_op.trtllm_moe_run_deepseek_fp8_activation(
+        gemm1_output.view(torch.uint8),
+        input_scales,
+        activation_output,
+        output_scales,
+        routing.total_num_padded_tokens,
+        routing.cta_idx_xy_to_mn_limit,
+        routing.num_non_exiting_ctas,
+        tile_tokens,
+        num_tokens,
+        top_k,
+        intermediate_size,
+        int(ActivationType.Swiglu),
+        enable_pdl,
+    )
+
+    expanded_map = routing.expanded_idx_to_permuted_idx
+    valid_rows = expanded_map[expanded_map >= 0].long()
+    assert valid_rows.numel() == (num_tokens if has_local_work else 0)
+    if not has_local_work:
+        assert torch.all(activation_output == 0xA5)
+        assert torch.all(output_scales == -1.0)
+        return
+
+    dequantized = gemm1_output.float()[valid_rows] * input_scales[
+        :, valid_rows
+    ].T.repeat_interleave(128, dim=1)
+    linear, gate = dequantized.chunk(2, dim=1)
+    expected = (gate / (1.0 + torch.exp(-gate))) * linear
+    expected = expected.reshape(-1, intermediate_size // 128, 128)
+    expected_scales = (expected.abs().amax(dim=-1) / 448.0).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    expected_fp8 = (expected / expected_scales.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    actual_fp8 = activation_output.view(torch.float8_e4m3fn).float()[valid_rows]
+    torch.testing.assert_close(
+        actual_fp8.reshape_as(expected), expected_fp8.float(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        output_scales[:, valid_rows].T, expected_scales, rtol=1e-6, atol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "name,invalid",
+    [
+        ("padded", "empty"),
+        ("count", "empty"),
+        ("count", "cpu"),
+        ("limits", "cpu"),
+        ("limits", "other_device"),
+        ("limits", "rank"),
+        ("limits", "strided"),
+        ("limits", "short"),
+    ],
+)
+def test_deepseek_fp8_activation_rejects_invalid_metadata(name, invalid):
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("Requires SM100 or SM103.")
+    if invalid == "other_device" and torch.cuda.device_count() < 2:
+        pytest.skip("Requires two CUDA devices.")
+
+    metadata = {
+        "padded": torch.zeros(1, device="cuda", dtype=torch.int32),
+        "limits": torch.zeros(2, device="cuda", dtype=torch.int32),
+        "count": torch.zeros(1, device="cuda", dtype=torch.int32),
+    }
+    metadata[name] = {
+        "empty": lambda x: x[:0],
+        "cpu": lambda x: x.cpu(),
+        "other_device": lambda x: x.to(
+            f"cuda:{(x.device.index + 1) % torch.cuda.device_count()}"
+        ),
+        "rank": lambda x: x.unsqueeze(0),
+        "strided": lambda x: x[:1].expand(2),
+        "short": lambda x: x[:1],
+    }[invalid](metadata[name])
+
+    moe_op = get_trtllm_moe_sm100_module().moe_op
+    # Two routing tiles, even though this invocation has no active local CTAs.
+    with pytest.raises(RuntimeError):
+        moe_op.trtllm_moe_run_deepseek_fp8_activation(
+            torch.zeros((16, 256), device="cuda", dtype=torch.uint8),
+            torch.ones((2, 16), device="cuda"),
+            torch.zeros((16, 128), device="cuda", dtype=torch.uint8),
+            torch.ones((1, 16), device="cuda"),
+            metadata["padded"],
+            metadata["limits"],
+            metadata["count"],
+            8,
+            1,
+            1,
+            128,
+            int(ActivationType.Swiglu),
+            False,
+        )
+    # Rejection must happen on the host, without poisoning the CUDA context.
+    torch.cuda.synchronize()
 
 
 # Test: TopK routing
