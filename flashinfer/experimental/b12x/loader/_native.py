@@ -22,13 +22,14 @@ _LOCK = threading.Lock()
 
 def _build() -> Path:
     import torch
+    from flashinfer.jit.cpp_ext import get_cuda_path
 
     source = Path(__file__).with_name("_storage.c")
     compiler = shlex.split(os.environ.get("CC", "cc"))
     if not compiler or not shutil.which(compiler[0]):
         raise RuntimeError("b12x.loader needs a C99 compiler (CC or cc)")
     compiler[0] = shutil.which(compiler[0])
-    cuda = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")).resolve()
+    cuda = Path(get_cuda_path()).resolve()
     includes = [
         Path(sysconfig.get_path("include")),
         cuda / "include",
