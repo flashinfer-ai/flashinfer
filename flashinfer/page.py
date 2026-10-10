@@ -840,7 +840,6 @@ def _as_float32_scalar_tensors(
     stream_capturing = _is_stream_capturing_on_device(device)
 
     tensors = []
-    cuda_tensors_to_validate = []
     for name, value in values:
         if not isinstance(value, torch.Tensor):
             if stream_capturing:
@@ -879,30 +878,9 @@ def _as_float32_scalar_tensors(
                 )
         if value.device != device:
             value = value.to(device=device)
-        value = value.contiguous()
-        tensors.append(value)
-        if is_capturing:
-            continue
-        if is_cuda_tensor:
-            cuda_tensors_to_validate.append((name, value))
-
-    # Validate CUDA scalar tensors with one device-to-host transfer instead of
-    # a separate implicit sync for each tensor.
-    if cuda_tensors_to_validate:
-        host_values = (
-            torch.stack([value.reshape(()) for _, value in cuda_tensors_to_validate])
-            .detach()
-            .cpu()
-            .tolist()
-        )
-        for (name, _), scalar in zip(
-            cuda_tensors_to_validate, host_values, strict=True
-        ):
-            scalar = float(scalar)
-            if not math.isfinite(scalar) or scalar <= 0.0:
-                raise ValueError(
-                    f"{name} must be a positive finite global decode scale"
-                )
+        # A CUDA value is left to the append kernel's trap; reading it here
+        # would synchronize the host with the stream on every call.
+        tensors.append(value.contiguous())
 
     return tuple(tensors)
 
@@ -959,13 +937,16 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
         format as ``paged_kv_cache``, replacing ``head_dim // 2`` with
         ``head_dim // 16``.
     k_scale : Union[float, torch.Tensor]
-        Positive finite global decode scale for K. During CUDA graph capture,
-        this must be a contiguous scalar ``torch.float32`` CUDA tensor on the
-        same device as ``append_key``.
+        Positive finite global decode scale for K. A float or CPU tensor is
+        checked on the host and raises ``ValueError``. A CUDA tensor is checked
+        by the append kernel when there are rows to write, so a bad value
+        surfaces as a CUDA error that can leave the CUDA context unusable.
+        During CUDA graph capture, this must be a contiguous scalar
+        ``torch.float32`` CUDA tensor on the same device as ``append_key``.
     v_scale : Union[float, torch.Tensor]
-        Positive finite global decode scale for V. During CUDA graph capture,
-        this must be a contiguous scalar ``torch.float32`` CUDA tensor on the
-        same device as ``append_key``.
+        Positive finite global decode scale for V, checked like ``k_scale``.
+        During CUDA graph capture, this must be a contiguous scalar
+        ``torch.float32`` CUDA tensor on the same device as ``append_key``.
     kv_layout : str
         Layout of the paged KV cache, either ``"NHD"`` or ``"HND"``.
 
