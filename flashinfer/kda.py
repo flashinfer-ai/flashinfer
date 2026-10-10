@@ -404,6 +404,8 @@ def recurrent_kda(
             selected slots of ``initial_state`` in place. ``output_final_state``
             returns that pool, not a gathered per-sequence copy. State-pool calls
             are not automatically selected for cuDNN.
+            Eligible inference calls cache native host submission after warmup;
+            see ``docs/api/kda.rst`` for build and stream requirements.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -569,26 +571,40 @@ def recurrent_kda(
     if backend == "cudnn":
         from .cudnn import cudnn_recurrent_kda
 
-        unsupported = [
-            name
-            for name, requested in (
-                ("num_spec_tokens", num_spec_tokens is not None),
-                ("num_accepted_tokens", num_accepted_tokens is not None),
-                ("initial_state_source", initial_state_source is not None),
-                ("initial_state_indices", initial_state_indices is not None),
-                ("seq_order", seq_order is not None),
-                ("prefill_workspace", prefill_workspace is not None),
-                ("state_checkpoints", state_checkpoints is not None),
-                ("checkpoint_cu_starts", checkpoint_cu_starts is not None),
-                ("checkpoint_every_n_tokens", checkpoint_every_n_tokens != 0),
-                ("checkpoint_state_indices", checkpoint_state_indices is not None),
-                ("disable_state_update", disable_state_update),
-                ("correction_cache", correction_cache is not None),
-                ("kg_cache", kg_cache is not None),
-            )
-            if requested
-        ]
-        if unsupported:
+        if (
+            num_spec_tokens is not None
+            or num_accepted_tokens is not None
+            or initial_state_source is not None
+            or initial_state_indices is not None
+            or seq_order is not None
+            or prefill_workspace is not None
+            or state_checkpoints is not None
+            or checkpoint_cu_starts is not None
+            or checkpoint_every_n_tokens != 0
+            or checkpoint_state_indices is not None
+            or disable_state_update
+            or correction_cache is not None
+            or kg_cache is not None
+        ):
+            unsupported = [
+                name
+                for name, requested in (
+                    ("num_spec_tokens", num_spec_tokens is not None),
+                    ("num_accepted_tokens", num_accepted_tokens is not None),
+                    ("initial_state_source", initial_state_source is not None),
+                    ("initial_state_indices", initial_state_indices is not None),
+                    ("seq_order", seq_order is not None),
+                    ("prefill_workspace", prefill_workspace is not None),
+                    ("state_checkpoints", state_checkpoints is not None),
+                    ("checkpoint_cu_starts", checkpoint_cu_starts is not None),
+                    ("checkpoint_every_n_tokens", checkpoint_every_n_tokens != 0),
+                    ("checkpoint_state_indices", checkpoint_state_indices is not None),
+                    ("disable_state_update", disable_state_update),
+                    ("correction_cache", correction_cache is not None),
+                    ("kg_cache", kg_cache is not None),
+                )
+                if requested
+            ]
             raise NotImplementedError(
                 'recurrent_kda(backend="cudnn") does not support '
                 + ", ".join(unsupported)
@@ -602,7 +618,21 @@ def recurrent_kda(
             raise NotImplementedError(
                 'recurrent_kda(backend="cudnn") state pools require ordinary multi-token prefill'
             )
-        return cudnn_recurrent_kda(
+        from . import _kda_cudnn_fast
+
+        inputs = (q, k, v, g, beta, cu_seqlens, output, A_log, dt_bias, initial_state)
+        config = (
+            scale,
+            lower_bound,
+            use_qk_l2norm_in_kernel,
+            use_gate_in_kernel,
+            beta_is_logit,
+        )
+        if ssm_state_indices is None:
+            result = _kda_cudnn_fast.try_execute(inputs, config, output_final_state)
+            if result is not None:
+                return result
+        result = cudnn_recurrent_kda(
             q,
             k,
             v,
@@ -621,6 +651,9 @@ def recurrent_kda(
             output=output,
             state_indices=ssm_state_indices,
         )
+        if ssm_state_indices is None:
+            _kda_cudnn_fast.prepare(inputs, config)
+        return result
     if checkpoint_state_indices is not None and backend == "cake":
         raise ValueError("checkpoint_state_indices is supported only by CuTe DSL")
 

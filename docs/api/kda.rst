@@ -41,6 +41,39 @@ and decode retains its existing layout contract.
 
     recurrent_kda
 
+Native cuDNN host submission
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Explicit ``backend="cudnn"`` calls under ``torch.inference_mode()`` can
+cache a ``cuDNNFastKDA`` executor after the first ordinary call. It reuses
+cuDNN frontend's compiled chain, scalar frame and a private workspace.
+Warm calls check tensor metadata, alignment, aliasing, device and stream,
+then update operand addresses and submit that chain once. New tensors with
+matching metadata can reuse the executor. Shape, layout or scalar changes
+use the ordinary path to prepare another executor. At most eight executors
+are retained; eviction waits for the executor's stream.
+
+This path requires contiguous CUDA BF16 Q/K/V/G, beta, output and supplied
+state, head dimension 128, FP32 gate parameters, int32 sequence offsets,
+and fused Q/K normalization, safe gate and beta sigmoid. Indexed state
+pools and CUDA Graph capture use the existing path. Each stream has its
+own workspace. Callers must order producer streams and complete pending
+uses before changing storage inside the same tensor object. Replaced
+tensor objects remain owned until their queued work completes.
+
+The helper builds on first eligible use through FlashInfer's JIT/Ninja
+build. Its source is included in source distributions and wheels. It needs
+a C++17 host compiler, CUDA toolkit headers, PyTorch's bundled pybind11
+headers and the DLPack C exchange API. Older PyTorch versions or unavailable
+build tools retain the ordinary cuDNN path. It uses the frontend's private
+compiled-chain interface; incompatible plans retain the ordinary path.
+Set ``FLASHINFER_CUDNN_KDA_NATIVE=0`` before import to disable it.
+
+Measure host enqueue cost, with setup excluded, using::
+
+    python benchmarks/bench_cudnn_kda_native.py --output native-kda.json
+    pytest tests/kda/test_cudnn_fast_kda.py
+
 Static PTX prefill on B300
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
