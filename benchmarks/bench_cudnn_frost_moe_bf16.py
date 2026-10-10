@@ -71,6 +71,8 @@ def configure_source_jit():
 
 
 def benchmark(args):
+    from flashinfer.fused_moe import CudnnFrostBf16Config
+
     gpu_uuid = torch.cuda.get_device_properties(torch.cuda.current_device()).uuid
     check_idle_gpu(gpu_uuid)
     torch.manual_seed(args.seed)
@@ -202,10 +204,26 @@ def benchmark(args):
         ids = logits.topk(args.top_k, dim=1).indices.int()
         scores = torch.rand(tokens, args.top_k, device="cuda").softmax(-1)
         act = MoEActivationPack(x, None, ids, scores)
-        layers = {"original": MoELayer(config), "with_cudnn_frost": MoELayer(config)}
+        layers = {
+            "original": MoELayer(config),
+            "with_cudnn_frost": MoELayer(
+                replace(
+                    config,
+                    backend=BackendOptions(
+                        (*config.backend.candidates, CudnnFrostBf16Config())
+                    ),
+                )
+            ),
+        }
         for label, layer in layers.items():
             actual_backends = {runner.backend_key for runner in layer.runners}
-            if actual_backends != expected_backends:
+            allowed = expected_backends | (
+                {"cudnn_frost_bf16"} if label == "with_cudnn_frost" else set()
+            )
+            if (
+                actual_backends - {"cudnn_frost_bf16"} != expected_backends
+                or not actual_backends <= allowed
+            ):
                 raise RuntimeError(
                     f"{label} backend pool mismatch: expected {expected_backends}, "
                     f"got {actual_backends}"
@@ -216,18 +234,14 @@ def benchmark(args):
             ),
             flush=True,
         )
-        # Benchmark-only dispatcher ablation, never a change to an existing runner.
-        layers["original"]._additional_candidates = lambda *args: []
         if args.probe_cudnn_frost:
-            from flashinfer.fused_moe.backends.cudnn_frost.bf16.moe import (
-                CudnnFrostBf16MoeRunner,
+            # Explicit benchmark-only probe outside the normal model shortlist.
+            probe = next(
+                r
+                for r in layers["with_cudnn_frost"].runners
+                if r.backend_key == "cudnn_frost_bf16"
             )
-
-            probe = CudnnFrostBf16MoeRunner(config, x.device)
-            probe.check_support()
-            probe.build()
-            layers["with_cudnn_frost"]._automatic_runners["cudnn_frost_bf16"] = probe
-            layers["with_cudnn_frost"]._additional_candidates = lambda *args: [probe]
+            probe._accepts_shape = lambda act: True
         outputs, graphs, winners = {}, {}, {}
         for label, layer in layers.items():
             with autotune():
@@ -252,7 +266,9 @@ def benchmark(args):
 
         # Measure the best independent cuDNN Frost candidate even if an original backend wins.
         layer = layers["with_cudnn_frost"]
-        cudnn_frost = layer._automatic_runners.get("cudnn_frost_bf16")
+        cudnn_frost = next(
+            (r for r in layer.runners if r.backend_key == "cudnn_frost_bf16"), None
+        )
         if cudnn_frost is not None and (
             args.probe_cudnn_frost or cudnn_frost.accepts(act, weights)
         ):

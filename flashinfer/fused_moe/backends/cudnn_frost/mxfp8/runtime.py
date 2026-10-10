@@ -29,6 +29,9 @@ _TAIL_SLOTS = {
     "gate_scale": 1,
     "linear_scale": 2,
     "output_scale": 3,
+    "gate_alpha": 4,
+    "up_alpha": 5,
+    "alpha": 4,
 }
 
 
@@ -101,6 +104,9 @@ def discover(
             weight_dtype="float8_e4m3fn",
             output_dtype="float8_e4m3fn" if fused else "bfloat16",
             scale_dtype="float8_e8m0fnu",
+            global_scale_dtype="float32",
+            global_scale_layout="per_group",
+            global_scale_position="gemm_output_before_activation",
             block_size=32,
             scale_layout="F8_128x4",
             token_scale_layout="segmented_F8_128x4",
@@ -120,7 +126,11 @@ def discover(
             raise RuntimeError(f"invalid MXFP8 numerical contract: {identity}")
         tail = tuple(raw.get("launch", {}).get("tail", ()))
         store = raw.get("tactic", {}).get("store_mode")
-        expected_tail = {"output"} if op == _FC2 else {"output", "scale"}
+        expected_tail = (
+            {"output", "alpha"} if op == _FC2 else {"output", "scale", "gate_alpha"}
+        )
+        if op != _FC2 and is_gated(expected["activation"]):
+            expected_tail.add("up_alpha")
         if expected["activation"] == "situ":
             expected_tail |= {"gate_scale", "linear_scale"}
         if fused:
@@ -158,13 +168,15 @@ def discover(
 
 
 def clear_artifact_cache() -> None:
-    """Refresh artifact metadata shared by selection, admission and packing."""
+    """Clear shared discovery caches for future builds and explicit refreshes."""
     global _artifact_cache_version
 
     from ..shortlist import _read
-    from .moe import _selected_kernels_cached
+    from .moe import _cached_artifact_roots, _selected_kernels_cached
 
     _artifact_cache_version += 1
+    runtime.artifact_root.cache_clear()
+    _cached_artifact_roots.cache_clear()
     discover.cache_clear()
     _selected_kernels_cached.cache_clear()
     _read.cache_clear()
@@ -261,6 +273,7 @@ def _launch_arguments(
     workspace,
     scale,
     activation_scales=None,
+    gemm_scales=None,
 ):
     s, k = tokens.shape
     e, n, _ = weights[0].shape
@@ -287,6 +300,15 @@ def _launch_arguments(
     )
     tail = {"output": out, "scale": scale}
     tail.update(activation_scales or {})
+    alpha_names = (
+        ("gate_alpha", "up_alpha")
+        if kernel.gated
+        else (("gate_alpha",) if kernel.fc1 else ("alpha",))
+    )
+    tail.update(
+        (name, value.reshape(offsets.numel() - 1, 1, 1))
+        for name, value in zip(alpha_names, gemm_scales, strict=True)
+    )
     return (
         problem,
         offsets,
@@ -303,8 +325,10 @@ class PreparedMxfp8GroupedGemm:
     Gated FC1 takes ``weights=(gate, up)`` and corresponding scales. Non-gated
     FC1 and FC2 take a one-element tuple. Activation parameters use the defaults
     in ACTIVATIONS, including SiTU's gate/linear scales (4/25) and Step's limit
-    (7). Each weight is contiguous [E,N,K]. Scale blobs must
-    follow pack_token_scales/pack_weight_scales; E8M0 bytes are never cast
+    (7). ``gemm_scales`` supplies float32 [G] multipliers for each weight,
+    applied before activation and output rounding. Each weight is contiguous
+    [E,N,K]. Scale blobs must follow pack_token_scales/pack_weight_scales;
+    E8M0 bytes are never cast
     numerically. Every concurrent stream must own its workspace and plan.
     """
 
@@ -319,6 +343,7 @@ class PreparedMxfp8GroupedGemm:
         out: torch.Tensor,
         *,
         scale: torch.Tensor | None = None,
+        gemm_scales: tuple[torch.Tensor, ...] | None = None,
         workspace: torch.Tensor | None = None,
     ):
         if tokens.device.type != "cuda":
@@ -374,6 +399,18 @@ class PreparedMxfp8GroupedGemm:
             scale = torch.ones((1, 1, 1), dtype=torch.float32, device=tokens.device)
         if scale.dtype != torch.float32 or tuple(scale.shape) != (1, 1, 1):
             raise ValueError("FC1 output scale must be float32 [1,1,1]")
+        if gemm_scales is None:
+            gemm_scales = tuple(
+                torch.ones(groups, dtype=torch.float32, device=tokens.device)
+                for _ in weights
+            )
+        if len(gemm_scales) != count or any(
+            value.dtype != torch.float32 or tuple(value.shape) != (groups,)
+            for value in gemm_scales
+        ):
+            raise ValueError("GEMM scales must be float32 [G], one per weight")
+        if any(value.data_ptr() % 4 for value in gemm_scales):
+            raise ValueError("GEMM scales require 4B alignment")
         activation_scales = {}
         if kernel.activation == "situ":
             activation = ACTIVATIONS["situ"]()
@@ -407,6 +444,7 @@ class PreparedMxfp8GroupedGemm:
             out,
             workspace,
             scale,
+            *gemm_scales,
             *activation_scales.values(),
         )
         if any(t.device != tokens.device or not t.is_contiguous() for t in tensors):
@@ -445,6 +483,7 @@ class PreparedMxfp8GroupedGemm:
             self.workspace,
             scale,
             activation_scales,
+            gemm_scales,
         )
 
     def __call__(self):
