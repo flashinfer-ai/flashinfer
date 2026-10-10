@@ -7,12 +7,14 @@ from b12x._lib.quant.block_codec import BLOCK_CODECS
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from types import MappingProxyType
 
 import torch
 from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
+from b12x._lib.scratch import scratch_buffer_spec
 from b12x.preparation.types import (
     FrozenMapping,
     MemoryRequirements,
@@ -20,11 +22,29 @@ from b12x.preparation.types import (
     _CompositePlan,
 )
 
-from ._impl import TPMoEScratchCaps, plan_b12x_fp4_moe_weights, plan_tp_moe_scratch
+from ._impl import (
+    TPMoEScratchCaps,
+    plan_b12x_fp4_moe_weights,
+    plan_tp_moe_scratch,
+    tp_moe_required_nbytes,
+)
 from ._tuning import FC2_TUNING, ROUTE_TUNING, MoeDecodeConfig, MoeDecodeQuery, TUNING
 from .planning import ActivationMode, _packed_recipe
 from .weights import PreparedExperts
 from .execution import ExecutionCapacity, RoutingSpec
+
+
+@lru_cache(maxsize=2048)
+def _scratch_memory(caps: TPMoEScratchCaps) -> MemoryRequirements:
+    return MemoryRequirements(
+        scratch=(
+            scratch_buffer_spec(
+                "tp_moe.scratch",
+                nbytes=tp_moe_required_nbytes(caps),
+                device=caps.device,
+            ),
+        )
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1606,11 +1626,7 @@ def plan(
             )
 
         def memory(config, device):
-            return MemoryRequirements(
-                scratch=plan_tp_moe_scratch(
-                    caps_for(config, device), prewarm_launches=False
-                ).scratch_specs()
-            )
+            return _scratch_memory(caps_for(config, device))
 
         def materialize(selection, device):
             caps = caps_for(selection.config, device)

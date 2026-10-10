@@ -75,7 +75,9 @@ def _qwen_query(tokens, deterministic, mode="nvfp4"):
 @pytest.mark.parametrize("mode", ("nvfp4", "multi", "nvfp4_auto"))
 @pytest.mark.parametrize("deterministic", (True, False))
 @pytest.mark.parametrize("tokens", CAPACITIES)
-def test_qwen_candidates_lower_through_native_route_compiler(tokens, deterministic, mode):
+def test_qwen_candidates_lower_through_native_route_compiler(
+    tokens, deterministic, mode
+):
     query, weights = _qwen_query(tokens, deterministic, mode)
     candidates = TUNING.eligible_plan(query, DEVICE).candidates
     dynamic = [config for _, config in candidates if config.backend == "dynamic"]
@@ -97,6 +99,27 @@ def test_qwen_candidates_lower_through_native_route_compiler(tokens, determinist
     assert not torch.cuda.is_initialized()
 
 
+@pytest.mark.parametrize("mode", ("nvfp4", "multi", "nvfp4_auto"))
+@pytest.mark.parametrize("deterministic", (True, False))
+@pytest.mark.parametrize("tokens", (1, 8, 4096))
+def test_memory_query_matches_scratch_binding(tokens, deterministic, mode, monkeypatch):
+    query, weights = _qwen_query(tokens, deterministic, mode)
+    for _, config in TUNING.eligible_plan(query, DEVICE).candidates:
+        caps = _preparation._lower_caps(query, config, weights, torch.device("cpu"))
+        expected = _impl.plan_tp_moe_scratch(
+            caps, prewarm_launches=False
+        ).scratch_specs()
+        actual = _preparation._scratch_memory(caps)
+        assert actual.scratch == expected
+
+        def forbid_plan(*args, **kwargs):
+            pytest.fail("identical memory requirements must reuse their layout")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(_preparation, "tp_moe_required_nbytes", forbid_plan)
+            assert _preparation._scratch_memory(replace(caps)) is actual
+
+
 @pytest.mark.parametrize("route", ("direct", "triton"))
 @pytest.mark.parametrize("mode", ("nvfp4", "multi", "nvfp4_auto"))
 def test_explicit_deterministic_route_overrides_reject_before_planning(route, mode):
@@ -110,23 +133,35 @@ def test_explicit_deterministic_route_overrides_reject_before_planning(route, mo
     )
     with pytest.raises(ValueError, match="deterministic"):
         TUNING.configure(query, device=DEVICE, override=config)
-    assert TUNING.configure(
-        replace(query, deterministic_output=False), device=DEVICE, override=config
-    ).pinned == config
+    assert (
+        TUNING.configure(
+            replace(query, deterministic_output=False), device=DEVICE, override=config
+        ).pinned
+        == config
+    )
 
 
 @pytest.mark.parametrize("requested", (None, False, True))
 @pytest.mark.parametrize("environment", ("0", "1"))
-def test_native_direct_plan_resolves_environment_before_route_geometry(monkeypatch, requested, environment):
+def test_native_direct_plan_resolves_environment_before_route_geometry(
+    monkeypatch, requested, environment
+):
     monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", environment)
     _, weights = _qwen_query(1, requested)
     config = MoeDecodeConfig(
-        backend="dynamic", route_planner="internal", max_active_clusters=None,
-        dynamic_tile_m=16, dynamic_route_mode="direct",
+        backend="dynamic",
+        route_planner="internal",
+        max_active_clusters=None,
+        dynamic_tile_m=16,
+        dynamic_route_mode="direct",
     )
     arguments = dict(
-        num_tokens=1, num_topk=10, device=torch.device("cuda", 0),
-        weight_plan=weights, quant_mode="nvfp4", deterministic_output=requested,
+        num_tokens=1,
+        num_topk=10,
+        device=torch.device("cuda", 0),
+        weight_plan=weights,
+        quant_mode="nvfp4",
+        deterministic_output=requested,
         decode_config=config,
     )
     deterministic = environment == "1" if requested is None else requested
