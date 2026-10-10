@@ -3571,10 +3571,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                     dtype=routing_dtype,
                     device=hidden_states.device,
                 )
-        if enable_pdl is None:
-            enable_pdl = device_support_pdl(hidden_states.device)
-        if not _device_support_moe_pdl(hidden_states.device):
-            enable_pdl = False
         if output is None:
             output = _alloc_trtllm_moe_output(
                 num_tokens, output_width, do_finalize, hidden_states.device
@@ -3601,6 +3597,55 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         dtype_weights = deduce_trtllm_gen_tensor_dtype(
             gemm1_weights, gemm1_weights_scale
         )
+        # SM107's general MoE PDL guard still covers the historical
+        # BF16/MXFP4/MXINT4 failures. Admit only explicitly requested PDL
+        # for the validated NVFP4 SiTU precomputed-routing chain (#5473).
+        # Per-token quantization, LoRA, DA and alternate routing families
+        # have different dependency chains and retain the existing guard.
+        rubin_routed_nvfp4_pdl = (
+            enable_pdl is True
+            and get_compute_capability(hidden_states.device) == (10, 7)
+            and dtype_act == DtypeTrtllmGen.E2m1
+            and dtype_weights == DtypeTrtllmGen.E2m1
+            and routing_input_mode
+            in (
+                RoutingInputMode.PackedPrecomputed,
+                RoutingInputMode.UnpackedPrecomputed,
+            )
+            and routing_method_type == RoutingMethodType.Renormalize.value
+            and activation_type == ActivationType.Situ.value
+            and per_token_scale is None
+            and gemm1_lora_delta is None
+            and gemm1_bias is None
+            and gemm2_bias is None
+            # SiTU's per-expert tanh scales stay inside fused FC1. Inspect
+            # metadata only: reading CUDA values would break graph capture.
+            and all(
+                param is None
+                or (
+                    param.dtype == torch.float32
+                    and param.shape == (num_local_experts,)
+                    and param.device == hidden_states.device
+                    and param.is_contiguous()
+                )
+                for param in (gemm1_alpha, gemm1_beta)
+            )
+            and gemm1_clamp_limit is None
+            and n_fused_shared == 0
+            and local_expert_offset == 0
+            and num_local_experts == num_experts
+            and do_finalize
+            and valid_hidden_size is None
+            and valid_intermediate_size is None
+            and routing_replay_out is None
+            and _enabled_trtllm_da_config() is None
+        )
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
+        if not rubin_routed_nvfp4_pdl and not _device_support_moe_pdl(
+            hidden_states.device
+        ):
+            enable_pdl = False
         moe_runner = TrtllmMoERunner(
             moe_op,
             top_k=top_k,
@@ -6784,7 +6829,16 @@ def trtllm_fp4_block_scale_routed_moe(
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
-        Whether to enable Programmatic Dependent Launch.
+        Whether to enable Programmatic Dependent Launch. On SM107, explicit
+        ``True`` is supported for NVFP4 activations and weights with SiTU,
+        precomputed Renormalize routing, all experts local, and finalized
+        output. Optional SiTU alpha/beta tensors must be contiguous float32
+        vectors with one value per local expert on the input device.
+        This exception requires no clamp limit, biases, per-token scales,
+        LoRA, shared experts, valid-dimension
+        overrides, routing replay, or distribution-aware dispatch. Other
+        SM107 configurations, including the default ``None``, retain the
+        PDL-disabled fallback.
     activation_type : int
         Activation type (default ``3`` — Swiglu).
         ``10`` SiTU computes
