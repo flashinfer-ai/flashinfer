@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Top-K decode kernels for FlashInfer.
+"""Top-K kernels for FlashInfer: per-row top-K over decode rows and over
+per-row windows of a packed prefill-indexer layout.
 
-The CuTe-DSL kernel source (GVR and radix Top-K for Blackwell sm_100+) lives in
-``flashinfer.topk_varlen.kernels``.  The public ``top_k_varlen`` API is defined in
+The CuTe-DSL kernel source (the GVR and self-sampling GVR V2 kernels for
+SM100, SM103 and SM107; the single-pass multi-CTA radix kernel for SM100,
+SM103, SM107, SM110, SM120 and SM121; the filtered-radix kernel for SM100,
+SM103 and SM107) lives in ``flashinfer.topk_varlen.kernels``.  The public
+``top_k_varlen`` API is defined in
 ``flashinfer.topk_varlen.topk_varlen`` and re-exported from the top-level
 ``flashinfer`` namespace. ``release_gvr2_resources`` frees the ``gvr_2``
 backend's per-device caches (default workspace slabs). ``warmup_prefill``

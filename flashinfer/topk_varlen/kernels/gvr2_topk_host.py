@@ -1362,27 +1362,58 @@ def warmup_prefill(
     row_stride: int | None = None,
     absolute_indices: bool = False,
 ) -> None:
-    """Compile and first-launch the windowed (prefill) engine set before
-    serving. For every launch-slab size a count in ``num_rows_list`` is cut
-    into (``_PREFILL_ROW_SLAB`` rows per launch, each slab routes on its own
-    row count) and every pow2 envelope bucket up to ``max_cols``, at both
-    edges of the bucket (the slab tier promotes and the register classes
-    2048 / 4096 / 8192 step exactly at the edges), this warms the slab tier
-    that width takes (calls whose bound the rung table sends to the slab)
-    plus the register rung the table admits for a bound at that edge: about
-    six slab engines plus the admitted rungs per k. A call without
-    ``max_seq_len`` routes by the logits width, so it is covered like a call
-    whose bound is that width.
-    ``max_cols`` is the compressed max column count (the logits width the
-    serving producer emits). Every engine is compiled for the exact launcher
-    key the serving call will look up and launched once on a one-row window,
-    so its first-call init and, for the slab family, THIS stream's default
-    workspace slab exist before a CUDA-graph capture on this stream; warm up
-    on the stream that captures. Idempotent per (device, stream, k,
-    max_cols, rows list, stride, output frame). TRT-LLM #18702
-    ``warmup_prefill`` mirror. ``absolute_indices`` warms the absolute-column
-    output variants (a distinct compiled set); call once per output frame the
-    server uses."""
+    """Compile, and launch once, every windowed (prefill) engine that a
+    ``top_k_varlen(..., row_starts=...)`` call with this geometry can select,
+    so that a later CUDA-graph capture compiles and allocates nothing. Call
+    it before serving with the serving device current and on the stream that
+    will capture: each engine is launched once on a one-row window, which
+    runs its first-call initialisation, and the current stream's default
+    workspace slab is created when missing (the streaming engine needs it; a
+    register-resident engine does not). The first call for a key returns
+    after a device synchronization; a repeat call for the same key returns
+    at once, re-creating the slab if it was released in between.
+
+    Coverage: a windowed call routes on its row count, ``top_k``, output
+    frame and window-length bound (``max_seq_len``, else the logits width),
+    never on the exact width or row stride, and a call of more than 32768
+    rows is issued in launches of at most 32768 rows, each routed on its own
+    count. For every row count in ``num_rows_list`` and every power-of-two
+    bucket of the bound from the first above ``top_k`` up to the one
+    covering ``max_cols`` (buckets are capped at 32768 columns; wider bounds
+    share that bucket), at both edges of the bucket, this compiles the
+    streaming engine that bound takes and the register-resident engine
+    (2048-, 4096- or 8192-column class) the host admits for it. A later call
+    is covered when its ``top_k`` and ``absolute_indices`` match, its bound
+    (or width) lies above ``top_k`` and at most ``max_cols``, and its row
+    count falls in a band warmed by ``num_rows_list`` (the default list
+    covers every row count); ``prefill_ready`` answers for one geometry.
+
+    Parameters
+    ----------
+    top_k : int
+        The call's ``top_k`` (512, 1024 or 2048).
+    max_cols : int
+        The largest window-length bound a covered call will route by: its
+        ``max_seq_len``, or its logits width when it passes none.
+    num_rows_list : Sequence[int], optional
+        Row counts to warm. The engines depend on the count only through a
+        few bands, which the default covers for every count; pass the
+        serving batch's counts to narrow or extend it.
+    row_stride : int, optional
+        Row stride of the one-row warm-up windows, in elements (a multiple
+        of 4, at least the bound); ``None`` picks a padded stride. The
+        windowed launchers do not key on the stride, so the default is right
+        for any producer layout.
+    absolute_indices : bool, optional
+        Warm the absolute-column output variants, a distinct compiled set;
+        call once per output frame the server uses. Default ``False``.
+
+    Raises
+    ------
+    RuntimeError
+        If the windowed engines cannot run on the current device: no CuTe
+        DSL, no CUDA, or a compute capability outside SM100 / SM103 / SM107.
+    """
     err = _prefill_env_error()
     if err is not None:
         raise RuntimeError(f"gvr_2 windowed (prefill) engines unavailable: {err}")
@@ -1433,7 +1464,7 @@ def warmup_prefill(
         row_stride,
         bool(absolute_indices),
     )
-    # THIS stream's default workspace slab, before the done-key short-circuit:
+    # this stream's default workspace slab, before the done-key short-circuit:
     # only an eager launch creates it and release_cached_resources() drops it
     # without touching the done set, so a re-warm after a release must bring
     # the capturing stream back to ready although every engine is already
@@ -1457,12 +1488,44 @@ def warmup_prefill(
 def prefill_ready(
     num_rows: int, k: int, n_env: int, width: int | None = None, absolute_indices: bool = False
 ) -> bool:
-    """True iff a windowed ``run_varlen`` call with this geometry would launch
-    without compiling (the same launcher keys it looks up), so a caller can
-    route around the engine under CUDA graph capture. ``n_env`` is the bound
-    the call routes by: the ``max_seq_len`` it will pass (then ``width`` is
-    the logits width), or the logits width itself for a call without
-    ``max_seq_len`` (leave ``width`` None)."""
+    """Whether a windowed ``top_k_varlen`` call (``row_starts`` given) with
+    this geometry would launch under CUDA-graph capture on the current device
+    and stream without compiling or allocating: every engine the call would
+    select is compiled and, where it selects the streaming engine, the
+    current stream's default workspace slab exists. Lets a serving framework
+    route around the engine under capture instead of catching the
+    capture-time ``RuntimeError``. Compiles and launches nothing and never
+    raises for an unusable environment.
+
+    Parameters
+    ----------
+    num_rows : int
+        Rows of the call (``logits.shape[0]``); ``0`` is always ready.
+    k : int
+        Its ``top_k``.
+    n_env : int
+        The window-length bound the call routes by: the ``max_seq_len`` it
+        will pass, or the logits width for a call without ``max_seq_len``.
+    width : int, optional
+        The logits width when ``n_env`` is a caller-given ``max_seq_len``
+        (the bound is clamped to it, as the call does); leave ``None`` when
+        ``n_env`` is the width itself.
+    absolute_indices : bool, optional
+        The call's ``absolute_indices`` (a distinct compiled set). Default
+        ``False``.
+
+    Returns
+    -------
+    bool
+        ``True`` when every launch the call makes (one per slab of at most
+        32768 rows) finds its compiled engine and, if that engine is the
+        streaming one, the current stream already has its default workspace
+        slab; ``False`` otherwise, and whenever the current device cannot run
+        the windowed engines (no CuTe DSL, no CUDA, or a compute capability
+        outside SM100 / SM103 / SM107). ``warmup_prefill`` covering the
+        geometry, or one eager windowed call of this geometry on this
+        stream, turns it ``True``.
+    """
     if num_rows == 0:
         return True
     if _prefill_env_error() is not None:

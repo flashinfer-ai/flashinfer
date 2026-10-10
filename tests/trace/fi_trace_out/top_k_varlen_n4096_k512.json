@@ -1,6 +1,6 @@
 {
   "name": "top_k_varlen_n4096_k512",
-  "description": "Decode-step top-K selection over batched logits with per-request seq_lens. GVR (Blackwell sm_100+) or masked-radix fallback backend.",
+  "description": "Per-row top-K over batched logits with per-request seq_lens: decode rows, or windows of a packed prefill-indexer layout when row_starts is given. Backends: gvr, gvr_2, radix, radix_filter (CuTe DSL; see top_k_varlen for each one's GPU list) and the masked-radix radix_cutlass fallback (every GPU).",
   "op_type": "topk",
   "tags": [
     "fi_api:flashinfer.topk_varlen.topk_varlen.top_k_varlen",
@@ -29,14 +29,14 @@
         "num_cols"
       ],
       "dtype": "float32",
-      "description": "Decode-step attention logits (bfloat16 / float16 / float32)."
+      "description": "Scores, one row per query token (bfloat16 / float16 / float32)."
     },
     "seq_lens": {
       "shape": [
         "batch_size"
       ],
       "dtype": "int32",
-      "description": "Effective KV-cache length per request."
+      "description": "Effective KV-cache length per request; the window length of each row when row_starts is given."
     },
     "top_k": {
       "shape": null,
@@ -70,7 +70,7 @@
       "shape": null,
       "dtype": "int32",
       "optional": true,
-      "description": "Windowed mode: the caller's bound on the window lengths; selects the gvr_2 engine (register rung vs streaming slab) before CUDA-graph capture. Ignored without row_starts."
+      "description": "Windowed mode: upper bound on the window lengths, in columns (defaults to the logits width); selects the gvr_2 engine (register-resident vs streaming) before CUDA-graph capture and must hold at every replay. Ignored without row_starts."
     }
   },
   "outputs": {

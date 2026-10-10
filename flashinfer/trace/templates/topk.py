@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TraceTemplate for top_k_varlen (GVR / radix decode-step top-K)."""
+"""TraceTemplate for top_k_varlen (per-row varlen top-K: decode rows or
+prefill windows)."""
 
 import torch
 
@@ -151,8 +152,10 @@ top_k_varlen_trace = TraceTemplate(
     op_type="topk",
     name_prefix="top_k_varlen",
     description=(
-        "Decode-step top-K selection over batched logits with per-request seq_lens. "
-        "GVR (Blackwell sm_100+) or masked-radix fallback backend."
+        "Per-row top-K over batched logits with per-request seq_lens: decode rows, "
+        "or windows of a packed prefill-indexer layout when row_starts is given. "
+        "Backends: gvr, gvr_2, radix, radix_filter (CuTe DSL; see top_k_varlen for "
+        "each one's GPU list) and the masked-radix radix_cutlass fallback (every GPU)."
     ),
     axes={
         "batch_size": Var(description="Number of decode requests."),
@@ -165,12 +168,15 @@ top_k_varlen_trace = TraceTemplate(
     inputs={
         "logits": Tensor(
             ["batch_size", "num_cols"],
-            description="Decode-step attention logits (bfloat16 / float16 / float32).",
+            description="Scores, one row per query token (bfloat16 / float16 / float32).",
         ),
         "seq_lens": Tensor(
             ["batch_size"],
             dtype="int32",
-            description="Effective KV-cache length per request.",
+            description=(
+                "Effective KV-cache length per request; the window length of each row "
+                "when row_starts is given."
+            ),
         ),
         "top_k": Scalar("int32", description="K — number of top elements to select."),
         "pre_idx": Tensor(
@@ -199,9 +205,10 @@ top_k_varlen_trace = TraceTemplate(
             "int32",
             optional=True,
             description=(
-                "Windowed mode: the caller's bound on the window lengths; selects "
-                "the gvr_2 engine (register rung vs streaming slab) before CUDA-graph "
-                "capture. Ignored without row_starts."
+                "Windowed mode: upper bound on the window lengths, in columns (defaults "
+                "to the logits width); selects the gvr_2 engine (register-resident vs "
+                "streaming) before CUDA-graph capture and must hold at every replay. "
+                "Ignored without row_starts."
             ),
         ),
     },
