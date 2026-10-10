@@ -242,7 +242,7 @@ def _launch_metadata_lists(
     token_layout: TokenLayout,
     early_exit_max_token_ctas: int,
 ):
-    """Return token launch metadata padded for persistent early-exit CTAs."""
+    """Return CGA routing records plus the per-token route map."""
     launch_token_tiles = token_layout.num_token_tiles
     if cfg.use_early_exit and cfg.is_persistent:
         launch_token_tiles = max(launch_token_tiles, early_exit_max_token_ctas)
@@ -262,7 +262,11 @@ def _launch_metadata_lists(
     if len(route_map) < min_route_rows:
         route_map.extend([0] * (min_route_rows - len(route_map)))
 
-    return tile_idx, mn_limit, route_map
+    return (
+        tile_idx[:: cfg.token_metadata_stride],
+        mn_limit[:: cfg.token_metadata_stride],
+        route_map,
+    )
 
 
 def _normalize_early_exit_launch_extent(
@@ -1623,7 +1627,7 @@ def reference_check(
         )
 
     token_tile_size = cfg.tile_n if cfg.is_swap_ab else cfg.tile_m
-    cluster_dim_in_token = 1 if cfg.is_swap_ab else cfg.cluster_m
+    cluster_dim_in_token = cfg.token_metadata_stride
     token_layout = _make_token_layout(
         num_tokens=total_tokens,
         num_experts=num_experts,
@@ -1951,7 +1955,10 @@ def reference_check(
     else:
         M, N, K, L = total_padded_tokens, out_hidden, in_hidden, num_experts
         kernel_a = activations_torch
-        kernel_b = _block_major_k_weight_tensor(preprocessed_weights, cfg)
+        kernel_b = _block_major_k_weight_tensor(
+            shuffle_matrix(preprocessed_weights, 128),
+            cfg,
+        )
         sf_a = sf_activations
         sf_b = _kernel_weight_sf(
             sf_weights,
@@ -1961,7 +1968,7 @@ def reference_check(
             num_experts=num_experts,
             is_gated=is_gated,
             weight_sf_layout=weight_sf_layout,
-            shuffle_for_swap_ab=False,
+            shuffle_for_swap_ab=True,
         )
 
     logical_output_m, logical_output_n = _logical_output_shape(cfg, M, N, is_gated)
@@ -2249,7 +2256,7 @@ def reference_check(
         cutlass.Int32, mn_limit.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
     )
     num_non_exiting_ctas = torch.tensor(
-        [num_token_tiles], dtype=torch.int32, device=device
+        [num_token_tiles // cfg.token_metadata_stride], dtype=torch.int32, device=device
     )
     num_non_exiting_ctas_dp = make_ptr(
         cutlass.Int32,
@@ -2845,7 +2852,7 @@ def _build_launch_io(
         )
 
     token_tile_size = cfg.tile_n if cfg.is_swap_ab else cfg.tile_m
-    cluster_dim_in_token = 1 if cfg.is_swap_ab else cfg.cluster_m
+    cluster_dim_in_token = cfg.token_metadata_stride
     token_layout = _make_token_layout(
         num_tokens=num_tokens,
         num_experts=num_experts,
@@ -3030,7 +3037,10 @@ def _build_launch_io(
     else:
         M, N, K, L = total_padded_tokens, out_hidden, in_hidden, num_experts
         kernel_a = activations_torch
-        kernel_b = _block_major_k_weight_tensor(preprocessed_weights, cfg)
+        kernel_b = _block_major_k_weight_tensor(
+            shuffle_matrix(preprocessed_weights, 128),
+            cfg,
+        )
         sf_a = sf_activations
         sf_b = _kernel_weight_sf(
             sf_weights,
@@ -3040,7 +3050,7 @@ def _build_launch_io(
             num_experts=num_experts,
             is_gated=is_gated,
             weight_sf_layout=weight_sf_layout,
-            shuffle_for_swap_ab=False,
+            shuffle_for_swap_ab=True,
         )
 
     logical_output_m, logical_output_n = _logical_output_shape(cfg, M, N, is_gated)
@@ -3259,7 +3269,9 @@ def _build_launch_io(
         cutlass.Int32, mn_limit.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
     )
     num_non_exiting_ctas = torch.tensor(
-        [token_layout.num_token_tiles], dtype=torch.int32, device=device
+        [token_layout.num_token_tiles // cfg.token_metadata_stride],
+        dtype=torch.int32,
+        device=device,
     )
     num_non_exiting_ctas_dp = make_ptr(
         cutlass.Int32,

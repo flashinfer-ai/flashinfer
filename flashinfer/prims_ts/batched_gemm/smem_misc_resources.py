@@ -20,6 +20,7 @@ from typing import Any, Optional
 import cutlass
 import cutlass.cute as cute
 from cutlass.experimental import primitives as prims
+from cutlass.utils import WorkTileInfo
 
 from cutlass.experimental.task_scheduling.enums import TileSchedulerType
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
@@ -105,10 +106,41 @@ class BatchedGemmWorkQueue(WorkQueue):
             )
 
     def _uses_fast_drain(self) -> bool:
+        # Batched cancellation bypasses the logical raster transform.
         return (
             getattr(self.cfg, "is_persistent", False)
             and getattr(self.cfg, "use_early_exit", False)
             and getattr(self.cfg, "use_clc_fast_drain", False)
+            and not self.cfg.rasterizes_features_first
+        )
+
+    @cute.jit
+    def _rasterize_batch_m_work_tile(self, work_tile):
+        if cutlass.const_expr(self.cfg.rasterizes_features_first):
+            m_idx, n_idx, l_idx = work_tile.tile_idx
+            grid_m, grid_n, _ = cute.arch.grid_dim()
+            cluster_m = cutlass.Int32(self.cfg.cluster_m)
+            # Decode the physical cluster ordinal as feature-first logical
+            # work, preserving both CTA rank and the scheduler validity bit.
+            ordinal = n_idx * (grid_m // cluster_m) + m_idx // cluster_m
+            work_tile = WorkTileInfo(
+                (
+                    (ordinal // grid_n) * cluster_m + m_idx % cluster_m,
+                    ordinal % grid_n,
+                    l_idx,
+                ),
+                work_tile.is_valid_tile,
+            )
+        return work_tile
+
+    @cute.jit
+    def _make_initial_work_tile(self):
+        return self._rasterize_batch_m_work_tile(super()._make_initial_work_tile())
+
+    @cute.jit
+    def _get_and_advance_work_tile_impl(self, stage_info):
+        return self._rasterize_batch_m_work_tile(
+            super()._get_and_advance_work_tile_impl(stage_info)
         )
 
     def get_smem_requirements(self):
@@ -166,7 +198,10 @@ class BatchedGemmWorkQueue(WorkQueue):
             num_non_exiting_ctas = num_non_exiting_ctas_view.load(
                 idx=cutlass.Int32(0), vector_size=1
             )[0]
-        return token_cta_idx >= num_non_exiting_ctas
+        return (
+            token_cta_idx // cutlass.Int32(self.cfg.token_metadata_stride)
+            >= num_non_exiting_ctas
+        )
 
     @cute.jit
     def _clc_fast_drain_batch(self, parity: cutlass.Int32) -> cutlass.Int32:

@@ -1199,11 +1199,12 @@ def test_validation_accepts_minimal_plain_fp8_per_token_sfb():
         dtype_c=int(DType.E4M3),
         tile_k=32,
         mma_k=32,
-        tile_n=16,
+        tile_n=128,
         route_act=int(RouteImpl.TMA),
         act_kind=int(ActKind.SWIGLU),
         batch_mode=int(BatchMode.BATCH_M),
         transpose_mma_output=0,
+        epi_tile_n=128,
         use_per_token_sf_b=1,
         per_token_sf_dtype=int(DType.BF16),
     )
@@ -1280,6 +1281,12 @@ def test_validation_accepts_nvfp4_per_token_sfb_only():
         **nvfp4_kwargs,
         "batch_mode": int(BatchMode.BATCH_M),
         "transpose_mma_output": 0,
+        "tile_n": 128,
+        "mma_n": 128,
+        "epi_tile_n": 128,
+        "num_stages_tmem_sfa": 2,
+        "num_stages_tmem_sfb": 2,
+        "sf_layout_b": int(SfLayout.R128c4),
     }
     cfg = make_config(
         **no_swap_ab_kwargs,

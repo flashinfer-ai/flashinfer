@@ -313,7 +313,8 @@ class BatchedGemmConfig:
     TRT-LLM Gen's BlockMajorK rule: start from the number of elements in a 128B
     K block, then use the padded smaller block only when the padded K tile spans
     more than two 128B SMEM slices. The layout always applies to the weight
-    operand: A when :attr:`is_swap_ab`, B otherwise.
+    operand: A when :attr:`is_swap_ab`, B otherwise. Both orientations require
+    block-shuffled weight rows, with gate/up rows interleaved for gated output.
     """
 
     sf_bits: int = 8
@@ -399,8 +400,8 @@ class BatchedGemmConfig:
     num_stages_workid: int = 3
     """Depth of the persistent CLC work-id fetch pipeline ring.
 
-    Used only when :attr:`is_persistent`; a value ``> 1`` prevents C scratch from
-    aliasing the A/B buffers (:attr:`aliases_c_scratch_with_ab`).
+    Used only when :attr:`is_persistent`. Queue depth does not serialize the
+    operand loaders with the epilogue of the preceding work tile.
     """
 
     # --- Warp assignments ---
@@ -678,11 +679,22 @@ class BatchedGemmConfig:
     window.
     """
 
+    @property
+    def cluster_shape(self) -> tuple[int, int, int]:
+        """Launch topology; the current MMA pipelines cluster only along M."""
+        return (self.cluster_m, 1, 1)
+
+    @property
+    def token_metadata_stride(self) -> int:
+        """Token CTAs per routing record; TRT-LLM routing records are per CGA."""
+        return self.cluster_shape[0 if self.is_batch_m else 1]
+
     use_max_tmem_overlap: int = 0
     """Enable the tile256 fused-SF / maximum-TMEM-overlap path. ``0``/``1``.
 
-    Valid only for ``tile_n == 256`` block-scaled kernels with ``cluster_m == 2``,
-    persistent scheduling, and ``num_stages_tmem_acc == 1``
+    Valid for ``tile_n == 256`` block-scaled kernels or BF16 BatchM K64,
+    with ``cluster_m == 2``, persistent scheduling, and
+    ``num_stages_tmem_acc == 1``
     (:func:`validate_config`). See :attr:`use_tile256_tmem_overlap`.
     """
 
@@ -1411,6 +1423,14 @@ class BatchedGemmConfig:
         return mn * (self.tile_k // self.input_sf_block_size_b)
 
     @property
+    def uses_rank4_sfb_tma(self) -> bool:
+        """Use 128-row SF groups when the packed rank-3 box would exceed 256."""
+        return self.use_tile256_tmem_overlap or (
+            self.smem_sfb_layout == int(SfLayout.R128c4)
+            and (self.is_mx_mma or self.has_cast_a or self.tile_n > 128)
+        )
+
+    @property
     def num_bytes_sfb_tma_per_stage(self) -> int:
         """GMEM bytes moved by one SFB TMA load.
 
@@ -1470,6 +1490,42 @@ class BatchedGemmConfig:
         )
 
     @property
+    def use_swizzled_non_swap_tma(self) -> bool:
+        """Stage row-major C in aligned boxes, independently of the MMA input type."""
+        output_cols = self.tile_n // (2 if self.has_gated_epilogue else 1)
+        fragment_cols = self.epi_tile_n // (8 if self.has_gated_epilogue else 4)
+        element_bytes = self.dtype_c_bits // 8
+        output_bytes = output_cols * element_bytes
+        fragment_bytes = fragment_cols * element_bytes
+        # x & -x is the largest power-of-two divisor; cap at 128B (192B -> 64B).
+        swizzle_bytes = min(128, output_bytes & -output_bytes)
+
+        # GmemC staging/conversion lacks FP32; this is not a TMA swizzle limit.
+        has_supported_output = self.uses_non_swap_tma_store and self.dtype_c_bits in (
+            8,
+            16,
+        )
+        # Output rows must contain whole swizzle boxes of at least 32 bytes.
+        has_aligned_output = output_bytes >= 32 and output_bytes % 32 == 0
+        # Each fragment contains whole 16-byte stores and fits one swizzle box.
+        has_compatible_fragment = (
+            fragment_bytes % 16 == 0 and fragment_bytes <= swizzle_bytes
+        )
+        # Each epilogue warp owns 32 rows of the output tile.
+        has_matching_warp_layout = self.tile_m == self.num_epilogue_warps * 32
+        return (
+            has_supported_output
+            and has_aligned_output
+            and has_compatible_fragment
+            and has_matching_warp_layout
+        )
+
+    @property
+    def rasterizes_features_first(self) -> bool:
+        """Traverse BatchM feature tiles before token tiles; CLC still schedules CGAs."""
+        return self.is_batch_m and self.is_persistent
+
+    @property
     def num_bytes_c_smem_scratch(self) -> int:
         """Total SMEM bytes reserved for the C epilogue staging buffer.
 
@@ -1477,6 +1533,11 @@ class BatchedGemmConfig:
         reduced per-warpgroup form when :attr:`uses_bf16_gated_tma_c_scratch` or
         :attr:`uses_deepseek_fp8_split_epilogue_tma_c_scratch`.
         """
+        if self.use_swizzled_non_swap_tma:
+            # Maximum TMEM overlap can visit the last fragment first. Keep
+            # each output box live until all of its fragments have arrived.
+            output_cols = self.tile_n // (2 if self.has_gated_epilogue else 1)
+            return self.tile_m * output_cols * self.dtype_c_bits // 8
         if self.uses_deepseek_fp8_split_epilogue_tma_c_scratch:
             return (
                 (self.tile_m // 2)
@@ -1494,18 +1555,48 @@ class BatchedGemmConfig:
         return self.num_bytes_c_per_stage * self.num_stages_c_smem
 
     @property
+    def uses_non_swap_tma_store(self) -> bool:
+        """Whether the row-major epilogue stages output through TMA.
+
+        A fragment must contain at least 16 contiguous output bytes for TMA.
+        Input quantization is independent; output block scaling needs its own
+        packed-value and scale-factor store path.
+        """
+        fragment_cols = self.epi_tile_n // (8 if self.has_gated_epilogue else 4)
+        fragment_bytes = fragment_cols * self.dtype_c_bits // 8
+        # Row-major TMA stores are selected only for BatchM kernels.
+        has_tma_store_path = self.is_batch_m and bool(self.use_tma_store)
+        # Block-scaled output needs separate packed-value and scale stores.
+        has_supported_output = not self.has_epilogue_quant
+        # Each fragment must fill the minimum 16-byte TMA box.
+        has_tma_fragment = fragment_bytes >= 16
+        return has_tma_store_path and has_supported_output and has_tma_fragment
+
+    @property
+    def non_swap_tma_store_cols(self) -> int:
+        """Columns in one row-major output TMA box, after gated activation."""
+        if self.use_swizzled_non_swap_tma:
+            output_cols = self.tile_n // (2 if self.has_gated_epilogue else 1)
+            output_bytes = output_cols * self.dtype_c_bits // 8
+            # Choose a power-of-two swizzle that divides the row, then convert to elements.
+            return min(128, output_bytes & -output_bytes) * 8 // self.dtype_c_bits
+        divisor = 2 if self.has_gated_epilogue else 1
+        return max(
+            self.epi_tile_n // (4 * divisor),
+            min(16, max(8, self.tile_n // divisor)),
+        )
+
+    @property
     def aliases_c_scratch_with_ab(self) -> bool:
         """True when the C epilogue scratch may reuse the A/B SMEM buffers.
 
-        ``False`` when :attr:`uses_bf16_gated_tma_c_scratch`, when persistent scheduling
-        overlaps the next tile's loads (:attr:`is_persistent` and
-        ``num_stages_workid > 1``), or for :attr:`has_cast_a`.
+        Persistent loaders can start the next tile before its predecessor's
+        epilogue completes, even with one work-id stage. Preserve the separate
+        staging required by gated TMA, row-major TMA, and CastA paths as well.
         """
-        if self.uses_bf16_gated_tma_c_scratch:
+        if self.uses_bf16_gated_tma_c_scratch or self.uses_non_swap_tma_store:
             return False
-        if self.is_persistent and self.num_stages_workid > 1:
-            return False
-        return not self.has_cast_a
+        return not self.is_persistent and not self.has_cast_a
 
     @property
     def tmem_alloc_cols(self) -> int:
@@ -1526,6 +1617,8 @@ class BatchedGemmConfig:
         if self.has_cast_a:
             total += self.tmem_cast_a_cols * self.num_stages_cast_a
         if not self.has_scale_factors:
+            if self.use_tile256_tmem_overlap:
+                return 2 * self.tile_n - self.tmem_overlap_chunk_cols
             return total
 
         if self.use_combined_sfab_copy:
@@ -1677,14 +1770,19 @@ class BatchedGemmConfig:
     def use_tile256_tmem_overlap(self) -> bool:
         """True for the ``tile_n == 256`` fused-SF / max-TMEM-overlap path.
 
-        Enabled by :attr:`use_max_tmem_overlap` on block-scaled ``tile_n == 256``
-        kernels; see :func:`validate_config` for the full constraint set.
+        Enabled for block-scaled N256 and BF16 BatchM N256 kernels. The
+        overlap chunk follows each path's T2R width; see :func:`validate_config`.
         """
         return (
-            self.has_scale_factors
+            (self.has_scale_factors or (self.is_bf16_mma and self.is_batch_m))
             and self.use_max_tmem_overlap != 0
             and self.tile_n == 256
         )
+
+    @property
+    def tmem_overlap_chunk_cols(self) -> int:
+        """Columns consumed before releasing the shared accumulator window."""
+        return self.epi_tile_n if self.is_swap_ab else self.epi_tile_n // 4
 
     @property
     def has_cluster(self) -> bool:
@@ -2064,7 +2162,7 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         )
         return
 
-    if cfg.use_tile256_tmem_overlap:
+    if cfg.use_tile256_tmem_overlap and cfg.has_scale_factors:
         cfg.num_mma_warps = 1
         cfg.num_copy_sfa_warps = 0
         cfg.num_copy_sfb_warps = 0
@@ -2073,7 +2171,7 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         cfg.num_workid_warps = 1 if cfg.is_persistent else 0
 
         cfg.epilogue_warp_idx = 0
-        if cfg.has_activation_side_effects:
+        if cfg.has_activation_side_effects and not cfg.is_batch_m:
             if cfg.uses_mxfp8_output_quant:
                 cfg.num_epilogue_warps = 4
                 cfg.num_load_a_warps = 1
@@ -2196,7 +2294,9 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         cfg.threads_per_cta = total_warps * 32
         return
 
-    cfg.num_epilogue_warps = 8 if (cfg.is_fp8_mma and cfg.tile_n == 256) else 4
+    cfg.num_epilogue_warps = (
+        8 if (cfg.is_fp8_mma and cfg.tile_n == 256 and not cfg.is_batch_m) else 4
+    )
     cfg.epilogue_warp_idx = 0
     cfg.num_cast_a_warps = 0
     cfg.num_mma_warps = 1
@@ -3060,12 +3160,24 @@ def validate_config(
     ):
         raise ValueError("Plain FP8 C output requires an activation-side epilogue")
 
+    if cfg.is_batch_m and not (
+        not cfg.has_epilogue_quant
+        and cfg.epi_tile_n % 128 == 0
+        and cfg.tile_n % 32 == 0
+        and cfg.epi_tile_m == 128
+    ):
+        raise ValueError(
+            "BatchM requires non-quantizing 128-row epilogues and whole 128-column shuffle blocks"
+        )
+
     if cfg.use_max_tmem_overlap != 0:
         if not cfg.use_tile256_tmem_overlap:
             raise ValueError(
-                "use_max_tmem_overlap is only supported for block-scaled tile_n=256 kernels"
+                "use_max_tmem_overlap requires block-scaled or BatchM BF16 tile_n=256 kernels"
             )
-        supported_tile_k = (128, 256) if cfg.is_mx_mma else (256,)
+        supported_tile_k = (
+            (64,) if cfg.is_bf16_mma else ((128, 256) if cfg.is_mx_mma else (256,))
+        )
         if (
             cfg.tile_k not in supported_tile_k
             or cfg.cluster_m != 2
@@ -3082,7 +3194,7 @@ def validate_config(
                 "use_max_tmem_overlap requires one accumulator TMEM stage, got "
                 f"num_stages_tmem_acc={cfg.num_stages_tmem_acc}"
             )
-        if cfg.tmem_total_cols < 512 or cfg.tmem_c_cols_per_stage != 256:
+        if cfg.tmem_alloc_cols != 512 or cfg.tmem_c_cols_per_stage != 256:
             raise ValueError(
                 "use_max_tmem_overlap tile256 expects 512 TMEM columns with "
                 f"256 C columns, got total={cfg.tmem_total_cols}, "
