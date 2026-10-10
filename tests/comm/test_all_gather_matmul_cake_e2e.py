@@ -15,11 +15,15 @@ limitations under the License.
 
 Multi-GPU numerical test of the Cake all-gather matmul backend on an NCCL
 subgroup of two, four or eight SM100 / SM103 devices: both weight layouts,
-tail row counts, scratch growth and the capacity-bound prepared launcher.
+tail row counts, scratch growth (including the stale rendezvous-handle guard),
+the capacity-bound prepared launcher, both torch symmetric-memory backends
+(the default CUDA backend and NVSHMEM) and CUDA-graph capture of the prepared
+launcher with replays interleaved with eager calls.
 """
 
 import gc
 import random
+import warnings
 import weakref
 
 import pytest
@@ -29,6 +33,7 @@ import torch.distributed._symmetric_memory as symm_mem
 import torch.multiprocessing as mp
 
 from flashinfer.comm import all_gather_matmul, prepare_all_gather_matmul
+from flashinfer.comm.all_gather_matmul import cake_all_gather_matmul as backend
 from flashinfer.utils import get_compute_capability
 
 K = 8192
@@ -48,10 +53,38 @@ def _check(actual, expected):
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
-def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype):
+def _replayed_launcher(launcher, static, device, expected_of, eager_sample, check):
+    """Capture two launcher calls into one graph, replay with fresh data, interleave eager calls."""
+
+    capture_stream = torch.cuda.Stream(device=device)
+    capture_stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(capture_stream):
+        warm = launcher(static)
+    torch.cuda.current_stream(device).wait_stream(capture_stream)
+    check(warm, expected_of(static))
+    del warm
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_first = launcher(static)
+        captured_second = launcher(static)
+    for _replay in range(3):
+        static.copy_(torch.randn_like(static))
+        graph.replay()
+        expected = expected_of(static)
+        check(captured_first, expected)
+        check(captured_second, expected)
+        check(launcher(eager_sample), expected_of(eager_sample))
+        del expected
+    del graph, captured_first, captured_second
+
+
+def _run_cake_subgroup(
+    rank: int, world_size: int, port: int, dtype: torch.dtype, symm_backend: str
+):
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
-    symm_mem.set_backend("NVSHMEM")
+    if symm_backend == "NVSHMEM":
+        symm_mem.set_backend("NVSHMEM")
     dist.init_process_group(
         backend="nccl",
         init_method=f"tcp://localhost:{port}",
@@ -70,6 +103,7 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
     # Two consecutive calls return fresh outputs and the first is not overwritten.
     first = all_gather_matmul(inp, weight, group, backend="cake")
     _check(first, expected)
+    assert backend.symmetric_memory_backend(device) == symm_backend
     first_snapshot = first.clone()
     second = all_gather_matmul(inp, weight, group, backend="cake")
     assert first.data_ptr() != second.data_ptr()
@@ -103,6 +137,21 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
             backend="cake",
         )
 
+    # A foreign symmetric buffer freed right before a growth: torch's
+    # NVSHMEM allocator before pytorch#192579 hands the next allocation at that
+    # address the freed buffer's cached rendezvous handle, and the backend
+    # re-allocates past the undersized handle. The buffer is sized between the
+    # current scratch (512 rows per peer) and the next one (1152 rows), the
+    # issue's pattern; whether the heap reuses the address depends on its
+    # state, so the detections are reported, not asserted.
+
+    foreign = symm_mem.empty(world_size, 640, K, dtype=dtype, device=device)
+    symm_mem.rendezvous(foreign, group=group.group_name)
+    del foreign
+    torch.cuda.synchronize(device)
+    dist.barrier(group=group)
+    retries_before_tail = backend._RENDEZVOUS_STATS["stale_retries"]
+
     # Tail row counts: the output has exactly world_size * M rows and the
     # scratch grows once when a larger M arrives.
     for tail_rows in (125, 1025):
@@ -111,6 +160,60 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
         assert tail_out.shape == (world_size * tail_rows, 2048)
         _check(tail_out, _expected(tail_inp, param.t(), group, world_size))
         del tail_inp, tail_out
+    if rank == 0:
+        print(
+            "[cake all-gather matmul e2e] stale rendezvous handles re-allocated after "
+            f"the foreign free: {backend._RENDEZVOUS_STATS['stale_retries'] - retries_before_tail}",
+            flush=True,
+        )
+
+    # Deterministic stale-handle injection on a real growth (1152 -> 2048 rows
+    # per peer through the prepared path): the first rendezvous of the new
+    # scratch is reported with half its buffer size, the backend parks that
+    # allocation and re-allocates, the parked allocation is released and the
+    # process-wide warning fires on the first detection only.
+    real_rendezvous = symm_mem.rendezvous
+    injected = {}
+
+    class _Undersized:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        @property
+        def buffer_size(self):
+            return int(self._handle.buffer_size) // 2
+
+    def undersized_rendezvous(tensor, group=None):
+        handle = real_rendezvous(tensor, group=group)
+        if "parked" not in injected and tensor.numel() == world_size * 2048 * K:
+            injected["parked"] = weakref.ref(tensor)
+            return _Undersized(handle)
+        return handle
+
+    retries_before = backend._RENDEZVOUS_STATS["stale_retries"]
+    grown_inp = torch.randn(2048, K, dtype=dtype, device=device)
+    symm_mem.rendezvous = undersized_rendezvous
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            grown = prepare_all_gather_matmul(
+                grown_inp, param.t(), group, backend="cake", max_rows=2048
+            )
+    finally:
+        symm_mem.rendezvous = real_rendezvous
+    assert "parked" in injected
+    assert backend._RENDEZVOUS_STATS["stale_retries"] == retries_before + 1
+    warned = any("pytorch#192579" in str(w.message) for w in caught)
+    assert warned == (retries_before == 0)
+    grown_out = grown(grown_inp)
+    _check(grown_out, _expected(grown_inp, param.t(), group, world_size))
+    torch.cuda.synchronize(device)
+    gc.collect()
+    assert injected["parked"]() is None
+    del grown, grown_inp, grown_out
 
     # The backend keeps no reference to the caller's tensors.
     inp_ref = weakref.ref(inp)
@@ -171,6 +274,69 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
                 launcher(torch.randn(2049, K, dtype=dtype, device=device))
             with pytest.raises(ValueError, match="contiguous"):
                 launcher(torch.randn(512, 2 * K, dtype=dtype, device=device)[:, :K])
+            # The prepared launcher is CUDA-graph capturable: two calls in one
+            # graph, three replays with fresh static input, an eager call
+            # between replays. 512 rows at world sizes 4 and 8 take the
+            # PDL-chained SM push route (N within the route's width ceiling),
+            # 1024 rows the copy-engine route; both are captured.
+            for static_rows in (512, 1024):
+                static = torch.randn(static_rows, K, dtype=dtype, device=device)
+                _replayed_launcher(
+                    launcher,
+                    static,
+                    device,
+                    lambda x: _expected(x, engine_param.t(), group, world_size),
+                    sample,
+                    _check,
+                )
+                del static
+            # Growth after capture is refused: a graph captured from the
+            # launcher bakes the addresses of the current scratch generation
+            # on every rank, so a later eager call beyond the prepared
+            # capacity raises a named error before any collective (prepare
+            # with max_rows covering every call before capturing). The
+            # captured graph keeps replaying correctly and the launcher still
+            # serves both routes.
+            if n == ENGINE_WIDTHS[world_size][0]:
+                graph_static = torch.randn(512, K, dtype=dtype, device=device)
+                growth_stream = torch.cuda.Stream(device=device)
+                growth_stream.wait_stream(torch.cuda.current_stream(device))
+                with torch.cuda.stream(growth_stream):
+                    warm = launcher(graph_static)
+                torch.cuda.current_stream(device).wait_stream(growth_stream)
+                del warm
+                growth_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(growth_graph, stream=growth_stream):
+                    captured_out = launcher(graph_static)
+                grown = torch.randn(8192, K, dtype=dtype, device=device)
+                with pytest.raises(RuntimeError, match="captured into a CUDA graph"):
+                    all_gather_matmul(grown, engine_param.t(), group, backend="cake")
+                for _replay in range(2):
+                    graph_static.copy_(torch.randn_like(graph_static))
+                    growth_graph.replay()
+                    replay_expected = _expected(
+                        graph_static, engine_param.t(), group, world_size
+                    )
+                    _check(captured_out, replay_expected)
+                    del replay_expected
+                for served_rows in (512, 1024):
+                    served = torch.randn(served_rows, K, dtype=dtype, device=device)
+                    served_expected = _expected(
+                        served, engine_param.t(), group, world_size
+                    )
+                    _check(launcher(served), served_expected)
+                    del served, served_expected
+                del growth_graph, captured_out, graph_static, grown
+            # Capture refuses to grow the scratch: a larger call must be prepared eagerly.
+            oversized = torch.randn(4096, K, dtype=dtype, device=device)
+            refusal_stream = torch.cuda.Stream(device=device)
+            refusal_graph = torch.cuda.CUDAGraph()
+            with (
+                pytest.raises(RuntimeError, match="inside CUDA-graph capture"),
+                torch.cuda.graph(refusal_graph, stream=refusal_stream),
+            ):
+                all_gather_matmul(oversized, engine_param.t(), group, backend="cake")
+            del refusal_graph, oversized
             del launcher, engine_param, sample, prepared_first, prepared_second
             del prepared_first_snapshot, prepared_expected
 
@@ -188,13 +354,27 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
     or get_compute_capability(torch.device("cuda:0")) not in ((10, 0), (10, 3)),
     reason="Cake all-gather matmul e2e requires SM100 or SM103",
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_all_gather_matmul_cake_arbitrary_subgroup(dtype):
+@pytest.mark.parametrize(
+    "dtype, symm_backend",
+    [
+        (torch.bfloat16, "CUDA"),
+        (torch.float16, "CUDA"),
+        pytest.param(
+            torch.bfloat16,
+            "NVSHMEM",
+            marks=pytest.mark.skipif(
+                not symm_mem.is_nvshmem_available(),
+                reason="torch symmetric memory has no NVSHMEM backend here",
+            ),
+        ),
+    ],
+)
+def test_all_gather_matmul_cake_arbitrary_subgroup(dtype, symm_backend):
     world_size = torch.cuda.device_count()
     port = random.randint(30000, 60000)
     mp.spawn(
         _run_cake_subgroup,
-        args=(world_size, port, dtype),
+        args=(world_size, port, dtype, symm_backend),
         nprocs=world_size,
         join=True,
     )

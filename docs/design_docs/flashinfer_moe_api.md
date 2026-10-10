@@ -738,7 +738,7 @@ out = layer(act, weights)            # subsequent calls: cached winner dispatch
 Key mechanisms (and where they live):
 
 - **Two packs, two lifetimes.** `MoEWeightPack` holds long-lived, backend-native weight materializations keyed by `backend_key` (`prepare_for` / `get_view`); `MoEActivationPack` carries per-call pre-routed activations. This is the concrete answer to reviewers' "backends need different weight preprocessing" concern (C29–C32): each backend stores its own view, none is hidden from the caller.
-- **One activation pack per MMA pair.** For NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8 and per-tensor FP8 every backend consumes the TRT-LLM canonical `hidden_states_q` / `hidden_states_scale` (formats per pair: `MoEActivationPack` docstring), so a mixed candidate set such as `(TrtllmFp4Config(), CuteDslConfig(), CutlassNvfp4Config())` runs on one pack and the `prepare_activations` helpers of different backends for one pair are interchangeable. Per-tensor FP8 carries no pack scale: the static `hidden_states_scale_global` / `intermediate_scale_global` are `prepare_weights` inputs of both `TrtllmFp8PerTensorConfig` and `CutlassFp8PerTensorConfig`, and CUTLASS folds its flat `quant_scales` from them at load time. Exceptions: b12x / cuTile NVFP4 take BF16 and quantize in-kernel, so they do not share candidate sets with the pre-quantized NVFP4 backends; the opt-in `QuantConfig(swizzled_scale_factors=True)` selects the flat swizzled MXFP8 `input_sf` that only the CUTLASS MXFP8 runners consume (every other runner rejects the flag in `check_support`); CUTLASS runners reject `QuantConfig(per_token_scale=True)`. Routing is matched separately: `routing_input_mode` support is per runner (`supported_routing_modes`) and `MoELayer.__call__` filters on it.
+- **One activation pack per MMA pair.** For NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8 and per-tensor FP8 every backend consumes the TRT-LLM canonical `hidden_states_q` / `hidden_states_scale` (formats per pair: `MoEActivationPack` docstring), so a mixed candidate set such as `(TrtllmFp4Config(), CuteDslConfig(), CutlassNvfp4Config())` runs on one pack and the `prepare_activations` helpers of different backends for one pair are interchangeable. Per-tensor FP8 carries no pack scale: the static `hidden_states_scale_global` / `intermediate_scale_global` are `prepare_weights` inputs of both `TrtllmFp8PerTensorConfig` and `CutlassFp8PerTensorConfig`, and CUTLASS folds its flat `quant_scales` from them at load time. Exceptions: b12x / cuTile NVFP4 take BF16 and quantize in-kernel, so they do not share candidate sets with the pre-quantized NVFP4 backends; the opt-in `QuantConfig(swizzled_scale_factors=True)` selects the flat swizzled MXFP8 `input_sf` that only the CUTLASS MXFP8 runners consume (every other runner rejects the flag in `check_support`); `QuantConfig(per_token_scale=True)` is accepted only by runners with `supports_per_token_scale` (TRT-LLM FP4, CuteDSL, Prims-TS, all NVFP4×NVFP4 only), and a non-None `MoEActivationPack.per_token_scale` only when that flag is set on the config, since the TRT-LLM and Prims-TS launchers switch kernels on the tensor's presence; every other combination is rejected in `check_support` / `MoERunner._validate_pack_contract` rather than dropping or silently honoring the scale. Routing is matched separately: `routing_input_mode` support is per runner (`supported_routing_modes`); `MoELayer.__call__` filters on it and every `pack_inputs` re-checks it through `MoERunner._validate_pack_contract`.
 - **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` / `CutlassNvfp4Config.prepare_weights(...)` (and the other quant-specific `Cutlass*Config.prepare_weights` helpers, backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7). Weight views are backend-native: CUTLASS NVFP4 uses swizzled `fp4_quantize` scales, not the TRTLLM shuffle / BlockMajorK path, and CUTLASS FP8 / MXFP8 / W4A8 / Humming likewise keep unshuffled or mixed-input layouts distinct from TRTLLM. The quantized activation payload is shared: for NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8 and per-tensor FP8 every backend consumes the TRT-LLM canonical `hidden_states_q` / `hidden_states_scale`, so the `prepare_activations` helpers of different backends for one pair are interchangeable (see "One activation pack per MMA pair" below). Each quant mode uses its matching `Cutlass*Config` / `Cutlass*Runner`; there is no quant-neutral CUTLASS fallback.
 - **One canonical source order.** Every `prepare_weights` takes gated `w1` as `[E, 2I, H]` with rows `[up, gate]` (first `I` rows are the linear half, last `I` the gate); backends that need `[gate, up]` swap halves in their prepare helper, never in `MoEConfig`. A caller holding `[gate, up]` checkpoints does one `chunk`/`cat` at load. The fuzz references read this order for every backend; `tests/moe/test_unified_moe.py::test_bf16_gate_up_row_order_is_up_then_gate` additionally runs asymmetric halves through the TRT-LLM and CUTLASS BF16 runners so a kernel and reference that share a swap cannot both pass.
 - **Breaking change — `CutlassConfig` removed.** The deprecated, unregistered `CutlassConfig` placeholder is gone. It was never a runnable `MoELayer` backend (`supported()` always returned false; it was not in `_BACKEND_RUNNERS`). Import, annotate, serialize, or feature-detect a quant-specific type instead (`CutlassBf16Config`, `CutlassNvfp4Config`, `CutlassFp8PerTensorConfig`, `CutlassFp8BlockConfig`, `CutlassMxfp8Config`, `CutlassMxfp8Mxfp4Config`, `CutlassW4A16Config`, `CutlassW4A8Config`, `CutlassHummingConfig`). Historical **Anchor:** / CR1 quotes earlier in this document still mention `CutlassConfig` as review history, not current API.
@@ -788,6 +788,51 @@ controls remain in backend-native `MoEWeightPack` views: TRT-LLM uses
 `situ_beta` / `situ_linear_beta`. Where supported, these tensors override the
 config-derived values.
 
+TRT-LLM supports StepFun's clipped activation through `SwiGLUStep(limit=7)`:
+
+```python
+activation = SwiGLUStep(limit=7.0)
+# Physical values, after FC1 dequantization:
+activated = up.clamp(-7.0, 7.0) * torch.nn.functional.silu(gate).clamp(max=7.0)
+```
+
+The gate is capped after SiLU. The fused epilogue accepts a per-expert
+`gemm1_clamp_limit` tensor and rejects `gemm1_alpha` / `gemm1_beta` for this
+activation. A null limit pointer uses physical `7`; a custom typed limit,
+including `SwiGLUStep(limit=16)`, is materialized during weight preparation.
+An explicit tensor in the prepared view overrides that typed limit.
+
+The tensor contains raw FC1 accumulator limits: for NVFP4 and per-tensor FP8,
+divide physical limits by the FC1 gate dequantization scale. BF16 and MXFP8
+use physical limits directly. The FP8 preparation helper performs this
+conversion, and the NVFP4 helper prepares unit global scales. With fused
+shared experts in NVFP4 or MXFP8, append the shared expert limits after the
+routed expert limits:
+
+```python
+limits = torch.full((num_local_experts + 1,), 7.0, device=device)
+limits[-1] = 16.0
+gate_scale = view.get(
+    "output1_scales_gate_scalar", view.get("output1_scale_gate_scalar")
+)
+view["gemm1_clamp_limit"] = (
+    limits if gate_scale is None else limits / gate_scale
+).contiguous()
+```
+
+The fused StepFun epilogue supports BF16, FP8 per tensor, MXFP8 block scale,
+and NVFP4. DeepSeek FP8 uses a separate activation kernel and rejects StepFun.
+NVFP4 also supports explicit per-token scaling through BF16-output FC1
+StepFun cubins followed by per-token requantization for FC2.
+The TRT-LLM backend requires batched-GEMM export `7.0.5.0.4.0` or later
+containing StepFun epilogues; older artifacts report missing StepFun kernels.
+
+StepFun trace references consume the same native weight layouts as the APIs:
+BF16 uses BlockMajorK, and shuffled weights use the prepared FC1/FC2 row
+order. MXFP8 and NVFP4 additionally use 128x4 weight-scale layouts. BF16 and
+MXFP8 traces retain `use_shuffled_weight` to select the row order. Serialized
+references restore these layouts using PyTorch.
+
 `SiTU.linear_scale` is the linear-branch soft-clamp scale, applied as
 `linear_scale * tanh(linear / linear_scale)`. It accepts `None` for the
 unclamped linear branch, which only the CuTe-DSL scalar ABI can express: the
@@ -815,6 +860,10 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cudnn_frost_mxfp8` | `CudnnFrostMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_frost_mxfp8_mxfp4` | `CudnnFrostMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_frost_nvfp4` | `CudnnFrostNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
+| `cudnn_grouped_gemm_bf16` | `CudnnGroupedGemmBf16Config` | `BF16×BF16` | `SwiGLU` |
+| `cudnn_grouped_gemm_fp8_per_tensor` | `CudnnGroupedGemmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU` |
+| `cudnn_grouped_gemm_mxfp8` | `CudnnGroupedGemmMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU` |
+| `cudnn_grouped_gemm_nvfp4` | `CudnnGroupedGemmNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU` |
 | `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×BF16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
@@ -838,17 +887,22 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
+| `prims_ts` | `PrimsTsConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
+| `prims_ts` | `PrimsTsConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |
+| `prims_ts` | `PrimsTsConfig` | `MXFP4×BF16` | `SwiGLU` |
+| `prims_ts` | `PrimsTsConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+| `prims_ts` | `PrimsTsConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `ReLU2` |
 | `prims_ts` | `PrimsTsConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
 | `sm12x_fp8` | `SM12xFp8Config` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `sm12x_mxfp8_mxfp4` | `SM12xMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU` |
 | `sm12x_nvfp4_bf16` | `SM12xNvfp4Bf16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
-| `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
+| `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×BF16` | `SwiGLU` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
-| `trtllm_fp4_routed` | `TrtllmFp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+| `trtllm_fp4_routed` | `TrtllmFp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `SiTU`, `ReLU2` |
 | `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
-| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `ReLU2` |
-| `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |
+| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `ReLU2` |
+| `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×BF16` | `SwiGLU` |
 <!-- END GENERATED MOE ACTIVATION MATRIX -->
 

@@ -64,7 +64,7 @@ _M_BUCKETS = (
 _MM_FP4_SWAP_PENALTY_MAX_M = 8192
 
 
-_SM100_CLUSTER_SHAPE_MN_CANDIDATES = [
+_CLUSTER_SHAPE_MN_CANDIDATES = [
     (1, 1),
     (1, 2),
     (1, 4),
@@ -81,7 +81,7 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
     """Compute the best tactic for a specific (M, N, K) on a GPU with sm_count SMs.
 
     Used for mm_fp4(backend='cute-dsl') without autotune by taking the
-    argmax of _score_mm_fp4_tactic over kernel-feasible
+    argmax of _score_block_scaled_tactic over kernel-feasible
     (tile, cluster, swap_ab), with prefetch disabled.
     """
     import cutlass
@@ -112,12 +112,12 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
     best_tactic = None
     best_score = -1.0
     for tile in _SM100_MMA_TILER_MN_CANDIDATES:
-        for cluster in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
+        for cluster in _CLUSTER_SHAPE_MN_CANDIDATES:
             if tile[0] == 256 and cluster[0] < 2:
                 continue  # 2-CTA MMA (tile_m == 256) requires cluster_m >= 2
             # swap_ab is only valid for 8-aligned n
             for swap_ab in (False,) if not n_aligned else (False, True):
-                score = _score_mm_fp4_tactic(
+                score = _score_block_scaled_tactic(
                     rep_m, n, real_k, sm_count, tile, cluster, swap_ab
                 )
                 if score > best_score and is_feasible(tile, cluster, swap_ab):
@@ -126,11 +126,14 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
     return best_tactic
 
 
-def _score_mm_fp4_tactic(
+def _score_block_scaled_tactic(
     m, n, real_k, sm_count, mma_tiler_mn, cluster_shape_mn, swap_ab
 ):
-    """Score a mm_fp4 cute-dsl tactic (higher means better).
-    Used for ranking candidates for both top-1 and autotune scenarios.
+    """Score a block-scaled cute-dsl GEMM tactic (higher means better).
+
+    Reads only the problem shape, tile, cluster and swap_ab, not the data type. Its
+    constants were calibrated on mm_fp4; it also picks the untuned SM107 mm_mxfp8
+    tactic. Used for ranking candidates for both top-1 and autotune scenarios.
     """
     if m == 0 or n == 0:
         return 0.0
@@ -203,7 +206,9 @@ def _rank_mm_fp4_autotune_tactics(valid_tactics, m, n, real_k, sm_count, max_tac
 
     def score(tactic):
         tile, cluster, swap_ab, _, _, _ = tactic
-        return _score_mm_fp4_tactic(m, n, real_k, sm_count, tile, cluster, swap_ab)
+        return _score_block_scaled_tactic(
+            m, n, real_k, sm_count, tile, cluster, swap_ab
+        )
 
     return sorted(valid_tactics, key=score, reverse=True)[:max_tactics]
 
@@ -250,7 +255,7 @@ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
 # sm100 16 / sm107 4 at M 33-512, and sm107 41 / sm100 19 above that --
 # narrow sm100 tiles win decode, wide sm107 tiles win prefill.
 #
-# So this scores the union with the same _score_mm_fp4_tactic used for
+# So this scores the union with the same _score_block_scaled_tactic used for
 # sm100 and for the top-N ranking, and emits whichever kernel won.
 _SM107_MMA_TILER_MN_CANDIDATES = [
     (128, 64),
@@ -265,6 +270,21 @@ _SM107_MMA_TILER_MN_CANDIDATES = [
 
 # (n, real_k, sm_count, sf_vec_size) -> dict[m_bucket -> tactic_tuple]
 _SM107_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
+
+# (n, real_k, sm_count) -> dict[m_bucket -> tactic_tuple | None]
+_SM107_MM_MXFP8_TACTIC_CACHE: dict[tuple, dict] = {}
+
+# SM107 MXFP8 block-scaled MMA: instruction K 64, K tile 128.
+_SM107_MXFP8_MMA_INST_SHAPE_K = 64
+_SM107_MXFP8_MMA_TILER_K = 128
+
+# mm_mxfp8 also offers 512-row tiles: two 256-row MMAs per CTA (B-reuse).
+_SM107_MXFP8_MMA_TILER_MN_CANDIDATES = _SM107_MMA_TILER_MN_CANDIDATES + [
+    (512, 64),
+    (512, 128),
+    (512, 192),
+    (512, 256),
+]
 
 # Fixed for FP4, matching the tactic enumeration in gemm_base.py.
 _SM107_MMA_INST_SHAPE_K = 128
@@ -337,7 +357,7 @@ def _compute_sm107_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
     best_score = -1.0
 
     # sm107 candidates are scored FIRST so that ties resolve to the
-    # Rubin-native kernel. _score_mm_fp4_tactic reads only tile, cluster
+    # Rubin-native kernel. _score_block_scaled_tactic reads only tile, cluster
     # and swap_ab, so a tile offered by both kernels scores identically and the
     # strict `>` below keeps whichever was seen first. The autotuner's measured
     # preference is sm107 at large M (41/60 winners above M=512), so sm107 wins
@@ -355,14 +375,14 @@ def _compute_sm107_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
         m_aligned = rep_m % 8 == 0
         for tile in _SM107_MMA_TILER_MN_CANDIDATES:
             inst_shape = (tile[0], tile[1], _SM107_MMA_INST_SHAPE_K)
-            for cluster in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
+            for cluster in _CLUSTER_SHAPE_MN_CANDIDATES:
                 if tile[0] == 256 and cluster[0] < 2:
                     continue
                 swap_options = (False, True) if (n_aligned and m_aligned) else (False,)
                 for swap_ab in swap_options:
                     if swap_ab and not n_aligned:
                         continue
-                    score = _score_mm_fp4_tactic(
+                    score = _score_block_scaled_tactic(
                         rep_m, n, real_k, sm_count, tile, cluster, swap_ab
                     )
                     if score > best_score and sm107_feasible(
@@ -387,11 +407,11 @@ def _compute_sm107_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
     # sm100 candidates -- the only ones that can express tile_n < 64, which is
     # what wins at decode M once swap_ab puts the small dimension on the N axis.
     for tile in _SM100_MMA_TILER_MN_CANDIDATES:
-        for cluster in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
+        for cluster in _CLUSTER_SHAPE_MN_CANDIDATES:
             if tile[0] == 256 and cluster[0] < 2:
                 continue  # 2-CTA MMA (tile_m == 256) requires cluster_m >= 2
             for swap_ab in (False,) if not n_aligned else (False, True):
-                score = _score_mm_fp4_tactic(
+                score = _score_block_scaled_tactic(
                     rep_m, n, real_k, sm_count, tile, cluster, swap_ab
                 )
                 if score > best_score and sm100_feasible(tile, cluster, swap_ab):
@@ -419,6 +439,88 @@ def _select_sm107_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
                 rep_m, n, real_k, sm_count, sf_vec_size
             )
         _SM107_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
+
+    bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
+    return bucket_tactics[bucket]
+
+
+def _get_sm107_mxfp8_tactics(m, n, real_k, c_cutlass_dtype):
+    """SM107-kernel tactics that can run an mm_mxfp8 (M, N, K); used by both the
+    SM107 cute-dsl runner's autotune enumeration and the untuned selector.
+
+    Each tactic is (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m).
+    """
+    import cutlass
+
+    from .dense_blockscaled_gemm_sm107 import (
+        Sm107BlockScaledPersistentDenseGemmKernel,
+    )
+
+    tactics = []
+    for tile in _SM107_MXFP8_MMA_TILER_MN_CANDIDATES:
+        for mma_inst_shape_m in (128, 256):
+            inst_shape = (mma_inst_shape_m, tile[1], _SM107_MXFP8_MMA_INST_SHAPE_K)
+            for cluster in _CLUSTER_SHAPE_MN_CANDIDATES:
+                for swap_ab in (False, True):
+                    kernel_m, kernel_n = (n, m) if swap_ab else (m, n)
+                    if Sm107BlockScaledPersistentDenseGemmKernel.can_implement(
+                        cutlass.Float8E4M3FN,
+                        cutlass.Float8E8M0FNU,
+                        32,
+                        c_cutlass_dtype,
+                        tile,
+                        inst_shape,
+                        cluster,
+                        kernel_m,
+                        kernel_n,
+                        real_k,
+                        1,
+                        "k",
+                        "k",
+                        "m" if swap_ab else "n",
+                        mma_tiler_k=_SM107_MXFP8_MMA_TILER_K,
+                    ):
+                        tactics.append((tile, cluster, swap_ab, mma_inst_shape_m))
+    return tactics
+
+
+def _compute_sm107_mxfp8_tactic_for_m(rep_m, n, real_k, sm_count):
+    """Best SM107-kernel mm_mxfp8 tactic for one (M, N, K), or None if none fits.
+
+    Ranked by _score_block_scaled_tactic. It considers only tactics whose MMA
+    instruction M equals the tile M: the scorer models every 256-row tile as a
+    2-CTA MMA and cannot score B-reuse (a 256-row tile issued as two 128-row MMAs
+    by one CTA). The autotuner still considers B-reuse.
+    """
+    import cutlass
+
+    best_tactic = None
+    best_score = -1.0
+    for tactic in _get_sm107_mxfp8_tactics(rep_m, n, real_k, cutlass.BFloat16):
+        tile, cluster, swap_ab, mma_inst_shape_m = tactic
+        if mma_inst_shape_m != tile[0]:
+            continue
+        score = _score_block_scaled_tactic(
+            rep_m, n, real_k, sm_count, tile, cluster, swap_ab
+        )
+        if score > best_score:
+            best_score = score
+            best_tactic = tactic
+    return best_tactic
+
+
+def _select_sm107_mm_mxfp8_cute_dsl_tactic(m, n, real_k, sm_count):
+    """Untuned mm_mxfp8(backend='cute-dsl') tactic on sm107, or None if the SM107
+    kernel cannot run the shape.
+    """
+    cache_key = (n, real_k, sm_count)
+    bucket_tactics = _SM107_MM_MXFP8_TACTIC_CACHE.get(cache_key)
+    if bucket_tactics is None:
+        bucket_tactics = {
+            rep_m: _compute_sm107_mxfp8_tactic_for_m(rep_m, n, real_k, sm_count)
+            for rep_m in _M_BUCKETS
+        }
+        _SM107_MM_MXFP8_TACTIC_CACHE[cache_key] = bucket_tactics
 
     bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
     return bucket_tactics[bucket]

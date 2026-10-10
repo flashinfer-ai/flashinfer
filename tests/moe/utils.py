@@ -616,6 +616,9 @@ def compute_reference_moe_fp4(
     Returns:
         Output tensor [num_tokens, hidden_size]
     """
+    if activation is None and int(activation_type) == ActivationType.SwigluStep.value:
+        activation = "swiglu_step"
+        swiglu_limit = 7.0 if swiglu_limit is None else swiglu_limit
     if activation is None:
         normalized_activation_type, gated = normalize_cute_dsl_moe_activation_type(
             activation_type
@@ -633,6 +636,7 @@ def compute_reference_moe_fp4(
     else:
         supported_activations = {
             "silu",
+            "swiglu_step",
             "situ",
             "gelu_tanh",
             "swigluoai_uninterleave",
@@ -709,6 +713,10 @@ def compute_reference_moe_fp4(
                     act_out = F.gelu(gate, approximate="tanh") * linear
                 elif activation == "silu":
                     act_out = silu(gate) * linear
+                elif activation == "swiglu_step":
+                    act_out = silu(gate).clamp(max=swiglu_limit) * linear.clamp(
+                        min=-swiglu_limit, max=swiglu_limit
+                    )
                 else:
                     if swiglu_limit is not None:
                         gate = gate.clamp(max=swiglu_limit)

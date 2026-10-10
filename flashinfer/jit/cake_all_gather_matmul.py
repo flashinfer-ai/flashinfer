@@ -22,7 +22,7 @@ sequence module per (world size, dtype, weight layout, architecture)
 (``SEQUENCES``): the route's device units together with the rendered one-call
 launcher ``run`` (barrier, bridge event, copy-engine pushes with their
 readiness epochs, main kernel with cached tensor maps) and, on the routes with
-a fused SM copy shape, ``run_fused``. The main kernels are tcgen05 code, so a
+a shape of at most ``SM_PUSH_MAX_ROWS`` padded rows, ``run_push``. The main kernels are tcgen05 code, so a
 sequence is compiled for its exact architecture (``sm_100a`` or ``sm_103a``).
 The tables are filled by the exporter from the program bundle; the loader never
 hashes sources or interprets argument plans.
@@ -41,121 +41,121 @@ from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 # Filled mechanically from the program bundle.
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_all_gather_matmul_05d590fb05d9692b74a8": {
+    "cake_all_gather_matmul_0207fc52f60d8009b335": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_05d590fb05d9692b74a8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0207fc52f60d8009b335_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_0a7520d9a4cae8d18425": {
+    "cake_all_gather_matmul_215935905975bd30dda9": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0a7520d9a4cae8d18425_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_215935905975bd30dda9_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_1371696ea325f44809f3": {
+    "cake_all_gather_matmul_40242e9c64d6e66af6f5": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1371696ea325f44809f3_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_2e04a762811cd00a1cd5": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "block": [32, 1, 1],
-        "dynamic_smem_bytes": 0,
-    },
-    "cake_all_gather_matmul_43e256e956ee81d48de7": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "block": [32, 1, 1],
-        "dynamic_smem_bytes": 0,
-    },
-    "cake_all_gather_matmul_567bafbe34f78949b4bf": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_567bafbe34f78949b4bf_kernel.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_775065698a2a5e33aece": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_775065698a2a5e33aece_kernel.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_a90116586399c59ba880": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a90116586399c59ba880_kernel.cu",
-        ],
-        "arches": ["sm_103a"],
         "block": [128, 1, 1],
         "dynamic_smem_bytes": 0,
     },
-    "cake_all_gather_matmul_ac7f1bb1b739b6d1f547": {
+    "cake_all_gather_matmul_72c819bc06bbde0de32b": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ac7f1bb1b739b6d1f547_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72c819bc06bbde0de32b_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_da440c509191f6e0d261": {
+    "cake_all_gather_matmul_7c66e75c60a4879c3f59": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_da440c509191f6e0d261_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_7c66e75c60a4879c3f59_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_e4758f4ef9810377a478": {
+    "cake_all_gather_matmul_847f7684f2820f90b306": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e4758f4ef9810377a478_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_847f7684f2820f90b306_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_e8d8dfcb549a27f6f839": {
+    "cake_all_gather_matmul_8dea171063652cd775f8": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e8d8dfcb549a27f6f839_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [32, 1, 1],
+        "dynamic_smem_bytes": 0,
+    },
+    "cake_all_gather_matmul_a0eff3774e45c89deb2d": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a0eff3774e45c89deb2d_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_f3155f0ac3f178ded967": {
+    "cake_all_gather_matmul_a80780ede8a1e951deef": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f3155f0ac3f178ded967_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a80780ede8a1e951deef_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_f85d24d083dd2de99b4a": {
+    "cake_all_gather_matmul_ad1e36214ed76b888e8a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f85d24d083dd2de99b4a_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ad1e36214ed76b888e8a_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_fe8067061d4e5933b221": {
+    "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fe8067061d4e5933b221_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [32, 1, 1],
+        "dynamic_smem_bytes": 0,
+    },
+    "cake_all_gather_matmul_bede04b43f0bd85c421d": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bede04b43f0bd85c421d_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_d3c3aacffd5b8472985d": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_d3c3aacffd5b8472985d_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_e485eef2b19e8858c4ea": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e485eef2b19e8858c4ea_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_fc5668c3f1fb4c1881e9": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fc5668c3f1fb4c1881e9_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -163,336 +163,334 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
 }
 ROUTES: dict[str, str] = {
-    "barrier_p0": "cake_all_gather_matmul_43e256e956ee81d48de7",
-    "barrier_p1": "cake_all_gather_matmul_2e04a762811cd00a1cd5",
-    "fused_peer_copy": "cake_all_gather_matmul_a90116586399c59ba880",
-    "main_bfloat16_ws2_k_major": "cake_all_gather_matmul_1371696ea325f44809f3",
-    "main_bfloat16_ws2_n_major": "cake_all_gather_matmul_567bafbe34f78949b4bf",
-    "main_bfloat16_ws4_k_major": "cake_all_gather_matmul_e4758f4ef9810377a478",
-    "main_bfloat16_ws4_n_major": "cake_all_gather_matmul_775065698a2a5e33aece",
-    "main_bfloat16_ws8_k_major": "cake_all_gather_matmul_fe8067061d4e5933b221",
-    "main_bfloat16_ws8_n_major": "cake_all_gather_matmul_da440c509191f6e0d261",
-    "main_float16_ws2_k_major": "cake_all_gather_matmul_0a7520d9a4cae8d18425",
-    "main_float16_ws2_n_major": "cake_all_gather_matmul_ac7f1bb1b739b6d1f547",
-    "main_float16_ws4_k_major": "cake_all_gather_matmul_e8d8dfcb549a27f6f839",
-    "main_float16_ws4_n_major": "cake_all_gather_matmul_f85d24d083dd2de99b4a",
-    "main_float16_ws8_k_major": "cake_all_gather_matmul_05d590fb05d9692b74a8",
-    "main_float16_ws8_n_major": "cake_all_gather_matmul_f3155f0ac3f178ded967",
+    "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+    "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+    "main_bfloat16_ws2_k_major": "cake_all_gather_matmul_0207fc52f60d8009b335",
+    "main_bfloat16_ws2_n_major": "cake_all_gather_matmul_72c819bc06bbde0de32b",
+    "main_bfloat16_ws4_k_major": "cake_all_gather_matmul_e485eef2b19e8858c4ea",
+    "main_bfloat16_ws4_n_major": "cake_all_gather_matmul_a80780ede8a1e951deef",
+    "main_bfloat16_ws8_k_major": "cake_all_gather_matmul_847f7684f2820f90b306",
+    "main_bfloat16_ws8_n_major": "cake_all_gather_matmul_ad1e36214ed76b888e8a",
+    "main_float16_ws2_k_major": "cake_all_gather_matmul_d3c3aacffd5b8472985d",
+    "main_float16_ws2_n_major": "cake_all_gather_matmul_bede04b43f0bd85c421d",
+    "main_float16_ws4_k_major": "cake_all_gather_matmul_fc5668c3f1fb4c1881e9",
+    "main_float16_ws4_n_major": "cake_all_gather_matmul_7c66e75c60a4879c3f59",
+    "main_float16_ws8_k_major": "cake_all_gather_matmul_215935905975bd30dda9",
+    "main_float16_ws8_n_major": "cake_all_gather_matmul_a0eff3774e45c89deb2d",
+    "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
 }
 SEQUENCES: dict[str, dict[str, Any]] = {
     "bfloat16_ws2_k_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1371696ea325f44809f3_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0207fc52f60d8009b335_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 2,
         "dtype": "bfloat16",
         "b_layout": "k_major",
-        "fused": False,
     },
     "bfloat16_ws2_k_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1371696ea325f44809f3_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0207fc52f60d8009b335_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 2,
         "dtype": "bfloat16",
         "b_layout": "k_major",
-        "fused": False,
     },
     "bfloat16_ws2_n_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_567bafbe34f78949b4bf_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72c819bc06bbde0de32b_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 2,
         "dtype": "bfloat16",
         "b_layout": "n_major",
-        "fused": False,
     },
     "bfloat16_ws2_n_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_567bafbe34f78949b4bf_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72c819bc06bbde0de32b_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 2,
         "dtype": "bfloat16",
         "b_layout": "n_major",
-        "fused": False,
     },
     "bfloat16_ws4_k_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e4758f4ef9810377a478_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e485eef2b19e8858c4ea_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 4,
         "dtype": "bfloat16",
         "b_layout": "k_major",
-        "fused": False,
     },
     "bfloat16_ws4_k_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e4758f4ef9810377a478_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e485eef2b19e8858c4ea_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 4,
         "dtype": "bfloat16",
         "b_layout": "k_major",
-        "fused": False,
     },
     "bfloat16_ws4_n_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_775065698a2a5e33aece_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a80780ede8a1e951deef_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 4,
         "dtype": "bfloat16",
         "b_layout": "n_major",
-        "fused": False,
     },
     "bfloat16_ws4_n_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_775065698a2a5e33aece_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a80780ede8a1e951deef_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 4,
         "dtype": "bfloat16",
         "b_layout": "n_major",
-        "fused": False,
     },
     "bfloat16_ws8_k_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fe8067061d4e5933b221_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_847f7684f2820f90b306_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 8,
         "dtype": "bfloat16",
         "b_layout": "k_major",
-        "fused": False,
     },
     "bfloat16_ws8_k_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fe8067061d4e5933b221_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a90116586399c59ba880_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_847f7684f2820f90b306_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 8,
         "dtype": "bfloat16",
         "b_layout": "k_major",
-        "fused": True,
     },
     "bfloat16_ws8_n_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_da440c509191f6e0d261_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ad1e36214ed76b888e8a_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 8,
         "dtype": "bfloat16",
         "b_layout": "n_major",
-        "fused": False,
     },
     "bfloat16_ws8_n_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_da440c509191f6e0d261_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a90116586399c59ba880_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ad1e36214ed76b888e8a_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 8,
         "dtype": "bfloat16",
         "b_layout": "n_major",
-        "fused": True,
     },
     "float16_ws2_k_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0a7520d9a4cae8d18425_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_d3c3aacffd5b8472985d_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 2,
         "dtype": "float16",
         "b_layout": "k_major",
-        "fused": False,
     },
     "float16_ws2_k_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0a7520d9a4cae8d18425_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_d3c3aacffd5b8472985d_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 2,
         "dtype": "float16",
         "b_layout": "k_major",
-        "fused": False,
     },
     "float16_ws2_n_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ac7f1bb1b739b6d1f547_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bede04b43f0bd85c421d_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 2,
         "dtype": "float16",
         "b_layout": "n_major",
-        "fused": False,
     },
     "float16_ws2_n_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ac7f1bb1b739b6d1f547_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bede04b43f0bd85c421d_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 2,
         "dtype": "float16",
         "b_layout": "n_major",
-        "fused": False,
     },
     "float16_ws4_k_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e8d8dfcb549a27f6f839_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fc5668c3f1fb4c1881e9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 4,
         "dtype": "float16",
         "b_layout": "k_major",
-        "fused": False,
     },
     "float16_ws4_k_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e8d8dfcb549a27f6f839_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fc5668c3f1fb4c1881e9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 4,
         "dtype": "float16",
         "b_layout": "k_major",
-        "fused": False,
     },
     "float16_ws4_n_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f85d24d083dd2de99b4a_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_7c66e75c60a4879c3f59_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 4,
         "dtype": "float16",
         "b_layout": "n_major",
-        "fused": False,
     },
     "float16_ws4_n_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f85d24d083dd2de99b4a_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_7c66e75c60a4879c3f59_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 4,
         "dtype": "float16",
         "b_layout": "n_major",
-        "fused": False,
     },
     "float16_ws8_k_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_05d590fb05d9692b74a8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_215935905975bd30dda9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 8,
         "dtype": "float16",
         "b_layout": "k_major",
-        "fused": False,
     },
     "float16_ws8_k_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_05d590fb05d9692b74a8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_215935905975bd30dda9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 8,
         "dtype": "float16",
         "b_layout": "k_major",
-        "fused": False,
     },
     "float16_ws8_n_major_sm_100a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f3155f0ac3f178ded967_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a0eff3774e45c89deb2d_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 8,
         "dtype": "float16",
         "b_layout": "n_major",
-        "fused": False,
     },
     "float16_ws8_n_major_sm_103a": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f3155f0ac3f178ded967_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a0eff3774e45c89deb2d_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 8,
         "dtype": "float16",
         "b_layout": "n_major",
-        "fused": False,
     },
 }
 COMPILE_FLAGS: list[str] = ["--use_fast_math"]
@@ -521,8 +519,15 @@ CHUNK_ROWS = 19 * BLOCK_M
 # of a contiguous ``[N, K]`` parameter.
 B_LAYOUTS: tuple[str, ...] = ("n_major", "k_major")
 MAIN_THREADS = 192
-# Fused SM103 peer copy: CTAs per remote peer along grid x, one peer per grid y.
-FUSED_COPY_CTAS_PER_PEER = 32
+# SM push kernel: CTAs per remote peer along grid x, one peer per grid y; padded
+# local rows up to which it replaces the copy-engine pushes (every world size,
+# dtype and architecture). Both mirror the Cake export adapter.
+PUSH_CTAS_PER_PEER = 32
+SM_PUSH_MAX_ROWS = 512
+# Width ceiling of the SM push route: N <= SM_PUSH_COLS_INTERCEPT - SM_PUSH_COLS_PER_ROW * padded_rows
+# (10240 at 128 padded rows, 4096 at 512); wider GEMMs overlap the copy-engine pushes instead.
+SM_PUSH_COLS_INTERCEPT = 12288
+SM_PUSH_COLS_PER_ROW = 16
 # Barrier flag pad: two phase epochs plus two sender-indexed mailbox banks per
 # phase and rank (``2 + 2 * 2 * world_size`` uint32 words).
 BARRIER_PHASES = 2
@@ -568,40 +573,40 @@ def chunk_plan(rows: int) -> tuple[int, int, int]:
     return padded, chunk_rows, (padded + chunk_rows - 1) // chunk_rows
 
 
-def main_grid(rows: int, n: int, *, peer_partitions: int) -> tuple[int, int, int]:
-    """Launch grid of the main kernel: one CTA per output tile of the first (padded) chunk."""
+def main_grid(
+    rows: int,
+    n: int,
+    *,
+    world_size: int,
+    sm_count: int,
+) -> tuple[int, int, int]:
+    """Launch grid of the persistent main kernel: one CTA per SM, bounded by the
+    total output tile count (``world_size * ceil128(rows) / 128 * N / 256``), each
+    CTA striding over the arrival-ordered tile list."""
 
-    _padded, chunk_rows, _num_chunks = chunk_plan(rows)
-    return ((chunk_rows // BLOCK_M) * (int(n) // BLOCK_N), int(peer_partitions), 1)
+    if int(world_size) <= 0 or int(sm_count) <= 0:
+        message = "the persistent main grid needs a positive world_size and sm_count"
+        raise ValueError(message)
+    total_tiles = int(world_size) * (padded_rows(rows) // BLOCK_M) * (int(n) // BLOCK_N)
+    return (max(1, min(total_tiles, int(sm_count))), 1, 1)
 
 
-# ``grid.y`` of the narrow (N <= 2048) rows per world size, from the same-session
-# y-sweeps on 8 x B200 / 8 x B300 (lever L2 of the engine-operand work): ws8 prefers every peer
-# concurrently, ws4 and ws2 prefer two partitions.
-_NARROW_ROW_PARTITIONS = {2: 2, 4: 2, 8: 8}
+def sm_push_max_cols(padded_rows: int) -> int:
+    """Widest ``N`` the SM push route serves at ``padded_rows`` padded local rows."""
+
+    return SM_PUSH_COLS_INTERCEPT - SM_PUSH_COLS_PER_ROW * int(padded_rows)
 
 
-def peer_partitions(
-    *, arch: str, dtype_name: str, world_size: int, rows: int, n: int, fused: bool
-) -> int:
-    """``grid.y`` of the main kernel: CTA partitions sharing the cyclic peer traversal.
+def uses_sm_push(*, rows: int, world_size: int, cols: int) -> bool:
+    """Padded local rows up to ``SM_PUSH_MAX_ROWS`` with ``N`` up to ``sm_push_max_cols`` push
+    through the SM kernel instead of the copy engines at world sizes 4 and 8 (a single peer
+    saturates neither route; a wider GEMM overlaps the copy-engine pushes but would wait behind
+    the SM push; the copy engine wins in both cases)."""
 
-    ``y = 1`` is the serial local-first traversal of the wide rows; the fused
-    SM103 TP8 packed-QKV route partitions over four; latency-bound shapes (few
-    CTAs per chunk: ``N <= 2048`` up to 8192 local rows, or one 128-row tile)
-    run every peer concurrently (``y = world_size``).
-    """
-
-    del arch, dtype_name
-    if fused:
-        return 4
-    n_tiles = n // BLOCK_N
-    m_tiles = min(padded_rows(rows), CHUNK_ROWS) // BLOCK_M
-    if m_tiles <= 1:
-        return world_size
-    if n_tiles <= 8 and rows <= 8192:
-        return _NARROW_ROW_PARTITIONS[world_size]
-    return 1
+    padded = padded_rows(rows)
+    if int(world_size) < 4 or padded > SM_PUSH_MAX_ROWS:
+        return False
+    return int(cols) <= sm_push_max_cols(padded)
 
 
 def weight_layout(w: torch.Tensor) -> str:
@@ -630,20 +635,6 @@ def weight_tma_source(w: torch.Tensor, b_layout: str) -> torch.Tensor:
     return w.t().view(1, n, K)
 
 
-def uses_fused_peer_copy(
-    *, arch: str, dtype_name: str, world_size: int, rows: int, n: int
-) -> bool:
-    """The SM103 TP8 packed-QKV route pushes its payload with the fused SM copy kernel."""
-
-    return (
-        arch == "sm_103a"
-        and dtype_name == "bfloat16"
-        and int(world_size) == 8
-        and int(rows) == 512
-        and int(n) == 1280
-    )
-
-
 def barrier_program(phase: int) -> str:
     """The barrier of one phase; its world size is a runtime argument."""
 
@@ -654,8 +645,8 @@ def main_program(world_size: int, dtype_name: str, b_layout: str) -> str:
     return ROUTES[f"main_{dtype_name}_ws{int(world_size)}_{b_layout}"]
 
 
-def fused_peer_copy_program() -> str:
-    return ROUTES["fused_peer_copy"]
+def peer_push_program() -> str:
+    return ROUTES["peer_push"]
 
 
 def _source_dir() -> Path:
@@ -693,13 +684,12 @@ def sequence_programs(sequence: str) -> tuple[str, ...]:
     """Programs whose device units the sequence module compiles (route order)."""
 
     row = SEQUENCES[sequence]
-    names = [ROUTES["barrier_p0"], ROUTES["barrier_p1"]]
-    if row["fused"]:
-        names.append(ROUTES["fused_peer_copy"])
-    names.append(
-        ROUTES[f"main_{row['dtype']}_ws{int(row['world_size'])}_{row['b_layout']}"]
+    return (
+        ROUTES["barrier_p0"],
+        ROUTES["barrier_p1"],
+        ROUTES["peer_push"],
+        ROUTES[f"main_{row['dtype']}_ws{int(row['world_size'])}_{row['b_layout']}"],
     )
-    return tuple(names)
 
 
 @functools.cache
@@ -746,7 +736,10 @@ __all__ = [
     "CAPABILITY_ARCH",
     "CHUNK_ROWS",
     "COMPILE_FLAGS",
-    "FUSED_COPY_CTAS_PER_PEER",
+    "PUSH_CTAS_PER_PEER",
+    "SM_PUSH_MAX_ROWS",
+    "SM_PUSH_COLS_INTERCEPT",
+    "SM_PUSH_COLS_PER_ROW",
     "K",
     "MAIN_THREADS",
     "PROGRAMS",
@@ -760,17 +753,17 @@ __all__ = [
     "chunk_plan",
     "device_facts",
     "dynamic_smem_bytes",
-    "fused_peer_copy_program",
     "launch_block",
     "load",
     "main_grid",
     "main_program",
     "padded_rows",
-    "peer_partitions",
+    "peer_push_program",
     "sequence_name",
     "sequence_programs",
+    "sm_push_max_cols",
     "spec",
-    "uses_fused_peer_copy",
+    "uses_sm_push",
     "weight_layout",
     "weight_tma_source",
 ]

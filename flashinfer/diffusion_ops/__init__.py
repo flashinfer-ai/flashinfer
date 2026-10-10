@@ -39,6 +39,12 @@ from .cake_minimax_h3_sm120_quant_fc1_swiglu import (
     minimax_h3_fc1_swiglu_fp8,
     prepare_minimax_h3_fc1_weight_fp8,
 )
+from .cake_minimax_h3_sm120_quant_mlp import (
+    minimax_h3_mlp_fp8_sm120,
+    minimax_h3_mlp_nvfp4_sm120,
+    prepare_minimax_h3_fc2_weight_fp8,
+    prepare_minimax_h3_fc2_weight_nvfp4_sm120,
+)
 
 from .cake_minimax_h3_sm120_quant_out_proj import (
     minimax_h3_fp8_out_proj,
@@ -70,6 +76,10 @@ __all__ = [
     "minimax_h3_fc1_swiglu",
     "minimax_h3_fc1_swiglu_fp8",
     "minimax_h3_fc1_swiglu_mxfp8",
+    "minimax_h3_mlp_fp8_sm120",
+    "minimax_h3_mlp_nvfp4_sm120",
+    "prepare_minimax_h3_fc2_weight_fp8",
+    "prepare_minimax_h3_fc2_weight_nvfp4_sm120",
     "minimax_h3_fc1_swiglu_nvfp4",
     "prepare_minimax_h3_fc1_weight_fp8",
     "prepare_minimax_h3_fc1_weight_mxfp8",

@@ -34,6 +34,7 @@ gdn_fused_decode_h5120_v48_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_replayssm_commit_k2_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
+gdn_prefill_gates_q4_k4_v8_d128.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
@@ -1061,6 +1062,15 @@ with contextlib.suppress(Exception):
     flashinfer.gdn_prefill.chunk_gated_delta_rule(
         gp_q, gp_k, gp_v, cu_seqlens=cu_seqlens
     )
+
+# ── GDN raw gate fusion (trace-only; no optional cuDNN dependency) ───────────
+from flashinfer.trace.templates.gdn import gdn_prefill_trace
+
+flashinfer.gdn_prefill.chunk_gated_delta_rule.fi_trace(
+    **gdn_prefill_trace(use_gate_in_kernel=True).init(total_seq_len=256, device=device),
+    backend="cudnn",
+    save_dir=SAVE_DIR,
+)
 
 # ── GDN-2 prefill (channel-wise gates, chunk prefill) ────────────────────────
 with contextlib.suppress(Exception):
@@ -2614,6 +2624,15 @@ with contextlib.suppress(Exception):
     )
     _cmk_k_rope = torch.randn(_cmk_T, 1, _cmk_rope, dtype=torch.bfloat16, device=device)
     _concat_mla_k(_cmk_k, _cmk_k_nope, _cmk_k_rope)
+
+# concat_mla_kv_quant_fp8 (MLA context K/V pack + fp8 cast, 12 local heads).
+with contextlib.suppress(Exception):
+    from flashinfer import concat_mla_kv_quant_fp8 as _concat_mla_kv_quant_fp8
+
+    _ckv_T, _ckv_H = 2048, 12
+    _ckv_kv_nope = torch.randn(_ckv_T, _ckv_H, 256, dtype=torch.bfloat16, device=device)
+    _ckv_k_pe = torch.randn(_ckv_T, 64, dtype=torch.bfloat16, device=device)
+    _concat_mla_kv_quant_fp8(_ckv_kv_nope, _ckv_k_pe)
 
 # xqa_batch_decode_with_kv_cache (SM100+ XQA decode wrapper, NHD 5-D cache).
 with contextlib.suppress(Exception):
