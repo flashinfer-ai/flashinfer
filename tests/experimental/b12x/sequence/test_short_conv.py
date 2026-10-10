@@ -43,6 +43,9 @@ def test_gdn_raw_projection_geometry_is_metadata_only():
         {"state_strides": (32, 6, 1)},
         {"state_strides": (65536, 1, 10240)},
         {"input_alignments": (16,)},
+        {"input_row_stride": 10239},
+        {"input_row_stride": True},
+        {"input_row_stride": 2**63},
     ],
 )
 def test_invalid_convolution_contract_is_rejected_without_cuda(override):
@@ -61,7 +64,7 @@ def test_invalid_convolution_contract_is_rejected_without_cuda(override):
 
 
 class _Case:
-    def __init__(self, mode, *, channels=10240, dilation=1):
+    def __init__(self, mode, *, channels=10240, dilation=1, input_padding=0):
         device = require_b12x()
         self.caps = short_conv.Caps(
             device=device,
@@ -83,7 +86,10 @@ class _Case:
         self.state = self.storage.as_strided(
             (6, channels, capacity), (stride, capacity, 1)
         )
-        self.x = torch.randn((12, channels), device=device).to(torch.bfloat16)
+        self.input_storage = torch.randn(
+            (12, channels + input_padding), device=device
+        ).to(torch.bfloat16)
+        self.x = self.input_storage[:, :channels]
         self.weight = (torch.randn((channels, 4), device=device) * 0.2).to(
             torch.bfloat16
         )
@@ -197,8 +203,9 @@ def _prepared(case):
 
 
 @pytest.mark.parametrize("mode", ["decode", "prefill", "mixed"])
-def test_gdn_width_raw_history_and_device_metadata_replay(mode):
-    case = _Case(mode)
+@pytest.mark.parametrize("input_padding", [0, 6144])
+def test_gdn_width_raw_history_and_device_metadata_replay(mode, input_padding):
+    case = _Case(mode, input_padding=input_padding)
     with _prepared(case) as binding:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -216,11 +223,13 @@ def test_gdn_width_raw_history_and_device_metadata_replay(mode):
             ([0, 0, 0], [5, 0, 2], [True, True, True], [1, 1, 1], [True, False, True]),
         )
         for lengths, slots, fresh, accepted, prefill in batches:
+            case.x.normal_()
             case.batch(
                 lengths, slots, fresh, accepted, prefill if mode == "mixed" else None
             )
             expected, state = case.oracle()
             untouched_padding = case.storage.reshape(6, -1)[:, -32:].clone()
+            untouched_input = case.input_storage.clone()
             torch.cuda.synchronize()
             allocated = torch.cuda.memory_allocated()
             graph.replay()
@@ -229,6 +238,9 @@ def test_gdn_width_raw_history_and_device_metadata_replay(mode):
             assert result.data_ptr() == case.args["out"].data_ptr()
             torch.testing.assert_close(result, expected, rtol=0.008, atol=0.002)
             torch.testing.assert_close(case.state, state, rtol=0, atol=0)
+            torch.testing.assert_close(
+                case.input_storage, untouched_input, rtol=0, atol=0
+            )
             torch.testing.assert_close(
                 case.storage.reshape(6, -1)[:, -32:], untouched_padding, rtol=0, atol=0
             )

@@ -51,6 +51,7 @@ def invocation_from_tensors(*, conv_state, scratch=None, **tensors):
     return FrozenMapping(
         {
             "state_strides": tuple(conv_state.stride()),
+            "input_row_stride": tensors["x"].stride(0),
             "input_alignments": tuple(
                 alignment if name in _SCRATCH else _alignment(tensors[name])
                 for name in OPERANDS
@@ -138,6 +139,7 @@ def compile_pipeline(payload, ordinal):
                 q.dilation,
                 128,
                 False,
+                q.input_row_stride,
                 num_warps=4,
                 grid=(q.max_tokens, channel_grid),
             ),
@@ -150,6 +152,7 @@ def compile_pipeline(payload, ordinal):
                 p["num_seqs"],
                 p["conv_state"],
                 *_state_args(q),
+                q.input_row_stride,
                 num_warps=4,
                 grid=(q.max_seqs, channel_grid),
             ),
@@ -183,6 +186,8 @@ class PreparedShortConv:
                 raise ValueError(
                     f"short convolution {name} device/alignment differs from preparation"
                 )
+        if tensors[0].stride() != (self.query.input_row_stride, 1):
+            raise ValueError("short convolution input strides differ from preparation")
         if tuple(tensors[9].stride()) != self.query.state_strides:
             raise ValueError(
                 "short convolution history strides differ from preparation"
@@ -258,7 +263,7 @@ class PreparedShortConv:
             "num_tokens": (1,),
         }
         for name in OPERANDS:
-            if name in _SCRATCH or name == "conv_state":
+            if name in _SCRATCH or name in ("conv_state", "x"):
                 continue
             dtype = (
                 torch.bool
@@ -275,6 +280,14 @@ class PreparedShortConv:
                 shape=shapes.get(name, (q.max_seqs,)),
                 dtype=dtype,
                 device=self.device,
+            )
+        if (
+            x.shape != shapes["x"]
+            or x.dtype != torch.bfloat16
+            or x.device != self.device
+        ):
+            raise ValueError(
+                "short convolution input must match declared BF16 shape and device"
             )
         _require_conv_state_tensor(
             conv_state,
@@ -365,6 +378,7 @@ class PreparedShortConv:
                 q.dilation,
                 128,
                 False,
+                q.input_row_stride,
             )
             p[3][(q.max_seqs, channels, 1)](
                 x,
@@ -375,6 +389,7 @@ class PreparedShortConv:
                 num_seqs,
                 conv_state,
                 *_state_args(q),
+                q.input_row_stride,
             )
 
 
@@ -384,7 +399,7 @@ def make_plan(caps, *, invocation=None, override=None):
     if not isinstance(caps, Caps):
         raise TypeError("caps must be short_conv.Caps")
     invocation = FrozenMapping(invocation or {})
-    if set(invocation) - {"state_strides", "input_alignments"}:
+    if set(invocation) - {"state_strides", "input_alignments", "input_row_stride"}:
         raise ValueError("unknown short convolution invocation metadata")
     query = ShortConvQuery(
         **{

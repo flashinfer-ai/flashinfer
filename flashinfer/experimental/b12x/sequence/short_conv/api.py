@@ -82,7 +82,8 @@ def bind(
     int32 ``query_start_loc [max_seqs + 1]``, int64 ``state_slot_ids [max_seqs]``,
     bool ``state_is_fresh [max_seqs]``, int32 ``num_accepted_tokens [max_seqs]``,
     and int32 ``num_seqs/num_tokens [1]``. Mixed batches additionally require
-    bool ``request_is_prefill [max_seqs]``. Only history may have a padded slot
+    bool ``request_is_prefill [max_seqs]``. History may have a padded slot
+    stride, and input rows may have a padded outer stride with unit column
     stride; every other operand must be contiguous. Mutated buffers must not
     overlap other operands. Binding does not allocate or read device values.
     """

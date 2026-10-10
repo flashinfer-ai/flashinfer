@@ -116,7 +116,10 @@ def _short_conv_kernel(
     DILATION: tl.constexpr,
     BLOCK_C: tl.constexpr,
     ADD_RESIDUAL: tl.constexpr,
+    INPUT_ROW_STRIDE: tl.constexpr = None,
 ):
+    if INPUT_ROW_STRIDE is None:
+        INPUT_ROW_STRIDE = CHANNELS
     token = tl.program_id(0)
     channel_block = tl.program_id(1)
     channels = channel_block * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -143,7 +146,9 @@ def _short_conv_kernel(
         source_relative = query_relative - history_distance
         from_query = source_relative >= 0
         query_token = query_start + source_relative
-        query_offsets = query_token.to(tl.int64) * CHANNELS + channels.to(tl.int64)
+        query_offsets = query_token.to(tl.int64) * INPUT_ROW_STRIDE + channels.to(
+            tl.int64
+        )
         query_value = tl.load(
             input_ptr + query_offsets,
             mask=live & channel_mask & from_query,
@@ -208,7 +213,10 @@ def _update_state_kernel(
     DECODE: tl.constexpr,
     MIXED: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    INPUT_ROW_STRIDE: tl.constexpr = None,
 ):
+    if INPUT_ROW_STRIDE is None:
+        INPUT_ROW_STRIDE = CHANNELS
     request = tl.program_id(0)
     channel_block = tl.program_id(1)
     channels = channel_block * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -250,7 +258,9 @@ def _update_state_kernel(
         from_query = source_position >= STATE_LENGTH
         query_relative = source_position - STATE_LENGTH
         query_token = query_start + query_relative
-        query_offsets = query_token.to(tl.int64) * CHANNELS + channels.to(tl.int64)
+        query_offsets = query_token.to(tl.int64) * INPUT_ROW_STRIDE + channels.to(
+            tl.int64
+        )
         query_value = tl.load(
             input_ptr + query_offsets,
             mask=(
@@ -286,7 +296,9 @@ def _update_state_kernel(
         if DECODE or MIXED:
             query_relative = candidate + 1
             query_token = query_start + query_relative
-            query_offsets = query_token.to(tl.int64) * CHANNELS + channels.to(tl.int64)
+            query_offsets = query_token.to(tl.int64) * INPUT_ROW_STRIDE + channels.to(
+                tl.int64
+            )
             candidate_value = tl.load(
                 input_ptr + query_offsets,
                 mask=(

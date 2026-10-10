@@ -10,9 +10,10 @@ addition. Qwen GDN uses 10240 channels, four taps, and dilation one.
 The plan fixes token, request, and state-slot capacities. Device-resident counts
 and packed query boundaries choose live work without host synchronization.
 Decode, prefill, and mixed modes use the same prepared/bound lifecycle.
-All buffers are caller owned. Only the outer history-slot stride may be padded;
-input and output rows, weights, and metadata are contiguous. Use
-`invocation_from_tensors` to prepare actual history strides and alignments.
+All buffers are caller owned. The outer history-slot and input-row strides may
+be padded; input columns, output rows, weights, and metadata are contiguous.
+Packed QKV/Z projections can expose QKV as a row-strided view without copying.
+Use `invocation_from_tensors` to prepare actual input/history strides and alignments.
 
 For kernel size `K`, dilation `d`, and speculative capacity `S`, history has
 shape `[slots, channels, d * (K - 1) + S]` in chronological order. Prefill

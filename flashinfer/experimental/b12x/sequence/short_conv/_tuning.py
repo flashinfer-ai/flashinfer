@@ -32,6 +32,7 @@ class ShortConvQuery:
     max_state_slots: int
     max_speculative_tokens: int
     state_strides: tuple[int, int, int] | None = None
+    input_row_stride: int | None = None
     input_alignments: tuple[int, ...] = (16,) * len(OPERANDS)
 
     def __post_init__(self):
@@ -60,6 +61,18 @@ class ShortConvQuery:
             raise ValueError(
                 "short convolution speculative capacity must be nonnegative"
             )
+        input_stride = (
+            self.channels if self.input_row_stride is None else self.input_row_stride
+        )
+        if type(input_stride) is not int or input_stride < self.channels:
+            raise ValueError(
+                "short convolution input rows must have a nonoverlapping positive stride"
+            )
+        if input_stride * self.max_tokens >= 2**63:
+            raise ValueError(
+                "short convolution input exceeds the Int64 indexing domain"
+            )
+        object.__setattr__(self, "input_row_stride", input_stride)
         capacity = self.state_capacity
         if capacity >= 2**31:
             raise ValueError(
