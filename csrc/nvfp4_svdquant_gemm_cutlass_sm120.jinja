@@ -1,0 +1,56 @@
+/*
+ * Copyright (c) 2026 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "flashinfer/gemm/nvfp4_svdquant_gemm_template_sm120.h"
+
+namespace flashinfer {
+namespace gemm {
+namespace svdquant_sm120 {
+
+{% if config in ("Tactic64x32x256SwapStaticConfig", "Tactic256x64x128SwapStaticConfig") -%}
+INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_TACTIC({{ config }})
+{%- elif "Static" in config -%}
+INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_STATIC_TACTIC({{ config }})
+{%- else -%}
+INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_TACTIC({{ config }})
+{%- endif %}
+{% set NO_INLINE_DOWN_CONFIGS = [
+    "Tactic128x128x128Config",
+    "Tactic128x128x128SwapConfig",
+    "Tactic128x128x128SkConfig",
+    "Tactic128x128x128SwapSkConfig",
+    "Tactic128x128x256Config",
+    "Tactic128x128x256SwapConfig",
+    "Tactic128x128x256SkConfig",
+    "Tactic128x128x256SwapSkConfig",
+    "Tactic256x128x128Config",
+    "Tactic256x128x128SwapConfig",
+    "Tactic128x256x128Config",
+    "Tactic128x256x128SwapConfig",
+    "Tactic128x64x128SwapConfig",
+    "Tactic128x64x128SwapSkConfig",
+    "Tactic128x64x256SwapConfig",
+    "Tactic128x64x256SwapSkConfig",
+    "Tactic128x32x128SwapConfig",
+    "Tactic128x32x256SwapConfig",
+] %}
+{% if config in NO_INLINE_DOWN_CONFIGS -%}
+INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_NO_INLINE_DOWN_TACTIC({{ config }})
+{%- endif %}
+
+}  // namespace svdquant_sm120
+}  // namespace gemm
+}  // namespace flashinfer
