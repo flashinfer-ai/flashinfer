@@ -55,14 +55,15 @@ def get_seed_and_offset(
         generator = get_default_generators(device)
     # add mutex if multi-trheading needed
     state = generator.get_state()
-    seed, offset = state.view(torch.int64)
-    offset += (increment + 3) // 4 * 4
+    seed, offset = map(int, state.view(torch.int64))
+    # Reserve this call's range, leaving the generator at the next unused offset.
+    next_offset = offset + (increment + 3) // 4 * 4
     generator.set_state(
         torch.tensor(
-            [seed, offset], dtype=torch.int64, device=torch.device("cpu")
+            [seed, next_offset], dtype=torch.int64, device=torch.device("cpu")
         ).view(torch.uint8)
     )
-    return int(seed), int(offset)
+    return seed, offset
 
 
 @functools.cache
@@ -724,7 +725,7 @@ def get_sampling_module():
         batch_size = b
         if seed is None or offset is None:
             seed, offset = get_seed_and_offset(
-                draft_probs.size(0) * (draft_probs.size(1) + 1), generator, device
+                draft_probs.size(0) * (draft_probs.size(1) + 2), generator, device
             )
 
         maybe_seed_arr, seed_val, maybe_offset_arr, offset_val = (
