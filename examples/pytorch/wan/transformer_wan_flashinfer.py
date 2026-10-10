@@ -48,6 +48,7 @@ import logging
 import math
 import os
 import sys
+import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,9 +64,14 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
-_EXAMPLES_PYTORCH_DIR = Path(__file__).resolve().parents[1]
-if str(_EXAMPLES_PYTORCH_DIR) not in sys.path:
-    sys.path.insert(0, str(_EXAMPLES_PYTORCH_DIR))
+# ``flashinfer_modules`` lives one level up; ``vsa_attention`` is a sibling.
+# Both are added explicitly so this file imports cleanly no matter where it is
+# loaded from.
+_WAN_DIR = Path(__file__).resolve().parent
+_EXAMPLES_PYTORCH_DIR = _WAN_DIR.parent
+for _p in (_EXAMPLES_PYTORCH_DIR, _WAN_DIR):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from flashinfer_modules import (
     GEMMBackend,
@@ -77,6 +83,13 @@ from flashinfer_modules import (
     apply_rotary_emb,
     create_linear_layer,
     get_1d_rotary_pos_embed,
+)
+
+from vsa_attention import (
+    VSAMetadata,
+    build_vsa_metadata,
+    vsa_attention,
+    vsa_supported,
 )
 
 
@@ -129,6 +142,12 @@ class WanTransformer3DConfig:
     # cross-attention. The default of 512 matches Wan 2.x text encoders; users
     # with custom text encoders should set this to their own context length.
     text_encoder_context_length: int = 512
+    # Video Sparse Attention (see vsa_attention.py). Replaces dense
+    # self-attention with the two-stage VSA path. Only meaningful on a
+    # VSA-finetuned checkpoint: the gated combine reads a per-token
+    # ``to_gate_compress`` projection that only such checkpoints carry.
+    use_vsa: bool = False
+    vsa_sparsity: float = 0.9  # fraction of KV blocks dropped; 0.9 keeps top 10%
 
     @property
     def inner_dim(self) -> int:
@@ -141,6 +160,8 @@ _FLASHINFER_ENV_OVERRIDES = {
     "use_skip_softmax_sparse": "FLASHINFER_USE_SKIP_SOFTMAX_SPARSE",
     "skip_softmax_threshold_scale_factor": "FLASHINFER_SKIP_SOFTMAX_THRESHOLD",
     "attention_backend": "FLASHINFER_ATTENTION_BACKEND",
+    "use_vsa": "FLASHINFER_USE_VSA",
+    "vsa_sparsity": "FLASHINFER_VSA_SPARSITY",
 }
 
 
@@ -173,7 +194,59 @@ def _config_value(config: Any, name: str, default: Any) -> Any:
 _FFN_KEY_REMAP: tuple[tuple[str, str], ...] = (
     (".net.0.proj.", ".proj_up."),
     (".net.2.", ".proj_down."),
+    # VSA checkpoints name the gate ``blocks.N.to_gate_compress``; we keep it on
+    # the attention module next to to_q/to_k/to_v, so re-point it at attn1.
+    (".to_gate_compress.", ".attn1.to_gate_compress."),
 )
+
+
+def _load_checkpoint_state_dict(
+    model_path: str,
+    subfolder: Optional[str] = None,
+    revision: Optional[str] = None,
+    variant: Optional[str] = None,
+) -> dict:
+    """Read a diffusers-layout checkpoint directly into a state dict.
+
+    Shards are merged by globbing rather than by reading
+    ``*.safetensors.index.json``, because some published checkpoints (the
+    FastVideo VSA ones among them) ship sharded weights without an index.
+    Loading this way also keeps keys the diffusers class doesn't declare.
+    """
+    root = Path(model_path)
+    if not root.is_dir():
+        from huggingface_hub import snapshot_download
+
+        allow = [f"{subfolder}/*"] if subfolder else None
+        root = Path(
+            snapshot_download(model_path, revision=revision, allow_patterns=allow)
+        )
+    directory = root / subfolder if subfolder else root
+
+    def _load_safetensors(path: Path) -> dict:
+        from safetensors.torch import load_file  # noqa: PLC0415
+
+        return load_file(str(path))
+
+    def _load_bin(path: Path) -> dict:
+        return torch.load(str(path), map_location="cpu", weights_only=True)
+
+    suffix = f".{variant}" if variant else ""
+    for pattern, load in (
+        (f"*{suffix}.safetensors", _load_safetensors),
+        (f"*{suffix}.bin", _load_bin),
+    ):
+        shards = sorted(directory.glob(pattern))
+        if shards:
+            state_dict: dict = {}
+            for shard in shards:
+                state_dict.update(load(shard))
+            return state_dict
+
+    raise FileNotFoundError(
+        f"no .safetensors or .bin weights found in {directory}"
+        + (f" for variant {variant!r}" if variant else "")
+    )
 
 
 def _remap_diffusers_state_dict(state_dict: dict) -> dict:
@@ -202,9 +275,13 @@ def _config_to_flashinfer_config(
         raw = os.getenv(env_name)
         if raw is None:
             continue
-        if field in {"online_act_quant", "use_skip_softmax_sparse"}:
+        # Coerce from the dataclass's declared type, so a new flag only has to
+        # be added to _FLASHINFER_ENV_OVERRIDES. Hand-kept name sets used to
+        # silently deliver "0" (truthy) as a bool.
+        declared = WanTransformer3DConfig.__dataclass_fields__[field].type
+        if declared is bool or declared == "bool":
             values[field] = _env_bool(env_name)
-        elif field == "skip_softmax_threshold_scale_factor":
+        elif declared is float or declared == "float":
             values[field] = float(raw)
         else:
             values[field] = raw
@@ -331,8 +408,22 @@ class FlashInferWanAttention(nn.Module):
         use_skip_softmax_sparse: bool = False,
         skip_softmax_threshold_scale_factor: float = 1.0,
         text_encoder_context_length: int = 512,
+        use_vsa: bool = False,
+        vsa_sparsity: float = 0.9,
     ):
         super().__init__()
+        # Same contract as the GEMM backends: an unsupported device warns and
+        # falls back to the dense path instead of failing inside the kernel.
+        if use_vsa and not vsa_supported(dim_head):
+            warnings.warn(
+                "VSA requires SM100 (Blackwell) and head_dim=128; falling back "
+                "to dense attention on this device.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            use_vsa = False
+        self.use_vsa = use_vsa
+        self.vsa_sparsity = vsa_sparsity
         self.inner_dim = dim_head * heads
         self.heads = heads
         self.dim_head = dim_head
@@ -368,6 +459,21 @@ class FlashInferWanAttention(nn.Module):
             bias=True,
             gemm_backend=gemm_backend,
             online_act_quant=online_act_quant,
+        )
+        # VSA's learned gate on the coarse (compressed-attention) branch. It is
+        # a fourth QKV-style projection of the same input, so it belongs here
+        # rather than on the block; ``_GATE_KEY_REMAP`` reconciles the checkpoint
+        # naming, which puts it at ``blocks.N.to_gate_compress``.
+        self.to_gate_compress = (
+            create_linear_layer(
+                dim,
+                self.inner_dim,
+                bias=True,
+                gemm_backend=gemm_backend,
+                online_act_quant=online_act_quant,
+            )
+            if use_vsa
+            else None
         )
         self.to_out = nn.ModuleList(
             [
@@ -423,6 +529,7 @@ class FlashInferWanAttention(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        vsa_meta: Optional[VSAMetadata] = None,
     ) -> torch.Tensor:
         encoder_hidden_states_img = None
         if self.add_k_proj is not None and encoder_hidden_states is not None:
@@ -432,7 +539,9 @@ class FlashInferWanAttention(nn.Module):
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
 
-        is_self_attention = encoder_hidden_states is None
+        is_self_attn_call = (
+            encoder_hidden_states is None and not self.is_cross_attention
+        )
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
 
@@ -459,6 +568,22 @@ class FlashInferWanAttention(nn.Module):
             key = key.to(torch.bfloat16)
             value = value.to(torch.bfloat16)
 
+        # VSA replaces dense self-attention entirely. Its gate is a fourth
+        # projection of the same input as q/k/v, and it cube-tiles the full
+        # (post all-to-all) sequence, so it rides the same Ulysses path below.
+        gate_compress = None
+        if self.use_vsa and is_self_attn_call:
+            if vsa_meta is None:
+                raise ValueError(
+                    "VSA self-attention requires vsa_meta; the transformer must "
+                    "pass it through."
+                )
+            gate_compress = self.to_gate_compress(hidden_states).view(
+                batch_size, seq_len_q, self.heads, self.dim_head
+            )
+            if needs_cast:
+                gate_compress = gate_compress.to(torch.bfloat16)
+
         # Ulysses context parallelism (self-attention only): the sequence dim
         # is sharded across ranks; all-to-all scatters heads / gathers sequence
         # so each rank attends over the full sequence with H/world_size heads,
@@ -467,8 +592,7 @@ class FlashInferWanAttention(nn.Module):
         use_ulysses = (
             ulysses_comm is not None
             and ulysses_comm.world_size > 1
-            and not self.is_cross_attention
-            and is_self_attention
+            and is_self_attn_call
         )
         if use_ulysses:
             # .contiguous(): the public API requires contiguous operands (the
@@ -476,6 +600,8 @@ class FlashInferWanAttention(nn.Module):
             query = ulysses_comm.scatter_heads(query.contiguous())
             key = ulysses_comm.scatter_heads(key.contiguous())
             value = ulysses_comm.scatter_heads(value.contiguous())
+            if gate_compress is not None:
+                gate_compress = ulysses_comm.scatter_heads(gate_compress.contiguous())
             seq_len_q = query.shape[1]
             seq_len_kv = key.shape[1]
 
@@ -508,19 +634,31 @@ class FlashInferWanAttention(nn.Module):
                 use_sparse=False,
             )
 
-        attn_backend, use_sparse = self.attention_dispatcher._resolve_attention_backend(
-            batch_size, query.device
-        )
-        hidden_states = self.attention_dispatcher._dispatch_attention(
-            attn_backend,
-            query,
-            key,
-            value,
-            batch_size,
-            seq_len_q,
-            seq_len_kv,
-            use_sparse=use_sparse,
-        )
+        if gate_compress is not None:
+            hidden_states = vsa_attention(
+                query,
+                key,
+                value,
+                gate_compress,
+                vsa_meta,
+                self.vsa_sparsity,
+            ).reshape(batch_size, seq_len_q, -1)
+        else:
+            attn_backend, use_sparse = (
+                self.attention_dispatcher._resolve_attention_backend(
+                    batch_size, query.device
+                )
+            )
+            hidden_states = self.attention_dispatcher._dispatch_attention(
+                attn_backend,
+                query,
+                key,
+                value,
+                batch_size,
+                seq_len_q,
+                seq_len_kv,
+                use_sparse=use_sparse,
+            )
 
         if use_ulysses:
             # (B, S_global, H_local*D) -> inverse all-to-all -> (B, S_local, H*D)
@@ -575,9 +713,10 @@ class FlashInferWanTransformerBlock(nn.Module):
         use_skip_softmax_sparse: bool = False,
         skip_softmax_threshold_scale_factor: float = 1.0,
         text_encoder_context_length: int = 512,
+        use_vsa: bool = False,
+        vsa_sparsity: float = 0.9,
     ):
         super().__init__()
-
         # 1. Self-attention (with optional skip-softmax sparse attention)
         self.norm1 = FlashInferFP32LayerNorm(dim, eps, elementwise_affine=False)
         self.attn1 = FlashInferWanAttention(
@@ -592,6 +731,8 @@ class FlashInferWanTransformerBlock(nn.Module):
             use_skip_softmax_sparse=use_skip_softmax_sparse,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
             text_encoder_context_length=text_encoder_context_length,
+            use_vsa=use_vsa,
+            vsa_sparsity=vsa_sparsity,
         )
 
         # 2. Cross-attention (always full attention, no sparse attention)
@@ -632,6 +773,7 @@ class FlashInferWanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         rotary_emb: Tuple[torch.Tensor, torch.Tensor],
+        vsa_meta: Optional[VSAMetadata] = None,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -654,7 +796,9 @@ class FlashInferWanTransformerBlock(nn.Module):
         norm_hidden_states = (
             self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa
         ).type_as(hidden_states)
-        attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb)
+        attn_output = self.attn1(
+            norm_hidden_states, None, None, rotary_emb, vsa_meta=vsa_meta
+        )
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(
             hidden_states
         )
@@ -958,6 +1102,8 @@ class FlashInferWanTransformer3DModel(nn.Module):
         text_encoder_context_length = getattr(
             config, "text_encoder_context_length", 512
         )
+        use_vsa = getattr(config, "use_vsa", False)
+        vsa_sparsity = getattr(config, "vsa_sparsity", 0.9)
 
         inner_dim = num_attention_heads * attention_head_dim
 
@@ -968,6 +1114,7 @@ class FlashInferWanTransformer3DModel(nn.Module):
         self.attention_backend = attention_backend
         self.use_skip_softmax_sparse = use_skip_softmax_sparse
         self.skip_softmax_threshold_scale_factor = skip_softmax_threshold_scale_factor
+        self.use_vsa = use_vsa
 
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
@@ -1004,6 +1151,8 @@ class FlashInferWanTransformer3DModel(nn.Module):
                     use_skip_softmax_sparse=use_skip_softmax_sparse,
                     skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                     text_encoder_context_length=text_encoder_context_length,
+                    use_vsa=use_vsa,
+                    vsa_sparsity=vsa_sparsity,
                 )
                 for _ in range(num_layers)
             ]
@@ -1076,6 +1225,17 @@ class FlashInferWanTransformer3DModel(nn.Module):
 
         rotary_emb = self.rope(hidden_states)
 
+        # VSA tiles the *global* post-patch token grid, so the metadata is built
+        # from the unsharded shape and shared by every rank (cached per shape).
+        vsa_meta = (
+            build_vsa_metadata(
+                (post_patch_num_frames, post_patch_height, post_patch_width),
+                hidden_states.device,
+            )
+            if self.use_vsa
+            else None
+        )
+
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
@@ -1132,12 +1292,17 @@ class FlashInferWanTransformer3DModel(nn.Module):
                     encoder_hidden_states,
                     timestep_proj,
                     rotary_emb,
+                    vsa_meta,
                     use_reentrant=False,
                 )
         else:
             for block in self.blocks:
                 hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    vsa_meta,
                 )
 
         if seq_sharded:
@@ -1214,19 +1379,46 @@ class FlashInferWanTransformer3DModel(nn.Module):
                 "pip install diffusers"
             ) from e
 
-        # Load original model to get config and weights
-        original_model = OriginalModel.from_pretrained(model_path, **kwargs)
+        subfolder = kwargs.pop("subfolder", None)
+        torch_dtype = kwargs.pop("torch_dtype", None)
 
-        # Create FlashInfer model with same config
-        config = _config_to_flashinfer_config(original_model.config, flashinfer_kwargs)
-        model = cls(config)
+        # Read the config through diffusers (handles hub + local paths), but
+        # load the weights ourselves. Instantiating the diffusers model just to
+        # copy its state dict would double peak host memory on a 14B checkpoint
+        # and — worse — silently drop any key diffusers doesn't know about,
+        # which is exactly where VSA's ``to_gate_compress`` weights live.
+        original_config = OriginalModel.load_config(
+            model_path, subfolder=subfolder, **kwargs
+        )
+        config = _config_to_flashinfer_config(original_config, flashinfer_kwargs)
+        # Materialize parameters directly in the target dtype. Callers cast the
+        # model afterwards anyway, so the only difference is peak host memory —
+        # which matters a lot at 14B x 8 ranks.
+        default_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch_dtype or default_dtype)
+        try:
+            model = cls(config)
+        finally:
+            torch.set_default_dtype(default_dtype)
 
         # Diffusers' FeedForward stores the two linear layers under
         # ``net.0.proj`` (GELU/GEGLU's projection) and ``net.2`` (output linear),
         # while FlashInferFeedForward names them ``proj_up`` and ``proj_down``.
         # Without renaming, load_state_dict(..., strict=False) silently drops
         # all FFN weights and the model produces meaningless outputs.
-        state_dict = _remap_diffusers_state_dict(original_model.state_dict())
+        state_dict = _remap_diffusers_state_dict(
+            _load_checkpoint_state_dict(
+                model_path,
+                subfolder=subfolder,
+                revision=kwargs.get("revision"),
+                variant=kwargs.get("variant"),
+            )
+        )
+        if torch_dtype is not None:
+            state_dict = {
+                k: v.to(torch_dtype) if v.is_floating_point() else v
+                for k, v in state_dict.items()
+            }
 
         # Copy weights. ``strict=False`` is required because some FlashInfer
         # GEMM backends (FP8, FP4, MXFP8, ...) register additional buffers
@@ -1318,6 +1510,21 @@ if __name__ == "__main__":
         type=float,
         default=1.0,
         help="Threshold scale factor for skip-softmax (higher = more sparse)",
+    )
+    parser.add_argument(
+        "--use-vsa",
+        action="store_true",
+        help=(
+            "Use Video Sparse Attention for self-attention (SM100, bf16, "
+            "head_dim=128). Needs a VSA-finetuned checkpoint, e.g. "
+            "FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers."
+        ),
+    )
+    parser.add_argument(
+        "--vsa-sparsity",
+        type=float,
+        default=0.9,
+        help="Fraction of KV blocks VSA drops (0.9 keeps the top 10%%)",
     )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-frames", type=int, default=21)
@@ -1418,7 +1625,9 @@ if __name__ == "__main__":
         f"gemm_backend={args.gemm_backend}, "
         f"online_act_quant={not args.offline_act_quant}, "
         f"attention_backend={args.attention_backend}, "
-        f"use_skip_softmax_sparse={args.skip_softmax_sparse}"
+        f"use_skip_softmax_sparse={args.skip_softmax_sparse}, "
+        f"use_vsa={args.use_vsa}"
+        + (f" (sparsity={args.vsa_sparsity})" if args.use_vsa else "")
     )
 
     load_kwargs = {
@@ -1429,6 +1638,8 @@ if __name__ == "__main__":
         "attention_backend": args.attention_backend,
         "use_skip_softmax_sparse": args.skip_softmax_sparse,
         "skip_softmax_threshold_scale_factor": args.skip_softmax_threshold,
+        "use_vsa": args.use_vsa,
+        "vsa_sparsity": args.vsa_sparsity,
     }
     if args.revision is not None:
         load_kwargs["revision"] = args.revision
