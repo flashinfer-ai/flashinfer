@@ -4384,5 +4384,126 @@ def test_vectorized_kernel_rejects_misaligned_input():
         )
 
 
+def _routing_with_expert_counts(head_counts, num_experts, num_tokens, top_k):
+    """Top-k routing in which expert e receives exactly counts[e] of the tokens.
+
+    The first experts get `head_counts`; the remaining rows go to the last experts, so the
+    experts in between are empty.
+    """
+    counts = list(head_counts) + [0] * (num_experts - len(head_counts))
+    remaining = num_tokens * top_k - sum(counts)
+    for e in reversed(range(len(head_counts), num_experts)):
+        counts[e] = min(num_tokens, remaining)
+        remaining -= counts[e]
+    assert remaining == 0 and max(counts) <= num_tokens
+    experts = torch.repeat_interleave(torch.arange(num_experts), torch.tensor(counts))
+    # Each expert's run is at most num_tokens long, so filling the top-k slots column by column
+    # never gives a token the same expert twice.
+    selected = experts.view(top_k, num_tokens).t()
+    return selected[torch.randperm(num_tokens)].contiguous()
+
+
+@pytest.mark.parametrize(
+    "num_tokens, num_experts, top_k, hidden_size, intermediate_size, head_counts",
+    [
+        # 64 tokens selects BLOCK_M = 64 for both grouped GEMMs
+        (64, 32, 4, 512, 256, [0, 1, 2, 31, 32, 33, 0, 63, 64, 17]),
+        (64, 16, 4, 512, 256, [0, 1, 64, 63, 0, 32]),
+        # BLOCK_M = 128, with expert row counts on either side of the tile boundaries
+        (128, 16, 4, 512, 256, [0, 1, 127, 128, 0, 64, 65]),
+        (320, 32, 4, 512, 256, [0, 1, 127, 128, 129, 255, 256, 257, 0, 0, 64]),
+        (1024, 64, 8, 1024, 512, None),
+    ],
+)
+@pytest.mark.skipif(
+    get_compute_capability(torch.device("cuda"))[0] != 9,
+    reason="FP8 block scaling is only supported on SM90",
+)
+def test_moe_fp8_block_scaling_expert_boundaries(
+    num_tokens, num_experts, top_k, hidden_size, intermediate_size, head_counts
+):
+    """FP8 block-scale MoE where the grouped GEMM tiles straddle expert boundaries.
+
+    From 32 tokens (64 on 78-SM GPUs) both grouped GEMMs use the normal DeepGEMM kernel, whose
+    row tiles span expert boundaries; smaller batches use the swap-AB kernel. The two compute
+    every output element with the same WGMMA and scale promotion sequence, so the batch must
+    match the same tokens run 16 at a time bit for bit. The routing gives experts no tokens, a
+    single token, or row counts on either side of the tile sizes, so a tile that writes past its
+    expert's rows or skips some of them shows up as a mismatch.
+    """
+    torch.manual_seed(42)
+    otype = torch.bfloat16
+    x = torch.randn(num_tokens, hidden_size, dtype=otype, device="cuda")
+    w31 = (
+        torch.randn(
+            num_experts, 2 * intermediate_size, hidden_size, dtype=otype, device="cuda"
+        )
+        / 10
+    )
+    w2 = (
+        torch.randn(
+            num_experts, hidden_size, intermediate_size, dtype=otype, device="cuda"
+        )
+        / 10
+    )
+    if head_counts is None:
+        selected_experts = torch.stack(
+            [torch.randperm(num_experts)[:top_k] for _ in range(num_tokens)]
+        )
+    else:
+        selected_experts = _routing_with_expert_counts(
+            head_counts, num_experts, num_tokens, top_k
+        )
+    selected_experts = selected_experts.to(torch.int).cuda()
+    routing_weights = F.softmax(torch.randn(num_tokens, top_k, device="cuda"), dim=1)
+
+    w31_quant, w31_scales = map(
+        torch.stack, zip(*(per_block_cast_to_fp8(w) for w in w31), strict=True)
+    )
+    w2_quant, w2_scales = map(
+        torch.stack, zip(*(per_block_cast_to_fp8(w) for w in w2), strict=True)
+    )
+
+    def run_moe(tokens):
+        output = torch.zeros_like(x[tokens])
+        fused_moe.cutlass_fused_moe(
+            x[tokens],
+            selected_experts[tokens],
+            routing_weights[tokens],
+            w31_quant,
+            w2_quant,
+            otype,
+            use_deepseek_fp8_block_scale=True,
+            quant_scales=[w31_scales, w2_scales],
+            output=output,
+        )
+        return output
+
+    flash_output = run_moe(slice(None))
+    small_batches = torch.cat(
+        [run_moe(slice(i, i + 16)) for i in range(0, num_tokens, 16)]
+    )
+    torch.testing.assert_close(flash_output, small_batches, rtol=0, atol=0)
+
+    # Loose check against a BF16 reference, in case both kernels are wrong the same way. The
+    # kernel also quantizes the FC2 input to FP8, which the reference does not.
+    x_quant, x_scales = per_token_group_quant_fp8(x, group_size=128)
+    x_dequant = (
+        x_quant.to(otype).view(num_tokens, -1, 128) * x_scales.to(otype).unsqueeze(-1)
+    ).view_as(x)
+    ref_output = compute_with_experts(
+        num_experts,
+        x_dequant,
+        dequantize_block(w31_quant, w31_scales, otype, w31.shape),
+        dequantize_block(w2_quant, w2_scales, otype, w2.shape),
+        selected_experts,
+        routing_weights,
+    )
+    rel_err = (
+        flash_output.float() - ref_output.float()
+    ).norm() / ref_output.float().norm()
+    assert rel_err < 0.08, f"relative error {rel_err:.4f}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
