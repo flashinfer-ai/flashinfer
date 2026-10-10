@@ -14,8 +14,9 @@ from ..conftest import require_b12x
     "heads,rows", [(16, 1), (32, 2), (16, 33), (32, 65), (16, 4096), (32, 4096)]
 )
 @pytest.mark.parametrize("major", ["n", "k"])
+@pytest.mark.parametrize("scale_dtype", [torch.uint8, torch.float8_e8m0fnu])
 @torch.no_grad()
-def test_glm_absorbed_projection_compiled_graph(heads, rows, major):
+def test_glm_absorbed_projection_compiled_graph(heads, rows, major, scale_dtype):
     device = require_b12x()
     torch.compiler.reset()
     generator = torch.Generator(device=device).manual_seed(531512)
@@ -31,7 +32,7 @@ def test_glm_absorbed_projection_compiled_graph(heads, rows, major):
         generator=generator,
     )
     extent = slice(0, 256) if major == "n" else slice(256, 512)
-    rhs = (values[:, extent], scales[:, extent])
+    rhs = (values[:, extent], scales[:, extent].view(scale_dtype))
     k, n = (256, 512) if major == "n" else (512, 256)
     source = torch.zeros((rows + 2, heads, k), dtype=torch.bfloat16, device=device)
     destination = torch.full(
