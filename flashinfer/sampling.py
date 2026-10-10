@@ -230,6 +230,45 @@ def get_sampling_module():
         pass
 
     @torch.library.custom_op(
+        "flashinfer::chain_speculative_sampling_out",
+        mutates_args=(
+            "output_token_ids",
+            "output_accepted_token_num",
+            "output_emitted_draft_token_num",
+        ),
+    )
+    def chain_speculative_sampling_out(
+        draft_probs: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        target_probs: torch.Tensor,
+        output_token_ids: torch.Tensor,
+        output_accepted_token_num: torch.Tensor,
+        output_emitted_draft_token_num: torch.Tensor,
+        deterministic: bool,
+        maybe_seed_arr: Optional[torch.Tensor],
+        seed_val: int,
+        maybe_offset_arr: Optional[torch.Tensor],
+        offset_val: int,
+    ) -> None:
+        module.chain_speculative_sampling(
+            draft_probs,
+            draft_token_ids,
+            target_probs,
+            output_token_ids,
+            output_accepted_token_num,
+            output_emitted_draft_token_num,
+            deterministic,
+            maybe_seed_arr,
+            seed_val,
+            maybe_offset_arr,
+            offset_val,
+        )
+
+    @chain_speculative_sampling_out.register_fake
+    def _fake_chain_speculative_sampling_out(*args):
+        pass
+
+    @torch.library.custom_op(
         "flashinfer::top_p_renorm_probs_out", mutates_args=("renorm_probs", "workspace")
     )
     def top_p_renorm_probs_out(
@@ -823,7 +862,7 @@ def get_sampling_module():
             _validate_and_convert_seed_offset(seed, offset, device, batch_size)
         )
 
-        module.chain_speculative_sampling(
+        chain_speculative_sampling_out(
             draft_probs,
             draft_token_ids,
             target_probs,

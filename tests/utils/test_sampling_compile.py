@@ -87,3 +87,68 @@ def test_sampling_pipeline_compiles_and_replays(indexed, rng):
         for result, reference in zip(actual, expected, strict=True):
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
         assert actual[2].all()
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("drafts", [0, 1, 7])
+@pytest.mark.parametrize("device_rng", [False, True])
+@torch.no_grad()
+def test_chain_sampling_compiles_and_replays(batch, drafts, device_rng):
+    draft = torch.full((batch, drafts, 257), 1 / 257, device="cuda")
+    ids = torch.zeros((batch, drafts), dtype=torch.int64, device="cuda")
+    target = torch.full((batch, drafts + 1, 257), 1 / 257, device="cuda")
+    accepted = torch.zeros(batch, dtype=torch.int32, device="cuda")
+    emitted = torch.zeros_like(accepted)
+    seed, offset = -97, (1 << 32) + 3
+    if device_rng:
+        seed = torch.full((batch,), (1 << 64) - 97, dtype=torch.uint64, device="cuda")
+        offset = torch.full((batch,), offset, dtype=torch.uint64, device="cuda")
+
+    def forward(draft, ids, target, accepted, emitted):
+        before = accepted.clone()
+        result = sampling.chain_speculative_sampling(
+            draft,
+            ids,
+            target,
+            accepted,
+            emitted,
+            deterministic=True,
+            seed=seed,
+            offset=offset,
+        )
+        return (*result, before)
+
+    inputs = draft, ids, target, accepted, emitted
+    forward(*inputs)
+    traced = make_fx(forward)(*inputs)
+    targets = {node.target for node in traced.graph.nodes if node.op == "call_function"}
+    assert torch.ops.flashinfer.chain_speculative_sampling_out.default in targets
+    compiled = torch.compile(traced, fullgraph=True, dynamic=False)
+    compiled(*inputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = compiled(*inputs)
+    for step, prefix in enumerate((drafts, 0, drafts // 2)):
+        draft.copy_(torch.softmax(torch.randn_like(draft), -1))
+        target.copy_(torch.softmax(torch.randn_like(target), -1))
+        target[:, :prefix].copy_(draft[:, :prefix])
+        target[:, prefix:drafts, 0] = 0
+        target[:, prefix:drafts] /= target[:, prefix:drafts].sum(-1, keepdim=True)
+        if device_rng:
+            seed.fill_((1 << 64) - 97 - step)
+            offset.fill_((1 << 32) + step)
+        accepted.fill_(11 + step)
+        emitted.fill_(19 + step)
+        expected = tuple(value.clone() for value in forward(*inputs))
+        accepted.fill_(11 + step)
+        emitted.fill_(19 + step)
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        for result, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        torch.testing.assert_close(accepted, expected[1], rtol=0, atol=0)
+        torch.testing.assert_close(emitted, expected[2], rtol=0, atol=0)
+        assert (emitted == 19 + step + prefix).all()
+        assert (actual[3] == 11 + step).all()
