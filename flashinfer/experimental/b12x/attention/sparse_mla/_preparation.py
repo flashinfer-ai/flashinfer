@@ -254,6 +254,10 @@ class _SparseMlaState:
                     sm_scale=self.caps.softmax_scale,
                     page_block_size=self.caps.page_size,
                     topk_length=binding.nsa_cache_seqlens_int32,
+                    output=binding.scratch.output_buffer[: binding.q.shape[0]],
+                    lse_out=binding.scratch.final_lse[
+                        : binding.q.shape[0], : binding.q.shape[1]
+                    ],
                     model_type=self.caps.model_type,
                     scale_format=self.caps.scale_format,
                     fp8_rope=self.caps.fp8_rope,
@@ -300,8 +304,7 @@ class _SparseMlaState:
             ),
             lse_out=(
                 binding.scratch.final_lse[: binding.q.shape[0], : binding.q.shape[1]]
-                if self.caps.return_lse
-                and getattr(binding.scratch, "final_lse", None) is not None
+                if getattr(binding.scratch, "final_lse", None) is not None
                 else None
             ),
             model_type=self.caps.model_type,
