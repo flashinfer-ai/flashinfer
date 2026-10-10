@@ -1940,6 +1940,62 @@ def test_nvfp4_quantize_tma_backend_parity(
     )
 
 
+# The CUDA TMA kernel walks rows in tiles of 16 for half/bf16, while 8x4 scale
+# factors are allocated for rows padded only to 8; m % 16 in [1, 8] leaves a
+# partial tile past that allocation.
+NVFP4_TMA_PARTIAL_ROW_TILE_SHAPES = [(1025, 512), (1032, 512), (1032, 2048)]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", NVFP4_TMA_PARTIAL_ROW_TILE_SHAPES)
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_tma_scale_stays_in_buffer(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    # Back the scale-factor allocation (the only 1-D uint8 buffer) with a
+    # sentinel-filled guard region that the kernel must leave untouched.
+    guard_bytes = n
+    guards = []
+    empty = torch.empty
+
+    def guarded_empty(*args, **kwargs):
+        buffer = empty(*args, **kwargs)
+        if buffer.dtype != torch.uint8 or buffer.dim() != 1:
+            return buffer
+        backing = torch.full((buffer.numel() + guard_bytes,), 0xA5, dtype=torch.uint8)
+        guards.append(backing[buffer.numel() :])
+        return backing[: buffer.numel()]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", guarded_empty)
+        nvfp4_quantize(x, global_scale, sfLayout=sf_layout, backend="cuda")
+    torch.cuda.synchronize()
+
+    assert len(guards) == 1
+    overwritten = (guards[0] != 0xA5).sum().item()
+    assert overwritten == 0, (
+        f"{overwritten} bytes written past the scale-factor buffer "
+        f"(shape={shape}, layout={sf_layout.name})"
+    )
+
+
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_nvfp4_quantize_tma_oob_rows(device: str) -> None:
