@@ -306,8 +306,11 @@ The block-size fields belong to `SageAttentionConfig`; the defaults are
 TensorRT-LLM's production recipe. Masks and scheduling follow the 16-bit
 plans. Every run first launches a small kernel that writes the plan's `sfQ`
 and `sfK` images, the Q and K scales in the order the attention kernel reads
-them; a block-sparse run's route prepare follows it. The paged block-sparse
-APIs do not support Sage attention.
+them; a block-sparse run's route prepare follows it as a programmatic
+dependent launch, starting while the image kernel drains and acquiring it
+before exiting, so the attention launch that follows in stream order finds
+both images and routes complete. The paged block-sparse APIs do not support
+Sage attention.
 
 With the default threshold, FP8 P is quantized at `C = 448 * 2**-8 = 1.75`:
 the E4M3 grid of P moves down by the threshold, so probabilities far below the

@@ -90,6 +90,9 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             "use_causal_mask": key.mask_type == "causal",
             "apply_token_mask": key.use_kv_valid_bits,
             "store_score_words": config.uses_prepared_score_keep_words,
+            # The route prepare of a Sage plan is a programmatic dependent of
+            # the scale prepare launched immediately before it.
+            "use_pdl": prepare_sage_scales is not None,
         }
         if key.page_size is not None:
             if sparse_format != "bsr" or use_proxy_routes:
@@ -154,10 +157,10 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         # not use (the V mean without a mean, the summary K scales without
         # proxy routes) is ``None`` and stays unbound. Attention reads its Q
         # and K scales from the images the Sage prepare writes first, never
-        # ``q_scale`` or ``k_scale``. The prepare kernels are ordinary
-        # launches in stream order; attention keeps its programmatic
-        # dependent launch on its immediate predecessor and acquires that
-        # grid before it reads any prepared value.
+        # ``q_scale`` or ``k_scale``. The Sage prepare is an ordinary launch;
+        # the route prepare that follows it is a programmatic dependent
+        # launch that acquires it before exiting, so the stream-ordered
+        # attention launch finds both the images and the routes complete.
         sage_kwargs = {}
         if cutlass.const_expr(static_config.use_sage_attention):
             sage_kwargs = {

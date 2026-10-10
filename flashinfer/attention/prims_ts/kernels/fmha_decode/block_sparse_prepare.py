@@ -39,6 +39,13 @@ list, moving on to later batches until the one holding its last block.
 described by ``_BlockSparseRouteLayout``. Payload outside each live row
 count is intentionally stale. ``max_blocks_per_row`` is the plan-declared
 semantic BSR-block limit, which remains distinct from packed-route capacity.
+
+A prepare launched with ``use_pdl`` is a programmatic dependent of the grid
+launched immediately before it on the same stream, a Sage plan's scale
+prepare, whose output the routes never read. Its CTAs may start while that
+grid drains; each acquires the grid after its last store, so the prepare's
+completion implies the producer's completion and memory visibility for the
+attention launch that follows in stream order and reads both.
 """
 
 from dataclasses import dataclass
@@ -47,6 +54,7 @@ import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda_drv
 from cutlass.cute.testing import assert_ as runtime_assert
+from cutlass.experimental import primitives as prims
 from cutlass.utils.smem_allocator import SmemAllocator
 
 from ..._block_sparse.prepared import (
@@ -936,11 +944,27 @@ def _allocate_warp_words(
     )[None, warp_idx]
 
 
+@cute.jit
+def _acquire_pdl_producer(use_pdl: cutlass.Constexpr[bool]) -> None:
+    """Acquire the preceding grid of a programmatic dependent launch before exit.
+
+    The routes depend on nothing that grid writes, so the prepare stores its
+    records first and acquires last; a prepare launched without ``use_pdl``
+    has no dependency to acquire.
+    """
+
+    if cutlass.const_expr(use_pdl):
+        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+
+
 class _PrepareRoutesBase:
     """Own shared route geometry and compile-time storage/policy flags.
 
     ``num_pattern_heads`` is the head axis of the BSR or bitmask inputs, one
-    when every KV head shares a pattern, and sizes the route rows.
+    when every KV head shares a pattern, and sizes the route rows. ``use_pdl``
+    launches the prepare as a programmatic dependent of the grid launched
+    immediately before it on the same stream and acquires that grid before
+    the kernel exits.
     """
 
     def __init__(
@@ -958,6 +982,7 @@ class _PrepareRoutesBase:
         apply_token_mask: bool = False,
         store_score_words: bool = False,
         page_size: int | None = None,
+        use_pdl: bool = False,
     ) -> None:
         if not isinstance(use_proxy_routes, bool):
             raise TypeError("use_proxy_routes must be a bool")
@@ -967,6 +992,8 @@ class _PrepareRoutesBase:
             raise TypeError("store_score_words must be a bool")
         if not isinstance(use_causal_mask, bool):
             raise TypeError("use_causal_mask must be a bool")
+        if not isinstance(use_pdl, bool):
+            raise TypeError("use_pdl must be a bool")
         if use_proxy_routes and page_size is not None:
             raise ValueError("paged KV does not support proxy routes")
 
@@ -996,6 +1023,7 @@ class _PrepareRoutesBase:
         )
         self.page_size = page_size if page_size is not None else 1
         self.minimum_seq_len_kv = seq_len_q if use_causal_mask else 1
+        self.use_pdl = use_pdl
         self.route_metadata_base_word_offset = layout.route_metadata_base_word_offset
 
     @property
@@ -1040,6 +1068,7 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
             grid=self.grid,
             block=[_THREADS_PER_CTA, 1, 1],
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -1195,6 +1224,7 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
 
         if lane_idx == cutlass.Int32(0) and row_is_valid:
             route_workspace[linear_row_idx] = total_route_count
+        _acquire_pdl_producer(self.use_pdl)
 
 
 class _PrepareBitmaskRoutes(_PrepareRoutesBase):
@@ -1214,6 +1244,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
         use_causal_mask: bool = False,
         apply_token_mask: bool = False,
         store_score_words: bool = False,
+        use_pdl: bool = False,
     ) -> None:
         super().__init__(
             batch_size=batch_size,
@@ -1227,6 +1258,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
             use_causal_mask=use_causal_mask,
             apply_token_mask=apply_token_mask,
             store_score_words=store_score_words,
+            use_pdl=use_pdl,
         )
 
     @cute.jit
@@ -1249,6 +1281,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
             grid=self.grid,
             block=[_THREADS_PER_CTA, 1, 1],
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -1372,6 +1405,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
 
         if lane_idx == cutlass.Int32(0) and row_is_valid:
             route_workspace[linear_row_idx] = total_route_count
+        _acquire_pdl_producer(self.use_pdl)
 
 
 __all__ = ["_PrepareBitmaskRoutes", "_PrepareBsrRoutes"]

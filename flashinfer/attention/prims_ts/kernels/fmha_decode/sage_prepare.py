@@ -234,8 +234,10 @@ class _PrepareSageScaleImages:
     The images cover ``batch_size * num_kv_heads`` sequences; the grid gives
     each of their 16-byte pieces one thread, the K image's pieces first and
     the Q image's after them. The kernel is an ordinary launch on the plan's
-    stream: a block-sparse plan's route prepare and the attention launch
-    follow it in stream order.
+    stream. A dense plan's attention launch follows it in stream order; a
+    block-sparse plan's route prepare follows it as a programmatic dependent
+    launch that acquires this grid before exiting, and attention follows the
+    route prepare in stream order.
     """
 
     def __init__(
