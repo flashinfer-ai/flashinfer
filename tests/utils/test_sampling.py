@@ -18,10 +18,12 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import device_support_pdl
 from tests.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )
+from tests.test_helpers.pdl import late_store
 
 
 def normal_distribution(std):
@@ -375,6 +377,29 @@ def test_softmax(
     probs_ref = torch.softmax(logits_scaled, dim=-1)
 
     assert torch.allclose(probs, probs_ref, atol=1e-5)
+
+
+# Batches of at most 128 rows with a vocabulary of at least 24576 take the vocab-splitting
+# map-reduce kernels; the rest take the fused kernel.
+@pytest.mark.parametrize("batch_size,vocab_size", [(128, 4096), (4, 32768)])
+def test_softmax_pdl_waits_for_temperature(batch_size, vocab_size):
+    logits = torch.randn(batch_size, vocab_size, device="cuda")
+    if not device_support_pdl(logits.device):
+        pytest.skip("PDL not supported on this device")
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+    softmax = flashinfer.sampling.get_sampling_module().softmax
+    temperature_value = 0.5
+
+    temperature = torch.full((batch_size,), temperature_value, device="cuda")
+    expected = softmax(workspace, logits, temperature, 0.0, False)
+
+    # Row 0's temperature is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the softmax kernel.
+    temperature[0] = temperature_value * 4
+    late_store(temperature, temperature_value)
+    probs = softmax(workspace, logits, temperature, 0.0, True)
+
+    torch.testing.assert_close(probs, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
