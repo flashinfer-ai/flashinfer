@@ -168,13 +168,21 @@ def test_legal_tactics_cover_each_axis_and_drop_illegal_ones():
     assert len(sm103) <= MAX_PROFILED_TACTICS
 
     swiglu = legal_tactics(103, "nvfp4_e2m1", "bf16", "swiglu")
-    assert all(not tactic[4] and tactic[8] == 8 for tactic in swiglu)
+    assert all(tactic[8] == 8 for tactic in swiglu)
+    # TMEM overlap is a SwiGLU candidate, never combined with TMA output stores.
+    assert any(tactic[4] for tactic in swiglu)
+    assert all(not (tactic[4] and tactic[9]) for tactic in swiglu)
     assert {tactic[9] for tactic in swiglu} == {True, False}
     assert any((tactic[0], tactic[1]) == (4, 4) for tactic in swiglu)
 
     qkv = legal_tactics(100, "nvfp4_e2m1", "bf16", "qkv_qknorm_rope")
     assert {tactic[9] for tactic in qkv} == {True, False}
-    assert all(tactic[5] == 4 and tactic[8] == 8 and not tactic[4] for tactic in qkv)
+    assert all(tactic[5] == 4 and tactic[8] == 8 for tactic in qkv)
+    # TMEM overlap is a QKV candidate at MMA-K 64 only, never with TMA stores.
+    assert any(tactic[4] for tactic in qkv)
+    assert all(tactic[6] == 64 and not tactic[9] for tactic in qkv if tactic[4])
+    qkv_sm103 = legal_tactics(103, "nvfp4_e2m1", "bf16", "qkv_qknorm_rope")
+    assert not any(tactic[4] and tactic[6] == 96 for tactic in qkv_sm103)
 
     fp8 = legal_tactics(100, "fp8_e4m3", "bf16", "linear")
     assert all(tactic[3] in (128, 256) and tactic[6] == 64 for tactic in fp8)
@@ -195,11 +203,26 @@ def test_legal_tactics_cover_each_axis_and_drop_illegal_ones():
                 )
 
     illegal_cluster = (1, 1, 256, 256, False, 5, 64, True, 4, False)
-    illegal_overlap = (2, 2, 256, 256, True, 5, 64, True, 8, False)
+    # TMEM overlap needs tile N 256; the same tactic without overlap is legal.
+    illegal_overlap = (2, 2, 128, 256, True, 5, 64, True, 8, False)
     illegal_tma = (2, 2, 256, 256, True, 5, 64, True, 8, True)
     assert not tactic_is_legal(100, "nvfp4_e2m1", "bf16", "linear", illegal_cluster)
     assert not tactic_is_legal(103, "nvfp4_e2m1", "bf16", "swiglu", illegal_overlap)
+    assert tactic_is_legal(
+        103,
+        "nvfp4_e2m1",
+        "bf16",
+        "swiglu",
+        (2, 2, 256, 256, True, 5, 64, True, 8, False),
+    )
     assert not tactic_is_legal(100, "nvfp4_e2m1", "bf16", "linear", illegal_tma)
+    assert tactic_is_legal(
+        100,
+        "nvfp4_e2m1",
+        "bf16",
+        "qkv_qknorm_rope",
+        (2, 2, 256, 256, True, 4, 64, True, 8, False),
+    )
     assert not tactic_is_legal(
         100,
         "nvfp4_e2m1",
@@ -215,7 +238,7 @@ def test_legal_tactics_cover_each_axis_and_drop_illegal_ones():
         (4, 4, 256, 256, False, 5, 64, True, 8, True),
     )
     assert illegal_cluster not in sm100
-    assert all(not tactic[4] for tactic in swiglu)
+    assert illegal_overlap not in swiglu
 
     narrowed = config_from_tactic(
         arch=100,
