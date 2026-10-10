@@ -488,3 +488,190 @@ def test_preparation_memory_error_falls_back_on_every_rank(tmp_path, failure_pha
         assert f"rank {rank}: fallback" in outputs[rank], (
             f"rank {rank} unexpected output:\n{outputs[rank]}"
         )
+
+
+_CACHE_HIT_WORKER_SRC = r"""
+import datetime, os
+from pathlib import Path
+import torch
+import torch.distributed as dist
+from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig, autotune, set_autotune_process_group
+from flashinfer.autotune_cache import autotune_v2, autotune_v2_reload, ManagedAutotuneCache
+
+rank = int(os.environ["RANK"])
+case = os.environ["CACHE_CASE"]
+root = Path(os.environ["CASE_ROOT"])
+
+class RunnerA(TunableRunner):
+    def get_cache_key_extras(self, inputs):
+        return (0 if case == "concurrent_publish" else rank,)
+    def get_valid_tactics(self, inputs, profile):
+        return [0, 1]
+    def forward(self, inputs, tactic=-1):
+        return inputs[0]
+
+class RunnerB(RunnerA):
+    pass
+
+config = TuningConfig()
+inputs = [torch.zeros(8, 8)]
+runners = [RunnerA(), RunnerB()]
+op = "test::distributed_cache_hit"
+tuner = AutoTuner.get()
+tuner.clear_cache()
+calls = []
+
+def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+    calls.append((type(runner).__name__, tactic))
+    elapsed = torch.tensor([1.0 if isinstance(runner, RunnerB) and tactic == 1 else 5.0])
+    dist.all_reduce(elapsed)
+    if case == "failed_profile":
+        return float("inf")
+    return elapsed.item() / 2
+
+AutoTuner._profile_single_kernel = profile
+# CPU tests replace only CUDA measurement/capture queries; cache lookup,
+# invalidation, publication, choose_one and distributed collectives are real.
+torch.cuda.is_current_stream_capturing = lambda: False
+dist.init_process_group("gloo", init_method="file://" + str(root / "rendezvous"),
+                        rank=rank, world_size=2, timeout=datetime.timedelta(seconds=30))
+try:
+    context = (autotune(True) if case in ("partial_memory", "partial_file")
+               else autotune_v2(cache_root=root / "cache"))
+    with context:
+        key = tuner._get_cache_key(op, runners[0], (inputs[0].shape,), config,
+                                   runners[0].get_cache_key_extras(inputs))
+        policy = tuner._profiling_policy(config)
+        store = tuner._active_managed_store
+        if case == "all_hit" or (rank == 0 and case not in ("all_miss", "concurrent_publish")):
+            if case == "partial_memory":
+                tuner._winner_cache()[key] = (0, None)
+            elif case == "partial_file":
+                tuner._file_configs[key.file_key] = ("RunnerA", 0)
+            else:
+                store.publish(key.file_key, "RunnerA", 0, key_fields=key.key_fields,
+                              profiling_policy=policy)
+        dist.barrier()
+        search = tuner.search_cache
+        first = True
+        def ordered_search(*args, **kwargs):
+            global first
+            if not first:
+                return search(*args, **kwargs)
+            first = False
+            if case != "concurrent_publish":
+                result = search(*args, **kwargs)
+                expected_hit = case == "all_hit" or (rank == 0 and case != "all_miss")
+                assert result[0] == expected_hit, (rank, case, result)
+                return result
+            if rank == 0:
+                result = search(*args, **kwargs)
+                assert not result[0]
+                dist.barrier()
+                return result
+            dist.barrier()
+            # Model another deployment publishing between the two lookups.
+            writer = ManagedAutotuneCache(store.manifest, root=store.root)
+            writer.publish(key.file_key, "RunnerA", 0, key_fields=key.key_fields,
+                           profiling_policy=policy)
+            result = search(*args, **kwargs)
+            assert result[0]
+            return result
+        tuner.search_cache = ordered_search
+        set_autotune_process_group(dist.group.WORLD)
+        # A nested rank_tactics shortlist has its own process-local cache.
+        ranked_key = tuner._get_cache_key("test::ranked", runners[0],
+            (inputs[0].shape,), config, runners[0].get_cache_key_extras(inputs))
+        if rank == 0:
+            tuner._ranked_tactics_cache[ranked_key] = (policy, (1, 0))
+        ranked = tuner.rank_tactics("test::ranked", [runners[0]], config, inputs, k=2)
+        assert ranked == ([-1] if case == "failed_profile" else [0, 1])
+        calls.clear()
+        expected = ("RunnerA", 0) if case == "all_hit" else (
+            ("RunnerA", -1) if case == "failed_profile" else ("RunnerB", 1))
+        chosen, tactic = tuner.choose_one(op, runners, config, inputs)
+        assert (type(chosen).__name__, tactic) == expected
+        assert bool(calls) == (case != "all_hit")
+        count = len(calls)
+        chosen, tactic = tuner.choose_one(op, runners, config, inputs)
+        assert (type(chosen).__name__, tactic) == expected
+        if case == "failed_profile":
+            assert len(calls) == 2 * count, "failed profiling must remain retryable"
+        else:
+            assert len(calls) == count, "second call must reuse the coordinated winner"
+        count = len(calls)
+        set_autotune_process_group(None)
+        tuner.search_cache = search
+    dist.barrier()
+    if store is not None:
+        autotune_v2_reload()
+    # Serving remains collective-free even if the caller has left the group set.
+    set_autotune_process_group(dist.group.WORLD)
+    original_reduce = dist.all_reduce
+    def unexpected_reduce(*args, **kwargs):
+        raise AssertionError("serving must not synchronize")
+    dist.all_reduce = unexpected_reduce
+    chosen, tactic = tuner.choose_one(op, runners, config, inputs)
+    assert (type(chosen).__name__, tactic) == expected, "reload revived an old runner"
+    assert len(calls) == count
+    # Even warm distributed tuning cannot perform a host collective in capture.
+    torch.cuda.is_current_stream_capturing = lambda: True
+    with autotune(True):
+        try:
+            tuner.choose_one(op, runners, config, inputs)
+        except RuntimeError as error:
+            assert "CUDA Graph capture" in str(error)
+        else:
+            raise AssertionError("distributed tuning in capture must fail")
+    dist.all_reduce = original_reduce
+    print("cache agreement OK", rank, case, count, flush=True)
+finally:
+    set_autotune_process_group(None)
+    dist.destroy_process_group()
+"""
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "all_hit",
+        "all_miss",
+        "partial_memory",
+        "partial_file",
+        "partial_managed",
+        "concurrent_publish",
+        "failed_profile",
+    ],
+)
+def test_cache_hit_disagreement_reprofiles_together(tmp_path, case):
+    """Real two-rank lookup/collectives converge despite partial or racing caches."""
+    processes = []
+    deadline = time.monotonic() + 120
+    try:
+        for rank in range(2):
+            env = dict(
+                os.environ,
+                RANK=str(rank),
+                CACHE_CASE=case,
+                CASE_ROOT=str(tmp_path),
+                TORCH_DISTRIBUTED_DEBUG="DETAIL",
+            )
+            processes.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", _CACHE_HIT_WORKER_SRC],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            )
+        for process in processes:
+            output, _ = process.communicate(timeout=max(0, deadline - time.monotonic()))
+            assert process.returncode == 0, output
+            assert "cache agreement OK" in output
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+        for process in processes:
+            process.communicate()
