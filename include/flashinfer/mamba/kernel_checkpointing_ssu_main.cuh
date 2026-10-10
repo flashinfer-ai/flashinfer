@@ -999,7 +999,8 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
     float D_val = 0.f, A_val = 0.f;
     if (work_unit < total_work) {
       int const seq = (work_unit / NHEADS) / D_SPLIT;  // compile-time NHEADS, D_SPLIT divisors
-      int64_t const raw_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
+      int64_t const raw_slot =
+          sbi ? static_cast<int64_t>(sbi[seq * params.state_batch_indices_stride_batch]) : seq;
       if (raw_slot != params.pad_slot_id) {
         cache_slot = static_cast<int32_t>(raw_slot);  // cache slots ≪ 2^31
         pnat = prev_ptr[raw_slot];
