@@ -171,8 +171,7 @@ class _NormFinalizePublishDeviceKernel:
             route = Int64(token) * self.topk + k
             row = Int32(permuted_idx[route])
             is_local = row >= Int32(0) and row < num_rows
-            # Every route runs the barrier; non-local rows contribute zeros.
-            scaled.fill(Float32(0.0))
+            # All threads in this token's CTA have the same route index.
             if is_local:
                 for trip in cutlass.range_constexpr(self.trips):
                     column = Int64(tidx + trip * self.threads) * VEC_BF16
@@ -182,23 +181,25 @@ class _NormFinalizePublishDeviceKernel:
                     if cutlass.const_expr(self.weight_before_norm):
                         values = values * gamma[trip, None].load()
                     scaled[trip, None].store(values)
-            sum_sq = (scaled.load() * scaled.load()).reduce(
-                cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
-            )
-            for offset in (16, 8, 4, 2, 1):
-                sum_sq = sum_sq + cute.arch.shuffle_sync_bfly(sum_sq, offset=offset)
-            if lane == 0:
-                cute.arch.store((warp_sums + (k * self.warps + warp)).llvm_ptr, sum_sq)
-            cute.arch.barrier()
-            total = Float32(0.0)
-            for w in cutlass.range_constexpr(self.warps):
-                total = total + cute.arch.load(
-                    (warp_sums + (k * self.warps + w)).llvm_ptr, Float32
+                sum_sq = (scaled.load() * scaled.load()).reduce(
+                    cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
                 )
-            inv_rms = cute.math.rsqrt(
-                total * Float32(1.0 / self.hidden) + Float32(self.eps), fastmath=True
-            )
-            if is_local:
+                for offset in (16, 8, 4, 2, 1):
+                    sum_sq = sum_sq + cute.arch.shuffle_sync_bfly(sum_sq, offset=offset)
+                if lane == 0:
+                    cute.arch.store(
+                        (warp_sums + (k * self.warps + warp)).llvm_ptr, sum_sq
+                    )
+                cute.arch.barrier()
+                total = Float32(0.0)
+                for w in cutlass.range_constexpr(self.warps):
+                    total = total + cute.arch.load(
+                        (warp_sums + (k * self.warps + w)).llvm_ptr, Float32
+                    )
+                inv_rms = cute.math.rsqrt(
+                    total * Float32(1.0 / self.hidden) + Float32(self.eps),
+                    fastmath=True,
+                )
                 weight = Float32(route_weights[route])
                 for trip in cutlass.range_constexpr(self.trips):
                     normalized = scaled[trip, None].load() * inv_rms
