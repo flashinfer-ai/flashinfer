@@ -106,10 +106,11 @@ struct FP8CollectiveEpilogue {
   static void prefetch_tma_descriptors(Params const& epilogue_params) {}
 
   template <typename BlockCoord, typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE,
-            typename TiledMma>
-  CUTLASS_DEVICE void store(Params const& epilogue_params, FrgTensorO const& tOrO,
+            typename TiledMma, typename AttentionVariant, typename MainloopParams>
+  CUTLASS_DEVICE void store(Params const& epilogue_params, FrgTensorO& tOrO,
                             FrgTensorLSE const& lse, SharedStorage& shared_storage,
-                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord) {
+                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord,
+                            AttentionVariant& variant, MainloopParams const& mainloop_params) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
 
@@ -118,6 +119,13 @@ struct FP8CollectiveEpilogue {
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
     auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(thread_idx);
+
+    if constexpr (has_output_transform_v<AttentionVariant, MainloopParams>) {
+      Tensor caccO = cute::make_identity_tensor(select<0, 2>(TileShape_QKD{}));
+      Tensor taccOcO = tiled_mma.get_thread_slice(thread_idx).partition_C(caccO);
+      transform_output_fragment<CTA_Q>(variant, mainloop_params, tOrO, taccOcO, lse, qo_tile_idx,
+                                       qo_len, qo_head_idx, batch_idx);
+    }
 
     Tensor tOrO_out = convert_type<DTypeO>(tOrO);
     Tensor taccOrO = smem_thr_copy_O.retile_S(tOrO_out);  // ((Atom,AtomNum), MMA_M, MMA_N)
@@ -166,10 +174,12 @@ struct FP8CollectiveEpilogue {
     // tma_store_wait<0>();
   }
 
-  // Write 0 to output and -inf to LSE
-  template <typename BlockCoord, typename SharedStorage>
+  // Write 0 to output and -inf to LSE, through the variant's output transform when it has one.
+  template <typename BlockCoord, typename SharedStorage, typename AttentionVariant,
+            typename MainloopParams>
   CUTLASS_DEVICE void store_zero(Params const& epilogue_params, SharedStorage& shared_storage,
-                                 int thread_idx, BlockCoord const& block_coord) {
+                                 int thread_idx, BlockCoord const& block_coord,
+                                 AttentionVariant& variant, MainloopParams const& mainloop_params) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
     Tensor mO = make_tensor(make_gmem_ptr(epilogue_params.O_ptr), epilogue_params.layout_O);
@@ -186,9 +196,15 @@ struct FP8CollectiveEpilogue {
     Tensor tOrO = make_fragment_like(tOgO);    // (CPY, CPY_O, CPY_D)
     clear(tOrO);
     Tensor tOcO = thr_copy_O.partition_D(cO);  // (CPY, CPY_O, CPY_D)
-    Tensor tOgOGroup = flatten_1(tOgO);        // (CPY, (CPY_O, CPY_D))
-    Tensor tOrOGroup = flatten_1(tOrO);        // (CPY, (CPY_O, CPY_D))
-    Tensor tOcOGroup = flatten_1(tOcO);        // (CPY, (CPY_O, CPY_D))
+    if constexpr (has_output_transform_v<AttentionVariant, MainloopParams>) {
+      // Before the flattened views below copy the fragment.
+      const int qo_tile_base = qo_tile_idx * get<0>(TileShape_QKD{});
+      transform_zero_fragment(variant, mainloop_params, tOrO, tOcO, qo_tile_base,
+                              qo_len - qo_tile_base, qo_head_idx, batch_idx);
+    }
+    Tensor tOgOGroup = flatten_1(tOgO);  // (CPY, (CPY_O, CPY_D))
+    Tensor tOrOGroup = flatten_1(tOrO);  // (CPY, (CPY_O, CPY_D))
+    Tensor tOcOGroup = flatten_1(tOcO);  // (CPY, (CPY_O, CPY_D))
 
     const int qo_tile_size = get<0>(TileShape_QKD{});
     int valid_qo_tile_size = std::min<int>(qo_len - qo_tile_idx * qo_tile_size, qo_tile_size);
