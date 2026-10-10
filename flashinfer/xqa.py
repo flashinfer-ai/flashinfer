@@ -399,8 +399,10 @@ def xqa(
         assert k_sf_cache is not None, "K SF cache is required when NVFP4 KV is used"
         assert v_sf_cache is not None, "V SF cache is required when NVFP4 KV is used"
 
-    if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
-        raise RuntimeError("XQA is only supported on SM90, SM100, SM120/SM121 GPUs")
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [8, 9, 10, 12]:
+        raise RuntimeError(
+            "XQA is only supported on SM8x, SM90, SM100, SM120/SM121 GPUs"
+        )
 
     xqa_module = get_xqa_module(
         q.dtype,
