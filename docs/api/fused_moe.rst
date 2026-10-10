@@ -134,6 +134,17 @@ model shortlist. Quantized hidden/intermediate sizes must be divisible by 128;
 artifact and native-plan bounds are checked per call. Configure another backend
 alongside Frost if unsupported calls need a fallback.
 
+Warm calls reuse artifact paths, kernel-selection metadata and exact-shape
+native plans. Admission and packing share validation and one assembler identity
+snapshot within the same synchronous ``MoELayer`` call; each new call validates
+its current input and weight packs again and rechecks the selected assembler.
+Standalone runner operations perform their own checks. Compiler changes and
+explicit artifact-cache refreshes invalidate preparation metadata, while active
+packed calls and captured CUDA graphs retain their original resources. Switching
+shape creates a new native plan when needed and reuses an already compiled
+generated kernel when its source and compiler identity are unchanged; small-token
+FMA specializations can have shape-specific compilation.
+
 The validated SM107 dependency baseline is PyTorch 2.14.1, CuTe DSL 4.8.0, TVM-FFI
 0.1.14.post1, and external PTXAS 13.4.92. CUDA 13.5 PTXAS is also validated.
 Runtime checks additionally require the DSL

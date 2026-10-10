@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import functools
 from itertools import product
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -24,6 +24,8 @@ from ..support import weight_view
 from ..compiler import require_moe_assembler
 from ..cache import (
     LRUCache,
+    call_preparation,
+    reuse_validation,
     require_graph_resource_retention,
     retain_graph_resources,
     TensorCache,
@@ -64,6 +66,11 @@ def _module(arch):
 
 
 def _artifact_roots():
+    return _cached_artifact_roots()
+
+
+@functools.cache
+def _cached_artifact_roots():
     return (common.artifact_root("mxfp8_mxfp4"),)
 
 
@@ -213,6 +220,13 @@ class _Inputs(list):
         self.tuning_config = tuning_config
 
 
+class _PreparationMetadata(NamedTuple):
+    first: tuple
+    second: tuple
+    fma_tactic: Any
+    plan_key: tuple
+
+
 class _Plans:
     def __init__(
         self,
@@ -346,6 +360,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
     """
 
     requires_exact_shape = True
+    uses_call_preparation = True
     backend_key = "cudnn_frost_mxfp8_mxfp4"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.MXFP8),)
@@ -358,6 +373,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self._plans, self._workspace_pool = LRUCache(), {}
+        self._preparation_metadata = LRUCache(maxsize=128)
         self._identity_scales = TensorCache(maxsize=32)
         self._fc1_scale_views = TensorCache()
 
@@ -408,6 +424,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
             )
         self._identity_scales.put(value, version, True)
 
+    @reuse_validation
     def _validate_pack(self, act, weights):
         require_moe_assembler()
         self._validate_pack_contract(act)
@@ -498,6 +515,43 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
             xsf.view(torch.uint8),
         )
 
+    def _prepare_metadata(self, t, h, i, e, k):
+        # Cache sealed selection metadata, never this call's tensors or pointers.
+        # Compiler and artifact changes must qualify native-plan lookups too.
+        selection_key = (
+            _artifact_roots(),
+            runtime._artifact_cache_version,
+            common._tactic_digest(POLICY_VERSION),
+            common._arch_for(self.device),
+            torch.cuda.get_device_properties(self.device).multi_processor_count,
+            t,
+            h,
+            i,
+            e,
+            k,
+            activation_name(self.config.activation),
+        )
+        metadata = self._preparation_metadata.get(selection_key)
+        if metadata is None:
+            first, second = _selected_kernels(
+                t, h, i, e, k, self.device, self.config.activation
+            )
+            fma_tactic = (
+                _fma_tactic(t, h, i, e, k, self.config.activation)
+                if first and second
+                else None
+            )
+            plan_key = (
+                selection_key,
+                tuple(a.tactic for a in first),
+                tuple(b.tactic for b in second),
+                fma_tactic,
+            )
+            metadata = _PreparationMetadata(first, second, fma_tactic, plan_key)
+            self._preparation_metadata[selection_key] = metadata
+        return metadata
+
+    @call_preparation
     def accepts(self, act, weights):
         major, minor = get_compute_capability(self.device)
         if not is_eligible(self.config, act, major * 10 + minor):
@@ -511,6 +565,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
         )
         return bool(first and second)
 
+    @call_preparation
     def pack_inputs(self, act, weights):
         self._require_built()
         t, h, i, e, k, w1, w2, sf1, sf2, xsf = self._validate_pack(act, weights)
@@ -531,22 +586,9 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
             cached = packed_sf1
             self._fc1_scale_views.put(sf1, version, cached)
         sf1 = cached
-        first, second = _selected_kernels(
-            t, h, i, e, k, self.device, self.config.activation
-        )
+        first, second, fma_tactic, key = self._prepare_metadata(t, h, i, e, k)
         if not first or not second:
             raise ValueError("No legal cuDNN Frost stage candidates for this problem")
-        fma_tactic = _fma_tactic(t, h, i, e, k, self.config.activation)
-        key = (
-            t,
-            h,
-            i,
-            e,
-            k,
-            tuple(a.tactic for a in first),
-            tuple(b.tactic for b in second),
-            fma_tactic,
-        )
         if key not in self._plans:
             with torch.cuda.device(self.device):
                 if torch.cuda.is_current_stream_capturing():
