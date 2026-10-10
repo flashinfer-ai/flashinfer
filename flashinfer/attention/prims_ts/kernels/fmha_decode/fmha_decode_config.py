@@ -29,13 +29,13 @@ import cutlass.utils as utils
 from cutlass import BFloat16, Float16, Float32, Float4E2M1FN, Float8E4M3FN, Int8
 
 from ...sage import SAGE_K_BLOCK_SIZES, is_power_of_two
-from ..._block_sparse.prepared import _SageKScaleImageLayout
 from ..._block_sparse.common import (
     _block_sparse_kv_atom_size,
     _block_sparse_proxy_summary_geometry,
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
+from ..._block_sparse.prepared import _SageKScaleImageLayout
 from ...split_kv_mode_policy import select_split_kv_modes
 from ..tcgen05_compat import ldtm_stat_supported
 from .fmha_decode_constants import (
@@ -2500,6 +2500,13 @@ class FmhaDecodeConfig:
             return 1 if proxy else self.sage_k_block_size
         return min(self.sage_k_block_size, self.sage_k_summary_block_size)
 
+    @property
+    def sage_mixed_k_geometry(self) -> bool:
+        """Whether exact and proxy routes read different ``sfK`` geometries."""
+        return self.use_sage_attention and (
+            self.sage_k_scale_block_size(proxy=True) != self.sage_k_scale_block_size()
+        )
+
     def sage_k_scale_image(self, seq_len_kv: int) -> _SageKScaleImageLayout:
         """Return the layout of a Sage plan's prepared ``sfK`` image."""
         assert self.use_sage_attention
@@ -2517,60 +2524,26 @@ class FmhaDecodeConfig:
             summary_block_size=self.sage_k_scale_block_size(proxy=True),
         )
 
-    def sage_k_groups_for_block(self, k_block_size: int) -> int:
-        """Return the K scale groups inside one streamed K32 score fragment."""
-        return max(1, self.softmax_score_fragment_regs // k_block_size)
-
-    @property
-    def sage_k_groups_per_fragment(self) -> int:
-        """Return the scale groups per fragment of an exact route or dense tile."""
+    def sage_k_groups_per_fragment(self, proxy: bool = False) -> int:
+        """Return the ``sfK`` groups of one streamed K32 score fragment of a route kind."""
         if not self.use_sage_attention:
             return 1
-        return self.sage_k_groups_for_block(self.sage_k_block_size)
-
-    @property
-    def sage_summary_k_groups_per_fragment(self) -> int:
-        """Return the scale groups per fragment of a proxy route's summaries."""
-        if not self.use_sage_attention:
-            return 1
-        return self.sage_k_groups_for_block(self.sage_k_summary_block_size)
-
-    def sage_k_groups_per_fragment_for(self, proxy: bool) -> int:
-        """Return the scale groups per fragment of one route kind."""
-        if proxy:
-            return self.sage_summary_k_groups_per_fragment
-        return self.sage_k_groups_per_fragment
-
-    @property
-    def sage_mixed_k_geometry(self) -> bool:
-        """Whether exact and proxy routes use different scale-group geometries."""
-        return (
-            self.use_sage_attention
-            and self.sage_summary_k_groups_per_fragment
-            != self.sage_k_groups_per_fragment
+        return max(
+            1, self.softmax_score_fragment_regs // self.sage_k_scale_block_size(proxy)
         )
 
-    def sage_scores_dequantized_for(self, proxy: bool) -> bool:
-        """Whether the max pass writes one route kind's scores back dequantized.
+    def sage_scores_dequantized(self, proxy: bool = False) -> bool:
+        """Whether the max pass writes a route kind's scores back dequantized.
 
-        With one scale per score (the one-token K block), the P pass then
-        reads neither ``sfK`` nor the INT32 bias. Coarser geometries keep the
-        scores quantized to avoid a TMEM round trip per tile.
+        A kind with one scale per score (the one-token K block) does, so the P
+        pass reads neither its ``sfK`` nor the INT32 bias; other geometries
+        stay quantized to avoid a TMEM round trip per tile.
         """
         return (
             self.use_sage_attention
-            and self.sage_k_groups_per_fragment_for(proxy)
+            and self.sage_k_groups_per_fragment(proxy)
             == self.softmax_score_fragment_regs
         )
-
-    def sage_k_scales_in_smem_for(self, groups: int) -> bool:
-        """Whether a tile with ``groups`` scale groups per fragment keeps ``sfK`` in SMEM.
-
-        Four or more groups per K32 fragment (K blocks of 4 or 1 token) would
-        need 16 or more registers per lane, so those tiles read ``sfK`` from
-        SMEM; larger blocks keep a rotating register array.
-        """
-        return self.use_sage_attention and groups >= 4
 
     @property
     def matches_kv256_task_topology(self) -> bool:

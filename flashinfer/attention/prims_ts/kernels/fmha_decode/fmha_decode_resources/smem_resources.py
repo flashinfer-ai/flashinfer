@@ -81,6 +81,7 @@ from .helpers_common import (
 )
 from .helpers_kv_tile_idx import (
     _load_runtime_seq_len_kv,
+    _local_kv_tile_idx_for_section,
     _num_skipped_kv_tiles,
     _runtime_clamp_valid_tile_idx,
     _runtime_last_valid_page_idx,
@@ -208,34 +209,6 @@ def _is_load_task_warp_leader(cfg: Constexpr[FmhaDecodeConfig]):
     if cutlass.const_expr(cfg.load_num_warps == 1):
         return elected
     return elected and _load_task_warp_rank(cfg) == Int32(0)
-
-
-@cute.jit
-def _local_kv_tile_idx_for_section(
-    cfg: Constexpr[FmhaDecodeConfig],
-    stage_info: StageInfo,
-    inst_id: Constexpr[int],
-    kv_kind: Constexpr[int],
-    section: Constexpr[FmhaStage],
-) -> Int32:
-    """Return the local K/V tile index implied by the TS HEAD/LOOP/TAIL cadence.
-
-    The schedule names whether a producer is K0/K1/V0/V1, while the phase
-    defines where that logical tile sits in the staggered decode pipeline:
-
-    - HEAD produces only initial K tiles.
-    - LOOP produces V for the current MMA iteration and K for the next one.
-    - TAIL drains the final V tiles after the last loop iteration.
-    """
-    num_insts_kv = Int32(cfg.num_insts_kv)
-    if cutlass.const_expr(section == FmhaStage.Head):
-        return Int32(inst_id)
-    if cutlass.const_expr(section == FmhaStage.Loop):
-        base = stage_info.loop_offset * num_insts_kv + Int32(inst_id)
-        if cutlass.const_expr(kv_kind == KV_KIND_V):
-            return base
-        return base + num_insts_kv
-    return stage_info.loop_end * num_insts_kv + Int32(inst_id)
 
 
 @cute.jit
