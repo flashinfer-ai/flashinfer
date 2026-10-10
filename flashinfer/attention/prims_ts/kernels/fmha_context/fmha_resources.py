@@ -433,6 +433,9 @@ class FmhaConfig:
     # stores E4M3 V as per-tile residuals whose bf16 tile means one K=16 UMMA
     # step per tile restores into O.
     vc_k_block_size: int = 0
+    # VC-Attention-QK16 V repair tiles after the whole K/V tiles. Non-zero
+    # replaces the tile-mean restoration.
+    vc_repair_tiles: int = 0
     # Strides of the per-(batch, head, channel) VC output scale table.
     vc_num_q_heads: int = 0
     vc_head_dim_v: int = 128
@@ -533,6 +536,11 @@ class FmhaConfig:
     def vc_qk8(self) -> bool:
         """VC-Attention-QK8, the E4M3 Q/K recipe with per-block dequant scales."""
         return self.vc_attention and self.q_dtype.width == 8
+
+    @property
+    def vc_restores_means(self) -> bool:
+        """Whether VC-Attention-QK16 restores the V tile means rather than using V repair rows."""
+        return self.vc_attention and self.vc_repair_tiles == 0
 
     def validate_vc_profile(self) -> None:
         """Validate the VC-Attention recipe against the configured kernel."""
@@ -2595,12 +2603,13 @@ class SmemPResource(MemoryResource):
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
         # VC-Attention appends the group's bf16 [128 x 16] row-sum operands behind
-        # the P tile, and VC-Attention-QK8 its K-scale table behind those.
+        # the P tile when it restores the tile means, and VC-Attention-QK8 its
+        # K-scale table behind those.
         extra_bytes = 0
-        if cfg.vc_attention:
-            extra_bytes = cfg.vc_rowsum_tile_bytes
-            if cfg.vc_qk8:
-                extra_bytes += cfg.vc_kscale_table_bytes
+        if cfg.vc_restores_means:
+            extra_bytes += cfg.vc_rowsum_tile_bytes
+        if cfg.vc_qk8:
+            extra_bytes += cfg.vc_kscale_table_bytes
         self._alloc = SmemAllocation(
             f"smem_p{group_idx}",
             cfg.smem_p_bytes + extra_bytes,
@@ -2617,8 +2626,10 @@ class SmemPResource(MemoryResource):
 
     @property
     def kscale_table_offset(self) -> int:
-        """Byte offset of the VC-Attention-QK8 K-scale table inside this allocation."""
-        return self.cfg.smem_p_bytes + self.cfg.vc_rowsum_tile_bytes
+        """Byte offset of the VC-Attention-QK8 K-scale table inside this allocation,
+        behind the row-sum operand when the tile means are restored."""
+        rowsum = self.cfg.vc_rowsum_tile_bytes if self.cfg.vc_restores_means else 0
+        return self.cfg.smem_p_bytes + rowsum
 
     @property
     def row_bytes(self) -> int:
@@ -2699,6 +2710,7 @@ class TmemSPResource(MemoryResource):
     # mean step.
     vc_row_scale: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     vc_prev_tile_sum: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    vc_kept_row_sum: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     # VC-Attention-QK8: sfK of the next K/V tile, read from the SMEM table one
     # tile ahead so no shared load sits on the row-max critical chain.
     vc_k_scale_next: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -2835,6 +2847,11 @@ class TmemSPResource(MemoryResource):
             dtype=Float32,
             default=Float32(0.0),
             docs="VC-Attention-QK16: previous tile's row sum, stored one tile late.",
+        )
+        self.vc_kept_row_sum = TaskLocalVariable(
+            dtype=Float32,
+            default=Float32(0.0),
+            docs="VC-Attention-QK16 V repair, row sum over the original tokens.",
         )
         self.vc_pend0 = TaskLocalVariable(
             dtype=Float32,
@@ -3303,13 +3320,15 @@ class TmemSPResource(MemoryResource):
             vc_pend13,
             vc_pend14,
             vc_pend15,
+            vc_kept_row_sum,
             vc_k_scale_next,
         ),
     )
     @cute.jit
     def vc_init_row_scale(self, stage_info: StageInfo) -> tuple[Float32, ...]:
         """VC-Attention work-tile setup. Returns the softmax scale in log2 units,
-        a zero previous-tile row sum, zero group row sums and tile 0's sfK.
+        a zero previous-tile row sum, zero group row sums, a zero kept row sum
+        (V repair) and tile 0's sfK.
 
         Under VC-Attention-QK8 the row scale also carries this row's sfQ, and the
         group's SMEM sfK table is filled with one coalesced pass. Both named
@@ -3332,7 +3351,7 @@ class TmemSPResource(MemoryResource):
             k_scale_next = self._vc_k_scales.fill(
                 stage_info, self.vc_k_scale, kv_head, k_base
             )
-        return (row_scale, Float32(0.0)) + (Float32(0.0),) * 16 + (k_scale_next,)
+        return (row_scale, Float32(0.0)) + (Float32(0.0),) * 17 + (k_scale_next,)
 
     @cute.jit
     def _vc_coords(self, stage_info: StageInfo) -> tuple[Int32, Int32, Int32]:
@@ -4725,6 +4744,37 @@ class TmemSPResource(MemoryResource):
             sums[i] * keep for i in range(VC_MEAN_GROUP_TILES)
         )
 
+    @consumer_work(returns=(vc_kept_row_sum, row_sum))
+    @cute.jit
+    def vc_store_p_repair(
+        self,
+        stage_info: StageInfo,
+        *,
+        old_row_max: SoftmaxScalar,
+        row_max: SoftmaxScalar,
+        row_sum: SoftmaxScalar,
+        vc_kept_row_sum: SoftmaxScalar,
+        p_chunk: SoftmaxRowSumContribution,
+        is_tail: cutlass.Constexpr[bool] = False,
+    ) -> tuple[Float32, Float32]:
+        """VC-Attention-QK16 V repair P store. The last ``vc_repair_tiles`` of the
+        loop domain stay out of the kept row sum that normalizes the output."""
+        self._store_p_row_smem(stage_info, _tmem_sp_pwords.pop(id(self)))
+        prims.fence_proxy(
+            kind=prims.Proxy.ASYNC_SHARED,
+            space=prims.SharedSpace.shared_cta,
+        )
+        acc_scale = cute.math.exp2(old_row_max - row_max, fastmath=True)
+        kept_chunk = p_chunk
+        if cutlass.const_expr(not is_tail):
+            first_repair = Int32(stage_info.loop_end) - Int32(self.cfg.vc_repair_tiles)
+            if Int32(stage_info.loop_offset) >= first_repair:
+                kept_chunk = Float32(0.0)
+        return (
+            vc_kept_row_sum * acc_scale + kept_chunk,
+            row_sum * acc_scale + p_chunk,
+        )
+
     @consumer_work
     @cute.jit
     def vc_store_rowsum_final(
@@ -5706,7 +5756,7 @@ class TmemOResource(MemoryResource):
             self.tmem_addr_cached, cutlass.Int8
         )
         self.tmem_o_addr_base_cached = Int32(0)
-        if cutlass.const_expr(self.cfg.vc_attention):
+        if cutlass.const_expr(self.cfg.vc_restores_means):
             issue = self._vc_restore_means()
             if cutlass.const_expr(self.cfg.two_cta_umma):
                 issue = issue & (

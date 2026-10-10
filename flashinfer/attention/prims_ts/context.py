@@ -50,6 +50,7 @@ from .vc_attention import (
     VCAttentionConfig,
     VCAttentionParams,
     validate_vc_params,
+    vc_repair_kv_len,
     vc_scale_shapes,
 )
 
@@ -302,6 +303,7 @@ def _make_context_kernel(
     vc_max_kv_tiles: int = 0,
     vc_seq_len_q: int = 0,
     vc_seq_len_k: int = 0,
+    vc_repair_tiles: int = 0,
 ):
     """Build one context kernel from its batch-independent static topology."""
 
@@ -358,6 +360,7 @@ def _make_context_kernel(
         vc_max_kv_tiles=vc_max_kv_tiles,
         vc_seq_len_q=vc_seq_len_q,
         vc_seq_len_k=vc_seq_len_k,
+        vc_repair_tiles=vc_repair_tiles,
         **paged_kwargs,
     )
     return fmha
@@ -1735,6 +1738,13 @@ def _resolve_paged_context_scheduler(
     return "static_persistent"
 
 
+def _fixed_kv_rows(max_seq_len_k: int, vc: Optional[VCAttentionConfig]) -> int:
+    """K/V rows of a fixed plan. V repair adds its tiles to the sequence."""
+    if vc is not None and vc.repair_tiles:
+        return vc_repair_kv_len(max_seq_len_k, vc.repair_tiles)
+    return max_seq_len_k
+
+
 def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec:
     """Build the contiguous compile key, including separate QK and PV dtype keys."""
     return _ContextCompileSpec(
@@ -1855,13 +1865,16 @@ def _get_compiled_context(
         vc_num_q_heads=num_qo_heads if vc_attention else 0,
         vc_head_dim_v=head_dim_vo or head_dim,
         vc_q_block_log2=compile_spec.vc.q_block_log2 if vc_attention else 7,
+        # The K scale table and flat layout cover the K/V rows, repair tiles included.
         vc_max_kv_tiles=(
-            (max_seq_len_k + _CONTEXT_KV_TILE_N - 1) // _CONTEXT_KV_TILE_N
+            (_fixed_kv_rows(max_seq_len_k, compile_spec.vc) + _CONTEXT_KV_TILE_N - 1)
+            // _CONTEXT_KV_TILE_N
             if vc_qk8
             else 0
         ),
         vc_seq_len_q=max_seq_len_q if vc_qk8 else 0,
-        vc_seq_len_k=max_seq_len_k if vc_qk8 else 0,
+        vc_seq_len_k=_fixed_kv_rows(max_seq_len_k, compile_spec.vc) if vc_qk8 else 0,
+        vc_repair_tiles=compile_spec.vc.repair_tiles if vc_attention else 0,
     )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
@@ -1970,7 +1983,12 @@ def _get_compiled_context(
     else:
         batch_size = cute.sym_int()
         q_shape = (batch_size, max_seq_len_q, num_qo_heads, head_dim)
-        kv_shape = (batch_size, max_seq_len_k, num_kv_heads, head_dim)
+        kv_shape = (
+            batch_size,
+            _fixed_kv_rows(max_seq_len_k, compile_spec.vc),
+            num_kv_heads,
+            head_dim,
+        )
         out_shape = (*q_shape[:-1], head_dim_vo)
         qo_indptr_shape = (1,)
         kv_indptr_shape = (1,)
@@ -2004,25 +2022,25 @@ def _get_compiled_context(
     variable_window_cta_starts_fake = fake_compact(
         cutlass.Int32, variable_window_cta_shape, 4
     )
+    vc_mu_shape: tuple[object, ...] = (1, 1, 1, 1, 1)
     vc_q_scale_shape: tuple[object, ...] = (1, 1)
     vc_k_scale_shape: tuple[object, ...] = (1, 1)
     if vc_attention:
         if packed:
             raise RuntimeError("VC-Attention context requires fixed tensors")
-        vc_mu_shape: tuple[object, ...] = vc_scale_shapes(
-            compile_spec.vc,
-            batch_size=batch_size,
-            seq_len_kv=max_seq_len_k,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim_vo or head_dim,
-        )["tile_means"]
+        if not compile_spec.vc.repair_tiles:
+            vc_mu_shape = vc_scale_shapes(
+                compile_spec.vc,
+                batch_size=batch_size,
+                seq_len_kv=max_seq_len_k,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim_vo or head_dim,
+            )["tile_means"]
         if vc_qk8:
             # Q/K scales use the sage flat layout, [heads, ceil(B*S/blk) + B - 1];
             # the slot count depends on the symbolic batch, so it stays dynamic.
             vc_q_scale_shape = (num_qo_heads, cute.sym_int())
             vc_k_scale_shape = (num_kv_heads, cute.sym_int())
-    else:
-        vc_mu_shape = (1, 1, 1, 1, 1)
     vc_mu_fake = fake_compact(cutlass.BFloat16, vc_mu_shape, 16)
     vc_q_scale_fake = fake_compact(cutlass.Float32, vc_q_scale_shape, 16)
     vc_k_scale_fake = fake_compact(cutlass.Float32, vc_k_scale_shape, 16)
@@ -2363,7 +2381,7 @@ def _validate_runtime_inputs(
         )
         kv_shape = (
             geometry.batch_size,
-            geometry.max_seq_len_k,
+            _fixed_kv_rows(geometry.max_seq_len_k, geometry.vc),
             geometry.num_kv_heads,
             geometry.head_dim,
         )
@@ -2897,7 +2915,8 @@ class BatchPrefillTSWrapper:
                     "vc.q_scale and vc.k_scale belong to VC-Attention-QK8 plans with "
                     "E4M3 Q/K"
                 )
-            vc_mu = vc.tile_means
+            if vc.tile_means is not None:
+                vc_mu = vc.tile_means
             group = geometry.num_qo_heads // geometry.num_kv_heads
             vc_output_scale = vc.v_scale.repeat_interleave(group, dim=1).reshape(-1)
             vc_ctrl = state.vc_ctrl_on if vc.demean else state.vc_ctrl_off

@@ -235,6 +235,8 @@ class _VCCase:
     # bf16 selects VC-Attention-QK16, E4M3 VC-Attention-QK8.
     qk_dtype: torch.dtype = torch.bfloat16
     q_block_size: int = 128
+    # V repair budget as a fraction of tokens. 0 means tile means.
+    repair_budget: float = 0.0
 
 
 _CASES = (
@@ -248,6 +250,11 @@ _CASES = (
     # Q scale blocks narrower than the Q tile.
     _VCCase("qk8-q-block-64", 1, 1024, 1, qk_dtype=_FP8, q_block_size=64),
     _VCCase("qk8-one-shot", 1, 2000, 2, one_shot=True, qk_dtype=_FP8),
+    # V repair, one repair tile before the masked partial tail, two tiles with no tail.
+    _VCCase("repair-partial-tile", 1, 2000, 2, repair_budget=0.02),
+    _VCCase("repair-two-batches", 2, 4096, 2, repair_budget=0.05),
+    _VCCase("qk8-repair-partial-tile", 1, 2000, 2, qk_dtype=_FP8, repair_budget=0.02),
+    _VCCase("qk8-repair-two-batches", 2, 4096, 2, qk_dtype=_FP8, repair_budget=0.05),
 )
 
 
@@ -279,6 +286,7 @@ def _plan(
     sm_scale=None,
     qk_dtype=torch.bfloat16,
     q_block_size=128,
+    repair_tiles=0,
     **overrides,
 ):
     arguments = dict(
@@ -294,12 +302,18 @@ def _plan(
         v_dtype=_FP8,
         out_dtype=torch.bfloat16,
         sm_scale=sm_scale,
-        vc_config=VCAttentionConfig(q_block_size=q_block_size),
+        vc_config=VCAttentionConfig(
+            q_block_size=q_block_size, repair_tiles=repair_tiles
+        ),
     )
     wrapper.plan(**{**arguments, **overrides})
 
 
 def _quantize(case: _VCCase, q, k, v):
+    if case.repair_budget:
+        return vca.vc_quantize_repair(
+            k, v, budget=case.repair_budget, q=q if case.qk_dtype == _FP8 else None
+        )
     if case.qk_dtype == _FP8:
         if case.q_block_size != 128:
             # The fused preparation quantizes Q per 128-token block; other Q
@@ -322,7 +336,9 @@ def _run_case(case: _VCCase):
             sm_scale=sm_scale,
             out_dtype=torch.bfloat16,
             vc=ops.params,
-            vc_config=VCAttentionConfig(q_block_size=case.q_block_size),
+            vc_config=VCAttentionConfig(
+                q_block_size=case.q_block_size, repair_tiles=ops.repair_tiles
+            ),
         )
     else:
         wrapper = BatchPrefillTSWrapper()
@@ -334,6 +350,7 @@ def _run_case(case: _VCCase):
             sm_scale=sm_scale,
             qk_dtype=case.qk_dtype,
             q_block_size=case.q_block_size,
+            repair_tiles=ops.repair_tiles,
         )
         out = wrapper.run(q_run, ops.k, ops.v, vc=ops.params)
     reference = vca.vc_reference(q, ops, sm_scale=sm_scale)

@@ -469,11 +469,13 @@ from `pack_vc_tile_means`; both are contiguous and 16-byte aligned on the run
 device, and a validating `run()` checks them against the plan. `demean` says
 whether the run restores the means (`False` after the V-Smooth window, when
 they are zero). QK8 plans add `q_scale` `[Hq, flat_scale_numel(B, Sq, q_block_size)]`
-and `k_scale` `[Hkv, flat_scale_numel(B, Skv, 128)]`, fp32 in the flat scale
-layout of `flashinfer.attention.prims_ts.sage` (`flat_block_scales` packs them).
-`VCAttentionPreprocessor.prepare`, `vc_quantize` and `vc_quantize_fp8`
-return everything with the permuted K and the E4M3 V (and Q) as
-`VCAttentionOperands`, whose `.params` is the run-time object.
+and `k_scale` `[Hkv, flat_scale_numel(B, Skv_rows, 128)]`, fp32 in the flat scale
+layout of `flashinfer.attention.prims_ts.sage` (`flat_block_scales` packs them;
+`Skv_rows` includes the repair tiles). `VCAttentionPreprocessor.prepare`,
+`vc_quantize` and `vc_quantize_fp8` return everything with the permuted K and the
+E4M3 V (and Q) as `VCAttentionOperands`, whose `.params` is the run-time object;
+`vc_quantize_repair` builds the V repair operands of either recipe instead
+(`VCAttentionConfig(repair_tiles=...)`).
 
 ### Example
 

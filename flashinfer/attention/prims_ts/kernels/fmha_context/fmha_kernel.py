@@ -1077,7 +1077,7 @@ def build_context_task_manager(
     # VC-Attention-QK16: one bf16 tile-mean operand per K/V tile, staged by the load
     # warp in lockstep with V and consumed by the UMMA warp's mean step.
     smem_mu: SmemMuResource | None = None
-    if cfg.vc_attention:
+    if cfg.vc_restores_means:
         smem_mu_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
             num_stages=cfg.vc_mean_stages,
             # Under two-CTA UMMA each CTA stages the N/2 channels of the mean
@@ -1835,7 +1835,7 @@ def _context_pipeline_stage_counts(
         "s0s1_seq": 0 if cfg.single_qkv_instance else 1,
         "tmem_p_prefix_ready": 2 if cfg.pv_half_overlap else 0,
         "smem_p": cfg.num_qkv_instances if cfg.p_in_smem else 0,
-        "smem_mu": cfg.vc_mean_stages if cfg.vc_attention else 0,
+        "smem_mu": cfg.vc_mean_stages if cfg.vc_restores_means else 0,
         "tmem_stats_done": 0 if cfg.stats_via_smem else cfg.num_qkv_instances,
         "work_queue": 1 if is_clc_dynamic else 0,
     }
@@ -1897,11 +1897,12 @@ def _kv_ring_smem_budget_bytes(
     smem_p_bytes = 0
     if cfg.p_in_smem:
         p_block_bytes = cfg.smem_p_bytes
-        if cfg.vc_attention:
+        if cfg.vc_restores_means:
             # The row-sum operand lives behind each P tile.
             p_block_bytes += cfg.vc_rowsum_tile_bytes
-            if cfg.vc_qk8:
-                p_block_bytes += cfg.vc_kscale_table_bytes
+        if cfg.vc_qk8:
+            # VC-Attention-QK8 keeps its K-scale table behind the P tile.
+            p_block_bytes += cfg.vc_kscale_table_bytes
         smem_p_bytes = (
             (p_block_bytes + align - 1) // align * align * cfg.num_qkv_instances
         )
@@ -1915,7 +1916,7 @@ def _kv_ring_smem_budget_bytes(
             is_clc_dynamic=is_clc_dynamic,
         ).values()
     )
-    if cfg.vc_attention:
+    if cfg.vc_restores_means:
         # The callers charge the tile-mean ring per K/V stage.
         fixed_barrier_stages -= cfg.vc_mean_stages
     fixed_smem_bytes = (
@@ -1957,7 +1958,7 @@ def _infer_single_instance_kv_stages(
         cfg.qk_mma_tiler[1] // cfg.cta_group_size * kv_head_dim * kv_dtype_width // 8
     )
     kv_stage_footprint_bytes = kv_stage_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
-    if cfg.vc_attention:
+    if cfg.vc_restores_means:
         kv_stage_footprint_bytes += (
             cfg.vc_mean_tile_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
         )
@@ -2005,7 +2006,7 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
         kv_rows_per_cta * kv_head_dim * cfg.v_dtype.width // 8
         + _PIPELINE_BARRIER_BYTES_PER_STAGE
     )
-    if cfg.vc_attention:
+    if cfg.vc_restores_means:
         v_stage_footprint += cfg.vc_mean_tile_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
     # K and V share the same head_dim and head_dim_per_stage_kv, so their
     # minimum ring depths (num_head_dim_stages) are equal and both rings are sized identically.
@@ -2017,7 +2018,7 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
             f"({cadence * (k_stage_footprint + v_stage_footprint)} bytes), but the "
             f"shared-memory budget fits only {budget_bytes} bytes"
         )
-    if cfg.vc_attention and n_stages < 2:
+    if cfg.vc_restores_means and n_stages < 2:
         # The tail holds the last two tile-mean operands at once.
         raise ValueError(
             f"VC-Attention-QK16 needs at least 2 stages per K/V ring, but the "
@@ -2850,6 +2851,7 @@ class FmhaTs:
         vc_max_kv_tiles: int = 0,
         vc_seq_len_q: int = 0,
         vc_seq_len_k: int = 0,
+        vc_repair_tiles: int = 0,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
         head_paired = resolve_head_paired_mode(
@@ -2937,6 +2939,7 @@ class FmhaTs:
         cfg.vc_max_kv_tiles = vc_max_kv_tiles
         cfg.vc_seq_len_q = vc_seq_len_q
         cfg.vc_seq_len_k = vc_seq_len_k
+        cfg.vc_repair_tiles = vc_repair_tiles
         cfg.fp8_psmem_early_token = fp8_psmem_early_token
         self.cfg = cfg
         # Compact Q and staged O fit two resident query tiles plus the K/V
@@ -3349,7 +3352,7 @@ class FmhaTs:
 
         # VC-Attention-QK16 tile-mean operands, one packed tile per K/V tile.
         tma_mu_desc = tma_v_desc
-        if cutlass.const_expr(cfg.vc_attention):
+        if cutlass.const_expr(cfg.vc_restores_means):
             if cutlass.const_expr(vc_mu is None):
                 raise ValueError("VC-Attention requires vc_mu")
             if cutlass.const_expr(
@@ -3552,7 +3555,7 @@ class FmhaTs:
             prims.prefetch_tensormap(tma_k_desc.get_ptr())
             prims.prefetch_tensormap(tma_v_desc.get_ptr())
             prims.prefetch_tensormap(tma_o_desc.get_ptr())
-            if cutlass.const_expr(cfg.vc_attention):
+            if cutlass.const_expr(cfg.vc_restores_means):
                 prims.prefetch_tensormap(tma_mu_desc.get_ptr())
 
         # 2. CLC dynamic: the response buffer is declared by the builder and
@@ -3589,10 +3592,10 @@ class FmhaTs:
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
             q_offset=q_offset,
-            tma_mu_desc=tma_mu_desc.get_ptr() if cfg.vc_attention else None,
+            tma_mu_desc=tma_mu_desc.get_ptr() if cfg.vc_restores_means else None,
             vc_q_scale=vc_q_scale if cfg.vc_qk8 else None,
             vc_k_scale=vc_k_scale if cfg.vc_qk8 else None,
-            vc_ctrl=vc_ctrl if cfg.vc_attention else None,
+            vc_ctrl=vc_ctrl if cfg.vc_restores_means else None,
             is_persistent=is_persistent,
             is_clc_dynamic=is_clc_dynamic,
             clc_response_ptr=clc_response_ptr,
