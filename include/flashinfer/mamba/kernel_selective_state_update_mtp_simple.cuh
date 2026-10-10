@@ -332,9 +332,9 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
   // Output pointers (for epilogue)
   auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
   auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
-  // Guard: outputLoadSize is only meaningful when DIM_PER_CTA >= warpSize
+  // Guard: outputLoadSize is only meaningful when DIM_PER_CTA is a multiple of warpSize
   constexpr auto outputLoadSize =
-      DIM_PER_CTA >= warpSize ? getVectorLoadSizeForFullUtilization<input_t, DIM_PER_CTA>() : 1;
+      DIM_PER_CTA % warpSize == 0 ? getVectorLoadSizeForFullUtilization<input_t, DIM_PER_CTA>() : 1;
   using load_output_t = PackedAligned<input_t, outputLoadSize>;
 
   // State scale pointer (only used when scaleState == true)
@@ -514,8 +514,8 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
                                 head * DIM + dim_offset;
   };
 
-  if constexpr (DIM_PER_CTA >= warpSize) {
-    // Fast path: each lane handles >= 1 element, use vectorized loads/stores
+  if constexpr (DIM_PER_CTA % warpSize == 0) {
+    // Fast path: each lane handles DIM_PER_CTA / warpSize elements, use vectorized loads/stores
     constexpr int elemsPerThreadEpilogue = DIM_PER_CTA / warpSize;
 
     for (int step = warp; step < seq_len; step += NUM_WARPS) {
@@ -544,18 +544,19 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
       }
     }
   } else {
-    // Narrow path: DIM_PER_CTA < warpSize, only first DIM_PER_CTA lanes participate
+    // Strided path: DIM_PER_CTA is not a multiple of warpSize (for example 16, 48 or 80),
+    // so each lane handles elements lane, lane + warpSize, ...
     for (int step = warp; step < seq_len; step += NUM_WARPS) {
-      if (lane < DIM_PER_CTA) {
-        int64_t const out_offset = out_addr(step);
-        float out_value = sram.out[step][lane];
+      int64_t const out_offset = out_addr(step);
+      for (int d = lane; d < DIM_PER_CTA; d += warpSize) {
+        float out_value = sram.out[step][d];
         if (z_ptr) {
           int64_t const z_offset = z_addr(step);
-          float z_value = toFloat(z_ptr[z_offset + lane]);
+          float z_value = toFloat(z_ptr[z_offset + d]);
           float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
           out_value *= z_value * sig_z;
         }
-        convertAndStore(&output[out_offset + lane], out_value);
+        convertAndStore(&output[out_offset + d], out_value);
       }
     }
   }

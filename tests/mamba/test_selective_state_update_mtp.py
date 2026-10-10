@@ -32,6 +32,8 @@ _BASE_PARAMS = (
     (   4,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # batch=4
     (  64,     8,     64,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # nheads=8
     (  64,    64,    128,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=128
+    (  64,    64,     80,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=80
+    (  64,    64,     96,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=96
     (  64,    64,     64,   64,    4,           torch.bfloat16,     torch.float32,  True ),  # dstate=64
     (  64,    64,     64,   96,    4,           torch.bfloat16,     torch.float32,  True ),  # dstate=96
     (  64,    64,     64,  128,    1,           torch.bfloat16,     torch.float32,  True ),  # cache_steps=1
@@ -41,6 +43,13 @@ _BASE_PARAMS = (
     (  64,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  False),  # use_out_tensor=False
 )
 # fmt: on
+
+
+def _skip_unsupported_dim(algorithm, dim):
+    """Skip head dims that the vertical and horizontal MTP kernels do not support."""
+    # Vertical needs dim divisible by warpSize (32); horizontal by TMA_STATE_ROWS (32).
+    if algorithm in ("vertical", "horizontal") and dim % 32 != 0:
+        pytest.skip(f"{algorithm} kernel requires dim divisible by 32, got {dim}")
 
 
 class TestSelectiveStateUpdateMTP:
@@ -203,6 +212,7 @@ class TestSelectiveStateUpdateMTP:
         use_out_tensor,
     ):
         """Test that kernel output matches reference within tolerance."""
+        _skip_unsupported_dim(self._algo, dim)
         inputs = self.make_inputs(
             batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
         )
