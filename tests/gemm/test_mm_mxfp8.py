@@ -851,3 +851,17 @@ def test_trtllm_raises_for_linear_b_descale():
             a_descale,
             b_descale,
         )
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl", "trtllm"])
+def test_mm_mxfp8_reuses_runner(backend):
+    _skip_if_unsupported(backend)
+    factory = (
+        gemm_base.get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner
+        if backend == "trtllm"
+        else gemm_base._cute_dsl_gemm_mxfp8_runner  # pyright: ignore[reportPrivateUsage]
+    )
+    _run_mm_mxfp8(128, 256, 256, torch.bfloat16, torch.bfloat16, backend, False, True)
+    misses = factory.cache_info().misses
+    _run_mm_mxfp8(128, 256, 256, torch.bfloat16, torch.bfloat16, backend, False, True)
+    assert factory.cache_info().misses == misses

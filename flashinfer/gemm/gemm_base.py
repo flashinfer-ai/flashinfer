@@ -6383,6 +6383,7 @@ def _check_cute_dsl_availability():
         raise ValueError("CuTe DSL is not available.")
 
 
+@functools.cache
 def _cute_dsl_gemm_mxfp8_runner(
     sm_major: int,
     sm_minor: int,
@@ -7724,6 +7725,7 @@ def _b12x_gemm_fp4_requirement(
 _CUTEDSL_LOW_LATENCY_BLOCK_SCALED_KERNEL_CACHE: dict[tuple, Callable] = {}
 
 
+@functools.cache
 def _cutedsl_low_latency_blockscaled_gemm_runner(
     sm_version: int,
     enable_pdl: bool,
@@ -8130,6 +8132,7 @@ def _select_sm100_mm_fp4_splitk_tactic(
     return (tile, (1, 1), True, False, _SM100_SPLITK_KERNEL_TYPE, split_k_slices)
 
 
+@functools.cache
 def _cute_dsl_gemm_fp4_runner(
     sm_major: int,
     sm_minor: int,
@@ -10034,6 +10037,7 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
             DtypeTrtllmGen.E2m1, DtypeTrtllmGen.Bfloat16, use_8x4_sf_layout
         )
 
+    @functools.cache
     def trtllm_mxfp8_gemm_runner(
         use_8x4_sf_layout: bool = True,
     ):
