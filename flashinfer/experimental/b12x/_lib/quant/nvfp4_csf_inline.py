@@ -238,66 +238,49 @@ def prepare_inline_scales(batch):
     if batch.codec != 0 or batch.layout != 0:
         raise ValueError("Inline NVFP4 requires native-order byte-window scales")
     e, r, c = batch.num_experts, batch.rows, batch.columns
-    tiles = r * c // 512
+    tiles = e * r * c // 512
     records = batch.exceptions.cpu().numpy().view("<u4")
     expert_bounds = batch.task_offsets.cpu().numpy()[:, [0, -1]]
     fixed = batch.fixed.cpu().numpy().reshape(-1)
     fixed16 = fixed.view("<u2")
-    metadata, payloads = [], []
-    payload_count = 0
-    for expert, (first, last) in enumerate(expert_bounds):
-        words = records[first:last]
-        position = words & 0xFFFFFF
-        row, col = position // c, position % c
-        native = (
-            ((row // 128 * (c // 4) + col // 4) * 32 + row % 32) * 16
-            + (row % 128 // 32) * 4
-            + col % 4
-        )
-        affected, inverse = np.unique(native // 4, return_inverse=True)
-        slab = expert * (r // 128) + affected // (c // 4 * 128)
-        slab_offset = slab * (128 * (1 + c // 2))
-        column = (affected // 128) % (c // 4)
-        lane = affected % 128
-        packed = fixed16[(slab_offset + 128) // 2 + column * 128 + lane].astype(
-            np.uint32
-        )
-        values = (packed | (packed << 8)) & 0x00FF00FF
-        values = (values | (values << 4)) & 0x0F0F0F0F
-        values += fixed[slab_offset + lane].astype(np.uint32) * 0x01010101
-        values = values.astype("<u4")
-        values.view(np.uint8)[inverse * 4 + native % 4] = (words >> 24).astype(np.uint8)
-        tile = affected // 128
-        group = (affected % 128) // 32
-        masks = np.zeros((tiles, 4), dtype=np.uint32)
-        np.bitwise_or.at(
-            masks, (tile, group), np.uint32(1) << (affected % 32).astype(np.uint32)
-        )
-        counts = np.bincount(tile * 4 + group, minlength=tiles * 4).reshape(tiles, 4)
-        prefix = np.cumsum(counts, axis=1, dtype=np.uint32) - counts.astype(np.uint32)
-        prefixes = np.sum(
-            prefix << (np.arange(4, dtype=np.uint32) * 8), axis=1, dtype=np.uint32
-        )
-        offsets = np.cumsum(counts.sum(axis=1), dtype=np.uint64)
-        offsets = offsets - counts.sum(axis=1) + payload_count
-        ends = offsets + counts.sum(axis=1)
-        metadata.append(
-            np.column_stack(
-                (
-                    offsets.astype(np.uint32),
-                    prefixes,
-                    masks,
-                    ends.astype(np.uint32),
-                    np.zeros(tiles, dtype=np.uint32),
-                )
-            ).astype("<u4")
-        )
-        payloads.append(values)
-        payload_count += len(values)
+    lengths = expert_bounds[:, 1] - expert_bounds[:, 0]
+    experts = np.repeat(np.arange(e, dtype=np.int64), lengths)
+    words = np.concatenate([records[first:last] for first, last in expert_bounds])
+    position = words & 0xFFFFFF
+    row, col = position // c, position % c
+    native = (
+        ((row // 128 * (c // 4) + col // 4) * 32 + row % 32) * 16
+        + (row % 128 // 32) * 4
+        + col % 4
+    )
+    # Global word indices keep expert payloads and tile partitions disjoint.
+    affected, inverse = np.unique(experts * (r * c // 4) + native // 4, return_inverse=True)
+    slab_offset = (affected // (c // 4 * 128)) * (128 * (1 + c // 2))
+    column = (affected // 128) % (c // 4)
+    lane = affected % 128
+    packed = fixed16[(slab_offset + 128) // 2 + column * 128 + lane].astype(np.uint32)
+    values = (packed | (packed << 8)) & 0x00FF00FF
+    values = (values | (values << 4)) & 0x0F0F0F0F
+    values += fixed[slab_offset + lane].astype(np.uint32) * 0x01010101
+    values = values.astype("<u4")
+    values.view(np.uint8)[inverse * 4 + native % 4] = (words >> 24).astype(np.uint8)
+    tile = affected // 128
+    group = (affected % 128) // 32
+    masks = np.zeros((tiles, 4), dtype=np.uint32)
+    np.bitwise_or.at(masks, (tile, group), np.uint32(1) << (affected % 32).astype(np.uint32))
+    counts = np.bincount(tile * 4 + group, minlength=tiles * 4).reshape(tiles, 4)
+    prefix = np.cumsum(counts, axis=1, dtype=np.uint32) - counts.astype(np.uint32)
+    prefixes = np.sum(prefix << (np.arange(4, dtype=np.uint32) * 8), axis=1, dtype=np.uint32)
+    sizes = counts.sum(axis=1)
+    ends = np.cumsum(sizes, dtype=np.uint64)
+    offsets = ends - sizes
+    metadata = np.column_stack((offsets.astype(np.uint32), prefixes, masks,
+        ends.astype(np.uint32), np.zeros(tiles, dtype=np.uint32))).astype("<u4")
+    payload_count = len(values)
     if payload_count >= 1 << 32:
         raise ValueError("NVFP4 inline exception count exceeds uint32 indexing")
-    offsets = np.concatenate(metadata).reshape(-1).view(np.uint8)
-    payload = np.concatenate(payloads).view(np.uint8)
+    offsets = metadata.reshape(-1).view(np.uint8)
+    payload = values.view(np.uint8)
     payload = np.pad(payload, (0, (-len(payload)) % 16))
     # A zero operand and invalid-tile marker support native TMA padding without
     # reading beyond a projection's final 128-row or 64-column scale atom.
