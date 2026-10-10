@@ -241,6 +241,11 @@ class Runner {
                                         int32_t intermediateSize, int32_t numExperts,
                                         int32_t numTokens) const;
 
+  // See TrtllmGenBatchedGemmRunner::isRedundantSplitKConfig.
+  [[nodiscard]] bool isRedundantSplitKConfig(int32_t configIndex, int32_t topK, int32_t hiddenSize,
+                                             int32_t intermediateSize, int32_t numExperts,
+                                             int32_t numTokens) const;
+
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
   // GEMM1: [numTokens, hiddenSize] @ [hiddenSize, 2*intermediateSize] -> [numTokens,
@@ -291,6 +296,11 @@ class Runner {
   [[nodiscard]] bool isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
                                         int32_t intermediateSize, int32_t numExperts,
                                         int32_t numTokens) const;
+
+  // See TrtllmGenBatchedGemmRunner::isRedundantSplitKConfig.
+  [[nodiscard]] bool isRedundantSplitKConfig(int32_t configIndex, int32_t topK, int32_t hiddenSize,
+                                             int32_t intermediateSize, int32_t numExperts,
+                                             int32_t numTokens) const;
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 

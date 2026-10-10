@@ -39,6 +39,30 @@ static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
 
 namespace {
 
+// Problem description shared by the config validity and tuning-space queries below.
+BatchedGemmData makeProblemData(bool transposeMmaOutput, int32_t m, int32_t n, int32_t k,
+                                std::vector<int32_t> const& batchedTokens, int32_t numTokens,
+                                int32_t numBatches, int32_t maxNumCtasInBatchDim) {
+  BatchedGemmData gemmData{};
+  gemmData.mProblemDimensions.mNumBatches = numBatches;
+  gemmData.mProblemDimensions.mNumTokens = numTokens;
+  gemmData.mProblemDimensions.mBatchM = !transposeMmaOutput;
+  gemmData.mProblemDimensions.mBatchedM =
+      transposeMmaOutput ? std::vector<int32_t>{} : batchedTokens;
+  gemmData.mProblemDimensions.mBatchedN =
+      transposeMmaOutput ? batchedTokens : std::vector<int32_t>{};
+  gemmData.mProblemDimensions.mM = transposeMmaOutput ? n : m;
+  gemmData.mProblemDimensions.mN = transposeMmaOutput ? m : n;
+  gemmData.mProblemDimensions.mK = k;
+  gemmData.mProblemDimensions.mRank = 0;
+  gemmData.mProblemDimensions.mWorldSize = 1;
+  gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+  return gemmData;
+}
+
 // The trtllm-gen cubin manifest is a downloaded artifact, so which architectures
 // it actually covers is not knowable at compile time. Encode only the
 // cubin-arch -> SM-version compatibility rules here and let `config.mSm` decide
@@ -487,25 +511,9 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
 
   int32_t multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-  BatchedGemmData gemmData{};
-  // Dims
-  gemmData.mProblemDimensions.mNumBatches = numBatches;
-  gemmData.mProblemDimensions.mNumTokens = numTokens;
-  gemmData.mProblemDimensions.mBatchM = !mOptions.transposeMmaOutput;
-  gemmData.mProblemDimensions.mBatchedM =
-      mOptions.transposeMmaOutput ? std::vector<int32_t>{} : batchedTokens;
-  gemmData.mProblemDimensions.mBatchedN =
-      mOptions.transposeMmaOutput ? batchedTokens : std::vector<int32_t>{};
-  gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
-  gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
-  gemmData.mProblemDimensions.mK = k;
-  gemmData.mProblemDimensions.mRank = 0;
-  gemmData.mProblemDimensions.mWorldSize = 1;
-  gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
-
-  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
-  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
-  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+  BatchedGemmData const gemmData =
+      makeProblemData(mOptions.transposeMmaOutput, m, n, k, batchedTokens, numTokens, numBatches,
+                      maxNumCtasInBatchDim);
 
   auto cmpFunc = [&configs, &gemmData, &bmm, &multiProcessorCount](int64_t idx0, int64_t idx1) {
     auto const& optionsA = configs[idx0].mOptions;
@@ -596,31 +604,39 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   auto const bmm = BatchedGemmInterface();
   auto const configs = bmm.getBatchedGemmConfigs();
 
-  BatchedGemmData gemmData{};
-  // Dims
-  gemmData.mProblemDimensions.mNumBatches = numBatches;
-  gemmData.mProblemDimensions.mNumTokens = numTokens;
-  gemmData.mProblemDimensions.mBatchM = !mOptions.transposeMmaOutput;
-  gemmData.mProblemDimensions.mBatchedM =
-      mOptions.transposeMmaOutput ? std::vector<int32_t>{} : batchedTokens;
-  gemmData.mProblemDimensions.mBatchedN =
-      mOptions.transposeMmaOutput ? batchedTokens : std::vector<int32_t>{};
-  gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
-  gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
-  gemmData.mProblemDimensions.mK = k;
-  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
-  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
-  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
-  gemmData.mProblemDimensions.mRank = 0;
-  gemmData.mProblemDimensions.mWorldSize = 1;
-  gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
-  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
-  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
-  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+  BatchedGemmData const gemmData =
+      makeProblemData(mOptions.transposeMmaOutput, m, n, k, batchedTokens, numTokens, numBatches,
+                      maxNumCtasInBatchDim);
 
   auto const& config = configs[configIndex];
 
   return bmm.isValidConfig(config, gemmData);
+}
+
+bool TrtllmGenBatchedGemmRunner::isRedundantSplitKConfig(int32_t configIndex, int32_t m, int32_t n,
+                                                         int32_t k,
+                                                         std::vector<int32_t> const& batchedTokens,
+                                                         int32_t numTokens, int32_t numBatches,
+                                                         int32_t maxNumCtasInBatchDim) const {
+  auto const bmm = BatchedGemmInterface();
+  auto const& config = bmm.getBatchedGemmConfigs()[configIndex];
+  if (config.mOptions.mNumSlicesForSplitK <= 1) {
+    return false;
+  }
+
+  BatchedGemmData const gemmData =
+      makeProblemData(mOptions.transposeMmaOutput, m, n, k, batchedTokens, numTokens, numBatches,
+                      maxNumCtasInBatchDim);
+  // Only a valid config describes a launchable grid.
+  if (!bmm.isValidConfig(config, gemmData)) {
+    return false;
+  }
+  // Split-K only pays off by putting CTAs on SMs that the un-split grid leaves idle. Once that
+  // grid has a CTA for every SM, the extra slices only add the cross-slice reduction.
+  auto const options = bmm.getOptionsFromConfigAndData(config, gemmData);
+  auto const grid = bmm.getGridDim(options, gemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
+  int64_t const numCtasPerSlice = static_cast<int64_t>(std::get<0>(grid)) * std::get<1>(grid);
+  return numCtasPerSlice >= tensorrt_llm::common::getMultiProcessorCount();
 }
 
 }  // namespace kernels
