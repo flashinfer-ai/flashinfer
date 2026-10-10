@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import math
+import os
 import warnings
 import collections
 import functools
@@ -117,6 +118,70 @@ def _cake_gdn_sentinel(device_index: int, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty(1, dtype=dtype, device=torch.device("cuda", device_index))
 
 
+# Int32 device copies of int64 ``cu_seqlens`` / ``checkpoint_cu_starts``, keyed exactly
+# like the host-int cache above.  Those two tensors are already immutable by this
+# adapter's contract (their values are host-resolved once per live tensor), so one
+# int32 copy per live tensor is as safe as the cached host ints.  ``state_indices`` is
+# dynamic device data (slot ids the caller may rewrite in place) and is converted per call.  The
+# kernels take int32 offsets / slots; converting on every call launched one extra
+# kernel ahead of the main kernel (and exposed the main launch gap in eager mode)
+# for int64 callers.
+_CAKE_GDN_I32_COPIES: collections.OrderedDict[
+    tuple[int, int, Optional[int], int],
+    tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor, int, torch.cuda.Event],
+] = collections.OrderedDict()
+
+_cake_gdn_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _cake_gdn_current_raw_stream(device_index: int) -> int:
+    """Handle of the current CUDA stream on one device (cheap, no Stream object)."""
+
+    if _cake_gdn_raw_stream is not None:
+        return int(_cake_gdn_raw_stream(device_index))
+    return int(torch.cuda.current_stream(device_index).cuda_stream)
+
+
+def _cake_gdn_i32(values: torch.Tensor) -> torch.Tensor:
+    """Return contract-immutable metadata as int32, converting an int64 tensor once.
+
+    Only for ``cu_seqlens`` and ``checkpoint_cu_starts``, whose values this adapter
+    already resolves once per live tensor (``_cake_gdn_host_ints``).  Int32 tensors
+    are returned as is.  During CUDA Graph capture the cast is always recorded, so
+    the graph's private pool owns the int32 copy and replay re-reads the live tensor;
+    the cache is neither consulted nor filled then.  Eagerly, the copy is reused while
+    the same tensor object (same storage, same version for non-inference tensors) is
+    passed again.  A copy consumed on a stream other than the one that produced it
+    first waits for the producing cast (an event recorded right after it) and is
+    recorded on the consuming stream, so the bounded LRU can drop it safely.
+    """
+
+    if values.dtype == torch.int32:
+        return values
+    if torch.cuda.is_current_stream_capturing():
+        return values.to(torch.int32)
+    device_index = int(values.device.index or 0)
+    version = None if values.is_inference() else int(values._version)
+    key = (device_index, int(values.data_ptr()), version, int(values.numel()))
+    raw_stream = _cake_gdn_current_raw_stream(device_index)
+    cached = _CAKE_GDN_I32_COPIES.get(key)
+    if cached is not None and cached[0]() is values:
+        _CAKE_GDN_I32_COPIES.move_to_end(key)
+        converted = cached[1]
+        if cached[2] != raw_stream:
+            consumer = torch.cuda.current_stream(device_index)
+            consumer.wait_event(cached[3])
+            converted.record_stream(consumer)
+        return converted
+    converted = values.to(torch.int32)
+    ready = torch.cuda.Event()
+    ready.record(torch.cuda.current_stream(device_index))
+    _CAKE_GDN_I32_COPIES[key] = (weakref.ref(values), converted, raw_stream, ready)
+    while len(_CAKE_GDN_I32_COPIES) > _CAKE_GDN_HOST_INTS_MAX:
+        _CAKE_GDN_I32_COPIES.popitem(last=False)
+    return converted
+
+
 def _cake_gdn_host_ints(values: torch.Tensor, *, purpose: str) -> tuple[int, ...]:
     """Resolve immutable CUDA integer metadata once, outside Graph capture."""
 
@@ -166,11 +231,30 @@ def _cake_gdn_prefill_seq_lens(
     return seq_lens
 
 
+# Per-call device-side slot validation, same default as ``gdn_decode.py``: the
+# ``torch._assert_async`` chain expands to four elementwise kernels plus the
+# ``_assert_async_cuda_kernel`` and exposes ~40 us of launch gaps around a
+# 25-70 us kernel on the indexed state-pool rows (R200 CUPTI per-kernel
+# decomposition: 5-6 kernels per call, 41-45 us of inter-kernel gap, while the
+# Cake kernel itself ran faster than the CuTe one).  The CuTe path trusts
+# caller-provided slots, so the Cake adapter does the same by default; set
+# ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1`` to restore the asynchronous
+# fail-closed check (used by the invalid-slot tests).
+_CAKE_GDN_VALIDATE_SLOTS = (
+    os.environ.get("FLASHINFER_CAKE_GDN_VALIDATE_SLOTS", "0") == "1"
+)
+
+
 def _cake_gdn_assert_state_slots(
     indices: torch.Tensor, pool_size: int, *, name: str, allow_minus_one: bool
 ) -> None:
-    """Validate CUDA-resident state slots without a host synchronization."""
+    """Validate CUDA-resident state slots without a host synchronization.
 
+    Only active when ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1``; see the note above.
+    """
+
+    if not _CAKE_GDN_VALIDATE_SLOTS:
+        return
     in_pool = (indices >= 0) & (indices < pool_size)
     valid = ((indices == -1) | in_pool) if allow_minus_one else in_pool
     torch._assert_async(
@@ -432,22 +516,21 @@ def _run_cake_gdn_prefill(
         max_chunks = max((length + 63) // 64 for length in seq_lens)
         if max_chunks <= 8:
             grid_x = min(128, total_tiles)
-        elif active_clusters in (148, 160) and total_tiles == 256:
+        elif active_clusters in (148, 160, 212) and total_tiles == 256:
+            # 212 = Rubin R200; balanced two tiles per CTA.
             grid_x = 128
         else:
             grid_x = min(active_clusters, total_tiles)
 
     empty_i32 = _cake_gdn_sentinel(device_index, torch.int32)
-    cu_seqlens_i32 = (
-        cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(torch.int32)
-    )
-    state_indices_i32 = (
-        empty_i32
-        if state_indices is None
-        else state_indices
-        if state_indices.dtype == torch.int32
-        else state_indices.to(torch.int32)
-    )
+    cu_seqlens_i32 = _cake_gdn_i32(cu_seqlens)
+    if state_indices is None:
+        state_indices_i32 = empty_i32
+    elif state_indices.dtype == torch.int32:
+        state_indices_i32 = state_indices
+    else:
+        # Slots are dynamic device data the caller may rewrite in place: convert per call.
+        state_indices_i32 = state_indices.to(torch.int32)
     empty_state = _cake_gdn_sentinel(device_index, state_dtype)
     launch_initial_state = initial_state if initial_state is not None else empty_state
     launch_output_state = (
@@ -461,9 +544,7 @@ def _run_cake_gdn_prefill(
     cu_checkpoints_i32 = (
         empty_i32
         if checkpoint_every_n_tokens == 0 or checkpoint_cu_starts is None
-        else checkpoint_cu_starts
-        if checkpoint_cu_starts.dtype == torch.int32
-        else checkpoint_cu_starts.to(torch.int32)
+        else _cake_gdn_i32(checkpoint_cu_starts)
     )
     tensormap_workspace = _cake_gdn_tensormap_workspace(
         device_index, torch.cuda.current_stream(device_index).cuda_stream, grid_x

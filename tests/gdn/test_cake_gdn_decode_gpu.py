@@ -1119,14 +1119,21 @@ def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
 
 
 @pytest.mark.parametrize(
-    ("batch_size", "num_q_heads", "num_v_heads", "pack_gates"),
+    ("batch_size", "num_q_heads", "num_v_heads", "pack_gates", "seq_len"),
     [
-        (8, 16, 64, True),
-        (8, 16, 32, False),
-        (2, 4, 8, False),
-        (3, 4, 8, False),
-        (5, 4, 8, False),
-        (8, 4, 8, False),
+        (8, 16, 64, True, 4),
+        (8, 16, 32, False, 4),
+        (2, 4, 8, False, 4),
+        (3, 4, 8, False, 4),
+        (5, 4, 8, False, 4),
+        (8, 4, 8, False, 4),
+        # Qwen3.5-35B-A3B TP=2 verify windows (tile16 records specialized to T=7 / T=8)
+        (1, 8, 16, False, 7),
+        (4, 8, 16, False, 7),
+        (1, 8, 16, False, 8),
+        # wide rows (TILE_V_WIDE 32 / 64; the `wide128_vpre` records on sm_107a)
+        (5, 8, 16, False, 7),
+        (8, 16, 64, True, 3),
     ],
 )
 def test_exported_bf16_verify_is_cuda_graph_safe(
@@ -1134,8 +1141,9 @@ def test_exported_bf16_verify_is_cuda_graph_safe(
     num_q_heads: int,
     num_v_heads: int,
     pack_gates: bool,
+    seq_len: int,
 ) -> None:
-    seq_len, cache_steps = 4, 4
+    cache_steps = seq_len
     tensors = _make_bf16_serving_inputs(
         batch_size=batch_size,
         seq_len=seq_len,

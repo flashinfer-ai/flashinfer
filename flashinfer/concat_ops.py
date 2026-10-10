@@ -137,8 +137,15 @@ def _concat_mla_k_cake(
     tokens, element_bytes = _validate_cake_concat_mla_k(k, k_nope, k_rope)
     if not tokens:
         return None
-    from .jit.cake_concat_mla_k import get_cake_concat_mla_k_module
+    from .jit.cake_concat_mla_k import (
+        cake_concat_mla_k_tokens_per_cta,
+        get_cake_concat_mla_k_module,
+    )
 
+    # One CTA copies two 1-byte tokens or one 2-byte token (the module's
+    # launch_policy); the kernel bounds the second token with ``tokens``.
+    window = cake_concat_mla_k_tokens_per_cta(element_bytes)
+    grid_x = (tokens + window - 1) // window
     with torch.cuda.device(k.device):
         get_cake_concat_mla_k_module(k.device).run(
             k.view(torch.uint8),
@@ -151,6 +158,7 @@ def _concat_mla_k_cake(
             int(k_nope.stride(1)) * element_bytes,
             int(k_rope.stride(0)) * element_bytes,
             tokens,
+            grid_x,
             1,
             1,
         )

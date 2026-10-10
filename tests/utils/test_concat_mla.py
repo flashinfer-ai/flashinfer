@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from flashinfer.concat_ops import concat_mla_k
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.utils import get_compute_capability
 
 NUM_LOCAL_HEADS = 128
@@ -175,8 +176,11 @@ def _make_cake_tensors(
 def _require_cake_concat_mla_k() -> None:
     if not torch.cuda.is_available():
         pytest.skip("Cake concat MLA K requires CUDA")
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
-        pytest.skip("Cake concat MLA K requires SM100 or SM103")
+    capability = get_compute_capability(torch.device("cuda"))
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake concat MLA K requires SM100, SM103 or SM107")
+    if capability == (10, 7) and not is_cuda_version_at_least("13.0"):
+        pytest.skip("Cake concat MLA K on SM107 requires CUDA 13.0 or newer")
 
 
 # ────────────────────────── Core correctness tests ──────────────────────────
@@ -358,6 +362,43 @@ def test_cake_concat_mla_k_full_contract(
     )
 
 
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_cake_concat_mla_k_is_cuda_graph_safe(num_tokens: int, dtype: torch.dtype):
+    """Capture the Cake route once and replay it on fresh input bytes: byte-exact vs eager."""
+
+    _require_cake_concat_mla_k()
+    torch.manual_seed(23)
+    k, k_nope, k_rope = _make_cake_tensors(num_tokens, dtype, "contiguous", False)
+    concat_mla_k(
+        k, k_nope, k_rope, backend="cake"
+    )  # JIT load + warm-up outside the capture
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        concat_mla_k(k, k_nope, k_rope, backend="cake")
+    torch.cuda.current_stream().wait_stream(stream)
+    for seed in (29, 31):
+        torch.manual_seed(seed)
+        _, fresh_nope, fresh_rope = _make_cake_tensors(
+            num_tokens, dtype, "contiguous", False
+        )
+        k_nope.copy_(fresh_nope)
+        k_rope.copy_(fresh_rope)
+        k.fill_(0)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = torch.empty_like(k)
+        expected[..., :QK_NOPE_HEAD_DIM] = k_nope
+        expected[..., QK_NOPE_HEAD_DIM:] = k_rope.expand(
+            num_tokens, NUM_LOCAL_HEADS, -1
+        )
+        assert torch.equal(
+            k.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+        )
+
+
 def test_cake_concat_mla_k_selects_sm100f_on_cc100(monkeypatch):
     from flashinfer.jit import cake_concat_mla_k
 
@@ -377,6 +418,7 @@ def test_cake_concat_mla_k_selects_sm100f_on_cc100(monkeypatch):
     [
         ("sm100f", (10, "0f"), "compute_100f", "compute_103a"),
         ("sm103a", (10, "3a"), "compute_103a", "compute_100f"),
+        ("sm107a", (10, "7a"), "compute_107a", "compute_103a"),
     ],
 )
 def test_cake_concat_mla_k_jit_target_isolated(

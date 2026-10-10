@@ -34,12 +34,13 @@ CakeKDAPackedT1Variant = Literal[
     "cpasync_tile64",
     "cpasync_tile128_ilp4",
     "cpasync_tile64_register_pipeline",
+    "cpasync_tile64_register_pipeline_early_publish",
     "cpasync_tile128_packed_state_v_private_prefetch",
     "cpasync_tile128_v_private_prefetch",
     "cpasync_tile128_paired_row_pipeline",
     "cpasync_tile128_register_pipeline",
 ]
-CakeKDAPackedT1Target = Literal["sm100a", "sm100f"]
+CakeKDAPackedT1Target = Literal["sm100a", "sm100f", "sm107a"]
 
 CAKE_KDA_PACKED_T1_VARIANTS: tuple[CakeKDAPackedT1Variant, ...] = (
     "register_tile16",
@@ -49,6 +50,7 @@ CAKE_KDA_PACKED_T1_VARIANTS: tuple[CakeKDAPackedT1Variant, ...] = (
     "cpasync_tile64",
     "cpasync_tile128_ilp4",
     "cpasync_tile64_register_pipeline",
+    "cpasync_tile64_register_pipeline_early_publish",
     "cpasync_tile128_packed_state_v_private_prefetch",
     "cpasync_tile128_v_private_prefetch",
     "cpasync_tile128_paired_row_pipeline",
@@ -58,8 +60,9 @@ CAKE_KDA_PACKED_T1_VARIANTS: tuple[CakeKDAPackedT1Variant, ...] = (
 _CAKE_KDA_PACKED_T1_TARGETS: tuple[CakeKDAPackedT1Target, ...] = (
     "sm100a",
     "sm100f",
+    "sm107a",
 )
-_CAKE_KDA_PACKED_T1_TARGET_KIND = {"sm100a": 1000, "sm100f": 100}
+_CAKE_KDA_PACKED_T1_TARGET_KIND = {"sm100a": 1000, "sm100f": 100, "sm107a": 1070}
 
 
 class CakeKDAPackedT1VariantMetadata(NamedTuple):
@@ -132,6 +135,14 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
         smem_bytes=16384,
         requires_aux_vec4=True,
     ),
+    "cpasync_tile64_register_pipeline_early_publish": CakeKDAPackedT1VariantMetadata(
+        body="cake_kda_packed_t1_cpasync_tile64_register_pipeline_early_publish.cu",
+        symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile64_register_pipeline_early_publish",
+        value_tiles=2,
+        threads=128,
+        smem_bytes=16384,
+        requires_aux_vec4=True,
+    ),
     "cpasync_tile128_packed_state_v_private_prefetch": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_cpasync_tile128_packed_state_v_private_prefetch.cu",
         symbol=(
@@ -170,34 +181,76 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
 }
 
 
+# Aligned-row selector bands per compute capability: ``(max_batch, variant)``
+# with an open last band.  SM100 (10.0 / 10.3) keeps the bands qualified on
+# B200.  SM107 (10.7, 212 SMs) is re-banded from the R200 variant
+# sweep: the register tile-16 kernel stays ahead through B18, the
+# cp.async tile-64 register pipeline carries the mid batches, and the tile-128
+# register pipeline takes over from B64, where the two tie.  The mid band
+# runs the early-publish build of the tile-64 register pipeline: the same
+# schedule with the output row published before the state write-back and
+# the state stored with an evict-last L2 hint, which is bitwise identical to
+# the tile-64 register pipeline and 1-3 % faster across B19-B63 on R200
+# (band geomean 0.987 of the plain pipeline's time, no row slower).  No
+# SM100 band selects it.  Every variant is an exact kernel; the selector only
+# moves the batch bands.
+_CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM100: tuple[
+    tuple[Optional[int], CakeKDAPackedT1Variant], ...
+] = (
+    (14, "register_tile16"),
+    (29, "register_tile8_interleaved"),
+    (38, "register_tile16_warp"),
+    (41, "cpasync_tile64_register_pipeline"),
+    (80, "cpasync_tile128_packed_state_v_private_prefetch"),
+    (101, "cpasync_tile128_v_private_prefetch"),
+    (152, "cpasync_tile128_paired_row_pipeline"),
+    (None, "cpasync_tile128_register_pipeline"),
+)
+_CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM107: tuple[
+    tuple[Optional[int], CakeKDAPackedT1Variant], ...
+] = (
+    (18, "register_tile16"),
+    (63, "cpasync_tile64_register_pipeline_early_publish"),
+    (None, "cpasync_tile128_register_pipeline"),
+)
+CAKE_KDA_PACKED_T1_ALIGNED_BANDS: dict[
+    tuple[int, ...], tuple[tuple[Optional[int], CakeKDAPackedT1Variant], ...]
+] = {
+    (10, 0): _CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM100,
+    (10, 3): _CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM100,
+    (10, 7): _CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM107,
+}
+
+
 def select_cake_kda_packed_t1_variant(
     batch: int,
     *,
+    compute_capability: tuple[int, int],
     state_aligned: bool,
     aux_vec4_aligned: bool,
 ) -> Optional[CakeKDAPackedT1Variant]:
-    """Return the qualified final selector, or ``None`` for the legacy route."""
+    """Return the qualified final selector, or ``None`` for the legacy route.
+
+    The aligned-row bands are keyed by compute capability
+    (``CAKE_KDA_PACKED_T1_ALIGNED_BANDS``); the scalar-aux bands are shared by
+    every supported capability and fail closed outside their qualified batches.
+    """
 
     if batch <= 0:
         raise ValueError(f"packed KDA T=1 batch must be positive, got {batch}")
+    bands = CAKE_KDA_PACKED_T1_ALIGNED_BANDS.get(tuple(compute_capability))
+    if bands is None:
+        raise ValueError(
+            "packed KDA T=1 has no qualified selector bands for compute capability "
+            f"{compute_capability[0]}.{compute_capability[1]}"
+        )
     if not state_aligned:
         return None
     if aux_vec4_aligned:
-        if batch <= 14:
-            return "register_tile16"
-        if batch <= 29:
-            return "register_tile8_interleaved"
-        if batch <= 38:
-            return "register_tile16_warp"
-        if batch <= 41:
-            return "cpasync_tile64_register_pipeline"
-        if batch <= 80:
-            return "cpasync_tile128_packed_state_v_private_prefetch"
-        if batch <= 101:
-            return "cpasync_tile128_v_private_prefetch"
-        if batch <= 152:
-            return "cpasync_tile128_paired_row_pipeline"
-        return "cpasync_tile128_register_pipeline"
+        for max_batch, variant in bands:
+            if max_batch is None or batch <= max_batch:
+                return variant
+        raise AssertionError("packed KDA T=1 selector bands must end open")
     if batch <= 24:
         return "cpasync_tile64_ilp4"
     if batch <= 37:
@@ -296,6 +349,7 @@ def get_cake_kda_packed_t1_module(
 
 
 __all__ = [
+    "CAKE_KDA_PACKED_T1_ALIGNED_BANDS",
     "CAKE_KDA_PACKED_T1_VARIANTS",
     "CAKE_KDA_PACKED_T1_VARIANT_METADATA",
     "CakeKDAPackedT1Target",

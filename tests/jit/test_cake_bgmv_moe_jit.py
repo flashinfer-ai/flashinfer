@@ -66,6 +66,7 @@ def test_selector_rejects_unsupported_shapes():
         ((9, 0), "sm90a"),
         ((10, 0), "sm100a"),
         ((10, 3), "sm103a"),
+        ((10, 7), "sm107a"),
         ((8, 0), None),
         ((10, 1), None),
         ((12, 0), None),
@@ -82,6 +83,7 @@ def test_arch_for_capability(capability, expected):
         ("sm90a", (9, "0a"), "-gencode=arch=compute_90a,code=sm_90a", (9, 0)),
         ("sm100a", (10, "0a"), "-gencode=arch=compute_100a,code=sm_100a", (10, 0)),
         ("sm103a", (10, "3a"), "-gencode=arch=compute_103a,code=sm_103a", (10, 3)),
+        ("sm107a", (10, "7a"), "-gencode=arch=compute_107a,code=sm_107a", (10, 7)),
     ],
 )
 @pytest.mark.parametrize("hidden_size", cake_bgmv_moe.CAKE_BGMV_MOE_HIDDEN_SIZES)
@@ -217,8 +219,9 @@ def test_variant_routing_by_token_count(hidden_size, num_tokens, expected):
         "sm90a": None,
         "sm100a": (32, 1024),
         "sm103a": (32, 1024),
+        "sm107a": (32, 1024),
     }
-    for arch in ("sm100a", "sm103a"):
+    for arch in ("sm100a", "sm103a", "sm107a"):
         assert (
             cake_bgmv_moe.cake_bgmv_moe_variant(hidden_size, 32, num_tokens, arch)
             == expected
@@ -238,17 +241,24 @@ def test_pdl_mode_policy():
     assert pdl("sm90a", 16, 2944, 132) == 1
     assert pdl("sm100a", 16, 2944, 148) == 1
     assert pdl("sm103a", 16, 2944, 148) == 1
+    assert pdl("sm107a", 16, 2944, 212) == 1
     # 128 tokens x 12 column CTAs = 1536 CTAs: still small on Hopper (12/SM),
-    # large on Blackwell (8/SM).
+    # large on Blackwell (8/SM x 148 = 1184), still small on Rubin's 212 SMs
+    # (8/SM x 212 = 1696).
     assert pdl("sm90a", 128, 1472, 132) == 1
     assert pdl("sm100a", 128, 1472, 148) == 2
+    assert pdl("sm107a", 128, 1472, 212) == 1
+    # 144 tokens x 12 column CTAs = 1728 CTAs: just above the Rubin crossover.
+    assert pdl("sm107a", 144, 1472, 212) == 2
     # 512 tokens x 6 column CTAs = 3072 CTAs: large.
     assert pdl("sm90a", 512, 736, 132) == 0
     assert pdl("sm100a", 512, 736, 148) == 2
     assert pdl("sm103a", 512, 736, 148) == 2
+    assert pdl("sm107a", 512, 736, 212) == 2
     # The specialized bodies take plain launches at every grid size.
     assert pdl("sm100a", 512, 3072, 148, "specialized") == 0
     assert pdl("sm103a", 1024, 2688, 148, "specialized") == 0
+    assert pdl("sm107a", 512, 3072, 212, "specialized") == 0
     assert pdl("sm100a", 32, 3072, 148, "specialized") == 0
     assert pdl("sm90a", 32, 3072, 132, "specialized") == 0
 
@@ -270,6 +280,7 @@ def test_generic_selector_rejects_unsupported_inputs():
         ("sm90a", (9, "0a"), "-gencode=arch=compute_90a,code=sm_90a", (9, 0)),
         ("sm100a", (10, "0a"), "-gencode=arch=compute_100a,code=sm_100a", (10, 0)),
         ("sm103a", (10, "3a"), "-gencode=arch=compute_103a,code=sm_103a", (10, 3)),
+        ("sm107a", (10, "7a"), "-gencode=arch=compute_107a,code=sm_107a", (10, 7)),
     ],
 )
 @pytest.mark.parametrize("rank", cake_bgmv_moe.CAKE_BGMV_MOE_GENERIC_RANKS)
@@ -343,7 +354,8 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
     # Lever 34: the bf16 Blackwell bundles run the mixed-precision ring grouped shrink.
     mixed = (
         1
-        if arch in ("sm100a", "sm103a") and cake_bgmv_moe._dtype_tag(dtype) == "bf16"
+        if arch in ("sm100a", "sm103a", "sm107a")
+        and cake_bgmv_moe._dtype_tag(dtype) == "bf16"
         else 0
     )
     assert f"#define CAKE_BGMV_MOE_GROUP_SHRINK_MIXED {mixed}" in binding

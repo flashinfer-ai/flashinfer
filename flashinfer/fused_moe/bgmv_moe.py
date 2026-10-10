@@ -209,7 +209,7 @@ BGMVMoEBackendUsed = Literal["cake", "portable"]
 CakeBGMVMoEVariant = Literal["specialized", "generic"]
 
 _CAKE_UNSUPPORTED_DEVICE_MESSAGE = (
-    "Cake BGMV MoE requires an exact SM90, SM100 or SM103 CUDA device; "
+    "Cake BGMV MoE requires an exact SM90, SM100, SM103 or SM107 CUDA device; "
     "got capability={capability}"
 )
 _fallback_reasons_warned: set = set()
@@ -313,7 +313,7 @@ class _BGMVMoEGraphPlan:
 
 
 class BGMVMoECakePlan(_BGMVMoEGraphPlan):
-    """Pointer-stable SM90/SM100/SM103 Cake BGMV MoE shrink+expand execution plan.
+    """Pointer-stable SM90/SM100/SM103/SM107 Cake BGMV MoE shrink+expand execution plan.
 
     Runs the generated Cake programs (one owner per output token, no output
     atomics, bitwise-reproducible replays). ``backend_used`` is ``"cake"``;
@@ -643,8 +643,9 @@ def prepare_bgmv_moe(
 
     The generated Cake path supports one LoRA slice, LoRA rank 8, 16, 32 or
     64, any hidden size that is a positive multiple of 8 (LoRA-B feat_out equal
-    to it), BF16/FP16 inputs, and exact SM90 (H100/H200), SM100 (B200/GB200) or
-    SM103 (B300/GB300) devices; each target runs its own cubin. Hidden sizes
+    to it), BF16/FP16 inputs, and exact SM90 (H100/H200), SM100 (B200/GB200),
+    SM103 (B300/GB300) or SM107 (Rubin R200) devices; each target runs its own
+    cubin. Hidden sizes
     2688 and 3072 at rank 32 use the specialized measured bodies at up to 2048
     tokens (``plan.variant == "specialized"``); everything else, including those
     shapes at larger token counts, uses the runtime-hidden generic bundles
@@ -935,7 +936,10 @@ def prepare_bgmv_moe(
     if variant == "specialized":
         schedule = select_cake_bgmv_moe_schedule(hidden_size, num_tokens, arch)
         schedule_id = CAKE_BGMV_MOE_SCHEDULE_IDS[schedule]
-        module = get_cake_bgmv_moe_module(hidden_size, dtype_name, arch)
+        # The binding's Configure() reads the current CUDA device (cudaGetDevice)
+        # when the module loads; pin it to the input's device.
+        with torch.cuda.device(x.device):
+            module = get_cake_bgmv_moe_module(hidden_size, dtype_name, arch)
     else:
         generic_schedule = select_cake_bgmv_moe_generic_schedule(
             hidden_size, num_tokens, arch
@@ -949,7 +953,9 @@ def prepare_bgmv_moe(
             # selector never picks the remap on a deep-ring grid, a forced remap
             # takes the two-stage form.
             shrink_launch = (0, shrink_launch[1])
-        module = get_cake_bgmv_moe_generic_module(rank, dtype_name, arch)
+        # Same device pin as the specialized module above.
+        with torch.cuda.device(x.device):
+            module = get_cake_bgmv_moe_generic_module(rank, dtype_name, arch)
     return BGMVMoECakePlan(
         module,
         y_accum=y_accum,

@@ -466,8 +466,9 @@ def test_dsv3_fused_routing_backend_correctness(
     if backend == "cake" and torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
+        (10, 7),
     ):
-        pytest.skip("Cake fused routing requires SM100 or SM103")
+        pytest.skip("Cake fused routing requires SM100, SM103 or SM107")
 
     num_tokens = 7
     torch.manual_seed(42)
@@ -516,6 +517,67 @@ def test_dsv3_fused_routing_backend_correctness(
     )
 
 
+@pytest.mark.parametrize(
+    "num_experts,n_group,topk_group,topk",
+    [
+        pytest.param(256, 8, 4, 8, id="grouped-k8g4"),
+        pytest.param(128, 1, 1, 1, id="single128"),
+    ],
+)
+@pytest.mark.parametrize("data_type", [torch.float32, torch.bfloat16])
+def test_dsv3_fused_routing_cake_is_cuda_graph_safe(
+    num_experts, n_group, topk_group, topk, data_type
+):
+    """Capture the Cake routing kernel once and replay it on fresh scores: bitwise vs eager."""
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake fused routing requires SM100, SM103 or SM107")
+    num_tokens = 7
+    torch.manual_seed(42)
+    scores = torch.randn(num_tokens, num_experts, device="cuda", dtype=data_type)
+    bias = torch.randn(num_experts, device="cuda", dtype=data_type)
+    topk_values = torch.empty(num_tokens, topk, device="cuda", dtype=data_type)
+    topk_indices = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int32)
+    routing_replay_out = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int16)
+
+    def run(backend):
+        fused_topk_deepseek(
+            scores,
+            bias,
+            n_group,
+            topk_group,
+            topk,
+            1.0,
+            topk_values,
+            topk_indices,
+            routing_replay_out=routing_replay_out,
+            backend=backend,
+        )
+
+    run("cake")  # JIT load + warm-up outside the capture
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        run("cake")
+    torch.cuda.current_stream().wait_stream(stream)
+    for seed in (7, 11):
+        torch.manual_seed(seed)
+        scores.copy_(
+            torch.randn(num_tokens, num_experts, device="cuda", dtype=data_type)
+        )
+        bias.copy_(torch.randn(num_experts, device="cuda", dtype=data_type))
+        graph.replay()
+        torch.cuda.synchronize()
+        replay = (topk_values.clone(), topk_indices.clone(), routing_replay_out.clone())
+        run("cake")
+        torch.cuda.synchronize()
+        for got, want in zip(
+            replay, (topk_values, topk_indices, routing_replay_out), strict=True
+        ):
+            assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
 @pytest.mark.parametrize("backend", ["default", "cake"])
 @pytest.mark.parametrize(
     "strided", ["scores", "bias", "topk_values", "topk_indices", "routing_replay_out"]
@@ -526,8 +588,9 @@ def test_dsv3_fused_routing_rejects_strided_views(backend, strided):
     if backend == "cake" and torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
+        (10, 7),
     ):
-        pytest.skip("Cake fused routing requires SM100 or SM103")
+        pytest.skip("Cake fused routing requires SM100, SM103 or SM107")
 
     num_tokens, num_experts, topk = 4, 256, 8
 

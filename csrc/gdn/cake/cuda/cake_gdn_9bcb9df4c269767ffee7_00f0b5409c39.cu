@@ -13,9 +13,10 @@
 // limitations under the License.
 
 // clang-format off
-#include "cake_gdn_common.cuh"
+// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
+#include "cake_gdn_device_common.cuh"
 
-#define CAKE_GDN_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_SQ_OFF 0
 #define SMEM_SQ_STAGE_BYTES 4352
@@ -26,240 +27,65 @@
 #define SMEM_SSCALAR_OFF 8704
 #define SMEM_SSCALAR_STAGE_BYTES 64
 #define SMEM_SSCALAR_STRIDE 64
-#define SMEM_TOTAL 8832
+#define SMEM_SV_OFF 8800
+#define SMEM_SV_STAGE_BYTES 512
+#define SMEM_SV_STRIDE 512
+#define SMEM_TOTAL 9344
 #define THREADS 128
-#define H 8
-#define HV 16
-#define INTERMEDIATE_TOKEN_STRIDE 262144
-#define STRIDED_INPUTS 1
-#define SCALE 0.08838834764831845
-
-__device__ __forceinline__ void fma_f32x2_noftz_inplace(float2* a, float2 b, float2 c) {
-    unsigned long long r;
-    asm("fma.rn.f32x2 %0, %1, %2, %3;"
-        : "=l"(r)
-        : "l"(*(unsigned long long*)a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    *(unsigned long long*)a = r;
-}
-
-__device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("mul.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void add_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("add.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void sub_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("sub.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ float2 add_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 sub_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("sub.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-// ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
-
-__device__ __forceinline__ float2 add_f32x2_rn_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rn_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rz_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rz_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rz.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rm_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rm.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rm_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rm.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rp_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rp.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rp_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rp.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rn_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rn_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rz_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rz_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rz.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rm_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rm.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rm_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rm.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rp_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rp.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rp_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rp.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
+#ifndef H
+#error "H is a downstream specialization of this program; define it on the compile line"
+#endif
+#ifndef HV
+#error "HV is a downstream specialization of this program; define it on the compile line"
+#endif
+#ifndef T_STEPS
+#error "T_STEPS is a downstream specialization of this program; define it on the compile line"
+#endif
+#ifndef INTERMEDIATE_BATCH_STRIDE
+#error "INTERMEDIATE_BATCH_STRIDE is a downstream specialization of this program; define it on the compile line"
+#endif
+#ifndef INTERMEDIATE_TOKEN_STRIDE
+#error "INTERMEDIATE_TOKEN_STRIDE is a downstream specialization of this program; define it on the compile line"
+#endif
+#ifndef STRIDED_INPUTS
+#error "STRIDED_INPUTS is a downstream specialization of this program; define it on the compile line"
+#endif
+#ifndef SCALE
+#error "SCALE is a downstream specialization of this program; define it on the compile line"
+#endif
 
 extern "C" {
 
-__global__ __launch_bounds__(128) void
-kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ intermediate_state, int* __restrict__ initial_state_indices, int* __restrict__ output_state_indices, long long state_size_p0, long long state_stride_p0, long long q_stride_p0, long long q_stride_p1, long long q_stride_p2, long long k_stride_p0, long long k_stride_p1, long long k_stride_p2, long long a_stride_p0, long long a_stride_p1, long long a_stride_p2, long long b_stride_p0, long long b_stride_p1, long long b_stride_p2, long long v_stride_p0, long long v_stride_p1, long long v_stride_p2)
+__global__ __launch_bounds__(THREADS) void
+kernel_cake_gdn_9bcb9df4c269767ffee7(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ intermediate_state, int* __restrict__ initial_state_indices, int* __restrict__ output_state_indices, long long state_size_p0, long long state_stride_p0, long long v_stride_p0, long long v_stride_p1, long long v_stride_p2, long long q_stride_p0, long long q_stride_p1, long long q_stride_p2, long long k_stride_p0, long long k_stride_p1, long long k_stride_p2, long long a_stride_p0, long long a_stride_p1, long long a_stride_p2, long long b_stride_p0, long long b_stride_p1, long long b_stride_p2)
 {
     const int tid = threadIdx.x;
-    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    const uint32_t lane = static_cast<uint32_t>(tid) & 31u;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1000
+#if __CUDA_ARCH__ == 1000
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1070
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#elif defined(__CUDA_ARCH__)
-#error "unsupported architecture for the Cake GDN decode kernel"
 #endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
 
+    const int cta_rank = 0;
+
     // Kernel setup ops
-    float* sQ = reinterpret_cast<float*>(smem_raw + 0);
-    const int sQ_addr = smem + 0;
-    float* sK = reinterpret_cast<float*>(smem_raw + 4352);
-    const int sK_addr = smem + 4352;
-    float* sScalar = reinterpret_cast<float*>(smem_raw + 8704);
-    const int sScalar_addr = smem + 8704;
+    float* sQ = reinterpret_cast<float*>(smem_raw + SMEM_SQ_OFF);
+    const int sQ_addr = smem + SMEM_SQ_OFF;
+    float* sK = reinterpret_cast<float*>(smem_raw + SMEM_SK_OFF);
+    const int sK_addr = smem + SMEM_SK_OFF;
+    float* sScalar = reinterpret_cast<float*>(smem_raw + SMEM_SSCALAR_OFF);
+    const int sScalar_addr = smem + SMEM_SSCALAR_OFF;
+    float* sV = reinterpret_cast<float*>(smem_raw + SMEM_SV_OFF);
+    const int sV_addr = smem + SMEM_SV_OFF;
 
     // === Task calls (dependency order) ===
     int linear_block = blockIdx.x;
@@ -292,6 +118,26 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
     float r_h[4];
     float r_v[4];
     float r_o[4];
+    int v_tok = ((lane_local < T_STEPS) ? lane_local : 0);
+    {
+        long long v_pre_base = (long long)n * v_stride_p0 + (long long)v_tok * v_stride_p1 + (long long)h * v_stride_p2;
+        {
+            uint2 _vld_0;
+            _vld_0 = *reinterpret_cast<const uint2*>(v + v_pre_base + (long long)v_row_a);
+            uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
+            #pragma unroll
+            for (int _pair = 0; _pair < 2; _pair++) {
+                (&r_v[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                (&r_v[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
+            }
+        }
+    }
+    if (lane_local < T_STEPS) {
+        sV[(warp_local * 8 + v_tok) * 4] = r_v[0];
+        sV[(warp_local * 8 + v_tok) * 4 + 1] = r_v[1];
+        sV[(warp_local * 8 + v_tok) * 4 + 2] = r_v[2];
+        sV[(warp_local * 8 + v_tok) * 4 + 3] = r_v[3];
+    }
     #pragma unroll
     for (int t_round = 0; t_round < T_STEPS; t_round += 4) {
         int t_pre_raw = warp_local + t_round;
@@ -303,33 +149,23 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
             long long q_base = (long long)n * q_stride_p0 + (long long)t_pre * q_stride_p1 + (long long)qk_h * q_stride_p2;
             long long k_base = (long long)n * k_stride_p0 + (long long)t_pre * k_stride_p1 + (long long)qk_h * k_stride_p2;
             {
-                uint2 _vld_0;
-                _vld_0 = *reinterpret_cast<const uint2*>(q + q_base + (long long)k_start);
-                uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
-                #pragma unroll
-                for (int _pair = 0; _pair < 2; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&r_q[0 + _pair * 2])[0]), "=f"((&r_q[0 + _pair * 2])[1])
-                        : "r"(_vpairs_0[_pair]));
-                }
-            }
-            {
                 uint2 _vld_1;
-                _vld_1 = *reinterpret_cast<const uint2*>(k + k_base + (long long)k_start);
+                _vld_1 = *reinterpret_cast<const uint2*>(q + q_base + (long long)k_start);
                 uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&r_k[0 + _pair * 2])[0]), "=f"((&r_k[0 + _pair * 2])[1])
-                        : "r"(_vpairs_1[_pair]));
+                    (&r_q[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
+                    (&r_q[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
+                }
+            }
+            {
+                uint2 _vld_2;
+                _vld_2 = *reinterpret_cast<const uint2*>(k + k_base + (long long)k_start);
+                uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
+                #pragma unroll
+                for (int _pair = 0; _pair < 2; _pair++) {
+                    (&r_k[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
+                    (&r_k[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
                 }
             }
         }
@@ -410,63 +246,43 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
     }
     __syncthreads();
     {
-        uint2 _vld_2;
-        _vld_2 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_a * 128) + (long long)k_start);
-        uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
-        #pragma unroll
-        for (int _pair = 0; _pair < 2; _pair++) {
-            asm volatile(
-                "{\n\t"
-                "shl.b32 %0, %2, 16;\n\t"
-                "and.b32 %1, %2, 0xffff0000;\n\t"
-                "}\n"
-                : "=f"((&r_h_a[0 + _pair * 2])[0]), "=f"((&r_h_a[0 + _pair * 2])[1])
-                : "r"(_vpairs_2[_pair]));
-        }
-    }
-    {
         uint2 _vld_3;
-        _vld_3 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_b * 128) + (long long)k_start);
+        _vld_3 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_a * 128) + (long long)k_start);
         uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3);
         #pragma unroll
         for (int _pair = 0; _pair < 2; _pair++) {
-            asm volatile(
-                "{\n\t"
-                "shl.b32 %0, %2, 16;\n\t"
-                "and.b32 %1, %2, 0xffff0000;\n\t"
-                "}\n"
-                : "=f"((&r_h_b[0 + _pair * 2])[0]), "=f"((&r_h_b[0 + _pair * 2])[1])
-                : "r"(_vpairs_3[_pair]));
+            (&r_h_a[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
+            (&r_h_a[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
         }
     }
     {
         uint2 _vld_4;
-        _vld_4 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_c * 128) + (long long)k_start);
+        _vld_4 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_b * 128) + (long long)k_start);
         uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4);
         #pragma unroll
         for (int _pair = 0; _pair < 2; _pair++) {
-            asm volatile(
-                "{\n\t"
-                "shl.b32 %0, %2, 16;\n\t"
-                "and.b32 %1, %2, 0xffff0000;\n\t"
-                "}\n"
-                : "=f"((&r_h_c[0 + _pair * 2])[0]), "=f"((&r_h_c[0 + _pair * 2])[1])
-                : "r"(_vpairs_4[_pair]));
+            (&r_h_b[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) << 16);
+            (&r_h_b[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) & 0xffff0000u);
         }
     }
     {
         uint2 _vld_5;
-        _vld_5 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_d * 128) + (long long)k_start);
+        _vld_5 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_c * 128) + (long long)k_start);
         uint32_t* _vpairs_5 = reinterpret_cast<uint32_t*>(&_vld_5);
         #pragma unroll
         for (int _pair = 0; _pair < 2; _pair++) {
-            asm volatile(
-                "{\n\t"
-                "shl.b32 %0, %2, 16;\n\t"
-                "and.b32 %1, %2, 0xffff0000;\n\t"
-                "}\n"
-                : "=f"((&r_h_d[0 + _pair * 2])[0]), "=f"((&r_h_d[0 + _pair * 2])[1])
-                : "r"(_vpairs_5[_pair]));
+            (&r_h_c[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) << 16);
+            (&r_h_c[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) & 0xffff0000u);
+        }
+    }
+    {
+        uint2 _vld_6;
+        _vld_6 = *reinterpret_cast<const uint2*>(state + read_state_head_base + (long long)(v_row_d * 128) + (long long)k_start);
+        uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6);
+        #pragma unroll
+        for (int _pair = 0; _pair < 2; _pair++) {
+            (&r_h_d[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) << 16);
+            (&r_h_d[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) & 0xffff0000u);
         }
     }
     float2 _f2_10 = make_float2(r_h_a[0], r_h_a[1]);
@@ -485,7 +301,7 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
     float2 h_d_pair0 = _f2_16;
     float2 _f2_17 = make_float2(r_h_d[2], r_h_d[3]);
     float2 h_d_pair1 = _f2_17;
-    #pragma unroll 1
+    #pragma unroll
     for (int t = 0; t < T_STEPS; t++) {
         int q_smem_addr = sQ_addr + (unsigned int)((t * 136 + qk_smem_col) * 4);
         int k_smem_addr = sK_addr + (unsigned int)((t * 136 + qk_smem_col) * 4);
@@ -559,24 +375,10 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
         for (int offset = 16; offset > 0; offset >>= 1)
             _warp_reduce_5 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_5, offset);
         float sum_hk_d = _warp_reduce_5;
-        {
-            long long v_base = (long long)n * v_stride_p0 + (long long)t * v_stride_p1 + (long long)h * v_stride_p2;
-            {
-                uint2 _vld_6;
-                _vld_6 = *reinterpret_cast<const uint2*>(v + v_base + (long long)v_row_a);
-                uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6);
-                #pragma unroll
-                for (int _pair = 0; _pair < 2; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&r_v[0 + _pair * 2])[0]), "=f"((&r_v[0 + _pair * 2])[1])
-                        : "r"(_vpairs_6[_pair]));
-                }
-            }
-        }
+        r_v[0] = sV[(warp_local * 8 + t) * 4];
+        r_v[1] = sV[(warp_local * 8 + t) * 4 + 1];
+        r_v[2] = sV[(warp_local * 8 + t) * 4 + 2];
+        r_v[3] = sV[(warp_local * 8 + t) * 4 + 3];
         float v_new_a = (r_v[0] - sum_hk_a) * beta_val;
         float v_new_b = (r_v[1] - sum_hk_b) * beta_val;
         float v_new_c = (r_v[2] - sum_hk_c) * beta_val;
@@ -695,28 +497,4 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
 }
 
 } // extern "C"
-
-#undef H
-#undef HV
-#undef INTERMEDIATE_BATCH_STRIDE
-#undef INTERMEDIATE_TOKEN_STRIDE
-#undef CAKE_GDN_INF
-#undef NUM_MAIN_STAGES
-#undef SCALE
-#undef SMEM_SK_OFF
-#undef SMEM_SK_STAGE_BYTES
-#undef SMEM_SK_STRIDE
-#undef SMEM_SQ_OFF
-#undef SMEM_SQ_STAGE_BYTES
-#undef SMEM_SQ_STRIDE
-#undef SMEM_SSCALAR_OFF
-#undef SMEM_SSCALAR_STAGE_BYTES
-#undef SMEM_SSCALAR_STRIDE
-#undef SMEM_TOTAL
-#undef STRIDED_INPUTS
-#undef THREADS
-#undef T_STEPS
-#undef sK_addr
-#undef sQ_addr
-#undef sScalar_addr
 // clang-format on
