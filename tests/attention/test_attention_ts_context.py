@@ -723,6 +723,8 @@ def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
     allowed_exact_names = {
         # This is caller-owned variable-window metadata, not a tuning control.
         "variable_window_cta_starts",
+        # The VC-Attention-QK16 recipe of a plan, a numerics contract.
+        "vc_config",
     }
     violations = []
     for surface in surfaces:
@@ -867,6 +869,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "window_left",
         "sm_scale",
         "output_scale",
+        "vc_config",
     )
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -886,6 +889,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "out",
         "scale_softmax_log2",
         "output_scale",
+        "vc",
         "validate",
     )
     assert plan_parameters["head_dim_vo"].default is None
@@ -1433,7 +1437,7 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
     empty_i32 = torch.empty(1, dtype=torch.int32)
     wrapper = BatchPrefillTSWrapper()
     wrapper._plan_state = context_module._ContextPlanState(
-        geometry=SimpleNamespace(packed=False, mask_type="dense"),
+        geometry=SimpleNamespace(packed=False, mask_type="dense", vc=None),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         empty_i32=empty_i32,
@@ -1441,6 +1445,7 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
         variable_window_cta_starts=empty_i32,
         compiled=lambda *_args: None,
         policy=(),
+        empty_vc_mu=empty_i32,
     )
 
     with pytest.raises(
