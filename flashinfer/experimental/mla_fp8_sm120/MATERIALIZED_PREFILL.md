@@ -1,5 +1,21 @@
 # SM120 materialized FP8 prefill research integration
 
+## Community-only SGLang publication (2026-10-10)
+
+The paired SGLang release now contains community commit
+29481685462732237d80d86076d6563e1f658102 plus only the optimization commits by
+sjtushenhai <1730536718@qq.com>. The earlier internal baseline overlays are
+excluded from that release. This FlashInfer branch contains community history
+plus the experimental commits by the same author.
+
+The 6.45–6.49 QPS and 51.05–51.99% results below are historical measurements
+from the earlier combined environment. They have **not** been reproduced on
+the community-only SGLang branch and must not be advertised as its verified
+throughput. FlashInfer runtime source is unchanged. CPU integration checks
+cover imports and explicit hook installation, not GPU numerical or service
+performance validation on the new base.
+
+
 This is an explicit local experiment for the SGLang GLM serving workload. It
 does not register a public FlashInfer API, alter automatic dispatch, install a
 package, or replace the existing absorbed-MLA implementation in this directory.
@@ -192,28 +208,29 @@ checkpoint. All owned capacity and diagnostic services have been stopped.
 
 ## Per-item commits (2026-10-10)
 
-Delivery target: sjtushenhai/flashinfer, branch fp8_mla_sm120_dev.
+Delivery target: sjtulizecheng/flashinfer, branch fp8_mla_sm120_dev.
 The commit sequence preserves the measured implementation stages; smaller
 PRMT/reciprocal/softmax/layout commits are separately reviewable but only have
 combined service measurements. Their percentages must not be added.
 
 | Item | Commit |
 | --- | --- |
-| 已有 SHARD_QK 实验（未计收益） | [6483a18e3a](https://github.com/sjtushenhai/flashinfer/commit/6483a18e3a9cc1f361acaa45a1efd40badbbaf75) |
-| 融合 FP8 prefill（K16） | [2d81fdc43f](https://github.com/sjtushenhai/flashinfer/commit/2d81fdc43f4d6b6dce365caa57310f524c3aa93a) |
-| PV K32 指令与对齐加载 | [3e25c2fb95](https://github.com/sjtushenhai/flashinfer/commit/3e25c2fb9533843d84b0eb747563eb621304f3f0) |
-| TMA 搬运与共享内存 swizzle | [28385bf2f0](https://github.com/sjtushenhai/flashinfer/commit/28385bf2f0ff55c41ac2231ef822b66de43aed6c) |
-| PRMT 概率寄存器重排 | [ffad90f628](https://github.com/sjtushenhai/flashinfer/commit/ffad90f628dc96b1a32283fcc1eaf7240c242211) |
-| V scale 近似倒数 | [c896ad61cb](https://github.com/sjtushenhai/flashinfer/commit/c896ad61cbbfff907f73ce7ba035a08fe57975f3) |
-| log2 在线 softmax 与 scale 融合 | [7cfe4cf382](https://github.com/sjtushenhai/flashinfer/commit/7cfe4cf3821de2fed7414fe936ee602935058090) |
-| head-major 临时 QKV 布局 | [d27368d7b6](https://github.com/sjtushenhai/flashinfer/commit/d27368d7b6cd8f58aaf8b3f73adfde205dbd96b4) |
-| 短 K dense FP8 GEMM 调度 | [f05215d47a](https://github.com/sjtushenhai/flashinfer/commit/f05215d47a4208011553fe5a93af0725d8bfd6fa) |
-| 完整块 mask 与 LPT 调度 | [438ee55eec](https://github.com/sjtushenhai/flashinfer/commit/438ee55eecc598a842178f122429a8c3d05a7b10) |
+| 已有 SHARD_QK 实验（未计收益） | [6483a18e3a](https://github.com/sjtulizecheng/flashinfer/commit/6483a18e3a9cc1f361acaa45a1efd40badbbaf75) |
+| 融合 FP8 prefill（K16） | [2d81fdc43f](https://github.com/sjtulizecheng/flashinfer/commit/2d81fdc43f4d6b6dce365caa57310f524c3aa93a) |
+| PV K32 指令与对齐加载 | [3e25c2fb95](https://github.com/sjtulizecheng/flashinfer/commit/3e25c2fb9533843d84b0eb747563eb621304f3f0) |
+| TMA 搬运与共享内存 swizzle | [28385bf2f0](https://github.com/sjtulizecheng/flashinfer/commit/28385bf2f0ff55c41ac2231ef822b66de43aed6c) |
+| PRMT 概率寄存器重排 | [ffad90f628](https://github.com/sjtulizecheng/flashinfer/commit/ffad90f628dc96b1a32283fcc1eaf7240c242211) |
+| V scale 近似倒数 | [c896ad61cb](https://github.com/sjtulizecheng/flashinfer/commit/c896ad61cbbfff907f73ce7ba035a08fe57975f3) |
+| log2 在线 softmax 与 scale 融合 | [7cfe4cf382](https://github.com/sjtulizecheng/flashinfer/commit/7cfe4cf3821de2fed7414fe936ee602935058090) |
+| head-major 临时 QKV 布局 | [d27368d7b6](https://github.com/sjtulizecheng/flashinfer/commit/d27368d7b6cd8f58aaf8b3f73adfde205dbd96b4) |
+| 短 K dense FP8 GEMM 调度 | [f05215d47a](https://github.com/sjtulizecheng/flashinfer/commit/f05215d47a4208011553fe5a93af0725d8bfd6fa) |
+| 完整块 mask 与 LPT 调度 | [438ee55eec](https://github.com/sjtulizecheng/flashinfer/commit/438ee55eecc598a842178f122429a8c3d05a7b10) |
 
 All final runtime and test files match the previously validated workspace
-byte for byte. The paired SGLang implementation is based on b1478c4293,
-with SM120 online NVFP4 support, FA4 one-shot prefix attention and the opt-in
-native FP8 decode changes. A newer SGLang base is not covered by these results.
+byte for byte. The historical measurements used the previous combined SGLang workspace.
+The publication now uses the community-only base stated above, with the
+SM120 online NVFP4, FA4 one-shot prefix and opt-in native FP8 decode patches.
+Historical service performance is not a validation of this changed baseline.
 
 Historical final-source numerical/sanitizer and projection validations are
 retained under tests/experimental/mla_fp8_sm120/results/. Recorded absolute

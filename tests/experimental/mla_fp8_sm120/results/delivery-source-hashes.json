@@ -70,5 +70,8 @@
     "name": "sjtushenhai",
     "email": "1730536718@qq.com"
   },
-  "identity_corrected_on": "2026-10-10"
+  "identity_corrected_on": "2026-10-10",
+  "sglang_publication_base": "29481685462732237d80d86076d6563e1f658102",
+  "sglang_internal_overlays_included": false,
+  "performance_verified_on_community_only_sglang": false
 }
