@@ -15,6 +15,7 @@ from flashinfer.fused_moe import (
     GeGLU,
     GeGLUTanh,
     Identity,
+    PowLU,
     ReLU,
     ReLU2,
     SiLU,
@@ -58,7 +59,11 @@ from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe.runners import MoERunner, _mxfp8_swizzled_act_sf_numel
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
 from flashinfer.fused_moe.utils import map_to_hybrid_bucket
-from tests.moe.utils import fp8_per_tensor_global_scale, fp8_per_tensor_requant_hook
+from tests.moe.utils import (
+    fp8_per_tensor_global_scale,
+    fp8_per_tensor_requant_hook,
+    powlu_ref,
+)
 from flashinfer.utils import (
     get_compute_capability,
     is_sm100a_supported,
@@ -78,6 +83,7 @@ _CUTLASS_ACTIVATIONS = (
     GeGLUTanh(),
     ReLU2(),
     SiTU(),
+    PowLU(),
     Identity(),
     GELU(),
     ReLU(),
@@ -574,6 +580,7 @@ def test_cutlass_mxfp4_linear_quantizer_clamps_finite_extremes():
         (SwiGLUStep(), 512),
         (GeGLUTanh(), 512),
         (SiTU(), 512),
+        (PowLU(), 512),
         (ReLU2(), 256),
         (Identity(), 256),
         (GELU(), 256),
@@ -695,6 +702,75 @@ def test_cutlass_rejects_situ_shapes_its_abi_cannot_express(activation, match):
     runner._device_arch = 100
     with pytest.raises(NotImplementedError, match=match):
         runner.check_support()
+
+
+def test_cutlass_powlu_materializes_only_non_default_scalars():
+    """PowLU rides the generic swiglu_* slots: m in alpha, the clamp in limit.
+
+    PowLUAdaptor's compile-time m equals PowLU()'s, so the default needs no
+    tensor, and an absent limit must stay absent rather than materialize a
+    finite clamp -- PowLU peaks near 4.02, so a wrong finite limit would be
+    silently clipping. beta has no PowLU meaning and must never be filled.
+    """
+    from flashinfer.fused_moe.runners import (
+        _cutlass_activation_params,
+        _cutlass_activation_required_keys,
+    )
+
+    default = _cutlass_activation_params(PowLU(), 4, torch.device("cpu"))
+    assert default["swiglu_alpha"] is None
+    assert default["swiglu_limit"] is None
+    assert _cutlass_activation_required_keys(PowLU()) == frozenset()
+
+    # A tuned m together with a clamp must materialize both slots.
+    tuned = PowLU(m=3.5, limit=7.0)
+    params = _cutlass_activation_params(tuned, 4, torch.device("cpu"))
+    torch.testing.assert_close(params["swiglu_alpha"], torch.full((4,), 3.5))
+    torch.testing.assert_close(params["swiglu_limit"], torch.full((4,), 7.0))
+    assert params["swiglu_beta"] is None
+    assert params["situ_beta"] is None
+    assert _cutlass_activation_required_keys(tuned) == frozenset(
+        ("swiglu_alpha", "swiglu_limit")
+    )
+
+    # A limit alone must not drag m into the view, and vice versa.
+    limit_only = _cutlass_activation_params(PowLU(limit=3.0), 4, torch.device("cpu"))
+    assert limit_only["swiglu_alpha"] is None
+    torch.testing.assert_close(limit_only["swiglu_limit"], torch.full((4,), 3.0))
+    m_only = _cutlass_activation_params(PowLU(m=3.5), 4, torch.device("cpu"))
+    assert m_only["swiglu_limit"] is None
+    torch.testing.assert_close(m_only["swiglu_alpha"], torch.full((4,), 3.5))
+
+
+def test_cutlass_powlu_per_expert_overrides():
+    """Per-expert m and clamp reach the kernel; beta is refused by name.
+
+    A model may give its routed experts one clamp and a fused shared expert
+    another, which only a per-expert tensor can express.
+    """
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config(activation=PowLU(m=3.5, limit=7.0))
+    runner.device = torch.device("cpu")
+
+    limits = torch.tensor([7.0, 7.0, 7.0, 5.0])
+    resolved = runner._resolve_activation_params({"gemm1_clamp_limit": limits})
+    assert resolved["swiglu_limit"] is limits
+    torch.testing.assert_close(resolved["swiglu_alpha"], torch.full((4,), 3.5))
+
+    m_per_expert = torch.full((4,), 2.5)
+    assert (
+        runner._resolve_activation_params({"gemm1_alpha": m_per_expert})["swiglu_alpha"]
+        is m_per_expert
+    )
+
+    with pytest.raises(ValueError, match="does not consume"):
+        runner._resolve_activation_params({"gemm1_beta": torch.zeros(4)})
+
+
+def test_cutlass_powlu_rejects_invalid_scalars():
+    for kwargs in ({"m": 0.0}, {"m": -1.0}, {"limit": 0.0}, {"m": float("inf")}):
+        with pytest.raises(ValueError):
+            PowLU(**kwargs)
 
 
 def test_cutlass_situ_unclamped_linear_fails_legibly():
@@ -1945,6 +2021,14 @@ def _reference(
                     intermediate = (
                         beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
                     ) * (linear_beta * torch.tanh(up / linear_beta))
+                elif isinstance(activation, PowLU):
+                    # PowLUAdaptor: shared reference in tests/moe/utils.py; the
+                    # clamp runs *after* the nonlinearity, as SwiGLUStep does.
+                    activated = powlu_ref(gate, activation.m)
+                    if activation.limit is not None:
+                        activated = activated.clamp(max=activation.limit)
+                        up = up.clamp(min=-activation.limit, max=activation.limit)
+                    intermediate = activated * up
                 else:
                     raise AssertionError(
                         f"unsupported CUTLASS activation {activation!r}"
