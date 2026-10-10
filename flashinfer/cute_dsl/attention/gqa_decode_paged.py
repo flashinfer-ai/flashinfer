@@ -566,6 +566,14 @@ class GroupedQueryAttentionDecodePaged:
         scale_o: Float32,
         log2_threshold_scale_factor: Optional[Float32],
     ):
+        """Warp-specialized GQA decode over a paged KV cache.
+
+        Same pipeline as the contiguous kernel, with K and V tiles gathered through
+        the request's page table: the TMA K warp prefetches each tile's page indices
+        one tile ahead into a ring of ``pt_stages`` shared-memory slots, which the
+        TMA V warp reads ``prefetch_iters`` tiles later. Optional BLASST tile
+        skipping is enabled by ``log2_threshold_scale_factor``.
+        """
         ##############################
         # Static variables
         ##############################

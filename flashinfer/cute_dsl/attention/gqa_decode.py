@@ -550,6 +550,15 @@ class GroupedQueryAttentionDecode:
         scale_s_log2_e: Float32,
         scale_o: Float32,
     ):
+        """Warp-specialized GQA decode over contiguous KV.
+
+        Each CTA handles one (KV split, grouped-head x prediction tile, KV head and
+        batch) block. TMA warps load Q, K and V; MMA warps compute ``S = K Q`` and
+        accumulate ``O += V P`` in tensor memory; softmax warpgroups produce the
+        online-softmax probabilities; the correction warpgroup rescales O as the
+        running max changes; and the reduction warp finalizes colmax and colsum for
+        the configured split-K reduction mode.
+        """
         ##############################
         # Static variables
         ##############################
@@ -1649,6 +1658,14 @@ class GroupedQueryAttentionDecode:
         sSink: Optional[cute.Tensor],
         scale_o: Float32,
     ):
+        """Finalize softmax normalization when there is no split-K reduction.
+
+        Waits for the final colmax and per-warp colsums, adds the attention sink
+        term (relative to the final colmax) when ``sSink`` is set, and writes
+        ``scale_o / colsum`` to ``sM`` for the correction warpgroup. When ``mL`` is
+        given, stores the log2-base LSE for lanes inside the grouped-head and
+        prediction bounds.
+        """
         store_lse = mL is not None
         if cutlass.const_expr(store_lse):
             gL = cute.local_tile(mL, (blk_tile_hp,), (coord_hp, coord_hb))
