@@ -15,12 +15,13 @@ grid of the logits consumers (the device's SM count) as the compile-line definit
 SM count (one JIT build per device SM count). The schedule
 metadata producer is specialised on a query ceiling (tiers `le16`, `le128`, `le2048`,
 `any`), which bounds its prefix arrays and boundary search at compile time; a route name
-carries the tier of its query count. Routes are chosen from host-known scalars only: FP4
-rows run the DeepGEMM-compatible metadata producer and the fused logits/cleanup kernel in
-one prepared submission; FP8 rows with `Q = 1` and `K <= 131072` or `Q = 128` and
-`K <= 4096` produce the metadata inside the logits launch (their cost partition and
-metadata offsets fold on the compile-line SM count exactly as in the shipped kernels); the
-other FP8 rows run the
+carries the tier of its query count. Routes are chosen from host-known scalars only: rows
+with `Q = 1` and `K <= 131072`, and rows of at most 32 query blocks (`Q <= 128`, the `le16`
+and `le128` tiers) with `K <= 1048576` produce the metadata inside the logits launch for
+both precisions (their cost partition and metadata offsets fold on the compile-line SM count
+exactly as in the shipped kernels; the catalog policy carries the bounds);
+the other FP4 rows run the DeepGEMM-compatible metadata producer and the fused
+logits/cleanup kernel in one prepared submission; the other FP8 rows run the
 metadata program followed by the logits program (a `Q % 4 != 0` tail uses the
 partial-block logits program).
 
@@ -114,7 +115,7 @@ without allocating (CUDA Graph replay with changed contents is supported; `plan.
 Tests: `tests/experimental/test_dense_mqa_generated.py` (dense, including the one-shot entry) and
 `tests/experimental/test_paged_mqa_generated.py` (paged; skips while the catalog has no paged routes).
 
-## Catalog schema `dense_mqa.v6` (route records)
+## Catalog schema `dense_mqa.v7` (route records)
 
 `dense_mqa_catalog.json` carries `policy`, `programs`, the dense `routes` and the paged
 `paged_routes`. Policy keys: `heads` (exported head counts), `block_q` (`{"32": 4, "64": 2}`),
@@ -123,7 +124,9 @@ handle the KV tail in-kernel), `max_q_blocks` and `metadata_tier_blocks` (`[4, 3
 query-block ceilings of the 32-head metadata programs, named per head count by their token ceiling, so the
 32-head tiers are `le16 / le128 / le2048 / any` and the 64-head tier names `le8 / le64 / le1024 / any`
 are aliases -- the 64-head routes have no metadata stage and no query bound),
-the shipped 32-head `fused_q1_max_kv` / `fused_q128_max_kv` / `max_q_tokens` / `metadata_tiers`, and
+the shipped 32-head `fused_q1_max_kv` / `fp8_fused_small_q_max_kv` (FP8), `fp4_fused_q1_max_kv` /
+`fp4_fused_small_q_max_kv` (FP4; the small-Q tables are keyed by the metadata block ceiling `"4"` / `"32"`),
+`max_q_tokens` / `metadata_tiers`, and
 `paged` (`heads` -- the paged head counts, independent of the dense `heads`; `block_kv`, `split_kv`,
 `next_n_atoms` -- 1 for every exported `next_n`, the logits programs iterate the atoms in-kernel;
 `max_batch`, `metadata_program`). Every route record
@@ -131,7 +134,8 @@ has `stages` (`[[stage, program], ...]`), `sequence` (a prepared sequence bindin
 `num_heads`, `block_q`, `clean_logits` (`"fused"`: the program writes `-inf` outside each window and in
 the padding, the shipped 32-head programs; `"raw"`: the program stores the computed tiles only, DeepGEMM's
 `clean_logits=False` semantics, the 64-head and paged programs) and `kv_alignment`. Routes: 32 heads
-`fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:<tier>`, `fp4:q1`, `fp4:<tier>`;
+`fp8:q1:short`, `fp8:q1`, `fp8:{full,partial}:{le16,le128}:short`, `fp8:{full,partial}:<tier>`, `fp4:q1:short`, `fp4:q1`,
+`fp4:{le16,le128}:short`, `fp4:<tier>`;
 64 heads `fp8:h64:q1` and `fp8:h64:{full,partial}:<tier>`, each a single `logits` stage -- the
 gridDim-strided `fp8_h64_logits_full` program for `Q % 2 == 0`, `fp8_h64_logits_partial` otherwise
 (including `Q = 1`); no metadata program, launch grid = the SM count (the `SM_COUNT` compile-line

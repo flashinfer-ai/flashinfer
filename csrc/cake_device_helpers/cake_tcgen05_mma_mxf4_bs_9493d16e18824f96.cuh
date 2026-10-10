@@ -22,12 +22,15 @@
 // after its typedefs and the helpers it calls.
 #pragma once
 
-__device__ __forceinline__ void elect_commit(int mbar_addr) {
+__device__ __forceinline__ void tcgen05_mma_mxf4_bs(int taddr, uint64_t a_desc, uint64_t b_desc,
+                                                    uint32_t i_desc, int sfa_taddr, int sfb_taddr,
+                                                    int enable_input_d) {
   asm volatile(
       "{\n\t"
-      ".reg .pred leader;\n\t"
-      "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-      "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-      ".shared::cluster.b64 [%0];\n\t"
-      "}\n" ::"r"(mbar_addr));
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %6, 0;\n\t"
+      "tcgen05.mma.cta_group::1.kind::mxf4.block_scale"
+      " [%0], %1, %2, %3, [%4], [%5], p;\n\t"
+      "}\n" ::"r"(taddr),
+      "l"(a_desc), "l"(b_desc), "r"(i_desc), "r"(sfa_taddr), "r"(sfb_taddr), "r"(enable_input_d));
 }

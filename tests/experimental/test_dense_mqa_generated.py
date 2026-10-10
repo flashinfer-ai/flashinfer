@@ -36,10 +36,12 @@ _FP4_LUT = (
     -6.0,
 )
 
-# The twenty scheduled model rows plus rows outside the old route table: KV
-# lengths never catalogued (2048, 8192, 65536, 1048576 for one query) and query
-# counts that are not 1, 16 or 128 (partial four-query blocks, 33 and 132
-# queries, and 2052/2053 queries on the unbounded metadata tier).
+# The twenty scheduled model rows plus the export's twenty holdout rows (mirrored
+# exactly): KV lengths never catalogued (2048, 8192, 65536, 1048576 for one
+# query, 1048832 = the first 256-multiple beyond the fused small-Q bound, where
+# the two-launch le16 / le128 routes run) and query counts that are not 1, 16 or
+# 128 (partial four-query blocks, 33 and 132 queries, and 2052/2053 queries on
+# the unbounded metadata tier).
 CASES = [
     (precision, queries, keys)
     for precision in ("fp4", "fp8")
@@ -63,12 +65,19 @@ CASES = [
     ("fp8", 16, 2048),
     ("fp8", 128, 2048),
     ("fp8", 1, 1048576),
+    ("fp4", 1, 1048576),
+    ("fp8", 33, 4096),
+    ("fp8", 3, 1048832),
     ("fp8", 130, 8192),
     ("fp4", 2052, 2048),
     ("fp8", 2052, 2048),
     ("fp8", 2053, 2048),
     ("fp8", 132, 2048),
-    ("fp8", 33, 8192),
+    ("fp8", 33, 1048832),
+    ("fp4", 16, 1048832),
+    ("fp4", 33, 1048832),
+    ("fp8", 16, 1048832),
+    ("fp8", 128, 1048832),
 ]
 
 
@@ -259,6 +268,33 @@ def _deep_gemm_check(
     assert torch.equal(plan.metadata[span:], meta[span:])
 
 
+@pytest.mark.parametrize("precision", ["fp4", "fp8"])
+@pytest.mark.parametrize("position", [0, 4096])
+def test_dense_mqa_single_query_empty_window(precision, position):
+    """A single query with an empty window (start == end, 4-aligned, at 0 and at K) takes the
+    fused single-query route's empty-work exit on the admitted devices: every logit is -inf
+    and the metadata records the empty partition."""
+    _skip_unless_exported()
+    keys = 4096
+    q, kv, qs, ks, weights, starts, ends = _inputs(precision, 1, keys)
+    starts.fill_(position)
+    ends.fill_(position)
+    plan = prepare_dense_mqa_logits(
+        precision, q, kv, weights, starts, ends, q_scales=qs, kv_scales=ks
+    )
+    assert plan.route_name == _runtime.route_name(precision, 1, keys)
+    plan.output.fill_(float("nan"))
+    plan.metadata.fill_(0x55555555)
+    plan.run()
+    torch.cuda.synchronize()
+    expected = _reference(precision, q, kv, qs, ks, weights, starts, ends, 1, keys)
+    assert bool(torch.isneginf(expected).all())
+    _check(plan, precision, expected, starts, ends, keys, plan.num_sms)
+    _deep_gemm_check(
+        plan, precision, q, kv, qs, ks, weights, starts, ends, 1, keys, plan.num_sms
+    )
+
+
 @pytest.mark.parametrize("precision,queries,keys", CASES)
 def test_dense_mqa_logits(precision, queries, keys):
     _skip_unless_exported()
@@ -309,19 +345,36 @@ def test_dense_mqa_logits(precision, queries, keys):
 @pytest.mark.parametrize(
     "precision,queries,keys,route",
     [
-        ("fp4", 1, 4096, "fp4:q1"),
-        ("fp4", 16, 1048576, "fp4:le16"),
-        ("fp4", 7, 2048, "fp4:le16"),
-        ("fp4", 17, 2048, "fp4:le128"),
+        ("fp4", 1, 4096, "fp4:q1:short"),
+        ("fp4", 1, 131072, "fp4:q1:short"),
+        ("fp4", 1, 131328, "fp4:q1"),
+        ("fp4", 16, 131072, "fp4:le16:short"),
+        ("fp4", 16, 1048576, "fp4:le16:short"),
+        ("fp4", 16, 1048832, "fp4:le16"),
+        ("fp4", 7, 2048, "fp4:le16:short"),
+        ("fp4", 17, 2048, "fp4:le128:short"),
+        ("fp4", 17, 8192, "fp4:le128:short"),
+        ("fp4", 17, 1048576, "fp4:le128:short"),
+        ("fp4", 17, 1048832, "fp4:le128"),
+        ("fp4", 33, 1048832, "fp4:le128"),
         ("fp4", 130, 65536, "fp4:le2048"),
         ("fp4", 2049, 4096, "fp4:any"),
         ("fp8", 1, 4096, "fp8:q1:short"),
         ("fp8", 1, 131072, "fp8:q1:short"),
         ("fp8", 1, 131328, "fp8:q1"),
-        ("fp8", 128, 4096, "fp8:q128:short"),
-        ("fp8", 128, 4352, "fp8:full:le128"),
-        ("fp8", 16, 2048, "fp8:full:le16"),
-        ("fp8", 3, 8192, "fp8:partial:le16"),
+        ("fp8", 128, 4096, "fp8:full:le128:short"),
+        ("fp8", 128, 4352, "fp8:full:le128:short"),
+        ("fp8", 128, 1048576, "fp8:full:le128:short"),
+        ("fp8", 128, 1048832, "fp8:full:le128"),
+        ("fp8", 16, 2048, "fp8:full:le16:short"),
+        ("fp8", 16, 131328, "fp8:full:le16:short"),
+        ("fp8", 16, 1048832, "fp8:full:le16"),
+        ("fp8", 3, 8192, "fp8:partial:le16:short"),
+        ("fp8", 3, 262144, "fp8:partial:le16:short"),
+        ("fp8", 3, 1048832, "fp8:partial:le16"),
+        ("fp8", 33, 4096, "fp8:partial:le128:short"),
+        ("fp8", 33, 8192, "fp8:partial:le128:short"),
+        ("fp8", 33, 1048832, "fp8:partial:le128"),
         ("fp8", 130, 8192, "fp8:partial:le2048"),
     ],
 )
@@ -380,7 +433,7 @@ def test_dense_route_table_is_catalog_driven():
     """Host-only: the 32-head names are unchanged, other head counts carry the
     ``h<H>`` infix with tiers named by their token ceiling, and availability
     (including the per-head KV alignment) is the catalog's word."""
-    assert _runtime.route_name("fp8", 16, 4096) == "fp8:full:le16"
+    assert _runtime.route_name("fp8", 16, 4096) == "fp8:full:le16:short"
     assert _runtime.route_name("fp8", 1, 4096) == "fp8:q1:short"
     assert _runtime.route_name("fp8", 130, 8192) == "fp8:partial:le2048"
     assert _runtime.dense_route_available(32, 16, 4096)
@@ -683,24 +736,34 @@ def test_h64_admission_matches_the_catalog_table():
 
 
 def _route_point(route_name, record):
-    """A legal ``(queries, keys)`` of one dense route: the KV length that selects the
-    route's KV range (``:short`` fused routes below their ceiling, the non-fused
-    ``fp8:q1`` above ``fused_q1_max_kv``, the 64-head routes any length) and the
-    smallest query count the router maps to the route name."""
+    """A legal ``(queries, keys)`` of one dense route: the smallest query count the
+    router maps to the route name at the first KV length of a short candidate list
+    that selects the route's KV range. Candidates: 300 for the 64-head routes (any
+    length, in-kernel tail), then 512 (the ``:short`` fused routes and the routes
+    without a fused twin) and every fused ceiling of the catalog policy plus 256
+    (the non-fused twins -- ``fp8:q1`` above ``fused_q1_max_kv``, ``fp4:q1`` above
+    ``fp4_fused_q1_max_kv``, the ``le16`` / ``le128`` tiers above their small-Q
+    fusion ceilings), so the helper follows the policy instead of assuming a
+    fixed KV length per route."""
     policy = _runtime._catalog()["policy"]
     precision = route_name.split(":")[0]
     num_heads = int(record["num_heads"])
-    if route_name.endswith(":short"):
-        keys = 512
-    elif route_name == "fp8:q1":
-        keys = int(policy["fused_q1_max_kv"]) + 256
+    if num_heads != _runtime.NUM_HEADS:
+        candidates = [300]
     else:
-        keys = 512 if num_heads == _runtime.NUM_HEADS else 300
-    for queries in range(1, 4200):
-        if _runtime.route_name(precision, queries, keys, num_heads) == route_name:
-            return queries, keys
+        ceilings = {int(policy["fused_q1_max_kv"]), int(policy["fp4_fused_q1_max_kv"])}
+        for table in (
+            policy["fp4_fused_small_q_max_kv"],
+            policy["fp8_fused_small_q_max_kv"],
+        ):
+            ceilings.update(int(v) for v in table.values())
+        candidates = [512] + sorted(c + 256 for c in ceilings if c > 0)
+    for keys in candidates:
+        for queries in range(1, 4200):
+            if _runtime.route_name(precision, queries, keys, num_heads) == route_name:
+                return queries, keys
     raise AssertionError(
-        f"no query count in 1..4199 selects {route_name} at K = {keys}"
+        f"no query count in 1..4199 selects {route_name} at K in {candidates}"
     )
 
 

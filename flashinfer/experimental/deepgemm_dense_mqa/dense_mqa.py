@@ -26,7 +26,7 @@ import json
 from pathlib import Path
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-CATALOG_SCHEMA = "dense_mqa.v6"
+CATALOG_SCHEMA = "dense_mqa.v7"
 NUM_HEADS = 32  # default head count of the public helpers
 BLOCK_QH = 128  # query rows x heads per MMA tile
 BLOCK_Q = BLOCK_QH // NUM_HEADS
@@ -172,23 +172,39 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
         raise ValueError("precision must be 'fp4' or 'fp8'")
     prefix = _route_prefix(precision, num_heads)
     if precision == "fp4":
-        return (
-            f"{prefix}:q1"
-            if queries == 1
-            else f"{prefix}:{metadata_tier(queries, num_heads)}"
-        )
+        if queries == 1:
+            if num_heads == NUM_HEADS and keys <= policy["fp4_fused_q1_max_kv"]:
+                return f"{prefix}:q1:short"
+            return f"{prefix}:q1"
+        tier = metadata_tier(queries, num_heads)
+        if num_heads == NUM_HEADS and keys <= _fused_small_q_bound(
+            policy["fp4_fused_small_q_max_kv"], queries, num_heads
+        ):
+            return f"{prefix}:{tier}:short"
+        return f"{prefix}:{tier}"
     if queries == 1:
         if num_heads == NUM_HEADS and keys <= policy["fused_q1_max_kv"]:
             return f"{prefix}:q1:short"
         return f"{prefix}:q1"
-    if (
-        num_heads == NUM_HEADS
-        and queries == 128
-        and keys <= policy["fused_q128_max_kv"]
-    ):
-        return f"{prefix}:q128:short"
     kind = "full" if queries % block_q(num_heads) == 0 else "partial"
-    return f"{prefix}:{kind}:{metadata_tier(queries, num_heads)}"
+    tier = metadata_tier(queries, num_heads)
+    if num_heads == NUM_HEADS and keys <= _fused_small_q_bound(
+        policy["fp8_fused_small_q_max_kv"], queries, num_heads
+    ):
+        return f"{prefix}:{kind}:{tier}:short"
+    return f"{prefix}:{kind}:{tier}"
+
+
+def _fused_small_q_bound(table, queries, num_heads):
+    """KV bound of the small-Q metadata fusion for a query count: the catalog table is keyed by the
+    metadata block ceiling (``"4"`` = at most 16 queries, ``"32"`` = at most 128 at 32 heads); 0 when
+    the ceiling is not admitted (shapes above 32 blocks never fuse)."""
+    bq = block_q(num_heads)
+    blocks = (queries + bq - 1) // bq
+    for ceiling in (4, 32):
+        if blocks <= ceiling:
+            return int(table.get(str(ceiling), 0))
+    return 0
 
 
 def kv_alignment(num_heads=NUM_HEADS):
@@ -643,7 +659,7 @@ class DenseMqaPlan:
                 f"FP4 output backing storage must include the final {bq}-row tile"
             )
         # The metadata buffer belongs to the head count's schedule, not to the route's stage list: the
-        # shipped 32-head fused routes (fp8:q1:short / fp8:q128:short) have no metadata stage yet WRITE
+        # shipped 32-head fused routes (*:q1:short and the small-Q *:<tier>:short routes) have no metadata stage yet WRITE
         # their schedule into ScheduleMeta in-kernel, so every 32-head plan owns the buffer; the 64-head
         # programs never touch it (ScheduleMeta bound to ks).
         if schedules_metadata(num_heads):

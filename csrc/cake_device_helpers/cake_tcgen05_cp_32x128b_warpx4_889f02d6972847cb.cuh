@@ -22,12 +22,6 @@
 // after its typedefs and the helpers it calls.
 #pragma once
 
-__device__ __forceinline__ void elect_commit(int mbar_addr) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred leader;\n\t"
-      "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-      "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-      ".shared::cluster.b64 [%0];\n\t"
-      "}\n" ::"r"(mbar_addr));
+__device__ __forceinline__ void tcgen05_cp_32x128b_warpx4(int taddr, uint64_t s_desc) {
+  asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;" ::"r"(taddr), "l"(s_desc));
 }
