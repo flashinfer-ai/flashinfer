@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from ..._lib.gating import default_is_supported
+from ..._lib.scratch import scratch_tensor
 from ...preparation.types import FrozenMapping, Plan, require_prepared
 from . import META
 from ._compat import Caps
@@ -181,7 +182,13 @@ def bind(plan: Plan, **kwargs: Any) -> Binding:
     if isinstance(plan, TPMoEScratchPlan):
         return plan.bind(**kwargs)
     state = require_prepared(plan, "moe.decode")
-    return replace(state.bind(**kwargs), plan=plan)
+    scratch = scratch_tensor(kwargs["scratch"], plan.scratch_specs(), owner="TP MoE")
+    return replace(
+        state.bind(**kwargs),
+        plan=plan,
+        compiler_scratch=scratch,
+        compiler_a4_prefill=kwargs.get("a4_prefill"),
+    )
 
 
 def run(*, binding: Binding):
@@ -189,6 +196,38 @@ def run(*, binding: Binding):
     plan = binding.plan
     if plan is not None:
         require_prepared(plan, "moe.decode", binding.a.device)
+    if (
+        plan is not None
+        and binding.compiler_scratch is not None
+        and binding.output is not None
+    ):
+        from torch.fx.experimental.proxy_tensor import get_proxy_mode
+
+        if torch.compiler.is_compiling() or get_proxy_mode() is not None:
+            from ._binding_ops import prepared_moe_out
+
+            output = (
+                binding.output_cast_target
+                if binding.output_cast_target is not None
+                else binding.output
+            )
+            prepared_moe_out(
+                binding.a,
+                binding.topk_weights,
+                binding.topk_ids,
+                output,
+                binding.compiler_scratch,
+                plan._handle,
+                binding.input_scales_static,
+                binding.fast_math,
+                binding.activation_amax,
+                binding.layer_idx,
+                binding.route_expert_map,
+                binding.output_expert_map,
+                binding.scales_expanded,
+                binding.compiler_a4_prefill,
+            )
+            return output
     return _run(binding=binding)
 
 
@@ -285,8 +324,14 @@ def route_topk(
     if kwargs:
         raise TypeError(f"unexpected route_topk arguments: {', '.join(kwargs)}")
     route_topk_out(
-        router_logits, topk_logits, topk_ids, topk_weights, plan.handle,
-        correction_bias, image_correction_bias, image_mask,
+        router_logits,
+        topk_logits,
+        topk_ids,
+        topk_weights,
+        plan.handle,
+        correction_bias,
+        image_correction_bias,
+        image_mask,
     )
 
 

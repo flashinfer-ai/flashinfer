@@ -1306,9 +1306,13 @@ class TPMoEFP4Binding:
     w4a8_csf_inline: bool = False
     mixed_trellis_binding: object | None = None
     mixed_trellis_buffers: object | None = None
+    compiler_scratch: torch.Tensor | None = None
+    compiler_a4_prefill: bool | None = None
 
     def run(self) -> torch.Tensor:
-        return b12x_moe_fp4(binding=self)
+        from .api import run
+
+        return run(binding=self)
 
 
 @dataclass(frozen=True, kw_only=True)

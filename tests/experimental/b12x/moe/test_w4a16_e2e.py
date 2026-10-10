@@ -222,11 +222,21 @@ def test_w4a16_prefill_reduction_prepared_capacity_and_graph(
             _assert_matches_oracle(actual, oracle, activation="silu")
             launchers.add(id(binding.fused_launch))
         assert len(launchers) == 1
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        traced = make_fx(
+            lambda: binding.run(), tracing_mode="fake", _allow_non_fake_inputs=True
+        )()
+        assert any(
+            node.target is torch.ops.b12x.prepared_moe_out.default
+            for node in traced.graph.nodes
+        )
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
-            captured = binding.run()
+            captured = traced()
         for factor in (-0.5, 2.0):
             x.mul_(factor)
+            ids.random_(0, experts)
             oracle = expected(capacity - 1)
             for tensor in scratch:
                 tensor.fill_(255)
