@@ -16,6 +16,7 @@ def _quant_q(
     S0: tl.constexpr,
     S1: tl.constexpr,
     T,
+    TOKENS,
     BN: tl.constexpr,
 ):
     block, head, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -27,7 +28,7 @@ def _quant_q(
     ).to(tl.float32)
     scale = tl.maximum(tl.max(tl.max(tl.abs(x), 1), 0) / 448.0, 1.0e-12)
     tl.store(
-        Y + row[:, None] * H * D + head * D + col[None, :],
+        Y + row[:, None] * D + head * TOKENS * D + col[None, :],
         (x / scale).to(tl.float8e4nv),
         row[:, None] < end,
     )
@@ -53,6 +54,7 @@ def _concat_quant_kv(
     VS0: tl.constexpr,
     VS1: tl.constexpr,
     T,
+    TOKENS,
     BN: tl.constexpr,
 ):
     block, head, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -72,7 +74,7 @@ def _concat_quant_kv(
     k = kn + kr
     sk = tl.maximum(tl.max(tl.max(tl.abs(k), 1), 0) / 448.0, 1.0e-12)
     tl.store(
-        K8 + row[:, None] * H * D + head * D + col[None, :],
+        K8 + row[:, None] * D + head * TOKENS * D + col[None, :],
         (k / sk).to(tl.float8e4nv),
         row[:, None] < end,
     )
@@ -82,7 +84,7 @@ def _concat_quant_kv(
     ).to(tl.float32)
     sv = tl.maximum(tl.max(tl.max(tl.abs(v), 1), 0) / 448.0, 1.0e-12)
     tl.store(
-        V8 + row[:, None] * H * D + head * D + col[None, :],
+        V8 + row[:, None] * D + head * TOKENS * D + col[None, :],
         (v / sv).to(tl.float8e4nv),
         row[:, None] < end,
     )
@@ -97,14 +99,29 @@ def prepare(q, k_nope, k_rope, v, cu_q, cu_k, max_q, max_k, tile_m=128, tile_n=6
     assert cu_q.numel() == cu_k.numel()
     b, h = cu_q.numel() - 1, q.shape[1]
     tq, tk = max(1, triton.cdiv(max_q, tile_m)), max(1, triton.cdiv(max_k, tile_n))
-    q8 = torch.empty(q.shape, device=q.device, dtype=torch.float8_e4m3fn)
-    k8 = torch.empty(v.shape, device=v.device, dtype=torch.float8_e4m3fn)
+    q8 = torch.empty(
+        (h, q.shape[0], 256), device=q.device, dtype=torch.float8_e4m3fn
+    ).transpose(0, 1)
+    k8 = torch.empty(
+        (h, v.shape[0], 256), device=v.device, dtype=torch.float8_e4m3fn
+    ).transpose(0, 1)
     v8 = torch.empty_like(k8)
     sq = torch.empty((b, h, tq), device=q.device, dtype=torch.float32)
     sk = torch.empty((b, h, tk), device=q.device, dtype=torch.float32)
     sv = torch.empty_like(sk)
     _quant_q[(tq, h, b)](
-        q, cu_q, q8, sq, h, 256, q.stride(0), q.stride(1), tq, tile_m, num_warps=8
+        q,
+        cu_q,
+        q8,
+        sq,
+        h,
+        256,
+        q.stride(0),
+        q.stride(1),
+        tq,
+        q.shape[0],
+        tile_m,
+        num_warps=8,
     )
     _concat_quant_kv[(tk, h, b)](
         k_nope,
@@ -124,6 +141,7 @@ def prepare(q, k_nope, k_rope, v, cu_q, cu_k, max_q, max_k, tile_m=128, tile_n=6
         v.stride(0),
         v.stride(1),
         tk,
+        v.shape[0],
         tile_n,
         num_warps=8,
     )
