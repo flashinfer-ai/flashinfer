@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MNNVL column all-gather fused with a gated residual and the next RMSNorm.
+"""MNNVL column all-gathers fused into the consumer of the gathered rows.
 
 Each TP rank holds the same tokens and a contiguous ``[M, H/TP]`` block of
-columns (for example a column-sharded output projection). The op gathers the
-blocks in rank order and runs the residual boundary of
-``flashinfer.norm.gated_residual_next_rmsnorm`` on the full rows, without
-materializing the gathered ``[M, H]`` tensor. It is two kernels (LL publish,
-then gather + dual norm) over a dedicated LL mailbox.
+columns (for example a column-sharded output projection). Each op gathers the
+blocks in rank order and runs its consumer on the full rows, without
+materializing the gathered ``[M, H]`` tensor: either the residual boundary of
+``flashinfer.norm.gated_residual_next_rmsnorm`` or an RMSNorm followed by
+NVFP4 quantization. Each is two kernels (LL publish, then gather + consumer)
+over a dedicated LL mailbox.
 """
 
 from __future__ import annotations
@@ -34,12 +35,19 @@ from .mnnvl_cutedsl.kernel_ll.all_gather_dual_norm import (
     LLAllGatherDualNormTuning,
     _NormConstants,
 )
+from .mnnvl_cutedsl.kernel_ll.all_gather_norm_quant import (
+    LLAllGatherNormQuant,
+    _NormQuantConstants,
+)
 
 __all__ = [
     "LLAllGatherDualNormTuning",
     "MNNVLCuteDSLAllGatherDualNormWorkspace",
+    "MNNVLCuteDSLAllGatherNormQuantWorkspace",
     "all_gather_gated_residual_next_rmsnorm",
+    "all_gather_rmsnorm_fp4_quantize",
     "supports_all_gather_gated_residual_next_rmsnorm",
+    "supports_all_gather_rmsnorm_fp4_quantize",
 ]
 
 
@@ -223,3 +231,129 @@ def all_gather_gated_residual_next_rmsnorm(
         post_weight=post_weight,
     )
     return residual_out, ffn_input
+
+
+class MNNVLCuteDSLAllGatherNormQuantWorkspace:
+    """Mailbox, stage state and compiled kernels for one TP group.
+
+    Construction is collective over ``group``. Compile every constant set
+    with :meth:`compile` before CUDA graph capture. Calls must not overlap.
+    """
+
+    def __init__(
+        self,
+        tp_size: int,
+        tp_rank: int,
+        max_token_num: int,
+        hidden_dim: int,
+        *,
+        group: ProcessGroup,
+        enable_pdl: bool = True,
+    ) -> None:
+        if tp_size not in (2, 4, 8):
+            raise ValueError("tp_size must be 2, 4, or 8")
+        if max_token_num <= 0:
+            raise ValueError("max_token_num must be positive")
+        self.device = require_mnnvl_multicast_device()
+        self.tp_size = tp_size
+        self.max_token_num = max_token_num
+        self.hidden_dim = hidden_dim
+        self._group = group
+        self._impl: LLAllGatherNormQuant | None = LLAllGatherNormQuant(
+            hidden_size=hidden_dim,
+            tp_size=tp_size,
+            rank=tp_rank,
+            capacity_m=max_token_num,
+            group=group,
+            enable_pdl=enable_pdl,
+        )
+
+    @property
+    def impl(self) -> LLAllGatherNormQuant:
+        if self._impl is None:
+            raise RuntimeError("workspace has been destroyed")
+        return self._impl
+
+    def destroy(self) -> None:
+        """Release the mailbox once in-flight work on every rank is done."""
+        if self._impl is not None:
+            torch.cuda.synchronize(self.device)
+            dist.barrier(self._group)
+            self._impl = None
+
+    def compile(self, *, eps: float, gain_center: float = 0.0) -> None:
+        """Compile one constant set ahead of time, e.g. before graph capture."""
+        self.impl.compiled(_NormQuantConstants(float(eps), float(gain_center)))
+
+
+def supports_all_gather_rmsnorm_fp4_quantize(
+    workspace: MNNVLCuteDSLAllGatherNormQuantWorkspace,
+    shard: torch.Tensor,
+    weight: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> bool:
+    """Whether this call fits the workspace; identical on every rank for equal M."""
+    hidden = workspace.hidden_dim
+    device = workspace.device
+    m = shard.shape[0] if shard.ndim == 2 else 0
+    return (
+        1 <= m <= workspace.max_token_num
+        and shard.shape[1] == hidden // workspace.tp_size
+        and shard.dtype == torch.bfloat16
+        and is_dense_on(shard, device, 16)
+        and weight.shape == (hidden,)
+        and weight.dtype == torch.bfloat16
+        and is_dense_on(weight, device, 16)
+        and global_scale.numel() == 1
+        and global_scale.dtype == torch.float32
+        and is_dense_on(global_scale, device, 4)
+    )
+
+
+def all_gather_rmsnorm_fp4_quantize(
+    shard: torch.Tensor,
+    weight: torch.Tensor,
+    global_scale: torch.Tensor,
+    workspace: MNNVLCuteDSLAllGatherNormQuantWorkspace,
+    *,
+    eps: float,
+    gain_center: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather column shards across TP, then RMSNorm and NVFP4-quantize the rows.
+
+    With ``x = concat_r(shard[r], dim=1)``::
+
+        y = bf16(x * rsqrt(mean(x**2) + eps) * (weight + gain_center))
+        packed, scales = fp4_quantize(
+            y, global_scale, sf_vec_size=16, is_sf_swizzled_layout=False
+        )
+
+    Args:
+        shard: ``[M, H/TP]`` BF16 columns ``[rank*H/TP, (rank+1)*H/TP)``.
+        weight: ``[H]`` BF16 RMSNorm weight.
+        global_scale: ``[1]`` FP32 NVFP4 global scale.
+        workspace: Workspace created on every rank of the TP group.
+        eps: RMSNorm epsilon.
+        gain_center: Constant added to ``weight``.
+
+    Returns:
+        ``(packed, scales)``: ``[M, H/2]`` uint8 E2M1 pairs and ``[M, H/16]``
+        uint8 E4M3 block scales in linear layout.
+    """
+    if not supports_all_gather_rmsnorm_fp4_quantize(
+        workspace, shard, weight, global_scale
+    ):
+        raise ValueError("unsupported all-gather RMSNorm FP4 quantize arguments")
+    m = shard.shape[0]
+    hidden = workspace.hidden_dim
+    packed = torch.empty((m, hidden // 2), dtype=torch.uint8, device=shard.device)
+    scales = torch.empty((m, hidden // 16), dtype=torch.uint8, device=shard.device)
+    workspace.impl(
+        shard,
+        weight,
+        global_scale.reshape(1),
+        packed,
+        scales,
+        constants=_NormQuantConstants(float(eps), float(gain_center)),
+    )
+    return packed, scales

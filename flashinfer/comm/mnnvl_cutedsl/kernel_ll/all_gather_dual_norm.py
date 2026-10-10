@@ -119,6 +119,54 @@ def _cluster_row_sum(
     return total
 
 
+@cute.jit
+def poll_owned_fragment(
+    mailbox: cute.Tensor,
+    stage_state: cute.Tensor,
+    packed: cute.Tensor,
+    token: Int32,
+    fragment: Int32,
+    tp: cutlass.Constexpr[int],
+    capacity_m: cutlass.Constexpr[int],
+    hidden_local: cutlass.Constexpr[int],
+    enable_pdl: cutlass.Constexpr[bool],
+) -> None:
+    """Wait for this token's 8 global columns ``fragment`` from their owner.
+
+    Stores the BF16x8 fragment into ``packed``, re-arms the mailbox slot,
+    advances the stage once per call and releases PDL dependents.
+    """
+    local_fragments = hidden_local // VEC_BF16
+    active_stage = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
+    # Each global column has exactly one owner; read it from that slot only.
+    source_rank = fragment // local_fragments
+    local_fragment = fragment % local_fragments
+    source_element = (
+        (Int64(active_stage) * tp + Int64(source_rank)) * capacity_m + Int64(token)
+    ) * hidden_local + Int64(local_fragment) * VEC_BF16
+    source_pointer = cute.make_ptr(
+        BFloat16,
+        (mailbox.iterator + source_element).llvm_ptr,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    # Always true; a runtime value keeps the poll a device loop.
+    dirty = fragment >= Int32(0)
+    while dirty:
+        value = load_global_u32x4(source_pointer, volatile=True)
+        dirty = fragment_has_negative_zero(value)
+        packed.store(value)
+
+    if token == 0 and fragment == 0:
+        store_global_u32(
+            stage_state.iterator + NEXT_STAGE,
+            (active_stage + Uint32(1)) % Uint32(LAMPORT_GENERATIONS),
+        )
+    if cutlass.const_expr(enable_pdl):
+        cute.arch.griddepcontrol_launch_dependents()
+    store_lamport_sentinel_u32x4(Int64(source_pointer.toint()))
+
+
 class _AllGatherDualNormDeviceKernel:
     def __init__(
         self,
@@ -140,7 +188,6 @@ class _AllGatherDualNormDeviceKernel:
         self.hidden = hidden
         self.tp = tp
         self.hidden_local = hidden // tp
-        self.local_fragments = self.hidden_local // VEC_BF16
         self.capacity_m = capacity_m
         self.cluster_size = cluster_size
         self.threads = threads
@@ -224,36 +271,18 @@ class _AllGatherDualNormDeviceKernel:
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
 
-        active_stage = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
-        # Each global column has exactly one owner; read it from that slot only.
-        source_rank = fragment // self.local_fragments
-        local_fragment = fragment % self.local_fragments
-        source_element = (
-            (Int64(active_stage) * self.tp + Int64(source_rank)) * self.capacity_m
-            + Int64(token)
-        ) * self.hidden_local + Int64(local_fragment) * VEC_BF16
-        source_pointer = cute.make_ptr(
-            BFloat16,
-            (contribution_mailbox.iterator + source_element).llvm_ptr,
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
         branch_packed = cute.make_rmem_tensor(cute.make_layout((4,)), Uint32)
-        # Always true; a runtime value keeps the poll a device loop.
-        dirty = fragment >= Int32(0)
-        while dirty:
-            packed = load_global_u32x4(source_pointer, volatile=True)
-            dirty = fragment_has_negative_zero(packed)
-            branch_packed.store(packed)
-
-        if token == 0 and cluster_rank == 0 and tidx == 0:
-            store_global_u32(
-                stage_state.iterator + NEXT_STAGE,
-                (active_stage + Uint32(1)) % Uint32(LAMPORT_GENERATIONS),
-            )
-        if cutlass.const_expr(self.enable_pdl):
-            cute.arch.griddepcontrol_launch_dependents()
-        store_lamport_sentinel_u32x4(Int64(source_pointer.toint()))
+        poll_owned_fragment(
+            contribution_mailbox,
+            stage_state,
+            branch_packed,
+            token,
+            fragment,
+            self.tp,
+            self.capacity_m,
+            self.hidden_local,
+            self.enable_pdl,
+        )
 
         smem = cutlass.utils.SmemAllocator()
         post_slots = smem.allocate_array(Float32, self.cluster_size * self.warps)
