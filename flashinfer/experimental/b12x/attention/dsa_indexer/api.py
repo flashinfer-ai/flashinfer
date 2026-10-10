@@ -262,14 +262,23 @@ def run(binding: Binding) -> torch.Tensor:
     )
     if isinstance(state, MXFP4PreparedState):
         return state.run(binding.runtime)
-    return state.run(
-        binding.runtime,
-        q_fp8=binding.q_fp8,
-        query_weights=binding.query_weights,
-        index_k_cache=binding.index_k_cache,
-        output_indices=binding.output_indices,
-        output_scores=binding.output_scores,
+    from ._ops import select
+
+    runtime = binding.runtime
+    select(
+        binding.q_fp8,
+        binding.query_weights,
+        binding.index_k_cache,
+        runtime.real_page_table,
+        runtime.cache_seqlens_int32,
+        runtime.active_width,
+        runtime.schedule_metadata,
+        runtime.scratch.shared_scratch,
+        binding.output_indices,
+        binding.output_scores,
+        binding.plan.handle,
     )
+    return binding.output_indices
 
 
 def score(binding: Binding) -> torch.Tensor:

@@ -16,6 +16,10 @@ The production paged DSA lifecycle is ``plan(Caps(...), invocation=...)`` →
 ``PreparationSession.prepare`` → ``bind(Plan, ...)`` → ``run``.
 Declarations carry no executable layout, CUDA allocation, or policy result.
 Lower-level scorer and selector stages are private implementation facets.
+Prepared FP8 execution is opaque to ``torch.compile`` with explicit input,
+output and scratch operands. Fused selection resets merge counters each call
+so caller-owned scratch can be reused by serialized operators. Its unused
+score output occupies planned scratch without a per-call allocation.
 
 Pure-torch semantics live in ``reference.py`` and ``msa_reference.py``.
 """
