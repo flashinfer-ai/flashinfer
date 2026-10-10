@@ -69,7 +69,8 @@ class SageAttentionParams:
     :class:`SageAttentionConfig`: ``q_scale`` is
     ``[Hq, flat_scale_numel(B, Sq, q_block_size)]``, ``k_scale`` is
     ``[Hkv, flat_scale_numel(B, Skv, k_block_size)]``, and ``v_scale`` and
-    ``v_mean`` are ``[Hkv, D]``. ``k_summary_scale`` holds the scales of the
+    ``v_mean`` are ``[B, Hkv, D]``, one per-channel row per batch entry and
+    KV head. ``k_summary_scale`` holds the scales of the
     K summaries of a proxy plan,
     ``[Hkv, flat_scale_numel(B, num_kv_blocks, k_summary_block_size)]``.
     ``v_mean`` and ``k_summary_scale`` are present exactly when the plan uses
@@ -123,7 +124,7 @@ def _validate_scale_tensor(
     tensor: torch.Tensor,
     name: str,
     *,
-    expected_shape: tuple[int, int],
+    expected_shape: tuple[int, ...],
     device: torch.device,
 ) -> None:
     if not isinstance(tensor, torch.Tensor):
@@ -152,7 +153,7 @@ def sage_scale_shapes(
     num_kv_heads: int,
     head_dim: int,
     summary_seq_len: int | None = None,
-) -> dict[str, tuple[int, int]]:
+) -> dict[str, tuple[int, ...]]:
     """Return the shape of every scale tensor a plan consumes, by field name.
 
     ``summary_seq_len`` is the KV block count of a proxy plan and ``None``
@@ -167,7 +168,7 @@ def sage_scale_shapes(
             num_kv_heads,
             flat_scale_numel(batch_size, seq_len_kv, config.k_block_size),
         ),
-        "v_scale": (num_kv_heads, head_dim),
+        "v_scale": (batch_size, num_kv_heads, head_dim),
     }
     if summary_seq_len is not None:
         shapes["k_summary_scale"] = (
@@ -175,13 +176,13 @@ def sage_scale_shapes(
             flat_scale_numel(batch_size, summary_seq_len, config.k_summary_block_size),
         )
     if config.v_mean:
-        shapes["v_mean"] = (num_kv_heads, head_dim)
+        shapes["v_mean"] = (batch_size, num_kv_heads, head_dim)
     return shapes
 
 
 def validate_sage_params(
     params: SageAttentionParams,
-    expected_shapes: Mapping[str, tuple[int, int]],
+    expected_shapes: Mapping[str, tuple[int, ...]],
     *,
     device: torch.device,
 ) -> None:

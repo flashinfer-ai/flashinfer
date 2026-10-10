@@ -35,6 +35,11 @@ from ..._block_sparse.common import (
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
+from ..._block_sparse.prepared import (
+    _SAGE_ATOM_MIN_WORDS,
+    _SAGE_ATOM_TOKENS,
+    _SageScaleLayout,
+)
 from ...split_kv_mode_policy import select_split_kv_modes
 from ..tcgen05_compat import ldtm_stat_supported
 from .fmha_decode_constants import (
@@ -1967,6 +1972,9 @@ class FmhaDecodeConfig:
                 "Sage attention requires a two-instance Keeps profile: "
                 "Q64/KV256 or Q128/KV128"
             )
+        if not self.groups_tokens_heads_q:
+            # The prepared ``sfQ`` rows follow the grouped Q tile rows.
+            raise ValueError("Sage attention requires groups_tokens_heads_q=True")
         if self.use_paged_kv or self.headdim != 128:
             raise ValueError("Sage attention requires contiguous K/V with headdim=128")
         # Only the direct output store applies the V channel scales and means;
@@ -2480,6 +2488,59 @@ class FmhaDecodeConfig:
     def softmax_num_warps(self, inst_id: int) -> int:
         """Return the warps of one softmax instance."""
         return self.softmax0_num_warps if inst_id == 0 else self.softmax1_num_warps
+
+    def sage_k_scale_block_size(self, proxy: bool = False) -> int:
+        """Return the K block size of the ``sfK`` words one route kind reads.
+
+        A plan's route kinds read one geometry wherever both read words in
+        the P pass: the finer of the K and summary block sizes, and the
+        prepared scales repeat the coarser kind's (``_SageScaleLayout``). A
+        P loop per kind would cost more than the repeated words: its second
+        copy of the loop spills the softmax warps' registers. One-token
+        summary scales are the exception: the max pass dequantizes a proxy
+        route's scores, so the P pass reads exact words only and each kind
+        keeps its own block size.
+        """
+        if not self.use_block_sparse_proxy_routes:
+            return self.sage_k_block_size
+        if self.sage_k_summary_block_size == 1:
+            return 1 if proxy else self.sage_k_block_size
+        return min(self.sage_k_block_size, self.sage_k_summary_block_size)
+
+    def sage_scale_layout(self, seq_len_kv: int) -> _SageScaleLayout:
+        """Return the layout of the Sage scales a plan prepares before attention.
+
+        Its K atoms are the plan's Keeps atoms, 64 K tokens of two K32 score
+        fragments, and its Q tiles the plan's grouped Q CTAs, so the softmax
+        reads a work tile's rows at ``q_group_idx * tile_size_q``. Every Sage
+        profile streams such fragments (``validate_sage_profile``).
+        """
+        assert self.use_sage_attention and self.groups_tokens_heads_q
+        assert self.keeps_atom_tokens == _SAGE_ATOM_TOKENS
+        assert self.keeps_fragments_per_atom == _SAGE_ATOM_MIN_WORDS
+        num_summaries = 0
+        if self.use_block_sparse_proxy_routes:
+            num_summaries, _ = _block_sparse_proxy_summary_geometry(
+                seq_len_kv, self.kv_block_size
+            )
+        layout = _SageScaleLayout(
+            seq_len_kv=seq_len_kv,
+            k_block_size=self.sage_k_block_size,
+            num_summaries=num_summaries,
+            k_summary_block_size=self.sage_k_summary_block_size,
+            k_tokens_block_size=self.sage_k_scale_block_size(),
+            summaries_block_size=self.sage_k_scale_block_size(proxy=True),
+            seq_len_q=self.max_seq_len_q,
+            q_block_size=self.sage_q_block_size,
+            heads_q_per_kv=self.heads_q_per_kv,
+            tile_size_q=self.tile_size_q,
+            headdim=self.headdim,
+            v_mean=self.sage_v_mean,
+        )
+        q_rows = layout.q_rows
+        assert q_rows.tokens_per_tile == self.q_tokens_per_cta
+        assert q_rows.tiles == self.num_q_ctas
+        return layout
 
     def sage_k_groups_for_block(self, k_block_size: int) -> int:
         """Return the K scale groups inside one streamed K32 score fragment."""

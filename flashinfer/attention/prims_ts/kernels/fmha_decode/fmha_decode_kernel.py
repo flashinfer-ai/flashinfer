@@ -1250,6 +1250,7 @@ def _build_decode_gen_schedule(
             scale_tensors=sage_scale_tensors,
             h_k_idx=h_k_idx,
             b_idx=b_idx,
+            num_heads_kv=num_heads_kv,
             name="sageVScales",
         )
     # Each softmax instance fills and reads its own ``sfK`` words; only the

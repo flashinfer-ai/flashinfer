@@ -72,7 +72,7 @@ class _RouteConfig:
     It is shared across sparse input and storage modes.
     """
 
-    num_kv_heads: int
+    num_pattern_heads: int
     num_q_blocks: int
     num_kv_blocks: int
     num_exact_words: int
@@ -99,7 +99,7 @@ class _RouteConfig:
     def create(
         *,
         layout: _BlockSparseRouteLayout,
-        num_kv_heads: int,
+        num_pattern_heads: int,
         seq_len_q: int,
         seq_len_kv: int,
         q_block_size: int,
@@ -117,7 +117,7 @@ class _RouteConfig:
         num_q_blocks = (seq_len_q + q_block_size - 1) // q_block_size
         num_kv_blocks = (seq_len_kv + kv_block_size - 1) // kv_block_size
         cfg = _RouteConfig(
-            num_kv_heads=num_kv_heads,
+            num_pattern_heads=num_pattern_heads,
             num_q_blocks=num_q_blocks,
             num_kv_blocks=num_kv_blocks,
             num_exact_words=(num_kv_blocks + _WARP_SIZE - 1) // _WARP_SIZE,
@@ -432,8 +432,8 @@ def _resolve_prepared_bsr_row(
     if lane_idx == cutlass.Int32(0) and row_is_valid:
         q_block_row_idx = linear_row_idx % cfg.num_q_blocks
         linear_batch_head_idx = linear_row_idx // cfg.num_q_blocks
-        kv_head_idx = linear_batch_head_idx % cfg.num_kv_heads
-        batch_idx = linear_batch_head_idx // cfg.num_kv_heads
+        kv_head_idx = linear_batch_head_idx % cfg.num_pattern_heads
+        batch_idx = linear_batch_head_idx // cfg.num_pattern_heads
         row_begin = cutlass.Int32(block_indptr[batch_idx, kv_head_idx, q_block_row_idx])
         row_end = cutlass.Int32(
             block_indptr[batch_idx, kv_head_idx, q_block_row_idx + 1]
@@ -937,13 +937,17 @@ def _allocate_warp_words(
 
 
 class _PrepareRoutesBase:
-    """Own shared route geometry and compile-time storage/policy flags."""
+    """Own shared route geometry and compile-time storage/policy flags.
+
+    ``num_pattern_heads`` is the head axis of the BSR or bitmask inputs, one
+    when every KV head shares a pattern, and sizes the route rows.
+    """
 
     def __init__(
         self,
         *,
         batch_size: int,
-        num_kv_heads: int,
+        num_pattern_heads: int,
         seq_len_q: int,
         seq_len_kv: int,
         q_block_size: int,
@@ -967,7 +971,7 @@ class _PrepareRoutesBase:
             raise ValueError("paged KV does not support proxy routes")
 
         num_q_blocks = (seq_len_q + q_block_size - 1) // q_block_size
-        num_rows = batch_size * num_kv_heads * num_q_blocks
+        num_rows = batch_size * num_pattern_heads * num_q_blocks
         # Structural score words (sequence tail, invalid atoms) can be stored
         # without a caller token mask; proxy routes and token masks require them.
         stores_score_words = use_proxy_routes or apply_token_mask or store_score_words
@@ -982,7 +986,7 @@ class _PrepareRoutesBase:
         self.route_layout = layout
         self.cfg = _RouteConfig.create(
             layout=layout,
-            num_kv_heads=num_kv_heads,
+            num_pattern_heads=num_pattern_heads,
             seq_len_q=seq_len_q,
             seq_len_kv=seq_len_kv,
             q_block_size=q_block_size,
@@ -993,6 +997,12 @@ class _PrepareRoutesBase:
         self.page_size = page_size if page_size is not None else 1
         self.minimum_seq_len_kv = seq_len_q if use_causal_mask else 1
         self.route_metadata_base_word_offset = layout.route_metadata_base_word_offset
+
+    @property
+    def grid(self) -> list[int]:
+        """Return the launch grid: one warp per route row, four rows per CTA."""
+
+        return [(self.cfg.num_rows + _WARPS_PER_CTA - 1) // _WARPS_PER_CTA, 1, 1]
 
 
 class _PrepareBsrRoutes(_PrepareRoutesBase):
@@ -1027,11 +1037,7 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
             route_workspace,
             max_blocks_per_row,
         ).launch(
-            grid=[
-                (self.cfg.num_rows + _WARPS_PER_CTA - 1) // _WARPS_PER_CTA,
-                1,
-                1,
-            ],
+            grid=self.grid,
             block=[_THREADS_PER_CTA, 1, 1],
             stream=stream,
         )
@@ -1198,7 +1204,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
         self,
         *,
         batch_size: int,
-        num_kv_heads: int,
+        num_pattern_heads: int,
         seq_len_q: int,
         seq_len_kv: int,
         q_block_size: int,
@@ -1211,7 +1217,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
     ) -> None:
         super().__init__(
             batch_size=batch_size,
-            num_kv_heads=num_kv_heads,
+            num_pattern_heads=num_pattern_heads,
             seq_len_q=seq_len_q,
             seq_len_kv=seq_len_kv,
             q_block_size=q_block_size,
@@ -1240,11 +1246,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
             route_workspace,
             max_blocks_per_row,
         ).launch(
-            grid=[
-                (self.cfg.num_rows + _WARPS_PER_CTA - 1) // _WARPS_PER_CTA,
-                1,
-                1,
-            ],
+            grid=self.grid,
             block=[_THREADS_PER_CTA, 1, 1],
             stream=stream,
         )
@@ -1268,8 +1270,8 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
         row_is_valid = linear_row_idx < self.cfg.num_rows
         q_block_idx = linear_row_idx % self.cfg.num_q_blocks
         linear_batch_head_idx = linear_row_idx // self.cfg.num_q_blocks
-        kv_head_idx = linear_batch_head_idx % self.cfg.num_kv_heads
-        batch_idx = linear_batch_head_idx // self.cfg.num_kv_heads
+        kv_head_idx = linear_batch_head_idx % self.cfg.num_pattern_heads
+        batch_idx = linear_batch_head_idx // self.cfg.num_pattern_heads
         smem = SmemAllocator()
         record_stage = _allocate_warp_words(smem, self.cfg.record_stage_words, warp_idx)
         selected_blocks = _allocate_warp_words(

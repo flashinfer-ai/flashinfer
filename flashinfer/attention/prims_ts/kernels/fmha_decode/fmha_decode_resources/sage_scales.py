@@ -92,7 +92,8 @@ class SageScaleTensors:
     """The plan's Sage scale tensors, shared by every resource that reads one.
 
     ``sfQ``, ``sfK`` and ``k_summary_scale`` are ``[heads, slots]`` FP32
-    arrays in the flat layout; the V scales and means are ``[Hkv, D]`` FP32.
+    arrays in the flat layout; the V scales and means are ``[B, Hkv, D]``
+    FP32, one row per batch entry and KV head.
     ``k_summary_scale`` is ``None`` without proxy routes and ``v_mean``
     without a channel mean. The dataclass is not frozen because the DSL
     replaces frozen dataclasses with proxies inside traced dynamic branches,
@@ -121,6 +122,26 @@ def _load_scale(scale_addr: Int64, index: Int32) -> Float32:
 
 
 @cute.jit
+def load_flat_scale(
+    scale_addr: Int64,
+    head_stride: Int32,
+    *,
+    head_idx: Int32,
+    batch_idx: Int32,
+    seq_len: Int32,
+    token_idx: Int32,
+    log2_block: Int32,
+) -> Float32:
+    """Return one head's scale of one token from a flat-layout scale array.
+
+    A token past ``seq_len`` takes the last valid slot.
+    """
+    token_idx = cute.math.min(token_idx, seq_len - Int32(1))
+    slot = flat_scale_slot(batch_idx, token_idx, seq_len, log2_block)
+    return _load_scale(scale_addr, head_idx * head_stride + slot)
+
+
+@cute.jit
 def load_q_scale(
     cfg: Constexpr[FmhaDecodeConfig],
     q_scale_addr: Int64,
@@ -136,14 +157,15 @@ def load_q_scale(
     q_head_idx = kv_head_idx * heads_q_per_kv + cute.math.min(
         local_head_idx, heads_q_per_kv - Int32(1)
     )
-    q_token_idx = cute.math.min(q_token_idx, Int32(cfg.max_seq_len_q - 1))
-    slot = flat_scale_slot(
-        batch_idx,
-        q_token_idx,
-        Int32(cfg.max_seq_len_q),
-        log2_block_size(cfg.sage_q_block_size),
+    return load_flat_scale(
+        q_scale_addr,
+        q_scale_head_stride,
+        head_idx=q_head_idx,
+        batch_idx=batch_idx,
+        seq_len=Int32(cfg.max_seq_len_q),
+        token_idx=q_token_idx,
+        log2_block=Int32(log2_block_size(cfg.sage_q_block_size)),
     )
-    return _load_scale(q_scale_addr, q_head_idx * q_scale_head_stride + slot)
 
 
 @cute.jit
@@ -168,9 +190,15 @@ def load_k_scale(
     log2_block = log2_k_block_size
     if cutlass.const_expr(log2_block is None):
         log2_block = Int32(log2_block_size(cfg.sage_k_block_size))
-    kv_token_idx = cute.math.min(kv_token_idx, seq_len_kv - Int32(1))
-    slot = flat_scale_slot(batch_idx, kv_token_idx, seq_len_kv, log2_block)
-    return _load_scale(k_scale_addr, kv_head_idx * k_scale_head_stride + slot)
+    return load_flat_scale(
+        k_scale_addr,
+        k_scale_head_stride,
+        head_idx=kv_head_idx,
+        batch_idx=batch_idx,
+        seq_len=seq_len_kv,
+        token_idx=kv_token_idx,
+        log2_block=log2_block,
+    )
 
 
 def sage_scale_arr_size(cfg: FmhaDecodeConfig, groups: int) -> int:
@@ -301,25 +329,26 @@ def stage_v_channel_scales(
     scales: SageScaleTensors,
     staged: cutlass.Array,
     *,
-    kv_head_idx: Int32,
+    sequence_idx: Int32,
     thread_idx: Int32,
     num_threads: Constexpr[int],
 ) -> None:
-    """Copy one KV head's per-channel V scales and means into SMEM.
+    """Copy one sequence's per-channel V scales and means into SMEM.
 
-    Each of the ``num_threads`` callers moves ``headdim / num_threads``
-    channels. Callers order these writes before the epilogue reads, and the
-    next tile's writes after the last read.
+    ``sequence_idx`` is the row ``b * Hkv + h`` of the ``[B, Hkv, D]``
+    tensors. Each of the ``num_threads`` callers moves ``headdim /
+    num_threads`` channels. Callers order these writes before the epilogue
+    reads, and the next tile's writes after the last read.
     """
     assert cfg.headdim % num_threads == 0
     v_scale_addr = scales.v_scale_ptr.toint()
-    head_base = kv_head_idx * Int32(cfg.headdim)
+    row_base = sequence_idx * Int32(cfg.headdim)
     for base in cutlass.range_constexpr(0, cfg.headdim, num_threads):
         channel = Int32(base) + thread_idx
-        staged[channel] = _load_scale(v_scale_addr, head_base + channel)
+        staged[channel] = _load_scale(v_scale_addr, row_base + channel)
         if cutlass.const_expr(cfg.sage_v_mean):
             staged[channel + Int32(cfg.headdim)] = _load_scale(
-                scales.v_mean_ptr.toint(), head_base + channel
+                scales.v_mean_ptr.toint(), row_base + channel
             )
 
 
@@ -754,7 +783,7 @@ class SageKScalesResource(DecodeGenResourceBase):
 
 @dataclass(kw_only=True)
 class SageVScalesResource(DecodeGenResourceBase):
-    """The staged ``sfV`` and ``v_mean`` of the work tile's KV head.
+    """The staged ``sfV`` and ``v_mean`` of the work tile's sequence.
 
     The pipeline is a one-stage pipeline of the correction warps.
     """
@@ -763,6 +792,7 @@ class SageVScalesResource(DecodeGenResourceBase):
     scale_tensors: SageScaleTensors | None = None
     h_k_idx: Int32 | None = None
     b_idx: Int32 | None = None
+    num_heads_kv: Int32 | None = None
     _alloc: Constexpr[SmemAllocation | None] = None
 
     @property
@@ -787,15 +817,17 @@ class SageVScalesResource(DecodeGenResourceBase):
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def stage_tile(self, stage_info: StageInfo) -> None:
-        """Copy the work tile's KV head scales and means into the acquired block."""
+        """Copy the work tile's V scales and means into the acquired block."""
         cfg = self.cfg
         task_cache = _decode_gen_task_cache(stage_info)
-        kv_head_idx, _ = _logical_head_batch(stage_info, self.h_k_idx, self.b_idx)
+        kv_head_idx, batch_idx = _logical_head_batch(
+            stage_info, self.h_k_idx, self.b_idx
+        )
         stage_v_channel_scales(
             cfg,
             self.scale_tensors,
             self.staged(stage_info.context),
-            kv_head_idx=kv_head_idx,
+            sequence_idx=batch_idx * self.num_heads_kv + kv_head_idx,
             thread_idx=task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX],
             num_threads=cfg.correction_barrier_threads,
         )

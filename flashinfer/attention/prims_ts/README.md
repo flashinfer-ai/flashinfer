@@ -304,7 +304,12 @@ scale must be finite and positive; the kernel does not check the values.
 
 The block-size fields belong to `SageAttentionConfig`; the defaults are
 TensorRT-LLM's production recipe. Masks and scheduling follow the 16-bit
-plans. The paged block-sparse APIs do not support Sage attention.
+plans. Every run first launches a small kernel that gathers the plan's scales
+into one buffer in the order the attention kernel reads them: the K scales
+per 64-token atom, the Q scales per Q-tile row and the V scales (and means)
+per KV head. A block-sparse run's route prepare follows it, and attention
+follows both in stream order. The paged block-sparse APIs do not support
+Sage attention.
 
 With the default threshold, FP8 P is quantized at `C = 448 * 2**-8 = 1.75`:
 the E4M3 grid of P moves down by the threshold, so probabilities far below the
@@ -326,8 +331,8 @@ slots.
 | --- | --- |
 | `q_scale` | `[Hq, flat_scale_numel(B, Sq, q_block_size)]` |
 | `k_scale` | `[Hkv, flat_scale_numel(B, Skv, k_block_size)]` |
-| `v_scale` | `[Hkv, D]` |
-| `v_mean` | `[Hkv, D]`; exactly when the recipe sets `v_mean=True` |
+| `v_scale` | `[B, Hkv, D]` |
+| `v_mean` | `[B, Hkv, D]`; exactly when the recipe sets `v_mean=True` |
 | `k_summary_scale` | `[Hkv, flat_scale_numel(B, ceil(Skv / kv_block_size), k_summary_block_size)]`; exactly for proxy plans |
 
 With proxy routes, `k_summary` holds the per-block K means in the K dtype,
@@ -372,7 +377,7 @@ v = torch.randn(B, Skv, Hkv, D, device=device).to(fp8)
 scales = SageAttentionParams(
     q_scale=torch.rand(Hq, flat_scale_numel(B, Sq, 1), device=device),
     k_scale=torch.rand(Hkv, flat_scale_numel(B, Skv, 16), device=device),
-    v_scale=torch.rand(Hkv, D, device=device),
+    v_scale=torch.rand(B, Hkv, D, device=device),
 )
 out = wrapper.run(q, k, v, sage=scales)  # [B, Sq, Hq, D] bfloat16
 ```
@@ -415,7 +420,7 @@ block_indptr = (
 scales = SageAttentionParams(
     q_scale=torch.rand(Hq, flat_scale_numel(B, Sq, 1), device=device),
     k_scale=torch.rand(Hkv, flat_scale_numel(B, Skv, 16), device=device),
-    v_scale=torch.rand(Hkv, D, device=device),
+    v_scale=torch.rand(B, Hkv, D, device=device),
     k_summary_scale=torch.rand(
         Hkv, flat_scale_numel(B, num_kv_blocks, 16), device=device
     ),
