@@ -1055,6 +1055,7 @@ def _test_verify_kernel_mtp(
     cache_intermediate_states: bool = True,
     disable_state_update: bool = True,
     seed: int = 0,
+    head_size_v: int | None = None,
 ):
     """Test gated_delta_rule_mtp API (MTP version) against reference."""
     _skip_if_not_sm90_or_later()
@@ -1072,7 +1073,8 @@ def _test_verify_kernel_mtp(
     H = num_q_heads
     HV = num_v_heads
     K = head_size
-    V = head_size
+    # Rectangular state: values may be narrower than keys.
+    V = head_size if head_size_v is None else head_size_v
 
     # Generate test inputs
     q = torch.randn(B, T, H, K, dtype=torch_dtype, device="cuda") * 0.1
@@ -1230,7 +1232,8 @@ def _test_verify_kernel_mtp(
 @pytest.mark.parametrize("alpha", [True])
 @pytest.mark.parametrize("scale", [1.0])
 @pytest.mark.parametrize("seq_len", [2, 4, 8])
-@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("head_size", [128, 64], ids=lambda d: f"dk{d}")
+@pytest.mark.parametrize("head_size_v", [128, 64], ids=lambda d: f"dv{d}")
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
@@ -1244,6 +1247,7 @@ def test_verify_kernel_mtp(
     num_k_heads: int,
     num_v_heads: int,
     head_size: int,
+    head_size_v: int,
     batch_size: int,
     seq_len: int,
     scale: float | str,
@@ -1252,6 +1256,8 @@ def test_verify_kernel_mtp(
     cache_intermediate_states: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
+    if head_size_v > head_size:
+        pytest.skip("DV > DK is not supported")
     scale_val = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_verify_kernel_mtp(
         dtype,
@@ -1266,6 +1272,7 @@ def test_verify_kernel_mtp(
         beta,
         cache_intermediate_states,
         seed,
+        head_size_v=head_size_v,
     )
 
 

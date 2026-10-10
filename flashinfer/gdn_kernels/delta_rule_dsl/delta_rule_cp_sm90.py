@@ -42,7 +42,6 @@ from .varlen_helper import (
 )
 from .delta_rule_sm90 import (
     _FullyFusedDeltaRuleSm90,
-    WarpGroupRole,
     LoadStoreWarpRole,
 )
 from .schedule import WorkDesc
@@ -2949,7 +2948,12 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         checkpoint_cu_starts_dtype: torch.dtype | None = None,
         state_inner_strides: tuple[int, ...] | None = None,
         initial_state_inner_strides: tuple[int, ...] | None = None,
+        head_size: int = 128,
+        head_size_v: int | None = None,
     ):
+        if head_size_v is not None and head_size != head_size_v:
+            raise ValueError(f"{type(self).__name__} does not support DK != DV")
+
         super().__init__(
             True,
             False,
@@ -2963,7 +2967,12 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             checkpoint_cu_starts_dtype=checkpoint_cu_starts_dtype,
             state_inner_strides=state_inner_strides,
             init_state_inner_strides=initial_state_inner_strides,
+            head_size=head_size,
+            head_size_v=head_size_v,
         )
+
+        self.D = head_size
+
         self.needs_initial_state = needs_initial_state
         self.store_final_state = store_final_state
         self.initial_state_dtype = initial_state_dtype
@@ -3535,7 +3544,9 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             first_B,
             tKVrKV,
             scale,
+            math_tidx,
             wg_idx,
+            self.first_q_in_blk(0),
         )
         self.maybe_store_checkpoint(
             tKVrKV,
@@ -3591,7 +3602,9 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                 self.BLK_KV,
                 tKVrKV,
                 scale,
+                math_tidx,
                 wg_idx,
+                self.first_q_in_blk(blk),
             )
             self.maybe_store_checkpoint(
                 tKVrKV,
@@ -3650,7 +3663,9 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                 last_B,
                 tKVrKV,
                 scale,
+                math_tidx,
                 wg_idx,
+                self.first_q_in_blk(last_blk),
             )
             self.maybe_store_checkpoint(
                 tKVrKV,
@@ -3860,8 +3875,8 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             checkpoint_every_n_tokens,
         ).launch(
             grid=(num_sab_heads * max_cp_chunks_per_seq, num_seqs, 1),
-            block=(512, 1, 1),
-            max_number_threads=(512, 1, 1),
+            block=(128 * self.warp_group_roles.num_warp_groups, 1, 1),
+            max_number_threads=(128 * self.warp_group_roles.num_warp_groups, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -3900,7 +3915,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         checkpoint_every_n_tokens: cutlass.Int32,
     ):
         NUM_LOAD_WARP_GROUPS = 1
-        NUM_STATE_MMA_WARP_GROUPS = 2
+        NUM_STATE_MMA_WARP_GROUPS = self.warp_group_roles.num_state_warp_groups
         NUM_AUX_MMA_WARP_GROUPS = 1
         THREADS_PER_WARP_GROUP = 128
         WARPS_PER_WARP_GROUP = 4
@@ -4135,7 +4150,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         cute.arch.sync_threads()
 
         if is_valid_chunk:
-            if warp_group_idx == WarpGroupRole.LDST:
+            if warp_group_idx == self.warp_group_roles.LDST:
                 cute.arch.setmaxregister_decrease(load_registers)
                 if ldst_warp_role == LoadStoreWarpRole.LOAD_QKV:
                     self.run_load_qkv_role(
@@ -4194,7 +4209,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                         num_sab_heads,
                     )
             else:
-                if warp_group_idx == WarpGroupRole.MATH_AUX:
+                if warp_group_idx == self.warp_group_roles.MATH_AUX:
                     cute.arch.setmaxregister_decrease(aux_mma_registers)
                     self.run_aux_math_role(
                         sQ_SD,
@@ -4384,9 +4399,10 @@ def cp_delta_rule_prefill_dsl_sm90(
         raise RuntimeError("max_seqlen must be provided")
     if not _skip_check and max_seqlen <= 0:
         raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
-    _, num_q_heads, d = q.shape
-    num_k_heads = k.shape[1]
-    num_v_heads = v.shape[1]
+    _, num_q_heads, dq = q.shape
+    _, num_k_heads, dk = k.shape
+    _, num_v_heads, dv = v.shape
+    assert dq == dk
     num_sab_heads = max(num_q_heads, num_v_heads)
     total_t_blocks = workspace_num_chunks_host(cu_seqlens, 64, total_seqlen)
     total_cp_chunks = workspace_num_chunks_host(cu_seqlens, cp_chunk_len, total_seqlen)
@@ -4400,7 +4416,7 @@ def cp_delta_rule_prefill_dsl_sm90(
                 f"alpha heads must equal max(q heads, v heads)={num_sab_heads}, got {alpha.shape[1]}"
             )
         if not _FullyFusedDeltaRuleSm90.can_implement(
-            num_q_heads, num_k_heads, num_v_heads, d, q.element_size()
+            num_q_heads, num_k_heads, num_v_heads, dk, dv, q.element_size()
         ):
             raise RuntimeError(
                 "CPDeltaRulePrefillSm90 only supports head counts where q/v heads are positive multiples "
@@ -4411,8 +4427,8 @@ def cp_delta_rule_prefill_dsl_sm90(
                 "t must have shape "
                 f"{(total_t_blocks, num_sab_heads, 64, 64)}, got {tuple(t.shape)}"
             )
-        expected_fixed_state_shape = (total_cp_chunks, num_sab_heads, d, d)
-        expected_state_shape = (num_seqs, num_sab_heads, d, d)
+        expected_fixed_state_shape = (total_cp_chunks, num_sab_heads, dv, dk)
+        expected_state_shape = (num_seqs, num_sab_heads, dv, dk)
         use_state_indices = state_indices is not None
         if fixed_state.shape != expected_fixed_state_shape or (
             state is not None
@@ -4477,10 +4493,10 @@ def cp_delta_rule_prefill_dsl_sm90(
             state_dtype_to_cutlass(state.dtype)
         if needs_checkpointing:
             state_dtype_to_cutlass(state_checkpoints.dtype)
-            if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, d, d):
+            if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, dv, dk):
                 raise RuntimeError(
                     "state_checkpoints must have shape "
-                    f"[*, {num_sab_heads}, {d}, {d}], got {tuple(state_checkpoints.shape)}"
+                    f"[*, {num_sab_heads}, {dv}, {dk}], got {tuple(state_checkpoints.shape)}"
                 )
             if not is_integer_dtype(
                 checkpoint_cu_starts.dtype
@@ -4513,20 +4529,20 @@ def cp_delta_rule_prefill_dsl_sm90(
     if total_cp_chunks == 0:
         return
     q_tma = q.as_strided(
-        (total_seqlen, d, num_q_heads),
-        (num_q_heads * d, 1, d),
+        (total_seqlen, dk, num_q_heads),
+        (num_q_heads * dk, 1, dk),
     )
     k_tma = k.as_strided(
-        (d, total_seqlen, num_k_heads),
-        (1, num_k_heads * d, d),
+        (dk, total_seqlen, num_k_heads),
+        (1, num_k_heads * dk, dk),
     )
     v_tma = v.as_strided(
-        (d, total_seqlen, num_v_heads),
-        (1, num_v_heads * d, d),
+        (dv, total_seqlen, num_v_heads),
+        (1, num_v_heads * dv, dv),
     )
     o_tma = o.as_strided(
-        (d, total_seqlen, num_sab_heads),
-        (1, num_sab_heads * d, d),
+        (dv, total_seqlen, num_sab_heads),
+        (1, num_sab_heads * dv, dv),
     )
     t_tma = t.as_strided(
         (64, 64, num_sab_heads, total_t_blocks),
@@ -4770,9 +4786,10 @@ def cp_delta_rule_dsl_sm90(
         )
     if not cu_seqlens.is_contiguous():
         raise RuntimeError("cu_seqlens must be contiguous")
-    _, num_q_heads, d = q.shape
-    num_k_heads = k.shape[1]
-    num_v_heads = v.shape[1]
+    _, num_q_heads, dq = q.shape
+    _, num_k_heads, dk = k.shape
+    _, num_v_heads, dv = v.shape
+    assert dq == dk
     num_sab_heads = max(num_q_heads, num_v_heads)
     if o.shape[1] != num_sab_heads:
         raise RuntimeError(
@@ -4787,13 +4804,13 @@ def cp_delta_rule_dsl_sm90(
             f"beta heads must equal max(q heads, v heads)={num_sab_heads}, got {beta.shape[1]}"
         )
     if not _FullyFusedDeltaRuleSm90.can_implement(
-        num_q_heads, num_k_heads, num_v_heads, d, q.element_size()
+        num_q_heads, num_k_heads, num_v_heads, dk, dv, q.element_size()
     ):
         raise RuntimeError(
             "CPDeltaRuleSm90 only supports head counts where q/v heads are positive multiples "
             f"of k heads, got q={num_q_heads}, k={num_k_heads}, v={num_v_heads}"
         )
-    expected_state_shape = (num_seqs, num_sab_heads, d, d)
+    expected_state_shape = (num_seqs, num_sab_heads, dv, dk)
     use_state_indices = state_indices is not None
     if state is not None and (
         (not use_state_indices and state.shape != expected_state_shape)
@@ -4843,10 +4860,10 @@ def cp_delta_rule_dsl_sm90(
         state_dtype_to_cutlass(state.dtype)
     if needs_checkpointing:
         state_dtype_to_cutlass(state_checkpoints.dtype)
-        if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, d, d):
+        if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, dv, dk):
             raise RuntimeError(
                 "state_checkpoints must have shape "
-                f"[*, {num_sab_heads}, {d}, {d}], got {tuple(state_checkpoints.shape)}"
+                f"[*, {num_sab_heads}, {dv}, {dk}], got {tuple(state_checkpoints.shape)}"
             )
         if not is_integer_dtype(
             checkpoint_cu_starts.dtype
