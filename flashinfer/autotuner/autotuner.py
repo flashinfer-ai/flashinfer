@@ -1128,6 +1128,16 @@ def is_in_profile_measurement() -> bool:
 _tune_process_group: Optional["torch.distributed.ProcessGroup"] = None
 
 
+def _autotune_independent() -> bool:
+    """Whether independent per-rank autotuning is enabled.
+
+    Only the exact value ``"1"`` enables it; the check lives in one
+    place so call sites cannot drift apart (drift would break the
+    cross-rank mode agreement verified by ``set_autotune_process_group``).
+    """
+    return os.environ.get("FLASHINFER_AUTOTUNE_INDEPENDENT", "0") == "1"
+
+
 def set_autotune_process_group(
     group: Optional["torch.distributed.ProcessGroup"],
 ) -> None:
@@ -1139,7 +1149,12 @@ def set_autotune_process_group(
     Prefer a CPU (``gloo``) subgroup; a NCCL group also works. ``None``
     disables (default); not thread-safe.
 
-    Caller contract: every rank must enter ``_profile_single_kernel`` the same
+    Caller contract: when ``group`` is non-``None``, every rank in the group
+    must call this setter with the same group in the same collective order
+    (each call performs an ``all_reduce`` mode check), and
+    ``FLASHINFER_AUTOTUNE_INDEPENDENT`` must select the same mode on every
+    rank -- only the exact value ``"1"`` enables independent mode. Every
+    rank must enter ``_profile_single_kernel`` the same
     number of times in the same order, or the reduction itself deadlocks. Across
     ranks that requires identical: ``get_valid_tactics`` and shape buckets;
     ``skip_ops`` (a skipped op returns before the tactic loop, doing zero
@@ -1159,6 +1174,26 @@ def set_autotune_process_group(
             set_autotune_process_group(None)
     """
     global _tune_process_group
+    # Verify FLASHINFER_AUTOTUNE_INDEPENDENT matches across the tune group
+    # to prevent mixed-mode deadlocks (one rank skips a collective that
+    # another enters). SUM-based so that EVERY misconfigured rank raises,
+    # not just the minority side.
+    if group is not None:
+        local = int(_autotune_independent())
+        world_size = torch.distributed.get_world_size(group)
+        backend = str(torch.distributed.get_backend(group)).lower()
+        device = "cuda" if backend == "nccl" else "cpu"
+        flag = torch.tensor([local], dtype=torch.int64, device=device)
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.SUM, group=group
+        )
+        if flag.item() != local * world_size:
+            raise RuntimeError(
+                "FLASHINFER_AUTOTUNE_INDEPENDENT must be set uniformly "
+                f"across all ranks in the tune group (local={local}, "
+                "at least one rank differs). Mixed settings cause "
+                "collective-order mismatches and tuning deadlocks."
+            )
     _tune_process_group = group
 
 
@@ -1170,6 +1205,21 @@ def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
 def _sync_oom_across_tune_group(local_oom: bool) -> bool:
     """Return whether any rank in the tuning group observed an OOM."""
     if _tune_process_group is None:
+        return local_oom
+    # Independent mode (#5898): skip the collective. On cold-start
+    # autotuning one rank profiles for >30 min while others block in this
+    # all_reduce, exceeding the gloo/NCCL timeout and killing all workers.
+    # Each rank handles its own OOM fallback instead.
+    #
+    # NOTE: independent mode trades guaranteed rank agreement for
+    # availability. On homogeneous TP (same GPU, same shapes — the
+    # standard vLLM/Megatron TP setup), local timings are near-identical
+    # and all ranks converge on the same tactic. For heterogeneous
+    # setups, or runners that require exact tactic agreement across
+    # ranks (e.g. NCCL symmetric memory allocation), keep the default
+    # synchronized mode. See the docstring on
+    # ``set_autotune_process_group`` for the caller contract.
+    if _autotune_independent():
         return local_oom
 
     import torch.distributed as dist
@@ -3091,7 +3141,8 @@ class AutoTuner:
             profile_exc = e
 
         try:
-            if _tune_process_group is not None:
+            _independent = _autotune_independent()
+            if _tune_process_group is not None and not _independent:
                 import torch.distributed as dist
 
                 # NCCL requires a CUDA tensor; a gloo (CPU) subgroup — the
