@@ -1540,7 +1540,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
 @pytest.mark.parametrize("page_size", [16, 64])
 @pytest.mark.parametrize("num_kv_heads", [1])
 @pytest.mark.parametrize("num_qo_heads", [1])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 def test_batch_prefill_with_paged_kv_cache_nvfp4(
@@ -2296,7 +2296,7 @@ def test_batch_prefill_paged_shared_kv_smem_unequal_kv_strides(kv_layout, qo_len
 @pytest.mark.parametrize("qo_len", [64, 128])
 @pytest.mark.parametrize("num_kv_heads", [1])
 @pytest.mark.parametrize("num_qo_heads", [1])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 def test_batch_prefill_with_ragged_kv_cache_nvfp4(
