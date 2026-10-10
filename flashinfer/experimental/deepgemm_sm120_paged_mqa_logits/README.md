@@ -12,30 +12,38 @@ GB202). Each prepared call returns a plan; `plan.run()` submits on the current
 PyTorch stream and returns the logical `[B * next_n, max_context_len]` view of
 the FP32 output.
 
-A call is a real **two-kernel sequence**: a single-warp scheduler writes
+Two kernels implement the operator: a single-warp scheduler writes
 `schedule_meta[num_sms + 1, 2]` (per-CTA `(q_atom_idx, kv_split_idx)` walk
 boundaries over 128-row KV segments) and a persistent 384-thread register-MMA
 program (`mma.sync.m16n8k32 e4m3·e4m3→f32` + `ldmatrix` + TMA + mbarriers; no
 tcgen05/TMEM/WGMMA, which `ptxas` rejects on this architecture) walks the range
-it finds there. Both kernels are delivered as **one** generated prepared-sequence
-binding, so `plan.run()` is a single FFI submission with the per-stage
-programmatic-dependent-launch attributes intact. `get_paged_mqa_logits_metadata`
-submits the scheduler alone through its own standalone program and returns the
-real schedule.
+it finds there. The prepared plan is a real **two-kernel sequence**: both
+kernels are delivered as **one** generated prepared-sequence binding, so
+`plan.run()` is a single FFI submission with the per-stage
+programmatic-dependent-launch attributes intact and the schedule rebuilt every
+run. The DeepGEMM-signature entries split the two: `get_paged_mqa_logits_metadata`
+submits the scheduler alone through its standalone program and returns the real
+schedule, and `fp8_paged_mqa_logits` given that schedule submits the logits
+program alone — **one kernel launch** per call, the per-layer contract a
+serving engine relies on.
 
 ## Shipped programs and routes
 
 Routes are selected from host-known scalars only — head count, page size and
-`next_n` — and named `sm120:fp8:h<H>:p<page_kv>:n<next_n>`:
+`next_n`. Each `(heads, page_kv, next_n)` ships as two routes over the same
+logits program: `sm120:fp8:h<H>:p<page_kv>:n<next_n>` (the `(metadata, logits)`
+prepared sequence, two launches) and `sm120:fp8:h<H>:p<page_kv>:n<next_n>:logits`
+(the logits program standalone, one launch, consuming a caller's schedule):
 
 | heads | page_kv | next_n | model |
 |---|---|---|---|
 | 32 | 128, 64 | 1, 2, 3, 4, 5, 6 | DeepSeek-V4.1-Flash decode |
 | 64 | 64 | 1, 2, 3, 4, 5, 6 | DeepSeek-V3.2 decode |
 
-`route_available(num_heads, page_kv, next_n)` answers on the host; there is no
-fallback for an unsupported configuration. The scheduler program is shared by
-every route (route `sm120:metadata`).
+`route_available(num_heads, page_kv, next_n)` answers on the host (true only
+when both routes ship); there is no fallback for an unsupported configuration.
+The scheduler program is shared by every sequence (standalone route
+`sm120:metadata`).
 
 The launch grid of the logits program **is** the CTA budget: the programs take
 no compile-line definitions, so one delivered text per program serves every SM
@@ -95,10 +103,21 @@ logits = fp8_paged_mqa_logits(
 ```
 
 These mirror the `deep_gemm` calls a DeepSeek-V3.2 serving engine makes, so a
-caller switches backends without re-shaping its tensors. `schedule_meta` fixes
-the CTA budget through its first dimension (`None` selects the device's SM
-count) and is rebuilt in the same sequence before the logits program reads it,
-so the one-shot entry is self-contained. `clean_logits=True` is rejected for
+caller switches backends without re-shaping its tensors, and they split the
+work the way DeepGEMM does: the engine builds `meta` **once per decode step**
+(with `num_sms` = the CTA budget, normally the device's SM count) and calls
+`fp8_paged_mqa_logits` **once per layer**, each call a single launch of the
+logits program with `meta.shape[0] - 1` CTAs consuming that schedule. The
+contract is DeepGEMM's: the schedule must have been built for the same
+`context_lens` (each request's last token), the same `next_n` and that budget.
+Nothing on the device can check this without a synchronisation, so a stale or
+foreign schedule yields unspecified logits rather than an error — rebuild it
+whenever the context lengths change. `schedule_meta=None` selects the device's
+SM count and runs the `(metadata, logits)` sequence instead (two launches),
+so the entry is still self-contained without a schedule.
+`sm120_paged_mqa.one_shot_plan(...)` returns the plan the entry would submit
+(`Sm120PagedLogitsPlan` with a schedule, `kernel_launches == 1`;
+`Sm120PagedIndexerPlan` without). `clean_logits=True` is rejected for
 two-dimensional context lengths exactly as DeepGEMM does, and `indices`
 (variable-length request selection) must be `None` — that scheduling branch is
 not ported.
@@ -119,9 +138,10 @@ cubin and its own measured denominator; it is not shipped yet.
 
 Generated CUDA and bindings live in
 `csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated` (one device source
-per program, one binding for the scheduler, one prepared-sequence binding per
-route). The runtime and the program/route catalog are in this directory; the
-public API is `flashinfer/sm120_paged_mqa_logits.py`.
+per program, one standalone binding per program — the scheduler and every
+logits program — and one prepared-sequence binding per sequence route). The
+runtime and the program/route catalog are in this directory; the public API is
+`flashinfer/sm120_paged_mqa_logits.py`.
 
 ```bash
 pytest tests/experimental/test_sm120_paged_mqa_logits.py -q
@@ -130,10 +150,13 @@ python benchmarks/bench_sm120_paged_mqa_logits.py
 
 The test covers every shipped `next_n`, both head counts and both page sizes
 against a dequantized PyTorch reference and an independent Python mirror of the
-schedule,
-the `clean_logits=False` write extent, the padded block-stride cache view, CUDA
-Graph replay with changed contents, one-shot/plan equivalence and the
-architecture-target gate. It skips on devices without catalogued programs.
+schedule, the `clean_logits=False` write extent, the padded block-stride cache
+view, CUDA Graph replay with changed contents (the prepared sequence, and the
+one-launch entry replayed behind an eagerly rebuilt schedule), one-shot/plan
+bitwise equivalence with the one-shot asserted to be a single launch of the
+sequence's own logits program, the schedule-buffer contract of the one-launch
+entry and the architecture-target gate. It skips on devices without catalogued
+programs.
 
 ## Catalog schema `sm120_paged_mqa.v1`
 
@@ -151,5 +174,8 @@ records (tile size, group count, KV stages, atoms, shared-memory bytes). A
 program record carries `kind` (`"module"` or `"sequence"`), `role`, `sources`,
 `standalone`, `compile_flags`, `ffi_entry`, `arg_plan` and the per-architecture
 `closure_sha256`. Every route record has `stages` (`[[stage, program], ...]`),
-`sequence` (the prepared-sequence binding, `null` for the metadata route),
-`kernel_launches`, `num_heads`, `page_kv`, `next_n` and `clean_logits`.
+`sequence` (the prepared-sequence binding; `null` for the single-stage
+`sm120:metadata` and `...:logits` routes, whose one program is `standalone`),
+`kernel_launches` (the stage count: 2 for a sequence route, 1 otherwise),
+`num_heads`, `page_kv`, `next_n` and `clean_logits`. A `...:logits` route's
+program is the logits stage of its sequence route.
