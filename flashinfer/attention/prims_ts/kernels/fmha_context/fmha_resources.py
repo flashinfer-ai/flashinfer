@@ -3280,7 +3280,9 @@ class TmemSPResource(MemoryResource):
     def init_softmax_state_early(self, stage_info: StageInfo) -> None:
         """Initialize softmax TMEM state without a function-lifetime P value."""
         self._init_function_state(stage_info)
-        if cutlass.const_expr(self.cfg.vc_attention):
+        if cutlass.const_expr(self.cfg.vc_restores_means):
+            # The row-sum operand exists behind the P tile only when the tile
+            # means are restored; V repair plans have no such buffer.
             self._zero_vc_rowsum_row(stage_info)
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=p_chunk)

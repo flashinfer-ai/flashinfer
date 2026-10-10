@@ -541,6 +541,18 @@ def test_one_shot_vc_config_requires_the_operands():
     q = torch.empty((1, 256, 1, _HEAD_DIM), dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="vc_config requires"):
         batch_prefill(q, q, q.to(_FP8), vc_config=VCAttentionConfig())
+    q, k, v = _random_inputs(1, 1024, 2)
+    repair = vca.vc_quantize_repair(k, v, budget=0.02)
+    with pytest.raises(NotImplementedError, match="does not run V repair"):
+        batch_prefill(q, repair.k, repair.v, vc=repair.params)
+    with pytest.raises(NotImplementedError, match="does not run V repair"):
+        batch_prefill(
+            q,
+            repair.k,
+            repair.v,
+            vc=repair.params,
+            vc_config=VCAttentionConfig(repair_tiles=repair.repair_tiles),
+        )
 
 
 @_REQUIRES_CONTEXT_GPU

@@ -150,8 +150,8 @@ class VCAttentionParams:
     E4M3 ``v`` residuals.
 
     ``v_scale`` is the ``[B, Hkv, D]`` fp32 per-channel E4M3 residual scale.
-    ``tile_means`` is the packed bf16 mean operand ``[B, Hkv, num_kv_tiles, 8,
-    256]`` from ``pack_vc_tile_means`` (means already divided by
+    ``tile_means`` is the packed bf16 mean operand ``[B, Hkv,
+    ceil(num_kv_tiles / 16), 16, 256]`` from ``pack_vc_tile_means`` (means already divided by
     ``v_scale``). The scale must be positive and finite. The kernel does not
     check it. ``demean`` says whether the run restores the means. It is
     ``False`` after the V-Smooth window, when they are zero and the kernel
@@ -369,6 +369,8 @@ def vc_token_permutation_with_centroids(
     b, s, h, d = v.shape
     if num_clusters is None:
         num_clusters = VC_KMEANS_CLUSTERS
+    # Seeding draws distinct value rows, so a short sequence caps the clusters.
+    num_clusters = min(num_clusters, s)
     n_groups = b * h
     # Work on a few heads at a time so the fp32 copy of V and the distance
     # matrix each stay under 0.75 GB.
