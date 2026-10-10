@@ -145,7 +145,9 @@ def cache_requirements(
         None,
     )
     if raw_ring_capacity is None:
-        raise ValueError("raw_ring_capacity must divide main_page_size and cover speculative history")
+        raise ValueError(
+            "raw_ring_capacity must divide main_page_size and cover speculative history"
+        )
 
     element_nbytes = dtype.itemsize
     kv_element_nbytes = kv_dtype.itemsize
@@ -2516,6 +2518,7 @@ def _qsa_decode_impl(
     cp_kv_cache_interleave_size: int = 1,
     attention_splits: int = 0,
     programs: QsaPrograms | None = None,
+    cache_only: bool = False,
 ) -> None:
     """Launch selector state updates, optionally followed by sparse attention."""
     rows = int(index_query.shape[0])
@@ -2715,6 +2718,9 @@ def _qsa_decode_impl(
         raw_interval_start_positions=raw_interval_start_positions,
         caps=caps,
     )
+
+    if cache_only:
+        return
 
     from ._sparse_gqa import launch_sparse_paged_gqa
 
@@ -2956,6 +2962,7 @@ def _qsa_decode_op(
     partial_lse_offset_bytes: int,
     output_lse_offset_bytes: int,
     selection_only: bool,
+    cache_only: bool = False,
 ) -> None:
     state = require_prepared(
         plan_from_handle(plan_handle), "attention.qsa", query.device
@@ -3073,6 +3080,7 @@ def _qsa_decode_op(
         cp_kv_cache_interleave_size=state.caps.cp_kv_cache_interleave_size,
         attention_splits=state.caps.attention_splits,
         programs=state.programs,
+        cache_only=cache_only,
     )
 
 
@@ -3137,6 +3145,7 @@ def _qsa_decode_fake(
     partial_lse_offset_bytes: int,
     output_lse_offset_bytes: int,
     selection_only: bool,
+    cache_only: bool = False,
 ) -> None:
     return None
 
@@ -3267,6 +3276,7 @@ def _qsa_decode_shared_op(
     partial_lse_offset_bytes: int,
     output_lse_offset_bytes: int,
     selection_only: bool,
+    cache_only: bool = False,
 ) -> None:
     state = require_prepared(
         plan_from_handle(plan_handle), "attention.qsa", query.device
@@ -3392,6 +3402,7 @@ def _qsa_decode_shared_op(
         cp_kv_cache_interleave_size=state.caps.cp_kv_cache_interleave_size,
         attention_splits=state.caps.attention_splits,
         programs=state.programs,
+        cache_only=cache_only,
     )
 
 
@@ -3454,6 +3465,7 @@ def _qsa_decode_shared_fake(
     partial_lse_offset_bytes: int,
     output_lse_offset_bytes: int,
     selection_only: bool,
+    cache_only: bool = False,
 ) -> None:
     return None
 
@@ -3473,6 +3485,7 @@ def _run(
     is_prefilling: torch.Tensor,
     selection_only: bool = False,
     programs: QsaPrograms | None = None,
+    cache_only: bool = False,
 ) -> torch.Tensor:
     """Validate a complete transaction and launch its combined or selector stage."""
     if not isinstance(binding, Binding):
@@ -3669,6 +3682,7 @@ def _run(
             cp_kv_cache_interleave_size=caps.cp_kv_cache_interleave_size,
             attention_splits=caps.attention_splits,
             programs=programs,
+            cache_only=cache_only,
         )
         return binding.output[:rows]
 
@@ -3733,6 +3747,7 @@ def _run(
             int(layout.partial_lse_offset_bytes),
             int(layout.output_lse_offset_bytes),
             selection_only,
+            cache_only,
         )
         return binding.output[:rows]
     _qsa_decode_op(
@@ -3795,6 +3810,7 @@ def _run(
         int(layout.partial_lse_offset_bytes),
         int(layout.output_lse_offset_bytes),
         selection_only,
+        cache_only,
     )
     return binding.output[:rows]
 
@@ -3814,8 +3830,16 @@ def run(
     is_prefilling: torch.Tensor | None = None,
     index_ready: torch.cuda.Event | None = None,
     reuse: DraftSelectionReuse | None = None,
-) -> torch.Tensor:
+    cache_only: bool = False,
+) -> torch.Tensor | None:
     """Run one packed QSA decode transaction after main K/V writes are enqueued.
+
+    ``cache_only=True`` updates compressed keys and the raw-key ring on the
+    calling stream, then returns ``None``. It skips query preparation, selection
+    and attention, leaving scratch, selected positions, output, and draft anchors
+    unchanged. All input tensors retain the prepared shape/stride contract;
+    query and index-query values are unused. Main K/V writes remain caller-owned.
+    Cache-only execution cannot use selection-stream overlap or draft reuse.
 
     Main Q/K/V writes precede this call on the calling stream. By default all
     QSA work follows them on that stream. A binding with ``selection_stream``
@@ -3877,6 +3901,14 @@ def run(
         raise TypeError("QSA binding requires a prepared plan")
     if binding.state.caps.dcp_size > 1:
         raise ValueError("DCP QSA requires select() followed by attend()")
+    if cache_only and (
+        reuse is not None
+        or binding.selection_stream is not None
+        or index_ready is not None
+    ):
+        raise ValueError(
+            "cache-only QSA requires the calling stream and no draft reuse"
+        )
     if reuse is not None:
         if not isinstance(reuse, DraftSelectionReuse):
             raise TypeError("reuse must be a qsa.DraftSelectionReuse")
@@ -3982,6 +4014,9 @@ def run(
         num_accepted_tokens=num_accepted_tokens,
         is_prefilling=is_prefilling,
     )
+    if cache_only:
+        _run(binding, **inputs, cache_only=True)
+        return None
     if binding.draft_selection is not None:
         from ._draft_selection import validate_buffers
 

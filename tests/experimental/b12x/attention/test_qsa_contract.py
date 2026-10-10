@@ -1435,7 +1435,9 @@ def test_qsa_completed_group_compression_matches_bf16_rounding_and_rope(
 
 
 @pytest.mark.parametrize("page_size", [96, 64])
-def test_qsa_packed_speculative_rejection_replaces_stale_groups_before_use(page_size) -> None:
+def test_qsa_packed_speculative_rejection_replaces_stale_groups_before_use(
+    page_size,
+) -> None:
     device = require_sm120()
     caps = _caps(
         device,
@@ -1525,7 +1527,9 @@ def test_qsa_packed_speculative_rejection_replaces_stale_groups_before_use(page_
 
 
 @pytest.mark.parametrize("page_size,drafts,width", [(1504, 3, 4), (64, 7, 8)])
-def test_qsa_production_page_boundary_after_speculative_rollback_graph_replay(page_size, drafts, width) -> None:
+def test_qsa_production_page_boundary_after_speculative_rollback_graph_replay(
+    page_size, drafts, width
+) -> None:
     device = require_sm120()
     caps = _caps(
         device,
@@ -3839,3 +3843,67 @@ def test_qsa_draft_reuse_validates_live_input_contract_before_mutation():
     with pytest.raises(ValueError, match="overlap"):
         qsa.run(binding, **common, reuse=qsa.DraftSelectionReuse(aliased_rows))
     assert state.num_source_rows.item() == 0
+
+
+@pytest.mark.parametrize("shared_pool", [False, True])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_qsa_cache_only_replay_matches_cache_mutations(shared_pool, compiled):
+    device = require_sm120()
+    caps = _caps(device, max_batch=1, max_raw_state_slots=1, max_q_rows=4)
+    allocate = (
+        _allocate_shared_compressed_raw_binding if shared_pool else _allocate_binding
+    )
+    binding = allocate(caps)
+    binding.main_block_table[0, 0] = 0
+    binding.compressed_block_table[0, 0] = 1
+    binding.main_k_cache.zero_()
+    binding.main_v_cache.zero_()
+    binding.compressed_k_cache.zero_()
+    binding.raw_k_ring.zero_()
+    binding.raw_logical_positions.fill_(-1)
+    binding.raw_rope_positions.fill_(-1)
+    dynamic = _dynamic_inputs(
+        binding, positions=(0, 1, 2, 3), request_ids=(0, 0, 0, 0), is_prefilling=(True,)
+    )
+    fields = (
+        "compressed_k_cache",
+        "raw_k_ring",
+        "raw_logical_positions",
+        "raw_rope_positions",
+        "raw_interval_start_positions",
+    )
+    initial = {name: getattr(binding, name).clone() for name in fields}
+    qsa.run(binding, **dynamic)
+    expected = {name: getattr(binding, name).clone() for name in fields}
+
+    def update():
+        return qsa.run(binding, **dynamic, cache_only=True)
+
+    forward = (
+        torch.compile(update, fullgraph=True, backend="eager") if compiled else update
+    )
+    dynamic["query"].fill_(float("nan"))
+    dynamic["index_query"].fill_(float("nan"))
+    assert forward() is None
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = _cuda_graph()
+    with torch.cuda.graph(graph, stream=stream):
+        forward()
+    stream.synchronize()
+    for poison in (0xA5, 0x5A):
+        for name, value in initial.items():
+            getattr(binding, name).copy_(value)
+        binding.scratch.fill_(poison)
+        binding.output.fill_(19)
+        binding.selected_positions.fill_(-17)
+        torch.cuda.synchronize()
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        for name, value in expected.items():
+            assert torch.equal(getattr(binding, name), value), name
+        assert (binding.output == 19).all()
+        assert (binding.selected_positions == -17).all()
+        assert (binding.scratch == poison).all()
