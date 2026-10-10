@@ -16,9 +16,39 @@ class CollectiveInverse:
         self,
         garbage_filled_diagonal: bool = True,
         garbage_filled_upper_triangular: bool = False,
+        has_stmatrix: bool = True,
     ):
+        """Fix what the input's unused halves hold and which store to use.
+
+        The two garbage flags say whether the diagonal and the upper triangle
+        of the input carry values the masking has to overwrite; the caller
+        knows, and reading them instead would cost a pass. `has_stmatrix` is
+        False for targets before SM90 -- see `_store_atom` for why that is a
+        drop-in rather than a different algorithm.
+        """
         self.garbage_filled_diagonal = garbage_filled_diagonal
         self.garbage_filled_upper_triangular = garbage_filled_upper_triangular
+        # stmatrix does not exist before sm_90. Callers targeting an older
+        # architecture pass False and get ordinary register-to-shared stores
+        # instead; see _store_atom for why that is a drop-in.
+        self.has_stmatrix = has_stmatrix
+
+    def _store_atom(self, num_matrices: int):
+        """The register-to-shared atom for writing an accumulator back.
+
+        Every use of this goes through ``make_tiled_copy_C``, which takes its
+        thread-value map from the MMA rather than from the atom, so the two
+        forms put each element at the same address. They differ in how many
+        instructions that takes: stmatrix moves an 8x8 tile per thread group,
+        an ordinary store moves one element. None of these sites transposes,
+        which is the case a plain store could not reproduce.
+        """
+        if self.has_stmatrix:
+            return cute.make_copy_atom(
+                warp.StMatrix8x8x16bOp(transpose=False, num_matrices=num_matrices),
+                cutlass.Float16,
+            )
+        return cute.make_copy_atom(cute.nvgpu.CopyR2SOp(), cutlass.Float16)
 
     # ── Level 1: NxN Gauss elimination on diagonal blocks ───────────────────────
 
@@ -78,6 +108,13 @@ class CollectiveInverse:
 
     @cute.jit
     def blockwise_8x8_to_16x16(self, mat: cute.Tensor):
+        """Invert one 16x16 diagonal block, given its two 8x8 diagonals.
+
+        Called by one warp on a (16, 16) shared slice whose 8x8 diagonal
+        blocks level 1 already inverted. Fills the lower-left 8x8 with
+        `-inv(D) @ C @ inv(A)`, which is the only part still missing; the
+        upper-right is zero and stays zero.
+        """
         lane_id = cute.arch.lane_idx()
 
         tiled_mma = cute.make_tiled_mma(
@@ -126,9 +163,7 @@ class CollectiveInverse:
         b_atom = cute.make_copy_atom(
             warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=1), cutlass.Float16
         )
-        o_atom = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=1), cutlass.Float16
-        )
+        o_atom = self._store_atom(1)
 
         D_tiled_copy = cute.make_tiled_copy_A(dinv_atom, tiled_mma)
         C_tiled_copy = cute.make_tiled_copy_B(b_atom, tiled_mma)
@@ -176,6 +211,12 @@ class CollectiveInverse:
 
     @cute.jit
     def blockwise_16x16_to_32x32(self, mat: cute.Tensor):
+        """Invert one 32x32 diagonal block from its two 16x16 diagonals.
+
+        One warp, one (32, 32) shared slice, and the same two-GEMM step as
+        level 2 with the tile doubled: the lower-left 16x16 is the part level 2
+        left unwritten.
+        """
         lane_id = cute.arch.lane_idx()
 
         tiled_mma = cute.make_tiled_mma(
@@ -207,9 +248,7 @@ class CollectiveInverse:
         b_atom = cute.make_copy_atom(
             warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=2), cutlass.Float16
         )
-        o_atom = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2), cutlass.Float16
-        )
+        o_atom = self._store_atom(2)
 
         D_tiled_copy = cute.make_tiled_copy_A(dinv_atom, tiled_mma)
         C_tiled_copy = cute.make_tiled_copy_B(b_atom, tiled_mma)
@@ -255,6 +294,13 @@ class CollectiveInverse:
 
     @cute.jit
     def blockwise_32x32_to_64x64(self, sT: cute.Tensor, barrier_id: cutlass.Int32):
+        """Invert the whole 64x64 from its two 32x32 diagonals.
+
+        All four warps, and the only level that needs them to talk: the
+        lower-left 32x32 is a sum of two products, so the warps holding one
+        half write it, the barrier publishes it, and the warps holding the
+        other half add theirs on top. That is what `barrier_id` is for.
+        """
         lane_id = cute.arch.lane_idx()
         warp_id = cute.arch.warp_idx() % 4  # WG-local warp ID 0..3
         x = warp_id // 2  # 0 or 1
@@ -308,9 +354,7 @@ class CollectiveInverse:
         O_atom_s2r = cute.make_copy_atom(
             warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.Float16
         )
-        O_atom_r2s = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.Float16
-        )
+        O_atom_r2s = self._store_atom(4)
 
         D_tiled_copy = cute.make_tiled_copy_A(dinv_atom, tiled_mma1)
         C_tiled_copy = cute.make_tiled_copy_B(c_atom, tiled_mma1)
