@@ -8,7 +8,9 @@ selection.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import os
+import threading
 import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
@@ -564,10 +566,17 @@ class _WeightViews:
 def _register_cache_eviction(cache: Dict, key: Tuple, *source_tensors) -> None:
     """Evict ``key`` when a source weight tensor is collected, so the cache
     follows the weights' lifetime instead of growing for the whole process.
+
+    Eviction is bound to this insertion by a generation number, so it never
+    drops a later entry for the same key, and parks the entry instead of
+    freeing it when a captured CUDA graph references it (see
+    _evict_weight_cache_entry()).
     """
+    generation = next(_WEIGHT_ENTRY_GENERATION_COUNTER)
+    _WEIGHT_ENTRY_GENERATIONS[(id(cache), key)] = generation
     for tensor in source_tensors:
         if tensor is not None:
-            weakref.finalize(tensor, cache.pop, key, None)
+            weakref.finalize(tensor, _evict_weight_cache_entry, cache, key, generation)
 
 
 _WEIGHT_CACHE: Dict[Tuple, Tuple] = {}
@@ -612,7 +621,7 @@ def _get_weight_views(
         w2_blockscale.data_ptr(),
         w2_alphas.data_ptr(),
     )
-    cached = _WEIGHT_CACHE.get(key)
+    cached = _get_weight_cache_entry(_WEIGHT_CACHE, key)
     if cached is None:
         # Cache the fresh buffers (scale factors + fp32 alphas).
         w1_rows = w1_fp4.shape[1]  # 2*n for gated, n for non-gated
@@ -634,10 +643,10 @@ def _get_weight_views(
             w1_alphas.contiguous().to(torch.float32),
             w2_alphas.contiguous().to(torch.float32),
         )
-        _WEIGHT_CACHE[key] = cached
-        _register_cache_eviction(
+        cached = _put_weight_cache_entry(
             _WEIGHT_CACHE,
             key,
+            cached,
             w1_fp4,
             w1_blockscale,
             w1_alphas,
@@ -2745,7 +2754,7 @@ def _get_w4a16_packed_weights(
         w2_weight_sf.data_ptr(),
         w2_alpha.data_ptr(),
     )
-    cached = _W4A16_WEIGHT_CACHE.get(key)
+    cached = _get_weight_cache_entry(_W4A16_WEIGHT_CACHE, key)
     if cached is not None:
         return cached
     if _is_cuda_graph_capturing():
@@ -2764,10 +2773,10 @@ def _get_w4a16_packed_weights(
         params_dtype=params_dtype,
         source_format=source_format,
     )
-    _W4A16_WEIGHT_CACHE[key] = prepared
-    _register_cache_eviction(
+    return _put_weight_cache_entry(
         _W4A16_WEIGHT_CACHE,
         key,
+        prepared,
         w1_weight,
         w1_weight_sf,
         w1_alpha,
@@ -2775,7 +2784,6 @@ def _get_w4a16_packed_weights(
         w2_weight_sf,
         w2_alpha,
     )
-    return prepared
 
 
 def _validate_w4a16_workspace(
@@ -2924,21 +2932,171 @@ _Sm120Workspace = Union[
 ]
 
 # Stores the workspace with the largest capacity seen per key and never
-# shrinks within a process. clear_sm120_moe_caches() releases everything.
+# shrinks within a process. clear_sm120_moe_caches() releases entries that no
+# captured CUDA graph references; graph-referenced entries are parked instead
+# (see _GRAPH_REFERENCED_WORKSPACES).
 # The key holds expert counts only, not placement: buffer geometry
 # depends only on the counts, and EP callers pass expert_map per call.
 _WORKSPACE_CACHE: Dict[Tuple, _Sm120Workspace] = {}
+# Storage handed out while a CUDA graph capture was underway. A captured
+# graph replays through the raw device pointers of its workspace and of the
+# prepared weights (converted scale factors, padded weights, W4A16-packed
+# weights) held by the weight caches, so once such storage is
+# graph-referenced it must not return to the allocator while any capturing
+# graph can still replay: replacement or cache clearing would let the freed
+# pages back a later unrelated allocation that replay then reads or
+# overwrites. Growth is one parked entry per replacement or clear of a
+# graph-referenced entry; release_graph_referenced_workspaces() frees them
+# once the caller has destroyed every graph captured against them.
+_GRAPH_REFERENCED_WORKSPACES: list = []
+# Prepared-weight cache entries read or created during capture, as
+# (id(cache), key). Weight entries are tuples or shared dataclasses, so they
+# are tracked by key rather than marked in place.
+_GRAPH_REFERENCED_WEIGHT_KEYS: set = set()
+# Insertion generation of each prepared-weight cache entry, as
+# (id(cache), key) -> generation, so a source-collection finalizer only
+# evicts the insertion it was registered for.
+_WEIGHT_ENTRY_GENERATIONS: Dict[Tuple, int] = {}
+_WEIGHT_ENTRY_GENERATION_COUNTER = itertools.count()
+# Serializes cache lookup and marking against replacement, clearing and
+# source-collection eviction so a concurrent mutation cannot drop a workspace
+# or prepared weights between a capture-time cache read and its
+# graph-referenced marking. Reentrant because eviction runs from weakref
+# finalizers, which garbage collection can trigger on a thread that already
+# holds the lock.
+_WORKSPACE_CACHE_LOCK = threading.RLock()
+
+
+def _mark_graph_referenced(workspace):
+    if workspace is not None and _is_cuda_graph_capturing():
+        workspace._sm12x_graph_referenced = True
+    return workspace
+
+
+def _retire_workspace(workspace) -> None:
+    """Drop a cache entry; graph-referenced storage is parked, not freed."""
+    if workspace is not None and getattr(workspace, "_sm12x_graph_referenced", False):
+        _GRAPH_REFERENCED_WORKSPACES.append(workspace)
+
+
+def _get_weight_cache_entry(cache: Dict, key: Tuple):
+    """Look up a prepared-weight cache entry, recording use during capture."""
+    with _WORKSPACE_CACHE_LOCK:
+        value = cache.get(key)
+        if value is not None and _is_cuda_graph_capturing():
+            _GRAPH_REFERENCED_WEIGHT_KEYS.add((id(cache), key))
+        return value
+
+
+def _put_weight_cache_entry(cache: Dict, key: Tuple, value, *source_tensors):
+    """Insert a prepared-weight cache entry and return ``value``.
+
+    Preparation runs outside the lock on the caller's stream, so two callers
+    can miss on the same key. The first insertion is cached and is never
+    replaced, since a graph captured in between may reference it. A later
+    caller keeps using the buffers it prepared itself, because the cached
+    ones may still be pending on another stream; if that caller is
+    capturing, its uncached buffers are parked as graph-referenced. Use
+    during capture is recorded, and the cached entry is evicted when a
+    source tensor is collected.
+    """
+    with _WORKSPACE_CACHE_LOCK:
+        capturing = _is_cuda_graph_capturing()
+        if key not in cache:
+            cache[key] = value
+            _register_cache_eviction(cache, key, *source_tensors)
+            if capturing:
+                _GRAPH_REFERENCED_WEIGHT_KEYS.add((id(cache), key))
+        elif capturing:
+            _GRAPH_REFERENCED_WORKSPACES.append(value)
+        return value
+
+
+def _evict_weight_cache_entry(cache: Dict, key: Tuple, generation: int) -> None:
+    """Drop a prepared-weight entry whose source tensor was collected.
+
+    Only the insertion registered for eviction is dropped. If a captured
+    graph references it, it is parked like a graph-referenced workspace
+    instead of being freed.
+    """
+    with _WORKSPACE_CACHE_LOCK:
+        graph_key = (id(cache), key)
+        if _WEIGHT_ENTRY_GENERATIONS.get(graph_key) != generation:
+            return
+        del _WEIGHT_ENTRY_GENERATIONS[graph_key]
+        entry = cache.pop(key, None)
+        if entry is None:
+            return
+        if graph_key in _GRAPH_REFERENCED_WEIGHT_KEYS:
+            _GRAPH_REFERENCED_WEIGHT_KEYS.discard(graph_key)
+            _GRAPH_REFERENCED_WORKSPACES.append(entry)
+
+
+def _cuda_devices_of(entries) -> set:
+    """CUDA devices of the tensors held directly by cache entries."""
+    devices = set()
+    for entry in entries:
+        values = (
+            entry
+            if isinstance(entry, tuple)
+            else tuple(getattr(entry, "__dict__", {}).values())
+        )
+        for value in values:
+            if isinstance(value, torch.Tensor) and value.is_cuda:
+                devices.add(value.device)
+    return devices
+
+
+def release_graph_referenced_workspaces() -> None:
+    """Free storage parked for captured CUDA graphs.
+
+    Only call this after every CUDA graph captured while SM12x MoE
+    workspaces or prepared weights were cached has been destroyed; a
+    remaining graph would replay through freed storage. Destroying a graph
+    does not wait for replays already in flight, so every device holding
+    parked or graph-referenced storage is synchronized before that storage
+    is released. Graph-referenced markers on entries still in the caches are
+    also cleared, since the graphs that recorded them no longer exist.
+    """
+    with _WORKSPACE_CACHE_LOCK:
+        released = list(_GRAPH_REFERENCED_WORKSPACES)
+        for workspace in _WORKSPACE_CACHE.values():
+            if getattr(workspace, "_sm12x_graph_referenced", False):
+                released.append(workspace)
+        for cache in (_WEIGHT_CACHE, _W4A16_WEIGHT_CACHE, _PADDED_WEIGHT_CACHE):
+            for key, value in list(cache.items()):
+                if (id(cache), key) in _GRAPH_REFERENCED_WEIGHT_KEYS:
+                    released.append(value)
+        # Outstanding replays may still use this storage, including entries
+        # that stay cached but lose their marker and could be freed by a
+        # later replacement or clear.
+        for device in _cuda_devices_of(released):
+            torch.cuda.synchronize(device)
+        _GRAPH_REFERENCED_WORKSPACES.clear()
+        _GRAPH_REFERENCED_WEIGHT_KEYS.clear()
+        for workspace in _WORKSPACE_CACHE.values():
+            if getattr(workspace, "_sm12x_graph_referenced", False):
+                workspace._sm12x_graph_referenced = False  # type: ignore[union-attr]
 
 
 def clear_sm120_moe_caches() -> None:
     """Release every module-level SM12x MoE cache.
 
-    References held by callers are unaffected.
+    References held by callers are unaffected. Workspaces and prepared
+    weights recorded by a captured CUDA graph are parked instead of
+    released; see release_graph_referenced_workspaces().
     """
-    _WORKSPACE_CACHE.clear()
-    _WEIGHT_CACHE.clear()
-    _W4A16_WEIGHT_CACHE.clear()
-    _PADDED_WEIGHT_CACHE.clear()
+    with _WORKSPACE_CACHE_LOCK:
+        for workspace in _WORKSPACE_CACHE.values():
+            _retire_workspace(workspace)
+        _WORKSPACE_CACHE.clear()
+        for cache in (_WEIGHT_CACHE, _W4A16_WEIGHT_CACHE, _PADDED_WEIGHT_CACHE):
+            for key, value in list(cache.items()):
+                if (id(cache), key) in _GRAPH_REFERENCED_WEIGHT_KEYS:
+                    _GRAPH_REFERENCED_WORKSPACES.append(value)
+            cache.clear()
+        _GRAPH_REFERENCED_WEIGHT_KEYS.clear()
+        _WEIGHT_ENTRY_GENERATIONS.clear()
     _STATIC_KERNEL_CACHE.clear()
     _MICRO_KERNEL_CACHE.clear()
     _DIRECT_MICRO_LAUNCH_CACHE.clear()
@@ -3064,43 +3222,45 @@ def _get_cached_workspace(
         activation,
         tile_m,
     )
-    cached = _WORKSPACE_CACHE.get(cache_key)
+    with _WORKSPACE_CACHE_LOCK:
+        cached = _WORKSPACE_CACHE.get(cache_key)
 
-    if cached is not None:
-        if isinstance(cached, Sm120DynamicMoEWorkspace):
-            if cached.routed_rows_capacity >= max(1, routed_rows):
-                assert tile_m is None or cached.tile_m == tile_m
-                return cached
-        elif isinstance(cached, Sm120W4A16MoEWorkspace):
-            if cached.routed_rows_capacity >= max(1, routed_rows):
-                return cached
-        else:
-            if cached.max_rows >= max(1, routed_rows):
-                return cached
+        if cached is not None:
+            if isinstance(cached, Sm120DynamicMoEWorkspace):
+                if cached.routed_rows_capacity >= max(1, routed_rows):
+                    assert tile_m is None or cached.tile_m == tile_m
+                    return _mark_graph_referenced(cached)
+            elif isinstance(cached, Sm120W4A16MoEWorkspace):
+                if cached.routed_rows_capacity >= max(1, routed_rows):
+                    return _mark_graph_referenced(cached)
+            else:
+                if cached.max_rows >= max(1, routed_rows):
+                    return _mark_graph_referenced(cached)
 
-    if quant_mode == "w4a16" and _is_cuda_graph_capturing():
-        raise RuntimeError(
-            "W4A16 workspace is not initialized for CUDA graph capture; "
-            "provide a preallocated workspace from "
-            "allocate_sm120_moe_workspace(..., quant_mode='w4a16') or warm the "
-            "functional path before capture."
+        if quant_mode == "w4a16" and _is_cuda_graph_capturing():
+            raise RuntimeError(
+                "W4A16 workspace is not initialized for CUDA graph capture; "
+                "provide a preallocated workspace from "
+                "allocate_sm120_moe_workspace(..., quant_mode='w4a16') or warm the "
+                "functional path before capture."
+            )
+        workspace = allocate_sm120_moe_workspace(
+            state_E=state_E,
+            weight_E=weight_E,
+            routed_rows=routed_rows,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=device,
+            quant_mode=quant_mode,
+            activation_precision=activation_precision,
+            backend=backend,
+            activation=activation,
         )
-    workspace = allocate_sm120_moe_workspace(
-        state_E=state_E,
-        weight_E=weight_E,
-        routed_rows=routed_rows,
-        k=k,
-        n=n,
-        num_topk=num_topk,
-        device=device,
-        quant_mode=quant_mode,
-        activation_precision=activation_precision,
-        backend=backend,
-        activation=activation,
-    )
 
-    _WORKSPACE_CACHE[cache_key] = workspace
-    return workspace
+        _retire_workspace(cached)
+        _WORKSPACE_CACHE[cache_key] = workspace
+        return _mark_graph_referenced(workspace)
 
 
 # ==========================================================================
@@ -3146,7 +3306,7 @@ def _pad_intermediate_to_tile(
         w2_weight_sf.data_ptr(),
         fc2_input_scale_src.data_ptr() if fc2_input_scale_src is not None else 0,
     )
-    cached = _PADDED_WEIGHT_CACHE.get(key)
+    cached = _get_weight_cache_entry(_PADDED_WEIGHT_CACHE, key)
     if cached is not None:
         return cached
 
@@ -3225,17 +3385,16 @@ def _pad_intermediate_to_tile(
     if fc2_input_scale_src is not None and fc2_input_scale_src.numel() == n:
         fc2_input_scale = pad_dim(fc2_input_scale_src, 0, n, n_pad)
     result = (w1p, w1_sf_p, w2p, w2_sf_p, fc2_input_scale, n_pad)
-    _PADDED_WEIGHT_CACHE[key] = result
-    _register_cache_eviction(
+    return _put_weight_cache_entry(
         _PADDED_WEIGHT_CACHE,
         key,
+        result,
         w1_weight,
         w1_weight_sf,
         w2_weight,
         w2_weight_sf,
         fc2_input_scale_src,
     )
-    return result
 
 
 def _validate_static_workspace_for_launch(
