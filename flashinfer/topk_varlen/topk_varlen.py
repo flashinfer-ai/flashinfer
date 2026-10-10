@@ -1593,12 +1593,12 @@ def top_k_varlen(
     every row's valid columns, ``-1`` padded where a row has fewer valid
     columns than ``top_k``, and with ``return_values=True`` also the selected
     scores. In decode mode, an index is the logits column, which is also the
-    key's position in its request's cache. In windowed mode, an index is by
-    default the position inside the window (``0`` is ``row_starts[r]``, the
-    request's first key, so it addresses the request's cache exactly like a
-    decode index); with ``absolute_indices=True`` it is the logits column
-    ``row_starts[r] + position`` instead, which addresses the chunk's packed
-    key sequence directly.
+    key's position in its request's cache. In windowed (prefill) mode, an
+    index is by default the position inside the window (``0`` is
+    ``row_starts[r]``, the request's first key, so it addresses the request's
+    cache exactly like a decode index); with ``absolute_indices=True`` it is
+    the logits column ``row_starts[r] + position`` instead, which addresses
+    the chunk's packed key sequence directly.
 
     Backend selection
     -----------------
@@ -1743,31 +1743,28 @@ def top_k_varlen(
     next_n : int, optional
         Speculative-decode temporal stride.  Default ``1``.
     pre_idx : torch.Tensor, optional
-        ``int32[num_rows // next_n, top_k]`` — top-K KV-cache indices
-        selected by **this same layer** at the **previous token's decode
-        step**: a warm start for the backends that take a hint (how each
-        backend consumes or ignores it is under ``backend``). Must be a
-        contiguous, 16-byte-aligned ``int32`` tensor of shape
-        ``[seq_lens.shape[0], top_k]``: a hint that violates this is
-        **discarded with a RuntimeWarning** and the call runs hint-free (an
-        explicit backend that requires a hint is refused). Not allowed in
-        windowed mode.
+        Decode mode only: a hint of each request's top-k indices, a warm
+        start for the backends that take one (how each backend consumes or
+        ignores it is under ``backend``), as a contiguous, 16-byte-aligned
+        ``int32`` tensor of shape ``[seq_lens.shape[0], top_k]``, one row
+        per request. A hint that breaks this is discarded with a
+        ``RuntimeWarning`` and the call runs hint-free (an explicit backend
+        that requires one is refused). Not allowed in windowed (prefill)
+        mode. Default ``None``.
     return_values : bool, optional
-        When ``True`` also return the selected logit values (in windowed mode
-        the values at the selected window columns, whichever index frame was
-        requested). Padded slots hold a backend-specific sentinel (see
-        ``backend``); test ``indices >= 0`` rather than the value. Default
-        ``False``.
+        When ``True`` also return the selected logit values. Padded slots hold
+        a backend-specific sentinel (see ``backend``); test ``indices >= 0``
+        rather than the value. Default ``False``.
     out_indices : torch.Tensor, optional
-        Pre-allocated ``int32[num_rows, top_k]`` output buffer: contiguous,
-        16-byte aligned, of that shape or a 1-D buffer
-        of exactly ``num_rows * top_k`` elements (viewed in place and returned
-        as its ``[num_rows, top_k]`` view over the same storage, not as the
-        caller's object); a wider, taller or otherwise shaped buffer raises
-        ``ValueError``.
+        Pre-allocated buffer for the indices: ``int32``, contiguous, 16-byte
+        aligned, of shape ``(num_rows, top_k)`` or flat with
+        ``num_rows * top_k`` elements. The result is written into it and
+        returned as a ``(num_rows, top_k)`` view of it. Default ``None``: a
+        new tensor is allocated.
     out_values : torch.Tensor, optional
-        Pre-allocated values buffer (same dtype as ``logits``, same layout
-        rules as ``out_indices``). Only used when ``return_values=True``.
+        Pre-allocated buffer for the values, in the dtype of ``logits`` and
+        under the layout rules of ``out_indices``; used only with
+        ``return_values=True``. Default ``None``.
     backend : {"radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "auto"}, optional
         Backend to use.  Default ``"auto"``.
 
@@ -1803,54 +1800,53 @@ def top_k_varlen(
         ``"gvr_2"``         — self-sampling GVR V2 (TRT-LLM PR #17821 port):
                               sample-calibrated threshold ladders, exact
                               tie-interchangeable top-K, one launch per batch
-                              (windowed mode: one per 32768-row slab). SM100,
-                              SM103 or SM107 with an installed CuTe DSL. fp32
-                              only; unit inner stride, row stride a multiple
-                              of 4 elements (the width, for a single row),
-                              16-byte-aligned base, non-overlapping rows (a
-                              row stride wider than ``num_cols`` is fine);
-                              ``top_k`` in {512, 1024, 2048};
-                              ``compress_ratio`` 1 or 4; ``pre_idx`` optional
-                              and consumed unshifted, steering the kernels'
-                              sampling only (without one they sample the
-                              identity positions; exact either way);
-                              ``load_balance`` ignored; padded value slots
-                              hold ``finfo(float32).min``; NaN ordering is
+                              (windowed (prefill) mode: one per 32768-row
+                              slab). SM100, SM103 or SM107 with an installed
+                              CuTe DSL. fp32 only; unit inner stride, row
+                              stride a multiple of 4 elements (the width, for a
+                              single row), 16-byte-aligned base,
+                              non-overlapping rows (a row stride wider than
+                              ``num_cols`` is fine); ``top_k`` in {512, 1024,
+                              2048}; ``compress_ratio`` 1 or 4; ``pre_idx``
+                              optional and consumed unshifted, steering the
+                              kernels' sampling only (without one they sample
+                              the identity positions; exact either way);
+                              ``load_balance`` ignored; padded value slots hold
+                              ``finfo(float32).min``; NaN ordering is
                               implementation-specific. Decode mode, and the
-                              only backend of windowed (prefill) mode.
-                              Engines: register-resident engines hold the
-                              whole row in registers (capacity classes of
-                              2048, 4096 and 8192 columns); the streaming
-                              engine ranks rows of any length. In decode the
-                              host picks the engine from the row count,
-                              ``num_cols``, ``top_k`` and the device. In
-                              windowed mode it picks from the ``max_window_len``
-                              bound: a register-resident engine only where its
-                              routing table admits one (never for a bound at
-                              or below ``top_k``; the 8192-column class only
-                              for ``top_k == 2048``; on SM107, for bounds up
-                              to 2560 columns, only up to 16384 rows for
+                              only backend of windowed (prefill) mode. Engines:
+                              register-resident engines hold the whole row in
+                              registers (capacity classes of 2048, 4096 and
+                              8192 columns); the streaming engine ranks rows of
+                              any length. In decode the host picks the engine
+                              from the row count, ``num_cols``, ``top_k`` and
+                              the device. In windowed (prefill) mode it picks
+                              from the ``max_window_len`` bound: a
+                              register-resident engine only where its routing
+                              table admits one (never for a bound at or below
+                              ``top_k``; the 8192-column class only for
+                              ``top_k == 2048``; on SM107, for bounds up to
+                              2560 columns, only up to 16384 rows for
                               ``top_k <= 1024`` and 4096 rows for
-                              ``top_k == 2048``), else the streaming engine;
-                              a window longer than the selected
-                              register-resident engine's capacity is emitted
-                              as all ``-1``. Windowed loads start at
-                              ``row_starts[r] & ~3``: the up to three columns
-                              before ``row_starts[r]`` are read for 16-byte
-                              alignment and never influence the result; no
-                              column at or after the window end is read. A
-                              start outside the row is clamped: a negative
-                              start acts as ``0`` with the length unchanged,
-                              a start at or past ``num_cols`` gives an empty
-                              window (all ``-1``). CUDA
-                              graphs: hinted and hint-free decode engines, and
-                              the windowed engines per output frame, are
-                              distinct compiled objects. A streaming-engine
-                              launch (its cross-CTA counters, offsets and
-                              candidates are mutable scratch) needs a default
-                              workspace slab that exists per device and raw
-                              CUDA stream handle: 21 MB, created by the first
-                              eager streaming-engine launch on that stream (a
+                              ``top_k == 2048``), else the streaming engine; a
+                              window longer than the selected register-resident
+                              engine's capacity is emitted as all ``-1``.
+                              Windowed loads start at ``row_starts[r] & ~3``:
+                              the up to three columns before ``row_starts[r]``
+                              are read for 16-byte alignment and never
+                              influence the result; no column at or after the
+                              window end is read. A start outside the row is
+                              clamped: a negative start acts as ``0`` with the
+                              length unchanged, a start at or past ``num_cols``
+                              gives an empty window (all ``-1``). CUDA graphs:
+                              hinted and hint-free decode engines, and the
+                              windowed engines per output frame, are distinct
+                              compiled objects. A streaming-engine launch (its
+                              cross-CTA counters, offsets and candidates are
+                              mutable scratch) needs a default workspace slab
+                              that exists per device and raw CUDA stream
+                              handle: 21 MB, created by the first eager
+                              streaming-engine launch on that stream (a
                               register-engine launch creates none), shared by
                               the graphs captured on that stream, which must
                               therefore not be replayed concurrently with each
@@ -1858,17 +1854,17 @@ def top_k_varlen(
                               one, so cross-stream concurrency needs no caller
                               workspace (``torch.cuda.Stream()`` recycles
                               handles from a fixed pool per device and
-                              priority; external or other-priority handles
-                              each add a slab). Warm up each decode geometry
-                              (row count, ``num_cols`` and row stride,
-                              ``top_k``, ``next_n``, ``compress_ratio``, hinted
-                              or not) with one eager call on the stream that
-                              will capture, and each windowed geometry (row
-                              count, ``top_k``, ``absolute_indices`` and the
-                              bound: ``max_window_len``, else ``num_cols``; width
-                              and row stride do not matter) with an eager call
-                              or ``flashinfer.topk_varlen.warmup_prefill`` on
-                              that stream (``flashinfer.topk_varlen.prefill_ready``
+                              priority; external or other-priority handles each
+                              add a slab). Warm up each decode geometry (row
+                              count, ``num_cols`` and row stride, ``top_k``,
+                              ``next_n``, ``compress_ratio``, hinted or not)
+                              with one eager call on the stream that will
+                              capture, and each windowed geometry (row count,
+                              ``top_k``, ``absolute_indices`` and the bound:
+                              ``max_window_len``, else ``num_cols``; width and
+                              row stride do not matter) with an eager call or
+                              ``flashinfer.topk_varlen.warmup_prefill`` on that
+                              stream (``flashinfer.topk_varlen.prefill_ready``
                               tells whether a windowed geometry would launch
                               without compiling); a capture missing the engine
                               or the slab raises ``RuntimeError``. Slabs live
@@ -1931,14 +1927,13 @@ def top_k_varlen(
     Raises
     ------
     BackendSupportedError
-        If ``backend="auto"`` finds no backend whose checks pass (in windowed
-        mode: anything ``"gvr_2"`` cannot run, see ``"gvr_2"`` under
-        ``backend``); if an
-        explicit backend is not registered for the device; or, under
-        ``skip_check=True`` only, if ``row_starts`` comes with a backend other
-        than ``"gvr_2"`` or an explicit ``"gvr"`` has no usable ``pre_idx``
-        (with checks on, both are refused by the backend's checker as
-        ``ValueError``).
+        If ``backend="auto"`` finds no backend whose checks pass; in windowed
+        (prefill) mode that is anything ``"gvr_2"`` cannot run (see
+        ``"gvr_2"`` under ``backend``). If an explicit backend is not
+        registered for the device. Under ``skip_check=True`` only, if
+        ``row_starts`` comes with a backend other than ``"gvr_2"`` or an
+        explicit ``"gvr"`` has no usable ``pre_idx`` (with checks on, both are
+        refused by the backend's checker as ``ValueError``).
     ValueError
         If ``logits`` / ``seq_lens`` / ``next_n`` violate the shape, dtype or
         grouping contract; if a windowed-mode argument violates its contract
@@ -1966,30 +1961,59 @@ def top_k_varlen(
 
     Examples
     --------
+    Decode mode (the default): one row per request, ``seq_lens`` in KV
+    tokens, indices are logits columns.
+
     >>> import torch, flashinfer
-    >>> torch.manual_seed(42)
-    >>> B, N_max, top_k = 32, 8192, 1024
-    >>>
-    >>> # Step t: no prior indices; use radix to get the first top-K.
-    >>> # Each request has a different KV-cache length in [top_k+1, N_max-1].
-    >>> logits = torch.randn(B, N_max, dtype=torch.bfloat16, device="cuda")
-    >>> seq_lens_t = torch.randint(top_k + 1, N_max, (B,), dtype=torch.int32, device="cuda")
-    >>> indices_t, _ = flashinfer.top_k_varlen(logits, seq_lens_t, top_k, backend="radix_cutlass")
-    >>> # Reference check: every selected value must be >= the K-th largest.
-    >>> for i in range(B):
-    ...     s = seq_lens_t[i].item()
-    ...     kth = torch.topk(logits[i, :s].float(), top_k).values[-1]
-    ...     assert (logits[i, :s].float()[indices_t[i].long()] < kth - 1e-5).sum() == 0
-    >>>
-    >>> # Step t+1: one new token appended per request; seq_lens grows by 1.
-    >>> logits_t1 = torch.randn(B, N_max, dtype=torch.bfloat16, device="cuda")
-    >>> seq_lens_t1 = seq_lens_t + 1
-    >>> # Pass indices_t as pre_idx: a warm start for the backends that take a hint.
-    >>> indices_t1, _ = flashinfer.top_k_varlen(logits_t1, seq_lens_t1, top_k, pre_idx=indices_t)
-    >>> for i in range(B):
-    ...     s = seq_lens_t1[i].item()
-    ...     kth = torch.topk(logits_t1[i, :s].float(), top_k).values[-1]
-    ...     assert (logits_t1[i, :s].float()[indices_t1[i].long()] < kth - 1e-5).sum() == 0
+    >>> _ = torch.manual_seed(42)
+    >>> B, N, top_k = 32, 8192, 1024
+    >>> logits = torch.randn(B, N, dtype=torch.float32, device="cuda")
+    >>> seq_lens = torch.randint(top_k + 1, N, (B,), dtype=torch.int32, device="cuda")
+    >>> indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k)
+    >>> for i in range(B):  # every hit is >= the K-th largest valid score
+    ...     s = seq_lens[i].item()
+    ...     kth = torch.topk(logits[i, :s], top_k).values[-1]
+    ...     assert (logits[i, :s][indices[i].long()] < kth).sum() == 0
+    >>> # the next step may pass the previous result as a hint
+    >>> logits_next = torch.randn(B, N, dtype=torch.float32, device="cuda")
+    >>> indices_next, _ = flashinfer.top_k_varlen(logits_next, seq_lens + 1, top_k, pre_idx=indices)
+
+    Decode mode with speculative tokens and KV compression: ``next_n`` rows
+    per request (row ``r`` belongs to request ``r // next_n``), one column
+    per ``compress_ratio`` KV tokens; ``seq_lens`` stays in tokens and each
+    row's column count follows from it (see ``seq_lens``).
+
+    >>> next_n, compress_ratio = 2, 4
+    >>> logits_s = torch.randn(B * next_n, N, dtype=torch.float32, device="cuda")
+    >>> tokens = torch.randint((top_k + 1) * compress_ratio, N * compress_ratio, (B,), dtype=torch.int32, device="cuda")
+    >>> indices_s, _ = flashinfer.top_k_varlen(logits_s, tokens, top_k, next_n=next_n, compress_ratio=compress_ratio)
+    >>> for r in range(B * next_n):
+    ...     i, t = divmod(r, next_n)
+    ...     c = (tokens[i].item() - next_n + t + 1) // compress_ratio  # row r's valid columns
+    ...     kth = torch.topk(logits_s[r, :c], top_k).values[-1]
+    ...     assert (logits_s[r, :c][indices_s[r].long()] < kth).sum() == 0
+
+    Windowed (prefill) mode: one row per query token of a packed chunk, each
+    ranking its own window ``[row_starts[r], row_starts[r] + seq_lens[r])``
+    given in columns; ``next_n``, ``compress_ratio`` and ``pre_idx`` are not
+    passed. Served by ``"gvr_2"`` (see ``backend``).
+
+    >>> # two requests of L keys each on one packed key axis of 2 * L columns;
+    >>> # a request's j-th token (0-based) ranks the request's first j + 1 keys
+    >>> R, L, top_k = 2, 2048, 512
+    >>> logits_p = torch.randn(R * L, R * L, dtype=torch.float32, device="cuda")
+    >>> row_starts = torch.tensor([q * L for q in range(R) for _ in range(L)], dtype=torch.int32, device="cuda")
+    >>> seq_lens_p = torch.tensor([j + 1 for _ in range(R) for j in range(L)], dtype=torch.int32, device="cuda")
+    >>> local, _ = flashinfer.top_k_varlen(logits_p, seq_lens_p, top_k, row_starts=row_starts, max_window_len=L)
+    >>> columns, _ = flashinfer.top_k_varlen(logits_p, seq_lens_p, top_k, row_starts=row_starts, max_window_len=L, absolute_indices=True)
+    >>> # the same hits as window positions and as logits columns (a row's
+    >>> # slot order is not fixed, so compare sorted rows)
+    >>> as_columns = torch.where(local >= 0, local + row_starts[:, None], local)
+    >>> assert torch.equal(as_columns.sort(dim=1).values, columns.sort(dim=1).values)
+    >>> assert local[0].max() == 0 and (local[0] >= 0).sum() == 1  # a 1-key window: one hit, -1 padded
+    >>> r = R * L - 1  # the last token of request 1 ranks the request's whole window, columns [L, 2L)
+    >>> w = logits_p[r, L : 2 * L]
+    >>> assert (w[local[r].long()] < torch.topk(w, top_k).values[-1]).sum() == 0
 
     See Also
     --------
