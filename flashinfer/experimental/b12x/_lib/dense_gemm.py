@@ -1971,8 +1971,10 @@ class DenseGemmKernel:
         mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread
         )
+        # A16 scalar shared loads must complete in every consumer thread.
         mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, self.num_mma_warps
+            pipeline.Agent.Thread,
+            self.num_mma_warps * (self.num_threads_per_warp if self.a16 else 1),
         )
 
         cta_layout_vmnk = cute.make_layout((1, *cta_layout_mnk.shape))
@@ -2692,7 +2694,14 @@ class DenseGemmKernel:
                                 packed_b_lookahead_state.advance()
 
                         if k_block_idx == num_k_blocks - 1:
-                            mainloop_pipeline.consumer_release(mainloop_consumer_state)
+                            if cutlass.const_expr(self.a16):
+                                pipeline.PipelineAsync.consumer_release(
+                                    mainloop_pipeline, mainloop_consumer_state
+                                )
+                            else:
+                                mainloop_pipeline.consumer_release(
+                                    mainloop_consumer_state
+                                )
                             mainloop_consumer_state.advance()
 
                             peek_ab_full_status = cutlass.Boolean(1)
@@ -2905,7 +2914,12 @@ class DenseGemmKernel:
                     )
 
                     if k_block_idx == num_k_blocks - 1:
-                        mainloop_pipeline.consumer_release(mainloop_consumer_state)
+                        if cutlass.const_expr(self.a16):
+                            pipeline.PipelineAsync.consumer_release(
+                                mainloop_pipeline, mainloop_consumer_state
+                            )
+                        else:
+                            mainloop_pipeline.consumer_release(mainloop_consumer_state)
                         mainloop_consumer_state.advance()
 
                     if k_block_next > 0:
@@ -3763,6 +3777,9 @@ class DenseGemmKernel:
 
                 for _k_tile in range(0, k_tile_iter_cnt, 1, unroll=2):
                     mainloop_pipeline.producer_acquire(mainloop_producer_state)
+                    if cutlass.const_expr(self.a16):
+                        # Order consumer reads before async-proxy stage reuse.
+                        cute.arch.fence_view_async_shared()
 
                     k_tile_global = k_tile_start + mainloop_producer_state.count
                     if cutlass.const_expr(self.load_path == "tma"):
