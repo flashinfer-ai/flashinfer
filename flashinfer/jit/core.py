@@ -24,7 +24,12 @@ from filelock import FileLock
 
 from ..compilation_context import CompilationContext
 from . import env as jit_env
-from .cpp_ext import generate_ninja_build_for_op, get_nvcc_parallelism_flags, run_ninja
+from .cpp_ext import (
+    generate_ninja_build_for_op,
+    get_nvcc_parallelism_flags,
+    resolve_object_names,
+    run_ninja,
+)
 from .utils import write_if_different
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
@@ -479,14 +484,8 @@ class JitSpecNvcc(JitSpec):
         return (self.jit_library_path,)
 
     def get_object_paths(self) -> List[Path]:
-        object_paths = []
         jit_dir = self.build_dir
-        for source in self.sources:
-            is_cuda = source.suffix == ".cu"
-            object_suffix = ".cuda.o" if is_cuda else ".o"
-            obj_name = source.with_suffix(object_suffix).name
-            object_paths.append(jit_dir / obj_name)
-        return object_paths
+        return [jit_dir / obj_name for obj_name in resolve_object_names(self.sources)]
 
     @property
     def aot_path(self) -> Path:
@@ -662,7 +661,8 @@ class JitSpecNvcc(JitSpec):
 
         # Generate entries for each source file
         compile_commands = []
-        for source in self.sources:
+        object_names = resolve_object_names(self.sources)
+        for source, obj_name in zip(self.sources, object_names, strict=True):
             is_cuda = source.suffix == ".cu"
 
             if is_cuda:
@@ -670,13 +670,10 @@ class JitSpecNvcc(JitSpec):
                 flags = cuda_cflags_by_source.get(
                     source.resolve(), cuda_cflags_expanded
                 )
-                object_suffix = ".cuda.o"
             else:
                 compiler = cxx
                 flags = cflags_expanded
-                object_suffix = ".o"
 
-            obj_name = source.with_suffix(object_suffix).name
             output_file = os.path.join(build_dir, obj_name)
 
             # Build the command string
