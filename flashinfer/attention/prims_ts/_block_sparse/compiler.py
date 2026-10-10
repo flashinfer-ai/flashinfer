@@ -152,25 +152,19 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         # Sage scale tensors are [heads, flat slots]; the head stride is the
         # flat slot count of one head. A slot the recipe does not use (the V
         # mean without a mean, the summary K scales without proxy routes) is
-        # ``None`` and stays unbound. The Sage prepare gathers the plan's
-        # scales first; both prepares and attention are ordinary launches in
-        # stream order.
+        # ``None`` and stays unbound. Attention reads its K scales from the
+        # buffer the Sage prepare writes first, never ``k_scale``; both
+        # prepares and attention are ordinary launches in stream order.
         sage_kwargs = {}
         if cutlass.const_expr(static_config.use_sage_attention):
             sage_kwargs = {
                 "sage_q_scale_iter": q_scale.iterator,
-                "sage_k_scale_iter": k_scale.iterator,
+                "sage_scales_iter": sage_scales.iterator,
                 "sage_v_scale_iter": v_scale.iterator,
                 "sage_q_scale_head_stride": Int32(q_scale.shape[1]),
-                "sage_k_scale_head_stride": Int32(k_scale.shape[1]),
             }
             if cutlass.const_expr(static_config.sage_v_mean):
                 sage_kwargs["sage_v_mean_iter"] = v_mean.iterator
-            if cutlass.const_expr(static_config.use_block_sparse_proxy_routes):
-                sage_kwargs["sage_k_summary_scale_iter"] = k_summary_scale.iterator
-                sage_kwargs["sage_k_summary_scale_head_stride"] = Int32(
-                    k_summary_scale.shape[1]
-                )
             prepare_sage_scales(
                 q_scale, k_scale, k_summary_scale, v_scale, v_mean, sage_scales, stream
             )
