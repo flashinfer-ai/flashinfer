@@ -10,6 +10,9 @@ addition. Qwen GDN uses 10240 channels, four taps, and dilation one.
 The plan fixes token, request, and state-slot capacities. Device-resident counts
 and packed query boundaries choose live work without host synchronization.
 Decode, prefill, and mixed modes use the same prepared/bound lifecycle.
+Decode with zero speculative capacity fuses history reads, convolution, SiLU,
+and the in-place history shift into one kernel. Speculative decode, prefill,
+and mixed batches stage history before computing outputs and committing state.
 All buffers are caller owned. The outer history-slot and input-row strides may
 be padded; input columns, output rows, weights, and metadata are contiguous.
 Packed QKV/Z projections can expose QKV as a row-strided view without copying.
@@ -27,8 +30,7 @@ The caller guarantees bounded device counts, monotone query boundaries spanning
 the live token range, valid accepted counts, and unique in-range nonnegative
 state slots. Inactive metadata may contain arbitrary values. Input, output,
 history, and scratch must not alias. Prepared plans, graph operands, and scratch
-must remain alive until replay has drained. Correctness and allocation stability
-are tested; throughput is not qualified.
+must remain alive until replay has drained.
 
 This example captures a four-token GDN prefill with caller-owned history:
 

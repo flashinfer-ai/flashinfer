@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 import torch
 import triton
-
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x._lib.scratch import scratch_buffer_spec, scratch_tensor
@@ -16,7 +15,7 @@ from b12x._lib.scratch_layout import (
 )
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 
-from ._tuning import OPERANDS, ShortConvQuery, TUNING
+from ._tuning import OPERANDS, TUNING, ShortConvQuery
 
 _SCRATCH = frozenset(("gathered_state", "request_ids"))
 _BOOL = frozenset(("state_is_fresh", "request_is_prefill"))
@@ -102,6 +101,33 @@ def compile_pipeline(payload, ordinal):
     }
     channel_grid = triton.cdiv(q.channels, 128)
     with torch.cuda.device(ordinal):
+        if q.mode == "decode" and q.max_speculative_tokens == 0:
+            return (
+                kernels._decode_short_conv_kernel.warmup(
+                    *(
+                        p[name]
+                        for name in (
+                            "x",
+                            "conv_weight",
+                            "query_start_loc",
+                            "state_slot_ids",
+                            "state_is_fresh",
+                            "num_seqs",
+                            "num_tokens",
+                            "conv_state",
+                            "out",
+                        )
+                    ),
+                    q.channels,
+                    q.kernel_size,
+                    q.dilation,
+                    q.input_row_stride,
+                    q.state_strides[0],
+                    128,
+                    num_warps=4,
+                    grid=(q.max_tokens, channel_grid),
+                ),
+            )
         return (
             kernels._request_ids_kernel.warmup(
                 p["query_start_loc"],
@@ -346,6 +372,25 @@ class PreparedShortConv:
         q, p = self.query, self.programs
         channels = triton.cdiv(q.channels, 128)
         with torch.cuda.device(self.device):
+            if q.mode == "decode" and q.max_speculative_tokens == 0:
+                p[0][(q.max_tokens, channels, 1)](
+                    x,
+                    conv_weight,
+                    query_start_loc,
+                    state_slot_ids,
+                    state_is_fresh,
+                    num_seqs,
+                    num_tokens,
+                    conv_state,
+                    out,
+                    q.channels,
+                    q.kernel_size,
+                    q.dilation,
+                    q.input_row_stride,
+                    q.state_strides[0],
+                    128,
+                )
+                return
             p[0][(q.max_tokens, 1, 1)](
                 query_start_loc,
                 num_seqs,

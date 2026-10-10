@@ -5,6 +5,88 @@ import triton.language as tl
 
 
 @triton.jit
+def _decode_short_conv_kernel(
+    input_ptr,
+    conv_weight_ptr,
+    query_start_loc_ptr,
+    state_slot_ids_ptr,
+    state_is_fresh_ptr,
+    num_seqs_ptr,
+    num_tokens_ptr,
+    conv_state_ptr,
+    out_ptr,
+    CHANNELS: tl.constexpr,
+    KERNEL_SIZE: tl.constexpr,
+    DILATION: tl.constexpr,
+    INPUT_ROW_STRIDE: tl.constexpr,
+    STATE_SLOT_STRIDE: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    token = tl.program_id(0)
+    channels = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    channel_mask = channels < CHANNELS
+    num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
+    num_seqs = tl.load(num_seqs_ptr).to(tl.int32)
+    token_live = (token < num_tokens) & (num_seqs > 0)
+    low = tl.zeros((), tl.int32)
+    high = tl.maximum(num_seqs, 1)
+    while low + 1 < high:
+        middle = (low + high) // 2
+        start = tl.load(query_start_loc_ptr + middle, mask=token_live, other=0)
+        low = tl.where(start <= token, middle, low)
+        high = tl.where(start <= token, high, middle)
+    slot = tl.load(state_slot_ids_ptr + low, mask=token_live, other=-1).to(tl.int64)
+    fresh = tl.load(state_is_fresh_ptr + low, mask=token_live, other=True).to(tl.int1)
+    live = token_live & (slot >= 0)
+    STATE_LENGTH: tl.constexpr = DILATION * (KERNEL_SIZE - 1)
+    state_offsets = slot * STATE_SLOT_STRIDE + channels.to(tl.int64) * STATE_LENGTH
+
+    # Each channel owns its history; load it before the in-place shift.
+    history = ()
+    for position in tl.static_range(STATE_LENGTH):
+        value = tl.load(
+            conv_state_ptr + state_offsets + position,
+            mask=live & channel_mask & ~fresh,
+            other=0.0,
+        )
+        history += (value,)
+    current = tl.load(
+        input_ptr + token.to(tl.int64) * INPUT_ROW_STRIDE + channels.to(tl.int64),
+        mask=live & channel_mask,
+        other=0.0,
+    )
+    accumulator = tl.zeros((BLOCK_C,), tl.float32)
+    for tap in tl.static_range(KERNEL_SIZE):
+        if tap == KERNEL_SIZE - 1:
+            value = current
+        else:
+            value = history[tap * DILATION]
+        weight = tl.load(
+            conv_weight_ptr + channels.to(tl.int64) * KERNEL_SIZE + tap,
+            mask=channel_mask,
+            other=0.0,
+        ).to(tl.float32)
+        accumulator += value.to(tl.float32) * weight
+    convolved = accumulator.to(tl.bfloat16).to(tl.float32)
+    activated = (convolved * tl.sigmoid(convolved)).to(tl.bfloat16)
+    tl.store(
+        out_ptr + token.to(tl.int64) * CHANNELS + channels.to(tl.int64),
+        tl.where(live, activated, 0.0),
+        mask=channel_mask,
+    )
+    for position in tl.static_range(STATE_LENGTH):
+        if position == STATE_LENGTH - 1:
+            value = current
+        else:
+            value = history[position + 1]
+        tl.store(
+            conv_state_ptr + state_offsets + position,
+            value,
+            mask=live & channel_mask,
+        )
+
+
+@triton.jit
 def _request_ids_kernel(
     query_start_loc_ptr,
     num_seqs_ptr,

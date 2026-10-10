@@ -5,7 +5,6 @@ from contextlib import contextmanager
 import pytest
 import torch
 import torch.nn.functional as F
-
 from b12x.preparation import PreparationSession, PreparedCall
 from b12x.sequence import short_conv
 from b12x.sequence.short_conv._tuning import ShortConvQuery
@@ -64,21 +63,30 @@ def test_invalid_convolution_contract_is_rejected_without_cuda(override):
 
 
 class _Case:
-    def __init__(self, mode, *, channels=10240, dilation=1, input_padding=0):
+    def __init__(
+        self,
+        mode,
+        *,
+        channels=10240,
+        dilation=1,
+        input_padding=0,
+        speculative_tokens=3,
+        kernel_size=4,
+    ):
         device = require_b12x()
         self.caps = short_conv.Caps(
             device=device,
             mode=mode,
             channels=channels,
-            kernel_size=4,
+            kernel_size=kernel_size,
             dilation=dilation,
             max_tokens=12,
             max_seqs=4,
             max_state_slots=6,
-            max_speculative_tokens=3,
+            max_speculative_tokens=speculative_tokens,
         )
-        self.length = dilation * 3
-        capacity = self.length + 3
+        self.length = dilation * (kernel_size - 1)
+        capacity = self.length + speculative_tokens
         stride = channels * capacity + 32
         self.storage = torch.full(
             (6 * stride,), 17, dtype=torch.bfloat16, device=device
@@ -90,7 +98,7 @@ class _Case:
             (12, channels + input_padding), device=device
         ).to(torch.bfloat16)
         self.x = self.input_storage[:, :channels]
-        self.weight = (torch.randn((channels, 4), device=device) * 0.2).to(
+        self.weight = (torch.randn((channels, kernel_size), device=device) * 0.2).to(
             torch.bfloat16
         )
         self.args = dict(
@@ -303,8 +311,9 @@ def test_binding_rejects_input_output_aliases_and_unknown_history_layout():
             )
 
 
-def test_convolution_rounds_bf16_before_silu():
-    case = _Case("decode", channels=64)
+@pytest.mark.parametrize("speculative_tokens", [0, 3])
+def test_convolution_rounds_bf16_before_silu(speculative_tokens):
+    case = _Case("decode", channels=64, speculative_tokens=speculative_tokens)
     case.x.fill_(1)
     case.weight.zero_()
     case.weight[:, 0] = 1
@@ -319,3 +328,50 @@ def test_convolution_rounds_bf16_before_silu():
         )
         assert not torch.equal(expected, unrounded)
         torch.testing.assert_close(binding.out[:1], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("channels", [65, 6144, 12288])
+@pytest.mark.parametrize("kernel_size,dilation", [(2, 1), (4, 1), (4, 3), (7, 2)])
+def test_single_token_decode_updates_packed_strided_history(
+    channels, kernel_size, dilation
+):
+    case = _Case(
+        "decode",
+        channels=channels,
+        dilation=dilation,
+        input_padding=160,
+        speculative_tokens=0,
+        kernel_size=kernel_size,
+    )
+    with _prepared(case) as binding:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            short_conv.run(binding)
+        batches = (
+            ([1, 0, 1, 1], [4, 3, 1, -1], [False, True, True, False]),
+            ([0, 1, 0, 1], [3, 4, 0, 1], [True, False, False, False]),
+            ([1], [0], [True]),
+            ([0, 0, 0], [5, 0, 2], [True, True, True]),
+            ([], [], []),
+        )
+        for lengths, slots, fresh in batches * 3:
+            case.x.normal_()
+            case.batch(lengths, slots, fresh, [1] * len(lengths))
+            for length, slot, is_fresh in zip(lengths, slots, fresh):
+                if length and slot >= 0 and is_fresh:
+                    case.state[slot].fill_(float("nan"))
+            expected, state = case.oracle()
+            padding = case.storage.reshape(6, -1)[:, -32:].clone()
+            inputs = case.input_storage.clone()
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            torch.testing.assert_close(binding.out, expected, rtol=0.008, atol=0.002)
+            torch.testing.assert_close(case.state, state, rtol=0, atol=0)
+            torch.testing.assert_close(case.input_storage, inputs, rtol=0, atol=0)
+            torch.testing.assert_close(
+                case.storage.reshape(6, -1)[:, -32:], padding, rtol=0, atol=0
+            )
+        graph.reset()
