@@ -492,6 +492,74 @@ def test_ragged_fp8_calibration_scales(q_dtype, kv_dtype, causal, k_scale, v_sca
     torch.testing.assert_close(actual_lse, expected_lse, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("qo_len", [2, 4])
+@pytest.mark.parametrize("tiny_q", [False, True])
+def test_batch_prefill_paged_short_q_fp8_kv(q_dtype, kv_dtype, qo_len, tiny_q):
+    # Causal paged prefill whose packed query tile fits in 16 rows (speculative
+    # verify, MTP) takes the FP8 KV path that runs its MMAs in FP16. tiny_q puts
+    # the bf16 query below the FP16 normal range, which the kernel must rescale.
+    if tiny_q and q_dtype == torch.float16:
+        pytest.skip("an fp16 query cannot hold values below the fp16 normal range")
+    torch.manual_seed(qo_len)
+    kv_heads, group_size, dim, page_size = 2, 4, 128, 16
+    heads = kv_heads * group_size
+    kv_lens = [qo_len, 300, 2049]
+    num_pages = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+    kv_indptr = torch.tensor([0] + num_pages, dtype=torch.int32).cumsum(0).int()
+    kv_indices = torch.randperm(int(kv_indptr[-1]), dtype=torch.int32)
+    last_page_len = torch.tensor(
+        [(kv_len - 1) % page_size + 1 for kv_len in kv_lens], dtype=torch.int32
+    )
+    kv_data = torch.randn(
+        int(kv_indptr[-1]), 2, page_size, kv_heads, dim, device="cuda"
+    ).to(kv_dtype)
+    q = torch.randn(len(kv_lens) * qo_len, heads, dim, device="cuda")
+    sm_scale = dim**-0.5
+    if tiny_q:
+        q *= 1e-6
+        sm_scale *= 1e6
+    q = q.to(q_dtype)
+    qo_indptr = torch.arange(len(kv_lens) + 1, dtype=torch.int32) * qo_len
+
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(32 << 20, dtype=torch.uint8, device="cuda"), "NHD", backend="fa2"
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        heads,
+        kv_heads,
+        dim,
+        page_size,
+        causal=True,
+        sm_scale=sm_scale,
+        q_data_type=q_dtype,
+        kv_data_type=kv_dtype,
+    )
+    out = wrapper.run(q, kv_data)
+
+    for i, kv_len in enumerate(kv_lens):
+        pages = kv_indices[kv_indptr[i] : kv_indptr[i + 1]].long().cuda()
+        k = kv_data[pages, 0].reshape(-1, kv_heads, dim)[:kv_len].float()
+        v = kv_data[pages, 1].reshape(-1, kv_heads, dim)[:kv_len].float()
+        k = k.repeat_interleave(group_size, dim=1)
+        v = v.repeat_interleave(group_size, dim=1)
+        qi = q[i * qo_len : (i + 1) * qo_len].float()
+        logits = torch.einsum("qhd,khd->hqk", qi, k) * sm_scale
+        mask = torch.arange(kv_len, device="cuda")[None, :] > (
+            torch.arange(qo_len, device="cuda")[:, None] + kv_len - qo_len
+        )
+        logits.masked_fill_(mask, float("-inf"))
+        expected = torch.einsum("hqk,khd->qhd", logits.softmax(-1), v)
+        torch.testing.assert_close(
+            out[i * qo_len : (i + 1) * qo_len].float(), expected, atol=1e-2, rtol=1e-2
+        )
+
+
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
         12, 7, 54, 1, 4, 4, 128, "NHD", torch.float8_e5m2

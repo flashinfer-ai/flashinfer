@@ -688,6 +688,104 @@ def test_batch_decode_tensor_cores_plan_max_kv_len(
     assert wrapper._max_kv_len == int(kv_lens.max())
 
 
+def _fp8_kv_decode_reference(q, k, v, sm_scale):
+    """fp32 decode attention for one request; q [H_qo, D], k/v [L, H_kv, D]."""
+    group_size = q.shape[0] // k.shape[1]
+    k = k.float().repeat_interleave(group_size, dim=1)
+    v = v.float().repeat_interleave(group_size, dim=1)
+    s = torch.einsum("hd,lhd->hl", q.float(), k) * sm_scale
+    return torch.einsum("hl,lhd->hd", torch.softmax(s, dim=-1), v)
+
+
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,head_dim",
+    [
+        (torch.bfloat16, torch.float8_e4m3fn, 128),
+        (torch.bfloat16, torch.float8_e5m2, 128),
+        (torch.float16, torch.float8_e4m3fn, 128),
+        (torch.float16, torch.float8_e5m2, 128),
+        (torch.bfloat16, torch.float8_e4m3fn, 256),
+    ],
+)
+@pytest.mark.parametrize("group_size", [1, 4, 8])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("q_range", ["normal", "large", "tiny"])
+def test_batch_decode_tensor_cores_fp8_kv(
+    q_dtype, kv_dtype, head_dim, group_size, page_size, q_range
+):
+    """Tensor-core decode over an FP8 KV cache against an fp32 reference.
+
+    The FP8 path runs its MMAs in FP16 and rescales bf16 query rows that do not
+    fit it. "large" puts 1e5 (beyond the FP16 range) into one head dimension of
+    some query heads, with K fixed to 1 there so the softmax still depends on the
+    other dimensions; "tiny" scales the query by 1e-6 (below the FP16 normal
+    range) and sm_scale up by 1e6.
+    """
+    if q_range != "normal" and q_dtype == torch.float16:
+        pytest.skip("an fp16 query cannot hold values outside the fp16 range")
+    torch.manual_seed(group_size * 7 + page_size)
+    num_kv_heads = 2
+    num_qo_heads = num_kv_heads * group_size
+    kv_lens = [1, 54, 999, 4097]
+    num_pages = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+    kv_indptr = torch.tensor([0] + num_pages, dtype=torch.int32).cumsum(0).int()
+    kv_indices = torch.randperm(int(kv_indptr[-1]), dtype=torch.int32)
+    last_page_len = torch.tensor(
+        [(kv_len - 1) % page_size + 1 for kv_len in kv_lens], dtype=torch.int32
+    )
+    kv_data = (
+        torch.randn(
+            int(kv_indptr[-1]), 2, num_kv_heads, page_size, head_dim, device="cuda"
+        )
+        * 2
+    ).to(kv_dtype)
+    q = torch.randn(len(kv_lens), num_qo_heads, head_dim, device="cuda")
+    sm_scale = head_dim**-0.5
+    if q_range == "large":
+        kv_data[:, 0, :, :, 0] = 1.0
+        q[:, ::3, 0] = 1e5
+    elif q_range == "tiny":
+        q *= 1e-6
+        sm_scale *= 1e6
+    q = q.to(q_dtype)
+
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "HND",
+        use_tensor_cores=True,
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=q_dtype,
+        kv_data_type=kv_dtype,
+        sm_scale=sm_scale,
+    )
+    o = wrapper.run(q, kv_data)
+
+    for i, kv_len in enumerate(kv_lens):
+        pages = kv_indices[kv_indptr[i] : kv_indptr[i + 1]].long().cuda()
+        k = kv_data[pages, 0].transpose(1, 2).reshape(-1, num_kv_heads, head_dim)
+        v = kv_data[pages, 1].transpose(1, 2).reshape(-1, num_kv_heads, head_dim)
+        o_ref = _fp8_kv_decode_reference(q[i], k[:kv_len], v[:kv_len], sm_scale)
+        torch.testing.assert_close(o[i].float(), o_ref, rtol=1e-2, atol=1e-2)
+        if i == len(kv_lens) - 1 and q_dtype == torch.bfloat16 and head_dim == 128:
+            # The single-request tensor-core decode takes the same FP8 path.
+            o_single = flashinfer.single_decode_with_kv_cache(
+                q[i],
+                k[:kv_len].contiguous(),
+                v[:kv_len].contiguous(),
+                use_tensor_cores=True,
+                sm_scale=sm_scale,
+            )
+            torch.testing.assert_close(o_single.float(), o_ref, rtol=1e-2, atol=1e-2)
+
+
 if __name__ == "__main__":
     test_batch_decode_tensor_cores_with_fast_plan(
         5, 4, 4096, 2048, True, 1, 4, 1, 128, "HND", "NONE"
