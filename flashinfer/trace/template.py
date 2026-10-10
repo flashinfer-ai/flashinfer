@@ -472,7 +472,8 @@ class Scalar:
     Parameters
     ----------
     dtype:
-        Fixed dtype string (e.g. ``"float32"``).
+        Default dtype string (e.g. ``"float32"``). When the runtime value is
+        a scalar tensor, its tensor dtype takes precedence.
     param:
         Python parameter name. Defaults to the key name in the dict.
     optional:
@@ -759,7 +760,16 @@ class TraceTemplate:
             inputs_json: Dict[str, Any] = {}
             for json_key, descriptor in template.inputs.items():
                 if isinstance(descriptor, Scalar):
-                    entry = {"shape": None, "dtype": descriptor.dtype}
+                    param = (
+                        descriptor.param if descriptor.param is not None else json_key
+                    )
+                    value = kwargs.get(param)
+                    scalar_dtype = (
+                        _dtype_str(value.dtype)
+                        if isinstance(value, torch.Tensor)
+                        else descriptor.dtype
+                    )
+                    entry = {"shape": None, "dtype": scalar_dtype}
                 else:
                     param = (
                         descriptor.param if descriptor.param is not None else json_key
