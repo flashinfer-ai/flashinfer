@@ -1324,6 +1324,112 @@ def test_verify_kernel_mtp_reuses_compile_across_cache_modes(monkeypatch, batch_
         gdn_decode_mtp._get_compiled_mtp_kernel_inline.cache_clear()
 
 
+def _saturating_softplus_inputs(batch, seq_len=4, heads=2, value_heads=8):
+    torch.manual_seed(42)
+    device = "cuda"
+
+    def rand(*shape, dtype=torch.bfloat16):
+        return torch.randn(*shape, dtype=dtype, device=device) * 0.1
+
+    a = rand(batch, seq_len, value_heads)
+    # softplus_beta * (a + dt_bias) beyond ~88 overflows the FP32 exp.
+    a[:, 0].fill_(100.0)
+    return dict(
+        q=rand(batch, seq_len, heads, 128),
+        k=rand(batch, seq_len, heads, 128),
+        v=rand(batch, seq_len, value_heads, 128),
+        initial_state=rand(batch + 3, value_heads, 128, 128, dtype=torch.float32),
+        initial_state_indices=torch.arange(batch, dtype=torch.int32, device=device),
+        A_log=rand(value_heads, dtype=torch.float32),
+        a=a,
+        dt_bias=rand(value_heads, dtype=torch.float32),
+        b=rand(batch, seq_len, value_heads),
+        disable_state_update=True,
+        use_qk_l2norm=True,
+        scale=0.37,
+    )
+
+
+@pytest.mark.parametrize("batch_size", [16, 17], ids=["inline", "warp_specialized"])
+def test_verify_kernel_mtp_saturating_softplus(batch_size):
+    """A saturating softplus must not depend on which MTP kernel B selects."""
+    _skip_if_not_sm90_or_later()
+    value_heads = 8
+    inline = (batch_size * value_heads) <= 128
+    assert inline == (batch_size == 16), "batch sizes must straddle the selector"
+    output, _ = gated_delta_rule_mtp(**_saturating_softplus_inputs(batch_size))
+    assert torch.isfinite(output).all(), (
+        f"{torch.isnan(output).float().mean().item():.1%} of the output is NaN"
+    )
+
+
+def test_verify_kernel_mtp_saturating_softplus_matches_inline():
+    """Both MTP kernels must agree once the softplus branch is taken."""
+    _skip_if_not_sm90_or_later()
+    value_heads = 8
+    args = _saturating_softplus_inputs(17, value_heads=value_heads)
+    assert 16 * value_heads <= 128 < 17 * value_heads
+    warp_out, _ = gated_delta_rule_mtp(**args)
+    inline_args = {
+        name: value[:16]
+        if torch.is_tensor(value) and value.shape[:1] == (17,)
+        else value
+        for name, value in args.items()
+    }
+    inline_out, _ = gated_delta_rule_mtp(**inline_args)
+    torch.testing.assert_close(warp_out[:16], inline_out, atol=1e-3, rtol=1e-2)
+
+
+def _saturating_bf16_state_inputs(batch, seq_len, heads=2, value_heads=8):
+    torch.manual_seed(42)
+    device = "cuda"
+
+    def rand(*shape, dtype=torch.bfloat16):
+        return torch.randn(*shape, dtype=dtype, device=device) * 0.1
+
+    a = rand(batch, seq_len, value_heads)
+    a[:, 0].fill_(100.0)
+    return dict(
+        A_log=rand(value_heads, dtype=torch.float32),
+        a=a,
+        dt_bias=rand(value_heads, dtype=torch.float32),
+        q=rand(batch, seq_len, heads, 128),
+        k=rand(batch, seq_len, heads, 128),
+        v=rand(batch, seq_len, value_heads, 128),
+        b=rand(batch, seq_len, value_heads),
+        initial_state_source=rand(batch + 3, value_heads, 128, 128),
+        initial_state_indices=torch.arange(batch, dtype=torch.int32, device=device),
+        scale=0.37,
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size", [8, 16, 17], ids=["ilp4", "wide_vec_128", "wide_vec"]
+)
+def test_gdn_decode_bf16_state_mtp_saturating_softplus(batch_size):
+    """Same guard on the bf16-state MTP kernels, across their B*HV dispatch."""
+    _skip_if_not_sm90_or_later()
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("gdn_decode_bf16_state not available")
+    output = gdn_decode_bf16_state_mtp(
+        **_saturating_bf16_state_inputs(batch_size, 4), disable_state_update=True
+    )
+    assert torch.isfinite(output).all(), (
+        f"{torch.isnan(output).float().mean().item():.1%} of the output is NaN"
+    )
+
+
+@pytest.mark.parametrize("batch_size", [8, 64], ids=["ilp4_t1", "wide_vec_t1"])
+def test_gdn_decode_bf16_state_t1_saturating_softplus(batch_size):
+    _skip_if_not_sm90_or_later()
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("gdn_decode_bf16_state not available")
+    output = gdn_decode_bf16_state(**_saturating_bf16_state_inputs(batch_size, 1))
+    assert torch.isfinite(output).all(), (
+        f"{torch.isnan(output).float().mean().item():.1%} of the output is NaN"
+    )
+
+
 # ============================================================================
 # Test MTP kernel with FP32 state, cache ON, state update ON (comprehensive)
 # This tests the full production configuration: all BS and T values

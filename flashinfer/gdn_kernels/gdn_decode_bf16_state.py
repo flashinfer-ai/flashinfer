@@ -349,21 +349,15 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         r_b_pre = cutlass.Float32(b[i_n, i_t_pre, i_hv])
                         x_pre = r_a_pre + r_dt_bias
                         beta_x_pre = softplus_beta * x_pre
-                        exp_beta_x_pre = cute.exp(beta_x_pre, fastmath=True)
-                        softplus_val_pre = (
-                            cutlass.Float32(1.0) / softplus_beta
-                        ) * cute.log(
-                            cutlass.Float32(1.0) + exp_beta_x_pre, fastmath=True
-                        )
-                        use_softplus_pre = (
-                            cutlass.Float32(1.0)
-                            if beta_x_pre <= softplus_threshold
-                            else cutlass.Float32(0.0)
-                        )
-                        softplus_x_pre = (
-                            use_softplus_pre * softplus_val_pre
-                            + (cutlass.Float32(1.0) - use_softplus_pre) * x_pre
-                        )
+                        softplus_x_pre = x_pre
+                        if beta_x_pre <= softplus_threshold:
+                            softplus_x_pre = (
+                                cutlass.Float32(1.0) / softplus_beta
+                            ) * cute.log(
+                                cutlass.Float32(1.0)
+                                + cute.exp(beta_x_pre, fastmath=True),
+                                fastmath=True,
+                            )
                         r_g_value_pre = (
                             -cute.exp(r_A_log, fastmath=True) * softplus_x_pre
                         )
@@ -459,21 +453,15 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
                         x_val = r_a_val + r_dt_bias
                         beta_x_val = softplus_beta * x_val
-                        exp_beta_x_val = cute.exp(beta_x_val, fastmath=True)
-                        softplus_val_v = (
-                            cutlass.Float32(1.0) / softplus_beta
-                        ) * cute.log(
-                            cutlass.Float32(1.0) + exp_beta_x_val, fastmath=True
-                        )
-                        use_softplus_v = (
-                            cutlass.Float32(1.0)
-                            if beta_x_val <= softplus_threshold
-                            else cutlass.Float32(0.0)
-                        )
-                        softplus_x_v = (
-                            use_softplus_v * softplus_val_v
-                            + (cutlass.Float32(1.0) - use_softplus_v) * x_val
-                        )
+                        softplus_x_v = x_val
+                        if beta_x_val <= softplus_threshold:
+                            softplus_x_v = (
+                                cutlass.Float32(1.0) / softplus_beta
+                            ) * cute.log(
+                                cutlass.Float32(1.0)
+                                + cute.exp(beta_x_val, fastmath=True),
+                                fastmath=True,
+                            )
                         r_g_value_v = -cute.exp(r_A_log, fastmath=True) * softplus_x_v
                         r_beta = cutlass.Float32(1.0) / (
                             cutlass.Float32(1.0) + cute.exp(-r_b_val, fastmath=True)
@@ -518,19 +506,14 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                     r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
                     x_val = r_a_val + r_dt_bias
                     beta_x_val = softplus_beta * x_val
-                    exp_beta_x_val = cute.exp(beta_x_val, fastmath=True)
-                    softplus_val_v = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                        cutlass.Float32(1.0) + exp_beta_x_val, fastmath=True
-                    )
-                    use_softplus_v = (
-                        cutlass.Float32(1.0)
-                        if beta_x_val <= softplus_threshold
-                        else cutlass.Float32(0.0)
-                    )
-                    softplus_x_v = (
-                        use_softplus_v * softplus_val_v
-                        + (cutlass.Float32(1.0) - use_softplus_v) * x_val
-                    )
+                    softplus_x_v = x_val
+                    if beta_x_val <= softplus_threshold:
+                        softplus_x_v = (
+                            cutlass.Float32(1.0) / softplus_beta
+                        ) * cute.log(
+                            cutlass.Float32(1.0) + cute.exp(beta_x_val, fastmath=True),
+                            fastmath=True,
+                        )
                     r_g_value_v = -cute.exp(r_A_log, fastmath=True) * softplus_x_v
                     r_beta = cutlass.Float32(1.0) / (
                         cutlass.Float32(1.0) + cute.exp(-r_b_val, fastmath=True)
@@ -1175,19 +1158,12 @@ def gdn_wide_vec_kernel(
                 r_b_pre = cutlass.Float32(b_gate[i_n, i_t_pre, i_hv])
                 x_pre = r_a_pre + r_dt_bias
                 beta_x_pre = softplus_beta * x_pre
-                exp_beta_x_pre = cute.exp(beta_x_pre, fastmath=True)
-                softplus_val_pre = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + exp_beta_x_pre, fastmath=True
-                )
-                use_softplus_pre = (
-                    cutlass.Float32(1.0)
-                    if beta_x_pre <= softplus_threshold
-                    else cutlass.Float32(0.0)
-                )
-                softplus_x_pre = (
-                    use_softplus_pre * softplus_val_pre
-                    + (cutlass.Float32(1.0) - use_softplus_pre) * x_pre
-                )
+                softplus_x_pre = x_pre
+                if beta_x_pre <= softplus_threshold:
+                    softplus_x_pre = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                        cutlass.Float32(1.0) + cute.exp(beta_x_pre, fastmath=True),
+                        fastmath=True,
+                    )
                 r_g_pre = cute.exp(
                     -cute.exp(r_A_log, fastmath=True) * softplus_x_pre, fastmath=True
                 )
@@ -2138,19 +2114,12 @@ def gdn_wide_vec_kernel_t1(
                 r_b_pre = cutlass.Float32(b_gate[i_n, i_t_pre, i_hv])
                 x_pre = r_a_pre + r_dt_bias
                 beta_x_pre = softplus_beta * x_pre
-                exp_beta_x_pre = cute.exp(beta_x_pre, fastmath=True)
-                softplus_val_pre = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + exp_beta_x_pre, fastmath=True
-                )
-                use_softplus_pre = (
-                    cutlass.Float32(1.0)
-                    if beta_x_pre <= softplus_threshold
-                    else cutlass.Float32(0.0)
-                )
-                softplus_x_pre = (
-                    use_softplus_pre * softplus_val_pre
-                    + (cutlass.Float32(1.0) - use_softplus_pre) * x_pre
-                )
+                softplus_x_pre = x_pre
+                if beta_x_pre <= softplus_threshold:
+                    softplus_x_pre = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                        cutlass.Float32(1.0) + cute.exp(beta_x_pre, fastmath=True),
+                        fastmath=True,
+                    )
                 r_g_pre = cute.exp(
                     -cute.exp(r_A_log, fastmath=True) * softplus_x_pre, fastmath=True
                 )
