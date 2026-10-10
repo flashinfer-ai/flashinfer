@@ -67,7 +67,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.topk import top_k_varlen_trace
-from ..topk import get_topk_module
+from ..topk import _ROW_STATES_NBYTES, get_topk_module
 
 from ..cute_dsl.availability import is_cute_dsl_available
 
@@ -75,7 +75,6 @@ _CUTE_DSL_AVAILABLE = is_cute_dsl_available()
 
 from ..utils import (
     BackendSupportedError,
-    _get_cache_buf,
     backend_requirement,
     get_device_sm_count,
     get_shared_bytes_per_block_optin,
@@ -1196,11 +1195,10 @@ def _run_radix_cutlass(
     # offsets=zeros: output indices are local column indices (0..N-1), no shift.
     offsets = torch.zeros(num_rows, dtype=torch.int32, device=logits.device)
 
-    row_states_buffer = _get_cache_buf(
-        f"radix_topk_row_states_{logits.device}",
-        1024 * 1024,
-        logits.device,
-        zero_init=True,
+    # Fresh zeroed state keeps concurrent calls disjoint and initializes the
+    # inter-CTA synchronization counters for every launch.
+    row_states_buffer = torch.zeros(
+        _ROW_STATES_NBYTES, dtype=torch.uint8, device=logits.device
     )
     # Write directly into out_indices — no second allocation or copy_ needed.
     get_topk_module().radix_topk_ragged_transform(
@@ -1301,33 +1299,13 @@ def _run_radix(
         num_sms,
     )
 
-    # row_states holds the global histograms + inter-CTA barrier counters used
-    # when ctas_per_group > 1. max_num_groups must equal the compile-time value
-    # (both = num_sms // ctas_per_group) so the buffer matches the grid.
-    #
-    # The buffer is allocated for the worst case (ctas_per_group=1 → num_sms
-    # groups) and sliced to the current max_num_groups. Fixing the allocation at
-    # num_sms means the shared, device-keyed buffer never has to grow between
-    # calls with different N/ctas_per_group (a grow would re-zero and churn), and
-    # matches TRT-LLM's `[num_sms, state_size]` allocation.
-    #
-    # zero_init=True: the multi-CTA path spins on _ARRIVAL_COUNTER, so the buffer
-    # MUST be zero before the first launch. The kernel self-resets the slots it
-    # touches at end-of-kernel, so steady state stays clean without re-zeroing —
-    # but a prior single-CTA call (which never writes row_states) could otherwise
-    # leave garbage a later multi-CTA call reads. Zeroing on the one-time
-    # allocation (outside any CUDA-graph capture) keeps both paths correct.
+    # Fresh zeroed state keeps concurrent calls disjoint and initializes the
+    # inter-CTA synchronization counters for every launch.
     max_num_groups = max(1, num_sms // ctas_per_group)
-    nbytes = max_num_groups * _RADIX_STATE_SIZE * 4  # int32 → 4 bytes each
-    row_states = (
-        _get_cache_buf(
-            f"radix_row_states_{logits.device}",
-            num_sms * _RADIX_STATE_SIZE * 4,  # worst case: ctas_per_group=1
-            logits.device,
-            zero_init=True,
-        )[:nbytes]
-        .view(torch.int32)
-        .view(max_num_groups, _RADIX_STATE_SIZE)
+    row_states = torch.zeros(
+        (max_num_groups, _RADIX_STATE_SIZE),
+        dtype=torch.int32,
+        device=logits.device,
     )
 
     compiled(
