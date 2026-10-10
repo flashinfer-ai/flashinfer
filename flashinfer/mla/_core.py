@@ -48,6 +48,7 @@ from ._utils import (
     MLAHeadDimensions as MLAHeadDimensions,
     deepseek_mla_dimensions as deepseek_mla_dimensions,
     smaller_mla_dimensions as smaller_mla_dimensions,
+    compact_query_mla_dimensions as compact_query_mla_dimensions,
     nope_mla_dimensions as nope_mla_dimensions,
     supported_mla_head_dimensions as supported_mla_head_dimensions,
     _check_mla_query_kv_shape,
@@ -3518,8 +3519,9 @@ def _mla_with_kv_cache_impl(
         Pre-allocated workspace buffer. Must be zero-initialized on first use
         by kernels that use semaphore state.
     qk_nope_head_dim : int
-        Non-RoPE query dimension. Dense MLA paths commonly use ``128`` or
-        ``64`` depending on model. The SM120/SM121 sparse v32/GLM backend
+        Non-RoPE query dimension before absorption. SM100/SM103 TRTLLM-GEN
+        sparse MLA supports ``64`` with ``kv_lora_rank=512`` and
+        ``qk_rope_head_dim=64``. The SM120/SM121 sparse v32/GLM backend
         validates it together with ``query.shape[-1]``. GLM-5.3 uses the
         native ``qk_rope_head_dim=0`` / ``query.shape[-1]=512`` geometry.
     kv_lora_rank : int
