@@ -88,7 +88,7 @@ def _cudnn_supports_direct_seqlens(dtype: torch.dtype, *, mixed: bool = False) -
 # boundary), and the heuristic picks the short-row engine for a declared
 # max_len <= 128 and another engine above (flip measured between 128 and 256 on
 # SM100 and SM107, independent of batch, LSE and head dims). Within a class
-# override matches a natively built plan. Bounded SM100 MLA prefixes use
+# override matches a natively built plan. Bounded SM100/SM107 MLA and D128 use
 # smaller power-of-two classes so plan-time occupancy and partial workspace
 # bounds remain useful without specializing every live length.
 _PREFILL_SHAPE_OVERRIDE_ENV = "FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE"
@@ -123,7 +123,7 @@ def _cudnn_version_supports_shape_override() -> bool:
 
 
 @functools.cache
-def _cudnn_supports_bounded_ragged() -> bool:
+def _cudnn_supports_bounded_ragged(*, d128: bool = False) -> bool:
     """Bounded packed overrides require a matching FE Python/native stack."""
     if not CUDNN_AVAILABLE:
         return False
@@ -131,7 +131,13 @@ def _cudnn_supports_bounded_ragged() -> bool:
         version = tuple(map(int, cudnn.__version__.split(".")[:2]))
         binder = getattr(getattr(cudnn, "_pybind_module", None), "_SdpaThdBinder", None)
         return version >= (1, 31) and bool(
-            getattr(binder, "supports_nonpaged_packed_split", False)
+            getattr(
+                binder,
+                "supports_nonpaged_d128_packed_split"
+                if d128
+                else "supports_nonpaged_packed_split",
+                False,
+            )
         )
     except (AttributeError, TypeError, ValueError):
         return False
@@ -155,17 +161,17 @@ def _override_seq_class(max_seq: int, *, is_q: bool) -> int:
 
 
 def _override_cache_shape(
-    batch_size: int, max_seq_q: int, max_seq_kv: int, *, bounded_mla: bool = False
+    batch_size: int, max_seq_q: int, max_seq_kv: int, *, bounded_ragged: bool = False
 ) -> tuple[int, int, int]:
     """Declared (batch, s_q, s_kv) of the override graph for a real (b, s_q,
     s_kv). q and kv are classed separately (a short-q / long-kv step must not
     be declared as short kv). Grows by powers of two when a caller exceeds the
     defaults; that changes the cache key and builds one more plan."""
     # A bounded declaration lets either FE provider reserve packed partials and
-    # select an underfilled MLA launch. Powers of two retain graph reuse across
+    # select an underfilled packed launch. Powers of two retain graph reuse across
     # steps; the packed-Q capacity follows the declaration, not the live total.
     if (
-        bounded_mla
+        bounded_ragged
         and 1 <= batch_size <= 4
         and 64 <= max_seq_q <= 1024
         and 2048 <= max_seq_kv <= 32768
@@ -956,7 +962,7 @@ class _PrefillMetadata:
     k_scale: Optional[torch.Tensor] = None
     v_scale: Optional[torch.Tensor] = None
 
-    _bounded_mla: bool = False
+    _bounded_ragged: bool = False
 
     def resolve(self, q, k_cache, v_cache, *, batch_offsets_units="elements"):
         # Element offsets count elements of each tensor's own storage, so the
@@ -989,17 +995,27 @@ class _PrefillMetadata:
         batch_offsets_units="tokens",
         token_strides=None,
     ):
-        self._bounded_mla = (
+        self._bounded_ragged = (
             q_dtype == torch.bfloat16
             # The bounded-override contract is part of FE 1.31. Keep older
             # stacks on the established broad cache rather than multiplying
             # their graphs without a usable packed split implementation.
-            and _cudnn_supports_bounded_ragged()
-            and (head_dim_qk, head_dim_vo) == (192, 128)
-            and 4 <= num_qo_heads == num_kv_heads <= 64
+            and head_dim_vo == 128
+            and 4 <= num_qo_heads <= 64
+            and (
+                (head_dim_qk == 192 and num_qo_heads == num_kv_heads)
+                or (
+                    head_dim_qk == 128
+                    and num_kv_heads > 0
+                    and num_qo_heads % num_kv_heads == 0
+                    and num_qo_heads // num_kv_heads in (1, 2, 4, 8)
+                )
+            )
+            and _cudnn_supports_bounded_ragged(d128=head_dim_qk == 128)
             and self.batch_offsets_q is not None
             and self.batch_offsets_q.device.type == "cuda"
-            and get_compute_capability(self.batch_offsets_q.device) == (10, 0)
+            and get_compute_capability(self.batch_offsets_q.device)
+            in ((10, 0), (10, 7))
         )
         if batch_offsets_units != "tokens":
             return self
@@ -1116,7 +1132,7 @@ class _PrefillMetadata:
                 self.cu_seq_lens_q.shape[0] - 1,
                 self.max_token_per_sequence,
                 self.max_sequence_kv,
-                bounded_mla=self._bounded_mla,
+                bounded_ragged=self._bounded_ragged,
             )
         return None
 
@@ -1233,7 +1249,7 @@ class _CudnnPrefillPlan:
             and previous.dtype == dtype
             and previous.metadata.o_data_type == metadata.o_data_type
             and previous.override_enabled == enabled
-            and previous.metadata._bounded_mla == metadata._bounded_mla
+            and previous.metadata._bounded_ragged == metadata._bounded_ragged
             and previous.exact_keys[True] == exact
             and all(
                 a is b
@@ -1288,7 +1304,7 @@ class _CudnnPrefillPlan:
             and exact == previous.exact_keys[True]
             and dtype == previous.dtype
             and self.override_enabled == previous.override_enabled
-            and metadata._bounded_mla == previous.metadata._bounded_mla
+            and metadata._bounded_ragged == previous.metadata._bounded_ragged
         ):
             self.override = previous.override
             self.exact_keys = previous.exact_keys

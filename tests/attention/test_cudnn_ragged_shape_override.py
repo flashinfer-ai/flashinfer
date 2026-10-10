@@ -375,11 +375,14 @@ def test_cache_shape_growth_when_exceeded(monkeypatch):
 @requires_override
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("lse_layout", [None, "NH", "HN"])
-def test_bounded_mla_replan_capture_and_rebinding(causal, lse_layout, monkeypatch):
+@pytest.mark.parametrize("head_dim_qk,num_kv_heads", [(192, 4), (128, 4), (128, 1)])
+def test_bounded_ragged_replan_capture_and_rebinding(
+    causal, lse_layout, head_dim_qk, num_kv_heads, monkeypatch
+):
     """One bounded graph handles different batches, totals, pointers and strides."""
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("bounded MLA cache classes are qualified on SM100")
-    if not cudnn_prefill._cudnn_supports_bounded_ragged():
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("bounded packed cache classes are qualified on SM100/SM107")
+    if not cudnn_prefill._cudnn_supports_bounded_ragged(d128=head_dim_qk == 128):
         pytest.skip("requires FE bounded packed overrides")
     from cutlass import cute
 
@@ -395,15 +398,30 @@ def test_bounded_mla_replan_capture_and_rebinding(causal, lse_layout, monkeypatc
     ):
         qo, ko = _indptr(qlens), _indptr(klens)
         q = torch.randn(
-            sum(qlens), 4, 192, device="cuda", dtype=torch.bfloat16, generator=generator
+            sum(qlens),
+            4,
+            head_dim_qk,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
         )
         k = torch.randn(
-            sum(klens), 4, 192, device="cuda", dtype=torch.bfloat16, generator=generator
+            sum(klens),
+            num_kv_heads,
+            head_dim_qk,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
         )
         v = torch.randn(
-            sum(klens), 4, 128, device="cuda", dtype=torch.bfloat16, generator=generator
+            sum(klens),
+            num_kv_heads,
+            128,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
         )
-        out = torch.empty_like(v[: len(q)])
+        out = torch.empty((len(q), 4, 128), device="cuda", dtype=q.dtype)
         lse = (
             None
             if lse_layout is None
@@ -412,7 +430,14 @@ def test_bounded_mla_replan_capture_and_rebinding(causal, lse_layout, monkeypatc
             )
         )
         wrapper.plan(
-            qo, ko, 4, 4, 192, head_dim_vo=128, causal=causal, q_data_type=q.dtype
+            qo,
+            ko,
+            4,
+            num_kv_heads,
+            head_dim_qk,
+            head_dim_vo=128,
+            causal=causal,
+            q_data_type=q.dtype,
         )
 
         def run():
@@ -484,7 +509,9 @@ def test_bounded_mla_replan_capture_and_rebinding(causal, lse_layout, monkeypatc
             qi = q[qo[i] : qo[i + 1]].double().transpose(0, 1)
             ki = k[ko[i] : ko[i + 1]].double().transpose(0, 1)
             vi = v[ko[i] : ko[i + 1]].double().transpose(0, 1)
-            scores = qi @ ki.transpose(-1, -2) * 192**-0.5
+            ki = ki.repeat_interleave(4 // num_kv_heads, dim=0)
+            vi = vi.repeat_interleave(4 // num_kv_heads, dim=0)
+            scores = qi @ ki.transpose(-1, -2) * head_dim_qk**-0.5
             if causal:
                 scores.masked_fill_(
                     torch.arange(nk, device="cuda")[None, :]
@@ -509,21 +536,24 @@ def test_bounded_mla_replan_capture_and_rebinding(causal, lse_layout, monkeypatc
 
 @requires_override
 @pytest.mark.parametrize("return_lse", [False, True])
-def test_bounded_mla_prewarm_classes_before_capture(return_lse, monkeypatch):
+@pytest.mark.parametrize("head_dim_qk,num_kv_heads", [(192, 4), (128, 1)])
+def test_bounded_ragged_prewarm_classes_before_capture(
+    return_lse, head_dim_qk, num_kv_heads, monkeypatch
+):
     """Warm declared capacities once, then capture new live shapes in any order."""
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("bounded MLA cache classes are qualified on SM100")
-    if not cudnn_prefill._cudnn_supports_bounded_ragged():
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("bounded packed cache classes are qualified on SM100/SM107")
+    if not cudnn_prefill._cudnn_supports_bounded_ragged(d128=head_dim_qk == 128):
         pytest.skip("requires FE bounded packed overrides")
     from cutlass import cute
 
     workspace = torch.empty(128 << 20, device="cuda", dtype=torch.uint8)
     generator = torch.Generator(device="cuda").manual_seed(734)
     q = torch.randn(
-        1024, 4, 192, device="cuda", dtype=torch.bfloat16, generator=generator
+        1024, 4, head_dim_qk, device="cuda", dtype=torch.bfloat16, generator=generator
     )
-    k = torch.zeros(8192, 4, 192, device="cuda", dtype=q.dtype)
-    v = torch.ones(8192, 4, 128, device="cuda", dtype=q.dtype)
+    k = torch.zeros(8192, num_kv_heads, head_dim_qk, device="cuda", dtype=q.dtype)
+    v = torch.ones(8192, num_kv_heads, 128, device="cuda", dtype=q.dtype)
     out = torch.empty(1024, 4, 128, device="cuda", dtype=q.dtype)
     lse = torch.empty(1024, 4, device="cuda") if return_lse else None
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
@@ -539,8 +569,8 @@ def test_bounded_mla_prewarm_classes_before_capture(return_lse, monkeypatch):
             _indptr(qlens),
             _indptr(klens),
             4,
-            4,
-            192,
+            num_kv_heads,
+            head_dim_qk,
             head_dim_vo=128,
             q_data_type=q.dtype,
             causal=False,
@@ -621,7 +651,8 @@ def test_bounded_mla_prewarm_classes_before_capture(return_lse, monkeypatch):
 
 
 @requires_override
-def test_bounded_mla_older_frontend_keeps_broad_graph(monkeypatch):
+@pytest.mark.parametrize("head_dim_qk", [192, 128])
+def test_bounded_ragged_older_frontend_keeps_broad_graph(head_dim_qk, monkeypatch):
     """Old FE keeps its existing graph signature, including SDPA kwargs."""
     cudnn = cudnn_prefill.cudnn
     original = cudnn.pygraph.sdpa
@@ -637,9 +668,11 @@ def test_bounded_mla_older_frontend_keeps_broad_graph(monkeypatch):
         m.setattr(cudnn.pygraph, "sdpa", old_sdpa)
         cudnn_prefill._cudnn_supports_bounded_ragged.cache_clear()
         try:
-            assert not cudnn_prefill._cudnn_supports_bounded_ragged()
+            assert not cudnn_prefill._cudnn_supports_bounded_ragged(
+                d128=head_dim_qk == 128
+            )
             # A distinct head count avoids a prior test's graph-cache entry.
-            _run("cudnn", [129], 5, 5, 192, dvo=128, kv_lens=[2049])
+            _run("cudnn", [129], 5, 5, head_dim_qk, dvo=128, kv_lens=[2049])
             assert observed
         finally:
             cudnn_prefill._cudnn_supports_bounded_ragged.cache_clear()
