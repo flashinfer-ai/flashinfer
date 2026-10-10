@@ -1096,6 +1096,25 @@ kernel_flashkda_bf16_bt16_prepare(__nv_bfloat16* __restrict__ q, CakeTensorMap c
             for (int value_idx_1 = 0; value_idx_1 < 4; value_idx_1++) {
                 diagonal_values[value_idx_1] = diagonal_values[value_idx_1] + diagonal_product[value_idx_1];
             }
+            // The off-diagonal block is composed from the complete 8x8 inverses.
+            unsigned int repack_low_word[1];
+            unsigned int repack_high_word[1];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __half2 _h2 = __float22half2_rn(make_float2(diagonal_values[_lp*2 + 0], diagonal_values[_lp*2+1 + 0]));
+                repack_low_word[_lp] = *(uint32_t*)&_h2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __half2 _h2 = __float22half2_rn(make_float2(diagonal_values[_lp*2 + 2], diagonal_values[_lp*2+1 + 2]));
+                repack_high_word[_lp] = *(uint32_t*)&_h2;
+            }
+            diagonal_frag[0] = 0;
+            diagonal_frag[1] = 0;
+            diagonal_frag[2] = 0;
+            diagonal_frag[3] = 0;
+            diagonal_frag[0] = repack_low_word[0];
+            diagonal_frag[3] = repack_high_word[0];
             unsigned int binv_frag[4];
             binv_frag[0] = 0;
             binv_frag[1] = 0;
@@ -1171,9 +1190,11 @@ kernel_flashkda_bf16_bt16_prepare(__nv_bfloat16* __restrict__ q, CakeTensorMap c
             }
             #pragma unroll
             for (int inverse_word = 0; inverse_word < 4; inverse_word++) {
+                // The 16x16 transpose moves block (1, 0) to (0, 1): transpose each
+                // 8x8 block and swap the two off-diagonal words.
                 asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n"
                     : "=r"(inverse_trans_frag[inverse_word])
-                    : "r"(inverse_frag[inverse_word]));
+                    : "r"(inverse_frag[(inverse_word >> 1) | ((inverse_word & 1) << 1)]));
             }
             float inverse_trans_frag_f32[8];
             #pragma unroll
