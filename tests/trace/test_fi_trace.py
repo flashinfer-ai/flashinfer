@@ -1559,6 +1559,128 @@ def test_nvfp4_append_trace_json_init_is_self_contained():
         assert isinstance(result, dict)
 
 
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("op", ["k_sum_v_amax", "q_grouped_amax", "k_grouped_amax"])
+def test_ulysses_lowp_trace_json_init_is_self_contained(head_dim, op):
+    suffix = "" if op == "k_sum_v_amax" else "_p8"
+    path = (
+        Path(__file__).parent
+        / "fi_trace_out"
+        / (f"ulysses_lowp_{op}_h8_d{head_dim}{suffix}.json")
+    )
+    definition = json.loads(path.read_text())
+    namespace = {}
+    exec(definition["init"], namespace)
+    inputs = namespace[f"_ulysses_lowp_{op}_init"](
+        batch=1, local_sequence=65, device="cpu"
+    )
+    tensor = inputs["q" if op == "q_grouped_amax" else "k"]
+    assert tensor.shape == (1, 65, 8, head_dim)
+    assert tensor.dtype == torch.bfloat16
+    from flashinfer.comm import _ulysses_lowp as lowp
+
+    regenerated = getattr(lowp, op).fi_trace(**inputs)
+    assert regenerated["init"] == definition["init"]
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("num_heads,world_size", [(8, 2), (16, 4)])
+@pytest.mark.parametrize("op", ["k_sum_v_amax", "q_grouped_amax", "k_grouped_amax"])
+def test_ulysses_lowp_trace_init_binds_const_axes(op, head_dim, num_heads, world_size):
+    from flashinfer.comm import _ulysses_lowp as lowp
+    from flashinfer.trace.templates import comm
+
+    init = getattr(comm, f"_ulysses_lowp_{op}_init")
+    original_defaults = dict(init.__kwdefaults__)
+    template = getattr(comm, f"ulysses_lowp_{op}_trace")
+    api = getattr(lowp, op)
+    source_inputs = init(
+        batch=1,
+        local_sequence=65,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        device="cpu",
+    )
+    if op != "k_sum_v_amax":
+        source_inputs["world_size"] = world_size
+    definition = api.fi_trace(**source_inputs)
+    namespace = {}
+    exec(definition["init"], namespace)
+    # Change the Var axes; the definition's Const axes must remain bound.
+    replay_inputs = namespace[init.__name__](batch=2, local_sequence=97, device="cpu")
+    tensor = replay_inputs["q" if op == "q_grouped_amax" else "k"]
+    assert tensor.shape == (2, 97, num_heads, head_dim)
+    if op != "k_sum_v_amax":
+        assert replay_inputs["world_size"] == world_size
+    if op == "k_grouped_amax":
+        assert replay_inputs["k_mean_global"].shape == (2, num_heads, head_dim)
+    regenerated = api.fi_trace(**replay_inputs)
+    assert regenerated["axes"] == definition["axes"]
+    assert regenerated["init"] == definition["init"]
+    assert init.__kwdefaults__ == original_defaults
+    assert template.init is init
+
+
+def test_trace_init_const_binding_is_opt_in():
+    import inspect
+
+    from flashinfer.trace.template import _render_init_source
+    from flashinfer.trace.templates.comm import _pcie_ipc_all_reduce_init
+
+    init = _pcie_ipc_all_reduce_init
+    original_source = _render_init_source(init)
+    assert original_source.endswith(inspect.getsource(init))
+    assert _render_init_source(init, {"hidden_dim": 64}) == original_source
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_ulysses_lowp_trace_head_dim(head_dim):
+    from flashinfer.comm import _ulysses_lowp as lowp
+
+    q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
+    mean = torch.empty(1, 8, head_dim, dtype=q.dtype)
+    spec = lowp.payload_spec(
+        batch_size=1, local_sequence=65, num_heads=8, head_dim=head_dim, world_size=8
+    )
+    calls = (
+        (lowp.k_sum_v_amax, dict(k=q, v=q)),
+        (lowp.q_grouped_amax, dict(q=q, rank=0, world_size=8)),
+        (lowp.k_grouped_amax, dict(k=q, k_mean_global=mean, rank=0, world_size=8)),
+        (
+            lowp.quant_qkv_pack,
+            dict(
+                q=q,
+                k=q,
+                v=q,
+                k_mean_global=mean,
+                q_amax_final=torch.empty(1, 8, 3),
+                k_amax_final=torch.empty(1, 8, 2),
+                v_scale_global=mean.float(),
+                rank=0,
+                world_size=8,
+            ),
+        ),
+        (
+            lowp.unpack_for_sage,
+            dict(
+                recv_u8=torch.empty(8, spec["chunk_bytes"], dtype=torch.uint8),
+                batch_size=1,
+                local_sequence=65,
+                local_heads=1,
+                head_dim=head_dim,
+                world_size=8,
+            ),
+        ),
+    )
+    for fn, kwargs in calls:
+        definition = fn.fi_trace(**kwargs)
+        _check_defn(definition, "comm", f"flashinfer.comm._ulysses_lowp.{fn.__name__}")
+        assert definition["axes"]["head_dim"]["value"] == head_dim
+        assert f"_d{head_dim}" in definition["name"]
+        path = Path(__file__).parent / "fi_trace_out" / f"{definition['name']}.json"
+        assert json.loads(path.read_text()) == definition
+
+
 def test_gdn_replayssm_commit_fi_trace():
     from flashinfer.gdn_decode import gated_delta_rule_replayssm_commit
     from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
