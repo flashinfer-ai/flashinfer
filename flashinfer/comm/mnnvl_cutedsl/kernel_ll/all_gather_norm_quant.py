@@ -12,19 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LL column all-gather consumed by an RMSNorm and NVFP4 quantization.
-
-The publisher is the shared ``_SharedOnlyPublishDeviceKernel`` with
-``hidden=H/TP``. ``_AllGatherNormQuantDeviceKernel`` reads every global
-column from its owner rank and computes over the full row::
-
-    y = bf16(x * rsqrt(mean(x**2) + eps) * (weight + gain_center))
-    packed, sf = nvfp4_quant(y, global_scale)
-
-The quantization matches ``fp4_quantize(y, global_scale, sf_vec_size=16,
-is_sf_swizzled_layout=False)``: E2M1 values and one linear E4M3 scale per 16
-columns.
-"""
+"""LL column all-gather consumed by an RMSNorm and NVFP4 quantization."""
 
 from __future__ import annotations
 
@@ -60,11 +48,9 @@ from ..runtime import (
     to_cute,
     to_cute_dynamic,
 )
-from .all_gather_dual_norm import _cluster_row_sum, poll_owned_fragment
-from .protocol import compile_shared_only_publish, create_ll_state
+from .column_gather import LLColumnGather, cluster_row_sum, poll_owned_fragment
 
 _THREADS = 128
-_PUBLISH_THREADS = 128
 _NVFP4_BLOCK = 16
 
 
@@ -162,7 +148,7 @@ class _AllGatherNormQuantDeviceKernel:
         smem = cutlass.utils.SmemAllocator()
         slots = smem.allocate_array(Float32, self.cluster_size * self.warps)
         x = packed_u32x4_to_bf16x8(packed.load()).to(Float32)
-        sum_sq = _cluster_row_sum(
+        sum_sq = cluster_row_sum(
             (x * x).reduce(
                 cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
             ),
@@ -208,13 +194,8 @@ class _AllGatherNormQuantDeviceKernel:
             )
 
 
-class LLAllGatherNormQuant:
-    """Column all-gather of ``[M, H/TP]`` shards fused into RMSNorm + NVFP4.
-
-    Owns its own mailbox and stage state. Construction is collective over
-    ``group``; calls on all ranks must use the same ``m`` and must not
-    overlap one another.
-    """
+class LLAllGatherNormQuant(LLColumnGather):
+    """Column all-gather of ``[M, H/TP]`` shards fused into RMSNorm + NVFP4."""
 
     def __init__(
         self,
@@ -229,44 +210,19 @@ class LLAllGatherNormQuant:
         cluster_size, remainder = divmod(hidden_size, _THREADS * VEC_BF16)
         if remainder or not 1 <= cluster_size <= 8:
             raise ValueError("hidden_size must be 1024 * n for n in [1, 8]")
-        if hidden_size % (tp_size * VEC_BF16):
-            raise ValueError("hidden_size must split into 8-element rank shards")
-        self.hidden_size = hidden_size
-        self.hidden_local = hidden_size // tp_size
-        self.tp_size = tp_size
-        self.capacity_m = capacity_m
         self.enable_pdl = enable_pdl
-        self.state = create_ll_state(
-            group, tp_size, rank, capacity_m, self.hidden_local
-        )
-        self._mailbox = to_cute(self.state.contribution_mailbox.tensor.flatten(), 16)
-        self._mailbox_multicast = Int64(
-            self.state.contribution_mailbox.multicast_address
-        )
-        self._stage_state = to_cute(self.state.stage_state, 4)
-        self._publish = compile_shared_only_publish(
-            hidden=self.hidden_local,
-            tp=tp_size,
+        super().__init__(
+            hidden_size=hidden_size,
+            tp_size=tp_size,
             rank=rank,
             capacity_m=capacity_m,
-            elements_per_thread=VEC_BF16,
-            threads=_PUBLISH_THREADS,
-            release_before_store=False,
+            group=group,
+            publish_threads=_THREADS,
+            publish_release_before_store=False,
             enable_pdl=enable_pdl,
         )
-        self._collectives: dict[_NormQuantConstants, Any] = {}
-        torch.cuda.synchronize()
-        dist.barrier(group)
 
-    def compiled(self, constants: _NormQuantConstants) -> Any:
-        """The consumer for one constant set; compile it before graph capture."""
-        collective = self._collectives.get(constants)
-        if collective is not None:
-            return collective
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "Compile the all-gather norm quant before CUDA graph capture"
-            )
+    def _compile(self, constants: _NormQuantConstants) -> Any:
         device_kernel = _AllGatherNormQuantDeviceKernel(
             hidden=self.hidden_size,
             tp=self.tp_size,
@@ -274,7 +230,7 @@ class LLAllGatherNormQuant:
             constants=constants,
             enable_pdl=self.enable_pdl,
         )
-        collective = cute.compile(
+        return cute.compile(
             device_kernel,
             make_fake_compact_tensor(
                 BFloat16,
@@ -293,8 +249,6 @@ class LLAllGatherNormQuant:
             Int32(self.capacity_m),
             current_cu_stream(),
         )
-        self._collectives[constants] = collective
-        return collective
 
     def __call__(
         self,
@@ -309,13 +263,7 @@ class LLAllGatherNormQuant:
         collective = self.compiled(constants)
         m = Int32(shard.shape[0])
         stream = current_cu_stream()
-        self._publish(
-            to_cute_dynamic(shard.flatten(), 16, divisibility=self.hidden_local),
-            self._stage_state,
-            self._mailbox_multicast,
-            m,
-            stream,
-        )
+        self._publish(shard, m, stream)
         collective(
             self._mailbox,
             to_cute(weight, 16),
@@ -324,7 +272,9 @@ class LLAllGatherNormQuant:
                 packed_output.flatten(), 16, divisibility=self.hidden_size // 2
             ),
             to_cute_dynamic(
-                scale_output.flatten(), 4, divisibility=self.hidden_size // _NVFP4_BLOCK
+                scale_output.flatten(),
+                4,
+                divisibility=self.hidden_size // _NVFP4_BLOCK,
             ),
             self._stage_state,
             m,

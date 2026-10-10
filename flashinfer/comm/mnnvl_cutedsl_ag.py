@@ -25,6 +25,9 @@ over a dedicated LL mailbox.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Generic, TypeVar
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -51,7 +54,10 @@ __all__ = [
 ]
 
 
-class MNNVLCuteDSLAllGatherDualNormWorkspace:
+_Impl = TypeVar("_Impl")
+
+
+class _AllGatherWorkspace(Generic[_Impl]):
     """Mailbox, stage state and compiled kernels for one TP group.
 
     Construction is collective over ``group``. Compile every constant set
@@ -61,34 +67,24 @@ class MNNVLCuteDSLAllGatherDualNormWorkspace:
     def __init__(
         self,
         tp_size: int,
-        tp_rank: int,
         max_token_num: int,
         hidden_dim: int,
-        *,
         group: ProcessGroup,
-        tuning: LLAllGatherDualNormTuning | None = None,
+        create: Callable[[], _Impl],
     ) -> None:
         if tp_size not in (2, 4, 8):
             raise ValueError("tp_size must be 2, 4, or 8")
         if max_token_num <= 0:
             raise ValueError("max_token_num must be positive")
-        device = require_mnnvl_multicast_device()
+        self.device = require_mnnvl_multicast_device()
         self.tp_size = tp_size
         self.max_token_num = max_token_num
         self.hidden_dim = hidden_dim
-        self.device = device
         self._group = group
-        self._impl: LLAllGatherDualNorm | None = LLAllGatherDualNorm(
-            hidden_size=hidden_dim,
-            tp_size=tp_size,
-            rank=tp_rank,
-            capacity_m=max_token_num,
-            group=group,
-            tuning=tuning or LLAllGatherDualNormTuning(),
-        )
+        self._impl: _Impl | None = create()
 
     @property
-    def impl(self) -> LLAllGatherDualNorm:
+    def impl(self) -> _Impl:
         if self._impl is None:
             raise RuntimeError("workspace has been destroyed")
         return self._impl
@@ -99,6 +95,43 @@ class MNNVLCuteDSLAllGatherDualNormWorkspace:
             torch.cuda.synchronize(self.device)
             dist.barrier(self._group)
             self._impl = None
+
+    def fits(self, shard: torch.Tensor) -> bool:
+        """Whether a ``[M, H/TP]`` BF16 shard fits; identical on every rank."""
+        m = shard.shape[0] if shard.ndim == 2 else 0
+        return (
+            1 <= m <= self.max_token_num
+            and shard.shape[1] == self.hidden_dim // self.tp_size
+            and shard.dtype == torch.bfloat16
+            and is_dense_on(shard, self.device, 16)
+        )
+
+
+class MNNVLCuteDSLAllGatherDualNormWorkspace(_AllGatherWorkspace[LLAllGatherDualNorm]):
+    def __init__(
+        self,
+        tp_size: int,
+        tp_rank: int,
+        max_token_num: int,
+        hidden_dim: int,
+        *,
+        group: ProcessGroup,
+        tuning: LLAllGatherDualNormTuning | None = None,
+    ) -> None:
+        super().__init__(
+            tp_size,
+            max_token_num,
+            hidden_dim,
+            group,
+            lambda: LLAllGatherDualNorm(
+                hidden_size=hidden_dim,
+                tp_size=tp_size,
+                rank=tp_rank,
+                capacity_m=max_token_num,
+                group=group,
+                tuning=tuning or LLAllGatherDualNormTuning(),
+            ),
+        )
 
     def compile(
         self,
@@ -145,17 +178,13 @@ def supports_all_gather_gated_residual_next_rmsnorm(
     """Whether this call fits the workspace; identical on every rank for equal M."""
     hidden = workspace.hidden_dim
     device = workspace.device
-    m = branch_shard.shape[0] if branch_shard.ndim == 2 else 0
     vectors = [(alpha, torch.float32, 32), (beta, torch.float32, 32)]
     vectors.append((next_weight, torch.bfloat16, 16))
     if post_weight is not None:
         vectors.append((post_weight, torch.bfloat16, 16))
     return (
-        1 <= m <= workspace.max_token_num
-        and branch_shard.shape[1] == hidden // workspace.tp_size
-        and branch_shard.dtype == torch.bfloat16
-        and is_dense_on(branch_shard, device, 16)
-        and residual.shape == (m, hidden)
+        workspace.fits(branch_shard)
+        and residual.shape == (branch_shard.shape[0], hidden)
         and residual.dtype == torch.float32
         and is_dense_on(residual, device, 32)
         and all(
@@ -233,13 +262,9 @@ def all_gather_gated_residual_next_rmsnorm(
     return residual_out, ffn_input
 
 
-class MNNVLCuteDSLAllGatherNormQuantWorkspace:
-    """Mailbox, stage state and compiled kernels for one TP group.
-
-    Construction is collective over ``group``. Compile every constant set
-    with :meth:`compile` before CUDA graph capture. Calls must not overlap.
-    """
-
+class MNNVLCuteDSLAllGatherNormQuantWorkspace(
+    _AllGatherWorkspace[LLAllGatherNormQuant]
+):
     def __init__(
         self,
         tp_size: int,
@@ -250,36 +275,20 @@ class MNNVLCuteDSLAllGatherNormQuantWorkspace:
         group: ProcessGroup,
         enable_pdl: bool = True,
     ) -> None:
-        if tp_size not in (2, 4, 8):
-            raise ValueError("tp_size must be 2, 4, or 8")
-        if max_token_num <= 0:
-            raise ValueError("max_token_num must be positive")
-        self.device = require_mnnvl_multicast_device()
-        self.tp_size = tp_size
-        self.max_token_num = max_token_num
-        self.hidden_dim = hidden_dim
-        self._group = group
-        self._impl: LLAllGatherNormQuant | None = LLAllGatherNormQuant(
-            hidden_size=hidden_dim,
-            tp_size=tp_size,
-            rank=tp_rank,
-            capacity_m=max_token_num,
-            group=group,
-            enable_pdl=enable_pdl,
+        super().__init__(
+            tp_size,
+            max_token_num,
+            hidden_dim,
+            group,
+            lambda: LLAllGatherNormQuant(
+                hidden_size=hidden_dim,
+                tp_size=tp_size,
+                rank=tp_rank,
+                capacity_m=max_token_num,
+                group=group,
+                enable_pdl=enable_pdl,
+            ),
         )
-
-    @property
-    def impl(self) -> LLAllGatherNormQuant:
-        if self._impl is None:
-            raise RuntimeError("workspace has been destroyed")
-        return self._impl
-
-    def destroy(self) -> None:
-        """Release the mailbox once in-flight work on every rank is done."""
-        if self._impl is not None:
-            torch.cuda.synchronize(self.device)
-            dist.barrier(self._group)
-            self._impl = None
 
     def compile(self, *, eps: float, gain_center: float = 0.0) -> None:
         """Compile one constant set ahead of time, e.g. before graph capture."""
@@ -295,12 +304,8 @@ def supports_all_gather_rmsnorm_fp4_quantize(
     """Whether this call fits the workspace; identical on every rank for equal M."""
     hidden = workspace.hidden_dim
     device = workspace.device
-    m = shard.shape[0] if shard.ndim == 2 else 0
     return (
-        1 <= m <= workspace.max_token_num
-        and shard.shape[1] == hidden // workspace.tp_size
-        and shard.dtype == torch.bfloat16
-        and is_dense_on(shard, device, 16)
+        workspace.fits(shard)
         and weight.shape == (hidden,)
         and weight.dtype == torch.bfloat16
         and is_dense_on(weight, device, 16)

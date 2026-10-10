@@ -50,17 +50,10 @@ from ..cute_dsl_primitives import (
     VEC_BF16,
     WARP_SIZE,
     bf16x8_to_packed_u32x4,
-    fragment_has_negative_zero,
     load_bf16x8_as_f32,
     load_f32x8,
-    load_global_u32x4,
-    load_volatile_u32,
-    map_shared_to_peer,
     packed_u32x4_to_bf16x8,
-    store_global_u32,
     store_global_u32x4,
-    store_lamport_sentinel_u32x4,
-    store_shared_cluster_f32,
     store_f32x8,
 )
 from ..runtime import (
@@ -69,8 +62,7 @@ from ..runtime import (
     to_cute,
     to_cute_dynamic,
 )
-from .device_kernels import ACTIVE_STAGE, LAMPORT_GENERATIONS, NEXT_STAGE
-from .protocol import compile_shared_only_publish, create_ll_state
+from .column_gather import LLColumnGather, cluster_row_sum, poll_owned_fragment
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,82 +81,6 @@ class _NormConstants:
     post_gain_center: float
     next_gain_center: float
     has_post_weight: bool
-
-
-@cute.jit
-def _cluster_row_sum(
-    value: Float32,
-    slots: cute.Pointer,
-    warps: cutlass.Constexpr[int],
-    cluster_size: cutlass.Constexpr[int],
-    cluster_rank: Int32,
-    warp: Int32,
-    lane: Int32,
-) -> Float32:
-    """Sum one value per thread over the cluster; every thread gets the total.
-
-    Each warp scatters its sum straight into ``slots[cluster_rank, warp]`` of
-    every peer CTA, so one cluster barrier replaces the CTA-level stage.
-    """
-    for offset in (16, 8, 4, 2, 1):
-        value = value + cute.arch.shuffle_sync_bfly(value, offset=offset)
-    if lane < cluster_size:
-        remote_slot = map_shared_to_peer(slots + (cluster_rank * warps + warp), lane)
-        store_shared_cluster_f32(remote_slot, value)
-    cute.arch.cluster_arrive()
-    cute.arch.cluster_wait()
-    total = Float32(0.0)
-    for slot in cutlass.range_constexpr(cluster_size * warps):
-        total = total + cute.arch.load((slots + slot).llvm_ptr, Float32)
-    return total
-
-
-@cute.jit
-def poll_owned_fragment(
-    mailbox: cute.Tensor,
-    stage_state: cute.Tensor,
-    packed: cute.Tensor,
-    token: Int32,
-    fragment: Int32,
-    tp: cutlass.Constexpr[int],
-    capacity_m: cutlass.Constexpr[int],
-    hidden_local: cutlass.Constexpr[int],
-    enable_pdl: cutlass.Constexpr[bool],
-) -> None:
-    """Wait for this token's 8 global columns ``fragment`` from their owner.
-
-    Stores the BF16x8 fragment into ``packed``, re-arms the mailbox slot,
-    advances the stage once per call and releases PDL dependents.
-    """
-    local_fragments = hidden_local // VEC_BF16
-    active_stage = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
-    # Each global column has exactly one owner; read it from that slot only.
-    source_rank = fragment // local_fragments
-    local_fragment = fragment % local_fragments
-    source_element = (
-        (Int64(active_stage) * tp + Int64(source_rank)) * capacity_m + Int64(token)
-    ) * hidden_local + Int64(local_fragment) * VEC_BF16
-    source_pointer = cute.make_ptr(
-        BFloat16,
-        (mailbox.iterator + source_element).llvm_ptr,
-        cute.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    # Always true; a runtime value keeps the poll a device loop.
-    dirty = fragment >= Int32(0)
-    while dirty:
-        value = load_global_u32x4(source_pointer, volatile=True)
-        dirty = fragment_has_negative_zero(value)
-        packed.store(value)
-
-    if token == 0 and fragment == 0:
-        store_global_u32(
-            stage_state.iterator + NEXT_STAGE,
-            (active_stage + Uint32(1)) % Uint32(LAMPORT_GENERATIONS),
-        )
-    if cutlass.const_expr(enable_pdl):
-        cute.arch.griddepcontrol_launch_dependents()
-    store_lamport_sentinel_u32x4(Int64(source_pointer.toint()))
 
 
 class _AllGatherDualNormDeviceKernel:
@@ -291,7 +207,7 @@ class _AllGatherDualNormDeviceKernel:
         branch = packed_u32x4_to_bf16x8(branch_packed.load()).to(Float32)
         if cutlass.const_expr(constants.has_post_weight):
             branch = branch * post_gamma
-        post_sum = _cluster_row_sum(
+        post_sum = cluster_row_sum(
             (branch * branch).reduce(
                 cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
             ),
@@ -310,7 +226,7 @@ class _AllGatherDualNormDeviceKernel:
         updated = alpha_values * stream_values + (beta_values * branch) * post_inv_rms
         store_f32x8(residual_output, row_element, updated)
 
-        next_sum = _cluster_row_sum(
+        next_sum = cluster_row_sum(
             (updated * updated).reduce(
                 cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
             ),
@@ -332,13 +248,8 @@ class _AllGatherDualNormDeviceKernel:
         )
 
 
-class LLAllGatherDualNorm:
-    """Column all-gather of ``[M, H/TP]`` shards fused into the dual norm.
-
-    Owns its own mailbox and stage state, separate from any AllReduce
-    workspace. Construction is collective over ``group``; calls on all ranks
-    must use the same ``m`` and must not overlap one another.
-    """
+class LLAllGatherDualNorm(LLColumnGather):
+    """Column all-gather of ``[M, H/TP]`` shards fused into the dual norm."""
 
     def __init__(
         self,
@@ -352,44 +263,19 @@ class LLAllGatherDualNorm:
     ) -> None:
         if tuning.cluster_size * tuning.threads * VEC_BF16 != hidden_size:
             raise ValueError("cluster_size * threads * 8 must equal hidden_size")
-        if hidden_size % (tp_size * VEC_BF16):
-            raise ValueError("hidden_size must split into 8-element rank shards")
-        self.hidden_size = hidden_size
-        self.hidden_local = hidden_size // tp_size
-        self.tp_size = tp_size
-        self.capacity_m = capacity_m
         self.tuning = tuning
-        self.state = create_ll_state(
-            group, tp_size, rank, capacity_m, self.hidden_local
-        )
-        self._mailbox = to_cute(self.state.contribution_mailbox.tensor.flatten(), 16)
-        self._mailbox_multicast = Int64(
-            self.state.contribution_mailbox.multicast_address
-        )
-        self._stage_state = to_cute(self.state.stage_state, 4)
-        self._publish = compile_shared_only_publish(
-            hidden=self.hidden_local,
-            tp=tp_size,
+        super().__init__(
+            hidden_size=hidden_size,
+            tp_size=tp_size,
             rank=rank,
             capacity_m=capacity_m,
-            elements_per_thread=VEC_BF16,
-            threads=tuning.publish_threads,
-            release_before_store=tuning.publish_release_before_store,
+            group=group,
+            publish_threads=tuning.publish_threads,
+            publish_release_before_store=tuning.publish_release_before_store,
             enable_pdl=tuning.enable_pdl,
         )
-        self._collectives: dict[_NormConstants, Any] = {}
-        torch.cuda.synchronize()
-        dist.barrier(group)
 
-    def compiled(self, constants: _NormConstants) -> Any:
-        """The consumer for one constant set; compile it before graph capture."""
-        collective = self._collectives.get(constants)
-        if collective is not None:
-            return collective
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "Compile the all-gather dual norm before CUDA graph capture"
-            )
+    def _compile(self, constants: _NormConstants) -> Any:
         device_kernel = _AllGatherDualNormDeviceKernel(
             hidden=self.hidden_size,
             tp=self.tp_size,
@@ -406,7 +292,7 @@ class LLAllGatherDualNorm:
         rows_f32 = make_fake_dynamic_compact_tensor(
             Float32, alignment=32, divisibility=self.hidden_size
         )
-        collective = cute.compile(
+        return cute.compile(
             device_kernel,
             make_fake_compact_tensor(
                 BFloat16,
@@ -426,8 +312,6 @@ class LLAllGatherDualNorm:
             Int32(self.capacity_m),
             current_cu_stream(),
         )
-        self._collectives[constants] = collective
-        return collective
 
     def __call__(
         self,
@@ -445,13 +329,7 @@ class LLAllGatherDualNorm:
         collective = self.compiled(constants)
         m = Int32(branch_shard.shape[0])
         stream = current_cu_stream()
-        self._publish(
-            to_cute_dynamic(branch_shard.flatten(), 16, divisibility=self.hidden_local),
-            self._stage_state,
-            self._mailbox_multicast,
-            m,
-            stream,
-        )
+        self._publish(branch_shard, m, stream)
         collective(
             self._mailbox,
             to_cute_dynamic(residual.flatten(), 32, divisibility=self.hidden_size),
