@@ -96,6 +96,10 @@ class CheckpointDisplay:
     def advance(self, selected_bytes):
         self._publish(shards=self._frame.shards + 1, selected_bytes=selected_bytes)
 
+    def update(self, selected_bytes):
+        """Update selected payload bytes without advancing a checkpoint shard."""
+        self._publish(selected_bytes=selected_bytes)
+
     def phase(self, phase):
         self._record_phase(time.monotonic())
         self._publish(phase=phase)
