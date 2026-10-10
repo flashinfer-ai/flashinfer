@@ -370,11 +370,10 @@ def _build_decode_gen_schedule(
     sparse_route_metadata: cute.Pointer | None = None,
     sparse_row_route_begin: Int32 | None = None,
     sparse_route_count: Int32 | None = None,
-    sage_q_scale_ptr: cute.Pointer | None = None,
+    sage_q_scale_image_ptr: cute.Pointer | None = None,
     sage_k_scale_image_ptr: cute.Pointer | None = None,
     sage_v_scale_ptr: cute.Pointer | None = None,
     sage_v_mean_ptr: cute.Pointer | None = None,
-    sage_q_scale_head_stride: Int32 | None = None,
 ) -> tuple[
     list[Task],
     dict[MemoryResource, list[MemoryResource]],
@@ -1015,8 +1014,7 @@ def _build_decode_gen_schedule(
     sage_scale_tensors = None
     if cfg.use_sage_attention:
         sage_scale_tensors = SageScaleTensors(
-            q_scale_ptr=sage_q_scale_ptr,
-            q_scale_head_stride=sage_q_scale_head_stride,
+            q_scale_image_ptr=sage_q_scale_image_ptr,
             k_scale_image_ptr=sage_k_scale_image_ptr,
             v_scale_ptr=sage_v_scale_ptr,
             v_mean_ptr=sage_v_mean_ptr,
@@ -1293,6 +1291,7 @@ def _build_decode_gen_schedule(
         seq_len_q=seq_len_q,
         h_k_idx=h_k_idx,
         b_idx=b_idx,
+        num_heads_kv=num_heads_kv,
         sync_barrier_id=0,
         sage_k_scales=sage_k_scales0,
         name="tmemS0",
@@ -1312,6 +1311,7 @@ def _build_decode_gen_schedule(
             seq_len_q=seq_len_q,
             h_k_idx=h_k_idx,
             b_idx=b_idx,
+            num_heads_kv=num_heads_kv,
             sync_barrier_id=1,
             score_seed_owner=tmem_s0,
             sage_k_scales=sage_k_scales1,
@@ -2596,11 +2596,10 @@ def _run_decode_gen_active(
     tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
-    g_sage_q_scale: cute.Pointer | None = None,
+    g_sage_q_scale_image: cute.Pointer | None = None,
     g_sage_k_scale_image: cute.Pointer | None = None,
     g_sage_v_scale: cute.Pointer | None = None,
     g_sage_v_mean: cute.Pointer | None = None,
-    g_sage_q_scale_head_stride: Int32 | None = None,
 ) -> None:
     """Run the complete decode body for one runtime-valid Q tile.
 
@@ -2738,11 +2737,10 @@ def _run_decode_gen_active(
         tma_desc_v_summary=tma_desc_v_summary_ptr,
         tma_desc_k_summary_atom=tma_desc_k_summary_atom_ptr,
         tma_desc_v_summary_atom=tma_desc_v_summary_atom_ptr,
-        sage_q_scale_ptr=g_sage_q_scale,
+        sage_q_scale_image_ptr=g_sage_q_scale_image,
         sage_k_scale_image_ptr=g_sage_k_scale_image,
         sage_v_scale_ptr=g_sage_v_scale,
         sage_v_mean_ptr=g_sage_v_mean,
-        sage_q_scale_head_stride=g_sage_q_scale_head_stride,
         page_idx_kv=g_page_idx_kv,
         page_table_stride=g_page_table_stride,
         page_table_capacity=g_page_table_capacity,
@@ -2945,11 +2943,10 @@ def _run_decode_gen_runtime_prefix(
     tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
-    g_sage_q_scale: cute.Pointer | None = None,
+    g_sage_q_scale_image: cute.Pointer | None = None,
     g_sage_k_scale_image: cute.Pointer | None = None,
     g_sage_v_scale: cute.Pointer | None = None,
     g_sage_v_mean: cute.Pointer | None = None,
-    g_sage_q_scale_head_stride: Int32 | None = None,
 ) -> None:
     """Run the general runtime split-prefix producer or retire its suffix."""
 
@@ -3034,11 +3031,10 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
-                g_sage_q_scale=g_sage_q_scale,
+                g_sage_q_scale_image=g_sage_q_scale_image,
                 g_sage_k_scale_image=g_sage_k_scale_image,
                 g_sage_v_scale=g_sage_v_scale,
                 g_sage_v_mean=g_sage_v_mean,
-                g_sage_q_scale_head_stride=g_sage_q_scale_head_stride,
             )
         else:
             _run_decode_gen_inactive_cluster_rank()
@@ -3092,11 +3088,10 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
-                g_sage_q_scale=g_sage_q_scale,
+                g_sage_q_scale_image=g_sage_q_scale_image,
                 g_sage_k_scale_image=g_sage_k_scale_image,
                 g_sage_v_scale=g_sage_v_scale,
                 g_sage_v_mean=g_sage_v_mean,
-                g_sage_q_scale_head_stride=g_sage_q_scale_head_stride,
             )
         else:
             _signal_padded_pdl_producer(cfg)
@@ -3144,11 +3139,10 @@ def decode_gen_kernel(
     tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
-    g_sage_q_scale: cute.Pointer | None = None,
+    g_sage_q_scale_image: cute.Pointer | None = None,
     g_sage_k_scale_image: cute.Pointer | None = None,
     g_sage_v_scale: cute.Pointer | None = None,
     g_sage_v_mean: cute.Pointer | None = None,
-    g_sage_q_scale_head_stride: Int32 | None = None,
 ) -> None:
     """Dispatch one static Q/split tile and drain padded launch slots safely."""
     q_group_cta_idx, h_k_idx, b_idx = cute.arch.block_idx()
@@ -3288,11 +3282,10 @@ def decode_gen_kernel(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
-                g_sage_q_scale=g_sage_q_scale,
+                g_sage_q_scale_image=g_sage_q_scale_image,
                 g_sage_k_scale_image=g_sage_k_scale_image,
                 g_sage_v_scale=g_sage_v_scale,
                 g_sage_v_mean=g_sage_v_mean,
-                g_sage_q_scale_head_stride=g_sage_q_scale_head_stride,
             )
         else:
             _run_decode_gen_runtime_prefix(
@@ -3342,11 +3335,10 @@ def decode_gen_kernel(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
-                g_sage_q_scale=g_sage_q_scale,
+                g_sage_q_scale_image=g_sage_q_scale_image,
                 g_sage_k_scale_image=g_sage_k_scale_image,
                 g_sage_v_scale=g_sage_v_scale,
                 g_sage_v_mean=g_sage_v_mean,
-                g_sage_q_scale_head_stride=g_sage_q_scale_head_stride,
             )
     else:
         # Packed-Q grids use a batch-wide maximum envelope. These Q CTAs own no
@@ -3393,17 +3385,16 @@ def fmha_decode_launch(
     v_token_stride: Int64 = 0,
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
-    sage_q_scale_iter: cute.Pointer | None = None,
+    sage_q_scale_image_iter: cute.Pointer | None = None,
     sage_k_scale_image_iter: cute.Pointer | None = None,
     sage_v_scale_iter: cute.Pointer | None = None,
     sage_v_mean_iter: cute.Pointer | None = None,
-    sage_q_scale_head_stride: Int32 | None = None,
 ) -> None:
     """Standalone JIT launcher for FMHA decode TS.
 
     The ``sage_*`` scale arguments are used only by a Sage attention config,
-    which takes its K scales from the prepared image
-    (``_SageKScaleImageLayout``).
+    which takes its Q and K scales from the prepared images
+    (``_SageQScaleImageLayout``, ``_SageKScaleImageLayout``).
     """
     log2_e = math.log2(math.e)
     b, h_q, h_k, s_k, d = problem_shape
@@ -3744,11 +3735,10 @@ def fmha_decode_launch(
         null_sparse_route_ptr,
         null_sparse_route_ptr,
         static_full_split_prefix,
-        g_sage_q_scale=sage_q_scale_iter,
+        g_sage_q_scale_image=sage_q_scale_image_iter,
         g_sage_k_scale_image=sage_k_scale_image_iter,
         g_sage_v_scale=sage_v_scale_iter,
         g_sage_v_mean=sage_v_mean_iter,
-        g_sage_q_scale_head_stride=sage_q_scale_head_stride,
     ).launch(
         grid=grid,
         block=[cfg.threads_per_cta, 1, 1],
@@ -3783,11 +3773,10 @@ def fmha_block_sparse_launch(
     num_physical_kv_pages: Int64 = 0,
     k_page_stride: Int64 = 0,
     v_page_stride: Int64 = 0,
-    sage_q_scale_iter: cute.Pointer | None = None,
+    sage_q_scale_image_iter: cute.Pointer | None = None,
     sage_k_scale_image_iter: cute.Pointer | None = None,
     sage_v_scale_iter: cute.Pointer | None = None,
     sage_v_mean_iter: cute.Pointer | None = None,
-    sage_q_scale_head_stride: Int32 | None = None,
 ) -> None:
     """Launch attention over exact and typed exact/proxy prepared KV routes.
 
@@ -3797,8 +3786,8 @@ def fmha_block_sparse_launch(
     layouts execute the same ``decode_gen_kernel`` schedule and
     physical copy policy. Exact builds constexpr-elide summary TensorMaps.
     The ``sage_*`` scale arguments are used only by a Sage attention config,
-    whose routes take their K scales from the prepared image
-    (``_SageKScaleImageLayout``).
+    which takes its Q and K scales from the prepared images
+    (``_SageQScaleImageLayout``, ``_SageKScaleImageLayout``).
     """
     if cutlass.const_expr(not cfg.use_block_sparse):
         raise ValueError("fmha_block_sparse_launch requires block-sparse config")
@@ -4063,11 +4052,10 @@ def fmha_block_sparse_launch(
         tma_desc_v_summary=v_desc_summary_primary,
         tma_desc_k_summary_atom=k_desc_summary_atom,
         tma_desc_v_summary_atom=v_desc_summary_atom,
-        g_sage_q_scale=sage_q_scale_iter,
+        g_sage_q_scale_image=sage_q_scale_image_iter,
         g_sage_k_scale_image=sage_k_scale_image_iter,
         g_sage_v_scale=sage_v_scale_iter,
         g_sage_v_mean=sage_v_mean_iter,
-        g_sage_q_scale_head_stride=sage_q_scale_head_stride,
     ).launch(
         grid=grid,
         block=[cfg.threads_per_cta, 1, 1],

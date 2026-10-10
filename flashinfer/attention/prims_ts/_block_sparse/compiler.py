@@ -37,7 +37,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     time which tensor slots it uses; the unused slots are ``None`` both for the
     compile-time fakes and for every later call, and the adapter body reads a
     slot only on the branch its configuration enables. A Sage plan first
-    writes its K-scale image; a dense plan then reaches the decode kernel
+    writes its scale images; a dense plan then reaches the decode kernel
     directly, while a block-sparse plan prepares its routes and launches the
     prepared-route attention. Paged block-sparse plans keep their own adapter
     because their K/V and request metadata differ in kind, not only in
@@ -57,7 +57,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         fmha_block_sparse_launch,
         fmha_decode_launch,
     )
-    from ..kernels.fmha_decode.sage_prepare import _PrepareSageKScaleImage
+    from ..kernels.fmha_decode.sage_prepare import _PrepareSageScaleImages
 
     config = _make_block_sparse_config(key)
     sparse_format = key.sparse_format
@@ -68,11 +68,12 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         key.num_kv_heads, key.share_pattern_across_kv_heads
     )
     sage_k_scale_image = None
-    prepare_sage_k_scales: _PrepareSageKScaleImage | None = None
+    prepare_sage_scales: _PrepareSageScaleImages | None = None
     if config.use_sage_attention:
         sage_k_scale_image = config.sage_k_scale_image(key.seq_len_kv)
-        prepare_sage_k_scales = _PrepareSageKScaleImage(
-            image=sage_k_scale_image,
+        prepare_sage_scales = _PrepareSageScaleImages(
+            cfg=config,
+            k_image=sage_k_scale_image,
             batch_size=key.batch_size,
             num_kv_heads=key.num_kv_heads,
         )
@@ -125,6 +126,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         row_route_offsets: cute.Tensor | None,
         route_workspace: cute.Tensor | None,
         k_scale_image: cute.Tensor | None,
+        q_scale_image: cute.Tensor | None,
         max_blocks_per_row: cutlass.Int32,
         # The Sage scale slots, in ``SAGE_ADAPTER_SLOTS`` order.
         q_scale: cute.Tensor | None,
@@ -148,25 +150,26 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             Int32(static_seq_len_kv),
             Int32(static_head_dim),
         )
-        # Sage scale tensors are [heads, flat slots]; the head stride is the
-        # flat slot count of one head. A slot the recipe does not use (the V
-        # mean without a mean, the summary K scales without proxy routes) is
-        # ``None`` and stays unbound. Attention reads its K scales from the
-        # image the Sage prepare writes first, never ``k_scale``. The prepare
-        # kernels are ordinary launches in stream order; attention keeps its
-        # programmatic dependent launch on its immediate predecessor and
-        # acquires that grid before it reads any prepared value.
+        # Sage scale tensors are [heads, flat slots]. A slot the recipe does
+        # not use (the V mean without a mean, the summary K scales without
+        # proxy routes) is ``None`` and stays unbound. Attention reads its Q
+        # and K scales from the images the Sage prepare writes first, never
+        # ``q_scale`` or ``k_scale``. The prepare kernels are ordinary
+        # launches in stream order; attention keeps its programmatic
+        # dependent launch on its immediate predecessor and acquires that
+        # grid before it reads any prepared value.
         sage_kwargs = {}
         if cutlass.const_expr(static_config.use_sage_attention):
             sage_kwargs = {
-                "sage_q_scale_iter": q_scale.iterator,
+                "sage_q_scale_image_iter": q_scale_image.iterator,
                 "sage_k_scale_image_iter": k_scale_image.iterator,
                 "sage_v_scale_iter": v_scale.iterator,
-                "sage_q_scale_head_stride": Int32(q_scale.shape[1]),
             }
             if cutlass.const_expr(static_config.sage_v_mean):
                 sage_kwargs["sage_v_mean_iter"] = v_mean.iterator
-            prepare_sage_k_scales(k_scale, k_summary_scale, k_scale_image, stream)
+            prepare_sage_scales(
+                q_scale, k_scale, k_summary_scale, q_scale_image, k_scale_image, stream
+            )
         if cutlass.const_expr(static_config.use_block_sparse):
             if cutlass.const_expr(sparse_format == "bsr"):
                 prepare_routes(
@@ -372,6 +375,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         row_route_offsets_fake = None
         route_workspace_fake = None
         k_scale_image_fake = None
+        q_scale_image_fake = None
         if use_proxy_routes:
             summary_shape = (
                 key.batch_size,
@@ -412,9 +416,12 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             )
             route_workspace_fake = fake_compact(Int32, (cute.sym_int(),), 4)
         if sage_k_scale_image is not None:
+            num_sequences = key.batch_size * key.num_kv_heads
             k_scale_image_fake = fake_compact(
-                Float32,
-                sage_k_scale_image.shape(key.batch_size * key.num_kv_heads),
+                Float32, sage_k_scale_image.shape(num_sequences)
+            )
+            q_scale_image_fake = fake_compact(
+                Float32, config.sage_q_scale_image.shape(num_sequences)
             )
         sage_fakes: tuple[object | None, ...] = sage_adapter_slots({})
         if key.sage is not None:
@@ -451,6 +458,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             row_route_offsets_fake,
             route_workspace_fake,
             k_scale_image_fake,
+            q_scale_image_fake,
             Int32(0),
             *sage_fakes,
             Float32(1.0),

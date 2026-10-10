@@ -266,6 +266,7 @@ class TmemSResource(DecodeGenResourceBase):
     h_k_idx: Int32 | None = None
     b_idx: Int32 | None = None
     q_group_idx: Int32 | None = None
+    num_heads_kv: Int32 | None = None
     scale_tensors: SageScaleTensors | None = None
     q_ref: Constexpr[MemoryResource | None] = None
     page_offsets_ref: Constexpr[MemoryResource | None] = None
@@ -2229,7 +2230,12 @@ class TmemSResource(DecodeGenResourceBase):
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=sage_q_scale)
     @cute.jit
     def load_sage_q_scale(self, stage_info: StageInfo) -> Float32:
-        """Load ``sfQ`` of the lane's Q row, fixed for the whole work tile."""
+        """Load ``sfQ`` of the lane's Q row, fixed for the whole work tile.
+
+        The word is the lane's row among the work tile's words of the
+        prepared image: one coalesced load per lane, with no slot arithmetic
+        or clamping here.
+        """
         cfg = self.cfg
         assert cfg.use_sage_attention
         task_cache = _decode_gen_task_cache(stage_info)
@@ -2237,20 +2243,12 @@ class TmemSResource(DecodeGenResourceBase):
         kv_head_idx, batch_idx = _logical_head_batch(
             stage_info, self.h_k_idx, self.b_idx
         )
-        q_token_idx, local_head_idx = _q_row_token_and_local_head(
-            cfg,
-            self.h_r,
-            _logical_q_group_idx(cfg, stage_info, self.q_group_idx),
-            _keeps_row_idx(cfg, warp_grp_thread_idx),
-        )
         return load_q_scale(
             cfg,
-            self.scale_tensors.q_scale_ptr.toint(),
-            self.scale_tensors.q_scale_head_stride,
-            kv_head_idx=kv_head_idx,
-            local_head_idx=local_head_idx,
-            batch_idx=batch_idx,
-            q_token_idx=q_token_idx,
+            self.scale_tensors,
+            sequence_idx=batch_idx * self.num_heads_kv + kv_head_idx,
+            q_group_idx=_logical_q_group_idx(cfg, stage_info, self.q_group_idx),
+            row_idx=_keeps_row_idx(cfg, warp_grp_thread_idx),
         )
 
     @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))

@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prepare the Sage K-scale image of a dense or block-sparse plan.
+"""Prepare the Sage scale images of a dense or block-sparse plan.
 
 Sage attention reads ``sfK`` from the ``_SageKScaleImageLayout`` image
 alone: per sequence and KV head, one chunk per 64-token atom holding the
 atom's scale groups in the order the softmax reads them, first for the K
-tokens, then for a proxy plan's block summaries. This kernel writes the image
-from the flat ``k_scale`` and ``k_summary_scale`` tensors ahead of the
-attention launch (and of a block-sparse plan's route prepare); one thread
-writes one 16-byte piece.
+tokens, then for a proxy plan's block summaries. It reads ``sfQ`` from the
+``_SageQScaleImageLayout`` image alone: per sequence and KV head, one word per
+row of each Q tile, the scale of the token and Q head the softmax maps the
+row to. This kernel writes both images from the flat ``q_scale``, ``k_scale``
+and ``k_summary_scale`` tensors ahead of the attention launch (and of a
+block-sparse plan's route prepare); one thread writes one 16-byte piece.
 """
 
 from dataclasses import dataclass
@@ -38,6 +40,11 @@ from ..._block_sparse.prepared import (
     _SageKScaleImageLayout,
 )
 from ...sage import log2_block_size
+from .fmha_decode_config import FmhaDecodeConfig
+from .fmha_decode_resources.helpers_common import (
+    _q_row_token_and_local_head,
+    _q_tile_valid_rows_for_seq,
+)
 from .fmha_decode_resources.sage_scales import load_flat_scale
 
 _THREADS_PER_CTA = 128
@@ -80,7 +87,40 @@ class _KindSource:
 
 
 @cute.jit
-def _write_image_piece(
+def _sequence_of_piece(
+    piece_idx: cutlass.Int32,
+    sequence_pieces: cutlass.Constexpr[int],
+    num_kv_heads: cutlass.Constexpr[int],
+) -> tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
+    """Return the batch, KV head and sequence-local piece of image piece ``piece_idx``."""
+
+    sequence_idx = piece_idx // cutlass.Int32(sequence_pieces)
+    piece_in_sequence = piece_idx - sequence_idx * cutlass.Int32(sequence_pieces)
+    batch_idx = sequence_idx // cutlass.Int32(num_kv_heads)
+    head_idx = sequence_idx - batch_idx * cutlass.Int32(num_kv_heads)
+    return batch_idx, head_idx, piece_in_sequence
+
+
+@cute.jit
+def _store_piece(
+    image: cute.Tensor, piece_idx: cutlass.Int32, words: cutlass.Array
+) -> None:
+    """Store four words as 16-byte piece ``piece_idx`` of ``image``."""
+
+    piece_ptr = cutlass.inttoptr(
+        image.iterator.toint()
+        + cutlass.Int64(piece_idx) * cutlass.Int64(_SAGE_IMAGE_PIECE_WORDS * 4),
+        mem_space=1,
+        dtype=cutlass.Float32,
+    )
+    piece_ptr.store(
+        words.data_ptr().load(count=_SAGE_IMAGE_PIECE_WORDS, alignment=4),
+        alignment=_SAGE_IMAGE_PIECE_WORDS * 4,
+    )
+
+
+@cute.jit
+def _write_k_image_piece(
     k_scale: cute.Tensor,
     k_summary_scale: cute.Tensor | None,
     k_scale_image: cute.Tensor,
@@ -88,7 +128,7 @@ def _write_image_piece(
     image: cutlass.Constexpr[_SageKScaleImageLayout],
     num_kv_heads: cutlass.Constexpr[int],
 ) -> None:
-    """Write 16-byte piece ``piece_idx`` of the image: four words of one atom's chunk.
+    """Write 16-byte piece ``piece_idx`` of the ``sfK`` image: four words of one atom's chunk.
 
     The piece lies in sequence ``b * Hkv + h`` of the image, in the chunks of
     the kind its position selects: the K tokens from ``k_scale``, or the
@@ -98,12 +138,9 @@ def _write_image_piece(
     and padding words are zero.
     """
 
-    sequence_pieces = image.sequence_words // _SAGE_IMAGE_PIECE_WORDS
-    sequence_idx = piece_idx // cutlass.Int32(sequence_pieces)
-    piece_in_sequence = piece_idx - sequence_idx * cutlass.Int32(sequence_pieces)
-    batch_idx = sequence_idx // cutlass.Int32(num_kv_heads)
-    head_idx = sequence_idx - batch_idx * cutlass.Int32(num_kv_heads)
-
+    batch_idx, head_idx, piece_in_sequence = _sequence_of_piece(
+        piece_idx, image.sequence_words // _SAGE_IMAGE_PIECE_WORDS, num_kv_heads
+    )
     kind = _KindSource.create(image.exact, k_scale)
     piece_in_kind = piece_in_sequence
     if cutlass.const_expr(image.summary is not None):
@@ -134,48 +171,106 @@ def _write_image_piece(
                 + word * kind.group_tokens,
                 log2_block=kind.log2_block,
             )
-    piece_ptr = cutlass.inttoptr(
-        k_scale_image.iterator.toint()
-        + cutlass.Int64(piece_idx) * cutlass.Int64(_SAGE_IMAGE_PIECE_WORDS * 4),
-        mem_space=1,
-        dtype=cutlass.Float32,
+    _store_piece(k_scale_image, piece_idx, words)
+
+
+@cute.jit
+def _write_q_image_piece(
+    q_scale: cute.Tensor,
+    q_scale_image: cute.Tensor,
+    piece_idx: cutlass.Int32,
+    cfg: cutlass.Constexpr[FmhaDecodeConfig],
+    num_kv_heads: cutlass.Constexpr[int],
+) -> None:
+    """Write 16-byte piece ``piece_idx`` of the ``sfQ`` image: four rows of one Q tile.
+
+    The piece lies in sequence ``b * Hkv + h`` of the image, in the tile its
+    position selects. Row ``r`` of the tile takes the Q scale of the token
+    and Q head the softmax maps the row to (``_q_row_token_and_local_head``);
+    a row past the tile's valid rows (``_q_tile_valid_rows_for_seq``) takes
+    the last valid row's.
+    """
+
+    image = cfg.sage_q_scale_image
+    batch_idx, kv_head_idx, piece_in_sequence = _sequence_of_piece(
+        piece_idx, image.sequence_words // _SAGE_IMAGE_PIECE_WORDS, num_kv_heads
     )
-    piece_ptr.store(
-        words.data_ptr().load(count=_SAGE_IMAGE_PIECE_WORDS, alignment=4),
-        alignment=_SAGE_IMAGE_PIECE_WORDS * 4,
+    tile_pieces = cutlass.Int32(image.tile_size_q // _SAGE_IMAGE_PIECE_WORDS)
+    tile_idx = piece_in_sequence // tile_pieces
+    first_row = (piece_in_sequence - tile_idx * tile_pieces) * cutlass.Int32(
+        _SAGE_IMAGE_PIECE_WORDS
     )
+    # The row helpers take the plan's heads per KV head as the packed row
+    # count and its fixed Q length; Sage plans have no variable Q lengths.
+    heads_q_per_kv = cutlass.Int32(cfg.heads_q_per_kv)
+    seq_len_q = cutlass.Int32(image.seq_len_q)
+    last_row = _q_tile_valid_rows_for_seq(
+        cfg, heads_q_per_kv, tile_idx, seq_len_q
+    ) - cutlass.Int32(1)
+
+    words = cutlass.Array(
+        cutlass.Float32, _SAGE_IMAGE_PIECE_WORDS, space=cutlass.AddressSpace.rmem
+    )
+    for elem in cutlass.range_constexpr(_SAGE_IMAGE_PIECE_WORDS):
+        row = cute.math.min(first_row + cutlass.Int32(elem), last_row)
+        q_token_idx, local_head_idx = _q_row_token_and_local_head(
+            cfg, heads_q_per_kv, tile_idx, row
+        )
+        words[elem] = load_flat_scale(
+            q_scale.iterator.toint(),
+            cutlass.Int32(q_scale.shape[1]),
+            head_idx=kv_head_idx * heads_q_per_kv + local_head_idx,
+            batch_idx=batch_idx,
+            seq_len=seq_len_q,
+            token_idx=q_token_idx,
+            log2_block=cutlass.Int32(log2_block_size(image.q_block_size)),
+        )
+    _store_piece(q_scale_image, piece_idx, words)
 
 
-class _PrepareSageKScaleImage:
-    """Write a Sage plan's ``sfK`` image from its flat scale tensors.
+class _PrepareSageScaleImages:
+    """Write a Sage plan's ``sfK`` and ``sfQ`` images from its flat scale tensors.
 
-    The image covers ``batch_size * num_kv_heads`` sequences; the grid gives
-    each of its 16-byte pieces one thread. The kernel is an ordinary launch
-    on the plan's stream: a block-sparse plan's route prepare and the
-    attention launch follow it in stream order.
+    The images cover ``batch_size * num_kv_heads`` sequences; the grid gives
+    each of their 16-byte pieces one thread, the K image's pieces first and
+    the Q image's after them. The kernel is an ordinary launch on the plan's
+    stream: a block-sparse plan's route prepare and the attention launch
+    follow it in stream order.
     """
 
     def __init__(
         self,
         *,
-        image: _SageKScaleImageLayout,
+        cfg: FmhaDecodeConfig,
+        k_image: _SageKScaleImageLayout,
         batch_size: int,
         num_kv_heads: int,
     ) -> None:
-        self.image = image
+        self.cfg = cfg
+        self.k_image = k_image
         self.num_kv_heads = num_kv_heads
-        num_sequences, sequence_words = image.shape(batch_size * num_kv_heads)
-        self.num_pieces = num_sequences * sequence_words // _SAGE_IMAGE_PIECE_WORDS
+        num_sequences = batch_size * num_kv_heads
+        _, k_sequence_words = k_image.shape(num_sequences)
+        _, q_sequence_words = cfg.sage_q_scale_image.shape(num_sequences)
+        self.num_k_pieces = num_sequences * k_sequence_words // _SAGE_IMAGE_PIECE_WORDS
+        self.num_pieces = (
+            self.num_k_pieces
+            + num_sequences * q_sequence_words // _SAGE_IMAGE_PIECE_WORDS
+        )
 
     @cute.jit
     def __call__(
         self,
+        q_scale: cute.Tensor,
         k_scale: cute.Tensor,
         k_summary_scale: cute.Tensor | None,
+        q_scale_image: cute.Tensor,
         k_scale_image: cute.Tensor,
         stream: cuda_drv.CUstream,
     ) -> None:
-        self.kernel(k_scale, k_summary_scale, k_scale_image).launch(
+        self.kernel(
+            q_scale, k_scale, k_summary_scale, q_scale_image, k_scale_image
+        ).launch(
             grid=[ceil_div(self.num_pieces, _THREADS_PER_CTA), 1, 1],
             block=[_THREADS_PER_CTA, 1, 1],
             stream=stream,
@@ -184,24 +279,34 @@ class _PrepareSageKScaleImage:
     @cute.kernel
     def kernel(
         self,
+        q_scale: cute.Tensor,
         k_scale: cute.Tensor,
         k_summary_scale: cute.Tensor | None,
+        q_scale_image: cute.Tensor,
         k_scale_image: cute.Tensor,
     ) -> None:
-        """Write this thread's piece of the image, if any."""
+        """Write this thread's piece of the K image or the Q image, if any."""
 
         thread_idx, _, _ = cute.arch.thread_idx()
         block_idx, _, _ = cute.arch.block_idx()
         piece_idx = block_idx * cutlass.Int32(_THREADS_PER_CTA) + thread_idx
-        if piece_idx < cutlass.Int32(self.num_pieces):
-            _write_image_piece(
+        if piece_idx < cutlass.Int32(self.num_k_pieces):
+            _write_k_image_piece(
                 k_scale,
                 k_summary_scale,
                 k_scale_image,
                 piece_idx,
-                self.image,
+                self.k_image,
+                self.num_kv_heads,
+            )
+        elif piece_idx < cutlass.Int32(self.num_pieces):
+            _write_q_image_piece(
+                q_scale,
+                q_scale_image,
+                piece_idx - cutlass.Int32(self.num_k_pieces),
+                self.cfg,
                 self.num_kv_heads,
             )
 
 
-__all__ = ["_PrepareSageKScaleImage"]
+__all__ = ["_PrepareSageScaleImages"]

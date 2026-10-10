@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared layouts of the route records and Sage K-scale image prepared before attention."""
+"""Shared layouts of the route records and Sage scale images prepared before attention."""
 
 from dataclasses import dataclass
 
@@ -401,10 +401,82 @@ class _SageKScaleImageLayout:
         return num_sequences, self.sequence_words
 
 
+@dataclass(frozen=True)
+class _SageQScaleImageLayout:
+    """Word layout of the ``sfQ`` image a Sage plan prepares before attention.
+
+    The image is ``image[b * Hkv + h][tile][row]`` in FP32 words: KV head
+    ``h`` of sequence ``b`` owns ``sequence_words`` consecutive words,
+    ``tile_size_q`` per Q tile, in the order the softmax lanes read them.
+    Word ``row`` of a tile is the ``sfQ`` of the Q row the softmax maps lane
+    row ``row`` to. A grouped Q tile stacks ``q_tokens_per_tile = tile_size_q
+    // heads_q_per_kv`` tokens of ``heads_q_per_kv`` Q heads each, so row
+    ``r`` of tile ``t`` is token ``t * q_tokens_per_tile + r //
+    heads_q_per_kv`` of Q head ``h * heads_q_per_kv + r % heads_q_per_kv``,
+    and its word is that head's scale of the token's ``q_block_size`` block
+    (``flat_scale_slot``). The tile's valid rows are ``min(seq_len_q - t *
+    q_tokens_per_tile, q_tokens_per_tile) * heads_q_per_kv``; a row from
+    there on repeats the last valid row's word, so a masked row keeps a
+    finite positive scale.
+
+    With 2-token Q blocks, two Q heads per KV head, a 64-row tile and
+    ``seq_len_q = 100``, a tile holds 32 tokens and a sequence has four tiles
+    of 64 words. Words 4 to 7 of tile 1 are rows 4 to 7: tokens 34 and 35 of
+    local heads 0 and 1 in turn, both tokens in block 17, so words 4 and 6
+    hold head 0's scale of block 17 and words 5 and 7 head 1's. Tile 3 has 4
+    valid tokens, so words 8 to 63 repeat word 7, head 1's scale of token 99.
+    """
+
+    seq_len_q: int
+    q_block_size: int
+    heads_q_per_kv: int
+    tile_size_q: int
+
+    def __post_init__(self) -> None:
+        if self.tile_size_q % _SAGE_IMAGE_PIECE_WORDS or (
+            self.heads_q_per_kv > self.tile_size_q
+        ):
+            raise ValueError("sfQ image tiles hold whole pieces of at least one token")
+
+    @property
+    def q_tokens_per_tile(self) -> int:
+        """Return the complete Q tokens of one tile."""
+
+        return self.tile_size_q // self.heads_q_per_kv
+
+    @property
+    def tiles(self) -> int:
+        """Return the Q tiles of one sequence, the last one possibly partial."""
+
+        return ceil_div(self.seq_len_q, self.q_tokens_per_tile)
+
+    def valid_rows(self, tile_idx: int) -> int:
+        """Return the rows of tile ``tile_idx`` that hold a token of the sequence."""
+
+        remaining = self.seq_len_q - tile_idx * self.q_tokens_per_tile
+        return min(remaining, self.q_tokens_per_tile) * self.heads_q_per_kv
+
+    @property
+    def sequence_words(self) -> int:
+        """Return the words of one sequence and KV head: ``tile_size_q`` per tile."""
+
+        return self.tiles * self.tile_size_q
+
+    def shape(self, num_sequences: int) -> tuple[int, int]:
+        """Return the image shape ``[num_sequences, sequence_words]`` for ``batch * Hkv`` sequences."""
+
+        _validate_i32_address(
+            num_sequences * self.sequence_words,
+            "sage_q_scale_image_words",
+        )
+        return num_sequences, self.sequence_words
+
+
 __all__ = [
     "_PREPARED_ROUTE_IS_FULL_FLAG",
     "_PREPARED_ROUTE_IS_PROXY_FLAG",
     "_BlockSparseRouteLayout",
     "_SageKScaleImageKind",
     "_SageKScaleImageLayout",
+    "_SageQScaleImageLayout",
 ]

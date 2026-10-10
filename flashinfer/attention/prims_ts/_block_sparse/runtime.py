@@ -653,6 +653,7 @@ def launch_block_sparse(
             state.row_route_offsets,
             state.route_workspace,
             state.sage_k_scale_image,
+            state.sage_q_scale_image,
             0 if state.max_blocks_per_row is None else state.max_blocks_per_row,
             *run_args.sage_slots,
             run_args.sm_scale,

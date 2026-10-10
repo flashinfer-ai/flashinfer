@@ -35,7 +35,7 @@ from ..._block_sparse.common import (
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
-from ..._block_sparse.prepared import _SageKScaleImageLayout
+from ..._block_sparse.prepared import _SageKScaleImageLayout, _SageQScaleImageLayout
 from ...split_kv_mode_policy import select_split_kv_modes
 from ..tcgen05_compat import ldtm_stat_supported
 from .fmha_decode_constants import (
@@ -1968,6 +1968,9 @@ class FmhaDecodeConfig:
                 "Sage attention requires a two-instance Keeps profile: "
                 "Q64/KV256 or Q128/KV128"
             )
+        if not self.groups_tokens_heads_q:
+            # The prepared ``sfQ`` image follows the grouped Q tile rows.
+            raise ValueError("Sage attention requires groups_tokens_heads_q=True")
         if self.use_paged_kv or self.headdim != 128:
             raise ValueError("Sage attention requires contiguous K/V with headdim=128")
         # Only the direct output store applies the V channel scales and means;
@@ -2523,6 +2526,24 @@ class FmhaDecodeConfig:
             exact_block_size=self.sage_k_scale_block_size(),
             summary_block_size=self.sage_k_scale_block_size(proxy=True),
         )
+
+    @property
+    def sage_q_scale_image(self) -> _SageQScaleImageLayout:
+        """Return the layout of a Sage plan's prepared ``sfQ`` image.
+
+        Its tiles are the plan's grouped Q CTAs, so the softmax reads the
+        work tile's rows at ``q_group_idx * tile_size_q``.
+        """
+        assert self.use_sage_attention and self.groups_tokens_heads_q
+        image = _SageQScaleImageLayout(
+            seq_len_q=self.max_seq_len_q,
+            q_block_size=self.sage_q_block_size,
+            heads_q_per_kv=self.heads_q_per_kv,
+            tile_size_q=self.tile_size_q,
+        )
+        assert image.q_tokens_per_tile == self.q_tokens_per_cta
+        assert image.tiles == self.num_q_ctas
+        return image
 
     def sage_k_groups_per_fragment(self, proxy: bool = False) -> int:
         """Return the ``sfK`` groups of one streamed K32 score fragment of a route kind."""

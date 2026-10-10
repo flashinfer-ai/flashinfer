@@ -14,10 +14,14 @@
 
 """Sage attention scale addressing for the decode softmax and epilogue.
 
-``sfQ`` and ``sfK`` use the trtllm-gen flat layout (``flat_scale_slot`` of
-:mod:`flashinfer.attention.prims_ts.sage`). Tokens past the sequence end and
-Q rows past the valid row count clamp to the last valid slot, so masked
-scores keep a finite scale and exponentiate to zero.
+``sfQ`` and ``sfK`` reach the softmax from the images the Sage prepare writes
+before attention (``_SageQScaleImageLayout``, ``_SageKScaleImageLayout``), in
+the order the softmax reads them; the prepare resolves the flat layout
+(``flat_scale_slot`` of :mod:`flashinfer.attention.prims_ts.sage`) and gives
+Q rows past the valid row count and K tokens past the sequence end the last
+valid scale, so masked scores keep a finite scale and exponentiate to zero.
+Each softmax lane loads its row's ``sfQ`` word once per work tile
+(``load_q_scale``).
 
 :class:`SageKScalesResource` is one softmax instance's ring of ``sfK``
 tiles, which the load warp produces after each K tile with ``cp.async``
@@ -59,7 +63,7 @@ from ...._block_sparse.prepared import (
     _SAGE_IMAGE_PIECE_WORDS,
     _BlockSparseRouteLayout,
 )
-from ....sage import flat_scale_slot, log2_block_size
+from ....sage import flat_scale_slot
 from ...stage import FmhaStage
 from ..fmha_decode_config import FmhaDecodeConfig
 from ..fmha_decode_constants import KV_KIND_K
@@ -84,17 +88,16 @@ Constexpr = cutlass.Constexpr
 class SageScaleTensors:
     """The plan's Sage scale tensors, shared by every resource that reads one.
 
-    ``sfQ`` is a ``[heads, slots]`` FP32 array in the flat layout; ``sfK`` is
-    the plan's prepared ``_SageKScaleImageLayout`` image
-    (``k_scale_image_ptr``); the V scales and means are ``[Hkv, D]`` FP32,
-    ``v_mean_ptr`` being ``None`` without a channel mean. The dataclass is
-    not frozen because the DSL replaces frozen dataclasses with proxies
-    inside traced dynamic branches, which changes the traced structure of
-    the holding resource.
+    ``sfQ`` and ``sfK`` are the plan's prepared images
+    (``_SageQScaleImageLayout`` at ``q_scale_image_ptr``,
+    ``_SageKScaleImageLayout`` at ``k_scale_image_ptr``); the V scales and
+    means are ``[Hkv, D]`` FP32, ``v_mean_ptr`` being ``None`` without a
+    channel mean. The dataclass is not frozen because the DSL replaces frozen
+    dataclasses with proxies inside traced dynamic branches, which changes
+    the traced structure of the holding resource.
     """
 
-    q_scale_ptr: cute.Pointer
-    q_scale_head_stride: Int32
+    q_scale_image_ptr: cute.Pointer
     k_scale_image_ptr: cute.Pointer
     v_scale_ptr: cute.Pointer
     v_mean_ptr: cute.Pointer | None
@@ -134,28 +137,25 @@ def load_flat_scale(
 @cute.jit
 def load_q_scale(
     cfg: Constexpr[FmhaDecodeConfig],
-    q_scale_addr: Int64,
-    q_scale_head_stride: Int32,
+    scales: SageScaleTensors,
     *,
-    kv_head_idx: Int32,
-    local_head_idx: Int32,
-    batch_idx: Int32,
-    q_token_idx: Int32,
+    sequence_idx: Int32,
+    q_group_idx: Int32,
+    row_idx: Int32,
 ) -> Float32:
-    """Return ``sfQ`` for one Q row (token and Q head of one KV head group)."""
-    heads_q_per_kv = Int32(cfg.heads_q_per_kv)
-    q_head_idx = kv_head_idx * heads_q_per_kv + cute.math.min(
-        local_head_idx, heads_q_per_kv - Int32(1)
+    """Return ``sfQ`` of row ``row_idx`` of Q tile ``q_group_idx`` from the prepared image.
+
+    ``sequence_idx = b * Hkv + h`` selects the sequence and KV head. The word
+    already holds the scale of the row's token and Q head, the last valid
+    row's for a row past the tile's valid rows (``_SageQScaleImageLayout``).
+    """
+    image = cfg.sage_q_scale_image
+    word = (
+        sequence_idx * Int32(image.sequence_words)
+        + q_group_idx * Int32(image.tile_size_q)
+        + row_idx
     )
-    return load_flat_scale(
-        q_scale_addr,
-        q_scale_head_stride,
-        head_idx=q_head_idx,
-        batch_idx=batch_idx,
-        seq_len=Int32(cfg.max_seq_len_q),
-        token_idx=q_token_idx,
-        log2_block=log2_block_size(cfg.sage_q_block_size),
-    )
+    return _load_scale(scales.q_scale_image_ptr.toint(), word)
 
 
 def sage_k_chunk_words(cfg: FmhaDecodeConfig, proxy: bool = False) -> int:

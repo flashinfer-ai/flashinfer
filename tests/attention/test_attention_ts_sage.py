@@ -178,6 +178,14 @@ _DENSE_CASES = (
         softmax_rescale_threshold_log2=0.0,
         persistent=True,
     ),
+    # Two Q heads per KV head and 32-token Q blocks keep the Q64 tile, which
+    # holds 32 tokens; 100 tokens leave the last Q tile four of them, and
+    # 2-token Q scale blocks span two rows of each head.
+    _SageCase(
+        "kv256_fp8_k16_q2_two_heads_ragged",
+        **{**_KV256, "seq_len_q": 100, "num_qo_heads": 4, "q_block_size": 32},
+        sage=SageAttentionConfig(q_block_size=2),
+    ),
 )
 _SPARSE_CASES = (
     _SageCase(
@@ -749,6 +757,80 @@ def test_sage_k_scale_image_matches_flat_scales(case: _SageCase) -> None:
     expected = _reference_k_scale_image(state.sage_k_scale_image_layout, case, params)
     assert state.sage_k_scale_image.shape == expected.shape
     assert torch.equal(state.sage_k_scale_image, expected)
+
+
+def _reference_q_scale_image(layout, case: _SageCase, params) -> torch.Tensor:
+    """Build the ``sfQ`` image from the flat scales as ``_SageQScaleImageLayout`` describes it.
+
+    Per sequence and KV head, each Q tile holds one word per row: the scale
+    of the row's token and Q head, with a row past the tile's valid rows
+    repeating the last valid row's.
+    """
+
+    tiles = torch.arange(layout.tiles, device="cuda")[:, None]
+    rows = torch.arange(layout.tile_size_q, device="cuda")
+    valid_rows = torch.tensor(
+        [layout.valid_rows(tile) for tile in range(layout.tiles)], device="cuda"
+    )[:, None]
+    rows = torch.minimum(rows, valid_rows - 1)
+    tokens = tiles * layout.q_tokens_per_tile + rows // layout.heads_q_per_kv
+    kv_heads = torch.arange(case.num_kv_heads, device="cuda")[:, None, None]
+    heads = kv_heads * layout.heads_q_per_kv + rows % layout.heads_q_per_kv
+    slots = _scale_slots(case.batch_size, layout.seq_len_q, layout.q_block_size)
+    image = params.q_scale[heads[None], slots[:, tokens][:, None]]
+    return image.flatten(0, 1).flatten(1, 2)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            _CASES_BY_NAME[name],
+            id=name,
+            marks=(
+                _REQUIRES_INT8_QK_GPU
+                if _CASES_BY_NAME[name].qk_dtype == torch.int8
+                else ()
+            ),
+        )
+        for name in (
+            # Dense plans: one Q head per KV head with full Q tiles; two heads
+            # per KV head, 2-token Q blocks and a ragged last tile; 16-token Q
+            # blocks under the persistent scheduler.
+            "kv256_fp8_k1_one_shot",
+            "kv256_fp8_k16_q2_two_heads_ragged",
+            "kv256_int8_k4_q16_mean_causal_persistent",
+            # Q128 tiles of eight Q heads per KV head, dense and exact routes;
+            # proxy routes.
+            "q128_int8_k1_q4_persistent",
+            "q128_exact_fp8_k16_mean_token_mask",
+            "kv256_proxy_fp8_k16_s1_mean_bitmask",
+        )
+    ],
+)
+@torch.no_grad()
+def test_sage_q_scale_image_matches_flat_scales(case: _SageCase) -> None:
+    """The prepared ``sfQ`` image holds every Q tile row's scale in the softmax's read order."""
+
+    torch.manual_seed(20260908)
+    q, k, v, params, summaries = _random_inputs(case)
+    patterns = None
+    if case.routes != "dense":
+        patterns = _random_patterns(case, torch.Generator().manual_seed(20260908))
+    valid = _token_mask(case) if case.use_token_mask else None
+    wrapper = _plan(
+        case, max_blocks_per_row=None if patterns is None else _widest_row(patterns)
+    )
+    wrapper.run(q, k, v, sage=params, **_routing(case, patterns, summaries, valid))
+    torch.cuda.synchronize()
+    state = wrapper._plan_state
+    layout = state.sage_q_scale_image_layout
+    assert layout.tiles > 1
+    expected = _reference_q_scale_image(layout, case, params)
+    assert state.sage_q_scale_image.shape == expected.shape
+    assert torch.equal(state.sage_q_scale_image, expected)
 
 
 @_REQUIRES_PRIMTS_GPU
