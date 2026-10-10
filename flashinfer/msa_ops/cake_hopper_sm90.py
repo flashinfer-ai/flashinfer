@@ -1015,11 +1015,15 @@ _PXP_F16_SHORT_MIN_TILES_PER_CTA = (
 _PXP_F16_W3_MAX_MTILES = 12  # chunk <= 1536 tokens in 128-row tiles
 _PXP_F16_W3_MAX_SPLIT = 8  # largest admissible one-CTA-per-SM split of the 192-row form
 _PXP_F16_W3_MIN_TILES_PER_CTA = 8  # key tiles per CTA that split must leave
+_PXP_VARIANT_F16_SHORT_NOFOLD = "f16t4"  # f16, FI's 128-row shape with FI's PLAIN grid order (no alternate-block fold)
+_PXP_F16_SHORT_FI_FOLD_GATE = 2  # perf round 5 Stage A (parent decision 10, adopted): 0 = always fold, 1 = fold-free
+#                                  wherever FI #6140 is, 2 = restricted to where the plain layout adds no SM-tile step
 # CTA shape of each production variant (``variant_bm`` / ``variant_slots_per_sm`` / the ``LPT`` knob of the module).
 _PXP_FORMS = {
     "wg4st": dict(bm=256, slots=1, lpt=False, f16=False),
     "f16db": dict(bm=256, slots=1, lpt=False, f16=True),
     "f16t4F": dict(bm=128, slots=2, lpt=True, f16=True),
+    "f16t4": dict(bm=128, slots=2, lpt=False, f16=True),
     "f16w3L": dict(bm=192, slots=1, lpt=True, f16=True),
 }
 # Causal-aware key-split planner (``select_nsplit_causal`` / ``estimate_span_us``): CTA cost = C_CTA + tiles x C_TILE
@@ -1254,11 +1258,17 @@ def proxy_prefill_route_available(
 
 
 def proxy_prefill_routes(*, use_fp32_acc: bool) -> tuple[str, ...]:
-    """Every route the host plan can select for one accumulation precision (the f16 path has three CTA shapes)."""
+    """Every route the host plan can select for one accumulation precision (the f16 path has four forms on three
+    CTA shapes: FI's 128-row shape folded and fold-free, the 192-row and the 256-row forms)."""
     variants = (
         (_PXP_VARIANT_FP32,)
         if use_fp32_acc
-        else (_PXP_VARIANT_F16_SHORT, _PXP_VARIANT_F16_W3, _PXP_VARIANT_F16)
+        else (
+            _PXP_VARIANT_F16_SHORT,
+            _PXP_VARIANT_F16_SHORT_NOFOLD,
+            _PXP_VARIANT_F16_W3,
+            _PXP_VARIANT_F16,
+        )
     )
     return tuple(f"proxy_prefill:fp8:st{_PXP_STAGES}:sb:{v}:main" for v in variants)
 
@@ -1335,6 +1345,108 @@ def f16_short_small_work_nsplit(
     return int(one) if one < int(nsplit) else int(nsplit)
 
 
+def fi_fold(n_mtiles: int, max_k_tiles: int) -> bool:
+    """FI #6140's compile-time fold gate, verbatim (``fi_fold`` of the module; ``cute_dsl/proxy_score_prefill_sm90.py``
+    877: ``fold = 1 if n_mtiles * 16 >= nkt else 0``): True = FI runs its alternate-block fold, False = FI launches the
+    plain grid.  ``n_mtiles`` = 128-row tiles of the longest chunk."""
+    return int(n_mtiles) * 16 >= int(max_k_tiles)
+
+
+def _pxp_cta_tiles(
+    *, n_mtiles: int, chunk: int, max_k_tiles: int, nsplit: int, bm: int = _PXP_BM
+) -> dict:
+    """Compute-tile count of every (row tile, split) CTA of one (head, sequence) under the planner's shape assumption
+    (``_pxp_cta_tiles`` of the module: ``chunk`` query tokens after ``max_k_tiles * 128 - chunk`` prefix tokens, the
+    kernel's own ``t_lim`` arithmetic)."""
+    pfx = max(int(max_k_tiles) * _BLOCK_SIZE - int(chunk), 0)
+    out = {}
+    for mt in range(int(n_mtiles)):
+        m0 = max(0, min(mt * bm, int(chunk) - bm))
+        qmax = min(m0 + bm - 1, int(chunk) - 1) + pfx
+        t_lim = min(qmax // _BLOCK_SIZE + 1, int(max_k_tiles))
+        for s in range(int(nsplit)):
+            out[(mt, s)] = -(-(t_lim - s) // int(nsplit)) if t_lim > s else 0
+    return out
+
+
+def per_sm_max_tiles(
+    *,
+    fold: bool,
+    n_mtiles: int,
+    hq: int,
+    batch: int,
+    max_k_tiles: int,
+    chunk: int,
+    nsplit: int,
+    sm_count: int,
+    slots_per_sm: int = _PXP_SLOTS_PER_SM_REF,
+):
+    """Largest per-SM compute-tile sum of the 128-row two-CTA-per-SM forms under the hardware's linear dispatch with SM
+    ``i`` hosting the linear CTA ids ``i``, ``sm_count + i``, ... (``per_sm_max_tiles`` of the module, the single-wave
+    pairing model): ``fold`` = FI's alternate-block fold layout (``LPT`` 2, grid ``(hq * nsplit, n_mtiles, batch)``, the
+    kernel's ``lid`` remap), else the plain layout (``LPT`` 0, grid ``(hq * n_mtiles, nsplit, batch)``).  ``None`` beyond
+    ``slots_per_sm * sm_count`` CTAs (the model is a single wave)."""
+    n_ctas = int(n_mtiles) * int(hq) * int(batch) * int(nsplit)
+    if n_ctas > int(slots_per_sm) * int(sm_count):
+        return None
+    tiles = _pxp_cta_tiles(
+        n_mtiles=n_mtiles, chunk=chunk, max_k_tiles=max_k_tiles, nsplit=nsplit
+    )
+    load = [0] * int(sm_count)
+    gx = int(hq) * (int(nsplit) if fold else int(n_mtiles))
+    gy = int(n_mtiles) if fold else int(nsplit)
+    nlin = gx * gy
+    for bz in range(int(batch)):
+        for lid in range(nlin):
+            if fold:
+                blk = lid // int(sm_count)
+                hi = min((blk + 1) * int(sm_count), nlin)
+                kid = hi - 1 - (lid - blk * int(sm_count)) if blk % 2 == 1 else lid
+                byf = kid // gx
+                split, mt = (kid - byf * gx) // int(hq), gy - 1 - byf
+            else:
+                by, bx = divmod(lid, gx)
+                split, mt = by, int(n_mtiles) - 1 - bx // int(hq)
+            load[(bz * nlin + lid) % int(sm_count)] += tiles[(mt, split)]
+    return max(load)
+
+
+def nofold_layout_admissible(
+    *,
+    n_mtiles: int,
+    hq: int,
+    batch: int,
+    max_k_tiles: int,
+    chunk: int,
+    nsplit: int,
+    sm_count: int,
+) -> bool:
+    """Stage-A restriction (perf round 5, parent decision 10; ``nofold_layout_admissible`` of the module): the fold-free
+    layout is admitted only where it does not carry more SM-tile steps than the fold (``per_sm_max_tiles`` of both
+    layouts defined and plain <= fold)."""
+    a = per_sm_max_tiles(
+        fold=True,
+        n_mtiles=n_mtiles,
+        hq=hq,
+        batch=batch,
+        max_k_tiles=max_k_tiles,
+        chunk=chunk,
+        nsplit=nsplit,
+        sm_count=sm_count,
+    )
+    b = per_sm_max_tiles(
+        fold=False,
+        n_mtiles=n_mtiles,
+        hq=hq,
+        batch=batch,
+        max_k_tiles=max_k_tiles,
+        chunk=chunk,
+        nsplit=nsplit,
+        sm_count=sm_count,
+    )
+    return a is not None and b is not None and b <= a
+
+
 def f16_short_form(
     *, hq: int, batch: int, max_k_tiles: int, max_seqlen_q: int, sm_count: int
 ) -> tuple[str, str]:
@@ -1342,7 +1454,10 @@ def f16_short_form(
     (``f16_short_form`` of the module): the 192-row three-warpgroup LPT form with the causal planner for short
     chunks (at most ``_PXP_F16_W3_MAX_MTILES`` 128-row tiles) whose one-CTA-per-SM split is at most
     ``_PXP_F16_W3_MAX_SPLIT`` and leaves at least ``_PXP_F16_W3_MIN_TILES_PER_CTA`` key tiles per CTA; otherwise FI's
-    128-row shape with FI's split rule."""
+    128-row shape with FI's split rule: the folded ``_PXP_VARIANT_F16_SHORT``, or -- Stage A of perf round 5,
+    ``_PXP_F16_SHORT_FI_FOLD_GATE`` -- the fold-free ``_PXP_VARIANT_F16_SHORT_NOFOLD`` where FI itself is fold-free
+    (``fi_fold`` False; gate 1) and, for gate 2, the fold-free layout is admissible (``nofold_layout_admissible`` at
+    FI's split after the small-work lowering)."""
     if -(-int(max_seqlen_q) // _PXP_WG_ROWS // 2) <= _PXP_F16_W3_MAX_MTILES:
         base = (
             -(-int(max_seqlen_q) // _PXP_FORMS[_PXP_VARIANT_F16_W3]["bm"])
@@ -1355,6 +1470,36 @@ def f16_short_form(
             and -(-int(max_k_tiles) // ns_w3) >= _PXP_F16_W3_MIN_TILES_PER_CTA
         ):
             return _PXP_VARIANT_F16_W3, "causal"
+    gate = _PXP_F16_SHORT_FI_FOLD_GATE
+    n_mt = -(-int(max_seqlen_q) // _PXP_BM)
+    if gate and not fi_fold(n_mt, max_k_tiles):
+        if gate == 1:
+            return _PXP_VARIANT_F16_SHORT_NOFOLD, "fi"
+        ns = select_proxy_prefill_nsplit_fi(
+            n_mtiles=n_mt,
+            hq=int(hq),
+            batch=int(batch),
+            max_k_tiles=int(max_k_tiles),
+            sm_count=int(sm_count),
+        )
+        ns = f16_short_small_work_nsplit(
+            ns,
+            n_mtiles=n_mt,
+            hq=int(hq),
+            batch=int(batch),
+            max_k_tiles=int(max_k_tiles),
+            sm_count=int(sm_count),
+        )
+        if nofold_layout_admissible(
+            n_mtiles=n_mt,
+            hq=int(hq),
+            batch=int(batch),
+            max_k_tiles=int(max_k_tiles),
+            chunk=int(max_seqlen_q),
+            nsplit=ns,
+            sm_count=int(sm_count),
+        ):
+            return _PXP_VARIANT_F16_SHORT_NOFOLD, "fi"
     return _PXP_VARIANT_F16_SHORT, "fi"
 
 
@@ -1369,8 +1514,9 @@ def plan_proxy_score_prefill(
     num_sms: int,
 ) -> HopperProxyPrefillPlan:
     """Mirror of the Cake planner ``plan_proxy_score_prefill_sm90``: f32 accumulation -> the 256-row ``wg4st`` form
-    with the causal planner; f16 accumulation -> ``f16_short_form`` (FI's 128-row shape with FI's split rule and the
-    small-work lowering, or the 192-row form with the causal planner) up to ``_PXP_F16_SHORT_MAX_K_TILES`` pages,
+    with the causal planner; f16 accumulation -> ``f16_short_form`` (FI's 128-row shape -- folded, or fold-free where
+    the perf-round-5 gate admits it -- with FI's split rule and the small-work lowering, or the 192-row form with the
+    causal planner) up to ``_PXP_F16_SHORT_MAX_K_TILES`` pages,
     the 256-row ``f16db`` form with the causal planner beyond.  Four ring stages; ``ceil(max_seqlen_q / rows)`` row
     tiles; the causal planner models every sequence as ``max_seqlen_q`` tokens after ``max_k_tiles * 128 -
     max_seqlen_q`` prefix tokens."""
@@ -1410,7 +1556,7 @@ def plan_proxy_score_prefill(
             max_k_tiles=int(max_k_tiles),
             sm_count=int(num_sms),
         )
-        if variant == _PXP_VARIANT_F16_SHORT:
+        if variant in (_PXP_VARIANT_F16_SHORT, _PXP_VARIANT_F16_SHORT_NOFOLD):
             nsplit = f16_short_small_work_nsplit(
                 nsplit,
                 n_mtiles=n_mtiles,

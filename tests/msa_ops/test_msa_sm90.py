@@ -300,19 +300,34 @@ def test_proxy_score_paged_fp8_runs():
 
 
 @sm90_only
-@pytest.mark.parametrize("use_fp32_acc", [True, False])
-def test_proxy_score_prefill_matches_fp32_reference(use_fp32_acc):
+@pytest.mark.parametrize(
+    "use_fp32_acc,batch,hq,chunk,ctx",
+    [
+        pytest.param(True, 2, 4, 512, 2048, id="fp32"),
+        pytest.param(False, 2, 4, 512, 2048, id="f16"),
+        # one index head, 1536-token chunk, 64K context: the fold-free plain-grid
+        # form of the 128-row f16-accumulation kernel (the CuTe DSL kernel itself
+        # launches the plain grid there and the plain layout adds no SM-tile step)
+        pytest.param(False, 1, 1, 1536, 65536, id="f16-fold-free-h1-chunk1536-ctx64K"),
+    ],
+)
+def test_proxy_score_prefill_matches_fp32_reference(
+    use_fp32_acc, batch, hq, chunk, ctx
+):
     """Chunked-prefill scoring against the FP32 oracle in both accumulation
-    precisions: f32 (default) and f16 (the CuTe DSL kernel's numerics); -inf
-    blocks must match exactly."""
-    q, k, cu_q, page_table, seqused_k, pages = _proxy_prefill_inputs()
+    precisions: f32 (default) and f16 (the CuTe DSL kernel's numerics), including
+    the fold-free plain-grid f16 form at its one-head 1536-token 64K-context
+    coordinates; -inf blocks must match exactly."""
+    q, k, cu_q, page_table, seqused_k, pages = _proxy_prefill_inputs(
+        batch=batch, chunk=chunk, ctx=ctx, hq=hq
+    )
     out = msa_proxy_score(
         q,
         k,
         cu_q,
         page_table=page_table,
         seqused_k=seqused_k,
-        max_seqlen_q=512,
+        max_seqlen_q=chunk,
         max_k_tiles=pages,
         use_fp32_acc=use_fp32_acc,
     )
