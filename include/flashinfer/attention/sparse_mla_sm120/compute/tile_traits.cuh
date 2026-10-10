@@ -19,7 +19,7 @@ struct ComputeTraits;
 template <ModelType MT, int TILE_BI, int TILE_MATH_WARPS>
 struct ComputeTraits<MT, QkComputeMode::FP8, TILE_BI, TILE_MATH_WARPS> {
   using KV = KVCacheTraits<MT>;
-  static constexpr int V_CHUNK = KV::QUANT_TILE;
+  static constexpr int V_CHUNK = MT == ModelType::GLM_NSA_NVFP4 ? KV::D_NOPE : KV::QUANT_TILE;
   static constexpr int N_V_CHUNKS = KV::D_NOPE / V_CHUNK;
   static constexpr int V_TRANS_STRIDE = TILE_BI + 16;
   static constexpr int W_FP8_STRIDE = TILE_BI + 16;

@@ -88,7 +88,8 @@ struct SmemLayout {
   static constexpr size_t SMEM_W_SC_ALL = SMEM_W_SC_ONE * (SPLIT_PC ? 2 : 1);
   static constexpr size_t SMEM_W_FP8_ONE = HPB * (TILE_BI + 16);
   static constexpr size_t SMEM_W_FP8_ONE_PARITY = SMEM_W_FP8_ONE * CT::N_V_CHUNKS;
-  static constexpr size_t SMEM_W_FP8 = SMEM_W_FP8_ONE_PARITY * (SPLIT_PC ? 2 : 1);
+  static constexpr size_t SMEM_W_FP8 =
+      SMEM_W_FP8_ONE_PARITY * (SPLIT_PC || MT == ModelType::GLM_NSA_NVFP4 ? 2 : 1);
   static constexpr size_t SMEM_ALPHA = SPLIT_PC ? 2 * HPB * sizeof(float) : 0;
 
   // Mbarrier (double-buffered)
@@ -110,7 +111,9 @@ struct SmemLayout {
   static constexpr size_t OFF_W_FP8 = OFF_W_SC_ALL + SMEM_W_SC_ALL;
   static constexpr size_t OFF_ALPHA = OFF_W_FP8 + SMEM_W_FP8;
   static constexpr size_t OFF_MBAR_KV = (OFF_ALPHA + SMEM_ALPHA + 7) / 8 * 8;
-  static constexpr size_t TOTAL = OFF_MBAR_KV + SMEM_MBAR_KV;
+  static constexpr size_t OFF_MBAR_RAW = OFF_MBAR_KV + SMEM_MBAR_KV;
+  static constexpr size_t TOTAL =
+      OFF_MBAR_RAW + (MT == ModelType::GLM_NSA_NVFP4 ? 2 * sizeof(uint64_t) : 0);
 
   static_assert(TOTAL <= 101376, "SG smem exceeds 99KB per-block limit");
 };

@@ -51,7 +51,7 @@
 // positional window rather than a genuine top-k. It is the first model whose
 // d_v diverges from 512 (it is 1024), so it opts out of the shared D_V assert
 // in kv_cache_traits.cuh.
-enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE, DOTS3_SWA, DSV4_1 };
+enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE, DOTS3_SWA, DSV4_1, GLM_NSA_NVFP4 };
 
 // Prefill kernel variants selected by the Python dispatch planner
 // (flashinfer/mla/_sparse_mla_sm120/_policy.py, KernelVariant; the values must

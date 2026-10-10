@@ -92,3 +92,14 @@ def gen_sparse_mla_sm120_module() -> JitSpec:
         ],
         extra_cuda_cflags=nvcc_flags,
     )
+
+
+def gen_sparse_mla_glm_nvfp4_sm120_module() -> JitSpec:
+    """GLM NVFP4 storage instantiations of the existing FP8 sparse MLA kernels."""
+    return gen_jit_spec(
+        "sparse_mla_glm_nvfp4_sm120",
+        [jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/glm_nvfp4_binding.cu"],
+        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[12]
+        ),
+    )

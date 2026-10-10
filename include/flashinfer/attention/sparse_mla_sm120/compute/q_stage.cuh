@@ -147,7 +147,7 @@ __device__ __forceinline__ QSwapABRegs<MT> quantize_q_to_regs_swapab(const bf16*
 // Called by the math threads only; the trailing bar:2 syncs the math group.
 // q_base must be 16B-aligned row-wise: every row offset is a multiple of
 // D_QK * 2 bytes, and D_QK * 2 % 16 == 0 for every supported model type.
-template <ModelType MT, int _MATH_THREADS>
+template <ModelType MT, int _MATH_THREADS, int Q_ROWS = HPB>
 __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q_nope_sc,
                                                    bf16* q_rope, const bf16* q_base,
                                                    int valid_hpb = HPB) {
@@ -165,7 +165,7 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
   // (only valid heads from gmem; zero-fill rest).
   if constexpr (D_ROPE > 0) {
     constexpr int ROPE_VECS_PER_HEAD = D_ROPE / 8;
-    for (int v = tid; v < HPB * ROPE_VECS_PER_HEAD; v += _MATH_THREADS) {
+    for (int v = tid; v < Q_ROWS * ROPE_VECS_PER_HEAD; v += _MATH_THREADS) {
       const int h = v / ROPE_VECS_PER_HEAD, r = v % ROPE_VECS_PER_HEAD;
       uint4 val = make_uint4(0, 0, 0, 0);
       if (h < valid_hpb) val = *reinterpret_cast<const uint4*>(q_base + h * DIM + D_NOPE + r * 8);
@@ -181,7 +181,7 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
   // LANES_PER_TILE lanes covers exactly one tile and the tile absmax is a
   // warp-local shuffle reduce — no smem amax scratch, no atomicMax.
   constexpr int VECS_PER_HEAD = D_NOPE / 8;  // uint4 vectors per head row
-  constexpr int TOTAL_VECS = HPB * VECS_PER_HEAD;
+  constexpr int TOTAL_VECS = Q_ROWS * VECS_PER_HEAD;
   constexpr int LANES_PER_TILE = QUANT_TILE / 8;  // vectors (and lanes) per tile
   constexpr int MAX_VECS = (TOTAL_VECS + _MATH_THREADS - 1) / _MATH_THREADS;
   static_assert(32 % LANES_PER_TILE == 0, "a tile must not straddle a warp");
@@ -208,10 +208,22 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
     // old zero-initialized amax; fmaxf on exact |values| is order-independent,
     // so the result is bitwise identical to the atomicMax reduction.
     float a = 0.f;
+    if constexpr (MT == ModelType::GLM_NSA_NVFP4) {
+      uint32_t a_bits = 0;
 #pragma unroll
-    for (int j = 0; j < 8; j++) a = fmaxf(a, fabsf(__bfloat162float(e[j])));
+      for (int j = 0; j < 8; ++j)
+        a_bits = max(a_bits, uint32_t(reinterpret_cast<const uint16_t*>(&pk)[j] & 0x7fff));
+      const uint32_t mask = LANES_PER_TILE == 32 ? 0xffffffffu
+                                                 : (((1u << LANES_PER_TILE) - 1)
+                                                    << (lane / LANES_PER_TILE * LANES_PER_TILE));
+      a_bits = __reduce_max_sync(mask, a_bits);
+      a = __uint_as_float(a_bits << 16);
+    } else {
 #pragma unroll
-    for (int m = 1; m < LANES_PER_TILE; m <<= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, m));
+      for (int j = 0; j < 8; j++) a = fmaxf(a, fabsf(__bfloat162float(e[j])));
+#pragma unroll
+      for (int m = 1; m < LANES_PER_TILE; m <<= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, m));
+    }
 
     // Scale, rounded up to power-of-2 for exact UE8M0 block-scaled MMA. Every
     // lane of the tile computes the identical value; the tile's first lane
@@ -227,7 +239,8 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
     if (in_range) {
       uint2 out = make_uint2(0, 0);
       if (load) {
-        const float si = 1.f / s;
+        const float si =
+            MT == ModelType::GLM_NSA_NVFP4 ? __uint_as_float(0x7f000000u - bits) : 1.f / s;
         out.x = cvt_e4m3x4(__bfloat162float(e[0]) * si, __bfloat162float(e[1]) * si,
                            __bfloat162float(e[2]) * si, __bfloat162float(e[3]) * si);
         out.y = cvt_e4m3x4(__bfloat162float(e[4]) * si, __bfloat162float(e[5]) * si,
