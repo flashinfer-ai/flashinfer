@@ -1022,6 +1022,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             ),
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
+            # Run longer causal tiles first; Q/K/V storage uses one byte.
+            lpt=self.is_causal,
+            element_size=1,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
@@ -1441,7 +1444,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     )
                     smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                     smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-            # The remaining iterations have no masking
+            # Remaining tiles are fully inside the causal boundary. Keep any
+            # custom/local mask, but omit redundant causal comparisons.
             for n_tile in cutlass.range(n_block, unroll=1):
                 compute_one_n_block(
                     n_block - n_tile - 1,
@@ -1449,7 +1453,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     smem_pipe_write,
                     seqlen=seqlen,
                     is_first_n_block=False,
-                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
+                    mask_fn=partial(
+                        mask_fn,
+                        mask_mod=self.mask_mod,
+                        mask_seqlen=False,
+                        mask_causal=False,
+                    ),
                 )
                 smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                 smem_pipe_write = self.advance_pipeline(smem_pipe_write)
