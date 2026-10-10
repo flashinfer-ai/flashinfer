@@ -203,7 +203,8 @@ def msa_sparse_decode_attention(
     KV blocks selected in ``q2k_indices``. Decode tokens are right-aligned:
     token ``i`` of a request sits at position ``seqlen_k - seqlen_q + i``.
     On compute capability 10.0/10.3/10.7, ``topk`` must be 16 and Q1 through
-    multi-token decode use the direct persistent M16 path.
+    multi-token decode use the direct persistent M16 path. On compute capability
+    9.0 (H100/H200) ``q`` must be bf16; fp16 ``q`` raises ``NotImplementedError``.
 
     Parameters
     ----------

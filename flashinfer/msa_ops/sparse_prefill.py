@@ -79,7 +79,9 @@ def msa_sparse_attention(
     causal, without an LSE and with ``seqused_k`` rather than ``cu_seqlens_k``
     (see the ``k``, ``k_scale``, ``seqused_k`` and ``k_global_scale``
     parameters below) -- and requires ``topk == 16``. Every other packed-NVFP4
-    layout remains SM120/SM121-only.
+    layout remains SM120/SM121-only. On compute capability 9.0 (H100/H200) both
+    sparse routes take bf16 ``q`` only and write bf16 output; fp16 ``q`` raises
+    ``NotImplementedError``.
 
     Parameters
     ----------
