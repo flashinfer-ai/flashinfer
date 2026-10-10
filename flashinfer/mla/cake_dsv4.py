@@ -148,13 +148,16 @@ member (``pv``) when its wave-aware split rule gives more than one tile per
 CTA and the one-tile SwapsAB member (``swap``) otherwise; rows with ``H >= 64``
 pick the member and split count with the lowest modelled chain cost among the
 one-tile ``tile`` member, the persistent member, the 2-CTA ``cluster`` member
-and the tile64 member (``t64``, 64 heads per CTA). The one-tile members run
-``o_chunks`` CTAs per work item; the split merge runs on
+and the tile64 member (``t64``, 64 heads per CTA); a one-tile row with
+``H <= 64`` whose grid gives 2 or 4 CTAs per work item runs the H64 tile member
+(``tile_h64``: 64-row Q boxes, same grid and output as ``tile``). The one-tile
+members run ``o_chunks`` CTAs per work item; the split merge runs on
 ``merge_heads_per_cta`` heads per CTA. Each (member, retrace knobs) pair is one
 registered variant (``_nvfp4_variant_name``: ``nvfp4_decode_persistent``,
 ``nvfp4_decode_cluster``, ``nvfp4_decode_t64_n64_oc1``,
 ``nvfp4_decode_pv_n{16,32}_oc1``, ``nvfp4_decode_swap_n{16,32}_oc{1,2,4}``,
-``nvfp4_decode_tile_oc{1,2,4}``) plus ``nvfp4_merge``, bound through the same
+``nvfp4_decode_tile_oc{1,2,4}``, ``nvfp4_decode_tile_h64_oc{2,4}``) plus
+``nvfp4_merge``, bound through the same
 registration machinery as the BF16/FP8 routes from the generated sources under
 ``csrc/cake_dsv4/sm_100a`` and ``csrc/cake_dsv4/sm_103a``; a plan that selects
 an unexported variant raises ``NotImplementedError``. Splits write
@@ -240,9 +243,12 @@ _NVFP4_CLUSTER_CTAS = (
 # than one tile per CTA; H > _NVFP4_PV_MAX_HEADS rows pick (member, splits) with the lowest modelled chain cost among
 # the one-tile "tile" member, the persistent member, the 2-CTA cluster member (H >= _NVFP4_CLUSTER_MIN_HEADS) and
 # the tile64 member "t64" (_NVFP4_T64_HEAD_COUNTS); one-tile rows take the SwapsAB one-tile member "swap" (H <=
-# _NVFP4_SWAP_MAX_HEADS) or the "tile" member, each with its own CTAs-per-work-item split (o_chunks).
+# _NVFP4_SWAP_MAX_HEADS) or the "tile" member, each with its own CTAs-per-work-item split (o_chunks); a "tile" row
+# with H <= _NVFP4_TILE_H64_MAX_HEADS whose split gives 2 or 4 CTAs per work item runs the H64 tile member "tile_h64"
+# (64-row Q boxes; same grid, bitwise-equal output), while its 1-CTA form stays on "tile".
 _NVFP4_PV_MAX_HEADS = 32
 _NVFP4_SWAP_MAX_HEADS = 32
+_NVFP4_TILE_H64_MAX_HEADS = 64
 _NVFP4_CLUSTER_MIN_HEADS = 64
 _NVFP4_T64_HEAD_COUNTS = (64, 128)
 _NVFP4_T64_TILE_Q = 64  # heads per CTA of the tile64 member (H128 runs two head tiles)
@@ -2386,7 +2392,7 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
 # --------------------------------------------------------------------------- #
 
 
-NVFP4Member = Literal["persistent", "cluster", "t64", "pv", "swap", "tile"]
+NVFP4Member = Literal["persistent", "cluster", "t64", "pv", "swap", "tile", "tile_h64"]
 
 
 @dataclass(frozen=True)
@@ -2453,6 +2459,7 @@ _NVFP4_VARIANT_KNOBS: Mapping[str, tuple[str, ...]] = {
     "pv": ("tile_n", "o_chunks"),
     "swap": ("tile_n", "o_chunks"),
     "tile": ("o_chunks",),
+    "tile_h64": ("o_chunks",),
 }
 _NVFP4_KNOB_TAGS = {"tile_n": "n", "o_chunks": "oc"}
 
@@ -2475,7 +2482,7 @@ def _nvfp4_variant_name(
 
 # Every decode variant a plan can select (the host names them statically so the export can check that each
 # generated program is bindable): persistent, cluster, t64 n64, pv n16 / n32, swap n{16,32} x oc{1,2,4},
-# tile oc{1,2,4}.
+# tile oc{1,2,4}, tile_h64 oc{2,4} (the H64 tile member has no 1-CTA form).
 _NVFP4_DECODE_VARIANTS = (
     _NVFP4_VARIANT_PERSISTENT,
     _NVFP4_VARIANT_CLUSTER,
@@ -2491,6 +2498,8 @@ _NVFP4_DECODE_VARIANTS = (
     "nvfp4_decode_tile_oc1",
     "nvfp4_decode_tile_oc2",
     "nvfp4_decode_tile_oc4",
+    "nvfp4_decode_tile_h64_oc2",
+    "nvfp4_decode_tile_h64_oc4",
 )
 _NVFP4_VARIANTS = (*_NVFP4_DECODE_VARIANTS, _NVFP4_VARIANT_MERGE)
 
@@ -2658,7 +2667,9 @@ def _nvfp4_plan(
     member (``swap``, ``o_chunks`` CTAs per work item).  Rows with ``H >= 64``
     pick (member, splits) from the round-43 chain model over the one-tile
     ``tile`` member, the persistent member, the 2-CTA ``cluster`` member and the
-    tile64 member ``t64`` (64 heads per CTA; ``H128`` runs two head tiles).  The
+    tile64 member ``t64`` (64 heads per CTA; ``H128`` runs two head tiles); a
+    one-tile row with ``H <= 64`` whose split gives 2 or 4 CTAs per work item
+    runs the H64 tile member ``tile_h64`` instead of ``tile`` (same grid).  The
     split merge runs behind any member with ``num_splits > 1`` on
     ``merge_heads_per_cta`` heads per CTA.
     """
@@ -2721,13 +2732,20 @@ def _nvfp4_plan(
                 member=member,
                 **common,
             )
-        # the one-tile member: one candidate tile per CTA, o_chunks CTAs per work item
+        # the one-tile member: one candidate tile per CTA, o_chunks CTAs per work item;
+        # H <= _NVFP4_TILE_H64_MAX_HEADS rows at 2 or 4 CTAs per work item run the H64
+        # tile member (the 1-CTA form keeps the tile member)
+        o_chunks = _nvfp4_tile_o_chunks(tokens * total_tiles * num_head_tiles, sms)
         return NVFP4Plan(
             num_head_tiles=num_head_tiles,
             num_splits=total_tiles,
             tiles_per_split=1,
-            member="tile",
-            o_chunks=_nvfp4_tile_o_chunks(tokens * total_tiles * num_head_tiles, sms),
+            member=(
+                "tile_h64"
+                if heads <= _NVFP4_TILE_H64_MAX_HEADS and o_chunks >= 2
+                else "tile"
+            ),
+            o_chunks=o_chunks,
             **common,
         )
     pv_splits, pv_tiles = _nvfp4_pv_splits(tokens, total_tiles, sms)

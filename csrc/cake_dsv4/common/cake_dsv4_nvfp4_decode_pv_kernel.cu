@@ -89,6 +89,8 @@
 #define SMEM_SMEM_MASK_STAGE_BYTES 16
 #define SMEM_SMEM_MASK_STRIDE 16
 #define SMEM_SMEM_PMAX_OFF 201248
+#define SMEM_SMEM_PSUM_OFF (24 * TILE_N + 201248)
+#define SMEM_SMEM_RSUM_OFF (48 * TILE_N + 201248)
 #define SMEM_SMEM_QF4B_OFF 1024
 #define SMEM_SMEM_QF4B_STRIDE 4096
 #define SMEM_SMEM_QROPE_B_OFF 13312
@@ -99,7 +101,7 @@
 namespace cake::dsv4_nvfp4 {
 
 template <int TILE_N>
-__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
 decode_pv(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_out, const __grid_constant__ CUtensorMap tmap_g4d, const __grid_constant__ CUtensorMap tmap_g4f, const __grid_constant__ CUtensorMap tmap_g4dx, const __grid_constant__ CUtensorMap tmap_g4fx, __nv_bfloat16* __restrict__ q_rows, uint8_t* __restrict__ main_cache, uint8_t* __restrict__ extra_cache, int* __restrict__ main_indices, int* __restrict__ extra_indices, int* __restrict__ main_lengths, int* __restrict__ extra_lengths, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ lse_out, int num_heads, int num_head_tiles, int num_splits, int num_main_tiles, int tiles_per_split, int main_width, int extra_width, int main_index_stride, int extra_index_stride, int has_main_lengths, int has_extra_lengths, int main_page_shift, int extra_page_shift, long long main_page_stride, long long extra_page_stride, int has_sinks, float lse_partial_scale, float lse_scale)
 {
     const int tid = threadIdx.x;
@@ -131,66 +133,66 @@ decode_pv(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CU
     const int num_bids = gridDim.x;
     const int cta_rank = 0;
     // Kernel setup ops
-    uint8_t* smem_qf4 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int smem_qf4_addr = smem + 1024;
-    uint8_t* smem_qsf = reinterpret_cast<uint8_t*>(smem_raw + 9216);
-    const int smem_qsf_addr = smem + 9216;
-    unsigned int* smem_qsf32 = reinterpret_cast<unsigned int*>(smem_raw + 9216);
-    const int smem_qsf32_addr = smem + 9216;
-    __nv_bfloat16* smem_qrope = reinterpret_cast<__nv_bfloat16*>(smem_raw + 13312);
-    const int smem_qrope_addr = smem + 13312;
-    __nv_bfloat16* smem_qstage = reinterpret_cast<__nv_bfloat16*>(smem_raw + 74752);
-    const int smem_qstage_addr = smem + 74752;
-    __nv_bfloat16* smem_ostage = reinterpret_cast<__nv_bfloat16*>(smem_raw + 21504);
-    const int smem_ostage_addr = smem + 21504;
-    uint8_t* smem_ksf = reinterpret_cast<uint8_t*>(smem_raw + 17408);
-    const int smem_ksf_addr = smem + 17408;
-    unsigned int* smem_ksf32 = reinterpret_cast<unsigned int*>(smem_raw + 17408);
-    const int smem_ksf32_addr = smem + 17408;
-    uint8_t* smem_kf4_0 = reinterpret_cast<uint8_t*>(smem_raw + 21504);
-    const int smem_kf4_0_addr = smem + 21504;
-    __nv_bfloat16* smem_krope_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 54272);
-    const int smem_krope_0_addr = smem + 54272;
-    uint8_t* smem_sfs_0 = reinterpret_cast<uint8_t*>(smem_raw + 70656);
-    const int smem_sfs_0_addr = smem + 70656;
-    unsigned int* smem_sfs32_0 = reinterpret_cast<unsigned int*>(smem_raw + 70656);
-    const int smem_sfs32_0_addr = smem + 70656;
-    int* smem_tok_0 = reinterpret_cast<int*>(smem_raw + 199712);
-    const int smem_tok_0_addr = smem + 199712;
-    uint8_t* smem_kf4_1 = reinterpret_cast<uint8_t*>(smem_raw + 74752);
-    const int smem_kf4_1_addr = smem + 74752;
-    __nv_bfloat16* smem_krope_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 107520);
-    const int smem_krope_1_addr = smem + 107520;
-    uint8_t* smem_sfs_1 = reinterpret_cast<uint8_t*>(smem_raw + 123904);
-    const int smem_sfs_1_addr = smem + 123904;
-    unsigned int* smem_sfs32_1 = reinterpret_cast<unsigned int*>(smem_raw + 123904);
-    const int smem_sfs32_1_addr = smem + 123904;
-    int* smem_tok_1 = reinterpret_cast<int*>(smem_raw + 200224);
-    const int smem_tok_1_addr = smem + 200224;
-    int* smem_tokr_0 = reinterpret_cast<int*>(smem_raw + 199712);
-    const int smem_tokr_0_addr = smem + 199712;
-    int* smem_tokr_1 = reinterpret_cast<int*>(smem_raw + 200224);
-    const int smem_tokr_1_addr = smem + 200224;
-    uint8_t* smem_v = reinterpret_cast<uint8_t*>(smem_raw + 128000);
-    const int smem_v_addr = smem + 128000;
-    uint8_t* smem_p = reinterpret_cast<uint8_t*>(smem_raw + 193536);
-    const int smem_p_addr = smem + 193536;
-    unsigned int* smem_rcptab = reinterpret_cast<unsigned int*>(smem_raw + 197632);
-    const int smem_rcptab_addr = smem + 197632;
-    unsigned int* smem_mask = reinterpret_cast<unsigned int*>(smem_raw + 199680);
-    const int smem_mask_addr = smem + 199680;
-    float* smem_pmax = reinterpret_cast<float*>(smem_raw + 201248);
-    const int smem_pmax_addr = smem + 201248;
-    float* smem_psum = reinterpret_cast<float*>(smem_raw + (24 * TILE_N + 201248));
-    const int smem_psum_addr = smem + (24 * TILE_N + 201248);
-    float* smem_rsum = reinterpret_cast<float*>(smem_raw + (48 * TILE_N + 201248));
-    const int smem_rsum_addr = smem + (48 * TILE_N + 201248);
-    uint8_t* smem_qf4b = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int smem_qf4b_addr = smem + 1024;
-    __nv_bfloat16* smem_qrope_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 13312);
-    const int smem_qrope_b_addr = smem + 13312;
-    uint8_t* smem_pb = reinterpret_cast<uint8_t*>(smem_raw + 193536);
-    const int smem_pb_addr = smem + 193536;
+    uint8_t* smem_qf4 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_QF4_OFF);
+    const int smem_qf4_addr = smem + SMEM_SMEM_QF4_OFF;
+    uint8_t* smem_qsf = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_QSF_OFF);
+    const int smem_qsf_addr = smem + SMEM_SMEM_QSF_OFF;
+    unsigned int* smem_qsf32 = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_QSF32_OFF);
+    const int smem_qsf32_addr = smem + SMEM_SMEM_QSF32_OFF;
+    __nv_bfloat16* smem_qrope = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_QROPE_OFF);
+    const int smem_qrope_addr = smem + SMEM_SMEM_QROPE_OFF;
+    __nv_bfloat16* smem_qstage = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_QSTAGE_OFF);
+    const int smem_qstage_addr = smem + SMEM_SMEM_QSTAGE_OFF;
+    __nv_bfloat16* smem_ostage = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_OSTAGE_OFF);
+    const int smem_ostage_addr = smem + SMEM_SMEM_OSTAGE_OFF;
+    uint8_t* smem_ksf = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_KSF_OFF);
+    const int smem_ksf_addr = smem + SMEM_SMEM_KSF_OFF;
+    unsigned int* smem_ksf32 = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_KSF32_OFF);
+    const int smem_ksf32_addr = smem + SMEM_SMEM_KSF32_OFF;
+    uint8_t* smem_kf4_0 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_KF4_0_OFF);
+    const int smem_kf4_0_addr = smem + SMEM_SMEM_KF4_0_OFF;
+    __nv_bfloat16* smem_krope_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_KROPE_0_OFF);
+    const int smem_krope_0_addr = smem + SMEM_SMEM_KROPE_0_OFF;
+    uint8_t* smem_sfs_0 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_SFS_0_OFF);
+    const int smem_sfs_0_addr = smem + SMEM_SMEM_SFS_0_OFF;
+    unsigned int* smem_sfs32_0 = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_SFS32_0_OFF);
+    const int smem_sfs32_0_addr = smem + SMEM_SMEM_SFS32_0_OFF;
+    int* smem_tok_0 = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_TOK_0_OFF);
+    const int smem_tok_0_addr = smem + SMEM_SMEM_TOK_0_OFF;
+    uint8_t* smem_kf4_1 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_KF4_1_OFF);
+    const int smem_kf4_1_addr = smem + SMEM_SMEM_KF4_1_OFF;
+    __nv_bfloat16* smem_krope_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_KROPE_1_OFF);
+    const int smem_krope_1_addr = smem + SMEM_SMEM_KROPE_1_OFF;
+    uint8_t* smem_sfs_1 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_SFS_1_OFF);
+    const int smem_sfs_1_addr = smem + SMEM_SMEM_SFS_1_OFF;
+    unsigned int* smem_sfs32_1 = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_SFS32_1_OFF);
+    const int smem_sfs32_1_addr = smem + SMEM_SMEM_SFS32_1_OFF;
+    int* smem_tok_1 = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_TOK_1_OFF);
+    const int smem_tok_1_addr = smem + SMEM_SMEM_TOK_1_OFF;
+    int* smem_tokr_0 = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_TOKR_0_OFF);
+    const int smem_tokr_0_addr = smem + SMEM_SMEM_TOKR_0_OFF;
+    int* smem_tokr_1 = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_TOKR_1_OFF);
+    const int smem_tokr_1_addr = smem + SMEM_SMEM_TOKR_1_OFF;
+    uint8_t* smem_v = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_V_OFF);
+    const int smem_v_addr = smem + SMEM_SMEM_V_OFF;
+    uint8_t* smem_p = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_P_OFF);
+    const int smem_p_addr = smem + SMEM_SMEM_P_OFF;
+    unsigned int* smem_rcptab = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_RCPTAB_OFF);
+    const int smem_rcptab_addr = smem + SMEM_SMEM_RCPTAB_OFF;
+    unsigned int* smem_mask = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_MASK_OFF);
+    const int smem_mask_addr = smem + SMEM_SMEM_MASK_OFF;
+    float* smem_pmax = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_PMAX_OFF);
+    const int smem_pmax_addr = smem + SMEM_SMEM_PMAX_OFF;
+    float* smem_psum = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_PSUM_OFF);
+    const int smem_psum_addr = smem + SMEM_SMEM_PSUM_OFF;
+    float* smem_rsum = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_RSUM_OFF);
+    const int smem_rsum_addr = smem + SMEM_SMEM_RSUM_OFF;
+    uint8_t* smem_qf4b = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_QF4B_OFF);
+    const int smem_qf4b_addr = smem + SMEM_SMEM_QF4B_OFF;
+    __nv_bfloat16* smem_qrope_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_QROPE_B_OFF);
+    const int smem_qrope_b_addr = smem + SMEM_SMEM_QROPE_B_OFF;
+    uint8_t* smem_pb = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_PB_OFF);
+    const int smem_pb_addr = smem + SMEM_SMEM_PB_OFF;
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&tmap_q))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&tmap_out))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&tmap_g4d))) : "memory");

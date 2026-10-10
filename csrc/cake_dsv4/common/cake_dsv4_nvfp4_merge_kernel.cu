@@ -24,8 +24,8 @@
 
 extern "C" {
 
-__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_nvfp4_d6fad161fd02521b6d50(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ lse_out, int num_heads, int num_splits, int heads_per_cta, float lse_scale)
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
+kernel_cake_dsv4_nvfp4_a9c628c1d0493dc9608a(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ lse_out, int num_heads, int num_splits, int heads_per_cta, float lse_scale)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

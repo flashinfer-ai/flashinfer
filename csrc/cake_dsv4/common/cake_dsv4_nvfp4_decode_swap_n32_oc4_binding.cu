@@ -33,7 +33,7 @@ __global__ void decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __
 }  // namespace cake::dsv4_nvfp4
 
 
-namespace cake_host_shim_56855dca834c72eb {
+namespace cake_host_shim_da84e4f27ebf839f {
 
 using namespace cake_host_shim_common;
 using tvm::ffi::TensorView;
@@ -200,6 +200,6 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_out, TensorView arg_q_rows, 
   CakeLaunchDirect(reinterpret_cast<const void*>(&cake::dsv4_nvfp4::decode_swap<32, 4>), "cake::dsv4_nvfp4::decode_swap<32, 4>", grid, block, 164224u, stream, kargs, nullptr, 0);
 }
 
-}  // namespace cake_host_shim_56855dca834c72eb
+}  // namespace cake_host_shim_da84e4f27ebf839f
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_56855dca834c72eb::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_da84e4f27ebf839f::Run);
