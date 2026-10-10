@@ -212,6 +212,81 @@ HEURISTIC_CONFIGS = {
 }
 
 
+# FI local extension: BF16 operands (sm90_bf16_bf16_bf16_pull_cutedsl).
+# 8-32768 (2026-10-02, 4x H200 NVLink, EP4: 384 experts, hidden 7168,
+# intermediate 3072, top-6; offline tuner `--dtype sm90_bf16`, 57 candidates
+# per bucket incl. K=64 tiles).  Swap-AB ping-pong cga(1,2,1) everywhere.
+# From 1024 tokens a K=64 tile wins: BF16 doubles the A/B stage bytes, and
+# halving K lets the M128N128 tile keep five-plus SMEM stages -- 17-22%
+# faster than the best K=128 tile (M128N64) at 2048-32768.  Up to 512
+# tokens K=64 and K=128 tie (+-0.4%); the K=128 rows stay.  Token-back ties
+# (<1%) keep epi_warps.
+_BF16_N8 = _config(swap_ab=True, pingpong=True, tile=(128, 8, 128), cga=(1, 2, 1),
+                   group_hint=264)
+_BF16_N16 = _config(swap_ab=True, pingpong=True, tile=(128, 16, 128), cga=(1, 2, 1),
+                    group_hint=264, tail_split_pairs=True)
+_BF16_N64 = _config(swap_ab=True, pingpong=True, tile=(128, 64, 128), cga=(1, 2, 1),
+                    group_hint=264, tail_split_pairs=True)
+_BF16_K64 = _config(swap_ab=True, pingpong=True, tile=(128, 128, 64), cga=(1, 2, 1),
+                    group_hint=264, tail_split_pairs=True)
+_BF16_K64_NO_HINT = _config(swap_ab=True, pingpong=True, tile=(128, 128, 64),
+                            cga=(1, 2, 1), tail_split_pairs=True)
+HEURISTIC_CONFIGS["bf16"] = {
+    8: _BF16_N8,
+    16: _BF16_N8,
+    32: _BF16_N8,
+    64: _BF16_N16,
+    128: _BF16_N16,
+    256: _BF16_N16,
+    512: _BF16_N64,
+    1024: _BF16_K64,
+    2048: _BF16_K64,
+    4096: _BF16_K64,
+    8192: _BF16_K64_NO_HINT,
+    16384: _BF16_K64_NO_HINT,
+    32768: _BF16_K64_NO_HINT,
+}
+# FI local extension: W4A16 (BF16 x NVFP4, weight_format="nvfp4"; swap-AB
+# only).  8-32768 (2026-10-02, 4x H200 NVLink, EP4, same geometry; offline
+# tuner `--dtype sm90_bf16_nvfp4`, 26 swap-AB candidates per bucket).  Up to
+# 1024 tokens the cooperative M256 tiles win (the EP1 1x H100 sweep had
+# preferred ping-pong M128N16 here); from 2048 the ping-pong M128N128 tile.
+# Token-back ties (<1%) keep epi_warps.
+_W4A16_M256 = {
+    n: _config(swap_ab=True, pingpong=False, tile=(256, n, 128), cga=cga,
+               group_hint=264)
+    for n, cga in ((8, (2, 1, 1)), (16, (2, 1, 1)), (32, (2, 1, 1)), (64, (1, 1, 1)))
+}
+_W4A16_PP = _config(swap_ab=True, pingpong=True, tile=(128, 128, 128),
+                    cga=(1, 2, 1), group_hint=264, tail_split_pairs=True)
+HEURISTIC_CONFIGS["bf16_nvfp4"] = {
+    8: _W4A16_M256[8],
+    16: _W4A16_M256[8],
+    32: _W4A16_M256[8],
+    64: _W4A16_M256[8],
+    128: _W4A16_M256[16],
+    256: _W4A16_M256[32],
+    512: _W4A16_M256[64],
+    1024: _W4A16_M256[64],
+    2048: _W4A16_PP,
+    4096: _W4A16_PP,
+    8192: _W4A16_PP,
+    16384: _config(swap_ab=True, pingpong=True, tile=(128, 128, 128),
+                   cga=(1, 2, 1), tail_split_pairs=True),
+    32768: _config(swap_ab=True, pingpong=True, tile=(128, 128, 128),
+                   cga=(1, 2, 1), tail_split_pairs=True),
+}
+
+
+def heuristic_table_key(
+    kind: str, fp8_scale_mode: str, weight_format: str = "dense"
+) -> str:
+    """``HEURISTIC_CONFIGS`` key of a session (FI local extension)."""
+    if weight_format == "nvfp4":
+        return "bf16_nvfp4"
+    return "bf16" if kind == "bf16" else fp8_scale_mode
+
+
 def token_bucket(tokens_per_rank: int) -> int:
     """Map a positive token count to the next measured power-of-two bucket."""
     if tokens_per_rank <= 0:
@@ -313,6 +388,7 @@ def resolve_hopper_fp8_config(
 
 __all__ = [
     "HEURISTIC_CONFIGS",
+    "heuristic_table_key",
     "HopperFp8Config",
     "HopperFp8ConfigSelection",
     "TAIL_SPLIT_ENV",

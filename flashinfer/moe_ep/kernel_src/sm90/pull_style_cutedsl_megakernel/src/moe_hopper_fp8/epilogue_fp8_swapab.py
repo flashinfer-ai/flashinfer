@@ -144,8 +144,12 @@ class SwapABFp8GluEpilogue:
         pingpong: bool = False,
         generate_c: bool = False,
         c_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        weight_dequant_multiplier: float = 1.0,
     ) -> None:
         self.fc1_output_dtype = fc1_output_dtype
+        # FI local extension: constant folded into the per-expert weight
+        # dequant scale (the W4A16 decode's 2^-7 bias; 1.0 otherwise).
+        self._weight_dequant_multiplier = weight_dequant_multiplier
         self.fc1_output_layout = fc1_output_layout
         self.acc_dtype = acc_dtype
         self.sf_dtype = sf_dtype
@@ -1720,6 +1724,14 @@ class SwapABFp8GluEpilogue:
                     fc2_act_dequant_scale
                     * Float32(fc2_weight_dequant_scale[expert_idx])
                 )
+                if cutlass.const_expr(self._weight_dequant_multiplier != 1.0):
+                    multiplier = Float32(self._weight_dequant_multiplier)
+                    fc1_act_weight_dequant_scale = (
+                        fc1_act_weight_dequant_scale * multiplier
+                    )
+                    fc2_act_weight_dequant_scale = (
+                        fc2_act_weight_dequant_scale * multiplier
+                    )
 
             if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
                 if cutlass.const_expr(self._fc1_store_offload):

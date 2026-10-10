@@ -149,6 +149,12 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         generate_c: bool = False,
         # Tail-split pair tasks (see fc1_fc2_fuse_sched); needs a 2-CTA token cluster.
         tail_split_pairs: bool = False,
+        # FI local extension: "nvfp4" = W4A16 -- packed NVFP4 weights in the
+        # augmented row-pair layout (kernel_fp8_glu_fc12_swapab
+        # W4A16PairTileBytes), decoded into register-sourced BF16 WGMMA.
+        # Swap-AB, BF16 activations, per_tensor ABI (the per-expert weight
+        # dequant scale carries the NVFP4 global scale).
+        weight_format: str = "dense",
     ) -> None:
         # Folding TMA-A / TMA-B / scheduler into the idle dispatch slots is
         # only possible with a single active dispatch warp.  Without the
@@ -211,6 +217,24 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             generate_c=generate_c,
             tail_split_pairs=tail_split_pairs,
         )
+
+        if weight_format not in ("dense", "nvfp4"):
+            raise ValueError(
+                f"weight_format must be 'dense' or 'nvfp4', got {weight_format!r}."
+            )
+        if weight_format == "nvfp4":
+            if not getattr(self, "is_swap_ab", False):
+                raise ValueError(
+                    "weight_format='nvfp4' (W4A16) needs the swap-AB kernel: "
+                    "the weights are the register-sourced WGMMA A operand."
+                )
+            if ab_dtype is not cutlass.BFloat16 or mma_tiler_mnk[2] != 128:
+                raise ValueError(
+                    "weight_format='nvfp4' runs BFloat16 activations with "
+                    f"mma_tiler K=128; got ab_dtype={ab_dtype.__name__}, "
+                    f"mma_tiler_mnk={mma_tiler_mnk}."
+                )
+            self.w4a16 = True
 
         self.enable_token_comm = True
         self.fold_producer_warps = _fold
@@ -287,8 +311,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             else logical_fc2_activation_sf_cols
         )
 
-        # FP8: 8 bits/elem = 1 byte/element (NVFP4 packs 2 per byte).
-        self.hidden_bytes = self.hidden
+        # FP8: 1 byte/element; BF16 (FI local extension): 2 (NVFP4 packs 2
+        # per byte).
+        self.hidden_bytes = self.hidden * self.ab_dtype.width // 8
         # Dispatch pulls scale metadata in uint32 units.  Per-tensor interprets
         # each word as four E8M0 bytes; blockwise interprets it as one FP32
         # scale.  In both modes the atom covers 128 K elements, so dispatch
@@ -1213,6 +1238,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                     slot_mask=token_rank_mask,
                 )
             else:
+                # FI local extension: masked (-1) routes are never dispatched,
+                # so their (token, topk) rows hold a previous launch's terms;
+                # mask them out by the local routing.
                 TopkReduce(
                     self.hidden,
                     self.num_topk,
@@ -1224,6 +1252,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                     output_activation,
                     score,
                     stream,
+                    slot_topk_idx=topk_idx,
                 )
 
     # =========================================================================

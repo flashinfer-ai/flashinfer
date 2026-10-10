@@ -100,7 +100,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
     ) -> None:
-        validate_mega_arch_sm90()
+        validate_mega_arch_sm90(self.kernel_name())
         validate_mega_fleet_params(
             fleet_params,
             bootstrap.world_size,
@@ -168,6 +168,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             kind=k.kind,
             fp8_scale_mode=k.fp8_scale_mode,
             fp8_accum_mode=k.fp8_accum_mode,
+            weight_format=getattr(k, "weight_format", "dense"),
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
             swap_ab=k.swap_ab,
             pingpong=k.pingpong,
@@ -349,7 +350,8 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
 
         fp = fleet_params
         return (
-            "sm90_fp8_fp8_bf16_pull_cutedsl",
+            self.kernel_name(),
+            getattr(k, "weight_format", "dense"),
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,

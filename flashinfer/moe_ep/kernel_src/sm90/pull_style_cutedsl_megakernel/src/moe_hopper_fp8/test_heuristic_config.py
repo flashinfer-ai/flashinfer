@@ -44,8 +44,10 @@ def _token_cluster_is_two(config) -> bool:
 
 class HopperFp8HeuristicConfigTest(unittest.TestCase):
     def test_all_scale_token_entries_exist(self) -> None:
-        self.assertEqual(set(HEURISTIC_CONFIGS), {"per_tensor", "blockwise"})
-        for configs in HEURISTIC_CONFIGS.values():
+        # FI local extension: "bf16" / "bf16_nvfp4" rows are checked below.
+        fp8_tables = {"per_tensor", "blockwise"}
+        self.assertTrue(fp8_tables <= set(HEURISTIC_CONFIGS))
+        for configs in (HEURISTIC_CONFIGS[name] for name in fp8_tables):
             self.assertEqual(tuple(configs), TOKEN_BUCKETS)
             for config in configs.values():
                 self.assertEqual(config.accum_mode, "1xacc")
@@ -55,6 +57,20 @@ class HopperFp8HeuristicConfigTest(unittest.TestCase):
                     config.token_back_mode,
                     ("epi_warps", "standalone_warps", "reuse_dispatch_warps"),
                 )
+
+    def test_fi_bf16_tables(self) -> None:
+        """FI local extension: dense BF16 may use K=64 tiles; W4A16 is swap-AB K=128."""
+        self.assertEqual(
+            set(HEURISTIC_CONFIGS) - {"per_tensor", "blockwise"}, {"bf16", "bf16_nvfp4"}
+        )
+        for name, k_tiles in (("bf16", (64, 128)), ("bf16_nvfp4", (128,))):
+            configs = HEURISTIC_CONFIGS[name]
+            self.assertEqual(tuple(configs), TOKEN_BUCKETS)
+            for config in configs.values():
+                self.assertIn(config.mma_tiler_mnk[2], k_tiles)
+                self.assertEqual(config.cluster_shape_mnk[2], 1)
+                if name == "bf16_nvfp4":
+                    self.assertTrue(config.swap_ab)
 
     def test_token_back_modes(self) -> None:
         # per_tensor: epi_warps everywhere (2026-09-18 four-rank H200 A/B: the

@@ -10,6 +10,7 @@ from .protocol import Sm90PushCombine, Sm90PushConfig, Sm90PushPayload, Sm90Push
 from .runner import Sm90PushMoERunner
 from .weights import (
     Sm90PushWeights,
+    interleave_sm90_push_gate_up,
     make_sm90_push_weights,
     transform_weights_for_sm90_push,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "Sm90PushCombine",
     "Sm90PushConfig",
     "Sm90PushWeights",
+    "interleave_sm90_push_gate_up",
     "Sm90PushPipe",
     "Sm90PushMoERunner",
     "make_sm90_push_weights",
