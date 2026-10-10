@@ -55,7 +55,7 @@ out4 = minimax_h3_varlen_nvfp4_attention(
 
 The BF16 one-shot API resolves its segment plan through a most-recently-used
 plan cache (`cached_bf16_segment_plan`, `BF16_PLAN_CACHE_CAPACITY = 256`
-entries keyed by `(cu_seqlens, device, num_heads, kv_splits, stream)`): the
+entries keyed by `(cu_seqlens, device, num_heads, kv_splits, q_split, stream)`): the
 first call for a segment layout builds and uploads the plan tables, every
 later call with the same `cu_seqlens` / `num_heads` on that device and stream
 re-launches with them -- no Python planning, no host-to-device copies, no
@@ -107,8 +107,10 @@ dropped) and `num_heads`:
   segment's token begin and length, `head << 16 | cluster_in_segment`,
   `kv_block_begin << 16 | kv_blocks` (the unit's K/V block range inside the
   segment), its partial slot (`-1` for an unsplit unit, which writes the BF16
-  output directly) and three reserved words, followed by `num_clusters` zero
-  records (every kernel role prefetches the record of its next unit),
+  output directly), `q_half` (`0` for a whole 512-row unit, `1` / `2` for the
+  first / second 256-row half of a tail-round Q-split unit) and two reserved
+  words, followed by `num_clusters` zero records (every kernel role prefetches
+  the record of its next unit),
 * `combine_table` (int32, `4 * num_combine_units` entries): per K/V-split
   unit the segment index, `head << 16 | cluster_in_segment`, its first partial
   slot and the number of splits, plus the plan's partial workspace
@@ -141,6 +143,25 @@ It is launched after the attention kernel on the same stream and skipped when
 the plan has no split units. Plans with at least as many units as clusters
 per wave are unchanged (unsplit units are bitwise identical to the previous
 kernel).
+
+**Tail-round Q-split.** When the unit count leaves a partial tail round
+(`total_units mod num_clusters != 0`), the clusters without a tail unit idle
+for a whole unit time. The planner (`bf16_choose_q_splits`, on by default:
+`BF16_Q_SPLIT_PLAN = True`) halves the most expensive unsplit two-stage units
+of the tail round into two 256-row single-stage records, one per idle
+cluster (`q_half` `1` / `2` in record word 5: the kernel runs the half at
+`unit_row0 = cluster_in_segment * 512 + (q_half >> 1) * 256` with its second
+Q stage skipped), simulating the slot assignment for `n = 1..idle` halved
+units and keeping the smallest `n` with the lowest makespan when it beats the
+unhalved plan by at least 0.5 % (`BF16_Q_SPLIT_MIN_GAIN`, 1 % until round 10; `center_5s_p2`, 1064
+units on 74 clusters: the 28 tail units are halved, 2.6 %). Only the slot ->
+rows mapping changes: each row's arithmetic, K/V range and output path are
+those of the whole unit, so the output is bitwise identical to the plain
+plan's; K/V-split ranges and single-stage units are never halved, so the
+combine path is untouched. The halves are separate records of the table
+(`total_tiles` counts them, `num_q_split_units` the halved units);
+`build_bf16_segment_plan(..., q_split=False)` yields the plain enumeration
+(word 5 is `0`).
 The plan is a host-side function of `(cu_seqlens, num_heads, num_SMs)` and
 reproduces the Cake production plan table for table (`num_heads < 2^15`,
 fewer than `2^16` clusters per segment). K/V TMA loads that run past a segment
@@ -250,7 +271,7 @@ is CUDA-Graph capturable.
   `fp4` PV is the fastest mode for long segments.
 * One-shot APIs synchronize once to read `cu_seqlens` unless
   `cu_seqlens_host` is passed (the fast path). BF16 plans are cached per
-  `(cu_seqlens, device, num_heads, kv_splits, stream)` (most recent 256;
+  `(cu_seqlens, device, num_heads, kv_splits, q_split, stream)` (most recent 256;
   the oldest is evicted); launches of one plan are stream-ordered on their
   stream (a K/V-split plan's partial workspace is rewritten by every
   launch) and concurrent streams never share a plan. The prepared runners

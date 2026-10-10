@@ -14,38 +14,8 @@
  * limitations under the License.
  */
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
+// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
+#include "cake_minimax_h3_varlen_attention_device_common.cuh"
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -55,29 +25,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_TOTAL 8704
 #define THREADS 256
 
-#include <math_constants.h>
-
-__device__ __forceinline__ float approx_rcp(float x) {
-    float y;
-    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-
-__device__ __forceinline__ float max_noftz(float a, float b) {
-    float c;
-    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-    return c;
-}
-
-
-
-
-
 extern "C" {
 
-__global__ __launch_bounds__(256) void
-kernel_cake_minimax_h3_varlen_attention_d18ed0a702ce625d75a8(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ q_fp4, uint8_t* __restrict__ k_fp4, uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_fp4_t, uint8_t* __restrict__ v_scale_lo, uint8_t* __restrict__ v_scale_hi, int* __restrict__ block_token, int* __restrict__ block_valid, int heads, int PB)
+__global__ __launch_bounds__(THREADS) void
+kernel_cake_minimax_h3_varlen_attention_cd9b0982c132645f17d1(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ q_fp4, uint8_t* __restrict__ k_fp4, uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_fp4_t, uint8_t* __restrict__ v_scale_lo, uint8_t* __restrict__ v_scale_hi, int* __restrict__ block_token, int* __restrict__ block_valid, int heads, int PB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -98,8 +49,8 @@ kernel_cake_minimax_h3_varlen_attention_d18ed0a702ce625d75a8(__nv_bfloat16* __re
     const int cta_rank = 0;
 
     // Kernel setup ops
-    __nv_bfloat16* v_smem_bf16 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
-    const int v_smem_bf16_addr = smem + 0;
+    __nv_bfloat16* v_smem_bf16 = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_V_SMEM_BF16_OFF);
+    const int v_smem_bf16_addr = smem + SMEM_V_SMEM_BF16_OFF;
 
     // === Task calls (dependency order) ===
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -127,62 +78,22 @@ kernel_cake_minimax_h3_varlen_attention_d18ed0a702ce625d75a8(__nv_bfloat16* __re
                 asm volatile(
                     "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                     : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]), "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7]) : "l"((const char*)_v8p_0 + 0) : "memory");
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&q_values[iteration * 16 + 0])[0]), "=f"((&q_values[iteration * 16 + 0])[1])
-                    : "r"(_v8_0_0[0]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&q_values[iteration * 16 + 2])[0]), "=f"((&q_values[iteration * 16 + 2])[1])
-                    : "r"(_v8_0_0[1]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&q_values[iteration * 16 + 4])[0]), "=f"((&q_values[iteration * 16 + 4])[1])
-                    : "r"(_v8_0_0[2]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&q_values[iteration * 16 + 6])[0]), "=f"((&q_values[iteration * 16 + 6])[1])
-                    : "r"(_v8_0_0[3]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&q_values[iteration * 16 + 8])[0]), "=f"((&q_values[iteration * 16 + 8])[1])
-                    : "r"(_v8_0_0[4]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&q_values[iteration * 16 + 10])[0]), "=f"((&q_values[iteration * 16 + 10])[1])
-                    : "r"(_v8_0_0[5]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&q_values[iteration * 16 + 12])[0]), "=f"((&q_values[iteration * 16 + 12])[1])
-                    : "r"(_v8_0_0[6]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&q_values[iteration * 16 + 14])[0]), "=f"((&q_values[iteration * 16 + 14])[1])
-                    : "r"(_v8_0_0[7]));
+                (&q_values[iteration * 16 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) << 16);
+                (&q_values[iteration * 16 + 0])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) & 0xffff0000u);
+                (&q_values[iteration * 16 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[1]) << 16);
+                (&q_values[iteration * 16 + 2])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[1]) & 0xffff0000u);
+                (&q_values[iteration * 16 + 4])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[2]) << 16);
+                (&q_values[iteration * 16 + 4])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[2]) & 0xffff0000u);
+                (&q_values[iteration * 16 + 6])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[3]) << 16);
+                (&q_values[iteration * 16 + 6])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[3]) & 0xffff0000u);
+                (&q_values[iteration * 16 + 8])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[4]) << 16);
+                (&q_values[iteration * 16 + 8])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[4]) & 0xffff0000u);
+                (&q_values[iteration * 16 + 10])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[5]) << 16);
+                (&q_values[iteration * 16 + 10])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[5]) & 0xffff0000u);
+                (&q_values[iteration * 16 + 12])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[6]) << 16);
+                (&q_values[iteration * 16 + 12])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[6]) & 0xffff0000u);
+                (&q_values[iteration * 16 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) << 16);
+                (&q_values[iteration * 16 + 14])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) & 0xffff0000u);
             }
             {
                 const void* _v8p_1 = (const void*)(k + (input_offset));
@@ -190,62 +101,22 @@ kernel_cake_minimax_h3_varlen_attention_d18ed0a702ce625d75a8(__nv_bfloat16* __re
                 asm volatile(
                     "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                     : "=r"(_v8_1_0[0]), "=r"(_v8_1_0[1]), "=r"(_v8_1_0[2]), "=r"(_v8_1_0[3]), "=r"(_v8_1_0[4]), "=r"(_v8_1_0[5]), "=r"(_v8_1_0[6]), "=r"(_v8_1_0[7]) : "l"((const char*)_v8p_1 + 0) : "memory");
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&k_values[iteration * 16 + 0])[0]), "=f"((&k_values[iteration * 16 + 0])[1])
-                    : "r"(_v8_1_0[0]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&k_values[iteration * 16 + 2])[0]), "=f"((&k_values[iteration * 16 + 2])[1])
-                    : "r"(_v8_1_0[1]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&k_values[iteration * 16 + 4])[0]), "=f"((&k_values[iteration * 16 + 4])[1])
-                    : "r"(_v8_1_0[2]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&k_values[iteration * 16 + 6])[0]), "=f"((&k_values[iteration * 16 + 6])[1])
-                    : "r"(_v8_1_0[3]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&k_values[iteration * 16 + 8])[0]), "=f"((&k_values[iteration * 16 + 8])[1])
-                    : "r"(_v8_1_0[4]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&k_values[iteration * 16 + 10])[0]), "=f"((&k_values[iteration * 16 + 10])[1])
-                    : "r"(_v8_1_0[5]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&k_values[iteration * 16 + 12])[0]), "=f"((&k_values[iteration * 16 + 12])[1])
-                    : "r"(_v8_1_0[6]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&k_values[iteration * 16 + 14])[0]), "=f"((&k_values[iteration * 16 + 14])[1])
-                    : "r"(_v8_1_0[7]));
+                (&k_values[iteration * 16 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[0]) << 16);
+                (&k_values[iteration * 16 + 0])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[0]) & 0xffff0000u);
+                (&k_values[iteration * 16 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[1]) << 16);
+                (&k_values[iteration * 16 + 2])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[1]) & 0xffff0000u);
+                (&k_values[iteration * 16 + 4])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[2]) << 16);
+                (&k_values[iteration * 16 + 4])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[2]) & 0xffff0000u);
+                (&k_values[iteration * 16 + 6])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[3]) << 16);
+                (&k_values[iteration * 16 + 6])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[3]) & 0xffff0000u);
+                (&k_values[iteration * 16 + 8])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[4]) << 16);
+                (&k_values[iteration * 16 + 8])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[4]) & 0xffff0000u);
+                (&k_values[iteration * 16 + 10])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[5]) << 16);
+                (&k_values[iteration * 16 + 10])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[5]) & 0xffff0000u);
+                (&k_values[iteration * 16 + 12])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[6]) << 16);
+                (&k_values[iteration * 16 + 12])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[6]) & 0xffff0000u);
+                (&k_values[iteration * 16 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[7]) << 16);
+                (&k_values[iteration * 16 + 14])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[7]) & 0xffff0000u);
             }
             {
                 const void* _v8p_2 = (const void*)(v + (input_offset));
@@ -253,62 +124,22 @@ kernel_cake_minimax_h3_varlen_attention_d18ed0a702ce625d75a8(__nv_bfloat16* __re
                 asm volatile(
                     "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                     : "=r"(_v8_2_0[0]), "=r"(_v8_2_0[1]), "=r"(_v8_2_0[2]), "=r"(_v8_2_0[3]), "=r"(_v8_2_0[4]), "=r"(_v8_2_0[5]), "=r"(_v8_2_0[6]), "=r"(_v8_2_0[7]) : "l"((const char*)_v8p_2 + 0) : "memory");
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&v_values[iteration * 16 + 0])[0]), "=f"((&v_values[iteration * 16 + 0])[1])
-                    : "r"(_v8_2_0[0]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&v_values[iteration * 16 + 2])[0]), "=f"((&v_values[iteration * 16 + 2])[1])
-                    : "r"(_v8_2_0[1]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&v_values[iteration * 16 + 4])[0]), "=f"((&v_values[iteration * 16 + 4])[1])
-                    : "r"(_v8_2_0[2]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&v_values[iteration * 16 + 6])[0]), "=f"((&v_values[iteration * 16 + 6])[1])
-                    : "r"(_v8_2_0[3]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&v_values[iteration * 16 + 8])[0]), "=f"((&v_values[iteration * 16 + 8])[1])
-                    : "r"(_v8_2_0[4]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&v_values[iteration * 16 + 10])[0]), "=f"((&v_values[iteration * 16 + 10])[1])
-                    : "r"(_v8_2_0[5]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&v_values[iteration * 16 + 12])[0]), "=f"((&v_values[iteration * 16 + 12])[1])
-                    : "r"(_v8_2_0[6]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&v_values[iteration * 16 + 14])[0]), "=f"((&v_values[iteration * 16 + 14])[1])
-                    : "r"(_v8_2_0[7]));
+                (&v_values[iteration * 16 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[0]) << 16);
+                (&v_values[iteration * 16 + 0])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[0]) & 0xffff0000u);
+                (&v_values[iteration * 16 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[1]) << 16);
+                (&v_values[iteration * 16 + 2])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[1]) & 0xffff0000u);
+                (&v_values[iteration * 16 + 4])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[2]) << 16);
+                (&v_values[iteration * 16 + 4])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[2]) & 0xffff0000u);
+                (&v_values[iteration * 16 + 6])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[3]) << 16);
+                (&v_values[iteration * 16 + 6])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[3]) & 0xffff0000u);
+                (&v_values[iteration * 16 + 8])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[4]) << 16);
+                (&v_values[iteration * 16 + 8])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[4]) & 0xffff0000u);
+                (&v_values[iteration * 16 + 10])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[5]) << 16);
+                (&v_values[iteration * 16 + 10])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[5]) & 0xffff0000u);
+                (&v_values[iteration * 16 + 12])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[6]) << 16);
+                (&v_values[iteration * 16 + 12])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[6]) & 0xffff0000u);
+                (&v_values[iteration * 16 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[7]) << 16);
+                (&v_values[iteration * 16 + 14])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[7]) & 0xffff0000u);
             }
         } else {
             #pragma unroll
@@ -344,10 +175,10 @@ kernel_cake_minimax_h3_varlen_attention_d18ed0a702ce625d75a8(__nv_bfloat16* __re
         float _fp8_rt_0;
         uint16_t _e4m3x2_3;
         uint32_t _f16x2_3;
-        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_3) : "f"(0.0f), "f"(raw_scale));
-        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_3) : "h"(_e4m3x2_3));
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_3) : "f"(0.0f), "f"(raw_scale));
+        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_3) : "h"(_e4m3x2_3));
         uint16_t _fp8_h0_3 = (uint16_t)(_f16x2_3 & 0xFFFFu);
-        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_3));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_3));
         float rounded_scale = _fp8_rt_0;
         float _rcp_0 = approx_rcp(rounded_scale);
         float inverse_scale = _rcp_0;
@@ -378,10 +209,10 @@ kernel_cake_minimax_h3_varlen_attention_d18ed0a702ce625d75a8(__nv_bfloat16* __re
         float _fp8_rt_1;
         uint16_t _e4m3x2_4;
         uint32_t _f16x2_4;
-        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_4) : "f"(0.0f), "f"(raw_scale_3));
-        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_4) : "h"(_e4m3x2_4));
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_4) : "f"(0.0f), "f"(raw_scale_3));
+        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_4) : "h"(_e4m3x2_4));
         uint16_t _fp8_h0_4 = (uint16_t)(_f16x2_4 & 0xFFFFu);
-        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_4));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_4));
         float rounded_scale_4 = _fp8_rt_1;
         float _rcp_1 = approx_rcp(rounded_scale_4);
         float inverse_scale_5 = _rcp_1;
@@ -494,10 +325,10 @@ kernel_cake_minimax_h3_varlen_attention_d18ed0a702ce625d75a8(__nv_bfloat16* __re
         float _fp8_rt_2;
         uint16_t _e4m3x2_5;
         uint32_t _f16x2_5;
-        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_5) : "f"(0.0f), "f"(raw_scale_1));
-        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_5) : "h"(_e4m3x2_5));
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_5) : "f"(0.0f), "f"(raw_scale_1));
+        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_5) : "h"(_e4m3x2_5));
         uint16_t _fp8_h0_5 = (uint16_t)(_f16x2_5 & 0xFFFFu);
-        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_2) : "h"(_fp8_h0_5));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_2) : "h"(_fp8_h0_5));
         float rounded_scale_1 = _fp8_rt_2;
         float _rcp_2 = approx_rcp(rounded_scale_1);
         float inverse_scale_1 = _rcp_2;
