@@ -565,8 +565,19 @@ class _LazyBatchPrefillIndependentModule(_LazyPagedKVStrideModule):
 
 
 @functools.cache
-def get_batch_prefill_module(backend, *args):
+def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
     lazy_independent_module: Optional[_LazyBatchPrefillIndependentModule] = None
+    dtype_kv = args[1]
+    effective_k = dtype_k if dtype_k is not None else dtype_kv
+    effective_v = dtype_v if dtype_v is not None else dtype_kv
+    if effective_k != effective_v:
+        raise NotImplementedError(
+            "Batch prefill does not support asymmetric K/V dtypes."
+        )
+    if effective_k != dtype_kv:
+        args = (*args[:1], effective_k, *args[2:])
+        dtype_k = effective_k
+        dtype_v = effective_v
     if backend == "trtllm-gen":
         uri = "trtllm_gen_context"
         module = get_trtllm_gen_prefill_module()
@@ -585,8 +596,10 @@ def get_batch_prefill_module(backend, *args):
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
-        uri = get_batch_prefill_uri(backend, *args)
-        module = gen_batch_prefill_module(backend, *args).build_and_load()
+        uri = get_batch_prefill_uri(backend, *args, dtype_k=dtype_k, dtype_v=dtype_v)
+        module = gen_batch_prefill_module(
+            backend, *args, dtype_k=dtype_k, dtype_v=dtype_v
+        ).build_and_load()
         plan_func = module.plan
         workspace_size_func = getattr(module, "workspace_size", None)
         ragged_run_func = module.ragged_run
