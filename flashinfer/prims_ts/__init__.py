@@ -21,6 +21,7 @@ from .utils import (
     configure_cute_dsl_cache_dir,
     get_prims_ts_compile_options,
     is_prims_ts_available,
+    is_prims_ts_device_supported,
 )
 
 configure_cute_dsl_cache_dir()
@@ -45,4 +46,5 @@ __all__ = [
     "fp4_linear",
     "fp4_linear_swiglu",
     "fp4_qkv_qknorm_rope",
+    "is_prims_ts_device_supported",
 ]

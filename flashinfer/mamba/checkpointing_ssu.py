@@ -276,7 +276,7 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
         # may contain zeros or negatives, so synthesize a valid positive state.
         tensor_initializers.append((16, autotuner_initializer_ones))
 
-    profile_arena_candidates = (
+    profile_replica_candidates = (
         0,  # state
         1,  # x
         4,  # B
@@ -293,9 +293,9 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
         20,  # cumAdt_vec
         21,  # cb_old
     )
-    profile_arena_inputs = tuple(
+    profile_replica_inputs = tuple(
         index
-        for index in profile_arena_candidates
+        for index in profile_replica_candidates
         if isinstance(inputs[index], torch.Tensor) and inputs[index].is_contiguous()
     )
 
@@ -306,7 +306,7 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
         use_cold_l2_cache=True,
         use_cuda_graph=True,
         profiling_repeat=100,
-        profile_arena_input_indices=profile_arena_inputs,
+        profile_replica_input_indices=profile_replica_inputs,
         inputs_pre_hook=_prepare_checkpointing_ssu_profile_inputs,
     )
 

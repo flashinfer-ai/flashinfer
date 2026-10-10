@@ -406,9 +406,18 @@ class TestPrimsTsUnifiedValidation:
 
 @prims_ts_unified_required
 class TestPrimsTsUnifiedGpu:
-    def test_nvfp4_layer_and_direct_runner_match_reference(self):
+    @pytest.mark.parametrize(
+        "routing_input_mode",
+        (RoutingInputMode.PackedPrecomputed, RoutingInputMode.UnpackedPrecomputed),
+    )
+    def test_nvfp4_layer_and_direct_runner_match_reference(self, routing_input_mode):
         act, weights, config, tensors = _make_packs_and_config(
             16, max_tokens=16, **SMALL
+        )
+        act = dataclasses.replace(
+            act,
+            routing_input_mode=routing_input_mode,
+            topk_weights=act.topk_weights.to(torch.bfloat16),
         )
         act, weights, config = _with_prims_ts_backend(
             act, weights, config, "trtllm_fp4_routed"
@@ -438,9 +447,14 @@ class TestPrimsTsUnifiedGpu:
         )(act, weights)
         _nvfp4_check(prims_out, trtllm_out.float(), "prims_ts nvfp4 geglu vs trtllm")
 
-    def test_bf16_layer_and_direct_runner_match_reference(self):
+    @pytest.mark.parametrize(
+        "routing_input_mode",
+        (RoutingInputMode.PackedPrecomputed, RoutingInputMode.UnpackedPrecomputed),
+    )
+    def test_bf16_layer_and_direct_runner_match_reference(self, routing_input_mode):
         act, weights, config, tensors = _make_bf16_packs_and_config(
             16,
+            routing_input_mode=routing_input_mode,
             hidden_size=256,
             intermediate_size=256,
             num_experts=8,

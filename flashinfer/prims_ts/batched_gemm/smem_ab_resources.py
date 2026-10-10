@@ -1095,8 +1095,10 @@ class SmemTmaGatherResource(MemoryResource):
         return local_limit
 
     @cute.jit
-    def _load_routed_row_or_zero(self, route_idx, row_in_tile, tile_limit):
-        routed_row = Int32(0)
+    def _load_routed_row_or_oob(self, route_idx, row_in_tile, tile_limit):
+        # An out-of-bounds coordinate requests TMA zero-fill for padding.
+        # Reusing token 0 creates concentrated reads that can slow down FC1.
+        routed_row = Int32(-1)
         if row_in_tile < tile_limit:
             routed_row = self.route_map.load(idx=route_idx, vector_size=1)[0]
         return cute.arch.make_warp_uniform(routed_row)
@@ -1156,16 +1158,16 @@ class SmemTmaGatherResource(MemoryResource):
             if cutlass.const_expr(all_gathers_valid):
                 base_row = coord_mn + cta_row_offset + gi * Int32(4)
                 row_base = cta_row_offset + gi * Int32(4)
-                self.routed_rows[wi * 4] = self._load_routed_row_or_zero(
+                self.routed_rows[wi * 4] = self._load_routed_row_or_oob(
                     base_row, row_base, tile_limit
                 )
-                self.routed_rows[wi * 4 + 1] = self._load_routed_row_or_zero(
+                self.routed_rows[wi * 4 + 1] = self._load_routed_row_or_oob(
                     base_row + Int32(1), row_base + Int32(1), tile_limit
                 )
-                self.routed_rows[wi * 4 + 2] = self._load_routed_row_or_zero(
+                self.routed_rows[wi * 4 + 2] = self._load_routed_row_or_oob(
                     base_row + Int32(2), row_base + Int32(2), tile_limit
                 )
-                self.routed_rows[wi * 4 + 3] = self._load_routed_row_or_zero(
+                self.routed_rows[wi * 4 + 3] = self._load_routed_row_or_oob(
                     base_row + Int32(3), row_base + Int32(3), tile_limit
                 )
             else:
@@ -1173,16 +1175,16 @@ class SmemTmaGatherResource(MemoryResource):
                 if is_valid_gather:
                     base_row = coord_mn + cta_row_offset + gi * Int32(4)
                     row_base = cta_row_offset + gi * Int32(4)
-                    self.routed_rows[wi * 4] = self._load_routed_row_or_zero(
+                    self.routed_rows[wi * 4] = self._load_routed_row_or_oob(
                         base_row, row_base, tile_limit
                     )
-                    self.routed_rows[wi * 4 + 1] = self._load_routed_row_or_zero(
+                    self.routed_rows[wi * 4 + 1] = self._load_routed_row_or_oob(
                         base_row + Int32(1), row_base + Int32(1), tile_limit
                     )
-                    self.routed_rows[wi * 4 + 2] = self._load_routed_row_or_zero(
+                    self.routed_rows[wi * 4 + 2] = self._load_routed_row_or_oob(
                         base_row + Int32(2), row_base + Int32(2), tile_limit
                     )
-                    self.routed_rows[wi * 4 + 3] = self._load_routed_row_or_zero(
+                    self.routed_rows[wi * 4 + 3] = self._load_routed_row_or_oob(
                         base_row + Int32(3), row_base + Int32(3), tile_limit
                     )
 

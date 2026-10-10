@@ -106,14 +106,14 @@ from ..utils import (
     register_custom_op,
     register_fake_op,
 )
-from .da_moe import DA_MAX_EXPERTS, DABody, DAGraphTopology, DAPlan
+from .da_moe import DA_MAX_EXPERTS, DA_MAX_TOP_K, DABody, DAGraphTopology, DAPlan
 from .utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
 )
 
 if TYPE_CHECKING:
-    from flashinfer.fused_moe.da_config import TrtllmDaConfig
+    from flashinfer.fused_moe.da_config import DaMoeConfig
 
 
 # RoutingInputMode (the FusedMoE launcher's routing-input ABI enum) lives in
@@ -327,6 +327,8 @@ class TrtllmDaResources:
     body_workspace: TrtllmDaBodyWorkspace
     # Device scalar written by the selector with the replay-selected body index.
     selected_body: torch.Tensor
+    # Per-CTA histograms fully overwritten before each selector reduction in this lane.
+    selector_histograms: torch.Tensor
     # Stable FromLogits router outputs, or None for caller-precomputed routing.
     canonical_routing: Optional[TRTLLMCanonicalRouting] = None
 
@@ -1808,16 +1810,11 @@ def cutlass_fused_moe_workspace_size(
 # trtllmgen-moe-fp8
 
 
-def _enabled_trtllm_da_config() -> Optional["TrtllmDaConfig"]:
+def _enabled_da_moe_config() -> Optional["DaMoeConfig"]:
     """Resolve the complete DA configuration only when its master switch is enabled."""
-    from flashinfer.fused_moe.da_config import (
-        TrtllmDaConfig,
-        is_trtllm_da_enabled,
-    )
+    from flashinfer.fused_moe.da_config import get_enabled_da_moe_config
 
-    if not is_trtllm_da_enabled():
-        return None
-    return TrtllmDaConfig.from_environment()
+    return get_enabled_da_moe_config()
 
 
 def get_trtllm_moe_sm100_module():
@@ -1863,7 +1860,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 da_routing_metadata=routing_metadata.tensors(),
                 **kwargs,
             )
-            return tuple(prepared)
+            return tuple(_torch_view_of_ffi_tensor(tensor) for tensor in prepared)
 
         def prepare_max_body_workspace(
             self,
@@ -2272,16 +2269,18 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             and do_finalize
             and gemm1_lora_delta is None
             and 0 < num_experts <= DA_MAX_EXPERTS
+            and 0 < top_k <= DA_MAX_TOP_K
         )
         if not da_eligible:
             return run_selected_tactic(tactic)
 
         from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
 
-        da_config = _enabled_trtllm_da_config()
+        da_config = _enabled_da_moe_config()
         if da_config is None:
             return run_selected_tactic(tactic)
         return run_dist_aware_tactic(
+            backend="trtllm",
             custom_op="flashinfer::trtllm_bf16_moe",
             tuner=tuner,
             config=da_config,
@@ -2529,16 +2528,21 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         # When do_finalize=False, the FC2 output format is determined on device based on runtime
         # expert distribution. Therefore it is not eligible for DA until we can canonicalize
         # output format. The exact launcher owns dtype, optional-operand, and top-k validation.
-        da_eligible = do_finalize and 0 < num_experts <= DA_MAX_EXPERTS
+        da_eligible = (
+            do_finalize
+            and 0 < num_experts <= DA_MAX_EXPERTS
+            and 0 < top_k <= DA_MAX_TOP_K
+        )
         if not da_eligible:
             return run_selected_tactic(tactic)
 
         from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
 
-        da_config = _enabled_trtllm_da_config()
+        da_config = _enabled_da_moe_config()
         if da_config is None:
             return run_selected_tactic(tactic)
         return run_dist_aware_tactic(
+            backend="trtllm",
             custom_op="flashinfer::trtllm_fp8_per_tensor_scale_moe",
             tuner=tuner,
             config=da_config,
@@ -2791,16 +2795,18 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 and expert_weights.dtype == torch.float32
             )
             and 0 < num_experts <= DA_MAX_EXPERTS
+            and 0 < top_k <= DA_MAX_TOP_K
         )
         if not da_eligible:
             return run_selected_tactic(tactic)
 
         from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
 
-        da_config = _enabled_trtllm_da_config()
+        da_config = _enabled_da_moe_config()
         if da_config is None:
             return run_selected_tactic(tactic)
         return run_dist_aware_tactic(
+            backend="trtllm",
             custom_op="flashinfer::trtllm_fp8_per_tensor_scale_routed_moe",
             tuner=tuner,
             config=da_config,
@@ -3362,16 +3368,18 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             and gemm1_lora_delta is None
             and _nfse == 0
             and 0 < num_experts <= DA_MAX_EXPERTS
+            and 0 < top_k <= DA_MAX_TOP_K
         )
         if not da_eligible:
             return run_selected_tactic(tactic)
 
         from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
 
-        da_config = _enabled_trtllm_da_config()
+        da_config = _enabled_da_moe_config()
         if da_config is None:
             return run_selected_tactic(tactic)
         return run_dist_aware_tactic(
+            backend="trtllm",
             custom_op="flashinfer::trtllm_fp8_block_scale_moe",
             tuner=tuner,
             config=da_config,
@@ -3757,13 +3765,14 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             and gemm1_lora_delta is None
             and num_fused_shared_experts == 0
             and 0 < num_experts <= DA_MAX_EXPERTS
+            and 0 < top_k <= DA_MAX_TOP_K
         )
         if not da_eligible:
             return run_selected_tactic(tactic)
 
         from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
 
-        da_config = _enabled_trtllm_da_config()
+        da_config = _enabled_da_moe_config()
         if da_config is None:
             return run_selected_tactic(tactic)
 
@@ -3772,6 +3781,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         routing_weight_index = MoeRunnerInputs.idx("expert_weights")
         runtime = TrtllmDaRuntime(moe_runner)
         return run_dist_aware_tactic(
+            backend="trtllm",
             custom_op="flashinfer::trtllm_fp4_block_scale_moe",
             tuner=tuner,
             config=da_config,
@@ -4106,16 +4116,18 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             and do_finalize
             and gemm1_lora_delta is None
             and 0 < num_experts <= DA_MAX_EXPERTS
+            and 0 < top_k <= DA_MAX_TOP_K
         )
         if not da_eligible:
             return run_selected_tactic(tactic)
 
         from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
 
-        da_config = _enabled_trtllm_da_config()
+        da_config = _enabled_da_moe_config()
         if da_config is None:
             return run_selected_tactic(tactic)
         return run_dist_aware_tactic(
+            backend="trtllm",
             custom_op="flashinfer::trtllm_mxint4_block_scale_moe",
             tuner=tuner,
             config=da_config,
@@ -4221,6 +4233,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         allocate_canonical_routing=moe_op.trtllm_moe_allocate_canonical_routing,
         canonicalize_routing=moe_op.trtllm_moe_canonicalize_routing,
         begin_da_switch_capture=moe_op.trtllm_moe_begin_da_switch_capture,
+        allocate_da_selector_workspace=moe_op.trtllm_moe_allocate_da_selector_workspace,
         inspect_da_workspace_lane=moe_op.trtllm_moe_inspect_da_workspace_lane,
         create_da_body_capture_stream=(moe_op.trtllm_moe_create_da_body_capture_stream),
         destroy_da_body_capture_stream=(
@@ -4375,7 +4388,7 @@ def canonicalize_trtllm_moe_routing_(
     canonical: TRTLLMCanonicalRouting,
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
-    hidden_states: torch.Tensor,
+    dtype_act: int,
     *,
     top_k: int,
     n_group: Optional[int],
@@ -4397,7 +4410,7 @@ def canonicalize_trtllm_moe_routing_(
     runtime.canonicalize_routing(
         routing_logits,
         routing_bias,
-        hidden_states,
+        dtype_act,
         canonical.tensors(),
         top_k,
         n_group,
@@ -4426,14 +4439,48 @@ class TrtllmDaRuntime:
         self._body_runner = runtime.DABodyRunner(moe_runner)
 
     @property
+    def backend(self) -> str:
+        """Return the explicit ordinary backend identity used by shared DA state."""
+        return "trtllm"
+
+    @property
     def moe_runner(self) -> "TrtllmMoERunner":
         """Return the composed ordinary full-operation runner."""
         return self._moe_runner
+
+    def normalize_baseline_tactic(
+        self,
+        factorized_space: Any,
+        baseline_tactic: Any,
+    ) -> tuple[int, int]:
+        """Return one concrete TRTLLM baseline in the shared DA body identity."""
+        del factorized_space
+        identity = tuple(int(value) for value in baseline_tactic)
+        if len(identity) != 2 or identity[1] < 0:
+            raise RuntimeError(
+                "DA tuning requires one concrete ordinary baseline tactic"
+            )
+        return identity
 
     def max_multi_tile_tokens(self, num_experts: int) -> int:
         """Return the native fused-preamble token bound for one expert domain."""
         runtime = get_trtllm_moe_sm100_module()
         return int(runtime.max_da_multi_tile_tokens(num_experts))
+
+    def prepare_profile_schedule(
+        self,
+        tuner: AutoTuner,
+        inputs: list[Any],
+        runner_kwargs: Mapping[str, Any],
+        tuning_config: TuningConfig,
+    ) -> tuple[TuningConfig, list[tuple[list[Any], dict[str, Any]]]]:
+        """Provision one complete maximum-profile replica ring and bucket views."""
+        effective_config, batches = tuner.prepare_profile_schedule(
+            inputs,
+            tuning_config,
+            **runner_kwargs,
+        )
+        return effective_config, batches
 
     def prepare_from_logits_profile(
         self,
@@ -4510,7 +4557,7 @@ class TrtllmDaRuntime:
             canonical,
             moe_inputs.routing_logits,
             runner_kwargs.get("routing_bias"),
-            moe_inputs.hidden_states,
+            int(self._moe_runner.dtype_act),
             top_k=self._moe_runner.top_k,
             n_group=runner_kwargs.get("n_group"),
             topk_group=runner_kwargs.get("topk_group"),
@@ -4528,6 +4575,18 @@ class TrtllmDaRuntime:
             norm_topk_prob=runner_kwargs.get("norm_topk_prob", True),
             enable_pdl=runner_kwargs["enable_pdl"],
         )
+
+    def stage_canonical_profile_routing(
+        self,
+        profile_inputs: List[torch.Tensor],
+        canonical: TRTLLMCanonicalRouting,
+    ) -> None:
+        """Copy one canonical ID/weight pair into an AutoTuner-owned profile view."""
+        moe_inputs = MoeRunnerInputs.from_list(profile_inputs)
+        assert moe_inputs.topk_ids is not None
+        assert moe_inputs.expert_weights is not None
+        moe_inputs.topk_ids.copy_(canonical.routing_replay_ids)
+        moe_inputs.expert_weights.copy_(canonical.expert_weights)
 
     def prepare(
         self,
@@ -4601,6 +4660,9 @@ class TrtllmDaRuntime:
             body_workspace=body_workspace,
             selected_body=torch.full(
                 (1,), -1, dtype=torch.int32, device=topk_ids.device
+            ),
+            selector_histograms=get_trtllm_moe_sm100_module().allocate_da_selector_workspace(
+                topk_ids, num_local_experts
             ),
             canonical_routing=canonical_routing,
         )
@@ -4677,6 +4739,7 @@ class TrtllmDaRuntime:
                 plan.exemplar_body_indices,
                 plan.num_selector_exemplars,
                 resources.selected_body,
+                resources.selector_histograms,
                 len(plan.bodies),
                 expected_capture_id,
                 previous_conditional_node_handle,

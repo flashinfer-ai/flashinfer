@@ -19,8 +19,11 @@
 
 namespace flashinfer::da_moe {
 
-/** Maximum local-expert domain supported by the distribution-aware selector. */
-inline constexpr int kDAMaxExperts = 512;
+/** Maximum global-expert domain supported by the distribution-aware selector. */
+inline constexpr int kDAMaxExperts = 1024;
+
+/** Maximum routed experts per token supported by the fused DA preamble. */
+inline constexpr int kDAMaxTopK = 32;
 
 /** Immutable maximum number of uploaded distribution exemplar rows. */
 inline constexpr int kDAMaxExemplars = 8;

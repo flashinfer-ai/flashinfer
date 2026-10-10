@@ -14,14 +14,41 @@ import torch
 
 _ResultT = TypeVar("_ResultT")
 
-# Maximum local-expert domain supported by the DA selector implementation.
-DA_MAX_EXPERTS = 512
+# Maximum global-expert domain supported by the DA selector implementation.
+DA_MAX_EXPERTS = 1024
+# Maximum routed experts per token supported by the fused DA preamble.
+DA_MAX_TOP_K = 32
 # Immutable maximum number of distribution exemplar rows in one DA plan.
 DA_MAX_EXEMPLARS = 8
 # Immutable maximum number of unique conditional child bodies.
 DA_MAX_BODIES = 8
 # Maximum number of CUDA Graphs that may concurrently replay one operation domain.
 DA_MAX_WORKSPACE_LANES = 8
+
+
+def _local_load_spectrum(
+    expert_ids: torch.Tensor,
+    *,
+    num_experts: int,
+    local_expert_offset: int,
+    num_local_experts: int,
+    normalize: bool,
+) -> torch.Tensor:
+    """Build a sorted histogram after suppressing every nonlocal assignment."""
+    ids = expert_ids.flatten().to(torch.int64)
+    if ids.numel() and bool(((ids < 0) | (ids >= num_experts)).any()):
+        raise ValueError("Selector exemplar contains an out-of-range expert ID")
+    local_end = local_expert_offset + num_local_experts
+    local_ids = ids[(ids >= local_expert_offset) & (ids < local_end)]
+    spectrum = (
+        torch.bincount(local_ids, minlength=num_experts)
+        .sort(descending=True)
+        .values.to(torch.float32)
+    )
+    if not normalize:
+        return spectrum
+    norm = torch.linalg.vector_norm(spectrum)
+    return spectrum if bool(norm == 0) else spectrum / norm
 
 
 class DAResourceLeaseConflict(RuntimeError):
@@ -302,6 +329,8 @@ class DAMoEDispatcher:
         self,
         num_experts: int,
         *,
+        local_expert_offset: int = 0,
+        num_local_experts: int | None = None,
         max_workspace_lanes: int = DA_MAX_WORKSPACE_LANES,
     ) -> None:
         """Create an unpublished dispatcher with immutable capacity settings."""
@@ -309,10 +338,19 @@ class DAMoEDispatcher:
             raise ValueError(
                 f"num_experts must be in [1, {DA_MAX_EXPERTS}], received {num_experts}"
             )
+        if num_local_experts is None:
+            num_local_experts = num_experts
+        if local_expert_offset < 0 or not (
+            0 < num_local_experts <= num_experts - local_expert_offset
+        ):
+            raise ValueError("the local expert shard must fit within num_experts")
         if max_workspace_lanes <= 0:
             raise ValueError("max_workspace_lanes must be positive")
         # Immutable expert count defining every selector spectrum width.
         self._num_experts = num_experts
+        # Immutable global interval whose assignments contribute to selector spectra.
+        self._local_expert_offset = local_expert_offset
+        self._num_local_experts = num_local_experts
         # Immutable maximum number of exemplar rows in a published plan.
         self._max_exemplars = DA_MAX_EXEMPLARS
         # Immutable maximum number of unique bodies in a published plan.
@@ -323,6 +361,7 @@ class DAMoEDispatcher:
         self._plan: DAPlan | None = None
         # Lightweight pointer signatures and capture diagnostics for warmed public bindings.
         self._bindings: OrderedDict[tuple[int, ...], DABindingRecord] = OrderedDict()
+        self._prepared_binding_keys: set[tuple[Any, ...]] = set()
         # Graph-stable workspaces indexed by immutable concurrent replay lane identifier.
         self._workspace_lanes: OrderedDict[int, DAWorkspaceLane] = OrderedDict()
         # Most recently prepared or captured lane used by diagnostics.
@@ -522,6 +561,7 @@ class DAMoEDispatcher:
         self._generation = next_generation
         self._plan = plan
         self._bindings.clear()
+        self._prepared_binding_keys.clear()
         self._workspace_lanes.clear()
         self._latest_workspace_lane_id = None
         self._pending_capture_generation = None
@@ -534,6 +574,7 @@ class DAMoEDispatcher:
         self._generation += 1
         self._plan = None
         self._bindings.clear()
+        self._prepared_binding_keys.clear()
         self._workspace_lanes.clear()
         self._latest_workspace_lane_id = None
         self._pending_capture_generation = None
@@ -543,6 +584,7 @@ class DAMoEDispatcher:
         self,
         bindings: Sequence[torch.Tensor],
         resource_factory: Callable[[DAPlan], Any] | None = None,
+        capture_binding_key: tuple[Any, ...] | None = None,
     ) -> Any | None:
         """Register a binding and ensure one idle workspace lane during warmup."""
         # Fallback and singleton plans deliberately own no DA replay resources because their
@@ -565,6 +607,8 @@ class DAMoEDispatcher:
         self._bindings.move_to_end(signature)
         lane = self._find_idle_workspace_lane()
         if lane is not None:
+            if capture_binding_key is not None:
+                self._prepared_binding_keys.add(capture_binding_key)
             self._latest_workspace_lane_id = lane.lane_id
             return lane.workspace
 
@@ -611,6 +655,8 @@ class DAMoEDispatcher:
         )
         self._next_workspace_lane_id += 1
         self._workspace_lanes[lane.lane_id] = lane
+        if capture_binding_key is not None:
+            self._prepared_binding_keys.add(capture_binding_key)
         self._latest_workspace_lane_id = lane.lane_id
         return workspace
 
@@ -647,6 +693,7 @@ class DAMoEDispatcher:
         run_fallback: Callable[[], _ResultT],
         run_body: Callable[[DABody], _ResultT],
         capture_switch: Callable[[DAPlan, Any, int, int], DACaptureOutcome | None],
+        capture_binding_key: tuple[Any, ...] | None = None,
     ) -> _ResultT:
         """Choose ordinary, fixed-body, or SWITCH capture without eager DA dispatch."""
         # Eager execution never injects or replays a hidden graph; it follows the caller's
@@ -662,10 +709,15 @@ class DAMoEDispatcher:
         if plan.mode is DAPlanMode.DA_SINGLE_BODY:
             return run_body(plan.bodies[0])
 
-        # SWITCH capture admits only warmed public bindings. Workspace selection is independent of
+        # Graph-pool activations can change addresses after warmup. Rebind only a prepared
+        # layer/ABI key; this registers host metadata and never allocates replay resources.
+        # Workspace selection is independent of
         # pointer identity so serial same-domain layers share one lane in the outer graph.
         signature = tensor_binding_signature(bindings)
         binding = self._bindings.get(signature)
+        if binding is None and capture_binding_key in self._prepared_binding_keys:
+            binding = DABindingRecord(signature)
+            self._bindings[signature] = binding
         if binding is None:
             return run_fallback()
         lane = self._pending_workspace_lane()
@@ -789,8 +841,10 @@ class DAMoEDispatcher:
             raise ValueError(
                 f"DA exemplar expert IDs must be in [0, {self._num_experts})"
             )
-        counts = torch.bincount(
-            expert_ids.flatten().to(torch.int64), minlength=self._num_experts
-        ).to(torch.float32)
-        spectrum = torch.sort(counts, descending=True).values
-        return spectrum / torch.linalg.vector_norm(spectrum)
+        return _local_load_spectrum(
+            expert_ids,
+            num_experts=self._num_experts,
+            local_expert_offset=self._local_expert_offset,
+            num_local_experts=self._num_local_experts,
+            normalize=True,
+        )

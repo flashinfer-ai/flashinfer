@@ -281,7 +281,8 @@ __device__ DataType calcSoftmax(cg::thread_block_tile<WarpSize> const& warp, Dat
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 template <typename KernelParams, typename BaseType, int NumThreads, int NumWarps,
           int MaxNumTopExperts, bool LoadExpertIdxFromGlobal = false,
-          typename PrecomputedExpertId = int32_t>
+          typename PrecomputedExpertId = int32_t,
+          int MaxNumTokens = NumBlocksPerCluster * NumThreads, bool CooperativePadding = false>
 __device__ void routingPermutation(KernelParams params,
                                    PackedScoreIdx<BaseType>* smemPackedScoreIdx,
                                    int32_t const warpIdx, uint32_t const clusterBlockRank,
@@ -307,6 +308,10 @@ __device__ void routingPermutation(KernelParams params,
   static constexpr int MaxExpandedIdxPerThread =
       (MaxNumTokensSingleCluster * MaxNumTopExperts + NumThreadsPerCluster - 1) /
       NumThreadsPerCluster;
+  static constexpr int StoredExpandedIdxPerThread =
+      MaxNumTokens > MaxNumTokensSingleCluster ? 1 : MaxExpandedIdxPerThread;
+  static_assert(MaxNumTokens <= MaxNumTokensSingleCluster || LoadExpertIdxFromGlobal,
+                "Extended token capacity requires replayable expert-ID inputs");
 
   // Needed for the exclusive sum of token offsets.
   // Note: the scan might include more bins than needed, with bin counts of 0 to pad
@@ -316,16 +321,28 @@ __device__ void routingPermutation(KernelParams params,
   uint32_t const clusterThreadIdx = NumThreads * clusterBlockRank + threadIdx.x;
   auto expandedIdxSize = params.mNumTokens * params.mTopK;
 
-  // number of experts may exceed number of threads — size by MaxNumExperts
+  // number of experts may exceed number of threads - size by MaxNumExperts
   __shared__ int32_t __attribute((aligned(128))) smemExpertCount[MaxNumExperts];
   __shared__ int32_t __attribute((aligned(128))) smemExpertOffset[MaxNumExperts];
+  // Large selected routing tiles can have long padding tails. Publish their bounds for
+  // warp-coalesced initialization; ordinary routing retains its existing per-thread stores.
+  __shared__ int2 smemPaddingBounds[CooperativePadding ? MaxNumExperts : 1];
+  // Extended-capacity instantiations use per-warp counts to make rank assignment deterministic.
+  __shared__ int32_t __attribute((aligned(128)))
+  smemWarpExpertState[MaxNumTokens > MaxNumTokensSingleCluster ? NumWarps : 1][MaxNumExperts];
 
-  // pre-fill the counts with 0 — each thread handles ExpertsPerThread experts
+  // Initialize the histogram storage selected by the compiled capacity.
+  if constexpr (MaxNumTokens > MaxNumTokensSingleCluster) {
+    for (int32_t index = threadIdx.x; index < NumWarps * MaxNumExperts; index += NumThreads) {
+      smemWarpExpertState[index / MaxNumExperts][index % MaxNumExperts] = 0;
+    }
+  } else {
 #pragma unroll
-  for (int e = 0; e < ExpertsPerThread; e++) {
-    int expert = threadIdx.x * ExpertsPerThread + e;
-    if (expert < params.mNumExperts) {
-      smemExpertCount[expert] = 0;
+    for (int e = 0; e < ExpertsPerThread; e++) {
+      int expert = threadIdx.x * ExpertsPerThread + e;
+      if (expert < params.mNumExperts) {
+        smemExpertCount[expert] = 0;
+      }
     }
   }
   __syncthreads();
@@ -333,12 +350,12 @@ __device__ void routingPermutation(KernelParams params,
   // each thread keeps some number of "expanded indexes" assigned to it
   // note that expanded indexes simply represent tokens here.
   // for each of these, we keep the associated expert and offset within expert in registers
-  int32_t expertIndexes[MaxExpandedIdxPerThread];
-  int32_t expertOffsets[MaxExpandedIdxPerThread];
+  int32_t expertIndexes[StoredExpandedIdxPerThread];
+  int32_t expertOffsets[StoredExpandedIdxPerThread];
   auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
 
-  // Define a lambda to avoid code duplication in both branches.
-  auto loopBody = [&](int ii, int expandedIdx) {
+  // Load one routing entry identically in both capacity decompositions.
+  auto loadScoreIdx = [&](int expandedIdx) {
     TypePacked scoreIdx;
     if constexpr (LoadExpertIdxFromGlobal) {
       if (precomputedExpertIds != nullptr) {
@@ -356,47 +373,100 @@ __device__ void routingPermutation(KernelParams params,
           smemPackedScoreIdx, expandedIdx / (NumWarps * params.mTopK));
       scoreIdx = remoteSmem[expandedIdx % (NumWarps * params.mTopK)];
     }
+    return scoreIdx;
+  };
 
-    expertIndexes[ii] = scoreIdx.idx;
+  // Count one expanded index and retain its block-local rank for the final permutation write.
+  auto countExpandedIdx = [&](int ii, int expandedIdx) {
+    TypePacked const scoreIdx = loadScoreIdx(expandedIdx);
     // check whether this expert is local to our GPU at all and ignore if not
     auto localExpertIdx = scoreIdx.idx - params.mLocalExpertsStartIdx;
     auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
                          (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
-    expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + scoreIdx.idx, 1) : 0;
+    if constexpr (MaxNumTokens > MaxNumTokensSingleCluster) {
+      // Aggregate equal experts within each warp so iteration and lane order define stable ranks.
+      uint32_t const activeMask = __activemask();
+      uint32_t const localMask = __ballot_sync(activeMask, isLocalExpert);
+      int32_t expertOffset = -1;
+      if (isLocalExpert) {
+        uint32_t const peerMask = __match_any_sync(localMask, static_cast<int32_t>(scoreIdx.idx));
+        int32_t const leaderLane = __ffs(peerMask) - 1;
+        int32_t warpBase = 0;
+        if ((threadIdx.x % WarpSize) == leaderLane) {
+          warpBase = atomicAdd(smemWarpExpertState[warpIdx] + scoreIdx.idx,
+                               static_cast<int32_t>(__popc(peerMask)));
+        }
+        warpBase = __shfl_sync(peerMask, warpBase, leaderLane);
+        uint32_t const lowerLaneMask = (uint32_t{1} << (threadIdx.x % WarpSize)) - 1;
+        expertOffset = warpBase + static_cast<int32_t>(__popc(peerMask & lowerLaneMask));
+      }
+      params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = expertOffset;
+    } else {
+      expertIndexes[ii] = scoreIdx.idx;
+      expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + scoreIdx.idx, 1) : 0;
+    }
     if (params.mPtrTopKWeights != nullptr && params.mPtrTopKIds == nullptr &&
         precomputedExpertIds == nullptr) {
       params.mPtrTopKWeights[expandedIdx] = OutputT{scoreIdx.score};
     }
   };
 
-  int constexpr IterStride = 4;
+  if constexpr (MaxNumTokens > MaxNumTokensSingleCluster) {
+    // A grid-stride pass scales to the requested capacity without expanding register arrays.
+    for (int32_t expandedIdx = static_cast<int32_t>(clusterThreadIdx);
+         expandedIdx < expandedIdxSize; expandedIdx += NumThreadsPerCluster) {
+      countExpandedIdx(/*ii=*/0, expandedIdx);
+    }
+  } else {
+    int constexpr IterStride = 4;
 #pragma unroll
-  for (int32_t ii0 = 0; ii0 < MaxExpandedIdxPerThread; ii0 += IterStride) {
-    // Whether it's safe to do multiple iterations without bound checks.
-    bool const takeFastPath = (ii0 + IterStride) * NumThreadsPerCluster <= expandedIdxSize;
-    if (takeFastPath) {
+    for (int32_t ii0 = 0; ii0 < MaxExpandedIdxPerThread; ii0 += IterStride) {
+      // Whether it's safe to do multiple iterations without bound checks.
+      bool const takeFastPath = (ii0 + IterStride) * NumThreadsPerCluster <= expandedIdxSize;
+      if (takeFastPath) {
 #pragma unroll
-      for (int32_t jj = 0; jj < IterStride; jj++) {
-        int const ii = ii0 + jj;
-        auto expandedIdx = static_cast<int32_t>(clusterThreadIdx) + ii * NumThreadsPerCluster;
-        loopBody(ii, expandedIdx);
-      }
-    } else {
-      bool doBreak = false;
+        for (int32_t jj = 0; jj < IterStride; jj++) {
+          int const ii = ii0 + jj;
+          auto expandedIdx = static_cast<int32_t>(clusterThreadIdx) + ii * NumThreadsPerCluster;
+          countExpandedIdx(ii, expandedIdx);
+        }
+      } else {
+        bool doBreak = false;
 #pragma unroll
-      for (int32_t jj = 0; jj < IterStride; jj++) {
-        int const ii = ii0 + jj;
-        auto expandedIdx = static_cast<int32_t>(clusterThreadIdx) + ii * NumThreadsPerCluster;
-        if (expandedIdx >= expandedIdxSize) {
-          doBreak = true;
+        for (int32_t jj = 0; jj < IterStride; jj++) {
+          int const ii = ii0 + jj;
+          auto expandedIdx = static_cast<int32_t>(clusterThreadIdx) + ii * NumThreadsPerCluster;
+          if (expandedIdx >= expandedIdxSize) {
+            doBreak = true;
+            break;
+          }
+          countExpandedIdx(ii, expandedIdx);
+        }
+        if (doBreak) {
           break;
         }
-        loopBody(ii, expandedIdx);
-      }
-      if (doBreak) {
-        break;
       }
     }
+  }
+
+  if constexpr (MaxNumTokens > MaxNumTokensSingleCluster) {
+    __syncthreads();
+    // Convert warp counts to exclusive warp prefixes and publish the block histogram.
+#pragma unroll
+    for (int e = 0; e < ExpertsPerThread; e++) {
+      int const expert = threadIdx.x * ExpertsPerThread + e;
+      if (expert < params.mNumExperts) {
+        int32_t blockCount = 0;
+#pragma unroll
+        for (int warp = 0; warp < NumWarps; ++warp) {
+          int32_t const warpCount = smemWarpExpertState[warp][expert];
+          smemWarpExpertState[warp][expert] = blockCount;
+          blockCount += warpCount;
+        }
+        smemExpertCount[expert] = blockCount;
+      }
+    }
+    __syncthreads();
   }
   // Make local histogram (token counts per expert) available to all threads in the cluster.
   __cluster_barrier_arrive();
@@ -482,7 +552,10 @@ __device__ void routingPermutation(KernelParams params,
           mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
-        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
+        if constexpr (!CooperativePadding) {
+          initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2),
+                                 mnLimit1);
+        }
       }
 
       // get the padded offset associated with this expert (token-space, CGA granularity)
@@ -495,6 +568,12 @@ __device__ void routingPermutation(KernelParams params,
 
       // write expert offsets to shared
       smemExpertOffset[expert] = offset + blockExpertOffset[e];
+      if constexpr (CooperativePadding) {
+        int32_t const paddedCount = params.mIsPow2
+                                        ? mulLog2<int32_t>(numCta[e], params.mPaddingLog2)
+                                        : mulTileN<int32_t>(numCta[e], params.mTileTokensDim);
+        smemPaddingBounds[expert] = make_int2(offset + count[e], offset + paddedCount);
+      }
     }
   }
 
@@ -513,6 +592,20 @@ __device__ void routingPermutation(KernelParams params,
   // make expert offsets available to all threads
   __syncthreads();
 
+  if constexpr (CooperativePadding) {
+    if (params.mPtrPermutedIdxToTokenIdx != nullptr) {
+      // Interleave experts over cluster blocks so an EP-local window uses all blocks.
+      // Each tail has one owner warp; lanes write consecutive rows and never touch live data.
+      for (int32_t expert = warpIdx * NumBlocksPerCluster + clusterBlockRank;
+           expert < params.mNumExperts; expert += NumWarps * NumBlocksPerCluster) {
+        int2 const bounds = smemPaddingBounds[expert];
+        for (int32_t row = bounds.x + threadIdx.x % WarpSize; row < bounds.y; row += WarpSize) {
+          params.mPtrPermutedIdxToTokenIdx[row] = -1;
+        }
+      }
+    }
+  }
+
   // Wait: we cannot exit while other blocks may be accessing the current block's shared memory.
   // Note: I observed a perf benefit to doing this before the final loop so the compiler can
   // implement break with EXIT.
@@ -522,20 +615,14 @@ __device__ void routingPermutation(KernelParams params,
   // at this point, we know the final offsets of experts and the offsets within
   // experts, which allows writing the final index values
 
-#pragma unroll
-  for (int32_t ii = 0; ii < MaxExpandedIdxPerThread; ++ii) {
-    auto expandedIdx = static_cast<int32_t>(clusterThreadIdx) + ii * NumThreadsPerCluster;
-    if (expandedIdx >= expandedIdxSize) {
-      break;
-    }
-    auto expertIdx = expertIndexes[ii];
+  auto writePermutation = [&](int32_t expandedIdx, int32_t expertIdx, int32_t blockLocalOffset) {
     // check whether this expert is local to our GPU at all
     auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
     auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
                          (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
     auto tokenIdx = expandedIdx / params.mTopK;
     auto permutedIdx =
-        isLocalExpert ? int32_t{smemExpertOffset[expertIdx]} + expertOffsets[ii] : int32_t{-1};
+        isLocalExpert ? int32_t{smemExpertOffset[expertIdx]} + blockLocalOffset : int32_t{-1};
     if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
       params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
     }
@@ -544,6 +631,28 @@ __device__ void routingPermutation(KernelParams params,
     }
     if (params.mPtrPermutedIdxToTokenIdx != nullptr && isLocalExpert) {
       params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
+    }
+  };
+
+  if constexpr (MaxNumTokens > MaxNumTokensSingleCluster) {
+    // Replace temporary ranks with final indices after re-reading the graph-live expert IDs.
+    for (int32_t expandedIdx = static_cast<int32_t>(clusterThreadIdx);
+         expandedIdx < expandedIdxSize; expandedIdx += NumThreadsPerCluster) {
+      auto const expertIdx = static_cast<int32_t>(loadScoreIdx(expandedIdx).idx);
+      auto blockLocalOffset = params.mPtrExpandedIdxToPermutedIdx[expandedIdx];
+      if (blockLocalOffset >= 0) {
+        blockLocalOffset += smemWarpExpertState[warpIdx][expertIdx];
+      }
+      writePermutation(expandedIdx, expertIdx, blockLocalOffset);
+    }
+  } else {
+#pragma unroll
+    for (int32_t ii = 0; ii < MaxExpandedIdxPerThread; ++ii) {
+      auto expandedIdx = static_cast<int32_t>(clusterThreadIdx) + ii * NumThreadsPerCluster;
+      if (expandedIdx >= expandedIdxSize) {
+        break;
+      }
+      writePermutation(expandedIdx, expertIndexes[ii], expertOffsets[ii]);
     }
   }
 

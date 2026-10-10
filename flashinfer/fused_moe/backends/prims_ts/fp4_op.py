@@ -22,6 +22,7 @@ import torch
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.autotuner import AutoTuner
+from flashinfer.fused_moe.tactic_search import MoeTactic
 from flashinfer.fused_moe.shared.inputs import (
     MoeRunnerInputs,
     RoutingInputMode,
@@ -395,12 +396,50 @@ def prims_ts_fp4_block_scale_moe(
             f"Config not supported by Prims-TS {mode_name} kernel ({reason})"
         )
 
-    intermediate_output = moe_runner.forward(
-        moe_inputs.to_list(),
-        tactic=tactic,
-        **common_kwargs,
+    def run_selected_tactic(
+        selected_tactic: MoeTactic,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        """Run one concrete PrimsTS tactic and reconstruct the public result."""
+        intermediate_output = moe_runner.forward(
+            moe_inputs.to_list(),
+            tactic=selected_tactic,
+            **common_kwargs,
+        )
+        return unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
+
+    from flashinfer.fused_moe.da_moe import DA_MAX_EXPERTS, DA_MAX_TOP_K
+
+    # DA requires finalization because the runtime-selected tactic may change the
+    # intermediate output format. The finalize kernel captured in the CUDA Graph
+    # normalizes that format.
+    da_eligible = (
+        do_finalize
+        and not num_fused_shared_experts
+        and 0 < num_experts <= DA_MAX_EXPERTS
+        and 0 < top_k <= DA_MAX_TOP_K
     )
-    return unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
+    if not da_eligible:
+        return run_selected_tactic(tactic)
+
+    from flashinfer.prims_ts.moe.da_runtime import run_prims_ts_da
+
+    return run_prims_ts_da(
+        custom_op="flashinfer::prims_ts_fp4_block_scale_moe",
+        runner=moe_runner,
+        tuning_config=tuning_config,
+        inputs=moe_inputs.to_list(),
+        runner_kwargs=common_kwargs,
+        baseline_tactic=tactic,
+        routing_input_mode=routing_input_mode,
+        num_experts=num_experts,
+        local_expert_offset=local_expert_offset,
+        num_local_experts=local_num_experts,
+        top_k=top_k,
+        routing_method_type=routing_method_type,
+        routed_scaling_factor=routed_scaling_factor,
+        run_fixed_tactic=run_selected_tactic,
+        finish_switch=lambda: unpack_trtllm_moe_output([], output, do_finalize, None),
+    )
 
 
 @register_fake_op("flashinfer::prims_ts_fp4_block_scale_moe")
@@ -442,6 +481,7 @@ def _fake_prims_ts_fp4_block_scale_moe(
     routing_input_mode: int = RoutingInputMode.FromLogits,
     topk_ids: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
+    num_fused_shared_experts: Optional[int] = None,
 ) -> List[torch.Tensor]:
     del (
         routing_logits,
@@ -478,6 +518,7 @@ def _fake_prims_ts_fp4_block_scale_moe(
         routing_input_mode,
         topk_ids,
         topk_weights,
+        num_fused_shared_experts,
     )
     hidden_size = (
         hidden_states.shape[-1] * 2

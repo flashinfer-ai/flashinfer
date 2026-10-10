@@ -2545,7 +2545,8 @@ def gemm(
     per_token_sf_a_ptr = per_token_sf_a_raw_ptr
     per_token_sf_b_ptr = per_token_sf_b_raw_ptr
 
-    # TMA route (gather4): the routed operand is 2D (K, total_rows) flat.
+    # TMA route (gather4) reads compact (K, num_tokens) input storage.
+    # GEMM M/N include routing padding and must not define its source bounds.
     # TmaOobOpt: non-routed activations use a 4D out-of-bounds TMA descriptor.
     # Non-swapAB: A=activations (routed 2D), B=weights (3D).
     # SwapAB:     A=weights (3D), B=activations (routed 2D).
@@ -2564,7 +2565,7 @@ def gemm(
         a_tensor = cute.make_tensor(a_ptr, a_layout)
     elif cutlass.const_expr(cfg.has_tma_route and not cfg.is_swap_ab):
         a_layout = cute.make_layout(
-            (cute.assume(k, 32), m), stride=(1, cute.assume(k, 32))
+            (cute.assume(k, 32), num_tokens), stride=(1, cute.assume(k, 32))
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
     elif cutlass.const_expr(cfg.use_bf16_kbox_tma_a):
@@ -2599,7 +2600,7 @@ def gemm(
         )
     elif cutlass.const_expr(cfg.has_tma_route and cfg.is_swap_ab):
         b_layout = cute.make_layout(
-            (cute.assume(k, 32), n), stride=(1, cute.assume(k, 32))
+            (cute.assume(k, 32), num_tokens), stride=(1, cute.assume(k, 32))
         )
     elif cutlass.const_expr(cfg.use_tma_oob_opt_b):
         b_layout = cute.make_layout(
@@ -2770,11 +2771,12 @@ def gemm(
         # SFA descriptor: routed TMA gather4 (2D linear) or regular tiled SF layout.
         # LDGSTS-routed SF bypasses TensorMap encoding and uses raw GMEM tensors.
         if cutlass.const_expr(uses_routed_sfa_tma_desc(cfg)):
-            # 2D linear layout: (K/sf_vec_size, total_tokens) for gather4.
+            # Bound the descriptor by physical input rows, not padded output
+            # capacity, so invalid gather rows receive TMA zero-fill.
             # Pad sf_k to 16-byte alignment (TMA requirement).
             sf_k_total = ((k // sf_vec_size + 15) // 16) * 16
             sfa_2d_layout = cute.make_layout(
-                (sf_k_total, m),
+                (sf_k_total, num_tokens),
                 stride=(1, sf_k_total),
             )
             sfa_tensor = cute.make_tensor(
@@ -2849,10 +2851,11 @@ def gemm(
         # SFB descriptor: routed TMA gather4 (2D linear) or regular tiled SF layout.
         # LDGSTS-routed SF bypasses TensorMap encoding and uses raw GMEM tensors.
         if cutlass.const_expr(uses_routed_sfb_tma_desc(cfg)):
-            # 2D linear layout: (K/sf_vec_size, total_tokens) for gather4
+            # Routed SF storage has one row per input token. Padded output
+            # capacity can exceed this allocation and is not its TMA extent.
             sf_k_total = ((k // sf_vec_size + 15) // 16) * 16
             sfb_2d_layout = cute.make_layout(
-                (sf_k_total, n),
+                (sf_k_total, num_tokens),
                 stride=(1, sf_k_total),
             )
             sfb_tensor = cute.make_tensor(

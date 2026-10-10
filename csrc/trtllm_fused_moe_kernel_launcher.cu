@@ -715,7 +715,8 @@ inline RoutingInputMode validateMultiTileRoutingInputs(
   TVM_FFI_ICHECK_GT(topk_ids.size(0), 0) << "topk_ids must contain at least one token.";
   TVM_FFI_ICHECK_EQ(topk_ids.size(1), top_k) << "topk_ids dim1 must match top_k.";
   TVM_FFI_ICHECK_GT(top_k, 0) << "top_k must be positive.";
-  TVM_FFI_ICHECK_LE(top_k, 8) << "fused multi-tile routing supports top_k <= 8.";
+  TVM_FFI_ICHECK_LE(top_k, da_moe::kDAMaxTopK)
+      << "fused multi-tile routing supports top_k <= " << da_moe::kDAMaxTopK << ".";
   TVM_FFI_ICHECK_GE(num_experts, top_k) << "num_experts must be at least top_k.";
   TVM_FFI_ICHECK_LE(num_experts, da_moe::kDAMaxExperts)
       << "fused multi-tile routing supports num_experts <= " << da_moe::kDAMaxExperts << ".";
@@ -6308,33 +6309,25 @@ Array<Tensor> trtllm_moe_allocate_canonical_routing(TensorView routing_logits, i
 }
 
 /** Launch the real TRTLLM router once and retain both conventional and replay outputs. */
-void trtllm_moe_canonicalize_routing(
-    TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
-    Array<Tensor> canonical, int64_t top_k, Optional<int64_t> n_group, Optional<int64_t> topk_group,
-    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
-    int64_t routing_method_type, bool use_routing_scales_on_input, bool use_deep_seek_fp8,
-    bool norm_topk_prob, bool enable_pdl, int64_t tile_tokens_dim) {
+void trtllm_moe_canonicalize_routing(TensorView routing_logits, Optional<TensorView> routing_bias,
+                                     int64_t dtype_act, Array<Tensor> canonical, int64_t top_k,
+                                     Optional<int64_t> n_group, Optional<int64_t> topk_group,
+                                     int64_t local_expert_offset, int64_t local_num_experts,
+                                     Optional<double> routed_scaling_factor,
+                                     int64_t routing_method_type, bool use_routing_scales_on_input,
+                                     bool use_deep_seek_fp8, bool norm_topk_prob, bool enable_pdl,
+                                     int64_t tile_tokens_dim) {
   // Decode the public tensor array once and retain named fields through routing.
   ffi::CUDADeviceGuard device_guard(routing_logits.device().device_id);
   CanonicalRoutingBuffers const buffers = CanonicalRoutingBuffers::from_ffi(canonical);
   int64_t const num_tokens = routing_logits.size(0);
   int64_t const num_experts = routing_logits.size(1);
-  TVM_FFI_ICHECK_EQ(hidden_states.size(0), num_tokens)
-      << "hidden_states and routing_logits must have the same token count.";
   TVM_FFI_ICHECK(local_num_experts > 0 && local_expert_offset + local_num_experts <= num_experts)
       << "the local expert range must lie within routing_logits.";
 
-  btg::Dtype dtype_elt;
-  if (hidden_states.dtype() == dl_float16) {
-    dtype_elt = btg::Dtype::Fp16;
-  } else if (hidden_states.dtype() == dl_bfloat16) {
-    dtype_elt = btg::Dtype::Bfloat16;
-  } else if (hidden_states.dtype() == dl_float8_e4m3fn) {
-    dtype_elt = btg::Dtype::E4m3;
-  } else {
-    TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "Unsupported activation dtype for canonical routing.";
-  }
+  // Logical block-scaled activation types cannot be recovered from their uint8 storage. The
+  // ordinary backend therefore passes the exact Dtype enum already used by its routed body.
+  btg::Dtype const dtype_elt = static_cast<btg::Dtype>(dtype_act);
   btg::Dtype const routing_bias_dtype =
       routing_bias.has_value() && routing_bias.value().dtype() == dl_float32 ? btg::Dtype::Fp32
                                                                              : btg::Dtype::Bfloat16;
@@ -6455,13 +6448,23 @@ Array<int64_t> trtllm_moe_inspect_da_workspace_lane(TensorView device_anchor,
   return {static_cast<int64_t>(context.capture_id), static_cast<int64_t>(is_serialized)};
 }
 
+/// Allocate selector scratch with the native histogram launch geometry.
+Tensor trtllm_moe_allocate_da_selector_workspace(TensorView topk_ids, int64_t local_num_experts) {
+  ffi::CUDADeviceGuard device_guard(topk_ids.device().device_id);
+  TVM_FFI_ICHECK_GT(local_num_experts, 0);
+  TVM_FFI_ICHECK_LE(local_num_experts, da_moe::kDAMaxExperts);
+  return alloc_tensor({da_moe::DASelectorHistogramBlocks(topk_ids.numel()), local_num_experts},
+                      dl_int32, topk_ids.device());
+}
+
 /// Inject parallel multi-tile routing, selector, and an empty SWITCH into an outer capture.
 Array<int64_t> trtllm_moe_begin_da_switch_capture(
     TensorView topk_ids, int64_t num_experts, int64_t top_k, int64_t local_expert_offset,
     int64_t local_num_experts, Array<int64_t> tile_tokens_dims, Array<Tensor> flat_routing_metadata,
     int64_t routing_input_mode, Optional<TensorView> topk_weights, TensorView exemplar_spectra,
     TensorView exemplar_body_indices, int64_t num_selector_exemplars, TensorView selected_body,
-    int64_t num_bodies, int64_t expected_capture_id, int64_t previous_conditional_node_handle) {
+    TensorView selector_histograms, int64_t num_bodies, int64_t expected_capture_id,
+    int64_t previous_conditional_node_handle) {
   // Reject invalid plan capacity before mutating the caller's active outer graph.
   ffi::CUDADeviceGuard device_guard(topk_ids.device().device_id);
   TVM_FFI_ICHECK_GT(num_bodies, 1) << "A DA SWITCH requires at least two bodies.";
@@ -6474,6 +6477,13 @@ Array<int64_t> trtllm_moe_begin_da_switch_capture(
   auto const input_mode = validateMultiTileRoutingInputs(
       topk_ids, num_experts, top_k, local_expert_offset, local_num_experts, tile_tokens_dims,
       routing_input_mode, topk_weights);
+  int const histogram_blocks = da_moe::DASelectorHistogramBlocks(topk_ids.numel());
+  CHECK_INPUT(selector_histograms);
+  TVM_FFI_ICHECK(selector_histograms.dtype() == dl_int32);
+  TVM_FFI_ICHECK_EQ(selector_histograms.device().device_id, topk_ids.device().device_id);
+  TVM_FFI_ICHECK_EQ(selector_histograms.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(selector_histograms.size(0), histogram_blocks);
+  TVM_FFI_ICHECK_EQ(selector_histograms.size(1), local_num_experts);
   cudaStream_t stream = get_stream(topk_ids.device());
   da_moe::ActiveCaptureContext original{};
   CHECK_CUDA_ERROR(da_moe::GetActiveCaptureContext(stream, &original));
@@ -6486,7 +6496,6 @@ Array<int64_t> trtllm_moe_begin_da_switch_capture(
       &is_workspace_lane_serialized));
   TVM_FFI_ICHECK(is_workspace_lane_serialized)
       << "DA workspace lane is not ordered after its previous invocation.";
-
   // Dispatch the fused preamble first, then rewind the capture frontier to create a sibling root.
   auto const routing_metadata =
       routingMetadataFromFfi(flat_routing_metadata, tile_tokens_dims.size());
@@ -6506,34 +6515,77 @@ Array<int64_t> trtllm_moe_begin_da_switch_capture(
                                                     cudaGraphCondAssignDefault));
   int64_t const assignment_numel = topk_ids.numel();
   bool const packed_ids = input_mode == RoutingInputMode::PackedPrecomputed;
-  if (packed_ids) {
-    da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, true>
-        <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
-            static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
-            static_cast<float const*>(exemplar_spectra.data_ptr()),
-            static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
-            static_cast<int>(num_selector_exemplars), conditional_handle,
-            static_cast<int32_t*>(selected_body.data_ptr()));
-  } else if (topk_ids.dtype() == dl_int16) {
-    da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, false, int16_t>
-        <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
-            static_cast<int16_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
-            static_cast<float const*>(exemplar_spectra.data_ptr()),
-            static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
-            static_cast<int>(num_selector_exemplars), conditional_handle,
-            static_cast<int32_t*>(selected_body.data_ptr()));
+  // Inspect the selector's root for overlap; the SWITCH must depend on its final reduction.
+  da_moe::ActiveCaptureContext selector_root{};
+  auto launch_selector_for_max_experts = [&](auto max_experts_tag) {
+    constexpr int kMaxExperts = decltype(max_experts_tag)::value;
+    if (histogram_blocks > 1 && num_selector_exemplars > 1) {
+      auto* histograms = static_cast<int32_t*>(selector_histograms.data_ptr());
+      if (packed_ids) {
+        da_moe::DAHistogramKernel<kMaxExperts, true>
+            <<<histogram_blocks, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+                static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel,
+                local_expert_offset, local_num_experts, histograms);
+      } else if (topk_ids.dtype() == dl_int16) {
+        da_moe::DAHistogramKernel<kMaxExperts, false, int16_t>
+            <<<histogram_blocks, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+                static_cast<int16_t const*>(topk_ids.data_ptr()), assignment_numel,
+                local_expert_offset, local_num_experts, histograms);
+      } else {
+        da_moe::DAHistogramKernel<kMaxExperts, false>
+            <<<histogram_blocks, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+                static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel,
+                local_expert_offset, local_num_experts, histograms);
+      }
+      CHECK_CUDA_ERROR(da_moe::GetActiveCaptureContext(stream, &selector_root));
+      da_moe::DASelectFromHistogramsKernel<kMaxExperts, da_moe::kDAMaxExemplars>
+          <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+              histograms, histogram_blocks, num_experts, local_num_experts, assignment_numel,
+              static_cast<float const*>(exemplar_spectra.data_ptr()),
+              static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
+              static_cast<int>(num_selector_exemplars), conditional_handle,
+              static_cast<int32_t*>(selected_body.data_ptr()));
+      return;
+    }
+    if (packed_ids) {
+      da_moe::DASelectorKernel<kMaxExperts, da_moe::kDAMaxExemplars, true>
+          <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+              static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+              local_expert_offset, local_num_experts,
+              static_cast<float const*>(exemplar_spectra.data_ptr()),
+              static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
+              static_cast<int>(num_selector_exemplars), conditional_handle,
+              static_cast<int32_t*>(selected_body.data_ptr()));
+    } else if (topk_ids.dtype() == dl_int16) {
+      da_moe::DASelectorKernel<kMaxExperts, da_moe::kDAMaxExemplars, false, int16_t>
+          <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+              static_cast<int16_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+              local_expert_offset, local_num_experts,
+              static_cast<float const*>(exemplar_spectra.data_ptr()),
+              static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
+              static_cast<int>(num_selector_exemplars), conditional_handle,
+              static_cast<int32_t*>(selected_body.data_ptr()));
+    } else {
+      da_moe::DASelectorKernel<kMaxExperts, da_moe::kDAMaxExemplars, false>
+          <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+              static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+              local_expert_offset, local_num_experts,
+              static_cast<float const*>(exemplar_spectra.data_ptr()),
+              static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
+              static_cast<int>(num_selector_exemplars), conditional_handle,
+              static_cast<int32_t*>(selected_body.data_ptr()));
+    }
+  };
+  constexpr int kMaxExpertsWithTwoBinsPerThread = 2 * da_moe::kDASelectorBlockThreads;
+  if (local_num_experts <= kMaxExpertsWithTwoBinsPerThread) {
+    launch_selector_for_max_experts(std::integral_constant<int, kMaxExpertsWithTwoBinsPerThread>{});
   } else {
-    da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, false>
-        <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
-            static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
-            static_cast<float const*>(exemplar_spectra.data_ptr()),
-            static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
-            static_cast<int>(num_selector_exemplars), conditional_handle,
-            static_cast<int32_t*>(selected_body.data_ptr()));
+    launch_selector_for_max_experts(std::integral_constant<int, da_moe::kDAMaxExperts>{});
   }
   CHECK_CUDA_ERROR(cudaPeekAtLastError());
   da_moe::ActiveCaptureContext after_selector{};
   CHECK_CUDA_ERROR(da_moe::GetActiveCaptureContext(stream, &after_selector));
+  if (selector_root.graph == nullptr) selector_root = after_selector;
 
   // Join both independent roots at one conditional node whose child graphs are populated later.
   std::vector<cudaGraphNode_t> switch_dependencies = after_parallel_work.dependencies;
@@ -6549,11 +6601,13 @@ Array<int64_t> trtllm_moe_begin_da_switch_capture(
                                         switch_dependencies.data(), switch_dependencies.size(),
                                         &conditional_params));
 
-  DASwitchCaptureState state{original.capture_id,
-                             conditional_node,
-                             after_parallel_work.dependencies.back(),
-                             after_selector.dependencies.back(),
-                             {}};
+  cudaGraphNode_t parallel_work_node = nullptr;
+  cudaGraphNode_t selector_node = nullptr;
+  CHECK_CUDA_ERROR(
+      da_moe::GetNewCaptureFrontierNode(original, after_parallel_work, &parallel_work_node));
+  CHECK_CUDA_ERROR(da_moe::GetNewCaptureFrontierNode(original, selector_root, &selector_node));
+  DASwitchCaptureState state{
+      original.capture_id, conditional_node, parallel_work_node, selector_node, {}};
   state.body_graphs.reserve(num_bodies);
   for (int64_t body_index = 0; body_index < num_bodies; ++body_index) {
     state.body_graphs.push_back(conditional_params.conditional.phGraph_out[body_index]);
@@ -6687,6 +6741,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_populate_routing_metadata_multi_tile,
                               trtllm_moe_populate_routing_metadata_multi_tile);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_begin_da_switch_capture,
                               trtllm_moe_begin_da_switch_capture);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_allocate_da_selector_workspace,
+                              trtllm_moe_allocate_da_selector_workspace);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_inspect_da_workspace_lane,
                               trtllm_moe_inspect_da_workspace_lane);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_create_da_body_capture_stream,

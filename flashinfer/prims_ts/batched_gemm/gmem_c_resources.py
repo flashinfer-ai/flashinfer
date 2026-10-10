@@ -2069,6 +2069,7 @@ class GmemCResource(MemoryResource):
         lane_id,
         m_local_row0,
         n_local_col,
+        warpgroup_idx,
         store_sf_c,
     ):
         local_absmax = self._fmax_ftz(
@@ -2097,6 +2098,11 @@ class GmemCResource(MemoryResource):
 
         if cutlass.const_expr(self.cfg.use_tma_store):
             smem_offset = self._fp4_tma_smem_byte_offset(m_local_row0, n_local_col)
+            # Match the per-group source used by _commit_swap_ab_fp4_tma.
+            # Tile256 has two epilogue groups; sharing scratch races their stores.
+            smem_offset += warpgroup_idx * Int32(
+                self.cfg.num_bytes_c_tma_store_per_group
+            )
             self.sC.subview(smem_offset).store(packed)
         elif output_in_bounds:
             if cutlass.const_expr(self.cfg.use_tma_oob_opt):
@@ -2690,6 +2696,7 @@ class GmemCResource(MemoryResource):
                                 lane_id,
                                 m_local_row0,
                                 tmem_col_even,
+                                warpgroup_idx,
                                 self.cfg.epi_tile_n not in (32, 64),
                             )
                             if cutlass.const_expr(self.cfg.epi_tile_n in (32, 64)):
