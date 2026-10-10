@@ -175,6 +175,98 @@ def _is_sm103(device_index: int) -> bool:
 def get_sampling_module():
     module = gen_sampling_module().build_and_load()
 
+    @torch.library.custom_op(
+        "flashinfer::softmax_out", mutates_args=("workspace_buffer", "probs")
+    )
+    def softmax_out(
+        workspace_buffer: torch.Tensor,
+        logits: torch.Tensor,
+        probs: torch.Tensor,
+        maybe_temperature_arr: Optional[torch.Tensor],
+        temperature_val: float,
+        enable_pdl: bool,
+    ) -> None:
+        module.softmax(
+            workspace_buffer,
+            logits,
+            probs,
+            maybe_temperature_arr,
+            temperature_val,
+            enable_pdl,
+        )
+
+    @softmax_out.register_fake
+    def _fake_softmax_out(*args):
+        pass
+
+    @torch.library.custom_op(
+        "flashinfer::sampling_from_probs_out", mutates_args=("samples", "valid")
+    )
+    def sampling_from_probs_out(
+        probs: torch.Tensor,
+        samples: torch.Tensor,
+        valid: torch.Tensor,
+        indices: Optional[torch.Tensor],
+        deterministic: bool,
+        maybe_seed_arr: Optional[torch.Tensor],
+        seed_val: int,
+        maybe_offset_arr: Optional[torch.Tensor],
+        offset_val: int,
+    ) -> None:
+        module.sampling_from_probs(
+            probs,
+            samples,
+            valid,
+            indices,
+            deterministic,
+            maybe_seed_arr,
+            seed_val,
+            maybe_offset_arr,
+            offset_val,
+        )
+
+    @sampling_from_probs_out.register_fake
+    def _fake_sampling_from_probs_out(*args):
+        pass
+
+    @torch.library.custom_op(
+        "flashinfer::top_p_renorm_probs_out", mutates_args=("renorm_probs", "workspace")
+    )
+    def top_p_renorm_probs_out(
+        probs: torch.Tensor,
+        renorm_probs: torch.Tensor,
+        maybe_top_p_arr: Optional[torch.Tensor],
+        top_p_val: float,
+        is_deterministic: bool,
+        workspace: torch.Tensor,
+    ) -> None:
+        module.top_p_renorm_probs(
+            probs, renorm_probs, maybe_top_p_arr, top_p_val, is_deterministic, workspace
+        )
+
+    @top_p_renorm_probs_out.register_fake
+    def _fake_top_p_renorm_probs_out(*args):
+        pass
+
+    @torch.library.custom_op(
+        "flashinfer::top_k_mask_logits_out",
+        mutates_args=("mask_logits", "row_states_buffer"),
+    )
+    def top_k_mask_logits_out(
+        logits: torch.Tensor,
+        mask_logits: torch.Tensor,
+        maybe_top_k_arr: Optional[torch.Tensor],
+        top_k_val: int,
+        row_states_buffer: torch.Tensor,
+    ) -> None:
+        module.top_k_mask_logits(
+            logits, mask_logits, maybe_top_k_arr, top_k_val, row_states_buffer
+        )
+
+    @top_k_mask_logits_out.register_fake
+    def _fake_top_k_mask_logits_out(*args):
+        pass
+
     @register_custom_op("flashinfer::softmax", mutates_args=("workspace_buffer",))
     def softmax(
         workspace_buffer: torch.Tensor,
@@ -188,7 +280,7 @@ def get_sampling_module():
         maybe_temperature_arr = (
             maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
         )
-        module.softmax(
+        softmax_out(
             workspace_buffer,
             logits,
             probs,
@@ -282,7 +374,7 @@ def get_sampling_module():
             _validate_and_convert_seed_offset(seed, offset, device, batch_size)
         )
 
-        module.sampling_from_probs(
+        sampling_from_probs_out(
             probs,
             samples,
             valid,
@@ -599,7 +691,7 @@ def get_sampling_module():
             maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
         )
         renorm_probs = torch.empty_like(probs)
-        module.top_p_renorm_probs(
+        top_p_renorm_probs_out(
             probs,
             renorm_probs,
             maybe_top_p_arr,
@@ -675,7 +767,7 @@ def get_sampling_module():
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         mask_logits = torch.empty_like(logits)
 
-        module.top_k_mask_logits(
+        top_k_mask_logits_out(
             logits,
             mask_logits,
             maybe_top_k_arr,
