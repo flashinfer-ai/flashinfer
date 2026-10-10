@@ -48,7 +48,7 @@ extern "C" __global__ void kernel_cake_all_gather_matmul_40242e9c64d6e66af6f5(
     unsigned int* __restrict__ inp, long long* __restrict__ payload_peers,
     long long* __restrict__ signal_peers, unsigned int* __restrict__ counters,
     unsigned int ready_target, int rank, int rows, int chunk_rows, int num_chunks);
-extern "C" __global__ void kernel_cake_all_gather_matmul_a0eff3774e45c89deb2d(
+extern "C" __global__ void kernel_cake_all_gather_matmul_5d04e5464f88d3d5ab8c(
     const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch,
     const __grid_constant__ CUtensorMap B, __half* __restrict__ C,
     __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready,
@@ -361,7 +361,7 @@ inline void launch_main(const CUtensorMap& a_local, const CUtensorMap& a_scratch
                    &ready,     &ready_target, &rank, &m, &scratch_pitch,
                    &signal_rows, &n_tiles, &remote_order};
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_a0eff3774e45c89deb2d), static_cast<int>(kMainDynamicSmem));
+      reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_5d04e5464f88d3d5ab8c), static_cast<int>(kMainDynamicSmem));
   (void)smem_ready;
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
@@ -376,7 +376,7 @@ inline void launch_main(const CUtensorMap& a_local, const CUtensorMap& a_scratch
   config.attrs = programmatic_launch ? &attribute : nullptr;
   config.numAttrs = programmatic_launch ? 1u : 0u;
   cudaError_t status =
-      cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_a0eff3774e45c89deb2d), kargs);
+      cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_5d04e5464f88d3d5ab8c), kargs);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "cudaLaunchKernelExC for the main kernel failed: " << cudaGetErrorString(status);
 }

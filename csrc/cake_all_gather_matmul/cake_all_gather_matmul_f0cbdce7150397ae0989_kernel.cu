@@ -33,7 +33,7 @@
 
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aacffd5b8472985d(
+__global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_f0cbdce7150397ae0989(
     const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch,
     const __grid_constant__ CUtensorMap B, __half* __restrict__ C,
     __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready,
@@ -130,7 +130,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aac
       unsigned int load_stage = 0;
       unsigned int load_phase = 1;
 #pragma unroll 1
-      for (int tile = bid; tile < 2 * ((M + 127) / 128 * 128 / 128 * n_tiles); tile += num_bids) {
+      for (int tile = bid; tile < 4 * ((M + 127) / 128 * 128 / 128 * n_tiles); tile += num_bids) {
         int peer_pass_pm = tile / ((M + 127) / 128 * 128 / 128 * n_tiles);
         int rem_pm = tile - peer_pass_pm * ((M + 127) / 128 * 128 / 128 * n_tiles);
         int c_pm_raw = rem_pm / ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) /
@@ -149,8 +149,9 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aac
             rem_pm - c_pm * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 *
                              n_tiles);
         int u_cm = tile - (M + 127) / 128 * 128 / 128 * n_tiles;
-        int c_cm_raw = u_cm / ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) /
-                               128 * n_tiles);
+        int c_cm_raw =
+            u_cm /
+            (3 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles));
         int c_cm =
             ((c_cm_raw < ((M + 127) / 128 * 128 +
                           (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) /
@@ -161,8 +162,9 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aac
                     (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) /
                            (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) -
                        1);
-        int v_cm = u_cm - c_cm * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) /
-                                  128 * n_tiles);
+        int v_cm =
+            u_cm - c_cm * (3 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) /
+                                128 * n_tiles));
         int tiles_m_cm =
             ((c_cm < ((M + 127) / 128 * 128 +
                       (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) /
@@ -197,7 +199,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aac
                            ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128));
         int bid_m = inner % tiles_m_c;
         int bid_n = inner / tiles_m_c;
-        int peer = (rank - peer_pass + 2) % 2;
+        int peer = (rank - peer_pass + 4) % 4;
         int off_m = chunk_idx * (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) +
                     bid_m * 128;
         int off_n = bid_n * 256;
@@ -210,10 +212,14 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aac
                    off_m / signal_rows);
               while (true) {
                 unsigned int _gca_v;
-                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p));
+                asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
+                             : "=r"(_gca_v)
+                             : "l"(_gca_p)
+                             : "memory");
                 if (_gca_v >= (unsigned int)(ready_target)) break;
               }
             }
+            asm volatile("fence.proxy.async.global;" ::: "memory");
           }
         }
 #pragma unroll 1
@@ -230,8 +236,12 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aac
                                peer * scratch_pitch + off_m, iter_k,
                                tma_full_addr + (load_stage) * 8);
             }
-            tma_3d_gmem2smem(smem_b_addr + load_stage * 49152, (&B), 0, off_n, iter_k,
-                             tma_full_addr + (load_stage) * 8);
+#pragma unroll
+            for (int b_panel = 0; b_panel < 4; b_panel++) {
+              tma_3d_gmem2smem(smem_b_addr + load_stage * 49152 + (unsigned int)(b_panel * 8192),
+                               (&B), off_n + b_panel * 64, off_k, 0,
+                               tma_full_addr + (load_stage) * 8);
+            }
             mbarrier_arrive_expect_tx(tma_full_addr + (load_stage) * 8, 49152);
           }
           load_stage += 1;
@@ -253,7 +263,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aac
       unsigned int _phase_epilogue_done = 1;
       unsigned int _phase_tma_full = 0;
 #pragma unroll 1
-      for (int tile_1 = bid; tile_1 < 2 * ((M + 127) / 128 * 128 / 128 * n_tiles);
+      for (int tile_1 = bid; tile_1 < 4 * ((M + 127) / 128 * 128 / 128 * n_tiles);
            tile_1 += num_bids) {
         mbarrier_wait(epilogue_done_addr + (mma_epi_stage) * 8, _phase_epilogue_done);
 #pragma unroll 1
@@ -263,8 +273,8 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aac
           int init_flag = ((iter_k_1 == 0) ? 1 : 0);
           int _mma_a_lo_0 =
               make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072);
-          int _mma_b_lo_0 =
-              make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072);
+          int _mma_b_lo_0 = make_warp_uniform(((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) +
+                                              (mma_tma_stage) * 3072);
           {
             uint64_t _mma_ss_a_desc_0 =
                 (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
@@ -272,25 +282,25 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aac
                 (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
             if (elect_sync()) {
               tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0,
-                              _mma_ss_b_desc_0, 138412048, ((init_flag) ? 0 : 1));
+                              _mma_ss_b_desc_0, 138477584, ((init_flag) ? 0 : 1));
             }
             incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-            incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+            incr_smem_desc_lo(_mma_ss_b_desc_0, 128U);
             if (elect_sync()) {
               tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0,
-                              _mma_ss_b_desc_0, 138412048, 1);
+                              _mma_ss_b_desc_0, 138477584, 1);
             }
             incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-            incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+            incr_smem_desc_lo(_mma_ss_b_desc_0, 128U);
             if (elect_sync()) {
               tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0,
-                              _mma_ss_b_desc_0, 138412048, 1);
+                              _mma_ss_b_desc_0, 138477584, 1);
             }
             incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-            incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+            incr_smem_desc_lo(_mma_ss_b_desc_0, 128U);
             if (elect_sync()) {
               tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0,
-                              _mma_ss_b_desc_0, 138412048, 1);
+                              _mma_ss_b_desc_0, 138477584, 1);
             }
           }
           elect_commit(mma_done_addr + (mma_tma_stage) * 8);
@@ -317,7 +327,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aac
       const int epi_tid = epi_warp * 32 + lane;
       unsigned int _phase_mainloop_done = 0;
 #pragma unroll 1
-      for (int tile_2 = bid; tile_2 < 2 * ((M + 127) / 128 * 128 / 128 * n_tiles);
+      for (int tile_2 = bid; tile_2 < 4 * ((M + 127) / 128 * 128 / 128 * n_tiles);
            tile_2 += num_bids) {
         int peer_pass_pm_1 = tile_2 / ((M + 127) / 128 * 128 / 128 * n_tiles);
         int rem_pm_1 = tile_2 - peer_pass_pm_1 * ((M + 127) / 128 * 128 / 128 * n_tiles);
@@ -338,8 +348,9 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aac
             rem_pm_1 - c_pm_1 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) /
                                  128 * n_tiles);
         int u_cm_1 = tile_2 - (M + 127) / 128 * 128 / 128 * n_tiles;
-        int c_cm_raw_1 = u_cm_1 / ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) /
-                                   128 * n_tiles);
+        int c_cm_raw_1 =
+            u_cm_1 /
+            (3 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles));
         int c_cm_1 =
             ((c_cm_raw_1 < ((M + 127) / 128 * 128 +
                             (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) /
@@ -351,8 +362,9 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aac
                            (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) -
                        1);
         int v_cm_1 =
-            u_cm_1 - c_cm_1 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) /
-                               128 * n_tiles);
+            u_cm_1 -
+            c_cm_1 * (3 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 *
+                           n_tiles));
         int tiles_m_cm_1 =
             ((c_cm_1 < ((M + 127) / 128 * 128 +
                         (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) /
@@ -387,7 +399,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_d3c3aac
                            ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128));
         int bid_m_1 = inner_1 % tiles_m_c_1;
         int bid_n_1 = inner_1 / tiles_m_c_1;
-        int peer_1 = (rank - peer_pass_1 + 2) % 2;
+        int peer_1 = (rank - peer_pass_1 + 4) % 4;
         int off_m_1 =
             chunk_idx_1 * (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) +
             bid_m_1 * 128;
