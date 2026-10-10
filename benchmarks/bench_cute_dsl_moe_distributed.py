@@ -36,8 +36,8 @@ Both Mega variants default to FC2 routing weights without in-kernel FC2 reductio
 With ``--no-fused-finalize``, Split W4A16 rounds each rank's weighted partial sum
 to BF16, while MegaMoE combines per-route BF16 results at the source rank.
 ``--refcheck`` compares these W4A16 paths with tolerance for that difference;
-``--apply-topk-in-fc1`` has a separate rounding contract. The MegaMoE precision
-speedup is W4A4 latency / W4A16 latency (>1 favors W4A16).
+``--apply-routing-weights-before-fc2`` has a separate rounding contract. The
+MegaMoE precision speedup is W4A4 latency / W4A16 latency (>1 favors W4A16).
 
 Run Nsight Systems mode directly to capture and report per-kernel breakdowns
 for all four topology/activation combinations:
@@ -197,8 +197,8 @@ def _profile_worker_arguments(args, num_tokens):
         )
     if args.precomputed_routing:
         arguments.append("--precomputed-routing")
-    if args.apply_topk_in_fc1:
-        arguments.append("--apply-topk-in-fc1")
+    if args.apply_routing_weights_before_fc2:
+        arguments.append("--apply-routing-weights-before-fc2")
     if args.use_per_token_activation:
         arguments.append("--use-per-token-activation")
     if not args.use_fused_finalize:
@@ -920,7 +920,9 @@ def _run_distributed_iterations(
                     "sample_count": len(samples),
                     "cuda_graph": args.cuda_graph,
                     "precomputed_routing": args.precomputed_routing,
-                    "apply_topk_in_fc1": args.apply_topk_in_fc1,
+                    "apply_routing_weights_before_fc2": (
+                        args.apply_routing_weights_before_fc2
+                    ),
                     "cold_l2_cache": True,
                     "sample_aggregation": "per_iteration_rank_max",
                     "samples_ms": [float(sample) for sample in samples],
@@ -1231,7 +1233,9 @@ def _benchmark_distributed_megamoe(
                 top_k=CFG.top_k,
                 knobs=args.megamoe_knobs,
                 # W4A4's API defaults to FC1 weighting; align both variants.
-                apply_topk_in_fc1=args.apply_topk_in_fc1,
+                apply_routing_weights_before_fc2=(
+                    args.apply_routing_weights_before_fc2
+                ),
                 enable_in_kernel_fc2_reduce=False,
             )
         ),
@@ -1289,7 +1293,9 @@ def _benchmark_distributed_megamoe(
                 "MEGAMOE_TACTIC_JSON",
                 {
                     "variant": variant.name,
-                    "apply_topk_in_fc1": args.apply_topk_in_fc1,
+                    "apply_routing_weights_before_fc2": (
+                        args.apply_routing_weights_before_fc2
+                    ),
                     "global_tokens": num_tokens,
                     "local_tokens": local_num_tokens,
                     "max_tokens_per_rank": capacity,
@@ -1967,9 +1973,9 @@ def main():
         help="Compute EP routes before warmup and exclude routing from timing.",
     )
     parser.add_argument(
-        "--apply-topk-in-fc1",
+        "--apply-routing-weights-before-fc2",
         action="store_true",
-        help="Weight MegaMoE FP32 SwiGLU activations before FC1 handoff quantization/casting.",
+        help="Apply MegaMoE routing weights before FC2.",
     )
     parser.add_argument(
         "--refcheck",
@@ -2101,10 +2107,11 @@ def main():
         parser.error("W4A4 MegaMoE supports per-tensor activation scaling only")
     if args.precomputed_routing and parallel_modes != ["ep"]:
         parser.error("--precomputed-routing requires --parallel-modes ep")
-    if args.apply_topk_in_fc1 and (not has_megamoe or args.refcheck):
+    if args.apply_routing_weights_before_fc2 and (not has_megamoe or args.refcheck):
         parser.error(
-            "--apply-topk-in-fc1 requires MegaMoE without --refcheck; "
-            "FC1 weighting has a distinct numerical contract"
+            "--apply-routing-weights-before-fc2 requires MegaMoE without "
+            "--refcheck; early routing-weight application has a distinct "
+            "numerical contract"
         )
     if args.refcheck and (
         args.mode != "benchmark"

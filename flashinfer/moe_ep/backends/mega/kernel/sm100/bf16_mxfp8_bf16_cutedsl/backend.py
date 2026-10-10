@@ -118,6 +118,8 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             kind=config.kind,
             gate_up_clamp=_clamp(config),
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
+            use_persistent_finalize_kernel=config.use_persistent_finalize_kernel,
+            num_valid_tokens_tensor=config.num_valid_tokens_tensor,
             knobs=config.knobs if isinstance(config.knobs, dict) else None,
         )
 
@@ -209,7 +211,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         if config.knobs == "auto":
             return None
 
-        from ......core.kernel.workspace_pool import knobs_pool_key
+        from ......core.kernel.workspace_pool import epilogue_pool_key, knobs_pool_key
 
         return (
             "sm100_bf16_mxfp8_bf16_cutedsl",
@@ -225,6 +227,8 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             config.kind,
             _clamp(config),
             config.enable_in_kernel_fc2_reduce,
+            config.use_persistent_finalize_kernel,
+            epilogue_pool_key(config.num_valid_tokens_tensor),
             knobs_pool_key(config.knobs),
         )
 

@@ -320,7 +320,7 @@ def autotune_sm107_block_scaled_mega_moe(
                 k.get("reduce_topk_in_kernel", cfg.reduce_topk_in_kernel)
                 for k in candidates
             ),
-            apply_topk_at_fc1=cfg.apply_topk_at_fc1,
+            apply_routing_weights_before_fc2=cfg.apply_routing_weights_before_fc2,
             activation=cfg.activation,
             situ_beta=cfg.situ_beta,
             situ_linear_beta=cfg.situ_linear_beta,

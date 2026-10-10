@@ -1349,7 +1349,7 @@ def _run_mega_torch_oracle(
                 fc2_weight=fc2_w_g,
                 fc2_weight_sf=fc2_sf_g,
                 ab_dtype=torch.float8_e4m3fn,
-                ref_compute_graph="deepgemm",  # matches the shim's apply_topk_in_fc1
+                ref_compute_graph="deepgemm",  # routing weights before FC2
                 fp8_accum_mode="1xacc",
                 mma_tiler_k=128,
                 fc2_output_dtype=torch.bfloat16,

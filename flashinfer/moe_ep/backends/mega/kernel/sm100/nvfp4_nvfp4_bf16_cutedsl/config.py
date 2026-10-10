@@ -32,18 +32,25 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     situ_beta: float | None = None
     situ_linear_beta: float | None = None
     fast_math: bool = True
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     # Enables in_kernel_fc2_reduce, knobs may still disable this if it is faster
     # In-flight top-k combine: cross-rank REDG atomic-add collapses the combine
     # as peer data arrives (no per-topk staging / explicit tail reduce).
     # ~1-2% faster and removes the multi-GB combine staging from the symmetric
-    # workspace.  Requires apply_topk_in_fc1=True and combine_dtype="bf16";
-    # accumulation order is nondeterministic (tolerance-compare outputs).
+    # workspace.  Requires apply_routing_weights_before_fc2=True and
+    # combine_dtype="bf16"; accumulation order is nondeterministic
+    # (tolerance-compare outputs).
     enable_in_kernel_fc2_reduce: bool = False
     # Cross-rank combine wire format: "bf16" (exact), "mxfp8" (2x less combine
     # traffic), "nvfp4" (4x less).  Quantized wires trade accuracy for NVLink
     # bandwidth and require enable_in_kernel_fc2_reduce=False.
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16"
+    # Forwards the actual token count to the top-k function to prevent wasted work
+    # when max_num_tokens is larger than the actual token count.
+    use_persistent_finalize_kernel: bool = False
+    # Caller-owned CUDA int32 (1,) live-token count the reducer reads; the
+    # workspace borrows it and never writes it. Update before every forward.
+    num_valid_tokens_tensor: Optional["torch.Tensor"] = None
     input_norm_const: float = 1.0
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
@@ -83,3 +90,9 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
                 raise ValueError("activation clamps are not supported with SiTU.")
         elif self.situ_beta is not None or self.situ_linear_beta is not None:
             raise ValueError("SiTU parameters require activation='situ'.")
+        if self.use_persistent_finalize_kernel and self.num_valid_tokens_tensor is None:
+            raise ValueError(
+                "use_persistent_finalize_kernel=True requires "
+                "num_valid_tokens_tensor: a caller-owned CUDA int32 tensor of "
+                "shape (1,) holding the live token count."
+            )

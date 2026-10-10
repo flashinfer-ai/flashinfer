@@ -337,18 +337,23 @@ def test_routing_weight_placement_partitions_cache(monkeypatch, tmp_path):
     key = dict(max_tokens=2048, **{**_KEY, "dtype": "bf16_nvfp4"})
     knob_cache.record_knobs(_KNOBS, **key)
     assert knob_cache.lookup_knobs(**key) == _KNOBS
-    assert knob_cache.lookup_knobs(apply_topk_in_fc1=False, **key) == _KNOBS
-    assert knob_cache.lookup_knobs(apply_topk_in_fc1=True, **key) is None
+    assert (
+        knob_cache.lookup_knobs(apply_routing_weights_before_fc2=False, **key) == _KNOBS
+    )
+    assert knob_cache.lookup_knobs(apply_routing_weights_before_fc2=True, **key) is None
 
     fc1_knobs = {**_KNOBS, "flag_batch": 8}
-    knob_cache.record_knobs(fc1_knobs, apply_topk_in_fc1=True, **key)
+    knob_cache.record_knobs(fc1_knobs, apply_routing_weights_before_fc2=True, **key)
     replacement = {**_KNOBS, "flag_batch": 2}
-    knob_cache.record_knobs(replacement, apply_topk_in_fc1=False, **key)
+    knob_cache.record_knobs(replacement, apply_routing_weights_before_fc2=False, **key)
     assert knob_cache.resolve_knobs(**key) == (replacement, "cache")
-    assert knob_cache.resolve_knobs(apply_topk_in_fc1=True, **key) == (
+    assert knob_cache.resolve_knobs(apply_routing_weights_before_fc2=True, **key) == (
         fc1_knobs,
         "cache",
     )
     entries = json.loads(path.read_text())["entries"]
     assert len(entries) == 2
-    assert {entry["apply_topk_in_fc1"] for entry in entries} == {False, True}
+    assert {entry["apply_routing_weights_before_fc2"] for entry in entries} == {
+        False,
+        True,
+    }

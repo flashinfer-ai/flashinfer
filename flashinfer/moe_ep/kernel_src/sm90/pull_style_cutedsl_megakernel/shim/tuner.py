@@ -122,7 +122,9 @@ def default_knobs(
     }
 
 
-def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
+def is_valid(
+    knobs: Dict[str, Any], *, apply_routing_weights_before_fc2: bool = True
+) -> bool:
     """``True`` if ``knobs`` is a compilable SM90 FP8 MegaMoE combo.
 
     Mirrors the kernel ctor / config ``__post_init__`` rules; unspecified
@@ -165,7 +167,7 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
         return False
     # Kernel invariant: the in-kernel reduce collapses topk before a separate
     # reducer could apply routing weights.
-    if in_kernel and not apply_topk_in_fc1:
+    if in_kernel and not apply_routing_weights_before_fc2:
         return False
     if knobs.get("active_dispatch_warps", 1) not in (1, 2, 4):
         return False
@@ -180,7 +182,7 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
             "reuse_dispatch_warps"
         ):
             return False
-        if in_kernel or not apply_topk_in_fc1:
+        if in_kernel or not apply_routing_weights_before_fc2:
             return False
     return True
 

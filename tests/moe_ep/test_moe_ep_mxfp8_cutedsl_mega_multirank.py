@@ -927,7 +927,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
                 fc2_weight_sf=_all_gather_stack(fc2_sf),
                 ab_dtype=torch.float8_e4m3fn,
                 gate_up_clamp=problem["gate_up_clamp"],
-                apply_topk_in_fc1=True,
+                apply_routing_weights_before_fc2=True,
             )
             # The topk weight is already folded before the fc1-out round-trip, so
             # the per-topk terms reduce with a plain sum; compare this rank's slice.
@@ -1022,10 +1022,23 @@ def test_mxfp8_cutedsl_preprocess_mega_weights_from_bf16():
 
 
 def test_mxfp8_cutedsl_mega_kernel_is_registered():
+    import torch
+
     from flashinfer.moe_ep import Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
-    kernel = create_mega_kernel(
-        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
+    config = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        use_persistent_finalize_kernel=True,
+        num_valid_tokens_tensor=torch.zeros(1, dtype=torch.int32),
     )
+    kernel = create_mega_kernel(config)
     assert kernel.kernel_name() == "sm100_mxfp8_mxfp8_bf16_cutedsl"
+    assert config.use_persistent_finalize_kernel
+    with pytest.raises(ValueError, match="requires num_valid_tokens_tensor"):
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=2,
+            use_persistent_finalize_kernel=True,
+        )
