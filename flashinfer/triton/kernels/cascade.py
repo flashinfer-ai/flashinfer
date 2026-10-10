@@ -5,14 +5,16 @@ import triton.language as tl  # type: ignore[import]
 @triton.jit
 def state_merge(o, m, d, other_o, other_m, other_d):
     m_max = tl.maximum(m, other_m)
-    d = d * tl.exp2(m - m_max) + other_d * tl.exp2(other_m - m_max)
-    o = o * tl.exp2(m - m_max) + other_o * tl.exp2(other_m - m_max)
+    # Keep m_max == -inf for empty states, using a finite shift only in exp2.
+    m_shift = tl.where(m_max == -float("inf"), 0.0, m_max)
+    d = d * tl.exp2(m - m_shift) + other_d * tl.exp2(other_m - m_shift)
+    o = o * tl.exp2(m - m_shift) + other_o * tl.exp2(other_m - m_shift)
     return o, m_max, d
 
 
 @triton.jit
 def state_normalize(o, m, d):
-    o = o / d
+    o = o / tl.where(d > 0, d, 1.0)
     return o, m, d
 
 
@@ -79,10 +81,13 @@ def merge_state_in_place_kernel(
         s_val = tl.load(s_ptr + pos * num_heads + head_idx)
         s_other_val = tl.load(s_other_ptr + pos * num_heads + head_idx)
         s_max = tl.maximum(s_val, s_other_val)
-        s_val = tl.exp2(s_val - s_max)
-        s_other_val = tl.exp2(s_other_val - s_max)
-        scale = s_val / (s_val + s_other_val)
-        other_scale = s_other_val / (s_val + s_other_val)
+        s_shift = tl.where(s_max == -float("inf"), 0.0, s_max)
+        s_val = tl.exp2(s_val - s_shift)
+        s_other_val = tl.exp2(s_other_val - s_shift)
+        d = s_val + s_other_val
+        denominator = tl.where(d > 0, d, 1.0)
+        scale = s_val / denominator
+        other_scale = s_other_val / denominator
         for tx in tl.range(bdx):
             offset = (pos * num_heads + head_idx) * head_dim + tx
             v_vec = tl.load(v_ptr + offset)
@@ -92,7 +97,7 @@ def merge_state_in_place_kernel(
         if s_ptr:
             tl.store(
                 s_ptr + pos * num_heads + head_idx,
-                tl.log2(s_val + s_other_val) + s_max,
+                tl.log2(d) + s_max,
             )
 
 
@@ -112,7 +117,7 @@ def merge_states_kernel(
 
     for tx in tl.range(bdx):
         for head_idx in tl.range(bdy):
-            o, m, d = 0.0, -5e4, 1.0
+            o, m, d = 0.0, -float("inf"), 1.0
             for iter in tl.range(num_index_sets):
                 s = tl.load(
                     s_ptr + (pos * num_index_sets + iter) * num_heads + head_idx
@@ -146,7 +151,7 @@ def variable_length_merge_states_kernel(
     pos = tl.program_id(axis=0)
     for tx in tl.range(bdx):
         for head_idx in tl.range(bdy):
-            o, m, d = 0.0, -5e4, 1.0
+            o, m, d = 0.0, -float("inf"), 1.0
             for iter in tl.range(tl.load(indptr + pos), tl.load(indptr + pos + 1)):
                 iter_i64 = iter.to(tl.int64)
                 s = tl.load(s_ptr + iter_i64 * num_heads + head_idx)
