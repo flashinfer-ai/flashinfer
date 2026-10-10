@@ -33,9 +33,14 @@ contents and a positive outer stride. A null initial slot supplies zero state
 without reading its contents. Null destination slots remain untouched. Empty
 sequences copy initial state to final state. Checkpoint export requires a
 positive offset divisible by 16; offset zero disables export. Packed metadata
-must identify in-range, conflict-free state slots. Padded output rows are zero.
+must identify in-range, conflict-free state slots. The FP32 variant zeros padded
+output rows. The BF16 chunk variant writes live rows; callers initialize padded
+capacity when downstream operators read it.
 
 Compilation and workspace allocation finish before CUDA graph capture.
+`run()` exposes one custom operator to `torch.compile`, declaring mutations
+of caller-owned scratch, recurrent state, and output. Kernel selection and
+precision remain fixed by the prepared plan.
 Captured replay can change device counts, packed boundaries and slot indices
 without compilation, host reads or allocation. Runtime execution never
 substitutes a PyTorch reference or another precision variant.

@@ -26,6 +26,7 @@ from .._shared.delta_prefill.contract import (
 )
 from ._tuning import CHUNK_TOKENS, GdnPrefillConfig, GdnPrefillQuery, tiles_capacity
 from ._parallel import ParallelBinding, ParallelPlan
+from ._ops import gdn_prefill_out
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -336,13 +337,34 @@ def run(
     state = require_prepared(
         binding.plan, "sequence.gdn_prefill", binding.output.device
     )
-    return state.run(
-        binding,
-        scale=scale,
-        eps=eps,
-        max_live_tokens=max_live_tokens,
-        max_live_seqs=max_live_seqs,
+    state._check(binding)
+    scale, eps = _check_run_scalars(scale, eps)
+    state.layout.launched_windows(max_live_tokens, max_live_seqs)
+    gdn_prefill_out(
+        binding.scratch,
+        binding.q,
+        binding.k,
+        binding.v,
+        binding.a,
+        binding.b,
+        binding.A_log,
+        binding.dt_bias,
+        binding.recurrent_state,
+        binding.cu_seqlens,
+        binding.initial_state_indices,
+        binding.final_state_indices,
+        binding.checkpoint_state_indices,
+        binding.checkpoint_offsets,
+        binding.num_seqs,
+        binding.num_tokens,
+        binding.output,
+        binding.plan.handle,
+        scale,
+        eps,
+        max_live_tokens,
+        max_live_seqs,
     )
+    return binding.output
 
 
 __all__ = [
