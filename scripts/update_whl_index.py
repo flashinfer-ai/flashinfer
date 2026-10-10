@@ -93,6 +93,29 @@ def get_package_info(wheel_path: pathlib.Path) -> Optional[dict]:
     return None
 
 
+# Matches one wheel row in a generated index page. The href is the stable key;
+# any ``data-`` attributes and the trailing visible marker are optional, so this
+# also matches rows written before the untested marker existed.
+ROW_RE = re.compile(r'<a href="(?P<href>[^"]*)"[^>]*>.*?</a>(?: \(untested\))?<br>\n')
+
+
+def build_row(download_url: str, wheel_name: str, untested: bool) -> str:
+    """Build one PEP 503 anchor row for ``wheel_name``.
+
+    ``data-untested`` is a custom attribute. PEP 503 only assigns meaning to the
+    ``data-`` keys it defines, so installers ignore this one and an untested
+    wheel stays normally installable -- unlike PEP 592 ``data-yanked``, which
+    would hide it from ordinary resolution. The trailing text after the anchor
+    makes the same state visible to anyone browsing the index in a browser.
+    """
+    if untested:
+        return (
+            f'<a href="{download_url}" data-untested="true">{wheel_name}</a>'
+            " (untested)<br>\n"
+        )
+    return f'<a href="{download_url}">{wheel_name}</a><br>\n'
+
+
 def compute_sha256(file_path: pathlib.Path) -> str:
     """Compute SHA256 hash of a file."""
     with open(file_path, "rb") as f:
@@ -139,6 +162,7 @@ def update_index(
     base_url: str = "https://github.com/flashinfer-ai/flashinfer/releases/download",
     release_tag: Optional[str] = None,
     nightly: bool = False,
+    untested: bool = False,
 ):
     """
     Update wheel index from dist directory.
@@ -149,6 +173,7 @@ def update_index(
         base_url: Base URL for wheel downloads
         release_tag: GitHub release tag (e.g., 'nightly' or 'v0.3.1')
         nightly: If True, update index to whl/nightly subdirectory for nightly releases
+        untested: If True, mark each wheel as untested in the index
     """
     dist_path = pathlib.Path(dist_dir)
     if not dist_path.exists():
@@ -203,20 +228,21 @@ def update_index(
         # Update index.html
         index_file = index_dir / "index.html"
 
-        # Read existing links to avoid duplicates
-        links = set()
+        # Read existing rows, keyed by download URL, so that re-running for a
+        # wheel already in the index rewrites its row in place instead of
+        # appending a near-duplicate that differs only in the untested marker.
+        rows: dict[str, str] = {}
         if index_file.exists():
             with index_file.open("r") as f:
                 content = f.read()
-                # Simple regex to extract the <a> tags
-                links.update(re.findall(r'<a href=".*?">.*?</a><br>\n', content))
+            for match in ROW_RE.finditer(content):
+                rows[match.group("href")] = match.group(0)
 
-        # Create and add new link
-        new_link = f'<a href="{download_url}">{wheel_path.name}</a><br>\n'
-        is_new = new_link not in links
+        # Create and add new row
+        new_row = build_row(download_url, wheel_path.name, untested)
+        is_new = rows.get(download_url) != new_row
+        rows[download_url] = new_row
         if is_new:
-            links.add(new_link)
-
             # Write the complete, valid HTML file
             with index_file.open("w") as f:
                 f.write("<!DOCTYPE html>\n")
@@ -224,8 +250,8 @@ def update_index(
                 f.write(f"<head><title>Links for {package}</title></head>\n")
                 f.write("<body>\n")
                 f.write(f"<h1>Links for {package}</h1>\n")
-                for link in sorted(list(links)):
-                    f.write(link)
+                for _, row in sorted(rows.items()):
+                    f.write(row)
                 f.write("</body>\n")
                 f.write("</html>\n")
             print(f"  ✅ Added to index: {index_dir}/index.html")
@@ -274,6 +300,14 @@ def main():
         action="store_true",
         help="Update index to whl/nightly subdirectory for nightly releases",
     )
+    parser.add_argument(
+        "--untested",
+        action="store_true",
+        help=(
+            "Mark each wheel as untested in the index. Use when the artifacts "
+            "were built and published but the test suite did not pass."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -283,6 +317,7 @@ def main():
         base_url=args.base_url,
         release_tag=args.release_tag,
         nightly=args.nightly,
+        untested=args.untested,
     )
 
 
