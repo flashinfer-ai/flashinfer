@@ -40,6 +40,7 @@ from .mla_decode import (
     BatchMLADecodePagedTSWrapper,
     batch_mla_decode_with_paged_kv_cache,
     get_prims_ts_batch_mla_decode_workspace_size,
+    should_use_prims_ts_balanced_mla,
 )
 from .q_token_kv_block_sparse_metadata import (
     QTokenKvBlockSparsePagedTSWrapper,
@@ -73,4 +74,5 @@ __all__ = [
     "BatchMLADecodePagedTSWrapper",
     "batch_mla_decode_with_paged_kv_cache",
     "get_prims_ts_batch_mla_decode_workspace_size",
+    "should_use_prims_ts_balanced_mla",
 ]
