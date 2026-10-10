@@ -79,11 +79,11 @@ class BatchedGemmWorkQueue(WorkQueue):
         self.cfg = cfg
         self.num_non_exiting_ctas_tensor = num_non_exiting_ctas_tensor
         self.num_non_exiting_ctas_value = num_non_exiting_ctas_value
-        self.fast_drain_response_ptr = None
-        self.fast_drain_mbar_ptr = None
+        self.fast_drain_response_ptr = fast_drain_response_ptr
+        self.fast_drain_mbar_ptr = fast_drain_mbar_ptr
         object.__setattr__(self, "_alloc_fast_drain_response", None)
         object.__setattr__(self, "_alloc_fast_drain_mbar", None)
-        if self._uses_fast_drain():
+        if self._uses_fast_drain() and fast_drain_response_ptr is None:
             object.__setattr__(
                 self,
                 "_alloc_fast_drain_response",
@@ -122,6 +122,8 @@ class BatchedGemmWorkQueue(WorkQueue):
     @cute.jit
     def _init_fast_drain_smem_state(self, stage_info: StageInfo) -> None:
         if cutlass.const_expr(not self._uses_fast_drain()):
+            return
+        if cutlass.const_expr(self.fast_drain_response_ptr is not None):
             return
         assert self._alloc_fast_drain_response is not None
         assert self._alloc_fast_drain_mbar is not None
