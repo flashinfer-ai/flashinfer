@@ -962,11 +962,12 @@ def _short_total_tokens_case(varlen, lengths, state_dtype, seed=7):
 )
 def test_cake_ssd_combined_accepts_short_total_tokens(varlen, lengths, state_dtype):
     """CAKE-1063: fewer than 128 tokens per call (batched ``seqlen < 128``,
-    packed varlen ``total < 128``, down to a single token).  The generated
-    host pins a 128-row TMA box on the token axis, so the runner binds the
-    x/B/C/out maps to zero-padded one-chunk buffers and copies the valid
-    output rows back; the result must match the fp64 recurrence at least as
-    well as CuTe on the zero-padded packed stream.
+    packed varlen ``total < 128``, down to a single token).  The token axis
+    of the x/B/C/out tensor maps admits a global extent below the 128-row
+    box: TMA zero-fills the rows past ``seqlen`` on loads and clips them on
+    stores, so the caller's tensors are bound directly; the result must
+    match the fp64 recurrence at least as well as CuTe on the zero-padded
+    packed stream.
 
     Single-token f16-state rows: the state is the initial state, so the
     rounding of the f16 initial state to the bf16 ``C . state`` MMA operand
@@ -1005,7 +1006,7 @@ def test_cake_ssd_combined_short_call_after_nan_injection_is_clean():
     carry NaN leaves NaN in every SMEM input/output stage of the persistent
     kernel; the short call that follows on the same runner must be NaN-free
     and match the reference, i.e. the pad rows the kernel consumes come from
-    the zero-padded buffers, never from stale SMEM."""
+    the TMA out-of-bounds zero fill, never from stale SMEM."""
 
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):
@@ -2395,6 +2396,68 @@ def test_source_public_api_signatures_are_stable():
     )
     assert _signature_contract(module.ssd_combined_fwd) == expected_run
 
+    # The prepared (CUDA-graph-capturable) submission entry: keyword-only,
+    # the shape-determining subset of ``run``'s arguments, identical on the
+    # public runner and the Cake runner it delegates to.
+    prepare_names = (
+        "x",
+        "dt",
+        "A",
+        "B",
+        "C",
+        "D",
+        "z",
+        "dt_bias",
+        "dt_softplus",
+        "dt_limit",
+        "initial_states",
+        "seq_idx",
+        "chunk_indices",
+        "chunk_offsets",
+        "seq_chunk_cumsum",
+        "return_final_states",
+        "num_seqs",
+        "cu_seqlens",
+        "out",
+    )
+    prepare_defaults = (
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        None,
+        None,
+        None,
+        False,
+        (0.0, float("inf")),
+        None,
+        None,
+        None,
+        None,
+        None,
+        True,
+        None,
+        None,
+        None,
+    )
+    expected_prepare = tuple(
+        zip(
+            prepare_names,
+            (inspect.Parameter.KEYWORD_ONLY,) * len(prepare_names),
+            prepare_defaults,
+            strict=True,
+        )
+    )
+    assert (
+        _signature_contract(module.SSDCombined.prepare, drop_self=True)
+        == expected_prepare
+    )
+    assert (
+        _signature_contract(cake_module.CakeSSDCombined.prepare, drop_self=True)
+        == expected_prepare
+    )
+
     helper_names = (
         "seq_idx",
         "chunk_indices",
@@ -3687,11 +3750,12 @@ def test_source_batched_unaligned_seqlen_binding_without_gpu(monkeypatch):
 
 @pytest.mark.parametrize("varlen", (False, True), ids=("batched_2x50", "varlen_8"))
 def test_source_short_total_tokens_binding_without_gpu(monkeypatch, varlen):
-    """CAKE-1063: with fewer than 128 tokens the x/B/C/out tensor maps are
-    bound to runner-owned one-chunk buffers (valid rows copied in, pad rows
-    zero, staged output copied back to the returned ``out``) while every
+    """CAKE-1063 / round 4: with fewer than 128 tokens the caller's x/B/C/out
+    are bound directly -- the exported tensor maps admit a token extent below
+    the 128-row box and TMA zero-fills the rows past ``seqlen`` -- and every
     logical argument -- ``seqlen``, ``nchunks``, the preprocess tables -- keeps
-    the caller's extent; a 128-token call binds the caller's tensors."""
+    the caller's extent, exactly like a 128-token call.  No runner-owned pad
+    buffers, no copy-back."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     calls = []
@@ -3702,9 +3766,9 @@ def test_source_short_total_tokens_binding_without_gpu(monkeypatch, varlen):
     def launch(name, _arch, **launch_kwargs):
         calls.append((name, launch_kwargs))
         # Stand in for the kernel: write a row pattern into the bound output.
-        staged = launch_kwargs["main"]["out_map"]
-        rows = torch.arange(staged.shape[1], dtype=torch.float32) + 1.0
-        staged.copy_(rows.reshape(1, -1, 1, 1).expand(staged.shape).to(staged.dtype))
+        bound = launch_kwargs["main"]["out_map"]
+        rows = torch.arange(bound.shape[1], dtype=torch.float32) + 1.0
+        bound.copy_(rows.reshape(1, -1, 1, 1).expand(bound.shape).to(bound.dtype))
 
     monkeypatch.setattr(module, "_launch_program", launch)
     batch, seqlen = (1, 8) if varlen else (2, 50)
@@ -3737,18 +3801,12 @@ def test_source_short_total_tokens_binding_without_gpu(monkeypatch, varlen):
     assert tuple(final.shape) == (batch if not varlen else 1, 2, 64, 128)
     ((_, launch_args),) = calls
     preprocess, main = launch_args["preprocess"], launch_args["main"]
-    for key, source in (("x_map", x), ("b_map", B), ("c_map", C)):
-        bound = main[key]
-        assert tuple(bound.shape) == (batch, 128, *source.shape[2:])
-        assert bound.dtype == torch.bfloat16
-        torch.testing.assert_close(bound[:, :seqlen], source, rtol=0, atol=0)
-        assert not bound[:, seqlen:].any(), key
-    staged = main["out_map"]
-    assert staged is main["out_native"]
-    assert tuple(staged.shape) == (batch, 128, 2, 64)
-    torch.testing.assert_close(out, staged[:, :seqlen], rtol=0, atol=0)
+    # The caller's tensors are bound directly: no runner-owned pad buffers,
+    # no copy-back.
+    assert main["x_map"] is x and main["b_map"] is B and main["c_map"] is C
+    assert main["out_map"] is out and main["out_native"] is out
     assert float(out[0, -1, 0, 0]) == float(seqlen)
-    # Logical extents are untouched by the padding.
+    # Logical extents are the caller's.
     assert main["seqlen"] == seqlen and main["nchunks"] == 1
     assert main["batch"] == batch and main["num_logical_chunks"] == 1
     assert preprocess["seqlen"] == seqlen and preprocess["num_segments"] == batch
@@ -3756,15 +3814,13 @@ def test_source_short_total_tokens_binding_without_gpu(monkeypatch, varlen):
         assert preprocess["segment_lengths"].tolist() == [seqlen] * batch
     assert main["dt"].shape == (batch, seqlen, 2)
 
-    # A second call of the same extent reuses the buffers and leaves the pad
-    # rows zero (nothing but the first ``seqlen`` rows is ever written).
+    # A second call of the same extent binds its own tensors.
     x2, dt2, A2, B2, C2 = inputs(seqlen)
-    runner.run(x2, dt2, A2, B2, C2, **kwargs(seqlen))
+    out2, _ = runner.run(x2, dt2, A2, B2, C2, **kwargs(seqlen))
     main2 = calls[-1][1]["main"]
-    assert main2["x_map"] is main["x_map"] and main2["out_map"] is staged
-    assert not main2["x_map"][:, seqlen:].any()
+    assert main2["x_map"] is x2 and main2["out_map"] is out2 and out2 is not out
 
-    # One full chunk: the caller's tensors are bound directly.
+    # One full chunk binds the same way.
     x3, dt3, A3, B3, C3 = inputs(128)
     out3, _ = runner.run(x3, dt3, A3, B3, C3, **kwargs(128))
     main3 = calls[-1][1]["main"]
@@ -4293,7 +4349,7 @@ def _batched_selection(
         (1, 128, 32, False),
         (1, 8, 256, True),
         (4, 8, 64, True),
-        (1, 32, 16, False),
+        (1, 32, 16, True),
     ),
     ids=("1x8x16", "1x8x8", "1x128x32", "1x8x256", "4x8x64", "1x32x16"),
 )
@@ -4304,9 +4360,10 @@ def test_source_chunk_parallel_selection_rule(
     Chunk-parallel needs fewer (sequence, head) items than SMs, a workspace
     within the cap and a predicted main-kernel time that beats the exact
     scan's by the selection margin: 1 x 2048 tokens x 8 heads (16 chunks,
-    128 tiles), the 32768-token few-head prefill and 4 x 8192 x 8 qualify;
-    8 chunks do not amortise the fixed cost, 128 heads pay for 4096 tiles,
-    and 1 x 2048 x 32 (512 tiles) lands inside the margin."""
+    128 tiles), the 32768-token few-head prefill, 4 x 8192 x 8 and -- since
+    the round-4 re-fit of the constants -- 1 x 2048 x 32 (512 tiles, measured
+    chunk-parallel / exact 0.91) qualify; 8 chunks do not amortise the fixed
+    cost and 128 heads pay for 4096 tiles."""
 
     selected = _batched_selection(batch, nheads, nchunks, capability=capability)
     assert selected is expected
@@ -4348,14 +4405,14 @@ def test_source_chunk_parallel_selection_quantities_follow_the_cost_model():
     # 128 tiles fit the first wave of 148 SMs: the fixed cost alone.
     assert predicted["chunk_parallel"] == pytest.approx(b200["cp_fixed"])
 
-    # The calibration row: 1 x 32768 tokens x 8 heads (the seed measured
-    # 688 -> 160 us on B200 and 667 -> 153 us on B300).
+    # The calibration row: 1 x 32768 tokens x 8 heads (the round-4 re-fit
+    # measured 667 -> 134 us on B200 and 617 -> 124 us on B300).
     long_prefill = quantities(8, 256, (10, 0))["predicted_us"]
-    assert long_prefill["exact_scan"] == pytest.approx(691.48)
-    assert long_prefill["chunk_parallel"] == pytest.approx(149.03)
+    assert long_prefill["exact_scan"] == pytest.approx(668.754)
+    assert long_prefill["chunk_parallel"] == pytest.approx(118.87)
     long_prefill = quantities(8, 256, (10, 3))["predicted_us"]
-    assert long_prefill["exact_scan"] == pytest.approx(668.24)
-    assert long_prefill["chunk_parallel"] == pytest.approx(141.85)
+    assert long_prefill["exact_scan"] == pytest.approx(617.45)
+    assert long_prefill["chunk_parallel"] == pytest.approx(106.38)
 
     large = quantities(128, 32, (10, 3))
     b300 = model[(10, 3)]
