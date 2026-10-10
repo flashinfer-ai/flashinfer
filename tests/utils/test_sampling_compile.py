@@ -16,6 +16,8 @@ limitations under the License.
 
 """ATen tracing retains sampling launches and per-request RNG state."""
 
+import functools
+
 import pytest
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -25,12 +27,14 @@ from flashinfer import sampling
 
 @pytest.mark.parametrize("indexed", [False, True])
 @pytest.mark.parametrize("rng", ["tensor", "scalar", "signed_scalar"])
+@pytest.mark.parametrize("min_p", [None, 0.1])
 @torch.no_grad()
-def test_sampling_pipeline_compiles_and_replays(indexed, rng):
+def test_sampling_pipeline_compiles_and_replays(indexed, rng, min_p):
     logits = torch.randn(4, 257, device="cuda", dtype=torch.bfloat16)
     temperature = torch.ones(4, device="cuda")
     top_k = torch.full((4,), 80, dtype=torch.int32, device="cuda")
     top_p = torch.full((4,), 0.8, device="cuda")
+    min_p_tensor = torch.full((4,), min_p or 0.0, device="cuda")
     indices = (
         torch.tensor([2, 0, 2, 1], device="cuda", dtype=torch.int32)
         if indexed
@@ -46,7 +50,12 @@ def test_sampling_pipeline_compiles_and_replays(indexed, rng):
         masked = sampling.top_k_mask_logits(logits, top_k)
         probs = sampling.softmax(masked, temperature=temperature, enable_pdl=False)
         probs = sampling.top_p_renorm_probs(probs, top_p, is_deterministic=True)
-        tokens, valid = sampling.sampling_from_probs(
+        sample = (
+            sampling.sampling_from_probs
+            if min_p is None
+            else functools.partial(sampling.min_p_sampling_from_probs, min_p=min_p_tensor)
+        )
+        tokens, valid = sample(
             probs,
             indices=indices,
             deterministic=True,
@@ -63,7 +72,7 @@ def test_sampling_pipeline_compiles_and_replays(indexed, rng):
         "softmax_out",
         "top_k_mask_logits_out",
         "top_p_renorm_probs_out",
-        "sampling_from_probs_out",
+        "sampling_from_probs_out" if min_p is None else "min_p_sampling_from_probs_out",
     ):
         assert getattr(torch.ops.flashinfer, name).default in targets
     compiled = torch.compile(traced, fullgraph=True, dynamic=False)
@@ -76,6 +85,7 @@ def test_sampling_pipeline_compiles_and_replays(indexed, rng):
         temperature.fill_(0.7 + step * 0.1)
         top_k.fill_(40 + 10 * step)
         top_p.fill_(0.5 + 0.1 * step)
+        min_p_tensor.fill_(step * 0.2)
         if rng == "tensor":
             seed.fill_((1 << 64) - 97 - step)
             offset.fill_((1 << 32) + step)

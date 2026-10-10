@@ -18,6 +18,7 @@ import functools
 from numbers import Real
 from types import SimpleNamespace
 from typing import Optional, Tuple, Union
+
 import torch
 
 from .api_logging import flashinfer_api
@@ -227,6 +228,40 @@ def get_sampling_module():
 
     @sampling_from_probs_out.register_fake
     def _fake_sampling_from_probs_out(*args):
+        pass
+
+    @torch.library.custom_op(
+        "flashinfer::min_p_sampling_from_probs_out", mutates_args=("samples", "valid")
+    )
+    def min_p_sampling_from_probs_out(
+        probs: torch.Tensor,
+        samples: torch.Tensor,
+        valid: torch.Tensor,
+        indices: Optional[torch.Tensor],
+        maybe_min_p_arr: Optional[torch.Tensor],
+        min_p_val: float,
+        deterministic: bool,
+        maybe_seed_arr: Optional[torch.Tensor],
+        seed_val: int,
+        maybe_offset_arr: Optional[torch.Tensor],
+        offset_val: int,
+    ) -> None:
+        module.min_p_sampling_from_probs(
+            probs,
+            samples,
+            valid,
+            indices,
+            maybe_min_p_arr,
+            min_p_val,
+            deterministic,
+            maybe_seed_arr,
+            seed_val,
+            maybe_offset_arr,
+            offset_val,
+        )
+
+    @min_p_sampling_from_probs_out.register_fake
+    def _fake_min_p_sampling_from_probs_out(*args):
         pass
 
     @torch.library.custom_op(
@@ -607,7 +642,7 @@ def get_sampling_module():
             _validate_and_convert_seed_offset(seed, offset, device, batch_size)
         )
 
-        module.min_p_sampling_from_probs(
+        min_p_sampling_from_probs_out(
             probs,
             samples,
             valid,
@@ -632,6 +667,8 @@ def get_sampling_module():
         min_p_val: float,
         deterministic: bool,
         generator: Optional[torch.Generator],
+        seed: Optional[Union[int, torch.Tensor]] = None,
+        offset: Optional[Union[int, torch.Tensor]] = None,
         return_valid: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         batch_size = indices.size(0) if indices is not None else probs.size(0)
