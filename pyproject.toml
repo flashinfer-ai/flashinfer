@@ -86,6 +86,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.cake_dsa_indexer" = ["csrc/**"]
 # Route catalog of the experimental SM120 paged MQA-logits export, read at runtime next to its module.
 "flashinfer.experimental.deepgemm_sm120_paged_mqa_logits" = ["*.json"]
+"flashinfer.experimental.adaptive_sparse_block_mask" = ["csrc/**"]
 "flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json"]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
