@@ -1,0 +1,30 @@
+{
+  "success": true,
+  "tests": 1,
+  "projection_shapes": [
+    [
+      1024,
+      8960,
+      512
+    ],
+    [
+      5093,
+      8960,
+      512
+    ],
+    [
+      5093,
+      2048,
+      1536
+    ]
+  ],
+  "relative_l2_threshold": 0.0001,
+  "reference": "existing SGLang block-FP8 GEMM, generated activation and weight inputs",
+  "source_hashes": {
+    "/sgl-workspace/flashinfer-fp8-mla-sm120/flashinfer/experimental/mla_fp8_sm120/projection_tuning.py": "ff5f161ce82efe7484c384809e47286e1f2e2494024c0a133c91ff9f71741946",
+    "/sgl-workspace/flashinfer-fp8-mla-sm120/flashinfer/experimental/mla_fp8_sm120/projection_policy.cuh": "b1372cad6bd59e399d93a211f5fe329f3986222e61849c0f57e19bbc36894ef0",
+    "/sgl-workspace/flashinfer-fp8-mla-sm120/tests/experimental/mla_fp8_sm120/test_projection_policy.py": "4966122b0457cf74d8b346816d88e1aa032108fa23be022a39fc25e625b98916"
+  },
+  "log_sha256": "feea55eed8e92e1ed46c5a91397357b4d5413f29e088e9478098ba9c57ac8885",
+  "qkva_padding_installed": false
+}

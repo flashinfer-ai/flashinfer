@@ -1,0 +1,74 @@
+{
+  "date": "2026-10-10",
+  "base": "b5f4f69795c1976efb8b560e8028ba7759c93878",
+  "files": {
+    "flashinfer/experimental/mla_fp8_sm120/materialized_fp8_cute.py": "f5e034786fc6838172dd76e4bcae7f420d2eff47a416b3aaab3d9340df15542c",
+    "flashinfer/experimental/mla_fp8_sm120/materialized_fp8_hook.py": "6ff3e5681d89b809f029eb2ba35efcf4139600859b201eb99fc16376ae345c0b",
+    "flashinfer/experimental/mla_fp8_sm120/materialized_fp8_interface.py": "27395b8ded3ce4509c0b4ae75cf35091312d9c9c548ddcb4646c151afad071bd",
+    "flashinfer/experimental/mla_fp8_sm120/materialized_fp8_quantize.py": "0121a925d95963994b2e6d63fe125c6e806e62129e31240c9fc4e6e6851e7eb2",
+    "flashinfer/experimental/mla_fp8_sm120/mla_fp8.cu": "7e3f9016afef7806ad3fdbe6c2aac5ab67839aaf2c5aae77db369fffa0c75a90",
+    "flashinfer/experimental/mla_fp8_sm120/projection_policy.cuh": "b1372cad6bd59e399d93a211f5fe329f3986222e61849c0f57e19bbc36894ef0",
+    "flashinfer/experimental/mla_fp8_sm120/projection_tuning.py": "ff5f161ce82efe7484c384809e47286e1f2e2494024c0a133c91ff9f71741946",
+    "flashinfer/experimental/mla_fp8_sm120/wrapper.py": "452e0519bd12c9370f4bb6ad33e67d5f8adb8ac94dbbdacd2d53af0e119febd2",
+    "tests/experimental/mla_fp8_sm120/check.py": "334820f8b7cb7caa91d07eca1e16ac430ca07e966dd13e45628bc41f0bb8a037",
+    "tests/experimental/mla_fp8_sm120/test_materialized_prefill.py": "19c01eec93973716370cf571591e2574f587f8c68bec62588a2f3d2b8a85df9f",
+    "tests/experimental/mla_fp8_sm120/test_projection_policy.py": "4966122b0457cf74d8b346816d88e1aa032108fa23be022a39fc25e625b98916"
+  },
+  "commits": [
+    {
+      "repo": "flashinfer",
+      "item": "已有 SHARD_QK 实验（未计收益）",
+      "sha": "6483a18e3a9cc1f361acaa45a1efd40badbbaf75"
+    },
+    {
+      "repo": "flashinfer",
+      "item": "融合 FP8 prefill（K16）",
+      "sha": "2d81fdc43f4d6b6dce365caa57310f524c3aa93a"
+    },
+    {
+      "repo": "flashinfer",
+      "item": "PV K32 指令与对齐加载",
+      "sha": "3e25c2fb9533843d84b0eb747563eb621304f3f0"
+    },
+    {
+      "repo": "flashinfer",
+      "item": "TMA 搬运与共享内存 swizzle",
+      "sha": "28385bf2f0ff55c41ac2231ef822b66de43aed6c"
+    },
+    {
+      "repo": "flashinfer",
+      "item": "PRMT 概率寄存器重排",
+      "sha": "ffad90f628dc96b1a32283fcc1eaf7240c242211"
+    },
+    {
+      "repo": "flashinfer",
+      "item": "V scale 近似倒数",
+      "sha": "c896ad61cbbfff907f73ce7ba035a08fe57975f3"
+    },
+    {
+      "repo": "flashinfer",
+      "item": "log2 在线 softmax 与 scale 融合",
+      "sha": "7cfe4cf3821de2fed7414fe936ee602935058090"
+    },
+    {
+      "repo": "flashinfer",
+      "item": "head-major 临时 QKV 布局",
+      "sha": "d27368d7b6cd8f58aaf8b3f73adfde205dbd96b4"
+    },
+    {
+      "repo": "flashinfer",
+      "item": "短 K dense FP8 GEMM 调度",
+      "sha": "f05215d47a4208011553fe5a93af0725d8bfd6fa"
+    },
+    {
+      "repo": "flashinfer",
+      "item": "完整块 mask 与 LPT 调度",
+      "sha": "438ee55eecc598a842178f122429a8c3d05a7b10"
+    }
+  ],
+  "commit_identity": {
+    "name": "sjtushenhai",
+    "email": "1730536718@qq.com"
+  },
+  "identity_corrected_on": "2026-10-10"
+}
