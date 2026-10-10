@@ -222,7 +222,7 @@ struct DMA {
       if (SCHEDULING_MODE == 0) {
         tile_id_ = blockIdx.y;
       } else {
-        get_next_tile_id(local_wid, tiw, smem_tile_id, params.tile_id_counter_ptr);
+        get_next_tile_id(local_wid, tiw, smem_tile_id, params);
       }
 
       auto cbw0 = shared->tma_q_tracker[0].createWriter();
@@ -311,7 +311,7 @@ struct DMA {
           if (SCHEDULING_MODE == 0) {
             tile_id_ += gridDim.y;
           } else {
-            get_next_tile_id(local_wid, tiw, smem_tile_id, params.tile_id_counter_ptr);
+            get_next_tile_id(local_wid, tiw, smem_tile_id, params);
           }
           continue;
         }
@@ -367,7 +367,7 @@ struct DMA {
         if (SCHEDULING_MODE == 0) {
           tile_id_ += gridDim.y;
         } else {
-          get_next_tile_id(local_wid, tiw, smem_tile_id, params.tile_id_counter_ptr);
+          get_next_tile_id(local_wid, tiw, smem_tile_id, params);
         }
       }  // gridDim.y
       // Signal compute groups to break.
@@ -388,7 +388,7 @@ struct DMA {
       if (SCHEDULING_MODE == 0) {
         tile_id_ = blockIdx.y;
       } else {
-        get_next_tile_id(local_wid, tiw, smem_tile_id, params.tile_id_counter_ptr);
+        get_next_tile_id(local_wid, tiw, smem_tile_id, params);
       }
 
       auto cbw0 = shared->tma_q_tracker[0].createWriter();
@@ -473,7 +473,7 @@ struct DMA {
           if (SCHEDULING_MODE == 0) {
             tile_id_ += gridDim.y;
           } else {
-            get_next_tile_id(local_wid, tiw, smem_tile_id, params.tile_id_counter_ptr);
+            get_next_tile_id(local_wid, tiw, smem_tile_id, params);
           }
           continue;
         }
@@ -542,7 +542,7 @@ struct DMA {
         if (SCHEDULING_MODE == 0) {
           tile_id_ += gridDim.y;
         } else {
-          get_next_tile_id(local_wid, tiw, smem_tile_id, params.tile_id_counter_ptr);
+          get_next_tile_id(local_wid, tiw, smem_tile_id, params);
         }
       }  // gridDim.y
 
@@ -780,11 +780,12 @@ struct DMA {
       cbr_v_scratch.pop(elect_one_, v_scratch_barrier_id);         // Advance to next phase
     }
 
-    inline __device__ void get_next_tile_id(int local_wid, int tiw, uint32_t smem_tile_id,
-                                            uint32_t* tile_id_counter_ptr) {
+    inline __device__ void get_next_tile_id(
+        int local_wid, int tiw, uint32_t smem_tile_id,
+        bert::Fused_multihead_attention_params_v2 const& params) {
       if constexpr (DMA_GROUP_TRANSPOSE_V) {
         if (elect_one_) {
-          tile_id_ = atomicAdd(tile_id_counter_ptr, 1);
+          tile_id_ = atomicAdd(params.tile_id_counter_ptr, 1);
           sts(smem_tile_id, tile_id_);
         }
         fence_view_async_shared();
@@ -796,7 +797,8 @@ struct DMA {
         // only one warp involved when the dma group doesn't need to transpose the v tile.
       } else {
         if (elect_one_) {
-          tile_id_ = atomicAdd(tile_id_counter_ptr, 1);
+          // After all tile IDs, each CTA takes one terminal ID; the last resets the counter.
+          tile_id_ = atomicInc(params.tile_id_counter_ptr, params.num_tiles + gridDim.y - 1);
         }
         tile_id_ = __shfl_sync(0xffffffff, tile_id_, 0);
       }

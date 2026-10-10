@@ -1151,6 +1151,10 @@ def run_trtllm_fmha_v2_prefill_case(
 
     o = torch.zeros(total_tokens, num_qo_heads, head_dim, dtype=o_dtype, device=device)
     workspace_buffer = _get_workspace_buffer()
+    check_tile_counter = is_sm90a_supported(workspace_buffer.device)
+    if check_tile_counter:
+        # These SM90 cases place the dynamic scheduler counter at workspace offset 0.
+        workspace_buffer[:4].fill_(0x5A)
 
     # --- Run kernel ---
     result = trtllm_fmha_v2_prefill(
@@ -1175,6 +1179,13 @@ def run_trtllm_fmha_v2_prefill_case(
         pos_encoding_mode=pos_encoding_mode,
         save_softmax_stats=save_softmax_stats,
     )
+
+    if check_tile_counter:
+        counter = workspace_buffer[:4].view(torch.int32).item()
+        if counter != 0:
+            raise RuntimeError(
+                f"FMHAv2 left a nonzero workspace tile counter: {counter}"
+            )
 
     if save_softmax_stats:
         output, kernel_lse = result

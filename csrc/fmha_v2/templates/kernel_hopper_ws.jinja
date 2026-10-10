@@ -407,6 +407,10 @@ void {{ launcher_name }}(
 {% endif %} // custom mask
     }
 
+    if( Ktraits::SCHEDULING_MODE > 0 && Ktraits::DMA_GROUP_TRANSPOSE_V ) {
+        // Exact FP8 scheduling can stop before num_tiles, so it cannot reset by wrapping.
+        FMHA_CHECK_CUDA(cudaMemsetAsync(params.tile_id_counter_ptr, 0, sizeof(uint32_t), stream));
+    }
 }
 
 #endif
