@@ -1695,27 +1695,27 @@ def _build_block_tables_from_paged_kv_indices(
     paged_kv_indices: torch.Tensor,
     batch_size: int,
     device: torch.device,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Convert flat paged-KV indices to a shared ``[B, M]`` block table.
-
-    This is the input format consumed by the existing backend and SM120 PRIMS.
-    K and V share every logical-to-physical page mapping.
-    """
-    blocks_per_seq = [
-        int(paged_kv_indptr_host[i + 1] - paged_kv_indptr_host[i])
-        for i in range(batch_size)
-    ]
-    max_num_blocks_per_seq = max(blocks_per_seq)
-    block_tables = torch.zeros(
-        (batch_size, max_num_blocks_per_seq),
-        dtype=torch.int32,
-        device=device,
-    )
-    for i, num_blocks_needed in enumerate(blocks_per_seq):
-        start = int(paged_kv_indptr_host[i])
-        end = int(paged_kv_indptr_host[i + 1])
-        block_tables[i, :num_blocks_needed] = paged_kv_indices[start:end]
-    return block_tables
+    """Stage shared K/V page mappings during plan, reusing output capacity."""
+    offsets = paged_kv_indptr_host.tolist()[: batch_size + 1]
+    spans = list(zip(offsets, offsets[1:], strict=False))
+    if out is None:
+        max_pages = max(end - start for start, end in spans)
+        out = torch.empty((batch_size, max_pages), dtype=torch.int32, device=device)
+    # Clear unused row tails, including retained capacity after a shorter replan.
+    out.zero_()
+    indices = paged_kv_indices.to(device)
+    dst, src = [], []
+    for i, (start, end) in enumerate(spans):
+        if end > start:
+            dst.append(out[i, : end - start])
+            src.append(indices[start:end])
+    if len(dst) == 1:
+        dst[0].copy_(src[0], non_blocking=True)
+    elif dst:
+        torch._foreach_copy_(dst, src, non_blocking=True)
+    return out
 
 
 # Ragged-prefill `auto` on Blackwell: tried in this order, first eligible wins.
@@ -3209,24 +3209,32 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 batch_size, 1, 1, 1
             )
             if block_tables is None:
-                table = _build_block_tables_from_paged_kv_indices(
-                    paged_kv_indptr.to("cpu"), paged_kv_indices, batch_size, self.device
+                page_indptr_host = paged_kv_indptr.to("cpu")
+                offsets = page_indptr_host.tolist()[: batch_size + 1]
+                max_pages = max(
+                    end - start
+                    for start, end in zip(offsets, offsets[1:], strict=False)
                 )
                 old_table = self._cudnn_block_tables
                 if (
                     old_table is None
                     or old_table.shape[0] != batch_size
-                    or old_table.shape[1] < table.shape[1]
+                    or old_table.shape[1] < max_pages
                 ):
                     if self.is_cuda_graph_enabled and old_table is not None:
                         raise ValueError(
                             "captured cuDNN block table cannot grow; supply a fixed block_tables buffer"
                         )
-                    self._cudnn_block_tables = table
-                else:
-                    old_table.zero_()
-                    old_table[:, : table.shape[1]].copy_(table)
-                self._block_tables = self._cudnn_block_tables
+                    self._cudnn_block_tables = torch.empty(
+                        (batch_size, max_pages), dtype=torch.int32, device=self.device
+                    )
+                self._block_tables = _build_block_tables_from_paged_kv_indices(
+                    page_indptr_host,
+                    self._paged_kv_indices_buf,
+                    batch_size,
+                    self.device,
+                    out=self._cudnn_block_tables,
+                )
             previous_cudnn_plan = self._cudnn_plan
             self._cudnn_plan = None
             self._cudnn_lse_unservable = False
