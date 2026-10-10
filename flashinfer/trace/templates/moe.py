@@ -2156,7 +2156,7 @@ def _moe_fp4_block_scale_init(
 ):
     """Build inputs for ``trtllm_fp4_block_scale_moe`` (any routing variant).
 
-    Sourced from ``tests/moe/test_trtllm_gen_fused_moe.py``:
+    Sourced from ``tests/moe/trtllm_gen/test_trtllm_gen_fused_moe.py``:
       hidden_states     = 2 * randn(...)                    (main fixture)
       hidden_states_sf  = 448*6 / amax(hs)                  (single global)
       weights[e]        = randn(...)
@@ -5392,7 +5392,7 @@ trtllm_gen_routing_trace = TraceTemplate(
         "total_num_padded_tokens are undefined. No reference is attached: "
         "the kernel's ordering within an expert's padded segment is not part "
         "of the contract, so the outputs are only defined up to a "
-        "per-expert permutation (tests/moe/test_trtllm_gen_routing.py checks "
+        "per-expert permutation (tests/moe/trtllm_gen/test_trtllm_gen_routing.py checks "
         "them by invariant instead)."
     ),
     axes={

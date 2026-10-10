@@ -84,7 +84,7 @@ def test_xqa_batch_decode_mla_reference_correctness(shape_kwargs):
         bmm1_scale=bmm1_scale,
         bmm2_scale=1.0,
     )
-    # Matches tests/attention/test_xqa.py pass-ratio (>=95% for FP8 MLA).
+    # Matches tests/attention/trtllm_gen/test_xqa.py pass-ratio (>=95% for FP8 MLA).
     _check(
         xqa_batch_decode_mla_trace,
         ref_out.float(),

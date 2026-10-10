@@ -423,11 +423,11 @@ contracts:
 
 ```bash
 pytest -q \
-  tests/attention/test_attention_ts_context.py \
-  tests/attention/test_attention_ts_decode.py \
-  tests/attention/test_attention_ts_q_token_kv_block_sparse_metadata.py \
-  tests/attention/test_attention_ts_block_sparse.py \
-  tests/attention/test_attention_ts_mask.py \
-  tests/attention/test_attention_ts_mla_decode.py \
-  tests/attention/test_attention_ts_sage.py
+  tests/attention/prims_ts/test_attention_ts_context.py \
+  tests/attention/prims_ts/test_attention_ts_decode.py \
+  tests/attention/prims_ts/test_attention_ts_q_token_kv_block_sparse_metadata.py \
+  tests/attention/prims_ts/test_attention_ts_block_sparse.py \
+  tests/attention/prims_ts/test_attention_ts_mask.py \
+  tests/attention/prims_ts/test_attention_ts_mla_decode.py \
+  tests/attention/prims_ts/test_attention_ts_sage.py
 ```

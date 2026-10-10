@@ -2477,7 +2477,7 @@ def test_cake_fmha_aot_registers_each_exact_blackwell_target(monkeypatch) -> Non
     reason="Cake FMHA requires SM100 or SM103",
 )
 def test_cake_decode_bf16_matches_flashinfer_reference() -> None:
-    from tests.attention.test_trtllm_gen_attention_decode import (
+    from tests.attention.trtllm_gen.test_trtllm_gen_attention_decode import (
         _test_trtllm_batch_decode,
     )
 
@@ -2676,7 +2676,7 @@ def test_cake_decode_exact_sink_matches_independent_reference() -> None:
     reason="Cake FMHA requires SM100 or SM103",
 )
 def test_cake_decode_fp16_nhd_matches_flashinfer_reference() -> None:
-    from tests.attention.test_trtllm_gen_attention_decode import (
+    from tests.attention.trtllm_gen.test_trtllm_gen_attention_decode import (
         _test_trtllm_batch_decode,
     )
 
@@ -2706,7 +2706,7 @@ def test_cake_decode_fp16_nhd_matches_flashinfer_reference() -> None:
     reason="Cake FMHA requires SM100 or SM103",
 )
 def test_cake_decode_fp16_hd512_matches_flashinfer_reference() -> None:
-    from tests.attention.test_trtllm_gen_attention_decode import (
+    from tests.attention.trtllm_gen.test_trtllm_gen_attention_decode import (
         _test_trtllm_batch_decode,
     )
 
@@ -2736,7 +2736,7 @@ def test_cake_decode_fp16_hd512_matches_flashinfer_reference() -> None:
     reason="Cake FMHA requires SM100 or SM103",
 )
 def test_cake_context_bf16_separate_tables_matches_reference(monkeypatch) -> None:
-    from tests.attention.test_trtllm_gen_attention_prefill import (
+    from tests.attention.trtllm_gen.test_trtllm_gen_attention_prefill import (
         _test_trtllm_batch_prefill,
     )
 
@@ -2773,7 +2773,7 @@ def test_cake_context_bf16_separate_tables_matches_reference(monkeypatch) -> Non
     reason="Cake FMHA requires SM100 or SM103",
 )
 def test_cake_context_fp8_nhd_device_scale_skip_matches_reference(monkeypatch) -> None:
-    from tests.attention.test_trtllm_gen_attention_prefill import (
+    from tests.attention.trtllm_gen.test_trtllm_gen_attention_prefill import (
         _test_trtllm_batch_prefill,
     )
 
@@ -2948,7 +2948,7 @@ def test_cake_decode_bf16_hd256_smallm_matches_flashinfer_reference(
     device = torch.device("cuda")
     if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
         pytest.skip("Cake FMHA requires SM100 or SM103")
-    from tests.attention.test_trtllm_gen_attention_decode import (
+    from tests.attention.trtllm_gen.test_trtllm_gen_attention_decode import (
         _test_trtllm_batch_decode,
     )
 

@@ -947,7 +947,7 @@ def _xqa_init(
 ):
     """Build inputs for ``flashinfer.xqa``.
 
-    Mirrors ``tests/attention/test_xqa.py``: q/output are
+    Mirrors ``tests/attention/trtllm_gen/test_xqa.py``: q/output are
     ``[batch_size, beam_width, num_heads_qo, head_dim]``, caches use the
     default NHD layout, and seq_lens/semaphores are uint32.
     """
@@ -1055,7 +1055,7 @@ def _xqa_mla_init(
 ):
     """Build inputs for ``flashinfer.xqa_mla``.
 
-    Mirrors ``tests/attention/test_xqa.py``: MLA uses 128 query heads,
+    Mirrors ``tests/attention/trtllm_gen/test_xqa.py``: MLA uses 128 query heads,
     FP8 Q/K/V latent width 576, and a bfloat16 output buffer width 512.
     """
     torch.manual_seed(seed)

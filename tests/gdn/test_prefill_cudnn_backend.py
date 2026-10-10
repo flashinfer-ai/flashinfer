@@ -23,7 +23,7 @@ Three oracles, deliberately layered:
 * ``reference_delta_rule.delta_rule``, this directory's own K-major serial
   reference, as a third independent check on the state's orientation.
 
-The graph-cache-key tests follow ``tests/attention/test_cudnn_graph_cache_key.py``:
+The graph-cache-key tests follow ``tests/attention/cudnn/test_cudnn_graph_cache_key.py``:
 every host scalar in ``_la_graph_key_fn`` is baked into the built graph as a
 compile-time constant, so a same-shape call that differs only in that scalar
 must not replay the first call's graph. Each such test runs the same shapes

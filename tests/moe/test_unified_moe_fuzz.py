@@ -73,7 +73,7 @@ Routing coverage (three modes, axes ``routing_method`` x ``routing_input_mode`` 
     RoutingConfig.method -- reaches the bug cluster the pre-routed harness structurally can't:
     DeepSeekV3 group-topk + bias (#2575), all-negative logits (#2822), fp32 router logits (#2796),
     bias-method weight leakage (#2485/#2907). The SAME ``_route`` oracle (ported verbatim from the
-    kernel-validated references in ``tests/moe/test_trtllm_gen_fused_moe.py``) is the authority for
+    kernel-validated references in ``tests/moe/trtllm_gen/test_trtllm_gen_fused_moe.py``) is the authority for
     every mode, so a kernel that routes wrong is caught by check #2. In-kernel routing is
     single-GPU (non-EP) here; EP + in-kernel routing semantics are a separate validation.
 
@@ -2499,7 +2499,7 @@ def _route(
 ):
     """Host routing reference: logits[T,E] -> (selected[T,k] int64, weights[T,k] float32).
 
-    Mirrors the per-method math in ``tests/moe/test_trtllm_gen_fused_moe.py``
+    Mirrors the per-method math in ``tests/moe/trtllm_gen/test_trtllm_gen_fused_moe.py``
     (``routing_reference_*`` / ``noaux_tc_ref``), which is validated against the SAME
     trtllm-gen kernel the unified FromLogits path drives -- so the in-kernel router
     agrees with this oracle by transitivity.  Selection/weight alignment is by column

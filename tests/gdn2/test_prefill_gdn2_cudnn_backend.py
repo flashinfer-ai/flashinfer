@@ -25,7 +25,7 @@ differentiate against. Two oracles stand in:
   kernel oracle for the degenerate corner, and it is the check that would catch
   a gate wired to the wrong axis.
 
-The graph-cache-key tests follow ``tests/attention/test_cudnn_graph_cache_key.py``.
+The graph-cache-key tests follow ``tests/attention/cudnn/test_cudnn_graph_cache_key.py``.
 Everything the engine owns -- architecture, head dims, dtypes, head counts --
 is left to cuDNN to accept or decline.
 """

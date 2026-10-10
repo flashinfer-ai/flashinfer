@@ -181,7 +181,7 @@ def test_two_dim_act_scale_mapping_is_unchanged():
     """The pre-existing 2-D layout must keep using dim 0 and no ConstraintSpec.
 
     Guards the autotuner cache key that
-    tests/moe/test_trtllm_gen_moe_autotune_tactics.py::_moe_profile_shapes
+    tests/moe/trtllm_gen/test_trtllm_gen_moe_autotune_tactics.py::_moe_profile_shapes
     hardcodes for 2-D scales (constrained dims are written as -1 in that key).
     """
     runner = _make_runner()

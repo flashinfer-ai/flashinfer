@@ -145,7 +145,7 @@ def _build_direct_runner(runner_type, config, device):
 
 # Reuse the canonical reference implementation + accuracy helpers from the
 # existing CuteDSL test — keeps tolerance bounds consistent across tests.
-from tests.moe.test_cute_dsl_fused_moe import (  # noqa: E402
+from tests.moe.cute_dsl.test_cute_dsl_fused_moe import (  # noqa: E402
     check_accuracy,
     compute_reference_moe_fp4,
     create_moe_tensors,

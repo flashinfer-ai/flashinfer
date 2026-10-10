@@ -104,7 +104,7 @@ def test_cudnn_batch_prefill_reference_correctness(shape_kwargs):
         False,
         block_tables=block_tables,
     )
-    # Matches tests/attention/test_cudnn_prefill.py.
+    # Matches tests/attention/cudnn/test_cudnn_prefill.py.
     _check(cudnn_batch_prefill_trace, ref_out, api_out, atol=1e-2, rtol=1e-2)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

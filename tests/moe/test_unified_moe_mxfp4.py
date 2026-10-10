@@ -48,7 +48,7 @@ from flashinfer.fused_moe.core import (
 )
 from flashinfer.quantization.fp4_quantization import block_scale_interleave
 from flashinfer.utils import get_compute_capability
-from tests.moe.test_cute_dsl_fused_moe import (
+from tests.moe.cute_dsl.test_cute_dsl_fused_moe import (
     check_accuracy,
     compute_reference_moe_fp4,
 )

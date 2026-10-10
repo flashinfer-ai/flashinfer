@@ -36,7 +36,7 @@ def test_segment_gemm_run_reference_correctness(shape_kwargs):
     ref_out = segment_gemm_run_trace.reference(
         inputs["x"], inputs["weights"], seg_indptr=inputs["seg_indptr"]
     )
-    # Matches tests/gemm/test_group_gemm.py.
+    # Matches tests/gemm/grouped/test_group_gemm.py.
     _check(segment_gemm_run_trace, ref_out, api_out, atol=2e-3, rtol=1e-3)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

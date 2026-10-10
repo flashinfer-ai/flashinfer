@@ -1741,7 +1741,7 @@ class FlashInferAttentionDispatcher(nn.Module):
         ).contiguous()
 
         # cudnn expects the per-sequence length tensors as 4-D `(batch, 1, 1, 1)`
-        # (see tests/attention/test_cudnn_prefill.py). Passing 1-D `(batch,)`
+        # (see tests/attention/cudnn/test_cudnn_prefill.py). Passing 1-D `(batch,)`
         # triggers "seqLenQDesc.getNbDims() != 4, CUDNN_STATUS_BAD_PARAM".
         actual_seq_lens_q = torch.full(
             (batch_size, 1, 1, 1), seq_len_q, dtype=torch.int32, device=device
