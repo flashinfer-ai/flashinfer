@@ -667,6 +667,9 @@ def get_batch_prefill_module(backend, *args):
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta,
                 token_pos_in_items_len,
+                # Both entry points share one parameter list; a ragged run has
+                # no pages, so this is never read.
+                0,  # kv_logical_block_size
             )
         elif is_fp8:
             # FA3 FP8: scale_q, scale_k, scale_v, sm_scale, scale_q_scalar, scale_k_scalar, scale_v_scalar
@@ -823,6 +826,8 @@ def get_batch_prefill_module(backend, *args):
         use_fp16_softmax: Optional[bool] = None,
         uses_spcompress: Optional[bool] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+        # Keep new parameters last: callers pass the ones above positionally.
+        kv_logical_block_size: int = 0,
     ) -> None:
         if backend == "trtllm-gen":
             assert num_qo_heads is not None
@@ -903,6 +908,7 @@ def get_batch_prefill_module(backend, *args):
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta
                 token_pos_in_items_len,
+                kv_logical_block_size,
             )
         else:
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
@@ -1014,6 +1020,8 @@ def get_batch_prefill_module(backend, *args):
         use_fp16_softmax: Optional[bool] = None,
         uses_spcompress: Optional[bool] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+        # Keep new parameters last, as the real implementation does.
+        kv_logical_block_size: int = 0,
     ) -> None:
         pass
 
@@ -3911,6 +3919,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         "scale_k_scalar": scale_k_scalar,
                         "scale_v_scalar": scale_v_scalar,
                         "token_pos_in_items_len": self._token_pos_in_items_len,
+                        "kv_logical_block_size": 0,
                     }
                     # prepare_jit_additional_args returns one entry per declared
                     # tensor name plus any scalars the caller passed

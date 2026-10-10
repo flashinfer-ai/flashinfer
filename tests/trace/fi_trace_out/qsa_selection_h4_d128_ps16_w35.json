@@ -1,0 +1,115 @@
+{
+  "name": "qsa_selection_h4_d128_ps16_w35",
+  "description": "QSASelection.run(): score the compressed cache, keep the top blocks of each row, and expand them into the caller's logical route.",
+  "op_type": "qsa_selection",
+  "tags": [
+    "fi_api:flashinfer.qsa_ops.selection.QSASelection.run",
+    "status:verified",
+    "sparse"
+  ],
+  "axes": {
+    "num_rows": {
+      "type": "var"
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 4
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "num_pages": {
+      "type": "var"
+    },
+    "page_size": {
+      "type": "const",
+      "value": 16
+    },
+    "num_requests": {
+      "type": "var"
+    },
+    "table_width": {
+      "type": "var"
+    },
+    "route_width": {
+      "type": "const",
+      "value": 35
+    },
+    "workspace_bytes": {
+      "type": "var"
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "num_rows",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k_compressed": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "block_table": {
+      "shape": [
+        "num_requests",
+        "table_width"
+      ],
+      "dtype": "int32",
+      "description": "Logical to physical page per request; negative is unmapped."
+    },
+    "token_to_request": {
+      "shape": [
+        "num_rows"
+      ],
+      "dtype": "int32",
+      "description": "Request of each row; a negative entry empties the row."
+    },
+    "query_positions": {
+      "shape": [
+        "num_rows"
+      ],
+      "dtype": "int32",
+      "description": "Position of each query."
+    },
+    "seq_lens": {
+      "shape": [
+        "num_requests"
+      ],
+      "dtype": "int32",
+      "description": "KV length of each request."
+    },
+    "out_route": {
+      "shape": [
+        "num_rows",
+        "route_width"
+      ],
+      "dtype": "int32"
+    },
+    "workspace": {
+      "shape": [
+        "workspace_bytes"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "out_route": {
+      "shape": [
+        "num_rows",
+        "route_width"
+      ],
+      "dtype": "int32",
+      "param": "out_route"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

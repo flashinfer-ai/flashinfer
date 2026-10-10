@@ -1,0 +1,326 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+from dataclasses import dataclass
+from typing import NamedTuple, Optional
+
+import torch
+
+from ..api_logging import flashinfer_api
+from .attention import QSAAttention
+from .selection import QSASelection, selection_route_width
+from ..topk import WORKSPACE_ALIGNMENT
+from ..utils import round_up
+
+
+@dataclass(frozen=True)
+class QSAConfig:
+    """Everything about a deployment's QSA that a cache does not decide.
+
+    ``num_slots`` and ``page_size`` are deliberately absent: they are the
+    cache's, and the cache does not exist when this is first asked.
+
+    Attributes
+    ----------
+    num_qo_heads, num_kv_heads, head_dim : int
+        The attention's query and cache heads, and the dimension of both.
+    max_rows : int
+        The widest batch a step may bring. The plan ladder's top rung is this,
+        and a batch past it has no plan.
+    q_data_type, kv_data_type, o_data_type : torch.dtype
+        Query, cache and output dtypes. A packed NVFP4 cache is ``uint8`` here
+        and says so through ``kv_cache_format``.
+    kv_cache_format : str
+        ``dense``, ``fp8_e4m3`` or ``nvfp4``. What the cache's bytes mean.
+    kv_layout : str
+        ``NHD`` or ``HND``, as the cache is laid out.
+    max_columns : int
+        The widest score row the selection can reach, which the deployment's
+        context length and compression decide.
+    compress_ratio, token_topk : int
+        How many tokens one compressed key stands for, and how many tokens a
+        query keeps. Together they fix the route's width.
+    index_num_heads, index_head_dim : int
+        The index side's query shape, which is not the attention's.
+    backend : str
+        Which block-sparse backend to plan for.
+    max_plans : int
+        Bounds how many rungs the plan ladder may have.
+    """
+
+    num_qo_heads: int
+    num_kv_heads: int
+    head_dim: int
+    max_rows: int
+    q_data_type: torch.dtype
+    kv_data_type: torch.dtype
+    o_data_type: torch.dtype
+    kv_cache_format: str
+    max_columns: int
+    compress_ratio: int
+    token_topk: int
+    index_num_heads: int
+    index_head_dim: int
+    kv_layout: str = "NHD"
+    backend: str = "auto"
+    max_plans: int = 16
+
+    @property
+    def route_width(self) -> int:
+        """Columns the route carries, which the top-k and compression fix."""
+        return selection_route_width(self.token_topk, self.compress_ratio)
+
+
+class QSAWorkspaceRequirements(NamedTuple):
+    """What a caller has to hand over, by lifetime.
+
+    Attributes
+    ----------
+    persistent_bytes : int
+        One contiguous ``uint8`` buffer this object keeps for its lifetime.
+    transient_bytes : int
+        One contiguous ``uint8`` buffer a call may share with anything else.
+    alignment : int
+        What the first byte of each has to start on.
+    """
+
+    persistent_bytes: int
+    transient_bytes: int
+    alignment: int
+
+
+class QSA:
+    """One deployment's QSA, selection and attention together.
+
+    The caller provides two contiguous buffers and this cuts everything out of
+    them: the plan arena and the row pointers, read back by every call, out of
+    the persistent one; the padded query and output, the physical route and its
+    mask, the selection's scratch and the float workspace, rewritten before they
+    are read, out of the transient one. The *logical* route stays the caller's:
+    it is per layer, and this object is shared between layers.
+
+    The order is fixed and it is the whole lifecycle:
+
+    1. :meth:`workspace_requirements` while the caller's scratch can still grow,
+    2. construction against the persistent buffer it allocated,
+    3. :meth:`bind_transient_workspace` once its scratch has stopped moving,
+    4. :meth:`plan_cache` once the cache exists, again if it is replaced,
+    5. :meth:`run_selection` and :meth:`run_attention`, after which the plans
+       are frozen because a graph may be replaying them.
+
+    Parameters
+    ----------
+    config : QSAConfig
+        The deployment's geometry.
+    persistent : torch.Tensor
+        ``uint8``, at least :meth:`workspace_requirements` ``.persistent_bytes``
+        long and aligned to its ``alignment``. Kept for the life of this object.
+    """
+
+    @flashinfer_api
+    def __init__(self, config: QSAConfig, persistent: torch.Tensor) -> None:
+        """See :class:`QSA`."""
+        self.config = config
+        self.device = persistent.device
+        self.route_width = config.route_width
+        self._attention = QSAAttention(
+            persistent,
+            max_rows=config.max_rows,
+            num_qo_heads=config.num_qo_heads,
+            num_kv_heads=config.num_kv_heads,
+            head_dim=config.head_dim,
+            route_width=config.route_width,
+            q_data_type=config.q_data_type,
+            kv_data_type=config.kv_data_type,
+            o_data_type=config.o_data_type,
+            kv_cache_format=config.kv_cache_format,
+            kv_layout=config.kv_layout,
+            backend=config.backend,
+            max_plans=config.max_plans,
+        )
+        self._selection = QSASelection(
+            max_rows=config.max_rows,
+            max_columns=config.max_columns,
+            compress_ratio=config.compress_ratio,
+            token_topk=config.token_topk,
+            num_heads=config.index_num_heads,
+            head_dim=config.index_head_dim,
+            device=persistent.device,
+        )
+
+    @flashinfer_api
+    def bind_transient_workspace(self, transient: torch.Tensor) -> None:
+        """Take the scratch both halves rewrite before they read, once the caller's
+        scratch has stopped moving: a reallocation would free what the views point into.
+
+        Parameters
+        ----------
+        transient : torch.Tensor
+            ``uint8``, at least :meth:`workspace_requirements`
+            ``.transient_bytes`` long and aligned to its ``alignment``.
+        """
+        attention_bytes, _selection_bytes = QSA._transient_split(
+            self.config, transient.device
+        )
+        self._attention.bind_transient_workspace(transient[:attention_bytes])
+        self._selection.bind_workspace(transient[attention_bytes:])
+
+    # -- sizing ------------------------------------------------------------
+
+    @staticmethod
+    def _attention_bytes(config: QSAConfig, device: torch.device):
+        return QSAAttention.workspace_bytes(
+            device=device,
+            max_rows=config.max_rows,
+            num_qo_heads=config.num_qo_heads,
+            num_kv_heads=config.num_kv_heads,
+            head_dim=config.head_dim,
+            route_width=config.route_width,
+            q_data_type=config.q_data_type,
+            kv_data_type=config.kv_data_type,
+            o_data_type=config.o_data_type,
+            kv_cache_format=config.kv_cache_format,
+            kv_layout=config.kv_layout,
+            backend=config.backend,
+            max_plans=config.max_plans,
+        )
+
+    @staticmethod
+    def _selection_bytes(config: QSAConfig, device: torch.device) -> int:
+        return QSASelection.plan_workspace_size(
+            device=device,
+            max_rows=config.max_rows,
+            max_columns=config.max_columns,
+            compress_ratio=config.compress_ratio,
+            token_topk=config.token_topk,
+            num_heads=config.index_num_heads,
+            head_dim=config.index_head_dim,
+        )
+
+    @staticmethod
+    def _transient_split(config: QSAConfig, device: torch.device):
+        _persistent, attention = QSA._attention_bytes(config, device)
+        selection = QSA._selection_bytes(config, device)
+        return (
+            round_up(attention, WORKSPACE_ALIGNMENT),
+            round_up(selection, WORKSPACE_ALIGNMENT),
+        )
+
+    @staticmethod
+    @flashinfer_api
+    def workspace_requirements(
+        config: QSAConfig, *, device: torch.device
+    ) -> QSAWorkspaceRequirements:
+        """How much memory of each lifetime this configuration runs out of,
+        computed from the geometry without building either half.
+
+        Parameters
+        ----------
+        config : QSAConfig
+            The deployment's geometry.
+        device : torch.device
+            The device the workspaces will be on.
+
+        Returns
+        -------
+        QSAWorkspaceRequirements
+            Persistent and transient bytes, and their alignment.
+        """
+        persistent, _attention = QSA._attention_bytes(config, device)
+        attention, selection = QSA._transient_split(config, device)
+        return QSAWorkspaceRequirements(
+            persistent_bytes=round_up(persistent, WORKSPACE_ALIGNMENT),
+            transient_bytes=attention + selection,
+            alignment=WORKSPACE_ALIGNMENT,
+        )
+
+    # -- planning ----------------------------------------------------------
+
+    @flashinfer_api
+    def plan_cache(self, num_slots: int, page_size: int) -> None:
+        """Plan for a cache of this many slots, in the workspace already held.
+
+        Called once the cache exists and again if it is replaced; a no-op for
+        the cache it already has, and refused after a run because a captured
+        graph replays the plans. See :meth:`QSAAttention.plan_cache`.
+        """
+        self._attention.plan_cache(num_slots, page_size)
+
+    @property
+    def num_slots(self) -> Optional[int]:
+        """The cache size the plans are for, or ``None`` before there is one."""
+        return self._attention.num_slots
+
+    # -- execution ---------------------------------------------------------
+
+    @flashinfer_api
+    def run_selection(
+        self,
+        q: torch.Tensor,
+        k_compressed: torch.Tensor,
+        block_table: torch.Tensor,
+        token_to_request: torch.Tensor,
+        query_positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        out_route: torch.Tensor,
+    ) -> torch.Tensor:
+        """Choose this batch's tokens into the caller's per-layer ``out_route``.
+        See :meth:`QSASelection.run`."""
+        return self._selection.run(
+            q,
+            k_compressed,
+            block_table,
+            token_to_request,
+            query_positions,
+            seq_lens,
+            out_route=out_route,
+        )
+
+    @flashinfer_api
+    def run_attention(
+        self,
+        q: torch.Tensor,
+        k_data: torch.Tensor,
+        v_data: torch.Tensor,
+        *,
+        route: torch.Tensor,
+        block_table: torch.Tensor,
+        token_to_request: torch.Tensor,
+        output_gate: torch.Tensor,
+        k_sf: Optional[torch.Tensor] = None,
+        v_sf: Optional[torch.Tensor] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Attend over the route the selection wrote, gate it, and return it. The
+        cache planes arrive per call, so nothing here outlives a tensor the caller
+        owns. See :meth:`QSAAttention.run`."""
+        return self._attention.run(
+            q,
+            k_data,
+            v_data,
+            route=route,
+            block_table=block_table,
+            token_to_request=token_to_request,
+            output_gate=output_gate,
+            k_sf=k_sf,
+            v_sf=v_sf,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            out=out,
+        )
