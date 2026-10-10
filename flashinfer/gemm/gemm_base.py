@@ -28,6 +28,9 @@ import torch
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 
+from ..experimental.frost_low_latency.support import (
+    check_bmm_fp8 as _frost_bmm_fp8_requirement,
+)
 from ..api_logging import flashinfer_api
 from ..trace.templates.gemm import (
     batch_deepgemm_fp8_nt_groupwise_trace,
@@ -9526,6 +9529,7 @@ def _heuristic_func_bmm_fp8(
         "cublas": _cublas_bmm_fp8_requirement,
         "cutlass": _cutlass_bmm_fp8_requirement,
         "cute-dsl": _cute_dsl_bmm_fp8_requirement,
+        "frost-low-latency": _frost_bmm_fp8_requirement,
     },
     common_check=_check_bmm_fp8_problem_size,
     heuristic_func=_heuristic_func_bmm_fp8,
@@ -9538,7 +9542,9 @@ def bmm_fp8(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
+    backend: Literal[
+        "cudnn", "cublas", "cutlass", "cute-dsl", "frost-low-latency", "auto"
+    ] = "cublas",
 ) -> torch.Tensor:
     r"""BMM FP8
 
@@ -9562,10 +9568,16 @@ def bmm_fp8(
     out: Optional[torch.Tensor]
         Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
 
-    backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"]
+    backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "frost-low-latency", "auto"]
         The backend to use for the operation. Defaults to ``"cublas"``.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
         ``"cute-dsl"`` uses CuTe-DSL kernels optimized for SM100+ (Blackwell/Rubin) architectures.
+
+        ``"frost-low-latency"`` is an explicit-only experimental SM100/SM107 SIMT backend
+        for E4M3 inputs, BF16 output, scalar FP32 scales, batch dimension 1,
+        M <= 64, K divisible by 512 and N divisible by 8. A must be contiguous,
+        B column-major, and both 16-byte aligned. It is not selected by auto
+        or autotuning, including when experimental auto backends are enabled.
 
     Returns
     -------
@@ -9596,6 +9608,11 @@ def bmm_fp8(
     >>> out.dtype
     torch.bfloat16
     """
+
+    if backend == "frost-low-latency":
+        from ..experimental.frost_low_latency.fp8 import bmm_fp8 as run
+
+        return run(A, B, A_scale, B_scale, dtype, out)
 
     if out is None:
         out = torch.empty(
