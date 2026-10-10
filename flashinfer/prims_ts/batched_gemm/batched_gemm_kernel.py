@@ -3014,7 +3014,7 @@ def gemm(
     else:
         tma_store_cols = cfg.non_swap_tma_store_cols
     if cutlass.const_expr(cfg.has_epilogue_quant):
-        if cutlass.const_expr(cfg.use_tma_store):
+        if cutlass.const_expr(cfg.use_tma_store and cfg.is_swap_ab):
             if cutlass.const_expr(cfg.uses_mxfp8_output_quant):
                 tma_c_swizzle = cuda.TensorMapSwizzle.s64b
                 tma_c_format = cuda.TensorMapDataFormat.BYTE
@@ -3091,14 +3091,17 @@ def gemm(
     if cutlass.const_expr(cfg.is_swap_ab and cfg.has_gated_epilogue):
         output_m_for_sf = m // Int32(2)
     if cutlass.const_expr(cfg.has_epilogue_quant):
+        sf_tokens = n if cutlass.const_expr(cfg.is_swap_ab) else m
+        if cutlass.const_expr(not cfg.is_swap_ab):
+            output_m_for_sf = n // Int32(2)
         sf_block_m = Int32(cfg.output_sf_block_size_c)
         sf_group_m = sf_block_m * Int32(4)
         if cutlass.const_expr(cfg.sf_layout_c == int(SfLayout.R8c4)):
-            sf_c_elems = ((n + Int32(7)) // Int32(8)) * (
+            sf_c_elems = ((sf_tokens + Int32(7)) // Int32(8)) * (
                 ((output_m_for_sf + sf_group_m - Int32(1)) // sf_group_m) * Int32(32)
             )
         else:
-            sf_c_elems = ((n + Int32(127)) // Int32(128)) * (
+            sf_c_elems = ((sf_tokens + Int32(127)) // Int32(128)) * (
                 ((output_m_for_sf + sf_group_m - Int32(1)) // sf_group_m) * Int32(512)
             )
         sf_c_layout = cute.make_layout((sf_c_elems,), stride=(1,))

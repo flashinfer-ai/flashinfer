@@ -1770,11 +1770,12 @@ class BatchedGemmConfig:
     def use_tile256_tmem_overlap(self) -> bool:
         """True for the ``tile_n == 256`` fused-SF / max-TMEM-overlap path.
 
-        Enabled for block-scaled N256 and BF16 BatchM N256 kernels. The
+        Enabled for block-scaled N256 and unscaled BatchM N256 kernels. The
         overlap chunk follows each path's T2R width; see :func:`validate_config`.
         """
+        has_unscaled_batch_m = self.is_batch_m and (self.is_bf16_mma or self.is_fp8_mma)
         return (
-            (self.has_scale_factors or (self.is_bf16_mma and self.is_batch_m))
+            (self.has_scale_factors or has_unscaled_batch_m)
             and self.use_max_tmem_overlap != 0
             and self.tile_n == 256
         )
@@ -3146,10 +3147,17 @@ def validate_config(
             raise ValueError(
                 "Output block scaling requires dtype_c=e2m1, mxe2m1, or mxe4m3"
             )
-        if not cfg.is_swap_ab or not cfg.has_gated_epilogue:
-            raise ValueError(
-                "Output block scaling currently requires is_swap_ab with a gated epilogue"
-            )
+        if not cfg.has_gated_epilogue:
+            raise ValueError("Output block scaling requires a gated epilogue")
+        if cfg.is_batch_m and cfg.uses_mx_output_quant:
+            raise ValueError("BatchM MX output block scaling is not implemented")
+        if cfg.is_batch_m and problem_mnk is not None:
+            _, problem_n, _ = problem_mnk
+            if isinstance(problem_n, int) and problem_n % 32:
+                raise ValueError(
+                    "BatchM NVFP4 gated output requires complete 16-value scale blocks "
+                    "(problem_n divisible by 32)"
+                )
         if cfg.sf_layout_c not in (int(SfLayout.R8c4), int(SfLayout.R128c4)):
             raise ValueError("Output block scaling requires sf_layout_c 8x4 or 128x4")
 
@@ -3161,22 +3169,21 @@ def validate_config(
         raise ValueError("Plain FP8 C output requires an activation-side epilogue")
 
     if cfg.is_batch_m and not (
-        not cfg.has_epilogue_quant
-        and cfg.epi_tile_n % 128 == 0
-        and cfg.tile_n % 32 == 0
-        and cfg.epi_tile_m == 128
+        cfg.epi_tile_n % 128 == 0 and cfg.tile_n % 32 == 0 and cfg.epi_tile_m == 128
     ):
         raise ValueError(
-            "BatchM requires non-quantizing 128-row epilogues and whole 128-column shuffle blocks"
+            "BatchM requires 128-row epilogues and whole 128-column shuffle blocks"
         )
 
     if cfg.use_max_tmem_overlap != 0:
         if not cfg.use_tile256_tmem_overlap:
             raise ValueError(
-                "use_max_tmem_overlap requires block-scaled or BatchM BF16 tile_n=256 kernels"
+                "use_max_tmem_overlap requires block-scaled or unscaled BatchM tile_n=256 kernels"
             )
         supported_tile_k = (
-            (64,) if cfg.is_bf16_mma else ((128, 256) if cfg.is_mx_mma else (256,))
+            (64,)
+            if cfg.is_bf16_mma
+            else ((128, 256) if cfg.is_mx_mma or cfg.is_fp8_mma else (256,))
         )
         if (
             cfg.tile_k not in supported_tile_k

@@ -1682,3 +1682,37 @@ def test_validation_rejects_plain_fp8_output_without_activation_side():
     )
     with pytest.raises(ValueError, match="Plain FP8 C output"):
         validate_config(cfg)
+
+
+def test_batch_m_nvfp4_output_rejects_partial_scale_block():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        ActKind,
+        BatchMode,
+        DType,
+        SfLayout,
+        make_config,
+        validate_config,
+    )
+
+    cfg = make_config(
+        batch_mode=int(BatchMode.BATCH_M),
+        transpose_mma_output=0,
+        act_kind=int(ActKind.SWIGLU),
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(DType.E2M1),
+        tile_m=128,
+        tile_n=128,
+        tile_k=256,
+        mma_m=128,
+        mma_n=128,
+        mma_k=64,
+        epi_tile_m=128,
+        epi_tile_n=128,
+        num_stages_a=2,
+        num_stages_b=2,
+        sf_layout_b=int(SfLayout.R128c4),
+    )
+    validate_config(cfg, problem_mnk=(256, 512, 512))
+    with pytest.raises(ValueError, match="complete 16-value scale blocks"):
+        validate_config(cfg, problem_mnk=(256, 528, 512))

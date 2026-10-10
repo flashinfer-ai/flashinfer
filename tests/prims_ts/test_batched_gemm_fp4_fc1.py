@@ -892,3 +892,73 @@ class TestFp4Fc1SfbTmaRouteCluster2:
             **base,
         )
         assert result, "routed-SFB tma cluster2 tile_n=64 (256 tokens) failed"
+
+
+@pytest.mark.parametrize("dtype", ["nvfp4", "fp8"])
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("use_tma_store", [0, 1])
+@pytest.mark.parametrize("sf_layout", [int(SfLayout.R8c4), int(SfLayout.R128c4)])
+def test_batch_m_quantized_output(dtype, overlap, use_tma_store, sf_layout):
+    """Quantized BatchM output across persistent reuse and the N256 overlap path."""
+    if dtype == "fp8" and sf_layout != int(SfLayout.R8c4):
+        pytest.skip("Plain FP8 output has no block-scale layout")
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    nvfp4 = dtype == "nvfp4"
+    dtype_kind = int(DType.E2M1 if nvfp4 else DType.E4M3)
+    cfg = dict(
+        batch_mode=int(BatchMode.BATCH_M),
+        transpose_mma_output=0,
+        dtype_a=dtype_kind,
+        dtype_b=dtype_kind,
+        dtype_c=dtype_kind,
+        tile_m=128,
+        tile_n=256 if overlap else 128,
+        tile_k=256 if nvfp4 else 128,
+        mma_m=256,
+        mma_n=256 if overlap else 128,
+        mma_k=64 if nvfp4 else 32,
+        cluster_m=2,
+        epi_tile_m=128,
+        epi_tile_n=128,
+        tile_scheduler=1,
+        num_stages_tmem_acc=1 if overlap else 2,
+        use_max_tmem_overlap=int(overlap),
+        use_unroll_loop_2x_for_mma=0,
+        act_kind=int(ActKind.SWIGLU),
+        route_act=0,
+        use_tma_store=use_tma_store,
+        use_global_scales=1,
+        sf_layout_b=int(SfLayout.R128c4),
+        sf_layout_c=sf_layout,
+        **uniform_pipeline_stage_overrides(2),
+    )
+    ok, quant = reference_check(
+        num_experts=3,
+        num_tokens=769,
+        top_k=2,
+        problem_n=512,
+        problem_k=512,
+        repeat_launches=3,
+        scale_c_value=0.75 if nvfp4 else 1024.0,
+        seed=317,
+        return_output=True,
+        **cfg,
+    )
+    ok_ref, bf16 = reference_check(
+        num_experts=3,
+        num_tokens=769,
+        top_k=2,
+        problem_n=512,
+        problem_k=512,
+        repeat_launches=3,
+        scale_c_value=0.75 if nvfp4 else 1024.0,
+        seed=317,
+        return_output=True,
+        **(cfg | {"dtype_c": int(DType.BF16)}),
+    )
+    assert ok and ok_ref
+    relative_rmse = (
+        (quant.float() - bf16.float()).square().mean() / bf16.float().square().mean()
+    ).sqrt()
+    assert relative_rmse < (0.2 if nvfp4 else 0.05)

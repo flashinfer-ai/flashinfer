@@ -1007,7 +1007,9 @@ class GmemCResource(MemoryResource):
                 up = self._maybe_add_bias_m(up, expert_idx, row, row_in_tile)
                 result = self._apply_gated_activation(gate, up, scale_gate)
                 result = self._maybe_apply_scale_c(result, scale_c)
-                if cutlass.const_expr(self.cfg.uses_non_swap_tma_store):
+                if cutlass.const_expr(
+                    self.cfg.uses_non_swap_tma_store or self.cfg.has_epilogue_quant
+                ):
                     gated_values[pi] = result
                 else:
                     result_out = self._to_output_value(result)
@@ -1027,7 +1029,11 @@ class GmemCResource(MemoryResource):
                             vector_size=1,
                             alignment=(1 if self.cfg.uses_fp8_output else 2),
                         )
-            if cutlass.const_expr(self.cfg.uses_non_swap_tma_store):
+            if cutlass.const_expr(self.cfg.has_epilogue_quant):
+                self._store_non_swap_nvfp4(
+                    gated_values, row, col_base, output_n, token_in_bounds
+                )
+            elif cutlass.const_expr(self.cfg.uses_non_swap_tma_store):
                 vec_out = self._to_output_value(
                     cutlass.Vector.from_elements(tuple(gated_values), dtype=Float32)
                 )
@@ -1839,6 +1845,36 @@ class GmemCResource(MemoryResource):
             thread_count=self.cfg.num_epilogue_warps * 32,
         )
         return block_absmax
+
+    @cute.jit
+    def _store_non_swap_nvfp4(self, values, row, col_base, output_n, token_in_bounds):
+        """Each lane owns contiguous feature blocks and their NVFP4 scales.
+
+        Packed values use direct stores: a 16-value block is only eight bytes,
+        below the minimum TMA box. SF-C uses the same token/feature layout as
+        BatchN, with logical coordinates reversed for BatchM.
+        """
+        num_values = self.cfg.epi_tile_n // 8
+        for block in cutlass.range_constexpr(num_values // 16):
+            absmax = Float32(0.0)
+            for i in cutlass.range_constexpr(16):
+                absmax = cute.math.max(absmax, cute.math.abs(values[block * 16 + i]))
+            sf = absmax * Float32(1.0 / 6.0)
+            inv_sf = cute.math.rcp(
+                cute.math.max(sf, Float32(1.0e-12)), approx=True, ftz=True
+            )
+            feature = col_base + Int32(block * 16)
+            if token_in_bounds & (feature < output_n):
+                sf_idx = self._sf_c_index(feature, row, output_n)
+                self.gSfCBytes.subview(sf_idx).store(
+                    sf.to(cutlass.Float8E4M3FN).bitcast(cutlass.Int8)
+                )
+                for pair in cutlass.range_constexpr(8):
+                    lo = values[block * 16 + pair * 2] * inv_sf
+                    hi = values[block * 16 + pair * 2 + 1] * inv_sf
+                    packed = _convert_f32x2_to_e2m1x2(hi, lo)
+                    byte_idx = (row * output_n + feature) // Int32(2) + Int32(pair)
+                    self.gCBytes.subview(byte_idx).store(packed)
 
     @cute.jit
     def _sf_c_index(self, m_row, n_col, output_m):
