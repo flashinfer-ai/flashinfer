@@ -7,6 +7,7 @@ import os
 import pytest
 import torch
 
+from ._mxfp8_reference import mxfp8_dequantize_ref, mxfp8_quantize_ref
 from ._sm90_push_fp8_reference import dequant_weight_128x128, reference_moe
 
 pytestmark = pytest.mark.usefixtures("isolated_deep_gemm_cache")
@@ -112,6 +113,7 @@ def _build_layer(
     fuse_fc1_epilogue: bool = True,
     capacity_factor: float = 1.0,
     seed: int = 7,
+    weights: str = "bf16",
 ):
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -126,6 +128,22 @@ def _build_layer(
     w13, w2 = _make_weights(total_experts, seed, device)
     local_start = rank * LOCAL_EXPERTS
     local_end = local_start + LOCAL_EXPERTS
+    local = slice(local_start, local_end)
+    if weights == "mxfp8":
+        # MXFP8 checkpoint pack; the backend converts it once, losslessly up
+        # to rare E4M3 underflow, so the reference uses the exact MXFP8
+        # values (fp32) instead of re-quantizing bf16.
+        (w13_q, w13_sf), (w2_q, w2_sf) = mxfp8_quantize_ref(w13), mxfp8_quantize_ref(w2)
+        pack = MoEWeightPack(
+            w13=w13_q[local].contiguous(),
+            w2=w2_q[local].contiguous(),
+            w13_scale=w13_sf[local].contiguous(),
+            w2_scale=w2_sf[local].contiguous(),
+        )
+        w13 = mxfp8_dequantize_ref(w13_q, w13_sf).float()
+        w2 = mxfp8_dequantize_ref(w2_q, w2_sf).float()
+    else:
+        pack = MoEWeightPack(w13=w13[local].contiguous(), w2=w2[local].contiguous())
     process_group = None
     if world_size > 1:
         import torch.distributed as dist
@@ -142,10 +160,7 @@ def _build_layer(
             max_tokens_per_rank=TOKEN_CAPACITY,
             token_hidden_size=HIDDEN,
         ),
-        weights=MoEWeightPack(
-            w13=w13[local_start:local_end].contiguous(),
-            w2=w2[local_start:local_end].contiguous(),
-        ),
+        weights=pack,
         backend=MegaConfig(
             megakernel=Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig(
                 intermediate_size=INTERMEDIATE,
@@ -193,6 +208,9 @@ def _dequant_reference(
         transform_weights_for_sm90_push,
     )
 
+    if w13.dtype == torch.float32:
+        # Exact MXFP8 values (see _build_layer); nothing to re-quantize.
+        return reference_moe(x, w13, w2, topk_ids, topk_weights)
     w13_fp8, w13_scales, w2_fp8, w2_scales = transform_weights_for_sm90_push(w13, w2)
     w13_dequant = torch.stack(
         [dequant_weight_128x128(w13_fp8[e], w13_scales[e]) for e in range(w13.shape[0])]
@@ -224,6 +242,7 @@ def _cosine(output: torch.Tensor, reference: torch.Tensor) -> float:
 
 
 @requires_sm90
+@pytest.mark.parametrize("weights", ["bf16", "mxfp8"])
 @pytest.mark.parametrize(
     "payload_dtype,combine_dtype,dedup_dispatch,grouped_combine,fuse_fc1_epilogue",
     [
@@ -239,6 +258,7 @@ def test_public_ep1_forward_configs(
     dedup_dispatch: bool,
     grouped_combine: bool,
     fuse_fc1_epilogue: bool,
+    weights: str,
 ) -> None:
     from flashinfer.moe_ep import MoEEpMegaLayer
 
@@ -252,6 +272,7 @@ def test_public_ep1_forward_configs(
         dedup_dispatch=dedup_dispatch,
         grouped_combine=grouped_combine,
         fuse_fc1_epilogue=fuse_fc1_epilogue,
+        weights=weights,
     )
     assert isinstance(layer, MoEEpMegaLayer)
     x, ids, weights = _make_inputs(TOKEN_CAPACITY, LOCAL_EXPERTS, 11, device)
@@ -266,10 +287,11 @@ def test_public_ep1_forward_configs(
 
 
 @requires_sm90
+@pytest.mark.parametrize("weights", ["bf16", "mxfp8"])
 @pytest.mark.parametrize("case", ["short", "masked", "hot", "empty"])
-def test_public_ep1_edge_routes_and_recovery(case: str) -> None:
+def test_public_ep1_edge_routes_and_recovery(case: str, weights: str) -> None:
     device = torch.device("cuda", 0)
-    layer, w13, w2 = _build_layer(1, 0, device)
+    layer, w13, w2 = _build_layer(1, 0, device, weights=weights)
     if case == "empty":
         num_tokens = 0
     elif case == "short":
@@ -342,9 +364,10 @@ def test_public_ep1_outputs_do_not_alias() -> None:
 
 
 @requires_sm90
-def test_public_ep1_graph_replay() -> None:
+@pytest.mark.parametrize("weights", ["bf16", "mxfp8"])
+def test_public_ep1_graph_replay(weights: str) -> None:
     device = torch.device("cuda", 0)
-    layer, _, _ = _build_layer(1, 0, device)
+    layer, _, _ = _build_layer(1, 0, device, weights=weights)
     inputs = [
         _make_inputs(TOKEN_CAPACITY, LOCAL_EXPERTS, 51 + index, device)
         for index in range(2)
@@ -436,6 +459,7 @@ def _dist_setup() -> tuple[int, int]:
 
 
 @requires_dist
+@pytest.mark.parametrize("weights", ["bf16", "mxfp8"])
 @pytest.mark.parametrize(
     "payload_dtype,combine_dtype,dedup_dispatch,grouped_combine,fuse_fc1_epilogue,mode",
     [
@@ -450,6 +474,7 @@ def test_public_ep2_forward_configs(
     grouped_combine: bool,
     fuse_fc1_epilogue: bool,
     mode: str,
+    weights: str,
 ) -> None:
     import torch.distributed as dist
 
@@ -465,6 +490,7 @@ def test_public_ep2_forward_configs(
         dedup_dispatch=dedup_dispatch,
         grouped_combine=grouped_combine,
         fuse_fc1_epilogue=fuse_fc1_epilogue,
+        weights=weights,
     )
     x, ids, weights = _make_inputs(
         TOKEN_CAPACITY,
@@ -485,13 +511,14 @@ def test_public_ep2_forward_configs(
 
 
 @requires_dist
-def test_public_ep2_uneven_empty_and_recovery() -> None:
+@pytest.mark.parametrize("weights", ["bf16", "mxfp8"])
+def test_public_ep2_uneven_empty_and_recovery(weights: str) -> None:
     import torch.distributed as dist
 
     rank, world_size = _dist_setup()
     device = torch.device("cuda", rank)
     total_experts = LOCAL_EXPERTS * world_size
-    layer, w13, w2 = _build_layer(world_size, rank, device)
+    layer, w13, w2 = _build_layer(world_size, rank, device, weights=weights)
     num_tokens = 0 if rank == 1 else max(TOKEN_CAPACITY - 13 * rank, 1)
     x, ids, weights = _make_inputs(
         num_tokens, total_experts, 71 + rank, device, rank=rank

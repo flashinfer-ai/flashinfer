@@ -157,6 +157,7 @@ def _mega_problem(
     num_experts: int = 8,
     topk: int = 4,
     hidden: int = 2048,
+    weights: str = "bf16",
 ):
     intermediate = 1024
     gate_up_clamp = 10.0
@@ -199,17 +200,31 @@ def _mega_problem(
         topk_ids=topk_ids,
         w13=w13,
         w2=w2,
+        weights=weights,
     )
 
 
-def _preprocess_weights(problem: dict):
+def _weight_pack(problem: dict):
+    """The layer's ``MoEWeightPack``: bf16 canonical, or an MXFP8 checkpoint
+    pack of the same weights (``weights="mxfp8"``, blockwise only)."""
     from flashinfer.moe_ep import MoEWeightPack
+
+    if problem["weights"] == "mxfp8":
+        from ._mxfp8_reference import mxfp8_quantize_ref
+
+        w13, w13_scale = mxfp8_quantize_ref(problem["w13"])
+        w2, w2_scale = mxfp8_quantize_ref(problem["w2"])
+        return MoEWeightPack(w13=w13, w2=w2, w13_scale=w13_scale, w2_scale=w2_scale)
+    return MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
+
+
+def _preprocess_weights(problem: dict):
     from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.weights import (
         preprocess_mega_weights,
     )
 
     return preprocess_mega_weights(
-        MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
+        _weight_pack(problem),
         intermediate_size=problem["intermediate"],
         hidden_size=problem["hidden"],
         kind=problem["kind"],
@@ -451,6 +466,7 @@ def _run_mega_layer(
     num_experts: int = 8,
     topk: int = 4,
     hidden: int = 2048,
+    weights: str = "bf16",
 ):
     import torch
     import torch.distributed as dist
@@ -462,7 +478,6 @@ def _run_mega_layer(
         MoEEpLayer,
         MoEEpMegaLayer,
         MoEEpTensors,
-        MoEWeightPack,
         bootstrap_moe_ep_runtime,
         ensure_moe_ep_cuda_device,
         finalize_moe_ep_runtime,
@@ -485,6 +500,7 @@ def _run_mega_layer(
         num_experts=num_experts,
         topk=topk,
         hidden=hidden,
+        weights=weights,
     )
     kernel = create_mega_kernel(
         _megakernel_config(
@@ -540,7 +556,7 @@ def _run_mega_layer(
                 max_tokens_per_rank=problem["max_tokens"],
                 token_hidden_size=problem["hidden"],
             ),
-            weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
+            weights=_weight_pack(problem),
             backend=MegaConfig(
                 megakernel=_megakernel_config(
                     problem,
@@ -620,6 +636,26 @@ def _run_mega_layer(
         raise
     finally:
         finalize_moe_ep_runtime(runtime)
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_moe_ep_sm90_pull_fp8_mega_layer_mxfp8_matches_reference(swap_ab):
+    """MXFP8 checkpoint weights through the layer (one-time blockwise conversion)."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="blockwise",
+        swap_ab=swap_ab,
+        weights="mxfp8",
+    )
+    print(f"rank {rank}: sm90 pull mega layer (mxfp8 weights, swap_ab={swap_ab}) OK")
 
 
 @pytest.mark.gpu_4
@@ -1246,7 +1282,7 @@ def _check_generate_c_output(fc1_c, ref_map, idx_g, rank, num_local_experts):
 
 
 def _run_mega_torch_oracle(
-    rank, world_size, *, fp8_scale_mode, swap_ab=False, generate_c=False
+    rank, world_size, *, fp8_scale_mode, swap_ab=False, generate_c=False, weights="bf16"
 ):
     """Real-EP kernel launch vs the drop's pure-torch GLOBAL reference.
 
@@ -1281,7 +1317,11 @@ def _run_mega_torch_oracle(
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
     problem = _mega_problem(
-        rank, world_size, fp8_scale_mode=fp8_scale_mode, swap_ab=swap_ab
+        rank,
+        world_size,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        weights=weights,
     )
     kernel = create_mega_kernel(_megakernel_config(problem))
     runtime = bootstrap_moe_ep_runtime(
@@ -1425,26 +1465,34 @@ def _run_mega_torch_oracle(
 @pytest.mark.gpu_4
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize(
-    "fp8_scale_mode,swap_ab",
+    "fp8_scale_mode,swap_ab,weights",
     [
-        ("per_tensor", False),
-        ("per_tensor", True),
-        ("blockwise", False),
-        ("blockwise", True),
+        ("per_tensor", False, "bf16"),
+        ("per_tensor", True, "bf16"),
+        ("blockwise", False, "bf16"),
+        ("blockwise", True, "bf16"),
+        ("blockwise", False, "mxfp8"),
+        ("blockwise", True, "mxfp8"),
     ],
 )
-def test_moe_ep_sm90_pull_fp8_mega_multirank_torch_oracle(fp8_scale_mode, swap_ab):
+def test_moe_ep_sm90_pull_fp8_mega_multirank_torch_oracle(
+    fp8_scale_mode, swap_ab, weights
+):
     """Real cross-rank EP kernel vs pure-torch global math (see helper doc)."""
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_torch_oracle(
-        rank, world_size, fp8_scale_mode=fp8_scale_mode, swap_ab=swap_ab
+        rank,
+        world_size,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        weights=weights,
     )
     print(
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega kernel ({fp8_scale_mode}, "
-        f"swap_ab={swap_ab}) matches the multi-rank torch oracle"
+        f"swap_ab={swap_ab}, weights={weights}) matches the multi-rank torch oracle"
     )
 
 
@@ -1521,4 +1569,283 @@ def test_moe_ep_sm90_pull_fp8_mega_multirank_generate_c(fp8_scale_mode, swap_ab)
         fp8_scale_mode=fp8_scale_mode,
         swap_ab=swap_ab,
         generate_c=True,
+    )
+
+
+def _routing_round(problem: dict, rank: int, world_size: int, name: str):
+    """Per-rank (hidden, weights, ids) for one routing round.
+
+    ``uneven`` gives rank 1 zero tokens and every rank a different count;
+    ``masked`` drops slots (and one whole token) with ``-1``; ``hot`` sends
+    every token on every rank to the same experts; ``all_remote`` keeps
+    every route off the sending rank.
+    """
+    import torch
+
+    x, w, ids = problem["hidden_states"], problem["topk_weights"], problem["topk_ids"]
+    if name == "uneven":
+        n = 0 if rank == 1 else max(problem["max_tokens"] - 13 * rank, 1)
+        return x[:n], w[:n], ids[:n]
+    ids = ids.clone()
+    if name == "masked":
+        ids[::3, 0] = -1
+        ids[1::5, -1] = -1
+        ids[5] = -1
+    elif name == "hot":
+        ids[:] = torch.arange(problem["topk"], device="cuda")
+    elif name == "all_remote":
+        num_local = problem["num_experts"] // world_size
+        g = torch.Generator(device="cuda").manual_seed(29 + rank)
+        scores = torch.randn(
+            ids.shape[0], problem["num_experts"], device="cuda", generator=g
+        )
+        scores[:, rank * num_local : (rank + 1) * num_local] = float("-inf")
+        ids = scores.topk(problem["topk"], dim=-1).indices
+    else:
+        assert name == "balanced", name
+    return x, w, ids
+
+
+def _run_mega_routing_rounds(rank, world_size, *, swap_ab, weights):
+    """Back-to-back routing rounds on ONE symm buffer vs the global torch oracle.
+
+    Every round gathers the FULL staged capacity (rows past a rank's live
+    count carry ``-1`` routes, so ranks may differ in token count) and each
+    rank checks its live rows.  Reusing the buffer catches stale combine rows
+    leaking into masked slots.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        bootstrap_moe_ep_runtime,
+        ensure_moe_ep_cuda_device,
+        finalize_moe_ep_runtime,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.staging import (
+        stage_mega_moe_inputs,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        Fp8BlockScaleK,
+        compute_megamoe_reference_fp8,
+        hopper_fp8_mega_moe,
+    )
+
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
+    problem = _mega_problem(
+        rank, world_size, fp8_scale_mode="blockwise", swap_ab=swap_ab, weights=weights
+    )
+    kernel = create_mega_kernel(_megakernel_config(problem))
+    runtime = bootstrap_moe_ep_runtime(
+        bootstrap, kernel.runtime_requirements(bootstrap)
+    )
+    rounds = ["balanced", "uneven", "masked", "hot"]
+    if world_size > 1:
+        rounds.append("all_remote")
+    rounds.append("balanced")
+    try:
+        cap, hidden = problem["max_tokens"], problem["hidden"]
+        sf_cols = hidden // Fp8BlockScaleK
+        l1, l2 = _preprocess_weights(problem)
+        fc1_w_g = _all_gather_stack(l1[0].mT).mT
+        fc2_w_g = _all_gather_stack(l2[0].mT).mT
+        fc1_sf_g = _all_gather_stack(l1[1])
+        fc2_sf_g = _all_gather_stack(l2[1])
+        symm_buffer = _alloc_symm_buffer(problem, rank, world_size)
+        try:
+            for name in rounds:
+                x, w, ids = _routing_round(problem, rank, world_size, name)
+                n = x.shape[0]
+                stage_mega_moe_inputs(
+                    x,
+                    w,
+                    ids,
+                    symm_buffer.x,
+                    symm_buffer.x_sf,
+                    symm_buffer.topk_idx,
+                    symm_buffer.topk_weights,
+                    kind=problem["kind"],
+                    fp8_scale_mode="blockwise",
+                )
+                y_kernel = torch.empty(n, hidden, dtype=torch.bfloat16, device="cuda")
+                hopper_fp8_mega_moe(
+                    y_kernel,
+                    l1,
+                    l2,
+                    symm_buffer,
+                    num_tokens=n,
+                    gate_up_clamp=problem["gate_up_clamp"],
+                    fast_math=problem["fast_math"],
+                )
+                torch.cuda.synchronize()
+                dist.barrier()
+                x_sf_g = _all_gather_stack(symm_buffer.x_sf[:cap, :sf_cols].clone())
+                combine_ref = compute_megamoe_reference_fp8(
+                    input_activation=_all_gather_stack(symm_buffer.x[:cap].clone()),
+                    input_activation_sf=x_sf_g,
+                    input_topk_idx=_all_gather_stack(
+                        symm_buffer.topk_idx[:cap].clone()
+                    ),
+                    input_topk_weights=_all_gather_stack(
+                        symm_buffer.topk_weights[:cap].clone()
+                    ),
+                    fc1_weight=fc1_w_g,
+                    fc1_weight_sf=fc1_sf_g,
+                    fc2_weight=fc2_w_g,
+                    fc2_weight_sf=fc2_sf_g,
+                    fc1_activation_block_scale=x_sf_g,
+                    fc1_weight_block_scale=fc1_sf_g,
+                    fc2_weight_block_scale=fc2_sf_g,
+                    fc2_activation_block_scale=None,
+                    ab_dtype=torch.float8_e4m3fn,
+                    ref_compute_graph="deepgemm",
+                    fp8_accum_mode="1xacc",
+                    mma_tiler_k=128,
+                    fc2_output_dtype=torch.bfloat16,
+                    gate_up_clamp=problem["gate_up_clamp"],
+                    fp8_scale_mode="blockwise",
+                )
+                if n:
+                    y_ref = combine_ref[rank, :n].to(torch.float32).sum(dim=1)
+                    yk = y_kernel.to(torch.float32)
+                    rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
+                    assert torch.isfinite(yk).all(), (rank, name)
+                    torch.testing.assert_close(
+                        yk, y_ref, atol=1e-2, rtol=1e-2, msg=f"rank {rank} {name}"
+                    )
+                    assert rel_l2.item() < 0.02, (rank, name, rel_l2.item())
+                    if name == "masked":
+                        assert torch.all(y_kernel[5] == 0), (rank, name)
+                dist.barrier()
+            return rank
+        finally:
+            symm_buffer.destroy()
+    finally:
+        finalize_moe_ep_runtime(runtime)
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("weights", ["bf16", "mxfp8"])
+def test_moe_ep_sm90_pull_fp8_mega_multirank_routing_rounds(swap_ab, weights):
+    """Uneven (incl. a zero-token rank) / masked / hot / all-remote rounds vs the oracle."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    _run_mega_routing_rounds(rank, world_size, swap_ab=swap_ab, weights=weights)
+
+
+def _run_mega_layer_graph_lockstep(
+    rank, world_size, *, fp8_scale_mode, swap_ab, weights
+):
+    """Collective warmup -> capture -> lockstep replays == eager, then masked inputs."""
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        ensure_moe_ep_cuda_device,
+    )
+
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
+    problem = _mega_problem(
+        rank,
+        world_size,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        weights=weights,
+    )
+    mega = MoEEpLayer(
+        bootstrap=bootstrap,
+        fleet_params=FleetParams(
+            num_experts=problem["num_experts"],
+            max_tokens_per_rank=problem["max_tokens"],
+            token_hidden_size=problem["hidden"],
+        ),
+        weights=_weight_pack(problem),
+        backend=MegaConfig(
+            megakernel=_megakernel_config(problem),
+            quantize_input=True,
+            preprocess_weights=True,
+        ),
+    )
+    graph = None
+    try:
+        t = MoEEpTensors(
+            hidden_states=problem["hidden_states"].clone(),
+            topk_ids=problem["topk_ids"].clone(),
+            topk_weights=problem["topk_weights"].clone(),
+        )
+        mega.warmup()
+        dist.barrier()
+        y_eager = mega.forward(t).clone()
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            y_graph = mega.forward(t)
+        dist.barrier()
+        for _ in range(3):
+            graph.replay()
+            torch.cuda.synchronize()
+            dist.barrier()
+        assert torch.equal(y_graph, y_eager), f"rank {rank}: replay != eager"
+
+        # Same buffers, new data and masked routes.
+        _, _, masked_ids = _routing_round(problem, rank, world_size, "masked")
+        t.topk_ids.copy_(masked_ids)
+        t.hidden_states.mul_(-0.5)
+        graph.replay()
+        torch.cuda.synchronize()
+        dist.barrier()
+        y_replay = y_graph.clone()
+        y_eager2 = mega.forward(t)
+        torch.cuda.synchronize()
+        dist.barrier()
+        assert torch.equal(y_replay, y_eager2), f"rank {rank}: masked replay != eager"
+        return rank
+    finally:
+        if graph is not None:
+            graph.reset()
+        mega.destroy()
+        torch.cuda.synchronize()
+        dist.barrier()
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,swap_ab,weights",
+    [
+        ("per_tensor", False, "bf16"),
+        ("blockwise", True, "bf16"),
+        ("blockwise", False, "mxfp8"),
+        ("blockwise", True, "mxfp8"),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_graph_lockstep(
+    fp8_scale_mode, swap_ab, weights
+):
+    """Multi-rank CUDA graph capture + lockstep replay matches eager bit-exactly."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    _run_mega_layer_graph_lockstep(
+        rank,
+        world_size,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        weights=weights,
     )

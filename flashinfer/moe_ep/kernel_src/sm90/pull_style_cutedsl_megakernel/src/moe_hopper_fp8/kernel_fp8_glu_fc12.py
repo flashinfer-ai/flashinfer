@@ -52,6 +52,13 @@ from moe_nvfp4_swapab.moe_utils import spin_wait
 # Sm90SwigluFp8Fc12Kernel
 # =============================================================================
 
+def _scale_int_tuple(value, factor: int):
+    """Multiply every leaf of a static (nested) stride tuple by ``factor``."""
+    if isinstance(value, tuple):
+        return tuple(_scale_int_tuple(v, factor) for v in value)
+    return value * factor
+
+
 class Sm90SwigluFp8Fc12Kernel:
 
     _setmaxnreg_min = 24
@@ -70,8 +77,13 @@ class Sm90SwigluFp8Fc12Kernel:
     # FP8 elements, and four such bytes are carried as one 128-element dispatch
     # scale atom. Gate/up interleave is tracked separately by
     # Fp8GateUpInterleave.
+    # FI local extension: BFloat16 runs the per-tensor path with unit
+    # dequant scales (BF16 WGMMA, BF16 FC1 output; the E8M0 wire rides along
+    # unused).
     VALID_AB_DTYPE_SF_SIZE: dict = {
-        Fp8E8M0SfVecSize: (cutlass.Float8E4M3FN, cutlass.Float8E5M2,),
+        Fp8E8M0SfVecSize: (
+            cutlass.Float8E4M3FN, cutlass.Float8E5M2, cutlass.BFloat16,
+        ),
     }
 
     # Interleave granularity for gate and up in SwiGLU / GeGlu
@@ -215,6 +227,16 @@ class Sm90SwigluFp8Fc12Kernel:
             self.fp8_output_rcp_limit = Fp8E4M3RcpLimit
         elif ab_dtype == cutlass.Float8E5M2:
             self.fp8_output_rcp_limit = Fp8E5M2RcpLimit
+        elif ab_dtype == cutlass.BFloat16:
+            # No FC1-output quantization: the per-tensor epilogue only
+            # multiplies by the (unit) static scales and converts to BF16.
+            if fp8_scale_mode != "per_tensor" or fp8_accum_mode != "1xacc":
+                raise ValueError(
+                    "BFloat16 ab_dtype runs the per_tensor/1xacc path with "
+                    f"unit scales; got fp8_scale_mode={fp8_scale_mode!r}, "
+                    f"fp8_accum_mode={fp8_accum_mode!r}."
+                )
+            self.fp8_output_rcp_limit = 1.0
         else:
             raise ValueError(
                 f"Unsupported Hopper FP8 ab_dtype for output quant: {ab_dtype}."
@@ -414,11 +436,11 @@ class Sm90SwigluFp8Fc12Kernel:
                 f"via subtile early-exit)."
             )
 
-        dispatch_scale_atom_k = Fp8DispatchScaleAtomK
-        if k % dispatch_scale_atom_k != 0:
+        k_atom = self._mma_tile_k_atom()
+        if k % k_atom != 0:
             raise ValueError(
-                f"mma_tiler K ({k}) must be a multiple of "
-                f"FP8 dispatch scale atom K = {dispatch_scale_atom_k}"
+                f"mma_tiler K ({k}) must be a multiple of {k_atom} "
+                "(FP8: the dispatch scale atom; BF16: one 128-B swizzle atom)"
             )
 
         supported_cluster_shapes = ((1, 1), (2, 1), (1, 2), (2, 2))
@@ -576,11 +598,18 @@ class Sm90SwigluFp8Fc12Kernel:
         self.fc2_c_smem_layout_staged = self.epilogue.fc2_staged_smem_layout(
             self.num_c_stage,
         )
-        if self.epilogue.fc2_bytes_per_stage != self.epilogue.bytes_per_stage:
+        # FC2 reuses the FC1 ring stage by stage.  FP8 FC1 (M64xN64) and
+        # BF16 FC2 (M64xN32) stages are both 4 KiB; a BF16 FC1 stage is
+        # 8 KiB, so FC2 stage i is strided onto FC1 slot i (FI local
+        # extension) instead of packing two FC2 stages into one FC1 slot.
+        if self.epilogue.bytes_per_stage % self.epilogue.fc2_bytes_per_stage != 0:
             raise ValueError(
-                "FC1 FP8 and FC2 BF16 epilogue scratch stages must have "
-                "the same byte size for SMEM reuse."
+                "FC1 epilogue scratch stages must be a whole multiple of the "
+                "FC2 BF16 stage size for SMEM reuse."
             )
+        self.fc2_c_stage_stride_ratio = (
+            self.epilogue.bytes_per_stage // self.epilogue.fc2_bytes_per_stage
+        )
 
         # Read epilogue's autonomous decisions.
         self.num_acc_stage = 1
@@ -598,6 +627,18 @@ class Sm90SwigluFp8Fc12Kernel:
             + b_copy_size
             + self._activation_sf_bytes_per_stage()
         ) * atom_thr_size
+
+    def _mma_tile_k_atom(self) -> int:
+        """Granularity of mma_tiler K.
+
+        FP8 keeps the dispatch scale atom (128: blockwise scale tiles and the
+        E8M0 SF words are per 128-K).  FI local extension: BF16 (per_tensor
+        ABI, no per-stage scale tiles) only needs one 128-B swizzle atom of
+        BF16 = 64, so K=64 tiles can trade K depth for pipeline stages.
+        """
+        if self.ab_dtype is cutlass.BFloat16 and self.fp8_scale_mode == "per_tensor":
+            return 64
+        return Fp8DispatchScaleAtomK
 
     def _activation_sf_bytes_per_stage(self) -> int:
         if self.fp8_scale_mode != "blockwise":
@@ -656,6 +697,17 @@ class Sm90SwigluFp8Fc12Kernel:
         num_ab_stage = (
             smem_capacity // occupancy - fixed_overhead
         ) // ab_bytes_per_stage
+        # The mainloop keeps one WGMMA in flight (k_pipe_mmas = 1), so it
+        # needs two A/B stages.  BF16 operands (FI local extension) double
+        # the per-stage bytes, which the largest FP8 tiles cannot afford;
+        # fail at setup instead of at a trace-time assert.
+        if num_ab_stage < 2:
+            raise ValueError(
+                f"mma_tiler_mnk={tuple(mma_tiler_mnk)} with {a_dtype.__name__} "
+                f"operands fits {num_ab_stage} A/B SMEM stage(s), need >= 2 "
+                f"({ab_bytes_per_stage} B/stage after {fixed_overhead} B fixed, "
+                f"of {smem_capacity // occupancy} B); use a smaller tile."
+            )
         return num_acc_stage, num_ab_stage, num_sched_stages
 
     def _apply_mega_warp_layout(self) -> None:
@@ -3621,15 +3673,28 @@ class Sm90SwigluFp8Fc12Kernel:
             byte_alignment=128,
             swizzle=c_smem_layout_staged.inner,
         )
-        # FC2 reuses the same WG-private bytes: FP8 64x64 and BF16 64x32
-        # are both 4 KiB per stage, so this adds no dynamic SMEM.
+        # FC2 reuses the same WG-private bytes (no extra dynamic SMEM): its
+        # stage stride is scaled so stage i lands on FC1 slot i (ratio 1 for
+        # FP8 FC1 output, 2 for BF16).
+        fc2_outer = fc2_c_smem_layout_staged.outer
+        if cutlass.const_expr(self.fc2_c_stage_stride_ratio != 1):
+            # The stage mode is itself hierarchical (e.g. ``(1,1):(0,0)``).
+            fc2_outer = cute.make_layout(
+                fc2_outer.shape,
+                stride=(
+                    *fc2_outer.stride[:-1],
+                    _scale_int_tuple(
+                        fc2_outer.stride[-1], self.fc2_c_stage_stride_ratio
+                    ),
+                ),
+            )
         sD = cute.make_tensor(
             cute.recast_ptr(
                 sC.iterator,
                 fc2_c_smem_layout_staged.inner,
                 dtype=cutlass.BFloat16,
             ),
-            fc2_c_smem_layout_staged.outer,
+            fc2_outer,
         )
 
         # ════════════════════════════════════════════════════════════════════

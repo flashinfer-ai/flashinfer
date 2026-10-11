@@ -1,7 +1,8 @@
 """Offline knob tuner for the SM90 pull-style FP8 mega kernel.
 
 Invoked through the :mod:`flashinfer.moe_ep.tune` CLI shim (``--dtype
-sm90_fp8_e4m3`` / ``sm90_fp8_e5m2``).  Kernel-specific pieces (dummy input
+sm90_fp8_e4m3`` / ``sm90_fp8_e5m2``; ``sm90_bf16`` reaches it through the
+BF16 backend's tuner, which shares this kernel).  Kernel-specific pieces (dummy input
 creation, candidate enumeration, knob resolution, the autotune entry point)
 live here, next to the backend that consumes the recorded winners; the sweep
 loop and shared helpers come from ``backends/mega/kernel/tuning.py``.
@@ -14,9 +15,11 @@ from typing import Any, Literal, cast
 from ...tuning import finish_sweep, run_tuning as _run_tuning, schedule_candidates
 
 
-def _kind(args) -> Literal["fp8_e4m3", "fp8_e5m2"]:
-    # CLI dtype "sm90_fp8_e4m3" -> shim kind "fp8_e4m3".
-    return cast(Literal["fp8_e4m3", "fp8_e5m2"], args.dtype.removeprefix("sm90_"))
+def _kind(args) -> Literal["fp8_e4m3", "fp8_e5m2", "bf16"]:
+    # CLI dtype "sm90_fp8_e4m3" -> shim kind "fp8_e4m3"; "sm90_bf16" -> "bf16".
+    return cast(
+        Literal["fp8_e4m3", "fp8_e5m2", "bf16"], args.dtype.removeprefix("sm90_")
+    )
 
 
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
@@ -47,8 +50,10 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
             seed=args.seed,
         )
         candidates = hopper_fp8_candidates(
-            fp8_scale_mode=args.fp8_scale_mode,
+            # BF16 sessions start from their own heuristic rows.
+            fp8_scale_mode="bf16" if _kind(args) == "bf16" else args.fp8_scale_mode,
             max_tokens=max_tokens,
+            k64=_kind(args) == "bf16",
         )
 
         if args.sweep == "schedule":

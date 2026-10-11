@@ -12,7 +12,8 @@ Weight quantization follows the kernel's dequant convention (verified against
 * ``blockwise``: DeepGEMM-style fp32 scales per 128x128 ``(N, K)`` weight
   block (``quantize_fp8_weight_block_nk``); the per-tensor dequant-scale slots
   ride as ``None`` (the shim substitutes cached unit tensors — the kernel ABI
-  still takes them but ignores their values).
+  still takes them but ignores their values).  MXFP8 packs land here too,
+  with power-of-two block scales (``..common.mxfp8``).
 
 FC1 gate/up interleave granularity is ``Fp8GateUpInterleave = 8`` (the SM90
 kernel's PostSwigluHalf fold), NOT the SM100 MXFP8 tree's 32.
@@ -128,6 +129,63 @@ def _swizzle_unit_e8m0_sf(
     )
 
 
+def _preprocess_mxfp8_mega_weights(
+    weights: "PrequantizedMoEWeights",
+    *,
+    intermediate_size: int,
+    hidden_size: int,
+    kind: Sm90Fp8Kind,
+    fp8_scale_mode: Sm90Fp8ScaleMode,
+) -> TransformedMegaWeights:
+    """MXFP8 E4M3 + E8M0 (1x32) pack → the blockwise kernel layout, exactly.
+
+    See ``..common.mxfp8``: power-of-two 128x128 scales make the conversion
+    lossless except for E4M3 underflow.
+    """
+    from ......core.validation.common import MoEEpConfigError
+    from ..common.mxfp8 import e8m0_bytes, mxfp8_to_fp8_block128, validate_mxfp8_pack
+
+    validate_mxfp8_pack(
+        weights,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        num_local_experts=weights.w13.shape[0],
+        kernel_name="sm90_fp8_fp8_bf16_pull_cutedsl",
+    )
+    if fp8_scale_mode != "blockwise" or kind != "fp8_e4m3":
+        raise MoEEpConfigError(
+            "sm90_fp8_fp8_bf16_pull_cutedsl runs MXFP8 weights as 128x128 "
+            "FP8 block scales; set fp8_scale_mode='blockwise' and "
+            f"kind='fp8_e4m3' (got fp8_scale_mode={fp8_scale_mode!r}, "
+            f"kind={kind!r})"
+        )
+    if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+        raise ValueError(
+            "blockwise FP8 requires hidden_size and intermediate_size to be "
+            f"multiples of 128; got hidden_size={hidden_size}, "
+            f"intermediate_size={intermediate_size}."
+        )
+
+    # The gate/up interleave is a row permutation, so it moves each row's
+    # 1x32 scales with it.  Block scales are then computed in the interleaved
+    # layout the kernel sees (an 8-row interleaved 128-row block mixes rows
+    # of two canonical gate/up blocks).
+    fc1_out = 2 * intermediate_size
+    w13 = _interleave_gate_up_8(weights.w13, intermediate_size=fc1_out)
+    w13_scale = _interleave_gate_up_8(
+        e8m0_bytes(weights.w13_scale), intermediate_size=fc1_out
+    )
+    fc1_weight, fc1_weight_sf = mxfp8_to_fp8_block128(w13, w13_scale)
+    fc2_weight, fc2_weight_sf = mxfp8_to_fp8_block128(weights.w2, weights.w2_scale)
+
+    # (E, N, K) row-major -> (E, K, N) K-major view; no .contiguous() (see
+    # preprocess_mega_weights).
+    return (
+        (fc1_weight.transpose(1, 2), fc1_weight_sf, None, None),
+        (fc2_weight.transpose(1, 2), fc2_weight_sf, None, None),
+    )
+
+
 def preprocess_mega_weights(
     weights: "MoEWeightPack",
     *,
@@ -138,7 +196,11 @@ def preprocess_mega_weights(
     fc1_activation_dequant_scale: float = 1.0,
     fc2_activation_dequant_scale: float = 1.0,
 ) -> TransformedMegaWeights:
-    """bf16 canonical weights → kernel-ready SM90 FP8 mega layout.
+    """bf16 canonical or MXFP8 weights → kernel-ready SM90 FP8 mega layout.
+
+    An MXFP8 ``PrequantizedMoEWeights`` (E4M3 + E8M0 1x32 scales) needs
+    ``fp8_scale_mode="blockwise"`` and is converted once to 128x128 block
+    scales; any other pre-quantized pack raises ``MoEEpConfigError``.
 
     ``fc1_activation_dequant_scale`` / ``fc2_activation_dequant_scale`` are
     the per-tensor static activation calibration scalars (materialized here as
@@ -147,18 +209,18 @@ def preprocess_mega_weights(
     """
     import torch
 
-    # Backend talks only to the pull_style_cutedsl_megakernel shim boundary.
-    from ......core.validation.common import MoEEpConfigError
-
     if isinstance(weights, PrequantizedMoEWeights):
-        # PORT NOTE: pre-quantized FP8 packs (per-expert or blockwise scales)
-        # are not wired yet for sm90_fp8_fp8_bf16_pull_cutedsl; kernel-ready weights can still
-        # bypass preprocessing entirely via MegaConfig.preprocess_weights=False
-        # + transformed_weights (validated by validate_transformed_mega_weights).
-        raise MoEEpConfigError(
-            "sm90_fp8_fp8_bf16_pull_cutedsl does not support PrequantizedMoEWeights yet; pass "
-            "canonical bf16 w13/w2, or supply kernel-ready transformed "
-            "weights with MegaConfig.preprocess_weights=False"
+        # MXFP8 is the one pre-quantized recipe: converted once to 128x128
+        # block scales.  Other pre-quantized FP8 packs are still unwired;
+        # kernel-ready weights can bypass preprocessing entirely via
+        # MegaConfig.preprocess_weights=False + transformed_weights
+        # (validated by validate_transformed_mega_weights).
+        return _preprocess_mxfp8_mega_weights(
+            weights,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            kind=kind,
+            fp8_scale_mode=fp8_scale_mode,
         )
 
     blockwise = fp8_scale_mode == "blockwise"

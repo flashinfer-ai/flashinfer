@@ -47,6 +47,9 @@ from .comm import (
 _KIND_TO_TORCH_DTYPE = {
     "fp8_e4m3": torch.float8_e4m3fn,
     "fp8_e5m2": torch.float8_e5m2,
+    # BF16 activations + weights (sm90_bf16_bf16_bf16_pull_cutedsl): the
+    # per_tensor kernel path with unit dequant scales and BF16 FC1 output.
+    "bf16": torch.bfloat16,
 }
 
 # Legacy per-tensor E8M0 scale wire dtype (moe_nvfp4_swapab.runner_common
@@ -99,6 +102,7 @@ def _kind_to_cutlass_dtype(kind: str):
     return {
         "fp8_e4m3": cutlass.Float8E4M3FN,
         "fp8_e5m2": cutlass.Float8E5M2,
+        "bf16": cutlass.BFloat16,
     }[kind]
 
 
@@ -120,7 +124,7 @@ class MegaMoEHopperFp8Config:
     hidden: int
     intermediate: int
 
-    kind: Literal["fp8_e4m3", "fp8_e5m2"] = "fp8_e4m3"
+    kind: Literal["fp8_e4m3", "fp8_e5m2", "bf16"] = "fp8_e4m3"
     fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor"
     fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc"
     swap_ab: bool = False
@@ -229,6 +233,14 @@ class MegaMoEHopperFp8Config:
             raise ValueError(
                 "fp8_accum_mode must be '1xacc' or '2xacc', "
                 f"got {self.fp8_accum_mode!r}."
+            )
+        if self.kind == "bf16" and (
+            self.fp8_scale_mode != "per_tensor" or self.fp8_accum_mode != "1xacc"
+        ):
+            raise ValueError(
+                "kind='bf16' runs the per_tensor/1xacc path with unit scales; "
+                f"got fp8_scale_mode={self.fp8_scale_mode!r}, "
+                f"fp8_accum_mode={self.fp8_accum_mode!r}."
             )
         if self.world_size < 1:
             raise ValueError(f"world_size must be >= 1, got {self.world_size}.")
@@ -364,10 +376,12 @@ class MegaMoEHopperFp8Config:
                     f"{_NONSWAP_TILE_M_CHOICES} and N in {_NONSWAP_TILE_N_CHOICES}; "
                     f"got mma_tiler_mnk={self.mma_tiler_mnk}."
                 )
-        if k % _FP8_DISPATCH_SCALE_ATOM_K != 0:
+        # BF16 has no per-K scale tiles: one 128-B swizzle atom (K=64) suffices.
+        k_atom = 64 if self.kind == "bf16" else _FP8_DISPATCH_SCALE_ATOM_K
+        if k % k_atom != 0:
             raise ValueError(
-                f"mma_tiler K ({k}) must be a multiple of the FP8 dispatch "
-                f"scale atom K = {_FP8_DISPATCH_SCALE_ATOM_K}."
+                f"mma_tiler K ({k}) must be a multiple of {k_atom} (FP8: the "
+                "dispatch scale atom; BF16: one 128-B swizzle atom)."
             )
         if self.load_balance_mode not in ("static", "atomic_counter"):
             raise ValueError(
@@ -1225,7 +1239,7 @@ TransformedFp8Weights = Tuple[
     Optional[torch.Tensor],
 ]
 
-HopperFp8Kind = Literal["fp8_e4m3", "fp8_e5m2"]
+HopperFp8Kind = Literal["fp8_e4m3", "fp8_e5m2", "bf16"]
 
 
 def _sym_zeros_byte_view_1b(
@@ -1416,6 +1430,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         value is not None
         for value in (swap_ab, pingpong, mma_tiler_mnk, cluster_shape_mnk)
     )
+    # BF16 sessions have their own heuristic rows (heuristic_config "bf16").
+    heuristic_mode = "bf16" if kind == "bf16" else fp8_scale_mode
     knob_overrides: Dict[str, Any] = {}
     if manual_geometry:
         if isinstance(knobs, dict) and knobs:
@@ -1430,7 +1446,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         from moe_hopper_fp8.heuristic_config import resolve_hopper_fp8_config
 
         selection = resolve_hopper_fp8_config(
-            fp8_scale_mode,
+            heuristic_mode,
             num_max_tokens,
             swap_ab=swap_ab,
             pingpong=pingpong,
@@ -1455,7 +1471,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         from .knob_cache import resolve_knobs as _resolve_cached_knobs
         from .tuner import GEOMETRY_KNOBS, default_knobs
 
-        geometry = default_knobs(num_max_tokens, fp8_scale_mode=fp8_scale_mode)
+        geometry = default_knobs(num_max_tokens, fp8_scale_mode=heuristic_mode)
         if isinstance(knobs, dict):
             resolved = dict(knobs)
         else:
@@ -1552,7 +1568,11 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     data_dtype = cfg.torch_ab_dtype
 
     sym_roots: list[torch.Tensor] = []
-    x, x_root = _sym_zeros_byte_view_1b((num_max_tokens, hidden), data_dtype)
+    if data_dtype.itemsize == 1:
+        x, x_root = _sym_zeros_byte_view_1b((num_max_tokens, hidden), data_dtype)
+    else:
+        # bf16 tokens: nvshmem4py allocates the dtype directly.
+        x = x_root = sym_zeros((num_max_tokens, hidden), data_dtype)
     sym_roots.append(x_root)
     if cfg.blockwise:
         # FP32 per-token block scales; storage padded to 4 words (16B TMA
@@ -1819,6 +1839,10 @@ def _create_dummy_weights(
     fc1_out = 2 * intermediate  # gate+up width
 
     def _weight(shape: Tuple[int, ...]) -> torch.Tensor:
+        if kind == "bf16":
+            # O(1) outputs: 1/sqrt(K)-scaled randn (K = last logical dim).
+            source = torch.randn(shape, device="cuda", generator=generator)
+            return (source * shape[-1] ** -0.5).to(torch.bfloat16)
         return create_fp8_tensor(
             shape,
             data_dtype,
@@ -1883,15 +1907,26 @@ def _create_dummy_weights(
         num_local_experts, fc2_sf_swizzled[0].numel()
     )
 
-    # Perf-style constant per-tensor dequant scales (driver perf_run branch).
-    fc1_activation_dequant_scale = make_fp8_per_tensor_dequant_scale(data_dtype, (1,))
-    fc1_weight_dequant_scale = make_fp8_per_tensor_dequant_scale(
-        data_dtype, (num_local_experts,)
-    )
-    fc2_activation_dequant_scale = make_fp8_per_tensor_dequant_scale(data_dtype, (1,))
-    fc2_weight_dequant_scale = make_fp8_per_tensor_dequant_scale(
-        data_dtype, (num_local_experts,)
-    )
+    if kind == "bf16":
+        # BF16 has nothing to dequantize: the per-tensor slots stay at one.
+        fc1_activation_dequant_scale = torch.ones(1, device="cuda")
+        fc1_weight_dequant_scale = torch.ones(num_local_experts, device="cuda")
+        fc2_activation_dequant_scale = torch.ones(1, device="cuda")
+        fc2_weight_dequant_scale = torch.ones(num_local_experts, device="cuda")
+    else:
+        # Perf-style constant per-tensor dequant scales (driver perf_run branch).
+        fc1_activation_dequant_scale = make_fp8_per_tensor_dequant_scale(
+            data_dtype, (1,)
+        )
+        fc1_weight_dequant_scale = make_fp8_per_tensor_dequant_scale(
+            data_dtype, (num_local_experts,)
+        )
+        fc2_activation_dequant_scale = make_fp8_per_tensor_dequant_scale(
+            data_dtype, (1,)
+        )
+        fc2_weight_dequant_scale = make_fp8_per_tensor_dequant_scale(
+            data_dtype, (num_local_experts,)
+        )
 
     return (
         (
@@ -1975,14 +2010,19 @@ def create_dummy_inputs(
     )
 
     data_dtype = symm_buffer._frontend.config.torch_ab_dtype
-    activation = create_fp8_tensor(
-        (num_tokens, hidden),
-        data_dtype,
-        perf_run=True,
-        nonzero_value=0.5,
-        generator=gen,
-        perf_positive_only=True,
-    )
+    if kind == "bf16":
+        activation = torch.randn((num_tokens, hidden), device="cuda", generator=gen).to(
+            torch.bfloat16
+        )
+    else:
+        activation = create_fp8_tensor(
+            (num_tokens, hidden),
+            data_dtype,
+            perf_run=True,
+            nonzero_value=0.5,
+            generator=gen,
+            perf_positive_only=True,
+        )
 
     scores = torch.randn(
         num_tokens,

@@ -422,11 +422,12 @@ class Fp8GluEpilogue:
         if _iket_active:
             iket.range_push("nswap_fc1_epi_m64n64_pt")
 
-        # Each call writes one FP8 pair from one M64 accumulator fragment.
+        # Each call writes one output pair (FP8 or BF16) from one M64
+        # accumulator fragment.
         r2s_copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self.fc1_output_dtype,
-            num_bits_per_copy=16,
+            num_bits_per_copy=2 * self.fc1_output_dtype.width,
         )
 
         subtile_begin = n_half * Fc1SubtilesPerHalf
@@ -774,7 +775,7 @@ class Fp8GluEpilogue:
         r2s_copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self.fc1_output_dtype,
-            num_bits_per_copy=16,
+            num_bits_per_copy=2 * self.fc1_output_dtype.width,
         )
 
         for m_sub in cutlass.range_constexpr(self._m64_fragment_count):

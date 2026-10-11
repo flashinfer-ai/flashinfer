@@ -293,12 +293,15 @@ def validate_mega_arch() -> None:
         )
 
 
-def validate_mega_arch_sm90() -> None:
-    """Arch gate for the SM90 (Hopper) mega kernels.
+def validate_mega_arch_sm90(
+    kernel_name: str = "sm90_fp8_fp8_bf16_pull_cutedsl",
+) -> None:
+    """Arch gate for the SM90 (Hopper) pull-style mega kernels.
 
-    The Hopper FP8 CuTeDSL mega kernel is compiled for sm_90 exactly (WGMMA
-    warp specialization; the fork is 1-CTA-only and does not target Blackwell
-    — Blackwell hosts use the sm_100 tree's kernels instead).
+    The Hopper CuTeDSL mega kernel (FP8 or BF16 operands) is compiled for
+    sm_90 exactly (WGMMA warp specialization; the fork is 1-CTA-only and does
+    not target Blackwell — Blackwell hosts use the sm_100 tree's kernels
+    instead).
     """
     import torch
 
@@ -307,7 +310,7 @@ def validate_mega_arch_sm90() -> None:
     cc = _device_capability()
     if cc != (9, 0):
         raise MoEEpArchError(
-            f"sm90_fp8_fp8_bf16_pull_cutedsl mega kernel requires sm_90 (Hopper); host has "
+            f"{kernel_name} mega kernel requires sm_90 (Hopper); host has "
             f"sm_{cc[0]}{cc[1]}"
         )
 

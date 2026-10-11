@@ -69,8 +69,13 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
     # FP8 elements, and four such bytes are carried as one 128-element dispatch
     # scale atom. Gate/up interleave is tracked separately by
     # Fp8GateUpInterleave.
+    # FI local extension: BFloat16 runs the per-tensor path with unit
+    # dequant scales (BF16 WGMMA, BF16 FC1 output; the E8M0 wire rides along
+    # unused).
     VALID_AB_DTYPE_SF_SIZE: dict = {
-        Fp8E8M0SfVecSize: (cutlass.Float8E4M3FN, cutlass.Float8E5M2,),
+        Fp8E8M0SfVecSize: (
+            cutlass.Float8E4M3FN, cutlass.Float8E5M2, cutlass.BFloat16,
+        ),
     }
 
     # Interleave granularity for gate and up in SwiGLU / GeGlu
@@ -193,6 +198,16 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             self.fp8_output_rcp_limit = Fp8E4M3RcpLimit
         elif ab_dtype == cutlass.Float8E5M2:
             self.fp8_output_rcp_limit = Fp8E5M2RcpLimit
+        elif ab_dtype == cutlass.BFloat16:
+            # No FC1-output quantization: the per-tensor epilogue only
+            # multiplies by the (unit) static scales and converts to BF16.
+            if fp8_scale_mode != "per_tensor" or fp8_accum_mode != "1xacc":
+                raise ValueError(
+                    "BFloat16 ab_dtype runs the per_tensor/1xacc path with "
+                    f"unit scales; got fp8_scale_mode={fp8_scale_mode!r}, "
+                    f"fp8_accum_mode={fp8_accum_mode!r}."
+                )
+            self.fp8_output_rcp_limit = 1.0
         else:
             raise ValueError(
                 f"Unsupported Hopper FP8 ab_dtype for output quant: {ab_dtype}."
@@ -359,11 +374,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 f"got ({m}, {n})."
             )
 
-        dispatch_scale_atom_k = Fp8DispatchScaleAtomK
-        if k % dispatch_scale_atom_k != 0:
+        k_atom = self._mma_tile_k_atom()
+        if k % k_atom != 0:
             raise ValueError(
-                f"mma_tiler K ({k}) must be a multiple of "
-                f"FP8 dispatch scale atom K = {dispatch_scale_atom_k}"
+                f"mma_tiler K ({k}) must be a multiple of {k_atom} "
+                "(FP8: the dispatch scale atom; BF16: one 128-B swizzle atom)"
             )
 
         supported_cluster_shapes = ((1, 1), (2, 1), (1, 2), (2, 2))

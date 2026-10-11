@@ -77,6 +77,10 @@ class TestIsValid:
             dict(swap_ab=True, pingpong=True, mma_tiler_mnk=(128, 32, 128))
         )
         # cluster domain.
+        # K=64 tiles are a dense-BF16 option only (FP8 keeps 128).
+        assert not pkg.is_valid({**ok, "mma_tiler_mnk": (64, 128, 64)})
+        assert pkg.is_valid({**ok, "mma_tiler_mnk": (64, 128, 64)}, k_atom=64)
+        assert not pkg.is_valid({**ok, "mma_tiler_mnk": (64, 128, 32)}, k_atom=64)
         assert not pkg.is_valid({**ok, "cluster_shape_mnk": (4, 1, 1)})
         assert not pkg.is_valid({**ok, "cluster_shape_mnk": (1, 1, 2)})
         assert pkg.is_valid({**ok, "cluster_shape_mnk": (2, 2, 1)})
@@ -125,6 +129,22 @@ class TestIsValid:
         # deduplicated.
         keys = [json.dumps(c, sort_keys=True, default=list) for c in cands]
         assert len(keys) == len(set(keys))
+
+    def test_autotune_candidates_bf16_k64(self):
+        """Dense BF16 sweeps also add K=64 twins; FP8 never sees K=64."""
+        pkg = _pkg()
+        base = pkg.hopper_fp8_candidates(fp8_scale_mode="bf16", max_tokens=8192)
+        with_k64 = pkg.hopper_fp8_candidates(
+            fp8_scale_mode="bf16", max_tokens=8192, k64=True
+        )
+        # The BF16 heuristic row leads either way (its large buckets are K=64).
+        assert base[0] == pkg.default_knobs(8192, fp8_scale_mode="bf16")
+        assert with_k64[: len(base)] == base
+        twins = with_k64[len(base) :]
+        assert twins and all(c["mma_tiler_mnk"][2] == 64 for c in twins)
+        assert all(pkg.is_valid(c, k_atom=64) for c in twins)
+        fp8 = pkg.hopper_fp8_candidates(fp8_scale_mode="per_tensor", max_tokens=8192)
+        assert all(c["mma_tiler_mnk"][2] == 128 for c in fp8)
 
 
 class TestWithKnobs:
