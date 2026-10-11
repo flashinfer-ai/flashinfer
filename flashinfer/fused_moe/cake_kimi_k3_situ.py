@@ -48,6 +48,11 @@ _M1_FUSED_ARCHES = ("sm_103a",)
 # consumes it (eight kernels); the others run the pre-shuffled scale-factor
 # route (nine kernels).
 _LARGE_Q8I_ARCHES = ("sm_103a",)
+# Architectures whose 4096-token route runs the same 8-bit per-tile partial FC2
+# and finalize behind the work5fd FC1 (eight kernels); the 2048-token route
+# keeps the BF16 expert output everywhere.
+_MID_Q8I_ARCHES = ("sm_103a",)
+_MID_Q8I_TOKENS = (4096,)
 # The 512- and 1024-token routes launch the routing kernel as one thread-block
 # cluster of this many CTAs (the kernel declares the matching cluster size).
 _ROUTE_MC_CLUSTER = 8
@@ -164,6 +169,16 @@ _SELECTORS = {
         _N32_CLAIM8_FC2_GRID_N,
     ),
     "mid_work5fd": (_GENERIC, _generic(128, fc1="fc1:n128_work5fd"), None),
+    "mid_q8i": (
+        _GENERIC,
+        _generic(
+            128,
+            fc1="fc1:n128_work5fd",
+            fc2="fc2:n128_q8i",
+            finalize="finalize:n128_q8i",
+        ),
+        None,
+    ),
     "large_c7": (
         _LARGE,
         _generic(
@@ -213,6 +228,8 @@ def _selector(arch, num_tokens):
     if num_tokens in _N32_CLAIM8_TOKENS:
         return "n32_claim8"
     if num_tokens in _MID_WORK5FD_TOKENS:
+        if arch in _MID_Q8I_ARCHES and num_tokens in _MID_Q8I_TOKENS:
+            return "mid_q8i"
         return "mid_work5fd"
     if num_tokens in _LARGE_C7_TOKENS:
         return "large_q8i" if arch in _LARGE_Q8I_ARCHES else "large_c7"
