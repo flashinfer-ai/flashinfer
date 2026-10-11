@@ -1521,9 +1521,13 @@ class _CuTeOneshotBackend:
 
     @staticmethod
     def _launch_geometry(size_packs: int) -> tuple[int, int]:
-        threads = int(os.getenv("B12X_PCIE_ONESHOT_THREADS", "256"))
+        # Longer payloads need enough outstanding peer loads to fill PCIe.
+        bulk = size_packs >= 2048
+        threads = int(os.getenv("B12X_PCIE_ONESHOT_THREADS", "512" if bulk else "256"))
         threads = min(512, max(64, (threads // 32) * 32))
-        block_limit = int(os.getenv("B12X_PCIE_ONESHOT_BLOCK_LIMIT", "8"))
+        block_limit = int(
+            os.getenv("B12X_PCIE_ONESHOT_BLOCK_LIMIT", "32" if bulk else "8")
+        )
         if block_limit <= 0 or block_limit > _MAX_BLOCKS:
             raise ValueError(
                 f"B12X_PCIE_ONESHOT_BLOCK_LIMIT must be in [1, {_MAX_BLOCKS}]"

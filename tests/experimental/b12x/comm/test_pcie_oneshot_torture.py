@@ -841,8 +841,8 @@ def _prepared_plain_worker(rank: int, world_size: int, port: int) -> None:
     pool = PCIeOneshotAllReducePool.from_process_group(
         process_group=dist.group.WORLD,
         device=device,
-        max_input_bytes=128 * 1024,
-        max_size=128 * 1024,
+        max_input_bytes=4096 * 2560 * 4,
+        max_size=4096 * 2560 * 4,
         max_concurrent_channels=1,
     )
     streams = []
@@ -851,11 +851,11 @@ def _prepared_plain_worker(rank: int, world_size: int, port: int) -> None:
             tuple(
                 f"prepared:{dtype}:{elements}"
                 for dtype in (torch.float16, torch.bfloat16, torch.float32)
-                for elements in (8, 4096, 32768)
+                for elements in (8, 4096, 32768, 4096 * 2560)
             )
         )
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
-            for elements in (8, 4096, 32768):
+            for elements in (8, 4096, 32768, 4096 * 2560):
                 stream = torch.cuda.Stream(device=device)
                 streams.append(stream)
                 with torch.cuda.stream(stream):
