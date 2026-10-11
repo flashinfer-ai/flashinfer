@@ -25,20 +25,17 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 9 of the optimization ladder: warp specialization with mbarriers.
-// Rung 8 had every warp both copying and computing, and had to drain its
-// wgmma groups (wait_group 0) before each slab so the stage could be
-// refilled; ncu: tensor pipe ~47%, issue 37%, 25% occupancy.  Here the
-// block is three warpgroups: warpgroup 0 is the producer (it only issues
-// the cp.async copies and signals a per-stage "full" mbarrier through
-// cp.async.mbarrier.arrive), warpgroups 1-2 are the consumers (they wait on
-// "full", build the A fragments, issue the wgmmas, and after wait_group 1
-// release the previous stage through an "empty" mbarrier).  The producer
-// never waits on compute and the consumers keep one slab of wgmma in
-// flight.  setmaxnreg moves registers from the producer (40) to the
-// consumers (232), and the ring grows to 6 stages (150 KB, 1 block / SM).
-// A fence.proxy.async makes the cp.async-written tiles visible to the
-// wgmma async proxy.  Requires sm_90a and K % 64 == 0.
+// Rung 10 of the optimization ladder: L2-aware tile rasterization.  Rung 9
+// (warp-specialized wgmma) moved 1.8 TB/s from DRAM on M=8192 N=12800
+// K=5120 (ncu: DRAM 54%, L2 hit 64%) against ~0.36 GB of compulsory
+// traffic: blocks were launched n-fastest, so each row of 100 n-tiles
+// re-streamed the whole 65 MB weight, which does not fit in the 50 MB L2,
+// once per m-tile.  Here the grid is one-dimensional and the block index is
+// mapped to (m-tile, n-tile) in groups of 8 m-tiles: consecutive blocks
+// share one weight tile and walk 8 act tiles, so a resident wave of ~130
+// blocks touches 8 act tiles + 16 weight tiles (~20 MB) instead of 130
+// weight tiles.  Nothing inside the block changes.  Requires sm_90a and
+// K % 64 == 0.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -57,6 +54,7 @@ constexpr int kW8A16TileN = 128;  // n rows per block (wgmma M)
 constexpr int kW8A16TileM = 128;  // m cols per block (wgmma N)
 constexpr int kW8A16TileK = 64;
 constexpr int kW8A16Stages = 6;
+constexpr int kW8A16GroupM = 8;                          // m-tiles per rasterization group
 constexpr int kW8A16ConsumerWGs = 2;                     // 64 n rows each
 constexpr int kW8A16Warpgroups = 1 + kW8A16ConsumerWGs;  // + 1 producer
 constexpr int kW8A16Threads = 128 * kW8A16Warpgroups;
@@ -245,8 +243,19 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int wg = warp >> 2;  // 0 = producer, 1..2 = consumers
-  const int n0 = blockIdx.x * kW8A16TileN;
-  const int m0 = blockIdx.y * kW8A16TileM;
+  // Grouped rasterization: within a group of kW8A16GroupM m-tiles, walk the
+  // n-tiles with m fastest, so neighbouring blocks share a weight tile.
+  const int tiles_m = (M + kW8A16TileM - 1) / kW8A16TileM;
+  const int tiles_n = (N + kW8A16TileN - 1) / kW8A16TileN;
+  const int group_size = kW8A16GroupM * tiles_n;
+  const int group = blockIdx.x / group_size;
+  const int first_m = group * kW8A16GroupM;
+  const int this_group_m = min(kW8A16GroupM, tiles_m - first_m);
+  const int in_group = blockIdx.x - group * group_size;
+  const int tile_m = first_m + in_group % this_group_m;
+  const int tile_n = in_group / this_group_m;
+  const int n0 = tile_n * kW8A16TileN;
+  const int m0 = tile_m * kW8A16TileM;
   const int num_slabs = K / kW8A16TileK;
 
   if (threadIdx.x == 0) {
@@ -367,7 +376,7 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
                          T* out, int M, int N, int K, cudaStream_t stream) {
   if (K % kW8A16TileK != 0) return cudaErrorInvalidValue;  // cp.async slabs must be whole
   const unsigned tiles_m = ceil_div(M, kW8A16TileM);
-  if (tiles_m > 65535u) return cudaErrorInvalidValue;  // gridDim.y limit
+  const unsigned tiles_n = ceil_div(N, kW8A16TileN);
   auto* kernel = W8A16Fp8GemmWgmmaWsKernel<T>;
   static bool attr_set = false;  // per instantiation; the attribute is per function
   if (!attr_set) {
@@ -376,7 +385,7 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
     if (e != cudaSuccess) return e;
     attr_set = true;
   }
-  const dim3 grid(ceil_div(N, kW8A16TileN), tiles_m);
+  const dim3 grid(tiles_m * tiles_n);  // 1-D; the kernel rasterizes it
   kernel<<<grid, kW8A16Threads, kW8A16SmemBytes, stream>>>(act, w, scale, bias, out, M, N, K);
   return cudaGetLastError();
 }
