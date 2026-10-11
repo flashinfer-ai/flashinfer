@@ -25,21 +25,19 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 30 of the optimization ladder: tile shape as a template knob and a
-// per-shape dispatch.  The final kernel of rung 29 (128n x 256m, the best
-// tile on GPU-filling problems) leaves the M <= 2048 rows at 0.6-0.8x
-// cuBLAS: a 256-wide m tile makes 4-8 m-tiles, the grid under-fills its
-// last wave, and split-K only kicks in below a third of a wave.  Here the
-// tile geometry lives in `W8A16Cfg<TileN, TileM, Stages>` -- 128x256 with
-// m64n256k16 (rung 23), 256x128 with two m64n128k16 row blocks (rung 19),
-// 128x128 (rung 18) -- all compiled from the same kernel, and the launcher
-// picks one per call from (M, N, K, SM count): the most efficient tile
-// whose grid still fills the machine, scored as tile efficiency (measured
-// on H100: 1.00 / 0.94 / 0.83) times the fill of the last wave; split-K
-// applies to the chosen tile below a third of a wave.  The bench can pin a
-// tile with FLASHINFER_W8A16_FP8_TILE=128x256|256x128|128x128 (auto by
-// default) so every shape class is measured under every tile.  Requires
-// sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
+// Rung 30b of the optimization ladder: split-K-aware tile dispatch.  Rung 30
+// ranked the three tile configs by (per-tile efficiency) x (last-wave fill)
+// with an early return for any tile whose grid reached two waves, and it
+// lost on every shape class: the early return handed under-filled 128x256
+// problems to 128x128, and split-K was not part of the score.  The pick is
+// now the smaller modelled time
+//   ceil(units * splits / SMs) * tileN * tileM * (K / splits) / eff
+//     + 16 * M * N * splits                   (fp32 round trip, split-K only)
+// between 128x256 (eff 1.00) and 128x128 (eff 0.65, fitted to the rung-30
+// tables: it only pays when it fills waves 128x256 leaves empty).  256x128
+// never won a row and its plain non-split instantiation spills, so auto
+// never takes it; it stays reachable through FLASHINFER_W8A16_FP8_TILE.
+// Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -47,6 +45,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -779,10 +778,26 @@ inline int W8A16Fp8GemmSplits(int M, int N, int K, int num_sms) {
   return max(splits, 1);
 }
 
-// Tile choice for (M, N, K) on a GPU with num_sms SMs: the most efficient
-// tile whose grid fills the machine; otherwise the tile that maximises
-// (measured per-tile efficiency) x (fill of the last wave).  The env var
-// FLASHINFER_W8A16_FP8_TILE pins a tile for benchmarking.
+// Modelled time of tile Cfg on (M, N, K): waves of (units x splits) blocks,
+// each a tileN x tileM x K/splits mainloop at relative efficiency `eff`,
+// plus the fp32 partial round trip when it splits.  Fitted to the rung-30
+// H100 tables (all three tiles forced on 108 shapes); only the ranking
+// matters, the unit is arbitrary.
+constexpr double kW8A16ModelReduceCost = 16.0;
+template <typename Cfg>
+inline double W8A16Fp8GemmModelTime(int M, int N, int K, int num_sms, double eff) {
+  const int splits = W8A16Fp8GemmSplits<Cfg>(M, N, K, num_sms);
+  const double units = static_cast<double>(ceil_div(M, Cfg::kTileM)) * ceil_div(N, Cfg::kTileN);
+  const double waves = std::ceil(units * splits / num_sms);
+  double t = waves * Cfg::kTileN * Cfg::kTileM * (static_cast<double>(K) / splits) / eff;
+  if (splits > 1) t += kW8A16ModelReduceCost * static_cast<double>(M) * N * splits;
+  return t;
+}
+
+// Tile choice for (M, N, K) on a GPU with num_sms SMs: 128x256 unless the
+// 128x128 grid is modelled faster (it fills waves 128x256 leaves empty on
+// narrow-N / short-M problems).  256x128 is never picked automatically (see
+// the header).  FLASHINFER_W8A16_FP8_TILE pins a tile for benchmarking.
 inline W8A16Tile W8A16Fp8GemmPickTile(int M, int N, int K, int num_sms) {
   static int forced = -1;
   if (forced < 0) {
@@ -795,30 +810,9 @@ inline W8A16Tile W8A16Fp8GemmPickTile(int M, int N, int K, int num_sms) {
     }
   }
   if (forced > 0) return static_cast<W8A16Tile>(forced);
-  struct Cand {
-    W8A16Tile tile;
-    int tn, tm;
-    double eff;  // H100 measured: rung 23 / rung 19 / rung 18 on filling shapes
-  };
-  const Cand cands[3] = {{W8A16Tile::k128x256, 128, 256, 1.00},
-                         {W8A16Tile::k256x128, 256, 128, 0.94},
-                         {W8A16Tile::k128x128, 128, 128, 0.83}};
-  (void)K;
-  W8A16Tile best = W8A16Tile::k128x256;
-  double best_score = -1.0;
-  for (const Cand& c : cands) {
-    const double units = static_cast<double>(ceil_div(M, c.tm)) * ceil_div(N, c.tn);
-    if (units >= 2.0 * num_sms) return c.tile;  // fills the machine: take the best tile
-    const double waves = units / num_sms;
-    const double fill =
-        waves / static_cast<double>(static_cast<long>(waves) + 1);  // last-wave fill
-    const double score = c.eff * (waves >= 1.0 ? fill : waves);     // under one wave: raw fill
-    if (score > best_score) {
-      best_score = score;
-      best = c.tile;
-    }
-  }
-  return best;
+  const double t_128x256 = W8A16Fp8GemmModelTime<W8A16Cfg128x256>(M, N, K, num_sms, 1.00);
+  const double t_128x128 = W8A16Fp8GemmModelTime<W8A16Cfg128x128>(M, N, K, num_sms, 0.65);
+  return t_128x128 < t_128x256 ? W8A16Tile::k128x128 : W8A16Tile::k128x256;
 }
 
 template <typename Cfg>
