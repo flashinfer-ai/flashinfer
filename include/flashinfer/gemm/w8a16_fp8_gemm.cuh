@@ -25,18 +25,18 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 26 of the optimization ladder: stream-K partials staged through
-// shared memory.  Rung 25's fixup wrote and read the fp32 partial tiles
-// straight from the accumulator fragments -- 4-byte accesses with 8 lanes
-// per 32 B sector, 2 x 128 KB per block -- and that traffic cost more than
-// the tail it removed (net 0.93x), besides pushing the non-split
-// instantiations to 432-448 B of spill.  Here each warpgroup moves its
-// 64 n x 256 m quarter of the partial through its 16 KB epilogue buffer in
-// four 64-row passes: fragments -> XOR-swizzled fp32 smem rows -> 16 B
-// coalesced global stores (and the reverse for the fixup add), so the
-// partial round trip runs at copy speed with the same register footprint
-// as the normal epilogue.  Scheduling is rung 25's.  Requires sm_90a,
-// K % 64 == 0, 16 B aligned bases, N % 8 == 0.
+// Rung 27 of the optimization ladder: back to the static persistent
+// schedule.  Rungs 25-26 tried stream-K for the tail wave (data-parallel
+// full waves + a shared tail, fp32 partials in a workspace with per-tile
+// counters, first as scattered fragment stores and then staged through
+// shared memory): correct, a real win on the wave-quantized rows (M=4096
+// up to 1.44x), but a net loss over the shape table and never spill-free
+// (432 B, then 1248 B of stack once the staging loops stopped unrolling).
+// This rung restores rung 24's kernel exactly -- one block per SM walking
+// whole units in the grouped order, split-K below a third of a wave,
+// register split 24 / 240 -- so the final kernel is the measured best and
+// the stream-K attempts stay in history.  Requires sm_90a, K % 64 == 0,
+// 16 B aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -70,7 +70,6 @@ constexpr int kW8A16WStageBytes = kW8A16TileN * kW8A16WRowBytes;  // 8 KB
 constexpr int kW8A16EpiPad = kW8A16TileN + 8;                     // elements per staged output row
 constexpr int kW8A16MaxSplits = 8;
 constexpr int kW8A16MinSlabsPerSplit = 8;  // amortize the partial-tile round trip
-constexpr int kW8A16MinStreamKPiece = 8;   // tail pieces no shorter than this (slabs)
 constexpr int kW8A16EpiBytes =
     kW8A16TileM * kW8A16EpiPad * 4;  // fp32 partial tile (split-K), reuses the stages
 constexpr int kW8A16EpiPasses = 2;   // 16-bit epilogue: half the tile per pass
@@ -81,7 +80,7 @@ constexpr int kW8A16EpiWgCols = kW8A16TileN / kW8A16ConsumerWGs;  // 64 n per wa
 constexpr int kW8A16EpiWgBytes = kW8A16EpiRows * kW8A16EpiWgCols * 2;  // 16 KB per warpgroup
 constexpr int kW8A16EpiOutBytes = kW8A16EpiWgBytes * kW8A16ConsumerWGs;
 constexpr int kW8A16SkewNs = 1500;  // warpgroup 2 start delay (about one epilogue)
-constexpr int kW8A16BarrierBytes = 2 * kW8A16Stages * 8 + 16;  // full[] + empty[] + fixup flag
+constexpr int kW8A16BarrierBytes = 2 * kW8A16Stages * 8;  // full[] + empty[]
 constexpr int kW8A16StageBytes = kW8A16Stages * (kW8A16AStageBytes + kW8A16WStageBytes);
 constexpr int kW8A16SmemBytesPersistent =
     kW8A16StageBytes + kW8A16EpiOutBytes + kW8A16BarrierBytes + 1024;
@@ -374,51 +373,12 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     n0 = tile_n * kW8A16TileN;  // may be >= N for an odd tile count: computes zeros
     m0 = tile_m * kW8A16TileM;
   };
-  // K extent in 64-wide slabs.  Split-K (blockIdx.y) takes one unit per
-  // block over a slab sub-range; stream-K gives this block an equal share of
-  // units x total_slabs consecutive slabs, crossing tile boundaries.
+  // Split-K: blockIdx.y selects a contiguous range of slabs.
   const int total_slabs = K / kW8A16TileK;
   const int per_split =
       (total_slabs + static_cast<int>(gridDim.y) - 1) / static_cast<int>(gridDim.y);
-  const int split_begin = kSplitK ? min(static_cast<int>(blockIdx.y) * per_split, total_slabs) : 0;
-  const int split_slabs = kSplitK ? min(per_split, total_slabs - split_begin) : total_slabs;
-  // Data-parallel part: whole units in persistent order; stream-K part: the
-  // tail units (< one wave) have their slabs shared equally by all blocks.
-  const int dp_units = kSplitK ? num_units : (num_units / unit_stride) * unit_stride;
-  const int sk_units = num_units - dp_units;
-  const int64_t sk_base = static_cast<int64_t>(dp_units) * total_slabs;  // first tail slab
-  const int64_t sk_work = static_cast<int64_t>(sk_units) * total_slabs;
-  // Only as many blocks share the tail as keep every piece >= kMinStreamKPiece
-  // slabs: a 4-tile tail over 132 blocks would mean 2-slab pieces and a
-  // 33-way serial fixup.
-  const int64_t sk_pieces_max = (sk_work + kW8A16MinStreamKPiece - 1) / kW8A16MinStreamKPiece;
-  const int sk_blocks = static_cast<int>(sk_pieces_max < unit_stride ? sk_pieces_max : unit_stride);
-  const int64_t share = sk_blocks > 0 ? (sk_work + sk_blocks - 1) / sk_blocks : 1;
-  const int64_t work_begin = kSplitK ? 0 : min(static_cast<int64_t>(pair) * share, sk_work);
-  const int64_t work_end = kSplitK ? 0 : min(work_begin + share, sk_work);
-  // Stream-K fixup state: partial slots [grid][2][TileM][TileN] fp32, then
-  // one counter per unit.
-  float* partials = ws;
-  int* counters = reinterpret_cast<int*>(ws + static_cast<int64_t>(unit_stride) * 2 * kW8A16TileM *
-                                                  kW8A16TileN);
-  int* fixup_flag = reinterpret_cast<int*>(empty_bar + kW8A16Stages);
-  // Walk this block's pieces: (unit, kt0, kt1).  Split-K: the one unit per
-  // block over [split_begin, split_begin + split_slabs).
-  auto for_each_piece = [&](auto&& fn) {
-    for (int unit = pair; unit < dp_units; unit += unit_stride) {
-      fn(unit, kSplitK ? split_begin : 0, kSplitK ? split_begin + split_slabs : total_slabs);
-    }
-    if constexpr (!kSplitK) {
-      for (int64_t s = work_begin; s < work_end;) {
-        const int unit = dp_units + static_cast<int>(s / total_slabs);
-        const int kt0 = static_cast<int>(s - static_cast<int64_t>(unit - dp_units) * total_slabs);
-        const int64_t left = work_end - s;
-        const int kt1 = static_cast<int>(kt0 + left < total_slabs ? kt0 + left : total_slabs);
-        fn(unit, kt0, kt1);
-        s += kt1 - kt0;
-      }
-    }
-  };
+  const int slab_begin = kSplitK ? min(static_cast<int>(blockIdx.y) * per_split, total_slabs) : 0;
+  const int num_slabs = kSplitK ? min(per_split, total_slabs - slab_begin) : total_slabs;
 
   if (threadIdx.x == 0) {
     prefetch_tensormap(&act_map);
@@ -442,16 +402,16 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     setmaxnreg_dec<24>();
     if (warp == 0 && lane == 0) {
       constexpr uint32_t kSlabBytes = kW8A16AStageBytes + kW8A16WStageBytes;
-      uint32_t g = 0;  // running slab index across pieces: stage = g % S
-      for_each_piece([&](int unit, int kt0, int kt1) {
+      uint32_t g = 0;  // running slab index across tiles: stage = g % S
+      for (int unit = pair; unit < num_units; unit += unit_stride) {
         int m0, n0;
         map_unit(unit, m0, n0);
-        for (int kt = kt0; kt < kt1; ++kt, ++g) {
+        for (int kt = 0; kt < num_slabs; ++kt, ++g) {
           const int stage = g % kW8A16Stages;
           const uint32_t round = g / kW8A16Stages;
           mbar_wait(&empty_bar[stage], (round & 1) ^ 1);  // fresh barrier: passes at once
           mbar_arrive_expect_tx(&full_bar[stage], kSlabBytes);
-          const int k0 = kt * kW8A16TileK;
+          const int k0 = (slab_begin + kt) * kW8A16TileK;
           if constexpr (kClusterSize > 1) {
             if (rank == 0) {
               tma_load_2d_multicast(a_base + stage * kW8A16AStageBytes, &act_map, &full_bar[stage],
@@ -462,7 +422,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
           }
           tma_load_2d(w_base + stage * kW8A16WStageBytes, &w_map, &full_bar[stage], k0, n0);
         }
-      });
+      }
     }
   } else {
     // ------------------------------ consumers -----------------------------
@@ -492,7 +452,6 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     const uint32_t ld_swz = (ld_r >> 1) & 3;
     const uint32_t ld_chunk_hi = lane / 16;
 
-    int num_slabs = 0;  // slabs in the current piece (read by step)
     // Load + convert the A fragments of one slab for both row blocks
     // (2 blocks x 4 k16 x 4 regs).
     auto load_frags = [&](uint32_t g, uint32_t(&frag)[kW8A16RowBlocks][4][4]) {
@@ -564,78 +523,10 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     };
 
     uint32_t frag0[kW8A16RowBlocks][4][4], frag1[kW8A16RowBlocks][4][4];
-    // Stream-K partial tiles, fp32 [TileM][TileN] row-major in the workspace.
-    // This warpgroup owns n columns [cwg*64, cwg*64 + 64) and all 256 m rows;
-    // it moves them in four 64-row passes through its 16 KB epilogue buffer
-    // ([64 m][64 n] fp32, 16 B chunk index XOR-swizzled by (m >> 1) & 7),
-    // fragments <-> smem in the mma layout and smem <-> global as 16 B rows.
-    float* pbuf = reinterpret_cast<float*>(epi_base + cwg * kW8A16EpiWgBytes);
-    const int wt = threadIdx.x - 128 - cwg * 128;  // warpgroup-local thread id
-    const int n_wg0 = cwg * (64 * kW8A16RowBlocks);
-    auto pidx = [](int r, int c) -> int {  // r: row 0..63, c: fp32 col 0..63
-      return r * 64 + ((((c >> 2) ^ ((r >> 1) & 7))) << 2) + (c & 3);
-    };
-    // Fragment (m = 8j + 2(lane%4) + q, n = wq*16 + lane/4 + 8h) = d[0][j*4+2h+q].
-    auto partial_store = [&](float* slot) {
-#pragma unroll
-      for (int pass = 0; pass < kW8A16TileM / 64; ++pass) {
-        warpgroup_bar_sync(cwg);  // buffer free
-#pragma unroll
-        for (int jj = 0; jj < 8; ++jj) {
-          const int j = pass * 8 + jj;
-#pragma unroll
-          for (int q = 0; q < 2; ++q) {
-            const int r = jj * 8 + (lane % 4) * 2 + q;
-            const int c = wq * 16 + lane / 4;
-            pbuf[pidx(r, c)] = d[0][j * 4 + q];
-            pbuf[pidx(r, c + 8)] = d[0][j * 4 + 2 + q];
-          }
-        }
-        warpgroup_bar_sync(cwg);  // rows staged
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          const int cid = wt + 128 * i;  // 1024 chunks of 16 B
-          const int r = cid / 16, ch = cid % 16;
-          const float4 v = *reinterpret_cast<const float4*>(&pbuf[pidx(r, ch * 4)]);
-          *reinterpret_cast<float4*>(slot + static_cast<int64_t>(pass * 64 + r) * kW8A16TileN +
-                                     n_wg0 + ch * 4) = v;
-        }
-      }
-    };
-    auto partial_add = [&](const float* slot) {
-#pragma unroll
-      for (int pass = 0; pass < kW8A16TileM / 64; ++pass) {
-        warpgroup_bar_sync(cwg);  // buffer free
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          const int cid = wt + 128 * i;
-          const int r = cid / 16, ch = cid % 16;
-          const float4 v = *reinterpret_cast<const float4*>(
-              slot + static_cast<int64_t>(pass * 64 + r) * kW8A16TileN + n_wg0 + ch * 4);
-          *reinterpret_cast<float4*>(&pbuf[pidx(r, ch * 4)]) = v;
-        }
-        warpgroup_bar_sync(cwg);  // rows landed
-#pragma unroll
-        for (int jj = 0; jj < 8; ++jj) {
-          const int j = pass * 8 + jj;
-#pragma unroll
-          for (int q = 0; q < 2; ++q) {
-            const int r = jj * 8 + (lane % 4) * 2 + q;
-            const int c = wq * 16 + lane / 4;
-            d[0][j * 4 + q] += pbuf[pidx(r, c)];
-            d[0][j * 4 + 2 + q] += pbuf[pidx(r, c + 8)];
-          }
-        }
-      }
-    };
-    static_assert(kW8A16RowBlocks == 1, "stream-K staging assumes one row block per warpgroup");
-    static_assert(kW8A16EpiWgBytes >= 64 * 64 * 4, "staging pass needs 16 KB per warpgroup");
-
-    uint32_t g = 0;  // running slab index across pieces (mirrors the producer's)
-    for_each_piece([&](int unit, int kt0, int kt1) {
+    uint32_t g = 0;  // running slab index across tiles (mirrors the producer's)
+    for (int unit = pair; unit < num_units; unit += unit_stride) {
       int m0, n0;
       map_unit(unit, m0, n0);
-      num_slabs = kt1 - kt0;
 #pragma unroll
       for (int b = 0; b < kW8A16RowBlocks; ++b)
 #pragma unroll
@@ -657,42 +548,6 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
           for (uint32_t c = 0; c < kClusterSize; ++c) mbar_arrive_remote(eb, c);
         } else {
           mbar_arrive(eb);
-        }
-      }
-
-      if constexpr (!kSplitK) {
-        // Stream-K fixup.  Blocks whose share intersects this unit's slabs
-        // [unit*T, (unit+1)*T): b_lo .. b_hi.  One block -> whole tile, no
-        // fixup.  Otherwise write the partial, count in, and let the last
-        // arrival reduce.  A block's partial of a unit sits in its slot 0
-        // when the unit is where its share starts, else in slot 1.
-        const int64_t t_begin = static_cast<int64_t>(unit - dp_units) * total_slabs;  // SK-relative
-        const int64_t t_end = t_begin + total_slabs;
-        const bool in_tail = unit >= dp_units;
-        const int b_lo = in_tail ? static_cast<int>(t_begin / share) : 0;
-        const int b_hi = in_tail ? static_cast<int>((t_end - 1) / share) : 0;
-        if (b_hi > b_lo) {
-          const int my_slot = (static_cast<int64_t>(pair) * share > t_begin) ? 0 : 1;
-          float* my_partial =
-              partials + (static_cast<int64_t>(pair) * 2 + my_slot) * kW8A16TileM * kW8A16TileN;
-          partial_store(my_partial);
-          __threadfence();
-          consumer_bar_sync();  // both warpgroups' partials are out
-          if (threadIdx.x == 128) {
-            const int prev = atomicAdd(&counters[unit - dp_units], 1);
-            *fixup_flag = (prev == b_hi - b_lo) ? 1 : 0;
-          }
-          consumer_bar_sync();
-          const bool last = *fixup_flag != 0;
-          consumer_bar_sync();  // everyone has read the flag before it is reused
-          if (!last) return;    // another block finishes this tile
-          __threadfence();
-          for (int b2 = b_lo; b2 <= b_hi; ++b2) {
-            if (b2 == pair) continue;
-            const int slot2 = (static_cast<int64_t>(b2) * share > t_begin) ? 0 : 1;
-            partial_add(partials +
-                        (static_cast<int64_t>(b2) * 2 + slot2) * kW8A16TileM * kW8A16TileN);
-          }
         }
       }
 
@@ -781,7 +636,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
           }
         }
       }
-    });  // for_each_piece
+    }  // unit loop
   }
   // No CTA may exit while its peer can still multicast into its smem or
   // arrive on its barriers.
@@ -842,17 +697,11 @@ inline int W8A16Fp8GemmSplits(int M, int N, int K, int num_sms) {
   return max(splits, 1);
 }
 
-// Workspace bytes a call needs: fp32 split-K partials when it splits,
-// otherwise the stream-K partial slots (2 per block) plus one counter per
-// tile, 256 B aligned.
+// Workspace bytes a call needs (0 when it will not split).
 inline int64_t W8A16Fp8GemmWorkspaceBytes(int M, int N, int K, int num_sms) {
   const int splits = W8A16Fp8GemmSplits(M, N, K, num_sms);
-  if (splits > 1) return static_cast<int64_t>(splits) * M * N * static_cast<int64_t>(sizeof(float));
-  const int64_t units = static_cast<int64_t>(ceil_div(M, kW8A16TileM)) * ceil_div(N, kW8A16TileN);
-  const int64_t grid = units < num_sms ? units : num_sms;
-  const int64_t partial_bytes = grid * 2 * kW8A16TileM * kW8A16TileN * sizeof(float);
-  const int64_t counter_bytes = ((units * sizeof(int)) + 255) / 256 * 256;
-  return partial_bytes + counter_bytes;
+  return splits > 1 ? static_cast<int64_t>(splits) * M * N * static_cast<int64_t>(sizeof(float))
+                    : 0;
 }
 
 // Host side: 2-D tiled tensor map over a row-major [rows x cols] matrix with
@@ -903,9 +752,9 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
   const unsigned tiles_n = ceil_div(N, kW8A16TileN);
   const unsigned pairs_n = ceil_div(tiles_n, static_cast<unsigned>(kClusterSize));
   int splits = W8A16Fp8GemmSplits(M, N, K, num_sms);
-  const int64_t need = W8A16Fp8GemmWorkspaceBytes(M, N, K, num_sms);
-  if (workspace == nullptr || workspace_bytes < need) {
-    return cudaErrorInvalidValue;  // both schedules need their workspace
+  if (splits > 1 &&
+      (workspace == nullptr || workspace_bytes < static_cast<int64_t>(splits) * M * N * 4)) {
+    splits = 1;  // no room for partials: run the single-pass kernel
   }
   const bool split = splits > 1;
   using KernelFn = void (*)(const CUtensorMap, const CUtensorMap, const float*, const T*, T*,
@@ -939,11 +788,6 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
   attr[0].val.clusterDim.z = 1;
   cfg.attrs = attr;
   cfg.numAttrs = kClusterSize > 1 ? 1 : 0;
-  if (!split) {
-    const int64_t counter_off = static_cast<int64_t>(clusters) * 2 * kW8A16TileM * kW8A16TileN;
-    e = cudaMemsetAsync(workspace + counter_off, 0, units * sizeof(int), stream);
-    if (e != cudaSuccess) return e;
-  }
   e = cudaLaunchKernelEx(&cfg, kernel, act_map, w_map, scale, bias, out, workspace, M, N, K);
   if (e != cudaSuccess) return e;
   if (split) {
