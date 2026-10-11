@@ -3481,7 +3481,7 @@ def _cpu_forwarding_runner(module, monkeypatch, calls, **constructor):
         d_has_hdim=False,
         has_initial_states=constructor.pop("has_initial_states", False),
         has_varlen=constructor.pop("has_varlen", False),
-        has_z=False,
+        has_z=constructor.pop("has_z", False),
         seq_idx_dtype=constructor.pop("seq_idx_dtype", torch.int32),
     )
 
@@ -4113,6 +4113,10 @@ def test_source_program_table_names_shipped_sources():
         for family in ("exact", "chunkpar")
         for state in ("bf16", "f16", "f32")
         for mode in ("batched", "varlen")
+    } | {
+        f"exact_{state}_{mode}_noring"
+        for state in ("bf16", "f16", "f32")
+        for mode in ("batched", "varlen")
     }
     assert set(module._SCAN_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("exact_")
@@ -4145,8 +4149,11 @@ def test_source_program_table_names_shipped_sources():
     }
     device_sources = set()
     for name, program in module._PROGRAMS.items():
-        family, state_key, mode = name.split("_")
+        family, state_key, mode, *variant = name.split("_")
         template_path, main_args, smem_bytes = family_host[family]
+        if variant:
+            assert (family, variant) == ("exact", ["noring"])
+            smem_bytes = module._EXACT_NORING_SMEM_BYTES
         assert program.family == family
         assert program.host_template == template_path
         assert program.main_args == main_args
@@ -4158,7 +4165,10 @@ def test_source_program_table_names_shipped_sources():
         assert program.main.module.startswith(
             program.main.kernel.removeprefix("kernel_") + "_"
         )
-        assert program.main.kernel.endswith(f"_{state_key}_{mode}")
+        # The symbol's trailing identity is ``<state>_<mode>[_<variant>]``.
+        assert program.main.kernel.endswith(
+            f"_{state_key}_{mode}" + "".join(f"_{part}" for part in variant)
+        )
         assert program.preprocess.threads > 0 and program.main.threads == 512
         assert not program.preprocess.fast_math and program.main.fast_math
         for kernel in program.kernels:
@@ -4193,10 +4203,10 @@ def test_source_program_table_names_shipped_sources():
             )
             assert state_check in rendered, state_check
         assert "DLDataType{kDLFloat, 16, 1}" in rendered
-    # One shared source per physical kernel: six exact-scan and six
-    # chunk-parallel main sources plus the one preprocess kernel, no
-    # architecture copies and no orphans.
-    assert len(device_sources) == 13
+    # One shared source per physical kernel: twelve exact-scan main sources
+    # (six ring + six ``_noring``) and six chunk-parallel main sources plus
+    # the one preprocess kernel, no architecture copies and no orphans.
+    assert len(device_sources) == 19
     assert sorted(
         path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
     ) == sorted(path.name for path in device_sources)
@@ -4405,14 +4415,15 @@ def test_source_chunk_parallel_selection_quantities_follow_the_cost_model():
     # 128 tiles fit the first wave of 148 SMs: the fixed cost alone.
     assert predicted["chunk_parallel"] == pytest.approx(b200["cp_fixed"])
 
-    # The calibration row: 1 x 32768 tokens x 8 heads (the round-4 re-fit
-    # measured 667 -> 134 us on B200 and 617 -> 124 us on B300).
+    # The calibration row: 1 x 32768 tokens x 8 heads (constants re-fit on
+    # the round-5 programs; round 4 measured 667 -> 134 us on B200 and
+    # 617 -> 124 us on B300).
     long_prefill = quantities(8, 256, (10, 0))["predicted_us"]
-    assert long_prefill["exact_scan"] == pytest.approx(668.754)
-    assert long_prefill["chunk_parallel"] == pytest.approx(118.87)
+    assert long_prefill["exact_scan"] == pytest.approx(659.326)
+    assert long_prefill["chunk_parallel"] == pytest.approx(118.29)
     long_prefill = quantities(8, 256, (10, 3))["predicted_us"]
-    assert long_prefill["exact_scan"] == pytest.approx(617.45)
-    assert long_prefill["chunk_parallel"] == pytest.approx(106.38)
+    assert long_prefill["exact_scan"] == pytest.approx(605.04)
+    assert long_prefill["chunk_parallel"] == pytest.approx(105.61)
 
     large = quantities(128, 32, (10, 3))
     b300 = model[(10, 3)]
@@ -5105,3 +5116,208 @@ def test_cake_ssd_combined_auto_keeps_the_exact_scan_for_many_heads(monkeypatch)
     assert runner._cake_runner.last_program_name == "exact_bf16_batched"
     assert tuple(out.shape) == (1, 1024, 128, 64)
     assert tuple(final.shape) == (1, 128, 64, 128)
+
+
+# ---- exact-scan schedule variant (CAKE-956 round 5 host selection) -------------------------------------------
+
+_VARIANT_CASES = (
+    # (mode_varlen, has_z, nheads, num_sequences, total_tokens, batch, seqlen, state dtype) -> variant;
+    # kernel-level calibration cells (ring / start, GB300 / B200) unless marked FI (the FI-level window
+    # gate and the 93-row gate rows, which decide the bf16 2 x 64 and 3 x 64 cells)
+    # nem_v8x64 (1.019 / 1.013): the gate's losing row
+    ((True, True, 128, 8, 8 * 64, 1, 8 * 64, "bfloat16"), "noring"),
+    # v64x64z 1.008 / 1.002
+    ((True, True, 128, 64, 64 * 64, 1, 64 * 64, "bfloat16"), "noring"),
+    # g6x64z 1.009 / 1.006
+    ((True, True, 128, 6, 6 * 64, 1, 6 * 64, "bfloat16"), "noring"),
+    # g4x64z tie (1.000-1.003 / 0.999-1.002): start
+    ((True, True, 128, 4, 4 * 64, 1, 4 * 64, "bfloat16"), "noring"),
+    # FI win_v3x64_bfloat16 0.996 / 0.989 (tie): start
+    ((True, True, 128, 3, 3 * 64, 1, 3 * 64, "bfloat16"), "noring"),
+    # FI nem_v64_64_bfloat16 1.011-1.018 / 0.997: start
+    ((True, True, 128, 2, 2 * 64, 1, 2 * 64, "bfloat16"), "noring"),
+    # g1x64z 0.937 / 0.943; FI 0.937 / 0.940
+    ((True, True, 128, 1, 64, 1, 64, "bfloat16"), ""),
+    # FI win_v3x64_float32 0.978 / 0.974
+    ((True, True, 128, 3, 3 * 64, 1, 3 * 64, "float32"), ""),
+    # FI nem_v64_64_float32 0.978-1.003 / 0.977
+    ((True, True, 128, 2, 2 * 64, 1, 2 * 64, "float32"), ""),
+    # FI win_v1x64_float32 0.939 / 0.941
+    ((True, True, 128, 1, 64, 1, 64, "float32"), ""),
+    # f32 threshold unchanged: 4 x 128 items
+    ((True, True, 128, 4, 4 * 64, 1, 4 * 64, "float32"), "noring"),
+    # f16 state follows bf16 (same state width)
+    ((True, True, 128, 2, 2 * 64, 1, 2 * 64, "float16"), "noring"),
+    # g8x63z 0.974 / 0.976 (window edge)
+    ((True, True, 128, 8, 8 * 63, 1, 8 * 63, "bfloat16"), ""),
+    # g8x65z 0.979 / 0.963 (window edge)
+    ((True, True, 128, 8, 8 * 65, 1, 8 * 65, "bfloat16"), ""),
+    ((True, True, 128, 8, 8 * 60, 1, 8 * 60, "bfloat16"), ""),  # g8x60z 0.961 / 0.960
+    # [63, 65] x 4: 1.008 / 1.007
+    ((True, True, 128, 8, 4 * (63 + 65), 1, 512, "bfloat16"), "noring"),
+    # [32, 96] x 4: 1.006 / 1.005
+    ((True, True, 128, 8, 4 * (32 + 96), 1, 512, "bfloat16"), "noring"),
+    # 64.5 tokens on average: inside the window, start
+    ((True, True, 128, 8, 516, 1, 516, "bfloat16"), "noring"),
+    # g5x64z tie (1.001 / 0.994): start
+    ((True, True, 128, 5, 5 * 64, 1, 5 * 64, "bfloat16"), "noring"),
+    ((True, True, 128, 8, 8 * 32, 1, 8 * 32, "bfloat16"), ""),  # g8x32z 0.988 / 0.985
+    # g8x128z 0.915 / 0.917
+    ((True, True, 128, 8, 8 * 128, 1, 8 * 128, "bfloat16"), ""),
+    # nem_v96p160 0.964 / 0.960
+    ((True, True, 128, 2, 96 + 160, 1, 256, "bfloat16"), ""),
+    # nem_v64x128 0.901 / 0.906
+    ((True, True, 128, 64, 64 * 128, 1, 64 * 128, "bfloat16"), ""),
+    # g8x64 (no z) 0.992 / 0.990
+    ((True, False, 128, 8, 8 * 64, 1, 8 * 64, "bfloat16"), ""),
+    # short_varlen_64_60 (no z) 1.000 / 1.003
+    ((True, False, 128, 2, 124, 1, 124, "bfloat16"), ""),
+    # 64 work items (below both thresholds): ring
+    ((True, True, 8, 8, 8 * 64, 1, 8 * 64, "bfloat16"), ""),
+    # 256 work items at 64 tokens, 16-bit state
+    ((True, True, 8, 32, 32 * 64, 1, 32 * 64, "bfloat16"), "noring"),
+    # 256 work items at 64 tokens, f32 state: ring
+    ((True, True, 8, 32, 32 * 64, 1, 32 * 64, "float32"), ""),
+    # 512 work items at 64 tokens
+    ((True, True, 8, 64, 64 * 64, 1, 64 * 64, "float32"), "noring"),
+    # short_batched_2x50 1.008 / 1.005
+    ((False, False, 128, 2, 100, 2, 50, "bfloat16"), "noring"),
+    ((False, False, 128, 2, 150, 2, 75, "bfloat16"), "noring"),  # gb2x75 1.005 / 0.993
+    # gb2x60 1.000 / 1.000 (tie): start
+    ((False, False, 128, 2, 120, 2, 60, "bfloat16"), "noring"),
+    ((False, False, 128, 2, 50, 2, 25, "bfloat16"), ""),  # gb2x25 0.990 / 0.991
+    ((False, False, 128, 2, 180, 2, 90, "bfloat16"), ""),  # gb2x90 0.987 / 0.995
+    ((False, False, 128, 2, 200, 2, 100, "bfloat16"), ""),  # gb2x100 0.995 / 0.991
+    ((False, False, 128, 1, 50, 1, 50, "bfloat16"), ""),  # gb1x50 0.970 / 0.955
+    ((False, False, 128, 3, 150, 3, 50, "bfloat16"), ""),  # gb3x50 0.992 / 0.986
+    # gb2x50z 1.002 / 0.987 (z: ring)
+    ((False, True, 128, 2, 100, 2, 50, "bfloat16"), ""),
+    ((False, False, 128, 4, 200, 4, 50, "bfloat16"), ""),  # gb4x50 0.973 / 0.960
+    # nem_b1x1000 0.925 / 0.911
+    ((False, False, 128, 1, 1000, 1, 1000, "bfloat16"), ""),
+    # gb64x128z 0.898 / 0.908
+    ((False, True, 128, 64, 64 * 128, 64, 128, "bfloat16"), ""),
+    # batched rule is dtype-independent
+    ((False, False, 128, 2, 100, 2, 50, "float32"), "noring"),
+)
+
+
+@pytest.mark.parametrize("args,expected", _VARIANT_CASES)
+def test_source_exact_scan_variant_rule_cells(args, expected):
+    """The host rule sends every calibrated losing cell to the start schedule and
+    every winning cell to the ring program (CAKE-956 round 5 calibration table in
+    the loader); it reads host-known shape quantities only."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    (
+        mode_varlen,
+        has_z,
+        nheads,
+        num_sequences,
+        total_tokens,
+        batch,
+        seqlen,
+        state_dtype,
+    ) = args
+    assert (
+        module._exact_scan_variant(
+            mode_varlen=mode_varlen,
+            has_z=has_z,
+            nheads=nheads,
+            num_sequences=num_sequences,
+            total_tokens=total_tokens,
+            batch=batch,
+            seqlen=seqlen,
+            state_dtype=getattr(torch, state_dtype),
+        )
+        == expected
+    )
+
+
+def test_source_exact_scan_variant_programs():
+    """Both exact-scan variants of every (state, mode) are programs of the exact
+    family (same host template and argument order); the ``_noring`` programs
+    carry their own main dynamic SMEM literal."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    for state_dtype in (torch.bfloat16, torch.float16, torch.float32):
+        for mode_varlen in (False, True):
+            ring = module._program_name("exact", state_dtype, mode_varlen)
+            noring = module._program_name("exact", state_dtype, mode_varlen, "noring")
+            assert noring == ring + "_noring"
+            a, b = module._PROGRAMS[ring], module._PROGRAMS[noring]
+            assert a.family == b.family == "exact"
+            assert a.host_template == b.host_template and a.main_args == b.main_args
+            assert (a.state_dtype_code, a.state_dtype_bits) == (
+                b.state_dtype_code,
+                b.state_dtype_bits,
+            )
+            assert a.main_smem_bytes == module._EXACT_SMEM_BYTES
+            assert b.main_smem_bytes == module._EXACT_NORING_SMEM_BYTES
+            assert a.main.module != b.main.module
+    assert len([name for name in module._PROGRAMS if name.startswith("exact_")]) == 12
+    assert len(module._PROGRAMS) == 18
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "varlen_8x64_z",
+        "varlen_8x128_z",
+        "varlen_8x64_noz",
+        "batched_2x50",
+        "batched_2x128",
+        "batched_2x50_z",
+    ),
+)
+def test_source_exact_scan_variant_selected_without_gpu(monkeypatch, case):
+    """The plan binds the variant the host rule selects from the call shape
+    (``cu_seqlens.numel() - 1`` sequences, ``x.shape`` tokens, the runner's
+    ``has_z``) -- the same program for :meth:`run` and :meth:`prepare`."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    varlen = case.startswith("varlen")
+    has_z = case.endswith("_z")
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=128,
+        ngroups=8,
+        has_varlen=varlen,
+        has_initial_states=True,
+        has_z=has_z,
+    )
+    if varlen:
+        tokens = {"varlen_8x64_z": 64, "varlen_8x128_z": 128, "varlen_8x64_noz": 64}[
+            case
+        ]
+        num_seqs, batch, seqlen = 8, 1, 8 * tokens
+        cu_seqlens = torch.arange(0, (num_seqs + 1) * tokens, tokens, dtype=torch.int32)
+        expected = "exact_bf16_varlen" + ("_noring" if tokens == 64 and has_z else "")
+    else:
+        num_seqs = batch = 2
+        seqlen = {"batched_2x50": 50, "batched_2x128": 128, "batched_2x50_z": 50}[case]
+        cu_seqlens = None
+        expected = "exact_bf16_batched" + (
+            "_noring" if seqlen == 50 and not has_z else ""
+        )
+    x = torch.empty((batch, seqlen, 128, 64), dtype=torch.bfloat16)
+    dt = torch.empty((batch, seqlen, 128), dtype=torch.float32)
+    A = torch.empty((128,), dtype=torch.float32)
+    B = torch.empty((batch, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {
+        "initial_states": torch.empty((num_seqs, 128, 64, 128), dtype=torch.bfloat16)
+    }
+    if has_z:
+        kwargs["z"] = torch.empty_like(x)
+    if varlen:
+        kwargs["cu_seqlens"] = cu_seqlens
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, _launch),) = calls
+    assert name == expected
+    monkeypatch.setattr(module, "_load_generated_program", lambda *_: None)
+    prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **kwargs)
+    assert prepared.program_name == expected
