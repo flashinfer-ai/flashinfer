@@ -25,17 +25,19 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 33 of the optimization ladder: paired 32-bit staging stores.  A
-// thread's accumulator fragment holds output columns n and n+8 for rows m
-// and m+1, so the 16-bit staging stores were scalar (two per row pair).
-// Lanes xor 4 hold the same rows for column n+1: one shuffle per row pair
-// swaps (m+1, n) for (m, n+1), after which the even-column lane packs
-// (m, n..n+1) and the odd-column lane packs (m+1, n-1..n), and each stores
-// one 32-bit word (one convert instruction per pair instead of two).  The
-// swizzled layout keeps the 32-bit stores conflict-free.  Split-K keeps its
-// fp32 scalar stores.  TMA-store epilogue (rung 31), shared-window stores
-// (rung 32) and tile dispatch (rung 30b) unchanged.  Requires sm_90a,
-// K % 64 == 0, 16 B aligned bases, N % 8 == 0.
+// Rung 34 of the optimization ladder: split-K from the cost model.  Split-K
+// used to trigger only when the tile grid was under a third of a wave, with
+// the split count aimed at one wave, independent of the tile choice; the
+// dispatcher then compared tiles with those fixed splits.  Now every
+// (tile, splits) pair is costed with the rung-30b model
+//   ceil(units * splits / SMs) * tileN * tileM * (K / splits) / eff
+//     + 8 * M * N * splits                      (fp32 round trip, splits > 1)
+// and the launch takes the cheapest: a 128x256 grid at half a wave now
+// splits two ways instead of falling back to the 61%-tensor-pipe 128x128
+// tile.  FLASHINFER_W8A16_FP8_SPLITS pins a split count for benchmarking.
+// Kernel code unchanged from rung 33 (TMA-store epilogue, shared-window
+// paired stores).  Requires sm_90a, K % 64 == 0, 16 B aligned bases,
+// N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -859,42 +861,60 @@ __global__ void W8A16SplitKReduceKernel(const float* __restrict__ ws, int splits
   *reinterpret_cast<uint4*>(out + i) = *reinterpret_cast<const uint4*>(v);
 }
 
-// Split-K plan: number of K splits for a problem on tile Cfg (1 = no split).
-// Split only when the tile grid is under a third of a wave of SMs, aim for
-// one wave, and keep at least 8 slabs per split so the fp32 partial round
-// trip stays small next to the mainloop.
+// Relative mainloop efficiency of a tile (H100, rung-30 tables): 128x256 is
+// the reference; 128x128 runs m64n128 wgmma at about two thirds of it.
+// 256x128 is only reachable through the env var, its value never competes.
 template <typename Cfg>
-inline int W8A16Fp8GemmSplits(int M, int N, int K, int num_sms) {
-  const int tiles =
-      static_cast<int>(ceil_div(M, Cfg::kTileM)) * static_cast<int>(ceil_div(N, Cfg::kTileN));
-  const int total_slabs = K / kW8A16TileK;
-  if (tiles * 3 > num_sms || total_slabs < 2 * kW8A16MinSlabsPerSplit) return 1;
-  int splits = static_cast<int>(ceil_div(num_sms, tiles));
-  splits = min(splits, kW8A16MaxSplits);
-  splits = min(splits, total_slabs / kW8A16MinSlabsPerSplit);
-  return max(splits, 1);
+constexpr double W8A16TileEff() {
+  return Cfg::kTileM == 256 ? 1.00 : (Cfg::kTileN == 256 ? 0.70 : 0.65);
 }
 
-// Modelled time of tile Cfg on (M, N, K): waves of (units x splits) blocks,
-// each a tileN x tileM x K/splits mainloop at relative efficiency `eff`,
-// plus the fp32 partial round trip when it splits.  Fitted to the rung-30
-// H100 tables (all three tiles forced on 108 shapes); only the ranking
-// matters, the unit is arbitrary.
-constexpr double kW8A16ModelReduceCost = 16.0;
+// Modelled time of tile Cfg on (M, N, K) with `splits` K splits: waves of
+// (units x splits) blocks, each a tileN x tileM x K/splits mainloop at the
+// tile's relative efficiency, plus the fp32 partial round trip when it
+// splits.  Fitted to the rung-30 H100 tables; only the ranking matters,
+// the unit is arbitrary.
+constexpr double kW8A16ModelReduceCost = 8.0;
 template <typename Cfg>
-inline double W8A16Fp8GemmModelTime(int M, int N, int K, int num_sms, double eff) {
-  const int splits = W8A16Fp8GemmSplits<Cfg>(M, N, K, num_sms);
+inline double W8A16Fp8GemmModelTime(int M, int N, int K, int num_sms, int splits) {
   const double units = static_cast<double>(ceil_div(M, Cfg::kTileM)) * ceil_div(N, Cfg::kTileN);
   const double waves = std::ceil(units * splits / num_sms);
-  double t = waves * Cfg::kTileN * Cfg::kTileM * (static_cast<double>(K) / splits) / eff;
+  double t =
+      waves * Cfg::kTileN * Cfg::kTileM * (static_cast<double>(K) / splits) / W8A16TileEff<Cfg>();
   if (splits > 1) t += kW8A16ModelReduceCost * static_cast<double>(M) * N * splits;
   return t;
 }
 
+// Split-K plan for tile Cfg: the split count (1 = no split) with the
+// smallest modelled time, keeping at least kW8A16MinSlabsPerSplit slabs per
+// split and at most kW8A16MaxSplits.  FLASHINFER_W8A16_FP8_SPLITS pins a
+// count for benchmarking (clamped to the slab limit).
+template <typename Cfg>
+inline int W8A16Fp8GemmSplits(int M, int N, int K, int num_sms) {
+  static int forced = -1;
+  if (forced < 0) {
+    const char* e = getenv("FLASHINFER_W8A16_FP8_SPLITS");
+    forced = e != nullptr ? max(atoi(e), 0) : 0;
+  }
+  const int total_slabs = K / kW8A16TileK;
+  const int max_splits = min(kW8A16MaxSplits, max(1, total_slabs / kW8A16MinSlabsPerSplit));
+  if (forced > 0) return min(forced, max_splits);
+  int best = 1;
+  double best_t = W8A16Fp8GemmModelTime<Cfg>(M, N, K, num_sms, 1);
+  for (int s = 2; s <= max_splits; ++s) {
+    const double t = W8A16Fp8GemmModelTime<Cfg>(M, N, K, num_sms, s);
+    if (t < best_t) {
+      best_t = t;
+      best = s;
+    }
+  }
+  return best;
+}
+
 // Tile choice for (M, N, K) on a GPU with num_sms SMs: 128x256 unless the
-// 128x128 grid is modelled faster (it fills waves 128x256 leaves empty on
-// narrow-N / short-M problems).  256x128 is never picked automatically (see
-// the header).  FLASHINFER_W8A16_FP8_TILE pins a tile for benchmarking.
+// 128x128 grid, each at its own best split count, is modelled faster.
+// 256x128 is never picked automatically (see the header).
+// FLASHINFER_W8A16_FP8_TILE pins a tile for benchmarking.
 inline W8A16Tile W8A16Fp8GemmPickTile(int M, int N, int K, int num_sms) {
   static int forced = -1;
   if (forced < 0) {
@@ -907,8 +927,10 @@ inline W8A16Tile W8A16Fp8GemmPickTile(int M, int N, int K, int num_sms) {
     }
   }
   if (forced > 0) return static_cast<W8A16Tile>(forced);
-  const double t_128x256 = W8A16Fp8GemmModelTime<W8A16Cfg128x256>(M, N, K, num_sms, 1.00);
-  const double t_128x128 = W8A16Fp8GemmModelTime<W8A16Cfg128x128>(M, N, K, num_sms, 0.65);
+  const double t_128x256 = W8A16Fp8GemmModelTime<W8A16Cfg128x256>(
+      M, N, K, num_sms, W8A16Fp8GemmSplits<W8A16Cfg128x256>(M, N, K, num_sms));
+  const double t_128x128 = W8A16Fp8GemmModelTime<W8A16Cfg128x128>(
+      M, N, K, num_sms, W8A16Fp8GemmSplits<W8A16Cfg128x128>(M, N, K, num_sms));
   return t_128x128 < t_128x256 ? W8A16Tile::k128x128 : W8A16Tile::k128x256;
 }
 
