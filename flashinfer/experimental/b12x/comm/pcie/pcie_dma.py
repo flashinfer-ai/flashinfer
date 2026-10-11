@@ -178,6 +178,7 @@ class PCIeDmaAllReduce:
         max_bytes: int,
         ext_module=None,
         fp8: Optional[str] = None,
+        ipc=None,
     ) -> None:
         # Kept only as a source-compatible keyword for callers that used to
         # inject the removed C++ extension.  Device work is always CuTe DSL.
@@ -194,8 +195,12 @@ class PCIeDmaAllReduce:
         if self.device.type != "cuda":
             raise ValueError("PCIe ring allreduce requires a CUDA device")
         self.max_bytes = int(max_bytes)
-        self._ipc = CudaRTLibrary()
-        self._ipc.cudaSetDevice(self.device.index or 0)
+        # Callers may supply the shared-memory allocator, e.g. VMM storage
+        # that an exporter retains at recorded addresses.
+        if ipc is None:
+            ipc = CudaRTLibrary()
+            ipc.cudaSetDevice(self.device.index or 0)
+        self._ipc = ipc
         self._kernels = _load_kernels(self._ipc)
         self._closed = False
         self._eager_replays: dict[
