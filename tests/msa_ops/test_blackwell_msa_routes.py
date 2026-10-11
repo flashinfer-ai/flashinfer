@@ -39,7 +39,11 @@ def _derive(route):
     """Re-derive one registered ``<kind>:...`` route from the inputs it encodes."""
     kind, *fields = route.split(":")
     if kind == "topk_select":
-        return "topk_select"
+        # the query-tiled radix select: a wide grid (the LOSS shape T1024 H8 nvp8192)
+        return backend._topk_route(1024, 8, 8192, 8192)
+    if kind == "topk_select_streaming":
+        # small latency-bound multi-pass grid (the tied T64 H4 nvp782 row): 256 rows, slice 98 > cap 64
+        return backend._topk_route(64, 4, 782, 8192)
     if kind == "prefill_union":
         q_dtype, kv_dtype, layout, gqa, variant = fields
         causal = variant != "any"
@@ -126,8 +130,6 @@ def test_fp8_q1_specializations_are_selected_only_on_their_coordinates():
 
 def test_long_prefill_predicate_covers_flat_and_paged_boundaries():
     common = dict(
-        batch_size=1,
-        total_q=8192,
         q_dtype=torch.bfloat16,
         k_dtype=torch.bfloat16,
         v_dtype=torch.bfloat16,
@@ -136,35 +138,45 @@ def test_long_prefill_predicate_covers_flat_and_paged_boundaries():
         return_temperature_lse=False,
         lse_temperature_scale=1.0,
     )
+    flat = dict(paged=False, group_size=16, max_pages=0)
+    assert backend._use_long_prefill(**common, **flat, q_lens=(8192,), k_lens=(8192,))
     assert backend._use_long_prefill(
-        **common, paged=False, group_size=16, max_pages=0, k_outer_dim=8192
+        **common, **flat, q_lens=(8192, 8320), k_lens=(8192, 8320)
     )
     assert backend._use_long_prefill(
-        **common, paged=True, group_size=8, max_pages=64, k_outer_dim=64
+        **common, paged=True, group_size=8, max_pages=64, q_lens=(8192,), k_lens=(64 * 128,)
     )
     assert backend._use_long_prefill(
-        **common, paged=True, group_size=16, max_pages=65, k_outer_dim=65
+        **common, paged=True, group_size=16, max_pages=65, q_lens=(8192,), k_lens=(65 * 128,)
+    )
+    # Paged K/V qualifies through the page-table width, not the KV lengths.
+    assert backend._use_long_prefill(
+        **common, paged=True, group_size=16, max_pages=65, q_lens=(8192, 8192), k_lens=(4096, 8320)
     )
     assert not backend._use_long_prefill(
-        **common, paged=True, group_size=16, max_pages=64, k_outer_dim=64
+        **common, paged=True, group_size=16, max_pages=64, q_lens=(8192,), k_lens=(64 * 128,)
     )
     assert not backend._use_long_prefill(
-        **common, paged=False, group_size=8, max_pages=0, k_outer_dim=8192
+        **common, paged=False, group_size=8, max_pages=0, q_lens=(8192,), k_lens=(8192,)
+    )
+    assert not backend._use_long_prefill(**common, **flat, q_lens=(8191,), k_lens=(8192,))
+    # One short request declines the whole batch; so does one short flat KV.
+    assert not backend._use_long_prefill(
+        **common, **flat, q_lens=(8192, 4096), k_lens=(8192, 8192)
     )
     assert not backend._use_long_prefill(
-        **{**common, "total_q": 8191},
-        paged=False,
-        group_size=16,
-        max_pages=0,
-        k_outer_dim=8192,
+        **common, **flat, q_lens=(8192, 8192), k_lens=(8192, 8191)
     )
     assert not backend._use_long_prefill(
         **{**common, "return_temperature_lse": True, "lse_temperature_scale": 0.7},
-        paged=False,
-        group_size=16,
-        max_pages=0,
-        k_outer_dim=8192,
+        **flat,
+        q_lens=(8192,),
+        k_lens=(8192,),
     )
+    with pytest.raises(ValueError):
+        backend._use_long_prefill(**common, **flat, q_lens=(8192, 8192), k_lens=(8192,))
+    with pytest.raises(ValueError):
+        backend._use_long_prefill(**common, **flat, q_lens=(), k_lens=())
 
 
 def test_prefill_route_selects_the_gqa16_paged_mask_family():
