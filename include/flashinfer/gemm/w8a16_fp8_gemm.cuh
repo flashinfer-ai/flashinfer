@@ -25,18 +25,19 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 27 of the optimization ladder: back to the static persistent
-// schedule.  Rungs 25-26 tried stream-K for the tail wave (data-parallel
-// full waves + a shared tail, fp32 partials in a workspace with per-tile
-// counters, first as scattered fragment stores and then staged through
-// shared memory): correct, a real win on the wave-quantized rows (M=4096
-// up to 1.44x), but a net loss over the shape table and never spill-free
-// (432 B, then 1248 B of stack once the staging loops stopped unrolling).
-// This rung restores rung 24's kernel exactly -- one block per SM walking
-// whole units in the grouped order, split-K below a third of a wave,
-// register split 24 / 240 -- so the final kernel is the measured best and
-// the stream-K attempts stay in history.  Requires sm_90a, K % 64 == 0,
-// 16 B aligned bases, N % 8 == 0.
+// Rung 28 of the optimization ladder: textbook ping-pong consumers.  Each
+// consumer warpgroup now owns its own 64(n) x 256(m) tile (one m64n256k16
+// row block); a block works on two tiles at a time, the producer streams
+// the first warpgroup's K slabs and then the second's through the shared
+// stage ring, and an ordered pair of named barriers lets only one
+// warpgroup issue its mainloop at a time: warpgroup 0 runs tile 2i while
+// warpgroup 1 stores tile 2i-1, then they swap (the FA3 / CUTLASS
+// "pingpong" schedule).  Each stage is consumed by one warpgroup, so the
+// act slab is loaded once per warpgroup tile instead of once per two,
+// which is the traffic cost rung 22 avoided.  The split-K path keeps the
+// cooperative 128(n) tile (its weight slab is two 64-row TMA boxes).
+// Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0,
+// cluster size 1.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -52,8 +53,9 @@
 namespace flashinfer {
 namespace gemm {
 
-constexpr int kW8A16TileN = 128;  // n rows per block (one wgmma M per consumer WG)
-constexpr int kW8A16TileM = 256;  // m cols per block (wgmma N)
+constexpr int kW8A16TileN = 128;   // split-K block tile n (two warpgroups x 64)
+constexpr int kW8A16PPTileN = 64;  // ping-pong: n rows per warpgroup tile
+constexpr int kW8A16TileM = 256;   // m cols per block (wgmma N)
 constexpr int kW8A16TileK = 64;
 constexpr int kW8A16Stages = 4;
 constexpr int kW8A16GroupM = 8;       // m-tiles per rasterization group
@@ -66,7 +68,7 @@ constexpr int kW8A16ConsumerWarps = kW8A16ConsumerThreads / 32;
 constexpr int kW8A16ARowBytes = kW8A16TileK * 2;  // act row = 64 bf16 = 128 B (SW128 atom)
 constexpr int kW8A16WRowBytes = kW8A16TileK;      // weight row = 64 fp8 = 64 B (SW64 atom)
 constexpr int kW8A16AStageBytes = kW8A16TileM * kW8A16ARowBytes;  // 32 KB
-constexpr int kW8A16WStageBytes = kW8A16TileN * kW8A16WRowBytes;  // 8 KB
+constexpr int kW8A16WStageBytes = kW8A16TileN * kW8A16WRowBytes;  // 8 KB (split-K); pp uses 4 KB
 constexpr int kW8A16EpiPad = kW8A16TileN + 8;                     // elements per staged output row
 constexpr int kW8A16MaxSplits = 8;
 constexpr int kW8A16MinSlabsPerSplit = 8;  // amortize the partial-tile round trip
@@ -79,7 +81,6 @@ constexpr int kW8A16EpiWgCols = kW8A16TileN / kW8A16ConsumerWGs;  // 64 n per wa
 // (m >> 1) & 7 so the four even rows a warp writes at once hit different banks.
 constexpr int kW8A16EpiWgBytes = kW8A16EpiRows * kW8A16EpiWgCols * 2;  // 16 KB per warpgroup
 constexpr int kW8A16EpiOutBytes = kW8A16EpiWgBytes * kW8A16ConsumerWGs;
-constexpr int kW8A16SkewNs = 1500;  // warpgroup 2 start delay (about one epilogue)
 constexpr int kW8A16BarrierBytes = 2 * kW8A16Stages * 8;  // full[] + empty[]
 constexpr int kW8A16StageBytes = kW8A16Stages * (kW8A16AStageBytes + kW8A16WStageBytes);
 constexpr int kW8A16SmemBytesPersistent =
@@ -359,7 +360,8 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
   const int pair = blockIdx.x / kClusterSize;
   const int unit_stride = gridDim.x / kClusterSize;
   const int tiles_m = (M + kW8A16TileM - 1) / kW8A16TileM;
-  const int tiles_n = (N + kW8A16TileN - 1) / kW8A16TileN;
+  constexpr int kUnitN = kSplitK ? kW8A16TileN : kW8A16PPTileN;  // n per unit
+  const int tiles_n = (N + kUnitN - 1) / kUnitN;
   const int pairs_n = (tiles_n + kClusterSize - 1) / kClusterSize;
   const int num_units = tiles_m * pairs_n;
   const int group_size = kW8A16GroupM * pairs_n;
@@ -370,7 +372,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     const int in_group = unit - group * group_size;
     const int tile_m = first_m + in_group % this_group_m;
     const int tile_n = (in_group / this_group_m) * kClusterSize + static_cast<int>(rank);
-    n0 = tile_n * kW8A16TileN;  // may be >= N for an odd tile count: computes zeros
+    n0 = tile_n * kUnitN;  // may be >= N for an odd tile count: computes zeros
     m0 = tile_m * kW8A16TileM;
   };
   // Split-K: blockIdx.y selects a contiguous range of slabs.
@@ -387,7 +389,9 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     for (int s = 0; s < kW8A16Stages; ++s) {
       mbar_init(&full_bar[s], 1);  // one arrive.expect_tx per slab (tx from both copies)
       // One arrive per consumer warp of every CTA in the cluster.
-      mbar_init(&empty_bar[s], kClusterSize * kW8A16ConsumerWarps);
+      // Split-K: both warpgroups release each stage; ping-pong: one does.
+      mbar_init(&empty_bar[s],
+                kClusterSize * (kSplitK ? kW8A16ConsumerWarps : kW8A16ConsumerWarps / 2));
     }
     fence_barrier_init();
   }
@@ -403,52 +407,61 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     if (warp == 0 && lane == 0) {
       constexpr uint32_t kSlabBytes = kW8A16AStageBytes + kW8A16WStageBytes;
       uint32_t g = 0;  // running slab index across tiles: stage = g % S
-      for (int unit = pair; unit < num_units; unit += unit_stride) {
-        int m0, n0;
-        map_unit(unit, m0, n0);
-        for (int kt = 0; kt < num_slabs; ++kt, ++g) {
-          const int stage = g % kW8A16Stages;
-          const uint32_t round = g / kW8A16Stages;
-          mbar_wait(&empty_bar[stage], (round & 1) ^ 1);  // fresh barrier: passes at once
-          mbar_arrive_expect_tx(&full_bar[stage], kSlabBytes);
-          const int k0 = (slab_begin + kt) * kW8A16TileK;
-          if constexpr (kClusterSize > 1) {
-            if (rank == 0) {
-              tma_load_2d_multicast(a_base + stage * kW8A16AStageBytes, &act_map, &full_bar[stage],
-                                    k0, m0, static_cast<uint16_t>((1u << kClusterSize) - 1));
+      // Split-K: one unit per block iteration (both warpgroups).  Ping-pong:
+      // two units per iteration, warpgroup 0's tile first, then warpgroup 1's.
+      constexpr int kPerIter = kSplitK ? 1 : 2;
+      for (int base = pair * kPerIter; base < num_units; base += unit_stride * kPerIter) {
+        for (int c = 0; c < kPerIter; ++c) {
+          const int unit = base + c;
+          if (unit >= num_units) break;
+          int m0, n0;
+          map_unit(unit, m0, n0);
+          for (int kt = 0; kt < num_slabs; ++kt, ++g) {
+            const int stage = g % kW8A16Stages;
+            const uint32_t round = g / kW8A16Stages;
+            mbar_wait(&empty_bar[stage], (round & 1) ^ 1);  // fresh barrier: passes at once
+            mbar_arrive_expect_tx(&full_bar[stage], kW8A16AStageBytes + kUnitN * kW8A16WRowBytes);
+            const int k0 = (slab_begin + kt) * kW8A16TileK;
+            if constexpr (kClusterSize > 1) {
+              if (rank == 0) {
+                tma_load_2d_multicast(a_base + stage * kW8A16AStageBytes, &act_map,
+                                      &full_bar[stage], k0, m0,
+                                      static_cast<uint16_t>((1u << kClusterSize) - 1));
+              }
+            } else {
+              tma_load_2d(a_base + stage * kW8A16AStageBytes, &act_map, &full_bar[stage], k0, m0);
             }
-          } else {
-            tma_load_2d(a_base + stage * kW8A16AStageBytes, &act_map, &full_bar[stage], k0, m0);
+            // Weight boxes are 64 rows: one per ping-pong tile, two per split tile.
+#pragma unroll
+            for (int hb = 0; hb < kUnitN / kW8A16PPTileN; ++hb) {
+              tma_load_2d(w_base + stage * kW8A16WStageBytes + hb * kW8A16PPTileN * kW8A16WRowBytes,
+                          &w_map, &full_bar[stage], k0, n0 + hb * kW8A16PPTileN);
+            }
           }
-          tma_load_2d(w_base + stage * kW8A16WStageBytes, &w_map, &full_bar[stage], k0, n0);
         }
       }
     }
   } else {
     // ------------------------------ consumers -----------------------------
     setmaxnreg_inc<240>();
-    const int cwg = wg - 1;  // consumer warpgroup: n rows cwg*128 .. +127
-    if (cwg == 1 && !kSplitK) {
-      // Start one epilogue late so the two warpgroups alternate between
-      // mainloop and epilogue instead of idling the tensor pipe together.
-      const uint64_t t0 = globaltimer_ns();
-      while (globaltimer_ns() - t0 < kW8A16SkewNs) {
-      }
-    }
-    const int wq = warp & 3;  // warp within it: rows wq*16 .. +15 of each row block
+    const int cwg = wg - 1;   // consumer warpgroup: n rows cwg*128 .. +127
+    const int wq = warp & 3;  // warp within the warpgroup: rows wq*16 .. +15 of its row block
     float d[kW8A16RowBlocks][128];
 
     // Row block b covers tile rows cwg*128 + b*64 .. +63.
     // Plain layout: rows r = base + wq*16 + lane/4 (+8), k = 2*(lane%4) (+8)
     // within each k16; the 16 B chunk holding k16 of row r sits at chunk
     // index (k16/16) ^ ((r>>1)&3) under the 64 B swizzle.
-    const int a_r = cwg * (64 * kW8A16RowBlocks) + wq * 16 + lane / 4;
+    // Rows of this warpgroup's fragments inside the weight stage: the split
+    // tile holds both warpgroups' 64 rows, a ping-pong stage only its own.
+    const int wg_row0 = kSplitK ? cwg * 64 : 0;
+    const int a_r = wg_row0 + wq * 16 + lane / 4;
     const int a_k = (lane % 4) * 2;
     const uint32_t swz0 = (a_r >> 1) & 3;  // same for a_r + 64 (64 is 0 mod 8)
     const uint32_t swz1 = ((a_r + 8) >> 1) & 3;
     // Prepared layout: ldmatrix row for this lane = base + (lane % 8) +
     // 8 * ((lane / 8) % 2), chunk = 2 * pair + lane / 16.
-    const int ld_r = cwg * (64 * kW8A16RowBlocks) + wq * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
+    const int ld_r = wg_row0 + wq * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
     const uint32_t ld_swz = (ld_r >> 1) & 3;
     const uint32_t ld_chunk_hi = lane / 16;
 
@@ -524,9 +537,24 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
 
     uint32_t frag0[kW8A16RowBlocks][4][4], frag1[kW8A16RowBlocks][4][4];
     uint32_t g = 0;  // running slab index across tiles (mirrors the producer's)
-    for (int unit = pair; unit < num_units; unit += unit_stride) {
+    // Ping-pong: this warpgroup takes every other unit of its block (2i + cwg)
+    // and its slabs sit at ring positions [(2i + cwg) T, (2i + cwg + 1) T).
+    // Named barriers 4 / 5 order the two mainloops: a warpgroup issues its
+    // mainloop only after the other has issued the previous one.
+    constexpr int kPerIter = kSplitK ? 1 : 2;
+    int iter = 0;
+    for (int base = pair * kPerIter; base < num_units; base += unit_stride * kPerIter, ++iter) {
+      const int unit = kSplitK ? base : base + cwg;
+      if (unit >= num_units) break;  // odd tail: warpgroup 1 has no tile
       int m0, n0;
       map_unit(unit, m0, n0);
+      if constexpr (!kSplitK) {
+        g = static_cast<uint32_t>(iter * 2 + cwg) * static_cast<uint32_t>(total_slabs);
+        if (!(iter == 0 && cwg == 0)) {
+          // wait for the other warpgroup to finish issuing its mainloop
+          asm volatile("bar.sync %0, 256;\n" ::"r"(4 + cwg) : "memory");
+        }
+      }
 #pragma unroll
       for (int b = 0; b < kW8A16RowBlocks; ++b)
 #pragma unroll
@@ -540,6 +568,14 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
         if (kt + 1 < num_slabs) step(kt + 1, g + kt + 1, frag1, frag0);
       }
       g += num_slabs;
+      if constexpr (!kSplitK) {
+        // Hand the tensor pipe over: the other warpgroup may issue now (only
+        // if it still has a tile to run).
+        const int other_next = (cwg == 0) ? base + 1 : base + unit_stride * 2;
+        if (other_next < num_units) {
+          asm volatile("bar.arrive %0, 256;\n" ::"r"(4 + (1 - cwg)) : "memory");
+        }
+      }
       wgmma_wait<0>();
       if (num_slabs > 0 && lane == 0) {
         uint64_t* eb = &empty_bar[(g - 1) % kW8A16Stages];
@@ -585,7 +621,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       const int ct = kSplitK ? threadIdx.x - 128 : threadIdx.x - 128 - cwg * 128;
       const int chunk = ct % kChunks;
       const int row0 = ct / kChunks;
-      const int n_chunk = n0 + (kSplitK ? 0 : cwg * kW8A16EpiWgCols) + chunk * kElemsPerChunk;
+      const int n_chunk = n0 + chunk * kElemsPerChunk;  // per-WG n0 in ping-pong
       TOut* dst_base = kSplitK
                            ? reinterpret_cast<TOut*>(ws) + static_cast<int64_t>(blockIdx.y) * M * N
                            : reinterpret_cast<TOut*>(out);
@@ -602,9 +638,8 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
         sync_here();  // previous pass / tile copied out before the buffer is reused
 #pragma unroll
         for (int b = 0; b < kW8A16RowBlocks; ++b) {
-          const int n_lo =
-              cwg * (64 * kW8A16RowBlocks) + b * 64 + wq * 16 + lane / 4;   // tile-local n
-          const int n_buf = kSplitK ? n_lo : n_lo - cwg * kW8A16EpiWgCols;  // buffer-local n
+          const int n_lo = wg_row0 + b * 64 + wq * 16 + lane / 4;  // tile-local n
+          const int n_buf = kSplitK ? n_lo : n_lo - wg_row0;       // split: shared tile
           float bias_lo = 0.f, bias_hi = 0.f;
           if (!kSplitK && bias != nullptr) {
             if (n0 + n_lo < N) bias_lo = static_cast<float>(bias[n0 + n_lo]);
@@ -744,12 +779,13 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
                                                          : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
                                kW8A16TileM, kW8A16TileK, CU_TENSOR_MAP_SWIZZLE_128B);
   if (e != cudaSuccess) return e;
-  e = MakeTmaMap2D(&w_map, w, N, K, 1, CU_TENSOR_MAP_DATA_TYPE_UINT8, kW8A16TileN, kW8A16TileK,
+  e = MakeTmaMap2D(&w_map, w, N, K, 1, CU_TENSOR_MAP_DATA_TYPE_UINT8, kW8A16PPTileN, kW8A16TileK,
                    CU_TENSOR_MAP_SWIZZLE_64B);
   if (e != cudaSuccess) return e;
 
   const unsigned tiles_m = ceil_div(M, kW8A16TileM);
-  const unsigned tiles_n = ceil_div(N, kW8A16TileN);
+  const unsigned tiles_n = ceil_div(N, kW8A16TileN);       // split-K units
+  const unsigned tiles_n_pp = ceil_div(N, kW8A16PPTileN);  // ping-pong units
   const unsigned pairs_n = ceil_div(tiles_n, static_cast<unsigned>(kClusterSize));
   int splits = W8A16Fp8GemmSplits(M, N, K, num_sms);
   if (splits > 1 &&
@@ -774,9 +810,10 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
   cudaLaunchConfig_t cfg = {};
   // Persistent: one block (cluster) per SM walks the units; split-K keeps one
   // unit per block so its fp32 tile can live in the idle stages.
-  const unsigned units = tiles_m * pairs_n;
+  const unsigned units = split ? tiles_m * pairs_n : tiles_m * tiles_n_pp;
+  const unsigned blocks_needed = split ? units : ceil_div(units, 2u);  // 2 tiles per pp block
   const unsigned clusters =
-      split ? units : min(units, static_cast<unsigned>(num_sms / kClusterSize));
+      split ? units : min(blocks_needed, static_cast<unsigned>(num_sms / kClusterSize));
   cfg.gridDim = dim3(clusters * kClusterSize, splits);  // x rasterized; y = K split
   cfg.blockDim = dim3(kW8A16Threads);
   cfg.dynamicSmemBytes = smem_bytes;
