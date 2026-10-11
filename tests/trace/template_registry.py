@@ -37,6 +37,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.activation",
     "flashinfer.attention._core",
     "flashinfer.attn_scores.attn_scores",
+    "flashinfer.attn_scores.single_head",
     "flashinfer.cake_vsa",
     "flashinfer.cascade",
     "flashinfer.comm.allreduce",
