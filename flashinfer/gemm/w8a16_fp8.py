@@ -1,0 +1,120 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+import functools
+from typing import Optional
+
+import torch
+
+from ..api_logging import flashinfer_api
+from ..jit.gemm.w8a16_fp8 import gen_w8a16_fp8_gemm_module
+from ..utils import register_custom_op, register_fake_op
+
+
+@functools.cache
+def get_w8a16_fp8_gemm_module():
+    return gen_w8a16_fp8_gemm_module().build_and_load()
+
+
+@register_custom_op("flashinfer::w8a16_fp8_gemm", mutates_args=("out",))
+def _w8a16_fp8_gemm_impl(
+    out: torch.Tensor,
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> None:
+    get_w8a16_fp8_gemm_module().w8a16_fp8_gemm(out, act, weight, weight_scale, bias)
+
+
+@register_fake_op("flashinfer::w8a16_fp8_gemm")
+def _w8a16_fp8_gemm_impl_fake(
+    out: torch.Tensor,
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> None:
+    pass
+
+
+@flashinfer_api
+def w8a16_fp8_gemm(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Linear layer with an FP8 e4m3 weight and a 16-bit activation (W8A16).
+
+    ``out = act @ (weight.float() * weight_scale).T + bias``, computed with the
+    weight dequantized inside the kernel; no 16-bit copy of the weight is
+    materialised.  This is the fused form of TRT-LLM's
+    ``W8A16FP8LinearMethod`` (``weight.to(dtype).mul_(scale)`` then
+    ``F.linear``) and consumes the same checkpoint tensors: an FP8QDQ weight
+    with one per-tensor scale.
+
+    Parameters
+    ----------
+    act: torch.Tensor
+        Activation, shape ``(..., K)``, ``float16`` or ``bfloat16``,
+        contiguous in the last dimension.  Leading dimensions are flattened.
+    weight: torch.Tensor
+        Weight, shape ``(N, K)`` (``torch.nn.Linear`` layout),
+        ``float8_e4m3fn``, contiguous.
+    weight_scale: torch.Tensor
+        One ``float32`` value (shape ``()`` or ``(1,)``) on ``act``'s device:
+        the per-tensor dequantization scale.
+    bias: Optional[torch.Tensor]
+        Optional bias, shape ``(N,)``, same dtype as ``act``.
+    out: Optional[torch.Tensor]
+        Optional output, shape ``(..., N)``, same dtype as ``act``.  Allocated
+        when omitted.
+
+    Returns
+    -------
+    out: torch.Tensor
+        ``(..., N)`` in ``act``'s dtype.
+    """
+    if act.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"act must be float16 or bfloat16, got {act.dtype}")
+    if weight.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"weight must be float8_e4m3fn, got {weight.dtype}")
+    if weight.dim() != 2:
+        raise ValueError(f"weight must be 2D [N, K], got shape {tuple(weight.shape)}")
+    k = act.shape[-1]
+    n = weight.shape[0]
+    if weight.shape[1] != k:
+        raise ValueError(f"K mismatch: act[..., {k}] vs weight[{n}, {weight.shape[1]}]")
+    if weight_scale.numel() != 1:
+        raise ValueError("weight_scale is one per-tensor value")
+    if weight_scale.dtype != torch.float32:
+        weight_scale = weight_scale.to(torch.float32)
+    weight_scale = weight_scale.reshape(1)
+
+    lead_shape = act.shape[:-1]
+    act2d = act.reshape(-1, k)
+    if out is None:
+        out = torch.empty(*lead_shape, n, dtype=act.dtype, device=act.device)
+    elif out.dtype != act.dtype or out.shape[-1] != n:
+        raise ValueError(
+            f"out must be {tuple(lead_shape) + (n,)} in {act.dtype}, "
+            f"got {tuple(out.shape)} in {out.dtype}"
+        )
+    out2d = out.reshape(-1, n)
+    _w8a16_fp8_gemm_impl(out2d, act2d, weight, weight_scale, bias)
+    return out

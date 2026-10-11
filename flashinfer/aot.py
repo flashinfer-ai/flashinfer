@@ -147,6 +147,7 @@ from .jit.gemm import (
     gen_trtllm_gen_gemm_module,
     gen_trtllm_low_latency_gemm_module,
     gen_blackwell_bf16_bmm_module,
+    gen_w8a16_fp8_gemm_module,
 )
 from .jit.gemm.cake_blackwell_bf16_bmm import BlackwellBf16BmmTarget
 from .jit.gemm.cake_grouped_fp8_gemm import (
@@ -1023,6 +1024,7 @@ def gen_all_modules(
             gen_rope_module(),
             gen_sampling_module(),
             gen_topk_module(),
+            gen_w8a16_fp8_gemm_module(),
         ]
         if has_sm100 or has_sm103:
             jit_specs.append(gen_blackwell_softmax_module())
