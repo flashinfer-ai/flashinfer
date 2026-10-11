@@ -122,11 +122,21 @@ class _NcclQkvExchange:
     graph_capturable = False
 
     def __init__(
-        self, group, *, device, hidden, num_heads, head_dim, layout, max_tokens
+        self,
+        group,
+        *,
+        device,
+        hidden,
+        num_heads,
+        head_dim,
+        layout,
+        max_tokens,
+        num_slots,
     ) -> None:
         from .ulysses import UlyssesCommunicator as _Communicator
 
         self.device = device
+        self.num_slots = int(num_slots)
         self.hidden, self.num_heads, self.head_dim = (
             int(hidden),
             int(num_heads),
@@ -147,11 +157,15 @@ class _NcclQkvExchange:
         norm_shape = (self.max_tokens, self.num_heads, self.head_dim)
         self._q_norm = torch.empty(norm_shape, dtype=torch.bfloat16, device=device)
         self._k_norm = torch.empty(norm_shape, dtype=torch.bfloat16, device=device)
-        self._payload = torch.empty(
-            self.world_size * self.max_tokens * self.h_local * 3 * self.head_dim,
-            dtype=torch.bfloat16,
-            device=device,
+        # ``num_slots`` receive regions cycled by consecutive calls, so a call's outputs
+        # stay valid for ``num_slots - 1`` further calls (the same contract as the Cake path).
+        self._slot_elems = (
+            self.world_size * self.max_tokens * self.h_local * 3 * self.head_dim
         )
+        self._payload = torch.empty(
+            self.num_slots * self._slot_elems, dtype=torch.bfloat16, device=device
+        )
+        self._next_slot = 0
         self._positions: dict[int, torch.Tensor] = {}
         self._last = None
 
@@ -193,7 +207,10 @@ class _NcclQkvExchange:
         local = (batch, s_local, heads, head_dim)
         s_global = s_local * self.world_size
         numel = batch * s_global * self.h_local * 3 * head_dim
-        payload = self._payload[:numel].view(
+        slot = self._next_slot
+        self._next_slot = (slot + 1) % self.num_slots
+        base = slot * self._slot_elems
+        payload = self._payload[base : base + numel].view(
             batch, s_global, self.h_local, 3 * head_dim
         )
         self._comm.scatter_qkv_head_chunk(
@@ -360,6 +377,7 @@ class QkvNormRopeExchangeOverlap:
                 head_dim=self.head_dim,
                 layout=layout,
                 max_tokens=self.max_tokens,
+                num_slots=self.num_slots,
             )
         self.graph_capturable = bool(getattr(self._impl, "graph_capturable", True))
 

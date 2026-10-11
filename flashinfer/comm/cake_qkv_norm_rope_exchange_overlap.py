@@ -173,6 +173,10 @@ class CakeQkvExchangeSession:
         self.group_name = _group_name(group)
         self.rank = int(dist.get_rank(group=group))
         self.world_size = int(dist.get_world_size(group=group))
+        if not 0 <= self.rank < self.world_size:
+            raise RuntimeError(
+                f"process group reports rank {self.rank} outside [0, {self.world_size})"
+            )
         if self.world_size not in loader.SUPPORTED_WORLD_SIZES:
             raise ValueError(
                 f"world size must be one of {loader.SUPPORTED_WORLD_SIZES}, got {self.world_size}"
@@ -494,8 +498,13 @@ class CakeQkvExchangeSession:
             phase = self._phase
             stream = torch.cuda.current_stream(self.device)
             consumer = self._consumer
+            # Readiness words of one call: ``world_size`` contiguous pads of ``plan.num_words`` words
+            # (the wait kernel scans ``words_total`` words from ``slot_base``).  Slots are spaced by the
+            # session capacity, not by this call's ``num_words``: consecutive calls with different row
+            # shapes may be in flight on different slots, and a shape-dependent stride would let a
+            # smaller call's slot overlap a larger call's words.
             words_total = self.world_size * plan.num_words
-            slot_base = slot * words_total
+            slot_base = slot * self.world_size * self.words_cap
             pad_base = slot_base + self.rank * plan.num_words
             try:
                 if capturing:

@@ -296,9 +296,14 @@ def check_against_fused(arms, device):
             for actual, want in zip(outputs, reference, strict=True)
         )
         verdicts[name] = {"max_abs_vs_fused": max_abs, "allclose_1e-2": close}
-        if not close:
+        # Agree on the verdict across ranks before raising: a rank that raised alone
+        # would leave its peers blocked in the next collective instead of reporting.
+        disagree = torch.tensor([0 if close else 1], device=device, dtype=torch.int32)
+        dist.all_reduce(disagree, op=dist.ReduceOp.MAX)
+        if int(disagree.item()):
             raise RuntimeError(
-                f"arm {name} disagrees with the fused arm (max |diff| = {max_abs:.4f})"
+                f"arm {name} disagrees with the fused arm on at least one rank "
+                f"(this rank: max |diff| = {max_abs:.4f}, allclose={close})"
             )
     return verdicts
 

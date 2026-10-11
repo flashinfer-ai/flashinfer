@@ -503,6 +503,15 @@ def _run_worker(rank, world_size, port):
         )
         try:
             assert nccl.backend == "nccl" and not nccl.graph_capturable
+            first = nccl(x, w_qkv, q_scale, k_scale, cos_sin)
+            _check_outputs(nccl, first, expected)
+            # A call's outputs stay valid for num_slots - 1 further calls on this path too:
+            # the next call lands in another receive slot and leaves the first views intact.
+            kept = tuple(t.clone() for t in first)
+            nccl(x.neg(), w_qkv, q_scale, k_scale, cos_sin)
+            torch.cuda.synchronize(device)
+            for before, view in zip(kept, first, strict=True):
+                assert torch.equal(before, view)
             _check_outputs(nccl, nccl(x, w_qkv, q_scale, k_scale, cos_sin), expected)
             refusal = torch.cuda.CUDAGraph()
             with (
