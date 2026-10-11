@@ -25,19 +25,23 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 21 of the optimization ladder: persistent tiles with a dedicated
-// epilogue buffer.  Through rung 20 every block computed one tile: its
-// producer went idle while the consumers staged and stored the tile, and
-// the next tile's first slabs were only requested once a new block
-// started.  Here the grid is one block per SM (per cluster), each block
-// walks units of the grouped raster (unit = blockIdx, += gridDim), and the
-// slab counters, stage indices and mbarrier phases simply continue across
-// tiles: the producer requests the next tile's slabs while the consumers
-// run the current epilogue.  The 16-bit epilogue tile moves out of the
-// pipeline stages into its own 33 KB buffer (half the tile at a time, two
-// passes), so 6 stages + buffer + barriers fit in 227 KB; the split-K path
-// keeps one unit per block and its fp32 tile in the idle stages.
-// Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
+// Rung 22 of the optimization ladder: skewed consumer warpgroups (ping-pong
+// on a shared tile).  Through rung 21 the two consumer warpgroups ran in
+// lockstep: they waited on the same slabs, finished the mainloop together
+// and synchronized with each other twice per epilogue pass, so the tensor
+// pipe idled for the whole epilogue + next-tile prologue of every tile.
+// The classic ping-pong puts the warpgroups on different tiles; with the
+// roles-swapped mainloop that would double the act traffic (rung 19's
+// shared B slab is why the L2 is comfortable).  Here the warpgroups keep
+// sharing the tile and the stage ring but are decoupled: each has its own
+// 16 KB epilogue buffer and its own named barrier, nothing synchronizes
+// them inside a tile, and warpgroup 2 starts the kernel one epilogue late
+// (a short spin on %globaltimer).  The skew is self-maintaining and bounded
+// by the ring depth: a stage is refilled only after both warpgroups release
+// it, so warpgroup 1 can run at most `stages` slabs ahead.  In steady state
+// one warpgroup is still issuing wgmma while the other stages and stores,
+// and vice versa, with no extra loads.  Requires sm_90a, K % 64 == 0, 16 B
+// aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -75,8 +79,13 @@ constexpr int kW8A16EpiBytes =
     kW8A16TileM * kW8A16EpiPad * 4;  // fp32 partial tile (split-K), reuses the stages
 constexpr int kW8A16EpiPasses = 2;   // 16-bit epilogue: half the tile per pass
 constexpr int kW8A16EpiRows = kW8A16TileM / kW8A16EpiPasses;
-constexpr int kW8A16EpiOutBytes = kW8A16EpiRows * kW8A16EpiPad * 2;  // dedicated 16-bit buffer
-constexpr int kW8A16BarrierBytes = 2 * kW8A16Stages * 8;             // full[] + empty[]
+constexpr int kW8A16EpiWgCols = kW8A16TileN / kW8A16ConsumerWGs;  // 128 n per warpgroup
+// Dense [64 m][128 n] per warpgroup; the 16 B chunk index is XOR-swizzled by
+// (m >> 1) & 7 so the four even rows a warp writes at once hit different banks.
+constexpr int kW8A16EpiWgBytes = kW8A16EpiRows * kW8A16EpiWgCols * 2;  // 16 KB per warpgroup
+constexpr int kW8A16EpiOutBytes = kW8A16EpiWgBytes * kW8A16ConsumerWGs;
+constexpr int kW8A16SkewNs = 1500;  // warpgroup 2 start delay (about one epilogue)
+constexpr int kW8A16BarrierBytes = 2 * kW8A16Stages * 8;  // full[] + empty[]
 constexpr int kW8A16StageBytes = kW8A16Stages * (kW8A16AStageBytes + kW8A16WStageBytes);
 constexpr int kW8A16SmemBytesPersistent =
     kW8A16StageBytes + kW8A16EpiOutBytes + kW8A16BarrierBytes + 1024;
@@ -219,6 +228,15 @@ __device__ __forceinline__ void setmaxnreg_dec() {
 // Named barrier among the consumer threads only (id 1; 0 is __syncthreads).
 __device__ __forceinline__ void consumer_bar_sync() {
   asm volatile("bar.sync 1, %0;\n" ::"n"(kW8A16ConsumerThreads) : "memory");
+}
+// Named barrier among the 128 threads of one consumer warpgroup (ids 2, 3).
+__device__ __forceinline__ void warpgroup_bar_sync(int cwg) {
+  asm volatile("bar.sync %0, 128;\n" ::"r"(2 + cwg) : "memory");
+}
+__device__ __forceinline__ uint64_t globaltimer_ns() {
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(t));
+  return t;
 }
 
 // K-major, 128 B swizzle matrix descriptor: 8-row core-matrix groups are
@@ -388,7 +406,14 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
   } else {
     // ------------------------------ consumers -----------------------------
     setmaxnreg_inc<232>();
-    const int cwg = wg - 1;   // consumer warpgroup: n rows cwg*128 .. +127
+    const int cwg = wg - 1;  // consumer warpgroup: n rows cwg*128 .. +127
+    if (cwg == 1 && !kSplitK) {
+      // Start one epilogue late so the two warpgroups alternate between
+      // mainloop and epilogue instead of idling the tensor pipe together.
+      const uint64_t t0 = globaltimer_ns();
+      while (globaltimer_ns() - t0 < kW8A16SkewNs) {
+      }
+    }
     const int wq = warp & 3;  // warp within it: rows wq*16 .. +15 of each row block
     float d[kW8A16RowBlocks][64];
 
@@ -518,28 +543,46 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       // pass, so the producer can keep filling stages for the next tile.
       constexpr int kPasses = kSplitK ? 1 : kW8A16EpiPasses;
       constexpr int kRowsPerTilePass = kW8A16TileM / kPasses;
-      TOut* tile = kSplitK ? reinterpret_cast<TOut*>(smem) : reinterpret_cast<TOut*>(epi_base);
+      // Split-K keeps the shared fp32 tile in the idle stages (both warpgroups
+      // sync); the persistent path gives each warpgroup its own [64 m][136 n]
+      // buffer for its 128 n columns and never synchronizes across warpgroups.
+      constexpr int kWgCols = kSplitK ? kW8A16TileN : kW8A16EpiWgCols;
+      TOut* tile = kSplitK ? reinterpret_cast<TOut*>(smem)
+                           : reinterpret_cast<TOut*>(epi_base + cwg * kW8A16EpiWgBytes);
       const float sc = kSplitK ? 1.f : *scale;
-      const int m_lo = (lane % 4) * 2;                               // tile-local m
-      constexpr int kElemsPerChunk = 16 / sizeof(TOut);              // 8 or 4
-      constexpr int kChunks = kW8A16TileN / kElemsPerChunk;          // 32 or 64
-      constexpr int kRowsPerPass = kW8A16ConsumerThreads / kChunks;  // 8 or 4
-      const int ct = threadIdx.x - 128;                              // consumer-local thread id
+      const int m_lo = (lane % 4) * 2;  // tile-local m
+      // Element index inside the staging buffer: padded rows for the fp32
+      // split-K tile, dense swizzled rows for the per-warpgroup 16-bit tile.
+      auto epi_idx = [](int m, int n) -> int {
+        if constexpr (kSplitK) return m * kW8A16EpiPad + n;
+        return m * kW8A16EpiWgCols + ((((n >> 3) ^ ((m >> 1) & 7))) << 3) + (n & 7);
+      };
+      constexpr int kElemsPerChunk = 16 / sizeof(TOut);  // 8 or 4
+      constexpr int kChunks = kWgCols / kElemsPerChunk;  // 16 or 64
+      constexpr int kThreadsHere = kSplitK ? kW8A16ConsumerThreads : 128;
+      constexpr int kRowsPerPass = kThreadsHere / kChunks;  // 8 or 4
+      const int ct = kSplitK ? threadIdx.x - 128 : threadIdx.x - 128 - cwg * 128;
       const int chunk = ct % kChunks;
       const int row0 = ct / kChunks;
-      const int n_chunk = n0 + chunk * kElemsPerChunk;
+      const int n_chunk = n0 + (kSplitK ? 0 : cwg * kW8A16EpiWgCols) + chunk * kElemsPerChunk;
       TOut* dst_base = kSplitK
                            ? reinterpret_cast<TOut*>(ws) + static_cast<int64_t>(blockIdx.y) * M * N
                            : reinterpret_cast<TOut*>(out);
+      auto sync_here = [&]() {
+        if constexpr (kSplitK) {
+          consumer_bar_sync();
+        } else {
+          warpgroup_bar_sync(cwg);
+        }
+      };
       if constexpr (kSplitK) consumer_bar_sync();  // both warpgroups are done reading the stages
 #pragma unroll
       for (int pass = 0; pass < kPasses; ++pass) {
-        // Both warpgroups must be done copying the previous pass / tile out
-        // of the buffer before anyone overwrites it.
-        consumer_bar_sync();
+        sync_here();  // previous pass / tile copied out before the buffer is reused
 #pragma unroll
         for (int b = 0; b < kW8A16RowBlocks; ++b) {
-          const int n_lo = cwg * 128 + b * 64 + wq * 16 + lane / 4;  // tile-local n
+          const int n_lo = cwg * 128 + b * 64 + wq * 16 + lane / 4;         // tile-local n
+          const int n_buf = kSplitK ? n_lo : n_lo - cwg * kW8A16EpiWgCols;  // buffer-local n
           float bias_lo = 0.f, bias_hi = 0.f;
           if (!kSplitK && bias != nullptr) {
             if (n0 + n_lo < N) bias_lo = static_cast<float>(bias[n0 + n_lo]);
@@ -551,19 +594,18 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
 #pragma unroll
             for (int q = 0; q < 2; ++q) {
               const int m = m_lo + jj * 8 + q;  // row within this pass's buffer
-              tile[m * kW8A16EpiPad + n_lo] = static_cast<TOut>(d[b][j * 4 + q] * sc + bias_lo);
-              tile[m * kW8A16EpiPad + n_lo + 8] =
-                  static_cast<TOut>(d[b][j * 4 + 2 + q] * sc + bias_hi);
+              tile[epi_idx(m, n_buf)] = static_cast<TOut>(d[b][j * 4 + q] * sc + bias_lo);
+              tile[epi_idx(m, n_buf + 8)] = static_cast<TOut>(d[b][j * 4 + 2 + q] * sc + bias_hi);
             }
           }
         }
-        consumer_bar_sync();  // this pass's rows are staged
+        sync_here();  // this pass's rows are staged
 #pragma unroll
         for (int i = 0; i < kRowsPerTilePass / kRowsPerPass; ++i) {
           const int r = row0 + kRowsPerPass * i;
           const int m = m0 + pass * kRowsPerTilePass + r;
           if (m >= M) continue;
-          const TOut* src = tile + r * kW8A16EpiPad + chunk * kElemsPerChunk;
+          const TOut* src = tile + epi_idx(r, chunk * kElemsPerChunk);
           TOut* dst = dst_base + static_cast<int64_t>(m) * N + n_chunk;
           if (n_chunk + kElemsPerChunk <= N) {
             *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
