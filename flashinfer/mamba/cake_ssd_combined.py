@@ -999,7 +999,8 @@ _EXACT_NORING_VARLEN_MIN_ITEMS = {  # sequences x heads, by state dtype
     torch.float16: 2 * 128,
     torch.float32: 4 * 128,
 }
-_EXACT_NORING_VARLEN_TOKENS = (63, 65)  # exclusive bounds on tokens per sequence (average over the call)
+# exclusive bounds on tokens per sequence (average over the call)
+_EXACT_NORING_VARLEN_TOKENS = (63, 65)
 _EXACT_NORING_BATCHED_BATCH = 2
 _EXACT_NORING_BATCHED_SEQLEN = (25, 90)  # exclusive bounds
 
