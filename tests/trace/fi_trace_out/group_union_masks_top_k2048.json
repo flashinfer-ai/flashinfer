@@ -1,0 +1,128 @@
+{
+  "name": "group_union_masks_top_k2048",
+  "description": "Each token group's union of keys as cache slots, and each token's bitmask over it.",
+  "op_type": "group_union_masks",
+  "tags": [
+    "fi_api:flashinfer.token_sparse.group_union_masks"
+  ],
+  "axes": {
+    "tokens": {
+      "type": "var",
+      "description": "Query tokens, in equal groups of consecutive ones."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 2048,
+      "description": "Key positions per token, a multiple of 512."
+    },
+    "groups": {
+      "type": "var",
+      "description": "Token groups, one union each."
+    },
+    "requests": {
+      "type": "var",
+      "description": "Block-table rows."
+    },
+    "blocks": {
+      "type": "var",
+      "description": "64-key blocks per request."
+    },
+    "unions": {
+      "type": "var",
+      "description": "Union rows."
+    },
+    "columns": {
+      "type": "var",
+      "description": "Union capacity in keys."
+    },
+    "masks": {
+      "type": "var",
+      "description": "Mask rows."
+    },
+    "words": {
+      "type": "var",
+      "description": "Mask words per row, 32 union columns each."
+    }
+  },
+  "inputs": {
+    "positions": {
+      "shape": [
+        "tokens",
+        "top_k"
+      ],
+      "dtype": "int32"
+    },
+    "query_rows": {
+      "shape": [
+        "tokens"
+      ],
+      "dtype": "int32"
+    },
+    "group_unions": {
+      "shape": [
+        "groups"
+      ],
+      "dtype": "int32"
+    },
+    "requests": {
+      "shape": [
+        "groups"
+      ],
+      "dtype": "int32"
+    },
+    "block_table": {
+      "shape": [
+        "requests",
+        "blocks"
+      ],
+      "dtype": "int32"
+    },
+    "union": {
+      "shape": [
+        "unions",
+        "columns"
+      ],
+      "dtype": "int32"
+    },
+    "union_sizes": {
+      "shape": [
+        "unions"
+      ],
+      "dtype": "int32"
+    },
+    "mask": {
+      "shape": [
+        "masks",
+        "words"
+      ],
+      "dtype": "int32"
+    },
+    "num_keys": {
+      "shape": null,
+      "dtype": "int32"
+    }
+  },
+  "outputs": {
+    "union": {
+      "shape": [
+        "unions",
+        "columns"
+      ],
+      "dtype": "int32"
+    },
+    "union_sizes": {
+      "shape": [
+        "unions"
+      ],
+      "dtype": "int32"
+    },
+    "mask": {
+      "shape": [
+        "masks",
+        "words"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}
