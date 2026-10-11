@@ -29,7 +29,6 @@ from b12x._lib.quant.nvfp4_csf import Nvfp4CsfDecoder, compile_nvfp4_csf_pair
 class CsfExpansionQuery:
     first: tuple[int, ...]
     second: tuple[int, ...]
-    stored_bytes: tuple[int, int]
     routes: int
     ids_dtype: str
 
@@ -106,7 +105,7 @@ def _parameters(query, device):
 
 TUNING = TuningContract(
     component_id="quantization.csf_block_expansion",
-    query_schema_version=6,
+    query_schema_version=7,
     config_schema_version=1,
     query_fields=frozenset(CsfExpansionQuery.__dataclass_fields__),
     config_fields=frozenset(CsfExpansionConfig.__dataclass_fields__),
@@ -234,7 +233,6 @@ def plan_csf_block_expansion(
     query = CsfExpansionQuery(
         first.geometry[:7] + first.geometry[9:],
         second.geometry[:7] + second.geometry[9:],
-        (first.fixed.numel(), second.fixed.numel()),
         routes,
         str(ids_dtype).removeprefix("torch."),
     )

@@ -23,7 +23,7 @@ from b12x._lib.quant.csf_blocks_tuning import (
 def test_scale_factory_declares_and_retains_all_route_abis(bits, destination):
     ordinal = torch.cuda.current_device()
     geometry = (256, 4, bits, 9, 256, 4, 8, destination, 1)
-    query = asdict(CsfExpansionQuery(geometry, geometry, (4096, 4096), 5, "int32"))
+    query = asdict(CsfExpansionQuery(geometry, geometry, 5, "int32"))
     config = asdict(CsfExpansionConfig(groups_per_task=2))
     job = CompileJob.create(
         "b12x._lib.quant.csf_blocks_tuning:compile_expansion", query, config, ordinal
