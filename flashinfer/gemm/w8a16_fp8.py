@@ -125,8 +125,16 @@ def w8a16_fp8_gemm(
         when omitted.
     weight_prepared: bool
         ``True`` when ``weight`` came from :func:`prepare_w8a16_fp8_weight`
-        (opt-in fast fragment path).  ``False`` (default) takes the plain
-        checkpoint layout.
+        (opt-in ldmatrix fragment path).  ``False`` (default) takes the plain
+        checkpoint layout, which is also the faster path on H100 / H200.
+
+    Notes
+    -----
+    Hopper only (``sm_90a``: wgmma + TMA).  ``K`` must be a multiple of 64,
+    ``N`` a multiple of 8, and ``act`` / ``weight`` / ``out`` 16-byte aligned
+    (the launcher rejects anything else).  Small problems (fewer tiles than a
+    third of the SM count) run split-K through an fp32 workspace that this
+    function allocates; otherwise one persistent block per SM.
 
     Returns
     -------
