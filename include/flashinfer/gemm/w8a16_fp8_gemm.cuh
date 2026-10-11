@@ -25,20 +25,13 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 17 of the optimization ladder: software-pipelined fragment
-// conversion with explicit double buffering.  Rungs 8-16 converted a slab's
-// A fragments right in front of the wgmmas that consumed them, so each
-// wgmma waited on the LDS -> cvt chain (ncu: 34-37% of stall cycles were
-// fixed-latency dependencies), and -- formally -- reused the fragment
-// registers of the previous slab's still-in-flight group (PTX requires A
-// registers to stay untouched until wgmma.wait_group retires them; it
-// worked because the hardware reads them early, but it was undefined).
-// Here the consumer keeps two fragment buffers: it issues slab kt from
-// buffer kt % 2, commits, waits for slab kt-1's group (wait_group 1) and
-// releases its stage, and only then loads + converts slab kt+1 into buffer
-// (kt+1) % 2 while slab kt's wgmmas are still running.  Both weight
-// layouts take the same path.  Requires sm_90a, K % 64 == 0, 16 B aligned
-// bases, N % 8 == 0.
+// Rung 18 of the optimization ladder: 8 pipeline stages.  With one block
+// per SM the pipeline ring is the only latency buffer between TMA (an L2
+// round trip of ~1-2 us when the L2 runs at 75%) and the two consumer
+// warpgroups; rung 17's 6 stages are ~3300 tensor-pipe cycles of slack.
+// The ring grows to 8 stages (192 KB of the 227 KB; the staged epilogue
+// still fits inside it).  Nothing else changes.  Requires sm_90a,
+// K % 64 == 0, 16 B aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -57,7 +50,7 @@ namespace gemm {
 constexpr int kW8A16TileN = 128;  // n rows per block (wgmma M)
 constexpr int kW8A16TileM = 128;  // m cols per block (wgmma N)
 constexpr int kW8A16TileK = 64;
-constexpr int kW8A16Stages = 6;
+constexpr int kW8A16Stages = 8;
 constexpr int kW8A16GroupM = 8;                          // m-tiles per rasterization group
 constexpr int kW8A16ConsumerWGs = 2;                     // 64 n rows each
 constexpr int kW8A16Warpgroups = 1 + kW8A16ConsumerWGs;  // + 1 producer
