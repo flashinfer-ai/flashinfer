@@ -8,6 +8,26 @@ from rich.console import Console
 from b12x.loader._progress import CheckpointDisplay
 
 
+def test_transient_panel_leaves_only_its_parent_display():
+    from rich.live import Live
+
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=True, width=100, height=30)
+    with Live("Load weights", console=console, auto_refresh=False) as parent:
+        with CheckpointDisplay(console=console, transient=True) as display:
+            display.source(2)
+            parent.refresh()
+            assert "b12x / weight loading" in output.getvalue()
+            output.seek(0)
+            output.truncate()
+            display.complete(
+                dict(ranks=1, payload_bytes=2, physical_bytes=4096, load_seconds=1)
+            )
+        parent.refresh()
+    assert "Load weights" in output.getvalue()
+    assert "b12x" not in output.getvalue()
+
+
 @pytest.mark.parametrize(
     "width,height", [(120, 30), (100, 20), (80, 10), (60, 8), (40, 8)]
 )
