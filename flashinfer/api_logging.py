@@ -1329,10 +1329,14 @@ def _compare_results(
             )
             return False
 
-        # Check values; apply relative and absolute tolerance.
-        if not torch.allclose(actual, expected, rtol=rtol, atol=atol):
-            diff = (actual - expected).abs().max().item()
-            _logger.warning(f"Value mismatch: max diff {diff}")
+        if actual.is_floating_point() or actual.is_complex():
+            if not torch.allclose(actual, expected, rtol=rtol, atol=atol):
+                diff = (actual - expected).abs().max().item()
+                _logger.warning(f"Value mismatch: max diff {diff}")
+                return False
+        # Discrete outputs such as sampled token IDs and validity masks need exact equality.
+        elif not torch.equal(actual, expected):
+            _logger.warning("Value mismatch: non-floating-point tensors differ")
             return False
         return True
 
@@ -1388,7 +1392,9 @@ def replay_from_dump(
     dump_dir : str
         Path to the dump directory
     compare_outputs : bool
-        If True, load and compare with saved outputs
+        If True, load and compare with saved outputs. Floating-point and complex
+        tensors use numerical tolerances; integer and boolean tensors must match
+        exactly.
     device : str
         Target device for tensors. Options:
         - "cuda" (default): Load to cuda:0
