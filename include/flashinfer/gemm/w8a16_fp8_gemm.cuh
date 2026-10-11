@@ -25,16 +25,17 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 32 of the optimization ladder: epilogue staging stores through the
-// shared window.  The fragment -> staging-buffer stores were generic
-// 64-bit stores (ST.E.U16 on a generic pointer derived from the dynamic
-// smem base), so the epilogue carried a 64-bit address per store next to
-// the 128 accumulator registers and rung 31's layout tipped the allocator
-// into a 64 B spill frame.  The stores are now st.shared.b16 / .f32 on a
-// 32-bit shared-window address (one cvta per tile, 32-bit index math),
-// which halves the address registers and drops the generic address-space
-// check.  TMA-store epilogue (rung 31) and tile dispatch (rung 30b)
-// unchanged.  Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
+// Rung 33 of the optimization ladder: paired 32-bit staging stores.  A
+// thread's accumulator fragment holds output columns n and n+8 for rows m
+// and m+1, so the 16-bit staging stores were scalar (two per row pair).
+// Lanes xor 4 hold the same rows for column n+1: one shuffle per row pair
+// swaps (m+1, n) for (m, n+1), after which the even-column lane packs
+// (m, n..n+1) and the odd-column lane packs (m+1, n-1..n), and each stores
+// one 32-bit word (one convert instruction per pair instead of two).  The
+// swizzled layout keeps the 32-bit stores conflict-free.  Split-K keeps its
+// fp32 scalar stores.  TMA-store epilogue (rung 31), shared-window stores
+// (rung 32) and tile dispatch (rung 30b) unchanged.  Requires sm_90a,
+// K % 64 == 0, 16 B aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -265,6 +266,19 @@ __device__ __forceinline__ void sts(uint32_t addr, __half v) {
 }
 __device__ __forceinline__ void sts(uint32_t addr, float v) {
   asm volatile("st.shared.f32 [%0], %1;\n" ::"r"(addr), "f"(v));
+}
+
+__device__ __forceinline__ void sts32(uint32_t addr, uint32_t v) {
+  asm volatile("st.shared.b32 [%0], %1;\n" ::"r"(addr), "r"(v));
+}
+// Two floats -> one packed 16-bit pair (a at the lower address).
+__device__ __forceinline__ uint32_t pack2(float a, float b, __nv_bfloat16) {
+  const __nv_bfloat162 h = __floats2bfloat162_rn(a, b);
+  return *reinterpret_cast<const uint32_t*>(&h);
+}
+__device__ __forceinline__ uint32_t pack2(float a, float b, __half) {
+  const __half2 h = __floats2half2_rn(a, b);
+  return *reinterpret_cast<const uint32_t*>(&h);
 }
 
 template <int N>
@@ -743,13 +757,28 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
 #pragma unroll
           for (int jj = 0; jj < (Cfg::kTileM / 8) / kPasses; ++jj) {
             const int j = pass * ((Cfg::kTileM / 8) / kPasses) + jj;
-#pragma unroll
-            for (int q = 0; q < 2; ++q) {
-              const int m = m_lo + jj * 8 + q;  // row within this pass's buffer
-              sts(tile_s + epi_idx(m, n_buf) * sizeof(TOut),
-                  static_cast<TOut>(d[b][j * 4 + q] * sc + bias_lo));
-              sts(tile_s + epi_idx(m, n_buf + 8) * sizeof(TOut),
-                  static_cast<TOut>(d[b][j * 4 + 2 + q] * sc + bias_hi));
+            const int m = m_lo + jj * 8;  // rows m, m+1 within this pass's buffer
+            const float v0 = d[b][j * 4 + 0] * sc + bias_lo;  // (m,   n)
+            const float v1 = d[b][j * 4 + 1] * sc + bias_lo;  // (m+1, n)
+            const float v2 = d[b][j * 4 + 2] * sc + bias_hi;  // (m,   n+8)
+            const float v3 = d[b][j * 4 + 3] * sc + bias_hi;  // (m+1, n+8)
+            if constexpr (kSplitK) {
+              sts(tile_s + epi_idx(m, n_buf) * sizeof(TOut), v0);
+              sts(tile_s + epi_idx(m + 1, n_buf) * sizeof(TOut), v1);
+              sts(tile_s + epi_idx(m, n_buf + 8) * sizeof(TOut), v2);
+              sts(tile_s + epi_idx(m + 1, n_buf + 8) * sizeof(TOut), v3);
+            } else {
+              // Lane xor 4 holds column n^1 of the same rows: swap (m+1, n)
+              // for (m, n+1) so each lane owns a 32-bit column pair.
+              const bool odd = (lane >> 2) & 1;  // n is odd
+              const float r0 = __shfl_xor_sync(0xffffffffu, odd ? v0 : v1, 4);
+              const float r2 = __shfl_xor_sync(0xffffffffu, odd ? v2 : v3, 4);
+              const int mm = odd ? m + 1 : m;
+              const int nn = odd ? n_buf - 1 : n_buf;
+              sts32(tile_s + epi_idx(mm, nn) * sizeof(TOut),
+                    pack2(odd ? r0 : v0, odd ? v1 : r0, TOut{}));
+              sts32(tile_s + epi_idx(mm, nn + 8) * sizeof(TOut),
+                    pack2(odd ? r2 : v2, odd ? v3 : r2, TOut{}));
             }
           }
         }
