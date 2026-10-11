@@ -1,15 +1,9 @@
-"""The stage-readable packed CSF index rebuilds exactly what the W4A16 expansion pass writes."""
+"""Packed CSF expansion preserves the native W4A16 scale layout."""
 
-import cutlass
-import cutlass.cute as cute
-import cutlass.utils as cutlass_utils
 import numpy as np
 import pytest
 import torch
-from cutlass.cutlass_dsl import Int32, Int64
 
-from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x._lib.intrinsics import ld_shared_u32, shared_ptr_to_u32
 from b12x._lib.quant.nvfp4_csf import (
     Nvfp4CsfDecoder,
     make_nvfp4_csf_batch,
@@ -28,8 +22,6 @@ from b12x._lib.quant.nvfp4_csf_packed import (
     record_bytes,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import _process_nvfp4_packed_scales
-from b12x.moe._shared.kernels.w4a16.prefill_a4 import A4PackedPrefillGemm
-from b12x._lib.utils import current_cuda_stream, make_ptr
 from ..conftest import require_b12x
 
 
@@ -295,125 +287,3 @@ def test_storage_without_inline_words_matches_uninlined_storage_size(
         expand_packed_csf_scales(inlined), expand_packed_csf_scales(plain)
     )
     assert inlined.storage.numel() > plain.storage.numel()
-
-
-class _A4ScaleStages:
-    def __init__(self, phase, inline, intermediate_size):
-        self.gemm = A4PackedPrefillGemm(
-            phase=phase,
-            hidden_size=512,
-            intermediate_size=intermediate_size,
-            top_k=2,
-            csf_inline_words=inline,
-        )
-
-    @cute.jit
-    def __call__(self, source, output, byte_count: Int64, experts: Int32, stream):
-        source = cute.make_tensor(source, cute.make_layout((byte_count,)))
-        output = cute.make_tensor(
-            output,
-            cute.make_layout(
-                (Int64(experts) * Int64(self.gemm.n_tiles * self.gemm.k_tiles * 256),)
-            ),
-        )
-        self.kernel(source, output).launch(
-            grid=(self.gemm.n_tiles, self.gemm.k_tiles, experts),
-            block=(self.gemm.threads, 1, 1),
-            stream=stream,
-        )
-
-    @cute.kernel
-    def kernel(self, source, output):
-        tid, _, _ = cute.arch.thread_idx()
-        n_tile, k_tile, expert = cute.arch.block_idx()
-        shared = cutlass_utils.SmemAllocator().allocate_tensor(
-            cutlass.Uint8,
-            cute.make_layout(self.gemm.shared_bytes),
-            byte_alignment=16,
-        )
-        base = shared_ptr_to_u32(shared.iterator)
-        stage = base + (Int32(k_tile) % Int32(self.gemm.stages)) * Int32(
-            self.gemm.stage_bytes
-        )
-        self.gemm._stage_csf_tile(source, base, tid, expert, n_tile)
-        self.gemm._issue_csf(source, stage, k_tile, tid, expert, n_tile)
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
-        self.gemm._expand_csf_stage(source, base, stage, tid)
-        cute.arch.sync_threads()
-        if tid < 256:
-            tile = (Int64(expert) * Int64(self.gemm.n_tiles) + Int64(n_tile)) * Int64(
-                self.gemm.k_tiles
-            ) + Int64(k_tile)
-            output[tile * Int64(256) + Int64(tid)] = ld_shared_u32(
-                stage + Int32(self.gemm.s_off) + Int32(tid) * Int32(4)
-            )
-
-
-@pytest.mark.parametrize("phase", ["fc1", "fc2"])
-@pytest.mark.parametrize("inline", [0, 4])
-@pytest.mark.parametrize("intermediate_size", [64, 256, 320])
-def test_a4_stage_words_match_dense_scale_tiles(phase, inline, intermediate_size):
-    """A4 reads separated gate/up slabs and global replacement-word spills exactly."""
-    device = require_b12x()
-    probe = _A4ScaleStages(phase, inline, intermediate_size)
-    gemm = probe.gemm
-    experts = 3
-    logical = _logical_scales(
-        experts, gemm.size_n, gemm.size_k // 16, 31, outliers=0.5
-    ).clip(max=0x6F)
-    lut = _value_table("w4a16", device)
-    rotation = gemm.intermediate_size if gemm.fc1 else 0
-    scales = build_packed_csf_scales(
-        repack_nvfp4_csf_batch(
-            _native_batch(logical, device), row_rotation=rotation, value_lut=lut
-        ),
-        inline=inline,
-    )
-    assert scales.max_atom_words > max(32, inline)
-    dense = _w4a16_scale_bytes(logical, lut, rotation)
-    expected = []
-    for tile in range(gemm.n_tiles):
-        if gemm.fc1:
-            first = tile * 128
-            live = min(128, gemm.intermediate_size - first)
-            halves = []
-            for offset in (0, gemm.intermediate_size):
-                half = torch.zeros(experts, gemm.size_k // 16, 128, dtype=torch.uint8)
-                half[:, :, :live] = dense[:, :, offset + first : offset + first + live]
-                halves.append(half)
-            expected.append(torch.cat(halves, dim=-1))
-        else:
-            expected.append(dense[:, :, tile * 256 : (tile + 1) * 256])
-    expected = torch.stack(expected, dim=1).reshape(
-        experts, gemm.n_tiles, gemm.k_tiles, 4, 256
-    )
-    output = torch.full(expected.shape, 0xD6, dtype=torch.uint8, device=device)
-    program = b12x_compile(
-        probe,
-        make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
-        Int64(1),
-        Int32(1),
-        current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "quant.w4a16_a4_csf_stage_oracle", 2, (phase, inline, intermediate_size)
-        ),
-    )
-    program(
-        make_ptr(
-            cutlass.Uint8,
-            scales.storage.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Uint32, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
-        ),
-        Int64(scales.storage.numel()),
-        Int32(experts),
-        current_cuda_stream(),
-    )
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)

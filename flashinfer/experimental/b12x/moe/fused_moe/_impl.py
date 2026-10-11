@@ -151,8 +151,6 @@ _W4A16_SCALE_FORMATS = {
     "iq2_xxs": "iq2_xxs",
     "q8_0": "q8_0",
     "e4m3_k16": "e4m3_k16",
-    "e4m3_k16_csf": "e4m3_k16_csf",
-    **{f"e4m3_k16_csf_i{words}": f"e4m3_k16_csf_i{words}" for words in range(4, 65, 4)},
     "e4m3_k32": "e4m3_k32",
     "e8m0_k32": "e8m0_k32",
 }
@@ -451,14 +449,6 @@ class B12XFP4ExpertWeights:
     representation: _PreparedWeightRepresentation | None = None
     immutable_input_scales: bool = False
     nvfp4_csf: object | None = None
-    # Packed W4A16 representation over the expanded scale scratch, for calls
-    # planned above the stage-scale token limit (nvfp4_csf expands into it).
-    w4a16_expanded: object | None = None
-    mxfp4_csf: object | None = None
-    # Compact W4A8 experts prepared from MXFP4-CSF checkpoints whose kernels read
-    # compressed scales inline: (w13, w2) Mxfp4CsfInlinePlane. The canonical scale
-    # fields keep the caller's expansion scratch, which these launches never read.
-    mxfp4_csf_inline: tuple | None = None
     a4_prefill_scales: bool = False
     _uniform_a1_scale: bool = field(default=False, init=False, repr=False)
     _a1_scale_version: int | None = field(default=None, init=False, repr=False)
@@ -857,9 +847,6 @@ class TPMoEScratchCaps:
     w4a16_a4_prefill_enabled: bool = False
     w4a16_a4_prefill_terms: int = 1
     w4a16_a4_prefill_warps: int = 8
-    w4a16_a4_csf_inline_words: int | None = None
-    w4a16_csf_stage_max_tokens: int = 1536
-    w4a8_csf_inline: bool = False
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -1022,8 +1009,6 @@ class TPMoEScratchPlan:
         ``scales_expanded`` states that ``expand_scales(experts)`` ran on this
         call's stream (or one it waits for) after the last other use of the
         shared NVFP4-CSF scratch; the call then skips its own expansion.
-        Eligible A4 calls above the prepared CSF stage limit consume these
-        expanded scales; smaller A4 calls retain shared-memory scale decoding.
 
         ``a4_prefill=True`` selects prepared NVFP4 activation launches.
         False and None keep W4A16 regardless of token count. Unsupported
@@ -1032,12 +1017,6 @@ class TPMoEScratchPlan:
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
         weight_plan = experts.plan
-        if (
-            weight_plan.w4a16_compressed_scales
-            and not self.caps.weight_plan.w4a16_compressed_scales
-        ):
-            # Calls above the stage-scale token limit run on expanded scales.
-            weight_plan = replace(weight_plan, w4a16_compressed_scales=False)
         if weight_plan != self.caps.weight_plan:
             raise ValueError(
                 "experts do not match the plan used to size TP MoE scratch"
@@ -1204,7 +1183,6 @@ class TPMoEScratchPlan:
         return replace(
             binding,
             scales_expanded=bool(scales_expanded),
-            w4a8_csf_inline=self.caps.w4a8_csf_inline,
         )
 
 
@@ -1303,7 +1281,6 @@ class TPMoEFP4Binding:
     a4_prefill_launches: object | None = None
     # The caller expanded every expert's NVFP4-CSF scales with expand_scales().
     scales_expanded: bool = False
-    w4a8_csf_inline: bool = False
     mixed_trellis_binding: object | None = None
     mixed_trellis_buffers: object | None = None
     compiler_scratch: torch.Tensor | None = None
@@ -2605,6 +2582,7 @@ def _w4a8_mx_micro_supported(
     weight_E: int,
     activation: str,
     source_format: str,
+    deterministic_output: bool = False,
 ) -> bool:
     source_format = _canonical_moe_policy_source_format(source_format)
     if source_format == "b12x_trellis":
@@ -2627,11 +2605,15 @@ def _w4a8_mx_micro_supported(
             and 0 < num_topk <= 32
             and weight_E > 0
         )
-    return _tiny_decode_enabled() and _tiny_decode_supports(
-        num_tokens=num_tokens,
-        k=k,
-        n=n,
-        activation=activation,
+    return (
+        not deterministic_output
+        and _tiny_decode_enabled()
+        and _tiny_decode_supports(
+            num_tokens=num_tokens,
+            k=k,
+            n=n,
+            activation=activation,
+        )
     )
 
 
@@ -2647,6 +2629,7 @@ def _w4a8_mx_micro_preferred(
         weight_E=query.num_experts,
         activation=query.activation,
         source_format=query.source_format,
+        deterministic_output=query.deterministic_output,
     ):
         return False
     capability = (
@@ -2677,6 +2660,7 @@ def _policy_micro_supported(query: MoeDecodeQuery) -> bool:
             weight_E=query.num_experts,
             activation=query.activation,
             source_format=query.source_format,
+            deterministic_output=query.deterministic_output,
         )
     return _band_runs_direct_micro(
         num_tokens=query.num_tokens,
@@ -3708,6 +3692,11 @@ def _plan_core_workspace(
                     ),
                 )
         intermediate_cache2_elements = routed_capacity * int(n)
+        if weight_layout == "modelopt" and not full_rotation:
+            intermediate_cache2_elements = max(
+                intermediate_cache2_elements,
+                min(token_capacity, 8) * int(num_topk) * align_up(int(n), 256),
+            )
         direct_m = routed_capacity // max(int(num_topk), 1)
         if (
             not full_rotation
@@ -6712,10 +6701,6 @@ def plan_b12x_fp4_moe_weights(
     num_experts: int,
     hidden_size: int,
     intermediate_size: int,
-    nvfp4_inline_scales: bool = False,
-    w4a16_compressed_scales: bool = False,
-    w4a16_csf_inline_words: int = 0,
-    w4a8_csf_inline: bool = False,
     w13_layout: str = "w13",
     w4a16_layout: PreparedWeightLayout | str | None = None,
     trellis_bits: int | None = None,
@@ -6761,10 +6746,6 @@ def plan_b12x_fp4_moe_weights(
 
     return replace(
         result,
-        nvfp4_inline_scales=bool(nvfp4_inline_scales),
-        w4a16_compressed_scales=bool(w4a16_compressed_scales),
-        w4a16_csf_inline_words=int(w4a16_csf_inline_words),
-        w4a8_csf_inline=bool(w4a8_csf_inline),
     )
 
 
@@ -7115,46 +7096,6 @@ def prepare_b12x_fp4_moe_weights(
         w2_alphas=canonical_a2,
         representation=representation,
         immutable_input_scales=immutable_input_scales,
-    )
-
-
-def prepare_b12x_x4t_weights(*, plan, weights) -> B12XFP4ExpertWeights:
-    """Keep exact nibbles and compressed scale planes in the expert owner."""
-    from b12x.moe._shared.kernels.w4a16.prepare import prepare_w4a16_x4t_weights
-
-    unit = torch.ones(plan.num_experts, dtype=torch.float32, device=weights.w13.device)
-    native = WeightPreparationTransform.W4A16_NATIVE in plan.transforms
-    value = prepare_w4a16_x4t_weights(
-        weights.w13,
-        weights.w13_scales,
-        unit,
-        weights.w2,
-        weights.w2_scales,
-        unit,
-        weights.w13_scale_scratch,
-        weights.w2_scale_scratch,
-        activation=plan.activation,
-        params_dtype=getattr(torch, plan.io_dtype),
-        w13_layout=plan.w13_layout,
-        weight_layout="modelopt" if native else "packed",
-    )
-    return B12XFP4ExpertWeights(
-        plan=plan,
-        a1_gscale=unit,
-        a2_gscale=unit,
-        w1_fp4=value.w13,
-        w2_fp4=value.w2,
-        w1_blockscale=value.w13_scale,
-        w2_blockscale=value.w2_scale,
-        w1_alphas=value.w13_global_scale,
-        w2_alphas=value.w2_global_scale,
-        representation=_PreparedWeightRepresentation(
-            quant_mode="w4a16",
-            layout=PreparedWeightLayout.SOURCE_NATIVE
-            if native
-            else PreparedWeightLayout.MMA_PACKED,
-            value=value,
-        ),
     )
 
 
@@ -9379,7 +9320,7 @@ def _prewarm_w4a16_planned_launches(
                 workspace.block_expert_ids.numel(),
                 int(block_size_m),
                 int(workspace.route_E),
-                bool(False),
+                False,
             )
             if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
                 if _B12X_TIMING:
@@ -11227,7 +11168,6 @@ def _get_dynamic_kernel(
     w4a8_repacked: bool = False,
     w4a8_n64_repacked: bool = False,
     nvfp4_materialize_intermediate: bool = False,
-    nvfp4_inline_scales: bool = False,
     direct_routing: bool = False,
     external_route_plan: bool = False,
     share_input_across_experts: bool = False,
@@ -11239,7 +11179,6 @@ def _get_dynamic_kernel(
     trellis_intermediate_hadamard: bool = False,
     planned_tile_m: int | None = None,
     planned_num_tokens: int | None = None,
-    w4a8_csf_inline: bool = False,
 ):
     """Resolve, compile, and cache the dynamic MoE kernel specialization for this
     launch geometry.
@@ -11302,8 +11241,6 @@ def _get_dynamic_kernel(
     ) or (quant_mode == "nvfp4" and nvfp4_materialize_intermediate)
     if w4a8_n64_repacked and not w4a8_repacked:
         raise ValueError("w4a8_n64_repacked requires repacked W4A8 weights")
-    if w4a8_csf_inline and (not w4a8_n64_repacked or int(trellis_bits) > 0):
-        raise ValueError("inline MXFP4-CSF scales require compact N64 W4A8 weights")
     if w4a8_n64_repacked and n % 64 != 0:
         raise ValueError("w4a8_n64_repacked requires N divisible by 64")
     if w4a8_n64_repacked:
@@ -11367,8 +11304,6 @@ def _get_dynamic_kernel(
         bool(materialize_intermediate),
         int(trellis_bits),
         bool(trellis_intermediate_hadamard),
-        *(("nvfp4_inline_scales_v2",) if nvfp4_inline_scales else ()),
-        *(("w4a8_csf_inline",) if w4a8_csf_inline else ()),
     )
     reuse_compiled = _first_env(
         "B12X_DYNAMIC_REUSE_COMPILED",
@@ -11434,10 +11369,6 @@ def _get_dynamic_kernel(
         # "e2m3" FP6 weights); w8a8_mx keeps mxfp6_fmt_a/b unset so the kernel
         # emits the native MmaMXF8Op instead of the inline FP6 MMA.
         kernel_kwargs["quant_recipe"] = quant_mode
-    if nvfp4_inline_scales:
-        kernel_kwargs["nvfp4_inline_scales"] = True
-    if w4a8_csf_inline:
-        kernel_kwargs["w4a8_csf_inline"] = True
     kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
     if is_w4a8:
         launch = _DynamicMoEW4A8Launch(
@@ -11772,7 +11703,6 @@ def _launch_dynamic_flat(
     w4a8_repacked: bool,
     w4a8_n64_repacked: bool,
     nvfp4_materialize_intermediate: bool,
-    nvfp4_inline_scales: bool,
     share_input_across_experts: bool,
     deterministic_output: bool,
     swiglu_limit: float | None,
@@ -11784,7 +11714,6 @@ def _launch_dynamic_flat(
     planned_tile_m: int,
     planned_direct_routing: bool,
     planned_num_tokens: int,
-    w4a8_csf_inline: bool = False,
 ) -> None:
     """Launch the compiled dynamic MoE kernel over bound workspace and weight views."""
     quant_mode = _normalize_quant_mode(quant_mode)
@@ -11983,7 +11912,6 @@ def _launch_dynamic_flat(
         w4a8_repacked=w4a8_repacked,
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
-        nvfp4_inline_scales=nvfp4_inline_scales,
         direct_routing=direct_routing,
         external_route_plan=external_route_plan,
         share_input_across_experts=share_input_across_experts,
@@ -11995,7 +11923,6 @@ def _launch_dynamic_flat(
         trellis_intermediate_hadamard=trellis_intermediate_hadamard,
         planned_tile_m=planned_tile_m,
         planned_num_tokens=planned_num_tokens,
-        w4a8_csf_inline=w4a8_csf_inline,
     )
     if volatile_launch_state and not external_route_plan:
         barrier_count.zero_()
@@ -12135,8 +12062,6 @@ def _encode_dynamic_launch_policy(
     planned_direct_routing: bool,
     w4a8_n64_repacked: bool,
     nvfp4_materialize_intermediate: bool = False,
-    nvfp4_inline_scales: bool = False,
-    w4a8_csf_inline: bool = False,
 ) -> int:
     try:
         tile_code = _DYNAMIC_TILE_M_POLICY_CODES[int(planned_tile_m)]
@@ -12153,15 +12078,13 @@ def _encode_dynamic_launch_policy(
         | (int(bool(planned_direct_routing)) << 4)
         | (int(bool(w4a8_n64_repacked)) << 5)
         | (int(bool(nvfp4_materialize_intermediate)) << 6)
-        | (int(bool(nvfp4_inline_scales)) << 7)
-        | (int(bool(w4a8_csf_inline)) << 8)
-        | ((int(policy_max_active_clusters) + 1) << 9)
+        | ((int(policy_max_active_clusters) + 1) << 7)
     )
 
 
 def _decode_dynamic_launch_policy(
     value: int,
-) -> tuple[bool, bool, int, bool, bool, bool, bool, bool, int]:
+) -> tuple[bool, bool, int, bool, bool, bool, int]:
     value = int(value)
     return (
         bool(value & 1),
@@ -12170,9 +12093,7 @@ def _decode_dynamic_launch_policy(
         bool(value & 16),
         bool(value & 32),
         bool(value & 64),
-        bool(value & 128),
-        bool(value & 256),
-        (value >> 9) - 1,
+        (value >> 7) - 1,
     )
 
 
@@ -12281,8 +12202,6 @@ def _tp_moe_dynamic_launch_op(
         planned_direct_routing,
         w4a8_n64_repacked,
         nvfp4_materialize_intermediate,
-        nvfp4_inline_scales,
-        w4a8_csf_inline,
         policy_max_active_clusters,
     ) = _decode_dynamic_launch_policy(launch_policy)
     _launch_dynamic_flat(
@@ -12345,7 +12264,6 @@ def _tp_moe_dynamic_launch_op(
         w4a8_repacked=w4a8_repacked,
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
-        nvfp4_inline_scales=nvfp4_inline_scales,
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
         swiglu_limit=swiglu_limit,
@@ -12357,7 +12275,6 @@ def _tp_moe_dynamic_launch_op(
         planned_tile_m=planned_tile_m,
         planned_direct_routing=planned_direct_routing,
         planned_num_tokens=planned_num_tokens,
-        w4a8_csf_inline=w4a8_csf_inline,
     )
 
 
@@ -12455,7 +12372,6 @@ def _launch_dynamic(
     w4a8_prepared: dict | None = None,
     w4a8_n64_repacked: bool = False,
     nvfp4_materialize_intermediate: bool = False,
-    nvfp4_inline_scales: tuple | None = None,
     share_input_across_experts: bool = False,
     deterministic_output: bool = False,
     swiglu_limit: float | None = None,
@@ -12466,7 +12382,6 @@ def _launch_dynamic(
     planned_tile_m: int = 128,
     dynamic_route_mode: str = "grouped",
     planned_num_tokens: int | None = None,
-    w4a8_csf_inline: tuple | None = None,
 ) -> None:
     del stream
     if dynamic_route_mode not in {"direct", "grouped"}:
@@ -12479,8 +12394,6 @@ def _launch_dynamic(
         planned_direct_routing=dynamic_route_mode == "direct",
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
-        nvfp4_inline_scales=nvfp4_inline_scales is not None,
-        w4a8_csf_inline=w4a8_csf_inline is not None,
     )
     if deterministic_output and workspace.route_output.numel() < routed_rows * k:
         raise RuntimeError(
@@ -12494,12 +12407,6 @@ def _launch_dynamic(
     w13_sfb_rp = w4a8_prepared["w13_sfb"] if w4a8_repacked else workspace.row_counts
     down_rp = w4a8_prepared["w2_rp"] if w4a8_repacked else workspace.row_counts
     down_sfb_rp = w4a8_prepared["w2_sfb"] if w4a8_repacked else workspace.row_counts
-    if w4a8_csf_inline is not None:
-        if not (w4a8_repacked and w4a8_n64_repacked):
-            raise RuntimeError("inline MXFP4-CSF scales require compact W4A8 weights")
-        # Every scale operand carries the inline storage: no launch argument
-        # references the caller's expansion scratch.
-        w13_sfb_rp, down_sfb_rp = (plane.storage for plane in w4a8_csf_inline)
     dynamic_w13_sf = (
         weights.w13_up_sf if weights.w13_up_sf is not None else weights.w13_sf
     )
@@ -12516,12 +12423,7 @@ def _launch_dynamic(
         if weights.dynamic_down_sf is not None
         else weights.down_sf
     )
-    if nvfp4_inline_scales is not None:
-        dynamic_w13_sf, dynamic_down_sf = (p.storage for p in nvfp4_inline_scales)
     sfb_down_mx = weights.sfb_down_mx
-    if w4a8_csf_inline is not None:
-        dynamic_w13_sf = dynamic_w13_gate_sf = w13_sfb_rp
-        dynamic_down_sf = sfb_down_mx = down_sfb_rp
     torch.ops.b12x.tp_moe_dynamic_launch(
         workspace.packed_a_view,
         workspace.packed_a_flat,
@@ -13280,27 +13182,6 @@ def _finalize_trellis_output(
     return target
 
 
-# Planned token capacity limit for W4A16 per-stage compressed-scale reads.
-W4A16_CSF_STAGE_MAX_TOKENS = int(
-    os.environ.get("B12X_W4A16_CSF_STAGE_MAX_TOKENS", "1536")
-)
-
-
-# Planned token capacity limit for compact W4A8 inline scale reads.
-W4A8_CSF_INLINE_MAX_TOKENS = int(
-    os.environ.get("B12X_W4A8_CSF_INLINE_MAX_TOKENS", "1536")
-)
-
-
-def _w4a16_reads_stage_scales(launch, a4_launches=None) -> bool:
-    """Whether this W4A16 call reads compressed scales per stage (its planned launch's format)."""
-    if a4_launches is not None:
-        return a4_launches.csf_inline_words is not None
-    if launch is not None:
-        return str(getattr(launch, "scale_format", None)).startswith("e4m3_k16_csf")
-    raise RuntimeError("Compressed W4A16 scales require a prepared fused launch")
-
-
 def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     """Execute one fully planned, prepared, and scratch-bound FP4 MoE launch."""
     if not isinstance(binding, TPMoEFP4Binding):
@@ -13351,50 +13232,14 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     w2_alphas = experts.w2_alphas
     topk_weights = binding.topk_weights
     topk_ids = binding.topk_ids
-    # Inline MXFP4-CSF experts read compressed scales inside the W4A8 kernels;
-    # other CSF experts expand their routed experts' scales into scratch first.
-    csf_inline = experts.mxfp4_csf_inline
-    if (
-        csf_inline is not None
-        and binding.implementation == "dynamic"
-        and not binding.w4a8_csf_inline
-    ):
-        # Plans above the inline limit run the native kernels over every
-        # expert's scales, expanded once from the inline storage.
-        from b12x._lib.quant.mxfp4_csf_inline import expand_mxfp4_csf_inline
-
-        for plane, scales in zip(
-            csf_inline, (w1_blockscale, w2_blockscale), strict=True
-        ):
-            expand_mxfp4_csf_inline(
-                plane, scales.view(torch.uint8).view(plane.num_experts, -1)
-            )
-        csf_inline = None
-    if experts.mxfp4_csf is not None and csf_inline is None:
-        experts.mxfp4_csf.decode(topk_ids, w1_blockscale, w2_blockscale)
     a4_launches = getattr(binding, "a4_prefill_launches", None)
-    stage_scales = experts.w4a16_expanded is not None and (
-        _w4a16_reads_stage_scales(binding.fused_launch, a4_launches)
-    )
     csf_reset_barriers = (
         experts.nvfp4_csf is not None
-        and not stage_scales
         and binding.implementation == "micro"
         and topk_ids.numel() > 0
     )
-    inline_scales = None
-    if (
-        experts.nvfp4_csf is not None
-        and binding.implementation == "dynamic"
-        and binding.quant_mode == "nvfp4"
-        and plan.decode_config.nvfp4_inline_scales
-    ):
-        inline_scales = experts.nvfp4_csf.inline_scales
-    if (
-        experts.nvfp4_csf is not None
-        and inline_scales is None
-        and not stage_scales
-        and not (binding.scales_expanded and not csf_reset_barriers)
+    if experts.nvfp4_csf is not None and not (
+        binding.scales_expanded and not csf_reset_barriers
     ):
         barriers = (
             (
@@ -13404,12 +13249,10 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             if csf_reset_barriers
             else None
         )
-        # W4A16 compressed storage expands into its shared scratch, not in place.
-        expanded = experts.w4a16_expanded
         experts.nvfp4_csf.decode(
             topk_ids,
-            w1_blockscale if expanded is None else expanded.w13_scale,
-            w2_blockscale if expanded is None else expanded.w2_scale,
+            w1_blockscale,
+            w2_blockscale,
             barriers=barriers,
         )
     workspace = None
@@ -13594,8 +13437,6 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
 
         prepared = prepared_payload
-        if experts.w4a16_expanded is not None and not stage_scales:
-            prepared = experts.w4a16_expanded
         if prepared is None:
             raise RuntimeError(
                 "the W4A16 weight plan did not materialize its required representation"
@@ -13890,10 +13731,6 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             launch_w4a8_compact_micro,
         )
 
-        if bool(compact.csf_inline) != (csf_inline is not None):
-            raise RuntimeError(
-                "compact W4A8 launchers and experts disagree on inline MXFP4-CSF scales"
-            )
         route_output = launch_w4a8_compact_micro(
             scratch=s.micro_intermediate,
             _prepared_kernel=compact.kernels[topk_ids.dtype],
@@ -13903,13 +13740,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             w13=wv.w1_storage,
-            w13_scales=(
-                wv.w1_scale_storage if csf_inline is None else csf_inline[0].storage
-            ),
+            w13_scales=(wv.w1_scale_storage),
             w2=wv.w2_storage,
-            w2_scales=(
-                wv.w2_scale_storage if csf_inline is None else csf_inline[1].storage
-            ),
+            w2_scales=(wv.w2_scale_storage),
             alpha1=wv.w1_alpha,
             alpha2=wv.w2_alpha,
             input_scale=input_gs,
@@ -13996,8 +13829,6 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             activation=activation,
             quant_mode=quant_mode,
             w4a8_prepared=dynamic_w4a8_prepared,
-            nvfp4_inline_scales=inline_scales,
-            w4a8_csf_inline=csf_inline if quant_mode == "w4a8_mx" else None,
             w4a8_n64_repacked=bool(getattr(prepared_payload, "n64_repack", False)),
             nvfp4_materialize_intermediate=decode_config.nvfp4_materialize_intermediate,
             deterministic_output=deterministic_output,

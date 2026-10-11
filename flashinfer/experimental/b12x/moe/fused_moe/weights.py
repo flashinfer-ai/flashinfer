@@ -11,9 +11,6 @@ import torch
 from b12x._lib.quant.block_codec import block_codec
 
 if TYPE_CHECKING:
-    from b12x._lib.quant.nvfp4_csf import Nvfp4CsfBatch
-    from b12x._lib.quant.x4t_scales import X4TScaleBatch
-
     from ._impl import B12XFP4ExpertWeights
     from .planning import WeightPlan
 
@@ -195,66 +192,62 @@ class PackedWeights:
 
 
 @dataclass(frozen=True)
-class CsfScalePlanes:
-    """Rank-local compressed scale planes in canonical 16-row slab order.
+class CsfBlockPlanes:
+    """Rank-local lossless FP4 scale blocks, one CPU plane per expert."""
 
-    Each tuple contains one CPU tensor per expert: uint8 fixed bytes and uint32
-    exceptions. The weight plan supplies matrix geometry and the scale codec.
-    ``prepare_weights`` uploads and rearranges these planes for its kernels.
-    """
+    planes: tuple
 
-    fixed: tuple[torch.Tensor, ...]
-    exceptions: tuple[torch.Tensor, ...]
+    def __post_init__(self):
+        from b12x.loader._csf_blocks import CsfBlockPlane
 
-    def __post_init__(self) -> None:
-        if not self.fixed or len(self.fixed) != len(self.exceptions):
-            raise ValueError(
-                "CSF requires matching nonempty fixed and exception planes"
-            )
-        for planes, dtype in (
-            (self.fixed, torch.uint8),
-            (self.exceptions, torch.uint32),
+        if not self.planes or any(
+            not isinstance(p, CsfBlockPlane) for p in self.planes
         ):
-            for plane in planes:
-                if not isinstance(plane, torch.Tensor) or plane.dtype != dtype:
-                    raise TypeError(f"CSF planes must be {dtype} tensors")
-                if plane.device.type != "cpu":
-                    raise ValueError("Unprepared CSF planes must reside on CPU")
+            raise TypeError("CSF blocks require a nonempty tuple of CPU scale planes")
+        first = self.planes[0]
+        for plane in self.planes:
+            plane.validate()
+            if (plane.rows, plane.columns, plane.quantization) != (
+                first.rows,
+                first.columns,
+                first.quantization,
+            ):
+                raise ValueError(
+                    "CSF expert scale planes must have matching geometry and quantization"
+                )
 
 
 @dataclass(frozen=True)
 class Nvfp4CsfWeights:
     """Native NVFP4 weights with compressed E4M3 scales and shared scratch.
 
-    FC1 weights and compressed rows use up/gate order. Scale planes may be
-    canonical CPU tensors or a prepared device batch.
+    FC1 weights and compressed rows use up/gate order. Scale planes use
+    the lossless 32x2 checkpoint encoding.
     The packed bundle's block-scale tensors are caller-owned expansion
     buffers. Their contents are overwritten before each expert invocation.
     Separate concurrent execution streams require separate buffers.
     """
 
     packed: PackedWeights
-    w13_scales: CsfScalePlanes | Nvfp4CsfBatch
-    w2_scales: CsfScalePlanes | Nvfp4CsfBatch
+    w13_scales: CsfBlockPlanes
+    w2_scales: CsfBlockPlanes
 
 
 @dataclass(frozen=True)
 class Mxfp4CsfWeights:
     """MXFP4-CSF nibbles, one-bit byte offsets and caller-owned scale buffers.
 
-    Scale planes may be canonical CPU tensors or a prepared device batch.
+    Scale planes use the lossless 32x2 checkpoint encoding.
     Buffers may be shared only by serialized layer executions on one CUDA
     stream. Concurrent model execution lanes require separate buffers.
-    Compact W4A8 preparation (intermediate size 64 mod 128) uses the buffers
-    once to build inline storage. Plans above the inline capacity expand into
-    those buffers before each call; smaller plans read inline storage directly.
-    B12X_W4A8_CSF_INLINE=0 keeps routed-expert expansion at all capacities.
+    Routed experts expand into native scale layouts before compute at every
+    token capacity, including compact W4A8 layouts.
     """
 
     w13: torch.Tensor
     w2: torch.Tensor
-    w13_scales: CsfScalePlanes | X4TScaleBatch
-    w2_scales: CsfScalePlanes | X4TScaleBatch
+    w13_scales: CsfBlockPlanes
+    w2_scales: CsfBlockPlanes
     w13_scale_scratch: torch.Tensor
     w2_scale_scratch: torch.Tensor
 
@@ -293,9 +286,14 @@ class PreparedExperts:
     def device(self) -> torch.device:
         return self._impl.w1_fp4.device
 
+    @property
+    def has_csf_blocks(self) -> bool:
+        decoder = self._impl.nvfp4_csf
+        return decoder is not None and decoder.first.geometry[3] in range(4, 10)
+
 
 __all__ = [
-    "CsfScalePlanes",
+    "CsfBlockPlanes",
     "Nvfp4CsfWeights",
     "Mxfp4CsfWeights",
     "PackedWeights",

@@ -11,8 +11,9 @@ from ..conftest import require_b12x
 @pytest.mark.parametrize("dtype", (torch.int32, torch.int64))
 @pytest.mark.parametrize("experts", (288, 512))
 @pytest.mark.parametrize("compile_forward", [False, True])
+@pytest.mark.parametrize("bitmap", [False, True])
 def test_presence_mask_invalid_duplicates_empty_and_graph(
-    dtype, experts, compile_forward
+    dtype, experts, compile_forward, bitmap
 ):
     device = require_b12x()
     invalid = 2**32 + 3 if dtype == torch.int64 else experts
@@ -20,7 +21,7 @@ def test_presence_mask_invalid_duplicates_empty_and_graph(
         ([3, -1, 3, 19, experts - 1, invalid] * 97), dtype=dtype, device=device
     )
     active = torch.empty(experts, dtype=torch.int32, device=device)
-    program = compile_csf_active_experts(dtype == torch.int64)
+    program = compile_csf_active_experts(dtype == torch.int64, experts if bitmap else 0)
     capture_call = lambda: mark_active_experts(ids, active, program)
     if compile_forward:
         from torch.fx.experimental.proxy_tensor import make_fx

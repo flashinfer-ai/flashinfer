@@ -1,21 +1,15 @@
-"""Stage-readable index of MMA-packed NVFP4-CSF scale planes for W4A16.
+"""Exception-word index for expansion into MMA-packed NVFP4 W4A16 scales.
 
-W4A16 reads expert block scales one pipeline stage at a time: G k-groups of
-one or more row slabs, in its MMA-packed byte order. Packed CSF planes
-(layout 1) store each 128-row slab's row bases and 4-bit codes in that order.
-This storage keeps them with the plane's value table folded in and adds, per
-atom of four k-groups of one slab, an exception record, optionally with the
-atom's first replacement words inline. A kernel rebuilds any stage in shared
-memory with one add per word instead of expanding whole experts into scratch
-before every MoE layer.
+Packed CSF planes retain row bases and four-bit offsets in the native
+MMA-packed order. The index folds in the projection's scale-normalization
+table and records complete replacement words for exceptions. Expansion writes
+caller-owned native scale scratch before W4A16 or A4 prefill compute.
 
-``B12X_NVFP4_CSF_INLINE_WORDS`` (read when the storage is built) sets the
-inline replacement words of a 128-row record (a multiple of four, at most 64;
-64-row records hold five eighths of it, rounded up to four). The default 0
-keeps 32-byte records and every replacement word in the spill area, the
-memory of uninlined storage; kernels then copy each stage's replacement-word
-window. Inline words make every stage copy independent of the others (no
-window), for 128 more bytes per atom at 32 words.
+Each record covers four k-groups of one row slab. Its 32-byte header indexes
+replacement words, optionally embedding a prefix in the record. MoE weight
+preparation uses header-only records and a separate replacement-word stream.
+The standalone storage builder also accepts embedded prefixes controlled by
+``B12X_NVFP4_CSF_INLINE_WORDS``; compute kernels do not consume this storage.
 
 W4A16's value table re-biases E4M3 exponents: it adds one constant to every
 normal scale byte. Stored row bases include that constant, so a word is its
@@ -117,7 +111,7 @@ def record_bytes(rows_per_slab: int, words: int) -> int:
 
 @dataclass(frozen=True)
 class PackedCsfScales:
-    """Inline-readable packed CSF scales of one projection."""
+    """Compressed packed scales and their exception-word index."""
 
     storage: torch.Tensor
     rows: int
@@ -469,7 +463,7 @@ def _load_at(pointer, offset: Int64):
 
 
 class PackedStoragePlane:
-    """Expands one slab of stage-readable storage per CTA (256 threads)."""
+    """Expand one slab into native packed scales per 256-thread CTA."""
 
     def __init__(self, geometry):
         self.rows, self.columns, configured, _ = map(int, geometry)

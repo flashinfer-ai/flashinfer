@@ -25,9 +25,7 @@ The W4A16 scales are lifted E4M3 bytes (``s * f * 2**7`` as FP16 bits 14..7, so
 ``lifted = e4m3(s * f) + 120`` for every kept scale, 0 for flushed ones); the
 kernels restore ``e4m3(s * f)`` per byte and fold ``1 / f`` back through the
 packed global scale (``g * 2**119 / f``) into the per-expert alpha.
-Stage-readable CSF storage reconstructs these same lifted bytes in shared
-memory from row bases, nibble offsets, and replacement words. FC1 stages
-the separated gate/up slabs; FC2 stages adjacent output slabs.
+
 
 Activation layout (``x_q`` for FC1, the intermediate for FC2): per row and
 K64 slice, eight u32 words of eight permuted positions each, stored in the
@@ -61,9 +59,7 @@ from b12x._lib.intrinsics import (
     fmax_f32,
     fp8_e4m3_to_f32,
     get_ptr_as_int64,
-    ld_global_nc_u32,
     ld_global_nc_v4_u32,
-    ld_shared_u16_zx_ordered,
     ld_shared_u32,
     ld_shared_v2_u32,
     ld_shared_v4_u32,
@@ -77,7 +73,6 @@ from b12x._lib.intrinsics import (
     st_shared_u32,
     st_shared_v4_u32,
 )
-from b12x._lib.quant.nvfp4_csf_packed import HEADER_BYTES, record_bytes
 
 # Position m of a 16-group holds physical K offset PI[m].
 PI = (0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15)
@@ -348,9 +343,6 @@ class A4PackedPrefillGemm:
     NVFP4 residual) into the same accumulators, and FC1 writes the intermediate
     the same way.
 
-    ``csf_inline_words=None`` consumes dense lifted scales. An integer selects
-    stage-readable CSF storage with that many inline replacement words per
-    record; remaining replacements are read from its spill area.
     """
 
     def __init__(
@@ -366,7 +358,6 @@ class A4PackedPrefillGemm:
         terms: int = 1,
         warps: int = NUM_WARPS,
         swiglu_limit: float | None = None,
-        csf_inline_words: int | None = None,
     ):
         if phase not in ("fc1", "fc2"):
             raise ValueError(f"unknown A4 prefill phase {phase!r}")
@@ -388,14 +379,6 @@ class A4PackedPrefillGemm:
         self.terms = int(terms)
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
-        self.csf_scales = csf_inline_words is not None
-        self.csf_inline_words = 0 if csf_inline_words is None else int(csf_inline_words)
-        if (
-            self.csf_inline_words < 0
-            or self.csf_inline_words > 64
-            or self.csf_inline_words % 4
-        ):
-            raise ValueError("CSF inline words must be a multiple of four up to 64")
         # Four warps per row group, one per N64 chunk slot; 16 warps own 32 rows
         # each (64 accumulators), 8 warps own 64 rows (128 accumulators).
         self.warps = int(warps)
@@ -416,21 +399,9 @@ class A4PackedPrefillGemm:
         self.b_off = self.terms * PLANE_STAGE_BYTES
         self.s_off = self.b_off + B_STAGE_BYTES
         self.stage_bytes = self.s_off + S_STAGE_BYTES
-        self.csf_off = self.stage_bytes
-        if self.csf_scales:
-            self.csf_record_bytes = record_bytes(128, self.csf_inline_words)
-            self.csf_slab_bytes = 128 + 64 * (self.size_k // 16)
-            self.csf_slabs = self.size_n // 128
-            self.csf_expert_bytes = self.csf_slabs * (
-                self.csf_slab_bytes + self.k_tiles * self.csf_record_bytes
-            )
-            self.csf_stage_records = 4 if self.fc1_half_slab else 2
-            self.stage_bytes += 512 + self.csf_stage_records * self.csf_record_bytes
         self.pipeline_bytes = self.stages * self.stage_bytes
-        self.csf_bases_off = max(self.pipeline_bytes, BLOCK_M * EPI_ROW_BYTES)
-        self.shared_bytes = self.csf_bases_off + ROUTE_BYTES
-        if self.csf_scales:
-            self.shared_bytes += 256
+        self.route_off = max(self.pipeline_bytes, BLOCK_M * EPI_ROW_BYTES)
+        self.shared_bytes = self.route_off + ROUTE_BYTES
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -448,8 +419,6 @@ class A4PackedPrefillGemm:
             BLOCK_M,
             TILE_K,
             self.warps,
-            self.csf_scales,
-            self.csf_inline_words,
         )
 
     @cute.jit
@@ -529,137 +498,6 @@ class A4PackedPrefillGemm:
             cp_async4_shared_global(dst, src)
 
     @cute.jit
-    def _csf_slab(self, n_tile: Int32, slab: Int32) -> Int32:
-        result = n_tile * Int32(2) + slab
-        if cutlass.const_expr(self.fc1):
-            result = n_tile + slab * Int32(self.intermediate_size // 128)
-        return result
-
-    @cute.jit
-    def _csf_block(self, scales_u8, expert: Int32) -> Int64:
-        return get_ptr_as_int64(scales_u8, Int64(HEADER_BYTES)) + Int64(expert) * Int64(
-            self.csf_expert_bytes
-        )
-
-    @cute.jit
-    def _stage_csf_tile(self, scales_u8, smem_base, tid, expert, n_tile):
-        if tid < Int32(16):
-            if cutlass.const_expr(self.fc1_half_slab):
-                chunk = tid // Int32(4)
-                packed_chunk = self._chunk_n64(n_tile, chunk)
-                self._copy_chunk(
-                    smem_base + Int32(self.csf_bases_off) + tid * Int32(16),
-                    self._csf_block(scales_u8, expert)
-                    + Int64(packed_chunk // Int32(2)) * Int64(self.csf_slab_bytes)
-                    + Int64(packed_chunk & Int32(1)) * Int64(64)
-                    + Int64(tid % Int32(4)) * Int64(16),
-                    n_tile,
-                    chunk,
-                )
-            else:
-                slab = self._csf_slab(n_tile, tid // Int32(8))
-                cp_async4_shared_global(
-                    smem_base + Int32(self.csf_bases_off) + tid * Int32(16),
-                    self._csf_block(scales_u8, expert)
-                    + Int64(slab) * Int64(self.csf_slab_bytes)
-                    + Int64(tid % Int32(8)) * Int64(16),
-                )
-
-    @cute.jit
-    def _issue_csf(self, scales_u8, stage_base, k_tile, tid, expert, n_tile):
-        block = self._csf_block(scales_u8, expert)
-        if tid < Int32(32):
-            if cutlass.const_expr(self.fc1_half_slab):
-                chunk = tid // Int32(8)
-                packed_chunk = self._chunk_n64(n_tile, chunk)
-                self._copy_chunk(
-                    stage_base + Int32(self.csf_off) + tid * Int32(16),
-                    block
-                    + Int64(packed_chunk // Int32(2)) * Int64(self.csf_slab_bytes)
-                    + Int64(128)
-                    + Int64(k_tile) * Int64(256)
-                    + Int64((tid % Int32(8)) // Int32(2)) * Int64(64)
-                    + Int64(packed_chunk & Int32(1)) * Int64(32)
-                    + Int64(tid & Int32(1)) * Int64(16),
-                    n_tile,
-                    chunk,
-                )
-            else:
-                slab = self._csf_slab(n_tile, tid // Int32(16))
-                cp_async4_shared_global(
-                    stage_base + Int32(self.csf_off) + tid * Int32(16),
-                    block
-                    + Int64(slab) * Int64(self.csf_slab_bytes)
-                    + Int64(128)
-                    + Int64(k_tile) * Int64(256)
-                    + Int64(tid % Int32(16)) * Int64(16),
-                )
-        if tid < Int32(self.csf_stage_records * self.csf_record_bytes // 16):
-            slot = tid // Int32(self.csf_record_bytes // 16)
-            slab = self._csf_slab(n_tile, slot)
-            if cutlass.const_expr(self.fc1_half_slab):
-                slab = self._chunk_n64(n_tile, slot) // Int32(2)
-            self._copy_chunk(
-                stage_base + Int32(self.csf_off + 512) + tid * Int32(16),
-                block
-                + Int64(self.csf_slabs * self.csf_slab_bytes)
-                + (Int64(slab) * Int64(self.k_tiles) + Int64(k_tile))
-                * Int64(self.csf_record_bytes)
-                + Int64(tid % Int32(self.csf_record_bytes // 16)) * Int64(16),
-                n_tile,
-                slot,
-            )
-
-    @cute.jit
-    def _expand_csf_stage(self, scales_u8, smem_base, stage_base, tid):
-        if tid < Int32(256):
-            group = tid // Int32(64)
-            chunk = (tid // Int32(16)) % Int32(4)
-            slab = chunk // Int32(2)
-            word = tid % Int32(16) + (chunk % Int32(2)) * Int32(16)
-            codes_offset = slab * Int32(256) + group * Int32(64) + word * Int32(2)
-            bases_offset = slab * Int32(128) + word * Int32(4)
-            if cutlass.const_expr(self.fc1_half_slab):
-                slab = chunk
-                local_word = tid % Int32(16)
-                word = local_word + (
-                    self._chunk_n64(Int32(0), chunk) & Int32(1)
-                ) * Int32(16)
-                codes_offset = (
-                    chunk * Int32(128) + group * Int32(32) + local_word * Int32(2)
-                )
-                bases_offset = chunk * Int32(64) + local_word * Int32(4)
-            codes = ld_shared_u16_zx_ordered(
-                stage_base + Int32(self.csf_off) + codes_offset
-            )
-            codes = (codes | (codes << Uint32(12))) & Uint32(0x0F0F0F0F)
-            value = codes + ld_shared_u32(
-                smem_base + Int32(self.csf_bases_off) + bases_offset
-            )
-            record = (
-                stage_base
-                + Int32(self.csf_off + 512)
-                + slab * Int32(self.csf_record_bytes)
-            )
-            mask = ld_shared_u32(record + Int32(16) + group * Int32(4))
-            bit = Uint32(1) << word.to(Uint32)
-            if (mask & bit) != Uint32(0):
-                prefixes = ld_shared_u32(record + Int32(4))
-                index = (
-                    (prefixes >> (group.to(Uint32) * Uint32(8))) & Uint32(255)
-                ) + cute.arch.popc(mask & (bit - Uint32(1))).to(Uint32)
-                if index < Uint32(self.csf_inline_words):
-                    value = ld_shared_u32(
-                        record + Int32(32) + index.to(Int32) * Int32(4)
-                    )
-                else:
-                    value = ld_global_nc_u32(
-                        get_ptr_as_int64(scales_u8, Int64(0))
-                        + (ld_shared_u32(record).to(Int64) + index.to(Int64)) * Int64(4)
-                    )
-            st_shared_u32(stage_base + Int32(self.s_off) + tid * Int32(4), value)
-
-    @cute.jit
     def _issue(
         self,
         tid: Int32,
@@ -692,16 +530,13 @@ class A4PackedPrefillGemm:
                 n_tile,
                 chunk,
             )
-        if cutlass.const_expr(self.csf_scales):
-            self._issue_csf(scales_u8, stage_base, k_tile, tid, expert, n_tile)
-        else:
-            if tid < Int32((TILE_K // 16) * 4 * 4):
-                self._copy_chunk(
-                    stage_base + s_dst,
-                    s_src + Int64(k_tile) * Int64((TILE_K // 16) * self.size_n),
-                    n_tile,
-                    (tid >> Int32(2)) & Int32(3),
-                )
+        if tid < Int32((TILE_K // 16) * 4 * 4):
+            self._copy_chunk(
+                stage_base + s_dst,
+                s_src + Int64(k_tile) * Int64((TILE_K // 16) * self.size_n),
+                n_tile,
+                (tid >> Int32(2)) & Int32(3),
+            )
 
     # -- mainloop ------------------------------------------------------------------
 
@@ -835,9 +670,6 @@ class A4PackedPrefillGemm:
         # Live 16-row blocks among this warp's (warp-uniform).
         warp_live = live_blocks - m_warp * Int32(self.mb_per_warp)
 
-        if cutlass.const_expr(self.csf_scales):
-            self._stage_csf_tile(scales_u8, smem_base, tid, expert, n_tile)
-
         for p in cutlass.range_constexpr(self.stages - 1):
             if Int32(p) < Int32(self.k_tiles):
                 self._issue(
@@ -877,9 +709,6 @@ class A4PackedPrefillGemm:
                     n_tile,
                 )
             cute.arch.cp_async_commit_group()
-            if cutlass.const_expr(self.csf_scales):
-                self._expand_csf_stage(scales_u8, smem_base, rd_base, tid)
-                cute.arch.sync_threads()
             if warp_live > Int32(0):
                 self._compute_stage(
                     rd_base, b_frag, s_frag, a_frag, sfa_frag, warp_live, acc
@@ -1332,7 +1161,7 @@ def a4_prefill_supported(
 ) -> bool:
     return (
         prepared_layout == "packed"
-        and (scale_format == "e4m3_k16" or str(scale_format).startswith("e4m3_k16_csf"))
+        and scale_format == "e4m3_k16"
         and activation == "silu"
         and bool(is_gated)
         and dtype == torch.bfloat16
@@ -1358,7 +1187,6 @@ class W4A16A4PrefillLaunches:
     fc2: object
     topk_sum: object
     route_pack: object
-    csf_inline_words: int | None = None
 
     def carriers(self) -> tuple[object, ...]:
         return (
@@ -1396,7 +1224,6 @@ def _compile_a4_kernels(
     terms: int,
     warps: int,
     swiglu_limit: float | None,
-    csf_inline_words: int | None = None,
 ):
     from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
     from b12x._lib.utils import current_cuda_stream
@@ -1410,7 +1237,6 @@ def _compile_a4_kernels(
         int(terms),
         warps,
         swiglu_limit,
-        csf_inline_words,
     )
     stream = current_cuda_stream()
     quant = b12x_compile(
@@ -1438,7 +1264,6 @@ def _compile_a4_kernels(
                     terms=terms,
                     warps=warps,
                     swiglu_limit=swiglu_limit,
-                    csf_inline_words=csf_inline_words,
                 ),
                 _fake(cutlass.Uint32),
                 _fake(cutlass.Uint32, 4),
@@ -1482,7 +1307,6 @@ def compile_w4a16_a4_prefill(
     terms: int = 1,
     warps: int = NUM_WARPS,
     swiglu_limit: float | None = None,
-    csf_inline_words: int | None = None,
 ) -> W4A16A4PrefillLaunches:
     from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_topk_sum
     from b12x.moe._shared.kernels.w4a16.route_pack import (
@@ -1497,7 +1321,6 @@ def compile_w4a16_a4_prefill(
         terms=terms,
         warps=warps,
         swiglu_limit=swiglu_limit,
-        csf_inline_words=csf_inline_words,
     )
     topk_sum = compile_w4a16_topk_sum(
         m=tokens,
@@ -1526,7 +1349,6 @@ def compile_w4a16_a4_prefill(
         fc2=fc2,
         topk_sum=topk_sum,
         route_pack=route_pack,
-        csf_inline_words=csf_inline_words,
     )
 
 

@@ -3,6 +3,7 @@
 import gc
 import statistics
 import time
+import weakref
 
 import pytest
 import torch
@@ -10,6 +11,55 @@ import torch
 from b12x._lib import compiler
 from b12x.preparation import PreparationSession, PreparedCall
 from ..conftest import require_b12x
+
+
+def test_graph_benchmark_uses_live_routes_and_releases_trial_storage():
+    from b12x.preparation._measurement import capture_benchmark_call, _prepare_race
+
+    device = require_b12x()
+    table = torch.arange(12, device=device, dtype=torch.float32).reshape(3, 4)
+    ids = torch.empty(2, device=device, dtype=torch.int64)
+    output = torch.empty(2, 4, device=device)
+    owner = torch.empty(1, device=device)
+    reference = weakref.ref(owner)
+    closed = []
+    call = capture_benchmark_call(
+        PreparedCall(
+            run=lambda: torch.index_select(table, 0, ids, out=output),
+            output=output,
+            reset=lambda: output.fill_(float("nan")),
+            produce=lambda: ids.fill_(0),
+            benchmark_producers=(lambda: ids.fill_(1), lambda: ids.fill_(2)),
+            owners=(owner,),
+            close=lambda: closed.append(True),
+        )
+    )
+    del owner
+    race = _prepare_race((call,), device_ordinal=device.index, samples=1)
+    try:
+        for _ in range(3):
+            call.reset()
+            call.produce()
+            allocations = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+            call.invoke()
+            torch.cuda.synchronize(device)
+            assert (
+                torch.cuda.memory_stats(device)["allocation.all.allocated"]
+                == allocations
+            )
+            race.timers[0].replay()
+            torch.cuda.synchronize(device)
+            torch.testing.assert_close(
+                output, table[2].expand_as(output), rtol=0, atol=0
+            )
+        assert reference() is not None
+    finally:
+        race.close()
+        call.close()
+    del call, race
+    gc.collect()
+    assert reference() is None
+    assert closed == [True]
 
 
 def test_graph_replay_survives_compiler_cache_eviction(monkeypatch):

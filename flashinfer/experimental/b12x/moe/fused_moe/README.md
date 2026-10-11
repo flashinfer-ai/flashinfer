@@ -22,7 +22,7 @@ Supported weights use packed ModelOpt NVFP4 with ordinary or compressed
 NVFP4-CSF block scales, BF16 input/output, SiLU gating, hidden size divisible
 by 256, and intermediate size divisible by 64. FC1 masks the unused half of
 a final 128-channel intermediate tile and reads gate/up scale halves from
-their original compressed slabs. A positive `swiglu_limit` uses
+native packed scale storage. A positive `swiglu_limit` uses
 the W4A16 activation contract: clamp the BF16 GEMM gate above the limit and the
 up input to the symmetric interval, round SiLU and up to BF16, multiply, then
 round the intermediate to BF16 before quantization. Expert maps, input router
@@ -41,36 +41,28 @@ caller-owned scratch buffers. When an exact decode variant lacks the padded
 A4 workspace, a composite plan reuses a larger fitting prepared variant in
 the same scratch arena. A plan with no fitting A4 variant retains W4A16.
 
-For stage-readable NVFP4-CSF storage, the A4 GEMMs reconstruct their scale
-tiles in shared memory from the same compressed bytes used by A16. The
-selected stage-decoding launches bypass full expansion into global scratch.
-Other consumers can still require that scratch; selecting an in-kernel
-decoder does not remove the shared allocation from the prepared owner.
+Compressed NVFP4 and MXFP4 scales expand into caller-owned native scale
+buffers before compute. Small calls expand only routed experts; long prefills
+expand all experts. MoE and dense GEMM kernels accept native scales and use the
+same arithmetic and tuning candidates as resident native weights. W4A16
+preparation preserves its scale normalization and packed layout in the expander.
 
-Plans also prepare dense A4 scale consumers when their capacity exceeds
-`B12X_W4A16_CSF_STAGE_MAX_TOKENS` (default `1536`). A call with more live rows
-than this limit selects those consumers only with `scales_expanded=True`.
-The caller must have expanded this layer's scales and ordered that expansion
-before the call, after the previous use of shared scale scratch. Calls at or
-below the limit, and calls without ready expanded scales, retain stage
-decoding. This size policy selects the scale consumer; precision remains
-controlled by `a4_prefill`.
+`expand_scales(experts)` expands every NVFP4 expert on the current stream.
+A later `bind(..., scales_expanded=True)` skips per-call expansion, except for
+micro kernels whose synchronization reset is fused with expansion. Callers
+must order expansion after the previous use of shared scale scratch and before
+compute. Concurrent execution streams require disjoint scratch or explicit
+stream dependencies.
 
 `uses_expanded_nvfp4_scales(plan, num_tokens=..., a4_prefill=...,
-route_ids_dtype=..., scales_expanded=...)` reports whether the selected call reads expanded
-NVFP4-CSF scales. It requires a prepared execution plan and performs no GPU
-work. Serving integrations can omit scale prefetch when every following-layer
-span uses a compressed-scale reader. To decide whether to prefetch, query
-the following layer's spans with prospective `scales_expanded=True`; pass
-True to the execution binding only after arranging the corresponding stream
-ordering. CUDA graph calls without external scale preparation use the default
-False and retain stage decoding. Outstanding writes to shared scale scratch
-still require synchronization before reusing that scratch.
+route_ids_dtype=..., scales_expanded=...)` reports whether a prepared call has
+compressed NVFP4 scales. All such calls consume expanded scales, independent
+of activation precision and token count. The query performs no GPU work.
 
 `B12X_W4A16_A4_PREFILL_TERMS=1` uses one NVFP4 activation plane. A value of `2`
 adds an independently quantized residual plane. `B12X_W4A16_A4_PREFILL_WARPS`
 accepts `8` (default) or `16`. These controls and the capability flag are immutable
-execution-plan inputs and are part of tuning query schema 26. Changing the
+execution-plan inputs and are part of tuning query schema 28. Changing the
 environment requires preparing another execution plan. Kernel compilation
 retains device-owned callables; replay performs no compilation or tensor
 allocation. A4 always applies router weights in the FP32 final sum. Set

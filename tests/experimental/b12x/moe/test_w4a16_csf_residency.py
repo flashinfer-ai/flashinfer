@@ -1,14 +1,4 @@
-"""Every planned W4A16 launch of a GLM-5.3 NVFP4-CSF model fits its cooperative grid.
-
-vLLM prepares one MoE plan per decode capacity up to 256 tokens (64 sequences
-x 4 MTP tokens) and prefill chunks up to 8192 tokens. Each fused W4A16 launch
-is cooperative: if the planned CTAs per SM do not fit, the launch fails with
-CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE. Compressed scales keep the residency
-(and so the persistent schedule) of native scales wherever their shared
-footprint admits it; where it does not (the fused kernel's own shared
-regions, such as a staged E4M3 value table, can leave room for fewer CTAs),
-they run fewer CTAs per SM and a different split-K partition.
-"""
+"""Compressed and native W4A16 weights use the same cooperative compute grid."""
 
 import numpy as np
 import pytest
@@ -22,17 +12,14 @@ from ..conftest import require_b12x
 _CAPACITIES = tuple(range(1, 257)) + (8192,)
 
 
-@pytest.mark.parametrize("inline", [0, 32])
 @pytest.mark.parametrize("intermediate", [256, 352])
 def test_csf_plans_fit_their_cooperative_grid_at_every_capacity(
-    intermediate, inline, monkeypatch
+    intermediate, monkeypatch
 ):
     device = require_b12x()
     monkeypatch.setenv("B12X_W4A16_SMALL_M_OCCUPANCY", "2")
-    monkeypatch.setenv("B12X_W4A16_CSF_INLINE", "1")
-    monkeypatch.setenv("B12X_NVFP4_CSF_INLINE_WORDS", str(inline))
     e, h, n, topk = 256, 6144, intermediate, 8
-    rng = np.random.default_rng(intermediate + inline)
+    rng = np.random.default_rng(intermediate)
     w13 = torch.randint(0, 256, (e, 2 * n, h // 2), dtype=torch.uint8, device=device)
     w2 = torch.randint(0, 256, (e, h, n // 2), dtype=torch.uint8, device=device)
     l13 = _logical_scales(rng, e, 2 * n, h // 16, 0.03)
@@ -60,10 +47,17 @@ def test_csf_plans_fit_their_cooperative_grid_at_every_capacity(
         )
 
     def planes(logical):
+        from b12x.loader._csf_blocks import export_csf_blocks
+
         fixed, exceptions = _planes(logical)
-        return moe.CsfScalePlanes(
-            tuple(torch.from_numpy(p) for p in fixed),
-            tuple(torch.from_numpy(p) for p in exceptions),
+        rows, columns = logical.shape[1:]
+        return moe.CsfBlockPlanes(
+            tuple(
+                export_csf_blocks(
+                    f, x, rows=rows, columns=columns, quantization="nvfp4"
+                )
+                for f, x in zip(fixed, exceptions, strict=True)
+            )
         )
 
     owners = (
@@ -81,9 +75,7 @@ def test_csf_plans_fit_their_cooperative_grid_at_every_capacity(
         ),
     )
     del w13, w2
-    assert owners[1].plan._impl.w4a16_scale_format == (
-        "e4m3_k16_csf" if inline == 0 else f"e4m3_k16_csf_i{inline}"
-    )
+    assert owners[1].plan._impl.w4a16_scale_format == ("e4m3_k16")
     torch.manual_seed(intermediate)
     x_all = (torch.randn(max(_CAPACITIES), h, device=device) * 0.5).to(torch.bfloat16)
     ids_all = torch.stack(
@@ -138,7 +130,7 @@ def test_csf_plans_fit_their_cooperative_grid_at_every_capacity(
         session.prepare(
             tuple(
                 p.request(
-                    name=f"csf-residency-{n}-{inline}-{tokens}-{i}",
+                    name=f"csf-residency-{n}-{tokens}-{i}",
                     prepare_call=prepare_for(tokens),
                 )
                 for tokens, pair in plans.items()
@@ -173,27 +165,14 @@ def test_csf_plans_fit_their_cooperative_grid_at_every_capacity(
             ), tokens
             assert torch.isfinite(outputs[1]).all(), tokens
             scale = float(outputs[0].float().abs().max())
-            if residency[0] == residency[1]:
-                # Both scale formats run the same schedule. Its cross-CTA
-                # split-K reductions (and the prefill route sum) are not
-                # ordered: native differs from itself by a BF16 rounding in
-                # rare elements, so allow a few such elements.
-                differ = outputs[1] != outputs[0]
-                rare = outputs[0].numel() // (10_000 if tokens <= 256 else 1_000)
-                assert int(differ.sum()) <= max(16, rare), tokens
-                if bool(differ.any()):
-                    delta = (outputs[1].float() - outputs[0].float()).abs()[differ]
-                    assert float(delta.max()) <= 2.0**-6 * scale, tokens
-            else:
-                # Fewer CTAs per SM: a different persistent grid splits K
-                # differently across CTAs, which reassociates FP32 partial
-                # sums. Results then differ by BF16 roundings of the
-                # intermediate and the output only: a few BF16 ulps.
-                assert residency[1] < residency[0], (tokens, residency)
-                torch.testing.assert_close(
-                    outputs[1].float(),
-                    outputs[0].float(),
-                    rtol=2.0**-6,
-                    atol=2.0**-10 * scale,
-                    msg=lambda m: f"{tokens} tokens, residency {residency}: {m}",
-                )
+            assert residency[0] == residency[1], (tokens, residency)
+            # Both scale formats run the same schedule. Its cross-CTA
+            # split-K reductions (and the prefill route sum) are not
+            # ordered: native differs from itself by a BF16 rounding in
+            # rare elements, so allow a few such elements.
+            differ = outputs[1] != outputs[0]
+            rare = outputs[0].numel() // (10_000 if tokens <= 256 else 1_000)
+            assert int(differ.sum()) <= max(16, rare), tokens
+            if bool(differ.any()):
+                delta = (outputs[1].float() - outputs[0].float()).abs()[differ]
+                assert float(delta.max()) <= 2.0**-6 * scale, tokens

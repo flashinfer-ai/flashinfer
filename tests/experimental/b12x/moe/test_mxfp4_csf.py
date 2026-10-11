@@ -11,34 +11,40 @@ from ..quantization.test_mxfp4_csf import fixture
 
 @pytest.mark.parametrize("tokens", [1, 17, 33, 128])
 @pytest.mark.parametrize("h,n", [(512, 192), (5120, 576), (512, 256)])
-@pytest.mark.parametrize("raw", [False, True])
-def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, raw):
+@pytest.mark.parametrize("raw", ["blocks"])
+def test_native_expert_output_and_shared_scratch_poisoned_replay(
+    tokens, h, n, raw, activation_mode="a8"
+):
     device = require_b12x()
     e, topk = 8, 2
     first, s13 = fixture(2 * n, h // 32, finite_scales=True)
     second, s2 = fixture(h, n // 32, finite_scales=True)
-    if raw:
+    from b12x.loader._csf_blocks import export_csf_blocks
 
-        def cpu_planes(batch):
-            offsets = batch.exception_offsets.cpu().tolist()
-            fixed = tuple(t.cpu() for t in batch.fixed)
-            exceptions = batch.exceptions.cpu()
-            return moe.CsfScalePlanes(
-                fixed,
-                tuple(
-                    exceptions[start:end]
-                    for start, end in zip(offsets[:-1], offsets[1:], strict=True)
-                ),
+    def cpu_planes(batch):
+        offsets = batch.exception_offsets.cpu().tolist()
+        records = batch.exceptions.cpu()
+        return moe.CsfBlockPlanes(
+            tuple(
+                export_csf_blocks(
+                    f.cpu(),
+                    records[a:b],
+                    rows=batch.rows,
+                    columns=batch.columns,
+                    quantization="mxfp4",
+                )
+                for f, a, b in zip(batch.fixed, offsets[:-1], offsets[1:], strict=True)
             )
+        )
 
-        first, second = cpu_planes(first), cpu_planes(second)
+    first, second = cpu_planes(first), cpu_planes(second)
     w13 = torch.randint(0, 256, (e, 2 * n, h // 2), dtype=torch.uint8, device=device)
     w2 = torch.randint(0, 256, (e, h, n // 2), dtype=torch.uint8, device=device)
     one = torch.ones(e, device=device)
     weight_plan = moe.plan_weights(
         source=moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
         activation=moe.ActivationSpec(
-            mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16
+            mode=activation_mode, nonlinearity="silu", io_dtype=torch.bfloat16
         ),
         geometry=moe.MoEGeometry(num_experts=e, hidden_size=h, intermediate_size=n),
     )
@@ -50,7 +56,11 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, r
         w13_global_scales=one,
         w2_global_scales=one,
     )
-    buffers = (torch.empty_like(s13), torch.empty_like(s2))
+    ordinary = moe.prepare_weights(plan=weight_plan, weights=packed)
+    buffers = tuple(
+        torch.empty_like(scale).view(torch.uint8)
+        for scale in (ordinary._impl.w1_blockscale, ordinary._impl.w2_blockscale)
+    )
     compressed = moe.Mxfp4CsfWeights(
         w13=w13,
         w2=w2,
@@ -59,14 +69,21 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, r
         w13_scale_scratch=buffers[0],
         w2_scale_scratch=buffers[1],
     )
-    experts = [
-        moe.prepare_weights(plan=weight_plan, weights=w) for w in (packed, compressed)
-    ]
+    experts = [ordinary, moe.prepare_weights(plan=weight_plan, weights=compressed)]
     impl = experts[1]._impl
     assert impl.w1_blockscale.data_ptr() == buffers[0].data_ptr()
     assert impl.w2_blockscale.data_ptr() == buffers[1].data_ptr()
-    assert impl.representation.value.w13_sfb.data_ptr() == buffers[0].data_ptr()
-    assert impl.representation.value.w2_sfb.data_ptr() == buffers[1].data_ptr()
+    native = impl.representation.value
+    assert (
+        getattr(
+            native, "w13_scale" if activation_mode == "a16" else "w13_sfb"
+        ).data_ptr()
+        == buffers[0].data_ptr()
+    )
+    assert (
+        getattr(native, "w2_scale" if activation_mode == "a16" else "w2_sfb").data_ptr()
+        == buffers[1].data_ptr()
+    )
     for attr in ("w1_fp4", "w2_fp4", "w1_blockscale", "w2_blockscale"):
         assert torch.equal(
             getattr(experts[0]._impl, attr), getattr(experts[1]._impl, attr)
@@ -156,6 +173,15 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, r
             assert (
                 torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
             )
+            active = ids.unique()
+            for name in ("w1_blockscale", "w2_blockscale"):
+                torch.testing.assert_close(
+                    getattr(experts[1]._impl, name).view(torch.uint8)[active],
+                    getattr(experts[0]._impl, name).view(torch.uint8)[active],
+                    rtol=0,
+                    atol=0,
+                    msg=name,
+                )
             assert torch.isfinite(outputs[0]).all() and torch.count_nonzero(outputs[0])
             torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
         for graph in graphs:
@@ -163,11 +189,10 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, r
 
 
 def _csf_planes(rows, columns, *, experts, seed):
-    """CSF planes with sparse exceptions in most native tiles and dense rows
-    whose tiles exceed the inline records (raw tiles)."""
+    """Scale blocks with sparse exceptions and densely overridden rows."""
     import numpy as np
 
-    from b12x._lib.quant.x4t_scales import make_x4t_scale_batch
+    from b12x.loader._csf_blocks import export_csf_blocks
 
     device = require_b12x()
     rng = np.random.default_rng(seed + rows + columns)
@@ -195,14 +220,17 @@ def _csf_planes(rows, columns, *, experts, seed):
             )
         )
         grids.append(grid)
-    batch = make_x4t_scale_batch(
-        fixed, exceptions, rows=rows, columns=columns, device=device
+    batch = moe.CsfBlockPlanes(
+        tuple(
+            export_csf_blocks(f, x, rows=rows, columns=columns, quantization="mxfp4")
+            for f, x in zip(fixed, exceptions, strict=True)
+        )
     )
     return batch, torch.from_numpy(np.stack(grids)).to(device)
 
 
 def _prepare_arms(h, n, layout, monkeypatch, *, experts=8, seed=0):
-    """Native, per-call expansion and inline CSF experts of one MXFP4 layer."""
+    """Native and compressed experts sharing the same MXFP4 arithmetic."""
     device = require_b12x()
     first, s13 = _csf_planes(2 * n, h // 32, experts=experts, seed=seed)
     second, s2 = _csf_planes(h, n // 32, experts=experts, seed=seed + 1)
@@ -232,8 +260,7 @@ def _prepare_arms(h, n, layout, monkeypatch, *, experts=8, seed=0):
         ),
     )
     arms, scratch = [native], []
-    for inline in ("0", "1"):
-        monkeypatch.setenv("B12X_W4A8_CSF_INLINE", inline)
+    for _ in range(1):
         buffers = (torch.empty_like(s13), torch.empty_like(s2))
         arms.append(
             moe.prepare_weights(
@@ -249,7 +276,6 @@ def _prepare_arms(h, n, layout, monkeypatch, *, experts=8, seed=0):
             )
         )
         scratch.append(buffers)
-    monkeypatch.delenv("B12X_W4A8_CSF_INLINE")
     return arms, scratch
 
 
@@ -266,35 +292,18 @@ def _assert_bitwise(expected, actual):
         (h, n, tokens)
         for h, n in ((5120, 576), (1024, 320), (512, 256))
         for tokens in (1, 8, 17, 64, 512)
-        # Deterministic N128 decode at 8 tokens plans direct routing, which
-        # that reduction contract does not support (independent of CSF).
-        if not (n % 128 == 0 and tokens == 8)
     ],
 )
-def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
+def test_expanded_scales_match_native_under_poisoned_replay(
     h, n, tokens, layout, ids_dtype, monkeypatch, after_plan=None
 ):
-    """Inline reads equal native scales and per-call expansion bit for bit.
-
-    The shared expansion scratch is poisoned with NaN E8M0 bytes before every
-    replay; inline launches never read or write it. N % 128 == 0 keeps the
-    per-call expansion (no inline storage).
-    """
+    """Poisoned scale scratch is restored before native kernels execute."""
     device = require_b12x()
     e, topk = 8, 2
-    (native, expanded, inline), scratch = _prepare_arms(h, n, layout, monkeypatch)
-    compact = n % 128 == 64
-    assert expanded._impl.mxfp4_csf is not None
-    assert expanded._impl.mxfp4_csf_inline is None
-    assert not expanded.plan._impl.w4a8_csf_inline
-    assert inline.plan._impl.w4a8_csf_inline == compact
-    assert (inline._impl.mxfp4_csf_inline is not None) == compact
-    assert (inline._impl.mxfp4_csf is None) == compact
-    if compact:
-        # Canonical scale storage stays the caller's scratch; launches read
-        # the inline planes instead.
-        assert inline._impl.w1_blockscale.data_ptr() == scratch[1][0].data_ptr()
-    arms = (native, expanded, inline)
+    (native, expanded), scratch = _prepare_arms(h, n, layout, monkeypatch)
+    assert expanded._impl.nvfp4_csf is not None
+    assert expanded._impl.w1_blockscale.data_ptr() == scratch[0][0].data_ptr()
+    arms = (native, expanded)
     plans = [
         moe.plan_execution(
             experts=owner,
@@ -335,7 +344,7 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
     ) as session:
         session.prepare(
             tuple(
-                p.request(name=f"mxfp4-csf-inline-{i}", prepare_call=prepare)
+                p.request(name=f"mxfp4-csf-expansion-{i}", prepare_call=prepare)
                 for i, p in enumerate(plans)
             )
         )
@@ -366,7 +375,7 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
         for _ in range(3):
             source.neg_()
             ids.add_(1).remainder_(e)
-            for buffer in scratch[1]:
+            for buffer in scratch[0]:
                 buffer.view(torch.uint8).fill_(0xFF)
             for output in outputs:
                 output.fill_(float("nan"))
@@ -378,24 +387,22 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
                 torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
             )
             _assert_bitwise(outputs[0], outputs[1])
-            _assert_bitwise(outputs[0], outputs[2])
-            if compact:
-                assert all(
-                    bool((buffer.view(torch.uint8) == 0xFF).all())
-                    for buffer in scratch[1]
-                )
+            assert all(
+                not bool((buffer.view(torch.uint8) == 0xFF).all())
+                for buffer in scratch[0]
+            )
         for graph in graphs:
             graph.reset()
 
 
 @pytest.mark.parametrize("capacity", [8, 512])
-def test_inline_capacity_plan_reuses_its_launches_for_live_counts(
+def test_expansion_capacity_plan_reuses_its_launches_for_live_counts(
     capacity, monkeypatch
 ):
     """One planned capacity serves smaller live counts under frozen resolution."""
     device = require_b12x()
     e, h, n, topk = 8, 5120, 576, 6
-    (native, _, inline), scratch = _prepare_arms(h, n, "w31", monkeypatch, seed=3)
+    (native, expanded), scratch = _prepare_arms(h, n, "w31", monkeypatch, seed=3)
     plans = [
         moe.plan_execution(
             experts=owner,
@@ -403,7 +410,7 @@ def test_inline_capacity_plan_reuses_its_launches_for_live_counts(
             invocation={"fast_math": False},
             routing=moe.RoutingSpec(deterministic_output=True),
         )
-        for owner in (native, inline)
+        for owner in (native, expanded)
     ]
     source = torch.randn(capacity, h, dtype=torch.bfloat16, device=device) * 0.1
     ids = torch.stack(
@@ -451,7 +458,7 @@ def test_inline_capacity_plan_reuses_its_launches_for_live_counts(
     ) as session:
         session.prepare(
             tuple(
-                p.request(name=f"csf-inline-live-{i}", prepare_call=prepare)
+                p.request(name=f"csf-expansion-live-{i}", prepare_call=prepare)
                 for i, p in enumerate(plans)
             )
         )
@@ -460,7 +467,7 @@ def test_inline_capacity_plan_reuses_its_launches_for_live_counts(
             (reference, expected, _), (binding, actual, _) = (
                 bind(plan, rows) for plan in plans
             )
-            for buffer in scratch[1]:
+            for buffer in scratch[0]:
                 buffer.view(torch.uint8).fill_(0xFF)
             moe.run(binding=reference)
             moe.run(binding=binding)
@@ -469,19 +476,11 @@ def test_inline_capacity_plan_reuses_its_launches_for_live_counts(
 
 
 @pytest.mark.parametrize("tokens", [17, 512])
-def test_inline_plans_above_the_limit_expand_the_inline_storage(tokens, monkeypatch):
-    """Plans above the inline token limit run native kernels over expanded scales.
-
-    The limit is lowered so that small capacities take the large-call path: the
-    poisoned scratch receives every expert's native scales from the inline
-    storage before each replay, and outputs equal native scales bit for bit.
-    """
-    from b12x.moe.fused_moe import _impl
-
+def test_prefill_expands_all_scales(tokens, monkeypatch):
+    """Prefill restores native scales for every expert before graph replay."""
     device = require_b12x()
     e, h, n, topk = 8, 5120, 576, 6
-    (native, _, inline), scratch = _prepare_arms(h, n, "w31", monkeypatch, seed=5)
-    monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 16)
+    (native, expanded), scratch = _prepare_arms(h, n, "w31", monkeypatch, seed=5)
     plans = [
         moe.plan_execution(
             experts=owner,
@@ -489,9 +488,8 @@ def test_inline_plans_above_the_limit_expand_the_inline_storage(tokens, monkeypa
             invocation={"fast_math": False},
             routing=moe.RoutingSpec(deterministic_output=True),
         )
-        for owner in (native, inline)
+        for owner in (native, expanded)
     ]
-    monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 1536)
     source = torch.randn(tokens, h, dtype=torch.bfloat16, device=device) * 0.1
     ids = torch.stack(
         [torch.randperm(e, device=device)[:topk] for _ in range(tokens)]
@@ -525,7 +523,7 @@ def test_inline_plans_above_the_limit_expand_the_inline_storage(tokens, monkeypa
         session.prepare(
             tuple(
                 p.request(
-                    name=f"csf-inline-large-{i}",
+                    name=f"csf-expansion-large-{i}",
                     prepare_call=lambda state, p=p: bind(p),
                 )
                 for i, p in enumerate(plans)
@@ -542,7 +540,7 @@ def test_inline_plans_above_the_limit_expand_the_inline_storage(tokens, monkeypa
         for _ in range(2):
             source.neg_()
             ids.add_(1).remainder_(e)
-            for buffer in scratch[1]:
+            for buffer in scratch[0]:
                 buffer.view(torch.uint8).fill_(0xFF)
             for call in calls:
                 call.output.fill_(float("nan"))
@@ -552,7 +550,7 @@ def test_inline_plans_above_the_limit_expand_the_inline_storage(tokens, monkeypa
             _assert_bitwise(calls[0].output, calls[1].output)
             reference = native._impl.representation.value
             for buffer, expected in zip(
-                scratch[1], (reference.w13_sfb, reference.w2_sfb), strict=True
+                scratch[0], (reference.w13_sfb, reference.w2_sfb), strict=True
             ):
                 assert torch.equal(
                     buffer.view(torch.uint8).view(-1),
@@ -562,32 +560,14 @@ def test_inline_plans_above_the_limit_expand_the_inline_storage(tokens, monkeypa
             graph.reset()
 
 
-def test_inline_requires_compact_split_kernels():
-    """Inline storage is accepted only by the compact N64 kernels that read it."""
-    from b12x.moe._shared.kernels.w4a8_compact_projection import (
-        W4A8CompactMicroProjectionKernel,
-    )
-    from b12x.moe._shared.kernels.w4a8_phase1 import W4A8MaterializedPhase1Kernel
-    from b12x.moe._shared.kernels.w4a8_phase2 import W4A8MaterializedPhase2Kernel
-
-    with pytest.raises(ValueError):
-        W4A8CompactMicroProjectionKernel(1024, 256, 2, csf_inline=True)
-    with pytest.raises(ValueError):
-        W4A8MaterializedPhase1Kernel(source_tile_m=16, csf_inline=True)
-    with pytest.raises(ValueError):
-        W4A8MaterializedPhase2Kernel(source_tile_m=16, csf_inline=True)
-
-
-def test_inline_capacity_control_is_retained_after_declaration(monkeypatch):
-    from b12x.moe.fused_moe import _impl
-
-    monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 1536)
-    test_inline_scales_match_native_and_expansion_under_poisoned_replay(
-        1024,
-        320,
-        17,
-        "w31",
-        torch.int32,
-        monkeypatch,
-        after_plan=lambda: monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 0),
+@pytest.mark.parametrize("tokens", [1, 33, 128])
+@pytest.mark.parametrize("mode", ["a8", "a16"])
+@pytest.mark.parametrize("h,n", [(5120, 576), (512, 256), (5120, 288), (256, 96)])
+def test_block_scales_use_native_expert_math_and_shared_scratch(tokens, mode, h, n):
+    test_native_expert_output_and_shared_scratch_poisoned_replay(
+        tokens=tokens,
+        h=h,
+        n=n,
+        raw="blocks",
+        activation_mode=mode,
     )

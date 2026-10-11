@@ -486,7 +486,7 @@ def test_csf_prefetch_query_matches_exact_variant_and_precision(
     monkeypatch.setattr(Nvfp4CsfDecoder, "decode", record_decode)
     for tokens in (4, 6, 128):
         for choice in (None, True):
-            expected = tokens != 4 and not (calibrated and choice is True)
+            expected = True
             with kernel_resolution_guard("prepared scale-consumer metadata"):
                 before = torch.cuda.memory_allocated()
                 assert (
@@ -538,7 +538,7 @@ def test_csf_prefetch_query_matches_exact_variant_and_precision(
             a4_prefill=True,
         )
         assert binding.a4_prefill_launches is None
-        assert not moe.uses_expanded_nvfp4_scales(small, num_tokens=4, a4_prefill=True)
+        assert moe.uses_expanded_nvfp4_scales(small, num_tokens=4, a4_prefill=True)
         # A4 cannot use a plan whose intermediate buffers do not fit its planes.
         root = plan._prepared.state
         state = root.variants[3072]
@@ -608,11 +608,10 @@ def test_a4_prefetch_reader_requires_live_size_and_ready_scales(monkeypatch):
                     launch = binding.a4_prefill_launches
                     if choice is True:
                         assert launch is not None
-                        expected = ready and tokens > 1536
-                        assert (launch.csf_inline_words is None) is expected
+                        expected = True
                     else:
                         assert launch is None
-                        expected = tokens != 4
+                        expected = True
                     assert uses_expanded is expected, (tokens, ready, choice)
         assert torch.cuda.memory_allocated() == before
 
@@ -710,25 +709,25 @@ def test_a4_prefill_graph_replay_reuses_launches(terms, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "intermediate_size,inline_words,terms,capacity,warps,tokens,ready",
+    "intermediate_size,terms,capacity,warps,tokens,ready",
     [
-        (256, 0, 1, 320, 8, 131, False),
-        (256, 0, 1, 3072, 8, 131, False),
-        (256, 4, 2, 3072, 8, 131, False),
-        (256, 64, 1, 3072, 16, 131, False),
-        (256, 4, 1, 3072, 8, 131, True),
-        (256, 4, 1, 3072, 8, 1537, False),
-        (256, 4, 1, 3072, 8, 1537, True),
-        (320, 0, 1, 320, 8, 131, False),
-        (320, 4, 2, 3072, 16, 131, False),
-        (320, 4, 1, 3072, 8, 1537, False),
-        (320, 4, 2, 3072, 8, 1537, True),
+        (256, 1, 320, 8, 131, False),
+        (256, 1, 3072, 8, 131, False),
+        (256, 2, 3072, 8, 131, False),
+        (256, 1, 3072, 16, 131, False),
+        (256, 1, 3072, 8, 131, True),
+        (256, 1, 3072, 8, 1537, False),
+        (256, 1, 3072, 8, 1537, True),
+        (320, 1, 320, 8, 131, False),
+        (320, 2, 3072, 16, 131, False),
+        (320, 1, 3072, 8, 1537, False),
+        (320, 2, 3072, 8, 1537, True),
     ],
 )
 def test_a4_csf_scale_readers_preserve_dense_graph_output(
-    intermediate_size, inline_words, terms, capacity, warps, tokens, ready, monkeypatch
+    intermediate_size, terms, capacity, warps, tokens, ready, monkeypatch
 ):
-    """Both CSF readers preserve dense arithmetic and caller expansion ordering."""
+    """Scale expansion preserves native arithmetic and caller stream ordering."""
     import numpy as np
 
     from b12x._lib.quant.nvfp4_csf import Nvfp4CsfDecoder
@@ -739,7 +738,6 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
     device = require_b12x()
     _env(monkeypatch, True, terms)
     monkeypatch.setenv("B12X_W4A16_A4_PREFILL_WARPS", str(warps))
-    monkeypatch.setenv("B12X_NVFP4_CSF_INLINE_WORDS", str(inline_words))
     I = intermediate_size
     case = _make_case(17, I)
     case["plan"] = moe.plan_weights(
@@ -787,28 +785,17 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
         outputs.append(output)
         scratches.append(scratch)
     launches = [binding.a4_prefill_launches for binding in bindings]
-    assert launches[0].csf_inline_words is None
-    consumes_expanded = ready and tokens > 1536
-    assert launches[1].csf_inline_words == (None if consumes_expanded else inline_words)
-    if not consumes_expanded:
-        assert launches[0].fc1 is not launches[1].fc1
-        assert launches[0].fc2 is not launches[1].fc2
-    expanded = owners[1]._impl.w4a16_expanded
+    assert launches[0].fc1 is launches[1].fc1
+    assert launches[0].fc2 is launches[1].fc2
     packed = owners[1]._impl.representation.value
-    assert (
-        expanded.w13.untyped_storage().data_ptr()
-        == packed.w13.untyped_storage().data_ptr()
-    )
-    assert (
-        expanded.w2.untyped_storage().data_ptr()
-        == packed.w2.untyped_storage().data_ptr()
-    )
-    scale_scratch = (expanded.w13_scale, expanded.w2_scale)
+    scale_scratch = (packed.w13_scale, packed.w2_scale)
+    consumes_expanded = ready
 
     def reject_expansion(*args, **kwargs):
-        raise AssertionError("A4 must use compressed stages or caller-expanded scales")
+        raise AssertionError("Caller-expanded scales must skip per-call expansion")
 
-    monkeypatch.setattr(Nvfp4CsfDecoder, "decode", reject_expansion)
+    if ready:
+        monkeypatch.setattr(Nvfp4CsfDecoder, "decode", reject_expansion)
     for buffer in scale_scratch:
         buffer.view(torch.uint8).fill_(0x7F)
     if consumes_expanded:
@@ -846,7 +833,7 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
                 torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
                 if not consumes_expanded:
                     assert all(
-                        torch.all(buffer.view(torch.uint8) == 0x7F)
+                        not torch.all(buffer.view(torch.uint8) == 0x7F)
                         for buffer in scale_scratch
                     )
     finally:

@@ -37,7 +37,7 @@ def _qwen_query(tokens, deterministic, mode="nvfp4"):
             num_experts=512, hidden_size=2560, intermediate_size=640
         ),
     )
-    native = replace(weights._impl, nvfp4_inline_scales=True)
+    native = weights._impl
     query = MoeDecodeQuery(
         quant_mode=mode,
         quant_modes=tuple(sorted(native.quant_modes)),
@@ -67,7 +67,6 @@ def _qwen_query(tokens, deterministic, mode="nvfp4"):
         numerical_recipe=None,
         controls=_preparation._control_snapshot(),
         shared_input_scales=True,
-        nvfp4_inline_scales=True,
     )
     return query, native
 
@@ -139,6 +138,38 @@ def test_explicit_deterministic_route_overrides_reject_before_planning(route, mo
         ).pinned
         == config
     )
+
+
+@pytest.mark.parametrize("width", (288, 576))
+@pytest.mark.parametrize("deterministic", (False, True))
+def test_mxfp4_micro_candidates_honor_deterministic_reduction(width, deterministic):
+    query, _ = _qwen_query(1, deterministic)
+    weights = moe.plan_weights(
+        source=moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
+        activation=moe.ActivationSpec(
+            mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16
+        ),
+        geometry=moe.MoEGeometry(
+            num_experts=512, hidden_size=5120, intermediate_size=width
+        ),
+    )._impl
+    query = replace(
+        query,
+        quant_mode="w4a8_mx",
+        quant_modes=tuple(weights.quant_modes),
+        source_format=weights.source_format,
+        hidden_size=5120,
+        intermediate_size=width,
+        w13_layout=weights.w13_layout,
+        weight_layouts=tuple(item.value for item in weights.weight_layouts),
+    )
+    candidates = TUNING.eligible_plan(query, DEVICE).candidates
+    assert any(config.backend == "micro" for _, config in candidates) == (
+        not deterministic or width == 576
+    )
+    assert TUNING.default_config(query, DEVICE).backend in {
+        config.backend for _, config in candidates
+    }
 
 
 @pytest.mark.parametrize("requested", (None, False, True))

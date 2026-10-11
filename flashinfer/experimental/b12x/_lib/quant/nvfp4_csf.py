@@ -363,13 +363,30 @@ class _Pair:
     def __init__(self, first, second, indexed=False):
         plane = _Plane
         if indexed:
-            from b12x._lib.quant.nvfp4_csf_inline import IndexedNvfp4Plane
+            from b12x._lib.quant.nvfp4_csf_indexed import IndexedNvfp4Plane
 
             plane = IndexedNvfp4Plane
         from b12x._lib.quant.nvfp4_csf_packed import PackedStoragePlane
+        from b12x._lib.quant.csf_blocks import (
+            CompactBlockStoragePlane,
+            Nvfp4BlockStoragePlane,
+        )
 
-        self.first = (PackedStoragePlane if first[3] == 2 else plane)(first)
-        self.second = (PackedStoragePlane if second[3] == 2 else plane)(second)
+        readers = {
+            2: PackedStoragePlane,
+            3: Nvfp4BlockStoragePlane,
+            4: CompactBlockStoragePlane,
+            5: CompactBlockStoragePlane,
+            6: CompactBlockStoragePlane,
+            7: CompactBlockStoragePlane,
+            8: CompactBlockStoragePlane,
+            9: CompactBlockStoragePlane,
+        }
+        self.first = readers.get(first[3], plane)(first)
+        self.second = readers.get(second[3], plane)(second)
+        self.threads = max(
+            getattr(self.first, "threads", 256), getattr(self.second, "threads", 256)
+        )
 
     @cute.jit
     def __call__(
@@ -416,7 +433,7 @@ class _Pair:
             barrier_slots,
         ).launch(
             grid=(capacity * Int32(self.first.tasks + self.second.tasks), 1, 1),
-            block=(256, 1, 1),
+            block=(self.threads, 1, 1),
             stream=stream,
         )
 
@@ -442,7 +459,7 @@ class _Pair:
             while slot_to_reset < barrier_slots:
                 barrier_count[slot_to_reset] = Int32(0)
                 barrier_epoch[slot_to_reset] = Int32(0)
-                slot_to_reset += Int32(256)
+                slot_to_reset += Int32(self.threads)
         slot = Int32(block) // Int32(self.first.tasks + self.second.tasks)
         task = Int32(block) % Int32(self.first.tasks + self.second.tasks)
         expert = slot
@@ -512,6 +529,27 @@ def compile_nvfp4_csf_pair(first, second, ids64=False, indexed=False):
     )
 
 
+def _matches_scale_output(plane, output):
+    if plane.geometry[3] in range(4, 10):
+        return (
+            output.dtype
+            in (torch.uint8, torch.int32, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+            and output.ndim >= 1
+            and output.shape[0] == plane.num_experts
+            and output.numel() * output.element_size()
+            == plane.num_experts * plane.rows * plane.columns
+        )
+    expected = (
+        (plane.num_experts, plane.columns, plane.rows)
+        if plane.layout
+        else (plane.num_experts, plane.rows, plane.columns)
+    )
+    return (
+        output.dtype in (torch.uint8, torch.float8_e4m3fn)
+        and tuple(output.shape) == expected
+    )
+
+
 def decode_nvfp4_csf_pair(
     first,
     second,
@@ -535,13 +573,7 @@ def decode_nvfp4_csf_pair(
         raise ValueError("NVFP4-CSF routes must be contiguous CUDA int32/int64")
     for batch, out in ((first, out13), (second, out2)):
         if (
-            out.dtype not in (torch.uint8, torch.float8_e4m3fn)
-            or tuple(out.shape)
-            != (
-                (batch.num_experts, batch.columns, batch.rows)
-                if batch.layout
-                else (batch.num_experts, batch.rows, batch.columns)
-            )
+            not _matches_scale_output(batch, out)
             or not out.is_contiguous()
             or out.device != batch.fixed.device
         ):
@@ -703,23 +735,18 @@ class Nvfp4CsfDecoder:
     programs: tuple
     routing_programs: tuple
     active: torch.Tensor
-    inline_scales: tuple | None = None
+    indexed_scales: tuple | None = None
     indexed_programs: tuple | None = None
+    bitmap_routes: bool = False
 
     @classmethod
-    def prepare(cls, first, second, out13, out2, *, inline_scales=None):
+    def prepare(cls, first, second, out13, out2, *, indexed_scales=None):
         from b12x._lib.quant.csf_routing import compile_csf_active_experts
 
         for plane, output in ((first, out13), (second, out2)):
             plane.validate()
-            expected = (
-                (plane.num_experts, plane.columns, plane.rows)
-                if plane.layout
-                else (plane.num_experts, plane.rows, plane.columns)
-            )
             if (
-                tuple(output.shape) != expected
-                or output.dtype != torch.float8_e4m3fn
+                not _matches_scale_output(plane, output)
                 or output.device != plane.fixed.device
                 or not output.is_contiguous()
             ):
@@ -744,17 +771,23 @@ class Nvfp4CsfDecoder:
             first,
             second,
             programs,
-            tuple(compile_csf_active_experts(ids64) for ids64 in (False, True)),
+            tuple(
+                compile_csf_active_experts(
+                    ids64, first.num_experts if first.geometry[3] in range(4, 10) else 0
+                )
+                for ids64 in (False, True)
+            ),
             torch.empty(
                 first.num_experts, dtype=torch.int32, device=first.fixed.device
             ),
-            inline_scales=inline_scales,
+            indexed_scales=indexed_scales,
+            bitmap_routes=first.geometry[3] in range(4, 10),
             indexed_programs=(
                 tuple(
                     compile_nvfp4_csf_pair(first.geometry, second.geometry, ids64, True)
                     for ids64 in (False, True)
                 )
-                if inline_scales is not None
+                if indexed_scales is not None
                 else None
             ),
         )
@@ -799,5 +832,5 @@ class Nvfp4CsfDecoder:
             mode=mode,
             program=programs[int(ids.dtype == torch.int64)],
             barriers=barriers,
-            indexed_scales=self.inline_scales if indexed else None,
+            indexed_scales=self.indexed_scales if indexed else None,
         )

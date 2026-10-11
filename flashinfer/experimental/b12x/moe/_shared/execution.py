@@ -311,20 +311,6 @@ class MoEWeightPreparationPlan:
     trellis_rate_granularity: str | None = None
     trellis_pair_kinds: frozenset[str] | None = None
     intermediate_hadamard_blocks: tuple[int, int] | None = None
-    nvfp4_inline_scales: bool = False
-    # Packed W4A16 experts keep their E4M3 K16 scales as stage-readable CSF
-    # storage. Kernels rebuild each pipeline stage from it; calls planned above
-    # the stage-read token limit expand their routed experts into scratch first.
-    w4a16_compressed_scales: bool = False
-    # Inline replacement words per 128-row record of that storage
-    # (B12X_NVFP4_CSF_INLINE_WORDS at preparation); 0 keeps every replacement
-    # word in the spill area and kernels copy per-stage windows of it.
-    w4a16_csf_inline_words: int = 0
-    # Compact (N64) W4A8 experts prepared from MXFP4-CSF checkpoints keep their
-    # E8M0 scales as inline storage (b12x._lib.quant.mxfp4_csf_inline). Every
-    # compact W4A8 launch within the inline capacity rebuilds its scale words;
-    # larger capacities expand into scratch before execution.
-    w4a8_csf_inline: bool = False
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)
@@ -579,9 +565,6 @@ class MoEWeightPreparationPlan:
     def w4a16_scale_format(self) -> str | None:
         if self.w4a16_weight_layout is None:
             return None
-        if self.w4a16_compressed_scales:
-            words = int(self.w4a16_csf_inline_words)
-            return "e4m3_k16_csf" if words == 0 else f"e4m3_k16_csf_i{words}"
         return self.specs[0].source_weight_scale.value
 
     def required_weight_layout(self, quant_mode: str) -> PreparedWeightLayout | None:

@@ -1,10 +1,4 @@
-"""W4A16 NVFP4 shards whose channel count is 32 mod 64 (2048/TP6 = 352).
-
-FC1 has 64 mod 128 gate/up rows (only N64 tiles divide it) and FC2 has K = 32
-mod 64 (K32 stages). Native packed scales and stage-read NVFP4-CSF scales must
-both run there, match an FP32 oracle, and agree bit for bit, with and without
-replacement words inline in the CSF records (B12X_NVFP4_CSF_INLINE_WORDS).
-"""
+"""W4A16 scale expansion preserves native arithmetic for partial TP tiles."""
 
 from dataclasses import replace
 
@@ -12,7 +6,6 @@ import numpy as np
 import pytest
 import torch
 
-from b12x._lib.quant.nvfp4_csf import make_nvfp4_csf_batch
 from b12x.moe import fused_moe as moe
 from b12x.moe._shared.kernels.w4a16.kernel import _select_tile_config
 from b12x.preparation import PreparationSession, PreparedCall
@@ -38,17 +31,14 @@ _E2M1 = (
 )
 
 
-@pytest.mark.parametrize(
-    "scale_format", ["e4m3_k16", "e4m3_k16_csf", "e4m3_k16_csf_i32"]
-)
 @pytest.mark.parametrize("block", [8, 32, 64])
-def test_k32_down_tiles_pair_with_n64_gate_up_tiles(scale_format, block):
+def test_k32_down_tiles_pair_with_n64_gate_up_tiles(block):
     """GLM-5.3 TP6: FC1 N = 704 and FC2 K = 352 share a 128-thread geometry."""
     common = dict(
         moe_block_size=block,
         sms=188,
         max_shared_mem=101_376,
-        scale_format=scale_format,
+        scale_format="e4m3_k16",
         weight_layout="packed",
     )
     fc1 = _select_tile_config(
@@ -120,27 +110,17 @@ def _dequant(weights, logical):
 
 
 @pytest.mark.parametrize(
-    "n,raw_planes,inline",
+    "n,raw_planes",
     [
-        (96, False, 0),
-        (96, True, 0),
-        (352, False, 0),
-        (352, True, 0),
-        (96, False, 32),
-        (352, True, 32),
-        (128, False, 0),
-        (128, False, 32),
+        (96, True),
+        (352, True),
+        (128, False),
     ],
 )
-def test_tp6_shard_native_and_csf_match_the_oracle(n, raw_planes, inline, monkeypatch):
+def test_tp6_shard_native_and_csf_match_the_oracle(n, raw_planes, monkeypatch):
     device = require_b12x()
     from b12x.moe.fused_moe import _impl
 
-    # 300 tokens exceed the patched stage-read limit: those calls expand the
-    # routed experts' scales from the same storage first.
-    monkeypatch.setattr(_impl, "W4A16_CSF_STAGE_MAX_TOKENS", 64)
-    monkeypatch.setenv("B12X_W4A16_CSF_INLINE", "1")
-    monkeypatch.setenv("B12X_NVFP4_CSF_INLINE_WORDS", str(inline))
     e, h, topk = 8, 256, 2
     rng = np.random.default_rng(n)
     w13 = torch.randint(0, 256, (e, 2 * n, h // 2), dtype=torch.uint8, device=device)
@@ -170,15 +150,17 @@ def test_tp6_shard_native_and_csf_match_the_oracle(n, raw_planes, inline, monkey
         )
 
     def compressed(logical):
+        from b12x.loader._csf_blocks import export_csf_blocks
+
         fixed, exceptions = _planes(logical)
-        if raw_planes:
-            return moe.CsfScalePlanes(
-                tuple(torch.from_numpy(p) for p in fixed),
-                tuple(torch.from_numpy(p) for p in exceptions),
-            )
         rows, columns = logical.shape[1:]
-        return make_nvfp4_csf_batch(
-            fixed, exceptions, rows=rows, columns=columns, device=device
+        return moe.CsfBlockPlanes(
+            tuple(
+                export_csf_blocks(
+                    f, x, rows=rows, columns=columns, quantization="nvfp4"
+                )
+                for f, x in zip(fixed, exceptions, strict=True)
+            )
         )
 
     native = moe.prepare_weights(
@@ -193,11 +175,7 @@ def test_tp6_shard_native_and_csf_match_the_oracle(n, raw_planes, inline, monkey
             w2_scales=compressed(l2),
         ),
     )
-    # The inline-word count is part of the planned scale format (and so of
-    # every compile key); the default keeps 32-byte records.
-    assert csf.plan._impl.w4a16_scale_format == (
-        "e4m3_k16_csf" if inline == 0 else f"e4m3_k16_csf_i{inline}"
-    )
+    assert csf.plan._impl.w4a16_scale_format == ("e4m3_k16")
     stored = csf._impl.w1_blockscale
     assert stored.numel() > 0
     r13, r2 = _dequant(w13, l13), _dequant(w2, l2)

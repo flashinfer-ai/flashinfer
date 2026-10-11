@@ -156,9 +156,7 @@ def _control_snapshot() -> FrozenMapping:
             "w4a16_a4_prefill_enabled": a4_enabled,
             "w4a16_a4_prefill_terms": a4_prefill_terms() if a4_enabled else 1,
             "w4a16_a4_prefill_warps": a4_prefill_warps() if a4_enabled else 8,
-            "w4a8_csf_inline_max_tokens": _impl.W4A8_CSF_INLINE_MAX_TOKENS,
             "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
-            "w4a16_csf_stage_max_tokens": _impl.W4A16_CSF_STAGE_MAX_TOKENS,
             "w4a16_skip_empty_m_blocks": _impl.os.environ.get(
                 "B12X_W4A16_SKIP_EMPTY_M_BLOCKS", "1"
             )
@@ -255,7 +253,6 @@ def _query(
         numerical_recipe=invocation.get("numerical_recipe"),
         controls=controls,
         shared_input_scales=experts._impl.can_share_input(input_scales_static=True),
-        nvfp4_inline_scales=plan.nvfp4_inline_scales,
     )
 
 
@@ -268,10 +265,6 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
     return {
         "quant_modes": tuple(plan.quant_modes),
         "source_format": plan.source_format,
-        "nvfp4_inline_scales": plan.nvfp4_inline_scales,
-        "w4a16_compressed_scales": plan.w4a16_compressed_scales,
-        "w4a16_csf_inline_words": plan.w4a16_csf_inline_words,
-        "w4a8_csf_inline": plan.w4a8_csf_inline,
         "activation": plan.activation,
         "params_dtype": plan.io_dtype,
         "num_experts": plan.num_experts,
@@ -325,18 +318,6 @@ def _lower_caps(
     device: torch.device,
 ) -> TPMoEScratchCaps:
     """One config-to-Caps lowering shared by compilation, sizing and serving."""
-    a4_csf_inline_words = (
-        weight_plan.w4a16_csf_inline_words
-        if weight_plan.w4a16_compressed_scales
-        else None
-    )
-    if getattr(
-        weight_plan, "w4a16_compressed_scales", False
-    ) and query.num_tokens > int(
-        query.controls.get("w4a16_csf_stage_max_tokens", 1536)
-    ):
-        # Large calls read the scales expanded once per call (see b12x_moe_fp4).
-        weight_plan = replace(weight_plan, w4a16_compressed_scales=False)
     mode = query.quant_mode
     if mode == "nvfp4_auto":
         mode = "w4a16" if config.backend == "w4a16" else "nvfp4"
@@ -357,10 +338,6 @@ def _lower_caps(
         weight_plan=weight_plan,
         quant_mode=mode,
         decode_config=config,
-        w4a16_a4_csf_inline_words=a4_csf_inline_words,
-        w4a16_csf_stage_max_tokens=int(
-            query.controls.get("w4a16_csf_stage_max_tokens", 1536)
-        ),
         core_token_counts=(query.num_tokens,),
         route_num_experts=query.route_num_experts,
         route_logits_dtype=(
@@ -379,14 +356,6 @@ def _lower_caps(
             else query.w4a16_block_size_m
         ),
         w4a16_fast_math=query.fast_math,
-        w4a8_csf_inline=bool(
-            weight_plan.w4a8_csf_inline
-            and (
-                config.backend != "dynamic"
-                or query.num_tokens
-                <= int(query.controls.get("w4a8_csf_inline_max_tokens", 1536))
-            )
-        ),
         w4a16_prefill_fused_sum=bool(
             query.controls.get("w4a16_prefill_fused_sum", False)
         ),
@@ -419,8 +388,6 @@ class _W4A16PrimaryLaunches:
     route_pack: object | None
     native_direct: object | None = None
     a4_prefill: object | None = None
-    a4_prefill_expanded: object | None = None
-    csf_stage_max_tokens: int = 1536
 
     def select_a4(
         self,
@@ -437,12 +404,6 @@ class _W4A16PrimaryLaunches:
     ) -> object | None:
         """Select compatible A4 calls, preserving explicit caller precision."""
         launches = self.a4_prefill
-        if (
-            scales_expanded
-            and int(tokens) > self.csf_stage_max_tokens
-            and self.a4_prefill_expanded is not None
-        ):
-            launches = self.a4_prefill_expanded
         if (
             launches is None
             or force is not True
@@ -528,11 +489,6 @@ class _W4A16PrimaryLaunches:
                 self.native_direct,
                 *(() if self.route_pack is None else self.route_pack.carriers()),
                 *(() if self.a4_prefill is None else self.a4_prefill.carriers()),
-                *(
-                    ()
-                    if self.a4_prefill_expanded is None
-                    else self.a4_prefill_expanded.carriers()
-                ),
             )
             if launcher is not None
         )
@@ -742,7 +698,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             num_experts=core.route_E,
             ordinal=core.device.index,
         )
-        a4_prefill = a4_prefill_expanded = None
+        a4_prefill = None
         from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
             a4_prefill_supported,
             compile_w4a16_a4_prefill,
@@ -778,15 +734,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             )
             a4_prefill = compile_w4a16_a4_prefill(
                 **a4_args,
-                csf_inline_words=caps.w4a16_a4_csf_inline_words,
             )
-            if (
-                caps.w4a16_a4_csf_inline_words is not None
-                and caps.max_tokens > caps.w4a16_csf_stage_max_tokens
-            ):
-                a4_prefill_expanded = compile_w4a16_a4_prefill(
-                    **a4_args, csf_inline_words=None
-                )
     # Direct routing requires exact M; packed routing accepts live M up to capacity.
     return _W4A16PrimaryLaunches(
         tokens=int(caps.max_tokens),
@@ -800,8 +748,6 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         route_pack=route_pack,
         native_direct=native_direct,
         a4_prefill=a4_prefill,
-        a4_prefill_expanded=a4_prefill_expanded,
-        csf_stage_max_tokens=caps.w4a16_csf_stage_max_tokens,
     )
 
 
@@ -895,12 +841,6 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
         "external_route_plan": external_route_plan,
         "share_input_across_experts": share_input,
         "planned_tile_m": tile_m,
-        "nvfp4_inline_scales": bool(
-            caps.weight_plan.nvfp4_inline_scales
-            and quant_mode == "nvfp4"
-            and plan.decode_config.nvfp4_inline_scales
-        ),
-        "w4a8_csf_inline": bool(n64_repacked and caps.w4a8_csf_inline),
     }
 
 
@@ -909,8 +849,6 @@ class _CompactLaunches:
     kernels: object
     quantize: object
     topk_sum: object
-    # The kernels read inline MXFP4-CSF scale storage (mxfp4_csf_inline).
-    csf_inline: bool = False
 
 
 def _compact_launches(plan, caps):
@@ -944,7 +882,6 @@ def _compact_launches(plan, caps):
         device_ordinal=ordinal,
         sm_count=sms,
     )
-    csf_inline = bool(getattr(caps.weight_plan, "w4a8_csf_inline", False))
     kernels = {
         dtype: _compiled_direct_w4a8_compact(
             ordinal,
@@ -958,7 +895,6 @@ def _compact_launches(plan, caps):
             plan.weight_E,
             plan.swiglu_limit,
             caps.w4a16_fast_math,
-            csf_inline,
         )
         for dtype in (torch.int32, torch.int64)
     }
@@ -967,7 +903,11 @@ def _compact_launches(plan, caps):
         m=m, topk=plan.num_topk, hidden_size=plan.k, apply_topk_weights=False
     )
     return attach_programs(
-        _CompactLaunches(MappingProxyType(kernels), quantize, topk_sum, csf_inline),
+        _CompactLaunches(
+            MappingProxyType(kernels),
+            quantize,
+            topk_sum,
+        ),
         tuple(kernels.values()),
         quantize,
         topk_sum,
@@ -1082,7 +1022,6 @@ def _program_carriers(
                 w4a8_repacked=dynamic["w4a8_repacked"],
                 w4a8_n64_repacked=dynamic["w4a8_n64_repacked"],
                 nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
-                nvfp4_inline_scales=dynamic["nvfp4_inline_scales"],
                 direct_routing=dynamic["direct_routing"],
                 external_route_plan=dynamic["external_route_plan"],
                 share_input_across_experts=dynamic["share_input_across_experts"],
@@ -1093,7 +1032,6 @@ def _program_carriers(
                 trellis_bits=caps.weight_plan.trellis_bits or 0,
                 trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                 planned_tile_m=dynamic["planned_tile_m"],
-                w4a8_csf_inline=dynamic["w4a8_csf_inline"],
             )
             launches.append(launch)
         if plan.deterministic_output:
@@ -1123,86 +1061,22 @@ class _FusedMoePrograms:
     launchers: tuple
 
 
-def _x4t_scale_program_payload(experts):
-    """Describe compressed-scale decoders without retaining weight tensors."""
-    representation = experts._impl.representation
-    weights = None if representation is None else representation.value
-    first = getattr(weights, "x4t_w13_scale", None)
-    if first is None:
-        return ()
-    if weights.x4t_packed_pair_programs is None:
-        return ("tp12", int(weights.x4t_w13_row_rotation))
-    return (
-        "packed_pair",
-        tuple(
-            (
-                plane.rows,
-                plane.columns,
-                plane.exception_task_rows,
-                plane.exception_row_rotation,
-            )
-            for plane in (first, weights.x4t_w2_scale)
-        ),
-    )
-
-
-@program_cache(scope="preparation")
-def compile_x4t_scale_programs(payload, ordinal):
-    """Declare every route ABI consumed by compressed-scale W4A16 weights."""
-    with torch.cuda.device(ordinal):
-        if payload[0] == "packed_pair":
-            from b12x._lib.quant.x4t_packed_scales import _compiled_packed_scale_pair
-
-            return tuple(
-                _compiled_packed_scale_pair(
-                    *tuple(
-                        (*plane, True, False, counts, ids64, sorted_ids)
-                        for plane in payload[1]
-                    )
-                )
-                for counts, ids64, sorted_ids in (
-                    (False, False, False),
-                    (True, False, False),
-                    (False, True, False),
-                    (False, False, True),
-                )
-            )
-        if payload[0] == "tp12":
-            from b12x._lib.quant.x4t_scales import _compiled_x4t_tp12_w4a16
-
-            return tuple(
-                _compiled_x4t_tp12_w4a16(payload[1], mapped, unique)
-                for mapped in (False, True)
-                for unique in (False, True)
-            )
-        raise ValueError(f"unsupported X4T scale program layout: {payload[0]!r}")
-
-
 @program_cache(scope="preparation")
 def compile_nvfp4_csf_programs(payload, ordinal):
     """Declare both integer routing ABIs for native NVFP4 scale expansion."""
     from b12x._lib.quant.nvfp4_csf import compile_nvfp4_csf_pair
     from b12x._lib.quant.csf_routing import compile_csf_active_experts
 
-    first, second, indexed = payload
+    first, second, indexed, bitmap_routes = payload
     with torch.cuda.device(ordinal):
         return tuple(
             compile_nvfp4_csf_pair(first, second, ids64, use_index)
             for ids64 in (False, True)
             for use_index in ((False, True) if indexed else (False,))
-        ) + tuple(compile_csf_active_experts(ids64) for ids64 in (False, True))
-
-
-@program_cache(scope="preparation")
-def compile_mxfp4_csf_programs(payload, ordinal):
-    """Retain scale expansion and expert presence under frozen resolution."""
-    from b12x._lib.quant.mxfp4_csf import compile_mxfp4_csf_pair
-    from b12x._lib.quant.csf_routing import compile_csf_active_experts
-
-    with torch.cuda.device(ordinal):
-        return tuple(
-            compile_mxfp4_csf_pair(*payload, ids64) for ids64 in (False, True)
-        ) + tuple(compile_csf_active_experts(ids64) for ids64 in (False, True))
+        ) + tuple(
+            compile_csf_active_experts(ids64, first[6] if bitmap_routes else 0)
+            for ids64 in (False, True)
+        )
 
 
 @program_cache(scope="preparation")
@@ -1258,6 +1132,7 @@ class _FusedMoeState:
     route_launcher: object
     w4a16_launches: _W4A16PrimaryLaunches | None = None
     compact_launches: _CompactLaunches | None = None
+    scale_decoder: object | None = None
 
     def _a4_launch_for(
         self,
@@ -1298,38 +1173,9 @@ class _FusedMoeState:
         collect_activation_amax,
         scales_expanded=False,
     ) -> bool:
-        from ._impl import _w4a16_reads_stage_scales
-
         if not 0 < int(num_tokens) <= self.scratch.caps.max_tokens:
             raise ValueError("token count exceeds prepared MoE capacity")
-        experts = self.experts._impl
-        if experts.nvfp4_csf is None:
-            return False
-        if self.w4a16_launches is None:
-            return not (
-                self.scratch.caps.quant_mode == "nvfp4"
-                and self.config.backend == "dynamic"
-                and self.config.nvfp4_inline_scales
-                and experts.nvfp4_csf.inline_scales is not None
-            )
-        activation_amax = True if collect_activation_amax else None
-        fused, _, _ = self.w4a16_launches.select(
-            tokens=num_tokens,
-            route_ids_dtype=route_ids_dtype,
-            has_route_map=has_route_map,
-            activation_amax=activation_amax,
-        )
-        a4 = self._a4_launch_for(
-            num_tokens=num_tokens,
-            a4_prefill=a4_prefill,
-            route_ids_dtype=route_ids_dtype,
-            has_route_map=has_route_map,
-            collect_activation_amax=collect_activation_amax,
-            scales_expanded=scales_expanded,
-        )
-        return not (
-            experts.w4a16_expanded is not None and _w4a16_reads_stage_scales(fused, a4)
-        )
+        return self.experts._impl.nvfp4_csf is not None
 
     def bind(self, **kwargs):
         experts = kwargs.pop("experts", self.experts)
@@ -1348,7 +1194,11 @@ class _FusedMoeState:
         ):
             raise ValueError("fast_math differs from the prepared numerical contract")
         kwargs["fast_math"] = fast_math
-        kwargs["experts"] = self.experts._impl
+        kwargs["experts"] = (
+            self.experts._impl
+            if self.scale_decoder is None
+            else replace(self.experts._impl, nvfp4_csf=self.scale_decoder)
+        )
         kwargs["unit_scale_contract"] = (
             _quant_mode(self.experts, self.config) == "w4a16"
         )
@@ -1480,6 +1330,7 @@ def plan(
     routing: RoutingSpec | None = None,
     invocation: FrozenMapping = FrozenMapping(),
     override: MoeDecodeConfig | None = None,
+    scale_expansion=None,
 ):
     """Declare prefill capacity and exact planned variants without GPU work."""
     if not isinstance(experts, PreparedExperts):
@@ -1506,7 +1357,6 @@ def plan(
         int(experts._impl.a1_gscale.numel()),
         int(experts._impl.a2_gscale.numel()),
     )
-    x4t_payload = _x4t_scale_program_payload(experts)
     lsc = experts._impl.nvfp4_csf
     lsc_payload = (
         ()
@@ -1515,15 +1365,33 @@ def plan(
             lsc.first.geometry,
             lsc.second.geometry,
             lsc.indexed_programs is not None,
+            lsc.bitmap_routes,
         )
     )
-    mx_csf = experts._impl.mxfp4_csf
-    mx_payload = (
-        () if mx_csf is None else (mx_csf.first.geometry, mx_csf.second.geometry)
+    expansions = (
+        {}
+        if scale_expansion is None
+        else dict(scale_expansion)
+        if isinstance(scale_expansion, Mapping)
+        else {counts[0]: scale_expansion}
     )
-    mx_inline = experts._impl.mxfp4_csf_inline
+    if expansions and (lsc is None or set(expansions) != set(counts)):
+        raise ValueError(
+            "Scale expansion plans must cover every compressed MoE variant"
+        )
+    for tokens, expansion in expansions.items():
+        if (
+            not isinstance(expansion, Plan)
+            or expansion.contract.component_id != "quantization.csf_block_expansion"
+            or expansion.query.routes != tokens * capacity.top_k
+            or expansion.query.first != lsc.first.geometry[:7] + lsc.first.geometry[9:]
+            or expansion.query.second
+            != lsc.second.geometry[:7] + lsc.second.geometry[9:]
+        ):
+            raise ValueError("Scale expansion geometry differs from its MoE variant")
 
     def child(tokens):
+        expansion = expansions.get(tokens)
         query = _query(experts, capacity, tokens, routing, controls, invocation)
         declaration_invocation = FrozenMapping(
             {
@@ -1538,14 +1406,7 @@ def plan(
                     }
                 ),
                 "controls": controls,
-                **({"x4t_scale_programs": x4t_payload} if x4t_payload else {}),
                 **({"nvfp4_csf_programs": lsc_payload} if lsc_payload else {}),
-                **({"mxfp4_csf_programs": mx_payload} if mx_payload else {}),
-                **(
-                    {"nvfp4_inline_scales": True}
-                    if experts.plan._impl.nvfp4_inline_scales
-                    else {}
-                ),
             }
         )
 
@@ -1575,34 +1436,12 @@ def plan(
                 *(
                     (
                         CompileJob.create(
-                            "b12x.moe.fused_moe._preparation:compile_x4t_scale_programs",
-                            x4t_payload,
-                            device.ordinal,
-                        ),
-                    )
-                    if x4t_payload
-                    else ()
-                ),
-                *(
-                    (
-                        CompileJob.create(
                             "b12x.moe.fused_moe._preparation:compile_nvfp4_csf_programs",
                             lsc_payload,
                             device.ordinal,
                         ),
                     )
-                    if lsc_payload
-                    else ()
-                ),
-                *(
-                    (
-                        CompileJob.create(
-                            "b12x.moe.fused_moe._preparation:compile_mxfp4_csf_programs",
-                            mx_payload,
-                            device.ordinal,
-                        ),
-                    )
-                    if mx_payload
+                    if lsc_payload and expansion is None
                     else ()
                 ),
                 *(
@@ -1612,16 +1451,6 @@ def plan(
                         device.ordinal,
                     )
                     for payload in _dynamic_route_plan_payloads(launch_plan, caps)
-                ),
-                *(
-                    CompileJob.create(
-                        "b12x.moe.fused_moe._preparation:compile_inline_scale_expansion",
-                        payload,
-                        device.ordinal,
-                    )
-                    for payload in _inline_expansion_payloads(
-                        launch_plan, mx_inline, caps
-                    )
                 ),
             )
 
@@ -1645,16 +1474,15 @@ def plan(
                 _prewarmed_route_pack_launches=programs.route_pack_launches,
             )
             launchers = list(programs.launchers)
-            if x4t_payload:
-                launchers.extend(
-                    compile_x4t_scale_programs(x4t_payload, device.ordinal)
-                )
-            if lsc_payload:
+            scale_decoder = None
+            if expansion is not None:
+                scale_decoder = expansion.prepared.state.decoder(lsc.active)
+                launchers.extend(scale_decoder.programs)
+                launchers.extend(scale_decoder.routing_programs)
+            elif lsc_payload:
                 launchers.extend(
                     compile_nvfp4_csf_programs(lsc_payload, device.ordinal)
                 )
-            if mx_payload:
-                launchers.extend(compile_mxfp4_csf_programs(mx_payload, device.ordinal))
             route_query = _route_query_from_moe(query, routing)
             route_launcher = compile_route_topk(
                 ROUTE_TUNING.encode_query(route_query), device.ordinal
@@ -1663,12 +1491,6 @@ def plan(
             launchers.extend(
                 compile_dynamic_route_plan(payload, device.ordinal)
                 for payload in _dynamic_route_plan_payloads(scratch.launch_plan, caps)
-            )
-            launchers.extend(
-                compile_inline_scale_expansion(payload, device.ordinal)
-                for payload in _inline_expansion_payloads(
-                    scratch.launch_plan, mx_inline, caps
-                )
             )
             launchers = tuple(launchers)
             carrier_tree = attach_programs(scratch, *launchers)
@@ -1682,6 +1504,7 @@ def plan(
                 route_launcher,
                 programs.w4a16,
                 programs.compact,
+                scale_decoder,
             )
 
         return Plan(
@@ -1759,24 +1582,6 @@ def _dynamic_route_plan_payloads(plan, caps):
         for tile in tiles
         for ids_dtype in ("int32", "int64")
     )
-
-
-def _inline_expansion_payloads(plan, inline, caps):
-    """Inline MXFP4-CSF plane expansions a launch plan above the inline limit runs."""
-    if inline is None or plan.implementation != "dynamic" or caps.w4a8_csf_inline:
-        return ()
-    from b12x._lib.quant.mxfp4_csf_inline import expansion_payload
-
-    return tuple(expansion_payload(plane) for plane in inline)
-
-
-@program_cache(scope="preparation")
-def compile_inline_scale_expansion(payload, ordinal):
-    """Compile the Triton expansion of one inline MXFP4-CSF plane geometry."""
-    from b12x._lib.quant.mxfp4_csf_inline import compile_expansion
-
-    with torch.cuda.device(ordinal):
-        return compile_expansion(payload)
 
 
 @program_cache(scope="preparation")

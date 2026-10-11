@@ -54,7 +54,7 @@ from .source import (
 from .trellis_layout import TrellisStaging
 from .weights import (
     PackedWeights,
-    CsfScalePlanes,
+    CsfBlockPlanes,
     Nvfp4CsfWeights,
     Mxfp4CsfWeights,
     IQ2XSWeights,
@@ -138,6 +138,7 @@ def _canonical_plan_execution(
     routing: RoutingSpec | None = None,
     invocation: FrozenMapping = FrozenMapping(),
     override: MoeDecodeConfig | None = None,
+    scale_expansion=None,
 ):
     """Declare capacity variants; preparation publishes executable states."""
     return _plan_execution(
@@ -146,6 +147,25 @@ def _canonical_plan_execution(
         routing=routing,
         invocation=invocation,
         override=override,
+        scale_expansion=scale_expansion,
+    )
+
+
+def plan_scale_expansion(
+    experts, *, routes, ids_dtype=torch.int32, invocation=FrozenMapping()
+):
+    """Declare native scale expansion; MoE requests depend on this prepared plan."""
+    from b12x._lib.quant.csf_blocks_tuning import plan_csf_block_expansion
+
+    decoder = experts._impl.nvfp4_csf
+    if decoder is None:
+        raise ValueError("Scale expansion requires compressed expert scales")
+    return plan_csf_block_expansion(
+        decoder.first,
+        decoder.second,
+        routes=routes,
+        ids_dtype=ids_dtype,
+        invocation=invocation,
     )
 
 
@@ -245,12 +265,8 @@ def expand_scales(experts: PreparedExperts) -> bool:
     decoder = getattr(impl, "nvfp4_csf", None)
     if decoder is None:
         return False
-    expanded = impl.w4a16_expanded
     with torch.cuda.device(experts.device):
-        if expanded is None:
-            decoder.decode_all(impl.w1_blockscale, impl.w2_blockscale)
-        else:
-            decoder.decode_all(expanded.w13_scale, expanded.w2_scale)
+        decoder.decode_all(impl.w1_blockscale, impl.w2_blockscale)
     return True
 
 
@@ -421,7 +437,7 @@ __all__ = [
     "PackedSourceFormat",
     "PackedWeights",
     "Mxfp4CsfWeights",
-    "CsfScalePlanes",
+    "CsfBlockPlanes",
     "Nvfp4CsfWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",
@@ -445,6 +461,7 @@ __all__ = [
     "uses_expanded_nvfp4_scales",
     "is_supported",
     "plan_execution",
+    "plan_scale_expansion",
     "plan_route_topk",
     "plan_fc2",
     "plan_weights",
