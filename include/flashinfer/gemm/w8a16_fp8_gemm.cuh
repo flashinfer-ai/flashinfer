@@ -25,21 +25,20 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 16 of the optimization ladder: opt-in prepared weight layout with
-// ldmatrix fragment loads.  Through rung 15 every consumer thread built its
-// wgmma A fragment with four 2-byte shared-memory loads per k16 (16 LDS.U16
-// per slab, each with its own address arithmetic) because the fragment
-// wants (k, k+1) and (k+8, k+9) of one row while memory holds k..k+15
-// contiguous.  With `prepare_w8a16_fp8_weight()` the weight's K axis is
-// permuted once, inside each 16-wide block, to [2c, 2c+1, 2c+8, 2c+9] for
-// c = 0..3 (same [N, K] shape, same per-tensor scale); then a single
-// ldmatrix.x4 on the fp8 tile delivers, per thread, exactly the four
-// bytes of two A registers for two k16 blocks at once: 2 LDSM per slab
-// instead of 16 LDS, no per-fragment address math, and the 64 B swizzle
-// keeps the 8-row phases conflict-free.  The plain checkpoint layout stays
-// the default (`kPrepared = false`, rung-15 path) and stays in the
-// benchmark; the prepared path is selected by the caller.  Requires
-// sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
+// Rung 17 of the optimization ladder: software-pipelined fragment
+// conversion with explicit double buffering.  Rungs 8-16 converted a slab's
+// A fragments right in front of the wgmmas that consumed them, so each
+// wgmma waited on the LDS -> cvt chain (ncu: 34-37% of stall cycles were
+// fixed-latency dependencies), and -- formally -- reused the fragment
+// registers of the previous slab's still-in-flight group (PTX requires A
+// registers to stay untouched until wgmma.wait_group retires them; it
+// worked because the hardware reads them early, but it was undefined).
+// Here the consumer keeps two fragment buffers: it issues slab kt from
+// buffer kt % 2, commits, waits for slab kt-1's group (wait_group 1) and
+// releases its stage, and only then loads + converts slab kt+1 into buffer
+// (kt+1) % 2 while slab kt's wgmmas are still running.  Both weight
+// layouts take the same path.  Requires sm_90a, K % 64 == 0, 16 B aligned
+// bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -378,12 +377,9 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     const uint32_t ld_swz = (ld_r >> 1) & 3;
     const uint32_t ld_chunk_hi = lane / 16;
 
-    for (int kt = 0; kt < num_slabs; ++kt) {
-      const int stage = kt % kW8A16Stages;
-      const uint32_t round = kt / kW8A16Stages;
-      mbar_wait(&full_bar[stage], round & 1);
-      const uint8_t* a_stage = a_base + stage * kW8A16AStageBytes;
-      const uint8_t* w_stage = w_base + stage * kW8A16WStageBytes;
+    // Load + convert the A fragments of one slab (4 k16 blocks x 4 regs).
+    auto load_frags = [&](int kt, uint32_t(&frag)[4][4]) {
+      const uint8_t* w_stage = w_base + (kt % kW8A16Stages) * kW8A16WStageBytes;
       if constexpr (kPrepared) {
 #pragma unroll
         for (int pair = 0; pair < kW8A16TileK / 32; ++pair) {
@@ -391,15 +387,11 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
           uint32_t r[4];
           ldmatrix_x4(r, w_stage + ld_r * kW8A16WRowBytes + ((chunk ^ ld_swz) << 4));
 #pragma unroll
-          for (int h = 0; h < 2; ++h) {  // k16 block 2*pair + h
-            uint32_t a_frag[4];
-            a_frag[0] = fp8x2_to_pair<T>(r[2 * h] & 0xffffu);
-            a_frag[1] = fp8x2_to_pair<T>(r[2 * h + 1] & 0xffffu);
-            a_frag[2] = fp8x2_to_pair<T>(r[2 * h] >> 16);
-            a_frag[3] = fp8x2_to_pair<T>(r[2 * h + 1] >> 16);
-            const uint64_t desc_b = make_smem_desc_sw128(a_stage + (2 * pair + h) * 32);
-            wgmma_fence();
-            wgmma_m64n128k16_rs<T>(d, a_frag, desc_b, 1);
+          for (int h = 0; h < 2; ++h) {
+            frag[2 * pair + h][0] = fp8x2_to_pair<T>(r[2 * h] & 0xffffu);
+            frag[2 * pair + h][1] = fp8x2_to_pair<T>(r[2 * h + 1] & 0xffffu);
+            frag[2 * pair + h][2] = fp8x2_to_pair<T>(r[2 * h] >> 16);
+            frag[2 * pair + h][3] = fp8x2_to_pair<T>(r[2 * h + 1] >> 16);
           }
         }
       } else {
@@ -408,17 +400,27 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
           const uint32_t chunk = k16 >> 4;
           const uint8_t* r0 = w_stage + a_r * kW8A16WRowBytes + ((chunk ^ swz0) << 4) + a_k;
           const uint8_t* r1 = w_stage + (a_r + 8) * kW8A16WRowBytes + ((chunk ^ swz1) << 4) + a_k;
-          uint32_t a_frag[4];
-          a_frag[0] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r0));
-          a_frag[1] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r1));
-          a_frag[2] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r0 + 8));
-          a_frag[3] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r1 + 8));
-          const uint64_t desc_b = make_smem_desc_sw128(a_stage + k16 * 2);
-          wgmma_fence();
-          wgmma_m64n128k16_rs<T>(d, a_frag, desc_b, 1);
+          frag[k16 / 16][0] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r0));
+          frag[k16 / 16][1] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r1));
+          frag[k16 / 16][2] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r0 + 8));
+          frag[k16 / 16][3] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r1 + 8));
         }
       }
+    };
+
+    // One slab: issue `cur`, retire the previous group, refill `nxt` with
+    // slab kt+1.  Buffers are named (not indexed at run time) so they stay
+    // in registers; the caller alternates them.
+    auto step = [&](int kt, uint32_t(&cur)[4][4], uint32_t(&nxt)[4][4]) {
+      const uint8_t* a_stage = a_base + (kt % kW8A16Stages) * kW8A16AStageBytes;
+      wgmma_fence();
+#pragma unroll
+      for (int k16 = 0; k16 < kW8A16TileK; k16 += 16) {
+        wgmma_m64n128k16_rs<T>(d, cur[k16 / 16], make_smem_desc_sw128(a_stage + k16 * 2), 1);
+      }
       wgmma_commit();
+      // Slab kt-1's group is retired here: its stage goes back to the
+      // producer and its fragment buffer (nxt) can be refilled.
       wgmma_wait<1>();
       if (kt > 0 && lane == 0) {
         uint64_t* eb = &empty_bar[(kt - 1) % kW8A16Stages];
@@ -429,6 +431,21 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
           mbar_arrive(eb);
         }
       }
+      if (kt + 1 < num_slabs) {
+        const int ns = kt + 1;
+        mbar_wait(&full_bar[ns % kW8A16Stages], (ns / kW8A16Stages) & 1);
+        load_frags(ns, nxt);  // overlaps slab kt's wgmmas
+      }
+    };
+
+    uint32_t frag0[4][4], frag1[4][4];
+    if (num_slabs > 0) {
+      mbar_wait(&full_bar[0], 0);
+      load_frags(0, frag0);
+    }
+    for (int kt = 0; kt < num_slabs; kt += 2) {
+      step(kt, frag0, frag1);
+      if (kt + 1 < num_slabs) step(kt + 1, frag1, frag0);
     }
     wgmma_wait<0>();
     if (num_slabs > 0 && lane == 0) {
