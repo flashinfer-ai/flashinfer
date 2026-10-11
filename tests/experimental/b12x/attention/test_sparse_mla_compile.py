@@ -17,6 +17,41 @@ _ALLOCATOR_COUNTERS = (
 )
 
 
+@pytest.mark.parametrize("heads", [16, 32])
+@pytest.mark.parametrize("rows", [1, 12])
+def test_glm_decode_compiler_uses_alignment_without_fake_pointers(
+    monkeypatch, heads, rows
+):
+    from torch._subclasses.fake_tensor import FakeTensor
+    from b12x.attention.sparse_mla._preparation import compile_sparse_mla
+
+    device = require_b12x()
+
+    def reject_pointer(self):
+        raise AssertionError("FakeTensor has no runtime data pointer")
+
+    monkeypatch.setattr(FakeTensor, "data_ptr", reject_pointer)
+    caps = sparse_mla.Caps(
+        device=device,
+        num_q_heads=heads,
+        max_q_rows=rows,
+        max_width=2051,
+        softmax_scale=256**-0.5,
+        max_batch=rows,
+        max_kv_rows=256,
+        kv_dtype=torch.uint8,
+        head_dim=512,
+        v_head_dim=512,
+        page_size=64,
+        model_type=sparse_mla.ModelType.GLM_NEXT,
+        cache_record_bytes=528,
+        mode="decode",
+    )
+    launch = compile_sparse_mla(caps, torch.cuda.current_device())
+    assert launch.vector_q
+    assert launch.grid_programs and launch.merge_program is not None
+
+
 @pytest.mark.parametrize(
     "mode,rows,heads",
     [("decode", 2, 32), ("decode", 2, 16), ("extend", 65, 32), ("extend", 4096, 16)],
