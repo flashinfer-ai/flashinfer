@@ -25,20 +25,19 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 12 of the optimization ladder: TMA loads.  In rungs 9-11 the
-// producer warpgroup's 128 threads each issued ~24 cp.async per K slab plus
-// the address arithmetic, roughly a thousand warp-instructions per SM per
-// slab against ~550 cycles of tensor-pipe work, and ncu showed the tensor
-// pipe near 47% with the schedulers busy on copies.  Here one producer
-// thread issues two cp.async.bulk.tensor.2d per slab: the act tile as a
-// [64 k x 128 m] bf16 box with the hardware 128 B swizzle (the layout the
-// wgmma descriptor already expects) and the weight tile as a [64 k x 128 n]
-// uint8 box with the 64 B swizzle (16 B chunk c of row r lands at
-// c ^ ((r >> 1) & 3), which keeps the consumers' 2-byte fragment reads
-// conflict-free).  The "full" mbarrier now completes on transaction bytes
-// (arrive.expect_tx), TMA zero-fills rows past M / N, and the other 127
-// producer threads idle.  Back on the 128 x 128 tile (rung 11's 128 x 256
-// did not pay), 6 stages.  Requires sm_90a and K % 64 == 0.
+// Rung 13 of the optimization ladder: shared-memory staged epilogue.  The
+// roles-swapped mainloop leaves each consumer thread with out^T fragments
+// (pairs of consecutive m for one n), and rungs 8-12 stored them straight
+// to out[m, n] with 2-byte scattered writes; ncu on rung 12 counted 50% of
+// all global sectors as excess from those stores (16 of 32 bytes per sector
+// used, estimated 27-50% of the kernel).  Here, once both consumer
+// warpgroups have drained their wgmmas (named barrier), each thread writes
+// its scaled + biased values into a [128 m][128 + 8 n] 16-bit tile in the
+// (now idle) pipeline shared memory -- the 8-element row pad spreads the
+// four m-pairs a warp writes at once over different banks -- and the 256
+// consumer threads then copy the tile out with 16-byte stores along n:
+// every row is 16 full 16 B chunks, fully coalesced.  Mainloop unchanged.
+// Requires sm_90a, K % 64 == 0 and 16 B aligned act / weight bases.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -67,7 +66,9 @@ constexpr int kW8A16ARowBytes = kW8A16TileK * 2;  // act row = 64 bf16 = 128 B (
 constexpr int kW8A16WRowBytes = kW8A16TileK;      // weight row = 64 fp8 = 64 B (SW64 atom)
 constexpr int kW8A16AStageBytes = kW8A16TileM * kW8A16ARowBytes;  // 16 KB
 constexpr int kW8A16WStageBytes = kW8A16TileN * kW8A16WRowBytes;  // 8 KB
-constexpr int kW8A16BarrierBytes = 2 * kW8A16Stages * 8;          // full[] + empty[]
+constexpr int kW8A16EpiPad = kW8A16TileN + 8;  // 16-bit elements per staged output row
+constexpr int kW8A16EpiBytes = kW8A16TileM * kW8A16EpiPad * 2;  // 34 KB, reuses the stages
+constexpr int kW8A16BarrierBytes = 2 * kW8A16Stages * 8;        // full[] + empty[]
 constexpr int kW8A16SmemBytes =
     kW8A16Stages * (kW8A16AStageBytes + kW8A16WStageBytes) + kW8A16BarrierBytes + 1024;
 
@@ -159,6 +160,11 @@ __device__ __forceinline__ void setmaxnreg_inc() {
 template <int N>
 __device__ __forceinline__ void setmaxnreg_dec() {
   asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(N));
+}
+
+// Named barrier among the consumer threads only (id 1; 0 is __syncthreads).
+__device__ __forceinline__ void consumer_bar_sync() {
+  asm volatile("bar.sync 1, %0;\n" ::"n"(kW8A16ConsumerThreads) : "memory");
 }
 
 // K-major, 128 B swizzle matrix descriptor: 8-row core-matrix groups are
@@ -336,25 +342,47 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     wgmma_wait<0>();
     if (num_slabs > 0) mbar_arrive(&empty_bar[(num_slabs - 1) % kW8A16Stages]);
 
-    // Epilogue (rows are n, cols are m; see rung 8).
+    // Epilogue.  Fragment layout per warp (m64nNk16 D): d[j*4 + 0..1] at
+    // (n = wq*16 + lane/4, m = 8j + 2*(lane%4) + {0,1}), d[j*4 + 2..3] at
+    // n + 8.  Stage the scaled tile as out[m][n] in smem, then store rows.
+    static_assert(kW8A16EpiBytes <= kW8A16Stages * (kW8A16AStageBytes + kW8A16WStageBytes),
+                  "epilogue tile must fit in the pipeline stages");
+    consumer_bar_sync();  // both warpgroups are done reading the stages
+    T* tile = reinterpret_cast<T*>(smem);
     const float sc = *scale;
-    const int n_lo = n0 + cwg * 64 + wq * 16 + lane / 4;
-    const int m_base = m0 + (lane % 4) * 2;
+    const int n_lo = cwg * 64 + wq * 16 + lane / 4;  // tile-local n
+    const int m_lo = (lane % 4) * 2;                 // tile-local m
     float bias_lo = 0.f, bias_hi = 0.f;
     if (bias != nullptr) {
-      if (n_lo < N) bias_lo = static_cast<float>(bias[n_lo]);
-      if (n_lo + 8 < N) bias_hi = static_cast<float>(bias[n_lo + 8]);
+      if (n0 + n_lo < N) bias_lo = static_cast<float>(bias[n0 + n_lo]);
+      if (n0 + n_lo + 8 < N) bias_hi = static_cast<float>(bias[n0 + n_lo + 8]);
     }
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
-      const int m = m_base + j * 8;
 #pragma unroll
       for (int q = 0; q < 2; ++q) {
-        const int mm = m + q;
-        if (mm >= M) continue;
-        T* row = out + static_cast<int64_t>(mm) * N;
-        if (n_lo < N) row[n_lo] = static_cast<T>(d[j * 4 + q] * sc + bias_lo);
-        if (n_lo + 8 < N) row[n_lo + 8] = static_cast<T>(d[j * 4 + 2 + q] * sc + bias_hi);
+        const int m = m_lo + j * 8 + q;
+        tile[m * kW8A16EpiPad + n_lo] = static_cast<T>(d[j * 4 + q] * sc + bias_lo);
+        tile[m * kW8A16EpiPad + n_lo + 8] = static_cast<T>(d[j * 4 + 2 + q] * sc + bias_hi);
+      }
+    }
+    consumer_bar_sync();  // the whole 128 x 128 tile is staged
+    // 128 rows x 16 chunks of 16 B; thread t owns chunk t % 16 of rows t / 16 + 16 i.
+    const int ct = threadIdx.x - 128;  // consumer-local thread id
+    const int chunk = ct % 16;
+    const int row0 = ct / 16;
+    const int n_chunk = n0 + chunk * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int r = row0 + 16 * i;
+      const int m = m0 + r;
+      if (m >= M) continue;
+      const T* src = tile + r * kW8A16EpiPad + chunk * 8;
+      T* dst = out + static_cast<int64_t>(m) * N + n_chunk;
+      if (n_chunk + 8 <= N) {
+        *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+      } else {
+        for (int e = 0; n_chunk + e < N; ++e) dst[e] = src[e];
       }
     }
   }
@@ -392,6 +420,9 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
   if (K % kW8A16TileK != 0) return cudaErrorInvalidValue;  // whole slabs only
   if ((reinterpret_cast<uintptr_t>(act) & 15) || (reinterpret_cast<uintptr_t>(w) & 15)) {
     return cudaErrorInvalidValue;  // TMA needs 16 B aligned bases
+  }
+  if (N % 8 != 0 || (reinterpret_cast<uintptr_t>(out) & 15)) {
+    return cudaErrorInvalidValue;  // 16 B output stores need N % 8 == 0 and an aligned out
   }
   CUtensorMap act_map, w_map;
   cudaError_t e = MakeTmaMap2D(&act_map, act, M, K, sizeof(T),
