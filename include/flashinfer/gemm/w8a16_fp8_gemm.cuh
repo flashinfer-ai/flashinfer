@@ -25,20 +25,15 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 23 of the optimization ladder: 128(n) x 256(m) tile with
-// wgmma.m64n256k16, revisited on the mature mainloop.  Rung 22's skewed
-// warpgroups showed that one warpgroup alone cannot keep the tensor pipe
-// busy with m64n128 wgmmas: its per-slab instruction stream (barrier wait,
-// 2 ldmatrix, 16 conversions, 8 wgmma issues with fences) is too thin to
-// cover the pipe when the other warpgroup is in its epilogue.  The same
-// 32768 outputs per block are kept but each warpgroup owns ONE m64 row block
-// of n and the full 256 m columns: every wgmma is twice as long
-// (64 x 256 x 16), one A fragment per k16 instead of two, half the
-// per-FLOP conversion work, and a single warpgroup's wgmma covers more of
-// the other's epilogue.  The act slab doubles (32 KB) and the ring drops to
-// 4 stages (160 KB + 32 KB epilogue buffers); L2 bytes per FLOP rise 22%
-// versus rung 19 (the L2 sat at 56%).  Requires sm_90a, K % 64 == 0, 16 B
-// aligned bases, N % 8 == 0.
+// Rung 24 of the optimization ladder: register rebalance 24 / 240.  With
+// the 128 x 256 tile the consumer warpgroups hold 128 accumulators plus two
+// fragment buffers, and rung 23's prepared-layout instantiations spilled
+// 232 B of stack at the 232-register consumer budget.  The producer is one
+// thread issuing TMA (a few pointers and counters), so it gives up 16 more
+// registers: setmaxnreg.dec 24 for the producer warpgroup, setmaxnreg.inc
+// 240 for the consumers (2 x 128 x 240 + 128 x 24 = 64512 <= 65536).
+// Nothing else changes.  Requires sm_90a, K % 64 == 0, 16 B aligned bases,
+// N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -401,7 +396,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
 
   if (wg == 0) {
     // ------------------------------ producer ------------------------------
-    setmaxnreg_dec<40>();
+    setmaxnreg_dec<24>();
     if (warp == 0 && lane == 0) {
       constexpr uint32_t kSlabBytes = kW8A16AStageBytes + kW8A16WStageBytes;
       uint32_t g = 0;  // running slab index across tiles: stage = g % S
@@ -428,7 +423,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     }
   } else {
     // ------------------------------ consumers -----------------------------
-    setmaxnreg_inc<232>();
+    setmaxnreg_inc<240>();
     const int cwg = wg - 1;  // consumer warpgroup: n rows cwg*128 .. +127
     if (cwg == 1 && !kSplitK) {
       // Start one epilogue late so the two warpgroups alternate between
