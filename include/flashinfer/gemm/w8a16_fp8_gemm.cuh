@@ -25,17 +25,14 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 35 of the optimization ladder: in-kernel split-K fixup.  Split-K
-// used to write every split's fp32 partial tile to the workspace and run a
-// second, bandwidth-bound kernel that re-read all of them (20% of the split
-// path: 9 us of 45 on und.q tp8 M=2048, 26 of 220 on mlp.down tp2 M=1024).
-// Now each split CTA writes its partial, fences, and bumps a per-tile
-// counter; the last CTA to arrive sums the other partials straight from L2
-// (still hot), adds its own from shared memory, applies scale and bias and
-// writes the 16-bit output.  One launch, one fewer pass over the partials,
-// and the counters cost a 4 B-per-tile memset.  Dispatch is rung 34's.
-// Kernel mainloop and the persistent epilogue unchanged from rung 33.
-// Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
+// Rung 36 of the optimization ladder: batched loads in the split-K fixup.
+// Rung 35's last-arriver fixup walked its rows one float4 at a time with a
+// dependent accumulate, so a CTA had a few KB in flight and spent 10+ us
+// pulling a 128 KB partial out of L2 (slower than the reduce kernel it
+// replaced).  The fixup now reads its own partial from shared memory and
+// each other split's partial in batches of 8 independent 16 B loads per
+// thread (32 KB per CTA in flight) before accumulating.  Everything else is
+// rung 35's.  Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -817,27 +814,49 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
               bb.z = static_cast<float>(bias[n_chunk + 2]);
               bb.w = static_cast<float>(bias[n_chunk + 3]);
             }
-#pragma unroll 2
-            for (int i = 0; i < kRowsPerTilePass / kRowsPerPass; ++i) {
-              const int r = row0 + kRowsPerPass * i;
-              const int m = m0 + pass * kRowsPerTilePass + r;
-              if (m >= M || !chunk_in) continue;
-              float4 acc =
-                  *reinterpret_cast<const float4*>(tile + epi_idx(r, chunk * kElemsPerChunk));
-              const int64_t off = static_cast<int64_t>(m) * N + n_chunk;
-              for (int sp = 0; sp < static_cast<int>(gridDim.y); ++sp) {
-                if (sp == static_cast<int>(blockIdx.y)) continue;
-                const float4 q = __ldcg(
-                    reinterpret_cast<const float4*>(ws + static_cast<int64_t>(sp) * M * N + off));
-                acc.x += q.x;
-                acc.y += q.y;
-                acc.z += q.z;
-                acc.w += q.w;
+            constexpr int kRowsPerThread = kRowsPerTilePass / kRowsPerPass;  // 32 or 16
+            constexpr int kBatch = 8;
+            static_assert(kRowsPerThread % kBatch == 0, "fixup batches must tile the rows");
+            const int splits = static_cast<int>(gridDim.y);
+            const int my_split = static_cast<int>(blockIdx.y);
+            for (int i0 = 0; i0 < kRowsPerThread; i0 += kBatch) {
+              float4 acc[kBatch];
+              bool ok[kBatch];
+              int64_t off[kBatch];
+#pragma unroll
+              for (int u = 0; u < kBatch; ++u) {
+                const int r = row0 + kRowsPerPass * (i0 + u);
+                const int m = m0 + pass * kRowsPerTilePass + r;
+                ok[u] = chunk_in && m < M;
+                off[u] = static_cast<int64_t>(m) * N + n_chunk;
+                acc[u] =
+                    *reinterpret_cast<const float4*>(tile + epi_idx(r, chunk * kElemsPerChunk));
               }
-              uint2 packed;
-              packed.x = pack2(acc.x * sc_out + bb.x, acc.y * sc_out + bb.y, T{});
-              packed.y = pack2(acc.z * sc_out + bb.z, acc.w * sc_out + bb.w, T{});
-              *reinterpret_cast<uint2*>(out + off) = packed;
+              for (int sp = 0; sp < splits; ++sp) {
+                if (sp == my_split) continue;
+                const float* part = ws + static_cast<int64_t>(sp) * M * N;
+                float4 q[kBatch];
+#pragma unroll
+                for (int u = 0; u < kBatch; ++u) {
+                  q[u] = ok[u] ? __ldcg(reinterpret_cast<const float4*>(part + off[u]))
+                               : make_float4(0.f, 0.f, 0.f, 0.f);
+                }
+#pragma unroll
+                for (int u = 0; u < kBatch; ++u) {
+                  acc[u].x += q[u].x;
+                  acc[u].y += q[u].y;
+                  acc[u].z += q[u].z;
+                  acc[u].w += q[u].w;
+                }
+              }
+#pragma unroll
+              for (int u = 0; u < kBatch; ++u) {
+                if (!ok[u]) continue;
+                uint2 packed;
+                packed.x = pack2(acc[u].x * sc_out + bb.x, acc[u].y * sc_out + bb.y, T{});
+                packed.y = pack2(acc[u].z * sc_out + bb.z, acc[u].w * sc_out + bb.w, T{});
+                *reinterpret_cast<uint2*>(out + off[u]) = packed;
+              }
             }
           }
         } else {
