@@ -115,7 +115,7 @@ without allocating (CUDA Graph replay with changed contents is supported; `plan.
 Tests: `tests/experimental/test_dense_mqa_generated.py` (dense, including the one-shot entry) and
 `tests/experimental/test_paged_mqa_generated.py` (paged; skips while the catalog has no paged routes).
 
-## Catalog schema `dense_mqa.v7` (route records)
+## Catalog schema `dense_mqa.v8` (route records)
 
 `dense_mqa_catalog.json` carries `policy`, `programs`, the dense `routes` and the paged
 `paged_routes`. Policy keys: `heads` (exported head counts), `block_q` (`{"32": 4, "64": 2}`),
@@ -127,9 +127,13 @@ are aliases -- the 64-head routes have no metadata stage and no query bound),
 the shipped 32-head `fused_q1_max_kv` / `fused_q128_max_kv` / `max_q_tokens` / `metadata_tiers`, and
 `paged` (`heads` -- the paged head counts, independent of the dense `heads`; `block_kv`, `split_kv`,
 `next_n_atoms` -- 1 for every exported `next_n`, the logits programs iterate the atoms in-kernel;
-`max_batch`, `metadata_program`), and -- v7 -- `dense_short` (`max_kv` 256, `min_q_blocks` 2, `fallback`
+`max_batch`, `metadata_program`, `admission`, `dynamic_scheduler` -- `max_batch`, the static -> dynamic route map and
+-- v8 -- `static_windows`: per architecture and static route the `[max_batch, max_context_len]` windows inside which the runtime
+keeps the static program for a batch the dynamic route would otherwise take), and -- v7 -- `dense_short` (`max_kv` 256, `min_q_blocks` 2, `fallback`
 `"tier"`: the shape-only gate of the 64-head one-split `:short` routes and where a withheld one is served). Every route record
-has `stages` (`[[stage, program], ...]`), `sequence` (a prepared sequence binding or `null`),
+has `stages` (`[[stage, {arch: program}], ...]`: the program the stage launches on each catalogued architecture --
+the names coincide where the architectures share one text and differ where the production text is chosen per
+architecture, as for the 64-head tier and `q1` routes since v8 -- their `:short` routes share one text), `sequence` (a prepared sequence binding or `null`),
 `num_heads`, `block_q`, `clean_logits` (`"fused"`: the program writes `-inf` outside each window and in
 the padding, the shipped 32-head programs; `"raw"`: the program stores the computed tiles only, DeepGEMM's
 `clean_logits=False` semantics, the 64-head and paged programs) and `kv_alignment`. Routes: 32 heads

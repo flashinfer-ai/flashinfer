@@ -26,7 +26,7 @@ import json
 from pathlib import Path
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-CATALOG_SCHEMA = "dense_mqa.v7"
+CATALOG_SCHEMA = "dense_mqa.v8"
 NUM_HEADS = 32  # default head count of the public helpers
 BLOCK_QH = 128  # query rows x heads per MMA tile
 BLOCK_Q = BLOCK_QH // NUM_HEADS
@@ -80,13 +80,35 @@ def _nvcc_flags(arch):
     return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
 
 
-def program_names(route=None):
-    """Names of the catalogued programs (optionally only those a route can launch)."""
+def stage_program(stage, arch):
+    """The program one route stage launches on ``arch``; ``stage`` is one ``[name, {arch: program}]`` entry
+    of a route record's ``stages`` (the catalog binds a stage's program per architecture)."""
+    name, by_arch = stage
+    try:
+        return by_arch[arch]
+    except KeyError:
+        raise RuntimeError(
+            f"route stage {name} has no program for {arch}; catalogued architectures: {sorted(by_arch)}"
+        ) from None
+
+
+def program_names(route=None, arch=None):
+    """Names of the catalogued programs: all of them, those a route launches on ``arch`` (stage order, then
+    the sequence), or -- without ``arch`` -- the sorted union over the architectures of what the route launches."""
     catalog = _catalog()
     if route is None:
         return sorted(catalog["programs"])
     record = catalog["routes"].get(route) or catalog["paged_routes"][route]
-    names = [program for _stage, program in record["stages"]]
+    if arch is None:
+        names = sorted(
+            {
+                program
+                for _stage, by_arch in record["stages"]
+                for program in by_arch.values()
+            }
+        )
+    else:
+        names = [stage_program(stage, arch) for stage in record["stages"]]
     if record.get("sequence"):
         names.append(record["sequence"])
     return names
@@ -736,7 +758,9 @@ class DenseMqaPlan:
         selections = (
             [(None, sequence)]
             if sequence
-            else [(stage, program) for stage, program in self.route["stages"]]
+            else [
+                (stage[0], stage_program(stage, arch)) for stage in self.route["stages"]
+            ]
         )
         self.program_names = [program for _stage, program in selections]
         for stage_name, program in selections:
