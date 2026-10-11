@@ -25,23 +25,21 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 29 of the optimization ladder: the final kernel of this ladder.  It
-// is the rung-24 / rung-27 kernel restored once more after the textbook
-// ping-pong experiment of rung 28 (slower, kept in history): one block per
-// SM walks whole 128(n) x 256(m) units in the grouped raster; a single
-// producer thread issues TMA loads (SW128 act, SW64 weight) into a 4-stage
-// ring with expect_tx barriers; two consumer warpgroups each own one
-// m64n256k16 row block and build their A fragments from the fp8 tile in
-// registers (plain checkpoint layout by default; the opt-in prepared
-// layout with ldmatrix is kept but carries 184 B of stack in its two
-// non-split instantiations); fragments are double-buffered and converted
-// one slab ahead; the epilogue is per-warpgroup, staged through a 16 KB
-// swizzled buffer and stored with 16 B writes; split-K through a workspace
-// below a third of a wave; register split 24 / 240.  On H100 SXM the plain
-// path runs the tensor pipe at ~92% on the GPU-filling Cosmos3 shapes
-// (0.93-0.97x cuBLAS bf16 on the dequantized weight, 2.1-2.5x TRT-LLM's
-// cast-copy at M=1024).  Requires sm_90a, K % 64 == 0, 16 B aligned
-// bases, N % 8 == 0.
+// Rung 30 of the optimization ladder: tile shape as a template knob and a
+// per-shape dispatch.  The final kernel of rung 29 (128n x 256m, the best
+// tile on GPU-filling problems) leaves the M <= 2048 rows at 0.6-0.8x
+// cuBLAS: a 256-wide m tile makes 4-8 m-tiles, the grid under-fills its
+// last wave, and split-K only kicks in below a third of a wave.  Here the
+// tile geometry lives in `W8A16Cfg<TileN, TileM, Stages>` -- 128x256 with
+// m64n256k16 (rung 23), 256x128 with two m64n128k16 row blocks (rung 19),
+// 128x128 (rung 18) -- all compiled from the same kernel, and the launcher
+// picks one per call from (M, N, K, SM count): the most efficient tile
+// whose grid still fills the machine, scored as tile efficiency (measured
+// on H100: 1.00 / 0.94 / 0.83) times the fill of the last wave; split-K
+// applies to the chosen tile below a third of a wave.  The bench can pin a
+// tile with FLASHINFER_W8A16_FP8_TILE=128x256|256x128|128x128 (auto by
+// default) so every shape class is measured under every tile.  Requires
+// sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -50,6 +48,8 @@
 #include <cuda_fp8.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <type_traits>
 
 #include "../utils.cuh"
@@ -57,40 +57,56 @@
 namespace flashinfer {
 namespace gemm {
 
-constexpr int kW8A16TileN = 128;  // n rows per block (one wgmma M per consumer WG)
-constexpr int kW8A16TileM = 256;  // m cols per block (wgmma N)
 constexpr int kW8A16TileK = 64;
-constexpr int kW8A16Stages = 4;
-constexpr int kW8A16GroupM = 8;       // m-tiles per rasterization group
-constexpr int kW8A16ConsumerWGs = 2;  // 128 n rows each (2 row blocks of 64)
-constexpr int kW8A16RowBlocks = kW8A16TileN / (64 * kW8A16ConsumerWGs);  // 1
-constexpr int kW8A16Warpgroups = 1 + kW8A16ConsumerWGs;                  // + 1 producer
+constexpr int kW8A16GroupM = 8;                          // m-tiles per rasterization group
+constexpr int kW8A16ConsumerWGs = 2;                     // consumer warpgroups per block
+constexpr int kW8A16Warpgroups = 1 + kW8A16ConsumerWGs;  // + 1 producer
 constexpr int kW8A16Threads = 128 * kW8A16Warpgroups;
 constexpr int kW8A16ConsumerThreads = 128 * kW8A16ConsumerWGs;
 constexpr int kW8A16ConsumerWarps = kW8A16ConsumerThreads / 32;
 constexpr int kW8A16ARowBytes = kW8A16TileK * 2;  // act row = 64 bf16 = 128 B (SW128 atom)
 constexpr int kW8A16WRowBytes = kW8A16TileK;      // weight row = 64 fp8 = 64 B (SW64 atom)
-constexpr int kW8A16AStageBytes = kW8A16TileM * kW8A16ARowBytes;  // 32 KB
-constexpr int kW8A16WStageBytes = kW8A16TileN * kW8A16WRowBytes;  // 8 KB
-constexpr int kW8A16EpiPad = kW8A16TileN + 8;                     // elements per staged output row
 constexpr int kW8A16MaxSplits = 8;
 constexpr int kW8A16MinSlabsPerSplit = 8;  // amortize the partial-tile round trip
-constexpr int kW8A16EpiBytes =
-    kW8A16TileM * kW8A16EpiPad * 4;  // fp32 partial tile (split-K), reuses the stages
-constexpr int kW8A16EpiPasses = 2;   // 16-bit epilogue: half the tile per pass
-constexpr int kW8A16EpiRows = kW8A16TileM / kW8A16EpiPasses;
-constexpr int kW8A16EpiWgCols = kW8A16TileN / kW8A16ConsumerWGs;  // 64 n per warpgroup
-// Dense [64 m][128 n] per warpgroup; the 16 B chunk index is XOR-swizzled by
-// (m >> 1) & 7 so the four even rows a warp writes at once hit different banks.
-constexpr int kW8A16EpiWgBytes = kW8A16EpiRows * kW8A16EpiWgCols * 2;  // 16 KB per warpgroup
-constexpr int kW8A16EpiOutBytes = kW8A16EpiWgBytes * kW8A16ConsumerWGs;
-constexpr int kW8A16SkewNs = 1500;  // warpgroup 2 start delay (about one epilogue)
-constexpr int kW8A16BarrierBytes = 2 * kW8A16Stages * 8;  // full[] + empty[]
-constexpr int kW8A16StageBytes = kW8A16Stages * (kW8A16AStageBytes + kW8A16WStageBytes);
-constexpr int kW8A16SmemBytesPersistent =
-    kW8A16StageBytes + kW8A16EpiOutBytes + kW8A16BarrierBytes + 1024;
-constexpr int kW8A16SmemBytesSplit = kW8A16StageBytes + kW8A16BarrierBytes + 1024;
-static_assert(kW8A16SmemBytesPersistent <= 232448, "exceeds the 227 KB opt-in limit");
+constexpr int kW8A16EpiPasses = 2;         // 16-bit epilogue: half the tile per pass
+constexpr int kW8A16SkewNs = 1500;         // warpgroup 2 start delay (about one epilogue)
+
+// Tile geometry.  TileN = weight rows per block (64 per consumer warpgroup
+// row block), TileM = act rows per block (the wgmma N extent: 128 or 256),
+// Stages = TMA ring depth.  Smem: stages + per-warpgroup 16-bit epilogue
+// buffers + barriers must fit the 227 KB opt-in limit.
+template <int kTileN_, int kTileM_, int kStages_>
+struct W8A16Cfg {
+  static constexpr int kTileN = kTileN_;
+  static constexpr int kTileM = kTileM_;
+  static constexpr int kStages = kStages_;
+  static constexpr int kRowBlocks = kTileN / (64 * kW8A16ConsumerWGs);  // m64 blocks per WG
+  static constexpr int kAcc = kTileM / 2;  // fp32 accumulators per thread per row block
+  static constexpr int kAStageBytes = kTileM * kW8A16ARowBytes;
+  static constexpr int kWStageBytes = kTileN * kW8A16WRowBytes;
+  static constexpr int kEpiPad = kTileN + 8;              // fp32 split-K tile row (elements)
+  static constexpr int kEpiBytes = kTileM * kEpiPad * 4;  // fp32 split-K tile, in the stages
+  static constexpr int kEpiRows = kTileM / kW8A16EpiPasses;
+  static constexpr int kEpiWgCols = kTileN / kW8A16ConsumerWGs;  // n per warpgroup
+  // Dense [kEpiRows][kEpiWgCols] 16-bit per warpgroup; 16 B chunk index XOR
+  // swizzled by (m >> 1) & 7 so the four even rows a warp writes at once hit
+  // different banks.
+  static constexpr int kEpiWgBytes = kEpiRows * kEpiWgCols * 2;
+  static constexpr int kEpiOutBytes = kEpiWgBytes * kW8A16ConsumerWGs;
+  static constexpr int kBarrierBytes = 2 * kStages * 8;  // full[] + empty[]
+  static constexpr int kStageBytes = kStages * (kAStageBytes + kWStageBytes);
+  static constexpr int kSmemBytesPersistent = kStageBytes + kEpiOutBytes + kBarrierBytes + 1024;
+  static constexpr int kSmemBytesSplit = kStageBytes + kBarrierBytes + 1024;
+  static_assert(kSmemBytesPersistent <= 232448, "exceeds the 227 KB opt-in limit");
+  static_assert(kEpiBytes <= kStageBytes, "fp32 split-K tile must fit in the pipeline stages");
+  static_assert(kTileM == 128 || kTileM == 256, "wgmma N extent must be 128 or 256");
+  static_assert(kRowBlocks >= 1 && kTileN % (64 * kW8A16ConsumerWGs) == 0, "TileN per WG");
+};
+using W8A16Cfg128x256 = W8A16Cfg<128, 256, 4>;  // rung 23/29: best on filling problems
+using W8A16Cfg256x128 = W8A16Cfg<256, 128, 5>;  // rung 19 shape
+using W8A16Cfg128x128 = W8A16Cfg<128, 128, 8>;  // rung 18 shape
+
+enum class W8A16Tile : int { kAuto = 0, k128x256 = 1, k256x128 = 2, k128x128 = 3 };
 
 // Two e4m3 values (packed in the low 16 bits) -> two T values packed in a
 // 32-bit register, laid out as an mma A/B operand expects.
@@ -252,6 +268,64 @@ __device__ __forceinline__ uint64_t make_smem_desc_sw128(const void* smem_ptr) {
   return desc;
 }
 
+// D[64 x 128] (+)= A[64 x 16] (registers) . B[16 x 128] (smem descriptor).
+template <typename T>
+__device__ __forceinline__ void wgmma_m64n128k16_rs(float (&d)[64], const uint32_t (&a)[4],
+                                                    uint64_t desc_b, int scale_d);
+template <>
+__device__ __forceinline__ void wgmma_m64n128k16_rs<__nv_bfloat16>(float (&d)[64],
+                                                                   const uint32_t (&a)[4],
+                                                                   uint64_t desc_b, int scale_d) {
+  asm volatile(
+      "{\n"
+      ".reg .pred p;\n"
+      "setp.ne.b32 p, %69, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 "
+      "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, "
+      "%20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, "
+      "%38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, "
+      "%56, %57, %58, %59, %60, %61, %62, %63}, "
+      "{%64, %65, %66, %67}, %68, p, 1, 1, 0;\n"
+      "}\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+        "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
+        "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]),
+        "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+        "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), "+f"(d[32]), "+f"(d[33]), "+f"(d[34]),
+        "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]), "+f"(d[40]), "+f"(d[41]),
+        "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]),
+        "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
+        "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]),
+        "+f"(d[63])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(scale_d));
+}
+template <>
+__device__ __forceinline__ void wgmma_m64n128k16_rs<__half>(float (&d)[64], const uint32_t (&a)[4],
+                                                            uint64_t desc_b, int scale_d) {
+  asm volatile(
+      "{\n"
+      ".reg .pred p;\n"
+      "setp.ne.b32 p, %69, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 "
+      "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, "
+      "%20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, "
+      "%38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, "
+      "%56, %57, %58, %59, %60, %61, %62, %63}, "
+      "{%64, %65, %66, %67}, %68, p, 1, 1, 0;\n"
+      "}\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+        "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
+        "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]),
+        "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+        "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), "+f"(d[32]), "+f"(d[33]), "+f"(d[34]),
+        "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]), "+f"(d[40]), "+f"(d[41]),
+        "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]),
+        "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
+        "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]),
+        "+f"(d[63])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(scale_d));
+}
+
 // D[64 x 256] (+)= A[64 x 16] (registers) . B[16 x 256] (smem descriptor).
 template <typename T>
 __device__ __forceinline__ void wgmma_m64n256k16_rs(float (&d)[128], const uint32_t (&a)[4],
@@ -336,7 +410,7 @@ __device__ __forceinline__ void wgmma_m64n256k16_rs<__half>(float (&d)[128], con
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(scale_d));
 }
 
-template <typename T, int kClusterSize, bool kPrepared, bool kSplitK>
+template <typename T, typename Cfg, int kClusterSize, bool kPrepared, bool kSplitK>
 __global__ void __launch_bounds__(kW8A16Threads, 1)
     W8A16Fp8GemmTmaKernel(const __grid_constant__ CUtensorMap act_map,
                           const __grid_constant__ CUtensorMap w_map,
@@ -347,10 +421,10 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
   uint8_t* smem = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(smem_raw) + 1023) &
                                              ~static_cast<uintptr_t>(1023));
   uint8_t* a_base = smem;                                     // act stages (SW128)
-  uint8_t* w_base = smem + kW8A16Stages * kW8A16AStageBytes;  // weight stages (SW64)
-  uint8_t* epi_base = smem + kW8A16StageBytes;  // 16-bit epilogue buffer (absent for split-K)
-  uint64_t* full_bar = reinterpret_cast<uint64_t*>(epi_base + (kSplitK ? 0 : kW8A16EpiOutBytes));
-  uint64_t* empty_bar = full_bar + kW8A16Stages;
+  uint8_t* w_base = smem + Cfg::kStages * Cfg::kAStageBytes;  // weight stages (SW64)
+  uint8_t* epi_base = smem + Cfg::kStageBytes;  // 16-bit epilogue buffer (absent for split-K)
+  uint64_t* full_bar = reinterpret_cast<uint64_t*>(epi_base + (kSplitK ? 0 : Cfg::kEpiOutBytes));
+  uint64_t* empty_bar = full_bar + Cfg::kStages;
 
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
@@ -363,8 +437,8 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
   const uint32_t rank = kClusterSize > 1 ? cluster_ctarank() : 0u;
   const int pair = blockIdx.x / kClusterSize;
   const int unit_stride = gridDim.x / kClusterSize;
-  const int tiles_m = (M + kW8A16TileM - 1) / kW8A16TileM;
-  const int tiles_n = (N + kW8A16TileN - 1) / kW8A16TileN;
+  const int tiles_m = (M + Cfg::kTileM - 1) / Cfg::kTileM;
+  const int tiles_n = (N + Cfg::kTileN - 1) / Cfg::kTileN;
   const int pairs_n = (tiles_n + kClusterSize - 1) / kClusterSize;
   const int num_units = tiles_m * pairs_n;
   const int group_size = kW8A16GroupM * pairs_n;
@@ -375,8 +449,8 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     const int in_group = unit - group * group_size;
     const int tile_m = first_m + in_group % this_group_m;
     const int tile_n = (in_group / this_group_m) * kClusterSize + static_cast<int>(rank);
-    n0 = tile_n * kW8A16TileN;  // may be >= N for an odd tile count: computes zeros
-    m0 = tile_m * kW8A16TileM;
+    n0 = tile_n * Cfg::kTileN;  // may be >= N for an odd tile count: computes zeros
+    m0 = tile_m * Cfg::kTileM;
   };
   // Split-K: blockIdx.y selects a contiguous range of slabs.
   const int total_slabs = K / kW8A16TileK;
@@ -389,7 +463,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     prefetch_tensormap(&act_map);
     prefetch_tensormap(&w_map);
 #pragma unroll
-    for (int s = 0; s < kW8A16Stages; ++s) {
+    for (int s = 0; s < Cfg::kStages; ++s) {
       mbar_init(&full_bar[s], 1);  // one arrive.expect_tx per slab (tx from both copies)
       // One arrive per consumer warp of every CTA in the cluster.
       mbar_init(&empty_bar[s], kClusterSize * kW8A16ConsumerWarps);
@@ -406,26 +480,26 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     // ------------------------------ producer ------------------------------
     setmaxnreg_dec<24>();
     if (warp == 0 && lane == 0) {
-      constexpr uint32_t kSlabBytes = kW8A16AStageBytes + kW8A16WStageBytes;
+      constexpr uint32_t kSlabBytes = Cfg::kAStageBytes + Cfg::kWStageBytes;
       uint32_t g = 0;  // running slab index across tiles: stage = g % S
       for (int unit = pair; unit < num_units; unit += unit_stride) {
         int m0, n0;
         map_unit(unit, m0, n0);
         for (int kt = 0; kt < num_slabs; ++kt, ++g) {
-          const int stage = g % kW8A16Stages;
-          const uint32_t round = g / kW8A16Stages;
+          const int stage = g % Cfg::kStages;
+          const uint32_t round = g / Cfg::kStages;
           mbar_wait(&empty_bar[stage], (round & 1) ^ 1);  // fresh barrier: passes at once
           mbar_arrive_expect_tx(&full_bar[stage], kSlabBytes);
           const int k0 = (slab_begin + kt) * kW8A16TileK;
           if constexpr (kClusterSize > 1) {
             if (rank == 0) {
-              tma_load_2d_multicast(a_base + stage * kW8A16AStageBytes, &act_map, &full_bar[stage],
+              tma_load_2d_multicast(a_base + stage * Cfg::kAStageBytes, &act_map, &full_bar[stage],
                                     k0, m0, static_cast<uint16_t>((1u << kClusterSize) - 1));
             }
           } else {
-            tma_load_2d(a_base + stage * kW8A16AStageBytes, &act_map, &full_bar[stage], k0, m0);
+            tma_load_2d(a_base + stage * Cfg::kAStageBytes, &act_map, &full_bar[stage], k0, m0);
           }
-          tma_load_2d(w_base + stage * kW8A16WStageBytes, &w_map, &full_bar[stage], k0, n0);
+          tma_load_2d(w_base + stage * Cfg::kWStageBytes, &w_map, &full_bar[stage], k0, n0);
         }
       }
     }
@@ -441,28 +515,28 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       }
     }
     const int wq = warp & 3;  // warp within it: rows wq*16 .. +15 of each row block
-    float d[kW8A16RowBlocks][128];
+    float d[Cfg::kRowBlocks][Cfg::kAcc];
 
     // Row block b covers tile rows cwg*128 + b*64 .. +63.
     // Plain layout: rows r = base + wq*16 + lane/4 (+8), k = 2*(lane%4) (+8)
     // within each k16; the 16 B chunk holding k16 of row r sits at chunk
     // index (k16/16) ^ ((r>>1)&3) under the 64 B swizzle.
-    const int a_r = cwg * (64 * kW8A16RowBlocks) + wq * 16 + lane / 4;
+    const int a_r = cwg * (64 * Cfg::kRowBlocks) + wq * 16 + lane / 4;
     const int a_k = (lane % 4) * 2;
     const uint32_t swz0 = (a_r >> 1) & 3;  // same for a_r + 64 (64 is 0 mod 8)
     const uint32_t swz1 = ((a_r + 8) >> 1) & 3;
     // Prepared layout: ldmatrix row for this lane = base + (lane % 8) +
     // 8 * ((lane / 8) % 2), chunk = 2 * pair + lane / 16.
-    const int ld_r = cwg * (64 * kW8A16RowBlocks) + wq * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
+    const int ld_r = cwg * (64 * Cfg::kRowBlocks) + wq * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
     const uint32_t ld_swz = (ld_r >> 1) & 3;
     const uint32_t ld_chunk_hi = lane / 16;
 
     // Load + convert the A fragments of one slab for both row blocks
     // (2 blocks x 4 k16 x 4 regs).
-    auto load_frags = [&](uint32_t g, uint32_t(&frag)[kW8A16RowBlocks][4][4]) {
-      const uint8_t* w_stage = w_base + (g % kW8A16Stages) * kW8A16WStageBytes;
+    auto load_frags = [&](uint32_t g, uint32_t(&frag)[Cfg::kRowBlocks][4][4]) {
+      const uint8_t* w_stage = w_base + (g % Cfg::kStages) * Cfg::kWStageBytes;
 #pragma unroll
-      for (int b = 0; b < kW8A16RowBlocks; ++b) {
+      for (int b = 0; b < Cfg::kRowBlocks; ++b) {
         if constexpr (kPrepared) {
 #pragma unroll
           for (int pair = 0; pair < kW8A16TileK / 32; ++pair) {
@@ -497,22 +571,26 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     // One slab: issue `cur` for both row blocks, retire the previous group,
     // refill `nxt` with slab kt+1.  Buffers are named so they stay in
     // registers; the caller alternates them.
-    auto step = [&](int kt, uint32_t g, uint32_t(&cur)[kW8A16RowBlocks][4][4],
-                    uint32_t(&nxt)[kW8A16RowBlocks][4][4]) {
-      const uint8_t* a_stage = a_base + (g % kW8A16Stages) * kW8A16AStageBytes;
+    auto step = [&](int kt, uint32_t g, uint32_t(&cur)[Cfg::kRowBlocks][4][4],
+                    uint32_t(&nxt)[Cfg::kRowBlocks][4][4]) {
+      const uint8_t* a_stage = a_base + (g % Cfg::kStages) * Cfg::kAStageBytes;
       wgmma_fence();
 #pragma unroll
       for (int k16 = 0; k16 < kW8A16TileK; k16 += 16) {
         const uint64_t desc_b = make_smem_desc_sw128(a_stage + k16 * 2);
 #pragma unroll
-        for (int b = 0; b < kW8A16RowBlocks; ++b) {
-          wgmma_m64n256k16_rs<T>(d[b], cur[b][k16 / 16], desc_b, 1);
+        for (int b = 0; b < Cfg::kRowBlocks; ++b) {
+          if constexpr (Cfg::kTileM == 256) {
+            wgmma_m64n256k16_rs<T>(d[b], cur[b][k16 / 16], desc_b, 1);
+          } else {
+            wgmma_m64n128k16_rs<T>(d[b], cur[b][k16 / 16], desc_b, 1);
+          }
         }
       }
       wgmma_commit();
       wgmma_wait<1>();
       if (kt > 0 && lane == 0) {
-        uint64_t* eb = &empty_bar[(g - 1) % kW8A16Stages];
+        uint64_t* eb = &empty_bar[(g - 1) % Cfg::kStages];
         if constexpr (kClusterSize > 1) {
 #pragma unroll
           for (uint32_t c = 0; c < kClusterSize; ++c) mbar_arrive_remote(eb, c);
@@ -522,22 +600,22 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       }
       if (kt + 1 < num_slabs) {
         const uint32_t ng = g + 1;
-        mbar_wait(&full_bar[ng % kW8A16Stages], (ng / kW8A16Stages) & 1);
+        mbar_wait(&full_bar[ng % Cfg::kStages], (ng / Cfg::kStages) & 1);
         load_frags(ng, nxt);  // overlaps slab kt's wgmmas
       }
     };
 
-    uint32_t frag0[kW8A16RowBlocks][4][4], frag1[kW8A16RowBlocks][4][4];
+    uint32_t frag0[Cfg::kRowBlocks][4][4], frag1[Cfg::kRowBlocks][4][4];
     uint32_t g = 0;  // running slab index across tiles (mirrors the producer's)
     for (int unit = pair; unit < num_units; unit += unit_stride) {
       int m0, n0;
       map_unit(unit, m0, n0);
 #pragma unroll
-      for (int b = 0; b < kW8A16RowBlocks; ++b)
+      for (int b = 0; b < Cfg::kRowBlocks; ++b)
 #pragma unroll
-        for (int i = 0; i < 128; ++i) d[b][i] = 0.f;
+        for (int i = 0; i < Cfg::kAcc; ++i) d[b][i] = 0.f;
       if (num_slabs > 0) {
-        mbar_wait(&full_bar[g % kW8A16Stages], (g / kW8A16Stages) & 1);
+        mbar_wait(&full_bar[g % Cfg::kStages], (g / Cfg::kStages) & 1);
         load_frags(g, frag0);
       }
       for (int kt = 0; kt < num_slabs; kt += 2) {
@@ -547,7 +625,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       g += num_slabs;
       wgmma_wait<0>();
       if (num_slabs > 0 && lane == 0) {
-        uint64_t* eb = &empty_bar[(g - 1) % kW8A16Stages];
+        uint64_t* eb = &empty_bar[(g - 1) % Cfg::kStages];
         if constexpr (kClusterSize > 1) {
 #pragma unroll
           for (uint32_t c = 0; c < kClusterSize; ++c) mbar_arrive_remote(eb, c);
@@ -561,27 +639,27 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       // at n + 8.  Stage the tile as out[m][n] in smem, then store rows with
       // 16 B writes: scaled 16-bit values to `out`, or raw fp32 partials to the
       // split-K workspace (scale / bias / cast happen in the reduce kernel).
-      static_assert(kW8A16EpiBytes <= kW8A16StageBytes,
+      static_assert(Cfg::kEpiBytes <= Cfg::kStageBytes,
                     "fp32 split-K tile must fit in the pipeline stages");
       using TOut = std::conditional_t<kSplitK, float, T>;
       // Split-K (one unit per block) stages its fp32 tile in the idle stages;
       // the persistent 16-bit path uses the dedicated buffer, half a tile per
       // pass, so the producer can keep filling stages for the next tile.
       constexpr int kPasses = kSplitK ? 1 : kW8A16EpiPasses;
-      constexpr int kRowsPerTilePass = kW8A16TileM / kPasses;
+      constexpr int kRowsPerTilePass = Cfg::kTileM / kPasses;
       // Split-K keeps the shared fp32 tile in the idle stages (both warpgroups
       // sync); the persistent path gives each warpgroup its own [64 m][136 n]
       // buffer for its 128 n columns and never synchronizes across warpgroups.
-      constexpr int kWgCols = kSplitK ? kW8A16TileN : kW8A16EpiWgCols;
+      constexpr int kWgCols = kSplitK ? Cfg::kTileN : Cfg::kEpiWgCols;
       TOut* tile = kSplitK ? reinterpret_cast<TOut*>(smem)
-                           : reinterpret_cast<TOut*>(epi_base + cwg * kW8A16EpiWgBytes);
+                           : reinterpret_cast<TOut*>(epi_base + cwg * Cfg::kEpiWgBytes);
       const float sc = kSplitK ? 1.f : *scale;
       const int m_lo = (lane % 4) * 2;  // tile-local m
       // Element index inside the staging buffer: padded rows for the fp32
       // split-K tile, dense swizzled rows for the per-warpgroup 16-bit tile.
       auto epi_idx = [](int m, int n) -> int {
-        if constexpr (kSplitK) return m * kW8A16EpiPad + n;
-        return m * kW8A16EpiWgCols + ((((n >> 3) ^ ((m >> 1) & 7))) << 3) + (n & 7);
+        if constexpr (kSplitK) return m * Cfg::kEpiPad + n;
+        return m * Cfg::kEpiWgCols + ((((n >> 3) ^ ((m >> 1) & 7))) << 3) + (n & 7);
       };
       constexpr int kElemsPerChunk = 16 / sizeof(TOut);  // 8 or 4
       constexpr int kChunks = kWgCols / kElemsPerChunk;  // 16 or 64
@@ -590,7 +668,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       const int ct = kSplitK ? threadIdx.x - 128 : threadIdx.x - 128 - cwg * 128;
       const int chunk = ct % kChunks;
       const int row0 = ct / kChunks;
-      const int n_chunk = n0 + (kSplitK ? 0 : cwg * kW8A16EpiWgCols) + chunk * kElemsPerChunk;
+      const int n_chunk = n0 + (kSplitK ? 0 : cwg * Cfg::kEpiWgCols) + chunk * kElemsPerChunk;
       TOut* dst_base = kSplitK
                            ? reinterpret_cast<TOut*>(ws) + static_cast<int64_t>(blockIdx.y) * M * N
                            : reinterpret_cast<TOut*>(out);
@@ -606,18 +684,18 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       for (int pass = 0; pass < kPasses; ++pass) {
         sync_here();  // previous pass / tile copied out before the buffer is reused
 #pragma unroll
-        for (int b = 0; b < kW8A16RowBlocks; ++b) {
+        for (int b = 0; b < Cfg::kRowBlocks; ++b) {
           const int n_lo =
-              cwg * (64 * kW8A16RowBlocks) + b * 64 + wq * 16 + lane / 4;   // tile-local n
-          const int n_buf = kSplitK ? n_lo : n_lo - cwg * kW8A16EpiWgCols;  // buffer-local n
+              cwg * (64 * Cfg::kRowBlocks) + b * 64 + wq * 16 + lane / 4;   // tile-local n
+          const int n_buf = kSplitK ? n_lo : n_lo - cwg * Cfg::kEpiWgCols;  // buffer-local n
           float bias_lo = 0.f, bias_hi = 0.f;
           if (!kSplitK && bias != nullptr) {
             if (n0 + n_lo < N) bias_lo = static_cast<float>(bias[n0 + n_lo]);
             if (n0 + n_lo + 8 < N) bias_hi = static_cast<float>(bias[n0 + n_lo + 8]);
           }
 #pragma unroll
-          for (int jj = 0; jj < (kW8A16TileM / 8) / kPasses; ++jj) {
-            const int j = pass * ((kW8A16TileM / 8) / kPasses) + jj;
+          for (int jj = 0; jj < (Cfg::kTileM / 8) / kPasses; ++jj) {
+            const int j = pass * ((Cfg::kTileM / 8) / kPasses) + jj;
 #pragma unroll
             for (int q = 0; q < 2; ++q) {
               const int m = m_lo + jj * 8 + q;  // row within this pass's buffer
@@ -685,16 +763,15 @@ __global__ void W8A16SplitKReduceKernel(const float* __restrict__ ws, int splits
   *reinterpret_cast<uint4*>(out + i) = *reinterpret_cast<const uint4*>(v);
 }
 
-// Split-K plan: number of K splits for a problem (1 = no split).  Split only
-// when the tile grid is under a third of a wave of SMs, aim for one wave, and
-// keep at least 8 slabs per split so the fp32 partial round trip stays small
-// next to the mainloop.
+// Split-K plan: number of K splits for a problem on tile Cfg (1 = no split).
+// Split only when the tile grid is under a third of a wave of SMs, aim for
+// one wave, and keep at least 8 slabs per split so the fp32 partial round
+// trip stays small next to the mainloop.
+template <typename Cfg>
 inline int W8A16Fp8GemmSplits(int M, int N, int K, int num_sms) {
   const int tiles =
-      static_cast<int>(ceil_div(M, kW8A16TileM)) * static_cast<int>(ceil_div(N, kW8A16TileN));
+      static_cast<int>(ceil_div(M, Cfg::kTileM)) * static_cast<int>(ceil_div(N, Cfg::kTileN));
   const int total_slabs = K / kW8A16TileK;
-  // Measured on H100: half a wave of 256 x 128 tiles with K = 5120 already
-  // beats the split (partial round trip + reduce); split below a third.
   if (tiles * 3 > num_sms || total_slabs < 2 * kW8A16MinSlabsPerSplit) return 1;
   int splits = static_cast<int>(ceil_div(num_sms, tiles));
   splits = min(splits, kW8A16MaxSplits);
@@ -702,11 +779,66 @@ inline int W8A16Fp8GemmSplits(int M, int N, int K, int num_sms) {
   return max(splits, 1);
 }
 
-// Workspace bytes a call needs (0 when it will not split).
-inline int64_t W8A16Fp8GemmWorkspaceBytes(int M, int N, int K, int num_sms) {
-  const int splits = W8A16Fp8GemmSplits(M, N, K, num_sms);
+// Tile choice for (M, N, K) on a GPU with num_sms SMs: the most efficient
+// tile whose grid fills the machine; otherwise the tile that maximises
+// (measured per-tile efficiency) x (fill of the last wave).  The env var
+// FLASHINFER_W8A16_FP8_TILE pins a tile for benchmarking.
+inline W8A16Tile W8A16Fp8GemmPickTile(int M, int N, int K, int num_sms) {
+  static int forced = -1;
+  if (forced < 0) {
+    const char* e = getenv("FLASHINFER_W8A16_FP8_TILE");
+    forced = 0;
+    if (e != nullptr) {
+      if (strcmp(e, "128x256") == 0) forced = 1;
+      if (strcmp(e, "256x128") == 0) forced = 2;
+      if (strcmp(e, "128x128") == 0) forced = 3;
+    }
+  }
+  if (forced > 0) return static_cast<W8A16Tile>(forced);
+  struct Cand {
+    W8A16Tile tile;
+    int tn, tm;
+    double eff;  // H100 measured: rung 23 / rung 19 / rung 18 on filling shapes
+  };
+  const Cand cands[3] = {{W8A16Tile::k128x256, 128, 256, 1.00},
+                         {W8A16Tile::k256x128, 256, 128, 0.94},
+                         {W8A16Tile::k128x128, 128, 128, 0.83}};
+  (void)K;
+  W8A16Tile best = W8A16Tile::k128x256;
+  double best_score = -1.0;
+  for (const Cand& c : cands) {
+    const double units = static_cast<double>(ceil_div(M, c.tm)) * ceil_div(N, c.tn);
+    if (units >= 2.0 * num_sms) return c.tile;  // fills the machine: take the best tile
+    const double waves = units / num_sms;
+    const double fill =
+        waves / static_cast<double>(static_cast<long>(waves) + 1);  // last-wave fill
+    const double score = c.eff * (waves >= 1.0 ? fill : waves);     // under one wave: raw fill
+    if (score > best_score) {
+      best_score = score;
+      best = c.tile;
+    }
+  }
+  return best;
+}
+
+template <typename Cfg>
+inline int64_t W8A16Fp8GemmWorkspaceBytesFor(int M, int N, int K, int num_sms) {
+  const int splits = W8A16Fp8GemmSplits<Cfg>(M, N, K, num_sms);
   return splits > 1 ? static_cast<int64_t>(splits) * M * N * static_cast<int64_t>(sizeof(float))
                     : 0;
+}
+
+// Workspace bytes a call needs (0 when it will not split), for the tile the
+// launcher will pick.
+inline int64_t W8A16Fp8GemmWorkspaceBytes(int M, int N, int K, int num_sms) {
+  switch (W8A16Fp8GemmPickTile(M, N, K, num_sms)) {
+    case W8A16Tile::k256x128:
+      return W8A16Fp8GemmWorkspaceBytesFor<W8A16Cfg256x128>(M, N, K, num_sms);
+    case W8A16Tile::k128x128:
+      return W8A16Fp8GemmWorkspaceBytesFor<W8A16Cfg128x128>(M, N, K, num_sms);
+    default:
+      return W8A16Fp8GemmWorkspaceBytesFor<W8A16Cfg128x256>(M, N, K, num_sms);
+  }
 }
 
 // Host side: 2-D tiled tensor map over a row-major [rows x cols] matrix with
@@ -732,10 +864,11 @@ inline cudaError_t MakeTmaMap2D(CUtensorMap* map, const void* base, uint64_t row
   return r == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
 }
 
-template <typename T, int kClusterSize = 1>
-cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scale, const T* bias,
-                         T* out, int M, int N, int K, bool weight_prepared, float* workspace,
-                         int64_t workspace_bytes, int num_sms, cudaStream_t stream) {
+template <typename T, typename Cfg, int kClusterSize = 1>
+cudaError_t W8A16Fp8GemmLaunch(const T* act, const __nv_fp8_e4m3* w, const float* scale,
+                               const T* bias, T* out, int M, int N, int K, bool weight_prepared,
+                               float* workspace, int64_t workspace_bytes, int num_sms,
+                               cudaStream_t stream) {
   if (K % kW8A16TileK != 0) return cudaErrorInvalidValue;  // whole slabs only
   if ((reinterpret_cast<uintptr_t>(act) & 15) || (reinterpret_cast<uintptr_t>(w) & 15)) {
     return cudaErrorInvalidValue;  // TMA needs 16 B aligned bases
@@ -747,16 +880,16 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
   cudaError_t e = MakeTmaMap2D(&act_map, act, M, K, sizeof(T),
                                std::is_same_v<T, __half> ? CU_TENSOR_MAP_DATA_TYPE_FLOAT16
                                                          : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-                               kW8A16TileM, kW8A16TileK, CU_TENSOR_MAP_SWIZZLE_128B);
+                               Cfg::kTileM, kW8A16TileK, CU_TENSOR_MAP_SWIZZLE_128B);
   if (e != cudaSuccess) return e;
-  e = MakeTmaMap2D(&w_map, w, N, K, 1, CU_TENSOR_MAP_DATA_TYPE_UINT8, kW8A16TileN, kW8A16TileK,
+  e = MakeTmaMap2D(&w_map, w, N, K, 1, CU_TENSOR_MAP_DATA_TYPE_UINT8, Cfg::kTileN, kW8A16TileK,
                    CU_TENSOR_MAP_SWIZZLE_64B);
   if (e != cudaSuccess) return e;
 
-  const unsigned tiles_m = ceil_div(M, kW8A16TileM);
-  const unsigned tiles_n = ceil_div(N, kW8A16TileN);
+  const unsigned tiles_m = ceil_div(M, Cfg::kTileM);
+  const unsigned tiles_n = ceil_div(N, Cfg::kTileN);
   const unsigned pairs_n = ceil_div(tiles_n, static_cast<unsigned>(kClusterSize));
-  int splits = W8A16Fp8GemmSplits(M, N, K, num_sms);
+  int splits = W8A16Fp8GemmSplits<Cfg>(M, N, K, num_sms);
   if (splits > 1 &&
       (workspace == nullptr || workspace_bytes < static_cast<int64_t>(splits) * M * N * 4)) {
     splits = 1;  // no room for partials: run the single-pass kernel
@@ -764,13 +897,13 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
   const bool split = splits > 1;
   using KernelFn = void (*)(const CUtensorMap, const CUtensorMap, const float*, const T*, T*,
                             float*, int, int, int);
-  static const KernelFn kernels[2][2] = {{W8A16Fp8GemmTmaKernel<T, kClusterSize, false, false>,
-                                          W8A16Fp8GemmTmaKernel<T, kClusterSize, false, true>},
-                                         {W8A16Fp8GemmTmaKernel<T, kClusterSize, true, false>,
-                                          W8A16Fp8GemmTmaKernel<T, kClusterSize, true, true>}};
+  static const KernelFn kernels[2][2] = {{W8A16Fp8GemmTmaKernel<T, Cfg, kClusterSize, false, false>,
+                                          W8A16Fp8GemmTmaKernel<T, Cfg, kClusterSize, false, true>},
+                                         {W8A16Fp8GemmTmaKernel<T, Cfg, kClusterSize, true, false>,
+                                          W8A16Fp8GemmTmaKernel<T, Cfg, kClusterSize, true, true>}};
   KernelFn kernel = kernels[weight_prepared][split];
   static bool attr_set[2][2] = {{false, false}, {false, false}};
-  const int smem_bytes = split ? kW8A16SmemBytesSplit : kW8A16SmemBytesPersistent;
+  const int smem_bytes = split ? Cfg::kSmemBytesSplit : Cfg::kSmemBytesPersistent;
   if (!attr_set[weight_prepared][split]) {
     e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     if (e != cudaSuccess) return e;
@@ -805,6 +938,26 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
   return cudaGetLastError();
 }
 
+// Public entry: picks the tile for (M, N, K, SM count) and launches it.
+template <typename T, int kClusterSize = 1>
+cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scale, const T* bias,
+                         T* out, int M, int N, int K, bool weight_prepared, float* workspace,
+                         int64_t workspace_bytes, int num_sms, cudaStream_t stream) {
+  switch (W8A16Fp8GemmPickTile(M, N, K, num_sms)) {
+    case W8A16Tile::k256x128:
+      return W8A16Fp8GemmLaunch<T, W8A16Cfg256x128, kClusterSize>(act, w, scale, bias, out, M, N, K,
+                                                                  weight_prepared, workspace,
+                                                                  workspace_bytes, num_sms, stream);
+    case W8A16Tile::k128x128:
+      return W8A16Fp8GemmLaunch<T, W8A16Cfg128x128, kClusterSize>(act, w, scale, bias, out, M, N, K,
+                                                                  weight_prepared, workspace,
+                                                                  workspace_bytes, num_sms, stream);
+    default:
+      return W8A16Fp8GemmLaunch<T, W8A16Cfg128x256, kClusterSize>(act, w, scale, bias, out, M, N, K,
+                                                                  weight_prepared, workspace,
+                                                                  workspace_bytes, num_sms, stream);
+  }
+}
 }  // namespace gemm
 }  // namespace flashinfer
 
