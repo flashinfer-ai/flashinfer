@@ -525,6 +525,16 @@ class TuningConfig:
             lane views in the reusable A/B profiling arenas. Their contents are
             staged once per profile even when they are not value-aware. Shared
             read-only tensors may be omitted and retain one pointer.
+        timer (str | None): Per-operation timing implementation. ``"cupti"``
+            times each profiled call by its CUPTI kernel span (the
+            ``bench_gpu_time`` measurement), which ranks microsecond-scale
+            kernels that CUDA-event windows cannot resolve. Falls back to CUDA
+            events when cupti-python is unavailable. A ``MeasurementPolicy``
+            that pins a timer or eager execution takes precedence. ``None``
+            keeps the default.
+        first_tactic_margin (float): Keep the first tactic of ``runners[0]``
+            (by convention its untuned default) unless another candidate is
+            faster by more than this fraction. ``0.0`` selects the minimum.
     """
 
     dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
@@ -544,6 +554,8 @@ class TuningConfig:
     # for inputs whose default tensor_initializer would be random
     # (e.g. token_selected_experts in MoE workloads).
     inputs_pre_hook: Callable | None = None
+    timer: str | None = None
+    first_tactic_margin: float = 0.0
 
 
 class ValueProfileArena:
@@ -2156,6 +2168,8 @@ class AutoTuner:
             value_aware_input_indices=tuning_config.value_aware_input_indices,
             profile_arena_input_indices=tuning_config.profile_arena_input_indices,
             inputs_pre_hook=tuning_config.inputs_pre_hook,
+            timer=tuning_config.timer,
+            first_tactic_margin=tuning_config.first_tactic_margin,
         )
         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
             new_config
@@ -2407,6 +2421,9 @@ class AutoTuner:
                         min_time = float("inf")
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         runner_id, tactic = None, None
+                        first_choice = (
+                            None  # (time, tactic) of runners[0]'s first tactic
+                        )
                         skipped_count = 0
                         for r_id, r in enumerate(runners):
                             runner_preparation_oom = False
@@ -2528,9 +2545,20 @@ class AutoTuner:
                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                                     # or some runtime error occurs during profiling.
                                     time_measured = float("inf")
+                                if r_id == 0 and first_choice is None:
+                                    first_choice = (time_measured, tac)
                                 if time_measured < min_time:
                                     min_time = time_measured
                                     runner_id, tactic = r_id, tac
+
+                        margin = tuning_config.first_tactic_margin
+                        if (
+                            margin > 0
+                            and first_choice is not None
+                            and first_choice[0] < float("inf")
+                            and min_time > first_choice[0] * (1.0 - margin)
+                        ):
+                            runner_id, tactic = 0, first_choice[1]
 
                         if skipped_count > 0:
                             logger.info(
@@ -3033,9 +3061,17 @@ class AutoTuner:
             # any other.  A CUPTI *infrastructure* failure (single-subscriber
             # conflict) is not a tactic failure: fall back to the CUDA-event
             # path for this and all later measurements.
+            # The op's timer applies unless the policy pins one (explicit
+            # timer or eager execution, which must include host cost).
+            requested_timer = tuning_config.timer
+            if measure_policy is not None and (
+                requested_timer is None
+                or measure_policy._timer != "auto"
+                or measure_policy.execution_mode == "eager"
+            ):
+                requested_timer = measure_policy.timer
             use_cupti = (
-                measure_policy is not None
-                and measure_policy.timer == "cupti"
+                requested_timer == "cupti"
                 and not self._cupti_disabled
                 and _load_cupti() is not None
             )
@@ -3217,7 +3253,9 @@ class AutoTuner:
                     runner(inputs, tactic=tactic, **kwargs)
 
             spans_ms = _cupti_measure_spans(
-                run_iteration, self.repeat, prologue=prologue
+                run_iteration,
+                self._get_profiling_repeat(tuning_config),
+                prologue=prologue,
             )
 
         # Median, not mean: robust to first-iteration instrumentation
