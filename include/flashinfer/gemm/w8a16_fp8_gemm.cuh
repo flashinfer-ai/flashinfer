@@ -25,17 +25,15 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 6 of the optimization ladder: mma.sync tensor cores.  Rungs 0-5 were
-// SIMT fp32 FMA and ended at ~30 TFLOP/s with the FMA pipe at 88% issue.
-// Here the 64x64x64 block tile is computed by 4 warps (32x32 each) with
-// mma.sync.m16n8k16 (f16 or bf16 inputs, f32 accumulate): the A fragments
-// come from the 16-bit act tile with ldmatrix.x4; the B fragments are built
-// in registers from the fp8 weight tile, each thread reading the two fp8
-// pairs its B slots need (k, k+1 and k+8, k+9 of column n) and converting
-// them with one e4m3x2 -> half2 instruction each (plus half2 -> float2 ->
-// bf162 when the activation is bf16, since e4m3 -> bf16 has no packed
-// conversion).  The weight is still never widened in memory.  Same 3-stage
-// cp.async ring as rung 5, 128 threads per block.  Requires K % 64 == 0.
+// Rung 7 of the optimization ladder: 128x128 block tile.  Rung 6 (mma.sync,
+// 64x64 tile) ran at ~200 TFLOP/s with ncu showing L2 at 83% and DRAM at
+// 49% of peak while the tensor pipe idled: a 64x64 tile re-reads each A and
+// B element from L2 once per 64 outputs.  Here the block tile grows to
+// 128x128 (8 warps as 2 x 4, 64x32 outputs each, i.e. 4 m16 x 4 n8 mma
+// tiles per warp per k16), halving the L2 traffic per FLOP.  The 3-stage
+// ring grows to 83 KB and moves to dynamic shared memory (opt-in above
+// 48 KB; 2 blocks per SM).  Fragment construction, cp.async pipeline and
+// the epilogue are unchanged from rung 6.  Requires K % 64 == 0.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -51,14 +49,23 @@
 namespace flashinfer {
 namespace gemm {
 
-constexpr int kW8A16TileM = 64;
-constexpr int kW8A16TileN = 64;
+constexpr int kW8A16TileM = 128;
+constexpr int kW8A16TileN = 128;
 constexpr int kW8A16TileK = 64;
 constexpr int kW8A16Stages = 3;
-constexpr int kW8A16Warps = 4;  // 2 (m) x 2 (n), 32x32 outputs each
+constexpr int kW8A16WarpsM = 2;                              // warps along m, 64 rows each
+constexpr int kW8A16WarpsN = 4;                              // warps along n, 32 cols each
+constexpr int kW8A16WarpTileM = kW8A16TileM / kW8A16WarpsM;  // 64 = 4 m16 tiles
+constexpr int kW8A16WarpTileN = kW8A16TileN / kW8A16WarpsN;  // 32 = 4 n8 tiles
+constexpr int kW8A16MTiles = kW8A16WarpTileM / 16;
+constexpr int kW8A16NTiles = kW8A16WarpTileN / 8;
+constexpr int kW8A16Warps = kW8A16WarpsM * kW8A16WarpsN;
 constexpr int kW8A16Threads = 32 * kW8A16Warps;
 constexpr int kW8A16APad = kW8A16TileK + 8;  // 72 bf16 = 144 B rows (16 B aligned, 36 words)
 constexpr int kW8A16WPad = kW8A16TileK + 8;  // 72 fp8  =  72 B rows (8 B aligned, 18 words)
+constexpr int kW8A16AStageBytes = kW8A16TileM * kW8A16APad * 2;
+constexpr int kW8A16WStageBytes = kW8A16TileN * kW8A16WPad;
+constexpr int kW8A16SmemBytes = kW8A16Stages * (kW8A16AStageBytes + kW8A16WStageBytes);
 
 // 8-byte predicated cp.async with zero fill (the shared helper only has 16 B).
 __device__ __forceinline__ void cp_async_pred_load_64b(void* smem_ptr, const void* gmem_ptr,
@@ -119,53 +126,58 @@ __device__ __forceinline__ uint32_t pack_pair(float x, float y) {
 
 template <typename T>
 __global__ void __launch_bounds__(kW8A16Threads)
-    W8A16Fp8GemmMmaSyncKernel(const T* __restrict__ act, const __nv_fp8_e4m3* __restrict__ w,
-                              const float* __restrict__ scale, const T* __restrict__ bias,
-                              T* __restrict__ out, int M, int N, int K) {
+    W8A16Fp8GemmMmaSync128Kernel(const T* __restrict__ act, const __nv_fp8_e4m3* __restrict__ w,
+                                 const float* __restrict__ scale, const T* __restrict__ bias,
+                                 T* __restrict__ out, int M, int N, int K) {
   using namespace cp_async;
-  __shared__ __align__(16) T a_s[kW8A16Stages][kW8A16TileM][kW8A16APad];
-  __shared__ __align__(16) __nv_fp8_e4m3 w_s[kW8A16Stages][kW8A16TileN][kW8A16WPad];
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  using ATile = T[kW8A16TileM][kW8A16APad];
+  using WTile = __nv_fp8_e4m3[kW8A16TileN][kW8A16WPad];
+  ATile* a_s = reinterpret_cast<ATile*>(smem_raw);
+  WTile* w_s = reinterpret_cast<WTile*>(smem_raw + kW8A16Stages * kW8A16AStageBytes);
 
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  const int wm = warp >> 1;  // warp row: rows wm*32 .. +31 of the tile
-  const int wn = warp & 1;   // warp col: cols wn*32 .. +31 of the tile
+  const int wm = warp / kW8A16WarpsN;  // rows wm*64 .. +63 of the tile
+  const int wn = warp % kW8A16WarpsN;  // cols wn*32 .. +31 of the tile
   const int m0 = blockIdx.y * kW8A16TileM;
   const int n0 = blockIdx.x * kW8A16TileN;
 
-  // Copy assignment per slab: act = 64 rows x 128 B = 512 x 16 B, weight =
-  // 64 rows x 64 B = 512 x 8 B; four copies per thread per operand (rows
-  // r, r+16, r+32, r+48).  Rows past M / N copy zeros (cp.async zfill).
-  const int a_r = threadIdx.x / 8;        // 0..15
-  const int a_c = (threadIdx.x % 8) * 8;  // first of 8 bf16
-  const int w_r = threadIdx.x / 8;        // 0..15
-  const int w_c = (threadIdx.x % 8) * 8;  // first of 8 fp8
-  bool a_ok[4], w_ok[4];
-  const T* a_src[4];
-  const __nv_fp8_e4m3* w_src[4];
+  // Copy assignment per slab: act = 128 rows x 128 B = 1024 x 16 B, weight =
+  // 128 rows x 64 B = 1024 x 8 B; four copies per thread per operand (rows
+  // r, r+32, r+64, r+96).  Rows past M / N copy zeros (cp.async zfill).
+  constexpr int kCopies = 4;
+  constexpr int kRowStep = kW8A16Threads / 8;  // 32
+  const int a_r = threadIdx.x / 8;             // 0..31
+  const int a_c = (threadIdx.x % 8) * 8;       // first of 8 bf16
+  const int w_r = threadIdx.x / 8;             // 0..31
+  const int w_c = (threadIdx.x % 8) * 8;       // first of 8 fp8
+  bool a_ok[kCopies], w_ok[kCopies];
+  const T* a_src[kCopies];
+  const __nv_fp8_e4m3* w_src[kCopies];
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    a_ok[i] = (m0 + a_r + 16 * i) < M;
-    w_ok[i] = (n0 + w_r + 16 * i) < N;
-    a_src[i] = act + static_cast<int64_t>(m0 + (a_ok[i] ? a_r + 16 * i : 0)) * K + a_c;
-    w_src[i] = w + static_cast<int64_t>(n0 + (w_ok[i] ? w_r + 16 * i : 0)) * K + w_c;
+  for (int i = 0; i < kCopies; ++i) {
+    a_ok[i] = (m0 + a_r + kRowStep * i) < M;
+    w_ok[i] = (n0 + w_r + kRowStep * i) < N;
+    a_src[i] = act + static_cast<int64_t>(m0 + (a_ok[i] ? a_r + kRowStep * i : 0)) * K + a_c;
+    w_src[i] = w + static_cast<int64_t>(n0 + (w_ok[i] ? w_r + kRowStep * i : 0)) * K + w_c;
   }
 
   auto issue_slab = [&](int kt, int stage) {
     const int k0 = kt * kW8A16TileK;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < kCopies; ++i) {
       pred_load<128, PrefetchMode::kNoPrefetch, SharedMemFillMode::kFillZero>(
-          &a_s[stage][a_r + 16 * i][a_c], a_src[i] + k0, a_ok[i]);
-      cp_async_pred_load_64b(&w_s[stage][w_r + 16 * i][w_c], w_src[i] + k0, w_ok[i]);
+          &a_s[stage][a_r + kRowStep * i][a_c], a_src[i] + k0, a_ok[i]);
+      cp_async_pred_load_64b(&w_s[stage][w_r + kRowStep * i][w_c], w_src[i] + k0, w_ok[i]);
     }
   };
 
-  float acc[2][4][4];  // [m16 tile][n8 tile][c fragment]
+  float acc[kW8A16MTiles][kW8A16NTiles][4];
 #pragma unroll
-  for (int i = 0; i < 2; ++i)
+  for (int i = 0; i < kW8A16MTiles; ++i)
 #pragma unroll
-    for (int j = 0; j < 4; ++j)
+    for (int j = 0; j < kW8A16NTiles; ++j)
 #pragma unroll
       for (int r = 0; r < 4; ++r) acc[i][j][r] = 0.f;
 
@@ -176,11 +188,10 @@ __global__ void __launch_bounds__(kW8A16Threads)
     commit_group();
   }
 
-  // Per-lane fragment coordinates (m16n8k16 layouts).
-  const int a_row = lane % 16;        // ldmatrix row within the m16 tile
-  const int a_col = (lane / 16) * 8;  // ldmatrix column half (0 or 8) within k16
-  const int b_n = lane / 4;           // column within the n8 tile
-  const int b_k = (lane % 4) * 2;     // first k of the pair within k16
+  const int a_row = lane % 16;
+  const int a_col = (lane / 16) * 8;
+  const int b_n = lane / 4;
+  const int b_k = (lane % 4) * 2;
 
   for (int kt = 0; kt < num_slabs; ++kt) {
     wait_group<kW8A16Stages - 2>();
@@ -192,46 +203,46 @@ __global__ void __launch_bounds__(kW8A16Threads)
     const int stage = kt % kW8A16Stages;
 #pragma unroll
     for (int k16 = 0; k16 < kW8A16TileK; k16 += 16) {
-      uint32_t a_frag[2][4];
+      uint32_t a_frag[kW8A16MTiles][4];
 #pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        mma::ldmatrix_m8n8x4(a_frag[i], &a_s[stage][wm * 32 + i * 16 + a_row][k16 + a_col]);
+      for (int i = 0; i < kW8A16MTiles; ++i) {
+        mma::ldmatrix_m8n8x4(a_frag[i],
+                             &a_s[stage][wm * kW8A16WarpTileM + i * 16 + a_row][k16 + a_col]);
       }
-      uint32_t b_frag[4][2];
+      uint32_t b_frag[kW8A16NTiles][2];
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const __nv_fp8_e4m3* row = &w_s[stage][wn * 32 + j * 8 + b_n][k16 + b_k];
+      for (int j = 0; j < kW8A16NTiles; ++j) {
+        const __nv_fp8_e4m3* row = &w_s[stage][wn * kW8A16WarpTileN + j * 8 + b_n][k16 + b_k];
         const uint32_t lo = *reinterpret_cast<const uint16_t*>(row);
         const uint32_t hi = *reinterpret_cast<const uint16_t*>(row + 8);
         b_frag[j][0] = fp8x2_to_pair<T>(lo);
         b_frag[j][1] = fp8x2_to_pair<T>(hi);
       }
 #pragma unroll
-      for (int i = 0; i < 2; ++i)
+      for (int i = 0; i < kW8A16MTiles; ++i)
 #pragma unroll
-        for (int j = 0; j < 4; ++j) mma_m16n8k16<T>(acc[i][j], a_frag[i], b_frag[j]);
+        for (int j = 0; j < kW8A16NTiles; ++j) mma_m16n8k16<T>(acc[i][j], a_frag[i], b_frag[j]);
     }
   }
   wait_group<0>();
 
-  // Epilogue: c[0],c[1] at (row g, cols 2t, 2t+1); c[2],c[3] at row g+8.
   const float s = *scale;
   const int g = lane / 4;
   const int t2 = (lane % 4) * 2;
 #pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const int n = n0 + wn * 32 + j * 8 + t2;
-    if (n >= N) continue;  // N % 2 == 0 is not assumed below for n+1
+  for (int j = 0; j < kW8A16NTiles; ++j) {
+    const int n = n0 + wn * kW8A16WarpTileN + j * 8 + t2;
+    if (n >= N) continue;
     float b0 = 0.f, b1 = 0.f;
     if (bias != nullptr) {
       b0 = static_cast<float>(bias[n]);
       if (n + 1 < N) b1 = static_cast<float>(bias[n + 1]);
     }
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < kW8A16MTiles; ++i) {
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
-        const int m = m0 + wm * 32 + i * 16 + g + h * 8;
+        const int m = m0 + wm * kW8A16WarpTileM + i * 16 + g + h * 8;
         if (m >= M) continue;
         const float v0 = acc[i][j][2 * h] * s + b0;
         const float v1 = acc[i][j][2 * h + 1] * s + b1;
@@ -252,9 +263,16 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
   if (K % kW8A16TileK != 0) return cudaErrorInvalidValue;  // cp.async slabs must be whole
   const unsigned tiles_m = ceil_div(M, kW8A16TileM);
   if (tiles_m > 65535u) return cudaErrorInvalidValue;  // gridDim.y limit
+  auto* kernel = W8A16Fp8GemmMmaSync128Kernel<T>;
+  static bool attr_set = false;  // per instantiation; the attribute is per function
+  if (!attr_set) {
+    cudaError_t e =
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kW8A16SmemBytes);
+    if (e != cudaSuccess) return e;
+    attr_set = true;
+  }
   const dim3 grid(ceil_div(N, kW8A16TileN), tiles_m);
-  W8A16Fp8GemmMmaSyncKernel<T>
-      <<<grid, kW8A16Threads, 0, stream>>>(act, w, scale, bias, out, M, N, K);
+  kernel<<<grid, kW8A16Threads, kW8A16SmemBytes, stream>>>(act, w, scale, bias, out, M, N, K);
   return cudaGetLastError();
 }
 
