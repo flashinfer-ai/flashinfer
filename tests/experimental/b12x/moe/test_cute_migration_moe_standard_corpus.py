@@ -896,7 +896,7 @@ def test_standard_moe_nvfp4_n16_tail_dynamic_live_graph_oracle(
 
 @pytest.mark.parametrize("share_input", [False, True])
 @pytest.mark.parametrize("topk", [8, 10])
-@pytest.mark.parametrize("m", [4, 7])
+@pytest.mark.parametrize("m", [4, 7, 25])
 @pytest.mark.parametrize("work_source", ["materialized_queue", "persistent_grid"])
 def test_standard_moe_external_route_plan_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,

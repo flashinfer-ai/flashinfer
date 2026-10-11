@@ -4382,9 +4382,13 @@ class MoEDynamicKernelBackend:
             cute.arch.sync_threads()
 
         if cutlass.const_expr(not self.work_is_streaming):
-            # The active materialized sources rendezvous once, publish every
-            # physical tile, then consume a fully addressable work domain.
-            if cutlass.const_expr(not self.w4a8_m1_materialized):
+            # NVFP4 external routing fixes counts and offsets before input packing.
+            # Task publication can overlap packing; the barrier after publication
+            # makes both packed inputs and task metadata visible to consumers.
+            if cutlass.const_expr(
+                not self.w4a8_m1_materialized
+                and not (self.external_route_plan and self.quant_recipe == "nvfp4")
+            ):
                 self._resident_grid_barrier(
                     barrier_count,
                     barrier_epoch,

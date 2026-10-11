@@ -11631,7 +11631,7 @@ def _get_dynamic_kernel(
         ),
         compile_spec=KernelCompileSpec.from_key(
             "integration.tp_moe.dynamic",
-            9,
+            11,
             cache_key,
         ),
         dsl_compile_options=dsl_compile_options,
