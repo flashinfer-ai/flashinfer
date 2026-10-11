@@ -494,11 +494,14 @@ def test_decode_config_round3_fused_rows(arch):
     # 16-token tiles cannot keep eight 4-lane groups busy per stage: the table's 4 lanes widen to 8, coupled staging.
     # Round 5: the 24-tile M = 256 row moves to a 4-CTA cluster split-K route (each CTA owns a quarter of K, FP32 partials
     # are exchanged through distributed shared memory in one round); the small dedicated inbox is used (no aliasing).
+    # Round 9 (K2, tier A' rule-5 packets k2x2_sm_100a / k2x5_sm_103a): the cluster widens to 6 CTAs on both GPUs (each
+    # CTA owns a sixth of K; the same one-round DSM exchange, bit-exact; the table keeps ``split`` 4 and the config takes
+    # the cluster width as its split), so ``split`` = ``csplit`` = 6 and the key carries ``_cs6``.
     cfg = decode_config(256, 1, 28, arch, SM_COUNT)
     assert (cfg.tok, cfg.split, cfg.csplit, cfg.cs_alias, cfg.fused) == (
         16,
-        4,
-        4,
+        6,
+        6,
         False,
         True,
     )
@@ -507,15 +510,16 @@ def test_decode_config_round3_fused_rows(arch):
     # 1.015-1.022x on both GPUs in 7 own-process rounds, bit-exact.
     # Round 8 (convergence passes): the cell runs 8 quantizer lanes on both GPUs (``_q8``); on sm_103a the BF16 ring is a
     # two-stage half-slot ring with the early release (``_r2_xh_qe``) and the token tile is prefetched one stage ahead
-    # (``_px1`` after ``_cs4``). See the Cake design record, round 8.
-    xb, key = {
-        "sm_100a": (4, "decode:t16_p4_fused_r4_x4_q8_cs4"),
-        "sm_103a": (2, "decode:t16_p4_fused_r2_xh_qe_x4_q8_cs4_px1"),
+    # (``_px1`` after ``_cs4``). See the Cake design record, round 8.  Round 9 (K2): with the 6-CTA inbox the SMEM clamp
+    # keeps three W stages on sm_100a (4-slot rings; ``_p3``) and four on sm_103a (2-slot ring; ``_p4``).
+    xb, module_stages, key = {
+        "sm_100a": (4, 3, "decode:t16_p3_fused_r4_x4_q8_cs6"),
+        "sm_103a": (2, 4, "decode:t16_p4_fused_r2_xh_qe_x4_q8_cs6_px1"),
     }[arch]
     assert (cfg.xb_stages, cfg.xq_stages, cfg.module_stages, cfg.qlanes) == (
         xb,
         4,
-        4,
+        module_stages,
         8,
     )
     assert cfg.kernel_key == key
@@ -591,8 +595,9 @@ def test_decode_config_round6_continuation_rules(arch):
         assert cfg.kernel_key_for(False) == cfg.kernel_key
     # Round 8 (knob-catalog sweep, passes 1-5) adopted further bit-exact tstore cells on both GPUs, and pass 14 adopted
     # ``tstore`` on the 24,2,512 cell of both architectures (27 / 29); see the Cake design record, round 8 (R8-14 and
-    # the pass records).
-    assert n_tstore == {"sm_100a": 27, "sm_103a": 29}[arch]
+    # the pass records).  Round 9 (K2, rule-5 packets): the sm_103a 5,28,512 cell moved to a 3-CTA cluster split-K route,
+    # which has no TMA-store epilogue, so its ``tstore`` flag is 0 (27 / 28).
+    assert n_tstore == {"sm_100a": 27, "sm_103a": 28}[arch]
     # Round-6 next loop (lever PX-S): eight small fused buckets per architecture prefetch their BF16 token tile one stage
     # ahead of its TMA load (``pfx: 1`` -> the ``_px1`` program); a prefetch changes no data path and no launch argument.
     n_pfx = 0
@@ -747,12 +752,18 @@ def test_decode_config_round6_continuation_rules(arch):
     # Round 6 continuation 12 (lever SKO): the tabulated ``gemm_sk`` rows launch the ordered stream-K instance when the
     # launch has one full wave of CTA pairs plus at most half a wave of tail tiles: the head pair of each tail tile runs
     # the first K half and hands its FP32 partial to the tail pair, which continues the same accumulation (bit-exact).
-    sk_rows = {k: e for k, e in decode_table(arch).items() if "gemm_sk" in e}
+    # A cell whose ordered form was replaced keeps the flag as ``gemm_sk: 0`` next to its new form (round 9: the sm_100a
+    # 56,48,4096 cell moved to the fix-up form), so the flag is read for truth, as the host does.
+    sk_rows = {k: e for k, e in decode_table(arch).items() if e.get("gemm_sk")}
     # round 7 adds measured stream-K cells on the 512 / 1024 / 2048 buckets; every cell's window opens at its bucket.
     # Round 8 (R8-19): the sm_103a 56,48,4096 selection is pruned -- on the 152-SM part the 448-tile launch leaves a
-    # 68-tile fractional wave (more than half a wave), so the ordered window never opened there; sm_100a keeps the cell.
+    # 68-tile fractional wave (more than half a wave), so the ordered window never opened there (a plain cell); the
+    # sm_100a cell carries exactly one stream-K form (ordered until round 9's third-wave adoption, fix-up after it).
     assert {"12,28,4096", "96,28,512"} <= set(sk_rows)
-    assert ("56,48,4096" in sk_rows) == (arch == "sm_100a")
+    o_proj_4096 = decode_table(arch).get("56,48,4096", {})
+    assert (bool(o_proj_4096.get("gemm_sk")) != bool(o_proj_4096.get("gemm_skf"))) == (
+        arch == "sm_100a"
+    )
     assert all(e["route"] == "gemm" and e["gemm_sk"] == 1 for e in sk_rows.values())
     sm_count = SM_COUNTS[arch]
     for key in sk_rows:
@@ -792,11 +803,11 @@ def test_decode_config_round6_continuation_rules(arch):
     # the launch has a fractional wave: the last full wave plus the fraction (118 / 119 tiles x 28 K iterations) is cut
     # into 74 equal K ranges; the pair finishing a tile adds the other contributors' FP32 partials in ordinal order
     # (reduction order of those tiles differs from the plain schedule; accepted by the user, max_abs_err 0.03125).
-    skf_rows = {k: e for k, e in decode_table(arch).items() if "gemm_skf" in e}
+    skf_rows = {k: e for k, e in decode_table(arch).items() if e.get("gemm_skf")}
     # round 7 adds measured fix-up stream-K cells on the 512 / 1024 / 2048 buckets; the round-6 cells stay
     assert {"384,28,256", "386,28,256", "5,28,16384"} <= set(skf_rows)
     assert all(
-        e["route"] == "gemm" and e["gemm_skf"] == 1 and "gemm_sk" not in e
+        e["route"] == "gemm" and e["gemm_skf"] == 1 and not e.get("gemm_sk")
         for e in skf_rows.values()
     )
     # 192 tiles (1 x 192 or 128 x 3 / 2) over 74 pairs: 2 full waves + 44 -> SK region = 118 tiles x 28 = 3304 K
@@ -842,7 +853,16 @@ def test_decode_config_round6_continuation_rules(arch):
         cb.gemm_stream_k_fixup_plan(256, 384, 28, arch, 96, cb._m_tiles(256), 192, 256)
         is None
     )
-    assert {"gemm_tstore_skf", "gemm_tstore_n192_skf"} <= required
+    # The kv_a 16384 cell (5,28,16384: ``gemm_bn`` 192 + ``gemm_skf``) names the 192-wide fix-up program; round 9 (K6) adds
+    # ``gemm_bk`` 128 to that cell on both GPUs, so its program carries ``_k128`` before ``_skf`` (round 8, lever L8).
+    kv_a_16384 = decode_table(arch)["5,28,16384"]
+    assert kv_a_16384.get("gemm_skf") and kv_a_16384.get("gemm_bn") == 192
+    n192_skf = (
+        "gemm_tstore_n192"
+        + ("_k128" if kv_a_16384.get("gemm_bk") == 128 else "")
+        + "_skf"
+    )
+    assert {"gemm_tstore_skf", n192_skf} <= required
     assert not any(
         k.startswith(("gemm_rstaged", "gemm_n192", "gemm_pf")) and k.endswith("_skf")
         for k in required
@@ -1143,6 +1163,17 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             else cb.BLOCK_K
         )
         k128 = "_k128" if bk == 128 else ""
+        # Round 9 (K6 arm G1): the tabulated ``gemm_stages`` / ``gemm_ts_slots`` rows launch the ``_s<n>`` / ``_ts<n>`` form
+        # of the TMA-store program (two operand stages, four staging slots; same output bits); the register epilogues
+        # keep the (3, 1) programs.  The tokens follow ``_k128`` and precede the stream-K suffix.
+        stages, slots = (
+            cb.gemm_stages_ts_slots(
+                M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch
+            )
+            if expected_kernel == "gemm_tstore"
+            else (cb.GEMM_NUM_STAGES, cb.GEMM_TS_SLOTS)
+        )
+        isfx = cb.gemm_instance_suffix(stages, slots)
         # Round 6 continuation 12 (lever SKO): the tabulated ``gemm_sk`` rows inside the stream-K wave window launch the
         # ``_sk`` instance over 2 x dp CTAs with the hand-off area behind the activation scale tiles.
         sk = cb.gemm_stream_k_plan(
@@ -1155,7 +1186,7 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             plan.gemm_n_tiles,
         )
         sk_key = cb.gemm_kernel_key(
-            expected_kernel + ("_n192" if bn == 192 else "") + k128 + "_sk", gpf
+            expected_kernel + ("_n192" if bn == 192 else "") + k128 + isfx + "_sk", gpf
         )
         if sk is not None and not cb.route_available(plan.arch, (sk_key,)):
             sk = None  # only the TMA-store stream-K program ships: other views keep the plain program
@@ -1177,7 +1208,7 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             else None
         )
         skf_key = cb.gemm_kernel_key(
-            expected_kernel + ("_n192" if bn == 192 else "") + k128 + "_skf", gpf
+            expected_kernel + ("_n192" if bn == 192 else "") + k128 + isfx + "_skf", gpf
         )
         if skf is not None and not cb.route_available(plan.arch, (skf_key,)):
             skf = None
@@ -1186,6 +1217,7 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             expected_kernel
             + ("_n192" if bn == 192 else "")
             + k128
+            + isfx
             + ("_sk" if sk is not None else "_skf" if skf is not None else ""),
             gpf,
         )
@@ -1194,6 +1226,7 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             _prepared.n_tiles if bn == 256 else -(-_prepared.n_valid // 192),
             bk,
         )
+        assert (plan.gemm_stages, plan.gemm_ts_slots) == (stages, slots)
         assert plan.grids[-1] == (
             sk.grid
             if sk is not None
