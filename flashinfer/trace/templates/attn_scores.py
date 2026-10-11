@@ -651,3 +651,32 @@ fp4_paged_mqa_logits_trace = TraceTemplate(
     check=_paged_mqa_logits_masked_check,
     init=_fp4_paged_mqa_logits_init,
 )
+
+
+single_head_paged_mqa_logits_trace = TraceTemplate(
+    op_type="single_head_paged_mqa_logits",
+    description=(
+        "Single-head paged MQA logits: FP32 dot products of query rows with their "
+        "request's paged BF16 keys (no head weights or ReLU). SM100/SM103."
+    ),
+    axes={
+        "rows": Var(description="Query rows, 1 to 8 per request group."),
+        "groups": Var(description="Groups of query rows, one request each."),
+        "requests": Var(description="Block-table rows."),
+        "pages": Var(description="Key cache pages."),
+        "blocks": Var(description="64-key blocks per request."),
+        "max_context": Var(description="Score columns: the context capacity."),
+        "page_size": Const(description="Keys per page."),
+        "dim": Const(description="Key and query dimension."),
+    },
+    inputs={
+        "query": Tensor(["rows", "dim"]),
+        "key_cache": Tensor(["pages", "page_size", "dim"]),
+        "block_table": Tensor(["requests", "blocks"]),
+        "context_lengths": Tensor(["groups"]),
+        "requests": Tensor(["groups"]),
+        "scores": Tensor(["rows", "max_context"]),
+    },
+    outputs={"scores": Tensor(["rows", "max_context"], dtype="float32")},
+    tags=["arch:sm100", "arch:sm103"],
+)
