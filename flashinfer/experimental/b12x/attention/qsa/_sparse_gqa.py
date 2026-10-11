@@ -20,7 +20,7 @@ from b12x._lib.compile_plan import (
 )
 
 from ._sparse_gqa_cute_config import (
-    MAX_SPLIT_ROWS as _MAX_SPLIT_ROWS,
+    split_row_limit,
     _is_page_token_head_layout,
     is_candidate as _cute_is_candidate,
     is_qwen_geometry as _is_qwen_geometry,
@@ -150,7 +150,7 @@ def _validate_launch(
             "output_lse must be contiguous float32 [capacity_rows, q_heads]"
         )
 
-    if rows > _MAX_SPLIT_ROWS:
+    if rows > split_row_limit(int(key_cache.shape[2])):
         if not query.is_contiguous():
             raise ValueError("query must be contiguous for selected-position paging")
         if not (
@@ -288,7 +288,7 @@ def launch_sparse_paged_gqa(
     if compile_only_launches_enabled():
         from ..paged._selected_forward import _compile, launch_sparse_gqa_merge
 
-        direct = int(query.shape[0]) > _MAX_SPLIT_ROWS
+        direct = int(query.shape[0]) > split_row_limit(int(key_cache.shape[2]))
         _, raw = _compile(
             query=query,
             key_cache=key_cache,
@@ -357,7 +357,7 @@ def launch_sparse_paged_gqa(
             run_compiled,
         )
 
-        direct = rows > _MAX_SPLIT_ROWS
+        direct = rows > split_row_limit(int(key_cache.shape[2]))
         raw = _prepared["direct" if direct else "split"]
         request_id_type = Int32 if request_ids.dtype == torch.int32 else Int64
         kv_type = Float8E4M3FN if key_cache.dtype == torch.float8_e4m3fn else BFloat16
@@ -418,7 +418,7 @@ def launch_sparse_paged_gqa(
                 ),
             )
         return output[:rows]
-    if rows > _MAX_SPLIT_ROWS:
+    if rows > split_row_limit(int(key_cache.shape[2])):
         from ..paged._selected_forward import launch_selected_paged_gqa_direct
 
         launch_selected_paged_gqa_direct(

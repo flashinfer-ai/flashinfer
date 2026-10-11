@@ -78,16 +78,25 @@ def test_split_policy_changes_plan_identity_without_changing_config_schema():
         (512, 1, 2048),
     ],
 )
-def test_default_policy_retains_partition_and_workspace(rows, splits, product):
-    caps = _caps(max_batch=1, max_q_rows=rows)
+@pytest.mark.parametrize("kv_heads", [1, 2])
+def test_default_policy_retains_partition_and_workspace(
+    rows, splits, product, kv_heads
+):
+    if kv_heads == 2:
+        splits = 1 if rows > 64 else splits
+        product = min(product, 1024)
+    caps = _caps(max_batch=1, max_q_rows=rows, kv_heads=kv_heads)
     assert contract._target_splits(caps, rows) == (16, splits)
     assert contract._scratch_layout(caps)[4:] == (product, rows)
 
 
 @pytest.mark.parametrize("splits", [1, 16, 64])
 @pytest.mark.parametrize("rows", [1, 2, 4, 16, 64, 65, 128, 512])
-def test_fixed_policy_bounds_only_partial_scratch(rows, splits):
-    caps = _caps(max_batch=1, max_q_rows=rows, attention_splits=splits)
+@pytest.mark.parametrize("kv_heads", [1, 2])
+def test_fixed_policy_bounds_only_partial_scratch(rows, splits, kv_heads):
+    caps = _caps(
+        max_batch=1, max_q_rows=rows, attention_splits=splits, kv_heads=kv_heads
+    )
     layout, score_chunk, score_width, score_chunks, product, work_rows = (
         contract._scratch_layout(caps)
     )
@@ -95,7 +104,7 @@ def test_fixed_policy_bounds_only_partial_scratch(rows, splits):
     assert contract._target_splits(caps, rows) == (16, splits)
     assert work_rows == rows
     assert (score_chunk, score_width, score_chunks) == default[1:4]
-    assert product == min(rows, 128) * splits
+    assert product == min(rows, 128 if kv_heads == 1 else 64) * splits
     assert layout.partial_output_nbytes == product * 24 * 256 * 4
     assert layout.partial_lse_nbytes == product * 24 * 4
     for name in ("prepared_query_nbytes", "score_nbytes", "topk_nbytes"):
@@ -182,8 +191,9 @@ def _operands(caps, device="meta"):
 
 def _assert_launch_slices(calls, operands, caps):
     rows = caps.max_q_rows
+    limit = 128 if caps.kv_heads == 1 else 64
     expected_rows = (
-        [min(128, rows - start) for start in range(0, rows, 128)]
+        [min(limit, rows - start) for start in range(0, rows, limit)]
         if caps.attention_splits
         else [rows]
     )
@@ -191,7 +201,7 @@ def _assert_launch_slices(calls, operands, caps):
     start = 0
     for call, count in zip(calls, expected_rows, strict=True):
         assert call["splits"] == (
-            caps.attention_splits or contract._qwen_row_splits(count)
+            caps.attention_splits or contract._qwen_row_splits(count, caps.kv_heads)
         )
         for name in (
             "query",
@@ -208,7 +218,7 @@ def _assert_launch_slices(calls, operands, caps):
                 tensor.storage_offset()
                 == source.storage_offset() + start * source.stride(0)
             )
-        if caps.attention_splits or count <= 128:
+        if caps.attention_splits or count <= limit:
             assert call["partial_output"].shape == (
                 count,
                 call["splits"],
@@ -232,12 +242,14 @@ def _assert_launch_slices(calls, operands, caps):
 @pytest.mark.parametrize("splits", [0, 1, 16, 64])
 @pytest.mark.parametrize("rows", [1, 4, 16, 64, 65, 128, 129, 512])
 @pytest.mark.parametrize("dcp_size", [1, 2])
+@pytest.mark.parametrize("kv_heads", [1, 2])
 def test_combined_slices_attention_without_slicing_selector(
-    monkeypatch, splits, rows, dcp_size
+    monkeypatch, splits, rows, dcp_size, kv_heads
 ):
     from b12x.attention.qsa import _kernels, _score_cute, _sparse_gqa
 
     caps = _caps(
+        kv_heads=kv_heads,
         max_batch=1,
         max_q_rows=rows,
         attention_splits=splits,
@@ -276,12 +288,14 @@ def test_combined_slices_attention_without_slicing_selector(
 @pytest.mark.parametrize("splits", [0, 1, 16, 64])
 @pytest.mark.parametrize("rows", [1, 4, 16, 64, 65, 128, 129, 512])
 @pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("kv_heads", [1, 2])
 def test_separate_and_draft_attention_use_identical_partition_contract(
-    monkeypatch, splits, rows, draft
+    monkeypatch, splits, rows, draft, kv_heads
 ):
     from b12x.attention.qsa import _sparse_gqa
 
     caps = _caps(
+        kv_heads=kv_heads,
         max_batch=rows if draft else 1,
         max_raw_state_slots=max(4, rows),
         max_q_rows=rows,

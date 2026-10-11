@@ -33,7 +33,9 @@ def _random(shape: tuple[int, ...], seed: int) -> torch.Tensor:
     return torch.randn(shape, generator=generator).to(torch.bfloat16)
 
 
-def _binding(device, rows: int, splits: int, *, dcp_rank: int | None = None):
+def _binding(
+    device, rows: int, splits: int, *, dcp_rank: int | None = None, kv_heads: int = 2
+):
     distributed = dcp_rank is not None
     caps = _caps(
         device,
@@ -45,8 +47,8 @@ def _binding(device, rows: int, splits: int, *, dcp_rank: int | None = None):
         num_compressed_cache_pages=64,
         main_page_size=64,
         compressed_page_size=16,
-        q_heads=24,
-        kv_heads=2,
+        q_heads=12 * kv_heads,
+        kv_heads=kv_heads,
         index_heads=4,
         attention_splits=splits,
         max_speculative_tokens=3,
@@ -99,7 +101,7 @@ def _inputs(binding, start: int, live: int):
         is_prefilling=(True,),
     )
     for name, shape, seed in (
-        ("query", (256, 24, 256), 921),
+        ("query", (256, binding.state.caps.q_heads, 256), 921),
         ("index_query", (256, 4, 128), 922),
         ("raw_index_key", (256, 128), 923),
     ):
@@ -234,10 +236,11 @@ def test_fixed_splits_combined_capacity_and_changed_live_graph_replay(splits):
             results[key] = (actual, selected, live_rows)
 
 
-@pytest.mark.parametrize("rows", [128, 129])
-def test_automatic_split_boundary_matches_reference_under_graph_replay(rows):
+@pytest.mark.parametrize("rows", [64, 65, 128, 129])
+@pytest.mark.parametrize("kv_heads", [1, 2])
+def test_automatic_split_boundary_matches_reference_under_graph_replay(rows, kv_heads):
     device = require_b12x()
-    binding = _binding(device, rows, 0)
+    binding = _binding(device, rows, 0, kv_heads=kv_heads)
     dynamic = _inputs(binding, 2048, rows)
     _, restore = _snapshot(_persistent(binding))
     graph, output = _capture(lambda: qsa.run(binding, **dynamic), restore)

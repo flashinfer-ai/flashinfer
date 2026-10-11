@@ -14,6 +14,11 @@ BLOCK_N = 16
 MAX_SPLIT_ROWS = 128
 
 
+def split_row_limit(kv_heads: int) -> int:
+    # Single-head shards need more rows to fill the GPU without splitting.
+    return MAX_SPLIT_ROWS if int(kv_heads) == 1 else 64
+
+
 def _is_page_token_head_layout(tensor: torch.Tensor) -> bool:
     """Accept a strided outer page with non-overlapping inner cache rows."""
     if tensor.ndim != 4 or int(tensor.stride(3)) != 1:
@@ -147,6 +152,7 @@ __all__ = [
     "BLOCK_N",
     "HEAD_DIM",
     "MAX_SPLIT_ROWS",
+    "split_row_limit",
     "NUM_SPLITS",
     "SELECTION_WIDTH",
     "is_candidate",

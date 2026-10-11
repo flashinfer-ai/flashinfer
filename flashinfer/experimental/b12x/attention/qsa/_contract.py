@@ -28,7 +28,7 @@ from ...preparation.types import (
     require_prepared,
 )
 from ._tuning import QsaConfig, QsaQuery, TUNING, _validate_attention_splits
-from ._sparse_gqa_cute_config import MAX_SPLIT_ROWS as _MAX_SPLIT_ROWS
+from ._sparse_gqa_cute_config import split_row_limit
 
 _ALIGN_BYTES = 256
 _SCORE_WORKSPACE_LIMIT_BYTES = 128 * 1024 * 1024
@@ -801,10 +801,12 @@ class _KernelCaps:
         )
 
 
-def _qwen_row_splits(rows: int) -> int:
-    return (
-        64 if rows == 1 else 32 if rows <= 4 else 16 if rows <= _MAX_SPLIT_ROWS else 1
-    )
+def _qwen_row_splits(rows: int, kv_heads: int) -> int:
+    if rows == 1:
+        return 64
+    if rows <= 4:
+        return 32
+    return 16 if rows <= split_row_limit(kv_heads) else 1
 
 
 def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
@@ -822,7 +824,9 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
         block_n=QWEN_CUTE_BLOCK_N,
         splits=QWEN_CUTE_NUM_SPLITS,
     ):
-        return QWEN_CUTE_BLOCK_N, caps.attention_splits or _qwen_row_splits(int(rows))
+        return QWEN_CUTE_BLOCK_N, caps.attention_splits or _qwen_row_splits(
+            int(rows), int(caps.kv_heads)
+        )
     raise NotImplementedError(
         "QSA requires the CuTe Qwen sparse-GQA geometry: q_heads divisible by "
         "kv_heads, head_dim=256, selection_width>=2051; "
@@ -862,11 +866,9 @@ def _scratch_layout(
         * torch.bfloat16.itemsize
     )
     score_nbytes = workspace_q_rows * score_workspace_width * torch.float32.itemsize
-    from ._sparse_gqa_cute_config import MAX_SPLIT_ROWS
-
     max_split_row_product = max(
         rows * _target_splits(caps, rows)[1]
-        for rows in range(1, min(workspace_q_rows, MAX_SPLIT_ROWS) + 1)
+        for rows in range(1, min(workspace_q_rows, split_row_limit(caps.kv_heads)) + 1)
     )
     partial_output_nbytes = (
         max_split_row_product
@@ -1297,7 +1299,8 @@ def _caps_from_query(query: QsaQuery, *, ordinal: int) -> Caps:
 
 def _compile_rows(caps: Caps) -> tuple[int, ...]:
     """Rows whose fixed split/direct native entries can execute at runtime."""
-    candidates = (1, 2, 5, _MAX_SPLIT_ROWS, _MAX_SPLIT_ROWS + 1, caps.max_q_rows)
+    limit = split_row_limit(caps.kv_heads)
+    candidates = (1, 2, 5, limit, limit + 1, caps.max_q_rows)
     return tuple(
         rows for rows in dict.fromkeys(candidates) if 0 < rows <= int(caps.max_q_rows)
     )
@@ -2843,7 +2846,9 @@ def _qsa_decode_impl(
                 _prepared=None if programs is None else programs.support,
             )
         attention_rows = (
-            min(chunk_rows, _MAX_SPLIT_ROWS) if caps.attention_splits else chunk_rows
+            min(chunk_rows, split_row_limit(caps.kv_heads))
+            if caps.attention_splits
+            else chunk_rows
         )
         for attention_start in range(0, chunk_rows, attention_rows):
             count = min(attention_rows, chunk_rows - attention_start)
@@ -4320,7 +4325,7 @@ def _qsa_attention_op(
     )
     # Use the same row-chunk and native CuTe split policy as the combined call.
     if state.caps.attention_splits:
-        work_rows = min(work_rows, _MAX_SPLIT_ROWS)
+        work_rows = min(work_rows, split_row_limit(state.caps.kv_heads))
     for start in range(0, rows, work_rows):
         count = min(work_rows, rows - start)
         row_slice = slice(start, start + count)
@@ -4477,9 +4482,10 @@ def _prime(binding: Binding, *, rows: int | None = None) -> None:
     )
     is_prefilling = torch.ones(int(caps.max_batch), dtype=torch.bool, device=device)
     warm_rows = {requested_rows}
-    if output_capacity > _MAX_SPLIT_ROWS:
-        warm_rows.add(_MAX_SPLIT_ROWS)
-        warm_rows.add(_MAX_SPLIT_ROWS + 1)
+    limit = split_row_limit(caps.kv_heads)
+    if output_capacity > limit:
+        warm_rows.add(limit)
+        warm_rows.add(limit + 1)
     for warm_row_count in sorted(warm_rows):
         query = torch.empty(
             (warm_row_count, int(caps.q_heads), int(caps.head_dim)),
