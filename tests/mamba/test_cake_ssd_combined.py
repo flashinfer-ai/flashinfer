@@ -4415,14 +4415,15 @@ def test_source_chunk_parallel_selection_quantities_follow_the_cost_model():
     # 128 tiles fit the first wave of 148 SMs: the fixed cost alone.
     assert predicted["chunk_parallel"] == pytest.approx(b200["cp_fixed"])
 
-    # The calibration row: 1 x 32768 tokens x 8 heads (the round-4 re-fit
-    # measured 667 -> 134 us on B200 and 617 -> 124 us on B300).
+    # The calibration row: 1 x 32768 tokens x 8 heads (constants re-fit on
+    # the round-5 programs; round 4 measured 667 -> 134 us on B200 and
+    # 617 -> 124 us on B300).
     long_prefill = quantities(8, 256, (10, 0))["predicted_us"]
-    assert long_prefill["exact_scan"] == pytest.approx(668.754)
-    assert long_prefill["chunk_parallel"] == pytest.approx(118.87)
+    assert long_prefill["exact_scan"] == pytest.approx(659.326)
+    assert long_prefill["chunk_parallel"] == pytest.approx(118.29)
     long_prefill = quantities(8, 256, (10, 3))["predicted_us"]
-    assert long_prefill["exact_scan"] == pytest.approx(617.45)
-    assert long_prefill["chunk_parallel"] == pytest.approx(106.38)
+    assert long_prefill["exact_scan"] == pytest.approx(605.04)
+    assert long_prefill["chunk_parallel"] == pytest.approx(105.61)
 
     large = quantities(128, 32, (10, 3))
     b300 = model[(10, 3)]
