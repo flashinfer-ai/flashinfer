@@ -37,9 +37,10 @@ def _w8a16_fp8_gemm_impl(
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor],
     weight_prepared: bool,
+    workspace: Optional[torch.Tensor],
 ) -> None:
     get_w8a16_fp8_gemm_module().w8a16_fp8_gemm(
-        out, act, weight, weight_scale, bias, weight_prepared
+        out, act, weight, weight_scale, bias, weight_prepared, workspace
     )
 
 
@@ -51,8 +52,19 @@ def _w8a16_fp8_gemm_impl_fake(
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor],
     weight_prepared: bool,
+    workspace: Optional[torch.Tensor],
 ) -> None:
     pass
+
+
+@functools.cache
+def _workspace_bytes(m: int, n: int, k: int, device_index: int) -> int:
+    """Bytes of fp32 split-K workspace this problem needs on this device (0 = none)."""
+    return int(
+        get_w8a16_fp8_gemm_module().w8a16_fp8_gemm_workspace_bytes(
+            m, n, k, device_index
+        )
+    )
 
 
 def prepare_w8a16_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -147,5 +159,15 @@ def w8a16_fp8_gemm(
             f"got {tuple(out.shape)} in {out.dtype}"
         )
     out2d = out.reshape(-1, n)
-    _w8a16_fp8_gemm_impl(out2d, act2d, weight, weight_scale, bias, weight_prepared)
+    # Under-filled grids run split-K through an fp32 workspace; the kernel
+    # decides, this only sizes the buffer (0 bytes = single pass).
+    ws_bytes = _workspace_bytes(act2d.shape[0], n, k, act.device.index or 0)
+    workspace = (
+        torch.empty(ws_bytes // 4, dtype=torch.float32, device=act.device)
+        if ws_bytes > 0
+        else None
+    )
+    _w8a16_fp8_gemm_impl(
+        out2d, act2d, weight, weight_scale, bias, weight_prepared, workspace
+    )
     return out

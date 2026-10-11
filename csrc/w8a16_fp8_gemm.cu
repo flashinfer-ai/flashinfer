@@ -21,7 +21,8 @@ using namespace flashinfer;
 
 // out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorView scale,
-                    ffi::Optional<TensorView> bias, bool weight_prepared) {
+                    ffi::Optional<TensorView> bias, bool weight_prepared,
+                    ffi::Optional<TensorView> workspace) {
   CHECK_INPUT(act);     // [M, K], fp16/bf16, contiguous
   CHECK_INPUT(weight);  // [N, K], fp8 e4m3, contiguous
   CHECK_INPUT(out);     // [M, N], act dtype, contiguous
@@ -57,6 +58,19 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
     bias_ptr = b.data_ptr();
   }
 
+  float* ws_ptr = nullptr;
+  int64_t ws_bytes = 0;
+  if (workspace.has_value()) {
+    const auto& wsv = workspace.value();
+    CHECK_INPUT(wsv);
+    CHECK_DEVICE(act, wsv);
+    TVM_FFI_ICHECK(encode_dlpack_dtype(wsv.dtype()) == float32_code) << "workspace must be float32";
+    ws_ptr = static_cast<float*>(wsv.data_ptr());
+    ws_bytes = wsv.numel() * 4;
+  }
+  int num_sms = 0;
+  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, act.device().device_id);
+
   ffi::CUDADeviceGuard device_guard(act.device().device_id);
   const cudaStream_t stream = get_stream(act.device());
 
@@ -66,9 +80,17 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
         static_cast<const __nv_fp8_e4m3*>(weight.data_ptr()),
         static_cast<const float*>(scale.data_ptr()), static_cast<const c_type*>(bias_ptr),
         static_cast<c_type*>(out.data_ptr()), static_cast<int>(M), static_cast<int>(N),
-        static_cast<int>(K), weight_prepared, stream);
+        static_cast<int>(K), weight_prepared, ws_ptr, ws_bytes, num_sms, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "w8a16_fp8_gemm failed with error code " << cudaGetErrorString(status);
     return true;
   });
+}
+
+// Workspace (bytes) the split-K path needs for this problem; 0 when it does not split.
+int64_t w8a16_fp8_gemm_workspace_bytes(int64_t M, int64_t N, int64_t K, int64_t device_id) {
+  int num_sms = 0;
+  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, static_cast<int>(device_id));
+  return gemm::W8A16Fp8GemmWorkspaceBytes(static_cast<int>(M), static_cast<int>(N),
+                                          static_cast<int>(K), num_sms);
 }
