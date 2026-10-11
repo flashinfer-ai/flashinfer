@@ -181,15 +181,48 @@ class DirectWeightSession:
                 torch.cuda.current_stream(self.device).cuda_stream,
             )
 
-    def materialize(self, source):
+    def materialize(self, source, *, device=None):
         """Read owned transform inputs without routing arithmetic through metadata."""
         import torch
 
         if source.device.type != "meta":
-            return source.clone()
-        destination = torch.empty(
-            source.shape, dtype=source.dtype, device=torch.device("cuda", self.device)
+            return source.clone() if device is None else source.to(device, copy=True)
+        target = (
+            torch.device("cuda", self.device)
+            if device is None
+            else torch.device(device)
         )
+        if target.type == "cpu":
+            item = self.sources.get(source.untyped_storage()._cdata)
+            if item is None:
+                raise NotImplementedError(
+                    "checkpoint transform source is not registered"
+                )
+            _, entry = item
+            if (
+                source._version != 0
+                or not source.is_contiguous()
+                or source.element_size() != entry.dtype.itemsize
+                or source.is_neg()
+                or source.is_conj()
+            ):
+                raise NotImplementedError(
+                    "CPU materialization requires an unchanged contiguous checkpoint view"
+                )
+            offset = source.storage_offset() * source.element_size()
+            if offset + source.nbytes > entry.nbytes:
+                raise ValueError(f"source view exceeds checkpoint range: {entry.name}")
+            if not source.numel():
+                return torch.empty(source.shape, dtype=source.dtype, device="cpu")
+            raw = bytearray(
+                self.native.direct_bytes(
+                    self.reader, entry.fd, entry.offset + offset, source.nbytes
+                )
+            )
+            self.payload_bytes += source.nbytes
+            self.loaded_tensors += 1
+            return torch.frombuffer(raw, dtype=source.dtype).reshape(source.shape)
+        destination = torch.empty(source.shape, dtype=source.dtype, device=target)
         self(destination, source)
         self.flush()
         return destination

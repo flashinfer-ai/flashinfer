@@ -49,17 +49,37 @@ def test_tp_column_slices_preserve_padding_and_expand_bf16(
         assert torch.all(backing[:, :, -1] == -17)
 
 
-def test_transform_materialization_owns_values_after_session_close(tmp_path):
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_transform_materialization_owns_values_after_session_close(tmp_path, device):
     expected = torch.arange(4096, dtype=torch.float32).reshape(32, 128)
     path = tmp_path / "transform.safetensors"
     save_file({"weight": expected}, path)
     with (
         DirectWeightSession() as session,
     ):
-        source = dict(session.weights([path]))["weight"][:, 64:]
-        actual = session.materialize(source)
+        extent = (
+            (slice(3, 17), slice(None))
+            if device == "cpu"
+            else (slice(None), slice(64, None))
+        )
+        source = dict(session.weights([path]))["weight"][extent]
+        actual = session.materialize(source, device=device)
+        assert actual.device.type == device
+        assert session.stats()["payload_bytes"] == actual.nbytes
     path.unlink()
-    torch.testing.assert_close(actual.cpu(), expected[:, 64:], rtol=0, atol=0)
+    torch.testing.assert_close(actual.cpu(), expected[extent], rtol=0, atol=0)
+
+
+def test_cpu_materialization_rejects_transformed_checkpoint_views(tmp_path):
+    path = tmp_path / "scales.safetensors"
+    save_file({"scales": torch.ones((32, 16), dtype=torch.uint8)}, path)
+    with DirectWeightSession() as session:
+        source = dict(session.weights([path]))["scales"]
+        with pytest.raises(NotImplementedError, match="contiguous"):
+            session.materialize(source[:, ::2], device="cpu")
+        source.add_(1)
+        with pytest.raises(NotImplementedError, match="unchanged"):
+            session.materialize(source, device="cpu")
 
 
 @pytest.mark.parametrize("offset", [0, 4103, 2**32 + 4103])
