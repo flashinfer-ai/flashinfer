@@ -25,17 +25,16 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 2 of the optimization ladder: shared-memory tiling.  Rung 1 streamed
-// both operands from L2/DRAM with no reuse beyond L1 (ncu: 1.5 TB/s of
-// traffic for 3 TFLOP/s, 44 of 47 issue cycles long-scoreboard).  Here a
-// 256-thread block computes a 16x16 output tile: for each BK=64 slab of K it
-// stages act[16][64] (bf16) and w[16][64] (fp8) in shared memory with
-// coalesced loads along K (each thread moves 4 act and 4 w elements), then
-// every thread computes one output from the two staged tiles.  Each staged
-// act element now feeds 16 outputs and each weight element 16 outputs
-// instead of one.  The smem rows are padded (66 bf16 / 68 fp8 = 33 / 17
-// words) so the 16 rows a warp reads at one k land in different banks.
-// Still one output per thread, scalar loads, SIMT fp32 FMA.
+// Rung 3 of the optimization ladder: register blocking.  Rung 2 computed one
+// output per thread from the smem tiles, i.e. two smem loads plus two
+// conversions per FMA, and ncu showed it issue-bound (82% issue slots busy,
+// IPC 3.3, 93% L1/TEX pipe) at 6.9 TFLOP/s.  Here a 256-thread block owns a
+// 64x64 output tile and every thread accumulates a 4x4 register block: per k
+// it loads 4 act and 4 weight values from smem and does 16 FMAs.  A thread's
+// rows / columns are strided by 16 inside the tile (ty + 16 i, tx + 16 j) so
+// the 16 weight rows a warp reads at one k are 9 words apart (conflict-free)
+// and the 2-byte output stores along n stay coalesced.  Still scalar loads,
+// still a per-element fp8 -> float conversion, still SIMT fp32 FMA.
 
 #include <cuda_fp8.h>
 
@@ -46,30 +45,39 @@
 namespace flashinfer {
 namespace gemm {
 
-constexpr int kW8A16TileM = 16;
-constexpr int kW8A16TileN = 16;
-constexpr int kW8A16TileK = 64;
-constexpr int kW8A16Threads = kW8A16TileM * kW8A16TileN;  // one output per thread
+constexpr int kW8A16TileM = 64;
+constexpr int kW8A16TileN = 64;
+constexpr int kW8A16TileK = 32;
+constexpr int kW8A16ThreadM = 4;  // outputs per thread along m
+constexpr int kW8A16ThreadN = 4;  // outputs per thread along n
+constexpr int kW8A16Threads = (kW8A16TileM / kW8A16ThreadM) * (kW8A16TileN / kW8A16ThreadN);
 
 template <typename T>
 __global__ void __launch_bounds__(kW8A16Threads)
-    W8A16Fp8GemmSmemTiledKernel(const T* __restrict__ act, const __nv_fp8_e4m3* __restrict__ w,
-                                const float* __restrict__ scale, const T* __restrict__ bias,
-                                T* __restrict__ out, int M, int N, int K) {
+    W8A16Fp8GemmRegBlockedKernel(const T* __restrict__ act, const __nv_fp8_e4m3* __restrict__ w,
+                                 const float* __restrict__ scale, const T* __restrict__ bias,
+                                 T* __restrict__ out, int M, int N, int K) {
+  constexpr int kThreadsN = kW8A16TileN / kW8A16ThreadN;  // 16
+  constexpr int kThreadsM = kW8A16TileM / kW8A16ThreadM;  // 16
+  // Row strides of 34 bf16 (17 words) and 36 fp8 (9 words): both odd, so
+  // rows 16 apart never share a bank.
   __shared__ T a_s[kW8A16TileM][kW8A16TileK + 2];
   __shared__ __nv_fp8_e4m3 w_s[kW8A16TileN][kW8A16TileK + 4];
 
-  const int tx = threadIdx.x & (kW8A16TileN - 1);  // n within the tile
-  const int ty = threadIdx.x / kW8A16TileN;        // m within the tile
+  const int tx = threadIdx.x % kThreadsN;
+  const int ty = threadIdx.x / kThreadsN;
   const int m0 = blockIdx.y * kW8A16TileM;
   const int n0 = blockIdx.x * kW8A16TileN;
-  const int m = m0 + ty;
-  const int n = n0 + tx;
 
-  float acc = 0.f;
+  float acc[kW8A16ThreadM][kW8A16ThreadN];
+#pragma unroll
+  for (int i = 0; i < kW8A16ThreadM; ++i)
+#pragma unroll
+    for (int j = 0; j < kW8A16ThreadN; ++j) acc[i][j] = 0.f;
+
   for (int k0 = 0; k0 < K; k0 += kW8A16TileK) {
-    // Stage: 16 rows x 64 columns of each operand, 4 elements per thread,
-    // consecutive threads take consecutive k so the global reads coalesce.
+    // Stage 64 rows x 32 columns of each operand; consecutive threads take
+    // consecutive k so the global reads coalesce.
 #pragma unroll
     for (int i = 0; i < (kW8A16TileM * kW8A16TileK) / kW8A16Threads; ++i) {
       const int idx = threadIdx.x + i * kW8A16Threads;
@@ -82,16 +90,37 @@ __global__ void __launch_bounds__(kW8A16Threads)
       w_s[r][c] = (gn < N && gk < K) ? w[static_cast<int64_t>(gn) * K + gk] : __nv_fp8_e4m3(0.f);
     }
     __syncthreads();
-#pragma unroll 16
+#pragma unroll 8
     for (int kk = 0; kk < kW8A16TileK; ++kk) {
-      acc = fmaf(static_cast<float>(a_s[ty][kk]), static_cast<float>(w_s[tx][kk]), acc);
+      float a_frag[kW8A16ThreadM];
+      float w_frag[kW8A16ThreadN];
+#pragma unroll
+      for (int i = 0; i < kW8A16ThreadM; ++i) {
+        a_frag[i] = static_cast<float>(a_s[ty + i * kThreadsM][kk]);
+      }
+#pragma unroll
+      for (int j = 0; j < kW8A16ThreadN; ++j) {
+        w_frag[j] = static_cast<float>(w_s[tx + j * kThreadsN][kk]);
+      }
+#pragma unroll
+      for (int i = 0; i < kW8A16ThreadM; ++i)
+#pragma unroll
+        for (int j = 0; j < kW8A16ThreadN; ++j) acc[i][j] = fmaf(a_frag[i], w_frag[j], acc[i][j]);
     }
     __syncthreads();
   }
 
-  if (m < M && n < N) {
+  const float s = *scale;
+#pragma unroll
+  for (int j = 0; j < kW8A16ThreadN; ++j) {
+    const int n = n0 + tx + j * kThreadsN;
+    if (n >= N) continue;
     const float b = bias != nullptr ? static_cast<float>(bias[n]) : 0.f;
-    out[static_cast<int64_t>(m) * N + n] = static_cast<T>(acc * (*scale) + b);
+#pragma unroll
+    for (int i = 0; i < kW8A16ThreadM; ++i) {
+      const int m = m0 + ty + i * kThreadsM;
+      if (m < M) out[static_cast<int64_t>(m) * N + n] = static_cast<T>(acc[i][j] * s + b);
+    }
   }
 }
 
@@ -101,7 +130,7 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
   const unsigned tiles_m = ceil_div(M, kW8A16TileM);
   if (tiles_m > 65535u) return cudaErrorInvalidValue;  // gridDim.y limit
   const dim3 grid(ceil_div(N, kW8A16TileN), tiles_m);
-  W8A16Fp8GemmSmemTiledKernel<T>
+  W8A16Fp8GemmRegBlockedKernel<T>
       <<<grid, kW8A16Threads, 0, stream>>>(act, w, scale, bias, out, M, N, K);
   return cudaGetLastError();
 }
