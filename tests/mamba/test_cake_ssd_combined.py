@@ -5121,40 +5121,51 @@ def test_cake_ssd_combined_auto_keeps_the_exact_scan_for_many_heads(monkeypatch)
 # ---- exact-scan schedule variant (CAKE-956 round 5 host selection) -------------------------------------------
 
 _VARIANT_CASES = (
-    # (mode_varlen, has_z, nheads, num_sequences, total_tokens, batch, seqlen) -> variant; calibration cells
-    ((True, True, 128, 8, 8 * 64, 1, 8 * 64), "noring"),  # nem_v8x64 (1.019 / 1.013): the gate's losing row
-    ((True, True, 128, 64, 64 * 64, 1, 64 * 64), "noring"),  # v64x64z 1.008 / 1.002
-    ((True, True, 128, 6, 6 * 64, 1, 6 * 64), "noring"),  # g6x64z 1.009 / 1.006
-    ((True, True, 128, 4, 4 * 64, 1, 4 * 64), "noring"),  # g4x64z tie (1.000-1.003 / 0.999-1.002): start
-    ((True, True, 128, 3, 3 * 64, 1, 3 * 64), ""),  # g3x64z 0.986 / 0.990
-    ((True, True, 128, 1, 64, 1, 64), ""),  # g1x64z 0.937 / 0.943
-    ((True, True, 128, 8, 8 * 63, 1, 8 * 63), ""),  # g8x63z 0.974 / 0.976 (window edge)
-    ((True, True, 128, 8, 8 * 65, 1, 8 * 65), ""),  # g8x65z 0.979 / 0.963 (window edge)
-    ((True, True, 128, 8, 8 * 60, 1, 8 * 60), ""),  # g8x60z 0.961 / 0.960
-    ((True, True, 128, 8, 4 * (63 + 65), 1, 512), "noring"),  # [63, 65] x 4: 1.008 / 1.007
-    ((True, True, 128, 8, 4 * (32 + 96), 1, 512), "noring"),  # [32, 96] x 4: 1.006 / 1.005
-    ((True, True, 128, 8, 516, 1, 516), "noring"),  # 64.5 tokens on average: inside the window, start
-    ((True, True, 128, 5, 5 * 64, 1, 5 * 64), "noring"),  # g5x64z tie (1.001 / 0.994): start
-    ((True, True, 128, 8, 8 * 32, 1, 8 * 32), ""),  # g8x32z 0.988 / 0.985
-    ((True, True, 128, 8, 8 * 128, 1, 8 * 128), ""),  # g8x128z 0.915 / 0.917
-    ((True, True, 128, 2, 96 + 160, 1, 256), ""),  # nem_v96p160 0.964 / 0.960
-    ((True, True, 128, 64, 64 * 128, 1, 64 * 128), ""),  # nem_v64x128 0.901 / 0.906
-    ((True, False, 128, 8, 8 * 64, 1, 8 * 64), ""),  # g8x64 (no z) 0.992 / 0.990
-    ((True, False, 128, 2, 124, 1, 124), ""),  # short_varlen_64_60 (no z) 1.000 / 1.003
-    ((True, True, 8, 8, 8 * 64, 1, 8 * 64), ""),  # 64 work items (one wave, nheads 8): ring
-    ((True, True, 8, 64, 64 * 64, 1, 64 * 64), "noring"),  # 512 work items at 64 tokens
-    ((False, False, 128, 2, 100, 2, 50), "noring"),  # short_batched_2x50 1.008 / 1.005
-    ((False, False, 128, 2, 150, 2, 75), "noring"),  # gb2x75 1.005 / 0.993
-    ((False, False, 128, 2, 120, 2, 60), "noring"),  # gb2x60 1.000 / 1.000 (tie): start
-    ((False, False, 128, 2, 50, 2, 25), ""),  # gb2x25 0.990 / 0.991
-    ((False, False, 128, 2, 180, 2, 90), ""),  # gb2x90 0.987 / 0.995
-    ((False, False, 128, 2, 200, 2, 100), ""),  # gb2x100 0.995 / 0.991
-    ((False, False, 128, 1, 50, 1, 50), ""),  # gb1x50 0.970 / 0.955
-    ((False, False, 128, 3, 150, 3, 50), ""),  # gb3x50 0.992 / 0.986
-    ((False, True, 128, 2, 100, 2, 50), ""),  # gb2x50z 1.002 / 0.987 (z: ring)
-    ((False, False, 128, 4, 200, 4, 50), ""),  # gb4x50 0.973 / 0.960
-    ((False, False, 128, 1, 1000, 1, 1000), ""),  # nem_b1x1000 0.925 / 0.911
-    ((False, True, 128, 64, 64 * 128, 64, 128), ""),  # gb64x128z 0.898 / 0.908
+    # (mode_varlen, has_z, nheads, num_sequences, total_tokens, batch, seqlen, state dtype) -> variant;
+    # kernel-level calibration cells (ring / start, GB300 / B200) unless marked FI (the FI-level window
+    # gate and the 93-row gate rows, which decide the bf16 2 x 64 and 3 x 64 cells)
+    ((True, True, 128, 8, 8 * 64, 1, 8 * 64, "bfloat16"), "noring"),  # nem_v8x64 (1.019 / 1.013): the gate's losing row
+    ((True, True, 128, 64, 64 * 64, 1, 64 * 64, "bfloat16"), "noring"),  # v64x64z 1.008 / 1.002
+    ((True, True, 128, 6, 6 * 64, 1, 6 * 64, "bfloat16"), "noring"),  # g6x64z 1.009 / 1.006
+    ((True, True, 128, 4, 4 * 64, 1, 4 * 64, "bfloat16"), "noring"),  # g4x64z tie (1.000-1.003 / 0.999-1.002): start
+    ((True, True, 128, 3, 3 * 64, 1, 3 * 64, "bfloat16"), "noring"),  # FI win_v3x64_bfloat16 0.996 / 0.989 (tie): start
+    ((True, True, 128, 2, 2 * 64, 1, 2 * 64, "bfloat16"), "noring"),  # FI nem_v64_64_bfloat16 1.011-1.018 / 0.997: start
+    ((True, True, 128, 1, 64, 1, 64, "bfloat16"), ""),  # g1x64z 0.937 / 0.943; FI 0.937 / 0.940
+    ((True, True, 128, 3, 3 * 64, 1, 3 * 64, "float32"), ""),  # FI win_v3x64_float32 0.978 / 0.974
+    ((True, True, 128, 2, 2 * 64, 1, 2 * 64, "float32"), ""),  # FI nem_v64_64_float32 0.978-1.003 / 0.977
+    ((True, True, 128, 1, 64, 1, 64, "float32"), ""),  # FI win_v1x64_float32 0.939 / 0.941
+    ((True, True, 128, 4, 4 * 64, 1, 4 * 64, "float32"), "noring"),  # f32 threshold unchanged: 4 x 128 items
+    ((True, True, 128, 2, 2 * 64, 1, 2 * 64, "float16"), "noring"),  # f16 state follows bf16 (same state width)
+    ((True, True, 128, 8, 8 * 63, 1, 8 * 63, "bfloat16"), ""),  # g8x63z 0.974 / 0.976 (window edge)
+    ((True, True, 128, 8, 8 * 65, 1, 8 * 65, "bfloat16"), ""),  # g8x65z 0.979 / 0.963 (window edge)
+    ((True, True, 128, 8, 8 * 60, 1, 8 * 60, "bfloat16"), ""),  # g8x60z 0.961 / 0.960
+    ((True, True, 128, 8, 4 * (63 + 65), 1, 512, "bfloat16"), "noring"),  # [63, 65] x 4: 1.008 / 1.007
+    ((True, True, 128, 8, 4 * (32 + 96), 1, 512, "bfloat16"), "noring"),  # [32, 96] x 4: 1.006 / 1.005
+    ((True, True, 128, 8, 516, 1, 516, "bfloat16"), "noring"),  # 64.5 tokens on average: inside the window, start
+    ((True, True, 128, 5, 5 * 64, 1, 5 * 64, "bfloat16"), "noring"),  # g5x64z tie (1.001 / 0.994): start
+    ((True, True, 128, 8, 8 * 32, 1, 8 * 32, "bfloat16"), ""),  # g8x32z 0.988 / 0.985
+    ((True, True, 128, 8, 8 * 128, 1, 8 * 128, "bfloat16"), ""),  # g8x128z 0.915 / 0.917
+    ((True, True, 128, 2, 96 + 160, 1, 256, "bfloat16"), ""),  # nem_v96p160 0.964 / 0.960
+    ((True, True, 128, 64, 64 * 128, 1, 64 * 128, "bfloat16"), ""),  # nem_v64x128 0.901 / 0.906
+    ((True, False, 128, 8, 8 * 64, 1, 8 * 64, "bfloat16"), ""),  # g8x64 (no z) 0.992 / 0.990
+    ((True, False, 128, 2, 124, 1, 124, "bfloat16"), ""),  # short_varlen_64_60 (no z) 1.000 / 1.003
+    ((True, True, 8, 8, 8 * 64, 1, 8 * 64, "bfloat16"), ""),  # 64 work items (below both thresholds): ring
+    ((True, True, 8, 32, 32 * 64, 1, 32 * 64, "bfloat16"), "noring"),  # 256 work items at 64 tokens, 16-bit state
+    ((True, True, 8, 32, 32 * 64, 1, 32 * 64, "float32"), ""),  # 256 work items at 64 tokens, f32 state: ring
+    ((True, True, 8, 64, 64 * 64, 1, 64 * 64, "float32"), "noring"),  # 512 work items at 64 tokens
+    ((False, False, 128, 2, 100, 2, 50, "bfloat16"), "noring"),  # short_batched_2x50 1.008 / 1.005
+    ((False, False, 128, 2, 150, 2, 75, "bfloat16"), "noring"),  # gb2x75 1.005 / 0.993
+    ((False, False, 128, 2, 120, 2, 60, "bfloat16"), "noring"),  # gb2x60 1.000 / 1.000 (tie): start
+    ((False, False, 128, 2, 50, 2, 25, "bfloat16"), ""),  # gb2x25 0.990 / 0.991
+    ((False, False, 128, 2, 180, 2, 90, "bfloat16"), ""),  # gb2x90 0.987 / 0.995
+    ((False, False, 128, 2, 200, 2, 100, "bfloat16"), ""),  # gb2x100 0.995 / 0.991
+    ((False, False, 128, 1, 50, 1, 50, "bfloat16"), ""),  # gb1x50 0.970 / 0.955
+    ((False, False, 128, 3, 150, 3, 50, "bfloat16"), ""),  # gb3x50 0.992 / 0.986
+    ((False, True, 128, 2, 100, 2, 50, "bfloat16"), ""),  # gb2x50z 1.002 / 0.987 (z: ring)
+    ((False, False, 128, 4, 200, 4, 50, "bfloat16"), ""),  # gb4x50 0.973 / 0.960
+    ((False, False, 128, 1, 1000, 1, 1000, "bfloat16"), ""),  # nem_b1x1000 0.925 / 0.911
+    ((False, True, 128, 64, 64 * 128, 64, 128, "bfloat16"), ""),  # gb64x128z 0.898 / 0.908
+    ((False, False, 128, 2, 100, 2, 50, "float32"), "noring"),  # batched rule is dtype-independent
 )
 
 
@@ -5165,7 +5176,7 @@ def test_source_exact_scan_variant_rule_cells(args, expected):
     the loader); it reads host-known shape quantities only."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    mode_varlen, has_z, nheads, num_sequences, total_tokens, batch, seqlen = args
+    mode_varlen, has_z, nheads, num_sequences, total_tokens, batch, seqlen, state_dtype = args
     assert (
         module._exact_scan_variant(
             mode_varlen=mode_varlen,
@@ -5175,6 +5186,7 @@ def test_source_exact_scan_variant_rule_cells(args, expected):
             total_tokens=total_tokens,
             batch=batch,
             seqlen=seqlen,
+            state_dtype=getattr(torch, state_dtype),
         )
         == expected
     )

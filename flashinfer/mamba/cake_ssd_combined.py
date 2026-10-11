@@ -959,6 +959,23 @@ def _render_host_source(template: str, name: str, program: _Program) -> str:
 #     batch 1 x 25 / 50 / 75 / 100 0.963-0.975 (B200 0.955-0.959); batch 3 x 50 / 75 0.992 / 0.985 (B200 0.986 / 0.981);
 #     batch 4 x 75 0.966 (B200 0.961); batch 8 x 50 0.944 (B200 0.948).
 #
+#   FI-level re-measurement of the 64-token window on the acceptance instrument (the
+#   FlashInfer call, CUPTI call span split per kernel, cold L2, 5 interleaved rounds,
+#   one process per arm; steps 2916e66a06685ae93d43293c GB300 / 9ac4a94a6de616b831f11b19
+#   B200), ring / start scan-kernel time, nseq x 64 tokens, z, initial states (GB300 / B200):
+#     bf16 state   nseq 1 0.937 / 0.940   nseq 2 1.011 / 1.001   nseq 3 0.996 / 0.989
+#     f32 state    nseq 1 0.939 / 0.941   nseq 2 1.003 / 0.975   nseq 3 0.978 / 0.974
+#   The 93-row gate row nem_v64_64 (2 x 64, bf16 state) read 1.018 / 1.017 / 1.013 on GB300
+#   in three earlier gates against 0.997 / 0.997 on B200, and its f32 twin 0.978-0.987 /
+#   0.977.  So with a 16-bit state the 2 x 64 cell is a measured loss on GB300 (four
+#   readings) and a tie on B200, and the 3 x 64 cell a tie on GB300 (B200 0.989):
+#   the start schedule begins at 2 sequences x 128 heads.  With an f32 state (twice
+#   the final-state bytes per item) the 2 x 64 and 3 x 64 cells keep winning on both
+#   archs, so its threshold stays at 4 x 128.  The kernel-level cells above read the
+#   bf16 2 x 64 cell as a tie (0.999 / 0.993-1.003); the FI-level reading decides
+#   because it is the acceptance instrument.  float16 state is unmeasured and
+#   follows bfloat16 (same state width).
+#
 # Rule: a measured losing cell goes to the start schedule (``_noring``); a
 # winning cell keeps the ring program; ties and unmeasured cells follow the ring
 # program only where the nearest measured cells win on BOTH archs, otherwise the
@@ -967,15 +984,21 @@ def _render_host_source(template: str, name: str, program: _Program) -> str:
 # one-chunk items on the scalar-store path): uniform 64-token sequences and
 # the pair-sum-128 mixtures, i.e. 64 tokens per sequence on average; uniform
 # 63 and 65 tokens win on both archs, so the window is exclusive of them; at
-# 64 tokens nseq 3 wins, 4 / 5 tie and 6 loses, so the item count threshold is
-# 4 sequences x 128 heads.  The batched no-z batch-2 cells at 50-75 tokens are
-# the only batched readings at or beyond the band (batch 1, 3, 4, 8 and z calls
-# win); 25 and 90 tokens win on both archs.  Only host-known quantities enter: the runner's
-# mode / has_z / nheads and the call's batch, seqlen and sequence count
+# 64 tokens the item-count threshold is 2 sequences x 128 heads for a 16-bit
+# state (the FI-level 2 x 64 loss above) and 4 sequences x 128 heads for an
+# f32 state (nseq 3 wins, 4 / 5 tie and 6 loses).  The batched no-z batch-2
+# cells at 50-75 tokens are the only batched readings at or beyond the band
+# (batch 1, 3, 4, 8 and z calls win); 25 and 90 tokens win on both archs.
+# Only host-known quantities enter: the runner's mode / has_z / nheads /
+# state dtype and the call's batch, seqlen and sequence count
 # (``cu_seqlens.numel() - 1``, ``num_seqs`` or ``initial_states.shape[0]``);
 # no per-sequence lengths and no device synchronisation, so prepared / captured
 # shapes keep their program.
-_EXACT_NORING_VARLEN_MIN_ITEMS = 4 * 128  # sequences x heads
+_EXACT_NORING_VARLEN_MIN_ITEMS = {  # sequences x heads, by state dtype
+    torch.bfloat16: 2 * 128,
+    torch.float16: 2 * 128,
+    torch.float32: 4 * 128,
+}
 _EXACT_NORING_VARLEN_TOKENS = (63, 65)  # exclusive bounds on tokens per sequence (average over the call)
 _EXACT_NORING_BATCHED_BATCH = 2
 _EXACT_NORING_BATCHED_SEQLEN = (25, 90)  # exclusive bounds
@@ -990,13 +1013,15 @@ def _exact_scan_variant(
     total_tokens: int,
     batch: int,
     seqlen: int,
+    state_dtype: torch.dtype,
 ) -> str:
     """Schedule variant of the exact-scan program for one call shape: ``""`` (the
     ring program) or ``"noring"`` (the start schedule), from host-known
     quantities only (see the calibration table above)."""
 
     if mode_varlen:
-        if not has_z or num_sequences * nheads < _EXACT_NORING_VARLEN_MIN_ITEMS:
+        min_items = _EXACT_NORING_VARLEN_MIN_ITEMS[state_dtype]
+        if not has_z or num_sequences * nheads < min_items:
             return ""
         low, high = _EXACT_NORING_VARLEN_TOKENS
         # tokens per sequence strictly inside (low, high), in integers
@@ -1430,6 +1455,7 @@ class CakeSSDCombined:
                 total_tokens=batch * seqlen,
                 batch=batch,
                 seqlen=seqlen,
+                state_dtype=self.state_dtype,
             )
         )
         workspace: dict[str, Any] = {
