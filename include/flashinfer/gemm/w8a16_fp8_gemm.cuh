@@ -25,15 +25,22 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 7 of the optimization ladder: 128x128 block tile.  Rung 6 (mma.sync,
-// 64x64 tile) ran at ~200 TFLOP/s with ncu showing L2 at 83% and DRAM at
-// 49% of peak while the tensor pipe idled: a 64x64 tile re-reads each A and
-// B element from L2 once per 64 outputs.  Here the block tile grows to
-// 128x128 (8 warps as 2 x 4, 64x32 outputs each, i.e. 4 m16 x 4 n8 mma
-// tiles per warp per k16), halving the L2 traffic per FLOP.  The 3-stage
-// ring grows to 83 KB and moves to dynamic shared memory (opt-in above
-// 48 KB; 2 blocks per SM).  Fragment construction, cp.async pipeline and
-// the epilogue are unchanged from rung 6.  Requires K % 64 == 0.
+// Rung 8 of the optimization ladder: wgmma (Hopper warpgroup MMA) with the
+// operand roles swapped.  Rung 7 (mma.sync, 128x128 tile) sat at 25%
+// occupancy with the tensor pipe under 50% busy: every mma.sync is a
+// warp-wide 16x8x16 and the fragment traffic through registers / ldmatrix
+// is the limiter.  Here each block computes out^T[n, m] = W[n, :] . act[m, :]
+// with wgmma.m64n128k16: the A operand (64 rows of n) is the fp8 weight
+// dequantized into registers (the RS form takes A from registers in the
+// mma.sync A-fragment layout, so the fp8 -> 16-bit conversion stays in
+// registers and the weight is never widened in memory), the B operand is
+// the act tile in shared memory in the canonical K-major 128-byte-swizzled
+// layout, described by a matrix descriptor.  Two warpgroups per block, each
+// owning 64 of the 128 n rows, 128 m columns, fp32 accumulators in
+// registers.  Loads are still cooperative cp.async (4 stages); the act
+// chunks are written pre-swizzled.  The epilogue writes the transposed
+// fragment straight to out[m, n] (8 consecutive n per store group).
+// Requires sm_90a and K % 64 == 0.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -43,29 +50,22 @@
 #include <type_traits>
 
 #include "../cp_async.cuh"
-#include "../mma.cuh"
 #include "../utils.cuh"
 
 namespace flashinfer {
 namespace gemm {
 
-constexpr int kW8A16TileM = 128;
-constexpr int kW8A16TileN = 128;
+constexpr int kW8A16TileN = 128;  // n rows per block (wgmma M)
+constexpr int kW8A16TileM = 128;  // m cols per block (wgmma N)
 constexpr int kW8A16TileK = 64;
-constexpr int kW8A16Stages = 3;
-constexpr int kW8A16WarpsM = 2;                              // warps along m, 64 rows each
-constexpr int kW8A16WarpsN = 4;                              // warps along n, 32 cols each
-constexpr int kW8A16WarpTileM = kW8A16TileM / kW8A16WarpsM;  // 64 = 4 m16 tiles
-constexpr int kW8A16WarpTileN = kW8A16TileN / kW8A16WarpsN;  // 32 = 4 n8 tiles
-constexpr int kW8A16MTiles = kW8A16WarpTileM / 16;
-constexpr int kW8A16NTiles = kW8A16WarpTileN / 8;
-constexpr int kW8A16Warps = kW8A16WarpsM * kW8A16WarpsN;
-constexpr int kW8A16Threads = 32 * kW8A16Warps;
-constexpr int kW8A16APad = kW8A16TileK + 8;  // 72 bf16 = 144 B rows (16 B aligned, 36 words)
-constexpr int kW8A16WPad = kW8A16TileK + 8;  // 72 fp8  =  72 B rows (8 B aligned, 18 words)
-constexpr int kW8A16AStageBytes = kW8A16TileM * kW8A16APad * 2;
-constexpr int kW8A16WStageBytes = kW8A16TileN * kW8A16WPad;
-constexpr int kW8A16SmemBytes = kW8A16Stages * (kW8A16AStageBytes + kW8A16WStageBytes);
+constexpr int kW8A16Stages = 4;
+constexpr int kW8A16Warpgroups = 2;  // 64 n rows each
+constexpr int kW8A16Threads = 128 * kW8A16Warpgroups;
+constexpr int kW8A16WPad = kW8A16TileK + 8;       // 72 fp8 rows (8 B aligned, 18 words)
+constexpr int kW8A16ARowBytes = kW8A16TileK * 2;  // act row = 64 bf16 = 128 B (swizzle atom)
+constexpr int kW8A16AStageBytes = kW8A16TileM * kW8A16ARowBytes;  // 16 KB
+constexpr int kW8A16WStageBytes = kW8A16TileN * kW8A16WPad;       // 9 KB
+constexpr int kW8A16SmemBytes = kW8A16Stages * (kW8A16AStageBytes + kW8A16WStageBytes) + 1024;
 
 // 8-byte predicated cp.async with zero fill (the shared helper only has 16 B).
 __device__ __forceinline__ void cp_async_pred_load_64b(void* smem_ptr, const void* gmem_ptr,
@@ -77,7 +77,7 @@ __device__ __forceinline__ void cp_async_pred_load_64b(void* smem_ptr, const voi
 }
 
 // Two e4m3 values (packed in the low 16 bits) -> two T values packed in a
-// 32-bit register, laid out as an mma B operand expects.
+// 32-bit register, laid out as an mma A/B operand expects.
 template <typename T>
 __device__ __forceinline__ uint32_t fp8x2_to_pair(uint32_t packed16);
 template <>
@@ -94,92 +94,148 @@ __device__ __forceinline__ uint32_t fp8x2_to_pair<__nv_bfloat16>(uint32_t packed
   return *reinterpret_cast<const uint32_t*>(&b);
 }
 
-// mma.sync.m16n8k16 row.col, 16-bit inputs, fp32 accumulate (in place).
-template <typename T>
-__device__ __forceinline__ void mma_m16n8k16(float (&c)[4], const uint32_t (&a)[4],
-                                             const uint32_t (&b)[2]) {
-  if constexpr (std::is_same_v<T, __half>) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%0,%1,%2,%3};\n"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-  } else {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%0,%1,%2,%3};\n"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-  }
+// ---- wgmma plumbing (sm_90a) -------------------------------------------
+
+__device__ __forceinline__ void wgmma_fence() {
+  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+}
+__device__ __forceinline__ void wgmma_commit() {
+  asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+}
+template <int N>
+__device__ __forceinline__ void wgmma_wait() {
+  asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
 }
 
+// K-major, 128 B swizzle matrix descriptor: 8-row core-matrix groups are
+// 1024 B apart (SBO), rows are 128 B, the 16 B chunks of a row are XOR
+// swizzled by (row % 8) inside a 1024 B aligned atom.
+__device__ __forceinline__ uint64_t make_smem_desc_sw128(const void* smem_ptr) {
+  const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  uint64_t desc = 0;
+  desc |= static_cast<uint64_t>((addr & 0x3FFFF) >> 4);  // start address
+  desc |= static_cast<uint64_t>(1) << 16;                // LBO (unused for SW128 K-major)
+  desc |= static_cast<uint64_t>(1024 >> 4) << 32;        // SBO
+  desc |= static_cast<uint64_t>(1) << 62;                // layout: 128 B swizzle
+  return desc;
+}
+
+// D[64 x 128] (+)= A[64 x 16] (registers) . B[16 x 128] (smem descriptor).
 template <typename T>
-__device__ __forceinline__ uint32_t pack_pair(float x, float y) {
-  if constexpr (std::is_same_v<T, __half>) {
-    const __half2 h = __floats2half2_rn(x, y);
-    return *reinterpret_cast<const uint32_t*>(&h);
-  } else {
-    const __nv_bfloat162 h = __floats2bfloat162_rn(x, y);
-    return *reinterpret_cast<const uint32_t*>(&h);
-  }
+__device__ __forceinline__ void wgmma_m64n128k16_rs(float (&d)[64], const uint32_t (&a)[4],
+                                                    uint64_t desc_b, int scale_d);
+template <>
+__device__ __forceinline__ void wgmma_m64n128k16_rs<__nv_bfloat16>(float (&d)[64],
+                                                                   const uint32_t (&a)[4],
+                                                                   uint64_t desc_b, int scale_d) {
+  asm volatile(
+      "{\n"
+      ".reg .pred p;\n"
+      "setp.ne.b32 p, %69, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 "
+      "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, "
+      "%20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, "
+      "%38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, "
+      "%56, %57, %58, %59, %60, %61, %62, %63}, "
+      "{%64, %65, %66, %67}, %68, p, 1, 1, 0;\n"
+      "}\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+        "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
+        "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]),
+        "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+        "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), "+f"(d[32]), "+f"(d[33]), "+f"(d[34]),
+        "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]), "+f"(d[40]), "+f"(d[41]),
+        "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]),
+        "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
+        "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]),
+        "+f"(d[63])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(scale_d));
+}
+template <>
+__device__ __forceinline__ void wgmma_m64n128k16_rs<__half>(float (&d)[64], const uint32_t (&a)[4],
+                                                            uint64_t desc_b, int scale_d) {
+  asm volatile(
+      "{\n"
+      ".reg .pred p;\n"
+      "setp.ne.b32 p, %69, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 "
+      "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, "
+      "%20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, "
+      "%38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, "
+      "%56, %57, %58, %59, %60, %61, %62, %63}, "
+      "{%64, %65, %66, %67}, %68, p, 1, 1, 0;\n"
+      "}\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+        "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
+        "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]),
+        "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+        "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), "+f"(d[32]), "+f"(d[33]), "+f"(d[34]),
+        "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]), "+f"(d[40]), "+f"(d[41]),
+        "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]),
+        "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
+        "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]),
+        "+f"(d[63])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(scale_d));
 }
 
 template <typename T>
 __global__ void __launch_bounds__(kW8A16Threads)
-    W8A16Fp8GemmMmaSync128Kernel(const T* __restrict__ act, const __nv_fp8_e4m3* __restrict__ w,
-                                 const float* __restrict__ scale, const T* __restrict__ bias,
-                                 T* __restrict__ out, int M, int N, int K) {
+    W8A16Fp8GemmWgmmaKernel(const T* __restrict__ act, const __nv_fp8_e4m3* __restrict__ w,
+                            const float* __restrict__ scale, const T* __restrict__ bias,
+                            T* __restrict__ out, int M, int N, int K) {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
   using namespace cp_async;
-  extern __shared__ __align__(16) uint8_t smem_raw[];
-  using ATile = T[kW8A16TileM][kW8A16APad];
+  extern __shared__ uint8_t smem_raw[];
+  // 1024 B alignment for the swizzle atoms.
+  uint8_t* smem = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(smem_raw) + 1023) &
+                                             ~static_cast<uintptr_t>(1023));
+  uint8_t* a_base = smem;                                     // act stages (swizzled)
+  uint8_t* w_base = smem + kW8A16Stages * kW8A16AStageBytes;  // weight stages (padded rows)
   using WTile = __nv_fp8_e4m3[kW8A16TileN][kW8A16WPad];
-  ATile* a_s = reinterpret_cast<ATile*>(smem_raw);
-  WTile* w_s = reinterpret_cast<WTile*>(smem_raw + kW8A16Stages * kW8A16AStageBytes);
+  WTile* w_s = reinterpret_cast<WTile*>(w_base);
 
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  const int wm = warp / kW8A16WarpsN;  // rows wm*64 .. +63 of the tile
-  const int wn = warp % kW8A16WarpsN;  // cols wn*32 .. +31 of the tile
-  const int m0 = blockIdx.y * kW8A16TileM;
+  const int wg = warp >> 2;  // warpgroup: n rows wg*64 .. +63
+  const int wq = warp & 3;   // warp within the warpgroup: rows wq*16 .. +15 of those
   const int n0 = blockIdx.x * kW8A16TileN;
+  const int m0 = blockIdx.y * kW8A16TileM;
 
-  // Copy assignment per slab: act = 128 rows x 128 B = 1024 x 16 B, weight =
-  // 128 rows x 64 B = 1024 x 8 B; four copies per thread per operand (rows
-  // r, r+32, r+64, r+96).  Rows past M / N copy zeros (cp.async zfill).
+  // Copies per slab: act = 128 rows x 8 chunks of 16 B = 1024 (4 per thread),
+  // chunk c of row r lands at r*128 + ((c ^ (r & 7)) * 16); weight = 128 rows
+  // x 8 chunks of 8 B = 1024 (4 per thread) into padded 72 B rows.
   constexpr int kCopies = 4;
   constexpr int kRowStep = kW8A16Threads / 8;  // 32
-  const int a_r = threadIdx.x / 8;             // 0..31
-  const int a_c = (threadIdx.x % 8) * 8;       // first of 8 bf16
-  const int w_r = threadIdx.x / 8;             // 0..31
-  const int w_c = (threadIdx.x % 8) * 8;       // first of 8 fp8
+  const int cr = threadIdx.x / 8;
+  const int cc = threadIdx.x % 8;
   bool a_ok[kCopies], w_ok[kCopies];
   const T* a_src[kCopies];
   const __nv_fp8_e4m3* w_src[kCopies];
+  uint32_t a_dst_off[kCopies];
 #pragma unroll
   for (int i = 0; i < kCopies; ++i) {
-    a_ok[i] = (m0 + a_r + kRowStep * i) < M;
-    w_ok[i] = (n0 + w_r + kRowStep * i) < N;
-    a_src[i] = act + static_cast<int64_t>(m0 + (a_ok[i] ? a_r + kRowStep * i : 0)) * K + a_c;
-    w_src[i] = w + static_cast<int64_t>(n0 + (w_ok[i] ? w_r + kRowStep * i : 0)) * K + w_c;
+    const int r = cr + kRowStep * i;
+    a_ok[i] = (m0 + r) < M;
+    w_ok[i] = (n0 + r) < N;
+    a_src[i] = act + static_cast<int64_t>(m0 + (a_ok[i] ? r : 0)) * K + cc * 8;
+    w_src[i] = w + static_cast<int64_t>(n0 + (w_ok[i] ? r : 0)) * K + cc * 8;
+    a_dst_off[i] = r * kW8A16ARowBytes + ((cc ^ (r & 7)) << 4);
   }
 
   auto issue_slab = [&](int kt, int stage) {
     const int k0 = kt * kW8A16TileK;
+    uint8_t* a_stage = a_base + stage * kW8A16AStageBytes;
 #pragma unroll
     for (int i = 0; i < kCopies; ++i) {
       pred_load<128, PrefetchMode::kNoPrefetch, SharedMemFillMode::kFillZero>(
-          &a_s[stage][a_r + kRowStep * i][a_c], a_src[i] + k0, a_ok[i]);
-      cp_async_pred_load_64b(&w_s[stage][w_r + kRowStep * i][w_c], w_src[i] + k0, w_ok[i]);
+          reinterpret_cast<T*>(a_stage + a_dst_off[i]), a_src[i] + k0, a_ok[i]);
+      cp_async_pred_load_64b(&w_s[stage][cr + kRowStep * i][cc * 8], w_src[i] + k0, w_ok[i]);
     }
   };
 
-  float acc[kW8A16MTiles][kW8A16NTiles][4];
+  float d[64];
 #pragma unroll
-  for (int i = 0; i < kW8A16MTiles; ++i)
-#pragma unroll
-    for (int j = 0; j < kW8A16NTiles; ++j)
-#pragma unroll
-      for (int r = 0; r < 4; ++r) acc[i][j][r] = 0.f;
+  for (int i = 0; i < 64; ++i) d[i] = 0.f;
 
   const int num_slabs = K / kW8A16TileK;
 #pragma unroll
@@ -188,10 +244,10 @@ __global__ void __launch_bounds__(kW8A16Threads)
     commit_group();
   }
 
-  const int a_row = lane % 16;
-  const int a_col = (lane / 16) * 8;
-  const int b_n = lane / 4;
-  const int b_k = (lane % 4) * 2;
+  // A fragment coordinates (same as the mma.sync m16n8k16 A layout): rows
+  // r = wq*16 + lane/4 (+8), k = 2*(lane%4) (+8) within each k16 step.
+  const int a_r = wg * 64 + wq * 16 + lane / 4;
+  const int a_k = (lane % 4) * 2;
 
   for (int kt = 0; kt < num_slabs; ++kt) {
     wait_group<kW8A16Stages - 2>();
@@ -201,60 +257,55 @@ __global__ void __launch_bounds__(kW8A16Threads)
     commit_group();
 
     const int stage = kt % kW8A16Stages;
+    const uint8_t* a_stage = a_base + stage * kW8A16AStageBytes;
+    wgmma_fence();
 #pragma unroll
     for (int k16 = 0; k16 < kW8A16TileK; k16 += 16) {
-      uint32_t a_frag[kW8A16MTiles][4];
-#pragma unroll
-      for (int i = 0; i < kW8A16MTiles; ++i) {
-        mma::ldmatrix_m8n8x4(a_frag[i],
-                             &a_s[stage][wm * kW8A16WarpTileM + i * 16 + a_row][k16 + a_col]);
-      }
-      uint32_t b_frag[kW8A16NTiles][2];
-#pragma unroll
-      for (int j = 0; j < kW8A16NTiles; ++j) {
-        const __nv_fp8_e4m3* row = &w_s[stage][wn * kW8A16WarpTileN + j * 8 + b_n][k16 + b_k];
-        const uint32_t lo = *reinterpret_cast<const uint16_t*>(row);
-        const uint32_t hi = *reinterpret_cast<const uint16_t*>(row + 8);
-        b_frag[j][0] = fp8x2_to_pair<T>(lo);
-        b_frag[j][1] = fp8x2_to_pair<T>(hi);
-      }
-#pragma unroll
-      for (int i = 0; i < kW8A16MTiles; ++i)
-#pragma unroll
-        for (int j = 0; j < kW8A16NTiles; ++j) mma_m16n8k16<T>(acc[i][j], a_frag[i], b_frag[j]);
+      const __nv_fp8_e4m3* r0 = &w_s[stage][a_r][k16 + a_k];
+      const __nv_fp8_e4m3* r1 = &w_s[stage][a_r + 8][k16 + a_k];
+      uint32_t a_frag[4];
+      a_frag[0] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r0));
+      a_frag[1] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r1));
+      a_frag[2] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r0 + 8));
+      a_frag[3] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r1 + 8));
+      const uint64_t desc_b = make_smem_desc_sw128(a_stage + k16 * 2);
+      wgmma_fence();
+      wgmma_m64n128k16_rs<T>(d, a_frag, desc_b, 1);
     }
+    wgmma_commit();
+    // The stage is recycled after the next iteration's __syncthreads, so
+    // every wgmma that reads it must have retired by then.
+    wgmma_wait<0>();
   }
   wait_group<0>();
 
-  const float s = *scale;
-  const int g = lane / 4;
-  const int t2 = (lane % 4) * 2;
+  // Epilogue.  Accumulator layout per warp (m64nNk16 D): d[j*4 + 0..1] at
+  // (row = wq*16 + lane/4, cols 8j + 2*(lane%4) + {0,1}), d[j*4 + 2..3] at
+  // row + 8.  Rows are n, cols are m.
+  const float sc = *scale;
+  const int n_lo = n0 + wg * 64 + wq * 16 + lane / 4;
+  const int m_base = m0 + (lane % 4) * 2;
+  float bias_lo = 0.f, bias_hi = 0.f;
+  if (bias != nullptr) {
+    if (n_lo < N) bias_lo = static_cast<float>(bias[n_lo]);
+    if (n_lo + 8 < N) bias_hi = static_cast<float>(bias[n_lo + 8]);
+  }
 #pragma unroll
-  for (int j = 0; j < kW8A16NTiles; ++j) {
-    const int n = n0 + wn * kW8A16WarpTileN + j * 8 + t2;
-    if (n >= N) continue;
-    float b0 = 0.f, b1 = 0.f;
-    if (bias != nullptr) {
-      b0 = static_cast<float>(bias[n]);
-      if (n + 1 < N) b1 = static_cast<float>(bias[n + 1]);
-    }
+  for (int j = 0; j < 16; ++j) {
+    const int m = m_base + j * 8;
 #pragma unroll
-    for (int i = 0; i < kW8A16MTiles; ++i) {
-#pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        const int m = m0 + wm * kW8A16WarpTileM + i * 16 + g + h * 8;
-        if (m >= M) continue;
-        const float v0 = acc[i][j][2 * h] * s + b0;
-        const float v1 = acc[i][j][2 * h + 1] * s + b1;
-        T* dst = out + static_cast<int64_t>(m) * N + n;
-        if (n + 1 < N) {
-          *reinterpret_cast<uint32_t*>(dst) = pack_pair<T>(v0, v1);
-        } else {
-          dst[0] = static_cast<T>(v0);
-        }
-      }
+    for (int q = 0; q < 2; ++q) {
+      const int mm = m + q;
+      if (mm >= M) continue;
+      T* row = out + static_cast<int64_t>(mm) * N;
+      if (n_lo < N) row[n_lo] = static_cast<T>(d[j * 4 + q] * sc + bias_lo);
+      if (n_lo + 8 < N) row[n_lo + 8] = static_cast<T>(d[j * 4 + 2 + q] * sc + bias_hi);
     }
   }
+#else
+  // wgmma needs sm_90a.
+  __trap();
+#endif
 }
 
 template <typename T>
@@ -263,7 +314,7 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
   if (K % kW8A16TileK != 0) return cudaErrorInvalidValue;  // cp.async slabs must be whole
   const unsigned tiles_m = ceil_div(M, kW8A16TileM);
   if (tiles_m > 65535u) return cudaErrorInvalidValue;  // gridDim.y limit
-  auto* kernel = W8A16Fp8GemmMmaSync128Kernel<T>;
+  auto* kernel = W8A16Fp8GemmWgmmaKernel<T>;
   static bool attr_set = false;  // per instantiation; the attribute is per function
   if (!attr_set) {
     cudaError_t e =
