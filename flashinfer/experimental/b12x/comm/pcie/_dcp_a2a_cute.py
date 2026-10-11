@@ -979,28 +979,28 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             32
         )
         warp_stride = Int32(gdim) * Int32(self._warps_per_block)
-        total_heads = local_heads * Int32(self._world_size)
-        rows = batch * total_heads
+        local_packs = local_heads * packs_per_head
+        tiles_per_rank = (local_packs + Int32(31)) // Int32(32)
+        tiles_per_batch = tiles_per_rank * Int32(self._world_size)
+        tiles = batch * tiles_per_batch
         local_stage = self._staging_words(staging[self._rank])
 
-        row = warp_first
-        while row < rows:
-            batch_index = row // total_heads
-            global_head = row - batch_index * total_heads
-            source_rank = global_head // local_heads
-            if source_rank == Int32(self._rank):
-                local_head = global_head - source_rank * local_heads
-                base = (
-                    Int64(batch_index) * Int64(local_heads) + Int64(local_head)
-                ) * Int64(packs_per_head)
-                pack = lane
-                while pack < packs_per_head:
-                    _copy_16b(
-                        local_input + base * Int64(4) + Int64(pack) * Int64(4),
-                        local_stage + base * Int64(4) + Int64(pack) * Int64(4),
-                    )
-                    pack += Int32(32)
-            row += warp_stride
+        # Assign complete 512-byte segments to warps, independently of head
+        # boundaries. Each rank stages and reads the same CTA's segments.
+        tile = warp_first
+        while tile < tiles:
+            batch_index = tile // tiles_per_batch
+            batch_tile = tile - batch_index * tiles_per_batch
+            source_rank = batch_tile // tiles_per_rank
+            rank_tile = batch_tile - source_rank * tiles_per_rank
+            pack = rank_tile * Int32(32) + lane
+            if source_rank == Int32(self._rank) and pack < local_packs:
+                source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
+                _copy_16b(
+                    local_input + source_pack * Int64(4),
+                    local_stage + source_pack * Int64(4),
+                )
+            tile += warp_stride
 
         block_pair_barrier(
             signals,
@@ -1010,38 +1010,33 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             max_blocks=_MAX_BLOCKS,
         )
 
-        row = warp_first
-        while row < rows:
-            batch_index = row // total_heads
-            global_head = row - batch_index * total_heads
-            source_rank = global_head // local_heads
-            local_head = global_head - source_rank * local_heads
-            source_base = (
-                Int64(batch_index) * Int64(local_heads) + Int64(local_head)
-            ) * Int64(packs_per_head)
-            output_base = Int64(row) * Int64(packs_per_head)
-            # Resolve the peer's base address first and copy once. Cloning the
-            # whole pack loop into all sixteen arms of the constexpr chain
-            # bloats the kernel and pays the chain on every row.
-            source_address = Int64((local_input + source_base * Int64(4)).toint())
-            for source in cutlass.range_constexpr(self._world_size):
-                if source_rank == Int32(source):
-                    if cutlass.const_expr(source == self._rank):
-                        source_words = local_input
-                    else:
-                        source_words = self._staging_words(staging[source])
-                    source_address = Int64(
-                        (source_words + source_base * Int64(4)).toint()
-                    )
-            output_address = Int64((output + output_base * Int64(4)).toint())
-            pack = lane
-            while pack < packs_per_head:
+        tile = warp_first
+        while tile < tiles:
+            batch_index = tile // tiles_per_batch
+            batch_tile = tile - batch_index * tiles_per_batch
+            source_rank = batch_tile // tiles_per_rank
+            rank_tile = batch_tile - source_rank * tiles_per_rank
+            pack = rank_tile * Int32(32) + lane
+            if pack < local_packs:
+                source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
+                output_pack = (
+                    Int64(batch_index) * Int64(self._world_size) + Int64(source_rank)
+                ) * Int64(local_packs) + Int64(pack)
+                source_address = Int64((local_input + source_pack * Int64(4)).toint())
+                for source in cutlass.range_constexpr(self._world_size):
+                    if source_rank == Int32(source):
+                        if cutlass.const_expr(source == self._rank):
+                            source_words = local_input
+                        else:
+                            source_words = self._staging_words(staging[source])
+                        source_address = Int64(
+                            (source_words + source_pack * Int64(4)).toint()
+                        )
                 _copy_16b_addr(
-                    source_address + Int64(pack) * Int64(16),
-                    output_address + Int64(pack) * Int64(16),
+                    source_address,
+                    Int64((output + output_pack * Int64(4)).toint()),
                 )
-                pack += Int32(32)
-            row += warp_stride
+            tile += warp_stride
 
         if cutlass.const_expr(self._device_slot_selection):
             if Int32(tidx) == Int32(0):
@@ -1935,7 +1930,7 @@ def _get_compiled_all_gather_heads(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.all_gather_heads",
-            12,
+            13,
             key,
             labels=(
                 "world_size",

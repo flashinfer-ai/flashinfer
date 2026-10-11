@@ -923,7 +923,17 @@ def _check_queued_mixed_grid_graph(
         )
 
 
-def _worker(rank: int, world_size: int, port: int) -> None:
+def _worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    heads_per_rank: int | None,
+    query_head_dim: int,
+) -> None:
+    global TOTAL_HEADS, QUERY_HEAD_DIM
+    if heads_per_rank is not None:
+        TOTAL_HEADS = heads_per_rank * world_size
+    QUERY_HEAD_DIM = query_head_dim
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     dist.init_process_group(
@@ -1067,7 +1077,8 @@ def _preflight_rejection_worker(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
+@pytest.mark.parametrize("heads_per_rank,query_head_dim", [(None, 576), (3, 64)])
+def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness(heads_per_rank, query_head_dim):
     if (
         os.getenv("B12X_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") == "1"
         or os.getenv("B12X_PCIE_DCP_TEST_EXPECT_PREFLIGHT_REJECTION") == "1"
@@ -1082,7 +1093,12 @@ def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
         )
-    mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
+    mp.spawn(
+        _worker,
+        args=(world_size, _free_port(), heads_per_rank, query_head_dim),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 def test_pcie_dcp_a2a_rejects_reduced_sm_slice_before_ipc_allocation():
