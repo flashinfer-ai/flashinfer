@@ -475,6 +475,7 @@ def test_moe_cluster_ladder_stops_at_the_planned_task_queue():
         backend="dynamic",
         route_planner="triton",
         dynamic_tile_m=16,
+        dynamic_mma_warps=None,
         dynamic_route_mode="grouped",
         w4a16_route_mode=None,
         max_active_clusters=30,
@@ -501,7 +502,9 @@ def test_a16_wide_tile_needs_more_than_one_n_tile():
         out_features=48,
     )
     space = TUNING.parameter_space(narrow, IDENTITY)
-    assignment = dict(mode="a16", tile_m=16, tile_n=64, tile_k=64, split_k=1)
+    assignment = dict(
+        mode="a16", tile_m=16, tile_n=64, tile_k=64, split_k=1, mma_warps=4
+    )
     space.validate(assignment)
     with pytest.raises(ValueError, match="predicates"):
         space.validate({**assignment, "tile_n": 128})
@@ -523,7 +526,9 @@ def test_iq2_transposed_tiles_are_raced_without_split_k():
         padded_in_features=768,
         out_features=136,
     )
-    assignment = dict(mode="a16", tile_m=8, tile_n=128, tile_k=256, split_k=1)
+    assignment = dict(
+        mode="a16", tile_m=8, tile_n=128, tile_k=256, split_k=1, mma_warps=None
+    )
     TUNING.parameter_space(query, IDENTITY).validate(assignment)
     TUNING.validate_config(query, BlockscaledConfig(**assignment), IDENTITY)
     with pytest.raises(ValueError, match="split-K"):
@@ -533,7 +538,11 @@ def test_iq2_transposed_tiles_are_raced_without_split_k():
     for recipe in ("nvfp4", "mxfp8"):
         with pytest.raises(ValueError, match="predicates"):
             TUNING.parameter_space(replace(query, recipe=recipe), IDENTITY).validate(
-                {**assignment, "tile_k": 128}
+                {
+                    **assignment,
+                    "tile_k": 128,
+                    "mma_warps": 4 if recipe == "mxfp8" else None,
+                }
             )
 
 
@@ -553,13 +562,15 @@ def test_nvfp4_a16_races_k256_tiles():
         activation_mode="a16",
     )
     for tile_m in (16, 32, 64):
-        assignment = dict(mode="a16", tile_m=tile_m, tile_n=128, tile_k=256, split_k=4)
+        assignment = dict(
+            mode="a16", tile_m=tile_m, tile_n=128, tile_k=256, split_k=4, mma_warps=None
+        )
         TUNING.parameter_space(query, IDENTITY).validate(assignment)
         TUNING.validate_config(query, BlockscaledConfig(**assignment), IDENTITY)
     with pytest.raises(ValueError, match="predicates"):
         TUNING.parameter_space(
             replace(query, recipe="mxfp8", global_scale_kind="none"), IDENTITY
-        ).validate({**assignment, "tile_m": 16})
+        ).validate({**assignment, "tile_m": 16, "mma_warps": 4})
 
 
 def test_gate_mean_partitions_span_one_warp_to_the_covering_block():

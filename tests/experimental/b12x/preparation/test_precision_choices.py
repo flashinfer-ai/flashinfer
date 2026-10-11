@@ -604,3 +604,95 @@ def test_compressed_mla_rejects_unaligned_q_before_preparation(mode):
                 q=q, swa_k_cache=cache, out=torch.empty_like(q)
             ),
         )
+
+
+def test_mxfp8_a16_races_compute_warps_without_merging_programs():
+    from b12x.gemm.blockscaled._tuning import (
+        BlockscaledConfig,
+        BlockscaledQuery,
+        TUNING,
+    )
+
+    query = BlockscaledQuery(
+        recipe="mxfp8",
+        num_tokens=4,
+        in_features=2560,
+        padded_in_features=2560,
+        out_features=512,
+        activation_mode="auto",
+    )
+    configs = [config for _, config in TUNING.eligible_plan(query, DEVICE).candidates]
+    a16 = [config for config in configs if config.mode == "a16"]
+    assert {config.mma_warps for config in a16} == {2, 4}
+    for config in a16:
+        assert replace(config, mma_warps=2) in a16
+        assert replace(config, mma_warps=4) in a16
+        assert BlockscaledConfig.from_config(FrozenMapping(config.to_dict())) == config
+    assert all(
+        config.mma_warps is None for config in configs if config.mode == "quantized"
+    )
+    for recipe in ("nvfp4", "mxfp4"):
+        restricted = replace(
+            query,
+            recipe=recipe,
+            global_scale_kind="multiplier" if recipe == "nvfp4" else "none",
+        )
+        assert all(
+            config.mma_warps is None
+            for _, config in TUNING.eligible_plan(restricted, DEVICE).candidates
+        )
+
+
+def test_nvfp4_m16_races_compute_warps_with_the_same_route_choices():
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig, TUNING
+
+    query = replace(_nvfp4_query(), num_tokens=4, routed_rows=16)
+    configs = [config for _, config in TUNING.eligible_plan(query, DEVICE).candidates]
+    m16 = [
+        config
+        for config in configs
+        if config.backend == "dynamic" and config.dynamic_tile_m == 16
+    ]
+    assert {config.dynamic_mma_warps for config in m16} == {None, 4}
+    for config in m16:
+        assert replace(config, dynamic_mma_warps=None) in m16
+        assert replace(config, dynamic_mma_warps=4) in m16
+        assert MoeDecodeConfig.from_config(FrozenMapping(config.to_dict())) == config
+    assert all(
+        config.dynamic_mma_warps is None for config in configs if config not in m16
+    )
+
+
+@pytest.mark.parametrize("tile", [16, 32, 64, 128])
+@pytest.mark.parametrize("warps", [None, 4])
+@pytest.mark.parametrize("clusters", [-1, 0, 1, 126, 188])
+def test_dynamic_launch_policy_preserves_compute_warps(tile, warps, clusters):
+    from b12x.moe.fused_moe._impl import (
+        _encode_dynamic_launch_policy,
+        _decode_dynamic_launch_policy,
+    )
+
+    for flags in range(32):
+        volatile, external, direct, n64, materialize = (
+            bool(flags & (1 << bit)) for bit in range(5)
+        )
+        policy = _encode_dynamic_launch_policy(
+            volatile_launch_state=volatile,
+            external_route_plan_requested=external,
+            planned_tile_m=tile,
+            planned_direct_routing=direct,
+            w4a8_n64_repacked=n64,
+            nvfp4_materialize_intermediate=materialize,
+            mma_warps=warps,
+            policy_max_active_clusters=clusters,
+        )
+        assert _decode_dynamic_launch_policy(policy) == (
+            volatile,
+            external,
+            tile,
+            direct,
+            n64,
+            materialize,
+            warps,
+            clusters,
+        )

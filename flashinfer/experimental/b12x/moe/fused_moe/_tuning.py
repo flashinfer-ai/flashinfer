@@ -89,6 +89,7 @@ class MoeDecodeConfig:
     route_planner: str
     max_active_clusters: int | None
     dynamic_tile_m: int | None = None
+    dynamic_mma_warps: int | None = None
     dynamic_route_mode: str | None = None
     w4a16_route_mode: str | None = None
     nvfp4_share_input: bool = False
@@ -103,6 +104,7 @@ class MoeDecodeConfig:
             "backend",
             "dynamic_route_mode",
             "dynamic_tile_m",
+            "dynamic_mma_warps",
             "max_active_clusters",
             "route_planner",
             "w4a16_route_mode",
@@ -121,6 +123,9 @@ class MoeDecodeConfig:
         route_planner = payload["route_planner"]
         max_active_clusters = payload["max_active_clusters"]
         dynamic_tile_m = payload["dynamic_tile_m"]
+        dynamic_mma_warps = payload["dynamic_mma_warps"]
+        if dynamic_mma_warps is not None and type(dynamic_mma_warps) is not int:
+            raise TypeError("dynamic_mma_warps must be an integer or null")
         dynamic_route_mode = payload["dynamic_route_mode"]
         w4a16_route_mode = payload["w4a16_route_mode"]
         if not isinstance(backend, str) or not isinstance(route_planner, str):
@@ -163,6 +168,7 @@ class MoeDecodeConfig:
             route_planner=route_planner,
             max_active_clusters=max_active_clusters,
             dynamic_tile_m=dynamic_tile_m,
+            dynamic_mma_warps=dynamic_mma_warps,
             dynamic_route_mode=dynamic_route_mode,
             w4a16_route_mode=w4a16_route_mode,
             nvfp4_share_input=payload["nvfp4_share_input"],
@@ -178,6 +184,7 @@ class MoeDecodeConfig:
             "route_planner": self.route_planner,
             "max_active_clusters": self.max_active_clusters,
             "dynamic_tile_m": self.dynamic_tile_m,
+            "dynamic_mma_warps": self.dynamic_mma_warps,
             "dynamic_route_mode": self.dynamic_route_mode,
             "w4a16_route_mode": self.w4a16_route_mode,
             "nvfp4_share_input": self.nvfp4_share_input,
@@ -382,6 +389,17 @@ def validate_moe_decode_config(
             )
         query = replace(
             query, quant_mode="w4a16" if config.backend == "w4a16" else "nvfp4"
+        )
+    if config.dynamic_mma_warps is not None and not (
+        type(config.dynamic_mma_warps) is int
+        and config.dynamic_mma_warps == 4
+        and config.backend == "dynamic"
+        and config.dynamic_tile_m == 16
+        and query.quant_mode == "nvfp4"
+        and query.activation == "silu"
+    ):
+        raise ValueError(
+            "explicit compute warps require four-warp NVFP4 SiLU M16 execution"
         )
     if any(
         type(value) is not bool
@@ -796,7 +814,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 TUNING = TuningContract(
     component_id="moe.decode",
     query_schema_version=28,
-    config_schema_version=23,
+    config_schema_version=24,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
     encode_query=MoeDecodeQuery.to_dict,
@@ -805,7 +823,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=25,
+    candidate_contract_version=26,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
         Knob(
@@ -829,6 +847,12 @@ TUNING = TuningContract(
             values=(16, 32, 64, 128),
             binding=ParameterBinding.COMPILE,
             when=FrozenMapping({"backend": "dynamic"}),
+        ),
+        Knob(
+            name="dynamic_mma_warps",
+            values=(None, 4),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "dynamic", "dynamic_tile_m": 16}),
         ),
         Knob(
             name="dynamic_route_mode",

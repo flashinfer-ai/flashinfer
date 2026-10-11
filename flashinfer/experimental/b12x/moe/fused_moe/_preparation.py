@@ -841,6 +841,7 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
         "external_route_plan": external_route_plan,
         "share_input_across_experts": share_input,
         "planned_tile_m": tile_m,
+        "mma_warps": plan.decode_config.dynamic_mma_warps,
     }
 
 
@@ -1032,6 +1033,7 @@ def _program_carriers(
                 trellis_bits=caps.weight_plan.trellis_bits or 0,
                 trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                 planned_tile_m=dynamic["planned_tile_m"],
+                mma_warps=dynamic["mma_warps"],
             )
             launches.append(launch)
         if plan.deterministic_output:

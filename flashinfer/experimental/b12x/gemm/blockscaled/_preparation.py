@@ -137,6 +137,7 @@ def compile_packed(
                 alpha_is_one=not fp4,
                 target_occupancy_override=1,
                 weight_only=query.recipe,
+                mma_warps=config.mma_warps,
                 alpha_reciprocal=query.global_scale_kind == "reciprocal",
                 input_k=query.in_features,
                 device_ordinal=ordinal,

@@ -802,6 +802,7 @@ class MoEDynamicKernelBackend:
         *,
         fast_math: bool = False,
         activation: str = "silu",
+        mma_warps: int | None = None,
         dynamic_down_scale: bool = False,
         share_input_across_experts: bool = False,
         deterministic_output: bool = False,
@@ -1305,10 +1306,13 @@ class MoEDynamicKernelBackend:
                 self.atom_shape = (2, 2, 1)
                 self.num_mma_warps = 4
         elif _tm == 16:
-            # W4A8's raw-MMA path benefits from exposing more independent
-            # N fragments without enlarging M (and therefore without padding
-            # sparse expert runs).  Keep the proven two-warp atom for W4A4.
-            if self.is_w4a8:
+            # More compute warps expose independent fragments without padding
+            # sparse expert runs to a larger M tile.
+            if mma_warps is not None and (
+                self.quant_recipe != "nvfp4" or mma_warps not in (2, 4)
+            ):
+                raise ValueError("M16 NVFP4 requires two or four compute warps")
+            if self.is_w4a8 or mma_warps == 4:
                 self.atom_shape = (1, 4, 1)
                 self.num_mma_warps = 4
             else:
@@ -1326,6 +1330,8 @@ class MoEDynamicKernelBackend:
         else:  # 64
             self.atom_shape = (4, 2, 1)
             self.num_mma_warps = 8
+        if mma_warps is not None and _tm != 16:
+            raise ValueError("explicit compute warps require an M16 tile")
         self.tma_load_warp_id = self.num_mma_warps
         self.num_threads_per_warp = 32
         # Give W4A8 two producer streams, with buffer epochs split by parity,
@@ -1415,7 +1421,7 @@ class MoEDynamicKernelBackend:
         return self._dense_cls._get_layoutSFB_TV(self, tiled_mma)
 
     @cute.jit
-    def _copy_fc1_sfb(self, source, destination, thr_mma, tidx, k_block):
+    def _partition_sfb(self, source, thr_mma, tidx):
         layout = self._thrfrg_SFB(source.layout, thr_mma)
         tensor = cute.make_tensor(source.iterator, layout)
         thread = thr_mma.thr_layout_vmnk.get_flat_coord(tidx)
@@ -1429,6 +1435,29 @@ class MoEDynamicKernelBackend:
                 stride=(partition.stride[0], *partition.stride[1]),
             ),
         )
+        return partition
+
+    @cute.jit
+    def _partition_staged_sfb(self, source, thr_mma, tidx):
+        partition = self._partition_sfb(source[None, None, 0], thr_mma, tidx)
+        return cute.make_tensor(
+            partition.iterator,
+            cute.make_layout(
+                (*partition.shape, source.shape[2]),
+                stride=(*partition.stride, source.stride[2]),
+            ),
+        )
+
+    @cute.jit
+    def _copy_sfb(self, copy, source, destination):
+        if cutlass.const_expr(self.direct_sfb):
+            cute.autovec_copy(source, destination)
+        else:
+            cute.copy(copy, source, destination)
+
+    @cute.jit
+    def _copy_fc1_sfb(self, source, destination, thr_mma, tidx, k_block):
+        partition = self._partition_sfb(source, thr_mma, tidx)
         cute.autovec_copy(
             cute.filter_zeros(partition[None, None, k_block]),
             cute.filter_zeros(destination[None, None, k_block]),
@@ -1480,6 +1509,7 @@ class MoEDynamicKernelBackend:
         # "e2m3"/"e3m2"); the native FP4 path keeps passing the operand dtype.
         self._mma_fmt_a = self.mxfp6_fmt_a if self.mxfp6_fmt_a is not None else None
         self._mma_fmt_b = self.mxfp6_fmt_b if self.mxfp6_fmt_b is not None else None
+        self.direct_sfb = self.quant_recipe == "nvfp4" and self.atom_shape[1] > 2
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
         self.num_m_tiles = self.tile_shape_mnk[0] // (16 * self.atom_shape[0])
         self.num_n_tiles = self.tile_shape_mnk[1] // (8 * self.atom_shape[1])
@@ -1502,6 +1532,9 @@ class MoEDynamicKernelBackend:
                 self.tile_shape_mnk[2],
             )
             fc1_m_warps = min(self.atom_shape[0], self._fc1_int_tile // 16)
+            fc1_m_warps = max(
+                fc1_m_warps, self.num_mma_warps // (self._fc1_tok_tile // 8)
+            )
             self.fc1_atom_shape = (fc1_m_warps, self.num_mma_warps // fc1_m_warps, 1)
             self.fc1_direct_sfb = self.fc1_atom_shape[1] > 2 or self._fc1_tok_tile < 64
             fc1_perm = sm120_utils.get_permutation_mnk(
@@ -4750,6 +4783,14 @@ class MoEDynamicKernelBackend:
         tCrSFB = self._dense_cls._partition_fragment_SFB(
             self, sSFB[None, None, 0], thr_mma, tidx
         )
+        if cutlass.const_expr(self.direct_sfb):
+            tCrSFB = cute.make_tensor(
+                tCrSFB.iterator,
+                cute.make_layout(
+                    (tCrSFB.shape[0], *tCrSFB.shape[1]),
+                    stride=(tCrSFB.stride[0], *tCrSFB.stride[1]),
+                ),
+            )
         if cutlass.const_expr(self.w4a4_fc1_fused):
             tCrB_up_fused = cute.make_fragment_like(tCrB)
             tCrSFB_up_fused = cute.make_fragment_like(tCrSFB)
@@ -4852,14 +4893,20 @@ class MoEDynamicKernelBackend:
         crA_fc1_cur = crA
         tCrSFA_fc1_cur = tCrSFA
         crSFA_fc1_cur = crSFA
-        csSFB = thr_ld_SFB.partition_S(sSFB)
-        csSFB_up = thr_ld_SFB.partition_S(sSFB_up)
+        if cutlass.const_expr(self.direct_sfb):
+            csSFB = self._partition_staged_sfb(sSFB, thr_mma, tidx)
+            csSFB_up = self._partition_staged_sfb(sSFB_up, thr_mma, tidx)
+        else:
+            csSFB = thr_ld_SFB.partition_S(sSFB)
+            csSFB_up = thr_ld_SFB.partition_S(sSFB_up)
         # The W4A8 mainloop decodes its B scale bytes directly and never uses
         # the generic SFB copy fragment.  With a four-warp N atom that generic
         # copy cannot be retiled to the raw-MMA fragment, so avoid asking CuTe
         # to form an unused (and invalid) mapping.
-        if cutlass.const_expr(self.is_w4a8):
+        if cutlass.const_expr(self.is_w4a8 or self.direct_sfb):
             crSFB = tCrSFB
+            if cutlass.const_expr(self.w4a4_fc1_fused):
+                crSFB_up_fused = tCrSFB_up_fused
         else:
             crSFB = thr_ld_SFB.retile(tCrSFB)
             if cutlass.const_expr(self.w4a4_fc1_fused):
@@ -6947,7 +6994,7 @@ class MoEDynamicKernelBackend:
                                 fz_csSFA_p[None, None, 0],
                                 fz_crSFA[None, None, 0],
                             )
-                        cute.copy(
+                        self._copy_sfb(
                             smem_copy_SFB,
                             fz_csSFB_p[None, None, 0],
                             fz_crSFB[None, None, 0],
@@ -6958,7 +7005,7 @@ class MoEDynamicKernelBackend:
                                 csB_up_p[None, None, 0],
                                 crB_up_fused[None, None, 0],
                             )
-                            cute.copy(
+                            self._copy_sfb(
                                 smem_copy_SFB,
                                 fz_csSFB_up_p[None, None, 0],
                                 fz_crSFB_up[None, None, 0],
@@ -7106,13 +7153,13 @@ class MoEDynamicKernelBackend:
                                         None, None, k_next if self.is_w6a8 else 0
                                     ],
                                 )
-                                cute.copy(
+                                self._copy_sfb(
                                     smem_copy_SFB,
                                     fz_csSFB_cur[None, None, k_next],
                                     fz_crSFB[None, None, k_next],
                                 )
                                 if cutlass.const_expr(self.w4a4_fc1_fused):
-                                    cute.copy(
+                                    self._copy_sfb(
                                         smem_copy_SFB,
                                         fz_csSFB_up_p[None, None, k_next],
                                         fz_crSFB_up[None, None, k_next],
@@ -7152,13 +7199,13 @@ class MoEDynamicKernelBackend:
                                         csB_up_p[None, None, k_next],
                                         crB_up_fused[None, None, k_next],
                                     )
-                                cute.copy(
+                                self._copy_sfb(
                                     smem_copy_SFB,
                                     fz_csSFB_p[None, None, k_next],
                                     fz_crSFB[None, None, k_next],
                                 )
                                 if cutlass.const_expr(self.w4a4_fc1_fused):
-                                    cute.copy(
+                                    self._copy_sfb(
                                         smem_copy_SFB,
                                         fz_csSFB_up_p[None, None, k_next],
                                         fz_crSFB_up[None, None, k_next],
@@ -7267,7 +7314,7 @@ class MoEDynamicKernelBackend:
                                 fz_csSFA_p[None, None, 0],
                                 fz_crSFA[None, None, 0],
                             )
-                            cute.copy(
+                            self._copy_sfb(
                                 smem_copy_SFB,
                                 fz_csSFB_p[None, None, 0],
                                 fz_crSFB[None, None, 0],
@@ -7370,7 +7417,7 @@ class MoEDynamicKernelBackend:
                                         fz_csSFA_p[None, None, k_next],
                                         fz_crSFA[None, None, k_next],
                                     )
-                                    cute.copy(
+                                    self._copy_sfb(
                                         smem_copy_SFB,
                                         fz_csSFB_p[None, None, k_next],
                                         fz_crSFB[None, None, k_next],
@@ -7400,7 +7447,7 @@ class MoEDynamicKernelBackend:
                                         fz_csSFA_p[None, None, k_next],
                                         fz_crSFA[None, None, k_next],
                                     )
-                                    cute.copy(
+                                    self._copy_sfb(
                                         smem_copy_SFB,
                                         fz_csSFB_p[None, None, k_next],
                                         fz_crSFB[None, None, k_next],
@@ -7863,7 +7910,7 @@ class MoEDynamicKernelBackend:
                             )
                             f2 = cute.filter_zeros(csSFB_phase2)
                             f4 = cute.filter_zeros(crSFB)
-                            cute.copy(
+                            self._copy_sfb(
                                 smem_copy_SFB, f2[None, None, 0], f4[None, None, 0]
                             )
 
@@ -8197,7 +8244,7 @@ class MoEDynamicKernelBackend:
                                     )
                                     f2 = cute.filter_zeros(csSFB_phase2)
                                     f4 = cute.filter_zeros(crSFB)
-                                    cute.copy(
+                                    self._copy_sfb(
                                         smem_copy_SFB,
                                         f2[None, None, k_next],
                                         f4[None, None, k_next],

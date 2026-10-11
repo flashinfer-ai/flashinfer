@@ -11168,6 +11168,7 @@ def _get_dynamic_kernel(
     w4a8_repacked: bool = False,
     w4a8_n64_repacked: bool = False,
     nvfp4_materialize_intermediate: bool = False,
+    mma_warps: int | None = None,
     direct_routing: bool = False,
     external_route_plan: bool = False,
     share_input_across_experts: bool = False,
@@ -11302,6 +11303,7 @@ def _get_dynamic_kernel(
         bool(direct_routing),
         bool(external_route_plan),
         bool(materialize_intermediate),
+        mma_warps,
         int(trellis_bits),
         bool(trellis_intermediate_hadamard),
     )
@@ -11339,6 +11341,8 @@ def _get_dynamic_kernel(
         fast_math=fast_math,
         dynamic_down_scale=dynamic_down_scale,
     )
+    if mma_warps is not None:
+        kernel_kwargs["mma_warps"] = mma_warps
     kernel_kwargs["share_input_across_experts"] = share_input_across_experts
     kernel_kwargs["deterministic_output"] = bool(deterministic_output)
     kernel_kwargs["num_topk"] = int(num_topk)
@@ -11703,6 +11707,7 @@ def _launch_dynamic_flat(
     w4a8_repacked: bool,
     w4a8_n64_repacked: bool,
     nvfp4_materialize_intermediate: bool,
+    mma_warps: int | None = None,
     share_input_across_experts: bool,
     deterministic_output: bool,
     swiglu_limit: float | None,
@@ -11912,6 +11917,7 @@ def _launch_dynamic_flat(
         w4a8_repacked=w4a8_repacked,
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
+        mma_warps=mma_warps,
         direct_routing=direct_routing,
         external_route_plan=external_route_plan,
         share_input_across_experts=share_input_across_experts,
@@ -12062,6 +12068,7 @@ def _encode_dynamic_launch_policy(
     planned_direct_routing: bool,
     w4a8_n64_repacked: bool,
     nvfp4_materialize_intermediate: bool = False,
+    mma_warps: int | None = None,
 ) -> int:
     try:
         tile_code = _DYNAMIC_TILE_M_POLICY_CODES[int(planned_tile_m)]
@@ -12071,6 +12078,8 @@ def _encode_dynamic_launch_policy(
         ) from exc
     if policy_max_active_clusters < -1:
         raise ValueError("policy_max_active_clusters must be -1 or nonnegative")
+    if mma_warps not in (None, 4):
+        raise ValueError("compute warps must be four or the tile default")
     return (
         int(bool(volatile_launch_state))
         | (int(bool(external_route_plan_requested)) << 1)
@@ -12078,13 +12087,14 @@ def _encode_dynamic_launch_policy(
         | (int(bool(planned_direct_routing)) << 4)
         | (int(bool(w4a8_n64_repacked)) << 5)
         | (int(bool(nvfp4_materialize_intermediate)) << 6)
-        | ((int(policy_max_active_clusters) + 1) << 7)
+        | (int(mma_warps == 4) << 7)
+        | ((int(policy_max_active_clusters) + 1) << 8)
     )
 
 
 def _decode_dynamic_launch_policy(
     value: int,
-) -> tuple[bool, bool, int, bool, bool, bool, int]:
+) -> tuple[bool, bool, int, bool, bool, bool, int | None, int]:
     value = int(value)
     return (
         bool(value & 1),
@@ -12093,7 +12103,8 @@ def _decode_dynamic_launch_policy(
         bool(value & 16),
         bool(value & 32),
         bool(value & 64),
-        (value >> 7) - 1,
+        4 if value & 128 else None,
+        (value >> 8) - 1,
     )
 
 
@@ -12202,6 +12213,7 @@ def _tp_moe_dynamic_launch_op(
         planned_direct_routing,
         w4a8_n64_repacked,
         nvfp4_materialize_intermediate,
+        mma_warps,
         policy_max_active_clusters,
     ) = _decode_dynamic_launch_policy(launch_policy)
     _launch_dynamic_flat(
@@ -12264,6 +12276,7 @@ def _tp_moe_dynamic_launch_op(
         w4a8_repacked=w4a8_repacked,
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
+        mma_warps=mma_warps,
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
         swiglu_limit=swiglu_limit,
@@ -12372,6 +12385,7 @@ def _launch_dynamic(
     w4a8_prepared: dict | None = None,
     w4a8_n64_repacked: bool = False,
     nvfp4_materialize_intermediate: bool = False,
+    mma_warps: int | None = None,
     share_input_across_experts: bool = False,
     deterministic_output: bool = False,
     swiglu_limit: float | None = None,
@@ -12394,6 +12408,7 @@ def _launch_dynamic(
         planned_direct_routing=dynamic_route_mode == "direct",
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
+        mma_warps=mma_warps,
     )
     if deterministic_output and workspace.route_output.numel() < routed_rows * k:
         raise RuntimeError(
@@ -13831,6 +13846,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             w4a8_prepared=dynamic_w4a8_prepared,
             w4a8_n64_repacked=bool(getattr(prepared_payload, "n64_repack", False)),
             nvfp4_materialize_intermediate=decode_config.nvfp4_materialize_intermediate,
+            mma_warps=decode_config.dynamic_mma_warps,
             deterministic_output=deterministic_output,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,

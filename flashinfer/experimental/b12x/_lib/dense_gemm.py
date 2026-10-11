@@ -753,10 +753,18 @@ class DenseGemmKernel:
         fused_quant_bf16: Optional[bool] = None,
         block_fp8: bool = False,
         weight_only: Optional[str] = None,
+        mma_warps: Optional[int] = None,
         alpha_reciprocal: bool = False,
     ):
         if weight_only not in (None, "nvfp4", "mxfp8", "iq2_xs", "iq2_xxs", "q8_0"):
             raise ValueError("weight_only must be nvfp4, mxfp8, or iq2_xs")
+        if mma_warps is not None and not (
+            type(mma_warps) is int
+            and mma_warps in (2, 4)
+            and weight_only == "mxfp8"
+            and mma_tiler_mn in ((16, 64), (16, 128))
+        ):
+            raise ValueError("explicit compute warps require MXFP8 A16 M16 N64/N128")
         self.weight_only = weight_only
         self.a16 = weight_only is not None
         self.a16_fp4 = weight_only == "nvfp4"
@@ -966,8 +974,15 @@ class DenseGemmKernel:
         # and shared-memory layouts.
         self.direct_sfa_prefix = direct_sfa_live16 and self.direct_sfb_representative
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
-        # Four compute warps hide MXFP8 load/dequantization latency at small M.
-        small_m_warps = 8 if self.a16_block else 4 if weight_only == "mxfp8" else 2
+        small_m_warps = (
+            mma_warps
+            if mma_warps is not None
+            else 8
+            if self.a16_block
+            else 4
+            if weight_only == "mxfp8"
+            else 2
+        )
         if self.a16_block_transposed:
             self.atom_shape = (mma_atom_mn[0] // 16, 1, 1)
         elif mma_atom_mn in ((16, 64), (16, 128)):
@@ -5295,10 +5310,12 @@ class _DenseGemmLaunch:
         plain_fp8: bool = False,
         block_fp8: bool = False,
         weight_only: Optional[str] = None,
+        mma_warps: Optional[int] = None,
         alpha_reciprocal: bool = False,
         input_k: Optional[int] = None,
     ):
         self._weight_only = weight_only
+        self._mma_warps = mma_warps
         self._alpha_reciprocal = alpha_reciprocal
         self._input_k = k if input_k is None else input_k
         self._storage_k = k // (
@@ -5614,6 +5631,7 @@ class _DenseGemmLaunch:
             plain_fp8=self._plain_fp8,
             block_fp8=self._block_fp8,
             weight_only=self._weight_only,
+            mma_warps=self._mma_warps,
             alpha_reciprocal=self._alpha_reciprocal,
         )(
             a_tensor,
@@ -6843,6 +6861,7 @@ def _get_compiled_dense_gemm(
     block_fp8: bool = False,
     target_occupancy_override: Optional[int] = None,
     weight_only: Optional[str] = None,
+    mma_warps: Optional[int] = None,
     alpha_reciprocal: bool = False,
     input_k: Optional[int] = None,
     device_ordinal: Optional[int] = None,
@@ -6963,6 +6982,7 @@ def _get_compiled_dense_gemm(
         plain_fp8=plain_fp8,
         block_fp8=block_fp8,
         weight_only=weight_only,
+        mma_warps=mma_warps,
         alpha_reciprocal=alpha_reciprocal,
         input_k=input_k,
         target_occupancy=(

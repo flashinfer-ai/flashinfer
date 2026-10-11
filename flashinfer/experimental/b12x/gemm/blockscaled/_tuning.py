@@ -57,12 +57,20 @@ class BlockscaledConfig:
     tile_n: int | None = None
     tile_k: int | None = None
     split_k: int | None = None
+    mma_warps: int | None = None
 
     @classmethod
     def from_config(cls, payload):
-        if set(payload) != {"mode", "tile_m", "tile_n", "tile_k", "split_k"}:
+        if set(payload) != {
+            "mode",
+            "tile_m",
+            "tile_n",
+            "tile_k",
+            "split_k",
+            "mma_warps",
+        }:
             raise ValueError(
-                "packed precision config requires mode and four nullable A16 knobs"
+                "packed precision config requires mode and five nullable A16 knobs"
             )
         return cls(**dict(payload))
 
@@ -263,6 +271,16 @@ def _validate_config(query, config, device):
         raise ValueError("configuration conflicts with caller activation precision")
     if query.recipe in BLOCK_CODECS and config.mode != "a16":
         raise ValueError("IQ2_XS supports only A16 execution")
+    if config.mma_warps is not None and not (
+        type(config.mma_warps) is int
+        and config.mma_warps in (2, 4)
+        and config.mode == "a16"
+        and query.recipe == "mxfp8"
+        and config.tile_m in (None, 16)
+    ):
+        raise ValueError(
+            "explicit compute warps require two- or four-warp MXFP8 A16 M16 execution"
+        )
     if config.mode == "a16":
         if query.recipe == "mxfp4":
             raise ValueError("MXFP4 does not support A16 execution")
@@ -398,7 +416,8 @@ def _tuning_parameters(query, device):
             if query.recipe in BLOCK_CODECS
             else ("a16", "quantized")
             if query.activation_mode == "auto"
-            else (query.activation_mode,)
+            else (query.activation_mode,),
+            "mma_warps": (2, 4) if query.recipe == "mxfp8" else (None,),
         },
         predicates=(eligible,),
     )
@@ -414,13 +433,14 @@ def _equivalence(query, device, config):
         "tile_n": n,
         "tile_k": k,
         "split_k": split,
+        "mma_warps": (config.mma_warps or 4) if query.recipe == "mxfp8" else None,
     }
 
 
 TUNING = TuningContract(
     component_id="gemm.blockscaled_precision",
     query_schema_version=22,
-    config_schema_version=22,
+    config_schema_version=23,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: {
@@ -431,7 +451,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    candidate_contract_version=20,
+    candidate_contract_version=21,
     knobs=(
         Knob(
             name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE
@@ -444,6 +464,12 @@ TUNING = TuningContract(
         Knob(name="tile_n", values=(4, 64, 128), when=FrozenMapping({"mode": "a16"})),
         Knob(name="tile_k", values=(64, 128, 256), when=FrozenMapping({"mode": "a16"})),
         Knob(name="split_k", values=(1, 2, 4, 8), when=FrozenMapping({"mode": "a16"})),
+        Knob(
+            name="mma_warps",
+            values=None,
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"mode": "a16"}),
+        ),
     ),
     parameters=_tuning_parameters,
     equivalence_key=_equivalence,
