@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""single_head_paged_mqa_logits against an exact reference over random paged BF16
-or NVFP4 keys."""
+"""single_head_paged_mqa_logits and quantize_write_index_k_nvfp4 against exact
+references over random paged BF16 or NVFP4 keys."""
 
 import pytest
 import torch
 
 from flashinfer import nvfp4_kv_dequantize
-from flashinfer.attn_scores import single_head_paged_mqa_logits
+from flashinfer.attn_scores import (
+    quantize_write_index_k_nvfp4,
+    single_head_paged_mqa_logits,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
@@ -121,6 +124,47 @@ def test_single_head_paged_mqa_logits_match_reference_and_replay(
     prepare(replayed)
     graph.replay()
     check(replayed)
+
+
+def e2m1(x: torch.Tensor) -> torch.Tensor:
+    """x rounded to E2M1, to nearest with ties to an even code, saturating."""
+    grid = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=x.device).double()
+    distance = (x.double().abs().clamp(max=6)[..., None] - grid).abs()
+    distance += torch.arange(8, device=x.device) % 2 * 1e-12  # ties: even codes
+    return (grid[distance.argmin(-1)] * x.sign()).float()
+
+
+@pytest.mark.parametrize("tokens", [1, 9, 300])
+@torch.inference_mode()
+def test_quantize_write_index_k_nvfp4_matches_reference(tokens: int) -> None:
+    """Each written key's blocks of 16 are scaled by an E4M3 amax / 6 and
+    rounded to E2M1; slots are shuffled, negative ones skipped, and nothing
+    else is written."""
+    torch.manual_seed(tokens)
+    pages = -(-tokens // 64) + 2
+    spread = 4 ** torch.randn(tokens, 1, device="cuda")
+    key = (torch.randn(tokens, 128, device="cuda") * spread).bfloat16()
+    key[0, :16] = 0  # a zero block: scale 0
+    slots = torch.randperm(64 * pages, device="cuda")[:tokens]
+    slots[1::5] = -1
+    key_cache = torch.full((pages, 64, 64), 7, dtype=torch.uint8, device="cuda")
+    key_scales = torch.full_like(key_cache[..., :8], 7).view(torch.float8_e4m3fn)
+    quantize_write_index_k_nvfp4(key, slots, key_cache, key_scales)
+
+    blocks = key.float().view(tokens, 8, 16)
+    scale = (blocks.abs().amax(-1) / 6).to(torch.float8_e4m3fn).float()
+    inverse = torch.where(scale > 0, 1 / scale, 0)
+    expected = (e2m1(blocks * inverse[..., None]) * scale[..., None]).flatten(1)
+    live = slots >= 0
+    rows, scale_rows = key_cache.view(-1, 64), key_scales.view(-1, 8)
+    torch.testing.assert_close(
+        scale_rows[slots[live]].float(), scale[live], rtol=0, atol=0
+    )
+    got = dequantize(rows[slots[live]], scale_rows[slots[live]]).float()
+    torch.testing.assert_close(got, expected[live], rtol=0, atol=0)
+    untouched = torch.ones(64 * pages, dtype=torch.bool, device="cuda")
+    untouched[slots[live]] = False
+    assert bool((rows[untouched] == 7).all())
 
 
 @torch.inference_mode()

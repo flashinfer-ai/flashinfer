@@ -17,6 +17,15 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.experimental.primitives import exit as exit_thread
 
+from ...cute_dsl.fp4_common import (
+    cvt_e2m1x8_f32,
+    cvt_f32_to_e4m3,
+    fabs_f32,
+    fdiv_rn,
+    fmax_f32,
+    fp8_e4m3_to_f32,
+)
+
 # The most key tiles a CTA runs over, staging their page indices (8 B a tile),
 # so a run covers 32K keys.
 TILES_PER_CTA = 256
@@ -542,6 +551,48 @@ class PagedScorer:
                 cute.make_tensor(place + half * 128, cute.make_layout(1)),
             )
         cute.arch.cp_async_mbarrier_arrive_noinc(keys.producer_get_barrier(stage))
+
+
+@cute.kernel
+def index_k_write_kernel(
+    key: cute.Tensor,
+    slots: cute.Tensor,
+    key_cache: cute.Tensor,
+    key_scales: cute.Tensor,
+):
+    """Quantize key i to NVFP4 (an E4M3 scale per 16 values, their amax over 6,
+    and 64 packed E2M1 bytes as 16 words) and write it at slot slots[i];
+    negative slots are not written. Lanes 16 h .. 16 h + 15 of warp w take key
+    2 w + h, lane l quantizing values 8 l .. 8 l + 7: lane pairs share a scale.
+    The E4M3 path of rmsnorm_fp4quant (flashinfer/cute_dsl), with a unit global
+    scale, so the largest value maps to about 6."""
+    lane = cute.arch.lane_idx()
+    part = lane % 16
+    i = (cute.arch.block_idx()[0] * 4 + cute.arch.warp_idx()) * 2 + lane // 16
+    key_cache = cute.recast_tensor(key_cache, cutlass.Int32)  # packed values as words
+    key_scales = cute.recast_tensor(key_scales, cutlass.Uint8)
+    slot = cutlass.Int64(-1)
+    values = cute.make_rmem_tensor((8,), cutlass.Float32)
+    values.fill(0.0)
+    if i < key.shape[0]:  # past the keys, a lane still joins its pair's shuffle
+        slot = slots[i].to(cutlass.Int64)
+        loaded = cute.make_rmem_tensor((8,), key.element_type)
+        loaded.store(cute.local_tile(key[i, None], (8,), (part,)).load())
+        values.store(loaded.load().to(cutlass.Float32))
+    amax = cutlass.Float32(0.0)
+    for j in cutlass.range_constexpr(8):
+        amax = fmax_f32(amax, fabs_f32(values[j]))
+    amax = fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, offset=1))
+    scale = cvt_f32_to_e4m3(fdiv_rn(amax, cutlass.Float32(6.0)))
+    inverse = cutlass.Float32(0.0)
+    if fp8_e4m3_to_f32(scale) > 0:
+        inverse = fdiv_rn(cutlass.Float32(1.0), fp8_e4m3_to_f32(scale))
+    packed = cvt_e2m1x8_f32(*(values[j] * inverse for j in range(8)))
+    if slot >= 0:
+        page, row = slot // 64, slot % 64
+        key_cache[page, row, part] = packed.to(cutlass.Int32)
+        if part % 2 == 0:
+            key_scales[page, row, part // 2] = scale.to(cutlass.Uint8)
 
 
 # One scorer per query rows per request and key format, so each compiles once.

@@ -10,7 +10,10 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..cute_dsl.availability import is_cute_dsl_experimental_available
-from ..trace.templates.attn_scores import single_head_paged_mqa_logits_trace
+from ..trace.templates.attn_scores import (
+    quantize_write_index_k_nvfp4_trace,
+    single_head_paged_mqa_logits_trace,
+)
 from ..utils import get_compute_capability, get_device_sm_count
 
 
@@ -119,3 +122,40 @@ def _score(rows: int, keys: tuple, args: tuple) -> None:
         (single_head_scorer.__file__,),
     )
     function(*args)
+
+
+@flashinfer_api(trace=quantize_write_index_k_nvfp4_trace)
+def quantize_write_index_k_nvfp4(
+    key: torch.Tensor,
+    slots: torch.Tensor,
+    key_cache: torch.Tensor,
+    key_scales: torch.Tensor,
+) -> None:
+    """Quantize indexer keys to NVFP4 and write them to a paged key cache.
+
+    Key ``i`` (row ``i`` of ``key``, BF16 or FP16 ``[tokens, 128]``) gets one
+    E4M3 scale per 16 values, their amax over 6 (with a unit global scale). It
+    is written at cache slot ``s = slots[i]`` (int64), in the layout
+    :func:`single_head_paged_mqa_logits` reads: its 64 packed E2M1 bytes go to
+    ``key_cache[s // 64, s % 64]`` (uint8 ``[pages, 64, 64]``) and its 8 scales
+    to ``key_scales[s // 64, s % 64]`` (float8_e4m3fn ``[pages, 64, 8]``).
+    Negative slots are skipped. It runs as one launch without host
+    synchronization, so it can be captured in a CUDA graph (run it once before
+    capture to compile it)."""
+    from ..cute_dsl.launch import launch
+    from .kernels import single_head_scorer
+
+    if key.shape[1] != 128 or key_cache.shape[1:] != (64, 64):
+        raise ValueError("Keys must be [tokens, 128] and the cache [pages, 64, 64]")
+    if key_scales.shape[1:] != (64, 8) or slots.shape[0] < key.shape[0]:
+        raise ValueError("key_scales must be [pages, 64, 8], with a slot per key")
+    if key.shape[0]:
+        launch(
+            single_head_scorer.index_k_write_kernel,
+            ((key.shape[0] + 7) // 8, 1),
+            128,
+            (key, slots, key_cache, key_scales),
+            (),
+            module="single_head_scorer",
+            key_files=(single_head_scorer.__file__,),
+        )

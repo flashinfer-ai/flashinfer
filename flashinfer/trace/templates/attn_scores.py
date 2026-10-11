@@ -683,3 +683,32 @@ single_head_paged_mqa_logits_trace = TraceTemplate(
     outputs={"scores": Tensor(["rows", "max_context"], dtype="float32")},
     tags=["arch:sm100", "arch:sm103"],
 )
+
+
+quantize_write_index_k_nvfp4_trace = TraceTemplate(
+    op_type="quantize_write_index_k_nvfp4",
+    description=(
+        "Indexer keys quantized to NVFP4 (E4M3 scale per 16 values) and written "
+        "at their slots of a 64-key paged cache."
+    ),
+    axes={
+        "tokens": Var(description="Keys to write."),
+        "dim": Const(description="Key dimension."),
+        "slots": Var(description="Slot mapping entries, one or more per key."),
+        "pages": Var(description="Key cache pages."),
+        "page_size": Const(description="Keys per page."),
+        "packed_dim": Const(description="Packed NVFP4 bytes per key."),
+        "scales": Const(description="E4M3 scales per key, one per 16 values."),
+    },
+    inputs={
+        "key": Tensor(["tokens", "dim"]),
+        "slots": Tensor(["slots"]),
+        "key_cache": Tensor(["pages", "page_size", "packed_dim"]),
+        "key_scales": Tensor(["pages", "page_size", "scales"]),
+    },
+    outputs={
+        "key_cache": Tensor(["pages", "page_size", "packed_dim"], dtype="uint8"),
+        "key_scales": Tensor(["pages", "page_size", "scales"], dtype="float8_e4m3fn"),
+    },
+    tags=["arch:sm100", "arch:sm103"],
+)
