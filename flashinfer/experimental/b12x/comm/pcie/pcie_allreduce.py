@@ -153,6 +153,7 @@ class PCIeAllReduce:
         max_size: int = DEFAULT_MAX_SIZE,
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
+        ipc=None,
         single_channel: bool = False,
         max_concurrent_channels: int = 1,
     ) -> "PCIeAllReduce":
@@ -167,10 +168,13 @@ class PCIeAllReduce:
                 max_size=max_size,
                 rank_data_bytes=rank_data_bytes,
                 ext_module=ext_module,
+                ipc=ipc,
                 single_channel=single_channel,
                 max_concurrent_channels=max_concurrent_channels,
             )
         else:
+            if ipc is not None:
+                raise ValueError("caller-owned shared memory requires the direct all-reduce runtime")
             if int(max_concurrent_channels) != 1:
                 raise ValueError(
                     "hierarchical all-reduce supports exactly one concurrent channel"

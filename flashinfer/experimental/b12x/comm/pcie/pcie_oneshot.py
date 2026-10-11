@@ -3618,6 +3618,7 @@ class PCIeOneshotAllReducePool:
         max_size: int = DEFAULT_MAX_SIZE,
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
+        ipc=None,
         single_channel: bool = False,
         max_concurrent_channels: int = 1,
     ) -> "PCIeOneshotAllReducePool":
@@ -3630,6 +3631,7 @@ class PCIeOneshotAllReducePool:
             max_size=max_size,
             rank_data_bytes=rank_data_bytes,
             ext_module=ext_module,
+            ipc=ipc,
             single_channel=single_channel,
             max_concurrent_channels=max_concurrent_channels,
         )
