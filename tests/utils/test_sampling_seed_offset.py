@@ -39,6 +39,7 @@ RNG_SHAPES = [(4, 4), (1, 4), (4, 1), (1, 1)]
 
 
 def _sampler(name, indexed, vocab_size=257):
+    """Build reproducible distributions for indexed and direct sampling paths."""
     generator = torch.Generator(device="cuda").manual_seed(42)
     logits = torch.randn(
         3 if indexed else 4, vocab_size, device="cuda", generator=generator
@@ -77,6 +78,7 @@ def _sampler(name, indexed, vocab_size=257):
 
 
 def _rng_tensors(seed_size, offset_size, dtype):
+    """Create broadcast or per-request RNG keys in the requested integer dtype."""
     seeds = [17, 324, 907, 1049][:seed_size]
     offsets = [0, 128, 512, 1024][:offset_size]
     return (
@@ -100,6 +102,7 @@ def _select_rows(sample, rows):
 
 
 def _assert_rng_reference(sample, actual, seed, offset):
+    """Check exact replay across singleton, reordered, and smaller batches."""
     # Tensor keys identify requests even in singleton or broadcast-only calls.
     seeds = seed.cpu().tolist()
     offsets = offset.cpu().tolist()
@@ -134,6 +137,7 @@ def _assert_rng_reference(sample, actual, seed, offset):
 @pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
 @pytest.mark.parametrize("seed_size,offset_size", RNG_SHAPES)
 def test_sampling_row_seed_offset(name, indexed, dtype, seed_size, offset_size):
+    """Tensor RNG keys must follow requests independently of batch layout."""
     sample = _sampler(name, indexed)
     seed, offset = _rng_tensors(seed_size, offset_size, dtype)
     actual = sample(seed=seed, offset=offset)
@@ -141,6 +145,7 @@ def test_sampling_row_seed_offset(name, indexed, dtype, seed_size, offset_size):
 
 
 def _chain_sampler(reject_at):
+    """Build draft distributions with a controlled rejection position."""
     # Deterministically accept draft token 0 until reject_at, then sample a
     # replacement. reject_at=3 exercises the all-accepted final-token draw.
     draft = torch.zeros(4, 3, 257, device="cuda")
@@ -162,6 +167,7 @@ def _chain_sampler(reject_at):
 @pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
 @pytest.mark.parametrize("seed_size,offset_size", RNG_SHAPES)
 def test_chain_sampling_row_seed_offset(reject_at, dtype, seed_size, offset_size):
+    """Speculative acceptance and replacement draws must be batch-invariant."""
     sample = _chain_sampler(reject_at)
     seed, offset = _rng_tensors(seed_size, offset_size, dtype)
     actual = sample(seed=seed, offset=offset)
@@ -171,6 +177,7 @@ def test_chain_sampling_row_seed_offset(reject_at, dtype, seed_size, offset_size
 @pytest.mark.parametrize("name", [*SAMPLERS, "chain"])
 @pytest.mark.parametrize("seed_size,offset_size", [(4, 4), (1, 1)])
 def test_sampling_rng_tensor_cuda_graph(name, seed_size, offset_size):
+    """Graph replay must read updated RNG tensors and preserve request identity."""
     sample = _chain_sampler(1) if name == "chain" else _sampler(name, True)
     seed, offset = _rng_tensors(seed_size, offset_size, torch.int64)
     sample(seed=seed, offset=offset)
@@ -188,6 +195,7 @@ def test_sampling_rng_tensor_cuda_graph(name, seed_size, offset_size):
 @pytest.mark.parametrize("name", ["seed", "offset"])
 @pytest.mark.parametrize("size", [0, 2, 5])
 def test_sampling_rng_tensor_ffi_rejects_invalid_length(name, size):
+    """Reject malformed RNG tensors at the FFI boundary before kernel launch."""
     # Exercise the FFI boundary directly, without the Python shape validator.
     module = sampling.gen_sampling_module().build_and_load()
     logits = torch.zeros(3, 257, device="cuda")
@@ -206,6 +214,7 @@ def test_sampling_rng_tensor_ffi_rejects_invalid_length(name, size):
 @pytest.mark.parametrize("name", SAMPLERS)
 @pytest.mark.parametrize("vocab_size", [256, 1026])
 def test_sampling_row_rng_vectorization(name, vocab_size):
+    """Preserve request-local draws across supported vectorized vocabulary widths."""
     # Cover vector widths 4 and 2 in addition to the width-1 (257) matrix.
     sample = _sampler(name, False, vocab_size)
     seed, offset = _rng_tensors(4, 4, torch.int64)
@@ -216,6 +225,7 @@ def test_sampling_row_rng_vectorization(name, vocab_size):
     "name", ["top_k_top_p_sequential", "top_k_top_p_logits_sequential"]
 )
 def test_sampling_row_rng_top_k_fast_path(name):
+    """The large-vocabulary top-k fast path must preserve request-local draws."""
     sample = _sampler(name, False, 65536)
     seed, offset = _rng_tensors(4, 4, torch.int64)
     _assert_rng_reference(sample, sample(seed=seed, offset=offset), seed, offset)
@@ -223,6 +233,7 @@ def test_sampling_row_rng_top_k_fast_path(name):
 
 @pytest.mark.parametrize("name", [*SAMPLERS, "chain"])
 def test_repeated_request_rng_replays_same_draw(name):
+    """Duplicated request keys must replay exactly, including high unsigned bits."""
     sample = _chain_sampler(1) if name == "chain" else _sampler(name, True)
     # Duplicate a single logical request, including its RNG values. Distinct
     # output slots must not introduce hidden randomness for this request.
