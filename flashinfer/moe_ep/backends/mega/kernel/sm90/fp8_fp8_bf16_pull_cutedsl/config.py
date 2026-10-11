@@ -33,6 +33,9 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     Expert weights must be kernel-ready FP8 at launch; supply bf16
     ``MoEWeightPack`` and enable ``MegaConfig.preprocess_weights`` (default),
     or pass kernel-ready transformed weights with ``preprocess_weights=False``.
+    An MXFP8 checkpoint (E4M3 + E8M0 per-32 scales) is also accepted with
+    ``fp8_scale_mode="blockwise"``: preprocessing converts it once to 128x128
+    power-of-two block scales (exact except for E4M3 underflow).
 
     Launch tuning is resolved through the ``knobs`` field (knob cache /
     heuristic table / explicit dict / ``"auto"`` autotune — see the field

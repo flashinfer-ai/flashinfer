@@ -1213,6 +1213,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                     slot_mask=token_rank_mask,
                 )
             else:
+                # FI local extension: masked (-1) routes are never dispatched,
+                # so their (token, topk) rows hold a previous launch's terms;
+                # mask them out by the local routing.
                 TopkReduce(
                     self.hidden,
                     self.num_topk,
@@ -1224,6 +1227,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                     output_activation,
                     score,
                     stream,
+                    slot_topk_idx=topk_idx,
                 )
 
     # =========================================================================

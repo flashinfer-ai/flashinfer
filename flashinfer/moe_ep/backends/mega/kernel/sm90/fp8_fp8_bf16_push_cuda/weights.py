@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 from ......core.validation.common import MoEEpConfigError
-from ......weights import MoEWeightPack
+from ......weights import MoEWeightPack, PrequantizedMoEWeights
 
 if TYPE_CHECKING:
     from ......kernel_src.sm90.push_style_megamoe import Sm90PushWeights
@@ -87,6 +87,57 @@ def validate_transformed_mega_weights(
         )
 
 
+def _preprocess_mxfp8_mega_weights(
+    weights: PrequantizedMoEWeights,
+    *,
+    intermediate_size: int,
+    hidden_size: int,
+    num_local_experts: int,
+    fuse_fc1_epilogue: bool,
+) -> Any:
+    """MXFP8 E4M3 + E8M0 (1x32) pack → ``Sm90PushWeights``, exactly.
+
+    See ``..common.mxfp8``: power-of-two 128x128 scales make the conversion
+    lossless except for E4M3 underflow.  The fused-FC1 gate/up interleave
+    moves whole 128-row blocks, so it runs after quantization as in the bf16
+    path.
+    """
+    from ......kernel_src.sm90.push_style_megamoe import (
+        Sm90PushWeights,
+        interleave_sm90_push_gate_up,
+    )
+    from ..common.mxfp8 import mxfp8_to_fp8_block128, validate_mxfp8_pack
+
+    validate_mxfp8_pack(
+        weights,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        num_local_experts=num_local_experts,
+        kernel_name="sm90_fp8_fp8_bf16_push_cuda",
+    )
+    if not weights.w13.is_cuda:
+        raise MoEEpConfigError(
+            "sm90_fp8_fp8_bf16_push_cuda MXFP8 weights must be CUDA tensors"
+        )
+    if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+        raise MoEEpConfigError(
+            "sm90_fp8_fp8_bf16_push_cuda needs hidden_size and intermediate_size "
+            f"to be multiples of 128; got hidden_size={hidden_size}, "
+            f"intermediate_size={intermediate_size}"
+        )
+    w13_fp8, w13_sf = mxfp8_to_fp8_block128(weights.w13, weights.w13_scale)
+    w2_fp8, w2_sf = mxfp8_to_fp8_block128(weights.w2, weights.w2_scale)
+    if fuse_fc1_epilogue:
+        w13_fp8, w13_sf = interleave_sm90_push_gate_up(w13_fp8, w13_sf)
+    return Sm90PushWeights(
+        w13_fp8=w13_fp8,
+        w13_sf=w13_sf,
+        w2_fp8=w2_fp8,
+        w2_sf=w2_sf,
+        w13_interleaved=fuse_fc1_epilogue,
+    )
+
+
 def preprocess_mega_weights(
     weights: MoEWeightPack,
     *,
@@ -103,12 +154,25 @@ def preprocess_mega_weights(
         raise MoEEpConfigError(
             f"sm90_fp8_fp8_bf16_push_cuda weights must be MoEWeightPack, got {type(weights).__name__}"
         )
-    if weights.w13_scale is not None or weights.w2_scale is not None:
-        raise MoEEpConfigError(
-            "sm90_fp8_fp8_bf16_push_cuda preprocessing accepts canonical bf16 weights only; "
-            "pass Sm90PushWeights through MegaConfig.transformed_weights to reuse "
-            "an already transformed bundle"
+    if isinstance(weights, PrequantizedMoEWeights):
+        # MXFP8 is the one pre-quantized recipe (converted once to 128x128
+        # block scales); an already transformed bundle goes through
+        # MegaConfig.transformed_weights instead.
+        transformed = _preprocess_mxfp8_mega_weights(
+            weights,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            num_local_experts=num_local_experts,
+            fuse_fc1_epilogue=fuse_fc1_epilogue,
         )
+        validate_transformed_mega_weights(
+            transformed,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            num_local_experts=num_local_experts,
+            fuse_fc1_epilogue=fuse_fc1_epilogue,
+        )
+        return transformed
     expected_w13 = (num_local_experts, 2 * intermediate_size, hidden_size)
     expected_w2 = (num_local_experts, hidden_size, intermediate_size)
     for name, tensor, shape in (
