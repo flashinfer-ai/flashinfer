@@ -68,7 +68,15 @@ def test_split_policy_changes_plan_identity_without_changing_config_schema():
 
 @pytest.mark.parametrize(
     "rows,splits,product",
-    [(1, 64, 64), (4, 32, 128), (16, 16, 256), (64, 16, 1024), (512, 1, 1024)],
+    [
+        (1, 64, 64),
+        (4, 32, 128),
+        (16, 16, 256),
+        (64, 16, 1024),
+        (128, 16, 2048),
+        (129, 1, 2048),
+        (512, 1, 2048),
+    ],
 )
 def test_default_policy_retains_partition_and_workspace(rows, splits, product):
     caps = _caps(max_batch=1, max_q_rows=rows)
@@ -87,7 +95,7 @@ def test_fixed_policy_bounds_only_partial_scratch(rows, splits):
     assert contract._target_splits(caps, rows) == (16, splits)
     assert work_rows == rows
     assert (score_chunk, score_width, score_chunks) == default[1:4]
-    assert product == min(rows, 64) * splits
+    assert product == min(rows, 128) * splits
     assert layout.partial_output_nbytes == product * 24 * 256 * 4
     assert layout.partial_lse_nbytes == product * 24 * 4
     for name in ("prepared_query_nbytes", "score_nbytes", "topk_nbytes"):
@@ -175,7 +183,7 @@ def _operands(caps, device="meta"):
 def _assert_launch_slices(calls, operands, caps):
     rows = caps.max_q_rows
     expected_rows = (
-        [min(64, rows - start) for start in range(0, rows, 64)]
+        [min(128, rows - start) for start in range(0, rows, 128)]
         if caps.attention_splits
         else [rows]
     )
@@ -200,7 +208,7 @@ def _assert_launch_slices(calls, operands, caps):
                 tensor.storage_offset()
                 == source.storage_offset() + start * source.stride(0)
             )
-        if caps.attention_splits or count <= 64:
+        if caps.attention_splits or count <= 128:
             assert call["partial_output"].shape == (
                 count,
                 call["splits"],
@@ -222,7 +230,7 @@ def _assert_launch_slices(calls, operands, caps):
 
 
 @pytest.mark.parametrize("splits", [0, 1, 16, 64])
-@pytest.mark.parametrize("rows", [1, 4, 16, 64, 65, 128, 512])
+@pytest.mark.parametrize("rows", [1, 4, 16, 64, 65, 128, 129, 512])
 @pytest.mark.parametrize("dcp_size", [1, 2])
 def test_combined_slices_attention_without_slicing_selector(
     monkeypatch, splits, rows, dcp_size
@@ -266,7 +274,7 @@ def test_combined_slices_attention_without_slicing_selector(
 
 
 @pytest.mark.parametrize("splits", [0, 1, 16, 64])
-@pytest.mark.parametrize("rows", [1, 4, 16, 64, 65, 128, 512])
+@pytest.mark.parametrize("rows", [1, 4, 16, 64, 65, 128, 129, 512])
 @pytest.mark.parametrize("draft", [False, True])
 def test_separate_and_draft_attention_use_identical_partition_contract(
     monkeypatch, splits, rows, draft

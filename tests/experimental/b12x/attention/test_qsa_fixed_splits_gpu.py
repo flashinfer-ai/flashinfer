@@ -99,9 +99,9 @@ def _inputs(binding, start: int, live: int):
         is_prefilling=(True,),
     )
     for name, shape, seed in (
-        ("query", (128, 24, 256), 921),
-        ("index_query", (128, 4, 128), 922),
-        ("raw_index_key", (128, 128), 923),
+        ("query", (256, 24, 256), 921),
+        ("index_query", (256, 4, 128), 922),
+        ("raw_index_key", (256, 128), 923),
     ):
         dynamic[name].copy_(_random(shape, seed)[:rows])
     return dynamic
@@ -196,7 +196,7 @@ def _capture(invoke: Callable, restore: Callable):
 def test_fixed_splits_combined_capacity_and_changed_live_graph_replay(splits):
     device = require_b12x()
     results = {}
-    for rows in (16, 65, 128):
+    for rows in (16, 65, 128, 129):
         live = min(rows, 67)
         binding = _binding(device, rows, splits)
         dynamic = _inputs(binding, 2048, live)
@@ -205,7 +205,7 @@ def test_fixed_splits_combined_capacity_and_changed_live_graph_replay(splits):
         for variant, live_rows in enumerate((live, live - 1)):
             _set_live(dynamic, 2048, live_rows)
             dynamic["query"].copy_(
-                (_random((128, 24, 256), 921).float() * (1 - variant * 0.25)).to(
+                (_random((256, 24, 256), 921).float() * (1 - variant * 0.25)).to(
                     torch.bfloat16
                 )[:rows]
             )
@@ -232,6 +232,21 @@ def test_fixed_splits_combined_capacity_and_changed_live_graph_replay(splits):
                 assert torch.equal(actual[:common], prior_output[:common])
                 assert torch.equal(selected[:common], prior_selected[:common])
             results[key] = (actual, selected, live_rows)
+
+
+@pytest.mark.parametrize("rows", [128, 129])
+def test_automatic_split_boundary_matches_reference_under_graph_replay(rows):
+    device = require_b12x()
+    binding = _binding(device, rows, 0)
+    dynamic = _inputs(binding, 2048, rows)
+    _, restore = _snapshot(_persistent(binding))
+    graph, output = _capture(lambda: qsa.run(binding, **dynamic), restore)
+    for live in (rows, rows - 1):
+        _set_live(dynamic, 2048, live)
+        restore()
+        binding.output.fill_(float("nan"))
+        _replay_without_allocations(graph, binding)
+        _check_reference(binding, dynamic, output, live)
 
 
 @pytest.mark.parametrize("splits", [1, 16, 64])

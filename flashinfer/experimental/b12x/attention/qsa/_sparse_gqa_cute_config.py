@@ -11,7 +11,7 @@ from ..paged._selected_forward_config import (
 )
 
 BLOCK_N = 16
-MAX_SPLIT_ROWS = 64
+MAX_SPLIT_ROWS = 128
 
 
 def _is_page_token_head_layout(tensor: torch.Tensor) -> bool:
