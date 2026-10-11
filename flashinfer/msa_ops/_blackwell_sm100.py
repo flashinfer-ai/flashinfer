@@ -165,7 +165,9 @@ _topk_workspaces: dict[int, dict[str, torch.Tensor]] = {}
 _topk_workspaces_lock = threading.Lock()
 
 
-def _topk_grid_plan(total_q: int, num_heads: int, num_valid_pages: int, max_k_tiles: int) -> dict:
+def _topk_grid_plan(
+    total_q: int, num_heads: int, num_valid_pages: int, max_k_tiles: int
+) -> dict:
     """Shape-only plan: over ``s in (1,2,4,8)`` with ``ceil(nvp / s) >= 32`` (else ``s = 1``), ``S`` minimises
     ``ceil(groups * s / 444) * (1536 + ceil(nvp / s))`` (ties: the larger ``s``); ``bid = (h * S + s) * num_qtiles + qtile``."""
     total_q = int(total_q)
@@ -173,17 +175,23 @@ def _topk_grid_plan(total_q: int, num_heads: int, num_valid_pages: int, max_k_ti
     num_valid_pages = int(num_valid_pages)
     max_k_tiles = int(max_k_tiles)
     if min(total_q, num_heads, num_valid_pages, max_k_tiles) <= 0:
-        raise ValueError("topk grid plan requires positive total_q, num_heads, num_valid_pages, max_k_tiles")
+        raise ValueError(
+            "topk grid plan requires positive total_q, num_heads, num_valid_pages, max_k_tiles"
+        )
     if num_heads * max_k_tiles >= 2**31:
         raise ValueError("num_heads * max_k_tiles must fit in int32")
     if total_q * num_heads * _TOPK >= 2**31:
         raise ValueError("total_q * num_heads * 16 must fit in int32")
     index_bits = max(1, (max_k_tiles - 1).bit_length())
     if index_bits > _TOPK_MAX_INDEX_BITS:
-        raise ValueError(f"max_k_tiles must be <= 2**{_TOPK_MAX_INDEX_BITS}, got {max_k_tiles}")
+        raise ValueError(
+            f"max_k_tiles must be <= 2**{_TOPK_MAX_INDEX_BITS}, got {max_k_tiles}"
+        )
     num_qtiles = (total_q + _TOPK_QT - 1) // _TOPK_QT
     groups = num_heads * num_qtiles
-    fitting = [c for c in _TOPK_SLICES if -(-num_valid_pages // c) >= _TOPK_MIN_SLICE] or [1]
+    fitting = [
+        c for c in _TOPK_SLICES if -(-num_valid_pages // c) >= _TOPK_MIN_SLICE
+    ] or [1]
     num_slices = fitting[0]
     best_cost = None
     for candidate in fitting:
@@ -194,7 +202,8 @@ def _topk_grid_plan(total_q: int, num_heads: int, num_valid_pages: int, max_k_ti
             num_slices = candidate
     slice_len = -(-num_valid_pages // num_slices)
     grid = groups * num_slices
-    chunks = -(-(-(-slice_len // 16)) // _TOPK_BMAX_CHUNK_ITERS)
+    slice_k_tiles = -(-slice_len // 16)
+    chunks = -(-slice_k_tiles // _TOPK_BMAX_CHUNK_ITERS)
     return {
         "num_qtiles": num_qtiles,
         "groups": groups,
@@ -206,7 +215,9 @@ def _topk_grid_plan(total_q: int, num_heads: int, num_valid_pages: int, max_k_ti
     }
 
 
-def _topk_route(total_q: int, num_heads: int, num_valid_pages: int, max_k_tiles: int) -> str:
+def _topk_route(
+    total_q: int, num_heads: int, num_valid_pages: int, max_k_tiles: int
+) -> str:
     """Shape-only program choice (duplicated verbatim from
     loom/examples/weave/minimax_sparse_topk_select_v2_sm100.py::topk_route): ``topk_select`` (the query-tiled
     radix select) or ``topk_select_streaming`` (the one-CTA-per-row program) for small latency-bound
@@ -222,7 +233,9 @@ def _topk_route(total_q: int, num_heads: int, num_valid_pages: int, max_k_tiles:
     return _TOPK_ROUTE_RADIX
 
 
-def _topk_workspace(device: torch.device, groups: int, num_slices: int, bmax_words: int, capturing: bool):
+def _topk_workspace(
+    device: torch.device, groups: int, num_slices: int, bmax_words: int, capturing: bool
+):
     """Per-device ``(partials u64, counters u32, block_max u32)`` grown eagerly to the largest plan seen.
 
     ``counters`` is zeroed once on (re)allocation and self-resets through the kernel's ``atom.inc``
@@ -247,17 +260,35 @@ def _topk_workspace(device: torch.device, groups: int, num_slices: int, bmax_wor
                     "msa_topk_select must be invoked eagerly with this (or a larger) shape on this "
                     "device before CUDA graph capture: the K-split workspace cannot grow under capture"
                 )
-            cap_partials = max(need_partials, 0 if entry is None else entry["partials"].numel())
-            cap_counters = max(need_counters, 0 if entry is None else entry["counters"].numel())
-            cap_bmax = max(need_bmax, 0 if entry is None else entry["block_max"].numel())
+            cap_partials = max(
+                need_partials, 0 if entry is None else entry["partials"].numel()
+            )
+            cap_counters = max(
+                need_counters, 0 if entry is None else entry["counters"].numel()
+            )
+            cap_bmax = max(
+                need_bmax, 0 if entry is None else entry["block_max"].numel()
+            )
             with torch.cuda.device(index):
                 entry = {
-                    "partials": torch.empty(cap_partials, dtype=torch.uint64, device=torch.device("cuda", index)),
-                    "counters": torch.zeros(cap_counters, dtype=torch.uint32, device=torch.device("cuda", index)),
-                    "block_max": torch.empty(cap_bmax, dtype=torch.uint32, device=torch.device("cuda", index)),
+                    "partials": torch.empty(
+                        cap_partials,
+                        dtype=torch.uint64,
+                        device=torch.device("cuda", index),
+                    ),
+                    "counters": torch.zeros(
+                        cap_counters,
+                        dtype=torch.uint32,
+                        device=torch.device("cuda", index),
+                    ),
+                    "block_max": torch.empty(
+                        cap_bmax, dtype=torch.uint32, device=torch.device("cuda", index)
+                    ),
                 }
             _topk_workspaces[index] = entry
         return entry["partials"], entry["counters"], entry["block_max"]
+
+
 _eager_dummies: dict[tuple, torch.Tensor] = {}
 _eager_dummies_lock = threading.Lock()
 # Workspace-free long-prefill calls keep the state of their latest binding only.
@@ -990,16 +1021,18 @@ def _read_request_lengths(
     """One device-to-host copy of the request boundaries."""
 
     q_bounds = [int(value) for value in cu_q.tolist()]
-    q_lens = tuple(b - a for a, b in zip(q_bounds, q_bounds[1:]))
+    q_lens = tuple(b - a for a, b in zip(q_bounds, q_bounds[1:], strict=False))
     if paged:
         k_lens = tuple(int(value) for value in kv_lens.tolist())
         k_first = 0
     else:
         k_bounds = [int(value) for value in cu_k.tolist()]
-        k_lens = tuple(b - a for a, b in zip(k_bounds, k_bounds[1:]))
+        k_lens = tuple(b - a for a, b in zip(k_bounds, k_bounds[1:], strict=False))
         k_first = k_bounds[0]
     if len(q_lens) != len(k_lens):
-        raise ValueError("cu_seqlens_q and the KV lengths must describe the same requests")
+        raise ValueError(
+            "cu_seqlens_q and the KV lengths must describe the same requests"
+        )
     if min(q_lens) <= 0 or min(k_lens) <= 0:
         raise ValueError("every request must have positive query and KV lengths")
     return _RequestLengths(q_lens, k_lens, q_bounds[0], k_first)
@@ -1285,10 +1318,14 @@ def _long_prefill_state(
                 # Zero-based 2-entry bounds of the request's slices; one request
                 # binds the caller's tensors instead.
                 cu_q_views.append(
-                    torch.tensor([0, len_q], dtype=torch.int32, device=q2k_indices.device)
+                    torch.tensor(
+                        [0, len_q], dtype=torch.int32, device=q2k_indices.device
+                    )
                 )
                 cu_k_views.append(
-                    torch.tensor([0, len_k], dtype=torch.int32, device=q2k_indices.device)
+                    torch.tensor(
+                        [0, len_k], dtype=torch.int32, device=q2k_indices.device
+                    )
                 )
             q_begin += len_q
         state["signature"] = signature
@@ -1423,7 +1460,12 @@ def _run_long_prefill(
         plan = state["plans"][index]
         q_end = q_begin + len_q
         if single:
-            cu_q_view, cu_k_view, q_offsets_view, kv_lens_view = cu_q, cu_k, q_offsets, kv_lens
+            cu_q_view, cu_k_view, q_offsets_view, kv_lens_view = (
+                cu_q,
+                cu_k,
+                q_offsets,
+                kv_lens,
+            )
         else:
             cu_q_view = state["cu_q"][index]
             cu_k_view = q_offsets_view = state["cu_k"][index]
@@ -2618,7 +2660,11 @@ def blackwell_msa_topk_select(
         return output
     plan = _topk_grid_plan(total_q, num_heads, valid, max_k_tiles)
     partials, counters, block_max = _topk_workspace(
-        max_score.device, plan["groups"], plan["num_slices"], plan["bmax_words"], capturing
+        max_score.device,
+        plan["groups"],
+        plan["num_slices"],
+        plan["bmax_words"],
+        capturing,
     )
     _program(f"{_TOPK_ROUTE_RADIX}:main", target).launch(
         (plan["grid"], 1, 1),

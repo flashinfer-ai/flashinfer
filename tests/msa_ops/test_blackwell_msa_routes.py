@@ -144,22 +144,44 @@ def test_long_prefill_predicate_covers_flat_and_paged_boundaries():
         **common, **flat, q_lens=(8192, 8320), k_lens=(8192, 8320)
     )
     assert backend._use_long_prefill(
-        **common, paged=True, group_size=8, max_pages=64, q_lens=(8192,), k_lens=(64 * 128,)
+        **common,
+        paged=True,
+        group_size=8,
+        max_pages=64,
+        q_lens=(8192,),
+        k_lens=(64 * 128,),
     )
     assert backend._use_long_prefill(
-        **common, paged=True, group_size=16, max_pages=65, q_lens=(8192,), k_lens=(65 * 128,)
+        **common,
+        paged=True,
+        group_size=16,
+        max_pages=65,
+        q_lens=(8192,),
+        k_lens=(65 * 128,),
     )
     # Paged K/V qualifies through the page-table width, not the KV lengths.
     assert backend._use_long_prefill(
-        **common, paged=True, group_size=16, max_pages=65, q_lens=(8192, 8192), k_lens=(4096, 8320)
+        **common,
+        paged=True,
+        group_size=16,
+        max_pages=65,
+        q_lens=(8192, 8192),
+        k_lens=(4096, 8320),
     )
     assert not backend._use_long_prefill(
-        **common, paged=True, group_size=16, max_pages=64, q_lens=(8192,), k_lens=(64 * 128,)
+        **common,
+        paged=True,
+        group_size=16,
+        max_pages=64,
+        q_lens=(8192,),
+        k_lens=(64 * 128,),
     )
     assert not backend._use_long_prefill(
         **common, paged=False, group_size=8, max_pages=0, q_lens=(8192,), k_lens=(8192,)
     )
-    assert not backend._use_long_prefill(**common, **flat, q_lens=(8191,), k_lens=(8192,))
+    assert not backend._use_long_prefill(
+        **common, **flat, q_lens=(8191,), k_lens=(8192,)
+    )
     # One short request declines the whole batch; so does one short flat KV.
     assert not backend._use_long_prefill(
         **common, **flat, q_lens=(8192, 4096), k_lens=(8192, 8192)
