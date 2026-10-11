@@ -16,6 +16,6 @@
 #include "tvm_ffi_utils.h"
 
 void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorView scale,
-                    ffi::Optional<TensorView> bias);
+                    ffi::Optional<TensorView> bias, bool weight_prepared);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(w8a16_fp8_gemm, w8a16_fp8_gemm);

@@ -21,7 +21,7 @@ using namespace flashinfer;
 
 // out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorView scale,
-                    ffi::Optional<TensorView> bias) {
+                    ffi::Optional<TensorView> bias, bool weight_prepared) {
   CHECK_INPUT(act);     // [M, K], fp16/bf16, contiguous
   CHECK_INPUT(weight);  // [N, K], fp8 e4m3, contiguous
   CHECK_INPUT(out);     // [M, N], act dtype, contiguous
@@ -66,7 +66,7 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
         static_cast<const __nv_fp8_e4m3*>(weight.data_ptr()),
         static_cast<const float*>(scale.data_ptr()), static_cast<const c_type*>(bias_ptr),
         static_cast<c_type*>(out.data_ptr()), static_cast<int>(M), static_cast<int>(N),
-        static_cast<int>(K), stream);
+        static_cast<int>(K), weight_prepared, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "w8a16_fp8_gemm failed with error code " << cudaGetErrorString(status);
     return true;

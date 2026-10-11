@@ -25,16 +25,21 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 15 of the optimization ladder: cluster size becomes a template knob,
-// default 1.  Rung 14's 2-CTA multicast did cut L2 throughput from 78% to
-// 45% of peak on the profiled shape, but the kernel got slower (1.75 ->
-// 2.03 ms, tensor pipe 65% -> 55%): pairing CTAs through shared "empty"
-// barriers makes each pair run at the pace of its slower member and the
-// cluster launch constrains placement, and L2 bandwidth was not what the
-// kernel was waiting on.  The multicast machinery stays in the code behind
-// `kClusterSize` (1 = plain TMA loads, local arrives, ordinary launch; 2 =
-// rung 14) for the per-shape sweep later in the ladder; the launcher uses
-// 1.  Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
+// Rung 16 of the optimization ladder: opt-in prepared weight layout with
+// ldmatrix fragment loads.  Through rung 15 every consumer thread built its
+// wgmma A fragment with four 2-byte shared-memory loads per k16 (16 LDS.U16
+// per slab, each with its own address arithmetic) because the fragment
+// wants (k, k+1) and (k+8, k+9) of one row while memory holds k..k+15
+// contiguous.  With `prepare_w8a16_fp8_weight()` the weight's K axis is
+// permuted once, inside each 16-wide block, to [2c, 2c+1, 2c+8, 2c+9] for
+// c = 0..3 (same [N, K] shape, same per-tensor scale); then a single
+// ldmatrix.x4 on the fp8 tile delivers, per thread, exactly the four
+// bytes of two A registers for two k16 blocks at once: 2 LDSM per slab
+// instead of 16 LDS, no per-fragment address math, and the 64 B swizzle
+// keeps the 8-row phases conflict-free.  The plain checkpoint layout stays
+// the default (`kPrepared = false`, rung-15 path) and stays in the
+// benchmark; the prepared path is selected by the caller.  Requires
+// sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -185,6 +190,15 @@ __device__ __forceinline__ void tma_load_2d_multicast(void* smem_dst, const CUte
       : "memory");
 }
 
+// ldmatrix x4 (four 8x8 b16 matrices; lane l supplies the row address of
+// row l % 8 of matrix l / 8).
+__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void* smem_row_ptr) {
+  const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(smem_row_ptr));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(a));
+}
+
 template <int N>
 __device__ __forceinline__ void setmaxnreg_inc() {
   asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(N));
@@ -270,7 +284,7 @@ __device__ __forceinline__ void wgmma_m64n128k16_rs<__half>(float (&d)[64], cons
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(scale_d));
 }
 
-template <typename T, int kClusterSize>
+template <typename T, int kClusterSize, bool kPrepared>
 __global__ void __launch_bounds__(kW8A16Threads, 1)
     W8A16Fp8GemmTmaKernel(const __grid_constant__ CUtensorMap act_map,
                           const __grid_constant__ CUtensorMap w_map,
@@ -351,13 +365,18 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
 #pragma unroll
     for (int i = 0; i < 64; ++i) d[i] = 0.f;
 
-    // A fragment coordinates: rows r = cwg*64 + wq*16 + lane/4 (+8), k =
-    // 2*(lane%4) (+8) within each k16.  With the 64 B swizzle, the 16 B
-    // chunk holding k16 of row r sits at chunk index (k16/16) ^ ((r>>1)&3).
+    // Plain layout: rows r = cwg*64 + wq*16 + lane/4 (+8), k = 2*(lane%4)
+    // (+8) within each k16; the 16 B chunk holding k16 of row r sits at
+    // chunk index (k16/16) ^ ((r>>1)&3) under the 64 B swizzle.
     const int a_r = cwg * 64 + wq * 16 + lane / 4;
     const int a_k = (lane % 4) * 2;
     const uint32_t swz0 = (a_r >> 1) & 3;
     const uint32_t swz1 = ((a_r + 8) >> 1) & 3;
+    // Prepared layout: ldmatrix row for this lane = warp row (lane % 8) +
+    // 8 * ((lane / 8) % 2), chunk = 2 * pair + lane / 16.
+    const int ld_r = cwg * 64 + wq * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
+    const uint32_t ld_swz = (ld_r >> 1) & 3;
+    const uint32_t ld_chunk_hi = lane / 16;
 
     for (int kt = 0; kt < num_slabs; ++kt) {
       const int stage = kt % kW8A16Stages;
@@ -365,19 +384,39 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       mbar_wait(&full_bar[stage], round & 1);
       const uint8_t* a_stage = a_base + stage * kW8A16AStageBytes;
       const uint8_t* w_stage = w_base + stage * kW8A16WStageBytes;
+      if constexpr (kPrepared) {
 #pragma unroll
-      for (int k16 = 0; k16 < kW8A16TileK; k16 += 16) {
-        const uint32_t chunk = k16 >> 4;
-        const uint8_t* r0 = w_stage + a_r * kW8A16WRowBytes + ((chunk ^ swz0) << 4) + a_k;
-        const uint8_t* r1 = w_stage + (a_r + 8) * kW8A16WRowBytes + ((chunk ^ swz1) << 4) + a_k;
-        uint32_t a_frag[4];
-        a_frag[0] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r0));
-        a_frag[1] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r1));
-        a_frag[2] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r0 + 8));
-        a_frag[3] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r1 + 8));
-        const uint64_t desc_b = make_smem_desc_sw128(a_stage + k16 * 2);
-        wgmma_fence();
-        wgmma_m64n128k16_rs<T>(d, a_frag, desc_b, 1);
+        for (int pair = 0; pair < kW8A16TileK / 32; ++pair) {
+          const uint32_t chunk = 2 * pair + ld_chunk_hi;
+          uint32_t r[4];
+          ldmatrix_x4(r, w_stage + ld_r * kW8A16WRowBytes + ((chunk ^ ld_swz) << 4));
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {  // k16 block 2*pair + h
+            uint32_t a_frag[4];
+            a_frag[0] = fp8x2_to_pair<T>(r[2 * h] & 0xffffu);
+            a_frag[1] = fp8x2_to_pair<T>(r[2 * h + 1] & 0xffffu);
+            a_frag[2] = fp8x2_to_pair<T>(r[2 * h] >> 16);
+            a_frag[3] = fp8x2_to_pair<T>(r[2 * h + 1] >> 16);
+            const uint64_t desc_b = make_smem_desc_sw128(a_stage + (2 * pair + h) * 32);
+            wgmma_fence();
+            wgmma_m64n128k16_rs<T>(d, a_frag, desc_b, 1);
+          }
+        }
+      } else {
+#pragma unroll
+        for (int k16 = 0; k16 < kW8A16TileK; k16 += 16) {
+          const uint32_t chunk = k16 >> 4;
+          const uint8_t* r0 = w_stage + a_r * kW8A16WRowBytes + ((chunk ^ swz0) << 4) + a_k;
+          const uint8_t* r1 = w_stage + (a_r + 8) * kW8A16WRowBytes + ((chunk ^ swz1) << 4) + a_k;
+          uint32_t a_frag[4];
+          a_frag[0] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r0));
+          a_frag[1] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r1));
+          a_frag[2] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r0 + 8));
+          a_frag[3] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r1 + 8));
+          const uint64_t desc_b = make_smem_desc_sw128(a_stage + k16 * 2);
+          wgmma_fence();
+          wgmma_m64n128k16_rs<T>(d, a_frag, desc_b, 1);
+        }
       }
       wgmma_commit();
       wgmma_wait<1>();
@@ -479,7 +518,7 @@ inline cudaError_t MakeTmaMap2D(CUtensorMap* map, const void* base, uint64_t row
 
 template <typename T, int kClusterSize = 1>
 cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scale, const T* bias,
-                         T* out, int M, int N, int K, cudaStream_t stream) {
+                         T* out, int M, int N, int K, bool weight_prepared, cudaStream_t stream) {
   if (K % kW8A16TileK != 0) return cudaErrorInvalidValue;  // whole slabs only
   if ((reinterpret_cast<uintptr_t>(act) & 15) || (reinterpret_cast<uintptr_t>(w) & 15)) {
     return cudaErrorInvalidValue;  // TMA needs 16 B aligned bases
@@ -500,12 +539,13 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
   const unsigned tiles_m = ceil_div(M, kW8A16TileM);
   const unsigned tiles_n = ceil_div(N, kW8A16TileN);
   const unsigned pairs_n = ceil_div(tiles_n, static_cast<unsigned>(kClusterSize));
-  auto* kernel = W8A16Fp8GemmTmaKernel<T, kClusterSize>;
-  static bool attr_set = false;  // per instantiation; the attribute is per function
-  if (!attr_set) {
+  auto* kernel = weight_prepared ? W8A16Fp8GemmTmaKernel<T, kClusterSize, true>
+                                 : W8A16Fp8GemmTmaKernel<T, kClusterSize, false>;
+  static bool attr_set[2] = {false, false};  // per instantiation and layout
+  if (!attr_set[weight_prepared]) {
     e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kW8A16SmemBytes);
     if (e != cudaSuccess) return e;
-    attr_set = true;
+    attr_set[weight_prepared] = true;
   }
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3(tiles_m * pairs_n * kClusterSize);  // 1-D; the kernel rasterizes it

@@ -346,16 +346,25 @@ def make_cublas(
 
 
 def make_kernel(
-    act: torch.Tensor, w_fp8: torch.Tensor, scale: torch.Tensor, bias
+    act: torch.Tensor,
+    w_fp8: torch.Tensor,
+    scale: torch.Tensor,
+    bias,
+    prepared: bool = False,
 ) -> Callable[[], torch.Tensor] | None:
+    """FlashInfer kernel; ``prepared`` uses the opt-in prepared weight layout
+    (the one-time ``prepare_w8a16_fp8_weight`` copy is done here, untimed)."""
     try:
-        from flashinfer.gemm import w8a16_fp8_gemm
+        from flashinfer.gemm import prepare_w8a16_fp8_weight, w8a16_fp8_gemm
     except ImportError:
         return None
     out = torch.empty(act.shape[0], w_fp8.shape[0], dtype=act.dtype, device=act.device)
+    w_use = prepare_w8a16_fp8_weight(w_fp8) if prepared else w_fp8
 
     def run() -> torch.Tensor:
-        return w8a16_fp8_gemm(act, w_fp8, scale, bias=bias, out=out)
+        return w8a16_fp8_gemm(
+            act, w_use, scale, bias=bias, out=out, weight_prepared=prepared
+        )
 
     return run
 
@@ -418,16 +427,18 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
         impls["cast"] = make_cast_copy(act, w_fp8, scale, bias)
     if "cublas" in args.impls:
         impls["cublas"] = make_cublas(act, w_deq, bias)
-    if "kernel" in args.impls:
-        fn = make_kernel(act, w_fp8, scale, bias)
+    for name, prepared in (("kernel", False), ("kernel_prep", True)):
+        if name not in args.impls:
+            continue
+        fn = make_kernel(act, w_fp8, scale, bias, prepared=prepared)
         if fn is None:
             print(
                 "# WARNING: flashinfer.gemm.w8a16_fp8_gemm not available; "
-                "kernel column skipped",
+                f"{name} column skipped",
                 file=sys.stderr,
             )
         else:
-            impls["kernel"] = fn
+            impls[name] = fn
 
     us: dict[str, float] = {}
     max_abs: dict[str, float] = {}
@@ -441,7 +452,8 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
         us[name], _, _ = _time_kernel(args, lambda: fn(), tag)
 
     passed: bool | None = None
-    if "kernel" in impls:
+    kernel_cols = [c for c in ("kernel", "kernel_prep") if c in impls]
+    if kernel_cols:
         # Both the kernel and the cast-copy differ from fp32 only by 16-bit
         # accumulation order; demand the kernel be no worse than that path
         # (with a floor so an exactly-fp32-accumulating reference isn't
@@ -454,9 +466,11 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
             cast_err, _ = _errors(out, ref)
             del out
         floor = args.tol_floor * ref.abs().max().item()
-        passed = max_abs["kernel"] <= max(args.tol_mult * cast_err, floor)
-        if not torch.isfinite(torch.tensor(max_abs["kernel"])):
-            passed = False
+        passed = all(
+            max_abs[c] <= max(args.tol_mult * cast_err, floor)
+            and torch.isfinite(torch.tensor(max_abs[c]))
+            for c in kernel_cols
+        )
 
     del act, w_fp8, w_deq, w_deq_f32, ref
     torch.cuda.empty_cache()
@@ -469,7 +483,7 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
 
 
 def _fmt_us(v: float | None) -> str:
-    return f"{v:10.1f}" if v is not None else f"{'-':>10}"
+    return f"{v:13.1f}" if v is not None else f"{'-':>13}"
 
 
 def _ratio(num: float | None, den: float | None) -> str:
@@ -480,13 +494,13 @@ def _ratio(num: float | None, den: float | None) -> str:
 
 
 def _impl_cols(args) -> list[str]:
-    return [i for i in ("cast", "cublas", "kernel") if i in args.impls]
+    return [i for i in ("cast", "cublas", "kernel", "kernel_prep") if i in args.impls]
 
 
 def table_header(args) -> str:
     hdr = f"{'layer':<12}{'tp':>3}{'M':>7}{'N':>7}{'K':>7}"
     for i in _impl_cols(args):
-        hdr += f"{i + ' us':>12}"
+        hdr += f"{i + ' us':>15}"
     hdr += f"{'TFLOP/s':>9}{'GB/s(W8)':>10}{'vs cast':>8}{'vs cublas':>10}"
     hdr += f"{'max|err|':>10}{'max rel':>10}{'cast|err|':>10}{'gate':>6}"
     return hdr + "\n" + "-" * len(hdr)
@@ -494,8 +508,8 @@ def table_header(args) -> str:
 
 def format_row(r: Row, args) -> str:
     # Throughput columns describe the kernel when it ran, else the cast path.
-    primary = (
-        "kernel" if "kernel" in r.us else ("cublas" if "cublas" in r.us else "cast")
+    primary = next(
+        (c for c in ("kernel_prep", "kernel", "cublas", "cast") if c in r.us), "cast"
     )
     t = r.us.get(primary)
     flops = 2.0 * r.m * r.n * r.k
@@ -535,8 +549,10 @@ def write_csv(rows: list[Row], path: str, args) -> None:
                 "cast_us",
                 "cublas_us",
                 "kernel_us",
+                "kernel_prep_us",
                 "kernel_max_abs",
                 "kernel_max_rel",
+                "kernel_prep_max_abs",
                 "cast_max_abs",
                 "cast_max_rel",
                 "gate",
@@ -555,8 +571,10 @@ def write_csv(rows: list[Row], path: str, args) -> None:
                     r.us.get("cast", ""),
                     r.us.get("cublas", ""),
                     r.us.get("kernel", ""),
+                    r.us.get("kernel_prep", ""),
                     r.max_abs.get("kernel", ""),
                     r.max_rel.get("kernel", ""),
+                    r.max_abs.get("kernel_prep", ""),
                     r.max_abs.get("cast", ""),
                     r.max_rel.get("cast", ""),
                     "" if r.passed is None else ("ok" if r.passed else "FAIL"),
@@ -599,8 +617,8 @@ def parse_args(argv=None):
     p.add_argument(
         "--impls",
         nargs="+",
-        default=["cast", "cublas", "kernel"],
-        choices=["cast", "cublas", "kernel"],
+        default=["cast", "cublas", "kernel", "kernel_prep"],
+        choices=["cast", "cublas", "kernel", "kernel_prep"],
     )
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--warmup", type=int, default=5)

@@ -18,7 +18,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.gemm import w8a16_fp8_gemm
+from flashinfer.gemm import prepare_w8a16_fp8_weight, w8a16_fp8_gemm
 
 
 def _quantize(w32: torch.Tensor):
@@ -38,7 +38,8 @@ def _cast_copy_reference(act, w_fp8, scale, bias):
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("bias", [False, True])
-def test_w8a16_fp8_gemm(m, n, k, dtype, bias):
+@pytest.mark.parametrize("prepared", [False, True])
+def test_w8a16_fp8_gemm(m, n, k, dtype, bias, prepared):
     torch.manual_seed(0)
     dev = torch.device("cuda")
     act = torch.randn(m, k, device=dev, dtype=torch.float32).to(dtype)
@@ -46,7 +47,12 @@ def test_w8a16_fp8_gemm(m, n, k, dtype, bias):
     w_fp8, scale = _quantize(w32)
     b = torch.randn(n, device=dev, dtype=torch.float32).to(dtype) if bias else None
 
-    out = w8a16_fp8_gemm(act, w_fp8, scale, bias=b)
+    if prepared:
+        out = w8a16_fp8_gemm(
+            act, prepare_w8a16_fp8_weight(w_fp8), scale, bias=b, weight_prepared=True
+        )
+    else:
+        out = w8a16_fp8_gemm(act, w_fp8, scale, bias=b)
     assert out.shape == (m, n)
     assert out.dtype == dtype
 

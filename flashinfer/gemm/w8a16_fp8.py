@@ -36,8 +36,11 @@ def _w8a16_fp8_gemm_impl(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor],
+    weight_prepared: bool,
 ) -> None:
-    get_w8a16_fp8_gemm_module().w8a16_fp8_gemm(out, act, weight, weight_scale, bias)
+    get_w8a16_fp8_gemm_module().w8a16_fp8_gemm(
+        out, act, weight, weight_scale, bias, weight_prepared
+    )
 
 
 @register_fake_op("flashinfer::w8a16_fp8_gemm")
@@ -47,8 +50,31 @@ def _w8a16_fp8_gemm_impl_fake(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor],
+    weight_prepared: bool,
 ) -> None:
     pass
+
+
+def prepare_w8a16_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+    r"""Return a copy of an FP8 ``[N, K]`` weight in the kernel's prepared layout.
+
+    Inside every 16-wide block of K the columns are reordered to
+    ``[2c, 2c+1, 2c+8, 2c+9]`` for ``c = 0..3``, which lets the kernel fetch a
+    whole wgmma A fragment with one ``ldmatrix``.  Shape, dtype and the
+    per-tensor scale are unchanged; the result is only valid with
+    ``w8a16_fp8_gemm(..., weight_prepared=True)``.  Do this once at load time.
+    """
+    if weight.dtype != torch.float8_e4m3fn or weight.dim() != 2:
+        raise ValueError("expected a 2-D float8_e4m3fn weight [N, K]")
+    k = weight.shape[1]
+    if k % 16 != 0:
+        raise ValueError(f"K must be a multiple of 16, got {k}")
+    base = torch.arange(0, k, 16, device=weight.device).repeat_interleave(16)
+    within = torch.tensor(
+        [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15], device=weight.device
+    ).repeat(k // 16)
+    perm = base + within
+    return weight.index_select(1, perm).contiguous()
 
 
 @flashinfer_api
@@ -58,6 +84,7 @@ def w8a16_fp8_gemm(
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    weight_prepared: bool = False,
 ) -> torch.Tensor:
     r"""Linear layer with an FP8 e4m3 weight and a 16-bit activation (W8A16).
 
@@ -84,6 +111,10 @@ def w8a16_fp8_gemm(
     out: Optional[torch.Tensor]
         Optional output, shape ``(..., N)``, same dtype as ``act``.  Allocated
         when omitted.
+    weight_prepared: bool
+        ``True`` when ``weight`` came from :func:`prepare_w8a16_fp8_weight`
+        (opt-in fast fragment path).  ``False`` (default) takes the plain
+        checkpoint layout.
 
     Returns
     -------
@@ -116,5 +147,5 @@ def w8a16_fp8_gemm(
             f"got {tuple(out.shape)} in {out.dtype}"
         )
     out2d = out.reshape(-1, n)
-    _w8a16_fp8_gemm_impl(out2d, act2d, weight, weight_scale, bias)
+    _w8a16_fp8_gemm_impl(out2d, act2d, weight, weight_scale, bias, weight_prepared)
     return out
