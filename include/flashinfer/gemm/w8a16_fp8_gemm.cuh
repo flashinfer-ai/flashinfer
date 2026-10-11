@@ -25,16 +25,19 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 20 of the optimization ladder: split-K for under-filled grids.  With
-// 256 x 128 tiles a problem like und.kv TP2 M=1024 (N=512) is 16 blocks on
-// 132 SMs and the TP8 N=128 rows are 4-8; those rows sat at 5-15% of the
-// tensor pipe.  When the tile grid is under a third of a wave the launcher
-// splits K across `splits` blocks (grid.y, one wave's worth, >= 8 slabs each), each running the
-// same mainloop over its range of 64-wide slabs and writing an fp32 partial tile to a
-// caller-provided workspace (ws[split][M][N], staged through shared memory, 16 B stores); a small
-// reduce kernel then sums the partials and applies scale, bias and the output cast.
-// `W8A16Fp8GemmWorkspaceBytes()` reports the workspace a problem needs (0 when it will not split).
-// The full-grid path is unchanged.  Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
+// Rung 21 of the optimization ladder: persistent tiles with a dedicated
+// epilogue buffer.  Through rung 20 every block computed one tile: its
+// producer went idle while the consumers staged and stored the tile, and
+// the next tile's first slabs were only requested once a new block
+// started.  Here the grid is one block per SM (per cluster), each block
+// walks units of the grouped raster (unit = blockIdx, += gridDim), and the
+// slab counters, stage indices and mbarrier phases simply continue across
+// tiles: the producer requests the next tile's slabs while the consumers
+// run the current epilogue.  The 16-bit epilogue tile moves out of the
+// pipeline stages into its own 33 KB buffer (half the tile at a time, two
+// passes), so 6 stages + buffer + barriers fit in 227 KB; the split-K path
+// keeps one unit per block and its fp32 tile in the idle stages.
+// Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -69,10 +72,16 @@ constexpr int kW8A16EpiPad = kW8A16TileN + 8;                     // elements pe
 constexpr int kW8A16MaxSplits = 8;
 constexpr int kW8A16MinSlabsPerSplit = 8;  // amortize the partial-tile round trip
 constexpr int kW8A16EpiBytes =
-    kW8A16TileM * kW8A16EpiPad * 4;                       // fp32 partial tile, reuses the stages
-constexpr int kW8A16BarrierBytes = 2 * kW8A16Stages * 8;  // full[] + empty[]
-constexpr int kW8A16SmemBytes =
-    kW8A16Stages * (kW8A16AStageBytes + kW8A16WStageBytes) + kW8A16BarrierBytes + 1024;
+    kW8A16TileM * kW8A16EpiPad * 4;  // fp32 partial tile (split-K), reuses the stages
+constexpr int kW8A16EpiPasses = 2;   // 16-bit epilogue: half the tile per pass
+constexpr int kW8A16EpiRows = kW8A16TileM / kW8A16EpiPasses;
+constexpr int kW8A16EpiOutBytes = kW8A16EpiRows * kW8A16EpiPad * 2;  // dedicated 16-bit buffer
+constexpr int kW8A16BarrierBytes = 2 * kW8A16Stages * 8;             // full[] + empty[]
+constexpr int kW8A16StageBytes = kW8A16Stages * (kW8A16AStageBytes + kW8A16WStageBytes);
+constexpr int kW8A16SmemBytesPersistent =
+    kW8A16StageBytes + kW8A16EpiOutBytes + kW8A16BarrierBytes + 1024;
+constexpr int kW8A16SmemBytesSplit = kW8A16StageBytes + kW8A16BarrierBytes + 1024;
+static_assert(kW8A16SmemBytesPersistent <= 232448, "exceeds the 227 KB opt-in limit");
 
 // Two e4m3 values (packed in the low 16 bits) -> two T values packed in a
 // 32-bit register, laid out as an mma A/B operand expects.
@@ -295,7 +304,8 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
                                              ~static_cast<uintptr_t>(1023));
   uint8_t* a_base = smem;                                     // act stages (SW128)
   uint8_t* w_base = smem + kW8A16Stages * kW8A16AStageBytes;  // weight stages (SW64)
-  uint64_t* full_bar = reinterpret_cast<uint64_t*>(w_base + kW8A16Stages * kW8A16WStageBytes);
+  uint8_t* epi_base = smem + kW8A16StageBytes;  // 16-bit epilogue buffer (absent for split-K)
+  uint64_t* full_bar = reinterpret_cast<uint64_t*>(epi_base + (kSplitK ? 0 : kW8A16EpiOutBytes));
   uint64_t* empty_bar = full_bar + kW8A16Stages;
 
   const int warp = threadIdx.x >> 5;
@@ -304,20 +314,26 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
 
   // Grouped rasterization (rung 10) over cluster pairs: the two CTAs of a
   // cluster (consecutive blockIdx.x) share tile_m and take n-tiles 2p, 2p+1.
+  // Persistent: a block walks units pair, pair + stride, ... (one unit when
+  // the grid covers every unit, as in split-K mode).
   const uint32_t rank = kClusterSize > 1 ? cluster_ctarank() : 0u;
   const int pair = blockIdx.x / kClusterSize;
+  const int unit_stride = gridDim.x / kClusterSize;
   const int tiles_m = (M + kW8A16TileM - 1) / kW8A16TileM;
   const int tiles_n = (N + kW8A16TileN - 1) / kW8A16TileN;
   const int pairs_n = (tiles_n + kClusterSize - 1) / kClusterSize;
+  const int num_units = tiles_m * pairs_n;
   const int group_size = kW8A16GroupM * pairs_n;
-  const int group = pair / group_size;
-  const int first_m = group * kW8A16GroupM;
-  const int this_group_m = min(kW8A16GroupM, tiles_m - first_m);
-  const int in_group = pair - group * group_size;
-  const int tile_m = first_m + in_group % this_group_m;
-  const int tile_n = (in_group / this_group_m) * kClusterSize + static_cast<int>(rank);
-  const int n0 = tile_n * kW8A16TileN;  // may be >= N for an odd tile count: computes zeros
-  const int m0 = tile_m * kW8A16TileM;
+  auto map_unit = [&](int unit, int& m0, int& n0) {
+    const int group = unit / group_size;
+    const int first_m = group * kW8A16GroupM;
+    const int this_group_m = min(kW8A16GroupM, tiles_m - first_m);
+    const int in_group = unit - group * group_size;
+    const int tile_m = first_m + in_group % this_group_m;
+    const int tile_n = (in_group / this_group_m) * kClusterSize + static_cast<int>(rank);
+    n0 = tile_n * kW8A16TileN;  // may be >= N for an odd tile count: computes zeros
+    m0 = tile_m * kW8A16TileM;
+  };
   // Split-K: blockIdx.y selects a contiguous range of slabs.
   const int total_slabs = K / kW8A16TileK;
   const int per_split =
@@ -347,17 +363,26 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     setmaxnreg_dec<40>();
     if (warp == 0 && lane == 0) {
       constexpr uint32_t kSlabBytes = kW8A16AStageBytes + kW8A16WStageBytes;
-      for (int kt = 0; kt < num_slabs; ++kt) {
-        const int stage = kt % kW8A16Stages;
-        const uint32_t round = kt / kW8A16Stages;
-        mbar_wait(&empty_bar[stage], (round & 1) ^ 1);  // fresh barrier: passes at once
-        mbar_arrive_expect_tx(&full_bar[stage], kSlabBytes);
-        const int k0 = (slab_begin + kt) * kW8A16TileK;
-        if (rank == 0) {
-          tma_load_2d_multicast(a_base + stage * kW8A16AStageBytes, &act_map, &full_bar[stage], k0,
-                                m0, static_cast<uint16_t>((1u << kClusterSize) - 1));
+      uint32_t g = 0;  // running slab index across tiles: stage = g % S
+      for (int unit = pair; unit < num_units; unit += unit_stride) {
+        int m0, n0;
+        map_unit(unit, m0, n0);
+        for (int kt = 0; kt < num_slabs; ++kt, ++g) {
+          const int stage = g % kW8A16Stages;
+          const uint32_t round = g / kW8A16Stages;
+          mbar_wait(&empty_bar[stage], (round & 1) ^ 1);  // fresh barrier: passes at once
+          mbar_arrive_expect_tx(&full_bar[stage], kSlabBytes);
+          const int k0 = (slab_begin + kt) * kW8A16TileK;
+          if constexpr (kClusterSize > 1) {
+            if (rank == 0) {
+              tma_load_2d_multicast(a_base + stage * kW8A16AStageBytes, &act_map, &full_bar[stage],
+                                    k0, m0, static_cast<uint16_t>((1u << kClusterSize) - 1));
+            }
+          } else {
+            tma_load_2d(a_base + stage * kW8A16AStageBytes, &act_map, &full_bar[stage], k0, m0);
+          }
+          tma_load_2d(w_base + stage * kW8A16WStageBytes, &w_map, &full_bar[stage], k0, n0);
         }
-        tma_load_2d(w_base + stage * kW8A16WStageBytes, &w_map, &full_bar[stage], k0, n0);
       }
     }
   } else {
@@ -366,10 +391,6 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     const int cwg = wg - 1;   // consumer warpgroup: n rows cwg*128 .. +127
     const int wq = warp & 3;  // warp within it: rows wq*16 .. +15 of each row block
     float d[kW8A16RowBlocks][64];
-#pragma unroll
-    for (int b = 0; b < kW8A16RowBlocks; ++b)
-#pragma unroll
-      for (int i = 0; i < 64; ++i) d[b][i] = 0.f;
 
     // Row block b covers tile rows cwg*128 + b*64 .. +63.
     // Plain layout: rows r = base + wq*16 + lane/4 (+8), k = 2*(lane%4) (+8)
@@ -387,8 +408,8 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
 
     // Load + convert the A fragments of one slab for both row blocks
     // (2 blocks x 4 k16 x 4 regs).
-    auto load_frags = [&](int kt, uint32_t(&frag)[kW8A16RowBlocks][4][4]) {
-      const uint8_t* w_stage = w_base + (kt % kW8A16Stages) * kW8A16WStageBytes;
+    auto load_frags = [&](uint32_t g, uint32_t(&frag)[kW8A16RowBlocks][4][4]) {
+      const uint8_t* w_stage = w_base + (g % kW8A16Stages) * kW8A16WStageBytes;
 #pragma unroll
       for (int b = 0; b < kW8A16RowBlocks; ++b) {
         if constexpr (kPrepared) {
@@ -425,9 +446,9 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     // One slab: issue `cur` for both row blocks, retire the previous group,
     // refill `nxt` with slab kt+1.  Buffers are named so they stay in
     // registers; the caller alternates them.
-    auto step = [&](int kt, uint32_t(&cur)[kW8A16RowBlocks][4][4],
+    auto step = [&](int kt, uint32_t g, uint32_t(&cur)[kW8A16RowBlocks][4][4],
                     uint32_t(&nxt)[kW8A16RowBlocks][4][4]) {
-      const uint8_t* a_stage = a_base + (kt % kW8A16Stages) * kW8A16AStageBytes;
+      const uint8_t* a_stage = a_base + (g % kW8A16Stages) * kW8A16AStageBytes;
       wgmma_fence();
 #pragma unroll
       for (int k16 = 0; k16 < kW8A16TileK; k16 += 16) {
@@ -440,7 +461,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       wgmma_commit();
       wgmma_wait<1>();
       if (kt > 0 && lane == 0) {
-        uint64_t* eb = &empty_bar[(kt - 1) % kW8A16Stages];
+        uint64_t* eb = &empty_bar[(g - 1) % kW8A16Stages];
         if constexpr (kClusterSize > 1) {
 #pragma unroll
           for (uint32_t c = 0; c < kClusterSize; ++c) mbar_arrive_remote(eb, c);
@@ -449,88 +470,109 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
         }
       }
       if (kt + 1 < num_slabs) {
-        const int ns = kt + 1;
-        mbar_wait(&full_bar[ns % kW8A16Stages], (ns / kW8A16Stages) & 1);
-        load_frags(ns, nxt);  // overlaps slab kt's wgmmas
+        const uint32_t ng = g + 1;
+        mbar_wait(&full_bar[ng % kW8A16Stages], (ng / kW8A16Stages) & 1);
+        load_frags(ng, nxt);  // overlaps slab kt's wgmmas
       }
     };
 
     uint32_t frag0[kW8A16RowBlocks][4][4], frag1[kW8A16RowBlocks][4][4];
-    if (num_slabs > 0) {
-      mbar_wait(&full_bar[0], 0);
-      load_frags(0, frag0);
-    }
-    for (int kt = 0; kt < num_slabs; kt += 2) {
-      step(kt, frag0, frag1);
-      if (kt + 1 < num_slabs) step(kt + 1, frag1, frag0);
-    }
-    wgmma_wait<0>();
-    if (num_slabs > 0 && lane == 0) {
-      uint64_t* eb = &empty_bar[(num_slabs - 1) % kW8A16Stages];
-      if constexpr (kClusterSize > 1) {
+    uint32_t g = 0;  // running slab index across tiles (mirrors the producer's)
+    for (int unit = pair; unit < num_units; unit += unit_stride) {
+      int m0, n0;
+      map_unit(unit, m0, n0);
 #pragma unroll
-        for (uint32_t c = 0; c < kClusterSize; ++c) mbar_arrive_remote(eb, c);
-      } else {
-        mbar_arrive(eb);
+      for (int b = 0; b < kW8A16RowBlocks; ++b)
+#pragma unroll
+        for (int i = 0; i < 64; ++i) d[b][i] = 0.f;
+      if (num_slabs > 0) {
+        mbar_wait(&full_bar[g % kW8A16Stages], (g / kW8A16Stages) & 1);
+        load_frags(g, frag0);
       }
-    }
-
-    // Epilogue.  Fragment layout per warp (m64nNk16 D): d[b][j*4 + 0..1] at
-    // (n = b*64 + wq*16 + lane/4, m = 8j + 2*(lane%4) + {0,1}), d[b][j*4 + 2..3]
-    // at n + 8.  Stage the tile as out[m][n] in smem, then store rows with
-    // 16 B writes: scaled 16-bit values to `out`, or raw fp32 partials to the
-    // split-K workspace (scale / bias / cast happen in the reduce kernel).
-    static_assert(kW8A16EpiBytes <= kW8A16Stages * (kW8A16AStageBytes + kW8A16WStageBytes),
-                  "epilogue tile must fit in the pipeline stages");
-    consumer_bar_sync();  // both warpgroups are done reading the stages
-    using TOut = std::conditional_t<kSplitK, float, T>;
-    TOut* tile = reinterpret_cast<TOut*>(smem);
-    const float sc = kSplitK ? 1.f : *scale;
-    const int m_lo = (lane % 4) * 2;  // tile-local m
-#pragma unroll
-    for (int b = 0; b < kW8A16RowBlocks; ++b) {
-      const int n_lo = cwg * 128 + b * 64 + wq * 16 + lane / 4;  // tile-local n
-      float bias_lo = 0.f, bias_hi = 0.f;
-      if (!kSplitK && bias != nullptr) {
-        if (n0 + n_lo < N) bias_lo = static_cast<float>(bias[n0 + n_lo]);
-        if (n0 + n_lo + 8 < N) bias_hi = static_cast<float>(bias[n0 + n_lo + 8]);
+      for (int kt = 0; kt < num_slabs; kt += 2) {
+        step(kt, g + kt, frag0, frag1);
+        if (kt + 1 < num_slabs) step(kt + 1, g + kt + 1, frag1, frag0);
       }
+      g += num_slabs;
+      wgmma_wait<0>();
+      if (num_slabs > 0 && lane == 0) {
+        uint64_t* eb = &empty_bar[(g - 1) % kW8A16Stages];
+        if constexpr (kClusterSize > 1) {
 #pragma unroll
-      for (int j = 0; j < 16; ++j) {
-#pragma unroll
-        for (int q = 0; q < 2; ++q) {
-          const int m = m_lo + j * 8 + q;
-          tile[m * kW8A16EpiPad + n_lo] = static_cast<TOut>(d[b][j * 4 + q] * sc + bias_lo);
-          tile[m * kW8A16EpiPad + n_lo + 8] = static_cast<TOut>(d[b][j * 4 + 2 + q] * sc + bias_hi);
+          for (uint32_t c = 0; c < kClusterSize; ++c) mbar_arrive_remote(eb, c);
+        } else {
+          mbar_arrive(eb);
         }
       }
-    }
-    consumer_bar_sync();  // the whole 128 x 256 tile is staged
-    // Rows of kW8A16TileN elements as 16 B chunks; thread t owns chunk
-    // t % kChunks of rows t / kChunks + kRowsPerPass * i.
-    constexpr int kElemsPerChunk = 16 / sizeof(TOut);              // 8 or 4
-    constexpr int kChunks = kW8A16TileN / kElemsPerChunk;          // 32 or 64
-    constexpr int kRowsPerPass = kW8A16ConsumerThreads / kChunks;  // 8 or 4
-    const int ct = threadIdx.x - 128;                              // consumer-local thread id
-    const int chunk = ct % kChunks;
-    const int row0 = ct / kChunks;
-    const int n_chunk = n0 + chunk * kElemsPerChunk;
-    TOut* dst_base = kSplitK
-                         ? reinterpret_cast<TOut*>(ws) + static_cast<int64_t>(blockIdx.y) * M * N
-                         : reinterpret_cast<TOut*>(out);
+
+      // Epilogue.  Fragment layout per warp (m64nNk16 D): d[b][j*4 + 0..1] at
+      // (n = b*64 + wq*16 + lane/4, m = 8j + 2*(lane%4) + {0,1}), d[b][j*4 + 2..3]
+      // at n + 8.  Stage the tile as out[m][n] in smem, then store rows with
+      // 16 B writes: scaled 16-bit values to `out`, or raw fp32 partials to the
+      // split-K workspace (scale / bias / cast happen in the reduce kernel).
+      static_assert(kW8A16EpiBytes <= kW8A16StageBytes,
+                    "fp32 split-K tile must fit in the pipeline stages");
+      using TOut = std::conditional_t<kSplitK, float, T>;
+      // Split-K (one unit per block) stages its fp32 tile in the idle stages;
+      // the persistent 16-bit path uses the dedicated buffer, half a tile per
+      // pass, so the producer can keep filling stages for the next tile.
+      constexpr int kPasses = kSplitK ? 1 : kW8A16EpiPasses;
+      constexpr int kRowsPerTilePass = kW8A16TileM / kPasses;
+      TOut* tile = kSplitK ? reinterpret_cast<TOut*>(smem) : reinterpret_cast<TOut*>(epi_base);
+      const float sc = kSplitK ? 1.f : *scale;
+      const int m_lo = (lane % 4) * 2;                               // tile-local m
+      constexpr int kElemsPerChunk = 16 / sizeof(TOut);              // 8 or 4
+      constexpr int kChunks = kW8A16TileN / kElemsPerChunk;          // 32 or 64
+      constexpr int kRowsPerPass = kW8A16ConsumerThreads / kChunks;  // 8 or 4
+      const int ct = threadIdx.x - 128;                              // consumer-local thread id
+      const int chunk = ct % kChunks;
+      const int row0 = ct / kChunks;
+      const int n_chunk = n0 + chunk * kElemsPerChunk;
+      TOut* dst_base = kSplitK
+                           ? reinterpret_cast<TOut*>(ws) + static_cast<int64_t>(blockIdx.y) * M * N
+                           : reinterpret_cast<TOut*>(out);
+      if constexpr (kSplitK) consumer_bar_sync();  // both warpgroups are done reading the stages
 #pragma unroll
-    for (int i = 0; i < kW8A16TileM / kRowsPerPass; ++i) {
-      const int r = row0 + kRowsPerPass * i;
-      const int m = m0 + r;
-      if (m >= M) continue;
-      const TOut* src = tile + r * kW8A16EpiPad + chunk * kElemsPerChunk;
-      TOut* dst = dst_base + static_cast<int64_t>(m) * N + n_chunk;
-      if (n_chunk + kElemsPerChunk <= N) {
-        *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
-      } else {
-        for (int e = 0; n_chunk + e < N; ++e) dst[e] = src[e];
+      for (int pass = 0; pass < kPasses; ++pass) {
+        // Both warpgroups must be done copying the previous pass / tile out
+        // of the buffer before anyone overwrites it.
+        consumer_bar_sync();
+#pragma unroll
+        for (int b = 0; b < kW8A16RowBlocks; ++b) {
+          const int n_lo = cwg * 128 + b * 64 + wq * 16 + lane / 4;  // tile-local n
+          float bias_lo = 0.f, bias_hi = 0.f;
+          if (!kSplitK && bias != nullptr) {
+            if (n0 + n_lo < N) bias_lo = static_cast<float>(bias[n0 + n_lo]);
+            if (n0 + n_lo + 8 < N) bias_hi = static_cast<float>(bias[n0 + n_lo + 8]);
+          }
+#pragma unroll
+          for (int jj = 0; jj < 16 / kPasses; ++jj) {
+            const int j = pass * (16 / kPasses) + jj;
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+              const int m = m_lo + jj * 8 + q;  // row within this pass's buffer
+              tile[m * kW8A16EpiPad + n_lo] = static_cast<TOut>(d[b][j * 4 + q] * sc + bias_lo);
+              tile[m * kW8A16EpiPad + n_lo + 8] =
+                  static_cast<TOut>(d[b][j * 4 + 2 + q] * sc + bias_hi);
+            }
+          }
+        }
+        consumer_bar_sync();  // this pass's rows are staged
+#pragma unroll
+        for (int i = 0; i < kRowsPerTilePass / kRowsPerPass; ++i) {
+          const int r = row0 + kRowsPerPass * i;
+          const int m = m0 + pass * kRowsPerTilePass + r;
+          if (m >= M) continue;
+          const TOut* src = tile + r * kW8A16EpiPad + chunk * kElemsPerChunk;
+          TOut* dst = dst_base + static_cast<int64_t>(m) * N + n_chunk;
+          if (n_chunk + kElemsPerChunk <= N) {
+            *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+          } else {
+            for (int e = 0; n_chunk + e < N; ++e) dst[e] = src[e];
+          }
+        }
       }
-    }
+    }  // unit loop
   }
   // No CTA may exit while its peer can still multicast into its smem or
   // arrive on its barriers.
@@ -659,15 +701,21 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
                                           W8A16Fp8GemmTmaKernel<T, kClusterSize, true, true>}};
   KernelFn kernel = kernels[weight_prepared][split];
   static bool attr_set[2][2] = {{false, false}, {false, false}};
+  const int smem_bytes = split ? kW8A16SmemBytesSplit : kW8A16SmemBytesPersistent;
   if (!attr_set[weight_prepared][split]) {
-    e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kW8A16SmemBytes);
+    e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     if (e != cudaSuccess) return e;
     attr_set[weight_prepared][split] = true;
   }
   cudaLaunchConfig_t cfg = {};
-  cfg.gridDim = dim3(tiles_m * pairs_n * kClusterSize, splits);  // x rasterized; y = K split
+  // Persistent: one block (cluster) per SM walks the units; split-K keeps one
+  // unit per block so its fp32 tile can live in the idle stages.
+  const unsigned units = tiles_m * pairs_n;
+  const unsigned clusters =
+      split ? units : min(units, static_cast<unsigned>(num_sms / kClusterSize));
+  cfg.gridDim = dim3(clusters * kClusterSize, splits);  // x rasterized; y = K split
   cfg.blockDim = dim3(kW8A16Threads);
-  cfg.dynamicSmemBytes = kW8A16SmemBytes;
+  cfg.dynamicSmemBytes = smem_bytes;
   cfg.stream = stream;
   cudaLaunchAttribute attr[1];
   attr[0].id = cudaLaunchAttributeClusterDimension;
