@@ -166,10 +166,13 @@ def test_last_element_contributes():
 
 
 @cuda_required
-@pytest.mark.parametrize("n,k", [(32, 5120), (384, 5120), (512, 5120), (288, 4096)])
+@pytest.mark.parametrize(
+    "n,k", [(32, 5120), (384, 5120), (512, 5120), (288, 4096), (336, 10240)]
+)
 @pytest.mark.parametrize("block_threads", [128, 256])
+@pytest.mark.parametrize("rows_per_tile", [1, 2, 4, 8])
 def test_long_k_row_tiles_reuse_graph_and_preserve_fp32_projection(
-    n, k, block_threads, projection_session
+    n, k, block_threads, rows_per_tile, projection_session
 ):
     """Prepared long-K projections retain FP32 output with runtime row counts."""
     from b12x.gemm import bf16_gemv
@@ -186,7 +189,9 @@ def test_long_k_row_tiles_reuse_graph_and_preserve_fp32_projection(
         weight,
         out=output,
         bias=bias,
-        override=bf16_gemv.GemvConfig(backend="simt", block_threads=block_threads),
+        override=bf16_gemv.GemvConfig(
+            backend="simt", block_threads=block_threads, rows_per_tile=rows_per_tile
+        ),
     )
     projection_session.freeze()
     try:

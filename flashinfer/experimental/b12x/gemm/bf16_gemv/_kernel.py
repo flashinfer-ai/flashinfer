@@ -17,7 +17,6 @@ from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compiler import KernelCompileSpec, run_compiled
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.intrinsics import (
-    block_reduce,
     get_ptr_as_int64,
     ld_global_v4_u32,
     shared_ptr_to_u32,
@@ -65,25 +64,6 @@ def _dot_bf16x8(
             xv & Uint32(0xFFFF0000)
         )
     return result
-
-
-@cute.jit
-def _reduce_store(
-    value: Float32,
-    reduction: cute.Tensor,
-    output: cute.Tensor,
-    offset: Int64,
-    bias: cute.Tensor,
-    column: Int32,
-    has_bias: cutlass.Constexpr,
-):
-    total = block_reduce(warp_reduce(value, _fadd), _fadd, reduction, Float32(0.0))
-    thread, _, _ = cute.arch.thread_idx()
-    if Int32(thread) == Int32(0):
-        if cutlass.const_expr(has_bias):
-            total += Float32(bias[column])
-        output[offset] = total.to(output.element_type)
-    cute.arch.barrier()
 
 
 class SmallNGemvKernel:
@@ -211,21 +191,31 @@ class SmallNGemvKernel:
                 tid,
             )
         allocator = cutlass.utils.SmemAllocator()
+        warps = self.block_threads // 32
         reduction = allocator.allocate_tensor(
-            Float32, cute.make_layout((1, self.block_threads // 32)), byte_alignment=16
+            Float32, cute.make_layout((self.rows_per_tile, warps)), byte_alignment=16
         )
+        lane = cute.arch.lane_idx()
+        warp = cute.arch.warp_idx()
         for r in cutlass.range_constexpr(self.rows_per_tile):
-            row = first_row + Int64(r)
-            if row < Int64(rows):
-                _reduce_store(
-                    acc[r],
-                    reduction,
-                    output,
-                    row * output_stride + Int64(column),
-                    bias,
-                    Int32(column),
-                    self.has_bias,
-                )
+            total = warp_reduce(acc[r], _fadd)
+            if lane == 0:
+                reduction[r, warp] = total
+        cute.arch.barrier()
+        if warp == 0:
+            for r in cutlass.range_constexpr(self.rows_per_tile):
+                row = first_row + Int64(r)
+                if row < Int64(rows):
+                    partial = Float32(0.0)
+                    if lane < warps:
+                        partial = reduction[r, lane]
+                    total = warp_reduce(partial, _fadd)
+                    if lane == 0:
+                        if cutlass.const_expr(self.has_bias):
+                            total += Float32(bias[Int32(column)])
+                        output[row * output_stride + Int64(column)] = total.to(
+                            output.element_type
+                        )
 
     @cute.jit
     def scalar_dot(
@@ -617,7 +607,7 @@ def compile_projection(
             Int32(0),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.bf16_projection.selected", 2, key
+                "gemm.bf16_projection.selected", 3, key
             ),
         )
 
