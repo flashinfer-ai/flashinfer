@@ -123,6 +123,7 @@ rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_nvfp4_quantize_k16384.json
+single_head_paged_mqa_logits_page_size64_dim128.json
 token_sparse_kv_indices_top_k2048_lists2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
@@ -2998,4 +2999,17 @@ group_union_masks.fi_trace(
     union_sizes=torch.empty(2, dtype=torch.int32),
     mask=torch.empty(8, 256, dtype=torch.int32),
     num_keys=16384,
+)
+
+# ── Single-head paged MQA logits ──────────────────────────────────────────────
+from flashinfer.attn_scores import single_head_paged_mqa_logits
+
+single_head_paged_mqa_logits.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty(8, 128, dtype=torch.bfloat16),
+    key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),
+    block_table=torch.empty(4, 16, dtype=torch.int32),
+    context_lengths=torch.empty(4, dtype=torch.int32),
+    requests=torch.arange(4, dtype=torch.int32),
+    scores=torch.empty(8, 1024),
 )
