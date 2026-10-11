@@ -30,9 +30,19 @@ request's block table (64-key pages), in one launch. A token can be split into
 several attention requests (`requests_per_token`), for example one per group of
 its query heads. Each of them gets the same lists.
 
+## Group unions and masks
+
+Dense attention kernels that take a per-query mask can serve token-sparse
+attention too. `flashinfer.token_sparse.group_union_masks` collects the union of
+keys of a group of consecutive tokens, as cache slots in ascending key order,
+and each token's bitmask over the union's columns, in one launch. The group
+then runs as one varlen entry whose K/V are the union's slots. This pays off
+when the tokens of a group share many keys, as neighboring prefill tokens of a
+request do. Per-token lists do not depend on that.
+
 ## CUDA graphs
 
-Run each kernel once before capture (the CuTe-DSL helper compiles on first use).
+Run each kernel once before capture (the CuTe-DSL helpers compile on first use).
 Lengths, positions and block tables can change in place between replays. The
 token-sparse core leaves its split-KV semaphores (`multi_ctas_kv_counter_buffer`)
 zeroed, so one zeroed buffer serves every call and every replay.

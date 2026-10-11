@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""Inputs of token-sparse attention, where each query token attends to its own
-list of keys (``trtllm_batch_decode_with_kv_cache(..., sparse_top_k=K)``)."""
+"""Inputs for token-sparse attention, where each query token attends to its own
+list of keys. trtllm-gen's token-sparse kernels
+(``trtllm_batch_decode_with_kv_cache(..., sparse_top_k=K)``) read a K and a V
+slot list per token. Dense attention kernels that take a mask can instead attend
+over a group of tokens' union of keys, with a bitmask per token."""
 
 import cutlass
 import cutlass.cute as cute
@@ -11,13 +14,22 @@ import torch
 
 from .api_logging import flashinfer_api
 from .cute_dsl.launch import launch
-from .trace.templates.token_sparse import token_sparse_kv_indices_trace
+from .topk_varlen.kernels import block_scan
+from .trace.templates.token_sparse import (
+    group_union_masks_trace,
+    token_sparse_kv_indices_trace,
+)
 
 # A thread loads LOAD key positions at a time (16 bytes), and THREADS threads read
 # a token's list in passes of PASS positions, so lists are whole passes long.
 LOAD, THREADS = 4, 128
 PASS = LOAD * THREADS
 PAGE = 64  # keys per block-table page
+# group_union_masks: a CTA of ROWS teams of THREADS threads reads ROWS rows at once.
+# Its bitmaps and masks hold 32 keys or columns per int32 word, and masks are
+# written in whole attention key tiles of TILE columns.
+ROWS, TILE = 4, 128
+CTA, TILE_WORDS, PAGE_WORDS = ROWS * THREADS, TILE // 32, PAGE // 32
 
 
 @cute.kernel
@@ -136,4 +148,225 @@ def token_sparse_kv_indices(
             constants,
             module="token_sparse",
             key_files=(__file__,),
+        )
+
+
+@cute.kernel
+def union_masks_kernel(
+    positions: cute.Tensor,
+    query_rows: cute.Tensor,
+    group_unions: cute.Tensor,
+    requests: cute.Tensor,
+    block_table: cute.Tensor,
+    union: cute.Tensor,
+    union_sizes: cute.Tensor,
+    mask: cute.Tensor,
+    key_tiles: cutlass.Int32,
+    group: cutlass.Constexpr[int],
+    words: cutlass.Constexpr[int],
+    top_k: cutlass.Constexpr[int],
+):
+    """Build one group's union of keys and its tokens' masks. CTA g takes rows
+    g * group to g * group + group - 1 of request requests[g], in three steps:
+
+    1. Mark: each row sets one bit per selected key in a shared bitmap of the
+       request's keys (bit k % 32 of int32 word k // 32).
+    2. Number: a prefix sum over the bitmap gives each union key its column, the
+       number of union keys below it. union[b, :U] gets the cache slots by
+       ascending key and union_sizes[b] the size U, for b = group_unions[g].
+    3. Mask: row r sets bit j of word w of mask row query_rows[r] when it selected
+       column 32w + j. Masks are written in whole tiles of TILE columns.
+
+    Union and mask rows of -1 are not written. The CTA reads ROWS rows at a time,
+    THREADS threads each, as in kv_indices_kernel."""
+    thread, g = cute.arch.thread_idx()[0], cute.arch.block_idx()[0]
+    # Team t (THREADS threads) takes rows t, t + ROWS, ... of the group.
+    lane, team = thread % THREADS, thread // THREADS
+    stage_words = min(group * top_k // 32, words)
+    shared = utils.SmemAllocator()
+    bitmap = shared.allocate_tensor(cutlass.Int32, cute.make_layout(words), 16)
+    # Union keys below each key tile, and a staging row of mask bits per team.
+    below = shared.allocate_tensor(
+        cutlass.Int32, cute.make_layout(words // TILE_WORDS), 16
+    )
+    stage = shared.allocate_tensor(
+        cutlass.Int32,
+        cute.make_layout((ROWS, stage_words), stride=(stage_words, 1)),
+        16,
+    )
+    sums = shared.allocate_tensor(cutlass.Int32, cute.make_layout(CTA // 32), 16)
+    first, row_stage = g * group, stage[team, None]
+    request, batch = requests[g], group_unions[g]
+    for base in cutlass.range(0, TILE_WORDS * key_tiles, CTA):  # whole scan rounds
+        bitmap[base + thread] = 0
+    for i in cutlass.range(lane, stage_words, THREADS):
+        row_stage[i] = 0
+    cute.arch.sync_threads()
+
+    # 1. Mark each row's keys in the bitmap.
+    keys = cute.make_rmem_tensor((LOAD, top_k // PASS), cutlass.Int32)
+    for r in cutlass.range(first + team, first + group, ROWS):
+        for i in cutlass.range_constexpr(top_k // PASS):
+            chunk = cute.local_tile(positions[r, None], (LOAD,), (lane + THREADS * i,))
+            keys[None, i].store(chunk.load())
+        for j in cutlass.range(top_k // THREADS, unroll_full=True):
+            if keys[j] >= 0:
+                word = bitmap.iterator + (keys[j] >> 5)
+                bit = cutlass.Int32(1) << (keys[j] & 31)
+                cute.arch.atomic_or(word.llvm_ptr, bit, scope="cta")
+    cute.arch.sync_threads()
+
+    # 2. Number the union keys, one word per thread in each round. The union keys
+    # below a word are a block prefix sum of the words' popcounts.
+    size = cutlass.Int32(0)
+    for base in cutlass.range(0, TILE_WORDS * key_tiles, CTA):
+        word = base + thread
+        bits = cutlass.Uint32(bitmap[word])
+        count = cutlass.Int32(cute.arch.popc(bits))
+        column, total = block_scan.block_prefix_sum_kernel(
+            count, sums, thread, CTA, CTA // 32, need_total_sum=True
+        )
+        column += size
+        if word % TILE_WORDS == 0:
+            below[word // TILE_WORDS] = column - count
+        if bits != 0 and batch >= 0:  # write the word's keys as cache slots
+            page = block_table[request, word // PAGE_WORDS]
+            for _ in cutlass.range(count):
+                bit = cutlass.Int32(cute.arch.bfind(bits))
+                bits ^= cutlass.Uint32(1) << bit
+                column -= 1
+                union[batch, column] = page * PAGE + word % PAGE_WORDS * 32 + bit
+        size += total
+        cute.arch.sync_threads()  # `sums` is reused
+    if thread == 0 and batch >= 0:
+        union_sizes[batch] = size
+
+    # 3. Each team ORs a row's columns into its staging row, then stores the row.
+    for r in cutlass.range(first + team, first + group, ROWS):
+        for i in cutlass.range_constexpr(top_k // PASS):
+            chunk = cute.local_tile(positions[r, None], (LOAD,), (lane + THREADS * i,))
+            keys[None, i].store(chunk.load())
+        for j in cutlass.range(top_k // THREADS, unroll_full=True):
+            key = keys[j]
+            if key >= 0:  # its column: union keys below its tile, word and bit
+                word = key >> 5
+                lower = (cutlass.Uint32(1) << cutlass.Uint32(key & 31)) - 1
+                column = below[word // TILE_WORDS] + cutlass.Int32(
+                    cute.arch.popc(cutlass.Uint32(bitmap[word]) & lower)
+                )
+                for k in cutlass.range_constexpr(TILE_WORDS - 1):  # earlier words
+                    if k < word % TILE_WORDS:
+                        column += cutlass.Int32(
+                            cute.arch.popc(bitmap[word - word % TILE_WORDS + k])
+                        )
+                bit = cutlass.Int32(1) << (column & 31)
+                stage_word = row_stage.iterator + (column >> 5)
+                cute.arch.atomic_or(stage_word.llvm_ptr, bit, scope="cta")
+        query = query_rows[r]
+        cute.arch.barrier(barrier_id=1 + team, number_of_threads=THREADS)
+        for i in cutlass.range(lane, (size + TILE - 1) // TILE, THREADS):
+            part = cute.local_tile(row_stage, (TILE_WORDS,), (i,))
+            if query >= 0:  # a row without a mask row still clears its stage
+                tile = cute.local_tile(mask[query, None], (TILE_WORDS,), (i,))
+                tile.store(part.load())
+            part.fill(0)
+        cute.arch.barrier(barrier_id=1 + team, number_of_threads=THREADS)
+
+
+@flashinfer_api(trace=group_union_masks_trace)
+def group_union_masks(
+    positions: torch.Tensor,
+    query_rows: torch.Tensor,
+    group_unions: torch.Tensor,
+    requests: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    union: torch.Tensor,
+    union_sizes: torch.Tensor,
+    mask: torch.Tensor,
+    num_keys: int,
+) -> None:
+    """Build the inputs of masked dense attention from key positions: each group
+    of consecutive tokens' union of keys, and each token's bitmask over it.
+
+    Neighboring tokens, such as a request's prefill tokens, select many of the
+    same keys, so a group of them can attend to their union as one varlen batch
+    entry, each token masked to its own keys. The tokens form ``len(requests)``
+    equal groups. It runs as one launch without host synchronization, so it can be captured in a
+    CUDA graph (run it once before capture to compile it).
+
+    Parameters
+    ----------
+    positions : torch.Tensor
+        int32 ``[tokens, K]``, as in :func:`token_sparse_kv_indices`.
+    query_rows : torch.Tensor
+        int32 ``[tokens]``: each token's row of ``mask``, -1 for none.
+    group_unions : torch.Tensor
+        int32 ``[groups]``: each group's row of ``union``, -1 for none.
+    requests : torch.Tensor
+        int32 ``[groups]``: each group's request, a row of ``block_table``.
+    block_table : torch.Tensor
+        int32 ``[requests, blocks]``: each request's pages of 64 keys.
+    union : torch.Tensor
+        int32, output: a row gets its group's union of ``U`` keys, as cache slots
+        in ascending key order.
+    union_sizes : torch.Tensor
+        int32, output: ``U`` for each union row.
+    mask : torch.Tensor
+        int32, output: bit ``j`` of word ``w`` of a token's row is set when the
+        token selected union column ``32w + j``. Only words
+        ``w < 4 ceil(U / 128)`` are written.
+    num_keys : int
+        A bound on the key positions. The block table must cover it.
+    """
+    rows, top_k = positions.shape
+    groups = len(requests)
+    group = rows // max(groups, 1)
+    key_tiles = (num_keys + TILE - 1) // TILE
+    columns = min(group * top_k, TILE * key_tiles)  # the most keys a union holds
+    # Shared memory, in int32 words: the key bitmap (PAGE_WORDS per page, in whole
+    # scan rounds of CTA words), its counts per key tile, a mask staging row per
+    # team, and the scan's per-warp sums.
+    words = CTA * -(-block_table.shape[1] * PAGE_WORDS // CTA)
+    stage = ROWS * min(group * top_k // 32, words)
+    shared = 4 * (words + words // TILE_WORDS + stage + CTA // 32)
+    device = torch.cuda.get_device_properties(positions.device)
+    if top_k % PASS:
+        raise ValueError(
+            f"The key lists must be a multiple of {PASS} long, got {top_k}"
+        )
+    if groups * group != rows or len(group_unions) != groups or len(query_rows) < rows:
+        raise ValueError("Groups must be equal and cover the tokens, a mask row each")
+    if len(union_sizes) < union.shape[0]:
+        raise ValueError("union_sizes must hold a size per union row")
+    if num_keys > PAGE * block_table.shape[1]:
+        raise ValueError("The block table must cover num_keys")
+    if min(union.shape[1], 32 * mask.shape[1]) < columns:
+        raise ValueError("union and mask rows must hold every group's union")
+    if shared > device.shared_memory_per_block_optin:
+        raise ValueError("A group's key bitmap and mask rows exceed shared memory")
+    args = (
+        positions,
+        query_rows,
+        group_unions,
+        requests,
+        block_table,
+        union,
+        union_sizes,
+        mask,
+        key_tiles,
+    )
+    if not all(
+        t.is_cuda and t.is_contiguous() and t.dtype == torch.int32 for t in args[:-1]
+    ):
+        raise ValueError("Positions, tables, unions and masks must be contiguous int32")
+    if rows:
+        launch(
+            union_masks_kernel,
+            (groups, 1),
+            CTA,
+            args,
+            (group, words, top_k),
+            module="token_sparse_union",
+            key_files=(__file__, block_scan.__file__),
         )
