@@ -34,6 +34,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable GDN native short-T path | `export FLASHINFER_GDN_WY_NATIVE_T=1` |
 | Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
 | Enable GDN native A/B tensors | `export FLASHINFER_GDN_WY_NATIVE_AB=1` |
+| Opt in to multi-wave KV split in trtllm-gen GQA decode (long or mixed-length KV) | `export FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT=1` |
 | Let `backend="auto"` pick experimental backends | `export FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` |
 | Override ragged-prefill `auto` backend order (Blackwell) | `export FLASHINFER_RAGGED_AUTO_BACKEND_ORDER=cutlass,cudnn` |
 | Override CuTe-DSL prefill scheduling | `export FLASHINFER_CUTE_PREFILL_PERSISTENT=0` (non-persistent) or `1` (persistent) |
