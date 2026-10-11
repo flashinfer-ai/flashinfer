@@ -36,6 +36,7 @@ from .dense_mqa import (
     _catalog,
     _resolve_device,
     _submission,
+    stage_program,
 )
 
 FUSED_ROW_BYTES = HEAD_DIM + 4  # one FP8 row + its FP32 scale
@@ -78,15 +79,55 @@ def paged_dynamic_scheduler():
     return dict(
         max_batch=int(entry.get("max_batch", 0)),
         routes={str(k): str(v) for k, v in (entry.get("routes") or {}).items()},
+        # arch -> static route -> [(max_batch, max_context_len), ...]: calls inside a window take the STATIC
+        # program although batch <= max_batch (the small-grid rule; None = unbounded)
+        static_windows={
+            str(arch): {
+                str(route): [
+                    (
+                        None if max_batch is None else int(max_batch),
+                        None if max_ctx is None else int(max_ctx),
+                    )
+                    for max_batch, max_ctx in windows
+                ]
+                for route, windows in (table or {}).items()
+            }
+            for arch, table in (entry.get("static_windows") or {}).items()
+        },
+    )
+
+
+def paged_static_preferred(arch, static_route, batch, max_context_len):
+    """True when ``policy.paged.dynamic_scheduler.static_windows[arch][static_route]`` has a window with
+    ``batch <= max_batch`` and ``max_context_len <= max_ctx`` (``None`` = unbounded). Host-only."""
+    windows = (
+        paged_dynamic_scheduler()["static_windows"]
+        .get(str(arch), {})
+        .get(static_route, [])
+    )
+    batch, max_context_len = int(batch), int(max_context_len)
+    return any(
+        (max_batch is None or batch <= max_batch)
+        and (max_ctx is None or max_context_len <= max_ctx)
+        for max_batch, max_ctx in windows
     )
 
 
 def paged_route_name(
-    num_heads, block_kv, next_n, logits_dtype="float32", *, batch=None
+    num_heads,
+    block_kv,
+    next_n,
+    logits_dtype="float32",
+    *,
+    batch=None,
+    max_context_len=None,
+    arch=None,
 ):
     """Logical paged route of a problem (host-known scalars only). With ``batch`` (the call's request count)
     the dynamic-scheduler route is returned when the catalog carries one for the geometry and
-    ``batch <= policy.paged.dynamic_scheduler.max_batch``; without ``batch`` the static route."""
+    ``batch <= policy.paged.dynamic_scheduler.max_batch`` -- except inside the architecture's static-preferred
+    windows (``static_windows``; applied only when ``arch`` and ``max_context_len`` are given); without
+    ``batch`` the static route."""
     if logits_dtype not in LOGITS_DTYPES:
         raise ValueError(f"logits_dtype must be one of {LOGITS_DTYPES}")
     suffix = "" if logits_dtype == "float32" else f":{logits_dtype}"
@@ -95,6 +136,12 @@ def paged_route_name(
         return static
     dynamic = paged_dynamic_scheduler()
     if static in dynamic["routes"] and int(batch) <= dynamic["max_batch"]:
+        if (
+            arch is not None
+            and max_context_len is not None
+            and paged_static_preferred(arch, static, batch, max_context_len)
+        ):
+            return static
         return dynamic["routes"][static]
     return static
 
@@ -158,7 +205,15 @@ def paged_route_available(
         raise ValueError(
             "paged_route_available(arch=...) requires batch and max_context_len"
         )
-    route = paged_route_name(num_heads, block_kv, next_n, logits_dtype, batch=batch)
+    route = paged_route_name(
+        num_heads,
+        block_kv,
+        next_n,
+        logits_dtype,
+        batch=batch,
+        max_context_len=max_context_len,
+        arch=arch,
+    )
     return paged_route_admitted(arch, route, batch, max_context_len)
 
 
@@ -368,7 +423,13 @@ class PagedMqaPlan:
                 f"no exported paged MQA route for {num_heads} heads, page {block_kv}, next_n {next_n}, {logits_dtype}"
             )
         route_name = paged_route_name(
-            num_heads, block_kv, next_n, logits_dtype, batch=batch
+            num_heads,
+            block_kv,
+            next_n,
+            logits_dtype,
+            batch=batch,
+            max_context_len=max_context_len,
+            arch=arch,
         )
         if enforce_admission and not paged_route_admitted(
             arch, route_name, batch, max_context_len
@@ -414,13 +475,14 @@ class PagedMqaPlan:
             ),
         }
         stages = list(self.route["stages"])
-        if [stage for stage, _program in stages] != ["logits"]:
+        if [stage for stage, _programs in stages] != ["logits"]:
             raise ValueError(
                 f"paged route {self.route_name} must be a single logits stage, catalog has {stages}"
             )
+        selections = [(stage[0], stage_program(stage, arch)) for stage in stages]
         self._submissions, self._programs = [], []
-        self.program_names = [program for _stage, program in stages]
-        for stage_name, program in stages:
+        self.program_names = [program for _stage, program in selections]
+        for stage_name, program in selections:
             submit, loaded = _submission(
                 arch, program, bindings, num_sms, stage=stage_name
             )

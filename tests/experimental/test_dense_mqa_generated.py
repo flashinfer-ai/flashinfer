@@ -344,7 +344,7 @@ def test_dense_mqa_sm_count_definition(sm_count):
     )
     assert plan.route_name == "fp8:q1:short"
     assert plan.num_sms == sm_count
-    program = dict(plan.route["stages"])["logits"]
+    program = dict(plan.route["stages"])["logits"][arch]
     assert plan.program_names == [program]
     record = _runtime._catalog()["programs"][program]
     assert record["definitions"] == ["SM_COUNT"]
@@ -417,12 +417,22 @@ def test_dense_route_table_is_catalog_driven():
         assert [stage for stage, _p in record["stages"]] == ["logits"]
         # Only tiers admitted on at least one architecture have a record (and programs); a route withheld
         # everywhere is absent from the table. Every catalogued 64-head route is a single logits stage whose
-        # program is a catalogued program (program ids are the generated-unit names, not template names).
-        programs = set(_runtime._catalog()["programs"])
+        # program on each architecture is a catalogued program delivered for that architecture (program ids
+        # are the generated-unit names, not template names; the 64-head production text is chosen per
+        # architecture, so the union over the architectures may hold one program per architecture).
+        programs = _runtime._catalog()["programs"]
+        arches = sorted(_runtime._catalog()["arches"])
         for r in _runtime._catalog()["routes"]:
             if r.startswith("fp8:h64:"):
-                names = _runtime.program_names(r)
-                assert len(names) == 1 and set(names) <= programs, (r, names)
+                for a in arches:
+                    names = _runtime.program_names(r, arch=a)
+                    assert len(names) == 1 and names[0] in programs, (r, a, names)
+                    assert a in programs[names[0]]["arches"], (r, a, names)
+                union = _runtime.program_names(r)
+                assert 1 <= len(union) <= len(arches) and set(union) <= set(programs), (
+                    r,
+                    union,
+                )
     else:
         assert not _runtime.dense_route_available(64, 16, 4096)
     assert (
@@ -584,8 +594,20 @@ def test_catalog_programs_are_delivered_and_distinct():
     generated = "csrc/experimental/deepgemm_dense_mqa/generated"
     for table in ("routes", "paged_routes"):
         for route, record in catalog.get(table, {}).items():
-            for _stage, program in record["stages"]:
-                assert program in programs, (table, route, program)
+            for _stage, by_arch in record["stages"]:
+                assert sorted(by_arch) == sorted(catalog["arches"]), (
+                    table,
+                    route,
+                    by_arch,
+                )
+                for arch, program in by_arch.items():
+                    assert program in programs, (table, route, arch, program)
+                    assert arch in programs[program]["arches"], (
+                        table,
+                        route,
+                        arch,
+                        program,
+                    )
             assert not record.get("sequence") or record["sequence"] in programs, (
                 table,
                 route,
@@ -796,7 +818,12 @@ def test_dense_bindings_cover_every_program_argument():
         if sequence:
             selections = [(None, sequence)]
         else:
-            selections = [tuple(stage) for stage in record["stages"]]
+            # Every program a stage launches on any architecture binds the same way.
+            selections = [
+                (stage, program)
+                for stage, by_arch in record["stages"]
+                for program in sorted(set(by_arch.values()))
+            ]
         for stage, program in selections:
             missing = []
             for kind, key in catalog["programs"][program]["arg_plan"]:

@@ -21,11 +21,11 @@
 #include "cake_deepgemm_dense_mqa_device_common.cuh"
 
 #define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 384
+#define TMEM_NCOLS 256
 #define TMEM_TMEM_ACC_OFFSET 0
 #define NUM_Q_PIPE_STAGES 3
 #define NUM_KV_PIPE_STAGES 5
-#define NUM_TMEM_PIPE_STAGES 3
+#define NUM_TMEM_PIPE_STAGES 2
 #define SMEM_NEGINF_SCRATCH_OFF 220672
 #define SMEM_NEGINF_SCRATCH_STAGE_BYTES 4096
 #define SMEM_NEGINF_SCRATCH_STRIDE 4096
@@ -49,7 +49,7 @@
 #define SMEM_CANDIDATE_QUEUE_INDICES_STRIDE 8192
 #define SMEM_TOTAL 224768
 #define CANDIDATE_MODE 0
-#define FULL_Q_BLOCKS 1
+#define FULL_Q_BLOCKS 0
 #ifndef SM_COUNT
 #error "SM_COUNT is a downstream specialization of this program; define it on the compile line"
 #endif
@@ -58,7 +58,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_deepgemm_dense_mqa_d192410db87e40988798(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_scales_alias, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, unsigned int* __restrict__ ScheduleMeta, float* __restrict__ CandidateValues, int* __restrict__ CandidateIndices, int* __restrict__ CandidateCounts, float* __restrict__ ScoreThresholds, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, unsigned int seq_len, unsigned int seq_len_kv, unsigned int stride_logits, unsigned int num_q_blocks, unsigned int num_kv_splits, unsigned int candidate_capacity)
+kernel_cake_deepgemm_dense_mqa_09b0415542de2fbca39a(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_scales_alias, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, unsigned int* __restrict__ ScheduleMeta, float* __restrict__ CandidateValues, int* __restrict__ CandidateIndices, int* __restrict__ CandidateCounts, float* __restrict__ ScoreThresholds, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, unsigned int seq_len, unsigned int seq_len_kv, unsigned int stride_logits, unsigned int num_q_blocks, unsigned int num_kv_splits, unsigned int candidate_capacity)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -79,7 +79,7 @@ kernel_cake_deepgemm_dense_mqa_d192410db87e40988798(const __grid_constant__ CUte
     #define kv_full_addr (mbar_base + 48)
     #define kv_empty_addr (mbar_base + 88)
     #define umma_full_addr (mbar_base + 128)
-    #define umma_empty_addr (mbar_base + 152)
+    #define umma_empty_addr (mbar_base + 144)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -116,8 +116,8 @@ kernel_cake_deepgemm_dense_mqa_d192410db87e40988798(const __grid_constant__ CUte
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&KV))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&KV_scales))) : "memory"); }
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 22 barriers)
-    // Mbarriers at smem_raw[0..176)
+    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 20 barriers)
+    // Mbarriers at smem_raw[0..160)
 
     if (warp == 9) {
         uint32_t leader = elect_sync();
@@ -145,25 +145,23 @@ kernel_cake_deepgemm_dense_mqa_d192410db87e40988798(const __grid_constant__ CUte
             mbarrier_init(smem + 112, 256);
             mbarrier_init(smem + 120, 256);
             // --- pipeline 'tmem_pipe' ---
-            // umma_full: 3 barriers, init_count=1
+            // umma_full: 2 barriers, init_count=1
             mbarrier_init(smem + 128, 1);
             mbarrier_init(smem + 136, 1);
-            mbarrier_init(smem + 144, 1);
-            // umma_empty: 3 barriers, init_count=128
+            // umma_empty: 2 barriers, init_count=128
+            mbarrier_init(smem + 144, 128);
             mbarrier_init(smem + 152, 128);
-            mbarrier_init(smem + 160, 128);
-            mbarrier_init(smem + 168, 128);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
     __syncwarp();
 
-    // TMEM alloc (512 columns, 384 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 176);
+    // TMEM alloc (256 columns, 256 used)
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 160);
     if (warp == 10) {
-        int _tmem_hold = smem + 176;
-        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
+        int _tmem_hold = smem + 160;
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
         __syncwarp();
     }
 
@@ -378,7 +376,7 @@ kernel_cake_deepgemm_dense_mqa_d192410db87e40988798(const __grid_constant__ CUte
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_tmem_acc + (mma_tmem_stage * 128))), "r"(0));
                             tcgen05_commit(umma_full_addr + (mma_tmem_stage) * 8);
                             mma_tmem_stage += 1;
-                            if (mma_tmem_stage == 3) { mma_tmem_stage = 0; _phase_umma_empty ^= 1; }
+                            if (mma_tmem_stage == 2) { mma_tmem_stage = 0; _phase_umma_empty ^= 1; }
                             mbarrier_wait(umma_empty_addr + (mma_tmem_stage) * 8, _phase_umma_empty);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int _mma_a_lo_1 = (((smem_kv_addr + 16384) >> 4) & 0x3FFF) + (mma_kv_stage) * 2112;
@@ -419,7 +417,7 @@ kernel_cake_deepgemm_dense_mqa_d192410db87e40988798(const __grid_constant__ CUte
                     :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_tmem_acc + (mma_tmem_stage * 128))), "r"(0));
                             tcgen05_commit(umma_full_addr + (mma_tmem_stage) * 8);
                             mma_tmem_stage += 1;
-                            if (mma_tmem_stage == 3) { mma_tmem_stage = 0; _phase_umma_empty ^= 1; }
+                            if (mma_tmem_stage == 2) { mma_tmem_stage = 0; _phase_umma_empty ^= 1; }
                         }
                         __syncwarp();
                         mma_kv_stage += 1;
@@ -502,7 +500,8 @@ kernel_cake_deepgemm_dense_mqa_d192410db87e40988798(const __grid_constant__ CUte
                     for (int qi_pre = 0; qi_pre < 2; qi_pre++) {
                         int q_row_pre = q_start_0 + (unsigned int)qi_pre;
                         {
-                            q_row_valid[qi_pre] = 1;
+                            int in_range = (((unsigned int)q_row_pre < seq_len) ? 1 : 0);
+                            q_row_valid[qi_pre] = in_range;
                         }
                     }
                     unsigned long long block_row_base64 = (unsigned long long)q_start_0 * (unsigned long long)stride_logits;
@@ -518,9 +517,6 @@ kernel_cake_deepgemm_dense_mqa_d192410db87e40988798(const __grid_constant__ CUte
                         mbarrier_arrive(kv_empty_addr + (math_kv_stage) * 8);
                         math_kv_stage += 1;
                         if (math_kv_stage == 5) { math_kv_stage = 0; _phase_kv_full_1 ^= 1; }
-                        if (kv_iter_2 == num_kv_blocks_2_1 - 1) {
-                            mbarrier_arrive(q_empty_addr + (math_q_stage) * 8);
-                        }
                         int kv_pos = kv_start_1_1 + kv_iter_2 * 256 + (unsigned int)math_thread_idx;
                         {
                             float _tmem_load_0[64];
@@ -566,7 +562,7 @@ kernel_cake_deepgemm_dense_mqa_d192410db87e40988798(const __grid_constant__ CUte
                             {
                                 float materialized_result = in_range_result;
                                 int q_rel = (unsigned int)q_row - q_start_0;
-                                {
+                                if (q_row_valid[0] != 0) {
                                     int out_elem = (unsigned int)q_rel * stride_logits + (unsigned int)kv_pos;
                                     *(reinterpret_cast<float*>(block_base_ptr + out_elem) + (0)) = materialized_result;
                                 }
@@ -618,25 +614,27 @@ kernel_cake_deepgemm_dense_mqa_d192410db87e40988798(const __grid_constant__ CUte
                             {
                                 float materialized_result_1 = in_range_result_1;
                                 int q_rel_1 = (unsigned int)q_row_1 - q_start_0;
-                                {
+                                if (q_row_valid[1] != 0) {
                                     int out_elem_1 = (unsigned int)q_rel_1 * stride_logits + (unsigned int)kv_pos;
                                     *(reinterpret_cast<float*>(block_base_ptr + out_elem_1) + (0)) = materialized_result_1;
                                 }
                             }
                         }
                         math_tmem_stage += 2;
-                        if (math_tmem_stage >= 3) {
-                            math_tmem_stage -= 3;
+                        if (math_tmem_stage >= 2) {
+                            math_tmem_stage -= 2;
                             math_tmem_phase ^= 1;
                         }
                     }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    mbarrier_arrive(q_empty_addr + (math_q_stage) * 8);
                     math_q_stage += 1;
                     if (math_q_stage == 3) { math_q_stage = 0; _phase_q_full_1 ^= 1; }
                 }
             }
             asm volatile("barrier.sync 8, 256;" ::: "memory");
             if (warp == 0) {
-                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(0), "r"(512));
+                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(0), "r"(256));
             }
         }
     }

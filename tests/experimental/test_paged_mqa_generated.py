@@ -40,6 +40,14 @@ CASES = [
     ),  # batch > dynamic_scheduler.max_batch: the static program of a single-atom geometry
     (32, 64, 1, 16, 4096),
     (64, 32, 1, 16, 4096),
+    (
+        32,
+        64,
+        2,
+        16,
+        4096,
+    ),  # next_n-2 coverage geometries: exported, admission withheld until their table clears
+    (64, 32, 2, 16, 4096),
 ]
 
 
@@ -69,7 +77,14 @@ def _admitted(q, ctx_2d, max_len, heads, page, next_n):
     arch = _runtime._resolve_device(q, None)[0]
     return _runtime.paged_route_admitted(
         arch,
-        _runtime.paged_route_name(heads, page, next_n, batch=int(ctx_2d.shape[0])),
+        _runtime.paged_route_name(
+            heads,
+            page,
+            next_n,
+            batch=int(ctx_2d.shape[0]),
+            max_context_len=int(max_len),
+            arch=arch,
+        ),
         int(ctx_2d.shape[0]),
         int(max_len),
     )
@@ -306,9 +321,19 @@ def test_paged_mqa_logits(heads, page, next_n, batch, avg_ctx):
         with pytest.raises(ValueError, match="is not admitted on"):
             prepare_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, max_len)
         plan = _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len)
+    # The plan's route is the shipped per-call rule: the dynamic-scheduler route by batch, the static
+    # route inside this architecture's static-preferred windows (batch, max_context_len).
     assert plan.route_name == _runtime.paged_route_name(
-        heads, page, next_n, batch=batch
+        heads, page, next_n, batch=batch, max_context_len=max_len, arch=plan.arch
     )
+    static = _runtime.paged_route_name(heads, page, next_n)
+    if (
+        plan.route_name == static
+        and static in _runtime.paged_dynamic_scheduler()["routes"]
+    ):
+        assert batch > _runtime.paged_dynamic_scheduler()[
+            "max_batch"
+        ] or _runtime.paged_static_preferred(plan.arch, static, batch, max_len)
     num_sms = plan.num_sms
     plan.output.fill_(float("nan"))
     stream = torch.cuda.Stream()
@@ -319,7 +344,9 @@ def test_paged_mqa_logits(heads, page, next_n, batch, avg_ctx):
     stream.synchronize()
     ref = _reference(q, kv_fp8, scale, weights, ctx_2d, block_table, max_len, page)
     _check(plan.logical_output, ref, ctx_2d, max_len, plan.output)
-    assert plan.launch_count == 1 and plan.program_names == [plan.route["stages"][0][1]]
+    assert plan.launch_count == 1 and plan.program_names == [
+        plan.route["stages"][0][1][plan.arch]
+    ]
     # One-shot entries on the same operands: identical bits. The metadata entry is a no-launch
     # placeholder of the DeepGEMM signature (zeros of the CTA-budget shape).
     meta = get_paged_mqa_logits_metadata(ctx_2d, page, num_sms)
@@ -581,8 +608,12 @@ def test_paged_bindings_cover_every_program_argument():
                 sched_counters=counters,
             ),
         }
-        assert [stage for stage, _program in route["stages"]] == ["logits"], route_name
-        for stage, program in route["stages"]:
+        assert [stage for stage, _programs in route["stages"]] == ["logits"], route_name
+        for stage, program in (
+            (stage, program)
+            for stage, by_arch in route["stages"]
+            for program in sorted(set(by_arch.values()))
+        ):
             arg_plan = catalog["programs"][program]["arg_plan"]
             missing = [name for _kind, name in arg_plan if name not in bindings[stage]]
             assert not missing, (
@@ -610,18 +641,19 @@ def test_paged_dynamic_scheduler_routes():
     for static, dyn in dynamic["routes"].items():
         assert static in catalog["paged_routes"] and dyn in catalog["paged_routes"]
         assert dyn == f"{static}:dyn"
-        static_program = catalog["paged_routes"][static]["stages"][0][1]
-        dyn_program = catalog["paged_routes"][dyn]["stages"][0][1]
-        # Program ids are content hashes of the generated text: the two routes serve distinct programs, and only
-        # the dynamic one binds the scheduler state.
-        assert dyn_program != static_program
-        assert (
-            catalog["programs"][dyn_program]["role"]
-            == catalog["programs"][static_program]["role"]
-        )
-        assert "sched_counters" in {
-            name for _kind, name in catalog["programs"][dyn_program]["arg_plan"]
-        }
+        for arch in sorted(catalog["arches"]):
+            static_program = catalog["paged_routes"][static]["stages"][0][1][arch]
+            dyn_program = catalog["paged_routes"][dyn]["stages"][0][1][arch]
+            # Program ids are content hashes of the generated text: the two routes serve distinct programs on
+            # every architecture, and only the dynamic one binds the scheduler state.
+            assert dyn_program != static_program, (static, arch)
+            assert (
+                catalog["programs"][dyn_program]["role"]
+                == catalog["programs"][static_program]["role"]
+            )
+            assert "sched_counters" in {
+                name for _kind, name in catalog["programs"][dyn_program]["arg_plan"]
+            }
         fields = {field[0]: int(field[1:]) for field in static.split(":")[2:5]}
         heads, page, next_n = fields["h"], fields["p"], fields["n"]
         assert _runtime.paged_route_name(heads, page, next_n) == static
@@ -644,6 +676,49 @@ def test_paged_dynamic_scheduler_routes():
             _runtime.paged_route_name(fields["h"], fields["p"], fields["n"], batch=1)
             == route_name
         )
+    # static-preferred windows: inside one, a batch the dynamic route would take stays on the static program when the
+    # call's architecture and max_context_len are given; without them (and outside the windows) the rule above holds.
+    for arch, table in dynamic["static_windows"].items():
+        for static, windows in table.items():
+            assert static in dynamic["routes"] and windows, (arch, static)
+            fields = {field[0]: int(field[1:]) for field in static.split(":")[2:5]}
+            for max_batch, max_ctx in windows:
+                assert max_batch is None or 1 <= max_batch <= dynamic["max_batch"]
+                assert max_ctx is None or max_ctx >= 1
+                batch = 1 if max_batch is None else max_batch
+                ctx = 256 if max_ctx is None else max_ctx
+                assert _runtime.paged_static_preferred(arch, static, batch, ctx)
+                assert (
+                    _runtime.paged_route_name(
+                        fields["h"],
+                        fields["p"],
+                        fields["n"],
+                        batch=batch,
+                        max_context_len=ctx,
+                        arch=arch,
+                    )
+                    == static
+                )
+                assert (
+                    _runtime.paged_route_name(
+                        fields["h"], fields["p"], fields["n"], batch=batch
+                    )
+                    == dynamic["routes"][static]
+                )
+                if max_ctx is not None:
+                    assert (
+                        _runtime.paged_route_name(
+                            fields["h"],
+                            fields["p"],
+                            fields["n"],
+                            batch=batch,
+                            max_context_len=max_ctx + 1,
+                            arch=arch,
+                        )
+                        == dynamic["routes"][static]
+                    ) or _runtime.paged_static_preferred(
+                        arch, static, batch, max_ctx + 1
+                    )
 
 
 def test_paged_admission_rules_are_applied_per_arch(monkeypatch):
@@ -724,10 +799,12 @@ def test_paged_admission_rules_are_applied_per_arch(monkeypatch):
     # route above it), so every probe is judged on the route the plan would select.
     arch = dense_mqa.device_arch(torch.device("cuda"))
     probes = ((17, 1024), (17, 32769), (65, 8448), (129, 8448), (4096, 131072))
-    route_for = lambda b: _runtime.paged_route_name(heads, page, 2, batch=b)
+    route_for = lambda b, c: _runtime.paged_route_name(
+        heads, page, 2, batch=b, max_context_len=c, arch=arch
+    )
     rules = {
-        route_for(b): _runtime.paged_admission_rules(arch, route_for(b))
-        for b, _c in probes
+        route_for(b, c): _runtime.paged_admission_rules(arch, route_for(b, c))
+        for b, c in probes
     }
     if all(r is None for r in rules.values()):
         return
@@ -735,7 +812,7 @@ def test_paged_admission_rules_are_applied_per_arch(monkeypatch):
         (
             (b, c)
             for b, c in probes
-            if not _runtime.paged_route_admitted(arch, route_for(b), b, c)
+            if not _runtime.paged_route_admitted(arch, route_for(b, c), b, c)
         ),
         None,
     )
