@@ -142,7 +142,6 @@ dtypes, raise :class:`ValueError`.
 .. autosummary::
     :toctree: ../generated
 
-    msa_packed_fp8_sparse_decode
     msa_proxy_score
     msa_proxy_score_fp4
     MSASparseAttentionWorkspace
