@@ -15,14 +15,18 @@ grid of the logits consumers (the device's SM count) as the compile-line definit
 SM count (one JIT build per device SM count). The schedule
 metadata producer is specialised on a query ceiling (tiers `le16`, `le128`, `le2048`,
 `any`), which bounds its prefix arrays and boundary search at compile time; a route name
-carries the tier of its query count. Routes are chosen from host-known scalars only: FP4
-rows run the DeepGEMM-compatible metadata producer and the fused logits/cleanup kernel in
-one prepared submission; FP8 rows with `Q = 1` and `K <= 131072` or `Q = 128` and
-`K <= 4096` produce the metadata inside the logits launch (their cost partition and
-metadata offsets fold on the compile-line SM count exactly as in the shipped kernels); the
-other FP8 rows run the
-metadata program followed by the logits program (a `Q % 4 != 0` tail uses the
-partial-block logits program).
+carries the tier of its query count. Routes are chosen from host-known scalars only. A
+32-head call takes ONE logits launch that computes the schedule in-kernel (a `:short`
+route) while its KV length is within the catalog policy's bound for its class: the fused
+single-query chain (`Q = 1`, `fused_q1_max_kv` / `fp4.fused_q1_max_kv`), the FP8 `Q = 128`
+text (`fused_q128_max_kv`), or the scan class of the query count -- the smallest
+`fused_scan_ceilings` entry (query blocks of 4) covering `ceil(Q / 4)`, served while
+`K <= fused_scan<ceiling>_max_kv` of that class: FP8 `le32` (warp scan, `1 < Q < 128`) /
+`le768` (CTA scan, `128 < Q <= 3072`) qualified by `full` / `partial` block kind, FP4
+`le32` / `le1024` (`1 < Q <= 4096`). Above the bound the call runs the metadata program
+followed by the logits program (FP4 in one prepared submission; FP8 as two submissions, a
+`Q % 4 != 0` tail using the partial-block logits program). Their cost partition and
+metadata offsets fold on the compile-line SM count exactly as in the shipped kernels.
 
 `prepare_dense_mqa_logits(precision, q, kv, weights, starts, ends, q_scales=None,
 kv_scales=None, output=None, metadata=None)` binds FP4 `q` uint8/int8 `[Q, 32, 64]`,
@@ -115,7 +119,7 @@ without allocating (CUDA Graph replay with changed contents is supported; `plan.
 Tests: `tests/experimental/test_dense_mqa_generated.py` (dense, including the one-shot entry) and
 `tests/experimental/test_paged_mqa_generated.py` (paged; skips while the catalog has no paged routes).
 
-## Catalog schema `dense_mqa.v8` (route records)
+## Catalog schema `dense_mqa.v9` (route records)
 
 `dense_mqa_catalog.json` carries `policy`, `programs`, the dense `routes` and the paged
 `paged_routes`. Policy keys: `heads` (exported head counts), `block_q` (`{"32": 4, "64": 2}`),
@@ -124,7 +128,10 @@ handle the KV tail in-kernel), `max_q_blocks` and `metadata_tier_blocks` (`[4, 3
 query-block ceilings of the 32-head metadata programs, named per head count by their token ceiling, so the
 32-head tiers are `le16 / le128 / le2048 / any` and the 64-head tier names `le8 / le64 / le1024 / any`
 are aliases -- the 64-head routes have no metadata stage and no query bound),
-the shipped 32-head `fused_q1_max_kv` / `fused_q128_max_kv` / `max_q_tokens` / `metadata_tiers`, and
+the shipped 32-head `fused_q1_max_kv` / `fused_q128_max_kv` / `max_q_tokens` / `metadata_tiers`, -- v9 -- the FP8
+in-kernel scan classes `fused_scan_ceilings` (`[32, 768]` query blocks) with one KV bound each
+(`fused_scan32_max_kv`, `fused_scan768_max_kv`) and the `fp4` block (`fused_q1_max_kv`, `fused_scan_ceilings`
+`[32, 1024]`, `fused_scan32_max_kv`, `fused_scan1024_max_kv`) that bound the single-launch 32-head routes, and
 `paged` (`heads` -- the paged head counts, independent of the dense `heads`; `block_kv`, `split_kv`,
 `next_n_atoms` -- 1 for every exported `next_n`, the logits programs iterate the atoms in-kernel;
 `max_batch`, `metadata_program`, `admission`, `dynamic_scheduler` -- `max_batch`, the static -> dynamic route map and
@@ -137,7 +144,10 @@ architecture, as for the 64-head tier and `q1` routes since v8 -- their `:short`
 `num_heads`, `block_q`, `clean_logits` (`"fused"`: the program writes `-inf` outside each window and in
 the padding, the shipped 32-head programs; `"raw"`: the program stores the computed tiles only, DeepGEMM's
 `clean_logits=False` semantics, the 64-head and paged programs) and `kv_alignment`. Routes: 32 heads
-`fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:<tier>`, `fp4:q1`, `fp4:<tier>`;
+`fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:le32:short`, `fp8:{full,partial}:le768:short`,
+`fp8:{full,partial}:<tier>`, `fp4:q1:short`, `fp4:q1`, `fp4:le32:short`, `fp4:le1024:short`, `fp4:<tier>` (every
+32-head `:short` route is one `logits` stage that writes the schedule metadata itself; the `le<N>:short` classes
+are named by query-block ceiling, the `<tier>` pairs by token ceiling);
 64 heads `fp8:h64:q1`, `fp8:h64:{full,partial}:<tier>` and the one-split `fp8:h64:{full,partial}:short` (a call with
 `K <= 256` and at least two query blocks; `served_route(precision, Q, K, H, arch=)` maps a `:short` route the device's
 arch withholds -- or the catalog does not carry -- to the tier route of the query count, never to the stock kernel),

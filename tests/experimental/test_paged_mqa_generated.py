@@ -40,13 +40,9 @@ CASES = [
     ),  # batch > dynamic_scheduler.max_batch: the static program of a single-atom geometry
     (32, 64, 1, 16, 4096),
     (64, 32, 1, 16, 4096),
-    (
-        32,
-        64,
-        2,
-        16,
-        4096,
-    ),  # next_n-2 coverage geometries: exported, admission withheld until their table clears
+    # next_n-2 coverage geometries: exported, admission withheld until their
+    # table clears
+    (32, 64, 2, 16, 4096),
     (64, 32, 2, 16, 4096),
 ]
 
@@ -327,13 +323,10 @@ def test_paged_mqa_logits(heads, page, next_n, batch, avg_ctx):
         heads, page, next_n, batch=batch, max_context_len=max_len, arch=plan.arch
     )
     static = _runtime.paged_route_name(heads, page, next_n)
-    if (
-        plan.route_name == static
-        and static in _runtime.paged_dynamic_scheduler()["routes"]
-    ):
-        assert batch > _runtime.paged_dynamic_scheduler()[
-            "max_batch"
-        ] or _runtime.paged_static_preferred(plan.arch, static, batch, max_len)
+    scheduler = _runtime.paged_dynamic_scheduler()
+    if plan.route_name == static and static in scheduler["routes"]:
+        preferred = _runtime.paged_static_preferred(plan.arch, static, batch, max_len)
+        assert batch > scheduler["max_batch"] or preferred
     num_sms = plan.num_sms
     plan.output.fill_(float("nan"))
     stream = torch.cuda.Stream()
@@ -688,37 +681,17 @@ def test_paged_dynamic_scheduler_routes():
                 batch = 1 if max_batch is None else max_batch
                 ctx = 256 if max_ctx is None else max_ctx
                 assert _runtime.paged_static_preferred(arch, static, batch, ctx)
-                assert (
-                    _runtime.paged_route_name(
-                        fields["h"],
-                        fields["p"],
-                        fields["n"],
-                        batch=batch,
-                        max_context_len=ctx,
-                        arch=arch,
-                    )
-                    == static
-                )
-                assert (
-                    _runtime.paged_route_name(
-                        fields["h"], fields["p"], fields["n"], batch=batch
-                    )
-                    == dynamic["routes"][static]
-                )
+                h, p, n = fields["h"], fields["p"], fields["n"]
+                at_ctx = {"batch": batch, "max_context_len": ctx, "arch": arch}
+                assert _runtime.paged_route_name(h, p, n, **at_ctx) == static
+                dyn_route = dynamic["routes"][static]
+                assert _runtime.paged_route_name(h, p, n, batch=batch) == dyn_route
                 if max_ctx is not None:
-                    assert (
-                        _runtime.paged_route_name(
-                            fields["h"],
-                            fields["p"],
-                            fields["n"],
-                            batch=batch,
-                            max_context_len=max_ctx + 1,
-                            arch=arch,
-                        )
-                        == dynamic["routes"][static]
-                    ) or _runtime.paged_static_preferred(
-                        arch, static, batch, max_ctx + 1
-                    )
+                    ctx1 = max_ctx + 1
+                    past = {"batch": batch, "max_context_len": ctx1, "arch": arch}
+                    beyond = _runtime.paged_route_name(h, p, n, **past) == dyn_route
+                    pref = _runtime.paged_static_preferred(arch, static, batch, ctx1)
+                    assert beyond or pref
 
 
 def test_paged_admission_rules_are_applied_per_arch(monkeypatch):
