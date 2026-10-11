@@ -966,6 +966,8 @@ class DenseGemmKernel:
         # and shared-memory layouts.
         self.direct_sfa_prefix = direct_sfa_live16 and self.direct_sfb_representative
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
+        # Four compute warps hide MXFP8 load/dequantization latency at small M.
+        small_m_warps = 8 if self.a16_block else 4 if weight_only == "mxfp8" else 2
         if self.a16_block_transposed:
             self.atom_shape = (mma_atom_mn[0] // 16, 1, 1)
         elif mma_atom_mn in ((16, 64), (16, 128)):
@@ -974,7 +976,7 @@ class DenseGemmKernel:
             # shape covering two warps of work under a launch geometry sized
             # for eight leaves warps 2-7 with no valid tile, reading shared
             # memory past the end of the staged operands.
-            self.atom_shape = (1, 8 if self.a16_block else 2, 1)
+            self.atom_shape = (1, small_m_warps, 1)
         elif mma_atom_mn in ((32, 64), (32, 128)):
             self.atom_shape = (2, 2, 1)
         elif atom_shape_24:
@@ -987,7 +989,7 @@ class DenseGemmKernel:
         if self.a16_block_transposed:
             self.num_mma_warps = mma_atom_mn[0] // 16
         elif mma_atom_mn in ((16, 64), (16, 128)):
-            self.num_mma_warps = 8 if self.a16_block else 2
+            self.num_mma_warps = small_m_warps
         elif mma_atom_mn in ((32, 64), (32, 128)):
             self.num_mma_warps = 4
         else:
