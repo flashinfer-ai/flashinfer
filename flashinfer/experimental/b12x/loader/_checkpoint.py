@@ -181,48 +181,15 @@ class DirectWeightSession:
                 torch.cuda.current_stream(self.device).cuda_stream,
             )
 
-    def materialize(self, source, *, device=None):
+    def materialize(self, source):
         """Read owned transform inputs without routing arithmetic through metadata."""
         import torch
 
         if source.device.type != "meta":
-            return source.clone() if device is None else source.to(device, copy=True)
-        target = (
-            torch.device("cuda", self.device)
-            if device is None
-            else torch.device(device)
+            return source.clone()
+        destination = torch.empty(
+            source.shape, dtype=source.dtype, device=torch.device("cuda", self.device)
         )
-        if target.type == "cpu":
-            item = self.sources.get(source.untyped_storage()._cdata)
-            if item is None:
-                raise NotImplementedError(
-                    "checkpoint transform source is not registered"
-                )
-            _, entry = item
-            if (
-                source._version != 0
-                or not source.is_contiguous()
-                or source.element_size() != entry.dtype.itemsize
-                or source.is_neg()
-                or source.is_conj()
-            ):
-                raise NotImplementedError(
-                    "CPU materialization requires an unchanged contiguous checkpoint view"
-                )
-            offset = source.storage_offset() * source.element_size()
-            if offset + source.nbytes > entry.nbytes:
-                raise ValueError(f"source view exceeds checkpoint range: {entry.name}")
-            if not source.numel():
-                return torch.empty(source.shape, dtype=source.dtype, device="cpu")
-            raw = bytearray(
-                self.native.direct_bytes(
-                    self.reader, entry.fd, entry.offset + offset, source.nbytes
-                )
-            )
-            self.payload_bytes += source.nbytes
-            self.loaded_tensors += 1
-            return torch.frombuffer(raw, dtype=source.dtype).reshape(source.shape)
-        destination = torch.empty(source.shape, dtype=source.dtype, device=target)
         self(destination, source)
         self.flush()
         return destination
@@ -397,6 +364,67 @@ class DirectWeightSession:
                     storage = tensor.untyped_storage()
                     self.sources[storage._cdata] = (storage, entry)
                 yield prefix + entry.name, tensor
+
+    def concatenate(self, destination, sources):
+        """Queue whole checkpoint tensors consecutively into one CUDA allocation.
+
+        This batches compressed components without constructing a destination
+        view and entering a CUDA device context for every source tensor.
+        """
+        import torch
+
+        if (
+            destination.device.type != "cuda"
+            or destination.device.index != self.device
+            or not destination.is_contiguous()
+            or destination.is_neg()
+            or destination.is_conj()
+        ):
+            raise ValueError(
+                "concatenated destination requires contiguous session CUDA storage"
+            )
+        entries = []
+        for source in sources:
+            if source.device.type != "meta":
+                raise ValueError("concatenation requires registered checkpoint tensors")
+            item = self.sources.get(source.untyped_storage()._cdata)
+            if item is None:
+                raise NotImplementedError(
+                    "checkpoint routing performed an unsupported data transformation"
+                )
+            _, entry = item
+            if (
+                source._version != 0
+                or source.storage_offset() != 0
+                or source.shape != entry.shape
+                or source.dtype != entry.dtype
+                or source.dtype != destination.dtype
+                or not source.is_contiguous()
+                or source.is_neg()
+                or source.is_conj()
+            ):
+                raise NotImplementedError(
+                    f"concatenation requires an unmodified whole tensor: {entry.name}"
+                )
+            entries.append(entry)
+        total = sum(entry.nbytes for entry in entries)
+        if total != destination.nbytes:
+            raise ValueError(
+                "concatenated source bytes must exactly fill the destination"
+            )
+        pointer = destination.data_ptr()
+        records = array("Q")
+        for entry in entries:
+            if entry.nbytes:
+                records.extend(
+                    (entry.fd, entry.offset, entry.nbytes, pointer, 0, 1, 0, 0)
+                )
+                pointer += entry.nbytes
+        self.records.extend(records)
+        self.destinations.append(destination)
+        torch.autograd.graph.increment_version(destination)
+        self.payload_bytes += total
+        self.loaded_tensors += len(entries)
 
     def __call__(self, destination, source):
         import torch

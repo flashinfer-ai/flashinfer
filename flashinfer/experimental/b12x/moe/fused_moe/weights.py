@@ -11,6 +11,7 @@ import torch
 from b12x._lib.quant.block_codec import block_codec
 
 if TYPE_CHECKING:
+    from b12x.loader._csf_source import CsfSource
     from ._impl import B12XFP4ExpertWeights
     from .planning import WeightPlan
 
@@ -229,8 +230,8 @@ class Nvfp4CsfWeights:
     """
 
     packed: PackedWeights
-    w13_scales: CsfBlockPlanes
-    w2_scales: CsfBlockPlanes
+    w13_scales: CsfBlockPlanes | CsfSource
+    w2_scales: CsfBlockPlanes | CsfSource
 
 
 @dataclass(frozen=True)
@@ -246,8 +247,8 @@ class Mxfp4CsfWeights:
 
     w13: torch.Tensor
     w2: torch.Tensor
-    w13_scales: CsfBlockPlanes
-    w2_scales: CsfBlockPlanes
+    w13_scales: CsfBlockPlanes | CsfSource
+    w2_scales: CsfBlockPlanes | CsfSource
     w13_scale_scratch: torch.Tensor
     w2_scale_scratch: torch.Tensor
 

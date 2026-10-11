@@ -193,7 +193,9 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
             )
         )
         if expansion is not None:
-            assert plans[1].prepared.state.scale_decoder.first.groups_per_task == (
+            assert plans[
+                1
+            ].prepared.state.execution_experts.nvfp4_csf.first.groups_per_task == (
                 expansion.selection.config.groups_per_task
             )
         owners, outputs, bindings, graphs = [], [], [], []

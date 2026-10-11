@@ -2,52 +2,17 @@
 
 from dataclasses import replace
 
-import numpy as np
 import torch
 
-from b12x._lib.quant.csf_blocks import Nvfp4CompactBlockPlane, upload_csf_block_payload
-from b12x._lib.quant.nvfp4_csf import Nvfp4CsfDecoder
-from b12x.loader._csf_blocks import (
-    concatenate_csf_blocks,
-    logical_csf_components,
-    slice_csf_blocks,
-    transform_csf_blocks,
+from b12x._lib.quant.csf_blocks import Nvfp4CompactBlockPlane
+from b12x._lib.quant._csf_prepare import (
+    expand_source_scales,
+    prepare_csf_payload,
+    validate_source,
 )
+from b12x._lib.quant.nvfp4_csf import Nvfp4CsfDecoder
+from b12x.loader._csf_source import CsfSource, upload_csf_planes
 from .weights import CsfBlockPlanes, Nvfp4CsfWeights, PackedWeights
-
-
-def _logical(plane):
-    bases, fields, positions, values = logical_csf_components(plane)
-    grid = bases[:, None] + fields
-    grid.ravel()[positions] = values
-    return grid
-
-
-def _rotate(plane, rotation):
-    if not rotation:
-        return plane
-    return concatenate_csf_blocks(
-        (
-            slice_csf_blocks(plane, row_range=(rotation, plane.rows)),
-            slice_csf_blocks(plane, row_range=(0, rotation)),
-        )
-    )
-
-
-def _fill_source_scales(planes, output, nvfp4):
-    for expert, plane in enumerate(planes):
-        logical = _logical(plane)
-        if nvfp4:
-            rows, columns = output.shape[1:]
-            grid = np.zeros((rows, columns), dtype=np.uint8)
-            grid[: plane.rows, : plane.columns] = logical
-            logical = (
-                grid.reshape(rows // 128, 4, 32, columns // 4, 4)
-                .transpose(0, 3, 2, 1, 4)
-                .copy()
-                .reshape(rows, columns)
-            )
-        output[expert].view(torch.uint8).copy_(torch.from_numpy(logical))
 
 
 def prepare_csf_block_weights(plan, weights):
@@ -66,23 +31,31 @@ def prepare_csf_block_weights(plan, weights):
         raise ValueError(
             "CSF expansion requires a uniform native scale layout per weight plan"
         )
-    if not isinstance(weights.w2_scales, CsfBlockPlanes):
-        raise TypeError("Both expert projections must use CSF block scale planes")
     geometry = plan.geometry
     e, h, n = geometry.num_experts, geometry.hidden_size, geometry.intermediate_size
     quantization = "nvfp4" if nvfp4 else "mxfp4"
     group_size = 16 if nvfp4 else 32
-    sources = (weights.w13_scales.planes, weights.w2_scales.planes)
+    device = weights.packed.w13.device if nvfp4 else weights.w13.device
+    sources = tuple(
+        upload_csf_planes(source.planes, device)
+        if isinstance(source, CsfBlockPlanes)
+        else source.to(device)
+        for source in (weights.w13_scales, weights.w2_scales)
+    )
     for source, rows, columns in zip(
         sources, (2 * n, h), (h // group_size, n // group_size), strict=True
     ):
-        if len(source) != e or any(
-            (p.rows, p.columns, p.quantization) != (rows, columns, quantization)
-            for p in source
-        ):
+        if not isinstance(source, CsfSource) or (
+            source.num_experts,
+            source.rows,
+            source.columns,
+            source.quantization,
+        ) != (e, rows, columns, quantization):
             raise ValueError(
                 "CSF block geometry must match its native expert weight plan"
             )
+    for source in sources:
+        validate_source(source)
     buffers = (
         (weights.packed.w13_block_scales, weights.packed.w2_block_scales)
         if nvfp4
@@ -109,8 +82,17 @@ def prepare_csf_block_weights(plan, weights):
             w13_global_scales=unit,
             w2_global_scales=unit,
         )
-    for source, output in zip(sources, source_outputs, strict=True):
-        _fill_source_scales(source, output, nvfp4)
+    initial_planes = None
+    if nvfp4 and mode is ActivationMode.A4:
+        initial_planes = tuple(
+            Nvfp4CompactBlockPlane(prepare_csf_payload(source)) for source in sources
+        )
+        Nvfp4CsfDecoder.prepare(*initial_planes, *source_outputs).decode_all(
+            *source_outputs
+        )
+    else:
+        for source, output in zip(sources, source_outputs, strict=True):
+            expand_source_scales(source, output, swizzled=nvfp4)
     tables = (None, None)
     if nvfp4 and mode is ActivationMode.A16:
         from b12x.moe._shared.kernels.w4a16.prepare import (
@@ -130,12 +112,11 @@ def prepare_csf_block_weights(plan, weights):
                 scale_factor=_nvfp4_compute_scale_factor(s, plan.activation.io_dtype),
             )
             .view(torch.uint8)[:, 0]
-            .cpu()
-            .numpy()
+            .contiguous()
             for s in source_outputs
         )
     elif not nvfp4:
-        table = np.minimum(np.arange(256), 247).astype(np.uint8)
+        table = torch.arange(256, device=device).clamp_max_(247).to(torch.uint8)
         tables = (table, table)
     prepared = prepare_weights(plan=plan, weights=native_weights)
     rep = prepared._impl.representation
@@ -184,24 +165,20 @@ def prepare_csf_block_weights(plan, weights):
     elif not nvfp4:
         native = replace(native, w13_sfb=outputs[0], w2_sfb=outputs[1])
     planes = tuple(
-        Nvfp4CompactBlockPlane(
-            upload_csf_block_payload(
-                tuple(
-                    _rotate(
-                        transform_csf_blocks(p, table) if table is not None else p, rot
-                    )
-                    for p in source
-                ),
-                outputs[0].device,
-                native_codes=True,
-                group_record_bytes=3,
+        initial_planes[index]
+        if initial_planes is not None and not rot
+        else Nvfp4CompactBlockPlane(
+            prepare_csf_payload(
+                source,
                 destination=destination,
+                rotation=rot,
+                value_table=table,
                 group_rows=group if destination in (2, 3) else None,
             ),
             layout=int(a16),
         )
-        for source, table, rot, group in zip(
-            sources, tables, (rotation, 0), (n, h), strict=True
+        for index, (source, table, rot, group) in enumerate(
+            zip(sources, tables, (rotation, 0), (n, h), strict=True)
         )
     )
     decoder = Nvfp4CsfDecoder.prepare(*planes, *outputs)

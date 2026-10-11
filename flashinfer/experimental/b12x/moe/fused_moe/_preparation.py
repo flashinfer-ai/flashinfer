@@ -1132,7 +1132,7 @@ class _FusedMoeState:
     route_launcher: object
     w4a16_launches: _W4A16PrimaryLaunches | None = None
     compact_launches: _CompactLaunches | None = None
-    scale_decoder: object | None = None
+    execution_experts: object | None = None
 
     def _a4_launch_for(
         self,
@@ -1194,11 +1194,7 @@ class _FusedMoeState:
         ):
             raise ValueError("fast_math differs from the prepared numerical contract")
         kwargs["fast_math"] = fast_math
-        kwargs["experts"] = (
-            self.experts._impl
-            if self.scale_decoder is None
-            else replace(self.experts._impl, nvfp4_csf=self.scale_decoder)
-        )
+        kwargs["experts"] = self.execution_experts or self.experts._impl
         kwargs["unit_scale_contract"] = (
             _quant_mode(self.experts, self.config) == "w4a16"
         )
@@ -1504,7 +1500,9 @@ def plan(
                 route_launcher,
                 programs.w4a16,
                 programs.compact,
-                scale_decoder,
+                replace(experts._impl, nvfp4_csf=scale_decoder)
+                if scale_decoder is not None
+                else experts._impl,
             )
 
         return Plan(

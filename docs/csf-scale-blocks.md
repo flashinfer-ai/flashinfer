@@ -59,6 +59,17 @@ and rebuilds rank-local groups and indexes. TP boundaries require complete
 32-row blocks and complete quantization groups. Partitions are derived from
 geometry rather than stored TP directories.
 
+Direct loaders batch verbatim checkpoint components into CUDA staging buffers.
+GPU kernels validate palettes and exception indexes, gather selected scale
+blocks into native order, and rebuild their indexes with a device prefix sum.
+Only validation flags and allocation sizes return to the CPU; scale matrices
+are neither decoded nor regrouped there. Staging is bounded to one expert layer.
+
+The slab checkpoint encoding `weight_scale_encoding: "csf"` is also accepted.
+Its fixed slabs and absolute exception records are uploaded verbatim and
+converted on the GPU to the same resident payload. Both checkpoint encodings
+use the same scale-expansion tuner and ordinary native compute kernels.
+
 Preparation applies the selected native kernel's scale transformations,
 including NVFP4 W4A16 normalization, MXFP4 exponent clamping, and projection
 row order. It permutes compressed fields, row bases, and exception positions

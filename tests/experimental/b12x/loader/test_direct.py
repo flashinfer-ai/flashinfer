@@ -49,37 +49,58 @@ def test_tp_column_slices_preserve_padding_and_expand_bf16(
         assert torch.all(backing[:, :, -1] == -17)
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_transform_materialization_owns_values_after_session_close(tmp_path, device):
+def test_transform_materialization_owns_values_after_session_close(tmp_path):
     expected = torch.arange(4096, dtype=torch.float32).reshape(32, 128)
     path = tmp_path / "transform.safetensors"
     save_file({"weight": expected}, path)
     with (
         DirectWeightSession() as session,
     ):
-        extent = (
-            (slice(3, 17), slice(None))
-            if device == "cpu"
-            else (slice(None), slice(64, None))
-        )
-        source = dict(session.weights([path]))["weight"][extent]
-        actual = session.materialize(source, device=device)
-        assert actual.device.type == device
-        assert session.stats()["payload_bytes"] == actual.nbytes
+        source = dict(session.weights([path]))["weight"][:, 64:]
+        actual = session.materialize(source)
     path.unlink()
-    torch.testing.assert_close(actual.cpu(), expected[extent], rtol=0, atol=0)
+    torch.testing.assert_close(actual.cpu(), expected[:, 64:], rtol=0, atol=0)
 
 
-def test_cpu_materialization_rejects_transformed_checkpoint_views(tmp_path):
-    path = tmp_path / "scales.safetensors"
-    save_file({"scales": torch.ones((32, 16), dtype=torch.uint8)}, path)
+@pytest.mark.parametrize("read_mode", ["bounce", "gds"])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.uint16, torch.uint32])
+def test_concatenated_components_preserve_bytes_and_destination_bounds(
+    tmp_path, read_mode, dtype
+):
+    expected = [torch.arange(n, dtype=torch.int64).to(dtype) for n in (0, 31, 259, 7)]
+    paths = [tmp_path / f"components-{i}.safetensors" for i in range(2)]
+    save_file({str(i): expected[i] for i in (0, 2)}, paths[0])
+    save_file({str(i): expected[i] for i in (1, 3)}, paths[1])
+    count = sum(t.numel() for t in expected)
+    backing = torch.full((count + 2,), 77, dtype=dtype, device="cuda")
+    with DirectWeightSession(read_mode=read_mode) as session:
+        sources = dict(session.weights(paths))
+        session.concatenate(backing[1:-1], [sources[str(i)] for i in range(4)])
+        assert session.payload_bytes == count * dtype.itemsize
+        assert session.loaded_tensors == 4
+    assert torch.equal(backing[1:-1].cpu(), torch.cat(expected))
+    assert backing[0].item() == backing[-1].item() == 77
+
+
+def test_concatenation_rejects_transformed_sources_without_queuing_partial_reads(
+    tmp_path,
+):
+    path = tmp_path / "components.safetensors"
+    save_file({"first": torch.arange(32), "second": torch.arange(32)}, path)
     with DirectWeightSession() as session:
-        source = dict(session.weights([path]))["scales"]
-        with pytest.raises(NotImplementedError, match="contiguous"):
-            session.materialize(source[:, ::2], device="cpu")
-        source.add_(1)
-        with pytest.raises(NotImplementedError, match="unchanged"):
-            session.materialize(source, device="cpu")
+        sources = dict(session.weights([path]))
+        first, second = sources["first"], sources["second"]
+        destination = torch.empty(64, dtype=torch.int64, device="cuda")
+        for invalid in (second[:16], second + 1, second.to(torch.float32)):
+            with pytest.raises(NotImplementedError):
+                session.concatenate(destination, (first, invalid))
+            assert not session.records
+        second.add_(1)
+        with pytest.raises(NotImplementedError, match="unmodified whole tensor"):
+            session.concatenate(destination, (first, second))
+        with pytest.raises(ValueError, match="exactly fill"):
+            session.concatenate(destination, (first,))
+        assert not session.records
 
 
 @pytest.mark.parametrize("offset", [0, 4103, 2**32 + 4103])

@@ -404,10 +404,13 @@ def prepare_weights(
             "device and staging are only supported for trellis preparation"
         )
     if isinstance(weights, (Nvfp4CsfWeights, Mxfp4CsfWeights)):
-        if not isinstance(weights.w13_scales, CsfBlockPlanes) or not isinstance(
-            weights.w2_scales, CsfBlockPlanes
+        from b12x.loader._csf_source import CsfSource
+
+        if not all(
+            isinstance(source, (CsfBlockPlanes, CsfSource))
+            for source in (weights.w13_scales, weights.w2_scales)
         ):
-            raise TypeError("Compressed expert weights require CsfBlockPlanes")
+            raise TypeError("Compressed expert weights require CSF checkpoint sources")
         from ._csf_preparation import prepare_csf_block_weights
 
         return prepare_csf_block_weights(plan, weights)
