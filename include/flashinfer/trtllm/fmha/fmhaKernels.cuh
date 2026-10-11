@@ -527,12 +527,7 @@ class TllmGenFmhaKernel {
   }
 
   // Is it MLA generation kernel ?
-  inline bool isMlaGenKernel(RunnerParams const& params) const {
-    return (params.mHeadDimQk == 576 && params.mHeadDimV == 512) ||
-           (params.mHeadDimQk == 320 && params.mHeadDimV == 256) ||
-           (isSparseMla(params.mSparseMlaType) && params.mHeadDimQk == 512 &&
-            params.mHeadDimV == 512);
-  }
+  inline bool isMlaGenKernel(RunnerParams const& params) const { return params.isMla(); }
 
   inline bool useDynamicNumTokensPerPage(RunnerParams const& params) const {
     return isPagedKv(params.mQkvLayout) && !isSparseMla(params.mSparseMlaType) &&
@@ -713,11 +708,13 @@ class TllmGenFmhaKernel {
           (!isDsv3MinLatencyMode && params.mHeadDimV < 512) || useMlaH512Cga;
 
       // Enable the CgaSmemReduction if the numCtasPerSeqKv <= 16 as the maximum cluster dimension
-      // is 16. Only the swapsMmaAbForGeneration kernel supports the CgaSmemReduction for now.
+      // is 16. The swapsMmaAbForGeneration kernels, and token-sparse MQA/GQA of either kernel type,
+      // ship CgaSmemReduction variants.
       // Other headDimV >= 512 shapes remain excluded because the cubin inventory is incomplete,
       // and tileSizeQ >= 32 CGA variants can exceed the device shared-memory limit.
       if (useCgaSmemReduction && numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16 &&
-          isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) &&
+          (isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) ||
+           params.isSparseMqaGqa()) &&
           isGmemReduction(selectKernelParams.mMultiCtasKvMode) &&
           !selectKernelParams.mForceGmemReduction) {
         selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::CgaSmemReduction;
@@ -1192,6 +1189,12 @@ class TllmGenFmhaKernel {
 
     // Normalize traits before the cost-model probe calls loadKernel().
     syncGqaGenerationTraitsForKernelHash(params, selectKernelParams);
+    // Token-sparse MQA/GQA cubins process one query token per CTA, so the tile must hold all of its
+    // heads: the index table is addressed per KV head, not per head group. (MLA does not get here.)
+    if (params.isSparseMqaGqa()) {
+      selectKernelParams.mGroupsTokensHeadsQ = false;
+      return;
+    }
 
     // When maxSeqLenQ > 1, use an experimental kernel-timing model to select the best kernel that
     // groups both tokensQ and headsQ into one CTA.
