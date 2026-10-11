@@ -25,22 +25,19 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 22 of the optimization ladder: skewed consumer warpgroups (ping-pong
-// on a shared tile).  Through rung 21 the two consumer warpgroups ran in
-// lockstep: they waited on the same slabs, finished the mainloop together
-// and synchronized with each other twice per epilogue pass, so the tensor
-// pipe idled for the whole epilogue + next-tile prologue of every tile.
-// The classic ping-pong puts the warpgroups on different tiles; with the
-// roles-swapped mainloop that would double the act traffic (rung 19's
-// shared B slab is why the L2 is comfortable).  Here the warpgroups keep
-// sharing the tile and the stage ring but are decoupled: each has its own
-// 16 KB epilogue buffer and its own named barrier, nothing synchronizes
-// them inside a tile, and warpgroup 2 starts the kernel one epilogue late
-// (a short spin on %globaltimer).  The skew is self-maintaining and bounded
-// by the ring depth: a stage is refilled only after both warpgroups release
-// it, so warpgroup 1 can run at most `stages` slabs ahead.  In steady state
-// one warpgroup is still issuing wgmma while the other stages and stores,
-// and vice versa, with no extra loads.  Requires sm_90a, K % 64 == 0, 16 B
+// Rung 23 of the optimization ladder: 128(n) x 256(m) tile with
+// wgmma.m64n256k16, revisited on the mature mainloop.  Rung 22's skewed
+// warpgroups showed that one warpgroup alone cannot keep the tensor pipe
+// busy with m64n128 wgmmas: its per-slab instruction stream (barrier wait,
+// 2 ldmatrix, 16 conversions, 8 wgmma issues with fences) is too thin to
+// cover the pipe when the other warpgroup is in its epilogue.  The same
+// 32768 outputs per block are kept but each warpgroup owns ONE m64 row block
+// of n and the full 256 m columns: every wgmma is twice as long
+// (64 x 256 x 16), one A fragment per k16 instead of two, half the
+// per-FLOP conversion work, and a single warpgroup's wgmma covers more of
+// the other's epilogue.  The act slab doubles (32 KB) and the ring drops to
+// 4 stages (160 KB + 32 KB epilogue buffers); L2 bytes per FLOP rise 22%
+// versus rung 19 (the L2 sat at 56%).  Requires sm_90a, K % 64 == 0, 16 B
 // aligned bases, N % 8 == 0.
 
 #include <cuda.h>
@@ -57,21 +54,21 @@
 namespace flashinfer {
 namespace gemm {
 
-constexpr int kW8A16TileN = 256;  // n rows per block (2 x wgmma M per consumer WG)
-constexpr int kW8A16TileM = 128;  // m cols per block (wgmma N)
+constexpr int kW8A16TileN = 128;  // n rows per block (one wgmma M per consumer WG)
+constexpr int kW8A16TileM = 256;  // m cols per block (wgmma N)
 constexpr int kW8A16TileK = 64;
-constexpr int kW8A16Stages = 6;
+constexpr int kW8A16Stages = 4;
 constexpr int kW8A16GroupM = 8;       // m-tiles per rasterization group
 constexpr int kW8A16ConsumerWGs = 2;  // 128 n rows each (2 row blocks of 64)
-constexpr int kW8A16RowBlocks = kW8A16TileN / (64 * kW8A16ConsumerWGs);  // 2
+constexpr int kW8A16RowBlocks = kW8A16TileN / (64 * kW8A16ConsumerWGs);  // 1
 constexpr int kW8A16Warpgroups = 1 + kW8A16ConsumerWGs;                  // + 1 producer
 constexpr int kW8A16Threads = 128 * kW8A16Warpgroups;
 constexpr int kW8A16ConsumerThreads = 128 * kW8A16ConsumerWGs;
 constexpr int kW8A16ConsumerWarps = kW8A16ConsumerThreads / 32;
 constexpr int kW8A16ARowBytes = kW8A16TileK * 2;  // act row = 64 bf16 = 128 B (SW128 atom)
 constexpr int kW8A16WRowBytes = kW8A16TileK;      // weight row = 64 fp8 = 64 B (SW64 atom)
-constexpr int kW8A16AStageBytes = kW8A16TileM * kW8A16ARowBytes;  // 16 KB
-constexpr int kW8A16WStageBytes = kW8A16TileN * kW8A16WRowBytes;  // 16 KB
+constexpr int kW8A16AStageBytes = kW8A16TileM * kW8A16ARowBytes;  // 32 KB
+constexpr int kW8A16WStageBytes = kW8A16TileN * kW8A16WRowBytes;  // 8 KB
 constexpr int kW8A16EpiPad = kW8A16TileN + 8;                     // elements per staged output row
 constexpr int kW8A16MaxSplits = 8;
 constexpr int kW8A16MinSlabsPerSplit = 8;  // amortize the partial-tile round trip
@@ -79,7 +76,7 @@ constexpr int kW8A16EpiBytes =
     kW8A16TileM * kW8A16EpiPad * 4;  // fp32 partial tile (split-K), reuses the stages
 constexpr int kW8A16EpiPasses = 2;   // 16-bit epilogue: half the tile per pass
 constexpr int kW8A16EpiRows = kW8A16TileM / kW8A16EpiPasses;
-constexpr int kW8A16EpiWgCols = kW8A16TileN / kW8A16ConsumerWGs;  // 128 n per warpgroup
+constexpr int kW8A16EpiWgCols = kW8A16TileN / kW8A16ConsumerWGs;  // 64 n per warpgroup
 // Dense [64 m][128 n] per warpgroup; the 16 B chunk index is XOR-swizzled by
 // (m >> 1) & 7 so the four even rows a warp writes at once hit different banks.
 constexpr int kW8A16EpiWgBytes = kW8A16EpiRows * kW8A16EpiWgCols * 2;  // 16 KB per warpgroup
@@ -252,24 +249,28 @@ __device__ __forceinline__ uint64_t make_smem_desc_sw128(const void* smem_ptr) {
   return desc;
 }
 
-// D[64 x 128] (+)= A[64 x 16] (registers) . B[16 x 128] (smem descriptor).
+// D[64 x 256] (+)= A[64 x 16] (registers) . B[16 x 256] (smem descriptor).
 template <typename T>
-__device__ __forceinline__ void wgmma_m64n128k16_rs(float (&d)[64], const uint32_t (&a)[4],
+__device__ __forceinline__ void wgmma_m64n256k16_rs(float (&d)[128], const uint32_t (&a)[4],
                                                     uint64_t desc_b, int scale_d);
 template <>
-__device__ __forceinline__ void wgmma_m64n128k16_rs<__nv_bfloat16>(float (&d)[64],
+__device__ __forceinline__ void wgmma_m64n256k16_rs<__nv_bfloat16>(float (&d)[128],
                                                                    const uint32_t (&a)[4],
                                                                    uint64_t desc_b, int scale_d) {
   asm volatile(
       "{\n"
       ".reg .pred p;\n"
-      "setp.ne.b32 p, %69, 0;\n"
-      "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 "
+      "setp.ne.b32 p, %133, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
       "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, "
       "%20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, "
       "%38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, "
-      "%56, %57, %58, %59, %60, %61, %62, %63}, "
-      "{%64, %65, %66, %67}, %68, p, 1, 1, 0;\n"
+      "%56, %57, %58, %59, %60, %61, %62, %63, %64, %65, %66, %67, %68, %69, %70, %71, %72, %73, "
+      "%74, %75, %76, %77, %78, %79, %80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, "
+      "%92, %93, %94, %95, %96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, "
+      "%108, %109, %110, %111, %112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, "
+      "%123, %124, %125, %126, %127}, "
+      "{%128, %129, %130, %131}, %132, p, 1, 1, 0;\n"
       "}\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
         "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
@@ -280,22 +281,35 @@ __device__ __forceinline__ void wgmma_m64n128k16_rs<__nv_bfloat16>(float (&d)[64
         "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]),
         "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
         "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]),
-        "+f"(d[63])
+        "+f"(d[63]), "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]), "+f"(d[68]), "+f"(d[69]),
+        "+f"(d[70]), "+f"(d[71]), "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]), "+f"(d[76]),
+        "+f"(d[77]), "+f"(d[78]), "+f"(d[79]), "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]),
+        "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]), "+f"(d[88]), "+f"(d[89]), "+f"(d[90]),
+        "+f"(d[91]), "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]), "+f"(d[96]), "+f"(d[97]),
+        "+f"(d[98]), "+f"(d[99]), "+f"(d[100]), "+f"(d[101]), "+f"(d[102]), "+f"(d[103]),
+        "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]), "+f"(d[108]), "+f"(d[109]),
+        "+f"(d[110]), "+f"(d[111]), "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]),
+        "+f"(d[116]), "+f"(d[117]), "+f"(d[118]), "+f"(d[119]), "+f"(d[120]), "+f"(d[121]),
+        "+f"(d[122]), "+f"(d[123]), "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(scale_d));
 }
 template <>
-__device__ __forceinline__ void wgmma_m64n128k16_rs<__half>(float (&d)[64], const uint32_t (&a)[4],
+__device__ __forceinline__ void wgmma_m64n256k16_rs<__half>(float (&d)[128], const uint32_t (&a)[4],
                                                             uint64_t desc_b, int scale_d) {
   asm volatile(
       "{\n"
       ".reg .pred p;\n"
-      "setp.ne.b32 p, %69, 0;\n"
-      "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 "
+      "setp.ne.b32 p, %133, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 "
       "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, "
       "%20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, "
       "%38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, "
-      "%56, %57, %58, %59, %60, %61, %62, %63}, "
-      "{%64, %65, %66, %67}, %68, p, 1, 1, 0;\n"
+      "%56, %57, %58, %59, %60, %61, %62, %63, %64, %65, %66, %67, %68, %69, %70, %71, %72, %73, "
+      "%74, %75, %76, %77, %78, %79, %80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, "
+      "%92, %93, %94, %95, %96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, "
+      "%108, %109, %110, %111, %112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, "
+      "%123, %124, %125, %126, %127}, "
+      "{%128, %129, %130, %131}, %132, p, 1, 1, 0;\n"
       "}\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
         "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
@@ -306,7 +320,16 @@ __device__ __forceinline__ void wgmma_m64n128k16_rs<__half>(float (&d)[64], cons
         "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]),
         "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
         "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]),
-        "+f"(d[63])
+        "+f"(d[63]), "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]), "+f"(d[68]), "+f"(d[69]),
+        "+f"(d[70]), "+f"(d[71]), "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]), "+f"(d[76]),
+        "+f"(d[77]), "+f"(d[78]), "+f"(d[79]), "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]),
+        "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]), "+f"(d[88]), "+f"(d[89]), "+f"(d[90]),
+        "+f"(d[91]), "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]), "+f"(d[96]), "+f"(d[97]),
+        "+f"(d[98]), "+f"(d[99]), "+f"(d[100]), "+f"(d[101]), "+f"(d[102]), "+f"(d[103]),
+        "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]), "+f"(d[108]), "+f"(d[109]),
+        "+f"(d[110]), "+f"(d[111]), "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]),
+        "+f"(d[116]), "+f"(d[117]), "+f"(d[118]), "+f"(d[119]), "+f"(d[120]), "+f"(d[121]),
+        "+f"(d[122]), "+f"(d[123]), "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(scale_d));
 }
 
@@ -415,19 +438,19 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       }
     }
     const int wq = warp & 3;  // warp within it: rows wq*16 .. +15 of each row block
-    float d[kW8A16RowBlocks][64];
+    float d[kW8A16RowBlocks][128];
 
     // Row block b covers tile rows cwg*128 + b*64 .. +63.
     // Plain layout: rows r = base + wq*16 + lane/4 (+8), k = 2*(lane%4) (+8)
     // within each k16; the 16 B chunk holding k16 of row r sits at chunk
     // index (k16/16) ^ ((r>>1)&3) under the 64 B swizzle.
-    const int a_r = cwg * 128 + wq * 16 + lane / 4;
+    const int a_r = cwg * (64 * kW8A16RowBlocks) + wq * 16 + lane / 4;
     const int a_k = (lane % 4) * 2;
     const uint32_t swz0 = (a_r >> 1) & 3;  // same for a_r + 64 (64 is 0 mod 8)
     const uint32_t swz1 = ((a_r + 8) >> 1) & 3;
     // Prepared layout: ldmatrix row for this lane = base + (lane % 8) +
     // 8 * ((lane / 8) % 2), chunk = 2 * pair + lane / 16.
-    const int ld_r = cwg * 128 + wq * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
+    const int ld_r = cwg * (64 * kW8A16RowBlocks) + wq * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
     const uint32_t ld_swz = (ld_r >> 1) & 3;
     const uint32_t ld_chunk_hi = lane / 16;
 
@@ -480,7 +503,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
         const uint64_t desc_b = make_smem_desc_sw128(a_stage + k16 * 2);
 #pragma unroll
         for (int b = 0; b < kW8A16RowBlocks; ++b) {
-          wgmma_m64n128k16_rs<T>(d[b], cur[b][k16 / 16], desc_b, 1);
+          wgmma_m64n256k16_rs<T>(d[b], cur[b][k16 / 16], desc_b, 1);
         }
       }
       wgmma_commit();
@@ -509,7 +532,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
 #pragma unroll
       for (int b = 0; b < kW8A16RowBlocks; ++b)
 #pragma unroll
-        for (int i = 0; i < 64; ++i) d[b][i] = 0.f;
+        for (int i = 0; i < 128; ++i) d[b][i] = 0.f;
       if (num_slabs > 0) {
         mbar_wait(&full_bar[g % kW8A16Stages], (g / kW8A16Stages) & 1);
         load_frags(g, frag0);
@@ -581,7 +604,8 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
         sync_here();  // previous pass / tile copied out before the buffer is reused
 #pragma unroll
         for (int b = 0; b < kW8A16RowBlocks; ++b) {
-          const int n_lo = cwg * 128 + b * 64 + wq * 16 + lane / 4;         // tile-local n
+          const int n_lo =
+              cwg * (64 * kW8A16RowBlocks) + b * 64 + wq * 16 + lane / 4;   // tile-local n
           const int n_buf = kSplitK ? n_lo : n_lo - cwg * kW8A16EpiWgCols;  // buffer-local n
           float bias_lo = 0.f, bias_hi = 0.f;
           if (!kSplitK && bias != nullptr) {
@@ -589,8 +613,8 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
             if (n0 + n_lo + 8 < N) bias_hi = static_cast<float>(bias[n0 + n_lo + 8]);
           }
 #pragma unroll
-          for (int jj = 0; jj < 16 / kPasses; ++jj) {
-            const int j = pass * (16 / kPasses) + jj;
+          for (int jj = 0; jj < (kW8A16TileM / 8) / kPasses; ++jj) {
+            const int j = pass * ((kW8A16TileM / 8) / kPasses) + jj;
 #pragma unroll
             for (int q = 0; q < 2; ++q) {
               const int m = m_lo + jj * 8 + q;  // row within this pass's buffer
