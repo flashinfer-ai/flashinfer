@@ -25,20 +25,16 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 31 of the optimization ladder: TMA-store epilogue.  The 16-bit
-// epilogue still had the 128 threads of each consumer warpgroup copy the
-// staged half tile out with 16 B loads and stores (per pass: 8 x LDS.128 +
-// STG.128 per thread behind two named barriers), tensor-pipe idle time on
-// every tile.  Here the per-warpgroup buffer is laid out as 64-column sub
-// tiles in the hardware 128 B swizzle, the fragments are written straight
-// into that layout, the warpgroup fences the async proxy, and one thread
-// hands each sub tile to the TMA unit as a cp.async.bulk.tensor store
-// through an output tensor map (rows and columns past M / N are clipped by
-// the hardware); the warpgroup returns to the next pass / tile while the
-// stores drain, waiting only for the buffer to have been read
-// (wait_group.read) before overwriting it.  Split-K keeps its fp32 copy
-// loop.  Tile dispatch is rung 30b's.  Requires sm_90a, K % 64 == 0, 16 B
-// aligned bases, N % 8 == 0.
+// Rung 32 of the optimization ladder: epilogue staging stores through the
+// shared window.  The fragment -> staging-buffer stores were generic
+// 64-bit stores (ST.E.U16 on a generic pointer derived from the dynamic
+// smem base), so the epilogue carried a 64-bit address per store next to
+// the 128 accumulator registers and rung 31's layout tipped the allocator
+// into a 64 B spill frame.  The stores are now st.shared.b16 / .f32 on a
+// 32-bit shared-window address (one cvta per tile, 32-bit index math),
+// which halves the address registers and drops the generic address-space
+// check.  TMA-store epilogue (rung 31) and tile dispatch (rung 30b)
+// unchanged.  Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -256,6 +252,19 @@ __device__ __forceinline__ void tma_store_wait_all() {
 }
 __device__ __forceinline__ void fence_proxy_async_smem() {
   asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+}
+
+// Epilogue staging stores on a 32-bit shared-window address.  Not "memory"
+// clobbered: ordering against the fence / barrier asm (volatile) is kept,
+// and the converts are free to interleave.
+__device__ __forceinline__ void sts(uint32_t addr, __nv_bfloat16 v) {
+  asm volatile("st.shared.b16 [%0], %1;\n" ::"r"(addr), "h"(__bfloat16_as_ushort(v)));
+}
+__device__ __forceinline__ void sts(uint32_t addr, __half v) {
+  asm volatile("st.shared.b16 [%0], %1;\n" ::"r"(addr), "h"(__half_as_ushort(v)));
+}
+__device__ __forceinline__ void sts(uint32_t addr, float v) {
+  asm volatile("st.shared.f32 [%0], %1;\n" ::"r"(addr), "f"(v));
 }
 
 template <int N>
@@ -685,6 +694,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       constexpr int kWgCols = kSplitK ? Cfg::kTileN : Cfg::kEpiWgCols;
       TOut* tile = kSplitK ? reinterpret_cast<TOut*>(smem)
                            : reinterpret_cast<TOut*>(epi_base + cwg * Cfg::kEpiWgBytes);
+      const uint32_t tile_s = static_cast<uint32_t>(__cvta_generic_to_shared(tile));
       const float sc = kSplitK ? 1.f : *scale;
       const int m_lo = (lane % 4) * 2;  // tile-local m
       // Element index inside the staging buffer: padded rows for the fp32
@@ -736,8 +746,10 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
 #pragma unroll
             for (int q = 0; q < 2; ++q) {
               const int m = m_lo + jj * 8 + q;  // row within this pass's buffer
-              tile[epi_idx(m, n_buf)] = static_cast<TOut>(d[b][j * 4 + q] * sc + bias_lo);
-              tile[epi_idx(m, n_buf + 8)] = static_cast<TOut>(d[b][j * 4 + 2 + q] * sc + bias_hi);
+              sts(tile_s + epi_idx(m, n_buf) * sizeof(TOut),
+                  static_cast<TOut>(d[b][j * 4 + q] * sc + bias_lo));
+              sts(tile_s + epi_idx(m, n_buf + 8) * sizeof(TOut),
+                  static_cast<TOut>(d[b][j * 4 + 2 + q] * sc + bias_hi));
             }
           }
         }
