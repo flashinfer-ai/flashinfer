@@ -349,6 +349,7 @@ def _enumerate_valid_tactics(
             hidden_size,
             intermediate_size,
             num_experts,  # num_local_experts
+            num_experts,  # num_experts
             activation_type.value,
             True,  # use_shuffled_weight
             WeightLayout.MajorK.value,
@@ -900,6 +901,7 @@ def _enumerate_fp8_valid_tactics(
             hidden_size,
             intermediate_size,
             num_experts,  # num_local_experts
+            num_experts,  # num_experts
             ActivationType.Swiglu.value,
             cfg["use_shuffled_weight"],
             cfg["weight_layout"],
