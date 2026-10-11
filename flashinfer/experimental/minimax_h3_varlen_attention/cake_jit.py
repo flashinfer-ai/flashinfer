@@ -324,12 +324,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a": "0893acbff67a2c6d92bdfe676df10324e631426e2edf1263ab14b1a90e81da7c",
         },
     },
-    "cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5": {
+    "cake_minimax_h3_varlen_attention_d2a0d1f1d6f417bd8dc0": {
         "arches": ["sm_100a", "sm_103a"],
         "role": "kernel",
         "sources": [
-            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5_kernel.cu",
-            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5_binding.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_d2a0d1f1d6f417bd8dc0_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_d2a0d1f1d6f417bd8dc0_binding.cu",
         ],
         "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
         "ffi_entry": "run",
@@ -350,8 +350,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "5f577d5ea5e8cbfa2c3c988b4a704c16429c5ab86821f2ede332ca4169c3ebda",
-            "sm_103a": "614453c2a4f50cf135bb31ecfb862c8ff5d5ac5974544a7f75b4b7df1893fc35",
+            "sm_100a": "db36ce506b4e9d9634dfac72f3a53c056dbbcf97a0b85980057935dd0dd1ef21",
+            "sm_103a": "bcdaa08fb62ef4681975e225e307c91da0d5959ff0b65c040f43c4a42842ac53",
         },
     },
 }
@@ -361,7 +361,7 @@ ROUTES: dict[str, dict[str, Any]] = {
         "variant": "bf16",
         "stages": ["attention", "combine"],
         "modules": {
-            "attention": "cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5",
+            "attention": "cake_minimax_h3_varlen_attention_d2a0d1f1d6f417bd8dc0",
             "combine": "cake_minimax_h3_varlen_attention_579b1fc2756eec97f194",
         },
     },
@@ -370,7 +370,7 @@ ROUTES: dict[str, dict[str, Any]] = {
         "variant": "bf16",
         "stages": ["attention", "combine"],
         "modules": {
-            "attention": "cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5",
+            "attention": "cake_minimax_h3_varlen_attention_d2a0d1f1d6f417bd8dc0",
             "combine": "cake_minimax_h3_varlen_attention_579b1fc2756eec97f194",
         },
     },
