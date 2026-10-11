@@ -25,14 +25,21 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 36 of the optimization ladder: batched loads in the split-K fixup.
-// Rung 35's last-arriver fixup walked its rows one float4 at a time with a
-// dependent accumulate, so a CTA had a few KB in flight and spent 10+ us
-// pulling a 128 KB partial out of L2 (slower than the reduce kernel it
-// replaced).  The fixup now reads its own partial from shared memory and
-// each other split's partial in batches of 8 independent 16 B loads per
-// thread (32 KB per CTA in flight) before accumulating.  Everything else is
-// rung 35's.  Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
+// Rung 37 of the optimization ladder: split-K reduce priced as launch plus
+// bandwidth.  Rungs 35-36 moved the split-K reduction into the main kernel
+// (last-arriving CTA per tile) and lost: one CTA per tile reducing 128 KB
+// partials serially cannot match the whole GPU streaming them, and the
+// counter memset costs what the reduce launch did.  The two-kernel split
+// path of rung 34 is restored unchanged; what changes is its price in the
+// dispatch model.  A reduce kernel costs a fixed launch-and-tail plus a
+// bandwidth-bound pass over splits x M x N fp32, so the model term is now
+//   kW8A16ModelSplitFixed + kW8A16ModelReduceCost * M * N * splits
+// (24M + 8 x M x N x splits, fitted to the rung-33/34 tables and the forced
+// split sweeps), replacing the purely linear term that under-priced small
+// splits and over-priced large ones.  FLASHINFER_W8A16_FP8_TILE and
+// FLASHINFER_W8A16_FP8_SPLITS pin a plan for benchmarking.  Kernel code
+// unchanged from rung 33.  Requires sm_90a, K % 64 == 0, 16 B aligned
+// bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -781,82 +788,17 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
         }
         if constexpr (kSplitK) {
           sync_here();  // this pass's rows are staged
-          // With N % 8 == 0 a 4-column chunk is either fully inside N or
-          // fully past it.
-          const bool chunk_in = n_chunk < N;
 #pragma unroll
           for (int i = 0; i < kRowsPerTilePass / kRowsPerPass; ++i) {
             const int r = row0 + kRowsPerPass * i;
             const int m = m0 + pass * kRowsPerTilePass + r;
-            if (m >= M || !chunk_in) continue;
-            *reinterpret_cast<uint4*>(dst_base + static_cast<int64_t>(m) * N + n_chunk) =
-                *reinterpret_cast<const uint4*>(tile + epi_idx(r, chunk * kElemsPerChunk));
-          }
-          // Serial fixup: the last split CTA to finish this tile reduces it.
-          // Writers: stores, fence, barrier, one atomic.  Reader: atomic,
-          // fence, L2 loads (ldcg) of the other partials.
-          __shared__ int s_last;
-          __threadfence();
-          consumer_bar_sync();
-          if (ct == 0) {
-            int* counter =
-                reinterpret_cast<int*>(ws + static_cast<int64_t>(gridDim.y) * M * N) + unit;
-            s_last = atomicAdd(counter, 1) == static_cast<int>(gridDim.y) - 1;
-          }
-          consumer_bar_sync();
-          if (s_last) {
-            __threadfence();
-            const float sc_out = *scale;
-            float4 bb = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (bias != nullptr && chunk_in) {
-              bb.x = static_cast<float>(bias[n_chunk]);
-              bb.y = static_cast<float>(bias[n_chunk + 1]);
-              bb.z = static_cast<float>(bias[n_chunk + 2]);
-              bb.w = static_cast<float>(bias[n_chunk + 3]);
-            }
-            constexpr int kRowsPerThread = kRowsPerTilePass / kRowsPerPass;  // 32 or 16
-            constexpr int kBatch = 8;
-            static_assert(kRowsPerThread % kBatch == 0, "fixup batches must tile the rows");
-            const int splits = static_cast<int>(gridDim.y);
-            const int my_split = static_cast<int>(blockIdx.y);
-            for (int i0 = 0; i0 < kRowsPerThread; i0 += kBatch) {
-              float4 acc[kBatch];
-              bool ok[kBatch];
-              int64_t off[kBatch];
-#pragma unroll
-              for (int u = 0; u < kBatch; ++u) {
-                const int r = row0 + kRowsPerPass * (i0 + u);
-                const int m = m0 + pass * kRowsPerTilePass + r;
-                ok[u] = chunk_in && m < M;
-                off[u] = static_cast<int64_t>(m) * N + n_chunk;
-                acc[u] =
-                    *reinterpret_cast<const float4*>(tile + epi_idx(r, chunk * kElemsPerChunk));
-              }
-              for (int sp = 0; sp < splits; ++sp) {
-                if (sp == my_split) continue;
-                const float* part = ws + static_cast<int64_t>(sp) * M * N;
-                float4 q[kBatch];
-#pragma unroll
-                for (int u = 0; u < kBatch; ++u) {
-                  q[u] = ok[u] ? __ldcg(reinterpret_cast<const float4*>(part + off[u]))
-                               : make_float4(0.f, 0.f, 0.f, 0.f);
-                }
-#pragma unroll
-                for (int u = 0; u < kBatch; ++u) {
-                  acc[u].x += q[u].x;
-                  acc[u].y += q[u].y;
-                  acc[u].z += q[u].z;
-                  acc[u].w += q[u].w;
-                }
-              }
-#pragma unroll
-              for (int u = 0; u < kBatch; ++u) {
-                if (!ok[u]) continue;
-                uint2 packed;
-                packed.x = pack2(acc[u].x * sc_out + bb.x, acc[u].y * sc_out + bb.y, T{});
-                packed.y = pack2(acc[u].z * sc_out + bb.z, acc[u].w * sc_out + bb.w, T{});
-                *reinterpret_cast<uint2*>(out + off[u]) = packed;
-              }
+            if (m >= M) continue;
+            const TOut* src = tile + epi_idx(r, chunk * kElemsPerChunk);
+            TOut* dst = dst_base + static_cast<int64_t>(m) * N + n_chunk;
+            if (n_chunk + kElemsPerChunk <= N) {
+              *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+            } else {
+              for (int e = 0; n_chunk + e < N; ++e) dst[e] = src[e];
             }
           }
         } else {
@@ -887,6 +829,40 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
 #endif
 }
 
+// Split-K reduce: out[i] = T(sum_s ws[s][i] * scale + bias[i % N]), 8 elements
+// per thread (two 16 B loads per split, one 16 B store).  Requires N % 8 == 0.
+template <typename T>
+__global__ void W8A16SplitKReduceKernel(const float* __restrict__ ws, int splits,
+                                        const float* __restrict__ scale, const T* __restrict__ bias,
+                                        T* __restrict__ out, int64_t mn, int N) {
+  const int64_t i = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 8;
+  if (i >= mn) return;
+  float acc[8];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) acc[e] = 0.f;
+  for (int sp = 0; sp < splits; ++sp) {
+    const float4* src = reinterpret_cast<const float4*>(ws + static_cast<int64_t>(sp) * mn + i);
+    const float4 a = src[0], b = src[1];
+    acc[0] += a.x;
+    acc[1] += a.y;
+    acc[2] += a.z;
+    acc[3] += a.w;
+    acc[4] += b.x;
+    acc[5] += b.y;
+    acc[6] += b.z;
+    acc[7] += b.w;
+  }
+  const float sc = *scale;
+  const int n = static_cast<int>(i % N);
+  alignas(16) T v[8];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    const float bb = bias != nullptr ? static_cast<float>(bias[n + e]) : 0.f;
+    v[e] = static_cast<T>(acc[e] * sc + bb);
+  }
+  *reinterpret_cast<uint4*>(out + i) = *reinterpret_cast<const uint4*>(v);
+}
+
 // Relative mainloop efficiency of a tile (H100, rung-30 tables): 128x256 is
 // the reference; 128x128 runs m64n128 wgmma at about two thirds of it.
 // 256x128 is only reachable through the env var, its value never competes.
@@ -897,17 +873,23 @@ constexpr double W8A16TileEff() {
 
 // Modelled time of tile Cfg on (M, N, K) with `splits` K splits: waves of
 // (units x splits) blocks, each a tileN x tileM x K/splits mainloop at the
-// tile's relative efficiency, plus the fp32 partial round trip when it
-// splits.  Fitted to the rung-30 H100 tables; only the ranking matters,
-// the unit is arbitrary.
+// tile's relative efficiency, plus - when it splits - the reduce kernel as a
+// fixed launch-and-tail plus a bandwidth pass over the partials.  The unit
+// is "one 128x256 tile-slab-element": a full wave of 128x256 tiles at
+// K = 5120 is 168M and takes about 54 us on H100, so the fixed term is
+// about 8 us and the linear term about 2.6 us per 1M fp32 partial
+// elements.  Fitted to the rung-30/33/34 H100 tables and the forced split
+// sweeps; only the ranking matters.
 constexpr double kW8A16ModelReduceCost = 8.0;
+constexpr double kW8A16ModelSplitFixed = 24.0e6;
 template <typename Cfg>
 inline double W8A16Fp8GemmModelTime(int M, int N, int K, int num_sms, int splits) {
   const double units = static_cast<double>(ceil_div(M, Cfg::kTileM)) * ceil_div(N, Cfg::kTileN);
   const double waves = std::ceil(units * splits / num_sms);
   double t =
       waves * Cfg::kTileN * Cfg::kTileM * (static_cast<double>(K) / splits) / W8A16TileEff<Cfg>();
-  if (splits > 1) t += kW8A16ModelReduceCost * static_cast<double>(M) * N * splits;
+  if (splits > 1)
+    t += kW8A16ModelSplitFixed + kW8A16ModelReduceCost * static_cast<double>(M) * N * splits;
   return t;
 }
 
@@ -960,15 +942,11 @@ inline W8A16Tile W8A16Fp8GemmPickTile(int M, int N, int K, int num_sms) {
   return t_128x128 < t_128x256 ? W8A16Tile::k128x128 : W8A16Tile::k128x256;
 }
 
-// Workspace of a split run: splits fp32 partial tiles [splits][M][N] followed
-// by one int32 arrival counter per tile.
 template <typename Cfg>
 inline int64_t W8A16Fp8GemmWorkspaceBytesFor(int M, int N, int K, int num_sms) {
   const int splits = W8A16Fp8GemmSplits<Cfg>(M, N, K, num_sms);
-  if (splits <= 1) return 0;
-  const int64_t tiles = static_cast<int64_t>(ceil_div(M, Cfg::kTileM)) * ceil_div(N, Cfg::kTileN);
-  return static_cast<int64_t>(splits) * M * N * static_cast<int64_t>(sizeof(float)) +
-         tiles * static_cast<int64_t>(sizeof(int));
+  return splits > 1 ? static_cast<int64_t>(splits) * M * N * static_cast<int64_t>(sizeof(float))
+                    : 0;
 }
 
 // Workspace bytes a call needs (0 when it will not split), for the tile the
@@ -1039,15 +1017,9 @@ cudaError_t W8A16Fp8GemmLaunch(const T* act, const __nv_fp8_e4m3* w, const float
   const unsigned tiles_n = ceil_div(N, Cfg::kTileN);
   const unsigned pairs_n = ceil_div(tiles_n, static_cast<unsigned>(kClusterSize));
   int splits = W8A16Fp8GemmSplits<Cfg>(M, N, K, num_sms);
-  const int64_t partial_bytes = static_cast<int64_t>(splits) * M * N * 4;
-  const int64_t counter_bytes = static_cast<int64_t>(tiles_m) * tiles_n * 4;
-  if (splits > 1 && (workspace == nullptr || workspace_bytes < partial_bytes + counter_bytes)) {
-    splits = 1;  // no room for partials + counters: run the single-pass kernel
-  }
-  if (splits > 1) {  // arrival counters start at zero
-    e = cudaMemsetAsync(reinterpret_cast<char*>(workspace) + partial_bytes, 0,
-                        static_cast<size_t>(counter_bytes), stream);
-    if (e != cudaSuccess) return e;
+  if (splits > 1 &&
+      (workspace == nullptr || workspace_bytes < static_cast<int64_t>(splits) * M * N * 4)) {
+    splits = 1;  // no room for partials: run the single-pass kernel
   }
   const bool split = splits > 1;
   using KernelFn = void (*)(const CUtensorMap, const CUtensorMap, const CUtensorMap, const float*,
@@ -1083,7 +1055,15 @@ cudaError_t W8A16Fp8GemmLaunch(const T* act, const __nv_fp8_e4m3* w, const float
   cfg.numAttrs = kClusterSize > 1 ? 1 : 0;
   e = cudaLaunchKernelEx(&cfg, kernel, act_map, w_map, out_map, scale, bias, out, workspace, M, N,
                          K);
-  return e;
+  if (e != cudaSuccess) return e;
+  if (split) {
+    const int64_t mn = static_cast<int64_t>(M) * N;
+    const int threads = 256;
+    const int64_t blocks = (mn / 8 + threads - 1) / threads;
+    W8A16SplitKReduceKernel<T><<<static_cast<unsigned>(blocks), threads, 0, stream>>>(
+        workspace, splits, scale, bias, out, mn, N);
+  }
+  return cudaGetLastError();
 }
 
 // Public entry: picks the tile for (M, N, K, SM count) and launches it.
