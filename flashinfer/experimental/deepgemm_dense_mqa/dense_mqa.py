@@ -26,7 +26,7 @@ import json
 from pathlib import Path
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-CATALOG_SCHEMA = "dense_mqa.v6"
+CATALOG_SCHEMA = "dense_mqa.v7"
 NUM_HEADS = 32  # default head count of the public helpers
 BLOCK_QH = 128  # query rows x heads per MMA tile
 BLOCK_Q = BLOCK_QH // NUM_HEADS
@@ -164,8 +164,12 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     The 32-head names are the shipped ones (``K % 256 == 0``); other head counts
     carry an ``h<H>`` infix, their programs take any ``K >= 1`` (in-kernel KV
     tail) and their tiers are named by the token ceiling of the shared block
-    ceilings (``le8`` / ``le64`` / ``le1024`` / ``any`` for 64 heads). Whether the
-    catalog ships the route is a separate question (:func:`dense_route_available`).
+    ceilings (``le8`` / ``le64`` / ``le1024`` / ``any`` for 64 heads); a 64-head
+    call with ``K <= policy.dense_short.max_kv`` and at least
+    ``policy.dense_short.min_q_blocks`` query blocks names the one-split
+    ``:short`` route of its kind (:func:`h64_short_shape`). Whether the catalog
+    ships the route is a separate question (:func:`dense_route_available`), and
+    which route the device is served is :func:`served_route`.
     """
     policy = _catalog()["policy"]
     if precision not in ("fp4", "fp8"):
@@ -188,7 +192,49 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     ):
         return f"{prefix}:q128:short"
     kind = "full" if queries % block_q(num_heads) == 0 else "partial"
+    if num_heads != NUM_HEADS and h64_short_shape(queries, keys, num_heads):
+        return f"{prefix}:{kind}:short"
     return f"{prefix}:{kind}:{metadata_tier(queries, num_heads)}"
+
+
+def h64_short_shape(queries, keys, num_heads=64):
+    """Shape-only one-split gate of the 64-head ``:short`` routes (``policy.dense_short``): ``K <= max_kv``
+    (every query block covers one 256-row KV split whatever the windows hold) and at least ``min_q_blocks``
+    query blocks (a one-block call does not gain from the one-split text). False when the catalog has no
+    ``dense_short`` policy."""
+    short = _catalog()["policy"].get("dense_short")
+    if short is None:
+        return False
+    blocks = (queries + block_q(num_heads) - 1) // block_q(num_heads)
+    return keys <= int(short["max_kv"]) and blocks >= int(short["min_q_blocks"])
+
+
+def _h64_tier_fallback(precision, queries, num_heads, route):
+    kind = route.split(":")[-2]
+    return f"{_route_prefix(precision, num_heads)}:{kind}:{metadata_tier(queries, num_heads)}"
+
+
+def served_route(precision, queries, keys, num_heads=NUM_HEADS, *, arch=None):
+    """The route the runtime serves for a problem on ``arch``: :func:`route_name`, except that a 64-head
+    ``:short`` route the catalog does not carry or ``arch`` withholds (``policy.dense_admission``) is served by
+    the tier route of the same query count -- the production program the tier table admits -- never by the
+    stock kernel (``policy.dense_short.fallback == "tier"``). ``arch=None`` is accepted only where the
+    architectures agree on the short route's admission (``ValueError`` otherwise, as :func:`_admitted`)."""
+    route = route_name(precision, queries, keys, num_heads)
+    if num_heads != NUM_HEADS and route.endswith(":short"):
+        if route not in _catalog()["routes"] or not _admitted(route, arch):
+            return _h64_tier_fallback(precision, queries, num_heads, route)
+    return route
+
+
+def _export_route(precision, queries, keys, num_heads=NUM_HEADS):
+    """The route the export resolves for a point (admission is routing policy, not a precondition of the
+    program): :func:`route_name`, or the tier route when a 64-head ``:short`` route has no catalog record."""
+    route = route_name(precision, queries, keys, num_heads)
+    short = num_heads != NUM_HEADS and route.endswith(":short")
+    if short and route not in _catalog()["routes"]:
+        return _h64_tier_fallback(precision, queries, num_heads, route)
+    return route
 
 
 def kv_alignment(num_heads=NUM_HEADS):
@@ -232,7 +278,7 @@ def dense_route_available(num_heads, queries, keys, precision="fp8", *, arch=Non
             return False
         if keys % kv_alignment(num_heads):
             return False
-        route = route_name(precision, queries, keys, num_heads)
+        route = served_route(precision, queries, keys, num_heads, arch=arch)
     except (ValueError, KeyError):
         return False
     if route not in _catalog()["routes"]:
@@ -242,8 +288,9 @@ def dense_route_available(num_heads, queries, keys, precision="fp8", *, arch=Non
 
 def h64_admission(arch):
     """``policy.dense_admission`` of one architecture: ``{"admitted_routes": [...], "withheld_routes": [...],
-    "reason": str | None}`` -- the 64-head tiers served on ``arch`` (every query count of those tiers), the
-    tiers the producer measured and did not admit there (the engine keeps its stock kernel; ``reason`` says
+    "reason": str | None}`` -- the 64-head routes served on ``arch`` (every query count of those tiers), the
+    routes the producer measured and did not admit there (a withheld TIER route keeps the engine's stock
+    kernel; a withheld ``:short`` route is served by its tier route, see :func:`served_route`; ``reason`` says
     why), two disjoint lists. Empty / ``None`` when the catalog has no 64-head family. Host-only."""
     record = _catalog()["policy"].get("dense_admission")
     arches = (
@@ -297,7 +344,8 @@ def route_record(precision, queries, keys, num_heads=NUM_HEADS, *, arch=None):
         raise ValueError(
             f"no exported dense MQA route for {(precision, num_heads, queries, keys)} on {arch or 'every arch'}"
         )
-    return _catalog()["routes"][route_name(precision, queries, keys, num_heads)]
+    served = served_route(precision, queries, keys, num_heads, arch=arch)
+    return _catalog()["routes"][served]
 
 
 def metadata_tier(queries, num_heads=NUM_HEADS):
@@ -527,7 +575,7 @@ class DenseMqaPlan:
             # Export validation runs every catalogued row on every architecture; the per-arch admission
             # (policy.dense_admission) is routing policy for the engines, not a precondition of the program.
             try:
-                available = route_name(
+                available = _export_route(
                     precision, queries, keys, num_heads
                 ) in _catalog()["routes"] and (keys % kv_alignment(num_heads) == 0)
             except ValueError:
@@ -610,7 +658,13 @@ class DenseMqaPlan:
         self.arch = arch
         self.num_sms = num_sms
         self.num_heads = num_heads
-        self.route_name = route_name(precision, queries, keys, num_heads)
+        # The served route: a withheld 64-head :short route runs its tier program on this arch; export validation
+        # (enforce_admission=False) runs every catalogued route on every arch.
+        self.route_name = (
+            served_route(precision, queries, keys, num_heads, arch=arch)
+            if enforce_admission
+            else _export_route(precision, queries, keys, num_heads)
+        )
         self.route = _catalog()["routes"][self.route_name]
         self.config = dict(
             precision=precision,

@@ -337,6 +337,94 @@ def test_mm_mxfp8_cute_dsl_low_m(m, k):
     )
 
 
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("auto_tuning", [False, True])
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 1536, 1024),
+        (100, 4096, 1024),  # M % 8 != 0
+        (256, 1536, 6144),
+        (4096, 6144, 1536),
+        (256, 1536, 544),  # K % 128 != 0: the last 128-wide K tile is partial
+        (129, 4096, 2080),
+    ],
+)
+def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
+    """On SM107, mm_mxfp8(backend="cute-dsl") runs the SM107 kernel and is correct."""
+    _skip_if_unsupported("cute-dsl")
+    from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
+
+    if not is_rubin_cute_dsl_available():
+        pytest.skip(
+            "The SM107 cute-dsl mm_mxfp8 path requires CuTe DSL >= 4.8 "
+            "(cutlass.utils.rubin_helpers)."
+        )
+
+    # Record the tactics the SM107 runner launches; it only builds the SM107 kernel.
+    sm107_tactics_run = []
+    make_sm107_runner = gemm_base._cute_dsl_gemm_mxfp8_sm107_runner  # pyright: ignore[reportPrivateUsage]
+
+    def recording_sm107_runner(*args, **kwargs):
+        runner = make_sm107_runner(*args, **kwargs)
+        forward = runner.forward
+
+        def recording_forward(inputs, tactic=None, **forward_kwargs):
+            sm107_tactics_run.append(tactic)
+            return forward(inputs, tactic=tactic, **forward_kwargs)
+
+        runner.forward = recording_forward
+        return runner
+
+    monkeypatch.setattr(
+        gemm_base, "_cute_dsl_gemm_mxfp8_sm107_runner", recording_sm107_runner
+    )
+    _run_mm_mxfp8(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        torch.bfloat16,
+        "cute-dsl",
+        auto_tuning=auto_tuning,
+        provide_out=True,
+    )
+
+    assert sm107_tactics_run, "mm_mxfp8 did not use the SM107 kernel"
+    if auto_tuning:
+        # The last launch is the run with the tuned SM107 tactic.
+        assert isinstance(sm107_tactics_run[-1], tuple), sm107_tactics_run[-1]
+        return
+    assert sm107_tactics_run == [-1], sm107_tactics_run
+
+    # Autotuning launches every tactic but only checks the one it picks, so also
+    # run every SM107 tactic for this shape against the reference.
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
+    )
+    reference = torch.mm(input, weight.T)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+    inputs = [
+        input_mxfp8,
+        weight_mxfp8.T,
+        input_scale,
+        weight_scale,
+        torch.bfloat16,
+        out,
+        workspace,
+    ]
+    runner = make_sm107_runner(torch.bfloat16)
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert tactics
+    for tactic in tactics:
+        out.zero_()
+        runner(inputs, tactic=tactic)
+        _assert_cosine_similarity(reference, out)
+
+
 def test_mm_mxfp8_cute_dsl_stale_split_k_tactic_falls_back():
     """A low-M cached tactic must not fail when reused for a larger M."""
     _skip_if_unsupported("cute-dsl")

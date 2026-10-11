@@ -114,7 +114,7 @@ BF16_MAX_SEGMENT_CLUSTERS = 1 << 16
 BF16_UNIT_OVERHEAD_BLOCKS = 2
 # Most recently used BF16 segment plans (device tables and the partial
 # workspace), keyed by ``(cu_seqlens, device index, num_heads, kv_splits,
-# stream)``.  The diffusion engine issues hundreds of calls per sample with
+# q_split, stream)``.  The diffusion engine issues hundreds of calls per sample with
 # one segment layout; a hit re-launches with the cached tables (no Python
 # planning, no host-to-device copies, no allocation, no synchronization).
 # Bounded: the oldest plan is evicted once the limit is reached, so varying
@@ -126,6 +126,18 @@ BF16_PLAN_CACHE_CAPACITY = 256
 # the other stage's MMAs.
 BF16_SINGLE_STAGE_COST_NUM = 3
 BF16_SINGLE_STAGE_COST_DEN = 5
+# Tail-round Q-split (mirrors the Cake production planner's ``Q_SPLIT_PLAN`` /
+# ``choose_q_splits``): a two-stage unit of the partial tail round, where
+# ``G - U mod G`` clusters would idle for a whole unit time, is emitted as two
+# 256-row single-stage records (record word 5, ``q_half`` 1 / 2) when the
+# simulated makespan improves by at least ``BF16_Q_SPLIT_MIN_GAIN``.  The bar
+# is lower than the K/V split's because a half costs nothing beyond its own
+# modelled single-stage inefficiency (no combine launch, no workspace).  The
+# registered attention program decodes the word on both architectures (it is
+# the Cake ``kernel_for_arch`` retrace traced with ``Q_SPLIT_DECODE``); plans
+# built with ``q_split=False`` are the plain enumeration (word 5 is 0).
+BF16_Q_SPLIT_PLAN = True
+BF16_Q_SPLIT_MIN_GAIN = 0.005
 # K/V-split planner (mirrors the Cake production planner ``choose_kv_splits``):
 # a unit is split into at most ``MAX_KV_SPLITS`` near-equal K/V block ranges;
 # the cost model is in K/V-block units (combine launch + per-slot traffic) and
@@ -336,15 +348,19 @@ class BF16SegmentPlan:
     """Host segment plan of the BF16 kernel (non-empty segments only).
 
     A *unit* is one head x one cluster tile (512 consecutive Q rows of one
-    segment); ``total_tiles = num_heads * total_clusters`` units run on a
-    persistent grid of ``num_clusters`` 2-CTA clusters (``2 * num_clusters``
-    CTAs).  ``unit_table`` holds ``UNIT_WORDS`` int32 per persistent-grid slot --
-    the segment index, ``head << 16 | cluster_in_segment``,
-    ``kv_block_begin << 16 | kv_blocks`` and the partial slot (-1 for an
-    unsplit unit) -- in slot order: unit ``u`` of the table runs on cluster
-    ``u % num_clusters`` as its ``u // num_clusters``-th unit (see
-    :func:`assign_unit_slots`).  ``total_tiles`` counts scheduled units
-    (split ranges included); ``combine_table`` holds ``COMBINE_WORDS`` int32
+    segment); the ``num_heads * total_clusters`` units run on a persistent
+    grid of ``num_clusters`` 2-CTA clusters (``2 * num_clusters`` CTAs).
+    ``unit_table`` holds ``UNIT_WORDS`` int32 per persistent-grid slot -- the
+    segment's token begin and length, ``head << 16 | cluster_in_segment``,
+    ``kv_block_begin << 16 | kv_blocks``, the partial slot (-1 for an unsplit
+    unit), ``q_half`` (0 for a whole 512-row unit, 1 / 2 for the first / second
+    256-row half of a tail-round Q-split unit, run as a single-stage unit) and
+    two reserved words -- in slot order: unit ``u`` of the table runs on
+    cluster ``u % num_clusters`` as its ``u // num_clusters``-th unit (see
+    :func:`assign_unit_slots`), followed by ``num_clusters`` zero records (the
+    kernel's one-unit-ahead record prefetch).  ``total_tiles`` counts scheduled
+    units (K/V ranges and Q-split halves included; ``num_q_split_units`` counts
+    the halved units); ``combine_table`` holds ``COMBINE_WORDS`` int32
     per split (segment, head, cluster) unit and ``partial_O`` / ``partial_ML``
     are that plan's FP16 / FP32 partial workspace.
     """
@@ -364,6 +380,7 @@ class BF16SegmentPlan:
     num_partial_slots: int
     num_combine_units: int
     max_kv_splits: int
+    num_q_split_units: int
 
 
 @functools.cache
@@ -528,6 +545,67 @@ def bf16_unit_cost(blocks: int, single_stage: bool) -> int:
     return blocks + BF16_UNIT_OVERHEAD_BLOCKS
 
 
+def bf16_choose_q_splits(
+    costs: Sequence[int], half_costs: Sequence[Optional[int]], num_clusters: int
+) -> list[bool]:
+    """Which units of the partial tail round to run as two 256-row single-stage halves.
+
+    ``costs[u]`` is the LPT cost of unit ``u`` and ``half_costs[u]`` the cost
+    of one of its halves (``bf16_unit_cost(blocks, True)``), or ``None`` for a
+    unit that must stay whole: a single-stage unit (nothing to halve) or a
+    K/V-split range (the halves must stay clear of the combine path).  The
+    statically strided grid runs ``U mod G`` units in its tail round while
+    ``G - U mod G`` clusters idle for a whole unit time; each idle cluster can
+    take one half.  The ``n`` most expensive halvable tail-round units are
+    halved for ``n`` in ``1..idle`` (the makespan is a maximum, so the
+    expensive units bound it; the halves are cheaper than every unit, so they
+    and the unhalved tail units stay in the tail round) and the ``n`` with the
+    smallest simulated makespan (:func:`lpt_makespan`, smallest ``n`` on ties)
+    is taken when it beats the unhalved makespan by at least
+    ``BF16_Q_SPLIT_MIN_GAIN``.  Returns the per-unit flag (all ``False``
+    without a tail round, without a halvable candidate or without a paying
+    ``n``).  At most ``G / 2`` makespan simulations.  Mirrors the Cake
+    production planner's ``choose_q_splits``.
+    """
+    U = len(costs)
+    flags = [False] * U
+    if U == 0:
+        return flags
+    G = max(1, int(num_clusters))
+    tail = U % G
+    if tail == 0:
+        return flags
+    idle = G - tail
+    if U < G:
+        tail_units = list(range(U))
+    else:
+        tail_units = assign_unit_slots(costs, G)[(U // G) * G :]
+    candidates = sorted(
+        (u for u in tail_units if half_costs[u] is not None), key=lambda u: -costs[u]
+    )
+    if not candidates:
+        return flags
+    base = lpt_makespan(costs, G)
+    best, best_n = base, 0
+    for n in range(1, min(len(candidates), idle) + 1):
+        halved = set(candidates[:n])
+        sim: list[int] = []
+        for u in range(U):
+            half = half_costs[u]
+            if half is not None and u in halved:
+                sim.extend((half, half))
+            else:
+                sim.append(costs[u])
+        span = lpt_makespan(sim, G)
+        if span < best:
+            best, best_n = span, n
+    if best > base * (1.0 - BF16_Q_SPLIT_MIN_GAIN):
+        return flags
+    for u in candidates[:best_n]:
+        flags[u] = True
+    return flags
+
+
 def build_bf16_segment_plan(
     cu_seqlens: Union[torch.Tensor, Sequence[int]],
     device: torch.device,
@@ -536,13 +614,20 @@ def build_bf16_segment_plan(
     num_clusters: Optional[int] = None,
     cu_seqlens_host: Optional[Sequence[int]] = None,
     kv_splits: Optional[int] = None,
+    q_split: Optional[bool] = None,
 ) -> BF16SegmentPlan:
     """Build the BF16 segment plan (tables and partial workspace on ``device``).
 
     ``num_clusters`` is the persistent-grid capacity in 2-CTA clusters; it
     defaults to ``bf16_grid_clusters(device)`` (``device`` must then be a CUDA
     device).  ``kv_splits`` forces one K/V split factor on every unit
-    (``None``: :func:`choose_kv_splits`).  The plan reproduces the Cake
+    (``None``: :func:`choose_kv_splits`).  ``q_split`` (``None``:
+    ``BF16_Q_SPLIT_PLAN``) enables the tail-round Q-split: unsplit two-stage
+    units of the partial tail round are emitted as two 256-row single-stage
+    records (``q_half`` 1 / 2 in record word 5) when
+    :func:`bf16_choose_q_splits` finds a paying makespan gain; the plan's
+    ``num_q_split_units`` counts the halved units.  Off, the records are
+    those of the plain plan (word 5 is 0).  The plan reproduces the Cake
     production planner's ``build_segment_plan`` table for table.
     """
     bounds = normalize_cu_seqlens(cu_seqlens, cu_seqlens_host=cu_seqlens_host)
@@ -570,8 +655,11 @@ def build_bf16_segment_plan(
         for _ in range(num_heads * clusters[seg])
     ]
     split_of = choose_kv_splits(unit_blocks, int(num_clusters), force=kv_splits)
-    units: list[tuple[int, int, int, int, int, int]] = []
+    # (segment, head, cluster_in_segment, kv_block_begin, kv_blocks, partial_slot, q_half)
+    units: list[tuple[int, int, int, int, int, int, int]] = []
     costs: list[int] = []
+    # LPT cost of one 256-row half of the unit; None for units that stay whole.
+    half_costs: list[Optional[int]] = []
     combine: list[int] = []
     partial_slots = 0
     unit_index = 0
@@ -583,19 +671,46 @@ def build_bf16_segment_plan(
                 # Units with at most half a cluster tile of valid rows run one Q stage.
                 single_stage = lens[seg] - c * CLUSTER_Q_ROWS <= CLUSTER_Q_ROWS // 2
                 if len(chunks) == 1:
-                    units.append((seg, head, c, 0, blocks[seg], -1))
+                    units.append((seg, head, c, 0, blocks[seg], -1, 0))
                     costs.append(bf16_unit_cost(blocks[seg], single_stage))
+                    # A two-stage unit may run as two 256-row single-stage halves.
+                    half_costs.append(
+                        None if single_stage else bf16_unit_cost(blocks[seg], True)
+                    )
                     continue
                 combine.extend((seg, (head << 16) | c, partial_slots, len(chunks)))
                 for begin, count in chunks:
-                    units.append((seg, head, c, begin, count, partial_slots))
+                    units.append((seg, head, c, begin, count, partial_slots, 0))
                     costs.append(bf16_unit_cost(count, single_stage))
+                    half_costs.append(None)  # K/V ranges stay clear of the combine path
                     partial_slots += 1
+    if q_split is None:
+        q_split = bool(BF16_Q_SPLIT_PLAN)
+    num_q_split_units = 0
+    if q_split:
+        halve = bf16_choose_q_splits(costs, half_costs, int(num_clusters))
+        if any(halve):
+            split_units: list[tuple[int, int, int, int, int, int, int]] = []
+            split_costs: list[int] = []
+            for u, (unit, cost) in enumerate(zip(units, costs, strict=True)):
+                if not halve[u]:
+                    split_units.append(unit)
+                    split_costs.append(cost)
+                    continue
+                half_cost = half_costs[u]
+                assert half_cost is not None
+                # Consecutive in enumeration order: the stable LPT sort keeps
+                # the two halves on neighbouring slots (one head's K/V in L2).
+                for q_half in (1, 2):
+                    split_units.append((*unit[:6], q_half))
+                    split_costs.append(half_cost)
+                num_q_split_units += 1
+            units, costs = split_units, split_costs
     total_tiles = len(units)
     num_clusters = min(int(num_clusters), max(total_tiles, 1))
     table: list[int] = []
-    for unit in assign_unit_slots(costs, num_clusters):
-        seg, head, c, begin, count, slot = units[unit]
+    for unit_index in assign_unit_slots(costs, num_clusters):
+        seg, head, c, begin, count, slot, q_half = units[unit_index]
         table.extend(
             (
                 begins[seg],
@@ -603,7 +718,7 @@ def build_bf16_segment_plan(
                 (head << 16) | c,
                 (begin << 16) | count,
                 slot,
-                0,
+                q_half,
                 0,
                 0,
             )
@@ -633,6 +748,7 @@ def build_bf16_segment_plan(
         num_partial_slots=partial_slots,
         num_combine_units=len(combine) // COMBINE_WORDS,
         max_kv_splits=max(split_of, default=1),
+        num_q_split_units=num_q_split_units,
     )
 
 
@@ -645,11 +761,14 @@ def cached_bf16_segment_plan(
     num_heads: int,
     *,
     kv_splits: Optional[int] = None,
+    q_split: Optional[bool] = None,
 ) -> BF16SegmentPlan:
-    """The BF16 segment plan of ``(cu_seqlens, device, num_heads, kv_splits)``
-    on the current stream, built once.
+    """The BF16 segment plan of ``(cu_seqlens, device, num_heads, kv_splits,
+    q_split)`` on the current stream, built once.
 
-    ``cu_seqlens`` is the validated host tuple (:func:`normalize_cu_seqlens`).
+    ``cu_seqlens`` is the validated host tuple (:func:`normalize_cu_seqlens`);
+    ``q_split`` (``None``: ``BF16_Q_SPLIT_PLAN``) is the tail-round Q-split
+    option of :func:`build_bf16_segment_plan` and part of the key.
     Plans live in a most-recently-used cache of ``BF16_PLAN_CACHE_CAPACITY``
     entries; a hit returns the same tables and partial workspace, so repeated
     calls with one segment layout cost no planning, uploads or allocations.
@@ -658,11 +777,13 @@ def cached_bf16_segment_plan(
     rewritten by every launch) and concurrent streams never share a plan.
     """
     index = _device_index(device)
+    q_split = bool(BF16_Q_SPLIT_PLAN) if q_split is None else bool(q_split)
     key = (
         tuple(int(v) for v in cu_seqlens),
         index,
         int(num_heads),
         None if kv_splits is None else int(kv_splits),
+        q_split,
         torch.cuda.current_stream(index).cuda_stream,
     )
     plan = _BF16_PLANS.get(key)
@@ -670,7 +791,11 @@ def cached_bf16_segment_plan(
         while len(_BF16_PLANS) >= BF16_PLAN_CACHE_CAPACITY:
             _BF16_PLANS.popitem(last=False)
         plan = build_bf16_segment_plan(
-            key[0], torch.device("cuda", index), num_heads, kv_splits=kv_splits
+            key[0],
+            torch.device("cuda", index),
+            num_heads,
+            kv_splits=kv_splits,
+            q_split=q_split,
         )
         _BF16_PLANS[key] = plan
     else:
@@ -1245,6 +1370,7 @@ class MiniMaxH3VarlenAttentionRunner:
             persistent_clusters=self.plan.num_clusters,
             kv_split_units=self.plan.num_combine_units,
             max_kv_splits=self.plan.max_kv_splits,
+            q_split_units=self.plan.num_q_split_units,
         )
 
 

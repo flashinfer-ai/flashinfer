@@ -24,9 +24,26 @@ Every launch of the call is a generated Cake program:
 
 | Route (host dispatch) | Programs | When |
 | --- | --- | --- |
-| quantization launch + persistent 2-CTA GEMM | `quant:u<units>`, `gemm_tstore` (16-byte aligned output base and a row stride that is a multiple of 8 elements: TMA-store epilogue) or `gemm` (other strides: register epilogue); the `_n192` instances of the same epilogues on the tabulated `gemm_bn` rows (the N = 576 `kv_a` family at M > 256: three 192-column tiles instead of 768 padded columns) ; decode programs carry `_px<D>` when the row's table key `pfx` prefetches the BF16 token tile into L2 D stages ahead of its TMA load (round-6 next loop, lever PX on the small fused rows: the tile's DRAM access precedes the weight burst instead of queueing behind it) | `M > 256` unless the family is tabulated for the decode kernel at that row count, and the tabulated `(N, K)` families whose measured best route is the GEMM |
-| quantization launch + decode | `quant:u1`, `decode:t<tok>_p<stages>` | measured table entry with `fused = false` |
-| fused decode | `decode:t<tok>_p<stages>_fused[_res]` | measured table entry with `fused = true` (the token tile is quantized in-CTA; `_res` keeps the quantized token tiles resident for `K <= 256`); above 256 rows only the single-N-tile families (`f_a`, `b_proj`) are tabulated |
+| quantization launch + persistent 2-CTA GEMM | `quant:u<units>`, `gemm_tstore` (16-byte aligned output base and a row stride that is a multiple of 8 elements: TMA-store epilogue) or `gemm` (other strides: register epilogue); the `_n192` instances of the same epilogues on the tabulated `gemm_bn` rows (the N = 576 `kv_a` family at M > 256: three 192-column tiles instead of 768 padded columns); the `_k128` instances of the TMA-store and staged-register epilogues on the tabulated `gemm_bk` rows (every 128-K half of an operand stage is loaded and multiplied under its own barrier pair, so the MMA of one half overlaps the TMA of the other; same SMEM layout, same MMA sequence, bit-identical output; the token follows `_n192` in the program name, before the stream-K suffixes) ; decode programs carry `_px<D>` when the row's table key `pfx` prefetches the BF16 token tile into L2 D stages ahead of its TMA load (round-6 next loop, lever PX on the small fused rows: the tile's DRAM access precedes the weight burst instead of queueing behind it) | `M > 256` unless the family is tabulated for the decode kernel at that row count, and the tabulated `(N, K)` families whose measured best route is the GEMM |
+| quantization launch + decode | `quant:u<units>` (`u1` unless the table cell pins a width with `quant_units`), `decode:t<tok>_p<stages>[_a<n>][_e<n>]...` | measured table entry with `fused = false` |
+| fused decode | `decode:t<tok>_p<stages>_fused[_w<n>][_a<n>][_e<n>][_res]` | measured table entry with `fused = true` (the token tile is quantized in-CTA; `_res` keeps the quantized token tiles resident for `K <= 256`); above 256 rows only the single-N-tile families (`f_a`, `b_proj`) are tabulated |
+
+Decode programs carry `_a<n>` when the row's table key `acc_bufs` gives the
+instance `n` TMEM accumulator sets and `_e<n>` when `epi_groups` gives it `n`
+epilogue warp groups (64/128-token tiles only; the host forces one group below
+64 tokens); both sit right after the `_fused[_w<n>]` block and are absent at
+the default of 1. A two-launch row whose cell carries `quant_units` launches
+the quantization program at that width (`quant:u<units>`, decode and GEMM
+routes alike; it must divide `K / 128`) instead of the `quant_units` rule.
+
+Decode programs carry `_dpf` when the row's table key `dpf` prefetches the
+tensor-map descriptors in the kernel prelude, before the first TMA issue
+(round-6 lever Q1, adopted in round 8 on the SM103 `tp1 f_b` cell of the
+65..256-row bucket); the token follows the TMA-store token `_tso` and
+precedes `_pi<n>` / `_xp`, as in the Cake kernel symbol, so a `tstore` row
+that pins it ships the pair `..._tso_dpf` (16-byte-aligned output views) and
+`..._dpf` (register epilogue). The prefetch changes no data path and no
+launch argument.
 
 `decode_table.py` is the measured dispatch table
 (`"<n_tiles128>,<num_k_iters>,<m_bucket>"`, buckets `M <= 1 / 8 / 64 / 256` for

@@ -86,7 +86,8 @@ published per tier and per architecture: `dense_admission(arch)` returns the adm
 withheld tier names and the producer's reason for that arch (`policy["dense_admission"]`, keyed by arch;
 `dense_admission()` gives every arch); a route withheld on an arch is not served there even when its record
 exists for another arch, so `dense_route_available(H, Q, K, arch=device_arch(device))` is `False` and the
-engine keeps its stock kernel. Without `arch` the call answers only where the architectures agree and raises
+engine keeps its stock kernel -- except for the 64-head `:short` one-split routes, whose withheld calls are served
+by the tier route of the query count (`served_route`; `dense_route_available` stays `True` there). Without `arch` the call answers only where the architectures agree and raises
 `ValueError` otherwise (no silent admit). `tests/experimental/test_dense_mqa_admission.py` pins this
 contract, host-only.
 
@@ -114,7 +115,7 @@ without allocating (CUDA Graph replay with changed contents is supported; `plan.
 Tests: `tests/experimental/test_dense_mqa_generated.py` (dense, including the one-shot entry) and
 `tests/experimental/test_paged_mqa_generated.py` (paged; skips while the catalog has no paged routes).
 
-## Catalog schema `dense_mqa.v6` (route records)
+## Catalog schema `dense_mqa.v7` (route records)
 
 `dense_mqa_catalog.json` carries `policy`, `programs`, the dense `routes` and the paged
 `paged_routes`. Policy keys: `heads` (exported head counts), `block_q` (`{"32": 4, "64": 2}`),
@@ -126,14 +127,19 @@ are aliases -- the 64-head routes have no metadata stage and no query bound),
 the shipped 32-head `fused_q1_max_kv` / `fused_q128_max_kv` / `max_q_tokens` / `metadata_tiers`, and
 `paged` (`heads` -- the paged head counts, independent of the dense `heads`; `block_kv`, `split_kv`,
 `next_n_atoms` -- 1 for every exported `next_n`, the logits programs iterate the atoms in-kernel;
-`max_batch`, `metadata_program`). Every route record
+`max_batch`, `metadata_program`), and -- v7 -- `dense_short` (`max_kv` 256, `min_q_blocks` 2, `fallback`
+`"tier"`: the shape-only gate of the 64-head one-split `:short` routes and where a withheld one is served). Every route record
 has `stages` (`[[stage, program], ...]`), `sequence` (a prepared sequence binding or `null`),
 `num_heads`, `block_q`, `clean_logits` (`"fused"`: the program writes `-inf` outside each window and in
 the padding, the shipped 32-head programs; `"raw"`: the program stores the computed tiles only, DeepGEMM's
 `clean_logits=False` semantics, the 64-head and paged programs) and `kv_alignment`. Routes: 32 heads
 `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:<tier>`, `fp4:q1`, `fp4:<tier>`;
-64 heads `fp8:h64:q1` and `fp8:h64:{full,partial}:<tier>`, each a single `logits` stage -- the
-gridDim-strided `fp8_h64_logits_full` program for `Q % 2 == 0`, `fp8_h64_logits_partial` otherwise
+64 heads `fp8:h64:q1`, `fp8:h64:{full,partial}:<tier>` and the one-split `fp8:h64:{full,partial}:short` (a call with
+`K <= 256` and at least two query blocks; `served_route(precision, Q, K, H, arch=)` maps a `:short` route the device's
+arch withholds -- or the catalog does not carry -- to the tier route of the query count, never to the stock kernel),
+each a single `logits` stage -- the
+gridDim-strided `fp8_h64_logits_full` program for `Q % 2 == 0`, `fp8_h64_logits_partial` otherwise (their `_short`
+variants -- the one-split text -- for the `:short` routes)
 (including `Q = 1`); no metadata program, launch grid = the SM count (the `SM_COUNT` compile-line
 definition, one device text per arch per program), the program's `ScheduleMeta` operand bound to `ks`
 and unused, `q [Q, 64, 128]` unpadded, output `[Q, align8(K + 256)]` with no padding rows; paged

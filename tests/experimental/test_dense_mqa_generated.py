@@ -394,6 +394,10 @@ def test_dense_route_table_is_catalog_driven():
         assert _runtime.route_name("fp8", 3, 4100, 64) == "fp8:h64:partial:le8"
         assert _runtime.route_name("fp8", 1, 300, 64) == "fp8:h64:q1"
         assert _runtime.route_name("fp8", 1024, 5124, 64) == "fp8:h64:full:le1024"
+        assert _runtime.route_name("fp8", 37, 37, 64) == "fp8:h64:partial:short"
+        assert _runtime.route_name("fp8", 16, 16, 64) == "fp8:h64:full:short"
+        assert _runtime.route_name("fp8", 2, 2, 64) == "fp8:h64:full:le8"
+        assert _runtime.route_name("fp8", 3, 257, 64) == "fp8:h64:partial:le8"
         # W-dense contract: single-stage gridDim-strided programs, no metadata stage, no query bound.
         assert not _runtime.schedules_metadata(64) and _runtime.max_queries(64) is None
         # Availability of a 64-head point is decided per architecture (policy.dense_admission).
@@ -645,7 +649,7 @@ def test_h64_admission_matches_the_catalog_table():
         *(
             f"fp8:h64:{kind}:{tier}"
             for kind in ("full", "partial")
-            for tier in ("le8", "le64", "le1024", "any")
+            for tier in ("le8", "le64", "le1024", "any", "short")
         ),
     }
     verdicts, sample = {}, {}
@@ -669,6 +673,31 @@ def test_h64_admission_matches_the_catalog_table():
             ), (arch, queries, route)
             verdicts.setdefault(route, set()).add(route in admitted)
             sample.setdefault(route, queries)
+        # The one-split ``:short`` routes (K <= dense_short.max_kv, >= dense_short.min_q_blocks query blocks):
+        # served where admitted, otherwise by the tier route of the query count -- never the stock kernel, so
+        # dense_route_available follows the served route and the fallback is a route the arch admits.
+        short = catalog["policy"]["dense_short"]
+        assert short["fallback"] == "tier" and int(short["min_q_blocks"]) == 2
+        max_kv = int(short["max_kv"])
+        for queries in (3, 4, 8, 16, 37, 64, 128, 129, 255, 256):
+            route = _runtime.route_name("fp8", queries, max_kv, 64)
+            assert route.endswith(":short"), (queries, route)
+            served = _runtime.served_route("fp8", queries, max_kv, 64, arch=arch)
+            kind = route.split(":")[-2]
+            if route in admitted:
+                assert served == route
+            else:
+                assert served == f"fp8:h64:{kind}:{_runtime.metadata_tier(queries, 64)}"
+            assert _runtime.dense_route_available(64, queries, max_kv, arch=arch) == (
+                served in admitted
+            ), (arch, queries, served)
+            record = _runtime.route_record("fp8", queries, max_kv, 64, arch=arch)
+            assert record["stages"][0][0] == "logits"
+        for queries in (1, 2):
+            route = _runtime.route_name("fp8", queries, max_kv, 64)
+            assert not route.endswith(":short")
+        assert not _runtime.route_name("fp8", 3, max_kv + 1, 64).endswith(":short")
+        assert not _runtime.route_name("fp8", 37, max_kv, 32).endswith(":short")
     for route, outcomes in verdicts.items():
         if len(outcomes) == 1:
             assert (
@@ -691,7 +720,9 @@ def _route_point(route_name, record):
     precision = route_name.split(":")[0]
     num_heads = int(record["num_heads"])
     if route_name.endswith(":short"):
-        keys = 512
+        # 32 heads: the fused routes below their KV ceiling; 64 heads: the one-split routes at K <= dense_short.max_kv
+        short_kv = int(policy["dense_short"]["max_kv"])
+        keys = 512 if num_heads == _runtime.NUM_HEADS else short_kv
     elif route_name == "fp8:q1":
         keys = int(policy["fused_q1_max_kv"]) + 256
     else:

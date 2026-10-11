@@ -13,8 +13,16 @@ takes the CTA budget ``num_sms`` as a kernel argument and derives its
 only: it launches nothing and returns a zero ``[num_sms + 1, 2]`` placeholder
 that no exported program reads (``schedule_meta`` is accepted and ignored).
 
-Routes are selected from host-known scalars only: head count, page size and
-``next_n`` (``paged_route_name``). Output: FP32 ``[B * next_n,
+Routes are selected from host-known scalars only: head count, page size,
+``next_n`` and the call's batch (``paged_route_name``): single-atom geometries
+carry a second, dynamic-scheduler program (route suffix ``:dyn``, served for
+``batch <= policy.paged.dynamic_scheduler.max_batch``) whose CTAs claim chunks
+of the (request, KV split) walk through an atomic counter instead of the static
+equal-split partition; its logits are bit-identical to the static program's.
+Both programs bind a per-plan scheduler state ``sched_counters`` (u32[2]),
+allocated zeroed by the plan; the dynamic program's last CTA resets it at the
+end of every launch, so repeated runs and CUDA-graph replays need no memset
+(a launch that does not run to completion leaves it dirty: re-create the plan). Output: FP32 ``[B * next_n,
 paged_logits_stride(max_context_len)]`` with DeepGEMM's ``clean_logits=False``
 semantics (inside every KV split a row touches, positions at or past the row's
 length are ``-inf``; cells beyond the row's last split are untouched);
@@ -63,12 +71,32 @@ def paged_next_n_atoms(next_n):
     return int(rule[key])
 
 
-def paged_route_name(num_heads, block_kv, next_n, logits_dtype="float32"):
-    """Logical paged route of a problem (host-known scalars only)."""
+def paged_dynamic_scheduler():
+    """``policy.paged.dynamic_scheduler``: ``max_batch`` and the static route -> dynamic route map (empty when the
+    catalog ships no dynamic-scheduler program)."""
+    entry = paged_policy().get("dynamic_scheduler") or {}
+    return dict(
+        max_batch=int(entry.get("max_batch", 0)),
+        routes={str(k): str(v) for k, v in (entry.get("routes") or {}).items()},
+    )
+
+
+def paged_route_name(
+    num_heads, block_kv, next_n, logits_dtype="float32", *, batch=None
+):
+    """Logical paged route of a problem (host-known scalars only). With ``batch`` (the call's request count)
+    the dynamic-scheduler route is returned when the catalog carries one for the geometry and
+    ``batch <= policy.paged.dynamic_scheduler.max_batch``; without ``batch`` the static route."""
     if logits_dtype not in LOGITS_DTYPES:
         raise ValueError(f"logits_dtype must be one of {LOGITS_DTYPES}")
     suffix = "" if logits_dtype == "float32" else f":{logits_dtype}"
-    return f"paged:fp8:h{int(num_heads)}:p{int(block_kv)}:n{int(next_n)}{suffix}"
+    static = f"paged:fp8:h{int(num_heads)}:p{int(block_kv)}:n{int(next_n)}{suffix}"
+    if batch is None:
+        return static
+    dynamic = paged_dynamic_scheduler()
+    if static in dynamic["routes"] and int(batch) <= dynamic["max_batch"]:
+        return dynamic["routes"][static]
+    return static
 
 
 def paged_admission_rules(arch, route_name):
@@ -130,6 +158,7 @@ def paged_route_available(
         raise ValueError(
             "paged_route_available(arch=...) requires batch and max_context_len"
         )
+    route = paged_route_name(num_heads, block_kv, next_n, logits_dtype, batch=batch)
     return paged_route_admitted(arch, route, batch, max_context_len)
 
 
@@ -174,9 +203,20 @@ def _route_exists(block_kv, next_n):
 
 
 def logits_bindings(
-    q, kv_cache, weights, context_lens, block_table, output, *, num_sms
+    q,
+    kv_cache,
+    weights,
+    context_lens,
+    block_table,
+    output,
+    *,
+    num_sms,
+    sched_counters=None,
 ):
     """Argument plan of the logits program (the single stage of every paged route).
+
+    ``sched_counters`` is the plan's scheduler state (u32[2], zeroed once; see the module docstring);
+    allocated here when not supplied.
 
     The names are the launcher contract of the paged programs: Q rows
     ``[B * next_n * H, 128]`` u8, the fused cache as its byte rows ``[pages,
@@ -192,7 +232,10 @@ def logits_bindings(
     batch, next_n = (int(v) for v in context_lens.shape)
     pages, block_kv = int(kv_cache.shape[0]), int(kv_cache.shape[1])
     fused = kv_cache.view(torch.uint8).reshape(pages, block_kv * FUSED_ROW_BYTES)
+    if sched_counters is None:
+        sched_counters = torch.zeros(2, dtype=torch.uint32, device=q.device)
     return dict(
+        sched_counters=sched_counters,
         Q=q.view(torch.uint8).reshape(-1, HEAD_DIM),
         KV=fused,
         KV_scales=fused.view(torch.float32),
@@ -238,6 +281,13 @@ class PagedMqaPlan:
     admission rules (``paged_route_admitted``) to the call's batch and
     ``max_context_len`` and raises ``ValueError`` outside them; the export
     protocol passes False to validate every exported shape.
+
+    The route is ``paged_route_name(H, block_kv, next_n, batch=B)``: the
+    dynamic-scheduler program for ``B <= policy.paged.dynamic_scheduler.max_batch``
+    when the geometry ships one, else the static program. ``plan.sched_counters``
+    (u32[2]) is the scheduler state bound to every launch of this plan: zeroed
+    here, reset by the dynamic program itself at the end of each launch (graph
+    replays included), never read by the static program.
     """
 
     def __init__(
@@ -317,7 +367,9 @@ class PagedMqaPlan:
             raise ValueError(
                 f"no exported paged MQA route for {num_heads} heads, page {block_kv}, next_n {next_n}, {logits_dtype}"
             )
-        route_name = paged_route_name(num_heads, block_kv, next_n, logits_dtype)
+        route_name = paged_route_name(
+            num_heads, block_kv, next_n, logits_dtype, batch=batch
+        )
         if enforce_admission and not paged_route_admitted(
             arch, route_name, batch, max_context_len
         ):
@@ -332,8 +384,9 @@ class PagedMqaPlan:
         self.arch, self.num_sms, self.num_heads = arch, num_sms, num_heads
         self.block_kv, self.next_n, self.batch = block_kv, next_n, batch
         self.max_context_len = max_context_len
-        self.route_name = paged_route_name(num_heads, block_kv, next_n, logits_dtype)
+        self.route_name = route_name
         self.route = _catalog()["paged_routes"][self.route_name]
+        self.sched_counters = torch.zeros(2, dtype=torch.uint32, device=q.device)
         stride = paged_logits_stride(max_context_len)
         if output is None:
             output = torch.empty(
@@ -350,7 +403,14 @@ class PagedMqaPlan:
             )
         bindings = {
             "logits": logits_bindings(
-                q, kv_cache, weights, context_lens, block_table, output, num_sms=num_sms
+                q,
+                kv_cache,
+                weights,
+                context_lens,
+                block_table,
+                output,
+                num_sms=num_sms,
+                sched_counters=self.sched_counters,
             ),
         }
         stages = list(self.route["stages"])
@@ -368,7 +428,7 @@ class PagedMqaPlan:
             self._programs.append(loaded)
         self.output, self.schedule_meta = output, schedule_meta
         self.logical_output = output[:, :max_context_len]
-        self._retained = (*tensors, output)
+        self._retained = (*tensors, output, self.sched_counters)
 
     @property
     def launch_count(self):
