@@ -617,7 +617,7 @@ def compile_projection(
             Int32(0),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.bf16_projection.selected", 1, key
+                "gemm.bf16_projection.selected", 2, key
             ),
         )
 

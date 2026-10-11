@@ -210,7 +210,7 @@ TUNING = TuningContract(
             name="block_threads", values=(128, 256), binding=ParameterBinding.COMPILE
         ),
     ),
-    candidate_contract_version=4,
+    candidate_contract_version=5,
     parameters=_parameters,
     materialize=lambda query, device, choice: GemvConfig(**dict(choice)),
 )

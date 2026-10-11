@@ -181,7 +181,11 @@ def test_long_k_row_tiles_reuse_graph_and_preserve_fp32_projection(
     storage = torch.full((18, n + 8), 123.0, device="cuda")
     output = storage[:17, :n]
     plan = _prepare_projection(
-        projection_session, source, weight, out=output, bias=bias,
+        projection_session,
+        source,
+        weight,
+        out=output,
+        bias=bias,
         override=bf16_gemv.GemvConfig(backend="simt", block_threads=block_threads),
     )
     projection_session.freeze()
@@ -252,7 +256,11 @@ def test_unquantized_bias_and_live_rows_reuse_native_graph(
     output = torch.empty(capacity, n + 3, device=device, dtype=output_dtype)
 
     plan = _prepare_projection(
-        projection_session, source, weight, bias=bias, out=output[:, :n],
+        projection_session,
+        source,
+        weight,
+        bias=bias,
+        out=output[:, :n],
         override=bf16_gemv.GemvConfig(backend="simt", block_threads=block_threads),
     )
 
@@ -532,7 +540,20 @@ def test_prefill_projection_retains_small_terms_between_cancelling_large_terms(n
 
 @cuda_required
 @pytest.mark.parametrize("m", [1, 2, 3, 8])
-@pytest.mark.parametrize("n,k", [(4096, 2048), (2560, 4096), (8192, 4096), (1040, 512)])
+@pytest.mark.parametrize(
+    "n,k",
+    [
+        (4096, 2048),
+        (2560, 4096),
+        (8192, 4096),
+        (1040, 512),
+        (10240, 320),
+        (257, 64),
+        (31, 192),
+        (513, 448),
+        (257, 576),
+    ],
+)
 def test_tensor_core_gemv_matches_fp64_reference(m, n, k):
     """Wide decode projections: one FP32 accumulation and one BF16 rounding."""
     torch.manual_seed(m * 131 + n + k)
@@ -549,7 +570,8 @@ def test_tensor_core_gemv_matches_fp64_reference(m, n, k):
 
 
 @cuda_required
-def test_tensor_core_gemv_replays_live_rows():
+@pytest.mark.parametrize("k", [320, 576, 2048])
+def test_tensor_core_gemv_replays_live_rows(k):
     """One tc plan prepared at eight rows serves CUDA-graph replays with fewer live
     rows: each replay matches FP64, leaves rows past the live count untouched and
     allocates nothing."""
@@ -557,7 +579,7 @@ def test_tensor_core_gemv_replays_live_rows():
     from b12x.preparation import require_prepared
 
     torch.manual_seed(7)
-    k, n = 2048, 4096
+    n = 4096
     weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
     x = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
     out = torch.full((8, n), float("nan"), device="cuda", dtype=torch.bfloat16)

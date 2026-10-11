@@ -4,6 +4,7 @@ At decode row counts the projection streams the weight once, so its cost is
 the weight read.  Each CTA owns 16 output features and its warps split K into
 64-wide chunks.  Weights are the ``m16n8k16`` MMA's 16-row A operand and the
 live rows its 8-column B operand, so one weight fragment serves every row.
+The warp count evenly divides K/64, with at most eight warps per CTA.
 Products accumulate in FP32; the warps reduce through shared memory in a fixed
 order and the result is rounded once, so the output is deterministic.
 
@@ -26,8 +27,8 @@ from b12x._lib.intrinsics import (
 )
 
 TC_MAX_ROWS = 8
-TC_WARPS = 8
-TC_K_MULTIPLE = 64 * TC_WARPS
+TC_MAX_WARPS = 8
+TC_K_MULTIPLE = 64
 _LANES = 32
 
 
@@ -40,12 +41,16 @@ class TensorCoreGemvKernel:
     """``out[m, n] = sum_k x[m, k] * w[n, k]`` for at most eight live rows."""
 
     def __init__(self, n: int, k: int):
-        if k % TC_K_MULTIPLE:
+        if k <= 0 or k % TC_K_MULTIPLE:
             raise ValueError(
-                f"tensor-core GEMV requires K to be a multiple of {TC_K_MULTIPLE}"
+                f"tensor-core GEMV requires K to be a positive multiple of {TC_K_MULTIPLE}"
             )
         self.n, self.k = int(n), int(k)
-        self.chunks_per_warp = (self.k // 64) // TC_WARPS
+        chunks = self.k // TC_K_MULTIPLE
+        self.warps = min(TC_MAX_WARPS, chunks)
+        while chunks % self.warps:
+            self.warps -= 1
+        self.chunks_per_warp = chunks // self.warps
 
     def _shared_storage_cls(self):
         class SharedStorage:
@@ -53,7 +58,7 @@ class TensorCoreGemvKernel:
 
         SharedStorage.__annotations__ = {
             "partials": cute.struct.Align[
-                cute.struct.MemRange[Float32, TC_WARPS * _LANES * 4], 16
+                cute.struct.MemRange[Float32, self.warps * _LANES * 4], 16
             ],
         }
         return cute.struct(SharedStorage)
@@ -87,7 +92,7 @@ class TensorCoreGemvKernel:
             output_stride,
         ).launch(
             grid=((self.n + 15) // 16, 1, 1),
-            block=(TC_WARPS * _LANES, 1, 1),
+            block=(self.warps * _LANES, 1, 1),
             stream=stream,
         )
 
@@ -151,7 +156,7 @@ class TensorCoreGemvKernel:
 
         storage = cutlass.utils.SmemAllocator().allocate(self._shared_storage_cls())
         partials = storage.partials.get_tensor(
-            cute.make_layout((TC_WARPS * _LANES * 4,))
+            cute.make_layout((self.warps * _LANES * 4,))
         )
         base = (warp * _LANES + lane) * 4
         partials[base] = acc0
@@ -162,7 +167,7 @@ class TensorCoreGemvKernel:
         if warp == 0:
             for e in cutlass.range_constexpr(4):
                 total = Float32(0.0)
-                for w in cutlass.range_constexpr(TC_WARPS):
+                for w in cutlass.range_constexpr(self.warps):
                     total = total + partials[Int32(w * _LANES * 4) + lane * 4 + e]
                 feature = first + group + (8 if e >= 2 else 0)
                 row = quad * 2 + (e % 2)
