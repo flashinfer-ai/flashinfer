@@ -25,17 +25,23 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 11 of the optimization ladder: 128(n) x 256(m) block tile with
-// wgmma.m64n256k16.  Rung 10 fixed the DRAM traffic (54% -> 12% of peak)
-// but the tensor pipe stayed near 50%: ncu's top stall was "fixed-latency
-// execution dependency", i.e. the consumer warps' fp8 -> bf16 conversion
-// chain feeding each wgmma's register A operand.  Doubling the wgmma N
-// (the m extent) to 256 halves that per-FLOP work: each converted A
-// fragment now feeds twice the MACs.  Accumulators grow to 128 fp32 per
-// consumer thread (fits in the 232-register budget), the act stage to 32 KB
-// and the ring shrinks to 5 stages (205 KB).  Producer, barriers and
-// rasterization are unchanged.  Requires sm_90a and K % 64 == 0.
+// Rung 12 of the optimization ladder: TMA loads.  In rungs 9-11 the
+// producer warpgroup's 128 threads each issued ~24 cp.async per K slab plus
+// the address arithmetic, roughly a thousand warp-instructions per SM per
+// slab against ~550 cycles of tensor-pipe work, and ncu showed the tensor
+// pipe near 47% with the schedulers busy on copies.  Here one producer
+// thread issues two cp.async.bulk.tensor.2d per slab: the act tile as a
+// [64 k x 128 m] bf16 box with the hardware 128 B swizzle (the layout the
+// wgmma descriptor already expects) and the weight tile as a [64 k x 128 n]
+// uint8 box with the 64 B swizzle (16 B chunk c of row r lands at
+// c ^ ((r >> 1) & 3), which keeps the consumers' 2-byte fragment reads
+// conflict-free).  The "full" mbarrier now completes on transaction bytes
+// (arrive.expect_tx), TMA zero-fills rows past M / N, and the other 127
+// producer threads idle.  Back on the 128 x 128 tile (rung 11's 128 x 256
+// did not pay), 6 stages.  Requires sm_90a and K % 64 == 0.
 
+#include <cuda.h>
+#include <cudaTypedefs.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -43,37 +49,27 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "../cp_async.cuh"
 #include "../utils.cuh"
 
 namespace flashinfer {
 namespace gemm {
 
 constexpr int kW8A16TileN = 128;  // n rows per block (wgmma M)
-constexpr int kW8A16TileM = 256;  // m cols per block (wgmma N)
+constexpr int kW8A16TileM = 128;  // m cols per block (wgmma N)
 constexpr int kW8A16TileK = 64;
-constexpr int kW8A16Stages = 5;
+constexpr int kW8A16Stages = 6;
 constexpr int kW8A16GroupM = 8;                          // m-tiles per rasterization group
 constexpr int kW8A16ConsumerWGs = 2;                     // 64 n rows each
 constexpr int kW8A16Warpgroups = 1 + kW8A16ConsumerWGs;  // + 1 producer
 constexpr int kW8A16Threads = 128 * kW8A16Warpgroups;
 constexpr int kW8A16ConsumerThreads = 128 * kW8A16ConsumerWGs;
-constexpr int kW8A16WPad = kW8A16TileK + 8;       // 72 fp8 rows (8 B aligned, 18 words)
-constexpr int kW8A16ARowBytes = kW8A16TileK * 2;  // act row = 64 bf16 = 128 B (swizzle atom)
-constexpr int kW8A16AStageBytes = kW8A16TileM * kW8A16ARowBytes;  // 32 KB
-constexpr int kW8A16WStageBytes = kW8A16TileN * kW8A16WPad;       // 9 KB
+constexpr int kW8A16ARowBytes = kW8A16TileK * 2;  // act row = 64 bf16 = 128 B (SW128 atom)
+constexpr int kW8A16WRowBytes = kW8A16TileK;      // weight row = 64 fp8 = 64 B (SW64 atom)
+constexpr int kW8A16AStageBytes = kW8A16TileM * kW8A16ARowBytes;  // 16 KB
+constexpr int kW8A16WStageBytes = kW8A16TileN * kW8A16WRowBytes;  // 8 KB
 constexpr int kW8A16BarrierBytes = 2 * kW8A16Stages * 8;          // full[] + empty[]
 constexpr int kW8A16SmemBytes =
     kW8A16Stages * (kW8A16AStageBytes + kW8A16WStageBytes) + kW8A16BarrierBytes + 1024;
-
-// 8-byte predicated cp.async with zero fill (the shared helper only has 16 B).
-__device__ __forceinline__ void cp_async_pred_load_64b(void* smem_ptr, const void* gmem_ptr,
-                                                       bool predicate) {
-  const uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  const int src_in_bytes = predicate ? 8 : 0;
-  asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr), "l"(gmem_ptr),
-               "n"(8), "r"(src_in_bytes));
-}
 
 // Two e4m3 values (packed in the low 16 bits) -> two T values packed in a
 // 32-bit register, laid out as an mma A/B operand expects.
@@ -106,7 +102,7 @@ __device__ __forceinline__ void wgmma_wait() {
   asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
 }
 
-// ---- mbarrier plumbing ----------------------------------------------------
+// ---- mbarrier / TMA plumbing ---------------------------------------------
 
 __device__ __forceinline__ void mbar_init(uint64_t* bar, uint32_t count) {
   const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
@@ -121,11 +117,10 @@ __device__ __forceinline__ void mbar_arrive(uint64_t* bar) {
       "}\n" ::"r"(a)
       : "memory");
 }
-// Arrive once every prior cp.async of this thread has completed (no pending
-// count increment: the init count must include these arrivals).
-__device__ __forceinline__ void mbar_cp_async_arrive(uint64_t* bar) {
+__device__ __forceinline__ void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
   const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(a) : "memory");
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(a), "r"(bytes)
+               : "memory");
 }
 __device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
   const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
@@ -139,8 +134,23 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
       "r"(parity)
       : "memory");
 }
-__device__ __forceinline__ void fence_proxy_async_smem() {
-  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+__device__ __forceinline__ void fence_barrier_init() {
+  asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+}
+__device__ __forceinline__ void prefetch_tensormap(const CUtensorMap* map) {
+  asm volatile("prefetch.tensormap [%0];\n" ::"l"(reinterpret_cast<uint64_t>(map)) : "memory");
+}
+// 2-D TMA tile load: box at (c0 = innermost coordinate, c1) -> smem, bytes
+// counted on the mbarrier.
+__device__ __forceinline__ void tma_load_2d(void* smem_dst, const CUtensorMap* map, uint64_t* bar,
+                                            int c0, int c1) {
+  const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+  const uint32_t b = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes "
+      "[%0], [%1, {%3, %4}], [%2];\n" ::"r"(dst),
+      "l"(reinterpret_cast<uint64_t>(map)), "r"(b), "r"(c0), "r"(c1)
+      : "memory");
 }
 template <int N>
 __device__ __forceinline__ void setmaxnreg_inc() {
@@ -164,28 +174,24 @@ __device__ __forceinline__ uint64_t make_smem_desc_sw128(const void* smem_ptr) {
   return desc;
 }
 
-// D[64 x 256] (+)= A[64 x 16] (registers) . B[16 x 256] (smem descriptor).
+// D[64 x 128] (+)= A[64 x 16] (registers) . B[16 x 128] (smem descriptor).
 template <typename T>
-__device__ __forceinline__ void wgmma_m64n256k16_rs(float (&d)[128], const uint32_t (&a)[4],
+__device__ __forceinline__ void wgmma_m64n128k16_rs(float (&d)[64], const uint32_t (&a)[4],
                                                     uint64_t desc_b, int scale_d);
 template <>
-__device__ __forceinline__ void wgmma_m64n256k16_rs<__nv_bfloat16>(float (&d)[128],
+__device__ __forceinline__ void wgmma_m64n128k16_rs<__nv_bfloat16>(float (&d)[64],
                                                                    const uint32_t (&a)[4],
                                                                    uint64_t desc_b, int scale_d) {
   asm volatile(
       "{\n"
       ".reg .pred p;\n"
-      "setp.ne.b32 p, %133, 0;\n"
-      "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
+      "setp.ne.b32 p, %69, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 "
       "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, "
       "%20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, "
       "%38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, "
-      "%56, %57, %58, %59, %60, %61, %62, %63, %64, %65, %66, %67, %68, %69, %70, %71, %72, %73, "
-      "%74, %75, %76, %77, %78, %79, %80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, "
-      "%92, %93, %94, %95, %96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, "
-      "%108, %109, %110, %111, %112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, "
-      "%123, %124, %125, %126, %127}, "
-      "{%128, %129, %130, %131}, %132, p, 1, 1, 0;\n"
+      "%56, %57, %58, %59, %60, %61, %62, %63}, "
+      "{%64, %65, %66, %67}, %68, p, 1, 1, 0;\n"
       "}\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
         "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
@@ -196,35 +202,22 @@ __device__ __forceinline__ void wgmma_m64n256k16_rs<__nv_bfloat16>(float (&d)[12
         "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]),
         "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
         "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]),
-        "+f"(d[63]), "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]), "+f"(d[68]), "+f"(d[69]),
-        "+f"(d[70]), "+f"(d[71]), "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]), "+f"(d[76]),
-        "+f"(d[77]), "+f"(d[78]), "+f"(d[79]), "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]),
-        "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]), "+f"(d[88]), "+f"(d[89]), "+f"(d[90]),
-        "+f"(d[91]), "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]), "+f"(d[96]), "+f"(d[97]),
-        "+f"(d[98]), "+f"(d[99]), "+f"(d[100]), "+f"(d[101]), "+f"(d[102]), "+f"(d[103]),
-        "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]), "+f"(d[108]), "+f"(d[109]),
-        "+f"(d[110]), "+f"(d[111]), "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]),
-        "+f"(d[116]), "+f"(d[117]), "+f"(d[118]), "+f"(d[119]), "+f"(d[120]), "+f"(d[121]),
-        "+f"(d[122]), "+f"(d[123]), "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])
+        "+f"(d[63])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(scale_d));
 }
 template <>
-__device__ __forceinline__ void wgmma_m64n256k16_rs<__half>(float (&d)[128], const uint32_t (&a)[4],
+__device__ __forceinline__ void wgmma_m64n128k16_rs<__half>(float (&d)[64], const uint32_t (&a)[4],
                                                             uint64_t desc_b, int scale_d) {
   asm volatile(
       "{\n"
       ".reg .pred p;\n"
-      "setp.ne.b32 p, %133, 0;\n"
-      "wgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 "
+      "setp.ne.b32 p, %69, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 "
       "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, "
       "%20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, "
       "%38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, "
-      "%56, %57, %58, %59, %60, %61, %62, %63, %64, %65, %66, %67, %68, %69, %70, %71, %72, %73, "
-      "%74, %75, %76, %77, %78, %79, %80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, "
-      "%92, %93, %94, %95, %96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, "
-      "%108, %109, %110, %111, %112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, "
-      "%123, %124, %125, %126, %127}, "
-      "{%128, %129, %130, %131}, %132, p, 1, 1, 0;\n"
+      "%56, %57, %58, %59, %60, %61, %62, %63}, "
+      "{%64, %65, %66, %67}, %68, p, 1, 1, 0;\n"
       "}\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
         "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
@@ -235,41 +228,30 @@ __device__ __forceinline__ void wgmma_m64n256k16_rs<__half>(float (&d)[128], con
         "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]),
         "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
         "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]),
-        "+f"(d[63]), "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]), "+f"(d[68]), "+f"(d[69]),
-        "+f"(d[70]), "+f"(d[71]), "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]), "+f"(d[76]),
-        "+f"(d[77]), "+f"(d[78]), "+f"(d[79]), "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]),
-        "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]), "+f"(d[88]), "+f"(d[89]), "+f"(d[90]),
-        "+f"(d[91]), "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]), "+f"(d[96]), "+f"(d[97]),
-        "+f"(d[98]), "+f"(d[99]), "+f"(d[100]), "+f"(d[101]), "+f"(d[102]), "+f"(d[103]),
-        "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]), "+f"(d[108]), "+f"(d[109]),
-        "+f"(d[110]), "+f"(d[111]), "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]),
-        "+f"(d[116]), "+f"(d[117]), "+f"(d[118]), "+f"(d[119]), "+f"(d[120]), "+f"(d[121]),
-        "+f"(d[122]), "+f"(d[123]), "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])
+        "+f"(d[63])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(scale_d));
 }
 
 template <typename T>
 __global__ void __launch_bounds__(kW8A16Threads, 1)
-    W8A16Fp8GemmWgmmaWsKernel(const T* __restrict__ act, const __nv_fp8_e4m3* __restrict__ w,
-                              const float* __restrict__ scale, const T* __restrict__ bias,
-                              T* __restrict__ out, int M, int N, int K) {
+    W8A16Fp8GemmTmaKernel(const __grid_constant__ CUtensorMap act_map,
+                          const __grid_constant__ CUtensorMap w_map,
+                          const float* __restrict__ scale, const T* __restrict__ bias,
+                          T* __restrict__ out, int M, int N, int K) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
-  using namespace cp_async;
   extern __shared__ uint8_t smem_raw[];
   uint8_t* smem = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(smem_raw) + 1023) &
                                              ~static_cast<uintptr_t>(1023));
-  uint8_t* a_base = smem;                                     // act stages (swizzled)
-  uint8_t* w_base = smem + kW8A16Stages * kW8A16AStageBytes;  // weight stages (padded rows)
+  uint8_t* a_base = smem;                                     // act stages (SW128)
+  uint8_t* w_base = smem + kW8A16Stages * kW8A16AStageBytes;  // weight stages (SW64)
   uint64_t* full_bar = reinterpret_cast<uint64_t*>(w_base + kW8A16Stages * kW8A16WStageBytes);
   uint64_t* empty_bar = full_bar + kW8A16Stages;
-  using WTile = __nv_fp8_e4m3[kW8A16TileN][kW8A16WPad];
-  WTile* w_s = reinterpret_cast<WTile*>(w_base);
 
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int wg = warp >> 2;  // 0 = producer, 1..2 = consumers
-  // Grouped rasterization: within a group of kW8A16GroupM m-tiles, walk the
-  // n-tiles with m fastest, so neighbouring blocks share a weight tile.
+
+  // Grouped rasterization (rung 10).
   const int tiles_m = (M + kW8A16TileM - 1) / kW8A16TileM;
   const int tiles_n = (N + kW8A16TileN - 1) / kW8A16TileN;
   const int group_size = kW8A16GroupM * tiles_n;
@@ -284,78 +266,60 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
   const int num_slabs = K / kW8A16TileK;
 
   if (threadIdx.x == 0) {
+    prefetch_tensormap(&act_map);
+    prefetch_tensormap(&w_map);
 #pragma unroll
     for (int s = 0; s < kW8A16Stages; ++s) {
-      mbar_init(&full_bar[s], 128);                     // one cp.async arrive per producer thread
+      mbar_init(&full_bar[s], 1);                       // one arrive.expect_tx per slab
       mbar_init(&empty_bar[s], kW8A16ConsumerThreads);  // every consumer thread releases
     }
+    fence_barrier_init();
   }
   __syncthreads();
 
   if (wg == 0) {
     // ------------------------------ producer ------------------------------
-    setmaxnreg_dec<56>();
-    // Per-slab copies: act = kW8A16TileM rows x 8 chunks of 16 B, weight =
-    // kW8A16TileN rows x 8 chunks of 8 B; each thread owns chunk cc of rows
-    // cr, cr+16, cr+32, ...  Addresses are formed per copy from one base
-    // pointer per operand (precomputing 24 pointers blew the register
-    // budget).  Rows past M / N copy zeros (cp.async zfill) from a safe
-    // address.  Chunk cc of act row r lands at r*128 + ((cc ^ (r & 7)) * 16).
-    constexpr int kACopies = kW8A16TileM / 16;
-    constexpr int kWCopies = kW8A16TileN / 16;
-    const int cr = threadIdx.x / 8;
-    const int cc = threadIdx.x % 8;
-    const T* a_src = act + static_cast<int64_t>(m0 + cr) * K + cc * 8;
-    const __nv_fp8_e4m3* w_src = w + static_cast<int64_t>(n0 + cr) * K + cc * 8;
-    const int64_t row16 = static_cast<int64_t>(16) * K;  // 16 rows of either operand
-    for (int kt = 0; kt < num_slabs; ++kt) {
-      const int stage = kt % kW8A16Stages;
-      const uint32_t round = kt / kW8A16Stages;
-      // A fresh barrier passes a wait on parity 1, so round 0 never blocks.
-      mbar_wait(&empty_bar[stage], (round & 1) ^ 1);
-      const int k0 = kt * kW8A16TileK;
-      uint8_t* a_stage = a_base + stage * kW8A16AStageBytes;
-#pragma unroll
-      for (int i = 0; i < kACopies; ++i) {
-        const int r = cr + 16 * i;
-        const bool ok = (m0 + r) < M;
-        const T* src = ok ? a_src + i * row16 + k0 : act;
-        pred_load<128, PrefetchMode::kNoPrefetch, SharedMemFillMode::kFillZero>(
-            reinterpret_cast<T*>(a_stage + r * kW8A16ARowBytes + ((cc ^ (r & 7)) << 4)), src, ok);
+    setmaxnreg_dec<40>();
+    if (warp == 0 && lane == 0) {
+      constexpr uint32_t kSlabBytes = kW8A16AStageBytes + kW8A16WStageBytes;
+      for (int kt = 0; kt < num_slabs; ++kt) {
+        const int stage = kt % kW8A16Stages;
+        const uint32_t round = kt / kW8A16Stages;
+        mbar_wait(&empty_bar[stage], (round & 1) ^ 1);  // fresh barrier: passes at once
+        mbar_arrive_expect_tx(&full_bar[stage], kSlabBytes);
+        const int k0 = kt * kW8A16TileK;
+        tma_load_2d(a_base + stage * kW8A16AStageBytes, &act_map, &full_bar[stage], k0, m0);
+        tma_load_2d(w_base + stage * kW8A16WStageBytes, &w_map, &full_bar[stage], k0, n0);
       }
-#pragma unroll
-      for (int i = 0; i < kWCopies; ++i) {
-        const int r = cr + 16 * i;
-        const bool ok = (n0 + r) < N;
-        const __nv_fp8_e4m3* src = ok ? w_src + i * row16 + k0 : w;
-        cp_async_pred_load_64b(&w_s[stage][r][cc * 8], src, ok);
-      }
-      mbar_cp_async_arrive(&full_bar[stage]);
     }
-    // Drain before exit so no copy is outstanding when the block retires.
-    wait_group<0>();
   } else {
     // ------------------------------ consumers -----------------------------
-    setmaxnreg_inc<224>();
+    setmaxnreg_inc<232>();
     const int cwg = wg - 1;   // consumer warpgroup: n rows cwg*64 .. +63
     const int wq = warp & 3;  // warp within it: rows wq*16 .. +15 of those
-    float d[128];
+    float d[64];
 #pragma unroll
-    for (int i = 0; i < 128; ++i) d[i] = 0.f;
+    for (int i = 0; i < 64; ++i) d[i] = 0.f;
 
+    // A fragment coordinates: rows r = cwg*64 + wq*16 + lane/4 (+8), k =
+    // 2*(lane%4) (+8) within each k16.  With the 64 B swizzle, the 16 B
+    // chunk holding k16 of row r sits at chunk index (k16/16) ^ ((r>>1)&3).
     const int a_r = cwg * 64 + wq * 16 + lane / 4;
     const int a_k = (lane % 4) * 2;
+    const uint32_t swz0 = (a_r >> 1) & 3;
+    const uint32_t swz1 = ((a_r + 8) >> 1) & 3;
 
     for (int kt = 0; kt < num_slabs; ++kt) {
       const int stage = kt % kW8A16Stages;
       const uint32_t round = kt / kW8A16Stages;
       mbar_wait(&full_bar[stage], round & 1);
-      fence_proxy_async_smem();  // cp.async writes -> visible to the wgmma async proxy
       const uint8_t* a_stage = a_base + stage * kW8A16AStageBytes;
+      const uint8_t* w_stage = w_base + stage * kW8A16WStageBytes;
 #pragma unroll
       for (int k16 = 0; k16 < kW8A16TileK; k16 += 16) {
-        const __nv_fp8_e4m3* r0 = &w_s[stage][a_r][k16 + a_k];
-        const __nv_fp8_e4m3* r1 = &w_s[stage][a_r + 8][k16 + a_k];
+        const uint32_t chunk = k16 >> 4;
+        const uint8_t* r0 = w_stage + a_r * kW8A16WRowBytes + ((chunk ^ swz0) << 4) + a_k;
+        const uint8_t* r1 = w_stage + (a_r + 8) * kW8A16WRowBytes + ((chunk ^ swz1) << 4) + a_k;
         uint32_t a_frag[4];
         a_frag[0] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r0));
         a_frag[1] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r1));
@@ -363,11 +327,9 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
         a_frag[3] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r1 + 8));
         const uint64_t desc_b = make_smem_desc_sw128(a_stage + k16 * 2);
         wgmma_fence();
-        wgmma_m64n256k16_rs<T>(d, a_frag, desc_b, 1);
+        wgmma_m64n128k16_rs<T>(d, a_frag, desc_b, 1);
       }
       wgmma_commit();
-      // Keep this slab's group in flight; the previous slab's group is now
-      // complete, so its stage can go back to the producer.
       wgmma_wait<1>();
       if (kt > 0) mbar_arrive(&empty_bar[(kt - 1) % kW8A16Stages]);
     }
@@ -384,7 +346,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       if (n_lo + 8 < N) bias_hi = static_cast<float>(bias[n_lo + 8]);
     }
 #pragma unroll
-    for (int j = 0; j < 32; ++j) {
+    for (int j = 0; j < 16; ++j) {
       const int m = m_base + j * 8;
 #pragma unroll
       for (int q = 0; q < 2; ++q) {
@@ -397,26 +359,62 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     }
   }
 #else
-  __trap();  // wgmma needs sm_90a
+  __trap();  // wgmma / TMA need sm_90a
 #endif
+}
+
+// Host side: 2-D tiled tensor map over a row-major [rows x cols] matrix with
+// element size `elem_bytes`, box [box_cols (inner) x box_rows].
+inline cudaError_t MakeTmaMap2D(CUtensorMap* map, const void* base, uint64_t rows, uint64_t cols,
+                                uint32_t elem_bytes, CUtensorMapDataType dtype, uint32_t box_rows,
+                                uint32_t box_cols, CUtensorMapSwizzle swizzle) {
+  static PFN_cuTensorMapEncodeTiled_v12000 encode = nullptr;
+  if (encode == nullptr) {
+    cudaDriverEntryPointQueryResult q;
+    void* fn = nullptr;
+    cudaError_t e = cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &fn, cudaEnableDefault, &q);
+    if (e != cudaSuccess || fn == nullptr) return cudaErrorUnknown;
+    encode = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(fn);
+  }
+  const uint64_t dims[2] = {cols, rows};
+  const uint64_t strides[1] = {cols * elem_bytes};  // bytes, for dim 1
+  const uint32_t box[2] = {box_cols, box_rows};
+  const uint32_t estr[2] = {1, 1};
+  CUresult r = encode(map, dtype, 2, const_cast<void*>(base), dims, strides, box, estr,
+                      CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return r == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
 }
 
 template <typename T>
 cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scale, const T* bias,
                          T* out, int M, int N, int K, cudaStream_t stream) {
-  if (K % kW8A16TileK != 0) return cudaErrorInvalidValue;  // cp.async slabs must be whole
+  if (K % kW8A16TileK != 0) return cudaErrorInvalidValue;  // whole slabs only
+  if ((reinterpret_cast<uintptr_t>(act) & 15) || (reinterpret_cast<uintptr_t>(w) & 15)) {
+    return cudaErrorInvalidValue;  // TMA needs 16 B aligned bases
+  }
+  CUtensorMap act_map, w_map;
+  cudaError_t e = MakeTmaMap2D(&act_map, act, M, K, sizeof(T),
+                               std::is_same_v<T, __half> ? CU_TENSOR_MAP_DATA_TYPE_FLOAT16
+                                                         : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                               kW8A16TileM, kW8A16TileK, CU_TENSOR_MAP_SWIZZLE_128B);
+  if (e != cudaSuccess) return e;
+  e = MakeTmaMap2D(&w_map, w, N, K, 1, CU_TENSOR_MAP_DATA_TYPE_UINT8, kW8A16TileN, kW8A16TileK,
+                   CU_TENSOR_MAP_SWIZZLE_64B);
+  if (e != cudaSuccess) return e;
+
   const unsigned tiles_m = ceil_div(M, kW8A16TileM);
   const unsigned tiles_n = ceil_div(N, kW8A16TileN);
-  auto* kernel = W8A16Fp8GemmWgmmaWsKernel<T>;
+  auto* kernel = W8A16Fp8GemmTmaKernel<T>;
   static bool attr_set = false;  // per instantiation; the attribute is per function
   if (!attr_set) {
-    cudaError_t e =
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kW8A16SmemBytes);
+    e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kW8A16SmemBytes);
     if (e != cudaSuccess) return e;
     attr_set = true;
   }
   const dim3 grid(tiles_m * tiles_n);  // 1-D; the kernel rasterizes it
-  kernel<<<grid, kW8A16Threads, kW8A16SmemBytes, stream>>>(act, w, scale, bias, out, M, N, K);
+  kernel<<<grid, kW8A16Threads, kW8A16SmemBytes, stream>>>(act_map, w_map, scale, bias, out, M, N,
+                                                           K);
   return cudaGetLastError();
 }
 
