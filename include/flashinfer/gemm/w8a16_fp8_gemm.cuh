@@ -25,21 +25,25 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 37 of the optimization ladder: split-K reduce priced as launch plus
-// bandwidth.  Rungs 35-36 moved the split-K reduction into the main kernel
-// (last-arriving CTA per tile) and lost: one CTA per tile reducing 128 KB
-// partials serially cannot match the whole GPU streaming them, and the
-// counter memset costs what the reduce launch did.  The two-kernel split
-// path of rung 34 is restored unchanged; what changes is its price in the
-// dispatch model.  A reduce kernel costs a fixed launch-and-tail plus a
-// bandwidth-bound pass over splits x M x N fp32, so the model term is now
-//   kW8A16ModelSplitFixed + kW8A16ModelReduceCost * M * N * splits
-// (24M + 8 x M x N x splits, fitted to the rung-33/34 tables and the forced
-// split sweeps), replacing the purely linear term that under-priced small
-// splits and over-priced large ones.  FLASHINFER_W8A16_FP8_TILE and
-// FLASHINFER_W8A16_FP8_SPLITS pin a plan for benchmarking.  Kernel code
-// unchanged from rung 33.  Requires sm_90a, K % 64 == 0, 16 B aligned
-// bases, N % 8 == 0.
+// Rung 38 of the optimization ladder: 64x256 tile with the K slabs split
+// between the two consumer warpgroups.  The 128x128 tile runs at 57-62% of
+// the tensor pipe on narrow-N rows (m64n128 wgmma halves the math behind
+// each fragment load + convert).  The new W8A16Cfg<64, 256, 4> keeps the
+// m64n256k16 wgmma of the 128x256 tile and doubles the unit count by
+// halving N: both warpgroups own the same 64 weight rows and take
+// alternating K slabs (a stage is consumed by one warpgroup, so its empty
+// barrier counts 4 warps), then swap accumulator halves through a 64 KB
+// shared buffer so each warpgroup finishes one 128-row M half of the
+// epilogue (persistent: TMA store of its half; split-K: its half of the
+// fp32 tile).  Costs: 1.8x the L2 bytes per MAC of 128x256 (activation
+// slab 32 KB per 64 weight rows) and one 64 KB smem exchange per tile.
+// Measured (H100): LOSER.  43% tensor pipe with L2 at 75% on 12800x5120
+// M=8192 (2.60 ms vs 1.31), and 61.6 us vs the 128x128 tile's 39.9 on und.q
+// tp8 M=2048: the activation traffic per MAC makes it L2-bound well below
+// the 128x128 tile.  Kept compiled and reachable through
+// FLASHINFER_W8A16_FP8_TILE=64x256 for the record; the dispatcher never
+// picks it (rung 37's two-tile choice stands).  Requires sm_90a, K % 64 == 0,
+// 16 B aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -81,19 +85,29 @@ struct W8A16Cfg {
   static constexpr int kTileN = kTileN_;
   static constexpr int kTileM = kTileM_;
   static constexpr int kStages = kStages_;
-  static constexpr int kRowBlocks = kTileN / (64 * kW8A16ConsumerWGs);  // m64 blocks per WG
-  static constexpr int kAcc = kTileM / 2;  // fp32 accumulators per thread per row block
+  // kTileN == 64: both consumer warpgroups own the same 64 weight rows and
+  // split the K slabs between them (rung 38); otherwise each owns half of N.
+  static constexpr bool kKSplit = kTileN == 64;
+  static constexpr int kWgRows = kKSplit ? kTileN : kTileN / kW8A16ConsumerWGs;
+  static constexpr int kRowBlocks = kWgRows / 64;  // m64 blocks per WG
+  static constexpr int kAcc = kTileM / 2;          // fp32 accumulators per thread per row block
   static constexpr int kAStageBytes = kTileM * kW8A16ARowBytes;
   static constexpr int kWStageBytes = kTileN * kW8A16WRowBytes;
   static constexpr int kEpiPad = kTileN + 8;              // fp32 split-K tile row (elements)
   static constexpr int kEpiBytes = kTileM * kEpiPad * 4;  // fp32 split-K tile, in the stages
   static constexpr int kEpiRows = kTileM / kW8A16EpiPasses;
-  static constexpr int kEpiWgCols = kTileN / kW8A16ConsumerWGs;  // n per warpgroup
+  static constexpr int kEpiWgCols = kKSplit ? kTileN : kTileN / kW8A16ConsumerWGs;  // n per WG
   // Dense [kEpiRows][kEpiWgCols] 16-bit per warpgroup; 16 B chunk index XOR
   // swizzled by (m >> 1) & 7 so the four even rows a warp writes at once hit
   // different banks.
   static constexpr int kEpiWgBytes = kEpiRows * kEpiWgCols * 2;
-  static constexpr int kEpiOutBytes = kEpiWgBytes * kW8A16ConsumerWGs;
+  // K-split exchange: each WG parks the other's M half of its accumulator
+  // (128 threads x 64 floats) in its own 32 KB region; the WG's 16-bit
+  // staging buffer reuses the front of that region afterwards.
+  static constexpr int kXchgWgBytes = kKSplit ? kW8A16ConsumerThreads / 2 * (kAcc / 2) * 4 : 0;
+  static constexpr int kEpiWgStride = kKSplit ? kXchgWgBytes : kEpiWgBytes;
+  static constexpr int kEpiOutBytes = kEpiWgStride * kW8A16ConsumerWGs;
+  static_assert(!kKSplit || kEpiWgBytes <= kXchgWgBytes, "staging buffer fits its exchange region");
   static constexpr int kBarrierBytes = 2 * kStages * 8;  // full[] + empty[]
   static constexpr int kStageBytes = kStages * (kAStageBytes + kWStageBytes);
   static constexpr int kSmemBytesPersistent = kStageBytes + kEpiOutBytes + kBarrierBytes + 1024;
@@ -101,13 +115,15 @@ struct W8A16Cfg {
   static_assert(kSmemBytesPersistent <= 232448, "exceeds the 227 KB opt-in limit");
   static_assert(kEpiBytes <= kStageBytes, "fp32 split-K tile must fit in the pipeline stages");
   static_assert(kTileM == 128 || kTileM == 256, "wgmma N extent must be 128 or 256");
-  static_assert(kRowBlocks >= 1 && kTileN % (64 * kW8A16ConsumerWGs) == 0, "TileN per WG");
+  static_assert(kRowBlocks >= 1 && kWgRows % 64 == 0, "TileN per WG");
+  static_assert(!kKSplit || kTileM == 256, "the K-split tile keeps the m64n256 wgmma");
 };
 using W8A16Cfg128x256 = W8A16Cfg<128, 256, 4>;  // rung 23/29: best on filling problems
 using W8A16Cfg256x128 = W8A16Cfg<256, 128, 5>;  // rung 19 shape
 using W8A16Cfg128x128 = W8A16Cfg<128, 128, 8>;  // rung 18 shape
+using W8A16Cfg64x256 = W8A16Cfg<64, 256, 4>;    // rung 38: K split between the consumer WGs
 
-enum class W8A16Tile : int { kAuto = 0, k128x256 = 1, k256x128 = 2, k128x128 = 3 };
+enum class W8A16Tile : int { kAuto = 0, k128x256 = 1, k256x128 = 2, k128x128 = 3, k64x256 = 4 };
 
 // Two e4m3 values (packed in the low 16 bits) -> two T values packed in a
 // 32-bit register, laid out as an mma A/B operand expects.
@@ -521,7 +537,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     for (int s = 0; s < Cfg::kStages; ++s) {
       mbar_init(&full_bar[s], 1);  // one arrive.expect_tx per slab (tx from both copies)
       // One arrive per consumer warp of every CTA in the cluster.
-      mbar_init(&empty_bar[s], kClusterSize * kW8A16ConsumerWarps);
+      mbar_init(&empty_bar[s], kClusterSize * (Cfg::kKSplit ? 4 : kW8A16ConsumerWarps));
     }
     fence_barrier_init();
   }
@@ -562,7 +578,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     // ------------------------------ consumers -----------------------------
     setmaxnreg_inc<240>();
     const int cwg = wg - 1;  // consumer warpgroup: n rows cwg*128 .. +127
-    if (cwg == 1 && !kSplitK) {
+    if (cwg == 1 && !kSplitK && !Cfg::kKSplit) {
       // Start one epilogue late so the two warpgroups alternate between
       // mainloop and epilogue instead of idling the tensor pipe together.
       const uint64_t t0 = globaltimer_ns();
@@ -576,13 +592,15 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     // Plain layout: rows r = base + wq*16 + lane/4 (+8), k = 2*(lane%4) (+8)
     // within each k16; the 16 B chunk holding k16 of row r sits at chunk
     // index (k16/16) ^ ((r>>1)&3) under the 64 B swizzle.
-    const int a_r = cwg * (64 * Cfg::kRowBlocks) + wq * 16 + lane / 4;
+    const int wg_n = Cfg::kKSplit ? 0 : cwg * (64 * Cfg::kRowBlocks);  // WG's first tile row
+    const int ctw = threadIdx.x - 128 - cwg * 128;                     // thread within the WG
+    const int a_r = wg_n + wq * 16 + lane / 4;
     const int a_k = (lane % 4) * 2;
     const uint32_t swz0 = (a_r >> 1) & 3;  // same for a_r + 64 (64 is 0 mod 8)
     const uint32_t swz1 = ((a_r + 8) >> 1) & 3;
     // Prepared layout: ldmatrix row for this lane = base + (lane % 8) +
     // 8 * ((lane / 8) % 2), chunk = 2 * pair + lane / 16.
-    const int ld_r = cwg * (64 * Cfg::kRowBlocks) + wq * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
+    const int ld_r = wg_n + wq * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
     const uint32_t ld_swz = (ld_r >> 1) & 3;
     const uint32_t ld_chunk_hi = lane / 16;
 
@@ -626,7 +644,11 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     // One slab: issue `cur` for both row blocks, retire the previous group,
     // refill `nxt` with slab kt+1.  Buffers are named so they stay in
     // registers; the caller alternates them.
-    auto step = [&](int kt, uint32_t g, uint32_t(&cur)[Cfg::kRowBlocks][4][4],
+    // K-split: this WG takes slabs kt0, kt0 + 2, ...; otherwise all of them.
+    constexpr int kKStep = Cfg::kKSplit ? 2 : 1;
+    const int kt0 = Cfg::kKSplit ? cwg : 0;
+    int n_my = 0;  // slabs this WG consumes in the current unit
+    auto step = [&](int i, uint32_t g, uint32_t(&cur)[Cfg::kRowBlocks][4][4],
                     uint32_t(&nxt)[Cfg::kRowBlocks][4][4]) {
       const uint8_t* a_stage = a_base + (g % Cfg::kStages) * Cfg::kAStageBytes;
       wgmma_fence();
@@ -644,8 +666,8 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       }
       wgmma_commit();
       wgmma_wait<1>();
-      if (kt > 0 && lane == 0) {
-        uint64_t* eb = &empty_bar[(g - 1) % Cfg::kStages];
+      if (i > 0 && lane == 0) {
+        uint64_t* eb = &empty_bar[(g - kKStep) % Cfg::kStages];
         if constexpr (kClusterSize > 1) {
 #pragma unroll
           for (uint32_t c = 0; c < kClusterSize; ++c) mbar_arrive_remote(eb, c);
@@ -653,10 +675,10 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
           mbar_arrive(eb);
         }
       }
-      if (kt + 1 < num_slabs) {
-        const uint32_t ng = g + 1;
+      if (i + 1 < n_my) {
+        const uint32_t ng = g + kKStep;
         mbar_wait(&full_bar[ng % Cfg::kStages], (ng / Cfg::kStages) & 1);
-        load_frags(ng, nxt);  // overlaps slab kt's wgmmas
+        load_frags(ng, nxt);  // overlaps this slab's wgmmas
       }
     };
 
@@ -669,18 +691,20 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       for (int b = 0; b < Cfg::kRowBlocks; ++b)
 #pragma unroll
         for (int i = 0; i < Cfg::kAcc; ++i) d[b][i] = 0.f;
-      if (num_slabs > 0) {
-        mbar_wait(&full_bar[g % Cfg::kStages], (g / Cfg::kStages) & 1);
-        load_frags(g, frag0);
+      n_my = Cfg::kKSplit ? (num_slabs - kt0 + 1) / 2 : num_slabs;
+      const uint32_t g0 = g + kt0;  // this WG's first slab of the unit
+      if (n_my > 0) {
+        mbar_wait(&full_bar[g0 % Cfg::kStages], (g0 / Cfg::kStages) & 1);
+        load_frags(g0, frag0);
       }
-      for (int kt = 0; kt < num_slabs; kt += 2) {
-        step(kt, g + kt, frag0, frag1);
-        if (kt + 1 < num_slabs) step(kt + 1, g + kt + 1, frag1, frag0);
+      for (int i = 0; i < n_my; i += 2) {
+        step(i, g0 + i * kKStep, frag0, frag1);
+        if (i + 1 < n_my) step(i + 1, g0 + (i + 1) * kKStep, frag1, frag0);
       }
       g += num_slabs;
       wgmma_wait<0>();
-      if (num_slabs > 0 && lane == 0) {
-        uint64_t* eb = &empty_bar[(g - 1) % Cfg::kStages];
+      if (n_my > 0 && lane == 0) {
+        uint64_t* eb = &empty_bar[(g0 + (n_my - 1) * kKStep) % Cfg::kStages];
         if constexpr (kClusterSize > 1) {
 #pragma unroll
           for (uint32_t c = 0; c < kClusterSize; ++c) mbar_arrive_remote(eb, c);
@@ -689,13 +713,61 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
         }
       }
 
+      if constexpr (Cfg::kKSplit) {
+        // Swap accumulator halves: WG c keeps M rows [c*128, c*128+128) (j
+        // blocks c*16..c*16+15) and hands the other half to its peer.  The
+        // same (warp, lane) in both WGs holds the same fragment positions.
+        float* xchg = kSplitK ? reinterpret_cast<float*>(smem + Cfg::kEpiBytes)
+                              : reinterpret_cast<float*>(epi_base);
+        constexpr int kXchgFloats = Cfg::kXchgWgBytes / 4;
+        if constexpr (!kSplitK) {
+          if (ctw == 0) tma_store_wait_read<0>();  // previous tile's store has read my region
+        }
+        consumer_bar_sync();  // both mainloops done; both regions free
+        // The half index must be a compile-time constant: indexing d[] with
+        // the runtime warpgroup id would push the accumulators to local
+        // memory for the whole kernel.
+        auto park = [&](auto mine_c) {
+          constexpr int kMine = decltype(mine_c)::value;
+          constexpr int kOther = kMine ^ 1;
+          float* outb = xchg + kMine * kXchgFloats;
+#pragma unroll
+          for (int jj = 0; jj < 16; ++jj)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+              outb[(jj * 4 + e) * 128 + ctw] = d[0][(kOther * 16 + jj) * 4 + e];
+        };
+        auto absorb = [&](auto mine_c) {
+          constexpr int kMine = decltype(mine_c)::value;
+          constexpr int kOther = kMine ^ 1;
+          const float* inb = xchg + kOther * kXchgFloats;
+#pragma unroll
+          for (int jj = 0; jj < 16; ++jj)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+              d[0][(kMine * 16 + jj) * 4 + e] += inb[(jj * 4 + e) * 128 + ctw];
+        };
+        if (cwg == 0) {
+          park(std::integral_constant<int, 0>{});
+        } else {
+          park(std::integral_constant<int, 1>{});
+        }
+        consumer_bar_sync();
+        if (cwg == 0) {
+          absorb(std::integral_constant<int, 0>{});
+        } else {
+          absorb(std::integral_constant<int, 1>{});
+        }
+        consumer_bar_sync();  // peer has read my region before I stage into it
+      }
+
       // Epilogue.  Fragment layout per warp (m64nNk16 D): d[b][j*4 + 0..1] at
       // (n = b*64 + wq*16 + lane/4, m = 8j + 2*(lane%4) + {0,1}), d[b][j*4 + 2..3]
       // at n + 8.  Stage the tile as out[m][n] in smem, then store rows with
       // 16 B writes: scaled 16-bit values to `out`, or raw fp32 partials to the
       // split-K workspace (scale / bias / cast happen in the reduce kernel).
-      static_assert(Cfg::kEpiBytes <= Cfg::kStageBytes,
-                    "fp32 split-K tile must fit in the pipeline stages");
+      static_assert(Cfg::kEpiBytes + 2 * Cfg::kXchgWgBytes <= Cfg::kStageBytes,
+                    "fp32 split-K tile (+ K-split exchange) must fit in the pipeline stages");
       using TOut = std::conditional_t<kSplitK, float, T>;
       // Split-K (one unit per block) stages its fp32 tile in the idle stages;
       // the persistent 16-bit path uses the dedicated buffer, half a tile per
@@ -711,7 +783,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       static_assert((Cfg::kEpiRows * 128) % 1024 == 0, "sub tiles keep 1024 B swizzle alignment");
       constexpr int kWgCols = kSplitK ? Cfg::kTileN : Cfg::kEpiWgCols;
       TOut* tile = kSplitK ? reinterpret_cast<TOut*>(smem)
-                           : reinterpret_cast<TOut*>(epi_base + cwg * Cfg::kEpiWgBytes);
+                           : reinterpret_cast<TOut*>(epi_base + cwg * Cfg::kEpiWgStride);
       const uint32_t tile_s = static_cast<uint32_t>(__cvta_generic_to_shared(tile));
       const float sc = kSplitK ? 1.f : *scale;
       const int m_lo = (lane % 4) * 2;  // tile-local m
@@ -730,7 +802,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       const int ct = kSplitK ? threadIdx.x - 128 : threadIdx.x - 128 - cwg * 128;
       const int chunk = ct % kChunks;
       const int row0 = ct / kChunks;
-      const int n_chunk = n0 + (kSplitK ? 0 : cwg * Cfg::kEpiWgCols) + chunk * kElemsPerChunk;
+      const int n_chunk = n0 + (kSplitK ? 0 : wg_n) + chunk * kElemsPerChunk;
       TOut* dst_base = kSplitK
                            ? reinterpret_cast<TOut*>(ws) + static_cast<int64_t>(blockIdx.y) * M * N
                            : reinterpret_cast<TOut*>(out);
@@ -744,15 +816,15 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       if constexpr (kSplitK) consumer_bar_sync();  // both warpgroups are done reading the stages
 #pragma unroll
       for (int pass = 0; pass < kPasses; ++pass) {
+        if (Cfg::kKSplit && !kSplitK && pass != cwg) continue;  // my M half only
         if constexpr (!kSplitK) {
           if (ct == 0) tma_store_wait_read<0>();  // the TMA unit is done reading the buffer
         }
         sync_here();  // previous pass / tile copied out before the buffer is reused
 #pragma unroll
         for (int b = 0; b < Cfg::kRowBlocks; ++b) {
-          const int n_lo =
-              cwg * (64 * Cfg::kRowBlocks) + b * 64 + wq * 16 + lane / 4;   // tile-local n
-          const int n_buf = kSplitK ? n_lo : n_lo - cwg * Cfg::kEpiWgCols;  // buffer-local n
+          const int n_lo = wg_n + b * 64 + wq * 16 + lane / 4;  // tile-local n
+          const int n_buf = kSplitK ? n_lo : n_lo - wg_n;       // buffer-local n
           float bias_lo = 0.f, bias_hi = 0.f;
           if (!kSplitK && bias != nullptr) {
             if (n0 + n_lo < N) bias_lo = static_cast<float>(bias[n0 + n_lo]);
@@ -761,7 +833,8 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
 #pragma unroll
           for (int jj = 0; jj < (Cfg::kTileM / 8) / kPasses; ++jj) {
             const int j = pass * ((Cfg::kTileM / 8) / kPasses) + jj;
-            const int m = m_lo + jj * 8;  // rows m, m+1 within this pass's buffer
+            if (Cfg::kKSplit && j / 16 != cwg) continue;  // the peer owns that M half
+            const int m = m_lo + jj * 8;                  // rows m, m+1 within this pass's buffer
             const float v0 = d[b][j * 4 + 0] * sc + bias_lo;  // (m,   n)
             const float v1 = d[b][j * 4 + 1] * sc + bias_lo;  // (m+1, n)
             const float v2 = d[b][j * 4 + 2] * sc + bias_hi;  // (m,   n+8)
@@ -809,7 +882,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
             for (int sub = 0; sub < Cfg::kEpiWgCols / 64; ++sub) {
               tma_store_2d(&out_map,
                            reinterpret_cast<const uint8_t*>(tile) + sub * Cfg::kEpiRows * 64 * 2,
-                           n0 + cwg * Cfg::kEpiWgCols + sub * 64, m0 + pass * kRowsPerTilePass);
+                           n0 + wg_n + sub * 64, m0 + pass * kRowsPerTilePass);
             }
             tma_store_commit();
           }
@@ -868,6 +941,7 @@ __global__ void W8A16SplitKReduceKernel(const float* __restrict__ ws, int splits
 // 256x128 is only reachable through the env var, its value never competes.
 template <typename Cfg>
 constexpr double W8A16TileEff() {
+  if (Cfg::kTileN == 64) return 0.45;  // K-split 64x256 (rung 38): L2-bound; env-only
   return Cfg::kTileM == 256 ? 1.00 : (Cfg::kTileN == 256 ? 0.70 : 0.65);
 }
 
@@ -932,6 +1006,7 @@ inline W8A16Tile W8A16Fp8GemmPickTile(int M, int N, int K, int num_sms) {
       if (strcmp(e, "128x256") == 0) forced = 1;
       if (strcmp(e, "256x128") == 0) forced = 2;
       if (strcmp(e, "128x128") == 0) forced = 3;
+      if (strcmp(e, "64x256") == 0) forced = 4;
     }
   }
   if (forced > 0) return static_cast<W8A16Tile>(forced);
@@ -939,6 +1014,7 @@ inline W8A16Tile W8A16Fp8GemmPickTile(int M, int N, int K, int num_sms) {
       M, N, K, num_sms, W8A16Fp8GemmSplits<W8A16Cfg128x256>(M, N, K, num_sms));
   const double t_128x128 = W8A16Fp8GemmModelTime<W8A16Cfg128x128>(
       M, N, K, num_sms, W8A16Fp8GemmSplits<W8A16Cfg128x128>(M, N, K, num_sms));
+  // 64x256 (rung 38) and 256x128 are env-only: both lose on every measured row.
   return t_128x128 < t_128x256 ? W8A16Tile::k128x128 : W8A16Tile::k128x256;
 }
 
@@ -957,6 +1033,8 @@ inline int64_t W8A16Fp8GemmWorkspaceBytes(int M, int N, int K, int num_sms) {
       return W8A16Fp8GemmWorkspaceBytesFor<W8A16Cfg256x128>(M, N, K, num_sms);
     case W8A16Tile::k128x128:
       return W8A16Fp8GemmWorkspaceBytesFor<W8A16Cfg128x128>(M, N, K, num_sms);
+    case W8A16Tile::k64x256:
+      return W8A16Fp8GemmWorkspaceBytesFor<W8A16Cfg64x256>(M, N, K, num_sms);
     default:
       return W8A16Fp8GemmWorkspaceBytesFor<W8A16Cfg128x256>(M, N, K, num_sms);
   }
@@ -1080,6 +1158,10 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
       return W8A16Fp8GemmLaunch<T, W8A16Cfg128x128, kClusterSize>(act, w, scale, bias, out, M, N, K,
                                                                   weight_prepared, workspace,
                                                                   workspace_bytes, num_sms, stream);
+    case W8A16Tile::k64x256:
+      return W8A16Fp8GemmLaunch<T, W8A16Cfg64x256, kClusterSize>(act, w, scale, bias, out, M, N, K,
+                                                                 weight_prepared, workspace,
+                                                                 workspace_bytes, num_sms, stream);
     default:
       return W8A16Fp8GemmLaunch<T, W8A16Cfg128x256, kClusterSize>(act, w, scale, bias, out, M, N, K,
                                                                   weight_prepared, workspace,
