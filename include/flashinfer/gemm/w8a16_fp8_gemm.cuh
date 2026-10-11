@@ -25,17 +25,16 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 10 of the optimization ladder: L2-aware tile rasterization.  Rung 9
-// (warp-specialized wgmma) moved 1.8 TB/s from DRAM on M=8192 N=12800
-// K=5120 (ncu: DRAM 54%, L2 hit 64%) against ~0.36 GB of compulsory
-// traffic: blocks were launched n-fastest, so each row of 100 n-tiles
-// re-streamed the whole 65 MB weight, which does not fit in the 50 MB L2,
-// once per m-tile.  Here the grid is one-dimensional and the block index is
-// mapped to (m-tile, n-tile) in groups of 8 m-tiles: consecutive blocks
-// share one weight tile and walk 8 act tiles, so a resident wave of ~130
-// blocks touches 8 act tiles + 16 weight tiles (~20 MB) instead of 130
-// weight tiles.  Nothing inside the block changes.  Requires sm_90a and
-// K % 64 == 0.
+// Rung 11 of the optimization ladder: 128(n) x 256(m) block tile with
+// wgmma.m64n256k16.  Rung 10 fixed the DRAM traffic (54% -> 12% of peak)
+// but the tensor pipe stayed near 50%: ncu's top stall was "fixed-latency
+// execution dependency", i.e. the consumer warps' fp8 -> bf16 conversion
+// chain feeding each wgmma's register A operand.  Doubling the wgmma N
+// (the m extent) to 256 halves that per-FLOP work: each converted A
+// fragment now feeds twice the MACs.  Accumulators grow to 128 fp32 per
+// consumer thread (fits in the 232-register budget), the act stage to 32 KB
+// and the ring shrinks to 5 stages (205 KB).  Producer, barriers and
+// rasterization are unchanged.  Requires sm_90a and K % 64 == 0.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -51,9 +50,9 @@ namespace flashinfer {
 namespace gemm {
 
 constexpr int kW8A16TileN = 128;  // n rows per block (wgmma M)
-constexpr int kW8A16TileM = 128;  // m cols per block (wgmma N)
+constexpr int kW8A16TileM = 256;  // m cols per block (wgmma N)
 constexpr int kW8A16TileK = 64;
-constexpr int kW8A16Stages = 6;
+constexpr int kW8A16Stages = 5;
 constexpr int kW8A16GroupM = 8;                          // m-tiles per rasterization group
 constexpr int kW8A16ConsumerWGs = 2;                     // 64 n rows each
 constexpr int kW8A16Warpgroups = 1 + kW8A16ConsumerWGs;  // + 1 producer
@@ -61,7 +60,7 @@ constexpr int kW8A16Threads = 128 * kW8A16Warpgroups;
 constexpr int kW8A16ConsumerThreads = 128 * kW8A16ConsumerWGs;
 constexpr int kW8A16WPad = kW8A16TileK + 8;       // 72 fp8 rows (8 B aligned, 18 words)
 constexpr int kW8A16ARowBytes = kW8A16TileK * 2;  // act row = 64 bf16 = 128 B (swizzle atom)
-constexpr int kW8A16AStageBytes = kW8A16TileM * kW8A16ARowBytes;  // 16 KB
+constexpr int kW8A16AStageBytes = kW8A16TileM * kW8A16ARowBytes;  // 32 KB
 constexpr int kW8A16WStageBytes = kW8A16TileN * kW8A16WPad;       // 9 KB
 constexpr int kW8A16BarrierBytes = 2 * kW8A16Stages * 8;          // full[] + empty[]
 constexpr int kW8A16SmemBytes =
@@ -165,24 +164,28 @@ __device__ __forceinline__ uint64_t make_smem_desc_sw128(const void* smem_ptr) {
   return desc;
 }
 
-// D[64 x 128] (+)= A[64 x 16] (registers) . B[16 x 128] (smem descriptor).
+// D[64 x 256] (+)= A[64 x 16] (registers) . B[16 x 256] (smem descriptor).
 template <typename T>
-__device__ __forceinline__ void wgmma_m64n128k16_rs(float (&d)[64], const uint32_t (&a)[4],
+__device__ __forceinline__ void wgmma_m64n256k16_rs(float (&d)[128], const uint32_t (&a)[4],
                                                     uint64_t desc_b, int scale_d);
 template <>
-__device__ __forceinline__ void wgmma_m64n128k16_rs<__nv_bfloat16>(float (&d)[64],
+__device__ __forceinline__ void wgmma_m64n256k16_rs<__nv_bfloat16>(float (&d)[128],
                                                                    const uint32_t (&a)[4],
                                                                    uint64_t desc_b, int scale_d) {
   asm volatile(
       "{\n"
       ".reg .pred p;\n"
-      "setp.ne.b32 p, %69, 0;\n"
-      "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 "
+      "setp.ne.b32 p, %133, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
       "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, "
       "%20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, "
       "%38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, "
-      "%56, %57, %58, %59, %60, %61, %62, %63}, "
-      "{%64, %65, %66, %67}, %68, p, 1, 1, 0;\n"
+      "%56, %57, %58, %59, %60, %61, %62, %63, %64, %65, %66, %67, %68, %69, %70, %71, %72, %73, "
+      "%74, %75, %76, %77, %78, %79, %80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, "
+      "%92, %93, %94, %95, %96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, "
+      "%108, %109, %110, %111, %112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, "
+      "%123, %124, %125, %126, %127}, "
+      "{%128, %129, %130, %131}, %132, p, 1, 1, 0;\n"
       "}\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
         "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
@@ -193,22 +196,35 @@ __device__ __forceinline__ void wgmma_m64n128k16_rs<__nv_bfloat16>(float (&d)[64
         "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]),
         "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
         "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]),
-        "+f"(d[63])
+        "+f"(d[63]), "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]), "+f"(d[68]), "+f"(d[69]),
+        "+f"(d[70]), "+f"(d[71]), "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]), "+f"(d[76]),
+        "+f"(d[77]), "+f"(d[78]), "+f"(d[79]), "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]),
+        "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]), "+f"(d[88]), "+f"(d[89]), "+f"(d[90]),
+        "+f"(d[91]), "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]), "+f"(d[96]), "+f"(d[97]),
+        "+f"(d[98]), "+f"(d[99]), "+f"(d[100]), "+f"(d[101]), "+f"(d[102]), "+f"(d[103]),
+        "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]), "+f"(d[108]), "+f"(d[109]),
+        "+f"(d[110]), "+f"(d[111]), "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]),
+        "+f"(d[116]), "+f"(d[117]), "+f"(d[118]), "+f"(d[119]), "+f"(d[120]), "+f"(d[121]),
+        "+f"(d[122]), "+f"(d[123]), "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(scale_d));
 }
 template <>
-__device__ __forceinline__ void wgmma_m64n128k16_rs<__half>(float (&d)[64], const uint32_t (&a)[4],
+__device__ __forceinline__ void wgmma_m64n256k16_rs<__half>(float (&d)[128], const uint32_t (&a)[4],
                                                             uint64_t desc_b, int scale_d) {
   asm volatile(
       "{\n"
       ".reg .pred p;\n"
-      "setp.ne.b32 p, %69, 0;\n"
-      "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 "
+      "setp.ne.b32 p, %133, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 "
       "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, "
       "%20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, "
       "%38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, "
-      "%56, %57, %58, %59, %60, %61, %62, %63}, "
-      "{%64, %65, %66, %67}, %68, p, 1, 1, 0;\n"
+      "%56, %57, %58, %59, %60, %61, %62, %63, %64, %65, %66, %67, %68, %69, %70, %71, %72, %73, "
+      "%74, %75, %76, %77, %78, %79, %80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, "
+      "%92, %93, %94, %95, %96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, "
+      "%108, %109, %110, %111, %112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, "
+      "%123, %124, %125, %126, %127}, "
+      "{%128, %129, %130, %131}, %132, p, 1, 1, 0;\n"
       "}\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
         "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
@@ -219,7 +235,16 @@ __device__ __forceinline__ void wgmma_m64n128k16_rs<__half>(float (&d)[64], cons
         "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]),
         "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
         "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]),
-        "+f"(d[63])
+        "+f"(d[63]), "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]), "+f"(d[68]), "+f"(d[69]),
+        "+f"(d[70]), "+f"(d[71]), "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]), "+f"(d[76]),
+        "+f"(d[77]), "+f"(d[78]), "+f"(d[79]), "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]),
+        "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]), "+f"(d[88]), "+f"(d[89]), "+f"(d[90]),
+        "+f"(d[91]), "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]), "+f"(d[96]), "+f"(d[97]),
+        "+f"(d[98]), "+f"(d[99]), "+f"(d[100]), "+f"(d[101]), "+f"(d[102]), "+f"(d[103]),
+        "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]), "+f"(d[108]), "+f"(d[109]),
+        "+f"(d[110]), "+f"(d[111]), "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]),
+        "+f"(d[116]), "+f"(d[117]), "+f"(d[118]), "+f"(d[119]), "+f"(d[120]), "+f"(d[121]),
+        "+f"(d[122]), "+f"(d[123]), "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(scale_d));
 }
 
@@ -269,24 +294,20 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
 
   if (wg == 0) {
     // ------------------------------ producer ------------------------------
-    setmaxnreg_dec<40>();
-    constexpr int kCopies = 8;         // 1024 chunks of each operand / 128 threads
-    constexpr int kRowStep = 128 / 8;  // 16
+    setmaxnreg_dec<56>();
+    // Per-slab copies: act = kW8A16TileM rows x 8 chunks of 16 B, weight =
+    // kW8A16TileN rows x 8 chunks of 8 B; each thread owns chunk cc of rows
+    // cr, cr+16, cr+32, ...  Addresses are formed per copy from one base
+    // pointer per operand (precomputing 24 pointers blew the register
+    // budget).  Rows past M / N copy zeros (cp.async zfill) from a safe
+    // address.  Chunk cc of act row r lands at r*128 + ((cc ^ (r & 7)) * 16).
+    constexpr int kACopies = kW8A16TileM / 16;
+    constexpr int kWCopies = kW8A16TileN / 16;
     const int cr = threadIdx.x / 8;
     const int cc = threadIdx.x % 8;
-    bool a_ok[kCopies], w_ok[kCopies];
-    const T* a_src[kCopies];
-    const __nv_fp8_e4m3* w_src[kCopies];
-    uint32_t a_dst_off[kCopies];
-#pragma unroll
-    for (int i = 0; i < kCopies; ++i) {
-      const int r = cr + kRowStep * i;
-      a_ok[i] = (m0 + r) < M;
-      w_ok[i] = (n0 + r) < N;
-      a_src[i] = act + static_cast<int64_t>(m0 + (a_ok[i] ? r : 0)) * K + cc * 8;
-      w_src[i] = w + static_cast<int64_t>(n0 + (w_ok[i] ? r : 0)) * K + cc * 8;
-      a_dst_off[i] = r * kW8A16ARowBytes + ((cc ^ (r & 7)) << 4);
-    }
+    const T* a_src = act + static_cast<int64_t>(m0 + cr) * K + cc * 8;
+    const __nv_fp8_e4m3* w_src = w + static_cast<int64_t>(n0 + cr) * K + cc * 8;
+    const int64_t row16 = static_cast<int64_t>(16) * K;  // 16 rows of either operand
     for (int kt = 0; kt < num_slabs; ++kt) {
       const int stage = kt % kW8A16Stages;
       const uint32_t round = kt / kW8A16Stages;
@@ -295,10 +316,19 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       const int k0 = kt * kW8A16TileK;
       uint8_t* a_stage = a_base + stage * kW8A16AStageBytes;
 #pragma unroll
-      for (int i = 0; i < kCopies; ++i) {
+      for (int i = 0; i < kACopies; ++i) {
+        const int r = cr + 16 * i;
+        const bool ok = (m0 + r) < M;
+        const T* src = ok ? a_src + i * row16 + k0 : act;
         pred_load<128, PrefetchMode::kNoPrefetch, SharedMemFillMode::kFillZero>(
-            reinterpret_cast<T*>(a_stage + a_dst_off[i]), a_src[i] + k0, a_ok[i]);
-        cp_async_pred_load_64b(&w_s[stage][cr + kRowStep * i][cc * 8], w_src[i] + k0, w_ok[i]);
+            reinterpret_cast<T*>(a_stage + r * kW8A16ARowBytes + ((cc ^ (r & 7)) << 4)), src, ok);
+      }
+#pragma unroll
+      for (int i = 0; i < kWCopies; ++i) {
+        const int r = cr + 16 * i;
+        const bool ok = (n0 + r) < N;
+        const __nv_fp8_e4m3* src = ok ? w_src + i * row16 + k0 : w;
+        cp_async_pred_load_64b(&w_s[stage][r][cc * 8], src, ok);
       }
       mbar_cp_async_arrive(&full_bar[stage]);
     }
@@ -306,12 +336,12 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     wait_group<0>();
   } else {
     // ------------------------------ consumers -----------------------------
-    setmaxnreg_inc<232>();
+    setmaxnreg_inc<224>();
     const int cwg = wg - 1;   // consumer warpgroup: n rows cwg*64 .. +63
     const int wq = warp & 3;  // warp within it: rows wq*16 .. +15 of those
-    float d[64];
+    float d[128];
 #pragma unroll
-    for (int i = 0; i < 64; ++i) d[i] = 0.f;
+    for (int i = 0; i < 128; ++i) d[i] = 0.f;
 
     const int a_r = cwg * 64 + wq * 16 + lane / 4;
     const int a_k = (lane % 4) * 2;
@@ -333,7 +363,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
         a_frag[3] = fp8x2_to_pair<T>(*reinterpret_cast<const uint16_t*>(r1 + 8));
         const uint64_t desc_b = make_smem_desc_sw128(a_stage + k16 * 2);
         wgmma_fence();
-        wgmma_m64n128k16_rs<T>(d, a_frag, desc_b, 1);
+        wgmma_m64n256k16_rs<T>(d, a_frag, desc_b, 1);
       }
       wgmma_commit();
       // Keep this slab's group in flight; the previous slab's group is now
@@ -354,7 +384,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       if (n_lo + 8 < N) bias_hi = static_cast<float>(bias[n_lo + 8]);
     }
 #pragma unroll
-    for (int j = 0; j < 16; ++j) {
+    for (int j = 0; j < 32; ++j) {
       const int m = m_base + j * 8;
 #pragma unroll
       for (int q = 0; q < 2; ++q) {
