@@ -25,19 +25,20 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 30b of the optimization ladder: split-K-aware tile dispatch.  Rung 30
-// ranked the three tile configs by (per-tile efficiency) x (last-wave fill)
-// with an early return for any tile whose grid reached two waves, and it
-// lost on every shape class: the early return handed under-filled 128x256
-// problems to 128x128, and split-K was not part of the score.  The pick is
-// now the smaller modelled time
-//   ceil(units * splits / SMs) * tileN * tileM * (K / splits) / eff
-//     + 16 * M * N * splits                   (fp32 round trip, split-K only)
-// between 128x256 (eff 1.00) and 128x128 (eff 0.65, fitted to the rung-30
-// tables: it only pays when it fills waves 128x256 leaves empty).  256x128
-// never won a row and its plain non-split instantiation spills, so auto
-// never takes it; it stays reachable through FLASHINFER_W8A16_FP8_TILE.
-// Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
+// Rung 31 of the optimization ladder: TMA-store epilogue.  The 16-bit
+// epilogue still had the 128 threads of each consumer warpgroup copy the
+// staged half tile out with 16 B loads and stores (per pass: 8 x LDS.128 +
+// STG.128 per thread behind two named barriers), tensor-pipe idle time on
+// every tile.  Here the per-warpgroup buffer is laid out as 64-column sub
+// tiles in the hardware 128 B swizzle, the fragments are written straight
+// into that layout, the warpgroup fences the async proxy, and one thread
+// hands each sub tile to the TMA unit as a cp.async.bulk.tensor store
+// through an output tensor map (rows and columns past M / N are clipped by
+// the hardware); the warpgroup returns to the next pass / tile while the
+// stores drain, waiting only for the buffer to have been read
+// (wait_group.read) before overwriting it.  Split-K keeps its fp32 copy
+// loop.  Tile dispatch is rung 30b's.  Requires sm_90a, K % 64 == 0, 16 B
+// aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -231,6 +232,32 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void* smem_r
                : "r"(a));
 }
 
+// 2-D TMA tile store smem -> global through `map` at box coordinates (c0, c1);
+// completion is tracked with bulk async groups.
+__device__ __forceinline__ void tma_store_2d(const CUtensorMap* map, const void* smem_src, int c0,
+                                             int c1) {
+  const uint32_t src = static_cast<uint32_t>(__cvta_generic_to_shared(smem_src));
+  asm volatile(
+      "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%2, %3}], [%1];\n" ::"l"(
+          reinterpret_cast<uint64_t>(map)),
+      "r"(src), "r"(c0), "r"(c1)
+      : "memory");
+}
+__device__ __forceinline__ void tma_store_commit() {
+  asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+}
+template <int N>
+__device__ __forceinline__ void tma_store_wait_read() {  // <= N groups still reading smem
+  asm volatile("cp.async.bulk.wait_group.read %0;\n" ::"n"(N) : "memory");
+}
+template <int N>
+__device__ __forceinline__ void tma_store_wait_all() {
+  asm volatile("cp.async.bulk.wait_group %0;\n" ::"n"(N) : "memory");
+}
+__device__ __forceinline__ void fence_proxy_async_smem() {
+  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+}
+
 template <int N>
 __device__ __forceinline__ void setmaxnreg_inc() {
   asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(N));
@@ -413,6 +440,7 @@ template <typename T, typename Cfg, int kClusterSize, bool kPrepared, bool kSpli
 __global__ void __launch_bounds__(kW8A16Threads, 1)
     W8A16Fp8GemmTmaKernel(const __grid_constant__ CUtensorMap act_map,
                           const __grid_constant__ CUtensorMap w_map,
+                          const __grid_constant__ CUtensorMap out_map,
                           const float* __restrict__ scale, const T* __restrict__ bias,
                           T* __restrict__ out, float* __restrict__ ws, int M, int N, int K) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
@@ -461,6 +489,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
   if (threadIdx.x == 0) {
     prefetch_tensormap(&act_map);
     prefetch_tensormap(&w_map);
+    if constexpr (!kSplitK) prefetch_tensormap(&out_map);
 #pragma unroll
     for (int s = 0; s < Cfg::kStages; ++s) {
       mbar_init(&full_bar[s], 1);  // one arrive.expect_tx per slab (tx from both copies)
@@ -647,8 +676,12 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       constexpr int kPasses = kSplitK ? 1 : kW8A16EpiPasses;
       constexpr int kRowsPerTilePass = Cfg::kTileM / kPasses;
       // Split-K keeps the shared fp32 tile in the idle stages (both warpgroups
-      // sync); the persistent path gives each warpgroup its own [64 m][136 n]
-      // buffer for its 128 n columns and never synchronizes across warpgroups.
+      // sync); the persistent path gives each warpgroup its own
+      // [kEpiRows m][kEpiWgCols n] buffer, laid out as 64-column sub tiles in
+      // the TMA 128 B swizzle so the TMA unit stores it straight to `out`, and
+      // never synchronizes across warpgroups.
+      static_assert(Cfg::kEpiWgCols % 64 == 0, "TMA store sub tiles are 64 columns");
+      static_assert((Cfg::kEpiRows * 128) % 1024 == 0, "sub tiles keep 1024 B swizzle alignment");
       constexpr int kWgCols = kSplitK ? Cfg::kTileN : Cfg::kEpiWgCols;
       TOut* tile = kSplitK ? reinterpret_cast<TOut*>(smem)
                            : reinterpret_cast<TOut*>(epi_base + cwg * Cfg::kEpiWgBytes);
@@ -658,7 +691,9 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       // split-K tile, dense swizzled rows for the per-warpgroup 16-bit tile.
       auto epi_idx = [](int m, int n) -> int {
         if constexpr (kSplitK) return m * Cfg::kEpiPad + n;
-        return m * Cfg::kEpiWgCols + ((((n >> 3) ^ ((m >> 1) & 7))) << 3) + (n & 7);
+        // 64-column sub tiles in the TMA 128 B swizzle: chunk ^ (row & 7).
+        constexpr int kSubElems = Cfg::kEpiRows * 64;
+        return (n / 64) * kSubElems + m * 64 + (((((n % 64) >> 3) ^ (m & 7))) << 3) + (n & 7);
       };
       constexpr int kElemsPerChunk = 16 / sizeof(TOut);  // 8 or 4
       constexpr int kChunks = kWgCols / kElemsPerChunk;  // 16 or 64
@@ -681,6 +716,9 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       if constexpr (kSplitK) consumer_bar_sync();  // both warpgroups are done reading the stages
 #pragma unroll
       for (int pass = 0; pass < kPasses; ++pass) {
+        if constexpr (!kSplitK) {
+          if (ct == 0) tma_store_wait_read<0>();  // the TMA unit is done reading the buffer
+        }
         sync_here();  // previous pass / tile copied out before the buffer is reused
 #pragma unroll
         for (int b = 0; b < Cfg::kRowBlocks; ++b) {
@@ -703,22 +741,40 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
             }
           }
         }
-        sync_here();  // this pass's rows are staged
+        if constexpr (kSplitK) {
+          sync_here();  // this pass's rows are staged
 #pragma unroll
-        for (int i = 0; i < kRowsPerTilePass / kRowsPerPass; ++i) {
-          const int r = row0 + kRowsPerPass * i;
-          const int m = m0 + pass * kRowsPerTilePass + r;
-          if (m >= M) continue;
-          const TOut* src = tile + epi_idx(r, chunk * kElemsPerChunk);
-          TOut* dst = dst_base + static_cast<int64_t>(m) * N + n_chunk;
-          if (n_chunk + kElemsPerChunk <= N) {
-            *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
-          } else {
-            for (int e = 0; n_chunk + e < N; ++e) dst[e] = src[e];
+          for (int i = 0; i < kRowsPerTilePass / kRowsPerPass; ++i) {
+            const int r = row0 + kRowsPerPass * i;
+            const int m = m0 + pass * kRowsPerTilePass + r;
+            if (m >= M) continue;
+            const TOut* src = tile + epi_idx(r, chunk * kElemsPerChunk);
+            TOut* dst = dst_base + static_cast<int64_t>(m) * N + n_chunk;
+            if (n_chunk + kElemsPerChunk <= N) {
+              *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+            } else {
+              for (int e = 0; n_chunk + e < N; ++e) dst[e] = src[e];
+            }
+          }
+        } else {
+          fence_proxy_async_smem();  // my fragment writes -> visible to the TMA unit
+          sync_here();               // the whole pass is staged
+          if (ct == 0) {
+#pragma unroll
+            for (int sub = 0; sub < Cfg::kEpiWgCols / 64; ++sub) {
+              tma_store_2d(&out_map,
+                           reinterpret_cast<const uint8_t*>(tile) + sub * Cfg::kEpiRows * 64 * 2,
+                           n0 + cwg * Cfg::kEpiWgCols + sub * 64, m0 + pass * kRowsPerTilePass);
+            }
+            tma_store_commit();
           }
         }
       }
     }  // unit loop
+    if constexpr (!kSplitK) {
+      if (threadIdx.x == 128 || threadIdx.x == 256)
+        tma_store_wait_all<0>();  // smem outlives the stores
+    }
   }
   // No CTA may exit while its peer can still multicast into its smem or
   // arrive on its barriers.
@@ -879,6 +935,12 @@ cudaError_t W8A16Fp8GemmLaunch(const T* act, const __nv_fp8_e4m3* w, const float
   e = MakeTmaMap2D(&w_map, w, N, K, 1, CU_TENSOR_MAP_DATA_TYPE_UINT8, Cfg::kTileN, kW8A16TileK,
                    CU_TENSOR_MAP_SWIZZLE_64B);
   if (e != cudaSuccess) return e;
+  CUtensorMap out_map;  // [M][N] 16-bit, stored as 128 B swizzled [kEpiRows x 64] boxes
+  e = MakeTmaMap2D(&out_map, out, M, N, sizeof(T),
+                   std::is_same_v<T, __half> ? CU_TENSOR_MAP_DATA_TYPE_FLOAT16
+                                             : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                   Cfg::kEpiRows, 64, CU_TENSOR_MAP_SWIZZLE_128B);
+  if (e != cudaSuccess) return e;
 
   const unsigned tiles_m = ceil_div(M, Cfg::kTileM);
   const unsigned tiles_n = ceil_div(N, Cfg::kTileN);
@@ -889,8 +951,8 @@ cudaError_t W8A16Fp8GemmLaunch(const T* act, const __nv_fp8_e4m3* w, const float
     splits = 1;  // no room for partials: run the single-pass kernel
   }
   const bool split = splits > 1;
-  using KernelFn = void (*)(const CUtensorMap, const CUtensorMap, const float*, const T*, T*,
-                            float*, int, int, int);
+  using KernelFn = void (*)(const CUtensorMap, const CUtensorMap, const CUtensorMap, const float*,
+                            const T*, T*, float*, int, int, int);
   static const KernelFn kernels[2][2] = {{W8A16Fp8GemmTmaKernel<T, Cfg, kClusterSize, false, false>,
                                           W8A16Fp8GemmTmaKernel<T, Cfg, kClusterSize, false, true>},
                                          {W8A16Fp8GemmTmaKernel<T, Cfg, kClusterSize, true, false>,
@@ -920,7 +982,8 @@ cudaError_t W8A16Fp8GemmLaunch(const T* act, const __nv_fp8_e4m3* w, const float
   attr[0].val.clusterDim.z = 1;
   cfg.attrs = attr;
   cfg.numAttrs = kClusterSize > 1 ? 1 : 0;
-  e = cudaLaunchKernelEx(&cfg, kernel, act_map, w_map, scale, bias, out, workspace, M, N, K);
+  e = cudaLaunchKernelEx(&cfg, kernel, act_map, w_map, out_map, scale, bias, out, workspace, M, N,
+                         K);
   if (e != cudaSuccess) return e;
   if (split) {
     const int64_t mn = static_cast<int64_t>(M) * N;
