@@ -122,11 +122,15 @@ def default_knobs(
     }
 
 
-def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
+def is_valid(
+    knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True, k_atom: int = 128
+) -> bool:
     """``True`` if ``knobs`` is a compilable SM90 FP8 MegaMoE combo.
 
     Mirrors the kernel ctor / config ``__post_init__`` rules; unspecified
     knobs fall back to the kernel defaults, so a partial dict is fine.
+    ``k_atom``: mma_tiler K granularity (128 for FP8 / W4A16, 64 for dense
+    BF16).
     """
     swap_ab = bool(knobs.get("swap_ab", False))
     pingpong = bool(knobs.get("pingpong", False))
@@ -145,7 +149,7 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
             return False
         if pingpong and n != 128:
             return False
-    if k % 128 != 0:
+    if k % k_atom != 0:
         return False
     if ck != 1 or (cm, cn) not in ((1, 1), (2, 1), (1, 2), (2, 2)):
         return False

@@ -77,6 +77,10 @@ class TestIsValid:
             dict(swap_ab=True, pingpong=True, mma_tiler_mnk=(128, 32, 128))
         )
         # cluster domain.
+        # K=64 tiles are a dense-BF16 option only (FP8 / W4A16 keep 128).
+        assert not pkg.is_valid({**ok, "mma_tiler_mnk": (64, 128, 64)})
+        assert pkg.is_valid({**ok, "mma_tiler_mnk": (64, 128, 64)}, k_atom=64)
+        assert not pkg.is_valid({**ok, "mma_tiler_mnk": (64, 128, 32)}, k_atom=64)
         assert not pkg.is_valid({**ok, "cluster_shape_mnk": (4, 1, 1)})
         assert not pkg.is_valid({**ok, "cluster_shape_mnk": (1, 1, 2)})
         assert pkg.is_valid({**ok, "cluster_shape_mnk": (2, 2, 1)})
@@ -125,6 +129,38 @@ class TestIsValid:
         # deduplicated.
         keys = [json.dumps(c, sort_keys=True, default=list) for c in cands]
         assert len(keys) == len(set(keys))
+
+    def test_autotune_candidates_bf16_k64(self):
+        """Dense BF16 sweeps also add K=64 twins; FP8 never sees K=64."""
+        pkg = _pkg()
+        base = pkg.hopper_fp8_candidates(fp8_scale_mode="bf16", max_tokens=8192)
+        with_k64 = pkg.hopper_fp8_candidates(
+            fp8_scale_mode="bf16", max_tokens=8192, k64=True
+        )
+        # The BF16 heuristic row leads either way (its large buckets are K=64).
+        assert base[0] == pkg.default_knobs(8192, fp8_scale_mode="bf16")
+        assert with_k64[: len(base)] == base
+        twins = with_k64[len(base) :]
+        assert twins and all(c["mma_tiler_mnk"][2] == 64 for c in twins)
+        assert all(pkg.is_valid(c, k_atom=64) for c in twins)
+        fp8 = pkg.hopper_fp8_candidates(fp8_scale_mode="per_tensor", max_tokens=8192)
+        assert all(c["mma_tiler_mnk"][2] == 128 for c in fp8)
+
+    def test_autotune_candidates_w4a16_swap_ab_only(self):
+        """W4A16 (weights = register-sourced WGMMA A) sweeps swap-AB tiles only."""
+        pkg = _pkg()
+        from moe_hopper_fp8.heuristic_config import heuristic_table_key
+
+        key = heuristic_table_key("bf16", "per_tensor", "nvfp4")
+        assert key == "bf16_nvfp4"
+        assert heuristic_table_key("bf16", "per_tensor") == "bf16"
+        assert heuristic_table_key("fp8_e4m3", "blockwise") == "blockwise"
+        cands = pkg.hopper_fp8_candidates(
+            fp8_scale_mode=key, max_tokens=2048, swap_ab_only=True
+        )
+        assert len(cands) >= 10
+        assert all(c["swap_ab"] and pkg.is_valid(c) for c in cands)
+        assert cands[0] == pkg.default_knobs(2048, fp8_scale_mode=key)
 
 
 class TestWithKnobs:
@@ -220,6 +256,14 @@ class TestKnobCache:
         knobs, source = pkg.resolve_knobs(**self._KEY, max_tokens=4096)
         assert source == "heuristic"
         assert knobs == pkg.default_knobs(4096, fp8_scale_mode="per_tensor")
+        # BF16 / W4A16 sessions fall back to their own heuristic rows.
+        knobs, source = pkg.resolve_knobs(
+            **{**self._KEY, "dtype": "bf16_nvfp4"},
+            max_tokens=8,
+            heuristic_mode="bf16_nvfp4",
+        )
+        assert source == "heuristic"
+        assert knobs == pkg.default_knobs(8, fp8_scale_mode="bf16_nvfp4")
 
     def test_disabled_cache(self, monkeypatch):
         pkg = _pkg()

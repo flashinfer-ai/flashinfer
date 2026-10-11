@@ -470,6 +470,152 @@ token-back modes — 38 candidates.
   `dedup_topk_design.md`.
 - `fp8_accum_mode`, `kind` (e4m3/e5m2), clamps.
 
+## BF16 operands (`sm90_bf16_bf16_bf16_pull_cutedsl`, 2026-10-01)
+
+Preview on ONE H100 (EP1, `MEGA_NO_DIST` off, real NVSHMEM), DSv4 P03
+geometry with the per-rank expert count of EP4 (96 local experts, hidden
+7168, intermediate 3072, top-6), heuristic launch configs, compute p50 µs
+(`torchrun --nproc_per_node=1 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py
+--scale-mode all --num-experts 96 --tokens 8,64,512,2048,8192`):
+
+| tokens/rank | FP8 per-tensor | FP8 blockwise | BF16 | BF16 / FP8 pt |
+|---:|---:|---:|---:|---:|
+| 8 | 1542 | 1547 | 2923 | 1.90× |
+| 64 | 3019 | 3210 | 5821 | 1.93× |
+| 512 | 3400 | 3430 | 6457 | 1.90× |
+| 2048 | 3683 (441 TF) | 3771 | 7197 (225 TF) | 1.95× |
+| 8192 | 7173 (905 TF) | 8703 | 20319 (319 TF) | 2.83× |
+
+~2× is the expected cost of BF16 (twice the weight/token bytes in the
+bandwidth-bound buckets, half the WGMMA rate in the compute-bound ones).
+EP1 has no cross-rank traffic, where BF16 also doubles the dispatch bytes;
+see the 4-GPU table below.
+
+**4× H200 EP4 (2026-10-02).**  `"bf16"` heuristic rows retuned with
+`torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune --arch sm90 --dtype
+sm90_bf16 --hidden 7168 --intermediate 3072 --num-experts 384 --topk 6
+--max-tokens 8 ... 32768` (they were a copy of the per-tensor rows; BF16
+sweeps also try a K=64 twin of every geometry).  Winners, all swap-AB
+ping-pong cga(1,2,1): M128N8 at 8-32, M128N16 (tail-split) at 64-256,
+M128N64 (tail-split) at 512, and from 1024 the **K=64** M128N128 tile
+(tail-split; group_hint 264 up to 4096, none from 8192).  At K=128 a BF16
+A/B stage is twice the FP8 bytes, so the M128N128 tile keeps only two SMEM
+stages at hidden 7168; K=64 halves the stage and restores the depth.  Best
+K=64 vs best K=128 tile in the tuner: -1.2 / -17 / -21 / -22 / -22 / -22% at
+1024 / 2048 / 4096 / 8192 / 16384 / 32768, a tie (+-0.4%) up to 512.  The
+copied per-tensor rows had been 0-7% slower than the best K=128 rows up to
+1024 and 15-37% slower from 2048.
+
+Same-run compute p50 µs (4×H200 NVLink, SM clocks not locked, max 1980
+MHz; DSv4 P03: 384 experts, hidden 7168, intermediate 3072, top-6,
+heuristic configs, `torchrun --nproc_per_node=4
+benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py --scale-mode all`):
+
+| tokens/rank | FP8 per-tensor | FP8 blockwise | BF16 | BF16 / FP8 pt |
+|---:|---:|---:|---:|---:|
+| 8 | 764 | 771 | 1385 | 1.81× |
+| 64 | 1512 | 1576 | 2872 | 1.90× |
+| 512 | 1699 | 1743 | 3133 | 1.84× |
+| 1024 | 1730 | 1984 | 3378 | 1.95× |
+| 2048 | 2254 (711 TF) | 3000 | 4181 (388 TF) | 1.85× |
+| 8192 | 7071 (929 TF) | 8296 | 14133 (460 TF) | 2.00× |
+| 32768 | 26511 (980 TF) | 31771 | 47490 (509 TF) | 1.79× |
+
+The K=64 rows took 2048-32768 from 4877 / 8646 / 16202 / 31029 / 60461 µs
+(K=128 rows, same machine) to 4181 / 7146 / 14133 / 24382 / 47490 µs.  At
+1024 K=64 and K=128 are within run noise (tuner -1.2%, bench +1.8%).  The
+H100 EP4 32768 BF16 point that once read 244 ms was run noise (an isolated
+rerun gave 107-114 ms); on H200 the large buckets scale linearly.
+
+Open BF16 levers:
+- The per-tensor E8M0 SF wire (hidden/32 bytes per token) is still
+  dispatched for BF16 although nothing reads it.
+
+## W4A16 (`sm90_bf16_nvfp4_bf16_pull_cutedsl`, 2026-10-01)
+
+Same single-H100 EP1 preview setup as the BF16 table above (96 local
+experts, hidden 7168, intermediate 3072, top-6, heuristic launch configs,
+compute p50 µs; all four formats in one run:
+`torchrun --nproc_per_node=1 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py
+--scale-mode all --num-experts 96 --tokens 8,64,512,2048,8192`):
+
+| tokens/rank | FP8 per-tensor | FP8 blockwise | BF16 | W4A16 | W4A16 / FP8 pt |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 1540 | 1547 | 2924 | 982 | 0.64× |
+| 64 | 3032 | 3208 | 5823 | 1886 | 0.62× |
+| 512 | 3401 | 3433 | 6454 | 2138 | 0.63× |
+| 2048 | 3676 (442 TF) | 3765 | 7194 (226 TF) | 3301 (494 TF) | 0.90× |
+| 8192 | 7211 (902 TF) | 8728 | 20339 (319 TF) | 12855 (508 TF) | 1.78× |
+
+W4A16 moves 0.5625 B per weight (FP8: 1), so it beats FP8 wherever the
+weight stream dominates (up to ~2048 tokens/rank here); at 8192 the BF16
+WGMMA rate (half of FP8's) bounds it, still 1.6× faster than dense BF16
+(the 0.56 B/elt A stage leaves room for deeper pipelines than BF16's 2 B).
+
+How the decode got here (same geometry, 256x16 cga(2,1,1) unless noted):
+- v1, per-element LUT decode from the original row layout: 4069 / 12307 /
+  10516 / 10160 / 39021 µs (8 / 64 / 512 / 2048 / 8192, heuristic tiles).
+- v2, lane-contiguous payload (one 16-B LDS per row and k-tile) + `prmt`
+  register LUT + `mul.bf16x2`: 1114 / 4205 / 2613 / 3773 / 14662 µs.
+  Stubbing the decode math out (wrong results, timing only) cut 64 / 512 /
+  2048 by 24 / 42 / 49% at 256x16: the decode was still the limiter.
+- v3 (current), bit-placement decode (one shift + mask per field per BF16
+  pair, E2M1 * 2^-126, bias undone in the epilogue scale) and
+  `cvt.rn.f16x2.e4m3x2` scale pairs: 1044 / 2970 / 2216 / 3249 / 12889 µs
+  on the BF16 rows, then the W4A16 heuristic rows above.
+
+The first `"bf16_nvfp4"` rows came from the offline tuner on this EP1
+setup (`python -m flashinfer.moe_ep.tune --dtype sm90_bf16_nvfp4 --hidden
+7168 --intermediate 3072 --num-experts 96 --topk 6 --max-tokens 8 ... 8192`,
+`MEGA_NO_DIST=1`); superseded by the 4× H200 EP4 retune below.  EP1 tuner
+p50 (µs) and margins over the runner-up:
+
+| bucket | winner | p50 | runner-up |
+|---:|---|---:|---|
+| 8-128 | ping-pong M128N16 cga(1,2,1), tail-split, gh 264 | 888 / 1210 / 1684 / 1877 / 1924 | M256N8 (128: N16) cga(2,1,1): +0.7 / +0.9 / +1.7 / +1.2 / +2.7% |
+| 256 | M256N32 cga(2,1,1), gh 264 | 2071 | reuse_dispatch_warps +1.6% |
+| 512 | ping-pong M128N64 cga(1,2,1), tail-split, gh 264 | 2178 | reuse +1.5% |
+| 1024 | ping-pong M128N128 cga(1,2,1), tail-split, gh 264 | 2745 | M128N64 +2.9% |
+| 2048-8192 | same + reuse_dispatch_warps | 3996 / 6777 / 12714 | epi_warps +1.8 / +7.0 / +1.5% |
+
+**4× H200 EP4 (2026-10-02).**  Retuned with `torchrun --nproc_per_node=4 -m
+flashinfer.moe_ep.tune --arch sm90 --dtype sm90_bf16_nvfp4 --hidden 7168
+--intermediate 3072 --num-experts 384 --topk 6 --max-tokens 8 ... 32768`.
+Winners: cooperative swap-AB M256 tiles with group_hint 264 up to 1024
+tokens -- N8 cga(2,1,1) at 8-64, N16 / N32 cga(2,1,1) at 128 / 256, N64
+cga(1,1,1) at 512-1024 -- then ping-pong M128N128 cga(1,2,1) tail-split
+(group_hint 264 to 8192, none at 16384+).  The EP1 rows were 26-33% slower
+at 8-128 tokens, 13% at 512, 0-5% elsewhere.  Same-run compute p50 µs (same
+run as the BF16 4×H200 table above, BF16 on its K=64 rows):
+
+| tokens/rank | FP8 per-tensor | FP8 blockwise | BF16 | W4A16 | W4A16 / FP8 pt | W4A16 / BF16 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 764 | 771 | 1385 | 647 | 0.85× | 0.47× |
+| 16 | 1092 | 1137 | 2063 | 950 | 0.87× | 0.46× |
+| 32 | 1371 | 1373 | 2592 | 1120 | 0.82× | 0.43× |
+| 64 | 1512 | 1576 | 2872 | 1282 | 0.85× | 0.45× |
+| 128 | 1546 | 1593 | 2949 | 1367 | 0.88× | 0.46× |
+| 256 | 1621 | 1671 | 3030 | 1494 | 0.92× | 0.49× |
+| 512 | 1699 | 1743 | 3133 | 1795 | 1.06× | 0.57× |
+| 1024 | 1730 | 1984 | 3378 | 2568 | 1.48× | 0.76× |
+| 2048 | 2254 (711 TF) | 3000 | 4181 (388 TF) | 4578 (368 TF) | 2.03× | 1.09× |
+| 4096 | 3715 | 5435 | 7146 | 7717 | 2.08× | 1.08× |
+| 8192 | 7071 (929 TF) | 8296 | 14133 (460 TF) | 14152 (458 TF) | 2.00× | 1.00× |
+| 16384 | 13430 | 17582 | 24382 | 26884 | 2.00× | 1.10× |
+| 32768 | 26511 (980 TF) | 31771 | 47490 (509 TF) | 52779 (481 TF) | 1.99× | 1.11× |
+
+At EP4 W4A16 beats FP8 up to 256 tokens/rank (8-18% faster) and dense BF16
+up to 1024 (24-57% faster).  From 2048 it is compute-bound at the BF16
+WGMMA rate and runs 0-11% behind dense BF16, whose K=64 rows keep a deeper
+pipeline; W4A16's packed layout is tiled per 128 K, so it cannot take the
+K=64 tile.  There W4A16's value is weight capacity (0.5625 vs 2 B per
+weight).  The crossover with FP8 is earlier than in the single-H100 EP1
+preview (W4A16 led up to ~2048 there): FP8 per-tensor is much faster on
+this 4×H200 run (1699 vs 3401 µs at 512 -- different GPU and EP setup).
+Levers: a K=64 W4A16 tile layout (64 B payload + 4 B scales per row and
+k-tile), a cheaper decode (~45 instructions per k16 block per thread), and
+an FP8-activation (W4A8) variant for the FP8 WGMMA rate.
+
 ## Sweep methodology + environment (reproduce recipe)
 
 **Hardware / software.**  One H200 node, 4x NVIDIA H200 141GB (sm_90,

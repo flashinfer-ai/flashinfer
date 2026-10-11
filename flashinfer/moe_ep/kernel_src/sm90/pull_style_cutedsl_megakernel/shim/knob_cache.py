@@ -229,8 +229,12 @@ def resolve_knobs(
     num_experts: int,
     topk: int,
     max_tokens: int,
+    heuristic_mode: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else built-in heuristic.
+
+    ``heuristic_mode``: the ``HEURISTIC_CONFIGS`` key for the fallback
+    (default ``fp8_scale_mode``; BF16 / W4A16 sessions pass their own).
 
     Returns ``(knobs, source)`` where source is ``"cache"`` or
     ``"heuristic"``.  Cheap and deterministic — safe on the engine hot path
@@ -250,7 +254,10 @@ def resolve_knobs(
         return cached, "cache"
     from .tuner import default_knobs
 
-    return default_knobs(max_tokens, fp8_scale_mode=fp8_scale_mode), "heuristic"
+    return (
+        default_knobs(max_tokens, fp8_scale_mode=heuristic_mode or fp8_scale_mode),
+        "heuristic",
+    )
 
 
 __all__ = [

@@ -40,14 +40,83 @@ owns dispatch, expert compute, and combine; output is always BF16
 | `sm100_nvfp4_nvfp4_bf16_cutedsl` (`nvfp4_cutedsl`) | NVFP4 (block-16) | NVFP4 (block-16) | BF16 | SM100 family | `knobs=None` → token-count heuristic; `knobs=dict` → pinned; `knobs="auto"` → collective compile+time sweep at first forward (never in serving); winners cacheable via `FLASHINFER_MOE_EP_KNOB_CACHE` |
 | `sm100_mxfp8_mxfp8_bf16_cutedsl` (`mxfp8_cutedsl`) | MXFP8 (block-32 UE8M0) | MXFP8 (block-32 UE8M0) | BF16 | SM100 family | same `knobs` surface as the NVFP4 backend |
 | `sm100_fp8_fp4_bf16_deepgemm` (`deep_gemm_mega`) | FP8 (E4M3, block-32 UE8M0) | FP4 (int8-packed, block-32) | BF16 | SM100 family | — (DeepGEMM selects its own JIT configs internally) |
-| `sm90_fp8_fp8_bf16_pull_cutedsl` (`sm90_pull_fp8`) | FP8 (E4M3/E5M2; per-tensor or DeepGEMM-style blockwise scales) | FP8 (same `fp8_scale_mode`) | BF16 | SM90 exactly | explicit geometry knobs on the config (`swap_ab`, `mma_tiler_mnk`); no tuner/knob-cache yet |
-| `sm90_fp8_fp8_bf16_push_cuda` (`sm90_push_fp8`) | FP8 (E4M3) | FP8 (E4M3) | BF16 | SM90 | — (static dimensions/protocol choices only) |
+| `sm90_fp8_fp8_bf16_pull_cutedsl` (`sm90_pull_fp8`) | FP8 (E4M3/E5M2; per-tensor or DeepGEMM-style blockwise scales) | FP8 (same `fp8_scale_mode`); BF16 or MXFP8 checkpoints (MXFP8: blockwise only) | BF16 | SM90 exactly | `knobs` (knob cache → token-bucket heuristic table; dict; `"auto"`) or the explicit geometry fields (`swap_ab`, `mma_tiler_mnk`, ...) |
+| `sm90_fp8_fp8_bf16_push_cuda` (`sm90_push_fp8`) | FP8 (E4M3) | FP8 (E4M3, 128×128 blockwise); BF16 or MXFP8 checkpoints | BF16 | SM90 | — (static dimensions/protocol choices only) |
 | `sm90_bf16_bf16_bf16_push_cake` | BF16 | BF16 | BF16 | SM90 | — (`capacity_factor`, `dedup_dispatch`, optional `clamp_limit`, `combine_wire` = `prereduced` (default: one pre-reduced bf16 row per (token, source rank), deterministic rank-ordered fp32 sum) or `per_route`; native BF16 end to end: bf16 dispatch payload, Cake-generated WGMMA FC1/FC2 with fp32 accumulation, bf16 combine wire) |
+| `sm90_bf16_bf16_bf16_pull_cutedsl` | BF16 | BF16 (canonical BF16/FP16/FP32 checkpoints, cast to BF16) | BF16 | SM90 exactly | same `knobs` / geometry surface as the FP8 pull backend (BF16 heuristic rows; `tune --dtype sm90_bf16`) |
+| `sm90_bf16_nvfp4_bf16_pull_cutedsl` | BF16 | NVFP4 (E2M1, E4M3 block-16, FP32 per-expert alpha), kept packed in HBM; or BF16 checkpoints quantized at init | BF16 | SM90 exactly | same surface, swap-AB geometries only (W4A16 heuristic rows; `tune --dtype sm90_bf16_nvfp4`) |
 
 The SM90 pull-style CuTeDSL tree is process-exclusive with the SM100 CuTeDSL
 tree (module names collide). Weight inputs are canonical BF16 `MoEWeightPack`
 by default (the backend quantizes at `preprocess_weights`); kernel-ready
 pre-quantized weights can be supplied instead.
+
+**SM90 native BF16.** `sm90_bf16_bf16_bf16_pull_cutedsl` is the pull-style
+megakernel compiled with BF16 operands: BF16 dispatch (twice the FP8 NVLink
+payload), BF16 WGMMA with FP32 accumulation, a BF16 FC1 output and BF16
+combine — no FP8 rounding anywhere, no calibration scales. It rides the FP8
+kernel's per-tensor ABI with unit dequant scales. Same shape rules as FP8
+per-tensor (`hidden`, `intermediate_size` multiples of 64), same masked
+routing, CUDA graph and combine options. BF16 doubles the A/B SMEM per
+pipeline stage, so tiles that leave fewer than two stages (e.g. swap-AB
+M256×N128 at hidden 7168) raise `ValueError` at compile time; the BF16
+heuristic rows avoid them. BF16 also accepts K=64 tiles
+(`mma_tiler_mnk=(M, N, 64)`; FP8 needs K=128), which halve the stage and keep
+the pipeline deep; the BF16 rows use the K=64 M128N128 tile from 1024
+tokens/rank. On 4× H200 at EP4 (DSv4 geometry, 384 experts) latency is
+1.8–2.0× the FP8 per-tensor path at every size (2× weight and dispatch
+bytes, half the tensor-core rate); see `TUNING.md`. Pre-quantized
+packs raise `MoEEpConfigError` (use an FP8 SM90 backend).
+
+**SM90 W4A16 (NVFP4 weights).** `sm90_bf16_nvfp4_bf16_pull_cutedsl` keeps
+NVFP4 expert weights packed in HBM (0.5625 B/element: E2M1 plus one E4M3
+scale per 16) and decodes them inside the GEMM. In the swap-AB layout the
+weights are WGMMA operand A, which Hopper can source from registers: each
+consumer thread loads its fragment of the TMA-staged tile, places the E2M1
+bits into BF16 with a shift and mask per pair and applies the block scale
+with one `mul.bf16x2` (exact: E2M1 × E4M3 has at most 6 significant bits).
+Tokens stay BF16 operand B in SMEM, and FP32 accumulation and the per-expert
+global scale (`fc1_alpha` / `fc2_alpha`) are applied in the epilogue.
+Dispatch, the FC1 handoff and combine are BF16, as on the BF16 backend.
+Inputs follow the SM100 W4A16 contract: a `MoEWeightPack` whose `w13` / `w2`
+are packed `uint8` or `float4_e2m1fn_x2` `(E, 2I, H/2)` / `(E, H, I/2)` (low
+nibble = even k) and whose `w13_scale` / `w2_scale` are linear E4M3
+`(E, 2I, H/16)` / `(E, H, I/16)`. A canonical BF16/FP16/FP32 pack is also
+accepted and quantized at init, with its per-expert global scale
+(`amax / (448·6)`) folded into alpha. Alphas default to one; set them on the
+config, or per forward on `MoEEpTensors.fc1_alpha` / `fc2_alpha`. Per-forward
+alphas are copied into workspace buffers, so captured CUDA graphs pick up
+in-place updates. Preprocessing (`backends/mega/kernel/sm90/common/nvfp4.py`)
+interleaves the gate/up rows. It canonicalizes each block without changing
+its value: a zero scale zeroes the codes, and a negative scale moves its sign
+into the codes. It then lays out each 128-K tile of a row pair as one
+144-byte TMA box. There is no fallback. Each of these raises
+`MoEEpConfigError` at layer construction: `swap_ab=False`, `hidden` or
+`intermediate_size` not a multiple of 128, NaN block scales, and wrong
+shapes or dtypes. On 4× H200 at EP4 (DSv4 geometry, 384 experts) latency
+is 0.82–0.92× the FP8 per-tensor path up to 256 tokens/rank (about half the
+weight bytes) and 0.43–0.76× dense BF16 up to 1024. From 2048 tokens it is
+bound by BF16 tensor-core throughput: about 2× FP8 and 1.0–1.11× dense BF16,
+whose K=64 tiles keep a deeper pipeline than W4A16's fixed 128-K tile. At
+those sizes W4A16's advantage is weight memory (0.5625 vs 2 bytes per
+weight). See `TUNING.md`.
+
+**SM90 MXFP8 weights.** SM90 has no block-scaled tensor-core MMA, so both
+SM90 FP8 backends run MXFP8 checkpoints on their existing FP8 kernels. A
+`PrequantizedMoEWeights` with `float8_e4m3fn` `w13`/`w2` and E8M0 scales
+(`float8_e8m0fnu` or `uint8`, one per 1×32 K block: `(E, 2I, H/32)` /
+`(E, H, I/32)`) is converted once in `preprocess_weights` to the 128×128 FP32
+block-scale layout (`backends/mega/kernel/sm90/common/mxfp8.py`); nothing is
+converted per forward, so latency equals the BF16-checkpoint blockwise path
+(measured on 4× H200 at EP4: within ±0.8% from 8 to 8192 tokens/rank).
+The block scales are powers of two, so the conversion is exact except for
+elements that underflow E4M3 after the rescale (error ≤ half an E4M3
+subnormal step × block scale; a few per 10⁵ for checkpoint-like weights).
+Pull requires `fp8_scale_mode="blockwise"` and `kind="fp8_e4m3"`; both require
+`hidden` and `intermediate_size` to be multiples of 128. There is no
+fallback: E5M2 MXFP8, any other pre-quantized recipe, MXFP8 with
+`fp8_scale_mode="per_tensor"`, and E8M0 NaN scales raise `MoEEpConfigError`
+at layer construction.
 
 ### Split (dispatch → inner kernel → combine)
 
@@ -238,7 +307,7 @@ moe_ep/
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,bf16_mxfp8_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
-  backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
+  backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda,bf16_bf16_bf16_push_cake,bf16_bf16_bf16_pull_cutedsl,bf16_nvfp4_bf16_pull_cutedsl,common}
   backends/mega/kernel/sm107/{mxfp8_mxfp8_bf16_cutedsl, mxfp8_mxfp4_bf16_cutedsl, nvfp4_nvfp4_bf16_cutedsl}
   kernel_src/sm100/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_bf16_glu, moe_nvfp4_swapab, moe_mxfp8_glu, src)
@@ -247,7 +316,7 @@ moe_ep/
     SKILL.md                   ← how to resync src/ when kernel team drops a new version
     TUNING.md                  ← tuning surface, measured perf, benchmark methodology
     ACKNOWLEDGEMENT.md         ← kernel authors
-  kernel_src/sm90/pull_style_cutedsl_megakernel/  ← Hopper pull-style FP8 kernel src + FI shim
+  kernel_src/sm90/pull_style_cutedsl_megakernel/  ← Hopper pull-style FP8/BF16 kernel src + FI shim
     src/                       ← VERBATIM drop, fork of the sm100 kernel repo (common, src, moe_nvfp4_swapab, moe_hopper_fp8)
     shim/, __init__.py, SKILL.md  ← same layering; process-exclusive with the sm100 tree (module names collide)
   kernel_src/sm90/push_style_megamoe/  ← Hopper push-style FP8 (raw CUDA, JIT-compiled)
@@ -384,6 +453,10 @@ classDiagram
 | Mega kernel | `sm100_bf16_nvfp4_bf16_cutedsl` | `Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` — BF16/NVFP4, SM100/SM103 |
 | Mega kernel | `sm100_nvfp4_nvfp4_bf16_cutedsl` | `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` — NVFP4, sm_100+ |
 | Mega kernel | `sm100_mxfp8_mxfp8_bf16_cutedsl` | `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig` — MXFP8 (`kind` e4m3/e5m2), sm_100+ |
+| Mega kernel | `sm90_fp8_fp8_bf16_pull_cutedsl` | `Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig` — FP8 (BF16/MXFP8 checkpoints), sm_90 |
+| Mega kernel | `sm90_fp8_fp8_bf16_push_cuda` | `Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig` — FP8 128×128 blockwise (BF16/MXFP8 checkpoints), sm_90 |
+| Mega kernel | `sm90_bf16_bf16_bf16_pull_cutedsl` | `Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig` — native BF16, sm_90 |
+| Mega kernel | `sm90_bf16_nvfp4_bf16_pull_cutedsl` | `Sm90_Bf16_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig` — BF16 × NVFP4 (W4A16, swap-AB), sm_90 |
 
 **Mega weights:** with `preprocess_weights=True` (default), canonical bf16 or pre-quantized `MoEWeightPack` is transformed at init. With `preprocess_weights=False`, supply `MegaConfig.transformed_weights` (from `preprocess_*_mega_weights`).
 
@@ -394,6 +467,11 @@ before the BF16 FC1 handoff, with a different rounding contract.
 **Mega activations:** with `quantize_input=True` (default), bf16 `[T, hidden]` is quantized into symm workspace at forward. Non-bf16 with `quantize_input=True` raises `MoEEpConfigError`; use `quantize_input=False` and pre-quantized activations plus `MoEEpTensors.scales`.
 BF16-activation backends ignore `quantize_input` and copy BF16 inputs.
 
+**Masked routes:** a `topk_ids` entry of `-1` drops that route: it is neither
+dispatched nor reduced, and a token whose routes are all `-1` gets a zero
+output row. The SM90 backends cover this in their single-GPU and multirank
+routing tests.
+
 ## Runtime
 
 Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True` (default), layers acquire a ref-counted process runtime and release it in `destroy()`.
@@ -401,7 +479,7 @@ Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True
 | Requirement | Used by |
 |-------------|---------|
 | `torch_dist` | split comm, all mega kernels |
-| `nvshmem` | `sm100_nvfp4_nvfp4_bf16_cutedsl`, `sm100_mxfp8_mxfp8_bf16_cutedsl`, `sm100_bf16_nvfp4_bf16_cutedsl` (skip with `MEGA_NO_DIST=1`) |
+| `nvshmem` | `sm100_nvfp4_nvfp4_bf16_cutedsl`, `sm100_mxfp8_mxfp8_bf16_cutedsl`, `sm100_bf16_nvfp4_bf16_cutedsl`, `sm90_fp8_fp8_bf16_pull_cutedsl`, `sm90_bf16_bf16_bf16_pull_cutedsl`, `sm90_bf16_nvfp4_bf16_pull_cutedsl` (skip with `MEGA_NO_DIST=1`) |
 
 **Host framework bootstrap (e.g. vLLM):** when the host already initialized `torch.distributed` and EP uses a subgroup, pass `BootstrapConfig(process_group=ep_group, world_size=ep_size, rank=ep_rank, auto_bootstrap=False)` and call `bootstrap_moe_ep_runtime(bootstrap, reqs)` once per worker after dist init. Mega kernels resolve comm via `bootstrap_comm_group` / `bootstrap_ep_rank_world` (`MegaKernelBackend.bind_ep_bootstrap`).
 
@@ -469,15 +547,15 @@ See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environ
 
 - **unit** — host-only pytest (mocks + single-GPU; no multirank)
 - **oracle** — single-GPU torch-oracle correctness for every SM100 compute path (see **Torch oracles** below)
-- **oracle_sm90** — single-GPU (Hopper) torch oracle for the sm90_fp8_fp8_bf16_pull_cutedsl mega kernel
+- **oracle_sm90** — single-GPU (Hopper) torch oracles for the pull-style mega kernel: sm90_fp8_fp8_bf16_pull_cutedsl (BF16 and MXFP8 checkpoints), sm90_bf16_bf16_bf16_pull_cutedsl (geometry / combine variants) and sm90_bf16_nvfp4_bf16_pull_cutedsl (NVFP4 and BF16 checkpoints, config/runtime alphas, zero/negative/subnormal block scales), masked/short/hot/empty routing rounds on one buffer, plus layer-level CUDA graph capture/replay
 - **oracle_sm107** — single-GPU (Rubin) torch oracle and boundary tests for NVFP4, MXFP8 E4M3, and MXFP8 E5M2
 - **qualify_sm107** — strict Rubin host, single-GPU, and multirank qualification, rejecting skipped/empty tests and OOMs; see the [qualification runbook](moe_ep_sm107_qualification.md)
 - **multirank** — 4-GPU split path: `test_moe_ep_layer_multirank.py` + `test_split_kernels.py` over NCCL-EP (and NIXL-EP when built)
 - **split_path_correctness_{bf16,nvfp4,ht}** — 4-GPU split-path numerics (LL EXPERT_MAJOR + RANK_MAJOR / NVFP4 / HT FLAT) vs a single-process `MoELayer` reference (Blackwell)
 - **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity **and multi-rank torch oracles**, plus single-rank preprocess/kernel-vs-reference checks (`MEGA_NO_DIST=1`) (Blackwell, sm_100+)
-- **mega_sm90** — 4-GPU (Hopper) sm90_fp8_fp8_bf16_pull_cutedsl mega parity + multi-rank torch oracle; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
+- **mega_sm90** — 4-GPU (Hopper) pull-style mega multirank: FP8 parity + multi-rank torch oracle (BF16 and MXFP8 checkpoints) and native BF16 / W4A16 vs a global-bank torch oracle, uneven/zero-token/masked/hot/all-remote (W4A16: plus runtime-alpha) routing rounds, and lockstep CUDA graph replay; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
 - **mega_sm107** — Rubin MoEEpLayer vs multirank torch oracle for all three formats, with idle ranks and pooled-layer graph replay; `NPROC_MULTIRANK=2`, `4`, or `8` (default 4), own torchrun process
-- **sm90_push** — 2-GPU (Hopper) sm90_fp8_fp8_bf16_push_cuda kernel + backend; own torchrun process
+- **sm90_push** — 2-GPU (Hopper) sm90_fp8_fp8_bf16_push_cuda kernel + backend (BF16 and MXFP8 checkpoints); own torchrun process
 - **sm90_bf16_push_cake** — 2-GPU (Hopper) sm90_bf16_bf16_bf16_push_cake backend vs an independent bf16 torch reference (single-process `-k ep1` cases, then torchrun EP≥2 routing patterns incl. the pre-reduce cases, uneven tokens, graph replay, combine-wire mismatch; every case under both combine wires); own torchrun process
 - **smoke** — NCCL-EP smoke script (and NIXL-EP when built)
 - **ft** — 4-GPU fault-tolerance (stalled-rank pytest half + dead-rank smoke half)
@@ -556,6 +634,8 @@ unless noted):
 | mega sm100_nvfp4_nvfp4_bf16_cutedsl (default, ikr, nvfp4/mxfp8 combine wires) | 2026-07-31 | 4x GB200 variant job |
 | mega sm100_mxfp8_mxfp8_bf16_cutedsl (default, ikr) | 2026-07-31 | 4x GB200 variant job |
 | mega sm90_fp8_fp8_bf16_pull_cutedsl (per_tensor/blockwise × swap_ab) | 2026-07-30 | Hopper, when landed (commit 7169aca9); not runnable on the SM100 cluster |
+| mega sm90_fp8_fp8_bf16_pull_cutedsl incl. MXFP8 checkpoints, sm90_bf16_bf16_bf16_pull_cutedsl, sm90_bf16_nvfp4_bf16_pull_cutedsl (W4A16) | 2026-10-02 | `oracle_sm90` (1x H200) + `mega_sm90` (4x H100 SXM and 4x H200, NVLink) |
+| sm90_fp8_fp8_bf16_push_cuda incl. MXFP8 checkpoints | 2026-10-02 | `sm90_push` (2x H100 SXM) + EP1 |
 
 ## Forward flow
 

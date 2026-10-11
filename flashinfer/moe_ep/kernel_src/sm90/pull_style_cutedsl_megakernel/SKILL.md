@@ -25,6 +25,59 @@ syncing future drops.
 Local extensions pending upstream (re-apply when syncing a drop that has
 not picked them up):
 
+- BF16 operands (2026-10-01, `sm90_bf16_bf16_bf16_pull_cutedsl`): the
+  per-tensor/1xacc path with unit dequant scales, compiled with
+  `ab_dtype=BFloat16`.  `kernel_fp8_glu_fc12{,_swapab}.py` admit BFloat16
+  in `VALID_AB_DTYPE_SF_SIZE` (per_tensor/1xacc only, rcp limit unused);
+  `epilogue_fp8.py` sizes the FC1 R2S pair copy by the output width (16 ->
+  `2 * width` bits); `kernel_fp8_glu_fc12.py` lets the FC1 ring stage be a
+  multiple of the FC2 BF16 stage (BF16 FC1 64x64 = 8 KiB vs FC2 4 KiB) by
+  scaling the FC2 view's stage stride (`fc2_c_stage_stride_ratio`,
+  `_scale_int_tuple`) and `_compute_stages` raises when fewer than two A/B
+  stages fit (was a trace-time assert); `megamoe_kernel_fp8.py` sizes
+  `hidden_bytes` by the operand width; `heuristic_config.py` adds the
+  `"bf16"` rows (4x H200 EP4 sweep).  K granularity is dtype-aware
+  (`_Sm90Fp8Fc12KernelBase._mma_tile_k_atom`, both validators): BF16
+  per_tensor accepts K=64 tiles (no per-K scale tiles; one 128-B swizzle
+  atom), FP8 keeps the 128 dispatch scale atom.  `test_heuristic_config.py`
+  checks the drop's FP8 tables plus the FI `"bf16"` / `"bf16_nvfp4"` rows.
+  Shim: kind `"bf16"` (K atom 64); tuner `is_valid(k_atom=)` and K=64
+  candidates for dense BF16 sweeps.
+- W4A16 mainloop (2026-10-01, `sm90_bf16_nvfp4_bf16_pull_cutedsl`,
+  `weight_format="nvfp4"`; swap-AB, BF16 operands, K tile 128 only).
+  Packed NVFP4 weights arrive as one augmented byte tensor per leg: per row
+  pair and 128-K tile one 144-B TMA box (lane-permuted E2M1 payloads of both
+  rows, then both rows' 8 E4M3 scales; layout owner:
+  `backends/mega/kernel/sm90/common/nvfp4.py::augment_w4a16`).
+  `kernel_fp8_glu_fc12.py`: class attr `w4a16`, `_a_bytes_per_stage` /
+  `_a_gmem_tiler` hooks for the A TMA box and stage bytes, an
+  `OperandSource.RMEM` tiled MMA and a `run_wgmma_task_tile` dispatch to
+  `_mma_w4a16_rs`.  `kernel_fp8_glu_fc12_swapab.py`: Uint8 A smem layout
+  (pairs x 144 x stages), augmented global views / TMA atoms, logical K
+  extents for the k-tile counts and FC2 spin threshold
+  (`_a_logical_extents`), and the RS mainloop: per k-tile one 16-B LDS of
+  payload + scales per fragment row, per k16 block a bit-placement decode
+  (sign -> bit 15, exp:mantissa -> bits 8..6: E2M1 * 2^-126), a
+  `cvt.rn.f16x2.e4m3x2`-based scale conversion (scale * 2^119) and one
+  `mul.rn.bf16x2`, double-buffered A fragments with `wait_group(1)`.
+  `epilogue_fp8_swapab.py`: `weight_dequant_multiplier` (2^7, undoes the
+  decode bias) folded into the per-expert weight dequant scale, which also
+  carries the NVFP4 global scale (alpha).  `megamoe_kernel_fp8.py`: ctor
+  `weight_format`.  `heuristic_config.py`: `"bf16_nvfp4"` rows and
+  `heuristic_table_key`.  Shim: `weight_format` config/compile key, the
+  augmented-weight launch checks, knob dtype `"bf16_nvfp4"`, NVFP4 dummy
+  inputs for the tuner.
+- Masked-route reduce (2026-10-01): the separate-reduce `TopkReduce` summed
+  every top-k slot, but a `-1` route is never dispatched, so its
+  `(token, topk)` combine row kept a PREVIOUS launch's term (wrong output on
+  any reused workspace; a fresh zeroed one hid it).
+  `moe_nvfp4_swapab/topk_reduce.py` gains `slot_topk_idx` (bf16 reduce
+  only): the per-token live-slot mask is derived from the local routing
+  (`topk_idx >= 0`) and reuses the `slot_mask` skip path;
+  `moe_hopper_fp8/megamoe_kernel_fp8.py` passes `slot_topk_idx=topk_idx` on
+  the non-grouped call.  Grouped token-back and in-kernel FC2 reduce were
+  already correct.  Covered by `test_sm90_fp8_kernel_routing_rounds_on_one_buffer`.
+
 - `moe_hopper_fp8/heuristic_config.py` carries a `token_back_mode` field
   per bucket (2026-08-23 FI-layer epi-vs-reuse sweep winners).
 - Wire-level top-k dedup (`dedup_dispatch`, 2026-08-24, design in

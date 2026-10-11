@@ -1,4 +1,4 @@
-"""SM90 (Hopper) pull-style FP8 mega-MoE token-sweep benchmark.
+"""SM90 (Hopper) pull-style FP8 / BF16 mega-MoE token-sweep benchmark.
 
 Reproduces the kernel drop's Hopper P03 multirank token sweep
 (``moe_hopper_fp8/run_token_sweep_benchmark.py``) through the FlashInfer
@@ -10,6 +10,12 @@ methodology.  Fixed-layout runs
 (``--both-orders`` / ``--swap-ab`` / ``--no-swap-ab``) map to the drop's
 ``20260720_multirank_{pertensor|blockwise}_{nonswapab|swapab}_TileM{M}_TileN{N}.csv``
 reference files.
+
+``--scale-mode bf16`` benchmarks ``sm90_bf16_bf16_bf16_pull_cutedsl`` (the
+same kernel with BF16 operands, no FP8 anywhere) through the identical
+harness, so ``--scale-mode all`` gives a same-node FP8 per-tensor /
+blockwise / BF16 comparison per token count (BF16 has no drop reference CSV
+and always uses dense randn data).
 
 Geometry defaults (the drop's DSV4 P03 case; all are CLI flags):
 tokens/rank sweep 8..32768 (powers of two), topk=6, 384 total experts
@@ -105,6 +111,11 @@ HEUR_CSV_FIELDS = (
 )
 
 
+def _heuristic_key(scale_mode: str) -> str:
+    """Heuristic-table row set: W4A16 sessions resolve on the BF16 rows."""
+    return "bf16" if scale_mode == "nvfp4" else scale_mode
+
+
 def _heuristic_cols(scale_mode: str, operand_order: str, tokens: int) -> list[str]:
     """The launch config the shim resolves for this point (heuristic mode)."""
     if operand_order != "heuristic":
@@ -116,7 +127,7 @@ def _heuristic_cols(scale_mode: str, operand_order: str, tokens: int) -> list[st
     bootstrap_paths()
     from moe_hopper_fp8.heuristic_config import select_heuristic_config
 
-    sel = select_heuristic_config(scale_mode, tokens)
+    sel = select_heuristic_config(_heuristic_key(scale_mode), tokens)
     c = sel.config
     return [
         str(int(c.swap_ab)),
@@ -146,9 +157,11 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--scale-mode",
-        choices=["per_tensor", "blockwise", "both"],
+        choices=["per_tensor", "blockwise", "both", "bf16", "nvfp4", "all"],
         default="both",
-        help="FP8 scale ABI(s) to sweep",
+        help="FP8 scale ABI(s) to sweep (both = per_tensor + blockwise), "
+        "bf16 = the BF16-operand backend, nvfp4 = W4A16 (BF16 x NVFP4), "
+        "all = all four",
     )
     order = p.add_mutually_exclusive_group()
     order.add_argument(
@@ -462,10 +475,14 @@ def _make_point_inputs(args, tokens: int, rank: int, world_size: int, device):
 
 
 def _make_transformed_weights(args, scale_mode: str, local_experts: int, rank, device):
-    """bf16 pack -> kernel-ready FP8 tuples, releasing the bf16 source."""
+    """bf16 pack -> kernel-ready FP8 (or BF16) tuples, releasing the bf16 source."""
     import torch
 
-    from flashinfer.moe_ep import preprocess_sm90_pull_fp8_mega_weights
+    from flashinfer.moe_ep import (
+        preprocess_sm90_pull_bf16_mega_weights,
+        preprocess_sm90_pull_fp8_mega_weights,
+        preprocess_sm90_pull_w4a16_mega_weights,
+    )
     from flashinfer.moe_ep.weights import MoEWeightPack
 
     g = torch.Generator(device="cuda").manual_seed(13 + rank)
@@ -488,15 +505,29 @@ def _make_transformed_weights(args, scale_mode: str, local_experts: int, rank, d
         device=device,
         generator=g,
     ) * (args.intermediate**-0.5)
-    transformed = preprocess_sm90_pull_fp8_mega_weights(
-        MoEWeightPack(w13=w13, w2=w2),
-        intermediate_size=args.intermediate,
-        hidden_size=args.hidden,
-        kind=args.kind,
-        fp8_scale_mode=scale_mode,
-        fc1_activation_dequant_scale=FC1_ACT_SCALE,
-        fc2_activation_dequant_scale=FC2_ACT_SCALE,
-    )
+    if scale_mode == "nvfp4":
+        # BF16 pack -> NVFP4 at preprocess (per-expert global scale).
+        transformed = preprocess_sm90_pull_w4a16_mega_weights(
+            MoEWeightPack(w13=w13, w2=w2),
+            intermediate_size=args.intermediate,
+            hidden_size=args.hidden,
+        )
+    elif scale_mode == "bf16":
+        transformed = preprocess_sm90_pull_bf16_mega_weights(
+            MoEWeightPack(w13=w13, w2=w2),
+            intermediate_size=args.intermediate,
+            hidden_size=args.hidden,
+        )
+    else:
+        transformed = preprocess_sm90_pull_fp8_mega_weights(
+            MoEWeightPack(w13=w13, w2=w2),
+            intermediate_size=args.intermediate,
+            hidden_size=args.hidden,
+            kind=args.kind,
+            fp8_scale_mode=scale_mode,
+            fc1_activation_dequant_scale=FC1_ACT_SCALE,
+            fc2_activation_dequant_scale=FC2_ACT_SCALE,
+        )
     del w13, w2  # release the bf16 source before the big workspaces come up
     return transformed
 
@@ -507,7 +538,11 @@ def _pingpong_tile_ok(c) -> bool:
 
 
 def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=None):
-    from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
+    from flashinfer.moe_ep import (
+        Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig,
+        Sm90_Bf16_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig,
+        Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
+    )
 
     pingpong = None if args.pingpong == "auto" else args.pingpong == "on"
     cluster_shape_mnk = None
@@ -534,7 +569,7 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
             bootstrap_paths()
             from moe_hopper_fp8.heuristic_config import select_heuristic_config
 
-            c = select_heuristic_config(scale_mode, tokens).config
+            c = select_heuristic_config(_heuristic_key(scale_mode), tokens).config
             swap_ab = c.swap_ab
             mma_tiler_mnk = tuple(c.mma_tiler_mnk)
             # Explicit geometry flips the shim into manual mode, which fills
@@ -583,14 +618,30 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         if getattr(args, "cga", None):
             cm, cn = (int(v) for v in args.cga.split(","))
             cluster_shape_mnk = (cm, cn, 1)
-    return Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
+    if scale_mode in ("bf16", "nvfp4"):
+        config_cls = (
+            Sm90_Bf16_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig
+            if scale_mode == "nvfp4"
+            else Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig
+        )
+        format_kwargs = {}
+    else:
+        config_cls = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
+        format_kwargs = dict(
+            kind=args.kind,
+            fp8_scale_mode=scale_mode,
+            fp8_accum_mode=(
+                args.fp8_accum_mode
+                if args.fp8_accum_mode is not None
+                else accum_override
+            ),
+            fc1_activation_dequant_scale=FC1_ACT_SCALE,
+            fc2_activation_dequant_scale=FC2_ACT_SCALE,
+        )
+    return config_cls(
+        **format_kwargs,
         intermediate_size=args.intermediate,
         top_k=args.top_k,
-        kind=args.kind,
-        fp8_scale_mode=scale_mode,
-        fp8_accum_mode=(
-            args.fp8_accum_mode if args.fp8_accum_mode is not None else accum_override
-        ),
         swap_ab=swap_ab,
         mma_tiler_mnk=mma_tiler_mnk,
         cluster_shape_mnk=cluster_shape_mnk,
@@ -616,8 +667,6 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         fc1_early_done_publish=args.fc1_early_done_publish,
         fold_producer_warps=args.fold_producer_warps,
         generate_c=args.generate_c,
-        fc1_activation_dequant_scale=FC1_ACT_SCALE,
-        fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )
 
 
@@ -714,7 +763,8 @@ def _run_point(
         transformed = _make_transformed_weights(
             args, scale_mode, local_experts, rank, device
         )
-        if args.use_sparse_data:
+        sparse_data = args.use_sparse_data and scale_mode not in ("bf16", "nvfp4")
+        if sparse_data:
             # Drop perf recipe for weights: positive-only random E4M3 bytes.
             for tw in (transformed[0][0], transformed[1][0]):
                 tw.view(torch.uint8).random_(0, 127)
@@ -764,7 +814,7 @@ def _run_point(
         bench_backend.bind_ep_bootstrap(bootstrap)
         bench_workspace = bench_backend.prepare_workspace(bootstrap, fleet_params)
         bench_backend.stage_inputs(t, bench_workspace, quantize_input=True)
-        if args.use_sparse_data:
+        if sparse_data:
             # Drop perf recipe for activations: replace the staged fp8
             # payload with uniform random finite E4M3 bytes (127=nan skipped).
             xb = bench_workspace.x.view(torch.uint8)
@@ -840,10 +890,20 @@ def _run_point(
     return result
 
 
+def _backend_name(scale_mode: str) -> str:
+    if scale_mode == "bf16":
+        return "sm90_bf16_bf16_bf16_pull_cutedsl"
+    if scale_mode == "nvfp4":
+        return "sm90_bf16_nvfp4_bf16_pull_cutedsl"
+    return "sm90_fp8_fp8_bf16_pull_cutedsl"
+
+
 def _ref_csv_name(scale_mode: str, operand_order: str, tile) -> str:
     if operand_order == "heuristic":
         # Per-point geometry follows the token bucket; no single drop CSV.
         return "heuristic(no-single-ref)"
+    if scale_mode in ("bf16", "nvfp4"):
+        return f"{scale_mode}(no-drop-ref)"
     scale_tag = "pertensor" if scale_mode == "per_tensor" else "blockwise"
     order_tag = "swapab" if operand_order == "swap_ab" else "nonswapab"
     return (
@@ -874,7 +934,7 @@ def _emit_row(
             csv_file.write(f"{CSV_FIELDS},{HEUR_CSV_FIELDS}\n")
 
     prefix = (
-        f"sm90_fp8_fp8_bf16_pull_cutedsl,{scale_mode},{operand_order},"
+        f"{_backend_name(scale_mode)},{scale_mode},{operand_order},"
         f"{tile[0]},{tile[1]},128,"
         f"{tokens},{args.top_k},{world_size},{args.num_experts},"
         f"{args.num_experts // world_size},{args.hidden},{args.intermediate},"
@@ -955,9 +1015,10 @@ def main() -> int:
         )
 
     tokens_list = [int(t) for t in args.tokens.split(",") if t]
-    scale_modes = (
-        ("per_tensor", "blockwise") if args.scale_mode == "both" else (args.scale_mode,)
-    )
+    scale_modes = {
+        "both": ("per_tensor", "blockwise"),
+        "all": ("per_tensor", "blockwise", "bf16", "nvfp4"),
+    }.get(args.scale_mode, (args.scale_mode,))
     orders = (
         ("non_swap_ab", "swap_ab")
         if args.operand_order == "both"
