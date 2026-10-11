@@ -25,21 +25,16 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 14 of the optimization ladder: 2-CTA cluster with TMA multicast of
-// the act tile.  Rung 13 left the kernel at ~65% tensor-pipe time with the
-// L2 at 77% of peak: every block streams its own 16 KB act and 8 KB weight
-// slab from L2, 12.6 GB per 1.07 TFLOP on the profiled shape.  Here blocks
-// are launched in clusters of two that share an m-tile and own adjacent
-// n-tiles; the leader CTA issues the act slab once as a multicast TMA that
-// lands in both CTAs' shared memory and credits both CTAs' "full" barriers,
-// while each CTA loads its own weight slab.  Per pair that is 16 + 2 x 8 KB
-// instead of 2 x 24 KB, one third less L2 traffic.  The "empty" barrier of
-// each CTA now collects one arrive per consumer warp of both CTAs (local
-// and remote through mapa / mbarrier.arrive.shared::cluster), so a slab is
-// only refilled when both consumers are done with it; a cluster barrier
-// brackets the kernel so no CTA leaves while its peer may still write into
-// it.  Everything else is rung 13.  Requires sm_90a, K % 64 == 0, 16 B
-// aligned bases, N % 8 == 0.
+// Rung 15 of the optimization ladder: cluster size becomes a template knob,
+// default 1.  Rung 14's 2-CTA multicast did cut L2 throughput from 78% to
+// 45% of peak on the profiled shape, but the kernel got slower (1.75 ->
+// 2.03 ms, tensor pipe 65% -> 55%): pairing CTAs through shared "empty"
+// barriers makes each pair run at the pace of its slower member and the
+// cluster launch constrains placement, and L2 bandwidth was not what the
+// kernel was waiting on.  The multicast machinery stays in the code behind
+// `kClusterSize` (1 = plain TMA loads, local arrives, ordinary launch; 2 =
+// rung 14) for the per-shape sweep later in the ladder; the launcher uses
+// 1.  Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -64,7 +59,6 @@ constexpr int kW8A16ConsumerWGs = 2;                     // 64 n rows each
 constexpr int kW8A16Warpgroups = 1 + kW8A16ConsumerWGs;  // + 1 producer
 constexpr int kW8A16Threads = 128 * kW8A16Warpgroups;
 constexpr int kW8A16ConsumerThreads = 128 * kW8A16ConsumerWGs;
-constexpr int kW8A16ClusterSize = 2;  // CTAs sharing one act tile (multicast)
 constexpr int kW8A16ConsumerWarps = kW8A16ConsumerThreads / 32;
 constexpr int kW8A16ARowBytes = kW8A16TileK * 2;  // act row = 64 bf16 = 128 B (SW128 atom)
 constexpr int kW8A16WRowBytes = kW8A16TileK;      // weight row = 64 fp8 = 64 B (SW64 atom)
@@ -276,7 +270,7 @@ __device__ __forceinline__ void wgmma_m64n128k16_rs<__half>(float (&d)[64], cons
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(scale_d));
 }
 
-template <typename T>
+template <typename T, int kClusterSize>
 __global__ void __launch_bounds__(kW8A16Threads, 1)
     W8A16Fp8GemmTmaKernel(const __grid_constant__ CUtensorMap act_map,
                           const __grid_constant__ CUtensorMap w_map,
@@ -297,18 +291,18 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
 
   // Grouped rasterization (rung 10) over cluster pairs: the two CTAs of a
   // cluster (consecutive blockIdx.x) share tile_m and take n-tiles 2p, 2p+1.
-  const uint32_t rank = cluster_ctarank();
-  const int pair = blockIdx.x / kW8A16ClusterSize;
+  const uint32_t rank = kClusterSize > 1 ? cluster_ctarank() : 0u;
+  const int pair = blockIdx.x / kClusterSize;
   const int tiles_m = (M + kW8A16TileM - 1) / kW8A16TileM;
   const int tiles_n = (N + kW8A16TileN - 1) / kW8A16TileN;
-  const int pairs_n = (tiles_n + kW8A16ClusterSize - 1) / kW8A16ClusterSize;
+  const int pairs_n = (tiles_n + kClusterSize - 1) / kClusterSize;
   const int group_size = kW8A16GroupM * pairs_n;
   const int group = pair / group_size;
   const int first_m = group * kW8A16GroupM;
   const int this_group_m = min(kW8A16GroupM, tiles_m - first_m);
   const int in_group = pair - group * group_size;
   const int tile_m = first_m + in_group % this_group_m;
-  const int tile_n = (in_group / this_group_m) * kW8A16ClusterSize + static_cast<int>(rank);
+  const int tile_n = (in_group / this_group_m) * kClusterSize + static_cast<int>(rank);
   const int n0 = tile_n * kW8A16TileN;  // may be >= N for an odd tile count: computes zeros
   const int m0 = tile_m * kW8A16TileM;
   const int num_slabs = K / kW8A16TileK;
@@ -320,11 +314,15 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     for (int s = 0; s < kW8A16Stages; ++s) {
       mbar_init(&full_bar[s], 1);  // one arrive.expect_tx per slab (tx from both copies)
       // One arrive per consumer warp of every CTA in the cluster.
-      mbar_init(&empty_bar[s], kW8A16ClusterSize * kW8A16ConsumerWarps);
+      mbar_init(&empty_bar[s], kClusterSize * kW8A16ConsumerWarps);
     }
     fence_barrier_init();
   }
-  cluster_sync_all();  // peers' barriers are initialised before any multicast / remote arrive
+  if constexpr (kClusterSize > 1) {
+    cluster_sync_all();  // peers' barriers are initialised before any multicast / remote arrive
+  } else {
+    __syncthreads();
+  }
 
   if (wg == 0) {
     // ------------------------------ producer ------------------------------
@@ -339,7 +337,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
         const int k0 = kt * kW8A16TileK;
         if (rank == 0) {
           tma_load_2d_multicast(a_base + stage * kW8A16AStageBytes, &act_map, &full_bar[stage], k0,
-                                m0, static_cast<uint16_t>((1u << kW8A16ClusterSize) - 1));
+                                m0, static_cast<uint16_t>((1u << kClusterSize) - 1));
         }
         tma_load_2d(w_base + stage * kW8A16WStageBytes, &w_map, &full_bar[stage], k0, n0);
       }
@@ -385,15 +383,23 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
       wgmma_wait<1>();
       if (kt > 0 && lane == 0) {
         uint64_t* eb = &empty_bar[(kt - 1) % kW8A16Stages];
+        if constexpr (kClusterSize > 1) {
 #pragma unroll
-        for (uint32_t c = 0; c < kW8A16ClusterSize; ++c) mbar_arrive_remote(eb, c);
+          for (uint32_t c = 0; c < kClusterSize; ++c) mbar_arrive_remote(eb, c);
+        } else {
+          mbar_arrive(eb);
+        }
       }
     }
     wgmma_wait<0>();
     if (num_slabs > 0 && lane == 0) {
       uint64_t* eb = &empty_bar[(num_slabs - 1) % kW8A16Stages];
+      if constexpr (kClusterSize > 1) {
 #pragma unroll
-      for (uint32_t c = 0; c < kW8A16ClusterSize; ++c) mbar_arrive_remote(eb, c);
+        for (uint32_t c = 0; c < kClusterSize; ++c) mbar_arrive_remote(eb, c);
+      } else {
+        mbar_arrive(eb);
+      }
     }
 
     // Epilogue.  Fragment layout per warp (m64nNk16 D): d[j*4 + 0..1] at
@@ -442,7 +448,7 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
   }
   // No CTA may exit while its peer can still multicast into its smem or
   // arrive on its barriers.
-  cluster_sync_all();
+  if constexpr (kClusterSize > 1) cluster_sync_all();
 #else
   __trap();  // wgmma / TMA need sm_90a
 #endif
@@ -471,7 +477,7 @@ inline cudaError_t MakeTmaMap2D(CUtensorMap* map, const void* base, uint64_t row
   return r == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
 }
 
-template <typename T>
+template <typename T, int kClusterSize = 1>
 cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scale, const T* bias,
                          T* out, int M, int N, int K, cudaStream_t stream) {
   if (K % kW8A16TileK != 0) return cudaErrorInvalidValue;  // whole slabs only
@@ -493,8 +499,8 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
 
   const unsigned tiles_m = ceil_div(M, kW8A16TileM);
   const unsigned tiles_n = ceil_div(N, kW8A16TileN);
-  const unsigned pairs_n = ceil_div(tiles_n, static_cast<unsigned>(kW8A16ClusterSize));
-  auto* kernel = W8A16Fp8GemmTmaKernel<T>;
+  const unsigned pairs_n = ceil_div(tiles_n, static_cast<unsigned>(kClusterSize));
+  auto* kernel = W8A16Fp8GemmTmaKernel<T, kClusterSize>;
   static bool attr_set = false;  // per instantiation; the attribute is per function
   if (!attr_set) {
     e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kW8A16SmemBytes);
@@ -502,17 +508,17 @@ cudaError_t W8A16Fp8Gemm(const T* act, const __nv_fp8_e4m3* w, const float* scal
     attr_set = true;
   }
   cudaLaunchConfig_t cfg = {};
-  cfg.gridDim = dim3(tiles_m * pairs_n * kW8A16ClusterSize);  // 1-D; the kernel rasterizes it
+  cfg.gridDim = dim3(tiles_m * pairs_n * kClusterSize);  // 1-D; the kernel rasterizes it
   cfg.blockDim = dim3(kW8A16Threads);
   cfg.dynamicSmemBytes = kW8A16SmemBytes;
   cfg.stream = stream;
   cudaLaunchAttribute attr[1];
   attr[0].id = cudaLaunchAttributeClusterDimension;
-  attr[0].val.clusterDim.x = kW8A16ClusterSize;
+  attr[0].val.clusterDim.x = kClusterSize;
   attr[0].val.clusterDim.y = 1;
   attr[0].val.clusterDim.z = 1;
   cfg.attrs = attr;
-  cfg.numAttrs = 1;
+  cfg.numAttrs = kClusterSize > 1 ? 1 : 0;
   e = cudaLaunchKernelEx(&cfg, kernel, act_map, w_map, scale, bias, out, M, N, K);
   if (e != cudaSuccess) return e;
   return cudaGetLastError();
