@@ -753,11 +753,19 @@ struct KernelParams {
 
     // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout
     // (numTokensKvInPagedKv, headDimQk).
+    // Token-sparse MQA/GQA (not MLA) flattens V the same way with its own base pointer. Its pages
+    // hold one token, so the page strides are the row strides: K and V may be views of one row.
     if (options.isSparseMla()) {
       shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk),
                                      static_cast<uint64_t>(INT_MAX)};
-      strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
+      strideK = std::vector<uint64_t>{
+          1, static_cast<uint64_t>(options.isMla() ? options.mHeadDimQk : options.kStrideBatch)};
       tileShapeKv[1] = 1;
+    }
+    if (options.isSparseMla() && !options.isMla()) {
+      shapeV = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimV),
+                                     static_cast<uint64_t>(INT_MAX)};
+      strideV = std::vector<uint64_t>{1, static_cast<uint64_t>(options.vStrideBatch)};
     }
     // K and V might use different tileShapes.
     std::vector<uint32_t> tileShapeK(tileShapeKv);

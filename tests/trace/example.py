@@ -122,6 +122,7 @@ rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_nvfp4_quantize_k16384.json
+token_sparse_kv_indices_top_k2048_lists2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
@@ -2971,3 +2972,16 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
+
+# ── Token-sparse attention inputs: key positions to K/V slot lists ────────────
+from flashinfer.token_sparse import token_sparse_kv_indices
+
+token_sparse_kv_indices.fi_trace(
+    save_dir=SAVE_DIR,
+    positions=torch.empty(4, 2048, dtype=torch.int32),
+    requests=torch.zeros(4, dtype=torch.int32),
+    block_table=torch.empty(2, 64, dtype=torch.int32),
+    block_tables=torch.empty(8, 2, 2048, dtype=torch.int32),
+    seq_lens=torch.empty(8, dtype=torch.int32),
+    requests_per_token=2,
+)
