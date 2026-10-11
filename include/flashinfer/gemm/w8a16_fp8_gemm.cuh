@@ -25,23 +25,18 @@
 // path materialises never exists.  The weight is [N, K] row-major (the
 // torch Linear layout, "NT" GEMM), act is [M, K] row-major.
 //
-// Rung 25 of the optimization ladder: stream-K scheduling.  The persistent
-// kernel of rungs 21-24 handed each block whole tiles (unit = blockIdx,
-// += gridDim), so a problem with 400 tiles on 132 SMs ran 3 full waves and
-// then 4 lonely tiles: the M = 1024-4096 rows paid up to a third of their
-// time in that tail.  Here every block gets an equal share of the total
-// slab count of the TAIL wave only (data-parallel + stream-K hybrid: the
-// full waves keep the grouped persistent order, which the L2 needs -- a
-// first attempt that streamed the whole problem scattered concurrent blocks
-// over distant tiles and ran 2x slower); a block's tail pieces may be
-// partial tiles.  A partial piece writes its
-// fp32 accumulators to a workspace slot (two slots per block) and bumps a
-// per-tile counter; the block that completes the last piece of a tile adds
-// the other pieces' partials into its registers and runs the normal
-// epilogue.  Pieces per tile and slot indices follow from the arithmetic
-// split, so no scheduling metadata is needed; counters are zeroed per call.
-// The split-K path (grids under a third of a wave) is unchanged.
-// Requires sm_90a, K % 64 == 0, 16 B aligned bases, N % 8 == 0.
+// Rung 26 of the optimization ladder: stream-K partials staged through
+// shared memory.  Rung 25's fixup wrote and read the fp32 partial tiles
+// straight from the accumulator fragments -- 4-byte accesses with 8 lanes
+// per 32 B sector, 2 x 128 KB per block -- and that traffic cost more than
+// the tail it removed (net 0.93x), besides pushing the non-split
+// instantiations to 432-448 B of spill.  Here each warpgroup moves its
+// 64 n x 256 m quarter of the partial through its 16 KB epilogue buffer in
+// four 64-row passes: fragments -> XOR-swizzled fp32 smem rows -> 16 B
+// coalesced global stores (and the reverse for the fixup add), so the
+// partial round trip runs at copy speed with the same register footprint
+// as the normal epilogue.  Scheduling is rung 25's.  Requires sm_90a,
+// K % 64 == 0, 16 B aligned bases, N % 8 == 0.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -569,38 +564,72 @@ __global__ void __launch_bounds__(kW8A16Threads, 1)
     };
 
     uint32_t frag0[kW8A16RowBlocks][4][4], frag1[kW8A16RowBlocks][4][4];
-    // Fragment <-> fp32 partial tile [TileM][TileN]: element (m = 8j + 2(lane%4)
-    // + q, n = cwg*64*RowBlocks + b*64 + wq*16 + lane/4 + 8h) is d[b][j*4 + 2h + q].
+    // Stream-K partial tiles, fp32 [TileM][TileN] row-major in the workspace.
+    // This warpgroup owns n columns [cwg*64, cwg*64 + 64) and all 256 m rows;
+    // it moves them in four 64-row passes through its 16 KB epilogue buffer
+    // ([64 m][64 n] fp32, 16 B chunk index XOR-swizzled by (m >> 1) & 7),
+    // fragments <-> smem in the mma layout and smem <-> global as 16 B rows.
+    float* pbuf = reinterpret_cast<float*>(epi_base + cwg * kW8A16EpiWgBytes);
+    const int wt = threadIdx.x - 128 - cwg * 128;  // warpgroup-local thread id
+    const int n_wg0 = cwg * (64 * kW8A16RowBlocks);
+    auto pidx = [](int r, int c) -> int {  // r: row 0..63, c: fp32 col 0..63
+      return r * 64 + ((((c >> 2) ^ ((r >> 1) & 7))) << 2) + (c & 3);
+    };
+    // Fragment (m = 8j + 2(lane%4) + q, n = wq*16 + lane/4 + 8h) = d[0][j*4+2h+q].
     auto partial_store = [&](float* slot) {
 #pragma unroll
-      for (int b = 0; b < kW8A16RowBlocks; ++b) {
-        const int n = cwg * (64 * kW8A16RowBlocks) + b * 64 + wq * 16 + lane / 4;
+      for (int pass = 0; pass < kW8A16TileM / 64; ++pass) {
+        warpgroup_bar_sync(cwg);  // buffer free
 #pragma unroll
-        for (int j = 0; j < kW8A16TileM / 8; ++j) {
+        for (int jj = 0; jj < 8; ++jj) {
+          const int j = pass * 8 + jj;
 #pragma unroll
           for (int q = 0; q < 2; ++q) {
-            const int m = j * 8 + (lane % 4) * 2 + q;
-            slot[m * kW8A16TileN + n] = d[b][j * 4 + q];
-            slot[m * kW8A16TileN + n + 8] = d[b][j * 4 + 2 + q];
+            const int r = jj * 8 + (lane % 4) * 2 + q;
+            const int c = wq * 16 + lane / 4;
+            pbuf[pidx(r, c)] = d[0][j * 4 + q];
+            pbuf[pidx(r, c + 8)] = d[0][j * 4 + 2 + q];
           }
+        }
+        warpgroup_bar_sync(cwg);  // rows staged
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          const int cid = wt + 128 * i;  // 1024 chunks of 16 B
+          const int r = cid / 16, ch = cid % 16;
+          const float4 v = *reinterpret_cast<const float4*>(&pbuf[pidx(r, ch * 4)]);
+          *reinterpret_cast<float4*>(slot + static_cast<int64_t>(pass * 64 + r) * kW8A16TileN +
+                                     n_wg0 + ch * 4) = v;
         }
       }
     };
     auto partial_add = [&](const float* slot) {
 #pragma unroll
-      for (int b = 0; b < kW8A16RowBlocks; ++b) {
-        const int n = cwg * (64 * kW8A16RowBlocks) + b * 64 + wq * 16 + lane / 4;
+      for (int pass = 0; pass < kW8A16TileM / 64; ++pass) {
+        warpgroup_bar_sync(cwg);  // buffer free
 #pragma unroll
-        for (int j = 0; j < kW8A16TileM / 8; ++j) {
+        for (int i = 0; i < 8; ++i) {
+          const int cid = wt + 128 * i;
+          const int r = cid / 16, ch = cid % 16;
+          const float4 v = *reinterpret_cast<const float4*>(
+              slot + static_cast<int64_t>(pass * 64 + r) * kW8A16TileN + n_wg0 + ch * 4);
+          *reinterpret_cast<float4*>(&pbuf[pidx(r, ch * 4)]) = v;
+        }
+        warpgroup_bar_sync(cwg);  // rows landed
+#pragma unroll
+        for (int jj = 0; jj < 8; ++jj) {
+          const int j = pass * 8 + jj;
 #pragma unroll
           for (int q = 0; q < 2; ++q) {
-            const int m = j * 8 + (lane % 4) * 2 + q;
-            d[b][j * 4 + q] += slot[m * kW8A16TileN + n];
-            d[b][j * 4 + 2 + q] += slot[m * kW8A16TileN + n + 8];
+            const int r = jj * 8 + (lane % 4) * 2 + q;
+            const int c = wq * 16 + lane / 4;
+            d[0][j * 4 + q] += pbuf[pidx(r, c)];
+            d[0][j * 4 + 2 + q] += pbuf[pidx(r, c + 8)];
           }
         }
       }
     };
+    static_assert(kW8A16RowBlocks == 1, "stream-K staging assumes one row block per warpgroup");
+    static_assert(kW8A16EpiWgBytes >= 64 * 64 * 4, "staging pass needs 16 KB per warpgroup");
 
     uint32_t g = 0;  // running slab index across pieces (mirrors the producer's)
     for_each_piece([&](int unit, int kt0, int kt1) {
