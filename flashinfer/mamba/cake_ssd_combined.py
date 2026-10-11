@@ -475,7 +475,9 @@ def _persistent_grid_size(*, total_work: int, sm_count: int) -> int:
 # of loom/examples/weave/
 # flashinfer_blackwell_mamba_ssd_combined_chunk_parallel_seed_v1.py), copied
 # verbatim: both copies must be refreshed together whenever the seed is
-# recalibrated.  Least-squares fits of the main-kernel time in microseconds:
+# recalibrated (CAKE-956 round 5, 2026-10-11: B200 step
+# b74734547976789d7eb7036b, B300 step 8ae022395365a025939cf937).
+# Least-squares fits of the main-kernel time in microseconds:
 #   exact scan     = serial_fixed + per_chunk(work_items) * chunks
 #     per_chunk is flat up to 32 concurrent (sequence, head) items and larger
 #     at 128 items (128 CTAs streaming x/B/C through L2); item counts in
@@ -486,18 +488,18 @@ def _persistent_grid_size(*, total_work: int, sm_count: int) -> int:
 _CHUNK_PARALLEL_COST_MODEL_US = {
     # (major, minor) compute capability -> calibrated constants.
     (10, 0): {  # B200, sm_100a
-        "serial_fixed": 4.69,
-        "serial_per_chunk_small": 2.594,
-        "serial_per_chunk_large": 2.809,
-        "cp_fixed": 25.2,
-        "cp_per_tile": 0.0493,
+        "serial_fixed": 4.99,
+        "serial_per_chunk_small": 2.556,
+        "serial_per_chunk_large": 2.758,
+        "cp_fixed": 25.0,
+        "cp_per_tile": 0.0491,
     },
     (10, 3): {  # B300 / GB300, sm_103a
-        "serial_fixed": 4.33,
-        "serial_per_chunk_small": 2.395,
-        "serial_per_chunk_large": 2.51,
-        "cp_fixed": 24.3,
-        "cp_per_tile": 0.0432,
+        "serial_fixed": 4.72,
+        "serial_per_chunk_small": 2.345,
+        "serial_per_chunk_large": 2.432,
+        "cp_fixed": 24.1,
+        "cp_per_tile": 0.0429,
     },
 }
 # Unmeasured capabilities use the B200 constants.
