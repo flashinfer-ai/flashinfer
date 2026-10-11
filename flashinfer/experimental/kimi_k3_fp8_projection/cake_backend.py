@@ -76,6 +76,7 @@ configuration and bitwise output parity on every contract row.  See
 from __future__ import annotations
 
 import functools
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, Optional
@@ -119,6 +120,19 @@ GEMM_K128_RSTAGED_BUCKETS = (
     16384,
 )  # round 8 (lever L8): the table buckets that hold a contract row with the 8-byte-aligned (``stride_pad`` 4) output stride, i.e. a staged-register launch (M 3 / 513 / 1000 / 1025 / 4097)
 GEMM_K128_RSTAGED_STRIDE_PAD = 4  # round 8 (lever L8): the output row stride of those rows, in BF16 elements past ``n_valid`` (``gemm_k128_cell_epilogues``)
+GEMM_NUM_STAGES = 3  # operand stages of the untokened GEMM programs (round 9, K6 arm G1: 2 on the tabulated ``gemm_stages`` rows, token ``_s2``)
+GEMM_TS_SLOTS = 1  # staging slots per epilogue group of the untokened GEMM programs (round 9: 4 on the tabulated ``gemm_ts_slots`` rows, token ``_ts4``; TMA-store programs only)
+GEMM_STAGES_FORMS = (
+    2,
+    3,
+)  # the operand-stage counts the Cake GEMM instance supports (``gemm_ir``)
+GEMM_TS_SLOT_FORMS = (
+    1,
+    4,
+)  # the staging-slot counts the Cake GEMM instance supports (4 needs the TMA-store epilogue)
+_GEMM_INSTANCE_TOKEN = re.compile(
+    r"(?:_s(?P<s>[0-9]+)|_ts(?P<ts>[0-9]+))(?=_|$)"
+)  # ``_s<n>`` / ``_ts<n>`` (never ``_sk`` / ``_skf<n>`` / ``_sks<n>`` / ``_tstore``)
 GEMM_SK_SUFFIX = "_sk"  # round 6 continuation 12 (lever SKO): the ordered stream-K instance of any GEMM epilogue program (table key ``gemm_sk``)
 GEMM_SKF_SUFFIX = "_skf"  # round 6 continuation 17/18 (lever SKF): the fix-up stream-K instance of the TMA-store GEMM programs (table key ``gemm_skf``)
 GEMM_SKF_MIN_ITERS = 4  # lever SKF: a pair's range of fewer K iterations cannot pay for the partial hand-offs
@@ -1088,11 +1102,59 @@ def gemm_block_k(M: int, n_tiles128: int, num_k_iters: int, arch: str) -> int:
     return bk
 
 
+def gemm_stages_ts_slots(
+    M: int, n_tiles128: int, num_k_iters: int, arch: str
+) -> tuple[int, int]:
+    """Round 9 (K6 arm G1): ``(operand stages, staging slots per epilogue group)`` of the GEMM route's TMA-store launch,
+    from the shape's table row (keys ``gemm_stages`` / ``gemm_ts_slots``: (2, 4) on the tabulated large-M ``f_b`` / ``kv_b``
+    rows, whose TMA-store programs carry the ``_s2_ts4`` tokens -- two operand stages and four staging slots, so a
+    32-column store chunk waits for the store issued one tile earlier instead of the previous chunk's read; same output
+    bits; (3, 1) otherwise).  TMA-store launches only: the register epilogues have no multi-slot staging and keep the
+    untokened programs (the Cake launcher's ``gemm_short_k_instance`` rule)."""
+    entry = decode_table_entry(M, n_tiles128, num_k_iters, arch)
+    if entry is None or entry.get("route") != "gemm":
+        return GEMM_NUM_STAGES, GEMM_TS_SLOTS
+    return _entry_stages_ts_slots(entry)
+
+
+def _entry_stages_ts_slots(entry: dict[str, Any]) -> tuple[int, int]:
+    stages = int(entry.get("gemm_stages", GEMM_NUM_STAGES))
+    slots = int(entry.get("gemm_ts_slots", GEMM_TS_SLOTS))
+    if stages not in GEMM_STAGES_FORMS or slots not in GEMM_TS_SLOT_FORMS:
+        raise ValueError(
+            f"decode table entry gemm_stages must be one of {GEMM_STAGES_FORMS} and gemm_ts_slots one of "
+            f"{GEMM_TS_SLOT_FORMS} (got {entry})"
+        )
+    return stages, slots
+
+
+def gemm_instance_suffix(num_stages: int, ts_slots: int) -> str:
+    """Program tokens of a GEMM operand-stage / staging-slot instance (round 9, K6 arm G1): ``_s<n>`` when the stages
+    differ from 3, ``_ts<n>`` when the slots differ from 1 -- the Cake symbol spelling, placed after ``_k128`` and before
+    the stream-K suffixes in the kernel key; empty for the (3, 1) form."""
+    return (f"_s{int(num_stages)}" if int(num_stages) != GEMM_NUM_STAGES else "") + (
+        f"_ts{int(ts_slots)}" if int(ts_slots) != GEMM_TS_SLOTS else ""
+    )
+
+
+def _gemm_key_instance(key: str) -> tuple[int, int]:
+    """``(operand stages, staging slots)`` a GEMM kernel key names through its ``_s<n>`` / ``_ts<n>`` tokens
+    (``_pf<D>`` stripped first); the (3, 1) defaults when the key carries none."""
+    stages, slots = GEMM_NUM_STAGES, GEMM_TS_SLOTS
+    for m in _GEMM_INSTANCE_TOKEN.finditer(key.split("_pf")[0]):
+        if m.group("s") is not None:
+            stages = int(m.group("s"))
+        else:
+            slots = int(m.group("ts"))
+    return stages, slots
+
+
 def gemm_k128_cell_epilogues(
     n_tiles128: int, num_k_iters: int, bucket: int
 ) -> tuple[bool, bool]:
     """Round 8 (lever L8): which ``_k128`` epilogue programs the contract rows of a GEMM-route table cell launch, as
-    ``(TMA store, staged register)``.  The Cake export plan ships only the programs its rows launch, so the enumeration
+    ``(TMA store, staged register)``; round 9 reads the TMA-store flag for the ``_s<n>`` / ``_ts<n>`` programs of a
+    ``gemm_stages`` / ``gemm_ts_slots`` cell the same way.  The Cake export plan ships only the programs its rows launch, so the enumeration
     cannot read the cell's flags alone: the bucket's perf row (a contiguous output, ``ldo == n_valid``) takes the TMA-store
     epilogue when the family's column edge is 16-byte aligned (``gemm_tma_store_eligible``) and otherwise the staged
     register epilogue when its rows are 8-byte aligned (``gemm_reg_staged_eligible``; the tp8 ``in_proj_qkvgfab`` edge,
@@ -1460,6 +1522,10 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                     f"decode table entry gemm_bk must be 128 or 256 (got {entry})"
                 )
             ksfx = GEMM_K128_SUFFIX if gbk == 128 else ""
+            # round 9 (K6 arm G1): the operand-stage / staging-slot tokens of the cell's TMA-store programs (table keys
+            # ``gemm_stages`` / ``gemm_ts_slots``; after ``_k128``, before the stream-K suffixes); the register epilogues of
+            # the bucket's padded-stride rows keep the untokened programs (Cake launcher rule)
+            isfx = gemm_instance_suffix(*_entry_stages_ts_slots(entry))
             gsk = bool(entry.get("gemm_sk", 0))
             gskf = bool(entry.get("gemm_skf", 0))
             gsks = bool(entry.get("gemm_sks", 0))
@@ -1476,10 +1542,23 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                 )
                 if k128_tstore and not (gsk or gskf or gsks):
                     gkeys.append(
-                        gemm_kernel_key(GEMM_TSTORE_KERNEL_KEY + sfx + ksfx, gpf)
+                        gemm_kernel_key(GEMM_TSTORE_KERNEL_KEY + sfx + ksfx + isfx, gpf)
                     )
                 if k128_rstaged:
                     gkeys.append(GEMM_RSTAGED_KERNEL_KEY + sfx + ksfx)
+            elif isfx:
+                # round 9 (K6 arm G1): the cell's TMA-store program in its tokened form (the perf row's launch when the
+                # family's column edge admits the TMA store and no stream-K lever names that program -- the keys below
+                # carry the tokens instead); the staged-register program of a 192-wide cell stays as today, the
+                # untokened TMA-store programs are launched by no row of this cell
+                if gemm_k128_cell_epilogues(n_tiles128, num_k_iters, bucket)[
+                    0
+                ] and not (gsk or gskf or gsks):
+                    gkeys.append(
+                        gemm_kernel_key(GEMM_TSTORE_KERNEL_KEY + sfx + isfx, gpf)
+                    )
+                if sfx:
+                    gkeys.append(GEMM_RSTAGED_KERNEL_KEY + sfx)
             else:
                 if gpf > 0:
                     # round 6 (lever GP): the prefetching GEMM program of the tabulated row's production epilogue (16-byte
@@ -1499,7 +1578,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                 # (``route_plan``)
                 gkeys.append(
                     gemm_kernel_key(
-                        GEMM_TSTORE_KERNEL_KEY + sfx + ksfx + GEMM_SK_SUFFIX, gpf
+                        GEMM_TSTORE_KERNEL_KEY + sfx + ksfx + isfx + GEMM_SK_SUFFIX, gpf
                     )
                 )
             if gskf:
@@ -1513,7 +1592,9 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                     else ""
                 )
                 gkeys.append(
-                    gemm_kernel_key(GEMM_TSTORE_KERNEL_KEY + sfx + ksfx + skf_sfx, gpf)
+                    gemm_kernel_key(
+                        GEMM_TSTORE_KERNEL_KEY + sfx + ksfx + isfx + skf_sfx, gpf
+                    )
                 )
             if gsks:
                 # round 7 (lever SKS): the sliced fix-up forms the row may launch (the slot form follows the
@@ -1524,6 +1605,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                             GEMM_TSTORE_KERNEL_KEY
                             + sfx
                             + ksfx
+                            + isfx
                             + f"{GEMM_SKS_SUFFIX}{form}",
                             gpf,
                         )
@@ -1881,6 +1963,8 @@ class ProjectionPlan:
     decode_tma_store: bool  # decode route: the row's ``tstore`` instance on a 16-byte-aligned output view (round 6, lever E1)
     gemm_bn: int  # GEMM route: output columns per CTA pair of the launched program (256, or 192 on the tabulated ``gemm_bn`` rows; round 6, lever L5)
     gemm_bk: int  # GEMM route: K elements per operand hand-off of the launched program (256, or 128 on the tabulated ``gemm_bk`` rows; round 8, lever L8)
+    gemm_stages: int  # GEMM route: operand stages of the launched program (3, or 2 on the tabulated ``gemm_stages`` rows' TMA-store launches; round 9, K6 arm G1)
+    gemm_ts_slots: int  # GEMM route: staging slots per epilogue group of the launched program (1, or 4 on the tabulated ``gemm_ts_slots`` rows' TMA-store launches; round 9, K6 arm G1)
     gemm_n_tiles: int  # GEMM route: CTA-pair N tiles of the launched program (``n_pad / 256`` or ``ceil(n_valid / 192)``)
     gemm_sk: Optional[
         StreamKPlan
@@ -1968,6 +2052,17 @@ def route_plan(
         # round 8 (lever L8): the 128-K operand hand-off form the table row asks for (TMA-store and staged-register
         # epilogues only, like the 192-wide form; the predicated register epilogue keeps the 256-K program)
         gbk = gemm_block_k(M, prepared.n_tiles128, prepared.num_k_iters, arch)
+        # round 9 (K6 arm G1): the operand-stage / staging-slot form the table row asks for (TMA-store epilogue only: the
+        # four-slot staging has no other form; the register epilogues keep the (3, 1) programs, Cake launcher rule)
+        isfx = (
+            gemm_instance_suffix(
+                *gemm_stages_ts_slots(
+                    M, prepared.n_tiles128, prepared.num_k_iters, arch
+                )
+            )
+            if base == GEMM_TSTORE_KERNEL_KEY
+            else ""
+        )
         # round 6 (lever GP): the prefetching program ships with the TMA-store epilogue only (Cake rule); use it when
         # registered.  Round 6 (lever L5): the 192-wide instance of the row's epilogue program when the table row asks
         # for it and the program is registered; every fallback keeps the row on a registered program.
@@ -1988,6 +2083,12 @@ def route_plan(
                 v
                 for s, pf, bn in stems
                 for v in ((s + GEMM_K128_SUFFIX, pf, bn), (s, pf, bn))
+            ]
+        if isfx:
+            # round 9 (K6 arm G1): each stem in its ``_s<n>`` / ``_ts<n>`` form first, then as today, so a missing program
+            # falls back at the same geometry onto a registered program
+            stems = [
+                v for s, pf, bn in stems for v in ((s + isfx, pf, bn), (s, pf, bn))
             ]
         # round 6 continuation 12 (lever SKO): the ordered stream-K instance (``_sk`` before ``_pf``) of each candidate when
         # the table row asks for it and the launch sits in the stream-K wave window (one full wave plus at most half a
@@ -2044,6 +2145,9 @@ def route_plan(
         gbk = (
             128 if GEMM_K128_SUFFIX in key.split("_pf")[0] else BLOCK_K
         )  # the launched program's hand-off (a fallback may have dropped the _k128 form)
+        gst, gts = _gemm_key_instance(
+            key
+        )  # the launched program's stages / slots (a fallback may have dropped the tokens)
         kernels.append(key)
         grids.append(
             sk_plan.grid
@@ -2055,6 +2159,7 @@ def route_plan(
     else:
         gbn = BLOCK_N
         gbk = BLOCK_K
+        gst, gts = GEMM_NUM_STAGES, GEMM_TS_SLOTS
         sk_plan = None
         skf_plan = None
     dec_ts = False
@@ -2079,6 +2184,8 @@ def route_plan(
         decode_tma_store=dec_ts,
         gemm_bn=gbn,
         gemm_bk=gbk,
+        gemm_stages=gst,
+        gemm_ts_slots=gts,
         gemm_n_tiles=gemm_n_tiles(prepared, gbn),
         gemm_sk=sk_plan,
         gemm_skf=skf_plan,
