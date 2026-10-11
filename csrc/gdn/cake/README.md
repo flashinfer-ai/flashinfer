@@ -9,16 +9,38 @@ with per-variant SASS equivalence checks against the generated originals.
 ## Layout
 
 - `manifest.json` is the only registry. Each entry under `variants` names
-  one kernel source (`outputs[0].path`, shared by every specialization of
-  the same kernel body), the compile-time `defines` that specialize it
+  its kernel sources (`outputs[].path`, each shared by every specialization of
+  the same kernel body), the compile-time `defines` that specialize them
   (passed as `-D` flags), the `specializations` the resolver matches, and
   one host shim (`host_binding`).
 - `cuda/` holds one file per distinct kernel body. Kernels that run on
-  several architectures carry each in `outputs[0].architectures`; genuine
+  several architectures carry each in `outputs[].architectures`; the
+  outputs of a record partition its `architectures`, and the loader
+  compiles the one output that lists the device's architecture. Genuine
   lowering differences sit behind exact `__CUDA_ARCH__` guards (SM107a takes
   the generic shared-address form, as Cake lowers it for every SM100-family
   target other than exact SM100a; the seven `fullgrid_vhold` prefill variants
-  stay SM100a-only).
+  stay SM100a-only) or, when one architecture's lowering of a shared body
+  differs from the shipped text, in that architecture's own output: the
+  SM107a decode bodies scale q through `cake_f32_mul_f64const_rn` (an exact,
+  FP64-free emulation of `(float)((double)x * SCALE)` defined in
+  `cake_gdn_device_common.cuh`; Cake's generator names it
+  `loom_f32_mul_f64const_rn` and the export maps the `loom_` prefix to
+  `cake_`) and are delivered as `sm_107a`-only outputs of the same records,
+  while the SM100a/SM103a outputs keep the shipped text byte for byte. In the
+  manifest this reads as follows: a decode record exported for SM107a together
+  with SM100a/SM103a (36 three-architecture decode records in the current
+  manifest) keeps its shipped body as `outputs[0]` with `architectures`
+  reduced to `["sm_100a", "sm_103a"]` and gains an `sm_107a` output; a decode
+  record exported for SM107a alone (the `_vpre` / `_pro` bodies; the fp32 T=1
+  `splitv8_tilev32` band body is born in this form) whose program takes the
+  helper gets a replacement body and its old file leaves the tree; `cake_gdn_device_common.cuh` is re-rendered for all three
+  architectures (it carries the helper definitions for every kernel that
+  includes it; the current generator writes them as content-addressed
+  `#include "cake_device_helpers/cake_<name>_<sha256[:16]>.cuh"` files under
+  `csrc/`, shared with other Cake families, so the cubin compile adds `csrc`
+  to its include path). No SM100a/SM103a kernel body and no kernel's
+  behaviour changes.
   `cuda/gdn_prefill_generated.cuh` and `../cake_gdn_common.cuh` are the
   shared device headers.
   Three prefill variants keep their own source with in-file defines
@@ -76,6 +98,18 @@ cache) resolves on SM107a to `gdn_decode_pretranspose_mtp_t4_splitv8_pro`
 token and every independent global load is issued before the first reduction;
 bitwise-identical to the shipped body, which SM100a/SM103a keep.  The fp32
 verify row (B=1 T=2, `..._mtp_t2_inline_tile8`) keeps one body everywhere.
+The indexed fp32-state T=1 row (`gdn_decode_pretranspose_splitv8`, H=16 /
+HV=32) follows the state-head count `B * HV` on SM107a
+(`CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS`, `cake_gdn_fp32_t1_route`): below 256
+state heads the shipped `splitv8` body (TILE_V 16, eight CTAs per state head),
+from 256 on its `gdn_decode_pretranspose_splitv8_tilev32` twin (TILE_V 32,
+four CTAs per state head; bitwise-identical output, only the row -> CTA
+mapping changes), 5-8.5 % faster on R200 from 256 through 2048 state heads
+under the route id `..._indexed_fp32_t1_splitv8_tilev32`.  Its records are
+exported for `sm_107a` only; SM100a/SM103a keep `splitv8` at every count.  The
+host launches `B * HV` times the CTAs per state head of the resolved record
+(`cake_gdn_fp32_t1_ctas_per_state`, keyed by the record's schedule), and each
+shim checks that grid.
 
 Single-token BF16-state decode admits every Qwen3.5 per-rank linear-attention
 geometry at any batch: H/HV = 16/32, 8/16, 4/8 (Qwen3.5-35B-A3B TP1/TP2/TP4)
