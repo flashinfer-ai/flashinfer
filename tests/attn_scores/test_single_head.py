@@ -2,11 +2,12 @@
 # Copyright (c) 2026 by FlashInfer team.
 
 """single_head_paged_mqa_logits against an exact reference over random paged BF16
-keys."""
+or NVFP4 keys."""
 
 import pytest
 import torch
 
+from flashinfer import nvfp4_kv_dequantize
 from flashinfer.attn_scores import single_head_paged_mqa_logits
 
 pytestmark = pytest.mark.skipif(
@@ -15,10 +16,23 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def bf16(rows: int) -> torch.Tensor:
-    """Random BF16 rows of small integers times {1/8, ..., 2}: exact FP32 dots."""
-    scales = 2.0 ** torch.randint(-3, 2, (rows, 128), device="cuda")
-    return (torch.randint(-8, 9, (rows, 128), device="cuda") * scales).bfloat16()
+def rows_of(nvfp4: bool, rows: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Random BF16 rows of small integers, or NVFP4 ones, times scales in
+    {1/8, ..., 2}: dot products are exact in FP32 either way."""
+    if not nvfp4:
+        scales = 2.0 ** torch.randint(-3, 2, (rows, 128), device="cuda")
+        values = torch.randint(-8, 9, (rows, 128), device="cuda") * scales
+        return values.bfloat16(), None
+    scales = 2.0 ** torch.randint(-3, 2, (rows, 8), device="cuda")
+    values = torch.randint(256, (rows, 64), device="cuda").byte()
+    return values, scales.to(torch.float8_e4m3fn)
+
+
+def dequantize(values: torch.Tensor, scales: torch.Tensor | None) -> torch.Tensor:
+    if scales is None:
+        return values.double()
+    one = torch.ones(1, device="cuda")
+    return nvfp4_kv_dequantize(values, scales.view(torch.uint8), one).double()
 
 
 @pytest.mark.parametrize(
@@ -29,19 +43,34 @@ def bf16(rows: int) -> torch.Tensor:
     ],
 )
 @pytest.mark.parametrize("rows", [1, 3, 8])
+@pytest.mark.parametrize("keys", ["bf16", "nvfp4", "nvfp4_packed"])
 @torch.inference_mode()
-def test_single_head_paged_mqa_logits_match_reference_and_replay(lengths, rows) -> None:
+def test_single_head_paged_mqa_logits_match_reference_and_replay(
+    lengths, rows, keys
+) -> None:
     """Keys on shuffled pages; table entries past a length would fault if read,
-    and scores past it stay unwritten. A replay sees new lengths and tables."""
+    and scores past it stay unwritten. A replay sees new lengths and tables.
+    nvfp4_packed: keys and scales are views of one cache, each page's 64 keys
+    then their scales."""
     torch.manual_seed(rows)
+    nvfp4 = keys != "bf16"
     batch, capacity = len(lengths), max(lengths) + 300
     width = -(-capacity // 64)
     pages = batch * width
-    key_cache = bf16(64 * pages).view(pages, 64, 128)
+    values, scales = rows_of(nvfp4, 64 * pages)
+    key_cache, key_scales = values.view(pages, 64, -1), None
+    if nvfp4:
+        key_scales = scales.view(pages, 64, 8)
+    if keys == "nvfp4_packed":
+        parts = (key_cache.flatten(1), key_scales.view(torch.uint8).flatten(1))
+        cache = torch.cat(parts, 1)
+        key_cache = cache[:, : 64 * 64].unflatten(1, (64, 64))
+        key_scales = cache[:, 64 * 64 :].view(torch.float8_e4m3fn)
+        key_scales = key_scales.unflatten(1, (64, 8))
     table = torch.empty(batch, width, dtype=torch.int32, device="cuda")
     context = torch.empty(batch, dtype=torch.int32, device="cuda")
     requests = torch.arange(batch, dtype=torch.int32, device="cuda").flip(0)
-    query = torch.empty(batch * rows, 128, dtype=torch.bfloat16, device="cuda")
+    query, query_scales = rows_of(nvfp4, batch * rows)
     scores = torch.empty(batch * rows, capacity, device="cuda")
 
     def prepare(lengths: list[int]) -> None:
@@ -50,23 +79,36 @@ def test_single_head_paged_mqa_logits_match_reference_and_replay(lengths, rows) 
         shuffled = torch.randperm(pages, device="cuda")[: table.numel()].int()
         past = torch.arange(width, device="cuda") >= ends
         table[requests.long()] = shuffled.view_as(table).masked_fill(past, 2**31 - 1)
-        query.copy_(bf16(batch * rows))
         scores.fill_(-7)
 
     def check(lengths: list[int]) -> None:
         for group, length in enumerate(lengths):
             mine = slice(group * rows, group * rows + rows)
-            request = int(requests[group])
-            keys = key_cache[table[request, : -(-length // 64)].long()].flatten(0, 1)
-            expected = query[mine].double() @ keys[:length].double().T
+            assert bool((scores[mine, length:] == -7).all())
+            if not length:
+                continue
+            page = table[int(requests[group]), : -(-length // 64)].long()
+            key = key_cache[page].flatten(0, 1)[:length]
+            key_scale = query_scale = None
+            if nvfp4:
+                key_scale = key_scales[page].flatten(0, 1)[:length]
+                query_scale = query_scales[mine]
+            expected = dequantize(query[mine], query_scale)
+            expected = expected @ dequantize(key, key_scale).T
             torch.testing.assert_close(
                 scores[mine, :length], expected.float(), rtol=0, atol=0
             )
-            assert bool((scores[mine, length:] == -7).all())
 
     def run() -> None:
         single_head_paged_mqa_logits(
-            query, key_cache, table, context, requests=requests, scores=scores
+            query,
+            key_cache,
+            table,
+            context,
+            requests=requests,
+            scores=scores,
+            query_scales=query_scales,
+            key_scales=key_scales,
         )
 
     prepare(list(lengths))
@@ -92,5 +134,14 @@ def test_single_head_paged_mqa_logits_rejects_bad_shapes() -> None:
     run = single_head_paged_mqa_logits
     with pytest.raises(ValueError, match="block table must cover"):
         run(query, key_cache, table[:, :1], context, requests=requests, scores=scores)
-    with pytest.raises(ValueError, match="BF16 of dimension 128"):
+    with pytest.raises(ValueError, match="both BF16 or both NVFP4"):
         run(query.float(), key_cache, table, context, requests=requests, scores=scores)
+    with pytest.raises(ValueError, match="need scales"):
+        run(
+            query.view(torch.uint8)[:, :64],
+            key_cache.view(torch.uint8)[..., :64],
+            table,
+            context,
+            requests=requests,
+            scores=scores,
+        )

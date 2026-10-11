@@ -124,6 +124,7 @@ rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_nvfp4_quantize_k16384.json
 single_head_paged_mqa_logits_page_size64_dim128.json
+single_head_paged_mqa_logits_page_size64_dim64.json
 token_sparse_kv_indices_top_k2048_lists2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
@@ -3012,4 +3013,16 @@ single_head_paged_mqa_logits.fi_trace(
     context_lengths=torch.empty(4, dtype=torch.int32),
     requests=torch.arange(4, dtype=torch.int32),
     scores=torch.empty(8, 1024),
+)
+
+single_head_paged_mqa_logits.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty(8, 64, dtype=torch.uint8),
+    key_cache=torch.empty(64, 64, 64, dtype=torch.uint8),
+    block_table=torch.empty(4, 16, dtype=torch.int32),
+    context_lengths=torch.empty(4, dtype=torch.int32),
+    requests=torch.arange(4, dtype=torch.int32),
+    scores=torch.empty(8, 1024),
+    query_scales=torch.empty(8, 8, dtype=torch.float8_e4m3fn),
+    key_scales=torch.empty(64, 64, 8, dtype=torch.float8_e4m3fn),
 )
