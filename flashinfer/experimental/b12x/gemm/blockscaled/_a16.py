@@ -30,10 +30,43 @@ class NVFP4LinearWeight:
     global_scale_kind: str
     in_features: int
     out_features: int
+    activation_global_scale: torch.Tensor | None = None
 
     @property
     def padded_in_features(self) -> int:
         return int(self.values.shape[1]) * 2
+
+
+@dataclass(frozen=True)
+class MXFP4LinearWeight:
+    """Packed E2M1 values and swizzled per-32 E8M0 scales, without a global gain."""
+
+    values: torch.Tensor
+    scale_mma: torch.Tensor
+    in_features: int
+    out_features: int
+
+    @property
+    def padded_in_features(self) -> int:
+        return int(self.values.shape[1]) * 2
+
+
+def pack_mxfp4_weight(weight, scale):
+    if weight.device.type != "cuda":
+        raise ValueError("MXFP4 weights must be on CUDA")
+    _check_tensor("weight", weight, weight.device, torch.uint8)
+    if weight.ndim != 2 or min(weight.shape) <= 0 or weight.shape[1] % 16:
+        raise ValueError("MXFP4 requires packed uint8 [N,K/2] with K32")
+    n, packed_k = weight.shape
+    k = packed_k * 2
+    if scale.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+        raise ValueError("MXFP4 requires E8M0 block scales")
+    storage = scale_storage(scale, n, k, 32)
+    _check_tensor("scale", storage, weight.device, torch.uint8)
+    from b12x._lib.intrinsics import as_grouped_scale_view_mx
+
+    mma = as_grouped_scale_view_mx(storage.view(1, -1), n, k)
+    return MXFP4LinearWeight(weight, mma, k, n)
 
 
 def _check_tensor(name, tensor, device, dtype=None):
@@ -215,6 +248,8 @@ def _weight_parts(weight):
 
     if isinstance(weight, IQ2XSLinearWeight):
         return weight.values, weight.metadata, None, False
+    if isinstance(weight, MXFP4LinearWeight):
+        return weight.values, weight.scale_mma, None, False
     if isinstance(weight, NVFP4LinearWeight):
         return weight.values, weight.scale_mma, weight.global_scale, True
     if isinstance(weight, MXFP8LinearWeight):
@@ -222,10 +257,11 @@ def _weight_parts(weight):
     raise TypeError("BF16 blockscaled linear requires NVFP4, MXFP8, or IQ2_XS weights")
 
 
-def _layout(m, n, k, fp4, config=None):
+def _layout(m, n, k, fp4, config=None, *, group=None):
     """Byte offsets into caller-owned scratch; all kernel pointers stay aligned."""
     value_bytes = m * (k // 2 if fp4 else k)
-    scale_bytes = triton.cdiv(m, 128) * triton.cdiv(k // (16 if fp4 else 32), 4) * 512
+    group = (16 if fp4 else 32) if group is None else group
+    scale_bytes = triton.cdiv(m, 128) * triton.cdiv(k // group, 4) * 512
     scale_start = triton.cdiv(value_bytes, 256) * 256
     alpha_start = triton.cdiv(scale_start + scale_bytes, 256) * 256
     partial_start = alpha_start + 256

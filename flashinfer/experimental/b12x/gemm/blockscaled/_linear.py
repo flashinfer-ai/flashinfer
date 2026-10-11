@@ -7,7 +7,7 @@ from b12x._lib.quant.block_codec import BLOCK_CODECS
 from b12x.preparation import Plan
 from b12x.preparation.types import plan_from_handle, require_prepared
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, TypeAlias
 
 import cutlass.cute as cute
@@ -25,7 +25,12 @@ from b12x.gemm._shared.wo_mxfp8 import (
     _check_gpu_tensor,
     pack_mxfp8_scales_for_dense_gemm,
 )
-from ._a16 import NVFP4LinearWeight, pack_nvfp4_weight
+from ._a16 import (
+    MXFP4LinearWeight,
+    NVFP4LinearWeight,
+    pack_mxfp4_weight,
+    pack_nvfp4_weight,
+)
 from ._iq2_xs import IQ2XSLinearWeight, pack_iq2_xs_weight
 
 
@@ -53,7 +58,11 @@ class TensorFP8LinearWeight:
 
 
 Weight: TypeAlias = (
-    MXFP8LinearWeight | TensorFP8LinearWeight | NVFP4LinearWeight | IQ2XSLinearWeight
+    MXFP8LinearWeight
+    | TensorFP8LinearWeight
+    | NVFP4LinearWeight
+    | MXFP4LinearWeight
+    | IQ2XSLinearWeight
 )
 
 
@@ -414,6 +423,7 @@ def pack_weight(
     recipe: str | None = None,
     global_scale: torch.Tensor | None = None,
     global_scale_kind: str = "multiplier",
+    activation_global_scale: torch.Tensor | None = None,
 ) -> Weight:
     """Pack a serialized dense weight for ``blockscaled.mm``.
 
@@ -425,6 +435,9 @@ def pack_weight(
     Pass the weight-only ``global_scale`` and its ``global_scale_kind``
     (``'multiplier'`` or ``'reciprocal'``); no scale transformation occurs.
 
+    ``recipe='mxfp4'`` borrows packed uint8 values and swizzled K/32 E8M0
+    scales without a global scale. BF16 inputs use MXFP4 activation quantization.
+
     ``recipe='iq2_xs'`` takes CUDA uint8 ``[N,K/256,74]`` safetensors block
     payloads with embedded scales; ``iq2_xxs`` takes 66-byte blocks.
     ``q8_0`` takes ``[N,K/32,34]`` blocks containing INT8 values and FP16 scales.
@@ -432,6 +445,8 @@ def pack_weight(
     Preparation losslessly rearranges descriptors and metadata for A16 GEMM.
     """
 
+    if activation_global_scale is not None and recipe != "nvfp4":
+        raise ValueError("only NVFP4 accepts an activation global scale")
     if recipe in BLOCK_CODECS:
         if (
             scale is not None
@@ -442,10 +457,26 @@ def pack_weight(
         return pack_iq2_xs_weight(weight, codec=recipe)
     if scale is None:
         raise ValueError("this weight recipe requires a scale tensor")
+    if recipe == "mxfp4":
+        if global_scale is not None or global_scale_kind != "multiplier":
+            raise ValueError("MXFP4 has no global scale")
+        return pack_mxfp4_weight(weight, scale)
     if recipe == "nvfp4":
-        return pack_nvfp4_weight(
+        packed = pack_nvfp4_weight(
             weight, scale, global_scale, global_scale_kind=global_scale_kind
         )
+        if activation_global_scale is not None:
+            from ._a16 import _check_tensor
+
+            _check_tensor(
+                "activation global scale",
+                activation_global_scale,
+                weight.device,
+                torch.float32,
+            )
+            if activation_global_scale.numel() != 1:
+                raise ValueError("activation global scale must be scalar")
+        return replace(packed, activation_global_scale=activation_global_scale)
     if (
         recipe not in (None, "mxfp8", "tensor_fp8")
         or global_scale is not None
@@ -934,7 +965,7 @@ def blockscaled_mm(
     if plan is None and isinstance(rhs, IQ2XSLinearWeight):
         raise TypeError("block-quantized linear weights require a prepared Plan")
 
-    if isinstance(rhs, (NVFP4LinearWeight, IQ2XSLinearWeight)) or (
+    if isinstance(rhs, (NVFP4LinearWeight, MXFP4LinearWeight, IQ2XSLinearWeight)) or (
         isinstance(rhs, MXFP8LinearWeight)
         and isinstance(lhs, torch.Tensor)
         and lhs.dtype == torch.bfloat16
@@ -942,6 +973,8 @@ def blockscaled_mm(
         if not isinstance(lhs, torch.Tensor):
             raise TypeError("packed linear requires a BF16 source tensor")
         options = dict(kwargs)
+        if isinstance(rhs, NVFP4LinearWeight):
+            options.setdefault("activation_global_scale", rhs.activation_global_scale)
         bias = options.pop("bias", None)
         out_dtype = options.pop("out_dtype", None)
         if out_dtype not in (None, torch.bfloat16):

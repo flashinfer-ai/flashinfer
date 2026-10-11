@@ -73,6 +73,7 @@ class BlockscaledConfig:
 def _validate_query(query, device):
     if not isinstance(query, BlockscaledQuery) or query.recipe not in (
         "nvfp4",
+        "mxfp4",
         "mxfp8",
         "iq2_xs",
         "iq2_xxs",
@@ -105,6 +106,10 @@ def _validate_query(query, device):
             raise ValueError(
                 "IQ2_XS requires BF16 activations without activation scaling"
             )
+    if query.recipe == "mxfp4" and (
+        query.activation_mode == "a16" or query.activation_scale_available
+    ):
+        raise ValueError("MXFP4 requires quantized activations without a global scale")
     if query.activation_mode not in ("auto", "a16", "quantized"):
         raise ValueError("activation mode must be auto, a16, or quantized")
     if query.output_mode not in (
@@ -150,9 +155,11 @@ def _automatic_a16(query, device):
 
 
 def _default_config(query, device):
-    if query.activation_mode == "quantized":
+    if query.activation_mode == "quantized" or query.recipe == "mxfp4":
         return BlockscaledConfig(mode="quantized")
-    if _automatic_a16(query, device):
+    if _automatic_a16(query, device) or (
+        query.recipe == "nvfp4" and not query.activation_scale_available
+    ):
         return _a16_default_config(query, device)
     if query.activation_mode == "a16" or query.recipe in BLOCK_CODECS:
         return _a16_default_config(query, device)
@@ -257,6 +264,8 @@ def _validate_config(query, config, device):
     if query.recipe in BLOCK_CODECS and config.mode != "a16":
         raise ValueError("IQ2_XS supports only A16 execution")
     if config.mode == "a16":
+        if query.recipe == "mxfp4":
+            raise ValueError("MXFP4 does not support A16 execution")
         simt = query.recipe in BLOCK_CODECS and config.tile_n == 4
         row_tiles = (
             (1, 2, 4, 8)
@@ -310,8 +319,10 @@ def _validate_config(query, config, device):
             for value in (config.tile_m, config.tile_n, config.tile_k, config.split_k)
         ):
             raise ValueError("quantized execution has no A16 launch knobs")
-        if query.padded_in_features % 128:
-            raise ValueError("quantized execution requires stored K128")
+        if query.padded_in_features % (256 if query.recipe == "mxfp4" else 128):
+            raise ValueError(
+                "quantized execution requires K256 for MXFP4 or K128 otherwise"
+            )
         if query.workspace_nbytes is not None and not functional_mxfp8_quantization(
             query, config
         ):
@@ -321,8 +332,9 @@ def _validate_config(query, config, device):
                 query.num_tokens,
                 query.out_features,
                 query.padded_in_features,
-                query.recipe == "nvfp4",
+                query.recipe in ("nvfp4", "mxfp4"),
                 (64, 64, 1),
+                group=16 if query.recipe == "nvfp4" else 32,
             )[-1]
             if query.workspace_nbytes < needed:
                 raise ValueError(
@@ -380,7 +392,9 @@ def _tuning_parameters(query, device):
     return ParameterSpace.create(
         TUNING.knobs,
         values={
-            "mode": ("a16",)
+            "mode": ("quantized",)
+            if query.recipe == "mxfp4"
+            else ("a16",)
             if query.recipe in BLOCK_CODECS
             else ("a16", "quantized")
             if query.activation_mode == "auto"

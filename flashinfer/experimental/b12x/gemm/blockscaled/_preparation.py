@@ -93,7 +93,8 @@ def compile_packed(
 
     query = _decode_query(query_payload)
     config = BlockscaledConfig.from_config(FrozenMapping(config_payload))
-    fp4 = query.recipe == "nvfp4"
+    fp4 = query.recipe in ("nvfp4", "mxfp4")
+    group = 16 if query.recipe == "nvfp4" else 32
     with torch.cuda.device(ordinal):
         if config.mode == "a16":
             if config.tile_n == 4:
@@ -184,11 +185,11 @@ def compile_packed(
                 K=query.padded_in_features,
                 FP4=fp4,
                 RECIPROCAL=query.global_scale_kind == "reciprocal",
-                GROUP=16 if fp4 else 32,
+                GROUP=group,
                 CHUNKS=16,
                 grid=(
                     query.num_tokens,
-                    triton.cdiv(query.padded_in_features // (16 if fp4 else 32), 16),
+                    triton.cdiv(query.padded_in_features // group, 16),
                     1,
                 ),
                 num_warps=4,
@@ -232,8 +233,9 @@ def _workspace_bytes(query, config):
         query.num_tokens,
         query.out_features,
         query.padded_in_features,
-        query.recipe == "nvfp4",
+        query.recipe in ("nvfp4", "mxfp4"),
         (64, 64, 1),
+        group=16 if query.recipe == "nvfp4" else 32,
     )[-1]
 
 
@@ -300,7 +302,9 @@ class _PackedExecutionState:
         from ._linear import _source_2d, _pad_k
 
         q, config = self.query, self.config
-        fp4 = q.recipe == "nvfp4"
+        nvfp4 = q.recipe == "nvfp4"
+        fp4 = q.recipe in ("nvfp4", "mxfp4")
+        group = 16 if nvfp4 else 32
         iq2 = q.recipe in BLOCK_CODECS
         if source.device != self.device or source.dtype != torch.bfloat16:
             raise ValueError("packed source differs from prepared dtype/device")
@@ -355,10 +359,10 @@ class _PackedExecutionState:
             scale_bytes = scales
         else:
             scale_bytes = scale_storage(
-                scales, q.out_features, q.padded_in_features, 16 if fp4 else 32
+                scales, q.out_features, q.padded_in_features, group
             )
         _check_tensor("weight scale", scale_bytes, self.device, torch.uint8)
-        if fp4:
+        if nvfp4:
             _check_tensor(
                 "weight global scale", global_scale, self.device, torch.float32
             )
@@ -394,7 +398,7 @@ class _PackedExecutionState:
                 return result.view(*source.shape[:-1], q.out_features)
             _check_tensor("source", source, self.device, torch.bfloat16)
             out = _validate_output(source, out, q.out_features)
-            reads = (source, values, scale_bytes) + ((global_scale,) if fp4 else ())
+            reads = (source, values, scale_bytes) + ((global_scale,) if nvfp4 else ())
             if q.recipe in IQ2_CODECS:
                 reads += (self.iq2_lut,)
             if any(_overlap(out, tensor) for tensor in reads):
@@ -446,7 +450,7 @@ class _PackedExecutionState:
                         current_cuda_stream(),
                     )
                 return out
-            if fp4:
+            if nvfp4:
                 _check_tensor(
                     "activation scale", activation_scale, self.device, torch.float32
                 )
@@ -464,7 +468,7 @@ class _PackedExecutionState:
             )
             scale_size = (
                 triton.cdiv(m, 128)
-                * triton.cdiv(q.padded_in_features // (16 if fp4 else 32), 4)
+                * triton.cdiv(q.padded_in_features // group, 4)
                 * 512
             )
             packed_scales = workspace[sf_start : sf_start + scale_size]
@@ -475,16 +479,16 @@ class _PackedExecutionState:
                 q.padded_in_features,
                 fp4,
                 q.global_scale_kind == "reciprocal",
-                16 if fp4 else 32,
+                group,
                 16,
             )
-            grid = (m, triton.cdiv(q.padded_in_features // (16 if fp4 else 32), 16), 1)
+            grid = (m, triton.cdiv(q.padded_in_features // group, 16), 1)
             self.programs["quantize"][grid](
                 source,
                 packed_values,
                 packed_scales,
-                activation_scale if fp4 else alpha,
-                global_scale if fp4 else alpha,
+                activation_scale if nvfp4 else alpha,
+                global_scale if nvfp4 else alpha,
                 alpha,
                 m,
                 *constants,
@@ -494,7 +498,7 @@ class _PackedExecutionState:
                 as_grouped_scale_view_mx,
             )
 
-            scale_view = (as_grouped_scale_view if fp4 else as_grouped_scale_view_mx)(
+            scale_view = (as_grouped_scale_view if nvfp4 else as_grouped_scale_view_mx)(
                 packed_scales.view(1, -1), m, q.padded_in_features
             )
             core.run(
@@ -643,8 +647,9 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
                 query.num_tokens,
                 query.out_features,
                 query.padded_in_features,
-                query.recipe == "nvfp4",
+                query.recipe in ("nvfp4", "mxfp4"),
                 (64, 64, 1),
+                group=16 if query.recipe == "nvfp4" else 32,
             )
         )
         needed = _workspace_bytes(query, config)
@@ -731,10 +736,12 @@ def _query_bf16_from_call(
     workspace=None,
     expected_m=None,
 ):
-    from ._a16 import _weight_parts
+    from ._a16 import MXFP4LinearWeight, _weight_parts
     from ._iq2_xs import IQ2XSLinearWeight
 
     values, _, _, fp4 = _weight_parts(weight)
+    if activation_global_scale is None:
+        activation_global_scale = getattr(weight, "activation_global_scale", None)
     if source.ndim < 2 or source.dtype != torch.bfloat16:
         raise ValueError(
             "packed BF16 queries require a BF16 source with at least two dimensions"
@@ -754,6 +761,8 @@ def _query_bf16_from_call(
     return BlockscaledQuery(
         recipe=weight.codec
         if isinstance(weight, IQ2XSLinearWeight)
+        else "mxfp4"
+        if isinstance(weight, MXFP4LinearWeight)
         else "nvfp4"
         if fp4
         else "mxfp8",
@@ -1391,12 +1400,14 @@ def query_from_call(
     alpha=None,
     **options,
 ):
-    from ._a16 import NVFP4LinearWeight
+    from ._a16 import MXFP4LinearWeight, NVFP4LinearWeight
     from ._iq2_xs import IQ2XSLinearWeight
     from ._linear import MXFP8LinearWeight, TensorFP8LinearWeight
     from ._tuning import FixedBlockscaledQuery
 
-    if isinstance(weight, (NVFP4LinearWeight, IQ2XSLinearWeight)) or (
+    if isinstance(
+        weight, (NVFP4LinearWeight, MXFP4LinearWeight, IQ2XSLinearWeight)
+    ) or (
         isinstance(weight, MXFP8LinearWeight)
         and isinstance(source, torch.Tensor)
         and source.dtype == torch.bfloat16
