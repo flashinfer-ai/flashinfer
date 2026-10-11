@@ -3789,6 +3789,7 @@ def trtllm_batch_decode_with_kv_cache(
     bf16q_fp8kv_transform_mode: Optional[Literal["k_only", "separate_kv"]] = None,
     request_order: Optional[torch.Tensor] = None,
     request_order_plan: Optional[Any] = None,
+    sparse_top_k: int = 0,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -4020,6 +4021,16 @@ def trtllm_batch_decode_with_kv_cache(
         descriptors are initialized; subsequent replays may update only the
         contents of ``request_order`` in place.
 
+    sparse_top_k : int = 0
+        Static token-sparse MQA/GQA (``trtllm-gen`` backend): each query token attends to
+        its own list of at most ``sparse_top_k`` KV tokens, such as a Top-K selection. Each
+        query token is its own request over pages of one token. Pass
+        ``uses_shared_paged_kv_idx=False`` and ``block_tables`` of shape
+        ``[batch_size, 2, sparse_top_k]`` with each token's K and V token indices, and
+        ``seq_lens`` with how many leading entries of each list are valid. ``sparse_top_k``
+        must be a multiple of 4, the heads of a KV head at most 128, and ``batch_size`` at
+        most 65535. ``0`` (default) disables it.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -4028,6 +4039,20 @@ def trtllm_batch_decode_with_kv_cache(
         Only returned when ``return_lse`` is True. Shape ``[num_tokens, num_qo_heads]``
         with dtype ``torch.float32``.
     """
+    if sparse_top_k:
+        if q_len_per_req != 1 or cum_seq_lens_q is not None:
+            raise ValueError("sparse_top_k requires one query token per request")
+        if uses_shared_paged_kv_idx or block_tables.shape[1:] != (2, sparse_top_k):
+            raise ValueError(
+                "sparse_top_k requires uses_shared_paged_kv_idx=False and block_tables "
+                f"of shape [batch_size, 2, {sparse_top_k}], got {tuple(block_tables.shape)}"
+            )
+        # The kernel copies indices with 16-byte cp.async (four int32s), and its
+        # non-persistent launch grid caps the request count at 65535 (as in mla/_core.py).
+        if sparse_top_k % 4 or query.shape[0] > 65535:
+            raise ValueError(
+                "sparse_top_k must be a multiple of 4 and batch_size at most 65535"
+            )
     if request_order is not None and backend != "cake":
         raise ValueError("request_order requires the explicit backend='cake'")
     if request_order_plan is not None and request_order is None:
@@ -4179,6 +4204,10 @@ def trtllm_batch_decode_with_kv_cache(
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
 
+    if sparse_top_k and backend != "trtllm-gen":
+        raise ValueError(
+            f"sparse_top_k is only supported by the trtllm-gen backend, got {backend!r}"
+        )
     if backend not in ("trtllm-gen", "cake") and bmm1_scale_log2 is not None:
         raise ValueError(
             "bmm1_scale_log2 is only supported when backend is 'trtllm-gen' or 'cake'"
@@ -4589,7 +4618,7 @@ def trtllm_batch_decode_with_kv_cache(
             o_sf_start_index,
             batch_size,
             window_left,
-            0,  # sparse_mla_top_k
+            sparse_top_k,
             sm_count,
             enable_pdl,
             workspace_buffer.numel() * workspace_buffer.element_size(),
