@@ -140,7 +140,7 @@ in separate processes on an idle GPU. These commands use **unlocked GPU clocks**
 
 ```bash
 PYTHONPATH=. python benchmarks/bench_union_gqa_primsts_compare.py \
-    --local-runtime-compat --cold-l2-cache --backend primsts \
+    --cold-l2-cache --backend primsts \
     --warmup 10 --iters 100 --rounds 3 --preheat-ms 1000 \
     > /tmp/union_gqa_primsts_comparison_cold.csv
 PYTHONPATH=. python benchmarks/bench_union_gqa.py \
