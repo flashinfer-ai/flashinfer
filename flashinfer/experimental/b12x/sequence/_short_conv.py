@@ -87,6 +87,123 @@ def _decode_short_conv_kernel(
 
 
 @triton.jit
+def _speculative_decode_short_conv_kernel(
+    input_ptr,
+    conv_weight_ptr,
+    query_start_loc_ptr,
+    state_slot_ids_ptr,
+    state_is_fresh_ptr,
+    num_accepted_tokens_ptr,
+    num_seqs_ptr,
+    num_tokens_ptr,
+    conv_state_ptr,
+    out_ptr,
+    CHANNELS: tl.constexpr,
+    STATE_LENGTH: tl.constexpr,
+    STATE_CAPACITY: tl.constexpr,
+    stride_state_slot: tl.constexpr,
+    stride_state_channel: tl.constexpr,
+    stride_state_position: tl.constexpr,
+    MAX_SPECULATIVE: tl.constexpr,
+    KERNEL_SIZE: tl.constexpr,
+    DILATION: tl.constexpr,
+    INPUT_ROW_STRIDE: tl.constexpr,
+    MAX_SEQS: tl.constexpr,
+    MAX_TOKENS: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """Speculative decode in one launch: the history gather, convolution and state update that
+    ``_prepare_history``, ``_short_conv`` and ``_update_state`` perform, with identical arithmetic.
+
+    Each program owns one request's channels, so it reads that request's history before
+    rewriting it in place. Program ``MAX_SEQS`` zeroes the rows past the packed tokens.
+    """
+    request = tl.program_id(0)
+    channels = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    channel_mask = channels < CHANNELS
+    if request == MAX_SEQS:
+        num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
+        for token in range(num_tokens, MAX_TOKENS):
+            tl.store(
+                out_ptr + token * CHANNELS + channels.to(tl.int64),
+                tl.zeros((BLOCK_C,), tl.bfloat16),
+                mask=channel_mask,
+            )
+    else:
+        num_seqs = tl.load(num_seqs_ptr).to(tl.int32)
+        request_live = request < num_seqs
+        slot = tl.load(state_slot_ids_ptr + request, mask=request_live, other=-1).to(tl.int64)
+        fresh = tl.load(state_is_fresh_ptr + request, mask=request_live, other=True).to(tl.int1)
+        live = request_live & (slot >= 0)
+        accepted = tl.load(num_accepted_tokens_ptr + request, mask=request_live, other=0).to(tl.int32)
+        rollback = tl.where(request_live, tl.minimum(accepted - 1, MAX_SPECULATIVE), 0)
+        query_start = tl.load(query_start_loc_ptr + request, mask=request_live, other=0).to(tl.int32)
+        query_length = tl.load(query_start_loc_ptr + request + 1, mask=request_live, other=0).to(tl.int32) - query_start
+        state_base = slot * stride_state_slot + channels.to(tl.int64) * stride_state_channel
+
+        history = ()
+        for position in tl.static_range(STATE_LENGTH):
+            source_position = position + rollback
+            history += (
+                tl.load(
+                    conv_state_ptr + state_base + source_position.to(tl.int64) * stride_state_position,
+                    mask=live & channel_mask & ~fresh & (source_position < STATE_CAPACITY),
+                    other=0.0,
+                ),
+            )
+        query = ()
+        for relative in tl.static_range(MAX_SPECULATIVE + 1):
+            query += (
+                tl.load(
+                    input_ptr + (query_start + relative).to(tl.int64) * INPUT_ROW_STRIDE + channels.to(tl.int64),
+                    mask=request_live & channel_mask & (relative < query_length),
+                    other=0.0,
+                ),
+            )
+
+        for relative in tl.static_range(MAX_SPECULATIVE + 1):
+            accumulator = tl.zeros((BLOCK_C,), tl.float32)
+            for tap in tl.static_range(KERNEL_SIZE):
+                if relative >= (KERNEL_SIZE - 1 - tap) * DILATION:
+                    source = query[relative - (KERNEL_SIZE - 1 - tap) * DILATION].to(tl.float32)
+                elif STATE_LENGTH + relative >= (KERNEL_SIZE - 1 - tap) * DILATION:
+                    source = history[STATE_LENGTH + relative - (KERNEL_SIZE - 1 - tap) * DILATION].to(tl.float32)
+                else:
+                    source = tl.zeros((BLOCK_C,), tl.float32)
+                weight = tl.load(
+                    conv_weight_ptr + channels.to(tl.int64) * KERNEL_SIZE + tap,
+                    mask=channel_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                accumulator += source * weight
+            convolved = accumulator.to(tl.bfloat16).to(tl.float32)
+            activated = (convolved * tl.sigmoid(convolved)).to(tl.bfloat16)
+            tl.store(
+                out_ptr + (query_start + relative).to(tl.int64) * CHANNELS + channels.to(tl.int64),
+                tl.where(live, activated, 0.0),
+                mask=request_live & channel_mask & (relative < query_length),
+            )
+
+        # Commit the first query token and keep the rest as the speculative tail.
+        for position in tl.static_range(STATE_LENGTH):
+            if position + 1 < STATE_LENGTH:
+                value = history[position + 1]
+            else:
+                value = query[position + 1 - STATE_LENGTH]
+            tl.store(
+                conv_state_ptr + state_base + position * stride_state_position,
+                value,
+                mask=live & channel_mask & (query_length > 0),
+            )
+        for candidate in tl.static_range(MAX_SPECULATIVE):
+            tl.store(
+                conv_state_ptr + state_base + (STATE_LENGTH + candidate) * stride_state_position,
+                query[candidate + 1],
+                mask=live & channel_mask & (query_length > 0),
+            )
+
+
+@triton.jit
 def _request_ids_kernel(
     query_start_loc_ptr,
     num_seqs_ptr,

@@ -81,6 +81,22 @@ def _state_args(q):
     )
 
 
+def _speculative_args(q):
+    return (
+        q.channels,
+        q.state_length,
+        q.state_capacity,
+        *q.state_strides,
+        q.max_speculative_tokens,
+        q.kernel_size,
+        q.dilation,
+        q.input_row_stride,
+        q.max_seqs,
+        q.max_tokens,
+        128,
+    )
+
+
 def _token_block(q) -> int:
     """Tokens per convolution program: tiles amortize row loads in prefill."""
     return 32 if q.max_tokens >= 256 else 1
@@ -107,6 +123,29 @@ def compile_pipeline(payload, ordinal):
     channel_grid = triton.cdiv(q.channels, 128)
     token_tiles = triton.cdiv(q.max_tokens, _token_block(q))
     with torch.cuda.device(ordinal):
+        if q.mode == "decode" and q.max_speculative_tokens > 0:
+            return (
+                kernels._speculative_decode_short_conv_kernel.warmup(
+                    *(
+                        p[name]
+                        for name in (
+                            "x",
+                            "conv_weight",
+                            "query_start_loc",
+                            "state_slot_ids",
+                            "state_is_fresh",
+                            "num_accepted_tokens",
+                            "num_seqs",
+                            "num_tokens",
+                            "conv_state",
+                            "out",
+                        )
+                    ),
+                    *_speculative_args(q),
+                    num_warps=4,
+                    grid=(q.max_seqs + 1, channel_grid),
+                ),
+            )
         if q.mode == "decode" and q.max_speculative_tokens == 0:
             return (
                 kernels._decode_short_conv_kernel.warmup(
@@ -399,6 +438,21 @@ class PreparedShortConv:
         q, p = self.query, self.programs
         channels = triton.cdiv(q.channels, 128)
         with torch.cuda.device(self.device):
+            if q.mode == "decode" and q.max_speculative_tokens > 0:
+                p[0][(q.max_seqs + 1, channels, 1)](
+                    x,
+                    conv_weight,
+                    query_start_loc,
+                    state_slot_ids,
+                    state_is_fresh,
+                    num_accepted_tokens,
+                    num_seqs,
+                    num_tokens,
+                    conv_state,
+                    out,
+                    *_speculative_args(q),
+                )
+                return
             if q.mode == "decode" and q.max_speculative_tokens == 0:
                 p[0][(q.max_tokens, channels, 1)](
                     x,

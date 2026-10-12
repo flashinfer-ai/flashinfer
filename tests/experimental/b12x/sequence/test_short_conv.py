@@ -399,3 +399,26 @@ def test_single_token_decode_updates_packed_strided_history(
                 case.storage.reshape(6, -1)[:, -32:], padding, rtol=0, atol=0
             )
         graph.reset()
+
+
+@pytest.mark.parametrize("dilation", [1, 2])
+@pytest.mark.parametrize("speculative_tokens", [1, 3, 7])
+def test_speculative_decode_matches_the_staged_kernels_bitwise(dilation, speculative_tokens):
+    """One-launch speculative decode equals mixed mode's gather/convolve/update with all requests decoding."""
+    window = speculative_tokens + 1
+    lengths = [window, window - 1, 0, 1][: 4]
+    slots, fresh, accepted = [1, 3, 0, 5], [False, False, False, True], [window, 1, 1, 1]
+    results = {}
+    for mode in ("decode", "mixed"):
+        torch.manual_seed(7)
+        case = _Case(mode, channels=1000, dilation=dilation, speculative_tokens=speculative_tokens,
+                     max_tokens=4 * window)
+        prior = torch.randn_like(case.state)
+        with _prepared(case) as binding:
+            case.state.copy_(prior)
+            case.batch(lengths, slots, fresh, accepted, [False] * 4 if mode == "mixed" else None)
+            short_conv.run(binding)
+            torch.cuda.synchronize()
+            results[mode] = (binding.out.clone(), case.state.clone())
+    assert torch.equal(results["decode"][0], results["mixed"][0])
+    assert torch.equal(results["decode"][1], results["mixed"][1])
