@@ -20,13 +20,29 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
-from ..jit.gemm.w8a16_fp8 import gen_w8a16_fp8_gemm_module
-from ..utils import register_custom_op, register_fake_op
+from ..jit.gemm.w8a16_fp8 import (
+    gen_w8a16_fp8_gemm_module,
+    gen_w8a16_fp8_gemm_sm100_module,
+)
+from ..utils import get_compute_capability, register_custom_op, register_fake_op
 
 
 @functools.cache
-def get_w8a16_fp8_gemm_module():
-    return gen_w8a16_fp8_gemm_module().build_and_load()
+def _get_module_for_major(major: int):
+    if major == 9:
+        return gen_w8a16_fp8_gemm_module().build_and_load()
+    if major == 10:
+        return gen_w8a16_fp8_gemm_sm100_module().build_and_load()
+    raise RuntimeError(
+        f"w8a16_fp8_gemm needs Hopper (sm_90a) or Blackwell (sm_100a), got SM {major}x"
+    )
+
+
+def get_w8a16_fp8_gemm_module(device: Optional[torch.device] = None):
+    """Kernel module for ``device`` (current device when omitted): Hopper or Blackwell build."""
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return _get_module_for_major(get_compute_capability(device)[0])
 
 
 @register_custom_op("flashinfer::w8a16_fp8_gemm", mutates_args=("out",))
@@ -39,7 +55,7 @@ def _w8a16_fp8_gemm_impl(
     weight_prepared: bool,
     workspace: Optional[torch.Tensor],
 ) -> None:
-    get_w8a16_fp8_gemm_module().w8a16_fp8_gemm(
+    get_w8a16_fp8_gemm_module(act.device).w8a16_fp8_gemm(
         out, act, weight, weight_scale, bias, weight_prepared, workspace
     )
 
@@ -59,11 +75,11 @@ def _w8a16_fp8_gemm_impl_fake(
 
 @functools.cache
 def _workspace_bytes(m: int, n: int, k: int, device_index: int) -> int:
-    """Bytes of fp32 split-K workspace this problem needs on this device (0 = none)."""
+    """Bytes of workspace this problem needs on this device (0 = none)."""
     return int(
-        get_w8a16_fp8_gemm_module().w8a16_fp8_gemm_workspace_bytes(
-            m, n, k, device_index
-        )
+        get_w8a16_fp8_gemm_module(
+            torch.device("cuda", device_index)
+        ).w8a16_fp8_gemm_workspace_bytes(m, n, k, device_index)
     )
 
 
@@ -154,6 +170,8 @@ def w8a16_fp8_gemm(
         raise ValueError(f"K mismatch: act[..., {k}] vs weight[{n}, {weight.shape[1]}]")
     if weight_scale.numel() != 1:
         raise ValueError("weight_scale is one per-tensor value")
+    if weight_prepared and get_compute_capability(act.device)[0] != 9:
+        raise ValueError("weight_prepared=True is a Hopper-only layout")
     if weight_scale.dtype != torch.float32:
         weight_scale = weight_scale.to(torch.float32)
     weight_scale = weight_scale.reshape(1)

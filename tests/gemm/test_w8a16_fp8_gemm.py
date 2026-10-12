@@ -19,6 +19,11 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer.gemm import prepare_w8a16_fp8_weight, w8a16_fp8_gemm
+from flashinfer.utils import get_compute_capability
+
+
+def _is_hopper() -> bool:
+    return get_compute_capability(torch.device("cuda"))[0] == 9
 
 
 def _quantize(w32: torch.Tensor):
@@ -40,6 +45,8 @@ def _cast_copy_reference(act, w_fp8, scale, bias):
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("prepared", [False, True])
 def test_w8a16_fp8_gemm(m, n, k, dtype, bias, prepared):
+    if prepared and not _is_hopper():
+        pytest.skip("prepared weight layout is Hopper-only")
     torch.manual_seed(0)
     dev = torch.device("cuda")
     act = torch.randn(m, k, device=dev, dtype=torch.float32).to(dtype)

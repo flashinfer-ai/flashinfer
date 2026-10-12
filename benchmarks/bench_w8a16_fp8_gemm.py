@@ -356,7 +356,8 @@ def make_kernel(
     (the one-time ``prepare_w8a16_fp8_weight`` copy is done here, untimed)."""
     try:
         from flashinfer.gemm import prepare_w8a16_fp8_weight, w8a16_fp8_gemm
-    except ImportError:
+    except ImportError as e:
+        print(f"# WARNING: flashinfer.gemm import failed: {e!r}", file=sys.stderr)
         return None
     out = torch.empty(act.shape[0], w_fp8.shape[0], dtype=act.dtype, device=act.device)
     w_use = prepare_w8a16_fp8_weight(w_fp8) if prepared else w_fp8
@@ -430,6 +431,8 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
     for name, prepared in (("kernel", False), ("kernel_prep", True)):
         if name not in args.impls:
             continue
+        if prepared and torch.cuda.get_device_capability()[0] != 9:
+            continue  # prepared weight layout is Hopper-only
         fn = make_kernel(act, w_fp8, scale, bias, prepared=prepared)
         if fn is None:
             print(
