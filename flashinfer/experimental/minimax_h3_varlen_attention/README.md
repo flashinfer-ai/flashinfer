@@ -103,14 +103,18 @@ unit with one table lookup. The host builds, from `cu_seqlens` (empty segments
 dropped) and `num_heads`:
 
 * `seg_begin[s]`, `seg_len[s]` (int32, `num_segments` entries),
-* `unit_table` (int32, `8 * (total_tiles + num_clusters)` entries): per slot the
+* `unit_table` (int32, `8 * (total_tiles + num_clusters + 1)` entries): per slot the
   segment's token begin and length, `head << 16 | cluster_in_segment`,
   `kv_block_begin << 16 | kv_blocks` (the unit's K/V block range inside the
   segment), its partial slot (`-1` for an unsplit unit, which writes the BF16
   output directly), `q_half` (`0` for a whole 512-row unit, `1` / `2` for the
   first / second 256-row half of a tail-round Q-split unit) and two reserved
   words, followed by `num_clusters` zero records (every kernel role prefetches
-  the record of its next unit),
+  the record of its next unit; the `attention_dyn` program uses word 6 of
+  padding record `c` as cluster `c`'s ticket mailbox and leaves the terminal
+  ticket there after the launch) and one more zero record whose word 0 is the
+  dynamic scheduler's ticket counter (reset by the kernel at the end of every
+  launch),
 * `combine_table` (int32, `4 * num_combine_units` entries): per K/V-split
   unit the segment index, `head << 16 | cluster_in_segment`, its first partial
   slot and the number of splits, plus the plan's partial workspace
@@ -162,6 +166,32 @@ combine path is untouched. The halves are separate records of the table
 (`total_tiles` counts them, `num_q_split_units` the halved units);
 `build_bf16_segment_plan(..., q_split=False)` yields the plain enumeration
 (word 5 is `0`).
+
+**Per-plan program dispatch.** The route registers three bitwise-identical
+attention programs (retraces of one Weave body): `attention` (the static
+schedule above), `attention_dyn` (a dynamic whole-unit ticket scheduler: the
+first wave stays static, then the leader CTA's load warp draws the cluster's
+next unit from a per-plan ticket counter one unit ahead of its use; units are
+handed out in the LPT slot order, so only a unit's cluster changes) and, on
+sm_100a only (`BF16_SREAD_ARCHES`), `attention_sread` (the stage-0 cross-stage
+read wait issued before every P store: no per-block guard on the publish
+tail). The planner decides per plan from the plan numbers alone
+(`bf16_dyn_sched`): the dynamic program when the plan has at least two waves
+and every cluster's static share is at least 8192 stage-weighted K/V blocks
+(a two-stage unit counts its blocks twice) and then either at least 64 units
+per cluster or a static cluster imbalance above the cheapest unit (`W_max -
+W_min > min weight`); the ticket chain costs a fixed ~2.5 us at a cluster's
+first unit, so one-wave plans and plans of many small units keep the static
+schedule and bind `attention_sread` (sm_100a) or `attention` (sm_103a).
+`plan.dyn_sched` / `plan.sread_unified`, `runner.attention_stage` and
+`route_metadata["attention_variant"]` disclose the choice. The ticket counter
+is word 0 of the extra zero record at the end of `unit_table`; the kernel
+resets it at the end of every launch, so cached plans need no host reset.
+Word 6 of padding record `c` is cluster `c`'s ticket mailbox (never read by
+the record prefetch) and keeps the terminal ticket after a launch, so the
+padding of a launched plan is launch state, not zeros. Launches of one plan
+are stream-ordered (the plan cache keys the stream); never launch one cached
+plan concurrently from two streams.
 The plan is a host-side function of `(cu_seqlens, num_heads, num_SMs)` and
 reproduces the Cake production plan table for table (`num_heads < 2^15`,
 fewer than `2^16` clusters per segment). K/V TMA loads that run past a segment
@@ -278,8 +308,9 @@ is CUDA-Graph capturable.
   never allocate or synchronize; device facts (SM count, compute
   capability) are read once per device.
 * Generated sources live under `csrc/cake_minimax_h3_varlen_attention/` (one
-  kernel source and one host binding per program, shared by both
-  architectures) and are registered in `cake_jit.py` (`MODULES`, `ROUTES`) by
+  kernel source and one host binding per program, shared by the
+  architectures that build it -- the BF16 `attention_sread` program is
+  sm_100a only) and are registered in `cake_jit.py` (`MODULES`, `ROUTES`) by
   the Cake generated-program export; the JIT builds a program for the
   device's exact architecture on first use. Until the export
   has run, the entry points raise `NotImplementedError` naming the missing
