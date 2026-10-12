@@ -35,6 +35,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
+#include <tuple>
 
 #include "flashinfer/gemm/nvfp4_svdquant_gemm_template_sm120.h"
 #include "flashinfer/gemm/svdquant_sm120_prefix_route.h"
@@ -330,7 +332,6 @@ cudaError_t query_stream_capture(cudaStream_t stream, bool& is_capturing) {
 
 struct LoraDownCublasLtState {
   static constexpr int kMaxHeuristicResults = 32;
-  static constexpr std::size_t kMaxCachedPlans = 8;
 
   cublasLtHandle_t handle = nullptr;
   cublasLtMatmulDesc_t operation = nullptr;
@@ -400,81 +401,73 @@ struct LoraDownCublasLtInitGuard {
 };
 
 LoraDownCublasLtState& lora_down_cublaslt_state(int device_id, int m, int k) {
-  static thread_local std::array<LoraDownCublasLtState, LoraDownCublasLtState::kMaxCachedPlans>
-      states{};
-  for (auto& state : states) {
-    if (state.initialized && state.device_id == device_id && state.m == m && state.k == k) {
-      return state;
-    }
-  }
-  for (auto& state : states) {
-    if (state.initialized) {
-      continue;
-    }
-    state.reset();
-    LoraDownCublasLtInitGuard init_guard{state};
-    constexpr int kRank = 32;
-    constexpr std::size_t kMaxWorkspaceBytes = 32 * 1024 * 1024;
-    int current_device = -1;
-    cudaError_t cuda_status = cudaGetDevice(&current_device);
-    TVM_FFI_ICHECK_EQ(cuda_status, cudaSuccess)
-        << "failed to query CUDA device for SM120 LoRA-down";
-    TVM_FFI_ICHECK_EQ(current_device, device_id)
-        << "SM120 LoRA-down initialized on the wrong CUDA device";
-    cublasStatus_t status = cublasLtCreate(&state.handle);
-    TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
-        << "failed to create cuBLASLt handle for SM120 LoRA-down";
-    status = cublasLtMatmulDescCreate(&state.operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
-    TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
-        << "failed to create cuBLASLt operation for SM120 LoRA-down";
-    status = cublasLtMatrixLayoutCreate(&state.l2_layout, CUDA_R_16BF, kRank, k, kRank);
-    TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
-        << "failed to create cuBLASLt L2 layout for SM120 LoRA-down";
-    status = cublasLtMatrixLayoutCreate(&state.x_layout, CUDA_R_16BF, k, m, k);
-    TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
-        << "failed to create cuBLASLt X layout for SM120 LoRA-down";
-    status = cublasLtMatrixLayoutCreate(&state.down_layout, CUDA_R_16BF, kRank, m, kRank);
-    TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
-        << "failed to create cuBLASLt output layout for SM120 LoRA-down";
-    status = cublasLtMatmulPreferenceCreate(&state.preference);
-    TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
-        << "failed to create cuBLASLt preference for SM120 LoRA-down";
-    status = cublasLtMatmulPreferenceSetAttribute(state.preference,
-                                                  CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                                  &kMaxWorkspaceBytes, sizeof(kMaxWorkspaceBytes));
-    TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
-        << "failed to set cuBLASLt workspace limit for SM120 LoRA-down";
-    int returned_results = 0;
-    status = cublasLtMatmulAlgoGetHeuristic(
-        state.handle, state.operation, state.l2_layout, state.x_layout, state.down_layout,
-        state.down_layout, state.preference, LoraDownCublasLtState::kMaxHeuristicResults,
-        state.heuristics.data(), &returned_results);
-    TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
-        << "failed to query cuBLASLt heuristic for SM120 LoRA-down";
-    TVM_FFI_ICHECK_GT(returned_results, 0) << "cuBLASLt returned no heuristic for SM120 LoRA-down";
-    // CTK 13.2 returns eight candidates for the admitted M537 and M1935
-    // problems. Cold-L2 sweeps select the candidates below
-    // independently for each exact (M, K); keep every other shape on
-    // cuBLASLt's first-ranked result.
-    int heuristic_index = 0;
-    if (m == 537) {
-      heuristic_index = (k == 5120 || k == 7168 || k == 14336) ? 2 : 0;
-    } else if (m == 1935) {
-      heuristic_index = k == 5120 ? 2 : k == 5376 ? 4 : k == 7168 ? 5 : 0;
-    }
-    TVM_FFI_ICHECK(heuristic_index >= 0 && heuristic_index < returned_results)
-        << "SM120 LoRA-down heuristic index must be in [0, " << returned_results << "), got "
-        << heuristic_index;
-    TVM_FFI_ICHECK_EQ(state.heuristics[heuristic_index].state, CUBLAS_STATUS_SUCCESS)
-        << "cuBLASLt heuristic is invalid for SM120 LoRA-down";
-    state.heuristic_index = heuristic_index;
-    state.device_id = device_id;
-    state.m = m;
-    state.k = k;
-    state.initialized = true;
+  // Keep warmed plans alive and their addresses stable when new shapes are added.
+  static thread_local std::map<std::tuple<int, int, int>, LoraDownCublasLtState> states;
+  auto& state = states.try_emplace(std::make_tuple(device_id, m, k)).first->second;
+  if (state.initialized) {
     return state;
   }
-  throw std::runtime_error("SM120 LoRA-down cuBLASLt plan cache is full");
+  state.reset();
+  LoraDownCublasLtInitGuard init_guard{state};
+  constexpr int kRank = 32;
+  constexpr std::size_t kMaxWorkspaceBytes = 32 * 1024 * 1024;
+  int current_device = -1;
+  cudaError_t cuda_status = cudaGetDevice(&current_device);
+  TVM_FFI_ICHECK_EQ(cuda_status, cudaSuccess) << "failed to query CUDA device for SM120 LoRA-down";
+  TVM_FFI_ICHECK_EQ(current_device, device_id)
+      << "SM120 LoRA-down initialized on the wrong CUDA device";
+  cublasStatus_t status = cublasLtCreate(&state.handle);
+  TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
+      << "failed to create cuBLASLt handle for SM120 LoRA-down";
+  status = cublasLtMatmulDescCreate(&state.operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+  TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
+      << "failed to create cuBLASLt operation for SM120 LoRA-down";
+  status = cublasLtMatrixLayoutCreate(&state.l2_layout, CUDA_R_16BF, kRank, k, kRank);
+  TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
+      << "failed to create cuBLASLt L2 layout for SM120 LoRA-down";
+  status = cublasLtMatrixLayoutCreate(&state.x_layout, CUDA_R_16BF, k, m, k);
+  TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
+      << "failed to create cuBLASLt X layout for SM120 LoRA-down";
+  status = cublasLtMatrixLayoutCreate(&state.down_layout, CUDA_R_16BF, kRank, m, kRank);
+  TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
+      << "failed to create cuBLASLt output layout for SM120 LoRA-down";
+  status = cublasLtMatmulPreferenceCreate(&state.preference);
+  TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
+      << "failed to create cuBLASLt preference for SM120 LoRA-down";
+  status = cublasLtMatmulPreferenceSetAttribute(state.preference,
+                                                CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                &kMaxWorkspaceBytes, sizeof(kMaxWorkspaceBytes));
+  TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
+      << "failed to set cuBLASLt workspace limit for SM120 LoRA-down";
+  int returned_results = 0;
+  status = cublasLtMatmulAlgoGetHeuristic(
+      state.handle, state.operation, state.l2_layout, state.x_layout, state.down_layout,
+      state.down_layout, state.preference, LoraDownCublasLtState::kMaxHeuristicResults,
+      state.heuristics.data(), &returned_results);
+  TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
+      << "failed to query cuBLASLt heuristic for SM120 LoRA-down";
+  TVM_FFI_ICHECK_GT(returned_results, 0) << "cuBLASLt returned no heuristic for SM120 LoRA-down";
+  // CTK 13.2 returns eight candidates for the admitted M537 and M1935
+  // problems. Cold-L2 sweeps select the candidates below
+  // independently for each exact (M, K); keep every other shape on
+  // cuBLASLt's first-ranked result.
+  int heuristic_index = 0;
+  if (m == 537) {
+    heuristic_index = (k == 5120 || k == 7168 || k == 14336) ? 2 : 0;
+  } else if (m == 1935) {
+    heuristic_index = k == 5120 ? 2 : k == 5376 ? 4 : k == 7168 ? 5 : 0;
+  }
+  TVM_FFI_ICHECK(heuristic_index >= 0 && heuristic_index < returned_results)
+      << "SM120 LoRA-down heuristic index must be in [0, " << returned_results << "), got "
+      << heuristic_index;
+  TVM_FFI_ICHECK_EQ(state.heuristics[heuristic_index].state, CUBLAS_STATUS_SUCCESS)
+      << "cuBLASLt heuristic is invalid for SM120 LoRA-down";
+  state.heuristic_index = heuristic_index;
+  state.device_id = device_id;
+  state.m = m;
+  state.k = k;
+  state.initialized = true;
+  return state;
 }
 
 void run_lora_down_cublaslt(TensorView x, TensorView l2t_smoothed, TensorView down,
