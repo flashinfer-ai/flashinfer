@@ -244,7 +244,9 @@ def autotune_sm107_block_scaled_mega_moe(
         trial.topk_weights.copy_(symm_buffer.topk_weights)
         if cfg.quant_kind == "nvfp4":
             for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
-                getattr(trial, name).copy_(getattr(symm_buffer, name))
+                # the scalars the workspace's launches use (bound per-call tensors by
+                # default, where the workspace tensors stay unwritten)
+                getattr(trial, name).copy_(symm_buffer._scalar_tensor(name))
         trial.note_staged_tokens(num_tokens)
         barrier()
         for _ in range(warmup_iters):
