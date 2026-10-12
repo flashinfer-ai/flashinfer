@@ -41,7 +41,7 @@
 #ifndef T_STEPS
 #error "T_STEPS is a downstream specialization of this program; define it on the compile line"
 #endif
-#define TILE_V_WIDE 64
+#define TILE_V_WIDE 32
 #ifndef UPDATE_STATE
 #error "UPDATE_STATE is a downstream specialization of this program; define it on the compile line"
 #endif
@@ -67,7 +67,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_gdn_5c39d6c8b1006cf953de(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ intermediate_state, int* __restrict__ initial_state_indices, int* __restrict__ output_state_indices, long long state_size_p0, long long state_stride_p0, long long q_stride_p0, long long q_stride_p1, long long q_stride_p2, long long k_stride_p0, long long k_stride_p1, long long k_stride_p2, long long a_stride_p0, long long a_stride_p1, long long a_stride_p2, long long b_stride_p0, long long b_stride_p1, long long b_stride_p2, long long v_stride_p0, long long v_stride_p1, long long v_stride_p2)
+kernel_cake_gdn_7fdc14dcdd658bc71978(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ intermediate_state, int* __restrict__ initial_state_indices, int* __restrict__ output_state_indices, long long state_size_p0, long long state_stride_p0, long long q_stride_p0, long long q_stride_p1, long long q_stride_p2, long long k_stride_p0, long long k_stride_p1, long long k_stride_p2, long long a_stride_p0, long long a_stride_p1, long long a_stride_p2, long long b_stride_p0, long long b_stride_p1, long long b_stride_p2, long long v_stride_p0, long long v_stride_p1, long long v_stride_p2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -199,10 +199,9 @@ kernel_cake_gdn_5c39d6c8b1006cf953de(__nv_bfloat16* __restrict__ q, __nv_bfloat1
             t_pre = ((t_pre_raw < T_STEPS) ? t_pre_raw : 0);
         }
         {
-            long long q_base = (long long)n * q_stride_p0 + (long long)t_pre * q_stride_p1 + (long long)qk_h * q_stride_p2;
-            long long k_base = (long long)n * k_stride_p0 + (long long)t_pre * k_stride_p1 + (long long)qk_h * k_stride_p2;
+            int qk_base = ((n * T_STEPS + t_pre) * H + qk_h) * 128;
             {
-                const uint4* _vptr_4 = reinterpret_cast<const uint4*>(q + q_base + (long long)k_start);
+                const uint4* _vptr_4 = reinterpret_cast<const uint4*>(q + qk_base + k_start);
                 uint4 _vld_4[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -216,7 +215,7 @@ kernel_cake_gdn_5c39d6c8b1006cf953de(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                 }
             }
             {
-                const uint4* _vptr_5 = reinterpret_cast<const uint4*>(k + k_base + (long long)k_start);
+                const uint4* _vptr_5 = reinterpret_cast<const uint4*>(k + qk_base + k_start);
                 uint4 _vld_5[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -275,7 +274,7 @@ kernel_cake_gdn_5c39d6c8b1006cf953de(__nv_bfloat16* __restrict__ q, __nv_bfloat1
         float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, sum_k, 1);
         sum_k = sum_k + _shfl_xor_7;
         float _rsqrt_0 = rsqrtf(sum_q + 1e-06f);
-        float q_norm = _rsqrt_0 * SCALE;
+        float q_norm = cake_f32_mul_f64const_rn(_rsqrt_0, SCALE);
         float _rsqrt_1 = rsqrtf(sum_k + 1e-06f);
         float k_norm = _rsqrt_1;
         float2 _f2_10 = make_float2(q_norm, q_norm);
@@ -327,12 +326,11 @@ kernel_cake_gdn_5c39d6c8b1006cf953de(__nv_bfloat16* __restrict__ q, __nv_bfloat1
         float x = 0.0f;
         beta_scalar = 0.0f;
         {
-            long long a_index = (long long)n * a_stride_p0 + (long long)t_pre * a_stride_p1 + (long long)h * a_stride_p2;
-            long long b_index = (long long)n * b_stride_p0 + (long long)t_pre * b_stride_p1 + (long long)h * b_stride_p2;
-            x = (float)a[a_index] + dt_bias[h];
-            float _expf_0 = __expf(-(float)b[b_index]);
-            float _rcp_0 = approx_rcp(1.0f + _expf_0);
-            beta_scalar = _rcp_0;
+            int gate_index = (n * T_STEPS + t_pre) * HV + h;
+            x = (float)a[gate_index] + dt_bias[h];
+            float _expf_1 = __expf(-(float)b[gate_index]);
+            float _rcp_1 = approx_rcp(1.0f + _expf_1);
+            beta_scalar = _rcp_1;
         }
         float _expf_2 = __expf(x);
         float _log2_0;
@@ -354,10 +352,10 @@ kernel_cake_gdn_5c39d6c8b1006cf953de(__nv_bfloat16* __restrict__ q, __nv_bfloat1
         #pragma unroll
         for (int pre_iter = 0; pre_iter < iters_per_group; pre_iter++) {
             {
-                long long v_pre_base = (long long)n * v_stride_p0 + (long long)v_tok * v_stride_p1 + (long long)h * v_stride_p2;
+                int vh_pre_base = ((n * T_STEPS + v_tok) * HV + h) * 128;
                 {
                     uint2 _vld_6;
-                    _vld_6 = *reinterpret_cast<const uint2*>(v + v_pre_base + (long long)v_row_pre + (long long)(pre_iter * 4));
+                    _vld_6 = *reinterpret_cast<const uint2*>(v + vh_pre_base + v_row_pre + pre_iter * 4);
                     uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6);
                     #pragma unroll
                     for (int _pair = 0; _pair < 2; _pair++) {
@@ -727,6 +725,81 @@ kernel_cake_gdn_5c39d6c8b1006cf953de(__nv_bfloat16* __restrict__ q, __nv_bfloat1
             h_d_pair1 = fma_f32x2_rn_ftz(k_pair1_1, v_new_d_pair, h_d_pair1);
             h_d_pair2 = fma_f32x2_rn_ftz(k_pair2_1, v_new_d_pair, h_d_pair2);
             h_d_pair3 = fma_f32x2_rn_ftz(k_pair3_1, v_new_d_pair, h_d_pair3);
+            {
+                long long cache_head_base = (long long)n * (long long)INTERMEDIATE_BATCH_STRIDE + (long long)t * (long long)INTERMEDIATE_TOKEN_STRIDE + (long long)h * 16384;
+                r_h[0] = h_a_pair0.x;
+                r_h[1] = h_a_pair0.y;
+                r_h[2] = h_a_pair1.x;
+                r_h[3] = h_a_pair1.y;
+                r_h[4] = h_a_pair2.x;
+                r_h[5] = h_a_pair2.y;
+                r_h[6] = h_a_pair3.x;
+                r_h[7] = h_a_pair3.y;
+                if (read_state_slot_valid != 0) {
+                    {
+                        __nv_bfloat162 _pk[4];
+                        _pk[0] = __floats2bfloat162_rn(r_h[0 + 0], r_h[0 + 1]);
+                        _pk[1] = __floats2bfloat162_rn(r_h[0 + 2], r_h[0 + 3]);
+                        _pk[2] = __floats2bfloat162_rn(r_h[0 + 4], r_h[0 + 5]);
+                        _pk[3] = __floats2bfloat162_rn(r_h[0 + 6], r_h[0 + 7]);
+                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(intermediate_state))[cache_head_base + (long long)(v_row_a * 128) + (long long)k_start + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    }
+                }
+                r_h[0] = h_b_pair0.x;
+                r_h[1] = h_b_pair0.y;
+                r_h[2] = h_b_pair1.x;
+                r_h[3] = h_b_pair1.y;
+                r_h[4] = h_b_pair2.x;
+                r_h[5] = h_b_pair2.y;
+                r_h[6] = h_b_pair3.x;
+                r_h[7] = h_b_pair3.y;
+                if (read_state_slot_valid != 0) {
+                    {
+                        __nv_bfloat162 _pk[4];
+                        _pk[0] = __floats2bfloat162_rn(r_h[0 + 0], r_h[0 + 1]);
+                        _pk[1] = __floats2bfloat162_rn(r_h[0 + 2], r_h[0 + 3]);
+                        _pk[2] = __floats2bfloat162_rn(r_h[0 + 4], r_h[0 + 5]);
+                        _pk[3] = __floats2bfloat162_rn(r_h[0 + 6], r_h[0 + 7]);
+                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(intermediate_state))[cache_head_base + (long long)(v_row_b * 128) + (long long)k_start + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    }
+                }
+                r_h[0] = h_c_pair0.x;
+                r_h[1] = h_c_pair0.y;
+                r_h[2] = h_c_pair1.x;
+                r_h[3] = h_c_pair1.y;
+                r_h[4] = h_c_pair2.x;
+                r_h[5] = h_c_pair2.y;
+                r_h[6] = h_c_pair3.x;
+                r_h[7] = h_c_pair3.y;
+                if (read_state_slot_valid != 0) {
+                    {
+                        __nv_bfloat162 _pk[4];
+                        _pk[0] = __floats2bfloat162_rn(r_h[0 + 0], r_h[0 + 1]);
+                        _pk[1] = __floats2bfloat162_rn(r_h[0 + 2], r_h[0 + 3]);
+                        _pk[2] = __floats2bfloat162_rn(r_h[0 + 4], r_h[0 + 5]);
+                        _pk[3] = __floats2bfloat162_rn(r_h[0 + 6], r_h[0 + 7]);
+                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(intermediate_state))[cache_head_base + (long long)(v_row_c * 128) + (long long)k_start + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    }
+                }
+                r_h[0] = h_d_pair0.x;
+                r_h[1] = h_d_pair0.y;
+                r_h[2] = h_d_pair1.x;
+                r_h[3] = h_d_pair1.y;
+                r_h[4] = h_d_pair2.x;
+                r_h[5] = h_d_pair2.y;
+                r_h[6] = h_d_pair3.x;
+                r_h[7] = h_d_pair3.y;
+                if (read_state_slot_valid != 0) {
+                    {
+                        __nv_bfloat162 _pk[4];
+                        _pk[0] = __floats2bfloat162_rn(r_h[0 + 0], r_h[0 + 1]);
+                        _pk[1] = __floats2bfloat162_rn(r_h[0 + 2], r_h[0 + 3]);
+                        _pk[2] = __floats2bfloat162_rn(r_h[0 + 4], r_h[0 + 5]);
+                        _pk[3] = __floats2bfloat162_rn(r_h[0 + 6], r_h[0 + 7]);
+                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(intermediate_state))[cache_head_base + (long long)(v_row_d * 128) + (long long)k_start + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    }
+                }
+            }
             float2 _f2_77 = make_float2(0.0f, 0.0f);
             float2 sum_hq_a_pair = fma_f32x2_rn_ftz(h_a_pair0, q_pair0_1, _f2_77);
             sum_hq_a_pair = fma_f32x2_rn_ftz(h_a_pair1, q_pair1_1, sum_hq_a_pair);
@@ -796,80 +869,6 @@ kernel_cake_gdn_5c39d6c8b1006cf953de(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         _pk[1] = __floats2bfloat162_rn(r_o[0 + 2], r_o[0 + 3]);
                         *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(out))[out_base + v_row_a]) = _pk2;
                     }
-                }
-            }
-        }
-        {
-            r_h[0] = h_a_pair0.x;
-            r_h[1] = h_a_pair0.y;
-            r_h[2] = h_a_pair1.x;
-            r_h[3] = h_a_pair1.y;
-            r_h[4] = h_a_pair2.x;
-            r_h[5] = h_a_pair2.y;
-            r_h[6] = h_a_pair3.x;
-            r_h[7] = h_a_pair3.y;
-            if (read_state_slot_valid != 0 && write_state_slot_valid != 0) {
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(r_h[0 + 0], r_h[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(r_h[0 + 2], r_h[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(r_h[0 + 4], r_h[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(r_h[0 + 6], r_h[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[write_state_head_base + (long long)(v_row_a * 128) + (long long)k_start + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                }
-            }
-            r_h[0] = h_b_pair0.x;
-            r_h[1] = h_b_pair0.y;
-            r_h[2] = h_b_pair1.x;
-            r_h[3] = h_b_pair1.y;
-            r_h[4] = h_b_pair2.x;
-            r_h[5] = h_b_pair2.y;
-            r_h[6] = h_b_pair3.x;
-            r_h[7] = h_b_pair3.y;
-            if (read_state_slot_valid != 0 && write_state_slot_valid != 0) {
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(r_h[0 + 0], r_h[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(r_h[0 + 2], r_h[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(r_h[0 + 4], r_h[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(r_h[0 + 6], r_h[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[write_state_head_base + (long long)(v_row_b * 128) + (long long)k_start + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                }
-            }
-            r_h[0] = h_c_pair0.x;
-            r_h[1] = h_c_pair0.y;
-            r_h[2] = h_c_pair1.x;
-            r_h[3] = h_c_pair1.y;
-            r_h[4] = h_c_pair2.x;
-            r_h[5] = h_c_pair2.y;
-            r_h[6] = h_c_pair3.x;
-            r_h[7] = h_c_pair3.y;
-            if (read_state_slot_valid != 0 && write_state_slot_valid != 0) {
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(r_h[0 + 0], r_h[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(r_h[0 + 2], r_h[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(r_h[0 + 4], r_h[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(r_h[0 + 6], r_h[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[write_state_head_base + (long long)(v_row_c * 128) + (long long)k_start + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                }
-            }
-            r_h[0] = h_d_pair0.x;
-            r_h[1] = h_d_pair0.y;
-            r_h[2] = h_d_pair1.x;
-            r_h[3] = h_d_pair1.y;
-            r_h[4] = h_d_pair2.x;
-            r_h[5] = h_d_pair2.y;
-            r_h[6] = h_d_pair3.x;
-            r_h[7] = h_d_pair3.y;
-            if (read_state_slot_valid != 0 && write_state_slot_valid != 0) {
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(r_h[0 + 0], r_h[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(r_h[0 + 2], r_h[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(r_h[0 + 4], r_h[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(r_h[0 + 6], r_h[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[write_state_head_base + (long long)(v_row_d * 128) + (long long)k_start + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
                 }
             }
         }

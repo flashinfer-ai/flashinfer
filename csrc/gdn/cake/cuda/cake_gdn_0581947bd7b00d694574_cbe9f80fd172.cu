@@ -192,7 +192,7 @@ kernel_cake_gdn_0581947bd7b00d694574(__nv_bfloat16* __restrict__ q, __nv_bfloat1
             _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
         sum_k = _warp_reduce_1;
         float _rsqrt_0 = rsqrtf(sum_q + 1e-06f);
-        float q_norm = _rsqrt_0 * SCALE;
+        float q_norm = cake_f32_mul_f64const_rn(_rsqrt_0, SCALE);
         float _rsqrt_1 = rsqrtf(sum_k + 1e-06f);
         float k_norm = _rsqrt_1;
         float2 _f2_6 = make_float2(q_norm, q_norm);
