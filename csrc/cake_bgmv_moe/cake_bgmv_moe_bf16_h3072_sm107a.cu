@@ -15,8 +15,8 @@
  */
 // Generated source for FlashInfer.
 // Bundle: Blackwell BGMV MoE shrink and deterministic expand portfolio, bf16 hidden 3072 rank 32.
-// Target: sm_107a only (256-bit B-row loads of the token-owned expand kernels; cp.async, shuffles,
-// atomics, FMA only); compile flags: none. Generated file; do not edit manually.
+// Target: sm_107a only (256-bit B-row loads of the T128 token-owned expand kernel; cp.async,
+// shuffles, atomics, FMA only); compile flags: none. Generated file; do not edit manually.
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -765,81 +765,6 @@ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void kernel_flashinfer_bgmv_moe_ex
             int pair = pair_base + route;
             long long expert = expert_ids[pair];
             float route_partial = 0.0f;
-            long long wide_index =
-                ((lora_id * (long long)num_experts + expert) * 3072 + (long long)output_col) * 32;
-            long long wide_index_hi = wide_index + 16;
-            float _vec_load_0[16];
-            {
-              const void* _v8p_0 =
-                  (const void*)(reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + wide_index +
-                                (0));
-              uint32_t _v8_0_0[8];
-              asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                           : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]),
-                             "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7])
-                           : "l"((const char*)_v8p_0 + 0)
-                           : "memory");
-              (&_vec_load_0[0 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) << 16);
-              (&_vec_load_0[0 + 0])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) & 0xffff0000u);
-              (&_vec_load_0[0 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[1]) << 16);
-              (&_vec_load_0[0 + 2])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[1]) & 0xffff0000u);
-              (&_vec_load_0[0 + 4])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[2]) << 16);
-              (&_vec_load_0[0 + 4])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[2]) & 0xffff0000u);
-              (&_vec_load_0[0 + 6])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[3]) << 16);
-              (&_vec_load_0[0 + 6])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[3]) & 0xffff0000u);
-              (&_vec_load_0[0 + 8])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[4]) << 16);
-              (&_vec_load_0[0 + 8])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[4]) & 0xffff0000u);
-              (&_vec_load_0[0 + 10])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[5]) << 16);
-              (&_vec_load_0[0 + 10])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[5]) & 0xffff0000u);
-              (&_vec_load_0[0 + 12])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[6]) << 16);
-              (&_vec_load_0[0 + 12])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[6]) & 0xffff0000u);
-              (&_vec_load_0[0 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) << 16);
-              (&_vec_load_0[0 + 14])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) & 0xffff0000u);
-            }
-            float _vec_load_1[16];
-            {
-              const void* _v8p_1 =
-                  (const void*)(reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + wide_index_hi +
-                                (0));
-              uint32_t _v8_1_0[8];
-              asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                           : "=r"(_v8_1_0[0]), "=r"(_v8_1_0[1]), "=r"(_v8_1_0[2]), "=r"(_v8_1_0[3]),
-                             "=r"(_v8_1_0[4]), "=r"(_v8_1_0[5]), "=r"(_v8_1_0[6]), "=r"(_v8_1_0[7])
-                           : "l"((const char*)_v8p_1 + 0)
-                           : "memory");
-              (&_vec_load_1[0 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[0]) << 16);
-              (&_vec_load_1[0 + 0])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[0]) & 0xffff0000u);
-              (&_vec_load_1[0 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[1]) << 16);
-              (&_vec_load_1[0 + 2])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[1]) & 0xffff0000u);
-              (&_vec_load_1[0 + 4])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[2]) << 16);
-              (&_vec_load_1[0 + 4])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[2]) & 0xffff0000u);
-              (&_vec_load_1[0 + 6])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[3]) << 16);
-              (&_vec_load_1[0 + 6])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[3]) & 0xffff0000u);
-              (&_vec_load_1[0 + 8])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[4]) << 16);
-              (&_vec_load_1[0 + 8])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[4]) & 0xffff0000u);
-              (&_vec_load_1[0 + 10])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[5]) << 16);
-              (&_vec_load_1[0 + 10])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[5]) & 0xffff0000u);
-              (&_vec_load_1[0 + 12])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[6]) << 16);
-              (&_vec_load_1[0 + 12])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[6]) & 0xffff0000u);
-              (&_vec_load_1[0 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[7]) << 16);
-              (&_vec_load_1[0 + 14])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[7]) & 0xffff0000u);
-            }
 #pragma unroll
             for (int rank_block = 0; rank_block < 4; rank_block++) {
               int rank_col = rank_block * 8;
@@ -858,22 +783,37 @@ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void kernel_flashinfer_bgmv_moe_ex
                       static_cast<uint32_t>(activation_carriers[_pair]) & 0xffff0000u);
                 }
               }
+              long long weight_index =
+                  ((lora_id * (long long)num_experts + expert) * 3072 + (long long)output_col) *
+                      32 +
+                  (long long)rank_col;
+              float _vec_load_0[8];
+              {
+                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(
+                    reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index + 0);
+                uint4 _vld_0[1];
 #pragma unroll
-              for (int element = 0; element < 8; element++) {
-                if (rank_block < 2) {
-                  float _fma_0 = __fmaf_rn(activation_values[element],
-                                           _vec_load_0[rank_block * 8 + element], route_partial);
-                  route_partial = _fma_0;
-                } else {
-                  float _fma_1 =
-                      __fmaf_rn(activation_values[element],
-                                _vec_load_1[(rank_block - 2) * 8 + element], route_partial);
-                  route_partial = _fma_1;
+                for (int _blk = 0; _blk < 1; _blk++) {
+                  _vld_0[_blk] = _vptr_0[_blk];
+                  uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+#pragma unroll
+                  for (int _pair = 0; _pair < 4; _pair++) {
+                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] =
+                        __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] =
+                        __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
+                  }
                 }
               }
+#pragma unroll
+              for (int element = 0; element < 8; element++) {
+                float _fma_0 =
+                    __fmaf_rn(activation_values[element], _vec_load_0[element], route_partial);
+                route_partial = _fma_0;
+              }
             }
-            float _fma_2 = __fmaf_rn(route_partial, topk_weights[pair], total);
-            total = _fma_2;
+            float _fma_1 = __fmaf_rn(route_partial, topk_weights[pair], total);
+            total = _fma_1;
           }
           *(reinterpret_cast<float*>(y_accum +
                                      (token * output_stride + output_offset + output_col)) +
@@ -953,11 +893,33 @@ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void kernel_flashinfer_bgmv_moe_ex
 #pragma unroll
             for (int rank_block_1 = 0; rank_block_1 < 4; rank_block_1++) {
               int rank_col_1 = rank_block_1 * 8;
+              float _vec_load_1[8];
+              {
+                const uint4* _vptr_1 = reinterpret_cast<const uint4*>(
+                    reinterpret_cast<const __nv_bfloat16*>(shrink_raw) +
+                    (pair_1 * 32 + rank_col_1) + 0);
+                uint4 _vld_1[1];
+#pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                  _vld_1[_blk] = _vptr_1[_blk];
+                  uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
+#pragma unroll
+                  for (int _pair = 0; _pair < 4; _pair++) {
+                    (&_vec_load_1[0 + _blk * 8 + _pair * 2])[0] =
+                        __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
+                    (&_vec_load_1[0 + _blk * 8 + _pair * 2])[1] =
+                        __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
+                  }
+                }
+              }
+              long long weight_index_1 =
+                  ((lora_id * (long long)num_experts + expert_1) * 3072 + (long long)output_col) *
+                      32 +
+                  (long long)rank_col_1;
               float _vec_load_2[8];
               {
                 const uint4* _vptr_2 = reinterpret_cast<const uint4*>(
-                    reinterpret_cast<const __nv_bfloat16*>(shrink_raw) +
-                    (pair_1 * 32 + rank_col_1) + 0);
+                    reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index_1 + 0);
                 uint4 _vld_2[1];
 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -972,37 +934,15 @@ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void kernel_flashinfer_bgmv_moe_ex
                   }
                 }
               }
-              long long weight_index =
-                  ((lora_id * (long long)num_experts + expert_1) * 3072 + (long long)output_col) *
-                      32 +
-                  (long long)rank_col_1;
-              float _vec_load_3[8];
-              {
-                const uint4* _vptr_3 = reinterpret_cast<const uint4*>(
-                    reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index + 0);
-                uint4 _vld_3[1];
-#pragma unroll
-                for (int _blk = 0; _blk < 1; _blk++) {
-                  _vld_3[_blk] = _vptr_3[_blk];
-                  uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
-#pragma unroll
-                  for (int _pair = 0; _pair < 4; _pair++) {
-                    (&_vec_load_3[0 + _blk * 8 + _pair * 2])[0] =
-                        __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
-                    (&_vec_load_3[0 + _blk * 8 + _pair * 2])[1] =
-                        __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
-                  }
-                }
-              }
 #pragma unroll
               for (int element_1 = 0; element_1 < 8; element_1++) {
-                float _fma_3 =
-                    __fmaf_rn(_vec_load_2[element_1], _vec_load_3[element_1], route_partial_1);
-                route_partial_1 = _fma_3;
+                float _fma_2 =
+                    __fmaf_rn(_vec_load_1[element_1], _vec_load_2[element_1], route_partial_1);
+                route_partial_1 = _fma_2;
               }
             }
-            float _fma_4 = __fmaf_rn(route_partial_1, topk_weights[pair_1], total_1);
-            total_1 = _fma_4;
+            float _fma_3 = __fmaf_rn(route_partial_1, topk_weights[pair_1], total_1);
+            total_1 = _fma_3;
           }
         }
         *(reinterpret_cast<float*>(y_accum + (token * output_stride + output_offset + output_col)) +
@@ -1456,10 +1396,6 @@ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void kernel_flashinfer_bgmv_moe_ex
   int output_col1 = output_col0 + 128;
   unsigned int activation_carriers[4];
   float activation_values[8];
-  float weight_wide0_lo[16];
-  float weight_wide0_hi[16];
-  float weight_wide1_lo[16];
-  float weight_wide1_hi[16];
   if (token < num_tokens) {
     int advance_parity = 0;
     unsigned int advance_count = 0;
@@ -1515,186 +1451,6 @@ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void kernel_flashinfer_bgmv_moe_ex
           long long expert = expert_ids[pair];
           float route_partial0 = 0.0f;
           float route_partial1 = 0.0f;
-          if (valid0 != 0) {
-            long long wide_index0 =
-                ((lora_id * (long long)num_experts + expert) * 3072 + (long long)output_col0) * 32;
-            long long wide_index0_hi = wide_index0 + 16;
-            {
-              const void* _v8p_0 =
-                  (const void*)(reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + (wide_index0));
-              uint32_t _v8_0_0[8];
-              asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                           : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]),
-                             "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7])
-                           : "l"((const char*)_v8p_0 + 0)
-                           : "memory");
-              (&weight_wide0_lo[0 + 0])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) << 16);
-              (&weight_wide0_lo[0 + 0])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) & 0xffff0000u);
-              (&weight_wide0_lo[0 + 2])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[1]) << 16);
-              (&weight_wide0_lo[0 + 2])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[1]) & 0xffff0000u);
-              (&weight_wide0_lo[0 + 4])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[2]) << 16);
-              (&weight_wide0_lo[0 + 4])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[2]) & 0xffff0000u);
-              (&weight_wide0_lo[0 + 6])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[3]) << 16);
-              (&weight_wide0_lo[0 + 6])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[3]) & 0xffff0000u);
-              (&weight_wide0_lo[0 + 8])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[4]) << 16);
-              (&weight_wide0_lo[0 + 8])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[4]) & 0xffff0000u);
-              (&weight_wide0_lo[0 + 10])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[5]) << 16);
-              (&weight_wide0_lo[0 + 10])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[5]) & 0xffff0000u);
-              (&weight_wide0_lo[0 + 12])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[6]) << 16);
-              (&weight_wide0_lo[0 + 12])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[6]) & 0xffff0000u);
-              (&weight_wide0_lo[0 + 14])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) << 16);
-              (&weight_wide0_lo[0 + 14])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) & 0xffff0000u);
-            }
-            {
-              const void* _v8p_1 =
-                  (const void*)(reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) +
-                                (wide_index0_hi));
-              uint32_t _v8_1_0[8];
-              asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                           : "=r"(_v8_1_0[0]), "=r"(_v8_1_0[1]), "=r"(_v8_1_0[2]), "=r"(_v8_1_0[3]),
-                             "=r"(_v8_1_0[4]), "=r"(_v8_1_0[5]), "=r"(_v8_1_0[6]), "=r"(_v8_1_0[7])
-                           : "l"((const char*)_v8p_1 + 0)
-                           : "memory");
-              (&weight_wide0_hi[0 + 0])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[0]) << 16);
-              (&weight_wide0_hi[0 + 0])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[0]) & 0xffff0000u);
-              (&weight_wide0_hi[0 + 2])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[1]) << 16);
-              (&weight_wide0_hi[0 + 2])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[1]) & 0xffff0000u);
-              (&weight_wide0_hi[0 + 4])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[2]) << 16);
-              (&weight_wide0_hi[0 + 4])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[2]) & 0xffff0000u);
-              (&weight_wide0_hi[0 + 6])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[3]) << 16);
-              (&weight_wide0_hi[0 + 6])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[3]) & 0xffff0000u);
-              (&weight_wide0_hi[0 + 8])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[4]) << 16);
-              (&weight_wide0_hi[0 + 8])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[4]) & 0xffff0000u);
-              (&weight_wide0_hi[0 + 10])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[5]) << 16);
-              (&weight_wide0_hi[0 + 10])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[5]) & 0xffff0000u);
-              (&weight_wide0_hi[0 + 12])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[6]) << 16);
-              (&weight_wide0_hi[0 + 12])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[6]) & 0xffff0000u);
-              (&weight_wide0_hi[0 + 14])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[7]) << 16);
-              (&weight_wide0_hi[0 + 14])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_1_0[7]) & 0xffff0000u);
-            }
-          }
-          if (valid1 != 0) {
-            long long wide_index1 =
-                ((lora_id * (long long)num_experts + expert) * 3072 + (long long)output_col1) * 32;
-            long long wide_index1_hi = wide_index1 + 16;
-            {
-              const void* _v8p_2 =
-                  (const void*)(reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + (wide_index1));
-              uint32_t _v8_2_0[8];
-              asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                           : "=r"(_v8_2_0[0]), "=r"(_v8_2_0[1]), "=r"(_v8_2_0[2]), "=r"(_v8_2_0[3]),
-                             "=r"(_v8_2_0[4]), "=r"(_v8_2_0[5]), "=r"(_v8_2_0[6]), "=r"(_v8_2_0[7])
-                           : "l"((const char*)_v8p_2 + 0)
-                           : "memory");
-              (&weight_wide1_lo[0 + 0])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[0]) << 16);
-              (&weight_wide1_lo[0 + 0])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[0]) & 0xffff0000u);
-              (&weight_wide1_lo[0 + 2])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[1]) << 16);
-              (&weight_wide1_lo[0 + 2])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[1]) & 0xffff0000u);
-              (&weight_wide1_lo[0 + 4])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[2]) << 16);
-              (&weight_wide1_lo[0 + 4])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[2]) & 0xffff0000u);
-              (&weight_wide1_lo[0 + 6])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[3]) << 16);
-              (&weight_wide1_lo[0 + 6])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[3]) & 0xffff0000u);
-              (&weight_wide1_lo[0 + 8])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[4]) << 16);
-              (&weight_wide1_lo[0 + 8])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[4]) & 0xffff0000u);
-              (&weight_wide1_lo[0 + 10])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[5]) << 16);
-              (&weight_wide1_lo[0 + 10])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[5]) & 0xffff0000u);
-              (&weight_wide1_lo[0 + 12])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[6]) << 16);
-              (&weight_wide1_lo[0 + 12])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[6]) & 0xffff0000u);
-              (&weight_wide1_lo[0 + 14])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[7]) << 16);
-              (&weight_wide1_lo[0 + 14])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_2_0[7]) & 0xffff0000u);
-            }
-            {
-              const void* _v8p_3 =
-                  (const void*)(reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) +
-                                (wide_index1_hi));
-              uint32_t _v8_3_0[8];
-              asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                           : "=r"(_v8_3_0[0]), "=r"(_v8_3_0[1]), "=r"(_v8_3_0[2]), "=r"(_v8_3_0[3]),
-                             "=r"(_v8_3_0[4]), "=r"(_v8_3_0[5]), "=r"(_v8_3_0[6]), "=r"(_v8_3_0[7])
-                           : "l"((const char*)_v8p_3 + 0)
-                           : "memory");
-              (&weight_wide1_hi[0 + 0])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[0]) << 16);
-              (&weight_wide1_hi[0 + 0])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[0]) & 0xffff0000u);
-              (&weight_wide1_hi[0 + 2])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[1]) << 16);
-              (&weight_wide1_hi[0 + 2])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[1]) & 0xffff0000u);
-              (&weight_wide1_hi[0 + 4])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[2]) << 16);
-              (&weight_wide1_hi[0 + 4])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[2]) & 0xffff0000u);
-              (&weight_wide1_hi[0 + 6])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[3]) << 16);
-              (&weight_wide1_hi[0 + 6])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[3]) & 0xffff0000u);
-              (&weight_wide1_hi[0 + 8])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[4]) << 16);
-              (&weight_wide1_hi[0 + 8])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[4]) & 0xffff0000u);
-              (&weight_wide1_hi[0 + 10])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[5]) << 16);
-              (&weight_wide1_hi[0 + 10])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[5]) & 0xffff0000u);
-              (&weight_wide1_hi[0 + 12])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[6]) << 16);
-              (&weight_wide1_hi[0 + 12])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[6]) & 0xffff0000u);
-              (&weight_wide1_hi[0 + 14])[0] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[7]) << 16);
-              (&weight_wide1_hi[0 + 14])[1] =
-                  __uint_as_float(static_cast<uint32_t>(_v8_3_0[7]) & 0xffff0000u);
-            }
-          }
 #pragma unroll
           for (int rank_block = 0; rank_block < 4; rank_block++) {
             int rank_col = rank_block * 8;
@@ -1714,45 +1470,73 @@ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void kernel_flashinfer_bgmv_moe_ex
               }
             }
             if (valid0 != 0) {
+              long long weight_index0 =
+                  ((lora_id * (long long)num_experts + expert) * 3072 + (long long)output_col0) *
+                      32 +
+                  (long long)rank_col;
+              float _vec_load_0[8];
+              {
+                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(
+                    reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index0 + 0);
+                uint4 _vld_0[1];
+#pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                  _vld_0[_blk] = _vptr_0[_blk];
+                  uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+#pragma unroll
+                  for (int _pair = 0; _pair < 4; _pair++) {
+                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] =
+                        __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] =
+                        __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
+                  }
+                }
+              }
 #pragma unroll
               for (int element = 0; element < 8; element++) {
-                if (rank_block < 2) {
-                  float _fma_0 =
-                      __fmaf_rn(activation_values[element],
-                                weight_wide0_lo[rank_block * 8 + element], route_partial0);
-                  route_partial0 = _fma_0;
-                } else {
-                  float _fma_1 =
-                      __fmaf_rn(activation_values[element],
-                                weight_wide0_hi[(rank_block - 2) * 8 + element], route_partial0);
-                  route_partial0 = _fma_1;
-                }
+                float _fma_0 =
+                    __fmaf_rn(activation_values[element], _vec_load_0[element], route_partial0);
+                route_partial0 = _fma_0;
               }
             }
             if (valid1 != 0) {
+              long long weight_index1 =
+                  ((lora_id * (long long)num_experts + expert) * 3072 + (long long)output_col1) *
+                      32 +
+                  (long long)rank_col;
+              float _vec_load_1[8];
+              {
+                const uint4* _vptr_1 = reinterpret_cast<const uint4*>(
+                    reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index1 + 0);
+                uint4 _vld_1[1];
+#pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                  _vld_1[_blk] = _vptr_1[_blk];
+                  uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
+#pragma unroll
+                  for (int _pair = 0; _pair < 4; _pair++) {
+                    (&_vec_load_1[0 + _blk * 8 + _pair * 2])[0] =
+                        __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
+                    (&_vec_load_1[0 + _blk * 8 + _pair * 2])[1] =
+                        __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
+                  }
+                }
+              }
 #pragma unroll
               for (int element_1 = 0; element_1 < 8; element_1++) {
-                if (rank_block < 2) {
-                  float _fma_2 =
-                      __fmaf_rn(activation_values[element_1],
-                                weight_wide1_lo[rank_block * 8 + element_1], route_partial1);
-                  route_partial1 = _fma_2;
-                } else {
-                  float _fma_3 =
-                      __fmaf_rn(activation_values[element_1],
-                                weight_wide1_hi[(rank_block - 2) * 8 + element_1], route_partial1);
-                  route_partial1 = _fma_3;
-                }
+                float _fma_1 =
+                    __fmaf_rn(activation_values[element_1], _vec_load_1[element_1], route_partial1);
+                route_partial1 = _fma_1;
               }
             }
           }
           if (valid0 != 0) {
-            float _fma_4 = __fmaf_rn(route_partial0, topk_weights[pair], total0);
-            total0 = _fma_4;
+            float _fma_2 = __fmaf_rn(route_partial0, topk_weights[pair], total0);
+            total0 = _fma_2;
           }
           if (valid1 != 0) {
-            float _fma_5 = __fmaf_rn(route_partial1, topk_weights[pair], total1);
-            total1 = _fma_5;
+            float _fma_3 = __fmaf_rn(route_partial1, topk_weights[pair], total1);
+            total1 = _fma_3;
           }
         }
       } else {
@@ -1829,93 +1613,93 @@ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void kernel_flashinfer_bgmv_moe_ex
 #pragma unroll
             for (int rank_block_1 = 0; rank_block_1 < 4; rank_block_1++) {
               int rank_col_1 = rank_block_1 * 8;
-              float _vec_load_0[8];
+              float _vec_load_2[8];
               {
-                const uint4* _vptr_4 = reinterpret_cast<const uint4*>(
+                const uint4* _vptr_2 = reinterpret_cast<const uint4*>(
                     reinterpret_cast<const __nv_bfloat16*>(shrink_raw) +
                     (pair_1 * 32 + rank_col_1) + 0);
-                uint4 _vld_4[1];
+                uint4 _vld_2[1];
 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
-                  _vld_4[_blk] = _vptr_4[_blk];
-                  uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4[_blk]);
+                  _vld_2[_blk] = _vptr_2[_blk];
+                  uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2[_blk]);
 #pragma unroll
                   for (int _pair = 0; _pair < 4; _pair++) {
-                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] =
-                        __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) << 16);
-                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] =
-                        __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) & 0xffff0000u);
+                    (&_vec_load_2[0 + _blk * 8 + _pair * 2])[0] =
+                        __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
+                    (&_vec_load_2[0 + _blk * 8 + _pair * 2])[1] =
+                        __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
                   }
                 }
               }
               if (valid0 != 0) {
-                long long weight_index0 = ((lora_id * (long long)num_experts + expert_1) * 3072 +
-                                           (long long)output_col0) *
-                                              32 +
-                                          (long long)rank_col_1;
-                float _vec_load_1[8];
+                long long weight_index0_1 = ((lora_id * (long long)num_experts + expert_1) * 3072 +
+                                             (long long)output_col0) *
+                                                32 +
+                                            (long long)rank_col_1;
+                float _vec_load_3[8];
                 {
-                  const uint4* _vptr_5 = reinterpret_cast<const uint4*>(
-                      reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index0 + 0);
-                  uint4 _vld_5[1];
+                  const uint4* _vptr_3 = reinterpret_cast<const uint4*>(
+                      reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index0_1 + 0);
+                  uint4 _vld_3[1];
 #pragma unroll
                   for (int _blk = 0; _blk < 1; _blk++) {
-                    _vld_5[_blk] = _vptr_5[_blk];
-                    uint32_t* _vpairs_5 = reinterpret_cast<uint32_t*>(&_vld_5[_blk]);
+                    _vld_3[_blk] = _vptr_3[_blk];
+                    uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
 #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                      (&_vec_load_1[0 + _blk * 8 + _pair * 2])[0] =
-                          __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) << 16);
-                      (&_vec_load_1[0 + _blk * 8 + _pair * 2])[1] =
-                          __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) & 0xffff0000u);
+                      (&_vec_load_3[0 + _blk * 8 + _pair * 2])[0] =
+                          __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
+                      (&_vec_load_3[0 + _blk * 8 + _pair * 2])[1] =
+                          __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
                     }
                   }
                 }
 #pragma unroll
                 for (int element_2 = 0; element_2 < 8; element_2++) {
-                  float _fma_6 =
-                      __fmaf_rn(_vec_load_0[element_2], _vec_load_1[element_2], route_partial0_1);
-                  route_partial0_1 = _fma_6;
+                  float _fma_4 =
+                      __fmaf_rn(_vec_load_2[element_2], _vec_load_3[element_2], route_partial0_1);
+                  route_partial0_1 = _fma_4;
                 }
               }
               if (valid1 != 0) {
-                long long weight_index1 = ((lora_id * (long long)num_experts + expert_1) * 3072 +
-                                           (long long)output_col1) *
-                                              32 +
-                                          (long long)rank_col_1;
-                float _vec_load_2[8];
+                long long weight_index1_1 = ((lora_id * (long long)num_experts + expert_1) * 3072 +
+                                             (long long)output_col1) *
+                                                32 +
+                                            (long long)rank_col_1;
+                float _vec_load_4[8];
                 {
-                  const uint4* _vptr_6 = reinterpret_cast<const uint4*>(
-                      reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index1 + 0);
-                  uint4 _vld_6[1];
+                  const uint4* _vptr_4 = reinterpret_cast<const uint4*>(
+                      reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index1_1 + 0);
+                  uint4 _vld_4[1];
 #pragma unroll
                   for (int _blk = 0; _blk < 1; _blk++) {
-                    _vld_6[_blk] = _vptr_6[_blk];
-                    uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6[_blk]);
+                    _vld_4[_blk] = _vptr_4[_blk];
+                    uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4[_blk]);
 #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                      (&_vec_load_2[0 + _blk * 8 + _pair * 2])[0] =
-                          __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) << 16);
-                      (&_vec_load_2[0 + _blk * 8 + _pair * 2])[1] =
-                          __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) & 0xffff0000u);
+                      (&_vec_load_4[0 + _blk * 8 + _pair * 2])[0] =
+                          __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) << 16);
+                      (&_vec_load_4[0 + _blk * 8 + _pair * 2])[1] =
+                          __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) & 0xffff0000u);
                     }
                   }
                 }
 #pragma unroll
                 for (int element_3 = 0; element_3 < 8; element_3++) {
-                  float _fma_7 =
-                      __fmaf_rn(_vec_load_0[element_3], _vec_load_2[element_3], route_partial1_1);
-                  route_partial1_1 = _fma_7;
+                  float _fma_5 =
+                      __fmaf_rn(_vec_load_2[element_3], _vec_load_4[element_3], route_partial1_1);
+                  route_partial1_1 = _fma_5;
                 }
               }
             }
             if (valid0 != 0) {
-              float _fma_8 = __fmaf_rn(route_partial0_1, topk_weights[pair_1], total0);
-              total0 = _fma_8;
+              float _fma_6 = __fmaf_rn(route_partial0_1, topk_weights[pair_1], total0);
+              total0 = _fma_6;
             }
             if (valid1 != 0) {
-              float _fma_9 = __fmaf_rn(route_partial1_1, topk_weights[pair_1], total1);
-              total1 = _fma_9;
+              float _fma_7 = __fmaf_rn(route_partial1_1, topk_weights[pair_1], total1);
+              total1 = _fma_7;
             }
           }
         }
