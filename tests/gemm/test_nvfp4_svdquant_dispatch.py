@@ -468,13 +468,14 @@ def test_sm120_tuned_linear_route_bypasses_repeated_autotuner_lookup():
 
     tuner = FakeTuner()
     runners = [object(), object()]
+    inputs = [torch.empty(16, dtype=torch.uint8)]
     svdquant_sm120_cutlass._SM120_LINEAR_DISPATCH_CACHE.clear()
     try:
         first = svdquant_sm120_cutlass._choose_sm120_linear_runner(
             tuner,
             runners,
             object(),
-            [],
+            inputs,
             device="cuda:0",
             m=256,
             n=3072,
@@ -488,7 +489,7 @@ def test_sm120_tuned_linear_route_bypasses_repeated_autotuner_lookup():
             tuner,
             runners,
             object(),
-            [],
+            inputs,
             device="cuda:0",
             m=256,
             n=3072,
@@ -501,7 +502,7 @@ def test_sm120_tuned_linear_route_bypasses_repeated_autotuner_lookup():
             tuner,
             runners,
             object(),
-            [],
+            inputs,
             device="cuda:0",
             m=256,
             n=3072,
@@ -544,7 +545,7 @@ def _sm120_linear_op_name_in_use(m, k, rank, n=5376, enable_pdl=False):
             tuner,
             runners,
             object(),
-            [],
+            [torch.empty(16, dtype=torch.uint8)],
             device="cuda:0",
             m=m,
             n=n,
@@ -703,7 +704,9 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
     )
     monkeypatch.setattr(gemm_svdquant.torch, "empty", fake_empty)
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "_get_cache_buf", lambda *args, **kwargs: "workspace"
+        svdquant_sm120_cutlass,
+        "_get_cache_buf",
+        lambda *args, **kwargs: torch.zeros(16, dtype=torch.uint8),
     )
     monkeypatch.setattr(
         svdquant_sm120_cutlass, "_sm120_max_workspace_bytes", lambda *args, **kwargs: 0
