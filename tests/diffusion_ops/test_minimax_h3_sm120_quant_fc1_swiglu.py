@@ -452,6 +452,22 @@ def prepared_nvfp4(model):
 
 
 @requires_sm120
+@pytest.mark.parametrize("chunk_rows", [0, -1, -2048])
+def test_prepare_fp8_weight_rejects_nonpositive_chunk_rows(model, chunk_rows):
+    with pytest.raises(ValueError, match="chunk_rows must be positive"):
+        prepare_minimax_h3_fc1_weight_fp8(model["fc1_weight"], chunk_rows=chunk_rows)
+
+
+@requires_sm120
+def test_prepare_fp8_weight_nondividing_chunk_rows(model, prepared_fp8):
+    w_q, w_scale = prepare_minimax_h3_fc1_weight_fp8(
+        model["fc1_weight"], chunk_rows=3000
+    )
+    assert torch.equal(w_q.view(torch.uint8), prepared_fp8["w_q"].view(torch.uint8))
+    assert torch.equal(w_scale, prepared_fp8["w_scale"])
+
+
+@requires_sm120
 def test_prepare_fp8_weight_is_interleaved_row_quantization(prepared_fp8):
     assert prepared_fp8["w_q"].dtype == torch.float8_e4m3fn
     assert tuple(prepared_fp8["w_q"].shape) == (MINIMAX_H3_FC1_ROWS, MINIMAX_H3_HIDDEN)
