@@ -150,7 +150,7 @@ main() {
             local nccl_wheel_lib
             nccl_wheel_lib=$(python -c \
                 'import nvidia.nccl, os; print(os.path.join(list(nvidia.nccl.__path__)[0], "lib"))')
-            export LD_LIBRARY_PATH="${nccl_wheel_lib}:${LD_LIBRARY_PATH:-}"
+            export LD_LIBRARY_PATH="${nccl_wheel_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
         fi
 
         echo "=========================================="

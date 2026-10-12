@@ -77,14 +77,14 @@ PIP_CONSTRAINT="" pip install --no-cache-dir \
 # off nccl4py. Persist it too, so later `srun`/exec shells in a saved container
 # inherit it.
 NCCL_WHEEL_LIB="$(python -c "import nvidia.nccl, os; print(os.path.join(list(nvidia.nccl.__path__)[0], 'lib'))")"
-export LD_LIBRARY_PATH="${NCCL_WHEEL_LIB}:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${NCCL_WHEEL_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 # Image builds persist the library selection. An unprivileged test job must
 # pass LD_LIBRARY_PATH to its test process instead.
 if [ "${EUID}" -eq 0 ]; then
     echo "${NCCL_WHEEL_LIB}" > /etc/ld.so.conf.d/000-flashinfer-nccl.conf
     ldconfig
     cat > /etc/profile.d/flashinfer-nccl.sh <<EOF
-export LD_LIBRARY_PATH=${NCCL_WHEEL_LIB}:\${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH="${NCCL_WHEEL_LIB}\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
 EOF
     chmod +x /etc/profile.d/flashinfer-nccl.sh
     ldconfig -p | grep -E "libnccl\.so\.2" || true

@@ -338,9 +338,9 @@ def test_shell_prints_fallback_summary_for_dependency_setup_failure(
     assert "phase=dependency-setup" in result.stdout
 
 
-@pytest.mark.parametrize("library_path", ["", "/existing/lib"])
+@pytest.mark.parametrize("library_path", [None, "", "/existing/lib"])
 def test_shell_passes_nccl_wheel_library_to_test_runner(
-    tmp_path: Path, library_path: str
+    tmp_path: Path, library_path: str | None
 ) -> None:
     scripts = tmp_path / "scripts"
     scripts.mkdir()
@@ -373,10 +373,14 @@ def test_shell_passes_nccl_wheel_library_to_test_runner(
     env = os.environ.copy()
     env.update(
         PYTHONPATH=str(modules),
-        LD_LIBRARY_PATH=library_path,
-        EXPECTED_LIBRARY_PATH=f"{wheel_lib}:{library_path}",
+        EXPECTED_LIBRARY_PATH=str(wheel_lib)
+        + (f":{library_path}" if library_path else ""),
         PATH=f"{Path(sys.executable).parent}{os.pathsep}{env['PATH']}",
     )
+    if library_path is None:
+        env.pop("LD_LIBRARY_PATH", None)
+    else:
+        env["LD_LIBRARY_PATH"] = library_path
     result = subprocess.run(
         ["bash", str(entrypoint)],
         cwd=tmp_path,
