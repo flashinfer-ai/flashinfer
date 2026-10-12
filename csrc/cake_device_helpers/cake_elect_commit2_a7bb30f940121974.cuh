@@ -20,15 +20,14 @@
 #pragma once
 
 __device__ __forceinline__ void elect_commit2(int mbar_addr0, int mbar_addr1) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred leader;\n\t"
-      "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-      "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-      ".shared::cluster.b64 [%0];\n\t"
-      "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-      ".shared::cluster.b64 [%1];\n\t"
-      "}\n" ::"r"(mbar_addr0),
-      "r"(mbar_addr1)
-      : "memory");
+    asm volatile(
+        "{\n\t"
+        ".reg .pred leader;\n\t"
+        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
+        "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one"
+        ".shared::cluster.b64 [%0];\n\t"
+        "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one"
+        ".shared::cluster.b64 [%1];\n\t"
+        "}\n"
+        :: "r"(mbar_addr0), "r"(mbar_addr1) : "memory");
 }

@@ -451,6 +451,7 @@ def _run_mega_layer(
     num_experts: int = 8,
     topk: int = 4,
     hidden: int = 2048,
+    capture_graph: bool = False,
 ):
     import torch
     import torch.distributed as dist
@@ -554,6 +555,7 @@ def _run_mega_layer(
                     mma_tiler_mnk=mma_tiler_mnk,
                     pingpong=pingpong,
                     cluster_shape_mnk=cluster_shape_mnk,
+                    tail_split_pairs=tail_split_pairs,
                 ),
                 quantize_input=quantize_input,
                 preprocess_weights=True,
@@ -576,6 +578,31 @@ def _run_mega_layer(
         y_layer2 = mega.forward(t)
         torch.cuda.synchronize()
         dist.barrier()
+
+        if capture_graph:
+            graph = None
+            y_graph = None
+            try:
+                # The two eager calls above complete lazy allocation/JIT.
+                # All ranks finish capture before any cross-rank replay.
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    y_graph = mega.forward(t)
+                dist.barrier()
+                for _ in range(3):
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    torch.testing.assert_close(y_graph, y_layer, atol=0.0, rtol=0.0)
+                y_after_graph = mega.forward(t)
+                torch.cuda.synchronize()
+                dist.barrier()
+                torch.testing.assert_close(y_after_graph, y_layer, atol=0.0, rtol=0.0)
+            finally:
+                # Release captured references before the symmetric workspace.
+                torch.cuda.synchronize()
+                y_graph = None
+                graph = None
 
         if quantize_input:
             y_ref = _reference_sm90_fp8_mega_moe_staged(problem, destroy_buffer=True)
@@ -1044,6 +1071,33 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_tail_split_pairs(case):
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
         f"(tail-split pair tasks {scale} swap={swap_ab} tile={tile} "
         f"pp={pingpong} cga={cga} tb={token_back}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("fp8_scale_mode", ["per_tensor", "blockwise"])
+def test_moe_ep_sm90_pull_fp8_mega_layer_graph_replay(fp8_scale_mode):
+    """Ordinary library Graph replay matches eager with real tail-pair tasks."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    swap_ab = fp8_scale_mode == "per_tensor"
+    _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        num_tokens=1088,
+        max_tokens=1088,
+        mma_tiler_mnk=(128, 128, 128) if swap_ab else (64, 256, 128),
+        pingpong=swap_ab,
+        cluster_shape_mnk=(1, 2, 1) if swap_ab else (2, 1, 1),
+        token_back_mode="epi_warps",
+        tail_split_pairs=True,
+        capture_graph=True,
     )
 
 

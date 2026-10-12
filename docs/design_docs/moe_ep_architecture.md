@@ -40,14 +40,16 @@ owns dispatch, expert compute, and combine; output is always BF16
 | `sm100_nvfp4_nvfp4_bf16_cutedsl` (`nvfp4_cutedsl`) | NVFP4 (block-16) | NVFP4 (block-16) | BF16 | SM100 family | `knobs=None` → token-count heuristic; `knobs=dict` → pinned; `knobs="auto"` → collective compile+time sweep at first forward (never in serving); winners cacheable via `FLASHINFER_MOE_EP_KNOB_CACHE` |
 | `sm100_mxfp8_mxfp8_bf16_cutedsl` (`mxfp8_cutedsl`) | MXFP8 (block-32 UE8M0) | MXFP8 (block-32 UE8M0) | BF16 | SM100 family | same `knobs` surface as the NVFP4 backend |
 | `sm100_fp8_fp4_bf16_deepgemm` (`deep_gemm_mega`) | FP8 (E4M3, block-32 UE8M0) | FP4 (int8-packed, block-32) | BF16 | SM100 family | — (DeepGEMM selects its own JIT configs internally) |
-| `sm90_fp8_fp8_bf16_pull_cutedsl` (`sm90_pull_fp8`) | FP8 (E4M3/E5M2; per-tensor or DeepGEMM-style blockwise scales) | FP8 (same `fp8_scale_mode`) | BF16 | SM90 exactly | explicit geometry knobs on the config (`swap_ab`, `mma_tiler_mnk`); no tuner/knob-cache yet |
+| `sm90_fp8_fp8_bf16_pull_cutedsl` (`sm90_pull_fp8`) | FP8 (E4M3/E5M2; per-tensor or DeepGEMM-style blockwise scales) | FP8 (same `fp8_scale_mode`) | BF16 | SM90 exactly | same `knobs` surface as the SM100 backends (heuristic table / knob cache / `knobs="auto"`) |
+| `sm90_bf16_bf16_bf16_pull_cutedsl` | BF16 | BF16 | BF16 | SM90 exactly | same `knobs` surface as the FP8 pull backend, shared knob cache |
 | `sm90_fp8_fp8_bf16_push_cuda` (`sm90_push_fp8`) | FP8 (E4M3) | FP8 (E4M3) | BF16 | SM90 | — (static dimensions/protocol choices only) |
 | `sm90_bf16_bf16_bf16_push_cake` | BF16 | BF16 | BF16 | SM90 | — (`capacity_factor`, `dedup_dispatch`, optional `clamp_limit`, `combine_wire` = `prereduced` (default: one pre-reduced bf16 row per (token, source rank), deterministic rank-ordered fp32 sum) or `per_route`; native BF16 end to end: bf16 dispatch payload, Cake-generated WGMMA FC1/FC2 with fp32 accumulation, bf16 combine wire) |
 
 The SM90 pull-style CuTeDSL tree is process-exclusive with the SM100 CuTeDSL
 tree (module names collide). Weight inputs are canonical BF16 `MoEWeightPack`
-by default (the backend quantizes at `preprocess_weights`); kernel-ready
-pre-quantized weights can be supplied instead.
+by default (the FP8 backend quantizes at `preprocess_weights`, the BF16 twin
+only re-lays them out); kernel-ready pre-quantized (FP8) or pre-laid-out
+(BF16) weights can be supplied instead.
 
 ### Split (dispatch → inner kernel → combine)
 
@@ -238,7 +240,7 @@ moe_ep/
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,bf16_mxfp8_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
-  backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
+  backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,bf16_bf16_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
   backends/mega/kernel/sm107/{mxfp8_mxfp8_bf16_cutedsl, mxfp8_mxfp4_bf16_cutedsl, nvfp4_nvfp4_bf16_cutedsl}
   kernel_src/sm100/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_bf16_glu, moe_nvfp4_swapab, moe_mxfp8_glu, src)
@@ -247,8 +249,8 @@ moe_ep/
     SKILL.md                   ← how to resync src/ when kernel team drops a new version
     TUNING.md                  ← tuning surface, measured perf, benchmark methodology
     ACKNOWLEDGEMENT.md         ← kernel authors
-  kernel_src/sm90/pull_style_cutedsl_megakernel/  ← Hopper pull-style FP8 kernel src + FI shim
-    src/                       ← VERBATIM drop, fork of the sm100 kernel repo (common, src, moe_nvfp4_swapab, moe_hopper_fp8)
+  kernel_src/sm90/pull_style_cutedsl_megakernel/  ← Hopper pull-style FP8 and BF16 kernel src + FI shim
+    src/                       ← VERBATIM drop, fork of the sm100 kernel repo (common, src, moe_nvfp4_swapab, moe_hopper_fp8, moe_hopper_bf16)
     shim/, __init__.py, SKILL.md  ← same layering; process-exclusive with the sm100 tree (module names collide)
   kernel_src/sm90/push_style_megamoe/  ← Hopper push-style FP8 (raw CUDA, JIT-compiled)
     src/{a2a,fp8_gemm}/        ← VERBATIM drop from flashinfer PR #4069 (.cu/.cuh)
@@ -469,13 +471,13 @@ See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environ
 
 - **unit** — host-only pytest (mocks + single-GPU; no multirank)
 - **oracle** — single-GPU torch-oracle correctness for every SM100 compute path (see **Torch oracles** below)
-- **oracle_sm90** — single-GPU (Hopper) torch oracle for the sm90_fp8_fp8_bf16_pull_cutedsl mega kernel
+- **oracle_sm90** — single-GPU (Hopper) torch oracle for the sm90_fp8_fp8_bf16_pull_cutedsl (FP8) and sm90_bf16_bf16_bf16_pull_cutedsl (BF16) mega kernels
 - **oracle_sm107** — single-GPU (Rubin) torch oracle and boundary tests for NVFP4, MXFP8 E4M3, and MXFP8 E5M2
 - **qualify_sm107** — strict Rubin host, single-GPU, and multirank qualification, rejecting skipped/empty tests and OOMs; see the [qualification runbook](moe_ep_sm107_qualification.md)
 - **multirank** — 4-GPU split path: `test_moe_ep_layer_multirank.py` + `test_split_kernels.py` over NCCL-EP (and NIXL-EP when built)
 - **split_path_correctness_{bf16,nvfp4,ht}** — 4-GPU split-path numerics (LL EXPERT_MAJOR + RANK_MAJOR / NVFP4 / HT FLAT) vs a single-process `MoELayer` reference (Blackwell)
 - **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity **and multi-rank torch oracles**, plus single-rank preprocess/kernel-vs-reference checks (`MEGA_NO_DIST=1`) (Blackwell, sm_100+)
-- **mega_sm90** — 4-GPU (Hopper) sm90_fp8_fp8_bf16_pull_cutedsl mega parity + multi-rank torch oracle; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
+- **mega_sm90** — 4-GPU (Hopper) sm90_fp8_fp8_bf16_pull_cutedsl (FP8) + sm90_bf16_bf16_bf16_pull_cutedsl (BF16) mega parity + multi-rank torch oracles; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
 - **mega_sm107** — Rubin MoEEpLayer vs multirank torch oracle for all three formats, with idle ranks and pooled-layer graph replay; `NPROC_MULTIRANK=2`, `4`, or `8` (default 4), own torchrun process
 - **sm90_push** — 2-GPU (Hopper) sm90_fp8_fp8_bf16_push_cuda kernel + backend; own torchrun process
 - **sm90_bf16_push_cake** — 2-GPU (Hopper) sm90_bf16_bf16_bf16_push_cake backend vs an independent bf16 torch reference (single-process `-k ep1` cases, then torchrun EP≥2 routing patterns incl. the pre-reduce cases, uneven tokens, graph replay, combine-wire mismatch; every case under both combine wires); own torchrun process
@@ -556,6 +558,7 @@ unless noted):
 | mega sm100_nvfp4_nvfp4_bf16_cutedsl (default, ikr, nvfp4/mxfp8 combine wires) | 2026-07-31 | 4x GB200 variant job |
 | mega sm100_mxfp8_mxfp8_bf16_cutedsl (default, ikr) | 2026-07-31 | 4x GB200 variant job |
 | mega sm90_fp8_fp8_bf16_pull_cutedsl (per_tensor/blockwise × swap_ab) | 2026-07-30 | Hopper, when landed (commit 7169aca9); not runnable on the SM100 cluster |
+| mega sm90_bf16_bf16_bf16_pull_cutedsl | 2026-10-08 | Hopper 4x H200, this branch |
 
 ## Forward flow
 

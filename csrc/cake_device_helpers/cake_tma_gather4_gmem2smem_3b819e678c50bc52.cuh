@@ -19,17 +19,19 @@
 // after its typedefs and the helpers it calls.
 #pragma once
 
-__device__ __forceinline__ void tma_gather4_gmem2smem(int dst, const void* tmap_ptr, int col_idx,
-                                                      int row0, int row1, int row2, int row3,
-                                                      int mbar_addr) {
-  // Canonical .shared::cta form for non-multicast gather4, matching
-  // trtllm-gen / cuda_ptx and the PTX ISA qualifier order
-  // (dim.dst.src.load_mode.completion_mechanism). Per the PTX grammar,
-  // .shared::cluster is reserved for the multicast variant (ctaMask).
-  asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
-      ".mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];" ::"r"(dst),
-      "l"(tmap_ptr), "r"(col_idx), "r"(row0), "r"(row1), "r"(row2), "r"(row3), "r"(mbar_addr)
-      : "memory");
+__device__ __forceinline__ void tma_gather4_gmem2smem(
+    int dst, const void *tmap_ptr,
+    int col_idx, int row0, int row1, int row2, int row3,
+    int mbar_addr) {
+    // Canonical .shared::cta form for non-multicast gather4, matching
+    // trtllm-gen / cuda_ptx and the PTX ISA qualifier order
+    // (dim.dst.src.load_mode.completion_mechanism). Per the PTX grammar,
+    // .shared::cluster is reserved for the multicast variant (ctaMask).
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
+        ".mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
+        :: "r"(dst), "l"(tmap_ptr), "r"(col_idx),
+           "r"(row0), "r"(row1), "r"(row2), "r"(row3),
+           "r"(mbar_addr) : "memory");
 }
