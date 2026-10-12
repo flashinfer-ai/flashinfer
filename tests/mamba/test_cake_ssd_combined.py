@@ -4260,10 +4260,11 @@ def test_source_program_table_names_shipped_sources():
             )
             assert state_check in rendered, state_check
         assert "DLDataType{kDLFloat, 16, 1}" in rendered
-    # One shared source per physical kernel: twelve exact-scan main sources
-    # (six ring + six ``_noring``) and six chunk-parallel main sources plus
-    # the one preprocess kernel, no architecture copies and no orphans.
-    assert len(device_sources) == 19
+    # One shared source per physical kernel: twelve fused exact-scan main
+    # sources (six ring + six ``_noring``), twelve two-kernel ``exactpre``
+    # main sources and six chunk-parallel main sources plus the one
+    # preprocess kernel, no architecture copies and no orphans.
+    assert len(device_sources) == 31
     assert sorted(
         path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
     ) == sorted(path.name for path in device_sources)
@@ -4938,7 +4939,9 @@ def test_source_chunk_parallel_forward_binds_the_workspace_without_gpu(monkeypat
     monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
     runner.run(*inputs(32768))
     name, launch = calls[-1]
-    assert name == runner.last_program_name == "exact_bf16_batched"
+    # 256 chunks per sequence exceed the fused window (16): the forced exact
+    # scan is the two-kernel ``exactpre`` program (the round-5 schedule).
+    assert name == runner.last_program_name == "exactpre_bf16_batched"
     assert set(launch["main"]) == set(module._MAIN_ARGS)
     assert launch["main_grid"] == (8, 1, 1)
 
