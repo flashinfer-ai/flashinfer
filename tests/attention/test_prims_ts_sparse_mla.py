@@ -375,6 +375,10 @@ def _dequant_output(output, scales, block_size):
         (16, 1, 128, 513, 128, "ue8m0", False, False),
         (5, 1, 128, 513, 32, "fp32", False, False),
         (5, 1, 16, 513, 128, "ue8m0", False, False),
+        # Short lists on the H128 2CTA schedule (capacity 256), fused output.
+        (80, 1, 128, 64, 128, "fp32", False, False),
+        (80, 1, 128, 64, 32, "ue8m0", False, True),
+        (1, 161, 128, 64, 128, "fp32", False, False),
         (1, 161, 64, 513, 32, "ue8m0", False, False),
         # Packed multiwave queries reuse the quantized output's shared stages.
         (2, 81, 128, 513, 32, "fp32", True, False),
@@ -739,6 +743,14 @@ def test_rope_quant_plan_options():
         ),
         pytest.param(1, 0, 64, 513, True, False, False, True, id="multiwave-prefill"),
         pytest.param(0, 4, 128, 2049, True, False, False, True, id="multiwave-decode"),
+        # Short lists (capacity 256 and 384) with enough rows for the H128 2CTA tile.
+        pytest.param(
+            0, 1, 128, 64, True, False, False, True, id="short-two-cta-decode"
+        ),
+        pytest.param(
+            1, 0, 128, 64, True, False, False, True, id="short-two-cta-prefill"
+        ),
+        pytest.param(0, 1, 128, 256, True, False, True, True, id="short-two-cta-384"),
         pytest.param(
             1, 3, 8, 8193, True, False, False, False, id="long-split-reduction"
         ),

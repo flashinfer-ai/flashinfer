@@ -256,9 +256,12 @@ def _choose_fp8(rows, heads, query_length, capacity, sm_count):
             scheduler="clc",
             paired_correction=True,
         )
-    if heads == 128 and capacity >= 512 and (rows * 2 >= sm_count):
+    if heads == 128 and capacity >= 256 and (rows * 2 >= sm_count):
         # The FP8 2CTA family uses its qualified static persistent scheduler;
-        # BF16's CLC choice below is a separate measured schedule.
+        # BF16's CLC choice below is a separate measured schedule. Short lists
+        # (capacity 256-384, e.g. HCA at moderate context) run this schedule
+        # too: one 2CTA tile covers H128 with a single KV stream, where the
+        # M64 keep fallback repeats it per head tile (B200: 2.4x faster).
         return SparseMlaProfile(family="2cta", scheduler="static", gather_issue_warps=1)
     if (
         heads <= 16
