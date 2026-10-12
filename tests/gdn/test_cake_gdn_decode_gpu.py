@@ -972,7 +972,10 @@ def test_exported_decode_matches_torch_on_caller_stream(batch_size: int) -> None
     route, entry = _load(batch_size)
     band = "small" if batch_size < 32 else "large"
     assert f"nontranspose_{band}" in route.route_id
-    assert route.route_id == cake_gdn.cake_gdn_nontranspose_fp32_t1_route(batch_size, _arch())[1]
+    assert (
+        route.route_id
+        == cake_gdn.cake_gdn_nontranspose_fp32_t1_route(batch_size, _arch())[1]
+    )
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
