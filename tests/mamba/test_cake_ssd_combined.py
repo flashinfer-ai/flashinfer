@@ -1407,10 +1407,17 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
         value.clone() for value in runner.run(*tensors, **arguments)
     )
     assert cake.seq_idx_status() == 0
+    program_triple = cake.last_program_name
 
     out, final = runner.run(*tensors, **_cu_seqlens_arguments(arguments, lengths))
 
     assert cake.seq_idx_status(reset=True) == 0
+    # The family rule reads the same host quantities in both forms; round 6
+    # made the families' rounding differ, so a form-dependent route would
+    # break this contract before any element compares.
+    assert cake.last_program_name == program_triple, (
+        f"cu_seqlens form ran {cake.last_program_name}, the triple {program_triple}"
+    )
     assert final.dtype == state_dtype
     assert tuple(final.shape) == (len(lengths), 8, 64, 128)
     assert torch.isfinite(out.to(torch.float32)).all()

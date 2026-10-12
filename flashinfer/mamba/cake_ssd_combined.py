@@ -771,10 +771,11 @@ def selection_quantities(
 
     ``work_items`` is the exact scan's concurrency (one CTA per (sequence,
     head) item); ``tiles`` the chunk-parallel tile bound (``num_segments *
-    nheads``, the preprocess row count; the cu_seqlens form passes its host
-    segment bound); ``chunks`` the serial chunk count per item: ``nchunks``
-    when batched, the mean logical-chunk count per packed sequence when varlen
-    (the per-sequence counts live on the device).
+    nheads``; varlen calls pass the host segment bound ``_segment_bound`` in
+    both metadata forms, so the rule is independent of the form that carries
+    the geometry); ``chunks`` the serial chunk count per item: ``nchunks``
+    when batched, the mean bound per packed sequence when varlen (the exact
+    per-sequence counts live on the device).
     """
 
     model = _CHUNK_PARALLEL_COST_MODEL_US.get(
@@ -1585,10 +1586,18 @@ class CakeSSDCombined:
         # sequence whose length is not a multiple of 128 is partial.
         lengths = torch.clamp(seqlen - chunks * _CHUNK_SIZE, max=_CHUNK_SIZE)
         tile_count = num_segments * self.nheads
+        # The family rule reads the same host quantities in both varlen
+        # metadata forms: the cu_seqlens form only knows the host segment
+        # bound, so the triple form selects on that bound too (its exact
+        # segment count still sizes the workspace) -- a call routes to the
+        # same program whichever form carries its sequence geometry.
+        selection_segments = (
+            _segment_bound(seqlen, num_sequences) if self.has_varlen else num_segments
+        )
         chunk_parallel = chunk_parallel_selected(
             nheads=self.nheads,
             num_sequences=num_sequences,
-            num_segments=num_segments,
+            num_segments=selection_segments,
             nchunks=nchunks,
             mode_varlen=self.has_varlen,
             sm_count=sm_count,
