@@ -45,7 +45,13 @@ _DEVICE_DIR = Path("generated") / "device"
 # main kernel takes six more arguments than the exact scan
 # (``_MAIN_ARGS_CHUNKPAR``), the three-phase chunk-parallel main kernel four
 # more (``_MAIN_ARGS_CHUNKPAR3``).
+# The start two-kernel exact-scan programs (``exact_*``, CAKE-956 round 5: the
+# retained files, 41 main arguments ``_MAIN_ARGS_START``) keep their original
+# launcher; the fused programs (``exactfused_*``, round 6) have their own.
 _HOST_TEMPLATE = Path("generated") / "host" / "mamba_ssd_combined_sequence.cpp"
+_EXACTFUSED_HOST_TEMPLATE = (
+    Path("generated") / "host" / "mamba_ssd_combined_fused_sequence.cpp"
+)
 _CHUNKPAR_HOST_TEMPLATE = (
     Path("generated") / "host" / "mamba_ssd_combined_chunk_parallel_sequence.cpp"
 )
@@ -85,12 +91,14 @@ class _Kernel:
 class _Program:
     """A two-launch program: metadata preprocess followed by the main kernel.
 
-    ``family`` is ``exact`` (the fused persistent scan, one CTA per
+    ``family`` is ``exactfused`` (the fused persistent scan, one CTA per
     (sequence, head) item, delta / cumsum computed in-CTA; its preprocess
     stage is skipped with a grid of 0 unless it publishes packed-varlen
     metadata), ``exactpre`` (the same persistent scan reading the delta /
     cumsum its preprocess wrote to the HBM workspace: the start two-launch
-    form, same main arguments), ``chunkpar`` (the look-back chunk-parallel
+    form, same main arguments, with the round-6 state update), ``exact`` (the
+    start two-launch program retained byte for byte for one-chunk items, see
+    :func:`two_kernel_family`; 41 main arguments), ``chunkpar`` (the look-back chunk-parallel
     program, one CTA per SM over item-major tile ranges) or ``chunkpar3``
     (the three-phase chunk-parallel program, one CTA per (chunk, head)
     tile); it fixes the host template and the main kernel's argument order.
@@ -113,33 +121,53 @@ class _Program:
 # Generated-source identities, ``generated/device/<module>.cu``: the Cake
 # kernel symbol followed by the export's module identity hash.  This block is
 # the single place the Cake export refreshes; every program binding below
-# derives from it.  Four kernel families ship, each x {bf16, f16, f32 state}
+# derives from it.  Five kernel families ship, each x {bf16, f16, f32 state}
 # x {batched, varlen}, plus one preprocess shared by all: the fused exact scan
-# (``exact_*``, CAKE-956 round 6 item 2: delta / cumsum computed in-CTA, one
-# launch), the two-kernel exact scan (``exactpre_*``: the start pre+scan form
-# the fused route keeps for saturated / long-item calls and for the seq_idx
-# triple form, see :func:`fused_selected`), the look-back chunk-parallel
-# program (``chunkpar_*``, round 6 item 1a) and the three-phase chunk-parallel
+# (``exactfused_*``, CAKE-956 round 6 item 2: delta / cumsum computed in-CTA,
+# one launch), the two-kernel exact scan (``exactpre_*``: the start pre+scan
+# form with the round-6 single-rounding state update, which the fused route
+# keeps for saturated / long-item calls and for the seq_idx triple form, see
+# :func:`fused_selected`), the START two-kernel exact scan (``exact_*``: the
+# round-5 programs retained byte for byte -- the export never refreshes
+# ``_SCAN_MODULES`` -- which :func:`two_kernel_family` keeps for one-chunk
+# items, CAKE-956 round 6 c9), the look-back chunk-parallel program
+# (``chunkpar_*``, round 6 item 1a) and the three-phase chunk-parallel
 # program (``chunkpar3_*``, the three-phase program kept as the second
-# chunk-parallel family).  Both exact-scan families ship two schedule
+# chunk-parallel family).  The three exact-scan families ship two schedule
 # variants of every program: the ring program (``<family>_<state>_<mode>``)
 # and the ``_noring`` program (the same kernel built with
 # ``epilogue_ring=False``, bitwise-identical outputs), selected per call by
 # :func:`_exact_scan_variant` from host-known shape quantities.
 _SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_08c5aea4d0"
+# Retained start programs (the FlashInfer 36fd76859292 files): a literal the
+# Cake export does not fill.
 _SCAN_MODULES = {
-    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_cf0cc7f97b",
-    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_e2e32e4f62",
-    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_7ba9991804",
-    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_5164405361",
-    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_a9cdf1469c",
-    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_b909ad0d33",
-    "exact_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_f26d53b67a",
-    "exact_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_e4b1e97be8",
-    "exact_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_f1a7364d1d",
-    "exact_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_e978a7b714",
-    "exact_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_5d52af609f",
-    "exact_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_3db93d8b16",
+    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_3876f7208d",
+    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_f074fc128b",
+    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_2dc39c9955",
+    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_636342f6cc",
+    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_9759edcc11",
+    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_6037fe869d",
+    "exact_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_77156893a6",
+    "exact_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_0f475595b9",
+    "exact_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_d19039c163",
+    "exact_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_d11774ac8e",
+    "exact_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_bbd73b5202",
+    "exact_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_52f48bcff4",
+}
+_EXACTFUSED_MODULES = {
+    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_cf0cc7f97b",
+    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_e2e32e4f62",
+    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_7ba9991804",
+    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_5164405361",
+    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_a9cdf1469c",
+    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_b909ad0d33",
+    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_f26d53b67a",
+    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_e4b1e97be8",
+    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_f1a7364d1d",
+    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_e978a7b714",
+    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_5d52af609f",
+    "exactfused_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_3db93d8b16",
 }
 _CHUNKPAR_MODULES = {
     "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_d4923ea014",
@@ -193,13 +221,17 @@ _STATE_DTYPE_KEYS = {
 }
 # Dynamic shared memory (bytes) of each family's main kernel; refreshed by the
 # Cake export.  0 is the unfilled placeholder: the program refuses to build.
-_EXACT_SMEM_BYTES = 232320
+_EXACTFUSED_SMEM_BYTES = 232320
 _CHUNKPAR_SMEM_BYTES = 231808
 _CHUNKPAR3_SMEM_BYTES = 232448
-# Main dynamic SMEM of the exact-scan ``_noring`` programs (the start schedule
+# Main dynamic SMEM of the fused ``_noring`` programs (the start schedule
 # keeps the prefix control placement); refreshed by the Cake export with the
-# ``exact_*_noring`` table entries.
-_EXACT_NORING_SMEM_BYTES = 232192
+# ``exactfused_*_noring`` table entries.
+_EXACTFUSED_NORING_SMEM_BYTES = 232192
+# Main dynamic SMEM of the retained start programs (``exact_*`` and
+# ``exact_*_noring``): literals of the round-5 files, not refreshed.
+_EXACT_SMEM_BYTES = 231808
+_EXACT_NORING_SMEM_BYTES = 232448
 # Main dynamic SMEM of the two-kernel exact-scan programs (``exactpre_*``) and
 # of their ``_noring`` twins; refreshed by the Cake export with the
 # ``exactpre_*`` table entries (0 = not exported yet).
@@ -307,6 +339,9 @@ _MAIN_ARGS = (
 # bind them (only the fused program reads them); the chunk-parallel
 # signature has none of them.
 _FUSED_ONLY_MAIN_ARGS = ("cu_seqlens", "metadata_from_cu_seqlens", "preprocess_status")
+# The retained start two-kernel program (``exact_*``) predates the three
+# fused-only inputs: its launcher binds the 41 arguments before them.
+_MAIN_ARGS_START = _MAIN_ARGS[: len(_MAIN_ARGS) - len(_FUSED_ONLY_MAIN_ARGS)]
 # Chunk-parallel main kernel (the ``chunkpar_*`` programs, the round-6
 # single-pass look-back program): the exact-scan order with the state-operand
 # tensor map ``h_map`` after ``out_map``, the workspace pointers ``s_work``
@@ -417,7 +452,8 @@ _MAIN_ARGS_CHUNKPAR3 = (
 )
 # Per family: host template, main-kernel argument order, main dynamic SMEM.
 _FAMILY_HOST = {
-    "exact": (_HOST_TEMPLATE, _MAIN_ARGS, _EXACT_SMEM_BYTES),
+    "exact": (_HOST_TEMPLATE, _MAIN_ARGS_START, _EXACT_SMEM_BYTES),
+    "exactfused": (_EXACTFUSED_HOST_TEMPLATE, _MAIN_ARGS, _EXACTFUSED_SMEM_BYTES),
     "chunkpar": (_CHUNKPAR_HOST_TEMPLATE, _MAIN_ARGS_CHUNKPAR, _CHUNKPAR_SMEM_BYTES),
     "exactpre": (_EXACTPRE_HOST_TEMPLATE, _MAIN_ARGS, _EXACTPRE_SMEM_BYTES),
     "chunkpar3": (_CHUNKPAR3_HOST_TEMPLATE, _MAIN_ARGS_CHUNKPAR3, _CHUNKPAR3_SMEM_BYTES),
@@ -434,6 +470,7 @@ def _scan(module: str) -> _Kernel:
 # Main dynamic SMEM of a family's non-default schedule variants.
 _VARIANT_SMEM_BYTES = {
     ("exact", "noring"): _EXACT_NORING_SMEM_BYTES,
+    ("exactfused", "noring"): _EXACTFUSED_NORING_SMEM_BYTES,
     ("exactpre", "noring"): _EXACTPRE_NORING_SMEM_BYTES,
 }
 
@@ -463,6 +500,7 @@ _PROGRAMS: dict[str, _Program] = {
     name: _program(name, module)
     for name, module in (
         *_SCAN_MODULES.items(),
+        *_EXACTFUSED_MODULES.items(),
         *_CHUNKPAR_MODULES.items(),
         *_EXACTPRE_MODULES.items(),
         *_CHUNKPAR3_MODULES.items(),
@@ -475,7 +513,7 @@ def _program_name(
 ) -> str:
     """The program of ``family`` serving a state dtype in batched or
     packed-varlen mode; ``variant`` names a non-default schedule variant of the
-    family (``"noring"`` for the two exact-scan families)."""
+    family (``"noring"`` for the three exact-scan families)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
     suffix = f"_{variant}" if variant else ""
@@ -1064,6 +1102,13 @@ _FUSED_ROUTE_MAX_CHUNKS_BATCHED = 16
 _FUSED_ROUTE_MAX_CHUNK_ITEMS_BATCHED = 2048
 _FUSED_ROUTE_MAX_ITEMS_VARLEN = 256
 _FUSED_ROUTE_MAX_CHUNK_ITEMS_VARLEN = 512
+# Two-kernel program choice (CAKE-956 round 6 c9 host route; mirrors the seed
+# module's ``two_kernel_route`` / ``TWO_KERNEL_ROUTE_MIN_CHUNKS``): the round-6
+# ``exactpre_*`` render carries lever 1b (the per-item decay-factor table and
+# the single-rounding FMA state update), whose fixed cost per work item is
+# repaid only where the item spans several chunks; one-chunk items keep the
+# retained start program ``exact_*``.
+_TWO_KERNEL_ROUTE_MIN_CHUNKS = 2
 
 
 def fused_selected(
@@ -1074,8 +1119,9 @@ def fused_selected(
     mode_varlen: bool,
     total_tokens: int,
 ) -> bool:
-    """Exact-scan shape window: the fused program (``exact_*``) for one-wave /
-    short-item calls, the two-kernel program (``exactpre_*``) otherwise.
+    """Exact-scan shape window: the fused program (``exactfused_*``) for
+    one-wave / short-item calls, the two-kernel form otherwise (``exactpre_*``
+    or the retained start ``exact_*``, see :func:`two_kernel_family`).
     ``nchunks`` is the chunk count per sequence (batched); ``total_tokens`` the
     packed token count (varlen; the per-sequence lengths live on the device
     and are not read).  The runner applies the window only where the fused
@@ -1095,6 +1141,28 @@ def fused_selected(
         items <= _FUSED_ROUTE_MAX_ITEMS_VARLEN
         and packed_chunks * int(nheads) <= _FUSED_ROUTE_MAX_CHUNK_ITEMS_VARLEN
     )
+
+
+def two_kernel_family(*, mode_varlen: bool, num_sequences: int, seqlen: int) -> str:
+    """Two-kernel program family of a call the chunk-parallel and fused routes
+    left on the two-kernel form: ``"exactpre"`` (the round-6 render) where the
+    host-known chunks per work item reach ``_TWO_KERNEL_ROUTE_MIN_CHUNKS``,
+    else ``"exact"`` (the retained start program).
+
+    Chunks per item: batched calls ``ceil(seqlen / 128)`` -- every item of a
+    batched call spans the same ``seqlen`` tokens; varlen calls
+    ``ceil(ceil(seqlen / num_sequences) / 128)`` with ``seqlen`` the packed
+    token count -- the mean sequence length is the host-known quantity (the
+    per-sequence lengths live in ``cu_seqlens`` / ``seq_idx`` on the device
+    and are not read), and the mean chunk count per item is what the table's
+    fixed cost is amortized over.  A ``num_sequences`` of 0 counts as 1.
+    """
+
+    if not mode_varlen:
+        chunks = -(-int(seqlen) // _CHUNK_SIZE)
+    else:
+        chunks = -(-(-(-int(seqlen) // max(int(num_sequences), 1))) // _CHUNK_SIZE)
+    return "exactpre" if chunks >= _TWO_KERNEL_ROUTE_MIN_CHUNKS else "exact"
 
 
 def _sequence_arguments(
@@ -1852,7 +1920,16 @@ class CakeSSDCombined:
         )
         workspace: dict[str, Any] = {
             "program": _program_name(
-                family if chunk_parallel else "exact" if fused else "exactpre",
+                family
+                if chunk_parallel
+                else "exactfused"
+                if fused
+                else two_kernel_family(
+                    mode_varlen=self.has_varlen,
+                    num_sequences=num_sequences,
+                    # packed varlen: x is [1, total tokens, nheads, 64]
+                    seqlen=batch * seqlen if self.has_varlen else seqlen,
+                ),
                 self.state_dtype,
                 self.has_varlen,
                 variant,
@@ -2652,7 +2729,7 @@ class CakeSSDCombined:
             checkpoint_state_count=checkpoint_state_count,
             preprocess_status=preprocess_status,
         )
-        if program.family == "exact":
+        if program.family == "exactfused":
             # The fused program computes delta / cumsum in-CTA and, in the
             # cu_seqlens form, derives the segment tables itself (it reads
             # ``cu_seqlens`` and flags an invalid one in ``preprocess_status``),
@@ -2757,13 +2834,14 @@ class CakeSSDCombined:
             "dt_max": dt_max,
             "write_final_states": int(return_final_states),
             "checkpoint_state_count": checkpoint_state_count,
-            # Both exact-scan families bind these (``_MAIN_ARGS``); only the
-            # fused program reads them: it derives the cu_seqlens segment
+            # The fused and exactpre programs bind these (``_MAIN_ARGS``; the
+            # retained start program's 41-argument launcher stops before
+            # them); only the fused program reads them: it derives the cu_seqlens segment
             # tables in-CTA and flags an invalid cu_seqlens in the runner's
             # status word.  The two-kernel and chunk-parallel programs read
             # the tables their preprocess published.
             "cu_seqlens": cu_seqlens_arg,
-            "metadata_from_cu_seqlens": int(program.family == "exact" and from_cu_seqlens),
+            "metadata_from_cu_seqlens": int(program.family == "exactfused" and from_cu_seqlens),
             "preprocess_status": preprocess_status,
         }
         if program.family in ("chunkpar", "chunkpar3"):
