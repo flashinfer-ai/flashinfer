@@ -118,42 +118,42 @@ class _Program:
 # same kernel built with ``epilogue_ring=False``, bitwise-identical outputs),
 # selected per call by :func:`_exact_scan_variant` from host-known shape
 # quantities.
-_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_ff8a998f8c"
+_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_08c5aea4d0"
 _SCAN_MODULES = {
-    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_3876f7208d",
-    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_f074fc128b",
-    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_2dc39c9955",
-    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_636342f6cc",
-    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_9759edcc11",
-    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_6037fe869d",
-    "exact_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_77156893a6",
-    "exact_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_0f475595b9",
-    "exact_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_d19039c163",
-    "exact_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_d11774ac8e",
-    "exact_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_bbd73b5202",
-    "exact_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_52f48bcff4",
+    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_cf0cc7f97b",
+    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_e2e32e4f62",
+    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_7ba9991804",
+    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_5164405361",
+    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_a9cdf1469c",
+    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_b909ad0d33",
+    "exact_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_f26d53b67a",
+    "exact_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_e4b1e97be8",
+    "exact_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_f1a7364d1d",
+    "exact_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_e978a7b714",
+    "exact_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_5d52af609f",
+    "exact_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_3db93d8b16",
 }
 _CHUNKPAR_MODULES = {
-    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_d34b53f551",
-    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_2ee7eee952",
-    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_889999950a",
-    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_72cf27a680",
-    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_70337c7f89",
-    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_9837d3f677",
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_f17431806f",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_a1c231f3d6",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_e2c4a6fe65",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_1161b3473c",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_d5600a56db",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_6798faa560",
 }
 _EXACTPRE_MODULES = {
-    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_PENDINGEXPORT",
-    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_PENDINGEXPORT",
-    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_PENDINGEXPORT",
-    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_PENDINGEXPORT",
-    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_PENDINGEXPORT",
-    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_PENDINGEXPORT",
-    "exactpre_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_noring_PENDINGEXPORT",
-    "exactpre_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_noring_PENDINGEXPORT",
-    "exactpre_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_noring_PENDINGEXPORT",
-    "exactpre_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_noring_PENDINGEXPORT",
-    "exactpre_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_noring_PENDINGEXPORT",
-    "exactpre_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_noring_PENDINGEXPORT",
+    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_4531674c62",
+    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_956e111919",
+    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_5103b26966",
+    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_7ed92cf8f5",
+    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_d0a3c9b35c",
+    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_2f69268561",
+    "exactpre_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_noring_ea22a1bb6b",
+    "exactpre_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_noring_dac8f82648",
+    "exactpre_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_noring_3ebc7e8e13",
+    "exactpre_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_noring_af40bd8812",
+    "exactpre_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_noring_4cbe908403",
+    "exactpre_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_noring_fd84383935",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -177,17 +177,17 @@ _STATE_DTYPE_KEYS = {
 }
 # Dynamic shared memory (bytes) of each family's main kernel; refreshed by the
 # Cake export.  0 is the unfilled placeholder: the program refuses to build.
-_EXACT_SMEM_BYTES = 231808
+_EXACT_SMEM_BYTES = 232320
 _CHUNKPAR_SMEM_BYTES = 232448
 # Main dynamic SMEM of the exact-scan ``_noring`` programs (the start schedule
 # keeps the prefix control placement); refreshed by the Cake export with the
 # ``exact_*_noring`` table entries.
-_EXACT_NORING_SMEM_BYTES = 232448
+_EXACT_NORING_SMEM_BYTES = 232192
 # Main dynamic SMEM of the two-kernel exact-scan programs (``exactpre_*``) and
 # of their ``_noring`` twins; refreshed by the Cake export with the
 # ``exactpre_*`` table entries (0 = not exported yet).
-_EXACTPRE_SMEM_BYTES = 0
-_EXACTPRE_NORING_SMEM_BYTES = 0
+_EXACTPRE_SMEM_BYTES = 232320
+_EXACTPRE_NORING_SMEM_BYTES = 232192
 
 
 # Positional launcher ABI shared by every program: preprocess arguments, its
