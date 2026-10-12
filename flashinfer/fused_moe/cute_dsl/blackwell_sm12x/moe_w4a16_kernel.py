@@ -39,6 +39,7 @@ from .moe_w4a16_fp4_helpers import (
     ld_global_acquire_i32,
     ld_global_nc_u32,
     ld_global_v4_f32,
+    ld_global_v4_u32,
     ld_shared_f32,
     ld_shared_i32_relaxed,
     ld_shared_u32,
@@ -75,6 +76,17 @@ from .moe_w4a16_fp4_helpers import (
     warp_reduce,
 )
 from flashinfer.cute_dsl.utils import current_cuda_stream, make_ptr
+from .moe_w4a16_fp8_helpers import (
+    GLOBAL_FP8_FIXUP as _FP8_GLOBAL_FIXUP,
+    bf16x2_bits_to_f32x2,
+    pack_f32x2_to_bf16x2_rn,
+    e2m1x8_to_e2m1c_nblk,
+    e2m1x8_to_e2m1c_nblk6,
+    f32x4_to_e4m3x4,
+    f8f6f4_mma_m16n8k32_f32,
+    prep_scale_byte_to_f32,
+    prep_scale_byte_to_f32_v2,
+)
 from .moe_w4a16_route_pack import (
     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
 )
@@ -105,6 +117,20 @@ def raise_if_kernel_resolution_frozen(*args, **kwargs) -> None:
 _ALLOWED_ROUTED_SIZES = _W4A16_ALLOWED_ROUTED_SIZES
 _PACK_FACTOR = 8
 _STAGES = 4
+# FP8 activation quantization preserves the prepared E2M1 weights and K32 scales.
+# The activation approximation is opt-in. Use a fixed, tested pipeline configuration.
+_FP8_KIND_EXACT_NATIVE = 3
+_FP8_TUNE_DEFAULTS = {
+    "conv6": 1,  # Six-instruction E2M1 container conversion.
+    "sdec": 1,  # Decode prepared scale bytes with prmt and mad.
+    "mskip": 2,  # Specialize the K loop for the number of valid M16 blocks.
+    "stages": 6,  # Shared-memory ring depth.
+    "pair": 1,  # One CTA barrier per two K tiles.
+    "actvec": 1,  # Vectorized activation loads.
+    "abuf1": 1,  # Load A fragments at the even K16 step.
+}
+
+
 _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT = 64
 _DEVICE_MAX_REG_BYTES = 255 * 1024
 _DEFAULT_MAX_SHARED_MEM = 101_376
@@ -530,6 +556,7 @@ class W4A16FusedMoeCompileResult:
     scale_format: str = "e4m3_k16"
     tc_decode_fused_sum: bool = False
     collect_activation_amax: bool = False
+    a_fp8: int = 0
 
 
 @dataclass(frozen=True)
@@ -563,9 +590,29 @@ class W4A16GemmKernel:
         fused_topk_sum: bool = False,
         fused_sum_topk: int = 1,
         schedule_whole_tiles: bool = False,
+        a_fp8: int = 0,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
+        self.a_fp8 = int(a_fp8)
+        if self.a_fp8 not in (0, _FP8_KIND_EXACT_NATIVE):
+            raise ValueError(f"unsupported a_fp8 level {a_fp8!r}")
+        self.tune = {
+            key: value if self.a_fp8 else (4 if key == "stages" else 0)
+            for key, value in _FP8_TUNE_DEFAULTS.items()
+        }
+        self.stages = self.tune["stages"] if self.a_fp8 else _STAGES
+        if self.a_fp8:
+            # FP8 prefill mode: route-packed large-M blocks only, bf16-prepared E4M3-K32
+            # scales (the K/32 group == one m16n8k32 MMA), packed Marlin weight layout.
+            if moe_block_size == 8 or direct_topk_routes or fused_topk_sum:
+                raise ValueError("a_fp8 requires route-packed moe_block_size >= 16")
+            if element_dtype != "bf16" or weight_layout != "packed":
+                raise ValueError("a_fp8 requires bf16 params and packed weights")
+            if _normalize_scale_format(scale_format) != "e4m3_k32":
+                raise ValueError("a_fp8 requires scale_format='e4m3_k32'")
+            if epilogue_activation is not None:
+                raise ValueError("a_fp8 supports gated activations only")
         if weight_layout not in _WEIGHT_LAYOUTS:
             raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
         scale_format = _normalize_scale_format(scale_format)
@@ -722,10 +769,23 @@ class W4A16GemmKernel:
             weight_layout=weight_layout,
         )
 
+        if self.a_fp8:
+            # The BF16 occupancy estimate does not cover FP8 register pressure.
+            # One CTA per SM keeps the cooperative grid resident for small shapes.
+            self.blocks_per_sm = 1
+
         # W4A16 shared-memory geometry, in int4 units unless noted.
-        self.a_sh_stride = 16 * self.cta_k_blocks // 8
+        # FP8 mode streams A as "virtual bf16": the fp8 [M, K] buffer is addressed as a
+        # bf16 [M, K/2] one, so one tile of tile_k fp8 values is geometrically a bf16
+        # tile of tile_k/2 and one ldmatrix x4 (32 bytes/row) is one m16n8k32 A fragment.
+        a_k_blocks = self.cta_k_blocks // 2 if self.a_fp8 else self.cta_k_blocks
+        self.a_k_blocks = int(a_k_blocks)
+        self.a_sh_stride = 16 * a_k_blocks // 8
         self.a_sh_stage = self.a_sh_stride * (16 * self.cta_m_blocks)
-        self.a_gl_rd_delta_o = 16 * self.cta_k_blocks // 8
+        self.a_gl_rd_delta_o = 16 * a_k_blocks // 8
+        # Row-XOR swizzle must stay inside a row: 8 int4/row (bf16 tile_k>=64) keeps the
+        # historical mask 7; fp8 tile_k=64 has 4 int4/row -> mask 3.
+        self.a_swizzle_mask = min(7, self.a_gl_rd_delta_o - 1)
         self.a_sh_wr_delta = self.a_sh_stride * (
             self.cta_threads // self.a_gl_rd_delta_o
         )
@@ -754,6 +814,11 @@ class W4A16GemmKernel:
             self.b_sh_chunks = self.b_sh_stage
             self.b_sh_wr_iters_nf3 = self.b_sh_wr_iters
 
+        if self.a_fp8 and self.b_sh_wr_iters % 2 != 0:
+            raise ValueError(
+                "a_fp8 needs an even number of K16 steps per warp row "
+                f"(b_sh_wr_iters={self.b_sh_wr_iters}, tile_n={tile_n}, tile_k={tile_k})"
+            )
         self.s_sh_stride = 16 * self.cta_n_blocks // 16
         self.s_tb_groups = (
             self.cta_k_blocks // 2 if self.scale_k32 else self.cta_k_blocks
@@ -772,21 +837,33 @@ class W4A16GemmKernel:
         self.sh_topk_off = sh_block_route_indices + sh_rd_block_route_indices
 
         sh_red_size = (2 * self.cta_n_blocks + 1) * 16 * self.cta_m_blocks
-        # B region size in int4 (16-byte) units. NF3 units are 12 bytes, so the
-        # region is 0.75x; round the total up to a 16-byte multiple so the
-        # following SMEM regions keep their 16-byte alignment (exact for all
-        # supported tiles since b_sh_stage is a multiple of 4).
-        sh_b_size = _covering_count(_STAGES * self.b_sh_stage_bytes, 16)
-        sh_size_min = min(sh_red_size, sh_b_size)
-        sh_size_max = max(sh_red_size, sh_b_size)
         sh_bias_size = self.cta_n_blocks * 16 // 8
-        sh_b_red_bias_size = max(sh_size_max, sh_size_min + sh_bias_size)
-        self.sh_b_off = self.sh_valid_count_off
-        self.sh_red_off = self.sh_valid_count_off
-        self.sh_s_off = self.sh_valid_count_off + sh_b_red_bias_size
-        self.sh_a_off = self.sh_s_off + _STAGES * self.s_sh_stage
-        self.shared_int4 = self.sh_a_off + _STAGES * self.a_sh_stage
-        self.shared_words = self.shared_int4 * 4
+        while True:
+            # B region size in int4 (16-byte) units. NF3 units are 12 bytes, so the
+            # region is 0.75x; round the total up to a 16-byte multiple so the
+            # following SMEM regions keep their 16-byte alignment (exact for all
+            # supported tiles since b_sh_stage is a multiple of 4).
+            sh_b_size = _covering_count(self.stages * self.b_sh_stage_bytes, 16)
+            sh_size_min = min(sh_red_size, sh_b_size)
+            sh_size_max = max(sh_red_size, sh_b_size)
+            sh_b_red_bias_size = max(sh_size_max, sh_size_min + sh_bias_size)
+            self.sh_b_off = self.sh_valid_count_off
+            self.sh_red_off = self.sh_valid_count_off
+            self.sh_s_off = self.sh_valid_count_off + sh_b_red_bias_size
+            self.sh_a_off = self.sh_s_off + self.stages * self.s_sh_stage
+            self.shared_int4 = self.sh_a_off + self.stages * self.a_sh_stage
+            self.shared_words = self.shared_int4 * 4
+            # FP8 pipeline stages>4: the fused kernel's software grid barrier needs every planned CTA
+            # resident, so a deeper ring must fit blocks_per_sm x (smem + 1 KiB reserve) in
+            # 97 KiB/SM (sm_120 has 100 KiB/SM; 3 KiB margin).  Otherwise this block size keeps the
+            # stock 4-stage ring (and no pair mode) -- never a co-residency gamble.
+            if (
+                self.stages == _STAGES
+                or (self.shared_words * 4 + 1024) * self.blocks_per_sm <= 97 * 1024
+            ):
+                break
+            self.stages = _STAGES
+            self.tune = dict(self.tune, stages=_STAGES, pair=0)
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -822,13 +899,13 @@ class W4A16GemmKernel:
             # entry even when their arithmetic geometry otherwise matches.
             self.blocks_per_sm,
             self.schedule_whole_tiles,
-        )
+        ) + ((("fp8_exact_v1", self.a_fp8),) if self.a_fp8 else ())
 
     @cute.jit
     def _activation_smem_permuted_offset(self, i: Int32) -> Int32:
         row = i // Int32(self.a_gl_rd_delta_o)
         return Int32(self.a_gl_rd_delta_o) * row + (
-            (i - row * Int32(self.a_gl_rd_delta_o)) ^ (row & Int32(7))
+            (i - row * Int32(self.a_gl_rd_delta_o)) ^ (row & Int32(self.a_swizzle_mask))
         )
 
     @cute.jit
@@ -1436,6 +1513,10 @@ class W4A16GemmKernel:
         active_size_m: Int32,
     ):
         global_scale_f32 = global_scale[expert_idx].to(cutlass.Float32)
+        if cutlass.const_expr(self.a_fp8):
+            # prepared global = g * 2**119 / F compensates the bf16 bit-trick dequant;
+            # the FP8 path applies the decoded K32 scale after each MMA.
+            global_scale_f32 *= cutlass.Float32(_FP8_GLOBAL_FIXUP)
         if cutlass.const_expr(self.scale_format_e8m0_k32):
             if cutlass.const_expr(self.is_fp16):
                 global_scale_f32 *= cutlass.Float32(_E8M0_K32_FP16_GLOBAL_COMPENSATION)
@@ -1481,7 +1562,8 @@ class W4A16GemmKernel:
 
     @cute.jit
     def _tile_stream_offsets(self, tid: Int32, expert_idx: Int32, output_n_tile: Int32):
-        a_gl_stride = Int32(self.size_k // 8)
+        # int4 (16 B) units per A row: 8 bf16 or 16 fp8 values.
+        a_gl_stride = Int32(self.size_k // (16 if self.a_fp8 else 8))
         b_gl_stride = Int32(16 * self.size_n // (_PACK_FACTOR * 4))
         s_gl_stride = Int32(self.scale_n_groups)
         if cutlass.const_expr(self.scale_k32):
@@ -1537,8 +1619,10 @@ class W4A16GemmKernel:
         a_sh_rd = Int32(self.a_sh_stride) * (
             (tid & Int32(31)) % Int32(lanes_per_row)
         ) + (tid & Int32(31)) // Int32(lanes_per_row)
+        # Each warp row owns b_sh_wr_iters K16 weight steps; in fp8 mode that is
+        # b_sh_wr_iters/2 A fragments of 2 int4 each.
         a_sh_rd += (
-            Int32(2)
+            Int32(1 if self.a_fp8 else 2)
             * ((tid // Int32(32)) // Int32(self.tb_n_warps))
             * Int32(self.b_sh_wr_iters)
         )
@@ -1832,39 +1916,73 @@ class W4A16GemmKernel:
             Int32(0),
             False,
         )
-        self._run_mma_pipeline(
-            a_bf16_flat,
-            b_i32_flat,
-            scales_i32_flat,
-            smem_base,
-            tid,
-            acc0,
-            acc1,
-            acc2,
-            acc3,
-            b_scale_cur,
-            b_scale_next,
-            a_regs,
-            a_regs_next,
-            b_sh_rd,
-            s_sh_rd,
-            a_sh_rd,
-            k_tiles,
-            reduce_k_tile,
-            block_valid_rows,
-            a_gl_stride,
-            b_gl_stride,
-            s_gl_stride,
-            scales_expert_off,
-            b_gl_rd_base,
-            a_gl_rd_row,
-            a_gl_rd_col0,
-            a_sh_wr,
-            a_rows_per_iter,
-            output_n_tile,
-            expert_idx,
-            False,
-        )
+        if cutlass.const_expr(self.a_fp8):
+            self._run_fp8_pipeline_mskip(
+                a_bf16_flat,
+                b_i32_flat,
+                scales_i32_flat,
+                smem_base,
+                tid,
+                acc0,
+                acc1,
+                acc2,
+                acc3,
+                b_scale_cur,
+                b_scale_next,
+                a_regs,
+                a_regs_next,
+                b_sh_rd,
+                s_sh_rd,
+                a_sh_rd,
+                k_tiles,
+                reduce_k_tile,
+                block_valid_rows,
+                a_gl_stride,
+                b_gl_stride,
+                s_gl_stride,
+                scales_expert_off,
+                b_gl_rd_base,
+                a_gl_rd_row,
+                a_gl_rd_col0,
+                a_sh_wr,
+                a_rows_per_iter,
+                output_n_tile,
+                expert_idx,
+            )
+        else:
+            self._run_mma_pipeline(
+                a_bf16_flat,
+                b_i32_flat,
+                scales_i32_flat,
+                smem_base,
+                tid,
+                acc0,
+                acc1,
+                acc2,
+                acc3,
+                b_scale_cur,
+                b_scale_next,
+                a_regs,
+                a_regs_next,
+                b_sh_rd,
+                s_sh_rd,
+                a_sh_rd,
+                k_tiles,
+                reduce_k_tile,
+                block_valid_rows,
+                a_gl_stride,
+                b_gl_stride,
+                s_gl_stride,
+                scales_expert_off,
+                b_gl_rd_base,
+                a_gl_rd_row,
+                a_gl_rd_col0,
+                a_sh_wr,
+                a_rows_per_iter,
+                output_n_tile,
+                expert_idx,
+                False,
+            )
 
         self._finish_tile(
             acc0,
@@ -1923,7 +2041,7 @@ class W4A16GemmKernel:
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
         tile_idx = Int32(0)
         while tile_idx < k_tiles:
-            for pipe in cutlass.range_constexpr(_STAGES):
+            for pipe in cutlass.range_constexpr(self.stages):
                 if tile_idx < k_tiles:
                     for kk in cutlass.range_constexpr(self.b_sh_wr_iters):
                         self._load_next_fragment_bundle(
@@ -2047,6 +2165,643 @@ class W4A16GemmKernel:
                     Int32(0),
                     uses_m_block_8,
                 )
+
+    @cute.jit
+    def _load_next_fragment_bundle_fp8(
+        self,
+        b_scale_next: cute.Tensor,
+        a_regs_next: cute.Tensor,
+        a_regs_cur: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        b_sh_rd: Int32,
+        s_sh_rd: Int32,
+        a_sh_rd: Int32,
+        pipe: cutlass.Constexpr[int],
+        kk: cutlass.Constexpr[int],
+        tile_idx: Int32,
+        k_tiles: Int32,
+        n_mb=None,
+    ):
+        """Register prefetch for step kk+1.  A changes only every second K16 step.
+        n_mb (FP8 pipeline mskip=2): only the first n_mb m16 A fragments are live."""
+        self._clear_b_scale_register_bundle(b_scale_next)
+        abuf1 = self.tune["abuf1"]
+        if cutlass.const_expr(kk + 1 < self.b_sh_wr_iters):
+            self._load_b_scale_register_bundle(
+                b_scale_next,
+                smem_base,
+                tid,
+                b_sh_rd,
+                s_sh_rd,
+                Int32(pipe),
+                Int32(kk + 1),
+            )
+            if cutlass.const_expr(abuf1):
+                pass
+            elif cutlass.const_expr((kk + 1) % 2 == 0):
+                self._load_a_registers_large_m_bundle(
+                    a_regs_next,
+                    smem_base,
+                    a_sh_rd,
+                    Int32(pipe),
+                    Int32((kk + 1) // 2),
+                    n_mb,
+                )
+            else:
+                self._copy_a_register_bundle_large_m(a_regs_next, a_regs_cur, n_mb)
+        else:
+            if cutlass.const_expr(not abuf1):
+                self._clear_a_register_bundle_large_m(a_regs_next, n_mb)
+            next_tile = tile_idx + Int32(1)
+            if next_tile < k_tiles:
+                self._load_b_scale_register_bundle(
+                    b_scale_next,
+                    smem_base,
+                    tid,
+                    b_sh_rd,
+                    s_sh_rd,
+                    Int32((pipe + 1) % self.stages),
+                    Int32(0),
+                )
+                if cutlass.const_expr(not abuf1):
+                    self._load_a_registers_large_m_bundle(
+                        a_regs_next,
+                        smem_base,
+                        a_sh_rd,
+                        Int32((pipe + 1) % self.stages),
+                        Int32(0),
+                        n_mb,
+                    )
+
+    @cute.jit
+    def _exact_k32_step_fp8(
+        self,
+        acc0,
+        acc1,
+        acc2,
+        acc3,
+        a_regs: cute.Tensor,
+        q_even: cute.Tensor,
+        b_scale_cur: cute.Tensor,
+        tid: Int32,
+        n_mb=None,
+        nmb_rt=None,
+    ):
+        """Native E2M1 FP8 step for one k32 = (even, odd) K16 pair.
+
+        B = E2M1 exactly (as E4M3 bytes, or native .e2m1 containers); one unscaled
+        kind::f8f6f4 m16n8k32 per (m-block, jj, n-block) into a zero C, then
+        acc += D * scale_f32(column).  This thread's C columns are 2t and 2t+1 of the n8
+        block; column c's prepared-scale word lives in lane 4c (the B-fragment column is
+        the groupID, every lane of a quad loads its column's word), i.e. lanes 8t, 8t+4.
+        Word w = b_scale_cur[1, w] covers jj = 2w, 2w+1: n-block0 byte jj%2, n-block1
+        byte jj%2+2.
+        FP8 pipeline: conv6 / sdec swap in bit-identical cheaper helpers; n_mb (mskip=2) limits
+        the m-blocks at trace time, nmb_rt (mskip=1) skips m-blocks >= nmb_rt at run time.
+        """
+        t4 = (tid & Int32(31)) & Int32(3)
+        src_lo = t4 * Int32(8)
+        src_hi = src_lo + Int32(4)
+        w_lo0 = Uint32(cute.arch.shuffle_sync(b_scale_cur[1, 0], src_lo))
+        w_hi0 = Uint32(cute.arch.shuffle_sync(b_scale_cur[1, 0], src_hi))
+        w_lo1 = Uint32(cute.arch.shuffle_sync(b_scale_cur[1, 1], src_lo))
+        w_hi1 = Uint32(cute.arch.shuffle_sync(b_scale_cur[1, 1], src_hi))
+        for jj in cutlass.range_constexpr(4):
+            w_lo = w_lo0
+            w_hi = w_hi0
+            if cutlass.const_expr(jj >= 2):
+                w_lo = w_lo1
+                w_hi = w_hi1
+            if cutlass.const_expr(self.tune["sdec"]):
+                sc_n0_lo = prep_scale_byte_to_f32_v2(w_lo, jj % 2)
+                sc_n0_hi = prep_scale_byte_to_f32_v2(w_hi, jj % 2)
+                sc_n1_lo = prep_scale_byte_to_f32_v2(w_lo, jj % 2 + 2)
+                sc_n1_hi = prep_scale_byte_to_f32_v2(w_hi, jj % 2 + 2)
+            else:
+                sc_n0_lo = prep_scale_byte_to_f32(w_lo, jj % 2)
+                sc_n0_hi = prep_scale_byte_to_f32(w_hi, jj % 2)
+                sc_n1_lo = prep_scale_byte_to_f32(w_lo, jj % 2 + 2)
+                sc_n1_hi = prep_scale_byte_to_f32(w_hi, jj % 2 + 2)
+            if cutlass.const_expr(self.tune["conv6"]):
+                b0_n0, b0_n1 = e2m1x8_to_e2m1c_nblk6(q_even[jj])
+                b1_n0, b1_n1 = e2m1x8_to_e2m1c_nblk6(b_scale_cur[0, jj])
+            else:
+                b0_n0, b0_n1 = e2m1x8_to_e2m1c_nblk(q_even[jj], 2)
+                b1_n0, b1_n1 = e2m1x8_to_e2m1c_nblk(b_scale_cur[0, jj], 2)
+            for mb in cutlass.range_constexpr(
+                self.cta_m_blocks if n_mb is None else n_mb
+            ):
+                acc = (acc0, acc1, acc2, acc3)[mb]
+                if cutlass.const_expr(nmb_rt is not None and mb > 0):
+                    if Int32(mb) < nmb_rt:
+                        self._exact_mma_ffma_fp8(
+                            acc,
+                            a_regs,
+                            mb,
+                            jj,
+                            b0_n0,
+                            b1_n0,
+                            b0_n1,
+                            b1_n1,
+                            sc_n0_lo,
+                            sc_n0_hi,
+                            sc_n1_lo,
+                            sc_n1_hi,
+                        )
+                else:
+                    self._exact_mma_ffma_fp8(
+                        acc,
+                        a_regs,
+                        mb,
+                        jj,
+                        b0_n0,
+                        b1_n0,
+                        b0_n1,
+                        b1_n1,
+                        sc_n0_lo,
+                        sc_n0_hi,
+                        sc_n1_lo,
+                        sc_n1_hi,
+                    )
+
+    @cute.jit
+    def _exact_mma_ffma_fp8(
+        self,
+        acc,
+        a_regs: cute.Tensor,
+        mb: cutlass.Constexpr[int],
+        jj: cutlass.Constexpr[int],
+        b0_n0: Uint32,
+        b1_n0: Uint32,
+        b0_n1: Uint32,
+        b1_n1: Uint32,
+        sc_n0_lo: cutlass.Float32,
+        sc_n0_hi: cutlass.Float32,
+        sc_n1_lo: cutlass.Float32,
+        sc_n1_hi: cutlass.Float32,
+    ):
+        """Same accumulator slots as _mma_accumulate_large_m(_fp8)."""
+        W = _SCALAR_ACC_FRAGMENT_WIDTH
+        btype = "e2m1"
+        d0, d1, d2, d3 = f8f6f4_mma_m16n8k32_f32(
+            a_regs[mb, 0],
+            a_regs[mb, 1],
+            a_regs[mb, 2],
+            a_regs[mb, 3],
+            b0_n0,
+            b1_n0,
+            btype,
+        )
+        e0, e1, e2, e3 = f8f6f4_mma_m16n8k32_f32(
+            a_regs[mb, 0],
+            a_regs[mb, 1],
+            a_regs[mb, 2],
+            a_regs[mb, 3],
+            b0_n1,
+            b1_n1,
+            btype,
+        )
+        i0 = jj * 8
+        acc[(i0 + 0) // W][(i0 + 0) % W] = (
+            acc[(i0 + 0) // W][(i0 + 0) % W] + d0 * sc_n0_lo
+        )
+        acc[(i0 + 1) // W][(i0 + 1) % W] = (
+            acc[(i0 + 1) // W][(i0 + 1) % W] + d1 * sc_n0_hi
+        )
+        acc[(i0 + 2) // W][(i0 + 2) % W] = (
+            acc[(i0 + 2) // W][(i0 + 2) % W] + d2 * sc_n0_lo
+        )
+        acc[(i0 + 3) // W][(i0 + 3) % W] = (
+            acc[(i0 + 3) // W][(i0 + 3) % W] + d3 * sc_n0_hi
+        )
+        acc[(i0 + 4) // W][(i0 + 4) % W] = (
+            acc[(i0 + 4) // W][(i0 + 4) % W] + e0 * sc_n1_lo
+        )
+        acc[(i0 + 5) // W][(i0 + 5) % W] = (
+            acc[(i0 + 5) // W][(i0 + 5) % W] + e1 * sc_n1_hi
+        )
+        acc[(i0 + 6) // W][(i0 + 6) % W] = (
+            acc[(i0 + 6) // W][(i0 + 6) % W] + e2 * sc_n1_lo
+        )
+        acc[(i0 + 7) // W][(i0 + 7) % W] = (
+            acc[(i0 + 7) // W][(i0 + 7) % W] + e3 * sc_n1_hi
+        )
+
+    @cute.jit
+    def _run_fp8_pipeline_mskip(
+        self,
+        a_bf16_flat: cute.Tensor,
+        b_i32_flat: cute.Tensor,
+        scales_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        acc0,
+        acc1,
+        acc2,
+        acc3,
+        b_scale_cur: cute.Tensor,
+        b_scale_next: cute.Tensor,
+        a_regs_cur: cute.Tensor,
+        a_regs_next: cute.Tensor,
+        b_sh_rd: Int32,
+        s_sh_rd: Int32,
+        a_sh_rd: Int32,
+        k_tiles: Int32,
+        reduce_k_tile: Int32,
+        block_valid_rows: Int32,
+        a_gl_stride: Int32,
+        b_gl_stride: Int32,
+        s_gl_stride: Int32,
+        scales_expert_off: Int32,
+        b_gl_rd_base: Int64,
+        a_gl_rd_row: Int32,
+        a_gl_rd_col0: Int32,
+        a_sh_wr: Int32,
+        a_rows_per_iter: Int32,
+        output_n_tile: Int32,
+        expert_idx: Int32,
+    ):
+        """FP8 pipeline `mskip`: m16 blocks whose rows are all route padding (valid rows are a
+        prefix of the block, block_valid_rows of them) are never stored, so their MMAs can
+        be skipped without touching any stored value.  mskip=1 guards each m-block >= 1 at
+        run time; mskip=2 instantiates the k-loop once per live m-block count."""
+        pa = (
+            a_bf16_flat,
+            b_i32_flat,
+            scales_i32_flat,
+            smem_base,
+            tid,
+            acc0,
+            acc1,
+            acc2,
+            acc3,
+            b_scale_cur,
+            b_scale_next,
+            a_regs_cur,
+            a_regs_next,
+            b_sh_rd,
+            s_sh_rd,
+            a_sh_rd,
+            k_tiles,
+            reduce_k_tile,
+            block_valid_rows,
+            a_gl_stride,
+            b_gl_stride,
+            s_gl_stride,
+            scales_expert_off,
+            b_gl_rd_base,
+            a_gl_rd_row,
+            a_gl_rd_col0,
+            a_sh_wr,
+            a_rows_per_iter,
+            output_n_tile,
+            expert_idx,
+        )
+        if cutlass.const_expr(self.tune["mskip"] == 0 or self.cta_m_blocks == 1):
+            self._run_mma_pipeline_fp8(*pa)
+        elif cutlass.const_expr(self.tune["mskip"] == 1):
+            nmb_rt = (block_valid_rows + Int32(15)) // Int32(16)
+            self._run_mma_pipeline_fp8(*pa, None, nmb_rt)
+        else:
+            nmb = (block_valid_rows + Int32(15)) // Int32(16)
+            if cutlass.const_expr(self.cta_m_blocks == 4):
+                if nmb >= Int32(4):
+                    self._run_mma_pipeline_fp8(*pa, 4, None)
+                elif nmb == Int32(3):
+                    self._run_mma_pipeline_fp8(*pa, 3, None)
+                elif nmb == Int32(2):
+                    self._run_mma_pipeline_fp8(*pa, 2, None)
+                else:
+                    self._run_mma_pipeline_fp8(*pa, 1, None)
+            elif cutlass.const_expr(self.cta_m_blocks == 3):
+                if nmb >= Int32(3):
+                    self._run_mma_pipeline_fp8(*pa, 3, None)
+                elif nmb == Int32(2):
+                    self._run_mma_pipeline_fp8(*pa, 2, None)
+                else:
+                    self._run_mma_pipeline_fp8(*pa, 1, None)
+            else:
+                if nmb >= Int32(2):
+                    self._run_mma_pipeline_fp8(*pa, 2, None)
+                else:
+                    self._run_mma_pipeline_fp8(*pa, 1, None)
+
+    @cute.jit
+    def _fp8_k16_compute(
+        self,
+        kk: cutlass.Constexpr[int],
+        acc0,
+        acc1,
+        acc2,
+        acc3,
+        q_even: cute.Tensor,
+        b_scale_cur: cute.Tensor,
+        a_regs_cur: cute.Tensor,
+        tid: Int32,
+        n_mb=None,
+        nmb_rt=None,
+    ):
+        """One K16 step of the FP8 MMA pipeline (shared by the 1-barrier-per-stage and the
+        FP8 pipeline `pair` pipelines): even steps stash their E2M1 words, odd steps convert both
+        halves and issue the k32 MMAs."""
+        if cutlass.const_expr(kk % 2 == 0):
+            for jj in cutlass.range_constexpr(4):
+                q_even[jj] = b_scale_cur[0, jj]
+        else:
+            self._exact_k32_step_fp8(
+                acc0,
+                acc1,
+                acc2,
+                acc3,
+                a_regs_cur,
+                q_even,
+                b_scale_cur,
+                tid,
+                n_mb,
+                nmb_rt,
+            )
+
+    @cute.jit
+    def _run_mma_pipeline_fp8(
+        self,
+        a_bf16_flat: cute.Tensor,
+        b_i32_flat: cute.Tensor,
+        scales_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        acc0,
+        acc1,
+        acc2,
+        acc3,
+        b_scale_cur: cute.Tensor,
+        b_scale_next: cute.Tensor,
+        a_regs_cur: cute.Tensor,
+        a_regs_next: cute.Tensor,
+        b_sh_rd: Int32,
+        s_sh_rd: Int32,
+        a_sh_rd: Int32,
+        k_tiles: Int32,
+        reduce_k_tile: Int32,
+        block_valid_rows: Int32,
+        a_gl_stride: Int32,
+        b_gl_stride: Int32,
+        s_gl_stride: Int32,
+        scales_expert_off: Int32,
+        b_gl_rd_base: Int64,
+        a_gl_rd_row: Int32,
+        a_gl_rd_col0: Int32,
+        a_sh_wr: Int32,
+        a_rows_per_iter: Int32,
+        output_n_tile: Int32,
+        expert_idx: Int32,
+        n_mb=None,
+        nmb_rt=None,
+    ):
+        """FP8 twin of _run_mma_pipeline: identical cp.async staging / barriers; the
+        even K16 step only stashes its E2M1 words, the odd step converts both halves to
+        E2M1 containers and issues one m16n8k32 MMA per n-block, followed by FP32 scaling.
+        FP8 pipeline `pair`: one CTA barrier per two k-tiles (6-slot ring, see
+        _run_mma_pipeline_fp8_pair)."""
+        q_even = cute.make_rmem_tensor((4,), Uint32)
+        for jj in cutlass.range_constexpr(4):
+            q_even[jj] = Uint32(0)
+        tile_idx = Int32(0)
+        if cutlass.const_expr(self.tune["pair"]):
+            while tile_idx < k_tiles:
+                for pipe in cutlass.range_constexpr(self.stages):
+                    if tile_idx < k_tiles:
+                        for kk in cutlass.range_constexpr(self.b_sh_wr_iters):
+                            self._load_next_fragment_bundle_fp8(
+                                b_scale_next,
+                                a_regs_next,
+                                a_regs_cur,
+                                smem_base,
+                                tid,
+                                b_sh_rd,
+                                s_sh_rd,
+                                a_sh_rd,
+                                pipe,
+                                kk,
+                                tile_idx,
+                                k_tiles,
+                                n_mb,
+                            )
+                            if cutlass.const_expr(self.tune["abuf1"] and kk % 2 == 0):
+                                # abuf1: this stage's A fragments, read BEFORE the stage's refill
+                                # + barrier (like the stock B read) so the next refill of this
+                                # slot is ordered after every warp's last read
+                                self._load_a_registers_large_m_bundle(
+                                    a_regs_cur,
+                                    smem_base,
+                                    a_sh_rd,
+                                    Int32(pipe),
+                                    Int32(kk // 2),
+                                    n_mb,
+                                )
+                            if cutlass.const_expr(kk == 0 and pipe % 2 == 0):
+                                self._pair_refill(
+                                    a_bf16_flat,
+                                    b_i32_flat,
+                                    scales_i32_flat,
+                                    smem_base,
+                                    tid,
+                                    pipe,
+                                    tile_idx,
+                                    k_tiles,
+                                    reduce_k_tile,
+                                    block_valid_rows,
+                                    a_gl_stride,
+                                    b_gl_stride,
+                                    s_gl_stride,
+                                    scales_expert_off,
+                                    b_gl_rd_base,
+                                    a_gl_rd_row,
+                                    a_gl_rd_col0,
+                                    a_sh_wr,
+                                    a_rows_per_iter,
+                                    output_n_tile,
+                                    expert_idx,
+                                )
+                            self._fp8_k16_compute(
+                                kk,
+                                acc0,
+                                acc1,
+                                acc2,
+                                acc3,
+                                q_even,
+                                b_scale_cur,
+                                a_regs_cur,
+                                tid,
+                                n_mb,
+                                nmb_rt,
+                            )
+                            self._copy_b_scale_register_bundle(
+                                b_scale_cur, b_scale_next
+                            )
+                            if cutlass.const_expr(not self.tune["abuf1"]):
+                                self._copy_a_register_bundle_large_m(
+                                    a_regs_cur, a_regs_next, n_mb
+                                )
+                        tile_idx += Int32(1)
+            # every real cp.async was consumed; the epilogue reuses the B region
+            cute.arch.sync_threads()
+        else:
+            while tile_idx < k_tiles:
+                for pipe in cutlass.range_constexpr(self.stages):
+                    if tile_idx < k_tiles:
+                        for kk in cutlass.range_constexpr(self.b_sh_wr_iters):
+                            self._load_next_fragment_bundle_fp8(
+                                b_scale_next,
+                                a_regs_next,
+                                a_regs_cur,
+                                smem_base,
+                                tid,
+                                b_sh_rd,
+                                s_sh_rd,
+                                a_sh_rd,
+                                pipe,
+                                kk,
+                                tile_idx,
+                                k_tiles,
+                                n_mb,
+                            )
+                            if cutlass.const_expr(self.tune["abuf1"] and kk % 2 == 0):
+                                # abuf1: this stage's A fragments, read BEFORE the stage's refill
+                                # + barrier (like the stock B read) so the next refill of this
+                                # slot is ordered after every warp's last read
+                                self._load_a_registers_large_m_bundle(
+                                    a_regs_cur,
+                                    smem_base,
+                                    a_sh_rd,
+                                    Int32(pipe),
+                                    Int32(kk // 2),
+                                    n_mb,
+                                )
+                            self._prefetch_pipeline_step(
+                                a_bf16_flat,
+                                b_i32_flat,
+                                scales_i32_flat,
+                                smem_base,
+                                tid,
+                                pipe,
+                                kk,
+                                tile_idx,
+                                k_tiles,
+                                reduce_k_tile,
+                                block_valid_rows,
+                                a_gl_stride,
+                                b_gl_stride,
+                                s_gl_stride,
+                                scales_expert_off,
+                                b_gl_rd_base,
+                                a_gl_rd_row,
+                                a_gl_rd_col0,
+                                a_sh_wr,
+                                a_rows_per_iter,
+                                output_n_tile,
+                                expert_idx,
+                            )
+                            self._fp8_k16_compute(
+                                kk,
+                                acc0,
+                                acc1,
+                                acc2,
+                                acc3,
+                                q_even,
+                                b_scale_cur,
+                                a_regs_cur,
+                                tid,
+                                n_mb,
+                                nmb_rt,
+                            )
+                            self._copy_b_scale_register_bundle(
+                                b_scale_cur, b_scale_next
+                            )
+                            if cutlass.const_expr(not self.tune["abuf1"]):
+                                self._copy_a_register_bundle_large_m(
+                                    a_regs_cur, a_regs_next, n_mb
+                                )
+                        tile_idx += Int32(1)
+                cute.arch.sync_threads()
+                if tile_idx < k_tiles:
+                    self._load_b_scale_register_bundle(
+                        b_scale_cur,
+                        smem_base,
+                        tid,
+                        b_sh_rd,
+                        s_sh_rd,
+                        Int32(0),
+                        Int32(0),
+                    )
+                    if cutlass.const_expr(not self.tune["abuf1"]):
+                        self._load_a_registers_large_m_bundle(
+                            a_regs_cur,
+                            smem_base,
+                            a_sh_rd,
+                            Int32(0),
+                            Int32(0),
+                            n_mb,
+                        )
+
+    @cute.jit
+    def _pair_refill(
+        self,
+        a_bf16_flat: cute.Tensor,
+        b_i32_flat: cute.Tensor,
+        scales_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        pipe: cutlass.Constexpr[int],
+        tile_idx: Int32,
+        k_tiles: Int32,
+        reduce_k_tile: Int32,
+        block_valid_rows: Int32,
+        a_gl_stride: Int32,
+        b_gl_stride: Int32,
+        s_gl_stride: Int32,
+        scales_expert_off: Int32,
+        b_gl_rd_base: Int64,
+        a_gl_rd_row: Int32,
+        a_gl_rd_col0: Int32,
+        a_sh_wr: Int32,
+        a_rows_per_iter: Int32,
+        output_n_tile: Int32,
+        expert_idx: Int32,
+    ):
+        """FP8 pipeline `pair` (6-slot ring, one commit group per k-tile): at the start of the
+        pair (t, t+1) wait until tiles <= t+2 landed (t+3 may still fly), barrier, then
+        refill the slots of t-2 / t-1 with t+4 / t+5.  The refill is issued AFTER the
+        barrier, so every warp has finished reading those slots (race-free by construction;
+        the stock pipeline refills before its barrier)."""
+        cute.arch.cp_async_wait_group(1)
+        cute.arch.sync_threads()
+        for j in cutlass.range_constexpr(2):
+            fetch_tile = tile_idx + Int32(4 + j)
+            if fetch_tile < k_tiles:
+                self._stage_k_tile_async(
+                    a_bf16_flat,
+                    b_i32_flat,
+                    scales_i32_flat,
+                    smem_base,
+                    tid,
+                    Int32((pipe + 4 + j) % self.stages),
+                    reduce_k_tile + fetch_tile,
+                    block_valid_rows,
+                    a_gl_stride,
+                    b_gl_stride,
+                    s_gl_stride,
+                    scales_expert_off,
+                    b_gl_rd_base,
+                    a_gl_rd_row,
+                    a_gl_rd_col0,
+                    a_sh_wr,
+                    a_rows_per_iter,
+                    output_n_tile,
+                    expert_idx,
+                )
+            else:
+                cute.arch.cp_async_commit_group()
 
     @cute.jit
     def _finish_tile(
@@ -2416,8 +3171,9 @@ class W4A16GemmKernel:
         a_sh_rd: Int32,
         pipe: Int32,
         kk: Int32,
+        n_mb=None,
     ):
-        for mb in cutlass.range_constexpr(self.cta_m_blocks):
+        for mb in cutlass.range_constexpr(self.cta_m_blocks if n_mb is None else n_mb):
             a0, a1, a2, a3 = self._load_a_registers_large_m(
                 smem_base,
                 a_sh_rd,
@@ -2444,8 +3200,8 @@ class W4A16GemmKernel:
         regs[1] = a1
 
     @cute.jit
-    def _clear_a_register_bundle_large_m(self, regs: cute.Tensor):
-        for mb in cutlass.range_constexpr(self.cta_m_blocks):
+    def _clear_a_register_bundle_large_m(self, regs: cute.Tensor, n_mb=None):
+        for mb in cutlass.range_constexpr(self.cta_m_blocks if n_mb is None else n_mb):
             for reg in cutlass.range_constexpr(4):
                 regs[mb, reg] = Uint32(0)
 
@@ -2455,8 +3211,10 @@ class W4A16GemmKernel:
             regs[reg] = Uint32(0)
 
     @cute.jit
-    def _copy_a_register_bundle_large_m(self, dst: cute.Tensor, src: cute.Tensor):
-        for mb in cutlass.range_constexpr(self.cta_m_blocks):
+    def _copy_a_register_bundle_large_m(
+        self, dst: cute.Tensor, src: cute.Tensor, n_mb=None
+    ):
+        for mb in cutlass.range_constexpr(self.cta_m_blocks if n_mb is None else n_mb):
             for reg in cutlass.range_constexpr(4):
                 dst[mb, reg] = src[mb, reg]
 
@@ -2567,6 +3325,10 @@ class W4A16GemmKernel:
             + (s_sh_rd + scale_group_id * Int32(2 * self.s_sh_stride)) * Int32(8)
         )
         s_pack0, s_pack1 = ld_shared_v2_u32(s_addr)
+        if cutlass.const_expr(self.a_fp8):
+            # Keep the prepared E5M3 bytes: jj -> word jj//2, n-block0 byte jj%2,
+            # n-block1 byte jj%2+2 (same lanes the bf16 decode below broadcasts).
+            return q0, q1, q2, q3, s_pack0, s_pack1, Uint32(0), Uint32(0)
         s0, s1 = self._dequant_scale_x4_to_elem2x2(s_pack0)
         s2, s3 = self._dequant_scale_x4_to_elem2x2(s_pack1)
         return q0, q1, q2, q3, s0, s1, s2, s3
@@ -2662,14 +3424,14 @@ class W4A16GemmKernel:
                     tid,
                     b_sh_rd,
                     s_sh_rd,
-                    Int32((pipe + 1) % _STAGES),
+                    Int32((pipe + 1) % self.stages),
                     Int32(0),
                 )
                 self._load_a_register_bundle(
                     a_regs_next,
                     smem_base,
                     a_sh_rd,
-                    Int32((pipe + 1) % _STAGES),
+                    Int32((pipe + 1) % self.stages),
                     Int32(0),
                     uses_m_block_8,
                 )
@@ -3220,7 +3982,9 @@ class W4A16GemmKernel:
         output_n_tile: Int32,
         expert_idx: Int32,
     ):
-        for pipe in cutlass.range_constexpr(_STAGES - 1):
+        for pipe in cutlass.range_constexpr(
+            4 if self.tune["pair"] else self.stages - 1
+        ):
             if Int32(pipe) < k_tiles:
                 self._stage_k_tile_async(
                     a_bf16_flat,
@@ -3245,7 +4009,7 @@ class W4A16GemmKernel:
                 )
             else:
                 cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(_STAGES - 2)
+        cute.arch.cp_async_wait_group(3 if self.tune["pair"] else self.stages - 2)
         cute.arch.sync_threads()
 
     @cute.jit
@@ -3273,7 +4037,7 @@ class W4A16GemmKernel:
         output_n_tile: Int32,
         expert_idx: Int32,
     ):
-        fetch_tile = tile_idx + Int32(_STAGES - 1)
+        fetch_tile = tile_idx + Int32(self.stages - 1)
         if fetch_tile < k_tiles:
             self._stage_k_tile_async(
                 a_bf16_flat,
@@ -3281,7 +4045,7 @@ class W4A16GemmKernel:
                 scales_i32_flat,
                 smem_base,
                 tid,
-                Int32((pipe + _STAGES - 1) % _STAGES),
+                Int32((pipe + self.stages - 1) % self.stages),
                 reduce_k_tile + fetch_tile,
                 block_valid_rows,
                 a_gl_stride,
@@ -3298,7 +4062,7 @@ class W4A16GemmKernel:
             )
         else:
             cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(_STAGES - 2)
+        cute.arch.cp_async_wait_group(self.stages - 2)
         cute.arch.sync_threads()
 
     @cute.jit
@@ -4123,9 +4887,28 @@ class W4A16FusedMoeKernel:
         tc_zero_output: bool = True,
         collect_activation_amax: bool = False,
         schedule_whole_tiles: bool = False,
+        a_fp8: int = 0,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
+        self.a_fp8 = int(a_fp8)
+        self.tune = {
+            key: value if self.a_fp8 else (4 if key == "stages" else 0)
+            for key, value in _FP8_TUNE_DEFAULTS.items()
+        }
+        if self.a_fp8:
+            if not is_gated or activation == SWIGLUOAI_UNINTERLEAVE:
+                raise ValueError("a_fp8 fused MoE supports gated SiLU only")
+            if direct_topk_routes or tc_decode_fused_sum or collect_activation_amax:
+                raise ValueError(
+                    "a_fp8 fused MoE requires the route-packed prefill path"
+                )
+            if apply_router_weight_on_input:
+                raise ValueError("a_fp8 folds the FC2 row scale into the top-k weights")
+            if int(intermediate_size) % 512 != 0:
+                raise ValueError(
+                    "a_fp8 activation phase needs intermediate_size % 512 == 0"
+                )
         swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_activation_swiglu_params(
             activation,
             swiglu_limit,
@@ -4207,6 +4990,7 @@ class W4A16FusedMoeKernel:
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
             schedule_whole_tiles=self.schedule_whole_tiles,
+            a_fp8=self.a_fp8,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -4228,6 +5012,7 @@ class W4A16FusedMoeKernel:
             fused_topk_sum=self.tc_decode_fused_sum,
             fused_sum_topk=int(top_k),
             schedule_whole_tiles=self.schedule_whole_tiles,
+            a_fp8=self.a_fp8,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -4314,6 +5099,7 @@ class W4A16FusedMoeKernel:
         activation_amax_flat: cute.Tensor,
         layer_idx: cutlass.Int32,
         topk_weights_ptr: cute.Pointer,
+        fp8_side_ptr: cute.Pointer,
         fc1_c_tmp_f32_flat: cute.Tensor,
         fc2_c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
@@ -4327,6 +5113,17 @@ class W4A16FusedMoeKernel:
         )
         topk_weights_flat = cute.make_tensor(
             topk_weights_ptr,
+            layout=cute.make_layout((active_m * Int32(self.top_k),), stride=(1,)),
+        )
+        # fp8 side buffer (fp32): [0, active_m) FC1 per-token act scales, then
+        # [active_m, active_m*(1+top_k)) FC2 top-k weights x per-route act scale.
+        # Non-fp8 launches pass any fp32 pointer; both views are const_expr-dead.
+        a_scale_flat = cute.make_tensor(
+            fp8_side_ptr,
+            layout=cute.make_layout((active_m,), stride=(1,)),
+        )
+        fc2_topk_flat = cute.make_tensor(
+            fp8_side_ptr + active_m,
             layout=cute.make_layout((active_m * Int32(self.top_k),), stride=(1,)),
         )
         grid = (grid_x, 1, 1)
@@ -4347,6 +5144,8 @@ class W4A16FusedMoeKernel:
             activation_amax_flat,
             layer_idx,
             topk_weights_flat,
+            a_scale_flat,
+            fc2_topk_flat,
             fc1_c_tmp_f32_flat,
             fc2_c_tmp_f32_flat,
             locks_i32_flat,
@@ -4382,6 +5181,8 @@ class W4A16FusedMoeKernel:
         activation_amax_flat: cute.Tensor,
         layer_idx: cutlass.Int32,
         topk_weights_flat: cute.Tensor,
+        a_scale_flat: cute.Tensor,
+        fc2_topk_flat: cute.Tensor,
         fc1_c_tmp_f32_flat: cute.Tensor,
         fc2_c_tmp_f32_flat: cute.Tensor,
         locks_i32_flat: cute.Tensor,
@@ -4431,6 +5232,8 @@ class W4A16FusedMoeKernel:
             cta,
             grid_x,
             active_m,
+            a_scale_flat=a_scale_flat,
+            fc2_topk_flat=fc2_topk_flat,
         )
 
     @cute.jit
@@ -4462,6 +5265,8 @@ class W4A16FusedMoeKernel:
         active_m: cutlass.Int32,
         fc1_emit_tile: cutlass.Constexpr = None,
         fc2_emit_tile: cutlass.Constexpr = None,
+        a_scale_flat: cute.Tensor = None,
+        fc2_topk_flat: cute.Tensor = None,
     ):
         # Phase assembly shared by the single-tier fused kernel and the hybrid
         # multi-tier entry: zero prologue, FC1, grid barrier, activation, grid
@@ -4518,14 +5323,27 @@ class W4A16FusedMoeKernel:
                 fc1_emit_tile,
             )
             self._grid_barrier(locks_i32_flat, tid, grid_x)
-            self._run_activation(
-                fc1_bf16_flat,
-                activated_bf16_flat,
-                tid,
-                cta,
-                grid_x,
-                active_m,
-            )
+            if cutlass.const_expr(self.a_fp8):
+                self._run_activation_fp8(
+                    fc1_bf16_flat,
+                    activated_bf16_flat,
+                    a_scale_flat,
+                    topk_weights_flat,
+                    fc2_topk_flat,
+                    tid,
+                    cta,
+                    grid_x,
+                    active_m,
+                )
+            else:
+                self._run_activation(
+                    fc1_bf16_flat,
+                    activated_bf16_flat,
+                    tid,
+                    cta,
+                    grid_x,
+                    active_m,
+                )
         else:
             self.fc1._run_persistent_gemm(
                 a_bf16_flat,
@@ -4565,6 +5383,9 @@ class W4A16FusedMoeKernel:
         if cutlass.const_expr(self.zero_fc2_output):
             self._zero_fc2_output(fc2_bf16_flat, tid, cta, grid_x, active_m)
             self._grid_barrier(locks_i32_flat, tid, grid_x)
+        fc2_topk_arg = topk_weights_flat
+        if cutlass.const_expr(self.a_fp8):
+            fc2_topk_arg = fc2_topk_flat
         self.fc2._run_persistent_gemm(
             activated_bf16_flat,
             w2_i32_flat,
@@ -4574,7 +5395,7 @@ class W4A16FusedMoeKernel:
             packed_route_indices,
             block_expert_ids,
             packed_route_count,
-            topk_weights_flat,
+            fc2_topk_arg,
             fc2_c_tmp_f32_flat,
             locks_i32_flat,
             smem_base,
@@ -4782,6 +5603,131 @@ class W4A16FusedMoeKernel:
                 activated_bf16_flat[idx] = self._cast_elem(x * x)
             idx += stride
 
+    @cute.jit
+    def _run_activation_fp8(
+        self,
+        fc1_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        a_scale_flat: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        fc2_topk_flat: cute.Tensor,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: cutlass.Int32,
+    ):
+        """Warp-per-routed-row SiLU(g)*u -> per-row dynamic E4M3 (sigma K order).
+
+        FC1 ran on unscaled FP8 activations, so both halves are first multiplied by the
+        token's FC1 act scale.  The row's FP8 scale (amax/448) is folded into the FC2
+        top-k weight so the FC2 GEMM epilogue needs no change.  Output bytes overwrite
+        the head of the bf16 activation buffer (fp8 row r at byte r*I).
+        """
+        warps = self.cta_threads // 32
+        epl = self.intermediate_size // 32  # values per lane, multiple of 16
+        lane = tid & Int32(31)
+        warp = tid // Int32(32)
+        row = cta * Int32(warps) + warp
+        rstride = grid_x * Int32(warps)
+        rows = active_m * Int32(self.top_k)
+        while row < rows:
+            token = row // Int32(self.top_k)
+            s_tok = a_scale_flat[token].to(cutlass.Float32)
+            base = row * Int32(self.fc1_cols) + lane * Int32(epl)
+            vals = cute.make_rmem_tensor((epl,), cutlass.Float32)
+            local_max = cutlass.Float32(0.0)
+            if cutlass.const_expr(self.tune["actvec"]):
+                # FP8 pipeline `actvec`: 2 x epl/8 128-bit loads instead of 2 x epl 16-bit loads;
+                # bf16 -> f32 is exact, so every value below is bit-identical.
+                g_raw = cute.make_rmem_tensor((epl,), cutlass.Float32)
+                u_raw = cute.make_rmem_tensor((epl,), cutlass.Float32)
+                for c in cutlass.range_constexpr(epl // 8):
+                    gw = ld_global_v4_u32(
+                        get_ptr_as_int64(fc1_bf16_flat, base + Int32(8 * c))
+                    )
+                    uw = ld_global_v4_u32(
+                        get_ptr_as_int64(
+                            fc1_bf16_flat, base + Int32(self.intermediate_size + 8 * c)
+                        )
+                    )
+                    for w in cutlass.range_constexpr(4):
+                        g_lo, g_hi = bf16x2_bits_to_f32x2(gw[w])
+                        u_lo, u_hi = bf16x2_bits_to_f32x2(uw[w])
+                        g_raw[8 * c + 2 * w] = g_lo
+                        g_raw[8 * c + 2 * w + 1] = g_hi
+                        u_raw[8 * c + 2 * w] = u_lo
+                        u_raw[8 * c + 2 * w + 1] = u_hi
+            for i in cutlass.range_constexpr(epl):
+                if cutlass.const_expr(self.tune["actvec"]):
+                    gate = g_raw[i] * s_tok
+                    up = u_raw[i] * s_tok
+                else:
+                    gate = fc1_bf16_flat[base + Int32(i)].to(cutlass.Float32) * s_tok
+                    up = (
+                        fc1_bf16_flat[base + Int32(self.intermediate_size + i)].to(
+                            cutlass.Float32
+                        )
+                        * s_tok
+                    )
+                gate, up = self._clamp_swiglu_inputs(gate, up)
+                if cutlass.const_expr(self.fast_math):
+                    exp_neg_gate = cute.math.exp(-gate, fastmath=True)
+                else:
+                    exp_neg_gate = cute.math.exp(-gate, fastmath=False)
+                silu = gate / (cutlass.Float32(1.0) + exp_neg_gate)
+                h = self._cast_elem(
+                    self._cast_elem(silu).to(cutlass.Float32)
+                    * self._cast_elem(up).to(cutlass.Float32)
+                ).to(cutlass.Float32)
+                vals[i] = h
+                local_max = fmax_f32(local_max, fabs_f32(h))
+            amax = fmax_f32(warp_reduce(local_max, fmax_f32), cutlass.Float32(1e-12))
+            inv = cutlass.Float32(448.0) / amax
+            out_byte = row * Int32(self.intermediate_size) + lane * Int32(epl)
+            for grp in cutlass.range_constexpr(epl // 16):
+                g0 = grp * 16
+                w0 = f32x4_to_e4m3x4(
+                    vals[g0 + 0] * inv,
+                    vals[g0 + 1] * inv,
+                    vals[g0 + 8] * inv,
+                    vals[g0 + 9] * inv,
+                )
+                w1 = f32x4_to_e4m3x4(
+                    vals[g0 + 2] * inv,
+                    vals[g0 + 3] * inv,
+                    vals[g0 + 10] * inv,
+                    vals[g0 + 11] * inv,
+                )
+                w2 = f32x4_to_e4m3x4(
+                    vals[g0 + 4] * inv,
+                    vals[g0 + 5] * inv,
+                    vals[g0 + 12] * inv,
+                    vals[g0 + 13] * inv,
+                )
+                w3 = f32x4_to_e4m3x4(
+                    vals[g0 + 6] * inv,
+                    vals[g0 + 7] * inv,
+                    vals[g0 + 14] * inv,
+                    vals[g0 + 15] * inv,
+                )
+                # activated buffer is typed bf16: element offset = byte offset / 2
+                st_global_v4_u32(
+                    get_ptr_as_int64(
+                        activated_bf16_flat, (out_byte + Int32(g0)) // Int32(2)
+                    ),
+                    w0,
+                    w1,
+                    w2,
+                    w3,
+                )
+            if lane == Int32(0):
+                fc2_topk_flat[row] = (
+                    topk_weights_flat[row].to(cutlass.Float32)
+                    * amax
+                    * cutlass.Float32(1.0 / 448.0)
+                )
+            row += rstride
+
 
 class W4A16ActivationKernel:
     def __init__(
@@ -4922,7 +5868,9 @@ class W4A16ActivationKernel:
 
 
 class W4A16TopKSumKernel:
-    def __init__(self, *, topk: int, hidden_size: int, element_dtype: str = "bf16"):
+    def __init__(
+        self, *, topk: int, hidden_size: int, element_dtype: str = "bf16", vec: int = 1
+    ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
         if topk <= 0 or hidden_size <= 0:
@@ -4932,6 +5880,13 @@ class W4A16TopKSumKernel:
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
         self.cta_threads = 256
+        # FP8 pipeline `tsumvec`: vec=8 -> one thread per 8 consecutive columns (bf16 only); every
+        # output element is still sum_{route 0..topk-1} f32(route value) in route order, RN.
+        self.vec = int(vec)
+        if self.vec not in (1, 8) or (
+            self.vec == 8 and (element_dtype != "bf16" or self.hidden_size % 8)
+        ):
+            raise ValueError(f"unsupported top-k sum vec={vec}")
 
     @cute.jit
     def _cast_elem(self, x: cutlass.Float32):
@@ -4962,7 +5917,7 @@ class W4A16TopKSumKernel:
             output_ptr,
             layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
         )
-        total = active_m * Int32(self.hidden_size)
+        total = active_m * Int32(self.hidden_size // self.vec)
         grid = (_covering_count(total, self.cta_threads), 1, 1)
         self.kernel(fc2_flat, topk_ids_flat, output_flat, active_m).launch(
             grid=grid,
@@ -4981,6 +5936,36 @@ class W4A16TopKSumKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         idx = Int32(bidx) * Int32(self.cta_threads) + Int32(tidx)
+        if cutlass.const_expr(self.vec == 8):
+            nvec = active_m * Int32(self.hidden_size // 8)
+            if idx < nvec:
+                e0 = idx * Int32(8)
+                token = e0 // Int32(self.hidden_size)
+                col = e0 - token * Int32(self.hidden_size)
+                acc = cute.make_rmem_tensor((8,), cutlass.Float32)
+                for e in cutlass.range_constexpr(8):
+                    acc[e] = cutlass.Float32(0.0)
+                for route in cutlass.range_constexpr(self.topk):
+                    row = token * Int32(self.topk) + Int32(route)
+                    # Negative route IDs have no FC2 row; do not read stale scratch.
+                    if topk_ids_flat[row].to(Int32) >= Int32(0):
+                        wv = ld_global_v4_u32(
+                            get_ptr_as_int64(
+                                fc2_flat, row * Int32(self.hidden_size) + col
+                            )
+                        )
+                        for w in cutlass.range_constexpr(4):
+                            lo, hi = bf16x2_bits_to_f32x2(wv[w])
+                            acc[2 * w] += _materialize_w4a16_topk_route_f32(lo)
+                            acc[2 * w + 1] += _materialize_w4a16_topk_route_f32(hi)
+                st_global_v4_u32(
+                    get_ptr_as_int64(output_flat, e0),
+                    pack_f32x2_to_bf16x2_rn(acc[0], acc[1]),
+                    pack_f32x2_to_bf16x2_rn(acc[2], acc[3]),
+                    pack_f32x2_to_bf16x2_rn(acc[4], acc[5]),
+                    pack_f32x2_to_bf16x2_rn(acc[6], acc[7]),
+                )
+            return
         total = active_m * Int32(self.hidden_size)
         if idx < total:
             token = idx // Int32(self.hidden_size)
@@ -5246,7 +6231,9 @@ def compile_w4a16_fused_moe(
     tc_decode_fused_sum: bool = False,
     collect_activation_amax: bool = False,
     force_tile_config: tuple[int, int, int, int] | None = None,
+    a_fp8: int = 0,
 ) -> W4A16FusedMoeCompileResult:
+    a_fp8 = int(a_fp8)
     scale_format = _normalize_scale_format(scale_format)
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     device = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
@@ -5545,6 +6532,7 @@ def compile_w4a16_fused_moe(
         direct_topk_routes=direct_topk_routes,
         tc_decode_fused_sum=tc_decode_fused_sum,
         collect_activation_amax=collect_activation_amax,
+        a_fp8=a_fp8,
     )
     cache_key = (
         "w4a16_fused_moe",
@@ -5674,6 +6662,9 @@ def compile_w4a16_fused_moe(
         assumed_align=4,
     )
     topk_fake = make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    fp8_side_fake = make_ptr(
+        cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4
+    )
     fc1_c_tmp_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (
@@ -5721,6 +6712,7 @@ def compile_w4a16_fused_moe(
         activation_amax_fake,
         0,
         topk_fake,
+        fp8_side_fake,
         fc1_c_tmp_fake,
         fc2_c_tmp_fake,
         locks_fake,
@@ -5762,6 +6754,7 @@ def compile_w4a16_fused_moe(
         scale_format=scale_format,
         tc_decode_fused_sum=bool(tc_decode_fused_sum),
         collect_activation_amax=collect_activation_amax,
+        a_fp8=int(a_fp8),
     )
     _FUSED_CACHE[cache_key] = result
     return result
@@ -5859,9 +6852,12 @@ def compile_w4a16_topk_sum(
     topk: int,
     hidden_size: int,
     element_dtype: str = "bf16",
+    vec: int = 1,
 ) -> W4A16TopKSumCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
-    cache_key = ("w4a16_topk_sum", element_dtype, topk, hidden_size)
+    cache_key = ("w4a16_topk_sum", element_dtype, topk, hidden_size) + (
+        (("vec", int(vec)),) if int(vec) != 1 else ()
+    )
     cached = _SUM_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -5873,6 +6869,7 @@ def compile_w4a16_topk_sum(
         topk=topk,
         hidden_size=hidden_size,
         element_dtype=element_dtype,
+        vec=int(vec),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -5950,7 +6947,11 @@ def _w4a16_fused_moe_launch_flat(
     tc_decode_fused_sum: bool,
     collect_activation_amax: bool,
     stream_int: int,
+    a_fp8: int = 0,
+    fp8_side: torch.Tensor | None = None,
 ) -> None:
+    if a_fp8 and fp8_side is None:
+        raise ValueError("a_fp8 launch requires the fp32 fp8_side buffer")
     swiglu_limit = float(swiglu_limit_value) if has_swiglu_limit else None
     collect_activation_amax = bool(collect_activation_amax)
     if collect_activation_amax and activation_amax is None:
@@ -5986,6 +6987,7 @@ def _w4a16_fused_moe_launch_flat(
         # its selected geometry so tile-specific packs (notably NF3) resolve the
         # identical cache entry instead of silently recompiling with auto tiles.
         force_tile_config=(fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n),
+        a_fp8=int(a_fp8),
     )
     fused.compiled(
         make_ptr(
@@ -6011,6 +7013,12 @@ def _w4a16_fused_moe_launch_flat(
         make_ptr(
             cutlass.Float32,
             topk_weights.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
+            cutlass.Float32,
+            (fp8_side if a_fp8 else topk_weights).data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=4,
         ),
@@ -6264,6 +7272,129 @@ def _w4a16_fused_moe_launch_fake(
 
 
 @torch.library.custom_op(
+    "flashinfer::w4a16_fp8_fused_moe_launch",
+    mutates_args=(
+        "fc1_out",
+        "activated",
+        "fc2_out",
+        "fp8_side",
+        "fc1_scratch",
+        "fc2_scratch",
+        "workspace",
+    ),
+)
+def _w4a16_fp8_fused_moe_launch_op(
+    a_input: torch.Tensor,
+    w13_arg: torch.Tensor,
+    w2_arg: torch.Tensor,
+    fc1_out: torch.Tensor,
+    activated: torch.Tensor,
+    fc2_out: torch.Tensor,
+    w13_scale_i32: torch.Tensor,
+    w2_scale_i32: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    packed_route_count: torch.Tensor,
+    fp8_side: torch.Tensor,
+    topk_weights: torch.Tensor,
+    fc1_scratch: torch.Tensor,
+    fc2_scratch: torch.Tensor,
+    workspace: torch.Tensor,
+    m: int,
+    size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    apply_router_weight_on_input: bool,
+    zero_fc2_output: bool,
+    moe_block_size: int,
+    max_m_blocks: int,
+    element_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    has_swiglu_limit: bool,
+    swiglu_limit_value: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    weight_layout: str,
+    scale_format: str,
+    w13_layout: str,
+    fc1_tile_k: int,
+    fc1_tile_n: int,
+    fc2_tile_k: int,
+    fc2_tile_n: int,
+    stream_int: int,
+    a_fp8_mode: int,
+) -> None:
+    """FP8-activation prefill launch: a_input is the sigma-ordered E4M3 [m, K] buffer
+    viewed as bf16 [m, K/2]; fp8_side[:m] holds its per-row fp32 scales.
+    a_fp8_mode: 0 for BF16 activations, 3 for FP8 activations with native E2M1 weights."""
+    _w4a16_fused_moe_launch_flat(
+        a_input=a_input,
+        w13_arg=w13_arg,
+        w2_arg=w2_arg,
+        fc1_out=fc1_out,
+        activated=activated,
+        fc2_out=fc2_out,
+        w13_scale_i32=w13_scale_i32,
+        w2_scale_i32=w2_scale_i32,
+        w13_global_scale=w13_global_scale,
+        w2_global_scale=w2_global_scale,
+        packed_route_indices=packed_route_indices,
+        block_expert_ids=block_expert_ids,
+        packed_route_count=packed_route_count,
+        activation_amax=None,
+        layer_idx=0,
+        topk_weights=topk_weights,
+        fc1_scratch=fc1_scratch,
+        fc2_scratch=fc2_scratch,
+        workspace=workspace,
+        m=m,
+        size_m=size_m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=topk,
+        activation=activation,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        zero_fc2_output=zero_fc2_output,
+        moe_block_size=moe_block_size,
+        max_m_blocks=max_m_blocks,
+        element_dtype=element_dtype,
+        fast_math=fast_math,
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        has_swiglu_limit=has_swiglu_limit,
+        swiglu_limit_value=swiglu_limit_value,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        weight_layout=weight_layout,
+        scale_format=scale_format,
+        w13_layout=w13_layout,
+        fc1_tile_k=fc1_tile_k,
+        fc1_tile_n=fc1_tile_n,
+        fc2_tile_k=fc2_tile_k,
+        fc2_tile_n=fc2_tile_n,
+        direct_topk_routes=False,
+        tc_decode_fused_sum=False,
+        collect_activation_amax=False,
+        stream_int=stream_int,
+        a_fp8=int(a_fp8_mode),
+        fp8_side=fp8_side,
+    )
+
+
+@_w4a16_fp8_fused_moe_launch_op.register_fake
+def _w4a16_fp8_fused_moe_launch_fake(*args, **kwargs) -> None:
+    return None
+
+
+@torch.library.custom_op(
     "flashinfer::w4a16_fused_moe_calibrated_launch",
     mutates_args=(
         "fc1_out",
@@ -6437,12 +7568,14 @@ def _w4a16_topk_sum_launch_flat(
     hidden_size: int,
     element_dtype: str,
     stream_int: int,
+    vec: int = 1,
 ) -> None:
     sum_kernel = compile_w4a16_topk_sum(
         m=m,
         topk=topk,
         hidden_size=hidden_size,
         element_dtype=element_dtype,
+        vec=vec,
     )
     sum_kernel.compiled(
         make_ptr(
@@ -6723,8 +7856,14 @@ def run_w4a16_moe(
     fused_launch: W4A16FusedMoeCompileResult | None = None,
     topk_sum_launch: W4A16TopKSumCompileResult | None = None,
     stream: cuda.CUstream | None = None,
+    a_fp8: int = 0,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
+    a_fp8 = int(a_fp8)
+    if a_fp8 and (fused_launch is not None or activation_amax is not None):
+        raise ValueError(
+            "a_fp8 supports only the runtime-compiled, uncalibrated launch"
+        )
     is_gated = validate_activation(activation)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_activation_swiglu_params(
         activation,
@@ -6797,6 +7936,8 @@ def run_w4a16_moe(
     )
     if fused_launch is None:
         block_size_m = select_route_block_size_m(m, topk, route_num_experts)
+        if a_fp8 and block_size_m == 8:
+            block_size_m = 16  # fp8 mode has no m8 (TC-decode) specialization
     else:
         block_size_m = int(fused_launch.moe_block_size)
     if block_size_m not in _ALLOWED_ROUTED_SIZES:
@@ -6813,6 +7954,7 @@ def run_w4a16_moe(
     preplanned_tc_decode = bool(getattr(fused_launch, "tc_decode_fused_sum", False))
     use_tc_decode = bool(
         (not collect_activation_amax)
+        and (not a_fp8)
         and (fused_launch is None or preplanned_tc_decode)
         and weight_layout in ("packed", "nf3_2p1")
         and expert_map is None
@@ -6828,6 +7970,7 @@ def run_w4a16_moe(
 
     direct_topk_eligible = (
         (not collect_activation_amax)
+        and (not a_fp8)
         and (m <= _MAX_DIRECT_TOPK_ROUTE_M or use_tc_decode)
         and weight_layout in ("packed", "nf3_2p1")
         and expert_map is None
@@ -6976,6 +8119,7 @@ def run_w4a16_moe(
             direct_topk_routes=use_direct_topk_routes,
             tc_decode_fused_sum=use_tc_decode,
             collect_activation_amax=collect_activation_amax,
+            a_fp8=a_fp8,
         )
     else:
         if int(fused_launch.size_m) < m:
@@ -7151,7 +8295,24 @@ def run_w4a16_moe(
         int(fused.fc2_tile_k),
         int(fused.fc2_tile_n),
     )
-    if collect_activation_amax:
+    if a_fp8:
+        from .moe_w4a16_fp8_act import quant_rows_fp8_sigma
+
+        # FC1 input: per-token E4M3 in sigma K order + fp32 scales in fp8_side[:m];
+        # the activation phase writes FC2's scaled top-k weights to fp8_side[m:].
+        fp8_side = torch.empty(
+            (m * (1 + topk),), dtype=torch.float32, device=a_input.device
+        )
+        a_q, _ = quant_rows_fp8_sigma(a_input, out_scale=fp8_side[:m])
+        torch.ops.flashinfer.w4a16_fp8_fused_moe_launch(
+            a_q.view(torch.uint8).view(torch.bfloat16),
+            *launch_common[1:],
+            fp8_side,
+            *launch_tail,
+            int(stream),
+            int(a_fp8),
+        )
+    elif collect_activation_amax:
         assert activation_amax is not None
         assert layer_idx_int is not None
         torch.ops.flashinfer.w4a16_fused_moe_calibrated_launch(
@@ -7174,6 +8335,25 @@ def run_w4a16_moe(
         # FC2 already wrote the top-k-summed result into `output`.
         return output
 
+    # The compiled sum ABI reads int32 IDs, including negative unrouted slots.
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+
+    if a_fp8:
+        # Vectorize the eager FP8 route reduction with the same route order as W4A16.
+        _w4a16_topk_sum_launch_flat(
+            fc2_out,
+            topk_ids,
+            output,
+            m,
+            topk,
+            hidden_size,
+            element_dtype,
+            int(stream),
+            vec=8,
+        )
+        return output
+
     if topk_sum_launch is not None:
         expected_sum = (topk, hidden_size)
         actual_sum = (
@@ -7185,10 +8365,6 @@ def run_w4a16_moe(
                 "preplanned W4A16 top-k sum launch does not match requested contract: "
                 f"requested={expected_sum}, planned={actual_sum}"
             )
-    # The sum skips unrouted (negative) slots, whose FC2 rows were never
-    # written; the packer already dropped them from the route list.
-    if topk_ids.dtype != torch.int32:
-        topk_ids = topk_ids.to(torch.int32)
     torch.ops.flashinfer.w4a16_topk_sum_launch(
         fc2_out,
         topk_ids.view(-1),

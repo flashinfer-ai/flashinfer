@@ -205,12 +205,14 @@ def _normalize_quant_mode(
         "mxfp4": "mxfp4",
         "bf16": "w4a16",
         "w4a16": "w4a16",
+        # Exact prepared weights with per-row FP8 activation quantization.
+        "w4a8_fp8_exact": "w4a8_fp8_exact",
     }
     try:
         return aliases[normalized]
     except KeyError as exc:
         raise ValueError(
-            "quant_mode must be 'nvfp4'/'w4a4', 'mxfp4', or 'w4a16' "
+            "quant_mode must be 'nvfp4'/'w4a4', 'mxfp4', 'w4a16' or 'w4a8_fp8_exact' "
             f"(got {quant_mode!r})."
         ) from exc
 
@@ -223,13 +225,18 @@ def _sf_params_for_quant_mode(quant_mode: str):
     return _NVFP4_BLOCK_SIZE, cutlass.Float8E4M3FN
 
 
+# BF16 input API shared by W4A16 and opt-in FP8 activation quantization.
+_B12X_FP8_LEVELS = {"w4a8_fp8_exact": 3}
+_B12X_W4A16_FAMILY = ("w4a16",) + tuple(_B12X_FP8_LEVELS)
+
+
 def _activation_precision_from_quant_mode(quant_mode: str) -> str:
-    return "bf16" if _normalize_quant_mode(quant_mode) == "w4a16" else "fp4"
+    return "bf16" if _normalize_quant_mode(quant_mode) in _B12X_W4A16_FAMILY else "fp4"
 
 
 def _normalize_source_format_for_quant_mode(source_format: str, quant_mode: str) -> str:
     normalized = _normalize_source_format(source_format)
-    if quant_mode != "w4a16" and normalized in (
+    if quant_mode not in _B12X_W4A16_FAMILY and normalized in (
         "compressed_tensors",
         "modelopt_e4m3_k32",
     ):
@@ -2832,6 +2839,7 @@ def _launch_sm120_w4a16_moe(
     source_format: str = "modelopt",
     _workspace=None,
     _prepared_weights=None,
+    a_fp8: int = 0,
 ) -> torch.Tensor:
     prepared = (
         _prepared_weights
@@ -2860,6 +2868,15 @@ def _launch_sm120_w4a16_moe(
             raise ValueError(
                 f"expert_map must be on {a.device}, got {expert_map.device}"
             )
+    if a_fp8 and (
+        getattr(prepared, "scale_format", None) != "e4m3_k32"
+        or getattr(prepared, "weight_layout", "packed") != "packed"
+        or a.dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "quant_mode='w4a8_fp8_exact' needs bf16 activations and packed E4M3-K32 "
+            "prepared weights (source_format='modelopt_e4m3_k32')"
+        )
     num_tokens = int(topk_ids.size(0))
     routed_rows = num_tokens * int(top_k)
     k = int(a.size(1))
@@ -2911,6 +2928,7 @@ def _launch_sm120_w4a16_moe(
         expert_offsets=workspace.expert_offsets,
         expert_map=expert_map if expert_map is not None else workspace.expert_map,
         fast_math=fast_math,
+        a_fp8=a_fp8,
     )
 
 
@@ -3458,7 +3476,11 @@ def launch_sm120_moe(
         raise ValueError(f"MXFP4 b12x hidden_size ({k}) must be a multiple of 128.")
 
     # W4A4 kernels need a tile-aligned gate/up split.
-    if quant_mode != "w4a16" and n % _LEVEL_TILE_N != 0 and _weight_views is None:
+    if (
+        quant_mode not in _B12X_W4A16_FAMILY
+        and n % _LEVEL_TILE_N != 0
+        and _weight_views is None
+    ):
         (
             w1_weight,
             w1_weight_sf,
@@ -3482,7 +3504,7 @@ def launch_sm120_moe(
 
     routed_rows = num_tokens * top_k
 
-    if quant_mode == "w4a16":
+    if quant_mode in _B12X_W4A16_FAMILY:
         return _launch_sm120_w4a16_moe(
             a=a,
             topk_ids=topk_ids,
@@ -3503,6 +3525,7 @@ def launch_sm120_moe(
             source_format=source_format,
             _workspace=_workspace,
             _prepared_weights=_prepared_weights,
+            a_fp8=_B12X_FP8_LEVELS.get(quant_mode, 0),
         )
 
     if quant_mode == "nvfp4" and input_global_scale is not None:

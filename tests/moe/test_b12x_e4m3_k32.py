@@ -62,7 +62,8 @@ def _weights(experts, rows, cols, generator):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("tokens", [17, 129])
-def test_k32_public_api_matches_reference(tokens):
+@pytest.mark.parametrize("quant_mode", ["w4a16", "w4a8_fp8_exact"])
+def test_k32_public_api_matches_reference(tokens, quant_mode):
     if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
         pytest.skip("SM12x required")
     from flashinfer.fused_moe import b12x_fused_moe
@@ -86,7 +87,7 @@ def test_k32_public_api_matches_reference(tokens):
         2,
         w1_alpha=g13,
         w2_alpha=g2,
-        quant_mode="w4a16",
+        quant_mode=quant_mode,
         source_format="modelopt_e4m3_k32",
     )
     reference = torch.zeros_like(x, dtype=torch.float32)
@@ -99,4 +100,5 @@ def test_k32_public_api_matches_reference(tokens):
         reference.index_add_(0, tokens_, y.bfloat16().float())
     relative_l2 = (out.float() - reference).norm() / reference.norm()
     assert torch.isfinite(out).all()
-    assert relative_l2 < 0.015, relative_l2.item()
+    tolerance = 0.015 if quant_mode == "w4a16" else 0.08
+    assert relative_l2 < tolerance, relative_l2.item()
