@@ -15,3 +15,8 @@ csrc/cake_megamoe_topk_reduce/cake_megamoe_topk_reduce_kernels.cu
 
 # Frozen SM110 attention sources are authenticated by their source manifest.
 flashinfer/experimental/sm110_xqa/csrc/sm110_xqa/sm_110a/*.cu
+
+# W8A16 Blackwell GEMM: fork of CUTLASS 4.4 sm100 mixed-input kernel, kept diffable against upstream.
+include/flashinfer/gemm/w8a16_sm100/kernel.hpp
+include/flashinfer/gemm/w8a16_sm100/collective.hpp
+include/flashinfer/gemm/w8a16_sm100/builder.hpp

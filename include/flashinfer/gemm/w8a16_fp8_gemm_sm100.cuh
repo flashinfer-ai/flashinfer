@@ -16,8 +16,8 @@
 #ifndef FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 #define FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 
-// W8A16 GEMM for Blackwell (sm_100a), rung B1: CUTLASS mixed-input mainloop with
-// a bit-trick fp8 -> 16-bit converter in the transform warps.
+// W8A16 GEMM for Blackwell (sm_100a), rung B2: FlashInfer's fork of CUTLASS's
+// mixed-input kernel (w8a16_sm100/), behaviour-identical to rung B1 at this rung.
 //
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
@@ -65,6 +65,12 @@
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/packed_stride.hpp"
+
+// FlashInfer's fork of the sm100 mixed-input kernel / collective / builder (rung B2+).
+#include "flashinfer/gemm/w8a16_sm100/builder.hpp"
+#include "flashinfer/gemm/w8a16_sm100/collective.hpp"
+#include "flashinfer/gemm/w8a16_sm100/kernel.hpp"
+#include "flashinfer/gemm/w8a16_sm100/policy.hpp"
 
 namespace flashinfer {
 namespace gemm {
@@ -183,9 +189,8 @@ struct W8A16Sm100Cfg {
   static constexpr bool kTwoSM = k2SM;
   using TileShape = cute::Shape<cute::Int<kTileW>, cute::Int<kTileA>, cute::Int<kTileK>>;
   using ClusterShape = cute::Shape<cute::Int<kClusterM>, cute::_1, cute::_1>;
-  using MainloopSchedule =
-      std::conditional_t<k2SM, cutlass::gemm::KernelTmaWarpSpecialized2SmMixedInputSm100,
-                         cutlass::gemm::KernelTmaWarpSpecialized1SmMixedInputSm100>;
+  using MainloopSchedule = std::conditional_t<k2SM, cutlass::gemm::KernelW8A16MixedInput2SmSm100,
+                                              cutlass::gemm::KernelW8A16MixedInput1SmSm100>;
   using EpilogueSchedule = std::conditional_t<k2SM, cutlass::epilogue::TmaWarpSpecialized2Sm,
                                               cutlass::epilogue::TmaWarpSpecialized1Sm>;
 };
