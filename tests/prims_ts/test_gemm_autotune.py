@@ -177,7 +177,12 @@ def test_legal_tactics_cover_each_axis_and_drop_illegal_ones():
 
     qkv = legal_tactics(100, "nvfp4_e2m1", "bf16", "qkv_qknorm_rope")
     assert {tactic[9] for tactic in qkv} == {True, False}
-    assert all(tactic[5] == 4 and tactic[8] == 8 and not tactic[4] for tactic in qkv)
+    assert all(tactic[5] == 4 and tactic[8] == 8 for tactic in qkv)
+    # TMEM overlap is a QKV candidate at MMA-K 64 only, never with TMA stores.
+    assert any(tactic[4] for tactic in qkv)
+    assert all(tactic[6] == 64 and not tactic[9] for tactic in qkv if tactic[4])
+    qkv_sm103 = legal_tactics(103, "nvfp4_e2m1", "bf16", "qkv_qknorm_rope")
+    assert not any(tactic[4] and tactic[6] == 96 for tactic in qkv_sm103)
 
     fp8 = legal_tactics(100, "fp8_e4m3", "bf16", "linear")
     assert all(tactic[3] in (128, 256) and tactic[6] == 64 for tactic in fp8)
@@ -211,6 +216,13 @@ def test_legal_tactics_cover_each_axis_and_drop_illegal_ones():
         (2, 2, 256, 256, True, 5, 64, True, 8, False),
     )
     assert not tactic_is_legal(100, "nvfp4_e2m1", "bf16", "linear", illegal_tma)
+    assert tactic_is_legal(
+        100,
+        "nvfp4_e2m1",
+        "bf16",
+        "qkv_qknorm_rope",
+        (2, 2, 256, 256, True, 4, 64, True, 8, False),
+    )
     assert not tactic_is_legal(
         100,
         "nvfp4_e2m1",
