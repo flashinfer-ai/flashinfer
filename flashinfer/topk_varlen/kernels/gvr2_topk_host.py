@@ -1049,6 +1049,16 @@ def _prefill_bucket(n_env: int) -> int:
     return min(1 << max(int(n_env) - 1, 1).bit_length(), 32768)
 
 
+def _prefill_bucket_for(n_env: int, k: int) -> int:
+    """Envelope bucket of a windowed launch. A bound at or below ``k`` makes
+    every row an identity row; such launches share the smallest non-identity
+    bucket's launcher (a launcher built for a larger envelope ranks shorter
+    windows exactly), so they need no compile of their own and the buckets
+    ``warmup_prefill`` compiles, ``prefill_ready`` checks and ``_launch_prefill``
+    looks up are the same."""
+    return _prefill_bucket(max(int(n_env), int(k) + 1))
+
+
 # ---- family routing for windowed rows ---------------------------------------
 # The window engines exist for two families: the register-resident `reg`
 # kernels (BLK=512, VPT in {1,2,4}: the row is read once into registers) and
@@ -1296,7 +1306,7 @@ def _launch_prefill(
     instead of window-local indices."""
     num_rows = lg.shape[0]
     n_hint = min(max(int(n_hint), 1), int(n_clamp))
-    n_bucket = _prefill_bucket(n_hint)
+    n_bucket = _prefill_bucket_for(n_hint, k)
     capture = _is_capturing()
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
@@ -1420,8 +1430,8 @@ def warmup_prefill(
     dev = torch.cuda.current_device()
     k = int(top_k)
     max_cols = int(max_cols)
-    lo = _prefill_bucket(k + 1)
-    hi = _prefill_bucket(max_cols)
+    lo = _prefill_bucket_for(k + 1, k)
+    hi = _prefill_bucket_for(max_cols, k)
     buckets = []
     b = lo
     while b <= hi:
@@ -1532,7 +1542,7 @@ def prefill_ready(
         return False
     width = int(n_env) if width is None else int(width)
     n_env = min(max(int(n_env), 1), width)
-    n_bucket = _prefill_bucket(n_env)
+    n_bucket = _prefill_bucket_for(n_env, k)
     # a slab (streaming main) launch also needs this (device, CURRENT stream)'s
     # default workspace slab, which only an eager launch on this stream creates
     # (warmup_prefill or one eager windowed call); register rungs never need it

@@ -1013,6 +1013,36 @@ def test_prefill_row_starts_out_of_range():
 
 
 @requires_gvr2
+def test_prefill_warmup_covers_identity_bounds():
+    """A bound at or below top_k (every row an identity row) shares the smallest
+    non-identity bucket's launcher, so warmup_prefill covers it, prefill_ready says
+    so, and a capture of such a call succeeds without an eager call of that
+    geometry (reviewer's reproducer: warm up K=2048 at 4096 columns, then a
+    one-row chunk with bound 512)."""
+    k, n = 2048, 4096
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        _host.warmup_prefill(k, n)
+        assert _host.prefill_ready(1, k, 512, width=n)
+        lg = torch.randn((1, n), dtype=torch.float32, device=_DEV)
+        rs = torch.zeros((1,), dtype=torch.int32, device=_DEV)
+        le = torch.tensor([300], dtype=torch.int32, device=_DEV)
+        out = torch.full((1, k), -7, dtype=torch.int32, device=_DEV)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            flashinfer.top_k_varlen(
+                lg, le, k, row_starts=rs, max_window_len=512, out_indices=out
+            )
+        g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        out[0, :300].sort().values, torch.arange(300, dtype=torch.int32, device=_DEV)
+    )
+    assert bool((out[0, 300:] == -1).all())
+
+
+@requires_gvr2
 def test_prefill_cuda_graph_replay_grows_windows():
     """Capture with every window short (identity rows at ks=0); replay with
     misaligned starts of every lead class and full-width windows: the slab
