@@ -1,4 +1,5 @@
 import hashlib
+import logging
 from pathlib import Path
 
 from flashinfer.artifacts import (
@@ -288,6 +289,44 @@ def test_get_available_header_files_rejects_partial_index():
 
     with pytest.raises(RuntimeError, match="Failed to fetch the header artifact"):
         get_available_header_files(source, retries=1, delay=0, timeout=5)
+
+
+@pytest.mark.parametrize(
+    "level, dumped", [(logging.DEBUG, True), (logging.INFO, False)]
+)
+def test_download_file_logs_error_response_only_at_debug(
+    monkeypatch, caplog, tmp_path, level, dumped
+):
+    """HTTP error headers and body are logged for CI, but not in client logs.
+
+    Akamai's 403 page carries the "Reference #" the edge team needs to identify
+    the rule that rejected a request; CI runs at DEBUG to keep it.
+    """
+    from flashinfer.jit import cubin_loader
+
+    # The JIT logger is not registered with logging's manager, so caplog cannot
+    # reach it; route the module's logging through one that it can.
+    test_logger = logging.getLogger("test_cubin_loader")
+    monkeypatch.setattr(cubin_loader, "logger", test_logger)
+    caplog.set_level(level, logger=test_logger.name)
+
+    url = "https://example.test/artifacts/kernel.cubin"
+    body = "<H1>Access Denied</H1>Reference&#32;&#35;18&#46;4d2f1502&#46;1694779729"
+    with responses.RequestsMock() as rsps:
+        rsps.add(
+            responses.GET,
+            url,
+            body=body,
+            status=403,
+            headers={"Server": "AkamaiGHost"},
+        )
+        assert not cubin_loader.download_file(
+            url, str(tmp_path / "kernel.cubin"), retries=1
+        )
+
+    assert "attempt 1 failed: 403" in caplog.text
+    assert ("Server: AkamaiGHost" in caplog.text) == dumped
+    assert (body in caplog.text) == dumped
 
 
 def test_get_checksums_unreachable_pin_raises(monkeypatch, tmp_path):

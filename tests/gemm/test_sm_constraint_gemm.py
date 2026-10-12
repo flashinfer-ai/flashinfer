@@ -1,5 +1,6 @@
 import pytest
 import torch
+from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
 
 import flashinfer
 import flashinfer.triton
@@ -18,18 +19,19 @@ def torch_addmm(a, b, c, alpha=1.0, beta=0.0):
     return C
 
 
-@pytest.mark.parametrize("M", [128, 512, 1024, 8192])
-@pytest.mark.parametrize("N", [128, 512, 1024, 8192])
-@pytest.mark.parametrize("K", [128, 512, 1024, 8192])
-@pytest.mark.parametrize("alpha", [0.5, 1.0, 2.0])
-@pytest.mark.parametrize("beta", [0.0, 0.5, 2.0])
-@pytest.mark.parametrize("num_sms", [1, 16, 64, 128, 132, 133])
-@pytest.mark.parametrize(
-    "dtype", [torch.float8_e4m3fn, torch.float16, torch.bfloat16, torch.float32]
+@parametrize_product(
+    {
+        "M": [128, 512, 1024, 8192],
+        "N": [128, 512, 1024, 8192],
+        "K": [128, 512, 1024, 8192],
+        "alpha": [0.5, 1.0, 2.0],
+        "beta": [0.0, 0.5, 2.0],
+        "num_sms": [1, 16, 64, 128, 132, 133],
+        "dtype": [torch.float8_e4m3fn, torch.float16, torch.bfloat16, torch.float32],
+        "EPILOGUE_SUBTILE": [True, False],  # only for descriptor persistent
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize(
-    "EPILOGUE_SUBTILE", [True, False]
-)  # only for descriptor persistent
 def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTILE):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     # TODO(P1): Most of these tests pass on Blackwell. We need triage these at some point.

@@ -89,10 +89,12 @@ constexpr int32_t kMixedWidth = 3 * kHeads * kHeadDim;
 constexpr int32_t kGateWidth = kHeads * kHeadDim;
 constexpr int32_t kTargetFamily = 100;
 constexpr int32_t kTargetSM100a = 1000;
+constexpr int32_t kTargetSM107a = 1070;
 constexpr int32_t kTargetKind = FLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND;
 
-static_assert(kTargetKind == kTargetFamily || kTargetKind == kTargetSM100a,
-              "packed KDA T=1 must be compiled for SM100f or legacy exact SM100a");
+static_assert(kTargetKind == kTargetFamily || kTargetKind == kTargetSM100a ||
+                  kTargetKind == kTargetSM107a,
+              "packed KDA T=1 must be compiled for SM100f, legacy exact SM100a or exact SM107a");
 static_assert(CAKE_KDA_PACKED_T1_VALUE_TILES == 1 || CAKE_KDA_PACKED_T1_VALUE_TILES == 2 ||
                   CAKE_KDA_PACKED_T1_VALUE_TILES == 8 || CAKE_KDA_PACKED_T1_VALUE_TILES == 16,
               "packed KDA T=1 has an unsupported value tiling");
@@ -123,6 +125,11 @@ inline void CheckTarget(int32_t device_id) {
     TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3 || minor == 7))
         << "this packed KDA T=1 module requires the SM100 family "
            "(compute capability 10.0, 10.3 or 10.7), got "
+        << major << "." << minor;
+  } else if (kTargetKind == kTargetSM107a) {
+    TVM_FFI_ICHECK(major == 10 && minor == 7)
+        << "this packed KDA T=1 module requires an exact SM107a device (compute capability 10.7), "
+           "got "
         << major << "." << minor;
   } else {
     TVM_FFI_ICHECK(major == 10 && minor == 0)
