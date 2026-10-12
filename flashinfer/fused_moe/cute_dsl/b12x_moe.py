@@ -218,10 +218,16 @@ def b12x_fused_moe(
         ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
     quant_mode : Optional[str]
         Quantization mode, ``"nvfp4"`` / ``"w4a4"``, ``"mxfp4"``, or
-        ``"w4a16"``. When set, selects the backend and internal workspace
-        family.
+        ``"w4a16"``. The opt-in ``"w4a8_fp8_exact"`` mode uses lossy per-row
+        E4M3 activation quantization with native E2M1 weights and E4M3 K32 scales.
+        It requires BF16 inputs, gated SiLU, and an intermediate size divisible
+        by 512. "Exact" refers to prepared weight decoding, not activations.
+        This mode is supported by this functional API, without expert parallelism.
+        When set, selects the backend and internal workspace family.
     source_format : str
-        Source weight format for ``quant_mode="w4a16"`` — ``"modelopt"`` or
+        Source weight format for ``quant_mode="w4a16"``. ``"modelopt_e4m3_k32"``
+        accepts logical E4M3 scales shaped ``[E, N, K // 32]`` with per-expert
+        FP32 global scales and E2M1 weights. Other formats include ``"modelopt"`` or
         ``"compressed_tensors"``.  Defaults to ``"modelopt"``.
 
     Returns
@@ -494,6 +500,11 @@ class B12xMoEWrapper:
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
         self.quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
+        if self.quant_mode == "w4a8_fp8_exact":
+            raise NotImplementedError(
+                "w4a8_fp8_exact is supported by b12x_fused_moe; "
+                "B12xMoEWrapper planning is not supported yet"
+            )
         self.activation_precision = _activation_precision_from_quant_mode(
             self.quant_mode
         )
