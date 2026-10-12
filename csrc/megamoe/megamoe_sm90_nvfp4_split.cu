@@ -8,57 +8,16 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include "megamoe_sm90_common.cuh"
 #include "megamoe_sm90_nvfp4_split_config.inc"
-#include "tvm_ffi_utils.h"
 
 namespace flashinfer::megamoe {
 namespace {
 
 namespace cfg = ::flashinfer::megamoe::config;
 
-inline CUtensorMapDataType tma_dtype(DLDataType dt) {
-  if (dt.code == kDLFloat8_e4m3fn) return CU_TENSOR_MAP_DATA_TYPE_UINT8;
-  if (dt.code == kDLFloat && dt.bits == 32) return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
-  return CU_TENSOR_MAP_DATA_TYPE_UINT8;
-}
-
-inline CUtensorMapSwizzle tma_swizzle(int mode) {
-  return mode == 128 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE;
-}
-
-CUtensorMap make_tma_2d_desc(void* ptr, DLDataType dtype, int gmem_inner_dim, int gmem_outer_dim,
-                             int smem_inner_dim, int smem_outer_dim, int gmem_outer_stride,
-                             int swizzle_mode) {
-  const int elem_size = (dtype.bits * dtype.lanes) / 8;
-  if (swizzle_mode != 0) smem_inner_dim = swizzle_mode / elem_size;
-  CUtensorMap tm{};
-  const cuuint64_t gd[2] = {static_cast<cuuint64_t>(gmem_inner_dim),
-                            static_cast<cuuint64_t>(gmem_outer_dim)};
-  const cuuint32_t sd[2] = {static_cast<cuuint32_t>(smem_inner_dim),
-                            static_cast<cuuint32_t>(smem_outer_dim)};
-  const cuuint64_t gs[1] = {
-      static_cast<cuuint64_t>(static_cast<int64_t>(gmem_outer_stride) * elem_size)};
-  const cuuint32_t es[2] = {1, 1};
-  const CUresult res =
-      cuTensorMapEncodeTiled(&tm, tma_dtype(dtype), 2, ptr, gd, gs, sd, es,
-                             CU_TENSOR_MAP_INTERLEAVE_NONE, tma_swizzle(swizzle_mode),
-                             CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_ICHECK_EQ(res, CUDA_SUCCESS) << "cuTensorMapEncodeTiled failed: " << res;
-  return tm;
-}
-
-inline int tma_aligned_size(int size, int elem_size) {
-  const int t = 16 / elem_size;
-  return (size + t - 1) / t * t;
-}
-
-CUtensorMap make_tma_sf_desc(void* ptr, DLDataType dtype, int shape_mn, int shape_k, int block_mn,
-                             int gran_k) {
-  const int elem_size = (dtype.bits * dtype.lanes) / 8;
-  shape_mn = tma_aligned_size(shape_mn, elem_size);
-  return make_tma_2d_desc(ptr, dtype, shape_mn, (shape_k + gran_k - 1) / gran_k, block_mn, 1,
-                          shape_mn, 0);
-}
+using detail::make_tma_2d_desc;
+using detail::make_tma_sf_desc;
 
 void launch_clustered(void* kernel, int threads, int smem, int cluster, void** args,
                       cudaStream_t stream) {
@@ -147,3 +106,40 @@ void sm90_nvfp4_mega_moe_split_launch(void* y, int* stats, int num_tokens,
 }
 
 }  // namespace flashinfer::megamoe
+
+using tvm::ffi::Array;
+using tvm::ffi::Optional;
+using tvm::ffi::TensorView;
+
+namespace flashinfer::megamoe {
+
+using detail::offset_ptr;
+
+void megamoe_sm90_nvfp4_split(TensorView y, TensorView symm_buffer, Array<int64_t> symm_buffer_ptrs,
+                              int64_t rank_idx, TensorView l1_weights, TensorView l2_weights,
+                              Array<int64_t> offsets, int64_t num_tokens,
+                              Optional<TensorView> cumulative_local_expert_recv_stats,
+                              Optional<TensorView> l1_global_scales,
+                              Optional<TensorView> l2_global_scales) {
+  namespace cfg = ::flashinfer::megamoe::config;
+  TVM_FFI_ICHECK_EQ(symm_buffer_ptrs.size(), cfg::kNumRanks);
+  TVM_FFI_ICHECK_GE(num_tokens, 1);
+  TVM_FFI_ICHECK_LE(num_tokens, cfg::kNumMaxTokensPerRank);
+
+  const std::vector<int64_t> ptrs(symm_buffer_ptrs.begin(), symm_buffer_ptrs.end());
+  int* stats = detail::optional_tensor_ptr<int>(cumulative_local_expert_recv_stats);
+  const float* gs1 = detail::optional_tensor_ptr<const float>(l1_global_scales);
+  const float* gs2 = detail::optional_tensor_ptr<const float>(l2_global_scales);
+
+  sm90_nvfp4_mega_moe_split_launch(
+      y.data_ptr(), stats, static_cast<int>(num_tokens), ptrs, static_cast<int>(rank_idx),
+      offset_ptr(symm_buffer, offsets[5]), offset_ptr(symm_buffer, offsets[6]),
+      offset_ptr(symm_buffer, offsets[7]), offset_ptr(symm_buffer, offsets[8]),
+      l1_weights.data_ptr(), l2_weights.data_ptr(), l1_weights.size(2), l1_weights.stride(1),
+      l2_weights.size(2), l2_weights.stride(1), gs1, gs2, get_stream(y.device()));
+}
+
+}  // namespace flashinfer::megamoe
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(megamoe_sm90_nvfp4_split,
+                              flashinfer::megamoe::megamoe_sm90_nvfp4_split);

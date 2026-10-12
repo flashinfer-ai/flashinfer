@@ -337,4 +337,35 @@ struct Buffer {
   }
 };
 
+// One allocation ABI shared by NVFP4 fused/split and MXFP4 fused. Activation
+// scales reserve per-64 capacity for L2; BN256 kernels use its dense per-128
+// prefix. The combine region is indexed by the original token and top-k slot.
+struct MegaMoEBuffers {
+  Workspace workspace;
+  Buffer input_token_buffer, input_sf_buffer, input_topk_idx_buffer, input_topk_weights_buffer;
+  Buffer l1_token_buffer, l1_sf_buffer, l1_topk_weights_buffer;
+  Buffer l2_token_buffer, l2_sf_buffer, combine_token_buffer;
+
+  CUTLASS_HOST_DEVICE
+  MegaMoEBuffers(void* base, uint32_t ranks, uint32_t experts, uint32_t capacity, uint32_t topk,
+                 uint32_t hidden, uint32_t intermediate, uint32_t pool_tokens,
+                 uint32_t sf_pool_tokens)
+      : workspace(base, ranks, experts, capacity, topk),
+        input_token_buffer(Data(hidden), 1, capacity, workspace.get_end_ptr()),
+        input_sf_buffer(Data(hidden / 32, false), 1, capacity, input_token_buffer.get_end_ptr()),
+        input_topk_idx_buffer(Data(topk * sizeof(int64_t), false), 1, capacity,
+                              input_sf_buffer.get_end_ptr()),
+        input_topk_weights_buffer(Data(topk * sizeof(float), false), 1, capacity,
+                                  input_topk_idx_buffer.get_end_ptr()),
+        l1_token_buffer(Data(hidden), 1, pool_tokens, input_topk_weights_buffer.get_end_ptr()),
+        l1_sf_buffer(Data(hidden / 32, false), 1, sf_pool_tokens, l1_token_buffer.get_end_ptr()),
+        l1_topk_weights_buffer(Data(sizeof(float), false), 1, pool_tokens,
+                               l1_sf_buffer.get_end_ptr()),
+        l2_token_buffer(Data(intermediate), 1, pool_tokens, l1_topk_weights_buffer.get_end_ptr()),
+        l2_sf_buffer(Data(intermediate / 16, false), 1, sf_pool_tokens,
+                     l2_token_buffer.get_end_ptr()),
+        combine_token_buffer(Data(hidden * sizeof(uint16_t)), topk, capacity,
+                             l2_sf_buffer.get_end_ptr()) {}
+};
+
 }  // namespace flashinfer::megamoe::layout

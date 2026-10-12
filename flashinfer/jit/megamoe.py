@@ -1,4 +1,4 @@
-"""JIT module generation for the SM90 NVFP4 MegaMoE kernel.
+"""JIT module generation for the three SM90 FP4 MegaMoE paths.
 
 The kernel resolves its shared-memory layout, task schedule and dispatch
 protocol at compile time, so one module is built per (shape, plan) pair. The
@@ -24,6 +24,37 @@ def _csrc_dir() -> Path:
         return checkout
     raise FileNotFoundError(
         f"MegaMoE CUDA sources not found (checked {installed}, {checkout})"
+    )
+
+
+def _gen_fp4_module(uri, template_name, filenames, render_args, use_fast_math):
+    """Shared config rendering, source staging and CUDA build policy."""
+    csrc = _csrc_dir()
+    directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    directory.mkdir(parents=True, exist_ok=True)
+    template = jinja2.Template((csrc / f"{template_name}.jinja").read_text())
+    write_if_different(
+        directory / f"{template_name}.inc", template.render(**render_args)
+    )
+    sources = []
+    for filename in filenames:
+        source = directory / filename
+        write_if_different(source, (csrc / filename).read_text())
+        sources.append(source)
+    return gen_jit_spec(
+        uri,
+        sources,
+        extra_cuda_cflags=[
+            "-std=c++20",
+            "--expt-relaxed-constexpr",
+            "--expt-extended-lambda",
+            "--ptxas-options=--register-usage-level=5",
+            "-DENABLE_BF16",
+            "-DENABLE_FP8",
+        ],
+        extra_cflags=["-std=c++20"],
+        extra_include_paths=[directory, csrc, jit_env.FLASHINFER_CSRC_DIR],
+        use_fast_math=use_fast_math,
     )
 
 
@@ -77,15 +108,12 @@ def gen_megamoe_sm90_nvfp4_module(
         activation_clamp,
         fast_math,
     )
-    csrc = _csrc_dir()
-    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
-    os.makedirs(gen_directory, exist_ok=True)
-
-    with open(csrc / "megamoe_sm90_nvfp4_config.jinja") as f:
-        config_templ = jinja2.Template(f.read())
-    write_if_different(
-        gen_directory / "megamoe_sm90_nvfp4_config.inc",
-        config_templ.render(
+    # Fused compiler fast-math follows the source policy.
+    return _gen_fp4_module(
+        uri,
+        "megamoe_sm90_nvfp4_config",
+        ("megamoe_sm90_nvfp4_fused.cu",),
+        dict(
             num_sms=num_sms,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
             num_experts=num_experts,
@@ -110,35 +138,7 @@ def gen_megamoe_sm90_nvfp4_module(
             no_clean_barrier=plan.no_clean_barrier,
             spin_debug=os.environ.get("FLASHINFER_MEGAMOE_SPIN_DEBUG", "0") == "1",
         ),
-    )
-
-    source_paths = []
-    for filename in ("megamoe_sm90_nvfp4_fused.cu", "megamoe_sm90_nvfp4_binding.cu"):
-        dest = gen_directory / filename
-        with open(csrc / filename) as f:
-            write_if_different(dest, f.read())
-        source_paths.append(dest)
-
-    return gen_jit_spec(
-        uri,
-        source_paths,
-        # The kernels take a float non-type template parameter (the activation
-        # clamp), which needs C++20. The register-usage level keeps the
-        # persistent kernel at one CTA per SM.
-        extra_cuda_cflags=[
-            "-std=c++20",
-            "--expt-relaxed-constexpr",
-            "--expt-extended-lambda",
-            "--ptxas-options=--register-usage-level=5",
-            "-DENABLE_BF16",
-            "-DENABLE_FP8",
-        ],
-        extra_cflags=["-std=c++20"],
-        extra_include_paths=[gen_directory, jit_env.FLASHINFER_CSRC_DIR],
-        # kFastMath only switches expf/division in the source; the module-wide
-        # -use_fast_math must follow it, or nvcc rewrites the precise branch
-        # into intrinsics and flushes denormals anyway.
-        use_fast_math=fast_math,
+        fast_math,
     )
 
 
@@ -198,7 +198,7 @@ def gen_megamoe_sm90_nvfp4_split_plan_module(
         [dest],
         extra_cuda_cflags=["-std=c++20", "--expt-relaxed-constexpr"],
         extra_cflags=["-std=c++20"],
-        extra_include_paths=[gen_directory, jit_env.FLASHINFER_CSRC_DIR],
+        extra_include_paths=[gen_directory, csrc, jit_env.FLASHINFER_CSRC_DIR],
     )
 
 
@@ -258,15 +258,12 @@ def gen_megamoe_sm90_nvfp4_split_module(
         activation_clamp,
         fast_math,
     )
-    csrc = _csrc_dir()
-    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
-    os.makedirs(gen_directory, exist_ok=True)
-
-    with open(csrc / "megamoe_sm90_nvfp4_split_config.jinja") as f:
-        templ = jinja2.Template(f.read())
-    write_if_different(
-        gen_directory / "megamoe_sm90_nvfp4_split_config.inc",
-        templ.render(
+    # Split kFastMath selects source intrinsics; retain denormals in this family.
+    return _gen_fp4_module(
+        uri,
+        "megamoe_sm90_nvfp4_split_config",
+        ("megamoe_sm90_nvfp4_split.cu",),
+        dict(
             num_sms=num_sms,
             num_ranks=num_ranks,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
@@ -286,32 +283,60 @@ def gen_megamoe_sm90_nvfp4_split_module(
             activation_clamp=activation_clamp,
             fast_math=fast_math,
         ),
+        False,
     )
-    source_paths = []
-    for filename in (
-        "megamoe_sm90_nvfp4_split.cu",
-        "megamoe_sm90_nvfp4_split_binding.cu",
-    ):
-        dest = gen_directory / filename
-        with open(csrc / filename) as f:
-            write_if_different(dest, f.read())
-        source_paths.append(dest)
 
+
+def gen_megamoe_sm90_layout_module() -> JitSpec:
+    csrc = _csrc_dir()
     return gen_jit_spec(
-        uri,
-        source_paths,
-        extra_cuda_cflags=[
-            "-std=c++20",
-            "--expt-relaxed-constexpr",
-            "--expt-extended-lambda",
-            "--ptxas-options=--register-usage-level=5",
-            "-DENABLE_BF16",
-            "-DENABLE_FP8",
-        ],
+        "megamoe_sm90_layout",
+        [csrc / "megamoe_sm90_layout.cu"],
+        extra_include_paths=[csrc, jit_env.FLASHINFER_CSRC_DIR],
+        extra_cuda_cflags=["-std=c++20", "--expt-relaxed-constexpr"],
         extra_cflags=["-std=c++20"],
-        extra_include_paths=[gen_directory, jit_env.FLASHINFER_CSRC_DIR],
-        # The split kernels are built without -use_fast_math even when
-        # kFastMath is set: kFastMath already selects __expf/fast_rcp in the
-        # source, and the flag would only add denormal flushing on top.
-        use_fast_math=False,
+    )
+
+
+def gen_megamoe_sm90_mxfp4_module(
+    plan,
+    num_sms,
+    num_ranks,
+    num_max_tokens_per_rank,
+    num_experts,
+    num_topk,
+    hidden,
+    intermediate_hidden,
+    activation_clamp,
+    fast_math,
+) -> JitSpec:
+    # Include every compile-time policy in the key, including rank width.
+    uri = get_megamoe_sm90_nvfp4_uri(
+        plan,
+        num_sms,
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        hidden,
+        intermediate_hidden,
+        activation_clamp,
+        fast_math,
+    ).replace("nvfp4", f"mxfp4_r{num_ranks}")
+    return _gen_fp4_module(
+        uri,
+        "megamoe_sm90_mxfp4_config",
+        ("megamoe_sm90_mxfp4_fused.cu",),
+        dict(
+            plan=plan,
+            num_sms=num_sms,
+            num_ranks=num_ranks,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_experts=num_experts,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate_hidden=intermediate_hidden,
+            activation_clamp=activation_clamp,
+            fast_math=fast_math,
+        ),
+        fast_math,
     )

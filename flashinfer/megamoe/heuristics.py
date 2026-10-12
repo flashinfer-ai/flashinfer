@@ -1,12 +1,11 @@
-"""Compile-time plan selection for the SM90 NVFP4 MegaMoE kernel.
+"""Compile-time plans for the SM90 NVFP4 and MXFP4 MegaMoE kernels.
 
 Every field returned here becomes a template parameter of the CUDA kernel, so
 the plan must be resolved on the Python side before the JIT module is built
 (FlashInfer renders them into ``megamoe_sm90_nvfp4_config.inc`` via Jinja).
 
-The tuning tables are measured values carried over verbatim from the reference
-implementation; a shape outside every bucket falls back to the generic dev-m
-schedule below, which is correct for any geometry but not individually tuned.
+Tuning buckets select tile shapes and pipeline depths for H20 and H200.
+Shapes outside those buckets use the generic scheduling policy.
 """
 
 from dataclasses import dataclass
@@ -123,6 +122,88 @@ class FusedPlan:
     no_clean_barrier: bool
     num_max_pool_tokens: int
     num_padded_sf_pool_tokens: int
+
+
+def select_mxfp4_fused_plan(
+    num_sms: int,
+    num_ranks: int,
+    num_experts: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+    num_max_tokens_per_rank: int,
+    num_tokens: int,
+) -> FusedPlan:
+    """Select MXFP4 tile geometry, pipeline depth and decode-warp partition.
+
+    Chunk-major weight tiles are independent of the selected BLOCK_N.
+    """
+    if num_sms <= 1:
+        raise ValueError("num_sms must be greater than one")
+    if num_ranks <= 0 or num_ranks > 32 or num_ranks & (num_ranks - 1):
+        raise ValueError("num_ranks must be a power of two in [1, 32]")
+    if num_experts <= 0 or num_experts % num_ranks:
+        raise ValueError("num_experts must divide evenly across ranks")
+    if not 0 < num_topk <= min(32, num_experts):
+        raise ValueError("num_topk must be in [1, min(32, num_experts)]")
+    if (
+        hidden <= 0
+        or hidden % 256
+        or intermediate_hidden <= 0
+        or intermediate_hidden % 128
+    ):
+        raise ValueError(
+            "hidden must be a multiple of 256 and intermediate_hidden of 128"
+        )
+    if not 0 < num_tokens <= num_max_tokens_per_rank:
+        raise ValueError("num_tokens must be in (0, num_max_tokens_per_rank]")
+    epr = num_experts // num_ranks
+
+    def max_tokens(bm):
+        return bm * num_experts // (num_ranks * num_topk)
+
+    limit = max_tokens(24) * H20_NUM_SMS // num_sms
+    bm = next((b for b in (8, 24, 32) if num_tokens <= max_tokens(b) * 7 // 10), 32)
+    if num_tokens <= 1:
+        epw, stages = 24, 8
+    elif num_tokens <= 8:
+        epw, stages = 16, 8
+    elif num_tokens <= 16:
+        epw, stages = 24, 8
+    else:
+        epw, stages = 48, 8
+    swap = num_tokens <= max(16, limit)
+    rs = swap
+    if num_sms > H20_NUM_SMS and bm < 16 and num_tokens <= 16:
+        rs = False
+    if swap and bm >= 16:
+        rs = False
+    if not swap:
+        bm, stages = 64, 3
+    elif not rs:
+        stages = 4 if bm == 8 else 3
+    epw = min(epw, epr)
+    while epr % epw:
+        epw -= 1
+    pool = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, epr)
+    return FusedPlan(
+        block_m=bm,
+        block_n=256,
+        num_experts_per_wave=epw,
+        num_stages=stages,
+        smem_size=SMEM_CAPACITY,
+        swap_ab=swap,
+        use_mode2_row_decoder=True,
+        single_active_dispatch_warp=swap,
+        use_interleaved_scheduler=True,
+        rs_swap_ab=rs,
+        push_dispatch=False,
+        no_clean_barrier=False,
+        num_max_pool_tokens=pool,
+        num_padded_sf_pool_tokens=max(
+            get_num_padded_sf_pool_tokens(pool, b) for b in CANDIDATE_BLOCK_M
+        ),
+    )
 
 
 def _select_arm(

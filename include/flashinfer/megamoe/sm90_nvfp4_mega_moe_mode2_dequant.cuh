@@ -51,13 +51,7 @@ __device__ __forceinline__ uint2 load_nvfp4_lut(const uint2* __restrict__ lut_sm
 // Code 0x7f is MegaMoE's documented saturating-448 fallback.
 
 __device__ __forceinline__ uint2 dequant_mode2_lop3_word(const uint32_t packed, const uint2& lut) {
-  const uint32_t magnitude_selectors = packed & 0x77777777u;
-  uint32_t out_hi = byte_perm_unchecked(lut.x, lut.y, magnitude_selectors);
-  uint32_t out_lo = byte_perm_unchecked(lut.x, lut.y, magnitude_selectors >> 16);
-  asm("lop3.b32 %0, %0, %1, 0x80808080, 0xf8;" : "+r"(out_hi) : "r"(packed));
-  const uint32_t shifted = packed << 4;
-  asm("lop3.b32 %0, %0, %1, 0x80808080, 0xf8;" : "+r"(out_lo) : "r"(shifted));
-  return make_uint2(out_hi, out_lo);
+  return detail::decode_fp4_word(packed, lut);
 }
 
 template <int kQuad, bool kHalfStream = false, bool kProducerMBarrier = false,
@@ -302,18 +296,8 @@ __device__ __forceinline__ void dequant_smem_b_inplace_two_rows_mode2_lop3(
 __device__ __forceinline__ void dequant_mode2_lop3_rs_word_pair(
     const uint32_t w_lo, const uint32_t w_hi, const uint2& lut_lo, const uint2& lut_hi,
     const bool keep_hi, uint32_t (&a_frag)[4]) {
-  const uint2 d_lo = dequant_mode2_lop3_word(w_lo, lut_lo);
-  const uint32_t keep_lo = keep_hi ? d_lo.x : d_lo.y;
-  const uint32_t ship_lo = keep_hi ? d_lo.y : d_lo.x;
-  const uint32_t recv_lo = __shfl_xor_sync(0xffffffffu, ship_lo, 1);
-  a_frag[0] = keep_hi ? keep_lo : recv_lo;
-  a_frag[1] = keep_hi ? recv_lo : keep_lo;
-  const uint2 d_hi = dequant_mode2_lop3_word(w_hi, lut_hi);
-  const uint32_t keep_hi_half = keep_hi ? d_hi.x : d_hi.y;
-  const uint32_t ship_hi_half = keep_hi ? d_hi.y : d_hi.x;
-  const uint32_t recv_hi_half = __shfl_xor_sync(0xffffffffu, ship_hi_half, 1);
-  a_frag[2] = keep_hi ? keep_hi_half : recv_hi_half;
-  a_frag[3] = keep_hi ? recv_hi_half : keep_hi_half;
+  detail::assemble_rs_word_pair(dequant_mode2_lop3_word(w_lo, lut_lo),
+                                dequant_mode2_lop3_word(w_hi, lut_hi), keep_hi, a_frag);
 }
 
 // Debug fallback (decode-and-discard): the lane decodes both of its fragment

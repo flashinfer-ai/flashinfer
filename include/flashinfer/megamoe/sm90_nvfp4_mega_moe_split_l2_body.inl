@@ -30,49 +30,7 @@ if (warp_idx == 0 and cute::elect_one_sync()) {
 // intentionally retains its old per-64 physical capacity in stage 1, while
 // the active logical layout densely addresses only per-128 groups.
 // =====================================================================
-const auto workspace = layout::Workspace(sym_buffer.get_base_ptr(), kNumRanks, kNumExperts,
-                                         kNumMaxTokensPerRank, kNumTopk);
-
-constexpr auto fp8_token_layout = layout::Data(kHidden);
-constexpr auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));
-constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
-// Per-128 K float SF: 4 bytes per per-128 group => `kHidden / 32` bytes/token (same as SM100
-// packing)
-constexpr auto fp8_sf_layout = layout::Data(kHidden / 32);
-// Retained physical capacity: 4 bytes per old per-64 group. Logical
-// per-128 scales occupy the dense first half of this allocation.
-constexpr auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / 16);
-constexpr auto input_topk_idx_layout = layout::Data(kNumTopk * sizeof(int64_t), false);
-constexpr auto input_topk_weights_layout = layout::Data(kNumTopk * sizeof(float), false);
-constexpr auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
-
-// Registered input area
-const auto input_token_buffer =
-    layout::Buffer(fp8_token_layout, 1, kNumMaxTokensPerRank, workspace.get_end_ptr());
-const auto input_sf_buffer =
-    layout::Buffer(fp8_sf_layout, 1, kNumMaxTokensPerRank, input_token_buffer.get_end_ptr());
-const auto input_topk_idx_buffer =
-    layout::Buffer(input_topk_idx_layout, 1, kNumMaxTokensPerRank, input_sf_buffer.get_end_ptr());
-const auto input_topk_weights_buffer = layout::Buffer(
-    input_topk_weights_layout, 1, kNumMaxTokensPerRank, input_topk_idx_buffer.get_end_ptr());
-
-// L1 input area
-const auto l1_token_buffer =
-    layout::Buffer(fp8_token_layout, 1, kNumMaxPoolTokens, input_topk_weights_buffer.get_end_ptr());
-const auto l1_sf_buffer =
-    layout::Buffer(fp8_sf_layout, 1, kNumPaddedSFPoolTokens, l1_token_buffer.get_end_ptr());
-const auto l1_topk_weights_buffer =
-    layout::Buffer(l1_topk_weights_layout, 1, kNumMaxPoolTokens, l1_sf_buffer.get_end_ptr());
-
-// L2 input area
-const auto l2_token_buffer = layout::Buffer(fp8_intermediate_token_layout, 1, kNumMaxPoolTokens,
-                                            l1_topk_weights_buffer.get_end_ptr());
-const auto l2_sf_buffer = layout::Buffer(fp8_intermediate_sf_layout, 1, kNumPaddedSFPoolTokens,
-                                         l2_token_buffer.get_end_ptr());
-
-// Combine input area
-const auto combine_token_buffer =
-    layout::Buffer(bf16_token_layout, kNumTopk, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
+#include <flashinfer/megamoe/detail/buffers.inl>
 
 // =====================================================================
 // GEMM data types and shape constants
@@ -652,95 +610,8 @@ if (warp_idx == 0) {
       kNumChunkSlots * kNumEpilogueWarps * kNumChunkBytes <=
       static_cast<uint32_t>(reinterpret_cast<uint8_t*>(barrier_start_ptr) - smem_buffer));
 
-  const auto combine_load_buffer = utils::PatternVisitor([&](const uint32_t& i) {
-    return math::advance_ptr<uint4>(smem_buffer,
-                                    (epilogue_warp_idx + i * kNumEpilogueWarps) * kNumChunkBytes);
-  });
-  const auto combine_store_buffer = math::advance_ptr<uint4>(
-      smem_buffer, (epilogue_warp_idx + kNumEpilogueWarps * 2) * kNumChunkBytes);
+#include <flashinfer/megamoe/detail/combine.inl>
 
-  auto combine_load_barriers = utils::PatternVisitor(
-      [&](const uint32_t& i) { return combine_barriers[i + epilogue_warp_idx * 2]; });
-
-  uint32_t combine_phase = 0;
-  uint32_t load_stage_idx = 0;
-  for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx; token_idx < num_tokens;
-       token_idx += kNumSMs * kNumEpilogueWarps) {
-    const int stored_topk_slot_idx =
-        lane_idx < kNumTopk ? static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() +
-                                                     token_idx * kNumTopk + lane_idx))
-                            : -1;
-    const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
-
-    for (uint32_t chunk = 0; chunk < kNumChunks; ++chunk) {
-      const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;
-
-      uint32_t mask = total_mask;
-      const auto move_mask_and_load = [&](const uint32_t& i) {
-        if (mask) {
-          const uint32_t slot_idx = __ffs(mask) - 1;
-          mask ^= 1 << slot_idx;
-          if (cute::elect_one_sync()) {
-            const auto src_ptr =
-                math::advance_ptr<uint8_t>(combine_token_buffer.get_rank_buffer(slot_idx)
-                                               .get_data_buffer(token_idx)
-                                               .get_base_ptr(),
-                                           chunk_byte_offset);
-            ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i],
-                             kNumChunkBytes);
-            ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);
-          }
-          __syncwarp();
-          return true;
-        }
-        return false;
-      };
-
-      bool do_reduce = move_mask_and_load(load_stage_idx);
-
-      float2 reduced[kNumUint4PerLane * kNumElemsPerUint4] = {};
-      while (do_reduce) {
-        do_reduce = move_mask_and_load(load_stage_idx ^ 1);
-        combine_load_barriers[load_stage_idx]->wait(combine_phase);
-#pragma unroll
-        for (uint32_t j = 0; j < kNumUint4PerLane; ++j) {
-          const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
-          const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
-#pragma unroll
-          for (uint32_t l = 0; l < kNumElemsPerUint4; ++l)
-            ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
-        }
-        combine_phase ^= load_stage_idx;
-        load_stage_idx ^= 1;
-      }
-
-#pragma unroll
-      for (uint32_t j = 0; j < kNumUint4PerLane; ++j) {
-        uint4 casted;
-        auto casted_bf16 = reinterpret_cast<nv_bfloat162*>(&casted);
-#pragma unroll
-        for (uint32_t l = 0; l < kNumElemsPerUint4; ++l)
-          casted_bf16[l] = __float22bfloat162_rn(reduced[j * kNumElemsPerUint4 + l]);
-
-        if (j == 0) {
-          ptx::tma_store_wait<0>();
-          __syncwarp();
-        }
-        ptx::st_shared(combine_store_buffer + j * 32 + lane_idx, casted.x, casted.y, casted.z,
-                       casted.w);
-      }
-      __syncwarp();
-
-      if (cute::elect_one_sync()) {
-        cute::tma_store_fence();
-        ptx::tma_store_1d(math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes +
-                                                   chunk_byte_offset),
-                          combine_store_buffer, kNumChunkBytes);
-        cute::tma_store_arrive();
-      }
-      __syncwarp();
-    }
-  }
   finish_no_dispatch_cleanup();
 }
 #else

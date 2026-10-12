@@ -10,75 +10,16 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include "megamoe_sm90_common.cuh"
 #include "megamoe_sm90_nvfp4_config.inc"
-#include "tvm_ffi_utils.h"
 
 namespace flashinfer::megamoe {
 namespace {
 
 namespace cfg = ::flashinfer::megamoe::config;
 
-inline CUtensorMapDataType tma_dtype(DLDataType dt) {
-  if (dt.code == kDLFloat8_e4m3fn) return CU_TENSOR_MAP_DATA_TYPE_UINT8;
-  if (dt.code == kDLFloat && dt.bits == 32) return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
-  if (dt.code == kDLUInt && dt.bits == 8) return CU_TENSOR_MAP_DATA_TYPE_UINT8;
-  TVM_FFI_ICHECK(false) << "unsupported TMA dtype";
-  return CU_TENSOR_MAP_DATA_TYPE_UINT8;
-}
-
-inline CUtensorMapSwizzle tma_swizzle(int mode) {
-  switch (mode) {
-    case 0:
-      return CU_TENSOR_MAP_SWIZZLE_NONE;
-    case 32:
-      return CU_TENSOR_MAP_SWIZZLE_32B;
-    case 64:
-      return CU_TENSOR_MAP_SWIZZLE_64B;
-    case 128:
-      return CU_TENSOR_MAP_SWIZZLE_128B;
-  }
-  TVM_FFI_ICHECK(false) << "unsupported swizzle mode " << mode;
-  return CU_TENSOR_MAP_SWIZZLE_NONE;
-}
-
-// 2-D tiled TMA descriptor. `gmem_inner_dim` is the contiguous dim; with a
-// swizzle the smem inner extent is dictated by the swizzle width.
-CUtensorMap make_tma_2d_desc(void* ptr, DLDataType dtype, int gmem_inner_dim, int gmem_outer_dim,
-                             int smem_inner_dim, int smem_outer_dim, int gmem_outer_stride,
-                             int swizzle_mode) {
-  const int elem_size = (dtype.bits * dtype.lanes) / 8;
-  if (swizzle_mode != 0) smem_inner_dim = swizzle_mode / elem_size;
-
-  CUtensorMap tensor_map{};
-  const cuuint64_t gmem_dims[2] = {static_cast<cuuint64_t>(gmem_inner_dim),
-                                   static_cast<cuuint64_t>(gmem_outer_dim)};
-  const cuuint32_t smem_dims[2] = {static_cast<cuuint32_t>(smem_inner_dim),
-                                   static_cast<cuuint32_t>(smem_outer_dim)};
-  const cuuint64_t gmem_strides[1] = {
-      static_cast<cuuint64_t>(static_cast<int64_t>(gmem_outer_stride) * elem_size)};
-  const cuuint32_t elem_strides[2] = {1, 1};
-  const CUresult res = cuTensorMapEncodeTiled(
-      &tensor_map, tma_dtype(dtype), 2, ptr, gmem_dims, gmem_strides, smem_dims, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, tma_swizzle(swizzle_mode), CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_ICHECK_EQ(res, CUDA_SUCCESS) << "cuTensorMapEncodeTiled failed: " << res;
-  return tensor_map;
-}
-
-inline int tma_aligned_size(int size, int elem_size) {
-  constexpr int kAlignment = 16;
-  const int t = kAlignment / elem_size;
-  return (size + t - 1) / t * t;
-}
-
-// Scale-factor descriptor: MN-major, unswizzled, one column per K granule.
-CUtensorMap make_tma_sf_desc(void* ptr, DLDataType dtype, int shape_mn, int shape_k, int block_mn,
-                             int gran_k) {
-  const int elem_size = (dtype.bits * dtype.lanes) / 8;
-  shape_mn = tma_aligned_size(shape_mn, elem_size);
-  const int outer = (shape_k + gran_k - 1) / gran_k;
-  return make_tma_2d_desc(ptr, dtype, shape_mn, outer, block_mn, 1, shape_mn, 0);
-}
+using detail::make_tma_2d_desc;
+using detail::make_tma_sf_desc;
 
 }  // namespace
 
@@ -159,3 +100,79 @@ void sm90_nvfp4_mega_moe_fused_launch(void* y, int* cumulative_local_expert_recv
 }
 
 }  // namespace flashinfer::megamoe
+
+using tvm::ffi::Array;
+using tvm::ffi::Optional;
+using tvm::ffi::TensorView;
+
+namespace flashinfer::megamoe {
+
+using detail::offset_ptr;
+
+/*!
+ * \brief Byte offsets of every region inside the symmetric buffer.
+ *
+ * Returns, in order:
+ *   [0] total bytes required
+ *   [1] x            (fp8, [num_max_tokens_per_rank, hidden])
+ *   [2] x_sf         (f32, [num_max_tokens_per_rank, hidden/128])
+ *   [3] topk_idx     (i64, [num_max_tokens_per_rank, num_topk])
+ *   [4] topk_weights (f32, [num_max_tokens_per_rank, num_topk])
+ *   [5] l1_acts      (fp8, [num_max_pool_tokens, hidden])
+ *   [6] l1_acts_sf   (f32, [num_padded_sf_pool_tokens, hidden/128], MN-major)
+ *   [7] l2_acts      (fp8, [num_max_pool_tokens, intermediate_hidden])
+ *   [8] l2_acts_sf   (f32, [num_padded_sf_pool_tokens, intermediate_hidden/64], MN-major)
+ *   [9] num_max_pool_tokens
+ *  [10] num_padded_sf_pool_tokens
+ */
+Array<int64_t> megamoe_sm90_nvfp4_symm_buffer_layout() {
+  return detail::symm_buffer_layout(8, cfg::kNumExperts, cfg::kNumMaxTokensPerRank, cfg::kNumTopk,
+                                    cfg::kHidden, cfg::kIntermediateHidden, cfg::kNumMaxPoolTokens,
+                                    cfg::kNumPaddedSFPoolTokens);
+}
+
+/*! \brief Plan constants this module was compiled for (for assertions in Python). */
+Array<int64_t> megamoe_sm90_nvfp4_plan() {
+  return Array<int64_t>(
+      {static_cast<int64_t>(cfg::kBlockM), static_cast<int64_t>(cfg::kBlockN),
+       static_cast<int64_t>(cfg::kNumStages), static_cast<int64_t>(cfg::kNumExpertsPerWave),
+       static_cast<int64_t>(cfg::kPushDispatch), static_cast<int64_t>(cfg::kNoCleanBarrier),
+       static_cast<int64_t>(cfg::kUseInterleavedScheduler), static_cast<int64_t>(cfg::kRSSwapAB)});
+}
+
+void megamoe_sm90_nvfp4_fused(TensorView y, TensorView symm_buffer, Array<int64_t> symm_buffer_ptrs,
+                              int64_t rank_idx, TensorView l1_weights, TensorView l2_weights,
+                              Array<int64_t> offsets, int64_t num_tokens,
+                              Optional<TensorView> cumulative_local_expert_recv_stats,
+                              Optional<TensorView> l1_global_scales,
+                              Optional<TensorView> l2_global_scales) {
+  TVM_FFI_ICHECK_EQ(symm_buffer_ptrs.size(), 8) << "MegaMoE is an 8-rank kernel";
+  TVM_FFI_ICHECK_GE(num_tokens, 1);
+  TVM_FFI_ICHECK_LE(num_tokens, cfg::kNumMaxTokensPerRank);
+
+  const std::vector<int64_t> ptrs(symm_buffer_ptrs.begin(), symm_buffer_ptrs.end());
+
+  int* stats = detail::optional_tensor_ptr<int>(cumulative_local_expert_recv_stats);
+  const float* gs1 = detail::optional_tensor_ptr<const float>(l1_global_scales);
+  const float* gs2 = detail::optional_tensor_ptr<const float>(l2_global_scales);
+
+  sm90_nvfp4_mega_moe_fused_launch(
+      y.data_ptr(), stats, static_cast<int>(num_tokens), ptrs, static_cast<int>(rank_idx),
+      offset_ptr(symm_buffer, offsets[5]), offset_ptr(symm_buffer, offsets[6]),
+      offset_ptr(symm_buffer, offsets[7]), offset_ptr(symm_buffer, offsets[8]),
+      l1_weights.data_ptr(), l2_weights.data_ptr(),
+      /* l1_acts_stride   */ cfg::kHidden,
+      /* l2_acts_stride   */ cfg::kIntermediateHidden,
+      /* l1_weights_inner */ l1_weights.size(2), l1_weights.stride(1),
+      /* l2_weights_inner */ l2_weights.size(2), l2_weights.stride(1), gs1, gs2,
+      get_stream(y.device()));
+}
+
+}  // namespace flashinfer::megamoe
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(megamoe_sm90_nvfp4_fused,
+                              flashinfer::megamoe::megamoe_sm90_nvfp4_fused);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(megamoe_sm90_nvfp4_symm_buffer_layout,
+                              flashinfer::megamoe::megamoe_sm90_nvfp4_symm_buffer_layout);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(megamoe_sm90_nvfp4_plan,
+                              flashinfer::megamoe::megamoe_sm90_nvfp4_plan);

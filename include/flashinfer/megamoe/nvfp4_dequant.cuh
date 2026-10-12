@@ -10,6 +10,7 @@
 #include <cuda_fp8.h>
 
 #include <cstdint>
+#include <flashinfer/megamoe/detail/fp4_decode.cuh>
 
 namespace flashinfer::megamoe {
 namespace nvfp4 {
@@ -83,10 +84,7 @@ FI_MEGAMOE_NVFP4_INLINE std::uint32_t pack_nvfp4_magnitude_selector(std::uint32_
 
 FI_MEGAMOE_NVFP4_INLINE std::uint32_t byte_perm_unchecked(std::uint32_t a, std::uint32_t b,
                                                           std::uint32_t selector) {
-  // Callers provide 0..7 selector nibbles; raw PTX avoids a redundant 0x7777 mask.
-  std::uint32_t out;
-  asm("prmt.b32 %0, %1, %2, %3;" : "=r"(out) : "r"(a), "r"(b), "r"(selector));
-  return out;
+  return detail::byte_perm_unchecked(a, b, selector);
 }
 
 template <bool kUseDp4aHi = false, bool kUseDp4aLo = kUseDp4aHi>

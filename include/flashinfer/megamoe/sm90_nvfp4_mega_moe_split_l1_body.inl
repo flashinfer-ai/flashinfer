@@ -56,44 +56,7 @@ if (warp_idx == 0 and cute::elect_one_sync()) {
 // intentionally retains its old per-64 physical capacity in stage 1, while
 // the active logical layout densely addresses only per-128 groups.
 // =====================================================================
-const auto workspace = layout::Workspace(sym_buffer.get_base_ptr(), kNumRanks, kNumExperts,
-                                         kNumMaxTokensPerRank, kNumTopk);
-
-constexpr auto fp8_token_layout = layout::Data(kHidden);
-constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
-// Per-128 K float SF: 4 bytes per per-128 group => `kHidden / 32` bytes/token (same as SM100
-// packing)
-constexpr auto fp8_sf_layout = layout::Data(kHidden / 32);
-// Retained physical capacity: 4 bytes per old per-64 group. Logical
-// per-128 scales occupy the dense first half of this allocation.
-constexpr auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / 16);
-constexpr auto input_topk_idx_layout = layout::Data(kNumTopk * sizeof(int64_t), false);
-constexpr auto input_topk_weights_layout = layout::Data(kNumTopk * sizeof(float), false);
-constexpr auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
-
-// Registered input area
-const auto input_token_buffer =
-    layout::Buffer(fp8_token_layout, 1, kNumMaxTokensPerRank, workspace.get_end_ptr());
-const auto input_sf_buffer =
-    layout::Buffer(fp8_sf_layout, 1, kNumMaxTokensPerRank, input_token_buffer.get_end_ptr());
-const auto input_topk_idx_buffer =
-    layout::Buffer(input_topk_idx_layout, 1, kNumMaxTokensPerRank, input_sf_buffer.get_end_ptr());
-const auto input_topk_weights_buffer = layout::Buffer(
-    input_topk_weights_layout, 1, kNumMaxTokensPerRank, input_topk_idx_buffer.get_end_ptr());
-
-// L1 input area
-const auto l1_token_buffer =
-    layout::Buffer(fp8_token_layout, 1, kNumMaxPoolTokens, input_topk_weights_buffer.get_end_ptr());
-const auto l1_sf_buffer =
-    layout::Buffer(fp8_sf_layout, 1, kNumPaddedSFPoolTokens, l1_token_buffer.get_end_ptr());
-const auto l1_topk_weights_buffer =
-    layout::Buffer(l1_topk_weights_layout, 1, kNumMaxPoolTokens, l1_sf_buffer.get_end_ptr());
-
-// L2 input area
-const auto l2_token_buffer = layout::Buffer(fp8_intermediate_token_layout, 1, kNumMaxPoolTokens,
-                                            l1_topk_weights_buffer.get_end_ptr());
-const auto l2_sf_buffer = layout::Buffer(fp8_intermediate_sf_layout, 1, kNumPaddedSFPoolTokens,
-                                         l2_token_buffer.get_end_ptr());
+#include <flashinfer/megamoe/detail/buffers.inl>
 
 // =====================================================================
 // GEMM data types and shape constants
@@ -586,50 +549,8 @@ if (warp_idx < kNumDispatchWarps) {
       }
 
       // Round-robin rank selection (identical to SM100)
-      uint32_t current_rank_in_expert_idx;
-      uint32_t remaining[kNumRanksPerLane];
-#pragma unroll
-      for (uint32_t i = 0; i < kNumRanksPerLane; ++i) remaining[i] = stored_rank_count[i];
-      uint32_t offset = 0;
-      uint32_t token_idx_in_expert = token_idx - expert_start_idx;
-      uint32_t slot_idx = token_idx_in_expert;
-      uint32_t token_idx_in_rank;
-      while (true) {
-        uint32_t num_actives_in_lane = 0;
-        uint32_t min_in_lane = 0xffffffff;
-#pragma unroll
-        for (uint32_t i = 0; i < kNumRanksPerLane; ++i) {
-          num_actives_in_lane += remaining[i] > 0;
-          if (remaining[i] > 0) min_in_lane = cute::min(min_in_lane, remaining[i]);
-        }
-        const uint32_t num_active_ranks = __reduce_add_sync(0xffffffff, num_actives_in_lane);
-        const uint32_t length = __reduce_min_sync(0xffffffff, min_in_lane);
 
-        const uint32_t num_round_tokens = length * num_active_ranks;
-        if (slot_idx < num_round_tokens) {
-          const uint32_t slot_idx_in_round = slot_idx % num_active_ranks;
-          uint32_t num_seen_ranks = 0;
-          current_rank_in_expert_idx = 0;
-#pragma unroll
-          for (uint32_t i = 0; i < kNumRanksPerLane; ++i) {
-            const uint32_t mask = __ballot_sync(0xffffffff, remaining[i] > 0);
-            const uint32_t num_active_lanes = __popc(mask);
-            if (slot_idx_in_round >= num_seen_ranks and
-                slot_idx_in_round < num_seen_ranks + num_active_lanes)
-              current_rank_in_expert_idx =
-                  i * 32 + __fns(mask, 0, slot_idx_in_round - num_seen_ranks + 1);
-            num_seen_ranks += num_active_lanes;
-          }
-          token_idx_in_rank = offset + (slot_idx / num_active_ranks);
-          break;
-        }
-        slot_idx -= num_round_tokens;
-        offset += length;
-#pragma unroll
-        for (uint32_t i = 0; i < kNumRanksPerLane; ++i)
-          remaining[i] -= cute::min(remaining[i], length);
-      }
-
+#include <flashinfer/megamoe/detail/dispatch_rank_selection.inl>
       const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
           current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
       const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;

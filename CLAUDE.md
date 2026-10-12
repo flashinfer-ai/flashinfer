@@ -160,6 +160,10 @@ def test_hopper_attention():
 
 ## Benchmarking
 
+For SM90 NVFP4 fused/split and MXFP4 fused MegaMoE, see
+[`docs/megamoe_sm90.md`](docs/megamoe_sm90.md) for kernel behavior, input layouts,
+API usage, eight-rank correctness tests and H20/H200 performance.
+
 FlashInfer provides a unified benchmarking framework in `benchmarks/flashinfer_benchmark.py`.
 
 **Key features:**
