@@ -55,8 +55,17 @@ struct MainloopW8A16Sm100MixedInput {
 };
 
 // Builder-level schedule tags (what the launcher passes to CollectiveBuilder).
+// *Smem* variants keep the converted A operand in shared memory (SS MMA atoms) instead
+// of TMEM; that is what frees TMEM for two 256-column accumulator stages (rung B4).
 struct KernelW8A16MixedInputSm100 {};
+struct KernelW8A16MixedInputSmem {};
 struct KernelW8A16MixedInput1SmSm100 final : KernelSchedule1Sm, KernelW8A16MixedInputSm100 {};
 struct KernelW8A16MixedInput2SmSm100 final : KernelSchedule2Sm, KernelW8A16MixedInputSm100 {};
+struct KernelW8A16MixedInput1SmSmemSm100 final : KernelSchedule1Sm,
+                                                 KernelW8A16MixedInputSm100,
+                                                 KernelW8A16MixedInputSmem {};
+struct KernelW8A16MixedInput2SmSmemSm100 final : KernelSchedule2Sm,
+                                                 KernelW8A16MixedInputSm100,
+                                                 KernelW8A16MixedInputSmem {};
 
 }  // namespace cutlass::gemm

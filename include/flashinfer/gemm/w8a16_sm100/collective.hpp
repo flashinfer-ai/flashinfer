@@ -1008,14 +1008,20 @@ public:
     auto tArA = make_tensor<ElementA>(tAsA(_,_,_,_,0).shape());  //(Copy,#Copy),MMA_Rest,MMA_M_Rest,MMA_K_Rest (Register)
     auto tArACompute = make_tensor<ElementAMma>(tAsA(_,_,_,_,0).shape());
     constexpr int K_BLOCK_MAX = size<3>(tArA);
-    static_assert(K_BLOCK_MAX % NumTransformationGroups == 0, "k-blocks split evenly across the transform warpgroups");
-    constexpr int K_BLOCKS_PER_GROUP = K_BLOCK_MAX / NumTransformationGroups;
+    // The two transform warpgroups split the per-thread fragment along one mode: the
+    // k-block mode (TMEM-A path: ((Copy,#Copy),MMA_Rest,MMA_M_Rest,MMA_K_Rest) with
+    // MMA_K_Rest = 8 for a 128-wide k-tile) when it divides evenly, otherwise the
+    // chunk mode 1 (smem-A path: ((1,8),8,1,1), K_Rest = 1).
+    constexpr bool kSplitOnK = (K_BLOCK_MAX % NumTransformationGroups == 0);
+    constexpr int kSplitExtent = kSplitOnK ? K_BLOCK_MAX : size<1>(tArA);
+    static_assert(kSplitExtent % NumTransformationGroups == 0, "fragment splits evenly across the transform warpgroups");
+    constexpr int kPerGroup = kSplitExtent / NumTransformationGroups;
     static_assert(KernelConversionMode == ConversionMode::DirectConvert,
                   "the split transform only carries the no-scale path (scales are per-k-block tensors)");
 
-    // Which half of the k-blocks this warpgroup owns.  Dispatched to a compile-time
-    // constant below so every fragment index stays static (a runtime index into the
-    // register fragments would send them to local memory).
+    // Which half this warpgroup owns.  Dispatched to a compile-time constant below so
+    // every fragment index stays static (a runtime index into the register fragments
+    // would send them to local memory).
     const int transform_group = (threadIdx.x % NumTransformationThreads) / NumTransformationThreadsPerGroup;
 
     uint32_t skip_wait = (k_tile_count <= 0);
@@ -1036,22 +1042,48 @@ public:
       auto curr_transform2mma_pipeline_producer_state = transform2mma_pipeline_producer_state;
 
       auto transform_half = [&](auto group) {
-        constexpr int kFirst = decltype(group)::value * K_BLOCKS_PER_GROUP;
-        // Copy this warpgroup's k-blocks of the input A matrix from SMEM
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < K_BLOCKS_PER_GROUP; ++i) {
-          copy(AutoVectorizingCopy{}, tAsA(_,_,_,kFirst + i,load2transform_consumer_index), tArA(_,_,_,kFirst + i));
+        constexpr int kFirst = decltype(group)::value * kPerGroup;
+        if constexpr (kSplitOnK) {
+          // Copy this warpgroup's k-blocks of the input A matrix from SMEM
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < kPerGroup; ++i) {
+            copy(AutoVectorizingCopy{}, tAsA(_,_,_,kFirst + i,load2transform_consumer_index), tArA(_,_,_,kFirst + i));
+          }
+
+          // Loads from SMEM are done (all transform warps). Signal the mainloop load as early as possible
+          transform_bar.sync();
+          load2transform_pipeline.consumer_release(curr_load2transform_pipeline_consumer_state);
+
+          // Dequantize this warpgroup's k-blocks in RF and store them into Smem or Tmem
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < kPerGroup; ++i) {
+            Utils::dequantize_A_kblock_for_transform(tArA, tArACompute, partitioned_extra_info, kFirst + i);
+            copy(dst_copy_A, tArACompute(_,_,_,kFirst + i), tAsACompute(_,_,_,kFirst + i,transform2mma_producer_index));
+          }
         }
+        else {
+          // Split along the chunk mode; each chunk still carries the (unit) k-block mode,
+          // re-expressed as a rank-4 view so the converter's k_block indexing applies.
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < kPerGroup; ++i) {
+            copy(AutoVectorizingCopy{}, tAsA(_,kFirst + i,_,_,load2transform_consumer_index), tArA(_,kFirst + i,_,_));
+          }
 
-        // Loads from SMEM are done (all transform warps). Signal the mainloop load as early as possible
-        transform_bar.sync();
-        load2transform_pipeline.consumer_release(curr_load2transform_pipeline_consumer_state);
+          transform_bar.sync();
+          load2transform_pipeline.consumer_release(curr_load2transform_pipeline_consumer_state);
 
-        // Dequantize this warpgroup's k-blocks in RF and store them into Smem or Tmem
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < K_BLOCKS_PER_GROUP; ++i) {
-          Utils::dequantize_A_kblock_for_transform(tArA, tArACompute, partitioned_extra_info, kFirst + i);
-          copy(dst_copy_A, tArACompute(_,_,_,kFirst + i), tAsACompute(_,_,_,kFirst + i,transform2mma_producer_index));
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < kPerGroup; ++i) {
+            auto src_chunk = tArA(_,kFirst + i,_,_);
+            auto dst_chunk = tArACompute(_,kFirst + i,_,_);
+            auto src4 = make_tensor(src_chunk.data(), make_layout(append(src_chunk.shape(), _1{}), append(src_chunk.stride(), _0{})));
+            auto dst4 = make_tensor(dst_chunk.data(), make_layout(append(dst_chunk.shape(), _1{}), append(dst_chunk.stride(), _0{})));
+            CUTLASS_PRAGMA_UNROLL
+            for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
+              Utils::dequantize_A_kblock_for_transform(src4, dst4, partitioned_extra_info, k_block);
+            }
+            copy(dst_copy_A, tArACompute(_,kFirst + i,_,_), tAsACompute(_,kFirst + i,_,_,transform2mma_producer_index));
+          }
         }
       };
       if (transform_group == 0) {
@@ -1155,13 +1187,22 @@ public:
     auto [src_copy_A, dst_copy_A, tAsA, tAsACompute] =
         setup_copy_ops(sA, InputCopyAtomA{}, sACompute, [&](auto &arg) {return TiledMma::make_fragment_A(arg);}, ComputeCopyAtomA{});
 
-    // Partition of thread -> shared and thread -> RF
-    auto fragment_compute = TiledMma::make_fragment_A(sS);
-    fragment_compute.data() = accumulators.data().get() + cutlass::detail::find_tmem_tensor_col_offset(accumulators);
-    auto r2t_tiled_copy = make_tmem_copy(ComputeCopyAtomA{}, fragment_compute(_,_,_,0));
-    auto src_copy_scale = make_tiled_copy_S(Copy_Atom<DefaultCopy, ElementScale>{}, r2t_tiled_copy);
-
-    auto partitioned_extra_info = Utils::partition_extra_transform_info(TiledMma{}, src_copy_scale, shared_storage);
+    // Partition of thread -> shared and thread -> RF for the scale / zero tensors.
+    // Only meaningful (and only compilable, it builds a TMEM copy) when scales exist;
+    // the no-scale path hands partition_extra_transform_info a copy it ignores, which
+    // is what lets the smem-A (SS) MMA atoms through (rung B4).
+    auto partitioned_extra_info = [&] () {
+      if constexpr (ModeHasScales) {
+        auto fragment_compute = TiledMma::make_fragment_A(sS);
+        fragment_compute.data() = accumulators.data().get() + cutlass::detail::find_tmem_tensor_col_offset(accumulators);
+        auto r2t_tiled_copy = make_tmem_copy(ComputeCopyAtomA{}, fragment_compute(_,_,_,0));
+        auto src_copy_scale = make_tiled_copy_S(Copy_Atom<DefaultCopy, ElementScale>{}, r2t_tiled_copy);
+        return Utils::partition_extra_transform_info(TiledMma{}, src_copy_scale, shared_storage);
+      }
+      else {
+        return Utils::partition_extra_transform_info(TiledMma{}, src_copy_A, shared_storage);
+      }
+    }();
 
     return cute::make_tuple(gA_mkl, dst_copy_A, tAsA, tAsACompute,
                             partitioned_extra_info);

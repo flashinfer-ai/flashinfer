@@ -41,6 +41,53 @@ namespace cutlass::gemm::collective {
 
 namespace detail {
 
+// Fork of sm100_make_trivial_mixed_input_tiled_mma (sm100_common.inl) keyed on the
+// W8A16 tags, with the 2SM smem-A (SS) case upstream leaves out.  ElementAMma is the
+// converted (compute) type; only 16-bit MMA types are needed here.
+template<
+  class ElementAMma,
+  class ElementBMma,
+  class ElementAccumulator,
+  class TileShape_MNK,
+  class ClusterShape_MNK,
+  UMMA::Major UmmaMajorA,
+  UMMA::Major UmmaMajorB,
+  class KernelScheduleType
+>
+constexpr auto
+w8a16_make_tiled_mma() {
+  constexpr int M = cute::size<0>(TileShape_MNK{});
+  constexpr int N = cute::size<1>(TileShape_MNK{});
+  static_assert(cute::is_same_v<ElementBMma, cutlass::half_t> || cute::is_same_v<ElementBMma, cutlass::bfloat16_t>,
+                "W8A16: the MMA type is the 16-bit activation type");
+  constexpr bool AInTmem = UmmaMajorA == cute::UMMA::Major::K &&
+                           !cute::is_base_of_v<KernelW8A16MixedInputSmem, KernelScheduleType>;
+  if constexpr (cute::is_base_of_v<KernelSchedule1Sm, KernelScheduleType>) {
+    if constexpr (AInTmem) {
+      return make_tiled_mma(cute::SM100_MMA_F16BF16_TS<ElementAMma, ElementBMma, ElementAccumulator,
+                                                       M, N, UmmaMajorA, UmmaMajorB>{});
+    }
+    else {
+      return make_tiled_mma(cute::SM100_MMA_F16BF16_SS<ElementAMma, ElementBMma, ElementAccumulator,
+                                                       M, N, UmmaMajorA, UmmaMajorB>{});
+    }
+  }
+  else if constexpr (cute::is_base_of_v<KernelSchedule2Sm, KernelScheduleType>) {
+    if constexpr (AInTmem) {
+      return make_tiled_mma(cute::SM100_MMA_F16BF16_2x1SM_TS<ElementAMma, ElementBMma, ElementAccumulator,
+                                                             M, N, UmmaMajorA, UmmaMajorB>{});
+    }
+    else {
+      return make_tiled_mma(cute::SM100_MMA_F16BF16_2x1SM_SS<ElementAMma, ElementBMma, ElementAccumulator,
+                                                             M, N, UmmaMajorA, UmmaMajorB>{});
+    }
+  }
+  else {
+    static_assert(cutlass::detail::dependent_false<TileShape_MNK> == 0,
+        "Unsupported W8A16 schedule for the SM100 collective builder.");
+  }
+}
+
 // Returns the maximum number of smem tiles that can be used with a given smem capacity, or overrides with manual count.
 template<
   int CapacityBytes,
@@ -83,13 +130,13 @@ w8a16_sm100_compute_stage_count_or_override_mixed_input(StageCountAutoCarveout<c
 
   constexpr int CtaM = get<0>(CtaTileShape_MNK{});
   constexpr int CtaN = get<1>(CtaTileShape_MNK{});
-  static_assert(CtaN <= 128, "Can't support CtaN>128 tiles");
+  static_assert(CtaN <= 256, "CtaN above 256 exceeds the MMA N extent");
   constexpr int CtaK = get<2>(CtaTileShape_MNK{});
   using AtomThrID = typename TiledMma::AtomThrID;
 
   constexpr int TmemColumns = 512;
 
-  constexpr bool IsAComputeinTmem = UmmaMajorA == cute::UMMA::Major::K && !cute::is_base_of_v<KernelTmaWarpSpecializedMixedInputSmemSm100, KernelScheduleType>;
+  constexpr bool IsAComputeinTmem = UmmaMajorA == cute::UMMA::Major::K && !cute::is_base_of_v<KernelW8A16MixedInputSmem, KernelScheduleType>;
   constexpr bool IsAComputeinSmem = !IsAComputeinTmem;
 
   // Detect 2x2 TMEM layout
@@ -223,7 +270,7 @@ struct CollectiveBuilder<
 
   static constexpr int ScalingFactor = 1;
 
-  using TiledMma = decltype(detail::sm100_make_trivial_mixed_input_tiled_mma<ElementAMma, ElementB, ElementAccumulator, TileShape_MNK, ClusterShape_MNK, UmmaMajorA, UmmaMajorB, KernelScheduleType>());
+  using TiledMma = decltype(detail::w8a16_make_tiled_mma<ElementAMma, ElementB, ElementAccumulator, TileShape_MNK, ClusterShape_MNK, UmmaMajorA, UmmaMajorB, KernelScheduleType>());
   using AtomThrID = typename TiledMma::AtomThrID;
   using AtomThrShapeMNK = Shape<decltype(shape<0>(typename TiledMma::ThrLayoutVMNK{})), _1, _1>;
   using CtaTileShape_MNK = decltype(shape_div(TileShape_MNK{}, AtomThrShapeMNK{}));
@@ -250,7 +297,7 @@ struct CollectiveBuilder<
   static constexpr int MMA_M = cute::size<0,0>(MmaShapeA_MK{});
   using CopyAtomPairA = cutlass::gemm::collective::detail::CollectiveMmaEmulatedCopyType<
     Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementA>,
-    cute::conditional_t<(UmmaMajorA == cute::UMMA::Major::K && !cute::is_base_of_v<KernelTmaWarpSpecializedMixedInputSmemSm100, KernelScheduleType>),
+    cute::conditional_t<(UmmaMajorA == cute::UMMA::Major::K && !cute::is_base_of_v<KernelW8A16MixedInputSmem, KernelScheduleType>),
                         cute::conditional_t<(MMA_M == 64 && size(AtomThrID{}) == 1), SM100_TMEM_STORE_16dp256b1x, SM100_TMEM_STORE_32dp32b8x>, // TS Implementation
                         Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementA>>                                         // SS Implementation
   >;

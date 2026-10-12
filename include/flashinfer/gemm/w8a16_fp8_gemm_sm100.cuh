@@ -16,10 +16,10 @@
 #ifndef FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 #define FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 
-// W8A16 GEMM for Blackwell (sm_100a), rung B3: FlashInfer's fork of CUTLASS's
-// mixed-input kernel (w8a16_sm100/) with two transform warpgroups (8 warps, two per
-// SM sub-partition) splitting each k-tile's k-blocks, so the conversion latency of
-// one warp is hidden by the other.
+// W8A16 GEMM for Blackwell (sm_100a), rung B4: FlashInfer's fork of CUTLASS's
+// mixed-input kernel (w8a16_sm100/) with two transform warpgroups and a 2SM
+// 256x256x64 tile whose converted A operand is staged in smem (env-selectable at this
+// rung; measured against the 256x128 TMEM-A tile).
 //
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
@@ -181,8 +181,10 @@ struct W8A16Sm100CutlassType<half> {
 };
 
 // kTileW: weight rows per MMA tile (M'), cluster-level for the 2SM schedule.
-// kTileA: activation rows per CTA tile (N'); the auto-carveout builder caps it at 128.
-template <int kTileW, int kTileA, int kTileK, int kClusterM, bool k2SM>
+// kTileA: activation rows per CTA tile (N'), up to the MMA's 256.
+// kAInSmem: converted A operand staged in smem (SS MMA) instead of TMEM; required when
+// two accumulator stages of kTileA columns already fill TMEM (kTileA == 256).
+template <int kTileW, int kTileA, int kTileK, int kClusterM, bool k2SM, bool kAInSmem = false>
 struct W8A16Sm100Cfg {
   static constexpr int kW = kTileW;
   static constexpr int kA = kTileA;
@@ -191,14 +193,22 @@ struct W8A16Sm100Cfg {
   static constexpr bool kTwoSM = k2SM;
   using TileShape = cute::Shape<cute::Int<kTileW>, cute::Int<kTileA>, cute::Int<kTileK>>;
   using ClusterShape = cute::Shape<cute::Int<kClusterM>, cute::_1, cute::_1>;
-  using MainloopSchedule = std::conditional_t<k2SM, cutlass::gemm::KernelW8A16MixedInput2SmSm100,
-                                              cutlass::gemm::KernelW8A16MixedInput1SmSm100>;
+  using MainloopSchedule = std::conditional_t<
+      k2SM,
+      std::conditional_t<kAInSmem, cutlass::gemm::KernelW8A16MixedInput2SmSmemSm100,
+                         cutlass::gemm::KernelW8A16MixedInput2SmSm100>,
+      std::conditional_t<kAInSmem, cutlass::gemm::KernelW8A16MixedInput1SmSmemSm100,
+                         cutlass::gemm::KernelW8A16MixedInput1SmSm100>>;
   using EpilogueSchedule = std::conditional_t<k2SM, cutlass::epilogue::TmaWarpSpecialized2Sm,
                                               cutlass::epilogue::TmaWarpSpecialized1Sm>;
 };
 
 using W8A16Sm100Cfg2SM256x128 = W8A16Sm100Cfg<256, 128, 128, 2, true>;
 using W8A16Sm100Cfg1SM128x128 = W8A16Sm100Cfg<128, 128, 128, 1, false>;
+// Rung B4: 256-row activation tile halves the transform work per MMA flop; the two
+// 256-column accumulator stages take all of TMEM, so A-compute lives in smem and the
+// k-tile drops to 64 to keep 4+ pipeline stages.
+using W8A16Sm100Cfg2SM256x256 = W8A16Sm100Cfg<256, 256, 64, 2, true, true>;
 
 template <typename T, typename Cfg>
 struct W8A16Sm100Gemm {
@@ -297,15 +307,17 @@ struct W8A16Sm100Gemm {
   }
 };
 
-enum class W8A16Sm100Tile { kAuto, k2SM256x128 = 1, k1SM128x128 = 2 };
+enum class W8A16Sm100Tile { kAuto, k2SM256x128 = 1, k1SM128x128 = 2, k2SM256x256 = 3 };
 
-// FLASHINFER_W8A16_FP8_TILE_SM100 = "2sm256x128" | "1sm128x128" pins the tile; read once.
+// FLASHINFER_W8A16_FP8_TILE_SM100 = "2sm256x128" | "1sm128x128" | "2sm256x256" pins the
+// tile; read once.
 inline W8A16Sm100Tile W8A16Sm100TileEnv() {
   static const W8A16Sm100Tile tile = [] {
     const char* s = std::getenv("FLASHINFER_W8A16_FP8_TILE_SM100");
     if (s == nullptr || *s == '\0') return W8A16Sm100Tile::kAuto;
     if (std::strcmp(s, "2sm256x128") == 0) return W8A16Sm100Tile::k2SM256x128;
     if (std::strcmp(s, "1sm128x128") == 0) return W8A16Sm100Tile::k1SM128x128;
+    if (std::strcmp(s, "2sm256x256") == 0) return W8A16Sm100Tile::k2SM256x256;
     return W8A16Sm100Tile::kAuto;
   }();
   return tile;
@@ -326,6 +338,9 @@ size_t W8A16Fp8GemmSm100WorkspaceBytes(int M, int N, int K, int device_id, int n
     case W8A16Sm100Tile::k1SM128x128:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg1SM128x128>::WorkspaceBytes(M, N, K, device_id,
                                                                         num_sms);
+    case W8A16Sm100Tile::k2SM256x256:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x256>::WorkspaceBytes(M, N, K, device_id,
+                                                                        num_sms);
     default:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128>::WorkspaceBytes(M, N, K, device_id,
                                                                         num_sms);
@@ -340,6 +355,10 @@ cudaError_t W8A16Fp8GemmSm100(const T* act, const __nv_fp8_e4m3* weight, const f
   switch (W8A16Sm100PickTile(M, N, K)) {
     case W8A16Sm100Tile::k1SM128x128:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg1SM128x128>::Run(act, weight, scale, bias, out, M, N, K,
+                                                             workspace, workspace_bytes, device_id,
+                                                             num_sms, stream);
+    case W8A16Sm100Tile::k2SM256x256:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x256>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,
                                                              num_sms, stream);
     default:
