@@ -118,3 +118,95 @@ locality and a 1248 B spill), 28 (textbook separate-tile ping-pong, 0.75x).
 `/home/scratch.ishovkun_gpu/w8a16-results/` (computelab scratch): `rung<N>_*_full.csv`
 (108-row tables, one per tile / device), `rung<N>_ncu_*.txt` (full `ncu --set full`
 dumps with `sm__pipe_tensor_op_hmma_cycles_active`), `rung<N>_log.txt`.
+
+# Blackwell branch (sm_100a, B200)
+
+Branch `w8a16-blackwell` continues the ladder on Blackwell.  Same API, same tests, same
+benchmark (plus TP 1, so 144 rows); a separate JIT module picked by compute capability
+(`gen_w8a16_fp8_gemm_sm100_module`), the Hopper module is untouched.  No prepared weight
+layout on Blackwell.
+
+## Why not the Hopper design
+
+tcgen05.mma takes both operands from shared memory (or A from TMEM), so the fp8 -> bf16
+conversion cannot ride in registers in front of the MMA.  CUTLASS's sm100 mixed-input
+kernel converts in a separate transform warpgroup (TMA -> smem -> registers -> TMEM /
+smem -> MMA); rung B0 wires it up as-is, rung B2 forks it into
+`include/flashinfer/gemm/w8a16_sm100/` (kernel, collective, builder; keyed on W8A16 dispatch
+tags, listed in `.clang-format-ignore` to stay diffable against CUTLASS 4.4) so the warp
+layout, tile shapes and TMEM budget can change.  Mapping: the fp8 weight `[N, K]` is the
+builder's A (M' = N), the activation `[M, K]` is B (N' = M), D `[M', N']` column-major is
+`out[M, N]` row-major; the per-tensor scale is the epilogue alpha (device pointer), the bias
+a per-row broadcast in the fused epilogue.
+
+## Final state (rung B9)
+
+Geometric mean of per-row time ratios over the 24 rows of each M class, B200
+(umb-b200-239, 148 SMs), free-running clocks, auto dispatch.
+
+| M | kernel / cuBLAS | kernel / cast-copy | kernel / rung B0 |
+|---|---|---|---|
+| 1024 | 1.40 | 0.36 | 1.03 |
+| 2048 | 1.13 | 0.40 | 0.91 |
+| 4096 | 1.10 | 0.55 | 0.88 |
+| 8192 | 1.09 | 0.73 | 0.84 |
+| 44160 | 1.11 | 1.04 | 0.82 |
+| 88320 | 1.10 | 1.08 | 0.83 |
+
+Pinned-clock ncu, auto dispatch: 12800x5120 M=8192 (192-row tile) tensor pipe 91.6%
+active / 89.7% elapsed at 753 us; 25600x5120 M=44160 (192) 92.5% / 92.3%; 5120x5120
+M=4096 (192) 87.6% / 83.0%, 126.5 us against cuBLAS 129; 1024x5120 M=2048 (128-row tile)
+56.5% / 40.2%.  cuBLAS itself (nvjet 128x256 2-CTA 6-stage) reaches ~92% on the large
+shape.  0 spills on every instantiation; 68 tests under auto and every pinned tile;
+144/144 rows within the error gate.  Best rows 1.65 PFLOPS.
+
+Ceiling probes (`-DW8A16_PROBE_NO_CONVERT`, transform copies without converting; perf
+only): the 256x128 TMEM-A skeleton reaches 98.9% tensor pipe and 553 us (cuBLAS 644), the
+256x256 smem-A skeleton 94.3% and 606 us.  The conversion instruction stream is the
+whole remaining cost; four instructions per converted pair (prmt, shift, mask, bf16x2
+multiply) is the floor found so far.
+
+## Knobs
+
+| Variable | Effect |
+|---|---|
+| `FLASHINFER_W8A16_FP8_TILE_SM100` | `2sm256x128`, `2sm256x192`, `2sm256x256` or `1sm128x128`: pins the tile instead of the cost model (auto picks among the first three). Read once per process. |
+
+Dispatch (`W8A16Sm100PickTile`): per tile, `ceil(units / (SMs / 2)) * tileA / eff` with
+`units = ceil(N / 256) * ceil(M / tileA)` and eff 1.00 / 1.22 / 1.10 for the 128 / 192 /
+256-row tiles (fitted offline on the B3 / B4 / B8 tables, geomean 1.008x the per-row
+oracle).
+
+## Rungs
+
+| Rung | Commit | Change | Result |
+|---|---|---|---|
+| B0 | 987ad3481 | CUTLASS 4.4 sm100 mixed-input mainloop, 2SM 256x128x128, swap-and-transpose mapping | baseline: 1.54 / 1.38 / 1.30 / 1.30 / 1.34 / 1.31 x cuBLAS; 69.9% tensor pipe |
+| B1 | 64b4a341b | pure-ALU e4m3 -> bf16 / f16 converter (sign-replicating prmt, shift, mask, x2^120) | +2-4% at large M; 73.3%; exact on all 254 finite encodings (new test) |
+| B2 | 7205301ec | fork kernel / collective / builder into FlashInfer, new dispatch tags | parity (identical ncu counts) |
+| B3 | 162fa988b | two transform warpgroups splitting the k-blocks (compile-time group index) | small win: 75.5% |
+| B4 | aea818528 | 2SM 256x256x64 tile, converted A in smem (2SM SS atom added to the forked builder) | MIXED: 78.7% pinned, wins wide rows 7-20%, loses narrow ones up to 2x; env-only |
+| B5 | 49fe38868 | four transform warpgroups | LOSER: 65.8% / 65.2%; +41% instructions (pipeline handshakes per warp) |
+| B5b | c33bec27c | back to two warpgroups | restore |
+| B6 | 6be0c7230 | pipe-balanced converter (mask first, IMAD shift) | LOSER: -4 to -5 points; IMAD latency on the dependent chain |
+| B6b | 8367b0aa4 | restore the B1 converter | restore |
+| B7 | 82c8b2f34 | dispatch between 256x128 and 256x256 by a wave-fill cost model | WIN: 1.46 / 1.31 / 1.20 / 1.22 / 1.21 / 1.18 |
+| B8 | 3c32207a4 | 2SM 256x192x128 tile with A in TMEM (2 acc stages x 192 + 2 A stages x 64 = 512 TMEM cols) | WIN: 91.9% active / 89.1% elapsed on 12800x5120 M=8192; best tile on 20-22 of 24 rows at M >= 8192 |
+| B9 | 62885dae2 | three-way dispatch | WIN: 1.40 / 1.13 / 1.10 / 1.09 / 1.11 / 1.10 x cuBLAS |
+
+## Why the losers lost
+
+- **B5**: every transform warp pays the per-k-tile pipeline handshakes (try_wait, acquire,
+  named barrier, commit) and steals issue slots from the MMA and TMA warps; the convert is
+  instruction-count bound, not latency bound.  (First build dispatched only two of the
+  four groups, leaving half of every k-tile as zeros; an identity-activation probe found it.)
+- **B6**: same four instructions per pair, but the IMAD on the dependent prmt -> shift ->
+  mask -> multiply chain costs more latency than the SHF it replaced, and two transform
+  warps per sub-partition cannot hide it.
+- **B4 on narrow problems**: a 256x256 cluster tile leaves 32 clusters on 148 SMs for
+  N=1024, M=2048; the dispatcher (B7/B9) keeps the 128-row tile there.
+
+## Results directory
+
+`/home/scratch.ishovkun_gpu/w8a16-results/blackwell/`: `rungB<N>_*_b200_full.csv`,
+`rungB<N>_ncu_*.txt`, `rungB5_sass.txt` / `rungB6_sass.txt` (cuobjdump of the module).

@@ -146,12 +146,16 @@ def w8a16_fp8_gemm(
 
     Notes
     -----
-    Hopper only (``sm_90a``: wgmma + TMA).  ``K`` must be a multiple of 64,
-    ``N`` a multiple of 8, and ``act`` / ``weight`` / ``out`` 16-byte aligned
-    (the launcher rejects anything else).  The launcher picks the tile shape
-    (128x256 or 128x128) and the split-K count from a wave-fill cost model;
-    a split run goes through an fp32 workspace that this function allocates,
-    otherwise one persistent block per SM walks the tiles.
+    Hopper (``sm_90a``: wgmma + TMA) and Blackwell (``sm_100a``: tcgen05 + TMA,
+    a FlashInfer fork of CUTLASS's mixed-input mainloop).  ``K`` must be a
+    multiple of 64, ``N`` a multiple of 8, and ``act`` / ``weight`` / ``out``
+    16-byte aligned (the launcher rejects anything else).  On Hopper the
+    launcher picks the tile shape (128x256 or 128x128) and the split-K count
+    from a wave-fill cost model; a split run goes through an fp32 workspace that
+    this function allocates, otherwise one persistent block per SM walks the
+    tiles.  On Blackwell it picks one of three 2SM tiles (256 weight rows by
+    128, 192 or 256 activation rows) from the same kind of model; ``weight_prepared``
+    is Hopper-only there.
 
     Returns
     -------
