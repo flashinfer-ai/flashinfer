@@ -1979,6 +1979,224 @@ def test_batch_decode_paged_token_head_scale_split_kv():
     _check(o_fp8, o_ref, o_orig, "batch_decode_paged_split_kv")
 
 
+# ---------------------------------------------------------------------------
+# 10. K-scale column-mapping regression
+#
+# The per-(token, head) K scale must hit the correct KV column of the S fragment
+# (m16n16 C layout: thread t holds KV columns 2*(t%4)+{0,1,8,9}). A near-uniform
+# scale (the default random-data case) masks a wrong-column bug because the
+# softmax is insensitive to it, so the K data's per-position magnitude ramps ~100x
+# to make the derived scale strongly non-uniform.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+def test_single_prefill_k_scale_column_sensitivity(q_dtype, causal):
+    _skip_bf16_on_sm75(q_dtype)
+    torch.manual_seed(0)
+    dev = "cuda:0"
+    dtype = torch.float8_e4m3fn
+    head_dim = 128
+    qo_len = 16
+    kv_len = 64
+    num_qo_heads = num_kv_heads = 4
+
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=q_dtype).to(dev)
+    mag = torch.logspace(-1, 1, kv_len, device=dev, dtype=torch.float32)
+    # The float32 magnitude ramp promotes the product to float32; cast back to q_dtype so
+    # quantize_token_head's dequant (in x_ref's dtype) is a 16-bit reference input.
+    k_ref = (
+        mag.view(kv_len, 1, 1)
+        * torch.randn(kv_len, num_kv_heads, head_dim, dtype=q_dtype, device=dev)
+    ).to(q_dtype)
+    v_ref = torch.randn(kv_len, num_kv_heads, head_dim, dtype=q_dtype).to(dev)
+
+    k_fp8, k_sf, k_deq = quantize_token_head(k_ref, dtype, head_dim)
+    v_fp8, v_sf, v_deq = quantize_token_head(v_ref, dtype, head_dim)
+
+    o_ref = flashinfer.single_prefill_with_kv_cache(
+        q, k_deq, v_deq, causal=causal, backend="fa2"
+    )
+    o_fp8 = flashinfer.single_prefill_with_kv_cache(
+        q, k_fp8, v_fp8, causal=causal, backend="fa2", kv_cache_sf=(k_sf, v_sf)
+    )
+    # The K scale is strongly non-uniform, so a wrong-column application shifts
+    # the softmax; require a tight match to the dequantized reference.
+    cos = _cos(o_fp8, o_ref)
+    assert cos > 0.999, f"K-scale column sensitivity cos {cos} <= 0.999"
+
+
+# ---------------------------------------------------------------------------
+# 11. V-scale fp16 underflow regression
+#
+# A V scale below the fp16 min subnormal (2^-24) rounds to 0 when converted to
+# half, zeroing the output. The kernel applies the scale to V (b_frag), not P:
+# P*v_scale can underflow in fp16 (P is in [0,1] after softmax), whereas
+# V*v_scale = V_dequant is in range. Case: 1 KV token, E5M2 V = 57344 (max),
+# v_scale = 2^-26 -> output 57344 * 2^-26 = 0.000854 (the bug yields 0). bf16 has
+# fp32's 8-bit exponent, so the same scale is representable and the __hmul2 path
+# must also be correct.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_single_prefill_v_scale_fp16_underflow(q_dtype):
+    _skip_bf16_on_sm75(q_dtype)
+    torch.manual_seed(0)
+    dev = "cuda:0"
+    dtype = torch.float8_e5m2
+    head_dim = 128
+    num_heads = 4
+    qo_len = 1
+    kv_len = 1
+
+    q = torch.randn(qo_len, num_heads, head_dim, dtype=q_dtype).to(dev)
+    # K: a single token, value 1.0 (E5M2), scale 1.0. The logit is irrelevant for
+    # a single KV token (the softmax of one element is 1), so K does not affect
+    # the output magnitude.
+    k_fp8 = torch.full((kv_len, num_heads, head_dim), 1.0, device=dev).to(dtype)
+    k_sf = torch.ones(kv_len, num_heads, dtype=torch.float32, device=dev)
+    k_deq = (k_fp8.to(q_dtype) * k_sf.unsqueeze(-1)).to(q_dtype)
+    # V: a single token, value 57344 (E5M2 max), scale 2^-26 (below the fp16 min
+    # subnormal 2^-24, so the fp16-underflow bug rounds it to 0).
+    v_fp8 = torch.full((kv_len, num_heads, head_dim), 57344.0, device=dev).to(dtype)
+    v_sf = torch.full((kv_len, num_heads), 2.0**-26, dtype=torch.float32, device=dev)
+    v_deq = (v_fp8.to(q_dtype) * v_sf.unsqueeze(-1)).to(q_dtype)
+
+    expected = 57344.0 * 2.0**-26  # 0.0008544921875
+
+    o_ref = flashinfer.single_prefill_with_kv_cache(
+        q, k_deq, v_deq, causal=False, backend="fa2"
+    )
+    o_fp8 = flashinfer.single_prefill_with_kv_cache(
+        q, k_fp8, v_fp8, causal=False, backend="fa2", kv_cache_sf=(k_sf, v_sf)
+    )
+
+    # The single-token output is the dequantized V (P = 1); it must not be zeroed
+    # by the fp16 underflow.
+    assert o_fp8.abs().max().item() > 0, "V-scale fp16 underflow zeroed the output"
+    assert torch.allclose(o_fp8.float(), o_ref.float(), atol=1e-6, rtol=1e-3), (
+        f"V-scale fp16 underflow: o_fp8={o_fp8.flatten()[:4].tolist()} "
+        f"o_ref={o_ref.flatten()[:4].tolist()} expected~{expected}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 12. decode CUDA-graph qo_indptr buffer regression
+#
+# plan(use_token_head_sf=True) forces the tensor-core path, but __init__ only
+# allocates the CUDA-graph qo_indptr buffer when use_tensor_cores was set at
+# construction. With use_cuda_graph=True, use_tensor_cores=False, plan() (for
+# q_len_per_req > 1) and run() must still work: the buffer is allocated lazily in
+# plan().
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("q_len_per_req", [1, 2])
+def test_decode_cudagraph_token_head_sf_qo_indptr(q_len_per_req):
+    torch.manual_seed(0)
+    dev = "cuda:0"
+    head_dim = 128
+    batch_size = 2
+    kv_len = 32
+    num_qo_heads = num_kv_heads = 4
+    page_size = 16
+    q_dtype = torch.float16
+    dtype = torch.float8_e4m3fn
+
+    (
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        paged_kv_cache,
+        _k_deq,
+        _k_orig,
+        kv_sf,
+    ) = _paged_kv(
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        q_dtype,
+        dtype,
+        dev,
+        "HND",
+    )
+
+    num_pages = paged_kv_indptr[-1].item()
+    paged_kv_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=dev)
+    paged_kv_indices_buf = torch.zeros(num_pages, dtype=torch.int32, device=dev)
+    paged_kv_last_page_len_buf = torch.zeros(batch_size, dtype=torch.int32, device=dev)
+
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws,
+        kv_layout="HND",
+        use_cuda_graph=True,
+        use_tensor_cores=False,  # the bug: tensor-core is forced later by plan()
+        paged_kv_indptr_buffer=paged_kv_indptr_buf,
+        paged_kv_indices_buffer=paged_kv_indices_buf,
+        paged_kv_last_page_len_buffer=paged_kv_last_page_len_buf,
+    )
+    fi.plan(
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=q_dtype,
+        kv_data_type=dtype,
+        use_token_head_sf=True,
+        q_len_per_req=q_len_per_req,
+    )
+    assert fi.use_tensor_cores
+    q = torch.randn(
+        batch_size * q_len_per_req, num_qo_heads, head_dim, dtype=q_dtype
+    ).to(dev)
+    o_fp8 = fi.run(q, paged_kv_cache, kv_cache_sf=kv_sf, q_len_per_req=q_len_per_req)
+    assert o_fp8.shape[0] == batch_size * q_len_per_req
+
+
+# ---------------------------------------------------------------------------
+# 13. ragged prefill cutlass module-arg regression
+#
+# The ragged wrapper's cutlass path built get_module_args with a trailing
+# use_token_head_sf, then inserted the device, passing 12 args to get_fmha_module
+# (11 params) -> TypeError even with use_token_head_sf=False. The cutlass branch
+# must drop use_token_head_sf (it is fa2-only, so this branch is only reached with
+# it False). CUTLASS FMHA requires SM100a/SM110a, so this is skipped elsewhere.
+# ---------------------------------------------------------------------------
+def test_ragged_prefill_cutlass_no_type_error():
+    from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
+
+    dev = torch.device("cuda:0")
+    if not (is_sm100a_supported(dev) or is_sm110a_supported(dev)):
+        pytest.skip("CUTLASS FMHA requires SM100a/SM110a")
+    torch.manual_seed(0)
+    head_dim = 128
+    batch_size = 2
+    qo_len = 16
+    kv_len = 32
+    num_qo_heads = num_kv_heads = 4
+    q_dtype = torch.float16
+
+    qo_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device=dev) * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device=dev) * kv_len
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        ws, kv_layout="HND", backend="cutlass"
+    )
+    # plan() builds the cutlass module; the regression was a TypeError here from
+    # passing 12 args to the 11-param get_fmha_module.
+    fi.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        q_data_type=q_dtype,
+        kv_data_type=q_dtype,
+    )
+
+
 if __name__ == "__main__":
     # Quick smoke: one config per entry (head_dim 128, e4m3, fp16, MHA) plus a
     # couple of cheap negative checks.

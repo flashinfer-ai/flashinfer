@@ -6068,12 +6068,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._fmha_v2_qo_indptr = self._qo_indptr_buf.to(torch.int32)
                 self._fmha_v2_kv_indptr = self._kv_indptr_buf.to(torch.int32)
             elif self._backend == "cutlass":
-                # insert the wrapper's device at the 9th position (0-indexed) of
-                # get_module_args. `self.device`, not `qo_indptr.device`: the
-                # caller may pass a host indptr, and the module has to be built
-                # for the device the kernel will run on.
+                # Insert the wrapper's device at position 9 (self.device, not qo_indptr.device:
+                # the caller may pass a host indptr). get_fmha_module takes (..., device,
+                # use_fp16_qk_reduction) with no use_token_head_sf — fa2-only, so this branch
+                # is only reached with it False; slice [9:10] to drop the trailing arg.
                 new_get_module_args = (
-                    get_module_args[:9] + (self.device,) + get_module_args[9:]
+                    get_module_args[:9] + (self.device,) + get_module_args[9:10]
                 )
                 self._cached_module = get_fmha_module(*new_get_module_args)
             elif self._backend != "cudnn":

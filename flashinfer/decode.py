@@ -2140,6 +2140,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # tensor-core (fa2 prefill) path, which reuses the prefill kernel and reads
             # the scale from the separate tensor.
             self._use_tensor_cores = True
+            # __init__ only allocates the CUDA-graph qo_indptr buffer when use_tensor_cores was
+            # set at construction; forcing tensor-core here requires it, so allocate lazily.
+            if self._use_cuda_graph and not hasattr(self, "_qo_indptr_buf"):
+                self._qo_indptr_buf = torch.arange(
+                    self._fixed_batch_size + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
         self._use_token_head_sf = use_token_head_sf
 
         # backend="auto" may resolve to cudnn; decided per plan() so that the

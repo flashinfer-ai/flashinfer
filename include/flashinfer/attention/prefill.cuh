@@ -1538,6 +1538,34 @@ __device__ __forceinline__ void apply_scale_packed2(void* frag, float sx, float 
   }
 }
 
+// Apply the per-(token, head) V scale to a transposed-B (V) fragment. Applied to V (not P)
+// because P*v_scale can underflow in fp16 (P is in [0,1] after softmax and the float32 scale
+// can be < 2^-24, the fp16 min subnormal), whereas V*v_scale = V_dequant is in range. For the
+// transposed-B layout, b_frag[0,2] cover KV rows 2*(t%4)+{0,1} and b_frag[1,3] cover
+// 2*(t%4)+{8,9} in the mma_kv tile, so the 4 scales sit at v_scale + {0,1,8,9}; v_scale is the
+// tile base (already offset by mma_kv*16 + 2*(t%4)).
+template <typename DTypeQ_>
+__device__ __forceinline__ void apply_v_token_head_scale(uint32_t* b_frag, const float* v_scale) {
+  if constexpr (std::is_same_v<DTypeQ_, half>) {
+    // fp16: the float32 scale can be < 2^-24, so it underflows when converted to half; multiply
+    // in fp32 via apply_scale_packed2 and round once.
+    apply_scale_packed2<DTypeQ_>(&b_frag[0], v_scale[0], v_scale[1]);
+    apply_scale_packed2<DTypeQ_>(&b_frag[1], v_scale[8], v_scale[9]);
+    apply_scale_packed2<DTypeQ_>(&b_frag[2], v_scale[0], v_scale[1]);
+    apply_scale_packed2<DTypeQ_>(&b_frag[3], v_scale[8], v_scale[9]);
+  } else {
+    // bf16: the 8-bit exponent matches fp32, so the scale never underflows and __hmul2 is both
+    // correct and faster (one op vs the fp32 upcast).
+    using packed2_ = __nv_bfloat162;
+    const packed2_ scale_lo = __floats2bfloat162_rn(v_scale[0], v_scale[1]);
+    const packed2_ scale_hi = __floats2bfloat162_rn(v_scale[8], v_scale[9]);
+    *(packed2_*)&b_frag[0] = __hmul2(*(packed2_*)&b_frag[0], scale_lo);
+    *(packed2_*)&b_frag[1] = __hmul2(*(packed2_*)&b_frag[1], scale_hi);
+    *(packed2_*)&b_frag[2] = __hmul2(*(packed2_*)&b_frag[2], scale_lo);
+    *(packed2_*)&b_frag[3] = __hmul2(*(packed2_*)&b_frag[3], scale_hi);
+  }
+}
+
 template <typename KTraits, bool REPACK_BF16 = false>
 __device__ __forceinline__ void compute_qk(
     smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, uint32_t* q_smem_offset_r,
@@ -1642,34 +1670,35 @@ __device__ __forceinline__ void compute_qk(
                          KTraits::NUM_MMA_KV * 16 * KV_STRIDE;
     }
   }
-  // Apply the per-(token, head) K scale to the accumulated S fragment, once per
-  // (mma_q, mma_kv), AFTER the mma_d loop. The scale is per KV row (independent of head_dim),
-  // so it factors out of the head_dim reduction: S_scaled = scale_row * (Q . K). Applying it to
-  // the accumulator keeps it in the accumulator's precision (rounded once when S is cast to
-  // DTypeQ for the PV MMA). For the m16n16 C layout, thread t's KV rows are t/4 (elements
-  // 0,1,4,5) and t/4+8 (elements 2,3,6,7) in the mma_kv tile. The scale pointer is already
-  // offset by the KV warp, so the in-tile row is mma_kv*16 + row.
+  // Apply the per-(token, head) K scale to the accumulated S fragment, once per (mma_q, mma_kv)
+  // AFTER the mma_d loop. The scale is per KV token (a column of S = Q @ K^T), independent of
+  // head_dim, so it factors out of the head_dim reduction: S_scaled = scale_token * (Q . K).
   if constexpr (KTraits::USE_TOKEN_HEAD_SF) {
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-      const float sa = k_scale_smem[mma_kv * 16 + lane_idx / 4];
-      const float sb = k_scale_smem[mma_kv * 16 + lane_idx / 4 + 8];
+      // m16n16 C layout: thread t holds KV columns 2*(t%4)+{0,1,8,9}, so the 4 in-tile scales
+      // sit at mma_kv*16 + 2*(t%4) + {0,1,8,9}.
+      const float* k_scale = k_scale_smem + mma_kv * 16 + 2 * (lane_idx % 4);
+      const float s0 = k_scale[0];
+      const float s1 = k_scale[1];
+      const float s8 = k_scale[8];
+      const float s9 = k_scale[9];
 #pragma unroll
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
         if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
-          s_frag[mma_q][mma_kv][0] *= sa;
-          s_frag[mma_q][mma_kv][1] *= sa;
-          s_frag[mma_q][mma_kv][2] *= sb;
-          s_frag[mma_q][mma_kv][3] *= sb;
-          s_frag[mma_q][mma_kv][4] *= sa;
-          s_frag[mma_q][mma_kv][5] *= sa;
-          s_frag[mma_q][mma_kv][6] *= sb;
-          s_frag[mma_q][mma_kv][7] *= sb;
+          s_frag[mma_q][mma_kv][0] *= s0;
+          s_frag[mma_q][mma_kv][1] *= s1;
+          s_frag[mma_q][mma_kv][2] *= s0;
+          s_frag[mma_q][mma_kv][3] *= s1;
+          s_frag[mma_q][mma_kv][4] *= s8;
+          s_frag[mma_q][mma_kv][5] *= s9;
+          s_frag[mma_q][mma_kv][6] *= s8;
+          s_frag[mma_q][mma_kv][7] *= s9;
         } else {
-          apply_scale_packed2<typename KTraits::DTypeQKAccum>(&s_frag[mma_q][mma_kv][0], sa, sa);
-          apply_scale_packed2<typename KTraits::DTypeQKAccum>(&s_frag[mma_q][mma_kv][2], sb, sb);
-          apply_scale_packed2<typename KTraits::DTypeQKAccum>(&s_frag[mma_q][mma_kv][4], sa, sa);
-          apply_scale_packed2<typename KTraits::DTypeQKAccum>(&s_frag[mma_q][mma_kv][6], sb, sb);
+          apply_scale_packed2<typename KTraits::DTypeQKAccum>(&s_frag[mma_q][mma_kv][0], s0, s1);
+          apply_scale_packed2<typename KTraits::DTypeQKAccum>(&s_frag[mma_q][mma_kv][2], s0, s1);
+          apply_scale_packed2<typename KTraits::DTypeQKAccum>(&s_frag[mma_q][mma_kv][4], s8, s9);
+          apply_scale_packed2<typename KTraits::DTypeQKAccum>(&s_frag[mma_q][mma_kv][6], s8, s9);
         }
       }
     }
@@ -2132,52 +2161,6 @@ __device__ __forceinline__ void compute_sfm_v(
 
 #pragma unroll
   for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-    if constexpr (KTraits::USE_TOKEN_HEAD_SF) {
-      // Apply the V scale for mma_kv to the P fragment, once per KV tile. For the transposed
-      // B (V) layout, thread t's KV rows are 2*(t%4)+{0,1} and 2*(t%4)+{8,9} in the mma_kv
-      // tile, so the 4 scales are at mma_kv*16 + 2*(t%4) + {0,1,8,9}. The scale is converted
-      // to DTypeQ once per mma_kv and applied with __hmul2: P is in [0,1] after softmax, so
-      // P*scale <= scale (no fp16/bf16 overflow), and __hmul2 rounds to DTypeQ once. OOB rows
-      // carry scale 1.0, so no NaN pollution.
-      using DTypeQ_ = typename KTraits::DTypeQ;
-      using packed2_ = std::conditional_t<std::is_same_v<DTypeQ_, half>, half2, __nv_bfloat162>;
-      const float* v_scale = v_scale_smem + mma_kv * 16 + 2 * (lane_idx % 4);
-      packed2_ scale_lo, scale_hi;
-      if constexpr (std::is_same_v<DTypeQ_, half>) {
-        scale_lo = __floats2half2_rn(v_scale[0], v_scale[1]);
-        scale_hi = __floats2half2_rn(v_scale[8], v_scale[9]);
-      } else {
-        scale_lo = __floats2bfloat162_rn(v_scale[0], v_scale[1]);
-        scale_hi = __floats2bfloat162_rn(v_scale[8], v_scale[9]);
-      }
-      // The MMA below reads s_frag_f16 (the downcast copy) for a float QK accumulator,
-      // but the raw s_frag (a half) for the fp16 QK-reduction accumulator. s_frag_f16 is
-      // only initialized in the float case, so scale whichever buffer the MMA actually
-      // reads; scaling s_frag_f16 in the half case would touch an uninitialized buffer
-      // and drop the scale.
-#pragma unroll
-      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
-        if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
-          *(packed2_*)&s_frag_f16[mma_q][mma_kv][0] =
-              __hmul2(*(packed2_*)&s_frag_f16[mma_q][mma_kv][0], scale_lo);
-          *(packed2_*)&s_frag_f16[mma_q][mma_kv][2] =
-              __hmul2(*(packed2_*)&s_frag_f16[mma_q][mma_kv][2], scale_lo);
-          *(packed2_*)&s_frag_f16[mma_q][mma_kv][4] =
-              __hmul2(*(packed2_*)&s_frag_f16[mma_q][mma_kv][4], scale_hi);
-          *(packed2_*)&s_frag_f16[mma_q][mma_kv][6] =
-              __hmul2(*(packed2_*)&s_frag_f16[mma_q][mma_kv][6], scale_hi);
-        } else {
-          *(packed2_*)&s_frag[mma_q][mma_kv][0] =
-              __hmul2(*(packed2_*)&s_frag[mma_q][mma_kv][0], scale_lo);
-          *(packed2_*)&s_frag[mma_q][mma_kv][2] =
-              __hmul2(*(packed2_*)&s_frag[mma_q][mma_kv][2], scale_lo);
-          *(packed2_*)&s_frag[mma_q][mma_kv][4] =
-              __hmul2(*(packed2_*)&s_frag[mma_q][mma_kv][4], scale_hi);
-          *(packed2_*)&s_frag[mma_q][mma_kv][6] =
-              __hmul2(*(packed2_*)&s_frag[mma_q][mma_kv][6], scale_hi);
-        }
-      }
-    }
 #pragma unroll
     for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
       if (mma_d >= d_base && mma_d < d_base + KTraits::NUM_MMA_D_VO_TILE) {
@@ -2222,8 +2205,16 @@ __device__ __forceinline__ void compute_sfm_v(
             *(packed2_*)&b_frag[2] = __hmul2(*(packed2_*)&b_frag[2], scale_lo);
             *(packed2_*)&b_frag[3] = __hmul2(*(packed2_*)&b_frag[3], scale_hi);
           }
+          if constexpr (KTraits::USE_TOKEN_HEAD_SF) {
+            apply_v_token_head_scale<typename KTraits::DTypeQ>(
+                b_frag, v_scale_smem + mma_kv * 16 + 2 * (lane_idx % 4));
+          }
         } else {
           v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
+          if constexpr (KTraits::USE_TOKEN_HEAD_SF) {
+            apply_v_token_head_scale<typename KTraits::DTypeQ>(
+                b_frag, v_scale_smem + mma_kv * 16 + 2 * (lane_idx % 4));
+          }
         }
         const uint32_t mma_d_local = mma_d - d_base;
 #pragma unroll
@@ -2934,7 +2925,9 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
               &v_smem_bf16, &v_smem_offset_r_bf16,
               smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
                                          16 * KTraits::NUM_MMA_D_VO),
-              lane_idx, s_frag, o_frag, d, d_base);
+              lane_idx, s_frag, o_frag, d, d_base,
+              smem_storage.v_scale_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
+                                            16));
         } else {
           compute_sfm_v<KTraits>(
               &v_smem, &v_smem_offset_r,
@@ -3972,32 +3965,6 @@ __device__ __forceinline__ void vosplit_compute_pv(
       a_frag[mma_q][2] = *(uint32_t*)&p_smem[r0 * CTA_TILE_KV + c0 + 8];
       a_frag[mma_q][3] = *(uint32_t*)&p_smem[(r0 + 8) * CTA_TILE_KV + c0 + 8];
     }
-    if constexpr (KTraits::USE_TOKEN_HEAD_SF) {
-      // Apply the per-(token, head) V scale for mma_kv to the P A-fragment, once per KV tile
-      // (mirrors compute_sfm_v's V path). The scale is per-KV-row (the mma_kv dimension),
-      // independent of the VO column, so it factors out of the local_d loop and is applied here
-      // before the MMA. Thread t's P columns in the mma_kv tile are (t%4)*2+{0,1} and
-      // (t%4)*2+{8,9}, so the 4 scales sit at mma_kv*16 + 2*(t%4) + {0,1,8,9}. P is in [0,1]
-      // after softmax, so P*scale <= scale (no fp16/bf16 overflow); out-of-bounds rows carry
-      // scale 1.0 (produce_kv_token_head_sf), so no NaN pollution.
-      using packed2 = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, __nv_bfloat162>;
-      const float* v_scale = smem_storage->v_scale_smem_ptr() + mma_kv * 16 + 2 * (lane_idx % 4);
-      packed2 scale_lo, scale_hi;
-      if constexpr (std::is_same_v<DTypeQ, half>) {
-        scale_lo = __floats2half2_rn(v_scale[0], v_scale[1]);
-        scale_hi = __floats2half2_rn(v_scale[8], v_scale[9]);
-      } else {
-        scale_lo = __floats2bfloat162_rn(v_scale[0], v_scale[1]);
-        scale_hi = __floats2bfloat162_rn(v_scale[8], v_scale[9]);
-      }
-#pragma unroll
-      for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
-        *(packed2*)&a_frag[mma_q][0] = __hmul2(*(packed2*)&a_frag[mma_q][0], scale_lo);
-        *(packed2*)&a_frag[mma_q][1] = __hmul2(*(packed2*)&a_frag[mma_q][1], scale_lo);
-        *(packed2*)&a_frag[mma_q][2] = __hmul2(*(packed2*)&a_frag[mma_q][2], scale_hi);
-        *(packed2*)&a_frag[mma_q][3] = __hmul2(*(packed2*)&a_frag[mma_q][3], scale_hi);
-      }
-    }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
     constexpr bool USE_SM8X_VEC_V_SCALE = true;
 #else
@@ -4079,6 +4046,10 @@ __device__ __forceinline__ void vosplit_compute_pv(
               *(packed2*)&b_frag[2] = __hmul2(*(packed2*)&b_frag[2], scale_lo);
               *(packed2*)&b_frag[3] = __hmul2(*(packed2*)&b_frag[3], scale_hi);
             }
+          }
+          if constexpr (KTraits::USE_TOKEN_HEAD_SF) {
+            apply_v_token_head_scale<DTypeQ>(
+                b_frag, smem_storage->v_scale_smem_ptr() + mma_kv * 16 + 2 * (lane_idx % 4));
           }
         } else {
           const uint32_t voff = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
