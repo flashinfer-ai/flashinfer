@@ -132,6 +132,135 @@ def test_create_workspace_derives_only_capacity_from_layer_fleet_params():
     layer.destroy()
 
 
+def test_live_profiles_preserve_capacity_and_handle_lifetime():
+    layer, _, _ = _make_layer()
+    layer._kernel.supports_live_token_tuning = True
+    with mock.patch.object(
+        layer._kernel, "prepare_workspace", side_effect=[object(), object()]
+    ):
+        small = layer.create_workspace(64, live_tokens=8)
+        large = layer.create_workspace(64, live_tokens=32)
+    assert small.max_tokens_per_rank == large.max_tokens_per_rank == 64
+    assert (small.live_tokens, large.live_tokens) == (8, 32)
+    assert layer._default_workspace_handle is None
+    assert layer._resolve_workspace(small)[1] is small._backend_workspace
+    with mock.patch.object(layer._kernel, "destroy"):
+        small.destroy()
+        assert not large.is_destroyed
+        assert layer._resolve_workspace(large)[1] is large._backend_workspace
+        layer.destroy()
+    assert large.is_destroyed
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
+        "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig",
+    ],
+)
+def test_live_tactics_change_pool_key_for_all_cached_backends(monkeypatch, config_name):
+    import torch
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    options = {"knobs": "cache"} if config_name.startswith("Sm107") else {}
+    backend = create_mega_kernel(
+        getattr(moe_ep, config_name)(intermediate_size=256, top_k=2, **options)
+    )
+    backend.bind_ep_bootstrap(
+        moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    )
+    cache = SimpleNamespace(
+        live_token_buckets=mock.Mock(return_value=[8, 16, 32]),
+        resolve_knobs=mock.Mock(
+            side_effect=lambda **key: (
+                {"token_in_flag_batch": 4 if key["live_tokens"] <= 16 else 8},
+                "cache",
+            )
+        ),
+    )
+    backend._ep_comm_group = object()
+    monkeypatch.setattr(backend, "_tuning_cache", lambda: cache)
+    fleet = moe_ep.FleetParams(2, 64, 128)
+    assert backend.live_token_buckets(fleet) == [8, 16, 32]
+    keys = [
+        backend._workspace_pool_key(dataclasses.replace(fleet, tuning_live_tokens=n))
+        for n in (8, 16, 32)
+    ]
+    assert keys[0] == keys[1]
+    assert keys[0] != keys[2]
+    backend._workspace_knobs(dataclasses.replace(fleet, tuning_live_tokens=8))
+    assert cache.resolve_knobs.call_count == 3
+    assert all(c.kwargs["max_tokens"] == 64 for c in cache.resolve_knobs.call_args_list)
+
+
+def test_live_profile_pool_shares_only_equal_tactics(monkeypatch, tmp_path):
+    import torch
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.knob_cache import (
+        record_knobs,
+    )
+
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        do_finalize=False,
+        apply_topk_in_fc1=False,
+    )
+    backend = create_mega_kernel(config)
+    backend.bind_ep_bootstrap(
+        moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    )
+    fleet = moe_ep.FleetParams(2, 64, 128)
+    for live, flag in ((8, 4), (16, 4), (32, 8)):
+        record_knobs(
+            {"flag_batch": flag},
+            dtype="nvfp4",
+            world_size=1,
+            hidden=128,
+            intermediate=256,
+            num_experts=2,
+            topk=2,
+            max_tokens=64,
+            live_tokens=live,
+            defer_topk_reduce=True,
+        )
+    assert backend.live_token_buckets(fleet) == [8, 16, 32]
+    keys = [
+        backend._workspace_pool_key(dataclasses.replace(fleet, tuning_live_tokens=n))
+        for n in (8, 16, 32)
+    ]
+    assert keys[0] == keys[1]
+    assert keys[0] != keys[2]
+
+
+def test_sm90_explicit_geometry_bypasses_live_cache(monkeypatch):
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    backend = create_mega_kernel(
+        moe_ep.Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
+            intermediate_size=256, top_k=2, swap_ab=True
+        )
+    )
+    monkeypatch.setattr(backend, "_tuning_cache", mock.Mock(side_effect=AssertionError))
+    fleet = moe_ep.FleetParams(2, 64, 128)
+    assert backend.live_token_buckets(fleet) == []
+    assert backend._workspace_knobs(fleet) is None
+
+
 def test_duplicate_capacity_is_rejected_and_different_capacity_does_not_alias(
     monkeypatch,
 ):

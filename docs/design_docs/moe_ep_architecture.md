@@ -689,3 +689,27 @@ Reconciliation goes through the bootstrap rendezvous store
 allreduce: an allreduce over the EP group would hang on exactly the rank being
 masked out. See `core/comm/fault_tolerance.py` and the runbook for the protocol
 and the recovery state machine.
+
+### Offline live-token tuning
+
+CuTeDSL MegaMoE tuning records both workspace capacity (`max_tokens`) and
+benchmark workload (`live_tokens`) in each JSON entry. Different workloads at
+the same capacity coexist; retuning the same pair replaces its winner. No
+profile tag is required. This applies to SM90, SM100, and SM107 tuners.
+
+Lookup first matches capacity exactly, then selects the smallest recorded live
+bucket at least as large as the workload, or the largest bucket if none is
+large enough. Legacy entries without `live_tokens` retain capacity-based
+fallback. Default callers without a live count select for full capacity.
+
+Before CUDA graph capture, enumerate `layer.live_token_buckets(capacity)`, create
+`layer.create_workspace(capacity, live_tokens=bucket)`, and warm each handle.
+Use the same cache and allocation order on all EP ranks. Select the handle using
+the EP-wide maximum padded token count; the handle retains its tactic and
+addresses through capture and replay. Equal tactics at the same capacity share
+buffers; distinct tactics require additional memory. Restart to reload tuning.
+Explicit knob dictionaries override offline tuning; SM107 requires `knobs="cache"`.
+
+For decode capacity 512 and prefill capacity 16384, record workloads separately
+under each capacity, for example `--max-tokens 512 --live-tokens 128` and
+`--max-tokens 16384 --live-tokens 2048`. Graph replay performs no JSON lookup.

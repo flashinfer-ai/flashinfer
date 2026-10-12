@@ -40,6 +40,58 @@ def _cache_env(monkeypatch, tmp_path):
     return path
 
 
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "sm90.pull_style_cutedsl_megakernel",
+        "sm100.cutedsl_megamoe",
+        "sm107.next_cutedsl_megamoe",
+    ],
+)
+def test_live_tokens_distinguish_workloads(monkeypatch, tmp_path, backend):
+    import importlib.util
+    import json
+    from pathlib import Path
+
+    # Load the host-only cache without importing conflicting kernel namespaces.
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "flashinfer/moe_ep/kernel_src"
+        / backend.replace(".", "/")
+        / "shim/knob_cache.py"
+    )
+    spec = importlib.util.spec_from_file_location("test_metadata_cache", source)
+    assert spec is not None and spec.loader is not None
+    cache = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cache)
+    path = _cache_env(monkeypatch, tmp_path)
+    key = dict(_KEY, max_tokens=512, device="testgpu")
+    if backend.startswith("sm90."):
+        key.pop("combine_dtype")
+        key.update(dtype="fp8", fp8_scale_mode="scalar")
+    cache.record_knobs(_KNOBS, live_tokens=128, **key)
+    entry = json.loads(path.read_text())["entries"][0]
+    assert entry["max_tokens"] == 512
+    assert entry["live_tokens"] == 128
+    assert "profile" not in entry
+    assert cache.lookup_knobs(**key) == _KNOBS
+    cache.record_knobs(_KNOBS, **key)
+    entries = json.loads(path.read_text())["entries"]
+    assert len(entries) == 2
+    assert {e["live_tokens"] for e in entries} == {128, 512}
+    small = {**_KNOBS, "flag_batch": 4}
+    cache.record_knobs(small, live_tokens=128, **key)
+    assert len(json.loads(path.read_text())["entries"]) == 2
+    assert cache.live_token_buckets(**key) == [128, 512]
+    assert cache.lookup_knobs(live_tokens=64, **key) == small
+    assert cache.lookup_knobs(live_tokens=129, **key) == _KNOBS
+    assert cache.live_token_buckets(**{**key, "max_tokens": 1024}) == []
+    assert cache.lookup_knobs(live_tokens=128, **{**key, "max_tokens": 1024}) == _KNOBS
+    for invalid in (-1, 513, True):
+        with pytest.raises(ValueError, match="live_tokens"):
+            cache.record_knobs(_KNOBS, live_tokens=invalid, **key)
+
+
 def test_record_lookup_roundtrip_restores_tuples(monkeypatch, tmp_path):
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         lookup_knobs,

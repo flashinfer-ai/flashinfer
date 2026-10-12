@@ -119,6 +119,28 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
         )
 
+    supports_live_token_tuning = True
+    _knob_cache_module = (
+        "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.knob_cache"
+    )
+
+    def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
+        k = self._kernel_config
+        return dict(
+            dtype="nvfp4",
+            world_size=self.ep_world_size,
+            hidden=fleet_params.token_hidden_size,
+            intermediate=2 * k.intermediate_size,
+            num_experts=fleet_params.num_experts,
+            topk=k.top_k,
+            max_tokens=fleet_params.max_tokens_per_rank,
+            combine_dtype=k.combine_dtype,
+            enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+            apply_topk_in_fc1=k.apply_topk_in_fc1,
+            defer_topk_reduce=not k.do_finalize
+            or self._uses_native_topk_reduce(fleet_params),
+        )
+
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         from ......kernel_src.sm100.cutedsl_megamoe import get_symm_buffer_for_mega_moe
 
@@ -148,7 +170,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc1_alpha=k.fc1_alpha,
             fc2_alpha=k.fc2_alpha,
             fc1_norm_const=k.fc1_norm_const,
-            knobs=k.knobs if isinstance(k.knobs, dict) else None,
+            knobs=self._workspace_knobs(fleet_params),
         )
         if not k.do_finalize:
             workspace._unfinalized_route_map = torch.arange(
@@ -512,7 +534,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             epilogue_pool_key(k.fc1_alpha),
             epilogue_pool_key(k.fc2_alpha),
             epilogue_pool_key(k.fc1_norm_const),
-            knobs_pool_key(k.knobs),
+            knobs_pool_key(self._workspace_knobs(fleet_params)),
         )
 
     def _forget_local_workspace_state(self, workspace) -> None:

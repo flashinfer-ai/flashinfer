@@ -148,6 +148,39 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
         )
 
+    supports_live_token_tuning = True
+    _knob_cache_module = "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.knob_cache"
+
+    def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
+        k = self._kernel_config
+        return dict(
+            dtype=k.kind,
+            world_size=self.ep_world_size,
+            hidden=fleet_params.token_hidden_size,
+            intermediate=k.intermediate_size,
+            num_experts=fleet_params.num_experts,
+            topk=k.top_k,
+            max_tokens=fleet_params.max_tokens_per_rank,
+            fp8_scale_mode=k.fp8_scale_mode,
+        )
+
+    def _has_explicit_geometry(self) -> bool:
+        k = self._kernel_config
+        return any(
+            value is not None
+            for value in (k.swap_ab, k.pingpong, k.mma_tiler_mnk, k.cluster_shape_mnk)
+        )
+
+    def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
+        if self._has_explicit_geometry():
+            return []
+        return super().live_token_buckets(fleet_params)
+
+    def _workspace_knobs(self, fleet_params: FleetParams) -> dict | None:
+        if self._has_explicit_geometry():
+            return None
+        return super()._workspace_knobs(fleet_params)
+
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         # Backend talks only to the pull_style_cutedsl_megakernel shim (never
         # src/ directly).
@@ -168,7 +201,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             kind=k.kind,
             fp8_scale_mode=k.fp8_scale_mode,
             fp8_accum_mode=k.fp8_accum_mode,
-            knobs=k.knobs if isinstance(k.knobs, dict) else None,
+            knobs=self._workspace_knobs(fleet_params),
             swap_ab=k.swap_ab,
             pingpong=k.pingpong,
             mma_tiler_mnk=k.mma_tiler_mnk,
@@ -381,5 +414,5 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             k.fold_producer_warps,
             k.generate_c,
             k.tail_split_pairs,
-            knobs_pool_key(k.knobs),
+            knobs_pool_key(self._workspace_knobs(fleet_params)),
         )

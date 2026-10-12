@@ -149,9 +149,9 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="live token count to stage and time (default: the bucket size). "
         "Use a decode-like count (e.g. 256) to tune for decode steps while "
-        "keeping the engine's buffer bucket; the cache entry is still keyed "
-        "on --max-tokens, so write decode-tuned winners to a separate cache "
-        "file (FLASHINFER_MOE_EP_KNOB_CACHE).",
+        "keeping the engine's buffer bucket. The measured count is recorded as "
+        "live_tokens in JSON; entries are keyed by capacity and live tokens, so "
+        "multiple workloads can share one cache file.",
     )
     parser.add_argument(
         "--skew",

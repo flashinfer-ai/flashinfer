@@ -61,6 +61,11 @@ class MoEEpMegaWorkspace:
         return self._fleet_params.max_tokens_per_rank
 
     @property
+    def live_tokens(self) -> int | None:
+        """Offline workload bucket; does not limit accepted input shapes."""
+        return self._fleet_params.tuning_live_tokens
+
+    @property
     def is_destroyed(self) -> bool:
         """Whether this handle has released its backing workspace."""
 
@@ -140,7 +145,7 @@ class MoEEpMegaLayer(nn.Module):
         # Dict insertion order gives every EP rank the same reverse-allocation
         # collective teardown order. One live profile per capacity also avoids
         # presenting pooled aliases as independent concurrency lanes.
-        self._workspaces: dict[int, MoEEpMegaWorkspace] = {}
+        self._workspaces: dict[tuple[int, int | None], MoEEpMegaWorkspace] = {}
         self._preprocessing_count = 0
         self._destroyed = False
         self._bootstrap_validated = False
@@ -185,12 +190,31 @@ class MoEEpMegaLayer(nn.Module):
             )
         return self._workspace
 
-    def create_workspace(self, max_tokens_per_rank: int) -> MoEEpMegaWorkspace:
+    def live_token_buckets(self, max_tokens_per_rank: int) -> list[int]:
+        """Read offline live-token profiles before capture (same cache on all ranks)."""
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise MoEEpConfigError("Read live-token profiles before CUDA graph capture")
+        return self._kernel.live_token_buckets(
+            dataclasses.replace(
+                self._fleet_params,
+                max_tokens_per_rank=max_tokens_per_rank,
+                tuning_live_tokens=None,
+            )
+        )
+
+    def create_workspace(
+        self,
+        max_tokens_per_rank: int,
+        *,
+        live_tokens: int | None = None,
+    ) -> MoEEpMegaWorkspace:
         """Allocate one reusable capacity profile for this layer.
 
         The handle reuses this layer's transformed weights and backend.  Call
         it collectively and in the same order on all EP ranks, before CUDA
-        graph capture. Only one live handle per capacity is allowed.
+        graph capture. Only one live handle per (capacity, live_tokens) is allowed.
+        ``live_tokens`` selects an offline workload profile without shrinking
+        capacity. Handles retain their compiled tactics and stable addresses.
         """
 
         if isinstance(max_tokens_per_rank, bool) or not isinstance(
@@ -210,18 +234,23 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError(
                 "MegaMoE workspace allocation cannot run during CUDA graph capture"
             )
-        if max_tokens_per_rank in self._workspaces:
+        if live_tokens is not None and not self._kernel.supports_live_token_tuning:
+            raise MoEEpConfigError("This backend does not support live-token tuning")
+        profile_key = (max_tokens_per_rank, live_tokens)
+        if profile_key in self._workspaces:
             raise MoEEpConfigError(
                 "a MegaMoE workspace profile for max_tokens_per_rank="
-                f"{max_tokens_per_rank} already exists on this layer"
+                f"{max_tokens_per_rank}, live_tokens={live_tokens} already exists on this layer"
             )
         fleet_params = dataclasses.replace(
             self._fleet_params,
             max_tokens_per_rank=max_tokens_per_rank,
+            tuning_live_tokens=live_tokens,
         )
         self._kernel.validate_init(self._bootstrap, fleet_params)
         is_default_capacity = (
-            max_tokens_per_rank == self._fleet_params.max_tokens_per_rank
+            live_tokens is None
+            and max_tokens_per_rank == self._fleet_params.max_tokens_per_rank
         )
         if is_default_capacity and self._workspace is not None:
             # Transfer the already-lazy-allocated default profile into the
@@ -234,7 +263,7 @@ class MoEEpMegaLayer(nn.Module):
                 fleet_params,
             )
         handle = MoEEpMegaWorkspace(self, fleet_params, backend_workspace)
-        self._workspaces[max_tokens_per_rank] = handle
+        self._workspaces[profile_key] = handle
         if is_default_capacity:
             self._default_workspace_handle = handle
         return handle
@@ -255,7 +284,10 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError("MegaMoE workspace belongs to a different layer")
         if workspace._destroyed or workspace._backend_workspace is None:
             raise MoEEpConfigError("MegaMoE workspace has been destroyed")
-        if self._workspaces.get(workspace.max_tokens_per_rank) is not workspace:
+        if (
+            self._workspaces.get((workspace.max_tokens_per_rank, workspace.live_tokens))
+            is not workspace
+        ):
             raise MoEEpConfigError(
                 "MegaMoE workspace was not created by this layer or is no longer active"
             )
@@ -264,7 +296,10 @@ class MoEEpMegaLayer(nn.Module):
     def _destroy_workspace_handle(self, workspace: MoEEpMegaWorkspace) -> None:
         if workspace._destroyed:
             return
-        if self._workspaces.get(workspace.max_tokens_per_rank) is not workspace:
+        if (
+            self._workspaces.get((workspace.max_tokens_per_rank, workspace.live_tokens))
+            is not workspace
+        ):
             raise MoEEpConfigError(
                 "MegaMoE workspace was not created by this layer or is no longer active"
             )
@@ -281,8 +316,11 @@ class MoEEpMegaLayer(nn.Module):
         workspace._backend_workspace = None
         if self._default_workspace_handle is workspace:
             self._default_workspace_handle = None
-        if self._workspaces.get(workspace.max_tokens_per_rank) is workspace:
-            del self._workspaces[workspace.max_tokens_per_rank]
+        if (
+            self._workspaces.get((workspace.max_tokens_per_rank, workspace.live_tokens))
+            is workspace
+        ):
+            del self._workspaces[(workspace.max_tokens_per_rank, workspace.live_tokens)]
 
     @property
     def supports_output_view(self) -> bool:

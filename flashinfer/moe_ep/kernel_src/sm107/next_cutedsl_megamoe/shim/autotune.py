@@ -300,6 +300,9 @@ def autotune_sm107_block_scaled_mega_moe(
             "no SM107 candidate passed configuration and sampled correctness checks"
         )
     winner = candidates[best]
+    from flashinfer.moe_ep.core.tuning import tuning_live_tokens
+
+    live_tokens = tuning_live_tokens(num_tokens, cfg.max_tokens_per_rank, process_group)
     if cfg.rank == 0:
         from .knob_cache import record_knobs
 
@@ -314,6 +317,7 @@ def autotune_sm107_block_scaled_mega_moe(
             num_experts=cfg.num_total_experts,
             topk=cfg.num_topk,
             max_tokens=cfg.max_tokens_per_rank,
+            live_tokens=live_tokens,
             p50_us=scores[best],
             source="autotune-cuda-events-sampled-oracle",
             allow_nondeterministic=any(

@@ -110,7 +110,7 @@ def _knobs_from_json(knobs: Dict[str, Any]) -> Dict[str, Any]:
     return {k: tuple(v) if isinstance(v, list) else v for k, v in knobs.items()}
 
 
-def lookup_knobs(
+def _matching_entries(
     *,
     dtype: str,
     world_size: int,
@@ -128,11 +128,11 @@ def lookup_knobs(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
-) -> Optional[Dict[str, Any]]:
+) -> List[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss."""
     path = _cache_path()
     if path is None:
-        return None
+        return []
     key = dict(
         backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
         kernel_variant=kernel_variant,
@@ -161,6 +161,56 @@ def lookup_knobs(
             allow_nondeterministic or not e["knobs"].get("reduce_topk_in_kernel", False)
         )
     ]
+    return matches
+
+
+def live_token_buckets(**kwargs: Any) -> List[int]:
+    from flashinfer.moe_ep.core.tuning import live_buckets
+
+    return live_buckets(_matching_entries(**kwargs), kwargs["max_tokens"])
+
+
+def lookup_knobs(
+    *,
+    dtype: str,
+    world_size: int,
+    hidden: int,
+    intermediate: int,
+    num_experts: int,
+    topk: int,
+    max_tokens: int,
+    live_tokens: Optional[int] = None,
+    combine_dtype: str = "bf16",
+    kernel_variant: str = "inference",
+    device: Optional[str] = None,
+    allow_nondeterministic: bool = False,
+    apply_topk_at_fc1: bool = True,
+    activation: str = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    gate_up_clamp: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    from flashinfer.moe_ep.core.tuning import select_token_entries
+
+    matches = _matching_entries(
+        dtype=dtype,
+        world_size=world_size,
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_experts,
+        topk=topk,
+        max_tokens=max_tokens,
+        combine_dtype=combine_dtype,
+        kernel_variant=kernel_variant,
+        device=device,
+        allow_nondeterministic=allow_nondeterministic,
+        apply_topk_at_fc1=apply_topk_at_fc1,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        gate_up_clamp=gate_up_clamp,
+    )
+    matches = select_token_entries(matches, max_tokens, live_tokens)
     if not matches:
         return None
     at_or_above = [e for e in matches if e["max_tokens"] >= max_tokens]
@@ -181,6 +231,7 @@ def record_knobs(
     num_experts: int,
     topk: int,
     max_tokens: int,
+    live_tokens: Optional[int] = None,
     combine_dtype: str = "bf16",
     kernel_variant: str = "inference",
     device: Optional[str] = None,
@@ -195,6 +246,8 @@ def record_knobs(
 ) -> Optional[str]:
     """Upsert one tuned entry (exact key incl. ``max_tokens``); atomic write.
 
+    ``live_tokens`` distinguishes workloads at the same workspace capacity.
+
     Best-effort: returns the cache path written, or ``None`` when the cache is
     disabled or the write failed.
     """
@@ -202,6 +255,10 @@ def record_knobs(
         raise ValueError(
             "recording in-kernel reduction requires allow_nondeterministic=True"
         )
+    if live_tokens is None:
+        live_tokens = max_tokens
+    if type(live_tokens) is not int or not 0 <= live_tokens <= max_tokens:
+        raise ValueError("live_tokens must be between zero and max_tokens")
     path = _cache_path()
     if path is None:
         return None
@@ -223,6 +280,7 @@ def record_knobs(
         topk=topk,
         combine_dtype=combine_dtype,
         max_tokens=max_tokens,
+        live_tokens=live_tokens,
         knobs=_knobs_to_json(knobs),
         p50_us=p50_us,
         source=source,
@@ -236,6 +294,7 @@ def record_knobs(
             if not (
                 all(e.get(f) == entry[f] for f in _KEY_FIELDS)
                 and e.get("max_tokens") == max_tokens
+                and e.get("live_tokens", e["max_tokens"]) == live_tokens
             )
         ]
         entries.append(entry)
@@ -321,6 +380,7 @@ def resolve_knobs(
     num_experts: int,
     topk: int,
     max_tokens: int,
+    live_tokens: Optional[int] = None,
     combine_dtype: str = "bf16",
     kernel_variant: str = "inference",
     allow_nondeterministic: bool = False,
@@ -342,6 +402,7 @@ def resolve_knobs(
         num_experts=num_experts,
         topk=topk,
         max_tokens=max_tokens,
+        live_tokens=live_tokens,
         combine_dtype=combine_dtype,
         kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,

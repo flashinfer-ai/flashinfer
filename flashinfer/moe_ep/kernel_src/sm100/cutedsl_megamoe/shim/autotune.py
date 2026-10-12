@@ -429,6 +429,9 @@ def autotune_nvfp4_mega_moe(
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
         # Persist for future pure-lookup engine starts; rank 0 writes (the
         # winner is identical on all ranks after the all_reduce).
+        from flashinfer.moe_ep.core.tuning import tuning_live_tokens
+
+        live_tokens = tuning_live_tokens(num_tokens, cfg.num_tokens_per_rank)
         if cfg.rank == 0:
             from .knob_cache import record_knobs
 
@@ -441,6 +444,7 @@ def autotune_nvfp4_mega_moe(
                 num_experts=cfg.num_total_experts,
                 topk=cfg.num_topk,
                 max_tokens=cfg.num_tokens_per_rank,
+                live_tokens=live_tokens,
                 combine_dtype=cfg.combine_dtype,
                 apply_topk_in_fc1=cfg.apply_topk_in_fc1,
                 defer_topk_reduce=cfg.defer_topk_reduce,
@@ -499,6 +503,9 @@ def autotune_mxfp8_mega_moe(
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
         # Persist for future pure-lookup engine starts; rank 0 writes (the
         # winner is identical on all ranks after the all_reduce).
+        from flashinfer.moe_ep.core.tuning import tuning_live_tokens
+
+        live_tokens = tuning_live_tokens(num_tokens, cfg.num_tokens_per_rank)
         if cfg.rank == 0:
             from .knob_cache import record_knobs
 
@@ -511,6 +518,7 @@ def autotune_mxfp8_mega_moe(
                 num_experts=cfg.num_total_experts,
                 topk=cfg.num_topk,
                 max_tokens=cfg.num_tokens_per_rank,
+                live_tokens=live_tokens,
                 p50_us=p50_s * 1e6,
                 source="autotune",
             )
@@ -571,6 +579,9 @@ def autotune_bf16_mega_moe(
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
         # Persist for future pure-lookup engine starts; rank 0 writes (the
         # winner is identical on all ranks after the all_reduce).
+        from flashinfer.moe_ep.core.tuning import tuning_live_tokens
+
+        live_tokens = tuning_live_tokens(num_tokens, cfg.num_tokens_per_rank)
         if cfg.rank == 0:
             from .knob_cache import record_knobs
 
@@ -583,6 +594,7 @@ def autotune_bf16_mega_moe(
                 num_experts=cfg.num_total_experts,
                 topk=cfg.num_topk,
                 max_tokens=cfg.num_tokens_per_rank,
+                live_tokens=live_tokens,
                 p50_us=p50_s * 1e6,
                 source="autotune",
             )
@@ -639,6 +651,9 @@ def autotune_bf16_mxfp8_mega_moe(
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
         # Persist for future pure-lookup engine starts; rank 0 writes (the
         # winner is identical on all ranks after the all_reduce).
+        from flashinfer.moe_ep.core.tuning import tuning_live_tokens
+
+        live_tokens = tuning_live_tokens(num_tokens, cfg.num_tokens_per_rank)
         if cfg.rank == 0:
             from .knob_cache import record_knobs
 
@@ -651,6 +666,7 @@ def autotune_bf16_mxfp8_mega_moe(
                 num_experts=cfg.num_total_experts,
                 topk=cfg.num_topk,
                 max_tokens=cfg.num_tokens_per_rank,
+                live_tokens=live_tokens,
                 p50_us=p50_s * 1e6,
                 source="autotune",
             )

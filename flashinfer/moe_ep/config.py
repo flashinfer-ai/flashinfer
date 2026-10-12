@@ -129,6 +129,9 @@ class FleetParams:
     :mod:`flashinfer.moe_ep.algo_knobs` Fleet-level knobs rather than top-level
     fields. Split-only fields ``dtype_bytes``, ``algorithm``, and ``layout`` are
     ignored by the mega path.
+
+    ``tuning_live_tokens`` selects an offline workload bucket for backends
+    supporting live-token tuning; it never changes the workspace capacity.
     """
 
     num_experts: int
@@ -137,8 +140,17 @@ class FleetParams:
     dtype_bytes: int = 2  # bf16 default; FP8 path overrides
     algorithm: EpAlgorithm = EpAlgorithm.LOW_LATENCY
     layout: EpLayout = EpLayout.EXPERT_MAJOR
+    # Optional offline-tuning workload bucket; capacity remains unchanged.
+    tuning_live_tokens: int | None = None
 
     def __post_init__(self) -> None:
+        if self.tuning_live_tokens is not None and (
+            type(self.tuning_live_tokens) is not int
+            or not 0 <= self.tuning_live_tokens <= self.max_tokens_per_rank
+        ):
+            raise ValueError(
+                "tuning_live_tokens must be an int between zero and capacity"
+            )
         for name in (
             "num_experts",
             "max_tokens_per_rank",

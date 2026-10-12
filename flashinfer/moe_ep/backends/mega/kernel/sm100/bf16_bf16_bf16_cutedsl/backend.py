@@ -97,6 +97,24 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
         )
 
+    supports_live_token_tuning = True
+    _knob_cache_module = (
+        "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.knob_cache"
+    )
+
+    def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
+        k = self._kernel_config
+        return dict(
+            dtype="bf16",
+            world_size=self.ep_world_size,
+            hidden=fleet_params.token_hidden_size,
+            intermediate=k.intermediate_size,
+            num_experts=fleet_params.num_experts,
+            topk=k.top_k,
+            max_tokens=fleet_params.max_tokens_per_rank,
+            enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+        )
+
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         from ......kernel_src.sm100.cutedsl_megamoe import (
             get_symm_buffer_for_bf16_mega_moe,
@@ -113,7 +131,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_world_size,
             gate_up_clamp=_clamp(config),
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
-            knobs=config.knobs if isinstance(config.knobs, dict) else None,
+            knobs=self._workspace_knobs(fleet_params),
         )
         if not config.do_finalize:
             workspace._unfinalized_route_map = torch.arange(
@@ -270,7 +288,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             _clamp(config),
             config.enable_in_kernel_fc2_reduce,
             config.do_finalize,
-            knobs_pool_key(config.knobs),
+            knobs_pool_key(self._workspace_knobs(fleet_params)),
         )
 
     def _forget_workspace_state(self, workspace) -> None:
