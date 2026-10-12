@@ -324,11 +324,13 @@ def validate_inputs(
     a_descale: _torch.Tensor,
     b_descale: _torch.Tensor,
     out: _torch.Tensor,
+    check_m: bool = True,
 ) -> tuple[int, int, int]:
     """Check one ``mm_mxfp8`` problem; return ``(m, n, k)``.
 
     ``a`` is ``(M, K)`` row-major E4M3, ``b`` is ``(K, N)`` column-major E4M3,
-    both scales are 1D uint8 in the 128x4 swizzled layout.
+    both scales are 1D uint8 in the 128x4 swizzled layout. ``check_m=False``
+    skips the checks that depend on M.
     """
     tensors = (a, b, a_descale, b_descale, out)
     if any(not isinstance(tensor, _torch.Tensor) for tensor in tensors):
@@ -354,13 +356,13 @@ def validate_inputs(
     n = b.shape[1]
     if out.shape != (m, n):
         raise ValueError(f"out must have shape {(m, n)}, got {tuple(out.shape)}")
-    if not 1 <= m <= _MAX_M:
+    if check_m and not 1 <= m <= _MAX_M:
         raise ValueError(f"M must be in [1, {_MAX_M}], got {m}")
     if n <= 0 or n % 16:
         raise ValueError(f"N={n} must be a positive multiple of 16")
     if not _k_supported(k):
         raise ValueError(f"K={k} must be a multiple of 256 and at most {_MAX_K}")
-    if a_descale.numel() < _swizzled_scale_len(m, k):
+    if check_m and a_descale.numel() < _swizzled_scale_len(m, k):
         raise ValueError("a_descale is shorter than the swizzled scale layout")
     if b_descale.numel() < _swizzled_scale_len(n, k):
         raise ValueError("b_descale is shorter than the swizzled scale layout")

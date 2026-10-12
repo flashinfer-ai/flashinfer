@@ -6808,9 +6808,8 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
 def _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl: bool):
     """Warp split-K MXFP8 runner for ``backend="cute-dsl"`` (M <= 16, K <= 5120).
 
-    Registered next to ``CuteDSLMxfp8GemmRunner``, only for inputs it serves, so
-    one autotune call profiles both; it offers no tactics for a profile it cannot
-    serve.
+    Registered next to ``CuteDSLMxfp8GemmRunner`` so one autotune call profiles
+    both; it offers no tactics for a profile it cannot serve.
     """
     from .kernels.dense_mxfp8_gemm_warp_splitk import (
         MxFp8WarpSplitKTactic,
@@ -6826,10 +6825,12 @@ def _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl: bool):
             _, _, _, _, _, out, _ = inputs
             return (str(out.dtype), enable_pdl)
 
-        def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
+        def supports_inputs(
+            self, inputs: List[torch.Tensor], check_m: bool = True
+        ) -> bool:
             a, b, a_descale, b_descale, _, out, _ = inputs
             try:
-                validate_inputs(a, b, a_descale, b_descale, out)
+                validate_inputs(a, b, a_descale, b_descale, out, check_m)
             except ValueError:
                 return False
             return True
@@ -6903,6 +6904,11 @@ def _cute_dsl_mxfp8_runners(
     if not is_cute_dsl_experimental_available():
         return [_cute_dsl_gemm_mxfp8_runner(sm_major, sm_minor, enable_pdl, out_dtype)]
     warp = _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl)
+    # One autotune call profiles every M bucket with these runners, so whether the
+    # warp runner is registered must not depend on M; per profile it offers
+    # tactics only for the M it serves.
+    if not warp.supports_inputs(inputs, check_m=False):
+        return [_cute_dsl_gemm_mxfp8_runner(sm_major, sm_minor, enable_pdl, out_dtype)]
     tcgen05 = _cute_dsl_gemm_mxfp8_runner(
         sm_major,
         sm_minor,
@@ -6910,11 +6916,8 @@ def _cute_dsl_mxfp8_runners(
         out_dtype,
         warp_splitk_supports=warp.supports_inputs,
     )
-    # Register the warp runner only for inputs it serves.
-    if not warp.supports_inputs(inputs):
-        return [tcgen05]
     m, k = inputs[0].shape
-    if m <= 8 or k <= 2048:
+    if warp.supports_inputs(inputs) and (m <= 8 or k <= 2048):
         return [warp, tcgen05]
     return [tcgen05, warp]
 
@@ -7270,11 +7273,11 @@ def mm_mxfp8(
         inputs=inputs,
     )
 
-    # A cached warp split-K entry is keyed by M bucket, so its tactic can be
-    # illegal for this M. Fall back to the first runner's default, as the
-    # autotuner itself does.
-    if hasattr(runner, "is_tactic_compatible") and not runner.is_tactic_compatible(
-        inputs, tactic
+    # A cached warp split-K entry is keyed by M bucket, so it can come from an M the
+    # kernel does not serve or carry a tactic illegal for this shape. Fall back to
+    # the first runner's default, as the autotuner itself does.
+    if hasattr(runner, "is_tactic_compatible") and not (
+        runner.supports_inputs(inputs) and runner.is_tactic_compatible(inputs, tactic)
     ):
         runner, tactic = runners[0], -1
 
