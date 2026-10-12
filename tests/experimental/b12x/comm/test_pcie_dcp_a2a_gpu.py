@@ -612,12 +612,18 @@ def _check_graph(
             channel.all_gather_heads(
                 odd_input, odd_output, plan=plans["all_gather_heads", odd_input.dtype]
             )
+    # Two ranks push into each other's staging, so a peer's next replay must
+    # not land before this rank's snapshot.
+    stream.synchronize()
+    dist.barrier()
     snapshots = [_local_staging_words(channel, stream)]
+    dist.barrier()
     for value in (1.0, 2.0):
         with torch.cuda.stream(stream):
             odd_input.fill_(value)
             odd_graph.replay()
         snapshots.append(_local_staging_words(channel, stream))
+        dist.barrier()
         torch.testing.assert_close(
             odd_output, torch.full_like(odd_output, value), rtol=0, atol=0
         )
