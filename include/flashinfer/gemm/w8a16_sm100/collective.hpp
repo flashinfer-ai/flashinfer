@@ -294,9 +294,9 @@ public:
   static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomScale{})) == 0, "SmemLayoutAtomScale must evenly divide tile k shape.");
 
   // Thread Counts
-  // Rung B3: two transform warpgroups.  Both map onto the same 128 TMEM lanes (rows);
+  // Rung B3/B5: transform warpgroups (two, then four).  All map onto the same 128 TMEM lanes (rows);
   // warpgroup g converts k-blocks [g * K_BLOCK_MAX / 2, (g + 1) * K_BLOCK_MAX / 2).
-  static constexpr uint32_t NumTransformationGroups = 2;
+  static constexpr uint32_t NumTransformationGroups = 4;
   static constexpr uint32_t NumTransformationThreadsPerGroup = 128;
   static constexpr uint32_t NumTransformationThreads = NumTransformationGroups * NumTransformationThreadsPerGroup;
   static constexpr uint32_t NumAccumThreads = 128; //Maintains compatibility with input_transform kernel
@@ -1057,7 +1057,9 @@ public:
           // Dequantize this warpgroup's k-blocks in RF and store them into Smem or Tmem
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < kPerGroup; ++i) {
+#ifndef W8A16_PROBE_NO_CONVERT
             Utils::dequantize_A_kblock_for_transform(tArA, tArACompute, partitioned_extra_info, kFirst + i);
+#endif
             copy(dst_copy_A, tArACompute(_,_,_,kFirst + i), tAsACompute(_,_,_,kFirst + i,transform2mma_producer_index));
           }
         }
@@ -1080,18 +1082,20 @@ public:
             auto dst4 = make_tensor(dst_chunk.data(), make_layout(append(dst_chunk.shape(), _1{}), append(dst_chunk.stride(), _0{})));
             CUTLASS_PRAGMA_UNROLL
             for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
+#ifndef W8A16_PROBE_NO_CONVERT
               Utils::dequantize_A_kblock_for_transform(src4, dst4, partitioned_extra_info, k_block);
+#endif
             }
             copy(dst_copy_A, tArACompute(_,kFirst + i,_,_), tAsACompute(_,kFirst + i,_,_,transform2mma_producer_index));
           }
         }
       };
-      if (transform_group == 0) {
-        transform_half(cute::Int<0>{});
-      }
-      else {
-        transform_half(cute::Int<1>{});
-      }
+      // One branch per warpgroup, each with its compile-time group index.
+      cute::for_each(cute::make_int_sequence<NumTransformationGroups>{}, [&](auto g) {
+        if (transform_group == decltype(g)::value) {
+          transform_half(g);
+        }
+      });
 
       // fence for SMEM writes
       cutlass::arch::fence_view_async_shared();
