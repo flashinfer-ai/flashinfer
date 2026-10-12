@@ -30,6 +30,7 @@ Tests include:
 - API consistency between functional and wrapper APIs
 - Micro kernel path for small decode batches
 - ReLU2 (non-gated) activation for Nemotron-Super
+- Fixed-order finalize (use_fused_finalize=False): bitwise repeats, chunking
 """
 
 import ast
@@ -970,6 +971,176 @@ def test_preallocated_dynamic_workspace_rejects_remapped_experts():
             activation_precision="fp4",
             _workspace=workspace,
             _weight_views=object(),
+        )
+
+
+@cute_dsl_available
+def test_fixed_order_chunk_tokens_stay_inside_default_static_band(monkeypatch):
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    # The env-tunable dispatch cutover must not resize fixed-order chunks.
+    monkeypatch.setenv("FLASHINFER_B12X_STATIC_COMPACT_CUTOVER_PAIRS", "0")
+    assert moe_dispatch._fixed_order_chunk_tokens(1, "nvfp4") == 1024
+    assert moe_dispatch._fixed_order_chunk_tokens(8, "nvfp4") == 128
+    assert moe_dispatch._fixed_order_chunk_tokens(3, "nvfp4") == 341
+    assert moe_dispatch._fixed_order_chunk_tokens(8, "mxfp4") == 80
+    assert moe_dispatch._fixed_order_chunk_tokens(4096, "nvfp4") == 1
+
+
+@cute_dsl_available
+def test_fixed_order_dispatch_chunks_tokens_into_static_launches(monkeypatch):
+    """use_fused_finalize=False never reaches dynamic and slices per chunk."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    _clear_static_cutover_env(monkeypatch)
+    moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+
+    num_tokens, top_k, k, n = 300, 8, 16, 256
+    static_launches, dynamic_launches, workspace_requests = [], [], []
+
+    def fake_workspace(**kwargs):
+        workspace_requests.append((kwargs["backend"], kwargs["routed_rows"]))
+        return object()
+
+    def fake_static(**kwargs):
+        static_launches.append(kwargs)
+        kwargs["scatter_output"].fill_(len(static_launches))
+        return kwargs["scatter_output"]
+
+    def fake_dynamic(**kwargs):
+        dynamic_launches.append(kwargs)
+        return kwargs["scatter_output"]
+
+    monkeypatch.setattr(moe_dispatch, "_get_cached_workspace", fake_workspace)
+    monkeypatch.setattr(
+        moe_dispatch, "_validate_static_workspace_for_launch", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(moe_dispatch, "launch_sm120_static_moe", fake_static)
+    monkeypatch.setattr(moe_dispatch, "launch_sm120_dynamic_moe", fake_dynamic)
+
+    x = torch.empty((num_tokens, k), dtype=torch.bfloat16)
+    topk_ids = torch.zeros((num_tokens, top_k), dtype=torch.int32)
+    topk_weights = torch.ones((num_tokens, top_k), dtype=torch.float32)
+    output = torch.zeros((num_tokens, k), dtype=torch.bfloat16)
+    alpha = torch.ones((8,), dtype=torch.float32)
+    kwargs = dict(
+        a=x,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w1_weight=torch.empty((8, 2 * n, k // 2), dtype=torch.uint8),
+        w1_weight_sf=torch.empty((8, 2 * n, 1), dtype=torch.float8_e4m3fn),
+        w1_alpha=alpha,
+        fc2_input_scale=torch.ones((1,), dtype=torch.float32),
+        w2_weight=torch.empty((8, k, n // 2), dtype=torch.uint8),
+        w2_weight_sf=torch.empty((8, k, n // 16), dtype=torch.float8_e4m3fn),
+        w2_alpha=alpha,
+        num_experts=8,
+        top_k=top_k,
+        num_local_experts=8,
+        scatter_output=output,
+        quant_mode="nvfp4",
+        _weight_views=object(),
+    )
+    try:
+        # Default: 2400 routed rows is past the static cutover.
+        assert moe_dispatch.launch_sm120_moe(**kwargs) is output
+        assert len(dynamic_launches) == 1 and not static_launches
+        assert workspace_requests == [("dynamic", num_tokens * top_k)]
+
+        workspace_requests.clear()
+        result = moe_dispatch.launch_sm120_moe(**kwargs, use_fused_finalize=False)
+    finally:
+        moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+
+    assert result is output
+    assert len(dynamic_launches) == 1
+    assert workspace_requests == [("static", 128 * top_k)]
+    assert [launch["num_tokens"] for launch in static_launches] == [128, 128, 44]
+    assert all(launch["use_fused_finalize"] is False for launch in static_launches)
+    start = 0
+    for index, launch in enumerate(static_launches, start=1):
+        rows = launch["num_tokens"]
+        assert launch["a"].data_ptr() == x[start].data_ptr()
+        assert launch["topk_ids"].data_ptr() == topk_ids[start].data_ptr()
+        assert launch["topk_weights"].data_ptr() == topk_weights[start].data_ptr()
+        assert launch["a"].shape == (rows, k)
+        assert launch["topk_ids"].shape == (rows, top_k)
+        # Each launch wrote its own slice of the caller's output buffer.
+        assert (output[start : start + rows] == index).all()
+        start += rows
+    assert start == num_tokens
+
+
+@cute_dsl_available
+def test_fixed_order_rejects_preallocated_dynamic_workspace():
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    workspace = object.__new__(moe_dispatch.Sm120DynamicMoEWorkspace)
+    workspace.activation_precision = "fp4"
+    workspace.quant_mode = "nvfp4"
+    alpha = torch.ones((2,), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=r"use_fused_finalize=False.*static"):
+        moe_dispatch.launch_sm120_moe(
+            a=torch.empty((1, 256), dtype=torch.bfloat16),
+            topk_ids=torch.zeros((1, 1), dtype=torch.int32),
+            topk_weights=torch.ones((1, 1), dtype=torch.float32),
+            w1_weight=torch.empty((2, 512, 128), dtype=torch.uint8),
+            w1_weight_sf=torch.empty((2, 512, 16), dtype=torch.float8_e4m3fn),
+            w1_alpha=alpha,
+            fc2_input_scale=torch.ones((1,), dtype=torch.float32),
+            w2_weight=torch.empty((2, 256, 128), dtype=torch.uint8),
+            w2_weight_sf=torch.empty((2, 256, 16), dtype=torch.float8_e4m3fn),
+            w2_alpha=alpha,
+            num_experts=2,
+            top_k=1,
+            num_local_experts=2,
+            scatter_output=torch.empty((1, 256), dtype=torch.bfloat16),
+            quant_mode="nvfp4",
+            use_fused_finalize=False,
+            _workspace=workspace,
+            _weight_views=object(),
+        )
+
+
+@cute_dsl_available
+def test_w4a16_rejects_fixed_order_finalize(monkeypatch):
+    """W4A16 has no fixed-order finalize; the flag must not be ignored."""
+    from flashinfer.fused_moe.cute_dsl import b12x_moe as b12x_moe_mod
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", _fake_cuda_13_version)
+
+    x = torch.empty((1, 16), dtype=torch.bfloat16)
+    weight = torch.empty((1, 32, 8), dtype=torch.uint8)
+    scale = torch.empty((1, 32, 1), dtype=torch.float8_e4m3fn)
+    alpha = torch.ones((1,), dtype=torch.float32)
+
+    with pytest.raises(NotImplementedError, match=r"use_fused_finalize=False.*w4a16"):
+        b12x_moe_mod.b12x_fused_moe(
+            x=x,
+            w1_weight=weight,
+            w1_weight_sf=scale,
+            w1_alpha=alpha,
+            w2_weight=weight,
+            w2_weight_sf=scale,
+            w2_alpha=alpha,
+            token_selected_experts=torch.zeros((1, 1), dtype=torch.int32),
+            token_final_scales=torch.ones((1, 1), dtype=torch.float32),
+            num_experts=1,
+            top_k=1,
+            quant_mode="w4a16",
+            use_fused_finalize=False,
+        )
+
+    with pytest.raises(NotImplementedError, match=r"use_fused_finalize=False.*w4a16"):
+        b12x_moe_mod.B12xMoEWrapper(
+            num_experts=1,
+            top_k=1,
+            hidden_size=16,
+            intermediate_size=16,
+            quant_mode="w4a16",
+            use_fused_finalize=False,
         )
 
 
@@ -2335,6 +2506,324 @@ class TestB12xApiConsistency:
 
 
 # =============================================================================
+# Test Class: Fixed-order finalize (use_fused_finalize=False)
+# =============================================================================
+
+_FIXED_ORDER_HIDDEN, _FIXED_ORDER_INTERMEDIATE, _FIXED_ORDER_EXPERTS = 256, 512, 32
+
+# (num_tokens, top_k) and the backend the default dispatch picks for it. The
+# fixed-order path launches the static kernel in chunks of 1024 // top_k tokens.
+_FIXED_ORDER_CASES = [
+    pytest.param(1, 1, "direct_micro", id="t1-k1-direct-micro"),
+    pytest.param(4, 8, "micro", id="t4-k8-micro"),
+    pytest.param(64, 2, "static", id="t64-k2-static"),
+    pytest.param(128, 8, "static", id="t128-k8-static"),
+    pytest.param(700, 2, "dynamic", id="t700-k2-dynamic-2chunks"),
+    pytest.param(300, 8, "dynamic", id="t300-k8-dynamic-3chunks"),
+    pytest.param(2050, 1, "dynamic", id="t2050-k1-dynamic-3chunks"),
+]
+
+_CROSS_PROCESS_PROBE = """
+import hashlib
+import torch
+from flashinfer import b12x_fused_moe
+from tests.moe.utils import create_b12x_moe_tensors
+
+def digest(*tensors):
+    h = hashlib.sha256()
+    for t in tensors:
+        h.update(t.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+    return h.hexdigest()
+
+for num_tokens, top_k in ((4, 8), (300, 8)):
+    t = create_b12x_moe_tensors(
+        num_tokens=num_tokens, hidden_size=256, intermediate_size=512,
+        num_experts=32, num_local_experts=32, top_k=top_k,
+    )
+    out = b12x_fused_moe(
+        x=t["x_bf16"], w1_weight=t["w1_weight"], w1_weight_sf=t["w1_weight_sf"],
+        w1_alpha=t["w1_alpha"], fc2_input_scale=t["fc2_input_scale"],
+        w2_weight=t["w2_weight"], w2_weight_sf=t["w2_weight_sf"],
+        w2_alpha=t["w2_alpha"],
+        token_selected_experts=t["token_selected_experts"],
+        token_final_scales=t["token_final_scales"],
+        num_experts=32, top_k=top_k, use_fused_finalize=False,
+    )
+    torch.cuda.synchronize()
+    inputs = digest(
+        t["x_bf16"], t["w1_weight"], t["w1_weight_sf"], t["w2_weight"],
+        t["w2_weight_sf"], t["token_selected_experts"], t["token_final_scales"],
+    )
+    print(f"{num_tokens} {top_k} inputs={inputs} output={digest(out)}")
+"""
+
+
+def _fixed_order_tensors(num_tokens: int, top_k: int):
+    return create_moe_tensors(
+        num_tokens=num_tokens,
+        hidden_size=_FIXED_ORDER_HIDDEN,
+        intermediate_size=_FIXED_ORDER_INTERMEDIATE,
+        num_experts=_FIXED_ORDER_EXPERTS,
+        num_local_experts=_FIXED_ORDER_EXPERTS,
+        top_k=top_k,
+    )
+
+
+def _b12x_call_kwargs(tensors):
+    return dict(
+        x=tensors["x_bf16"],
+        w1_weight=tensors["w1_weight"],
+        w1_weight_sf=tensors["w1_weight_sf"],
+        w1_alpha=tensors["w1_alpha"],
+        fc2_input_scale=tensors["fc2_input_scale"],
+        w2_weight=tensors["w2_weight"],
+        w2_weight_sf=tensors["w2_weight_sf"],
+        w2_alpha=tensors["w2_alpha"],
+        token_selected_experts=tensors["token_selected_experts"],
+        token_final_scales=tensors["token_final_scales"],
+    )
+
+
+def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor, what: str):
+    differing = (actual.view(torch.int16) != expected.view(torch.int16)).sum().item()
+    assert differing == 0, f"{what}: {differing} of {actual.numel()} elements differ"
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+class TestB12xFixedOrderFinalize:
+    """use_fused_finalize=False: static kernel only, bitwise repeatable."""
+
+    @pytest.mark.parametrize("num_tokens,top_k,default_backend", _FIXED_ORDER_CASES)
+    def test_bitwise_repeat_and_agreement_with_default(
+        self, num_tokens: int, top_k: int, default_backend: str
+    ):
+        from flashinfer import b12x_fused_moe
+
+        tensors = _fixed_order_tensors(num_tokens, top_k)
+        common = dict(
+            num_experts=_FIXED_ORDER_EXPERTS, top_k=top_k, **_b12x_call_kwargs(tensors)
+        )
+
+        baseline = b12x_fused_moe(**common, use_fused_finalize=False)
+        assert baseline.shape == (num_tokens, _FIXED_ORDER_HIDDEN)
+        assert torch.isfinite(baseline).all()
+        for repeat in range(3):
+            _assert_bitwise_equal(
+                b12x_fused_moe(**common, use_fused_finalize=False),
+                baseline,
+                f"fixed-order repeat {repeat}",
+            )
+
+        default = b12x_fused_moe(**common)
+        if default_backend == "static":
+            # Same kernel, same launch: the flag changes nothing here.
+            _assert_bitwise_equal(baseline, default, "fixed-order vs static")
+        else:
+            # Same FC2 partials, different BF16 rounding order. Measured on
+            # RTX 5070 Ti over 20 trials per shape: at most 2.4% of the peak
+            # output magnitude, which is also the default path's own rerun
+            # spread (up to 2.1%). A dropped route or a misplaced chunk is an
+            # error of the order of the peak itself.
+            peak = default.float().abs().max().item()
+            max_diff = (baseline.float() - default.float()).abs().max().item()
+            assert max_diff <= 0.05 * peak, (
+                f"fixed-order vs {default_backend}: max diff {max_diff:.3e} "
+                f"({max_diff / peak:.2%} of peak {peak:.3e})"
+            )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=_FIXED_ORDER_EXPERTS,
+            top_k=top_k,
+            hidden_size=_FIXED_ORDER_HIDDEN,
+            intermediate_size=_FIXED_ORDER_INTERMEDIATE,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+        passed, percent_within, atol = check_accuracy(baseline, ref_output)
+        assert passed, (
+            f"fixed-order: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f})"
+        )
+
+    @pytest.mark.parametrize(
+        "num_tokens,top_k",
+        [
+            pytest.param(2, 2, id="t2-k2-micro"),
+            pytest.param(400, 8, id="t400-k8-dynamic-5chunks"),
+        ],
+    )
+    def test_mxfp4_bitwise_repeat(self, num_tokens: int, top_k: int):
+        """MXFP4 shares the static schedule; its band is 640 routed rows."""
+        from flashinfer import b12x_fused_moe
+
+        tensors = create_b12x_mxfp4_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=_FIXED_ORDER_HIDDEN,
+            intermediate_size=_FIXED_ORDER_INTERMEDIATE,
+            num_experts=_FIXED_ORDER_EXPERTS,
+            num_local_experts=_FIXED_ORDER_EXPERTS,
+            top_k=top_k,
+        )
+        kwargs = _b12x_call_kwargs(tensors)
+        del kwargs["fc2_input_scale"]
+        common = dict(
+            num_experts=_FIXED_ORDER_EXPERTS,
+            top_k=top_k,
+            quant_mode="mxfp4",
+            use_fused_finalize=False,
+            **kwargs,
+        )
+
+        baseline = b12x_fused_moe(**common)
+        for repeat in range(3):
+            _assert_bitwise_equal(
+                b12x_fused_moe(**common), baseline, f"MXFP4 fixed-order repeat {repeat}"
+            )
+
+        expected = compute_reference_moe_mxfp4_w4a4(
+            tensors["x_bf16"],
+            tensors["w1_weight_bf16"],
+            tensors["w2_weight_bf16"],
+            tensors["token_selected_experts"],
+            tensors["token_final_scales"],
+            num_experts=_FIXED_ORDER_EXPERTS,
+            top_k=top_k,
+            intermediate_size=_FIXED_ORDER_INTERMEDIATE,
+        )
+        passed, percent_within, atol = check_accuracy(baseline, expected)
+        assert passed, (
+            f"MXFP4 fixed-order: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f})"
+        )
+
+    def test_chunking_past_static_memref_limit(self):
+        """4096 tokens x top-k 8 cannot be one static launch; chunks must match."""
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        num_tokens, top_k = 4096, 8
+        with pytest.raises(ValueError, match="runtime memref limit"):
+            moe_dispatch.allocate_sm120_static_workspace(
+                state_E=_FIXED_ORDER_EXPERTS,
+                weight_E=_FIXED_ORDER_EXPERTS,
+                max_rows=num_tokens * top_k,
+                k=_FIXED_ORDER_HIDDEN,
+                n=_FIXED_ORDER_INTERMEDIATE,
+                num_topk=top_k,
+                device=torch.device("cuda"),
+            )
+
+        tensors = _fixed_order_tensors(num_tokens, top_k)
+        kwargs = _b12x_call_kwargs(tensors)
+        common = dict(num_experts=_FIXED_ORDER_EXPERTS, top_k=top_k)
+
+        result = b12x_fused_moe(**common, **kwargs, use_fused_finalize=False)
+        assert torch.isfinite(result).all()
+        _assert_bitwise_equal(
+            b12x_fused_moe(**common, **kwargs, use_fused_finalize=False),
+            result,
+            "chunked repeat",
+        )
+
+        # Each 128-token chunk is a default static launch on its own, so the
+        # chunked output must equal those launches bit for bit.
+        chunk = moe_dispatch._fixed_order_chunk_tokens(top_k, "nvfp4")
+        sliced = ("x", "token_selected_experts", "token_final_scales")
+        for start in range(0, num_tokens, chunk):
+            chunk_kwargs = {
+                name: value[start : start + chunk].contiguous()
+                if name in sliced
+                else value
+                for name, value in kwargs.items()
+            }
+            _assert_bitwise_equal(
+                result[start : start + chunk],
+                b12x_fused_moe(**common, **chunk_kwargs),
+                f"chunk at token {start}",
+            )
+
+    def test_cross_process_repeat(self):
+        """Two fresh processes must produce the same output bits."""
+        import os
+        import subprocess
+        import sys
+
+        repo_root = Path(__file__).resolve().parents[2]
+        env = dict(
+            os.environ,
+            PYTHONPATH=os.pathsep.join([str(repo_root), *(p for p in sys.path if p)]),
+        )
+        outputs = []
+        for _ in range(2):
+            completed = subprocess.run(
+                [sys.executable, "-c", _CROSS_PROCESS_PROBE],
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=repo_root,
+                timeout=1800,
+            )
+            assert completed.returncode == 0, completed.stderr[-2000:]
+            lines = [
+                line for line in completed.stdout.splitlines() if "output=" in line
+            ]
+            assert len(lines) == 2, completed.stdout
+            outputs.append(lines)
+        assert outputs[0] == outputs[1]
+
+    @pytest.mark.parametrize("num_tokens,top_k", [(4, 8), (300, 8)])
+    def test_wrapper_cuda_graph_replay_is_bitwise_stable(
+        self, num_tokens: int, top_k: int
+    ):
+        """Capture covers every chunk launch; replays match eager bit for bit."""
+        from flashinfer import B12xMoEWrapper, b12x_fused_moe
+
+        tensors = _fixed_order_tensors(num_tokens, top_k)
+        kwargs = _b12x_call_kwargs(tensors)
+
+        moe = B12xMoEWrapper(
+            num_experts=_FIXED_ORDER_EXPERTS,
+            top_k=top_k,
+            hidden_size=_FIXED_ORDER_HIDDEN,
+            intermediate_size=_FIXED_ORDER_INTERMEDIATE,
+            use_cuda_graph=True,
+            max_num_tokens=num_tokens,
+            use_fused_finalize=False,
+        )
+        assert moe._dynamic_workspace is None
+        assert moe._static_workspace.max_rows == min(num_tokens * top_k, 1024)
+
+        for _ in range(3):
+            moe.run(**kwargs)
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            output = moe.run(**kwargs)
+        torch.cuda.synchronize()
+
+        eager = b12x_fused_moe(
+            num_experts=_FIXED_ORDER_EXPERTS,
+            top_k=top_k,
+            **kwargs,
+            use_fused_finalize=False,
+        )
+        assert torch.isfinite(eager).all() and not (eager == 0).all()
+        for replay in range(3):
+            output.zero_()
+            g.replay()
+            torch.cuda.synchronize()
+            _assert_bitwise_equal(output, eager, f"CUDA graph replay {replay}")
+
+
+# =============================================================================
 # Test Class: Micro Kernel (SM120-only, small decode batches)
 # =============================================================================
 
@@ -3426,6 +3915,24 @@ def test_wrapper_defaults_allocate_own_buffers(monkeypatch):
     assert second._static_workspace is not first._static_workspace
     assert second._dynamic_workspace is not first._dynamic_workspace
     assert second._moe_output is not first._moe_output
+
+
+def test_wrapper_fixed_order_allocates_one_chunk_static_workspace(monkeypatch):
+    """use_fused_finalize=False needs no dynamic workspace and one chunk of rows."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    allocs = []
+    monkeypatch.setattr(
+        moe_dispatch,
+        "allocate_sm120_moe_workspace",
+        lambda **kw: allocs.append(kw) or object(),
+    )
+
+    moe = _make_cpu_wrapper(monkeypatch, use_fused_finalize=False)
+
+    assert [kw["backend"] for kw in allocs] == ["static"]
+    assert allocs[0]["max_rows"] == 1024  # top_k=1: one 1024-token chunk
+    assert moe._dynamic_workspace is None
 
 
 def test_wrapper_shared_buffers_are_reused(monkeypatch):
