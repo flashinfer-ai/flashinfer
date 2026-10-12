@@ -1386,13 +1386,71 @@ def _skip_unless_cake_arch():
         "x".join(str(length) for length in lengths) for lengths in _CU_SEQLENS_LENGTHS
     ],
 )
+def _assert_two_forms_p6(monkeypatch, *, lengths, state_dtype, initial_states, programs):
+    """P6 reading of the two packed-varlen metadata forms where they run
+    different arithmetic (CAKE-956 round 6 c9): on the K fixed seeds run the
+    seq_idx triple form and the cu_seqlens form of the same inputs on the
+    forced exact scan plus the forced three-phase program (bitwise the
+    round-5 scan, the baseline reading), and judge each form's output and
+    final states against the fp64 recurrence under clause GOAL6-A-20261012
+    (``_assert_p6_clause``).  ``programs`` = (cu_seqlens program, triple
+    program) the forms must keep running."""
+
+    candidates = {"cu_seqlens": {}, "triple": {}}
+    baseline = {}
+    for seed in _P6_SEEDS:
+        constructor, tensors, arguments = _case(
+            varlen=True,
+            lengths=lengths,
+            state_dtype=state_dtype,
+            initial_states=initial_states,
+            seed=seed,
+        )
+        runner = SSDCombined(**constructor, backend="cake")
+        monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
+        out_triple, final_triple = (value.clone() for value in runner.run(*tensors, **arguments))
+        assert runner._cake_runner.last_program_name == programs[1]
+        out_cu, final_cu = (
+            value.clone()
+            for value in runner.run(*tensors, **_cu_seqlens_arguments(arguments, lengths))
+        )
+        assert runner._cake_runner.last_program_name == programs[0]
+        monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "three_phase")
+        out_base, final_base = (value.clone() for value in runner.run(*tensors, **arguments))
+        assert runner._cake_runner.last_program_name.startswith("chunkpar3_")
+        y, states = _fp64_reference(constructor, tensors, {**arguments, "num_seqs": len(lengths)})
+        for label, cu, triple, base, oracle in (
+            ("out", out_cu, out_triple, out_base, y),
+            ("final", final_cu, final_triple, final_base, states),
+        ):
+            candidates["cu_seqlens"].setdefault(label, []).append(_p6_metrics(cu, oracle))
+            candidates["triple"].setdefault(label, []).append(_p6_metrics(triple, oracle))
+            baseline.setdefault(label, []).append(_p6_metrics(base, oracle))
+    for form, readings in candidates.items():
+        program = programs[0 if form == "cu_seqlens" else 1]
+        for label, metrics in readings.items():
+            _assert_p6_clause(metrics, baseline[label], f"{form} form ({program}) {label}")
+
+
 def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
-    lengths, state_dtype, initial_states
+    monkeypatch, lengths, state_dtype, initial_states
 ):
     """The cu_seqlens form (the device derives seq_chunk_cumsum and the
-    chunk-128 tables) is bitwise the chunk-128 triple call of the same
-    inputs on every sequence geometry, with ``seq_idx`` optional and never
-    read; the status word stays clear."""
+    chunk-128 tables) matches the chunk-128 triple call of the same inputs on
+    every sequence geometry, with ``seq_idx`` optional and never read; the
+    status word stays clear.
+
+    Where both forms run the same arithmetic they are bitwise.  CAKE-956
+    round 6 c9 routes the two-kernel form of one-chunk items to the retained
+    round-5 start program (``two_kernel_family``), while a cu_seqlens call
+    inside the fused window runs the round-6 fused program (single-rounding
+    FMA state update): those two forms differ by that rounding, so each form
+    is judged on its own against the fp64 recurrence under the P6 clause
+    GOAL6-A-20261012 (``_assert_two_forms_p6``: the three-phase program's
+    reading as the round-5 baseline, ``_P6_SEEDS`` seeds) and the two forms
+    are compared at the state dtype tolerance as a sanity check only (the
+    tolerance never replaces the P6 reading).  The host contract -- ``run`` /
+    ``prepare`` signatures and both metadata forms -- is unchanged."""
 
     _skip_unless_cake_arch()
     constructor, tensors, arguments = _case(
@@ -1421,10 +1479,7 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     # grid is 0, i.e. in the cu_seqlens form: the triple runs the two-kernel
     # program of the same variant -- ``exactpre`` (round-6 arithmetic, the
     # fused program's) from two chunks per item, the retained start ``exact``
-    # program for one-chunk items (CAKE-956 round 6 c9).  Where both forms run
-    # round-6 arithmetic they stay bitwise; a fused cu_seqlens call whose
-    # triple runs the start program differs from it by the single-rounding
-    # state update only (P6 metric), compared at the state dtype tolerance.
+    # program for one-chunk items (CAKE-956 round 6 c9).
     same_arithmetic = True
     if program_triple.startswith("chunkpar_"):
         assert program_cu == program_triple, (
@@ -1455,19 +1510,26 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     assert final.dtype == state_dtype
     assert tuple(final.shape) == (len(lengths), 8, 64, 128)
     assert torch.isfinite(out.to(torch.float32)).all()
-
-    def forms_agree(a, b):
-        if same_arithmetic:
-            return torch.equal(a, b)
-        tolerance = {torch.float32: 1e-5}.get(a.dtype, 1e-2)
-        return torch.allclose(
-            a.to(torch.float32), b.to(torch.float32), atol=tolerance, rtol=tolerance
+    if same_arithmetic:
+        assert torch.equal(out, out_triple), (
+            f"cu_seqlens form ({program_cu}) differs from the triple ({program_triple})"
         )
-
-    assert forms_agree(out, out_triple), (
-        f"cu_seqlens form ({program_cu}) differs from the triple ({program_triple})"
-    )
-    assert forms_agree(final, final_triple)
+        assert torch.equal(final, final_triple)
+    else:
+        # Sanity only: the forms differ by the single-rounding state update.
+        for name, cu, triple in (("out", out, out_triple), ("final_states", final, final_triple)):
+            tolerance = {torch.float32: 1e-5}.get(cu.dtype, 1e-2)
+            assert torch.allclose(
+                cu.to(torch.float32), triple.to(torch.float32), atol=tolerance, rtol=tolerance
+            ), f"{name}: cu_seqlens form ({program_cu}) vs triple ({program_triple}) beyond {tolerance}"
+        # The reading that decides: each form passes the P6 clause on its own.
+        _assert_two_forms_p6(
+            monkeypatch,
+            lengths=lengths,
+            state_dtype=state_dtype,
+            initial_states=initial_states,
+            programs=(program_cu, program_triple),
+        )
     # seq_idx riding along (callers that still build it) changes nothing.
     out_ride, final_ride = runner.run(
         *tensors, **_cu_seqlens_arguments(arguments, lengths, keep_seq_idx=True)
@@ -1481,7 +1543,6 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
             *tensors, **_cu_seqlens_arguments(arguments, lengths)
         )
         assert torch.equal(out_fn, out) and torch.equal(final_fn, final)
-
 
 @pytest.mark.parametrize(
     "lengths,checkpoints",
