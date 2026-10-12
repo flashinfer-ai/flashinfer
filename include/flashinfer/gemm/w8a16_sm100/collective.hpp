@@ -296,7 +296,7 @@ public:
   // Thread Counts
   // Rung B3/B5: transform warpgroups (two, then four).  All map onto the same 128 TMEM lanes (rows);
   // warpgroup g converts k-blocks [g * K_BLOCK_MAX / 2, (g + 1) * K_BLOCK_MAX / 2).
-  static constexpr uint32_t NumTransformationGroups = 4;
+  static constexpr uint32_t NumTransformationGroups = 2;
   static constexpr uint32_t NumTransformationThreadsPerGroup = 128;
   static constexpr uint32_t NumTransformationThreads = NumTransformationGroups * NumTransformationThreadsPerGroup;
   static constexpr uint32_t NumAccumThreads = 128; //Maintains compatibility with input_transform kernel
