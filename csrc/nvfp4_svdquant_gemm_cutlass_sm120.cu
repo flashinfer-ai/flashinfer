@@ -34,6 +34,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "flashinfer/gemm/nvfp4_svdquant_gemm_template_sm120.h"
 #include "flashinfer/gemm/svdquant_sm120_prefix_route.h"
@@ -250,6 +251,16 @@ namespace {
 
 constexpr auto FLOAT4_E2M1X2 = dl_uint8;  // packed e2m1
 constexpr auto SF_DTYPE = dl_uint8;       // swizzled ue4m3 block scales
+
+inline bool fits_nonnegative_int(int64_t value) {
+  return value >= 0 && value <= std::numeric_limits<int>::max();
+}
+
+inline void check_sm120_tactic(int64_t tactic) {
+  TVM_FFI_ICHECK(tactic >= 0 &&
+                 tactic < flashinfer::gemm::svdquant_sm120::kNvfp4SvdquantGemmSm120NumTactics)
+      << "invalid NVFP4 SVDQuant SM120 tactic: " << tactic;
+}
 
 // ceil(rows / 128) * 128 * ceil(cols / 4) * 4, the 128x4-swizzled block-scale layout size.
 inline int64_t swizzled_sf_size(int64_t rows, int64_t sfCols) {
@@ -468,6 +479,11 @@ LoraDownCublasLtState& lora_down_cublaslt_state(int device_id, int m, int k) {
 
 void run_lora_down_cublaslt(TensorView x, TensorView l2t_smoothed, TensorView down,
                             TensorView workspace_buffer, cudaStream_t stream) {
+  TVM_FFI_ICHECK(fits_nonnegative_int(x.size(0)) && fits_nonnegative_int(x.size(1)))
+      << "SM120 LoRA-down dimensions must fit in int32";
+  TVM_FFI_ICHECK_EQ(l2t_smoothed.ndim(), 2) << "l2t_smoothed must have shape [k, rank]";
+  TVM_FFI_ICHECK(fits_nonnegative_int(l2t_smoothed.size(1)))
+      << "SM120 LoRA-down rank must fit in int32";
   int const m = static_cast<int>(x.size(0));
   int const k = static_cast<int>(x.size(1));
   int const rank = static_cast<int>(l2t_smoothed.size(1));
@@ -597,8 +613,12 @@ void nvfp4_svdquant_gemm_impl(TensorView a, TensorView b, TensorView a_sf, Tenso
   TVM_FFI_ICHECK_EQ(b.ndim(), 2) << "b must be [n, k/2]";
   int64_t const m = a.size(0);
   int64_t const kPacked = a.size(1);
-  int64_t const k = kPacked * 2;
   int64_t const n = b.size(0);
+  TVM_FFI_ICHECK(fits_nonnegative_int(m) && fits_nonnegative_int(n))
+      << "NVFP4 SVDQuant SM120 m and n must fit in int32";
+  TVM_FFI_ICHECK(kPacked > 0 && kPacked <= std::numeric_limits<int>::max() / 2)
+      << "NVFP4 SVDQuant SM120 unpacked k must fit in int32";
+  int64_t const k = kPacked * 2;
   TVM_FFI_ICHECK_EQ(b.size(1), kPacked) << "a and b inner dimensions mismatch";
   TVM_FFI_ICHECK(n > 0 && k > 0) << "n and k must be positive";
   TVM_FFI_ICHECK(n % 32 == 0 && k % 32 == 0) << "n and k must be divisible by 32";
@@ -615,8 +635,8 @@ void nvfp4_svdquant_gemm_impl(TensorView a, TensorView b, TensorView a_sf, Tenso
   // tactics -- so the decision belongs to can_implement, not to a module-wide
   // equality test. Infeasibility surfaces below as "no feasible fallback
   // tactic", or from run_tactic_impl when an explicit tactic is passed.
-  TVM_FFI_ICHECK(loraRank > 0 && loraRank % 32 == 0)
-      << "the LoRA rank (d.shape[1]) must be a positive multiple of 32, got " << loraRank;
+  TVM_FFI_ICHECK(loraRank > 0 && fits_nonnegative_int(loraRank) && loraRank % 32 == 0)
+      << "the LoRA rank (d.shape[1]) must be a positive int32 multiple of 32, got " << loraRank;
   TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(d.data_ptr()) % 16, 0)
       << "d must be 16-byte aligned for TMA";
   TVM_FFI_ICHECK(l1.ndim() == 2 && l1.size(0) == n && l1.size(1) == loraRank)
@@ -728,6 +748,11 @@ void nvfp4_svdquant_linear_sm120(TensorView x, TensorView pqs, TensorView global
                                  TensorView workspace_buffer, int64_t tactic, bool enable_pdl,
                                  int64_t producer_family, int64_t tiling0, int64_t tiling1,
                                  int64_t tiling2, int64_t address_policy) {
+  TVM_FFI_ICHECK_GE(tactic, -1) << "invalid NVFP4 SVDQuant SM120 linear tactic: " << tactic;
+  TVM_FFI_ICHECK(producer_family >= -1 && producer_family <= std::numeric_limits<int>::max() &&
+                 fits_nonnegative_int(tiling0) && fits_nonnegative_int(tiling1) &&
+                 fits_nonnegative_int(tiling2) && fits_nonnegative_int(address_policy))
+      << "NVFP4 SVDQuant SM120 producer parameters must fit in int32";
   // Was: `x.size(0) == 27280 && x.size(1) == 14336`. One shape, one card, wired
   // into the entry point as a literal. Same objection as every other table this
   // backend has shed -- a persisting-L2 window that helps on one part is not
@@ -799,22 +824,35 @@ int64_t nvfp4_svdquant_gemm_lora_rank() {
 
 bool nvfp4_svdquant_gemm_can_implement(int64_t m, int64_t n, int64_t k, int64_t lora_rank,
                                        int64_t tactic) {
+  if (!fits_nonnegative_int(m) || !fits_nonnegative_int(n) || !fits_nonnegative_int(k) ||
+      !fits_nonnegative_int(lora_rank)) {
+    return false;
+  }
+  check_sm120_tactic(tactic);
   return flashinfer::gemm::nvfp4_svdquant_gemm_can_implement(
       static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), static_cast<int>(lora_rank),
       static_cast<int>(tactic));
 }
 
 int64_t nvfp4_svdquant_gemm_fallback_tactic(int64_t m, int64_t n, int64_t k, int64_t lora_rank) {
+  if (!fits_nonnegative_int(m) || !fits_nonnegative_int(n) || !fits_nonnegative_int(k) ||
+      !fits_nonnegative_int(lora_rank)) {
+    return -1;
+  }
   return flashinfer::gemm::nvfp4_svdquant_gemm_fallback_tactic(
       static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), static_cast<int>(lora_rank));
 }
 
 int64_t nvfp4_svdquant_gemm_shared_storage_size(int64_t tactic) {
+  check_sm120_tactic(tactic);
   return static_cast<int64_t>(
       flashinfer::gemm::nvfp4_svdquant_gemm_shared_storage_size(static_cast<int>(tactic)));
 }
 
 int64_t nvfp4_svdquant_gemm_workspace_size(int64_t m, int64_t n, int64_t k, int64_t tactic) {
+  TVM_FFI_ICHECK(fits_nonnegative_int(m) && fits_nonnegative_int(n) && fits_nonnegative_int(k))
+      << "NVFP4 SVDQuant SM120 dimensions must fit in int32";
+  check_sm120_tactic(tactic);
   return static_cast<int64_t>(flashinfer::gemm::nvfp4_svdquant_gemm_workspace_size(
       static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), static_cast<int>(tactic)));
 }
@@ -823,6 +861,7 @@ int64_t nvfp4_svdquant_gemm_workspace_size(int64_t m, int64_t n, int64_t k, int6
 // packed into one int64: kernel_id | splits<<8 | raster<<16 | swizzle<<24 |
 // streamk<<32, with raster 0=Heuristic 1=AlongM 2=AlongN.
 int64_t nvfp4_svdquant_gemm_tactic_row(int64_t tactic) {
+  check_sm120_tactic(tactic);
   auto const rt = flashinfer::gemm::svdquant_sm120::decode_runtime_tactic(static_cast<int>(tactic));
   int64_t const streamk =
       flashinfer::gemm::svdquant_sm120::kernel_is_streamk_sm120(rt.kernel_id) ? 1 : 0;

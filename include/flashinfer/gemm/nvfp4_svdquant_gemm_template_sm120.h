@@ -32,6 +32,8 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -585,17 +587,54 @@ inline RuntimeTacticSm120 decode_runtime_tactic(int tactic) {
   return kRuntimeTacticTableSm120[tactic];
 }
 
-// Shape-dependent legality of a row: forced Split-K may not exceed the K-tile
-// count (the CUTLASS scheduler validates split syntax but not this bound).
+// Validate before constructing CUTLASS layouts or scheduler parameters: their
+// dynamic SF strides and several scheduler products are still 32-bit.
 template <class Config>
-inline bool runtime_tactic_feasible(RuntimeTacticSm120 const& rt, int k) {
-  if (rt.swizzle < 1 || (rt.swizzle & (rt.swizzle - 1)) != 0) return false;
-  if (rt.splits > 1) {
-    int const cta_k = cute::size<2>(typename Config::MmaTileShape{});
-    int const k_tiles = (k + cta_k - 1) / cta_k;
-    if (rt.splits > k_tiles) return false;
+inline bool runtime_tactic_feasible(RuntimeTacticSm120 const& rt, int m, int n, int k) {
+  if (m < 0 || n <= 0 || k <= 0 || rt.splits < 1 || rt.swizzle < 1 ||
+      (rt.swizzle & (rt.swizzle - 1)) != 0)
+    return false;
+  constexpr int cta_m = cute::size<0>(typename Config::MmaTileShape{});
+  constexpr int cta_n = cute::size<1>(typename Config::MmaTileShape{});
+  constexpr int cta_k = cute::size<2>(typename Config::MmaTileShape{});
+  int const problem_m = Config::SwapAB ? n : m;
+  int const problem_n = Config::SwapAB ? m : n;
+  constexpr int64_t max_int = std::numeric_limits<int>::max();
+  // CuTe ceil_div evaluates a + b before subtracting one.
+  if (problem_m > max_int - cta_m || problem_n > max_int - cta_n || k > max_int - cta_k)
+    return false;
+  auto pad = [](int64_t value, int64_t multiple) {
+    return (value + multiple - 1) / multiple * multiple;
+  };
+  constexpr int sf_vec = Config::CollectiveMainloop::Sm1xxBlkScaledConfig::SFVecSize;
+  int64_t const sf_cols = pad(k, 4 * sf_vec) / sf_vec;
+  if (pad(m, 128) * sf_cols > max_int || pad(n, 128) * sf_cols > max_int) return false;
+  int const k_tiles = k / cta_k + (k % cta_k != 0);
+  if (rt.splits > k_tiles) return false;
+  int64_t const m_tiles = pad((int64_t(problem_m) + cta_m - 1) / cta_m, rt.swizzle);
+  int64_t const n_tiles = pad((int64_t(problem_n) + cta_n - 1) / cta_n, rt.swizzle);
+  int64_t const output_tiles = m_tiles * n_tiles;
+  if (output_tiles > max_int) return false;
+  if constexpr (cute::is_same_v<typename Config::TileSchedulerTag, StreamKTag>) {
+    // Bound every possible Stream-K group without depending on the device's SM count.
+    if (output_tiles > max_int / k_tiles) return false;
   }
   return true;
+}
+
+// Keep CUTLASS's LayoutSF parameter types after computing layout intermediates
+// in int64. runtime_tactic_feasible has checked that the final strides fit.
+template <class Layout>
+constexpr auto narrow_sf_layout(Layout const& layout) {
+  auto narrow = [](auto value) {
+    if constexpr (cute::is_static<decltype(value)>::value) {
+      return value;
+    } else {
+      return static_cast<int32_t>(value);
+    }
+  };
+  return cute::make_layout(cute::transform_leaf(layout.shape(), narrow),
+                           cute::transform_leaf(layout.stride(), narrow));
 }
 
 // The single scheduler-argument applicator shared by run_tactic,
@@ -629,6 +668,8 @@ size_t shared_storage_size_for_tactic() {
 
 template <class Config>
 size_t workspace_size_for_tactic(RuntimeTacticSm120 const& rt, int m, int n, int k) {
+  if (!runtime_tactic_feasible<Config>(rt, m, n, k))
+    throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): tactic infeasible for this shape");
   using Gemm = typename Config::Gemm;
   Gemm gemm;
   typename Gemm::Arguments args{};
@@ -644,7 +685,7 @@ size_t workspace_size_for_tactic(RuntimeTacticSm120 const& rt, int m, int n, int
 
 template <class Config>
 bool can_implement_tactic(RuntimeTacticSm120 const& rt, int m, int n, int k, int lora_rank) {
-  if (!runtime_tactic_feasible<Config>(rt, k)) return false;
+  if (!runtime_tactic_feasible<Config>(rt, m, n, k)) return false;
   using Gemm = typename Config::Gemm;
   using Sm1xxBlkScaledConfig = typename Config::CollectiveMainloop::Sm1xxBlkScaledConfig;
   typename Gemm::Arguments args{};
@@ -656,8 +697,13 @@ bool can_implement_tactic(RuntimeTacticSm120 const& rt, int m, int n, int k, int
   }
   args.mainloop.dA = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideA>(k, 0);
   args.mainloop.dB = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideB>(k, 0);
-  args.mainloop.layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(args.problem_shape);
-  args.mainloop.layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(args.problem_shape);
+  // CuTe's layout construction also multiplies the uncompressed M/N and K extents.
+  auto const sf_shape = cute::make_shape(int64_t(Config::SwapAB ? n : m),
+                                         int64_t(Config::SwapAB ? m : n), int64_t(k), int64_t(1));
+  args.mainloop.layout_SFA =
+      narrow_sf_layout(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(sf_shape));
+  args.mainloop.layout_SFB =
+      narrow_sf_layout(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(sf_shape));
   args.mainloop.lora_rank = lora_rank;
   // Pointer non-null checks are part of can_implement; use sentinels for the dry-run query.
   args.mainloop.ptr_D = reinterpret_cast<cutlass::bfloat16_t const*>(size_t(256));
@@ -678,6 +724,8 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
                      void const* L1, void const* bias, void const* inline_down_x,
                      void const* inline_down_l2t, int m, int n, int k, int lora_rank, char* ws,
                      size_t wsBytes, cudaStream_t stream, bool enable_pdl) {
+  if (!runtime_tactic_feasible<Config>(rt, m, n, k))
+    throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): tactic infeasible for this shape");
   using Gemm = std::conditional_t<CompileInlineDown, typename Config::Gemm,
                                   typename Config::GemmNoInlineDown>;
   using Sm1xxBlkScaledConfig = typename Config::CollectiveMainloop::Sm1xxBlkScaledConfig;
@@ -717,8 +765,12 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
   }
   args.mainloop.dA = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideA>(k, 0);
   args.mainloop.dB = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideB>(k, 0);
-  args.mainloop.layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(args.problem_shape);
-  args.mainloop.layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(args.problem_shape);
+  auto const sf_shape = cute::make_shape(int64_t(Config::SwapAB ? n : m),
+                                         int64_t(Config::SwapAB ? m : n), int64_t(k), int64_t(1));
+  args.mainloop.layout_SFA =
+      narrow_sf_layout(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(sf_shape));
+  args.mainloop.layout_SFB =
+      narrow_sf_layout(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(sf_shape));
   args.mainloop.lora_rank = lora_rank;
   bool const use_inline_down = inline_down_x != nullptr && inline_down_l2t != nullptr;
   if constexpr (!CompileInlineDown) {
@@ -752,8 +804,6 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
   args.epilogue.thread.beta_ptr = nullptr;
   args.epilogue.thread.bias_ptr = static_cast<OutElementType const*>(bias);
 
-  if (!runtime_tactic_feasible<Config>(rt, k))
-    throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): tactic infeasible for this shape");
   apply_runtime_scheduler_args<Config>(rt, args.scheduler);
 
   Gemm gemm;
