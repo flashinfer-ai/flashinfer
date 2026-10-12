@@ -183,7 +183,7 @@ def _radix_cutlass_top_k_varlen_check(
     max_window_len=None,
     absolute_indices=False,
     page_table=None,
-    page_size=1,
+    page_size=None,
     compress_ratio=None,
     next_n=None,
     pre_idx=None,
@@ -246,7 +246,7 @@ def _gvr_top_k_varlen_check(
     max_window_len=None,
     absolute_indices=False,
     page_table=None,
-    page_size=1,
+    page_size=None,
     compress_ratio=None,
     next_n=None,
     pre_idx=None,
@@ -300,7 +300,7 @@ def _gvr2_top_k_varlen_check(
     max_window_len=None,
     absolute_indices=False,
     page_table=None,
-    page_size=1,
+    page_size=None,
     compress_ratio=None,
     next_n=None,
     pre_idx=None,
@@ -363,7 +363,7 @@ def _top_k_varlen_heuristic(
     max_window_len=None,
     absolute_indices=False,
     page_table=None,
-    page_size: int = 1,
+    page_size: Optional[int] = None,
     compress_ratio: Optional[int] = None,
     next_n: Optional[int] = None,
     pre_idx=None,
@@ -1317,7 +1317,7 @@ def _radix_top_k_varlen_check(
     max_window_len=None,
     absolute_indices=False,
     page_table=None,
-    page_size=1,
+    page_size=None,
     compress_ratio=None,
     next_n=None,
     pre_idx=None,
@@ -1464,7 +1464,7 @@ def _radix_filter_top_k_varlen_check(
     max_window_len=None,
     absolute_indices=False,
     page_table=None,
-    page_size=1,
+    page_size=None,
     compress_ratio=None,
     next_n=None,
     pre_idx=None,
@@ -1598,7 +1598,7 @@ def top_k_varlen(
     max_window_len: Optional[int] = None,
     absolute_indices: bool = False,
     page_table: Optional[torch.Tensor] = None,
-    page_size: int = 1,
+    page_size: Optional[int] = None,
     compress_ratio: Optional[int] = None,
     next_n: Optional[int] = None,
     pre_idx: Optional[torch.Tensor] = None,
@@ -1775,8 +1775,9 @@ def top_k_varlen(
         ``row_starts`` or ``return_values``; the backends that serve it are
         listed under ``backend``. Default ``None``.
     page_size : int, optional
-        Columns per ``page_table`` entry, a power of two up to ``2**30``.
-        Ignored without ``page_table``. Default ``1``.
+        Columns per ``page_table`` entry, a power of two up to ``2**30``. Any
+        value but ``None`` without ``page_table`` raises ``ValueError``.
+        Default ``None``, meaning ``1``.
     compress_ratio : int, optional
         Decode mode only: KV-index compression factor (``1`` for DSv3.2, ``4``
         for DSv4), every logit column standing for ``compress_ratio``
@@ -1957,7 +1958,8 @@ def top_k_varlen(
         ``absolute_indices`` not a ``bool``; if ``page_table`` comes with
         ``row_starts``, ``pre_idx`` or ``return_values``, is not a contiguous
         2-D ``int32`` tensor with one row per request covering the buffer
-        width, or ``page_size`` is not a power of two up to ``2**30``; if an
+        width, or ``page_size`` is given without ``page_table`` or is not a
+        power of two up to ``2**30``; if an
         ``out_indices`` /
         ``out_values`` buffer is outside the contract above; or if an explicit
         backend's checker rejects the problem (reported as "Problem size is
@@ -2137,6 +2139,13 @@ def top_k_varlen(
             "windowed (prefill) mode, and in decode every row starts at column "
             "0 and num_cols already bounds it"
         )
+    if page_table is None and page_size is not None:
+        raise ValueError(
+            "page_size requires page_table: it is the page granularity of that "
+            "table and has no meaning without it; do not pass it, not even 1"
+        )
+    if page_size is None:
+        page_size = 1  # the paged default, resolved before the checks below
     if page_table is not None:
         if not (
             isinstance(page_table, torch.Tensor)

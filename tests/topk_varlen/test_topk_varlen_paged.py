@@ -257,6 +257,11 @@ def test_paged_api_validation():
     lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
     lens = torch.full((rows,), ncols, dtype=torch.int32, device=_DEV)
     pt = torch.zeros((rows, ncols // 64), dtype=torch.int32, device=_DEV)
+    # page_size is a paged-output argument: any value without page_table is
+    # refused by the API body, on every GPU (decode admission is universal)
+    for ps in (64, 1):
+        with pytest.raises(ValueError, match="page_size requires page_table"):
+            flashinfer.top_k_varlen(lg, lens, k, page_size=ps)
     if not flashinfer.top_k_varlen.is_backend_supported("gvr_2", _cc()):
         from flashinfer.utils import BackendSupportedError
 
@@ -275,14 +280,23 @@ def test_paged_api_validation():
     for kw in bad:
         with pytest.raises(ValueError, match="page_table|page_size"):
             flashinfer.top_k_varlen(lg, lens, k, **kw)
-    # combinations no backend admits: gvr_2's checker refuses them, so `auto`
-    # reports no suitable backend; an explicit gvr_2 call raises at validation
+    # None is the omitted form: the same paged output as page_size=1
+    pt1 = _page_table(rows, ncols, 1, seed=3)
+    out_none, _ = flashinfer.top_k_varlen(lg, lens, k, page_table=pt1)
+    out_one, _ = flashinfer.top_k_varlen(lg, lens, k, page_table=pt1, page_size=1)
+    torch.cuda.synchronize()
+    assert _same_rows(out_none, out_one)
+    # mode conflicts are refused by the API body with a ValueError, under auto
+    # and an explicit gvr_2 alike (the checker admits the call for that)
     for kw in (
         dict(row_starts=torch.zeros(rows, dtype=torch.int32, device=_DEV)),
         dict(pre_idx=torch.zeros((rows, k), dtype=torch.int32, device=_DEV)),
     ):
-        with pytest.raises((BackendSupportedError, ValueError)):
-            flashinfer.top_k_varlen(lg, lens, k, page_table=pt, page_size=64, **kw)
+        for extra in ({}, {"backend": "gvr_2"}):
+            with pytest.raises(ValueError, match="page_table"):
+                flashinfer.top_k_varlen(
+                    lg, lens, k, page_table=pt, page_size=64, **kw, **extra
+                )
     # other backends refuse it explicitly
     with pytest.raises((BackendSupportedError, ValueError)):
         flashinfer.top_k_varlen(

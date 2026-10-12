@@ -29,7 +29,7 @@ def _top_k_varlen_reference(
     row_starts=None,
     absolute_indices=False,
     page_table=None,
-    page_size=1,
+    page_size=None,
     next_n=1,
     **_unused,
 ):
@@ -37,6 +37,7 @@ def _top_k_varlen_reference(
     row_starts[r] + seq_lens[r])`` with window-local indices when
     ``row_starts`` is given, absolute columns with ``absolute_indices``).
     Reference uses torch.topk on each row."""
+    page_size = 1 if page_size is None else page_size
     num_rows, N = logits.shape
     indices = torch.empty(num_rows, top_k, dtype=torch.int32, device=logits.device)
     logits_f32 = logits.to(torch.float32)
