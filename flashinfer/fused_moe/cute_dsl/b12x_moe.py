@@ -221,7 +221,9 @@ def b12x_fused_moe(
         ``"w4a16"``. When set, selects the backend and internal workspace
         family.
     source_format : str
-        Source weight format for ``quant_mode="w4a16"`` — ``"modelopt"`` or
+        Source weight format for ``quant_mode="w4a16"``. ``"modelopt_e4m3_k32"``
+        accepts logical E4M3 scales shaped ``[E, N, K // 32]`` with per-expert
+        FP32 global scales and E2M1 weights. Other formats include ``"modelopt"`` or
         ``"compressed_tensors"``.  Defaults to ``"modelopt"``.
 
     Returns
