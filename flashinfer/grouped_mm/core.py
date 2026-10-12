@@ -399,6 +399,11 @@ def grouped_mm_mxfp8(
         Block scale tensor for A. Can be:
         - 2D swizzled 128x4: shape (cum_m, k // 32)
         dtype: uint8.
+        The tensor is the 128x4 swizzle of all ``cum_m`` token rows as one
+        matrix (rows padded to a multiple of 128), e.g. the output of
+        ``nvfp4_quantize``/``mxfp8_quantize`` on ``a``. Expert segments in
+        ``m_indptr`` need not start on multiples of 128: the scales are
+        re-laid out internally into the per-expert padded order cuDNN reads.
     b_descale : torch.Tensor
         Block scale tensor for B. Can be:
         - 3D swizzled 128x4: shape (batch_size, n, k // 32)
@@ -564,6 +569,11 @@ def grouped_mm_fp4(
         Block scale tensor for A. Can be:
         - 2D swizzled 128x4: shape (cum_m, k // block_size)
         dtype: float8_e4m3fn or uint8.
+        The tensor is the 128x4 swizzle of all ``cum_m`` token rows as one
+        matrix (rows padded to a multiple of 128), e.g. the output of
+        ``nvfp4_quantize``/``mxfp8_quantize`` on ``a``. Expert segments in
+        ``m_indptr`` need not start on multiples of 128: the scales are
+        re-laid out internally into the per-expert padded order cuDNN reads.
     b_descale : torch.Tensor
         Block scale tensor for B. Can be:
         - 3D swizzled 128x4: shape (batch_size, n, k // block_size)

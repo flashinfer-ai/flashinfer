@@ -349,6 +349,78 @@ def _run_cudnn_moe_grouped_gemm(
     return out
 
 
+def _segmented_token_scale_capacity_rows(total_rows: int, num_groups: int) -> int:
+    """Rows of the per-group-padded token scale blob cuDNN's MoE block-scale kernels read.
+
+    Mirrors cuDNN frontend's ``segmented_row_scale_capacity_rows``: with ``total_rows``
+    tokens split over at most ``num_groups`` non-empty groups, independently padding
+    every group to whole 128-row blocks needs at most ``A + (total_rows - A) // 128``
+    blocks, ``A = min(total_rows, num_groups)``. The bound is static, so the blob can
+    be sized without reading ``m_indptr`` on the host.
+    """
+    active = min(total_rows, num_groups)
+    return 128 * (active + (total_rows - active) // 128)
+
+
+def _segment_token_descale_per_group(
+    a_descale: torch.Tensor, m_indptr: torch.Tensor, cum_m: int, k_blocks: int
+) -> torch.Tensor:
+    """Re-lay A's block scales from one 128x4 swizzle over all ``cum_m`` tokens into
+    the layout cuDNN's MoE block-scale kernels read.
+
+    ``grouped_mm_fp4`` / ``grouped_mm_mxfp8`` take ``a_descale`` as one F8_128x4-reordered
+    tensor over every token, which is what the quantizers produce. cuDNN's MoE grouped
+    block-scale kernels (SM100 and SM12x) instead read token scales that are
+    F8_128x4-reordered and padded to whole 128-row blocks *per group*, groups
+    concatenated in order: group ``g`` starts at block ``sum(ceil(rows_g' / 128))`` over
+    the groups before it, and its rows are addressed group-locally. The two layouts
+    coincide only when every group starts on a multiple of 128 rows; for any other
+    ``m_indptr`` the kernel reads the wrong scales (or past the buffer) and returns
+    wrong values without an error.
+
+    One Triton kernel does it: each program writes one destination 128-row block,
+    finding its group from ``m_indptr`` on the device, so this needs no host
+    synchronization and is safe under CUDA graph capture. Padding rows are zero. Returns a dense ``(capacity_rows, round_up(k_blocks, 4))``
+    tensor of ``a_descale``'s dtype.
+    """
+    import triton
+
+    from ...triton.kernels.grouped_scale import segment_scale_128x4_per_group_kernel
+
+    cols = ((k_blocks + 3) // 4) * 4
+    col_words = cols // 4
+    rows = a_descale.numel() // cols
+    num_groups = m_indptr.numel() - 1
+    cap = _segmented_token_scale_capacity_rows(cum_m, num_groups)
+    src = a_descale.contiguous().view(torch.uint8).view(torch.int32)
+    dst = torch.empty(cap * col_words, dtype=torch.int32, device=a_descale.device)
+    block_c = min(32, triton.next_power_of_2(col_words))
+    grid = (cap // 128, triton.cdiv(col_words, block_c))
+    segment_scale_128x4_per_group_kernel[grid](
+        src,
+        dst,
+        m_indptr.to(torch.int32),
+        num_groups,
+        rows,
+        num_col_words=col_words,
+        BLOCK_G=max(16, triton.next_power_of_2(num_groups)),
+        BLOCK_C=block_c,
+    )
+    return dst.view(torch.uint8).view(cap, cols).view(a_descale.dtype)
+
+
+def _bind_as_declared(blob: torch.Tensor, declared: torch.Tensor) -> torch.Tensor:
+    """A view of ``blob`` with ``declared``'s shape and dense strides.
+
+    The graph declares the logical token scales, and cuDNN reads the scale buffer
+    through its base pointer, so the larger segmented blob is bound through a view
+    whose shape matches the declaration. Binding a tensor of a different shape makes
+    cuDNN take its per-call shape-override path, which costs tens of milliseconds of
+    host time per execute. The view keeps the blob alive.
+    """
+    return blob.reshape(-1)[: declared.numel()].view(declared.shape)
+
+
 @functools.lru_cache(maxsize=1024)
 def _build_cudnn_moe_block_scale_grouped_gemm_graph(
     handle,
@@ -564,6 +636,17 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
 
     token_3d = a.unsqueeze(0)
     token_descale_3d = a_descale.unsqueeze(0)
+    # The graph declares the logical token scales; the kernel reads the per-group
+    # padded blob (see _segment_token_descale_per_group), so that is what runs.
+    token_descale_runtime = _bind_as_declared(
+        _segment_token_descale_per_group(
+            a_descale,
+            m_indptr,
+            cum_m,
+            a.shape[1] // 32,  # MXFP8: one UE8M0 scale per 32
+        ),
+        a_descale,
+    ).unsqueeze(0)
     weight_3d = b.transpose(1, 2)
     weight_descale_3d = b_descale.transpose(1, 2)
     fto = m_indptr[:-1].reshape(-1, 1, 1).contiguous()
@@ -605,7 +688,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
 
     variant_pack = {
         _CUDNN_UIDs.TOKEN.value: token_3d,
-        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_3d,
+        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_runtime,
         _CUDNN_UIDs.WEIGHT.value: weight_3d,
         _CUDNN_UIDs.WEIGHT_SCALE_FACTOR.value: weight_descale_3d,
         _CUDNN_UIDs.FIRST_TOKEN_OFFSET.value: fto,
@@ -665,6 +748,17 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
 
     token_3d = a.unsqueeze(0)
     token_descale_3d = a_descale.unsqueeze(0)
+    # The graph declares the logical token scales; the kernel reads the per-group
+    # padded blob (see _segment_token_descale_per_group), so that is what runs.
+    token_descale_runtime = _bind_as_declared(
+        _segment_token_descale_per_group(
+            a_descale,
+            m_indptr,
+            cum_m,
+            a.shape[1] * 2 // block_size,  # packed FP4: two per byte
+        ),
+        a_descale,
+    ).unsqueeze(0)
     weight_3d = b.transpose(1, 2)
     weight_descale_3d = b_descale.transpose(1, 2)
     fto = m_indptr[:-1].reshape(-1, 1, 1).contiguous()
@@ -713,7 +807,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
 
     variant_pack = {
         _CUDNN_UIDs.TOKEN.value: token_3d,
-        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_3d,
+        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_runtime,
         _CUDNN_UIDs.WEIGHT.value: weight_3d,
         _CUDNN_UIDs.WEIGHT_SCALE_FACTOR.value: weight_descale_3d,
         _CUDNN_UIDs.FIRST_TOKEN_OFFSET.value: fto,

@@ -20,6 +20,19 @@ class TestGroupedMmMxfp8:
     """Tests for grouped_mm_mxfp8 (block-scaled MXFP8 grouped GEMM)."""
 
     MIN_COS_SIM = 0.9
+    # Expert segments that do not start on a multiple of 128 rows, the shape real
+    # routing produces. cuDNN reads token scales padded to 128 rows per group, so
+    # these exercise the re-layout in _segment_token_descale_per_group; before it,
+    # every segment that started mid-tile was silently wrong (or NaN).
+    UNALIGNED_SEGMENTS = [
+        [64, 64],
+        [120, 136],
+        [16, 48, 64],
+        [128, 64, 64],
+        [192, 64],
+        [13, 83, 0, 67, 77],
+    ]
+    MIN_SEGMENT_COS_SIM = 0.97
 
     @staticmethod
     def _quantize_a(a_bf16):
@@ -148,6 +161,50 @@ class TestGroupedMmMxfp8:
             dim=0,
         )
         assert cos_sim > self.MIN_COS_SIM
+
+    @requires_cudnn_moe_block_scale
+    @pytest.mark.parametrize("seg_lens", UNALIGNED_SEGMENTS)
+    def test_unaligned_segments(self, seg_lens):
+        """Segments starting off a 128-row boundary are as accurate as aligned ones."""
+        torch.manual_seed(3)
+        num_experts = len(seg_lens)
+        cum_m = sum(seg_lens)
+        k, n = 512, 256
+
+        a_bf16 = torch.randn(cum_m, k, dtype=torch.bfloat16, device="cuda")
+        b_bf16 = torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda")
+        m_indptr = torch.tensor(
+            [0, *torch.tensor(seg_lens).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        a_mxfp8, a_scale = self._quantize_a(a_bf16)
+        b_mxfp8, b_scale = self._quantize_b(b_bf16)
+
+        out = grouped_mm_mxfp8(
+            a_mxfp8,
+            b_mxfp8,
+            a_scale,
+            b_scale,
+            m_indptr,
+            out_dtype=torch.bfloat16,
+        )
+        ref = ref_grouped_mm(a_bf16, b_bf16, m_indptr, out_dtype=torch.bfloat16)
+
+        assert torch.isfinite(out).all()
+        for e in range(num_experts):
+            start, end = m_indptr[e].item(), m_indptr[e + 1].item()
+            if start == end:
+                continue
+            cos_sim = F.cosine_similarity(
+                ref[start:end].reshape(-1).float(),
+                out[start:end].reshape(-1).float(),
+                dim=0,
+            )
+            assert cos_sim > self.MIN_SEGMENT_COS_SIM, (
+                f"segment {e} rows [{start}, {end}): cosine similarity {cos_sim:.4f}"
+            )
 
     @requires_cudnn_moe_block_scale
     def test_single_expert(self):
