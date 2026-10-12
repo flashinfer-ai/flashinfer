@@ -467,6 +467,11 @@ def _validate_prepared_activation_params(
             required += ("gemm1_beta",)
         if activation.limit != default.limit:
             required += ("gemm1_clamp_limit",)
+    elif isinstance(activation, SwiGLUStep):
+        if view.get("gemm1_alpha") is not None or view.get("gemm1_beta") is not None:
+            raise ValueError(f"{runner}: SwiGLUStep consumes gemm1_clamp_limit only.")
+        if activation.limit != SwiGLUStep().limit:
+            required = ("gemm1_clamp_limit",)
     elif isinstance(activation, SiTU):
         # TRTLLM reuses gemm1_alpha/beta, whose null SiTU defaults are 1/1
         # rather than the typed 4/25. Require explicit tensors even at default.
@@ -5529,7 +5534,13 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
     supported_activation_classes_by_quant: ClassVar[
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
-        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (
+            SwiGLU,
+            SwiGLUStep,
+            GeGLU,
+            SiTU,
+            ReLU2,
+        ),
         (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
         (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
     }
@@ -5923,7 +5934,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
         (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
-        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, SwiGLUStep, GeGLU, ReLU2),
     }
 
     def _check_support(self) -> None:
@@ -6277,9 +6288,8 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
-    # The per-tensor cubin manifest has SwiGLU and ReLU2 epilogues. GeGLU is
-    # representable by the enum but has no matching generated kernel.
-    supported_activation_classes = (SwiGLU, ReLU2)
+    # GeGLU is representable by the enum but has no matching generated kernel.
+    supported_activation_classes = (SwiGLU, SwiGLUStep, ReLU2)
 
     def _check_activation_parameters(self) -> None:
         if (
@@ -6445,6 +6455,26 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         from .core import MoeRunnerInputs
 
         view = weights.get_view(self.backend_key)
+        _validate_prepared_activation_params(
+            view, self.config.activation, type(self).__name__
+        )
+        _validate_optional_gemm1_activation_params(
+            view,
+            self._num_local_experts,
+            act.hidden_states_q.device,
+            type(self).__name__,
+        )
+        if not isinstance(self.config.activation, SwiGLUStep):
+            unsupported = [
+                key
+                for key in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+                if view.get(key) is not None
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"{type(self).__name__} cannot consume {unsupported}; "
+                    "only SwiGLUStep accepts per-expert activation limits."
+                )
         routing = self.config.routing
         num_tokens, hidden_size = act.hidden_states_q.shape
         self._validate_tensors(act, view, hidden_size)
@@ -6516,6 +6546,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
             gemm1_weights=view["gemm1_weights"],
             output1_scales_scalar=view["output1_scales_scalar"],
             output1_scales_gate_scalar=view["output1_scales_gate_scalar"],
+            gemm1_clamp_limit=view.get("gemm1_clamp_limit"),
             gemm2_weights=view["gemm2_weights"],
             output2_scales_scalar=view["output2_scales_scalar"],
             num_experts=routing.num_experts,
@@ -6575,9 +6606,8 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
-    # The BF16 cubin manifest currently contains SwiGLU and ReLU2. GeGLU and
-    # SiTU are represented by the launcher enum but have no matching kernels.
-    supported_activation_classes = (SwiGLU, ReLU2)
+    # GeGLU and SiTU are represented by the launcher enum but have no matching kernels.
+    supported_activation_classes = (SwiGLU, SwiGLUStep, ReLU2)
 
     def _check_support(self) -> None:
         super()._check_support()

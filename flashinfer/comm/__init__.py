@@ -101,6 +101,9 @@ from .ulysses_topology import (
     probe_ulysses_rank_topology as probe_ulysses_rank_topology,
 )
 from .ulysses_topology import resolve_ulysses_backend as resolve_ulysses_backend
+from .qkv_norm_rope_exchange_overlap import (
+    QkvNormRopeExchangeOverlap as QkvNormRopeExchangeOverlap,
+)
 
 # Unified AllReduce Fusion API
 from .allreduce import AllReduceFusionWorkspace as AllReduceFusionWorkspace

@@ -50,8 +50,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include "cake_device_helpers/cake_elect_sync_1ee8cd91025d8932.cuh"
 #include "cake_device_helpers/cake_mbarrier_init_15e581aef85ee586.cuh"
 #include "cake_device_helpers/cake_mbarrier_wait_c93bf7e39b218733.cuh"
-#include "cake_device_helpers/cake_mbarrier_wait_cluster_hint_bdb29a0e36dedbee.cuh"
-#include "cake_device_helpers/cake_mbarrier_test_wait_4a900601b6d11699.cuh"
 union MmaSmemDesc {
     uint64_t u64;
     uint32_t u32[2];
@@ -62,6 +60,8 @@ union MmaSmemDesc {
 #include "cake_device_helpers/cake_tma_3d_gmem2smem_7df1e07811f83fc6.cuh"
 #include "cake_device_helpers/cake_tma_2d_gmem2smem_f2637c69284c470a.cuh"
 #include "cake_device_helpers/cake_tcgen05_commit_3d61b9d0baed52f9.cuh"
-#include "cake_device_helpers/cake_tcgen05_commit_cg1_multicast_ee8587d2c4433261.cuh"
 #include "cake_device_helpers/cake_make_warp_uniform_26e432f3ff129648.cuh"
+#include "cake_device_helpers/cake_mbarrier_test_wait_4a900601b6d11699.cuh"
 #include "cake_device_helpers/cake_cp_async_bulk_gmem2smem_5198c9805c6ecc8d.cuh"
+#include "cake_device_helpers/cake_mbarrier_wait_cluster_hint_bdb29a0e36dedbee.cuh"
+#include "cake_device_helpers/cake_tcgen05_commit_cg1_multicast_ee8587d2c4433261.cuh"

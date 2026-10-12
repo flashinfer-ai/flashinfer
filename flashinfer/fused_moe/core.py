@@ -37,14 +37,14 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.moe import (
     cutlass_fused_moe_trace,
-    trtllm_bf16_moe_trace,
-    trtllm_bf16_routed_moe_trace,
+    trtllm_bf16_moe_trace_dispatch as trtllm_bf16_moe_trace,
+    trtllm_bf16_routed_moe_trace_dispatch as trtllm_bf16_routed_moe_trace,
     trtllm_fp4_block_scale_moe_trace_dispatch,
     trtllm_fp4_block_scale_routed_moe_trace,
     trtllm_fp8_block_scale_moe_trace_dispatch,
-    trtllm_fp8_block_scale_routed_moe_trace,
-    trtllm_fp8_per_tensor_scale_moe_trace,
-    trtllm_fp8_per_tensor_scale_routed_moe_trace,
+    trtllm_fp8_block_scale_routed_moe_trace_dispatch as trtllm_fp8_block_scale_routed_moe_trace,
+    trtllm_fp8_per_tensor_scale_moe_trace_dispatch as trtllm_fp8_per_tensor_scale_moe_trace,
+    trtllm_fp8_per_tensor_scale_routed_moe_trace_dispatch as trtllm_fp8_per_tensor_scale_routed_moe_trace,
     trtllm_mxint4_block_scale_moe_trace,
 )
 from ..autotuner import (
@@ -852,6 +852,37 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 return [-1]
             valid_tactics = valid_tactics if valid_tactics else all_tactics
 
+            requires_activation_fusion_gemm1 = (
+                stage == 1
+                and self.activation_type == ActivationType.ClampedRelu2
+                and get_compute_capability(inputs[0].device)[0] == 10
+                and (
+                    self.use_mxfp8_act_scaling
+                    or (
+                        self.x_dtype == torch.bfloat16
+                        and self.weight_dtype == torch.bfloat16
+                    )
+                )
+            )
+            if requires_activation_fusion_gemm1:
+                try:
+                    supports_activation_fusion = (
+                        self.fused_moe_runner.get_tactic_supports_activation_fusion
+                    )
+                except AttributeError as e:
+                    raise RuntimeError(
+                        "ClampedRelu2 tactic filtering requires activation-fusion "
+                        "capability metadata in the FlashInfer CUTLASS module"
+                    ) from e
+                valid_tactics = [
+                    t for t in valid_tactics if supports_activation_fusion(t)
+                ]
+                if not valid_tactics:
+                    raise RuntimeError(
+                        "ClampedRelu2 requires a generated SM10x GEMM1 tactic with "
+                        "activation fusion in the CUTLASS epilogue"
+                    )
+
             if not self.use_w4_group_scaling:
                 return valid_tactics
 
@@ -966,6 +997,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        clamped_relu2_limit: Optional[torch.Tensor] = None,
         situ_beta: Optional[torch.Tensor] = None,
         situ_linear_beta: Optional[torch.Tensor] = None,
         swizzled_input_sf: bool = True,
@@ -1099,6 +1131,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
+            clamped_relu2_limit,
             situ_beta,
             situ_linear_beta,
             swizzled_input_sf,
@@ -1144,6 +1177,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        clamped_relu2_limit: Optional[torch.Tensor] = None,
         situ_beta: Optional[torch.Tensor] = None,
         situ_linear_beta: Optional[torch.Tensor] = None,
         swizzled_input_sf: bool = True,
@@ -1295,6 +1329,7 @@ def cutlass_fused_moe(
     profile_ids: Optional[List[int]] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
     *,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
     situ_beta: Optional[torch.Tensor] = None,
     situ_linear_beta: Optional[torch.Tensor] = None,
     backend: str = "cutlass",
@@ -1368,7 +1403,11 @@ def cutlass_fused_moe(
         Swiglu beta for swiglu activation.
 
     swiglu_limit : Optional[torch.Tensor]
-        Swiglu limit for swiglu activation.
+        Per-expert SwiGLU limits for SwiGLU variants.
+
+    clamped_relu2_limit : Optional[torch.Tensor]
+        Model-wide positive clamp scale for ClampedRelu2, provided as a
+        one-element float32 CUDA tensor.
 
     situ_beta : Optional[torch.Tensor]
         Per-expert ``beta`` tanh scale for the ``Situ`` activation (float32,
@@ -1432,7 +1471,10 @@ def cutlass_fused_moe(
         adjacent kernel on the stream also supports it, or ``False`` to disable.
 
     activation_type: ActivationType = ActivationType.Swiglu
-        Activation to apply on for GEMM1, note that Relu2 means non-gated GEMM1
+        Activation to apply after GEMM1. ``Relu2`` and ``ClampedRelu2`` use a
+        non-gated GEMM1. On SM10x, ``ClampedRelu2`` fuses
+        ``(limit * tanh(relu(x) / limit))**2`` into the BF16xBF16 or
+        MXFP8xMXFP8 GEMM1 epilogue.
 
     swizzled_input_sf : bool = True
         Whether the input scaling factor (input_sf) is in swizzled layout. Defaults to True.
@@ -1504,6 +1546,55 @@ def cutlass_fused_moe(
     if backend != "cutlass":
         raise ValueError(f"unsupported fused MoE backend: {backend!r}")
     major, minor = get_compute_capability(input.device)
+    if int(activation_type) == int(ActivationType.ClampedRelu2):
+        if clamped_relu2_limit is None:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 requires a one-element "
+                "clamped_relu2_limit tensor"
+            )
+        if clamped_relu2_limit.ndim != 1 or clamped_relu2_limit.numel() != 1:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 requires model-wide "
+                "clamped_relu2_limit with shape (1,), got "
+                f"{tuple(clamped_relu2_limit.shape)}"
+            )
+        check_shape_dtype_device(
+            clamped_relu2_limit,
+            (1,),
+            torch.float32,
+            input.device,
+            "ClampedRelu2 clamped_relu2_limit",
+        )
+        if (
+            swiglu_alpha is not None
+            or swiglu_beta is not None
+            or swiglu_limit is not None
+        ):
+            raise ValueError(
+                "ActivationType.ClampedRelu2 does not accept SwiGLU activation parameters"
+            )
+        if situ_beta is not None or situ_linear_beta is not None:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 does not accept SiTU activation parameters"
+            )
+        if major != 10:
+            raise NotImplementedError("ClampedRelu2 requires an SM10x GPU")
+        is_bf16 = (
+            input.dtype == torch.bfloat16 and fc1_expert_weights.dtype == torch.bfloat16
+        )
+        if not (use_mxfp8_act_scaling or is_bf16):
+            raise NotImplementedError(
+                "ClampedRelu2 supports only BF16xBF16 or MXFP8xMXFP8 MoE"
+            )
+        if fc1_expert_biases is not None or min_latency_mode:
+            raise NotImplementedError(
+                "ClampedRelu2 does not support FC1 bias or min-latency mode"
+            )
+    elif clamped_relu2_limit is not None:
+        raise ValueError(
+            "clamped_relu2_limit is supported only with ActivationType.ClampedRelu2"
+        )
+
     device_arch = f"{major * 10 + minor}"
 
     if use_wfp4afp8_humming and device_arch != "90":
@@ -1554,6 +1645,7 @@ def cutlass_fused_moe(
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
+            clamped_relu2_limit,
             situ_beta,
             situ_linear_beta,
             swizzled_input_sf,
@@ -2290,7 +2382,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
+        gemm1_clamp_limit: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
+        _validate_fp8_per_tensor_step_limit(
+            activation_type, gemm1_clamp_limit, local_num_experts, hidden_states.device
+        )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
         if not _device_support_moe_pdl(hidden_states.device):
@@ -2381,6 +2477,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             "activation_type": activation_type,
             "norm_topk_prob": norm_topk_prob,
             "routing_replay_out": routing_replay_out,
+            "gemm1_clamp_limit": gemm1_clamp_limit,
         }
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_fp8_per_tensor_scale_moe",
@@ -2422,6 +2519,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 [],
                 [],
                 False,
+                gemm1_clamp_limit,
             )
             # Convert the native result back to the established public output contract.
             return _unpack_trtllm_moe_output(
@@ -2491,6 +2589,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
+        gemm1_clamp_limit: Optional[torch.Tensor] = None,
     ):
         # Acknowledge the declared mutation-only argument without reading device data in fake mode.
         _ = routing_replay_out
@@ -2534,7 +2633,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         activation_type: int = ActivationType.Swiglu.value,
         routing_replay_out: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
+        gemm1_clamp_limit: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
+        _validate_fp8_per_tensor_step_limit(
+            activation_type, gemm1_clamp_limit, local_num_experts, hidden_states.device
+        )
         assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -2621,6 +2724,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             "activation_type": activation_type,
             "norm_topk_prob": True,
             "routing_replay_out": routing_replay_out,
+            "gemm1_clamp_limit": gemm1_clamp_limit,
         }
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_fp8_per_tensor_scale_routed_moe",
@@ -2663,6 +2767,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 [],
                 [],
                 False,
+                gemm1_clamp_limit,
             )
             return _unpack_trtllm_moe_output(
                 intermediate_output, output, do_finalize, None, expert_weights
@@ -2748,6 +2853,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         activation_type: int = ActivationType.Swiglu.value,
         routing_replay_out: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
+        gemm1_clamp_limit: Optional[torch.Tensor] = None,
     ):
         # Acknowledge the declared mutation-only argument without reading device data in fake mode.
         _ = routing_replay_out
@@ -4673,6 +4779,28 @@ def _validate_fused_shared_experts(
     return n_fused_shared
 
 
+def _validate_fp8_per_tensor_step_limit(
+    activation_type: int,
+    gemm1_clamp_limit: Optional[torch.Tensor],
+    local_num_experts: int,
+    device: torch.device,
+) -> None:
+    if gemm1_clamp_limit is None:
+        return
+    if int(activation_type) != int(ActivationType.SwigluStep):
+        raise ValueError(
+            "FP8 per-tensor gemm1_clamp_limit is supported for "
+            "ActivationType.SwigluStep only."
+        )
+    check_shape_dtype_device(
+        gemm1_clamp_limit,
+        (local_num_experts,),
+        torch.float32,
+        device,
+        "gemm1_clamp_limit",
+    )
+
+
 def _validate_fp8_block_scale_gemm1_activation_params(
     fp8_quantization_type: Fp8QuantizationType,
     activation_type: int,
@@ -4680,6 +4808,14 @@ def _validate_fp8_block_scale_gemm1_activation_params(
     gemm1_beta: Optional[torch.Tensor],
     gemm1_clamp_limit: Optional[torch.Tensor],
 ) -> None:
+    if int(activation_type) == int(ActivationType.SwigluStep):
+        if Fp8QuantizationType(fp8_quantization_type) != Fp8QuantizationType.MxFp8:
+            raise ValueError("SwigluStep requires the fused MxFp8 GEMM1 epilogue.")
+        if gemm1_alpha is not None or gemm1_beta is not None:
+            raise ValueError(
+                "ActivationType.SwigluStep accepts gemm1_clamp_limit only."
+            )
+        return
     if gemm1_alpha is None and gemm1_beta is None and gemm1_clamp_limit is None:
         return
     if Fp8QuantizationType(fp8_quantization_type) not in (
@@ -4810,7 +4946,7 @@ def trtllm_bf16_moe(
         Maximum number of tokens for autotuning (default ``8192``).
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu;
-        ``6`` Relu2 (non-gated).
+        ``6`` Relu2 (non-gated); ``7`` SwigluStep.
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
@@ -4836,10 +4972,11 @@ def trtllm_bf16_moe(
         ``None`` (default), ``beta=0.0`` is used.
     gemm1_clamp_limit : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 CUDA per-expert clamp
-        limit.  Supported with ``ActivationType.Swiglu``.  When provided,
-        ``X1 = clamp(X1, -limit, limit)`` and
-        ``X2 = clamp(X2, max=limit)``.  When ``None`` (default), no clamp
-        is applied.
+        limit.  With ``Swiglu``, clamps ``X1`` to ``[-limit, limit]`` and
+        ``X2`` from above before SiLU; ``None`` leaves both unclamped.
+        With ``SwigluStep``, clamps ``X1`` to ``[-limit, limit]`` and
+        ``silu(X2)`` from above.  ``None`` uses a physical limit of ``7``.
+        BF16 uses physical and raw accumulator units interchangeably.
     output : Optional[torch.Tensor]
         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
         Allocated internally when ``None`` (default).
@@ -5024,7 +5161,7 @@ def trtllm_bf16_routed_moe(
     tune_max_num_tokens : int
         Maximum number of tokens for autotuning (default ``8192``).
     activation_type : int
-        Activation type (default ``3`` — Swiglu).
+        Activation type (default ``3`` — Swiglu). ``7`` selects SwigluStep.
     routing_replay_out : Optional[torch.Tensor]
         Optional ``int16`` tensor of shape ``(num_tokens_or_larger, top_k)``
         used to capture the selected expert IDs during routing.  Column
@@ -5048,10 +5185,13 @@ def trtllm_bf16_routed_moe(
         ``None`` (default), ``beta=0.0`` is used.
     gemm1_clamp_limit : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 CUDA per-expert clamp
-        limit.  Supported with ``ActivationType.Swiglu``.  When provided,
-        ``X1 = clamp(X1, -limit, limit)`` and
-        ``X2 = clamp(X2, max=limit)``.  When ``None`` (default), no clamp
-        is applied.
+        limit. With ``ActivationType.Swiglu``, it clamps ``X1`` to
+        ``[-limit, limit]`` and ``X2`` from above before SiLU; ``None``
+        disables that clamp. With ``ActivationType.SwigluStep``, it caps
+        ``X1`` and ``silu(X2)`` at the physical limit; ``None`` uses ``7``.
+        BF16 has no global FC1 dequant scale, so raw accumulator and
+        physical limits coincide. SwigluStep rejects ``gemm1_alpha`` and
+        ``gemm1_beta``.
     output : Optional[torch.Tensor]
         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
         Allocated internally when ``None`` (default).
@@ -5152,6 +5292,7 @@ def trtllm_fp8_per_tensor_scale_moe(
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""FP8 per-tensor-scale MoE operation.
 
@@ -5225,7 +5366,13 @@ def trtllm_fp8_per_tensor_scale_moe(
         Maximum number of tokens for autotuning (default ``8192``).
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``0`` Gelu; ``3`` Swiglu;
-        ``4`` Geglu; ``6`` Relu2; ``9`` Identity.
+        ``4`` Geglu; ``6`` Relu2; ``7`` SwigluStep; ``9`` Identity.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 raw accumulator limits for
+        ``SwigluStep``.  The default ``None`` uses a physical limit of ``7``.
+        For a physical limit ``L`` with non-unit FC1 dequant scale, pass
+        ``L / output1_scales_gate_scalar`` per expert. The limits can differ
+        between experts, for example ``7`` or ``16``.
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
@@ -5247,6 +5394,9 @@ def trtllm_fp8_per_tensor_scale_moe(
     """
     _validate_routing_replay_out(
         routing_replay_out, top_k, num_tokens=hidden_states.shape[0]
+    )
+    _validate_fp8_per_tensor_step_limit(
+        activation_type, gemm1_clamp_limit, local_num_experts, hidden_states.device
     )
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
         routing_logits,
@@ -5274,6 +5424,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         norm_topk_prob,
         routing_replay_out,
         output,
+        gemm1_clamp_limit,
     )
 
     if do_finalize:
@@ -5311,6 +5462,7 @@ def trtllm_fp8_per_tensor_scale_routed_moe(
     activation_type: int = ActivationType.Swiglu.value,
     routing_replay_out: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""Pre-routed FP8 per-tensor-scale MoE operation.
 
@@ -5379,6 +5531,9 @@ def trtllm_fp8_per_tensor_scale_routed_moe(
     output : Optional[torch.Tensor]
         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
         Allocated internally when ``None`` (default).
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional raw accumulator limits for ``SwigluStep``; see
+        :func:`trtllm_fp8_per_tensor_scale_moe` for the scaling contract.
 
     Returns
     -------
@@ -5388,6 +5543,9 @@ def trtllm_fp8_per_tensor_scale_routed_moe(
     """
     _validate_routing_replay_out(
         routing_replay_out, top_k, num_tokens=hidden_states.shape[0]
+    )
+    _validate_fp8_per_tensor_step_limit(
+        activation_type, gemm1_clamp_limit, local_num_experts, hidden_states.device
     )
     topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_routed_moe(
@@ -5417,6 +5575,7 @@ def trtllm_fp8_per_tensor_scale_routed_moe(
         activation_type,
         routing_replay_out,
         output,
+        gemm1_clamp_limit,
     )
 
     if do_finalize:
@@ -5810,7 +5969,7 @@ def trtllm_fp8_block_scale_moe(
         otherwise a ``ValueError`` is raised.
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
-        ``6`` Relu2; ``9`` Identity.
+        ``6`` Relu2; ``7`` SwigluStep (MxFp8 only); ``9`` Identity.
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
@@ -5840,11 +5999,12 @@ def trtllm_fp8_block_scale_moe(
         When ``None`` (default), ``beta=0.0`` is used.
     gemm1_clamp_limit : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert clamp limit.
-        Supported for ``Fp8QuantizationType.MxFp8`` and
-        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.
-        When provided, ``X1 = clamp(X1, -limit, limit)`` and
-        ``X2 = clamp(X2, max=limit)``.  When ``None`` (default), no clamp
-        is applied.
+        With ``Swiglu``, supported for MxFp8 and DeepSeekFp8 and clamps
+        ``X1`` to ``[-limit, limit]`` and ``X2`` from above before SiLU.
+        With ``SwigluStep``, supported only for fused MxFp8 and clamps
+        ``X1`` and ``silu(X2)`` at the physical limit.  ``None`` uses
+        physical ``7`` for SwigluStep.  MXFP8 has no global FC1 dequant
+        scale, so raw accumulator and physical units coincide.
     output : Optional[torch.Tensor]
         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
         Allocated internally when ``None`` (default).
@@ -6089,7 +6249,7 @@ def trtllm_fp8_block_scale_routed_moe(
         FP8 quantization scheme (default ``Fp8QuantizationType.DeepSeekFp8``).
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
-        ``6`` Relu2; ``9`` Identity.
+        ``6`` Relu2; ``7`` SwigluStep; ``9`` Identity.
     gemm1_alpha : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA alpha
         parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
@@ -6108,11 +6268,13 @@ def trtllm_fp8_block_scale_routed_moe(
         When ``None`` (default), ``beta=0.0`` is used.
     gemm1_clamp_limit : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert clamp limit.
-        Supported for ``Fp8QuantizationType.MxFp8`` and
-        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.
-        When provided, ``X1 = clamp(X1, -limit, limit)`` and
-        ``X2 = clamp(X2, max=limit)``.  When ``None`` (default), no clamp
-        is applied.
+        With ``ActivationType.Swiglu``, supported for MxFp8 and
+        DeepSeekFp8; it clamps ``X1`` to ``[-limit, limit]`` and ``X2``
+        from above before SiLU. ``None`` disables that clamp. With
+        ``ActivationType.SwigluStep``, supported only for fused MxFp8;
+        it caps ``X1`` and ``silu(X2)`` at the physical limit, with a
+        default of ``7`` when ``None``. MxFp8 has no global FC1 dequant
+        scale, so raw accumulator and physical limits coincide.
 
     valid_hidden_size : Optional[int]
         Valid (unpadded) hidden dimension.  When provided, the ``hidden_size``
@@ -6278,6 +6440,10 @@ def trtllm_fp4_block_scale_moe(
         ``None`` materializes per-expert ``beta=1``.
     gemm1_clamp_limit : Optional[torch.Tensor]
         ``[num_experts]`` swiglu clamp limit, ``float32``.
+        For ``SwigluStep``, this is the raw accumulator limit (physical
+        limit divided by ``output1_scale_gate_scalar``); ``None`` uses
+        physical ``7``.  The fused epilogue caps ``silu(gate)`` and the up
+        branch.  Alpha and beta are not accepted for SwigluStep.
         For SiTU a provided limit is per-local-expert, finite, and positive;
         it clamps ``x0`` to ``[-limit, limit]`` and ``x1`` from above.
     gemm2_weights : torch.Tensor
@@ -6558,6 +6724,9 @@ def trtllm_fp4_block_scale_routed_moe(
         ``None`` materializes per-expert ``beta=1``.
     gemm1_clamp_limit : Optional[torch.Tensor]
         ``[num_experts]`` swiglu clamp limit, float32.
+        For ``SwigluStep``, pass the physical limit divided by
+        ``output1_scale_gate_scalar`` when the scale is non-unit; ``None``
+        uses physical ``7``.  Alpha and beta are not accepted.
         For SiTU a provided limit is per-local-expert, finite, and positive;
         it clamps ``x0`` to ``[-limit, limit]`` and ``x1`` from above.
     gemm2_weights : torch.Tensor
