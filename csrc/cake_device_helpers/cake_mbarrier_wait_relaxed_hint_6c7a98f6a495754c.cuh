@@ -24,17 +24,17 @@
 
 // Exact unqualified CTA wait used by source schedules whose PTX intentionally
 // omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
+__device__ __forceinline__ void mbarrier_wait_relaxed_hint(int mbar_addr, int phase,
+                                                           uint32_t suspend_time_hint) {
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      "LAB_WAIT_RELAXED_HINT:\n\t"
+      "mbarrier.try_wait.parity.shared::cta.b64"
+      " P1, [%0], %1, %2;\n\t"
+      "@P1 bra DONE_RELAXED_HINT;\n\t"
+      "bra LAB_WAIT_RELAXED_HINT;\n\t"
+      "DONE_RELAXED_HINT:\n\t"
+      "}\n" ::"r"(mbar_addr),
+      "r"(phase), "r"(suspend_time_hint));
 }
