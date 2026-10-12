@@ -69,6 +69,7 @@ from flashinfer.utils import (
     is_sm12x_supported,
     is_sm90a_supported,
 )
+from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
 
 
 _CUTLASS_ACTIVATIONS = (
@@ -154,14 +155,16 @@ def test_all_registered_runners_use_enforced_lifecycle():
         assert runner_type.build is MoERunner.build
 
 
-@pytest.mark.parametrize("runner_type", tuple(_BACKEND_RUNNERS.values()))
-@pytest.mark.parametrize(
-    "method,args",
-    (
-        ("pack_inputs", (None, None)),
-        ("get_valid_tactics", ([], None)),
-        ("forward", ([],)),
-    ),
+@parametrize_product(
+    {
+        "runner_type": tuple(_BACKEND_RUNNERS.values()),
+        "method,args": (
+            ("pack_inputs", (None, None)),
+            ("get_valid_tactics", ([], None)),
+            ("forward", ([],)),
+        ),
+    },
+    regular=pairwise_product_cases,
 )
 def test_registered_runner_execution_requires_build(runner_type, method, args):
     runner = runner_type.__new__(runner_type)
@@ -597,21 +600,23 @@ def test_cutlass_bf16_preparation_uses_activation_gating(activation, rows):
     assert view["fc2_expert_weights"].shape == (4, 128, 256)
 
 
-@pytest.mark.parametrize(
-    "config_cls",
-    (
-        CutlassBf16Config,
-        CutlassW4A16Config,
-        CutlassNvfp4Config,
-        CutlassFp8PerTensorConfig,
-        CutlassFp8BlockConfig,
-        CutlassMxfp8Mxfp4Config,
-        CutlassMxfp8Config,
-        CutlassW4A8Config,
-        CutlassHummingConfig,
-    ),
+@parametrize_product(
+    {
+        "config_cls": (
+            CutlassBf16Config,
+            CutlassW4A16Config,
+            CutlassNvfp4Config,
+            CutlassFp8PerTensorConfig,
+            CutlassFp8BlockConfig,
+            CutlassMxfp8Mxfp4Config,
+            CutlassMxfp8Config,
+            CutlassW4A8Config,
+            CutlassHummingConfig,
+        ),
+        "activation": (SwiGLU(), Identity()),
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("activation", (SwiGLU(), Identity()))
 def test_all_cutlass_preparers_reject_opposite_activation_geometry(
     config_cls, activation
 ):
@@ -747,10 +752,14 @@ def test_cutlass_situ_rejects_gemm1_spelled_overrides(key):
         runner._resolve_activation_params({key: torch.full((4,), 1.0)})
 
 
-@pytest.mark.parametrize(
-    "activation", (SwiGLU(alpha=1.7), SwiGLUStep(), GeGLUTanh(), ReLU2())
+@parametrize_product(
+    {
+        "activation": (SwiGLU(alpha=1.7), SwiGLUStep(), GeGLUTanh(), ReLU2()),
+        "key": ("situ_beta", "situ_linear_beta"),
+    },
+    regular=pairwise_product_cases,
+    ids=lambda case: f"{type(case[0]).__name__}-{case[1]}",
 )
-@pytest.mark.parametrize("key", ("situ_beta", "situ_linear_beta"), ids=lambda k: k)
 def test_cutlass_non_situ_rejects_situ_spelled_overrides(activation, key):
     """The mirror of the SiTU case: a situ_* key is foreign to every other one.
 
@@ -1037,14 +1046,16 @@ def test_cutlass_nvfp4_rejects_swizzled_scale_factors():
     runner.check_support()
 
 
-@pytest.mark.parametrize(
-    "runner_cls, quant",
-    (
-        (CutlassMxfp8Runner, (QuantFormat.MXFP8, QuantFormat.MXFP8)),
-        (CutlassMxfp8Mxfp4Runner, (QuantFormat.MXFP4, QuantFormat.MXFP8)),
-    ),
+@parametrize_product(
+    {
+        "runner_cls, quant": (
+            (CutlassMxfp8Runner, (QuantFormat.MXFP8, QuantFormat.MXFP8)),
+            (CutlassMxfp8Mxfp4Runner, (QuantFormat.MXFP4, QuantFormat.MXFP8)),
+        ),
+        "swizzled": (None, False, True),
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("swizzled", (None, False, True))
 def test_cutlass_mxfp8_scale_layout_follows_swizzled_scale_factors(
     runner_cls, quant, swizzled
 ):
@@ -2242,13 +2253,15 @@ def _run_flat_cutlass_independently(
 
 
 @cutlass_bf16_required
-@pytest.mark.parametrize(
-    "activation",
-    _CUTLASS_ACTIVATIONS
-    + (
-        SwiGLU(alpha=1.7, beta=1.0, limit=7.0),
-        SiTU(gate_scale=2.0, linear_scale=10.0),
-    ),
+@parametrize_product(
+    {
+        "activation": _CUTLASS_ACTIVATIONS
+        + (
+            SwiGLU(alpha=1.7, beta=1.0, limit=7.0),
+            SiTU(gate_scale=2.0, linear_scale=10.0),
+        ),
+    },
+    regular=pairwise_product_cases,
 )
 def test_cutlass_bf16_moe_layer_matches_independent_reference(activation):
     config, act, weights, w1, w2 = _make_case(activation=activation)
@@ -2268,7 +2281,12 @@ def test_cutlass_bf16_moe_layer_matches_independent_reference(activation):
 
 
 @cutlass_w4a16_required
-@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+@parametrize_product(
+    {
+        "activation": _CUTLASS_ACTIVATIONS,
+    },
+    regular=pairwise_product_cases,
+)
 def test_cutlass_w4a16_moe_layer_matches_quantized_reference(activation):
     config, act, weights, w1, w2, view = _make_w4a16_case(activation=activation)
     assert view["fc1_expert_weights"].dtype is torch.uint8
@@ -2605,7 +2623,12 @@ def _nvfp4_requant_hook(device):
 
 
 @cutlass_nvfp4_required
-@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+@parametrize_product(
+    {
+        "activation": _CUTLASS_ACTIVATIONS,
+    },
+    regular=pairwise_product_cases,
+)
 def test_cutlass_nvfp4_moe_layer_matches_quantized_reference(activation):
     config, act, weights, view = _make_nvfp4_case(activation=activation)
     assert view["fc1_expert_weights"].dtype is torch.uint8
@@ -2814,7 +2837,12 @@ def _assert_fp8_per_tensor_view_folded(view):
 
 
 @cutlass_fp8_required
-@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+@parametrize_product(
+    {
+        "activation": _CUTLASS_ACTIVATIONS,
+    },
+    regular=pairwise_product_cases,
+)
 def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation):
     torch.manual_seed(45)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -2895,7 +2923,12 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation
 
 
 @cutlass_fp8_block_required
-@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+@parametrize_product(
+    {
+        "activation": _CUTLASS_ACTIVATIONS,
+    },
+    regular=pairwise_product_cases,
+)
 def test_cutlass_fp8_block_moe_layer_matches_quantized_reference(activation):
     torch.manual_seed(46)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -2957,7 +2990,12 @@ def test_cutlass_fp8_block_moe_layer_matches_quantized_reference(activation):
 
 
 @cutlass_mxfp8_mxfp4_required
-@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+@parametrize_product(
+    {
+        "activation": _CUTLASS_ACTIVATIONS,
+    },
+    regular=pairwise_product_cases,
+)
 def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference(activation):
     from flashinfer import mxfp4_dequantize, mxfp8_dequantize_host
 
@@ -3041,7 +3079,12 @@ def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference(activation):
 
 
 @cutlass_mxfp8_required
-@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+@parametrize_product(
+    {
+        "activation": _CUTLASS_ACTIVATIONS,
+    },
+    regular=pairwise_product_cases,
+)
 def test_cutlass_mxfp8_moe_layer_matches_quantized_reference(activation):
     from flashinfer import mxfp8_dequantize_host
 
@@ -3212,7 +3255,12 @@ def _dequant_int4(packed, scale, group_size=128):
 
 
 @cutlass_w4a8_required
-@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+@parametrize_product(
+    {
+        "activation": _CUTLASS_ACTIVATIONS,
+    },
+    regular=pairwise_product_cases,
+)
 def test_cutlass_w4a8_moe_layer_matches_quantized_reference(activation):
     torch.manual_seed(49)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -3273,7 +3321,12 @@ def test_cutlass_w4a8_moe_layer_matches_quantized_reference(activation):
 
 
 @cutlass_humming_required
-@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+@parametrize_product(
+    {
+        "activation": _CUTLASS_ACTIVATIONS,
+    },
+    regular=pairwise_product_cases,
+)
 def test_cutlass_humming_moe_layer_matches_quantized_reference(activation):
     torch.manual_seed(50)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -3344,7 +3397,12 @@ def test_cutlass_humming_moe_layer_matches_quantized_reference(activation):
 
 
 @cutlass_fp8_required
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@parametrize_product(
+    {
+        "activation": (SwiGLU(), ReLU2()),
+    },
+    regular=pairwise_product_cases,
+)
 def test_cutlass_fp8_per_tensor_shares_canonical_pack_with_trtllm(activation):
     """The per-tensor FP8 pack from ``TrtllmFp8PerTensorConfig
     .prepare_activations`` (no pack scale) feeds TRTLLM and CUTLASS runners
