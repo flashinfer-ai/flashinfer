@@ -258,6 +258,14 @@ def test_asan_interface_header_is_only_included_under_asan():
         assert lines[i - 1] == "#if defined(TLLM_HAS_ASAN)"
         assert lines[i + 1] == "#endif"
 
+    # The guard is only meaningful if TLLM_HAS_ASAN is decided before anything is
+    # included, so the detection block has to precede the first #include.
+    define_idx = lines.index("#define TLLM_HAS_ASAN")
+    first_include = next(
+        i for i, line in enumerate(lines) if line.startswith("#include")
+    )
+    assert define_idx < first_include
+
 
 def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
     monkeypatch, tmp_path
