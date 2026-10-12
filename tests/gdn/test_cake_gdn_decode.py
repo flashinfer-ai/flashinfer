@@ -700,17 +700,27 @@ def test_decode_resolver_routes_the_fp32_mtp_bodies_per_architecture(arch) -> No
     # The promoted fp32-state MTP update row (B4 T4, cache) runs the `_pro` twin of
     # `mtp_t4_splitv8` on Rubin (sm_107a): same kernel contract, bitwise-identical
     # output, only the schedule of the producer phase differs.  The verify row
-    # (B1 T2, `mtp_t2_inline_tile8`) keeps one body everywhere; route ids never change.
+    # (B1 T2, `mtp_t2_inline_tile8`) runs its `_bb` twin on Rubin (branch-light token
+    # body, bitwise-identical output); every other architecture keeps the shipped
+    # bodies.  Route ids never change.
     assert cake_gdn.CAKE_GDN_FP32_MTP_ARCH_BODIES == {
-        "sm_107a": "gdn_decode_pretranspose_mtp_t4_splitv8_pro"
+        (
+            "sm_107a",
+            "gdn_decode_pretranspose_mtp_t4_splitv8",
+        ): "gdn_decode_pretranspose_mtp_t4_splitv8_pro",
+        (
+            "sm_107a",
+            "gdn_decode_pretranspose_mtp_t2_inline_tile8",
+        ): "gdn_decode_pretranspose_mtp_t2_inline_tile8_bb",
     }
     suffix = "_pro" if arch == "sm_107a" else ""
+    inline_suffix = "_bb" if arch == "sm_107a" else ""
     rows = [
         (
             dict(batch_size=1, seq_len=2, disable_state_update=True, cache_steps=2),
             "flashinfer.gdn_decode.indexed_fp32_mtp_t2.inline_tile8_verify_cache",
             "_mtp_t2_inline_tile8",
-            "",
+            inline_suffix,
         ),
         (
             dict(batch_size=4, seq_len=4, disable_state_update=False, cache_steps=4),

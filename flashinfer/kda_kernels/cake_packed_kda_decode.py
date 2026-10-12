@@ -40,7 +40,10 @@ _MIXED_WIDTH = 3 * _HEADS * _HEAD_DIM
 # SM100-family cubin on compute capability 10.7 (same kernel source; the output and
 # state pool are bitwise identical). Every other variant keeps the family target.
 _SM107_NATIVE_VARIANTS: frozenset[str] = frozenset(
-    {"cpasync_tile64_register_pipeline_early_publish"}
+    {
+        "cpasync_tile64_register_pipeline_early_publish",
+        "cpasync_tile64_register_pipeline_early_publish_bulk1",
+    }
 )
 
 

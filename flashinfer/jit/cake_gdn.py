@@ -649,12 +649,20 @@ CAKE_GDN_BF16_WIDE_ARCH_BODIES: dict[str, str] = {"sm_107a": "wide128_vpre"}
 # `..._mtp_t4_splitv8`) is routed per architecture as well: Rubin (sm_107a) runs its
 # `_pro` twin (producer phase parallel over the draft tokens, every independent global
 # load issued before the first reduction; bitwise-identical output), B200 / B300 keep
-# the shipped body.  The verify body `..._mtp_t2_inline_tile8` is the same everywhere.
-# Mirrors the splitv8 entry of `FP32_MTP_ARCH_BODIES` / `select_fp32_mtp_body` in
-# loom.examples.weave.gdn_decode_pretranspose; keyed by architecture here because the
-# table applies to that one base (the resolver consults it for the splitv8 row only).
-CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[str, str] = {
-    "sm_107a": "gdn_decode_pretranspose_mtp_t4_splitv8_pro"
+# the shipped body.  The verify body `..._mtp_t2_inline_tile8` runs its `_bb` twin on
+# Rubin as well (softplus branch as a select, cache-row moves hoisted out of the
+# slot-valid branch, merged output-store conditions; bitwise-identical output).
+# Mirrors `FP32_MTP_ARCH_BODIES` / `select_fp32_mtp_body` in
+# loom.examples.weave.gdn_decode_pretranspose, keyed by (architecture, base schedule).
+CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[tuple[str, str], str] = {
+    (
+        "sm_107a",
+        "gdn_decode_pretranspose_mtp_t4_splitv8",
+    ): "gdn_decode_pretranspose_mtp_t4_splitv8_pro",
+    (
+        "sm_107a",
+        "gdn_decode_pretranspose_mtp_t2_inline_tile8",
+    ): "gdn_decode_pretranspose_mtp_t2_inline_tile8_bb",
 }
 # The fp32-state T=1 pretranspose body (`..._splitv8`, route `indexed_fp32_t1_splitv8`)
 # is routed per architecture by the state-head count B*HV: Rubin (sm_107a) runs the
@@ -992,9 +1000,7 @@ def select_cake_gdn_decode_variant(
                 "B4/B16/B64 T4 update rows"
             )
         base_attr, route = selected
-        schedule_attr = base_attr
-        if base_attr == "gdn_decode_pretranspose_mtp_t4_splitv8":
-            schedule_attr = CAKE_GDN_FP32_MTP_ARCH_BODIES.get(arch, base_attr)
+        schedule_attr = CAKE_GDN_FP32_MTP_ARCH_BODIES.get((arch, base_attr), base_attr)
         mtp_specializations: dict[str, int | float] = {
             "H": num_q_heads,
             "HV": num_v_heads,

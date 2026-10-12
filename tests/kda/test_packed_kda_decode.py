@@ -702,6 +702,8 @@ def test_kernel_facade_selects_optimized_variant_and_caller_stream_cpu(monkeypat
     ("capability", "variant", "expected"),
     [
         ((10, 7), "cpasync_tile64_register_pipeline_early_publish", "sm107a"),
+        ((10, 7), "cpasync_tile64_register_pipeline_early_publish_bulk1", "sm107a"),
+        ((10, 3), "cpasync_tile64_register_pipeline_early_publish_bulk1", "sm100f"),
         ((10, 7), "register_tile16", "sm100f"),
         ((10, 7), "cpasync_tile128_register_pipeline", "sm100f"),
         ((10, 7), "cpasync_tile64_ilp4", "sm100f"),
@@ -726,9 +728,13 @@ def test_kernel_facade_native_sm107_target_is_variant_keyed_cpu(
     ("batch", "expected_variant", "expected_target"),
     [
         (16, "register_tile16", "sm100f"),
+        (17, "register_tile16", "sm100f"),
+        (18, "cpasync_tile64_register_pipeline_early_publish", "sm107a"),
         (19, "cpasync_tile64_register_pipeline_early_publish", "sm107a"),
         (32, "cpasync_tile64_register_pipeline_early_publish", "sm107a"),
-        (63, "cpasync_tile64_register_pipeline_early_publish", "sm107a"),
+        (48, "cpasync_tile64_register_pipeline_early_publish", "sm107a"),
+        (56, "cpasync_tile64_register_pipeline_early_publish_bulk1", "sm107a"),
+        (63, "cpasync_tile64_register_pipeline_early_publish_bulk1", "sm107a"),
         (64, "cpasync_tile128_register_pipeline", "sm100f"),
         (128, "cpasync_tile128_register_pipeline", "sm100f"),
     ],
