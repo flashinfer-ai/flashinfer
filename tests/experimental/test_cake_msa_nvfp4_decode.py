@@ -34,7 +34,17 @@ from flashinfer.experimental.msa_nvfp4_decode.cake_backend import (
     SUPPORTED_COMPUTE_CAPABILITIES,
     tail_plan,
     TOPK,
+    UNION_MAX_SEQLEN_Q,
+    UNION_MIN_SEQLEN_Q,
+    UNION_Q_VALUES,
+    UNION_SPLIT_FACTORS,
+    union_plan,
+    union_program_available,
+    union_q_for,
+    union_route_applies,
+    union_split_factor,
     validate_msa_nvfp4_decode_inputs,
+    validate_use_cache_hit,
 )
 from flashinfer.msa_ops import _nvfp4_decode_sm100 as upstream
 from flashinfer.msa_ops import (
@@ -48,6 +58,8 @@ from tests.test_helpers.cake_msa_nvfp4_inputs import (
 )
 
 ATOL = RTOL = 1e-2
+# Part B gate of the union program: per-row relative L2 error against the FP32 oracle.
+UNION_MAX_ROW_REL_L2 = 0.004
 # FlashInfer's acceptance for its own NVFP4 route
 # (tests/msa_ops/test_msa_nvfp4_decode_sm100.py ``_assert_peer``): the route
 # accumulates at lower precision than the FP32 oracle on some head geometries,
@@ -266,6 +278,163 @@ def test_public_entry_routes_only_to_cake():
         )
 
 
+@pytest.mark.parametrize("value", [False, True, "auto"])
+def test_use_cache_hit_accepts_exactly_its_three_values(value):
+    assert validate_use_cache_hit(value) is value or validate_use_cache_hit(value) == value
+
+
+@pytest.mark.parametrize("value", [0, 1, "True", "false", "Auto", "AUTO", None, 1.0, "", b"auto"])
+def test_use_cache_hit_rejects_everything_else(value):
+    with pytest.raises(ValueError, match="use_cache_hit"):
+        validate_use_cache_hit(value)
+
+
+def test_use_cache_hit_domain_is_a_uniform_seqlen_q_in_two_to_four():
+    assert (UNION_MIN_SEQLEN_Q, UNION_MAX_SEQLEN_Q) == (2, 4)
+    assert [union_route_applies(q) for q in (1, 2, 3, 4, 5, 8, 32)] == [
+        False,
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert [union_q_for(q) for q in (1, 2, 3, 4)] == [2, 2, 4, 4]
+
+
+def test_use_cache_hit_true_refuses_a_seqlen_q_outside_the_domain():
+    """The refusal is a host decision made before any device check: seqlen_q 8 is
+    inside the API's [1, 32] but outside the union program's [2, 4]."""
+    inputs = _cpu_inputs((2000, 1500), num_kv_heads=2, group_size=16, seqlen_q=8)
+    with pytest.raises(ValueError, match="use_cache_hit=True requires"):
+        prepare_backend(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            inputs["q2k_indices"],
+            k_scale=inputs["k_scale"],
+            v_scale=inputs["v_scale"],
+            page_table=inputs["page_table"],
+            seqused_k=inputs["seqused_k"],
+            k_global_scale=inputs["k_global_scale"],
+            v_global_scale=inputs["v_global_scale"],
+            seqlen_q=8,
+            use_cache_hit=True,
+        )
+    # ``1 == True`` is not an accepted spelling.
+    with pytest.raises(ValueError, match="use_cache_hit must be"):
+        prepare_backend(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            inputs["q2k_indices"],
+            k_scale=inputs["k_scale"],
+            v_scale=inputs["v_scale"],
+            page_table=inputs["page_table"],
+            seqused_k=inputs["seqused_k"],
+            k_global_scale=inputs["k_global_scale"],
+            v_global_scale=inputs["v_global_scale"],
+            seqlen_q=8,
+            use_cache_hit=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "units,num_sms,pairs_max,expected",
+    [
+        # 148- and 152-SM parts agree on every row of the export denominator.
+        # S doubles while ``units x 2S`` CTAs fit one wave (and 2S <= pairs, S < 8).
+        (2, 148, 32, 8),  # tp2 batch 1 (Q4, 150K context): the eight-way cap
+        (2, 160, 32, 8),
+        (16, 148, 32, 8),  # tp2 batch 8: 16 x 8 = 128 CTAs fit one wave on both parts
+        (16, 160, 32, 8),
+        (32, 148, 32, 4),  # tp1 batch 8: 32 x 4 = 128 fits, 32 x 8 = 256 does not
+        (32, 160, 32, 4),
+        (64, 148, 32, 2),  # tp2 batch 32: 64 x 2 = 128 fits, 64 x 4 = 256 does not
+        (64, 160, 32, 2),
+        (128, 148, 32, 1),  # tp4 batch 128 / tp2 batch 64: the units alone exceed half the part
+        (128, 160, 32, 1),
+        (256, 148, 32, 1),
+        (8, 148, 4, 4),  # kv900 (8 pages, 4 pairs): at most one pair per CTA
+        (8, 148, 3, 1),  # fewer than four pairs never split
+        (6, 148, 9, 8),  # kv2200 correctness rows (18 pages, 9 pairs)
+        (32, 148, 16, 4),  # Q2 coverage: 16 Q = 32 ids cap, 8K context
+        (32, 160, 16, 4),
+        (64, 148, 16, 2),
+        (64, 160, 16, 2),
+        (128, 148, 16, 1),
+        (128, 160, 16, 1),
+    ],
+)
+def test_union_split_factor_rule(units, num_sms, pairs_max, expected):
+    assert union_split_factor(units, num_sms, pairs_max) == expected
+
+
+def test_union_plan_rule():
+    # 8 requests x 2 KV heads at seqlen_q 4 and 1200 pages (64 ids cap -> 32 pairs): 16 units,
+    # eight-way clusters (16 x 8 = 128 CTAs fit one wave), 128 CTAs.
+    assert union_plan(total_q=32, seqlen_q=4, num_kv_heads=2, max_pages=1200, num_sms=148) == (
+        4,
+        8,
+        16,
+        (128, 1, 1),
+    )
+    # seqlen_q 3 runs the width-4 program; the unsplit grid is persistent over min(units, SMs).
+    assert union_plan(total_q=384, seqlen_q=3, num_kv_heads=2, max_pages=64, num_sms=148) == (
+        4,
+        1,
+        256,
+        (148, 1, 1),
+    )
+    assert union_plan(total_q=384, seqlen_q=3, num_kv_heads=2, max_pages=64, num_sms=160) == (
+        4,
+        1,
+        256,
+        (160, 1, 1),
+    )
+    # seqlen_q 2: the width-2 program, 32 ids cap -> 16 pairs; 64 units: 64 x 2 = 128 CTAs
+    # fit one wave, 64 x 4 = 256 do not -> two-way clusters, 128 CTAs.
+    assert union_plan(total_q=64, seqlen_q=2, num_kv_heads=2, max_pages=64, num_sms=148) == (
+        2,
+        2,
+        64,
+        (128, 1, 1),
+    )
+    with pytest.raises(ValueError, match="unit"):
+        union_plan(total_q=0, seqlen_q=2, num_kv_heads=2, max_pages=64, num_sms=148)
+
+
+@pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
+def test_architectures_with_union_programs_register_the_whole_ladder(arch):
+    """An architecture that registers union programs registers one per
+    (query-group width, split factor) pair, each with a source pair the JIT
+    can hand to nvcc; the union argument plan carries the selection strides."""
+    pairs = cake_jit.registered_union_pairs(arch)
+    if not pairs:
+        with pytest.raises(NotImplementedError):
+            cake_jit.select_union_program(arch, union_q=2, splits=1)
+        pytest.skip(f"no union program registered for {arch}")
+    assert pairs == tuple((q, s) for q in UNION_Q_VALUES for s in UNION_SPLIT_FACTORS)
+    root = cake_jit.Path(cake_jit.__file__).resolve().parent / "csrc"
+    names = set()
+    for union_q, splits in pairs:
+        name = cake_jit.select_union_program(arch, union_q=union_q, splits=splits)
+        record = cake_jit.PROGRAMS[name]
+        assert record["route"] == "union"
+        assert record["cluster"] is (splits > 1)
+        assert arch in record["arches"] and len(record["sources"]) == 2
+        assert all((root / relative).is_file() for relative in record["sources"])
+        names.add(name)
+    assert len(names) == len(pairs)  # one distinct program per pair
+    plan = cake_jit.ARG_PLANS["union"]
+    plan_names = [n for _k, n in plan]
+    assert {"q2k_token_stride", "q2k_head_stride"} <= set(plan_names)
+    assert plan_names[-3:] == ["grid_x", "grid_y", "grid_z"]
+    with pytest.raises(NotImplementedError):
+        cake_jit.select_union_program("sm_90a", union_q=2, splits=1)
+
+
 def test_toolchain_guard_declines_programs_the_toolkit_cannot_compile(monkeypatch):
     """A checkout may register sm_107a programs on a toolkit without compute_107a:
     the JIT declines them up front and the backend reports no program for 10.7."""
@@ -322,7 +491,7 @@ def test_every_architecture_registers_the_split_ladder(arch):
         if cake_jit.toolchain_supports(arch):
             spec = cake_jit.gen_program_spec(name, arch)
             assert spec.name == f"{name}_{arch}"
-    for route in ("persistent", "short"):
+    for route in ("persistent", "short", "union"):
         plan = cake_jit.ARG_PLANS.get(route)
         if plan:
             assert [n for k, n in plan if k == "grid"] == ["grid_x", "grid_y", "grid_z"]
@@ -354,25 +523,41 @@ def test_tail_plan_rule():
 
 
 def _oracle(inputs):
-    return upstream.reference(
-        q=inputs["q"],
-        k_data=inputs["k"],
-        v_data=inputs["v"],
-        k_scale=inputs["k_scale"],
-        v_scale=inputs["v_scale"],
-        q2k_indices=inputs["q2k_indices"],
-        page_table=inputs["page_table"],
-        seqused_k=inputs["seqused_k"],
-        softmax_scale=inputs["softmax_scale"],
-        k_global_scale=inputs["k_global_scale"],
-        v_global_scale=inputs["v_global_scale"],
-        out=torch.empty_like(inputs["q"]),
-        seqlen_q=inputs["seqlen_q"],
-        causal=True,
-    )
+    """FP32 oracle (Part B contract): ``upstream.reference`` rounds to ``out.dtype``,
+    so the buffer is FP32, and its einsums run with cuBLAS TF32 switched off
+    (the NGC images export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 as the default)."""
+    q = inputs["q"]
+    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        reference = upstream.reference(
+            q=q,
+            k_data=inputs["k"],
+            v_data=inputs["v"],
+            k_scale=inputs["k_scale"],
+            v_scale=inputs["v_scale"],
+            q2k_indices=inputs["q2k_indices"],
+            page_table=inputs["page_table"],
+            seqused_k=inputs["seqused_k"],
+            softmax_scale=inputs["softmax_scale"],
+            k_global_scale=inputs["k_global_scale"],
+            v_global_scale=inputs["v_global_scale"],
+            out=torch.empty(q.shape, dtype=torch.float32, device=q.device),
+            seqlen_q=inputs["seqlen_q"],
+            causal=True,
+        )
+        torch.cuda.synchronize()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    return reference
 
 
-def _prepare(inputs, *, out=None, lse=None):
+def _assert_close(actual, expected):
+    """BF16 output vs the FP32 oracle: element-wise ``|a - e| <= ATOL + RTOL * |e|``."""
+    torch.testing.assert_close(actual.float(), expected.float(), atol=ATOL, rtol=RTOL)
+
+
+def _prepare(inputs, *, out=None, lse=None, use_cache_hit="auto"):
     return prepare_msa_nvfp4_sparse_decode(
         inputs["q"],
         inputs["k"],
@@ -388,6 +573,7 @@ def _prepare(inputs, *, out=None, lse=None):
         softmax_scale=inputs["softmax_scale"],
         out=out,
         lse=lse,
+        use_cache_hit=use_cache_hit,
     )
 
 
@@ -438,7 +624,7 @@ def _run_and_check(seq_lens, num_kv_heads, *, group_size=16, seqlen_q=1, seed):
     out = runner()
     torch.cuda.synchronize()
     expected = _oracle(inputs)
-    torch.testing.assert_close(out, expected, atol=ATOL, rtol=RTOL)
+    _assert_close(out, expected)
     assert torch.isfinite(runner.lse).all()
     assert runner.lse.shape == (inputs["q"].shape[0], inputs["q"].shape[1])
     return inputs, runner
@@ -605,7 +791,7 @@ def test_short_items_take_the_cluster_program():
     torch.cuda.synchronize()
     after = torch.cuda.memory_stats()
     assert after["allocation.all.allocated"] - before["allocation.all.allocated"] == 0
-    torch.testing.assert_close(runner.out, _oracle(inputs), atol=ATOL, rtol=RTOL)
+    _assert_close(runner.out, _oracle(inputs))
 
 
 def test_short_program_graph_replay_follows_new_selections():
@@ -629,7 +815,7 @@ def test_short_program_graph_replay_follows_new_selections():
     torch.cuda.synchronize()
     graph.replay()
     torch.cuda.synchronize()
-    torch.testing.assert_close(runner.out, _oracle(inputs), atol=ATOL, rtol=RTOL)
+    _assert_close(runner.out, _oracle(inputs))
 
 
 def test_graph_replay_follows_new_queries_and_selections():
@@ -663,7 +849,7 @@ def test_graph_replay_follows_new_queries_and_selections():
         graph.replay()
         torch.cuda.synchronize()
         expected = _oracle(inputs)
-        torch.testing.assert_close(runner.out, expected, atol=ATOL, rtol=RTOL)
+        _assert_close(runner.out, expected)
 
 
 def test_launch_makes_no_allocation():
@@ -695,5 +881,336 @@ def test_multi_round_batches_take_the_last_round_split():
     assert cake_jit.PROGRAMS[runner.program]["tail"] is True
     runner()
     torch.cuda.synchronize()
-    torch.testing.assert_close(runner.out, _oracle(inputs), atol=ATOL, rtol=RTOL)
+    _assert_close(runner.out, _oracle(inputs))
     assert torch.isfinite(runner.lse).all()
+
+
+# ---------------------------------------------------------------------------
+# Device: the request-packed union program (``use_cache_hit=True``)
+# ---------------------------------------------------------------------------
+
+
+def _require_union_program():
+    _require_program()
+    arch = arch_for(torch.device("cuda"))
+    if not union_program_available(arch):
+        pytest.skip(f"no request-packed NVFP4 MSA decode program registered for {arch}")
+
+
+def _device_sms() -> int:
+    return torch.cuda.get_device_properties(torch.device("cuda")).multi_processor_count
+
+
+def _assert_row_rel_l2(actual, expected, *, limit=UNION_MAX_ROW_REL_L2):
+    a = actual.float().reshape(-1, actual.shape[-1])
+    b = expected.float().reshape(-1, expected.shape[-1])
+    rel = (a - b).norm(dim=-1) / b.norm(dim=-1).clamp(min=1e-6)
+    assert float(rel.max()) <= limit, f"max row rel-L2 {float(rel.max())} > {limit}"
+
+
+def _run_union(
+    seq_lens,
+    num_kv_heads,
+    *,
+    group_size=16,
+    seqlen_q,
+    overlap,
+    seed,
+    page_table_order="identity",
+    k_global_scale=None,
+    v_global_scale=None,
+):
+    """Prepare with ``use_cache_hit=True``, assert the production plan, launch and check the oracle."""
+    extra = {}
+    if k_global_scale is not None:
+        extra["k_global_scale"] = k_global_scale
+    if v_global_scale is not None:
+        extra["v_global_scale"] = v_global_scale
+    inputs = build_decode_inputs(
+        seq_lens,
+        num_kv_heads=num_kv_heads,
+        group_size=group_size,
+        seqlen_q=seqlen_q,
+        device="cuda",
+        seed=seed,
+        q_overlap_fraction=overlap,
+        page_table_order=page_table_order,
+        **extra,
+    )
+    runner = _prepare(inputs, use_cache_hit=True)
+    assert runner.route == "union"
+    assert runner.tail is False
+    union_q, splits, _units, grid = union_plan(
+        total_q=int(inputs["q"].shape[0]),
+        seqlen_q=seqlen_q,
+        num_kv_heads=num_kv_heads,
+        max_pages=inputs["max_pages"],
+        num_sms=_device_sms(),
+    )
+    assert (runner.union_q, runner.splits, runner.num_ctas) == (union_q, splits, grid[0])
+    assert runner.program == cake_jit.select_union_program(
+        runner.arch, union_q=runner.union_q, splits=runner.splits
+    )
+    assert cake_jit.PROGRAMS[runner.program]["cluster"] is (runner.splits > 1)
+    runner.out.fill_(float("nan"))
+    runner.lse.fill_(float("nan"))
+    out = runner()
+    torch.cuda.synchronize()
+    expected = _oracle(inputs)
+    _assert_close(out, expected)
+    _assert_row_rel_l2(out, expected)
+    assert torch.isfinite(runner.lse).all()
+    assert runner.lse.shape == (inputs["q"].shape[0], inputs["q"].shape[1])
+    return inputs, runner
+
+
+@pytest.mark.parametrize(
+    "seq_lens,num_kv_heads,seqlen_q,overlap,page_table_order,scales",
+    [
+        ([8192] * 8, 2, 4, 0.5, "identity", None),  # tp2 batch 8: 16 units, eight-way clusters
+        ([8192] * 8, 2, 4, 0.0, "identity", None),  # disjoint selections: |U| = 64 per unit
+        ([8192] * 8, 2, 4, 1.0, "identity", None),  # identical history: |U| = 16 + 3
+        ([8192] * 8, 2, 3, 0.75, "identity", None),  # seqlen_q 3: width-4 program, phantom token
+        ([2200] * 3, 2, 2, 0.5, "shuffled", None),  # width-2 program, 18 pages, 24-token page tail
+        ([2200] * 3, 1, 4, 0.5, "shared_prefix", None),  # tp4, shared-prefix page table
+        ([900] * 4, 2, 4, 0.5, "identity", None),  # fewer than sixteen visible pages, -1 tails
+        ([153600] * 2, 2, 4, 0.75, "identity", None),  # 1200 pages per request, eight-way clusters
+        ([8192] * 64, 2, 4, 0.0, "identity", None),  # 128 units: the unsplit persistent program
+        ([8192] * 8, 4, 4, 1.0, "identity", None),  # tp1 geometry (64 query heads)
+        ([8192] * 8, 1, 4, 0.0, "identity", None),  # tp4 geometry (16 query heads)
+        ([5000, 130, 300, 2049], 2, 4, 0.5, "shuffled", None),  # ragged, requests within one page
+        ([8192] * 8, 2, 4, 0.5, "identity", (1.75, 0.6)),  # non-unit global scales
+    ],
+)
+def test_union_decode_matches_the_fp32_oracle(
+    seq_lens, num_kv_heads, seqlen_q, overlap, page_table_order, scales
+):
+    _require_union_program()
+    k_scale, v_scale = scales if scales is not None else (None, None)
+    _run_union(
+        seq_lens,
+        num_kv_heads,
+        seqlen_q=seqlen_q,
+        overlap=overlap,
+        seed=len(seq_lens) * 7 + seqlen_q + int(overlap * 100),
+        page_table_order=page_table_order,
+        k_global_scale=k_scale,
+        v_global_scale=v_scale,
+    )
+
+
+def _union_batch_requesting(splits: int, num_sms: int, num_kv_heads: int, union_q: int) -> int:
+    """Smallest batch of 8K-token requests whose ``batch * num_kv_heads`` units make
+    ``union_split_factor`` pick ``splits`` on a ``num_sms`` part, or 0 when the part
+    cannot request that factor with whole requests (checked, not assumed)."""
+    pairs = (min(TOPK * union_q, (8192 + PAGE_SIZE - 1) // PAGE_SIZE) + 1) // 2
+    if splits == 1:
+        units = (num_sms // 2 // num_kv_heads + 1) * num_kv_heads
+    else:
+        units = num_sms // splits // num_kv_heads * num_kv_heads
+    if units < num_kv_heads:
+        return 0
+    return units // num_kv_heads if union_split_factor(units, num_sms, pairs) == splits else 0
+
+
+def test_every_union_program_runs_on_the_attached_part():
+    """Each registered (query-group width, split factor) program prepares, launches and
+    matches the oracle; the batch for each factor is derived from the part's SM count and
+    the selection is asserted, not assumed."""
+    _require_union_program()
+    arch = arch_for(torch.device("cuda"))
+    num_sms = _device_sms()
+    seen = set()
+    for union_q, splits in cake_jit.registered_union_pairs(arch):
+        batch = _union_batch_requesting(splits, num_sms, 2, union_q)
+        if batch == 0:
+            continue
+        _inputs, runner = _run_union(
+            [8192] * batch, 2, seqlen_q=union_q, overlap=0.5, seed=200 + batch + union_q
+        )
+        assert (runner.union_q, runner.splits) == (union_q, splits), (batch, num_sms, runner)
+        seen.add((union_q, splits))
+    assert seen == set(cake_jit.registered_union_pairs(arch)), (num_sms, seen)
+
+
+def test_use_cache_hit_true_is_a_no_op_at_seqlen_q_one():
+    _require_program()
+    inputs = build_decode_inputs([8192] * 4, num_kv_heads=4, device="cuda", seed=61)
+    plain = _prepare(inputs, use_cache_hit=False)
+    switched = _prepare(inputs, use_cache_hit=True)
+    assert switched.route == plain.route != "union"
+    assert switched.program == plain.program
+    plain.out.fill_(float("nan"))
+    reference = plain().clone()
+    torch.cuda.synchronize()
+    switched.out.fill_(float("nan"))
+    out = switched()
+    torch.cuda.synchronize()
+    assert torch.equal(out, reference)
+
+
+def test_auto_resolves_to_the_per_token_programs():
+    """``"auto"`` is the default and currently selects exactly what ``False`` selects;
+    only an explicit ``True`` reaches the union program."""
+    _require_program()
+    inputs = build_decode_inputs(
+        [8192] * 8, num_kv_heads=2, seqlen_q=4, device="cuda", seed=63, q_overlap_fraction=0.5
+    )
+    auto = _prepare(inputs)
+    plain = _prepare(inputs, use_cache_hit=False)
+    assert auto.route == plain.route != "union"
+    assert (auto.program, auto.splits, auto.tail, auto.grid) == (
+        plain.program,
+        plain.splits,
+        plain.tail,
+        plain.grid,
+    )
+    plain.out.fill_(float("nan"))
+    reference = plain().clone()
+    torch.cuda.synchronize()
+    auto.out.fill_(float("nan"))
+    out = auto()
+    torch.cuda.synchronize()
+    assert torch.equal(out, reference)
+    _assert_close(out, _oracle(inputs))
+    if union_program_available(arch_for(inputs["q"].device)):
+        assert _prepare(inputs, use_cache_hit=True).route == "union"
+
+
+def test_union_output_is_independent_of_sibling_selections():
+    """A token's output must not depend on which pages the other tokens of its request
+    select: the newest token of every request keeps its row while its siblings are
+    re-drawn with a different overlap pattern, and its output and LSE are bitwise
+    unchanged (masked-out union pages leave no trace)."""
+    _require_union_program()
+    seq_lens, num_kv_heads, seqlen_q = [8192] * 8, 2, 4
+    inputs, runner = _run_union(seq_lens, num_kv_heads, seqlen_q=seqlen_q, overlap=0.5, seed=71)
+    out_a = runner.out.clone()
+    lse_a = runner.lse.clone()
+    probe = torch.tensor(
+        [b * seqlen_q + (seqlen_q - 1) for b in range(len(seq_lens))], device="cuda"
+    )
+    others = torch.tensor(
+        [t for t in range(len(seq_lens) * seqlen_q) if t % seqlen_q != seqlen_q - 1],
+        device="cuda",
+    )
+    fresh = build_decode_inputs(
+        seq_lens,
+        num_kv_heads=num_kv_heads,
+        seqlen_q=seqlen_q,
+        device="cuda",
+        seed=72,
+        q_overlap_fraction=0.0,
+    )
+    mixed = fresh["q2k_indices"].clone()
+    mixed[:, probe] = inputs["q2k_indices"][:, probe]
+    assert not torch.equal(mixed[:, others], inputs["q2k_indices"][:, others])
+    del fresh
+    inputs["q2k_indices"].copy_(mixed)
+    runner.out.fill_(float("nan"))
+    runner.lse.fill_(float("nan"))
+    out_b = runner()
+    torch.cuda.synchronize()
+    assert torch.equal(out_b[probe], out_a[probe])
+    assert torch.equal(runner.lse[probe], lse_a[probe])
+    expected = _oracle(inputs)
+    _assert_close(out_b, expected)
+    _assert_row_rel_l2(out_b, expected)
+
+
+def test_union_graph_replay_follows_new_queries_and_selections():
+    """Capture the union program once; replay after new queries and a new selection
+    are written in place."""
+    _require_union_program()
+    inputs, runner = _run_union([8192] * 8, 2, seqlen_q=4, overlap=0.5, seed=81)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        runner()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            runner()
+    torch.cuda.synchronize()
+    gen = torch.Generator(device="cuda").manual_seed(2027)
+    for step in range(3):
+        inputs["q"].copy_(
+            torch.randn(inputs["q"].shape, generator=gen, device="cuda").to(torch.bfloat16)
+        )
+        if step:
+            fresh = build_decode_inputs(
+                [8192] * 8,
+                num_kv_heads=2,
+                seqlen_q=4,
+                device="cuda",
+                seed=90 + step,
+                q_overlap_fraction=0.25 * step,
+            )
+            inputs["q2k_indices"].copy_(fresh["q2k_indices"])
+            del fresh
+        runner.out.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = _oracle(inputs)
+        _assert_close(runner.out, expected)
+        _assert_row_rel_l2(runner.out, expected)
+
+
+def test_union_launch_makes_no_allocation():
+    _require_union_program()
+    _, runner = _run_union([8192] * 8, 2, seqlen_q=4, overlap=0.5, seed=83)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()
+    runner()
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats()
+    assert after["allocation.all.allocated"] - before["allocation.all.allocated"] == 0
+
+
+def test_use_cache_hit_true_under_capture_requires_a_built_program():
+    """A first-time JIT build cannot happen inside a CUDA-graph capture: under a real
+    capture the union route binds a program built before capture and refuses one that
+    was not, before any build could start."""
+    _require_union_program()
+    inputs, runner = _run_union([8192] * 8, 2, seqlen_q=4, overlap=0.5, seed=85)
+    key = (runner.program, runner.arch)
+    assert cake_jit.program_loaded(*key)
+    # The per-token program is built eagerly too, so binding it under capture below
+    # cannot start a build either.
+    per_token = _prepare(inputs, use_cache_hit=False)
+    assert per_token.route != "union"
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        runner()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            # Built by the eager preparation above: binding under capture is allowed and
+            # the captured launch is the union program.
+            captured = _prepare(inputs, out=runner.out, lse=runner.lse, use_cache_hit=True)
+            assert (captured.route, captured.program) == ("union", runner.program)
+            captured()
+            # Forget the built program for the rest of the capture (real registry state,
+            # restored below): the same preparation now refuses before reaching the JIT.
+            module = cake_jit._LOADED.pop(key)
+            try:
+                with pytest.raises(ValueError, match="before capture"):
+                    _prepare(inputs, out=runner.out, lse=runner.lse, use_cache_hit=True)
+            finally:
+                cake_jit._LOADED[key] = module
+            # The per-token routes are not subject to the union capture rule.
+            assert (
+                _prepare(inputs, out=runner.out, lse=runner.lse, use_cache_hit=False).route
+                == per_token.route
+            )
+    torch.cuda.synchronize()
+    # The launch bound under capture replays correctly.
+    runner.out.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = _oracle(inputs)
+    _assert_close(runner.out, expected)
+    _assert_row_rel_l2(runner.out, expected)
