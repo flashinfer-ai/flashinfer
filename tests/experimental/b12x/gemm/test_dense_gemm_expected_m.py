@@ -1599,3 +1599,43 @@ def test_expected_m_prefill_hint_for_narrow_n():
     assert small == base
     assert prefill == (64, 128)
     assert no_hint_decode == (16, 64)
+
+
+def _a16_launch(mma_warps):
+    return _DenseGemmLaunch(
+        n=2560,
+        k=6144,
+        l=1,
+        c_l=1,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        ab_dtype=cutlass.BFloat16,
+        sf_dtype=cutlass.Uint8,
+        c_dtype=cutlass.BFloat16,
+        alpha_dtype=cutlass.Float32,
+        sf_vec_size=32,
+        mma_k=16,
+        tile_k=128,
+        mma_tiler_mn=(16, 64),
+        cluster_shape_mn=(1, 1),
+        policy=_DenseGemmPolicy(True, True, False, 1, False, False),
+        sm_count=48,
+        sm_version="sm_121a",
+        load_path="tma",
+        swap_ab=False,
+        sfb_k_reuse=False,
+        b_tile_major=False,
+        alpha_is_one=True,
+        weight_only="mxfp8",
+        mma_warps=mma_warps,
+    )
+
+
+def test_a16_compute_warps_specialize_the_compile_key():
+    # Two- and four-warp MXFP8 A16 programs launch 96- and 160-thread CTAs. A
+    # shared key let whichever compiled first stand in for the other, so
+    # autotuning timed one program under both choices.
+    keys = {warps: _a16_launch(warps).compile_key() for warps in (None, 2, 4)}
+    assert keys[2] != keys[4]
+    assert len(set(keys.values())) == 3

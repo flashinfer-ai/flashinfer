@@ -5459,6 +5459,7 @@ class _DenseGemmLaunch:
             else key
             + (
                 self._weight_only,
+                self._mma_warps,
                 self._alpha_reciprocal,
                 self._input_k,
             )
