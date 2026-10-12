@@ -135,8 +135,12 @@ def test_create_workspace_derives_only_capacity_from_layer_fleet_params():
 def test_live_profiles_preserve_capacity_and_handle_lifetime():
     layer, _, _ = _make_layer()
     layer._kernel.supports_live_token_tuning = True
-    with mock.patch.object(
-        layer._kernel, "prepare_workspace", side_effect=[object(), object()]
+    # These fake workspaces exercise handle bookkeeping on any host GPU.
+    with (
+        mock.patch.object(layer._kernel, "validate_init"),
+        mock.patch.object(
+            layer._kernel, "prepare_workspace", side_effect=[object(), object()]
+        ),
     ):
         small = layer.create_workspace(64, live_tokens=8)
         large = layer.create_workspace(64, live_tokens=32)
