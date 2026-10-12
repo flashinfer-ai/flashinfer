@@ -21,6 +21,8 @@ Import layering (strict, one direction)::
     layer / modes / core  -->  backends  -->  cute_dsl or kernel_src.<drop>
     cute_dsl  -->  kernel_src.<drop> public helpers  -->  shim/  -->  src/
 
+    backends / drop shims / benchmarks  -->  sm90_routing (pure-host leaf)
+
 - Only a drop's ``shim/`` may import that drop's vendored ``src/`` tree;
   nothing else imports ``src/``, ever.
 - Only ``backends/`` and ``cute_dsl/`` may import a drop's shim, and only
@@ -29,9 +31,13 @@ Import layering (strict, one direction)::
 - The layer, ``modes/``, ``core/``, and everything above use backend APIs
   only (config classes + the ``core.kernel.registry``) — no ``kernel_src``,
   no shim.
-- Sole exception: kernel-oracle *tests* may import a drop's package
-  ``__init__`` to validate the drop below the backend — still never ``src/``
-  internals or shim submodules.
+- ``sm90_routing`` is a shared, zero-dependency host contract leaf. Backends,
+  drop shims, and benchmarks may import it, but it must never import a
+  backend, ``kernel_src``, PyTorch, or CUDA, and it is not re-exported here.
+- Sole exceptions are isolated tests below the backend boundary: kernel-oracle
+  tests import a drop's package ``__init__``, while host-only white-box tests
+  may import shim submodules. Tests still never import vendored ``src/``
+  modules, and the SM90/SM100 white-box suites run in separate processes.
 
 Keeping upper layers off ``kernel_src`` is what makes a drop swappable (see
 ``kernel_src/README.md``) without touching user-facing APIs.
@@ -104,6 +110,10 @@ from .backends.mega.kernel.sm90.bf16_bf16_bf16_push_cake import (
 from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
     Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_pull_fp8_mega_weights,
+)
+from .backends.mega.kernel.sm90.fp8_mxfp4_bf16_pull_cutedsl import (
+    Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm90_pull_mxfp4_mega_weights,
 )
 from .backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda import (
     Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
@@ -291,6 +301,7 @@ __all__ = [
     "Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
+    "Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "SplitConfig",
@@ -322,6 +333,7 @@ __all__ = [
     "preprocess_sm107_mxfp8_mega_weights",
     "preprocess_sm107_nvfp4_mega_weights",
     "preprocess_sm90_pull_fp8_mega_weights",
+    "preprocess_sm90_pull_mxfp4_mega_weights",
     "preprocess_sm90_push_cake_bf16_mega_weights",
     "preprocess_sm90_push_fp8_mega_weights",
     "register_communication",
