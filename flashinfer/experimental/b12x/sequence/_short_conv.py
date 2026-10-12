@@ -277,6 +277,112 @@ def _short_conv_kernel(
 
 
 @triton.jit
+def _short_conv_tiled_kernel(
+    input_ptr,
+    gathered_state_ptr,
+    conv_weight_ptr,
+    query_start_loc_ptr,
+    request_ids_ptr,
+    state_slot_ids_ptr,
+    num_tokens_ptr,
+    out_ptr,
+    CHANNELS: tl.constexpr,
+    STATE_LENGTH: tl.constexpr,
+    KERNEL_SIZE: tl.constexpr,
+    DILATION: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    INPUT_ROW_STRIDE: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    MAX_TOKENS: tl.constexpr,
+):
+    """``_short_conv_kernel`` over a tile of tokens, with identical arithmetic."""
+    tokens = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    channels = tl.max_contiguous(
+        tl.multiple_of(tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C), BLOCK_C),
+        BLOCK_C,
+    )
+    channel_mask = channels < CHANNELS
+    num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
+    token_live = tokens < num_tokens
+    request = tl.load(request_ids_ptr + tokens, mask=token_live, other=-1).to(tl.int32)
+    slot = tl.load(
+        state_slot_ids_ptr + request,
+        mask=token_live & (request >= 0),
+        other=-1,
+    ).to(tl.int64)
+    live = token_live & (request >= 0) & (slot >= 0)
+    query_start = tl.load(query_start_loc_ptr + request, mask=live, other=0).to(tl.int32)
+    query_relative = tokens - query_start
+
+    accumulator = tl.zeros((BLOCK_T, BLOCK_C), tl.float32)
+    # Only tokens within the first taps of their request read carried history;
+    # tiles without such a token skip that gather.
+    history_reach = (KERNEL_SIZE - 1) * DILATION
+    if tl.min(tl.where(live, query_relative, history_reach), axis=0) < history_reach:
+        for tap in tl.static_range(0, KERNEL_SIZE):
+            history_distance = (KERNEL_SIZE - 1 - tap) * DILATION
+            source_relative = query_relative - history_distance
+            from_query = source_relative >= 0
+            query_rows = tl.multiple_of(
+                (query_start + source_relative).to(tl.int64) * INPUT_ROW_STRIDE, 16
+            )
+            query_value = tl.load(
+                input_ptr + query_rows[:, None] + channels[None, :],
+                mask=(live & from_query)[:, None] & channel_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            history_position = STATE_LENGTH + source_relative
+            history_offsets = (
+                request.to(tl.int64)[:, None] * CHANNELS
+                + channels.to(tl.int64)[None, :]
+            ) * STATE_LENGTH + history_position[:, None]
+            history_value = tl.load(
+                gathered_state_ptr + history_offsets,
+                mask=(
+                    live
+                    & ~from_query
+                    & (history_position >= 0)
+                    & (history_position < STATE_LENGTH)
+                )[:, None]
+                & channel_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            source = tl.where(from_query[:, None], query_value, history_value)
+            weight = tl.load(
+                conv_weight_ptr + channels.to(tl.int64) * KERNEL_SIZE + tap,
+                mask=channel_mask,
+                other=0.0,
+            ).to(tl.float32)
+            accumulator += source * weight[None, :]
+    else:
+        for tap in tl.static_range(0, KERNEL_SIZE):
+            source_relative = query_relative - (KERNEL_SIZE - 1 - tap) * DILATION
+            query_rows = tl.multiple_of(
+                (query_start + source_relative).to(tl.int64) * INPUT_ROW_STRIDE, 16
+            )
+            query_value = tl.load(
+                input_ptr + query_rows[:, None] + channels[None, :],
+                mask=live[:, None] & channel_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            weight = tl.load(
+                conv_weight_ptr + channels.to(tl.int64) * KERNEL_SIZE + tap,
+                mask=channel_mask,
+                other=0.0,
+            ).to(tl.float32)
+            accumulator += query_value * weight[None, :]
+
+    conv_float = accumulator.to(tl.bfloat16).to(tl.float32)
+    activated = (conv_float * tl.sigmoid(conv_float)).to(tl.bfloat16)
+    output_rows = tl.multiple_of(tokens.to(tl.int64) * CHANNELS, 16)
+    tl.store(
+        out_ptr + output_rows[:, None] + channels[None, :],
+        tl.where(live[:, None], activated, 0.0),
+        mask=(tokens < MAX_TOKENS)[:, None] & channel_mask[None, :],
+    )
+
+
+@triton.jit
 def _update_state_kernel(
     input_ptr,
     gathered_state_ptr,

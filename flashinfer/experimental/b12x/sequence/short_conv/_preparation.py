@@ -81,6 +81,11 @@ def _state_args(q):
     )
 
 
+def _token_block(q) -> int:
+    """Tokens per convolution program: tiles amortize row loads in prefill."""
+    return 32 if q.max_tokens >= 256 else 1
+
+
 @program_cache(scope="preparation")
 def compile_pipeline(payload, ordinal):
     from .. import _short_conv as kernels
@@ -100,6 +105,7 @@ def compile_pipeline(payload, ordinal):
         for name, alignment in zip(OPERANDS, q.input_alignments)
     }
     channel_grid = triton.cdiv(q.channels, 128)
+    token_tiles = triton.cdiv(q.max_tokens, _token_block(q))
     with torch.cuda.device(ordinal):
         if q.mode == "decode" and q.max_speculative_tokens == 0:
             return (
@@ -150,7 +156,28 @@ def compile_pipeline(payload, ordinal):
                 num_warps=4,
                 grid=(q.max_seqs, channel_grid),
             ),
-            kernels._short_conv_kernel.warmup(
+            kernels._short_conv_tiled_kernel.warmup(
+                p["x"],
+                p["gathered_state"],
+                p["conv_weight"],
+                p["query_start_loc"],
+                p["request_ids"],
+                p["state_slot_ids"],
+                p["num_tokens"],
+                p["out"],
+                q.channels,
+                q.state_length,
+                q.kernel_size,
+                q.dilation,
+                128,
+                q.input_row_stride,
+                _token_block(q),
+                q.max_tokens,
+                num_warps=4,
+                grid=(token_tiles, channel_grid),
+            )
+            if _token_block(q) > 1
+            else kernels._short_conv_kernel.warmup(
                 p["x"],
                 p["gathered_state"],
                 p["conv_weight"],
@@ -408,23 +435,44 @@ class PreparedShortConv:
                 gathered_state,
                 *_state_args(q),
             )
-            p[2][(q.max_tokens, channels, 1)](
-                x,
-                gathered_state,
-                conv_weight,
-                query_start_loc,
-                request_ids,
-                state_slot_ids,
-                num_tokens,
-                out,
-                q.channels,
-                q.state_length,
-                q.kernel_size,
-                q.dilation,
-                128,
-                False,
-                q.input_row_stride,
-            )
+            token_block = _token_block(q)
+            if token_block > 1:
+                p[2][(triton.cdiv(q.max_tokens, token_block), channels, 1)](
+                    x,
+                    gathered_state,
+                    conv_weight,
+                    query_start_loc,
+                    request_ids,
+                    state_slot_ids,
+                    num_tokens,
+                    out,
+                    q.channels,
+                    q.state_length,
+                    q.kernel_size,
+                    q.dilation,
+                    128,
+                    q.input_row_stride,
+                    token_block,
+                    q.max_tokens,
+                )
+            else:
+                p[2][(q.max_tokens, channels, 1)](
+                    x,
+                    gathered_state,
+                    conv_weight,
+                    query_start_loc,
+                    request_ids,
+                    state_slot_ids,
+                    num_tokens,
+                    out,
+                    q.channels,
+                    q.state_length,
+                    q.kernel_size,
+                    q.dilation,
+                    128,
+                    False,
+                    q.input_row_stride,
+                )
             p[3][(q.max_seqs, channels, 1)](
                 x,
                 gathered_state,

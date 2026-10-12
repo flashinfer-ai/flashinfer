@@ -72,6 +72,7 @@ class _Case:
         input_padding=0,
         speculative_tokens=3,
         kernel_size=4,
+        max_tokens=12,
     ):
         device = require_b12x()
         self.caps = short_conv.Caps(
@@ -80,7 +81,7 @@ class _Case:
             channels=channels,
             kernel_size=kernel_size,
             dilation=dilation,
-            max_tokens=12,
+            max_tokens=max_tokens,
             max_seqs=4,
             max_state_slots=6,
             max_speculative_tokens=speculative_tokens,
@@ -95,7 +96,7 @@ class _Case:
             (6, channels, capacity), (stride, capacity, 1)
         )
         self.input_storage = torch.randn(
-            (12, channels + input_padding), device=device
+            (max_tokens, channels + input_padding), device=device
         ).to(torch.bfloat16)
         self.x = self.input_storage[:, :channels]
         self.weight = (torch.randn((channels, kernel_size), device=device) * 0.2).to(
@@ -210,10 +211,11 @@ def _prepared(case):
         yield box[0]
 
 
+@pytest.mark.parametrize("max_tokens", [12, 300])
 @pytest.mark.parametrize("mode", ["decode", "prefill", "mixed"])
 @pytest.mark.parametrize("input_padding", [0, 6144])
-def test_gdn_width_raw_history_and_device_metadata_replay(mode, input_padding):
-    case = _Case(mode, input_padding=input_padding)
+def test_gdn_width_raw_history_and_device_metadata_replay(mode, input_padding, max_tokens):
+    case = _Case(mode, input_padding=input_padding, max_tokens=max_tokens)
     with _prepared(case) as binding:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -295,6 +297,28 @@ def test_prefill_chunks_match_one_canonical_convolution(dilation):
             case.state[3, :, : case.length], sequence[-case.length :].T, rtol=0, atol=0
         )
 
+
+
+@pytest.mark.parametrize("dilation", [1, 3])
+def test_tiled_prefill_matches_canonical_convolution_across_tiles(dilation):
+    """Capacities that tile tokens keep requests crossing tile boundaries exact."""
+    case = _Case("prefill", channels=200, dilation=dilation, max_tokens=300)
+    with _prepared(case) as binding:
+        for lengths, slots, fresh in (
+            ([31, 70, 1, 150], [3, 1, -1, 4], [True, False, True, False]),
+            ([300], [2], [False]),
+            ([33, 2], [5, 0], [False, True]),
+        ):
+            case.x.normal_()
+            case.state.normal_()
+            case.batch(lengths, slots, fresh, [1] * len(lengths))
+            expected, state = case.oracle()
+            short_conv.run(binding)
+            live = sum(lengths)
+            torch.testing.assert_close(
+                binding.out[:live], expected[:live], rtol=0.008, atol=0.002
+            )
+            torch.testing.assert_close(case.state, state, rtol=0, atol=0)
 
 def test_binding_rejects_input_output_aliases_and_unknown_history_layout():
     case = _Case("mixed", channels=64)
