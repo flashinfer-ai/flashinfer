@@ -21,7 +21,6 @@ asserts the text or structure of a generated source.
 
 import pytest
 import torch
-import tvm_ffi
 
 from flashinfer.fused_moe import (
     QuantConfig,
@@ -50,7 +49,6 @@ from flashinfer.jit.cake_kimi_k3_situ import (
     KERNELS,
     MODULES,
     cake_situ_program,
-    get_cake_situ_module,
 )
 from flashinfer.tllm_enums import ActivationType, RoutingMethodType
 from flashinfer.utils import device_support_pdl
@@ -69,9 +67,10 @@ REFERENCE_SM_COUNT = 148
 # the separate quantization + router kernel (four kernels, the "m1" selector).
 FUSED_M1_ARCHES = ("sm_100a", "sm_103a")
 # Architectures whose 8192- and 16384-token route stores the FC2 result as an
-# 8-bit per-tile partial with per-tile FP32 scales (eight kernels); the others
-# run the pre-shuffled scale-factor route (nine kernels).
-LARGE_Q8I_ARCHES = ("sm_103a",)
+# 8-bit per-tile partial with per-tile FP32 scales (eight kernels) -- both
+# today; an architecture outside this set would run the pre-shuffled
+# scale-factor route (nine kernels, the "large_c7" selector).
+LARGE_Q8I_ARCHES = ("sm_100a", "sm_103a")
 # Architectures whose 4096-token route stores the FC2 result as the same 8-bit
 # per-tile partial behind the work5fd FC1; the 2048-token route keeps the BF16
 # expert output everywhere.
@@ -186,11 +185,9 @@ def test_cake_situ_rejects_unsupported_dispatch(options, message):
 
 def test_cake_situ_workspace_size_holds_every_smaller_shape():
     # The per-shape layout is not monotonic in the token count (32 and 64 force
-    # tile-N16 and need more scratch than the tile-N8 counts after them, and
-    # the pre-shuffled scale-factor images of 8192 tokens exceed the ordinary
-    # layout of the counts just above), but the public size query must still
-    # honor the documented contract that a maximum-size buffer holds every
-    # smaller prepared shape.
+    # tile-N16 and need more scratch than the tile-N8 counts after them), but
+    # the public size query must still honor the documented contract that a
+    # maximum-size buffer holds every smaller prepared shape.
     sizes = [_workspace_size(max_num_tokens=n) for n in range(1, 16385)]
     running_max = 0
     for size in sizes:
@@ -205,19 +202,18 @@ def test_cake_situ_workspace_size_holds_every_smaller_shape():
                 assert _workspace_size(max_num_tokens=max_tokens) >= at_t
 
 
-def test_cake_situ_workspace_layout_adds_pre_shuffled_scale_factors():
-    # The 8192- and 16384-token layouts append the pre-shuffled FC1 scale-factor
-    # images (one 4096-byte image per N-tile and 512-element K-step) as their
-    # last field; every other token count keeps its previous layout.
+def test_cake_situ_workspace_layout_has_no_pre_shuffled_scale_factors():
+    # No delivered architecture's selector of 8192 / 16384 tokens is the
+    # pre-shuffled scale-factor route any more, so the architecture-independent
+    # layout of those token counts carries no ``sfb_shuffled`` images (the
+    # INT8 partial and its per-tile scales are carved out of the BF16
+    # expert-output scratch); every other token count keeps its layout.
     for num_tokens, expected_tiles in ((8192, 1913), (16384, 2937)):
         tile_n, _, max_tiles = _geometry(num_tokens)
         assert (tile_n, max_tiles) == (128, expected_tiles)
         layout, nbytes = _workspace_layout(num_tokens)
-        offset, size, dtype, shape = layout["sfb_shuffled"]
-        assert size == max_tiles * (HIDDEN // 512) * 4096
-        assert dtype == torch.uint8 and shape == (size,)
-        assert offset == max(start for start, _, _, _ in layout.values())
-        assert nbytes >= offset + size
+        assert "sfb_shuffled" not in layout
+        assert nbytes >= max(start + size for start, size, _, _ in layout.values())
     for num_tokens in (1, 8, 16, 64, 256, 512, 2048, 4096, 8191, 8193):
         assert "sfb_shuffled" not in _workspace_layout(num_tokens)[0]
 
@@ -384,7 +380,7 @@ def test_cake_situ_prepare_smaller_shape_in_maximum_size_buffer(
     cake_situ_device,
 ):
     # Allocating for a token count strictly between two forced tile-N16 counts
-    # (or just above a pre-shuffled count) must still allow preparing the
+    # (or just above a large token count) must still allow preparing the
     # smaller count in the same buffer.
     workspace = torch.empty(
         _workspace_size(max_num_tokens=max_num_tokens),
@@ -829,186 +825,3 @@ def _submit_prepared(num_tokens, routing, device, weights, workspace):
         output,
         _options(x, ids, route_weights, output, weights, workspace),
     )
-
-
-def _fc1_scales_by_row(views, max_tiles):
-    # FC1 stores its output scale factors in the tile layout FC2 loads: per
-    # tile and per 64 elements of the intermediate size one 512-byte block
-    # whose word (row % 32, row // 32) holds the row's four scale bytes.
-    blocks = views["intermediate_scales"].view(max_tiles, INTERMEDIATE // 64, 32, 4, 4)
-    return blocks.permute(0, 3, 2, 1, 4).reshape(max_tiles * 128, INTERMEDIATE // 16)
-
-
-def _per_pair_scratch(views, max_tiles):
-    # The routing scatter assigns each (token, expert-slot) pair a row inside
-    # its expert's tiles; that position is not deterministic from call to
-    # call, so the per-row scratch is compared in pair order through
-    # token_to_permuted (the map finalization uses), never by row index.
-    permuted = views["token_to_permuted"].long()
-    return {
-        "intermediate_packed": views["intermediate_packed"][permuted].clone(),
-        "intermediate_scales": _fc1_scales_by_row(views, max_tiles)[permuted].clone(),
-        "expert_output": views["expert_output"][permuted].clone(),
-    }
-
-
-def _launch(program, arch, stage_values):
-    # Launch one program alone with the values the host bound for its stage.
-    module = get_cake_situ_module(program, arch)
-    entry = getattr(module, MODULES[program]["ffi_entry"])
-    args = [
-        stage_values["grid"][("grid_x", "grid_y", "grid_z").index(name)]
-        if kind == "grid"
-        else stage_values[name]
-        for kind, name in MODULES[program]["arg_plan"]
-    ]
-    with tvm_ffi.use_torch_stream():
-        entry(*args)
-
-
-@pytest.mark.parametrize(
-    "num_tokens, routing",
-    [(8192, "skewed"), (16384, "uniform")],
-    ids=["m8192_skewed", "m16384_uniform"],
-)
-def test_cake_situ_pre_shuffled_route_matches_plain_fc1(
-    num_tokens,
-    routing,
-    cake_situ_device,
-    cake_situ_weights,
-    cake_situ_workspace,
-):
-    # The 8192- and 16384-token routes run the scale-factor writer and the FC1
-    # program that loads the pre-shuffled images. Their FC1 outputs (per routed
-    # pair), the FC2 outputs and the complete call must be bitwise identical to
-    # the tile-N128 FC1 program that gathers and shuffles the scale factors
-    # itself (the generic tile-128 route's FC1), run here on the same
-    # workspace, inputs and stage bindings.
-    device, weights, workspace = (
-        cake_situ_device,
-        cake_situ_weights,
-        cake_situ_workspace,
-    )
-    arch = _arch(device)
-    if _expected_selector(arch, num_tokens) != "large_c7":
-        pytest.skip(
-            f"{arch} routes {num_tokens} tokens to {_expected_selector(arch, num_tokens)}; "
-            "the pre-shuffled scale-factor programs are not delivered for it"
-        )
-    _, _, _, output, options = _submit_prepared(
-        num_tokens, routing, device, weights, workspace
-    )
-    prepared = _prepared(workspace, num_tokens)
-    assert prepared["selector"] == "large_c7"
-    plain_fc1 = cake_situ_program(arch, "fc1:n128")
-    assert plain_fc1 != prepared["modules"]["fc1"]
-    plain_names = {name for _, name in MODULES[plain_fc1]["arg_plan"]}
-    assert "SFB" in plain_names and "SFBS" not in plain_names
-
-    views = _cake_situ_workspace_views(workspace, num_tokens)
-    total_tiles = int(views["total_tiles"].item())
-    assert 0 < total_tiles < prepared["max_tiles"]
-    pre_shuffled = _per_pair_scratch(views, prepared["max_tiles"])
-    pre_shuffled_output = output.clone()
-    for name in ("intermediate_packed", "intermediate_scales"):
-        views[name].zero_()
-    views["expert_output"].fill_(float("nan"))
-    output.fill_(float("nan"))
-
-    bindings = _cake_situ_stage_bindings(options, prepared)
-    # The route's FC1 binding carries the pre-shuffled images (SFBS); the plain
-    # program gathers the routed scale factors itself from the quantized
-    # activations' scales (SFB), which the host binds for the writer stage.
-    _launch(plain_fc1, arch, {**bindings["fc1"], "SFB": views["x_scales"]})
-    for stage in ("fc2", "finalize"):
-        _launch(prepared["modules"][stage], arch, bindings[stage])
-    torch.cuda.synchronize(device)
-    assert int(views["total_tiles"].item()) == total_tiles
-    for name, tensor in _per_pair_scratch(views, prepared["max_tiles"]).items():
-        assert torch.equal(tensor, pre_shuffled[name]), name
-    assert torch.equal(output, pre_shuffled_output)
-
-
-def _reference_sfb_shuffle(x_scales, route_map, tile_mn_limit, total_tiles):
-    # Image (tile, k) is the 128 x 32-byte block of routed scale factors for
-    # K-step k, stored word by word (one word = the four 16-element groups of
-    # 64 elements of K) at word index j * 128 + (row % 32) * 4 + row // 32.
-    # Rows past the tile's valid row count are zero.
-    device = x_scales.device
-    k_tiles = x_scales.shape[1] // 32
-    rows = torch.arange(total_tiles * 128, device=device)
-    tile, row = rows // 128, rows % 128
-    valid = rows < tile_mn_limit.long()[tile]
-    tokens = route_map.long()[rows[valid]]
-    image = torch.zeros(
-        total_tiles, k_tiles, 8, 32, 4, 4, dtype=torch.uint8, device=device
-    )
-    image[tile[valid], :, :, row[valid] % 32, row[valid] // 32, :] = x_scales[
-        tokens
-    ].view(-1, k_tiles, 8, 4)
-    return image.view(total_tiles, k_tiles * 4096)
-
-
-@pytest.mark.parametrize(
-    "num_tokens, routing",
-    [(8192, "uniform"), (16384, "skewed")],
-    ids=["m8192_uniform", "m16384_skewed"],
-)
-def test_cake_situ_sfb_shuffle_writer_matches_reference(
-    num_tokens,
-    routing,
-    cake_situ_device,
-    cake_situ_weights,
-    cake_situ_workspace,
-):
-    # Launch the scale-factor writer alone, on the routing tables and
-    # quantized scale factors the complete call left in the workspace, and
-    # compare its images with a Python shuffle. A sentinel fill shows that
-    # padding tiles past the routed tile count are never written and that
-    # padding rows of a partial tile are written as zeros.
-    device, weights, workspace = (
-        cake_situ_device,
-        cake_situ_weights,
-        cake_situ_workspace,
-    )
-    arch = _arch(device)
-    if _expected_selector(arch, num_tokens) != "large_c7":
-        pytest.skip(
-            f"{arch} routes {num_tokens} tokens to {_expected_selector(arch, num_tokens)}; "
-            "the pre-shuffled scale-factor writer is not delivered for it"
-        )
-    _, _, _, _, options = _submit_prepared(
-        num_tokens, routing, device, weights, workspace
-    )
-    prepared = _prepared(workspace, num_tokens)
-    assert prepared["selector"] == "large_c7"
-    views = _cake_situ_workspace_views(workspace, num_tokens)
-    stage = _cake_situ_stage_bindings(options, prepared)["sfb_shuffle"]
-    max_tiles = prepared["max_tiles"]
-    assert stage["grid"] == (max_tiles, 1, 1) and stage["grid_n"] == max_tiles
-    total_tiles = int(views["total_tiles"].item())
-    assert 0 < total_tiles < max_tiles
-    rows_in_tile = views["tile_mn_limit"][:total_tiles].long() - 128 * torch.arange(
-        total_tiles, device=device
-    )
-    assert rows_in_tile.min() >= 1 and rows_in_tile.max() <= 128
-    assert (rows_in_tile < 128).any()
-    if routing == "skewed":
-        assert (rows_in_tile <= 2).sum() >= 400
-
-    sentinel = 0xFF
-    images = views["sfb_shuffled"].view(max_tiles, -1)
-    images.fill_(sentinel)
-    _launch(prepared["modules"]["sfb_shuffle"], _arch(device), stage)
-    torch.cuda.synchronize(device)
-    expected = _reference_sfb_shuffle(
-        views["x_scales"], views["route_map"], views["tile_mn_limit"], total_tiles
-    )
-    assert torch.equal(images[:total_tiles], expected)
-    assert (images[total_tiles:] == sentinel).all()
-    # FC1 consumes the same bytes through its 4-D TMA view: one 512-byte
-    # (2 x 256) block per 64 elements of K for every tile.
-    fc1_images = _cake_situ_stage_bindings(options, prepared)["fc1"]["SFBS"]
-    assert fc1_images.data_ptr() == images.data_ptr()
-    assert tuple(fc1_images.shape) == (max_tiles, HIDDEN // 64, 2, 256)
-    assert fc1_images.numel() == images.numel()

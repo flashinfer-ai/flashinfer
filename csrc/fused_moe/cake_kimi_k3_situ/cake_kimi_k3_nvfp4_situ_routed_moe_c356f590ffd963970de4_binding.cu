@@ -27,10 +27,10 @@
 #include <cstdint>
 #include <vector>
 
-extern "C" __global__ void kernel_cake_kimi_k3_nvfp4_situ_routed_moe_1ba6921046b292c2a98f(uint8_t* __restrict__ expert_output, float* __restrict__ partial_scale, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ token_to_permuted, __nv_bfloat16* __restrict__ out, int M);
+extern "C" __global__ void kernel_cake_kimi_k3_nvfp4_situ_routed_moe_c356f590ffd963970de4(uint8_t* __restrict__ expert_output, float* __restrict__ partial_scale, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ token_to_permuted, __nv_bfloat16* __restrict__ out, int M);
 
 
-namespace cake_host_shim_4f548d441c3de777 {
+namespace cake_host_shim_1bfd89f743b29a17 {
 
 
 using tvm::ffi::Optional;
@@ -208,9 +208,9 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   config.dynamicSmemBytes = 0u;
   config.stream = stream;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_kimi_k3_nvfp4_situ_routed_moe_1ba6921046b292c2a98f), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_kimi_k3_nvfp4_situ_routed_moe_c356f590ffd963970de4), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_kimi_k3_nvfp4_situ_routed_moe_1ba6921046b292c2a98f failed: "
+      << "cudaLaunchKernelExC for kernel_cake_kimi_k3_nvfp4_situ_routed_moe_c356f590ffd963970de4 failed: "
       << cudaGetErrorString(launch_status);
 
 }
@@ -251,8 +251,8 @@ int64_t PrepareEntry() { return static_cast<int64_t>(reinterpret_cast<uintptr_t>
 
 int64_t SubmitEntry() { return static_cast<int64_t>(reinterpret_cast<uintptr_t>(&SubmitStage)); }
 
-}  // namespace cake_host_shim_4f548d441c3de777
+}  // namespace cake_host_shim_1bfd89f743b29a17
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_4f548d441c3de777::Run);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(prepare_entry, cake_host_shim_4f548d441c3de777::PrepareEntry);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(submit_entry, cake_host_shim_4f548d441c3de777::SubmitEntry);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_1bfd89f743b29a17::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(prepare_entry, cake_host_shim_1bfd89f743b29a17::PrepareEntry);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(submit_entry, cake_host_shim_1bfd89f743b29a17::SubmitEntry);
