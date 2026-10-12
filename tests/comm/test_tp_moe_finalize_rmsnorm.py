@@ -634,22 +634,27 @@ def _worker(local_rank: int, master_port: int | None, world_size: int) -> None:
 
 
 def _allocation_failure_worker(
-    local_rank: int, master_port: int | None, world_size: int
+    local_rank: int, master_port: int | None, world_size: int, site: str
 ) -> None:
     _init_group(local_rank, master_port, world_size)
     import torch.distributed._symmetric_memory as symm_mem
 
-    original_empty = symm_mem.empty
+    # Rank 0 fails either the symmetric workspace or the local FP32 scratch
+    # (the only FP32 allocation during initialization).
+    target = symm_mem if site == "workspace" else torch
+    original_empty = target.empty
     if dist.get_rank() == 0:
 
-        def fail_empty(*args, **kwargs):
-            raise torch.OutOfMemoryError("injected workspace allocation failure")
+        def fail(*args, **kwargs):
+            if site == "workspace" or kwargs.get("dtype") == torch.float32:
+                raise torch.OutOfMemoryError(f"injected {site} allocation failure")
+            return original_empty(*args, **kwargs)
 
-        symm_mem.empty = fail_empty
+        target.empty = fail
     try:
         assert not init_tp_moe_finalize_rmsnorm()
     finally:
-        symm_mem.empty = original_empty
+        target.empty = original_empty
         dist.destroy_process_group()
 
 
@@ -663,20 +668,16 @@ def _path_worker(
 ) -> None:
     _init_group(local_rank, master_port, world_size)
     module = importlib.import_module("flashinfer.comm.tp_moe_finalize_rmsnorm")
-    selector = getattr(module, "_select_path", None)
+    selector = module._select_path
+    crossover_fn = module._token_crossover
     try:
-        if path.startswith("token"):
-            assert hasattr(module, f"_make_{path}_program"), (
-                "token-owner path is missing"
-            )
-        crossover_fn = getattr(module, "_token_crossover", None)
         if path == "token1":
             # the real selector, with the token-owner path from the first token
             module._token_crossover = lambda nsm: 1
-        elif path != "auto" and selector is not None:
+        elif path != "auto":
             module._select_path = lambda *_: path
         assert init_tp_moe_finalize_rmsnorm()
-        crossover = 256 if selector is None else module._token_crossover(module._WS.nsm)
+        crossover = module._token_crossover(module._WS.nsm)
         tokens = dict.fromkeys(
             n
             for n in (
@@ -805,10 +806,8 @@ def _path_worker(
                 check()
             del graph
     finally:
-        if selector is not None:
-            module._select_path = selector
-        if crossover_fn is not None:
-            module._token_crossover = crossover_fn
+        module._select_path = selector
+        module._token_crossover = crossover_fn
         dist.destroy_process_group()
 
 
@@ -863,27 +862,24 @@ def test_tp_moe_finalize_rmsnorm_eager_and_cudagraph(world_size: int) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("site", ["workspace", "scratch"])
 def test_tp_moe_finalize_rmsnorm_allocation_failure_is_rank_consistent(
-    world_size: int,
+    world_size: int, site: str
 ) -> None:
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("TP MoE finalize requires SM100 or SM103")
     if "LOCAL_RANK" in os.environ:
         if int(os.environ["WORLD_SIZE"]) != world_size:
             pytest.skip("different torchrun world size")
-        module = importlib.import_module("flashinfer.comm.tp_moe_finalize_rmsnorm")
-        workspace = module._WS
-        module._WS = module._Ws()
-        try:
-            _run_env_worker(
-                _allocation_failure_worker,
-                (int(os.environ["LOCAL_RANK"]), None, world_size),
-            )
-        finally:
-            module._WS = workspace
+        _run_env_worker(
+            _allocation_failure_worker,
+            (int(os.environ["LOCAL_RANK"]), None, world_size, site),
+        )
         return
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"{world_size} GPUs are required")
     mp.spawn(
-        _allocation_failure_worker, args=(_free_port(), world_size), nprocs=world_size
+        _allocation_failure_worker,
+        args=(_free_port(), world_size, site),
+        nprocs=world_size,
     )

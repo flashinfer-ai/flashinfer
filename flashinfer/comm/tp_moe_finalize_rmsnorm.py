@@ -595,7 +595,7 @@ def _make_program(
             return (slot * ws + src) * H_DIM
         return ((gm * NS + slot) * ws + src) * H_DIM
 
-    def flag_off(slot, phase, src, sx):
+    def flag_off(slot, phase, src):
         return (slot * 2 + phase) * ws + src
 
     @cute.jit
@@ -638,21 +638,17 @@ def _make_program(
                 )
 
     @cute.jit
-    def wait_phase(
-        slot: Int32, phase: cutlass.Constexpr, gen: Int32, tidx: Int32, sx: Int32
-    ):
+    def wait_phase(slot: Int32, phase: cutlass.Constexpr, gen: Int32, tidx: Int32):
         if tidx < ws and tidx != my_rank:
             flags = _pin(cutlass.Int32, a_lam + flag_bytes, 4)
-            ptr = flags + flag_off(slot, phase, tidx, sx)
+            ptr = flags + flag_off(slot, phase, tidx)
             value = ld_acquire(ptr)
             while value != gen:
                 value = ld_acquire(ptr)
         cute.arch.barrier()
 
     @cute.jit
-    def publish_phase(
-        slot: Int32, phase: cutlass.Constexpr, gen: Int32, tidx: Int32, sx: Int32
-    ):
+    def publish_phase(slot: Int32, phase: cutlass.Constexpr, gen: Int32, tidx: Int32):
         # CTA synchronization carries every writer's accesses into the
         # system release/acquire chain, as in multi_gpu_barrier.
         cute.arch.barrier()
@@ -662,7 +658,7 @@ def _make_program(
                 if tidx == peers[r]:
                     peer = cutlass.Int64(a_lam_peers[peers[r]])
             flags = _pin(cutlass.Int32, peer + flag_bytes, 4)
-            st_release(flags + flag_off(slot, phase, my_rank, sx), gen)
+            st_release(flags + flag_off(slot, phase, my_rank), gen)
         cute.arch.barrier()
 
     @cute.jit
@@ -674,7 +670,6 @@ def _make_program(
         gen: Int32,
         tidx: Int32,
         h0: Int32,
-        sx: Int32,
     ):
         # The previous copy waited for every owner, which had consumed all
         # input rows before publishing its output. Input storage is now free.
@@ -688,7 +683,7 @@ def _make_program(
                 if cutlass.const_expr(dest != my_rank):
                     if tok % ws == dest:
                         flags = _pin(cutlass.Int32, a_lam_peers[dest] + flag_bytes, 4)
-                        st_release(flags + flag_off(slot, 0, my_rank, sx), gen)
+                        st_release(flags + flag_off(slot, 0, my_rank), gen)
 
     @cute.jit
     def copy_tokens(
@@ -698,9 +693,8 @@ def _make_program(
         gen: Int32,
         tidx: Int32,
         h0: Int32,
-        sx: Int32,
     ):
-        wait_phase(slot, 1, gen, tidx, sx)
+        wait_phase(slot, 1, gen, tidx)
         pb = _pin(cutlass.BFloat16, a_lam + A_BYTES)
         for src in cutlass.range_constexpr(ws):
             tok = base + src
@@ -1120,7 +1114,7 @@ def _make_program(
             if cutlass.const_expr(token_owner):
                 base = tok * ws + start
                 tok = base + my_rank
-                wait_phase(cta, 0, g0 + it + 1, tidx, sx)
+                wait_phase(cta, 0, g0 + it + 1, tidx)
             if tok < n_tok:
                 finalize_tile(
                     gIn,
@@ -1144,7 +1138,7 @@ def _make_program(
                 if cutlass.const_expr(comm and not token_owner):
                     advance_idle(g0 + it, cta, h0)
             if cutlass.const_expr(token_owner):
-                publish_phase(cta, 1, g0 + it + 1, tidx, sx)
+                publish_phase(cta, 1, g0 + it + 1, tidx)
 
         # every CTA of the cluster has read the counter by now (they all passed
         # the cluster barrier inside the first tile), so one writer is safe.
@@ -1402,9 +1396,7 @@ def _make_program(
         sx, cta, _ = cute.arch.block_idx()
         slot = cta // ws
         gen = ld_gen(_pin(cutlass.Int32, a_gen, 4) + slot) + 1
-        scatter_tokens(
-            gIn, gIdx, start + cta, slot, gen, tidx, sx * band + tidx * VEC, sx
-        )
+        scatter_tokens(gIn, gIdx, start + cta, slot, gen, tidx, sx * band + tidx * VEC)
 
     @cute.kernel
     def copy_kernel(gOut: cute.Tensor, start: Int32):
@@ -1414,7 +1406,7 @@ def _make_program(
         if cutlass.const_expr(split > 1):
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
-        copy_tokens(gOut, start + cta * ws, cta, gen, tidx, sx * band + tidx * VEC, sx)
+        copy_tokens(gOut, start + cta * ws, cta, gen, tidx, sx * band + tidx * VEC)
         if cutlass.const_expr(split > 1):
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
@@ -1689,6 +1681,7 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
     allocation_flag = torch.empty((1,), dtype=torch.int32, device=device)
     lam = None
     generation = None
+    scratch = None
     allocation_error = None
     try:
         lam = symm_mem.empty(
@@ -1697,6 +1690,14 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
             device=device,
         )
         generation = torch.zeros((4 * NSLOT,), dtype=torch.int32, device=device)
+        # Local scratch of the single launch: weighted FP32 expert rows per
+        # slot and one arrival counter per (slot, H band).
+        scratch = (
+            torch.empty(
+                (tl_slots * K_EXPERTS * H_DIM,), dtype=torch.float32, device=device
+            ),
+            torch.zeros((tl_slots * _MAX_SPLIT,), dtype=torch.int32, device=device),
+        )
     except RuntimeError as error:
         allocation_error = error
     if not _group_all(allocation_error is None, device, group, flag=allocation_flag):
@@ -1713,20 +1714,15 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
             )
         _WS.initialized = True
         return False
-    assert lam is not None and generation is not None
+    assert lam is not None and generation is not None and scratch is not None
     lam[:a_i32].fill_(SENT_A_I32)
     lam[a_i32 : a_i32 + b_i32].fill_(SENT_B_I32)
     lam[a_i32 + b_i32 + token_i32 : a_i32 + b_i32 + token_i32 + token_flags_i32].zero_()
     tl_base = a_i32 + b_i32 + token_i32 + token_flags_i32
     lam[tl_base:].fill_(SENT_A_I32)
     _WS.gen = generation
-    # Local scratch of the single launch: weighted FP32 expert rows per slot and
-    # one arrival counter per (slot, H band).
-    tl_y = torch.empty(
-        (tl_slots * K_EXPERTS * H_DIM,), dtype=torch.float32, device=device
-    )
-    tl_ycnt = torch.zeros((tl_slots * _MAX_SPLIT,), dtype=torch.int32, device=device)
-    _WS.scratch = (tl_y, tl_ycnt)
+    _WS.scratch = scratch
+    tl_y, tl_ycnt = scratch
     torch.cuda.synchronize()
     hdl = symm_mem.rendezvous(lam, group=group)
     _WS.lam, _WS.hdl = lam, hdl
