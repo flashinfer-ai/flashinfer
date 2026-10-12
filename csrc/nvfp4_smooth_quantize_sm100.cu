@@ -87,6 +87,11 @@ void nvfp4_quantize_smooth(TensorView x, TensorView pqs, TensorView global_scale
   CHECK_DEVICE(xq, x);
   CHECK_DEVICE(sf, x);
 
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(x.data_ptr()) % 16, 0)
+      << "x must be 16-byte aligned";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(pqs.data_ptr()) % 16, 0)
+      << "pqs must be 16-byte aligned";
+
   TVM_FFI_ICHECK_EQ(x.ndim(), 2) << "x must be [m, n]";
   TVM_FFI_ICHECK(x.size(0) >= 0 && x.size(0) <= std::numeric_limits<int>::max())
       << "m must fit in int32";
@@ -159,6 +164,11 @@ void check_sm120_prefix_inputs(TensorView x, TensorView pqs, TensorView global_s
   CHECK_DEVICE(xq, x);
   CHECK_DEVICE(sf, x);
   CHECK_DEVICE(down, x);
+
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(x.data_ptr()) % 16, 0)
+      << "x must be 16-byte aligned";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(pqs.data_ptr()) % 16, 0)
+      << "pqs must be 16-byte aligned";
 
   TVM_FFI_ICHECK_EQ(x.ndim(), 2) << "x must be 2-D [m, k]";
   TVM_FFI_ICHECK(x.size(0) >= 0 && x.size(0) <= std::numeric_limits<int>::max() - 127)

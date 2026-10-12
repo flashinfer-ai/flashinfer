@@ -107,16 +107,12 @@ def test_ranks_off_the_granularity_are_refused(monkeypatch, rank):
         gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=rank))
 
 
-def test_fused_linear_admission_is_rank_32_only(monkeypatch):
-    """The fused K12 route is the part that is still rank-32 only.
-
-    Its producer carries its own constexpr rank, so unlike the GEMM half it did
-    not become a build parameter. This is the boundary the deleted test was
-    reaching for.
-    """
-    for rank in (64, 96, 128):
+def test_fused_linear_admission_supports_ranks_32_and_64():
+    """The fused prefix has separate rank-32 and rank-64 specializations."""
+    for rank in (96, 128):
         assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(64, 3072, rank)
-    assert svdquant_sm120_cutlass._sm120_fused_linear_supported(64, 3072, 32)
+    for rank in (32, 64):
+        assert svdquant_sm120_cutlass._sm120_fused_linear_supported(64, 3072, rank)
 
 
 def test_sm120_accepts_rank_32(monkeypatch):
@@ -126,29 +122,14 @@ def test_sm120_accepts_rank_32(monkeypatch):
     assert gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=32)) is True
 
 
-def test_sm120_fused_route_declines_rank_64_but_the_entry_still_serves_it():
-    """Rank 64 is served on SM120; only the *fused* prefix declines it.
-
-    This replaces a test that asserted svdquant_linear raises "rank 32 only" for
-    rank > 32 on SM120. That rejection was never implemented -- the string never
-    existed outside a docstring -- and it is now the wrong contract: the LoRA
-    rank is a build parameter of the GEMM half, so rank 64 is a supported rank,
-    verified end to end on SM120 (4096x3072x3072 and 512x5120x5120 at 52.6 and
-    52.7 dB SQNR through the public entry).
-
-    What *is* true is narrower: the fused K12 prefix carries its own
-    compile-time rank of 32, so it must not offer itself for anything else. The
-    shape then takes the unfused route rather than being refused.
-    """
+def test_fused_prefix_rank_limit_does_not_restrict_shared_gemm_validation():
+    """The shared GEMM check also admits ranks with no SM120 fused prefix."""
     m, k = 64, 3072
-    assert svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, 32)
-    for rank in (64, 96, 128):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank), (
-            f"the fused prefix stages rank 32 only, but offered itself for {rank}"
+    for rank in (96, 128):
+        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)
+        assert (
+            gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=rank)) is True
         )
-    # Declining the fused route is not rejecting the problem: the public check
-    # accepts any positive multiple of 32.
-    assert gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=64)) is True
 
 
 @pytest.mark.parametrize("rank", [32, 64, 128])
@@ -595,6 +576,7 @@ _SM120_ROUTE_V6_MKR = (73984, 14336, 32)
         (64, 3072, 32, 10),
         (537, 5376, 32, 10),
         (17, 3072, 32, 10),
+        (512, 3072, 64, 11),
     ],
 )
 def test_sm120_linear_op_name_uses_current_route_abi(m, k, rank, route_version):
@@ -609,7 +591,6 @@ def test_sm120_linear_op_name_uses_current_route_abi(m, k, rank, route_version):
     "m,k,rank",
     [
         (256, 12288, 32),  # K outside the packed-family admission
-        (512, 3072, 64),  # rank outside the fused producer topology
         (64, 1536, 32),  # native producers with no new packed family
         (27280, 14336, 32),  # fused route on the same K as row 52
         (73984, 14336, 16),  # right (m, k), rank the fused route never admitted
@@ -631,7 +612,7 @@ def test_sm120_linear_op_name_keeps_v5_for_every_other_shape(m, k, rank):
         (*_SM120_ROUTE_V6_MKR, "svdquant_linear_sm120_routes_v6_tactics_v3"),
         (64, 3072, 32, "svdquant_linear_sm120_routes_v10_tactics_v3"),
         (17, 3072, 32, "svdquant_linear_sm120_routes_v10_tactics_v3"),
-        (64, 3072, 64, "svdquant_linear_sm120_routes_v5_tactics_v3"),
+        (64, 3072, 64, "svdquant_linear_sm120_routes_v11_tactics_v3"),
     ],
 )
 def test_sm120_linear_op_name_separates_pdl_in_the_persistent_key(
@@ -722,7 +703,7 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
     )
     monkeypatch.setattr(gemm_svdquant.torch, "empty", fake_empty)
     monkeypatch.setattr(
-        gemm_svdquant, "_get_cache_buf", lambda *args, **kwargs: "workspace"
+        svdquant_sm120_cutlass, "_get_cache_buf", lambda *args, **kwargs: "workspace"
     )
     monkeypatch.setattr(
         svdquant_sm120_cutlass, "_sm120_max_workspace_bytes", lambda *args, **kwargs: 0
@@ -737,7 +718,7 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
     )
     svdquant_sm120_cutlass._SM120_LINEAR_DISPATCH_CACHE.clear()
 
-    x = SimpleNamespace(ndim=2, shape=(m, k), device="cuda:0")
+    x = torch.zeros((m, k), dtype=torch.bfloat16)
     weight = SimpleNamespace(ndim=2, shape=(n, k // 2))
     l2t = SimpleNamespace(ndim=2, shape=(k, 32))
     out = gemm_svdquant.svdquant_linear(
@@ -745,7 +726,7 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
         weight,
         "weight_sf",
         "alpha",
-        "pre_quant_scale",
+        torch.ones(k, dtype=torch.bfloat16),
         l2t,
         "l1_scaled",
         "global_scale",
@@ -774,12 +755,12 @@ def test_sm120_linear_route_pool(monkeypatch):
     monkeypatch.setattr(
         svdquant_sm120_cutlass,
         "_sm120_fused_linear_runner",
-        lambda enable_pdl, device: "fused",
+        lambda enable_pdl, device, rank: "fused",
     )
     monkeypatch.setattr(
         svdquant_sm120_cutlass,
         "_sm120_cutlass_linear_runner",
-        lambda enable_pdl, device: "cutlass",
+        lambda enable_pdl, device, rank: "cutlass",
     )
     monkeypatch.setattr(
         svdquant_sm120_cutlass,

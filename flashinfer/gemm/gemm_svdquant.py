@@ -956,6 +956,20 @@ def mm_nvfp4_svdquant(
     return out
 
 
+def _normalize_nvfp4_quantize_smooth_inputs(
+    x: torch.Tensor, pre_quant_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Make vectorized BF16 inputs contiguous and 16-byte aligned."""
+    normalized_x = x.contiguous()
+    normalized_scale = pre_quant_scale.reshape(x.shape[1]).contiguous()
+    # contiguous() preserves storage-offset views whose addresses may be unaligned.
+    if normalized_x.data_ptr() % 16 != 0:
+        normalized_x = normalized_x.clone()
+    if normalized_scale.data_ptr() % 16 != 0:
+        normalized_scale = normalized_scale.clone()
+    return normalized_x, normalized_scale
+
+
 def _check_nvfp4_quantize_smooth_problem(
     x: torch.Tensor,
     pre_quant_scale: torch.Tensor,
@@ -1028,14 +1042,7 @@ def nvfp4_quantize_smooth(
         enable_pdl = device_support_pdl(x.device)
     if backend == "auto":
         backend = nvfp4_quantize_smooth.suitable_auto_backends[0]
-    # Both backends consume vectorized BF16 operands. A contiguous storage-offset
-    # view can still be misaligned, so materialize only the exceptional case.
-    x = x.contiguous()
-    pre_quant_scale = pre_quant_scale.reshape(x.shape[1]).contiguous()
-    if x.data_ptr() % 16 != 0:
-        x = x.clone()
-    if pre_quant_scale.data_ptr() % 16 != 0:
-        pre_quant_scale = pre_quant_scale.clone()
+    x, pre_quant_scale = _normalize_nvfp4_quantize_smooth_inputs(x, pre_quant_scale)
     if backend == "cute-dsl":
         from ..quantization.kernels.nvfp4_quantize import (
             nvfp4_quantize_smooth_cute_dsl,

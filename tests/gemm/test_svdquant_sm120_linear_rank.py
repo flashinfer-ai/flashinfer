@@ -59,6 +59,53 @@ def test_linear_rejects_unsupported_ranks_before_loading_kernels(rank: int) -> N
         )
 
 
+@pytest.mark.parametrize("rank", (32, 64))
+def test_linear_storage_offset_inputs_match_aligned_inputs(rank: int) -> None:
+    if not torch.cuda.is_available() or get_compute_capability(
+        torch.device("cuda")
+    ) != (12, 0):
+        pytest.skip("requires SM120")
+    m, n, k = 64, 128, 3072
+    torch.manual_seed(0)
+    x = torch.randn(m * k + 1, dtype=torch.bfloat16, device="cuda")[1:].view(m, k)
+    pqs = torch.ones(k + 1, dtype=torch.bfloat16, device="cuda")[1:]
+    assert x.is_contiguous() and x.data_ptr() % 16 == 2
+    assert pqs.is_contiguous() and pqs.data_ptr() % 16 == 2
+    weight = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device="cuda")
+    weight_sf = torch.full((n * k // 16,), 0x38, dtype=torch.uint8, device="cuda")
+    alpha = torch.ones(1, device="cuda")
+    global_sf = torch.ones(1, device="cuda")
+    l2t = torch.randn((k, rank), dtype=torch.bfloat16, device="cuda") / k**0.25
+    l1 = torch.randn((n, rank), dtype=torch.bfloat16, device="cuda") / rank**0.25
+
+    expected = svdquant_linear(
+        x.clone(),
+        weight,
+        weight_sf,
+        alpha,
+        pqs.clone(),
+        l2t,
+        l1,
+        global_sf,
+        enable_pdl=False,
+        backend="cutlass-sm120",
+    )
+    actual = svdquant_linear(
+        x,
+        weight,
+        weight_sf,
+        alpha,
+        pqs,
+        l2t,
+        l1,
+        global_sf,
+        enable_pdl=False,
+        backend="cutlass-sm120",
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("rank", [32, 64])
 @pytest.mark.parametrize(
     "shape", [(129, 256, 256), (537, 5376, 7168), (64, 3072, 3072)]

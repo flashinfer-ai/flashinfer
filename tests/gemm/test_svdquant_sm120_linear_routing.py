@@ -11,6 +11,7 @@ from flashinfer.gemm import gemm_svdquant
 
 from flashinfer.gemm import svdquant_sm120_cutlass
 from flashinfer.gemm import svdquant_sm120_routes as _sm120_routes
+from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig
 
 
 class _FakeTensor:
@@ -92,7 +93,7 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
     )
     monkeypatch.setattr(gemm_svdquant.torch, "empty", fake_empty)
     monkeypatch.setattr(
-        gemm_svdquant,
+        svdquant_sm120_cutlass,
         "_get_cache_buf",
         # Not the string "workspace": the entry point reads this buffer's dtype
         # on its way to a route.
@@ -124,7 +125,7 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
         svdquant_sm120_cutlass, "_choose_sm120_linear_runner", choose_runner
     )
 
-    x = _FakeTensor((537, 5376), dtype=torch.bfloat16)
+    x = torch.zeros((537, 5376), dtype=torch.bfloat16)
     weight = _FakeTensor((5376, 2688), dtype=torch.uint8)
     raw_l2t = _FakeTensor((5376, 32), dtype=torch.bfloat16)
 
@@ -133,9 +134,7 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
         weight,
         "weight_sf",
         "alpha",
-        # A marker string everywhere it is only carried through, but the entry
-        # point reads pre_quant_scale's dtype on its way to a route.
-        _FakeTensor((5376,), dtype=torch.bfloat16),
+        torch.ones(5376, dtype=torch.bfloat16),
         raw_l2t,
         "l1_scaled",
         "global_scale",
@@ -151,3 +150,114 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
     assert out is allocated[-1]
     assert chooser_inputs[0][5] is raw_l2t
     assert native_calls[0][3] is packed_l2t
+
+
+@pytest.mark.parametrize("rank", (32, 64))
+@pytest.mark.parametrize("fused", (False, True))
+@pytest.mark.parametrize(
+    "x_offset,pqs_offset,x_stride,pqs_stride,pqs_matrix",
+    [
+        (0, 0, 1, 1, False),
+        (1, 0, 1, 1, False),
+        (0, 1, 1, 1, False),
+        (0, 0, 2, 2, False),
+        (0, 0, 1, 1, True),
+    ],
+    ids=("aligned", "offset-x", "offset-scale", "strided", "scale-matrix"),
+)
+def test_linear_normalizes_inputs_before_tuning_and_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+    fused: bool,
+    x_offset: int,
+    pqs_offset: int,
+    x_stride: int,
+    pqs_stride: int,
+    pqs_matrix: bool,
+) -> None:
+    # Real CPU tensor views preserve the storage-offset/alignment behavior;
+    # only tactic selection and the native CUDA calls are replaced.
+    m, n, k = 64, 128, 3072
+    x = (
+        torch.arange(m * k * x_stride + x_offset, dtype=torch.float32)
+        .to(torch.bfloat16)[x_offset::x_stride]
+        .reshape(m, k)
+    )
+    pqs = torch.arange(k * pqs_stride + pqs_offset, dtype=torch.float32).to(
+        torch.bfloat16
+    )[pqs_offset::pqs_stride]
+    if pqs_matrix:
+        pqs = pqs.reshape(1, k)
+    expected_x, expected_pqs = x.clone(), pqs.reshape(k).clone()
+    observed: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def record_prefix(
+        activation: torch.Tensor,
+        scale: torch.Tensor,
+        *_args: torch.Tensor | int | bool | None,
+    ) -> None:
+        observed.append((activation, scale))
+
+    module = SimpleNamespace(
+        nvfp4_svdquant_linear_sm120=record_prefix,
+        nvfp4_quantize_smooth=record_prefix,
+        nvfp4_svdquant_gemm=lambda *args: None,
+    )
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass,
+        "get_nvfp4_svdquant_sm120_module",
+        lambda rank=32: module,
+    )
+    runner = (
+        svdquant_sm120_cutlass._sm120_fused_linear_runner(False, x.device, rank)
+        if fused
+        else svdquant_sm120_cutlass._sm120_cutlass_linear_runner(False, x.device, rank)
+    )
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "_cached_sm120_linear_runners", lambda *args: [runner]
+    )
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "_sm120_max_workspace_bytes", lambda *args: 0
+    )
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass,
+        "_get_cache_buf",
+        lambda *args: torch.empty(16, dtype=torch.uint8),
+    )
+
+    def choose(
+        tuner: AutoTuner,
+        runners: list[TunableRunner],
+        config: TuningConfig,
+        inputs: list[torch.Tensor],
+        **kwargs: int | bool | torch.device,
+    ) -> tuple[TunableRunner, int]:
+        observed.append((inputs[0], inputs[4]))
+        return runners[0], 0
+
+    monkeypatch.setattr(svdquant_sm120_cutlass, "_choose_sm120_linear_runner", choose)
+    gemm_svdquant.svdquant_linear(
+        x,
+        torch.empty((n, k // 2), dtype=torch.uint8),
+        torch.empty(n * k // 16, dtype=torch.uint8),
+        torch.ones(1),
+        pqs,
+        torch.zeros((k, rank), dtype=torch.bfloat16),
+        torch.zeros((n, rank), dtype=torch.bfloat16),
+        torch.ones(1),
+        enable_pdl=False,
+        backend="cutlass-sm120",
+    )
+
+    assert len(observed) == 2
+    for actual_x, actual_pqs in observed:
+        assert actual_x.is_contiguous() and actual_x.data_ptr() % 16 == 0
+        assert actual_pqs.is_contiguous() and actual_pqs.data_ptr() % 16 == 0
+        torch.testing.assert_close(actual_x, expected_x, rtol=0, atol=0)
+        torch.testing.assert_close(actual_pqs, expected_pqs, rtol=0, atol=0)
+        if x.is_contiguous() and x.data_ptr() % 16 == 0:
+            assert actual_x.data_ptr() == x.data_ptr()
+        if pqs.is_contiguous() and pqs.data_ptr() % 16 == 0:
+            assert actual_pqs.data_ptr() == pqs.data_ptr()
+    assert observed[0][0] is observed[1][0]
+    assert observed[0][1] is observed[1][1]
