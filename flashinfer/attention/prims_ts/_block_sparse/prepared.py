@@ -16,7 +16,7 @@
 
 from dataclasses import dataclass
 
-from flashinfer.utils import ceil_div, round_up
+from flashinfer.utils import round_up
 
 from .common import _SIGNED_INT32_MAX, _block_sparse_kv_atom_size
 

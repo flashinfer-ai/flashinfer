@@ -295,9 +295,7 @@ def _random_inputs(case: _SageCase):
     params = SageAttentionParams(
         q_scale=q_scale / _SCALE_SHIFT,
         k_scale=k_scale * _SCALE_SHIFT,
-        v_scale=torch.empty((batch, hkv, _HEAD_DIM), device="cuda").uniform_(
-            0.25, 1.0
-        ),
+        v_scale=torch.empty((batch, hkv, _HEAD_DIM), device="cuda").uniform_(0.25, 1.0),
         v_mean=(
             torch.randn((batch, hkv, _HEAD_DIM), device="cuda")
             if case.sage.v_mean

@@ -96,7 +96,12 @@ from .helpers_common import (
 from .smem_block_sparse_metadata import (
     _swaps_forwards_packed_route_full,
 )
-from .sage_scales import load_q_scale, load_sage_k_fragment, sage_k_view, sage_sequence_words
+from .sage_scales import (
+    load_q_scale,
+    load_sage_k_fragment,
+    sage_k_view,
+    sage_sequence_words,
+)
 from .helpers_kv_tile_idx import (
     resolve_keeps_tile_context,
     _kv_tile_is_fully_unmasked_for_q_group,

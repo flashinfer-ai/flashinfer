@@ -414,11 +414,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         if sage_scale_layout is not None:
             sage_scales_fake = fake_compact(
                 Float32,
-                (
-                    sage_scale_layout.total_words(
-                        key.batch_size * key.num_kv_heads
-                    ),
-                ),
+                (sage_scale_layout.total_words(key.batch_size * key.num_kv_heads),),
             )
         sage_fakes: tuple[object | None, ...] = sage_adapter_slots({})
         if key.sage is not None:

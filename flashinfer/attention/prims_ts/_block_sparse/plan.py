@@ -131,7 +131,7 @@ class _BlockSparsePlanState:
     page_size: int | None
     sage: SageAttentionConfig | None
     # Expected shape of every Sage scale tensor, by field name.
-    sage_scale_shapes: dict[str, tuple[int, int]] | None
+    sage_scale_shapes: dict[str, tuple[int, ...]] | None
 
     # Only an unmasked specialization needs a shape-correct ABI placeholder;
     # dense plans own neither it nor route storage.
@@ -316,9 +316,7 @@ def _build_block_sparse_plan_state(
         sage_scales = None
         if spec.sage_scales is not None:
             sage_scales = torch.empty(
-                spec.sage_scales.total_words(
-                    static.batch_size * static.num_kv_heads
-                ),
+                spec.sage_scales.total_words(static.batch_size * static.num_kv_heads),
                 dtype=torch.float32,
                 device=device,
             )
