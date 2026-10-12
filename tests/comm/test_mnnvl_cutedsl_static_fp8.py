@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unrun GPU validation for the source-only static FP8 reference.
+"""Static FP8 output of the MNNVL CuTe DSL all-reduce fusion.
 
-Run on a supported eight/sixteen-rank NVLink system after preparing that system:
-    torchrun --standalone --nproc-per-node=8 -m pytest -q \
+Runs at the launched world size (4, 8 or 16 ranks), for example:
+    torchrun --standalone --nproc-per-node=4 -m pytest -q \
         tests/comm/test_mnnvl_cutedsl_static_fp8.py
-
-This file has only been syntax-checked; it is not evidence of GPU correctness.
 """
 
 import pytest
@@ -27,12 +25,28 @@ import torch.distributed as dist
 
 from flashinfer.comm import AllReduceFusionPattern as P
 from flashinfer.comm import allreduce_fusion
+from flashinfer.comm.mnnvl_cutedsl import (
+    KernelTarget,
+    MNNVLCuteDSLConfig,
+    MRangeDispatch,
+    ProtocolKind,
+    StaticProfile,
+)
+from flashinfer.comm.mnnvl_cutedsl.kernel_bt import (
+    BTAllReduceTuning,
+    BTFinalizeTuning,
+)
+from flashinfer.comm.mnnvl_cutedsl.kernel_ht import (
+    HTAllReduceTuning,
+    HTFinalizeTuning,
+)
+from flashinfer.comm.mnnvl_cutedsl.kernel_ll import (
+    LLAllReduceTuning,
+    LLFinalizeTuning,
+)
 from flashinfer.comm.mnnvl_cutedsl_ar import MNNVLCuteDSLAllReduceFusionWorkspace
 from tests.comm.test_mnnvl_cutedsl_numerical_contract import (
-    HIDDEN_SIZE,
-    PROTOCOL_CONFIGS,
     RMS_EPS,
-    TOP_K,
     WEIGHT_BIAS,
     _assert_norm_contract,
     _assert_prenorm_contract,
@@ -42,7 +56,52 @@ from tests.comm.test_mnnvl_cutedsl_numerical_contract import (
     distributed_group as distributed_group,
 )
 
-pytestmark = [pytest.mark.gpu_8, pytest.mark.arch_blackwell]
+pytestmark = pytest.mark.gpu_4
+
+HIDDEN_SIZE = 8192
+TOP_K = 10
+CAPACITY = 64
+FP8_MAX = 448.0
+
+# Default tunings of every protocol are valid for H8192 at TP4, TP8 and TP16,
+# so one single-protocol profile per world size covers whatever torchrun launched.
+_TUNINGS = {
+    "ll": (ProtocolKind.LL, LLFinalizeTuning(), LLAllReduceTuning()),
+    "bt": (ProtocolKind.BT, BTFinalizeTuning(), BTAllReduceTuning()),
+    "ht": (ProtocolKind.HT, HTFinalizeTuning(), HTAllReduceTuning()),
+}
+
+
+def _single_protocol_config(protocol: str, tp_size: int) -> MNNVLCuteDSLConfig:
+    kind, finalize, all_reduce = _TUNINGS[protocol]
+
+    def route(preset):
+        return MRangeDispatch(
+            upper_bounds=(None,), targets=(KernelTarget(kind, preset),)
+        )
+
+    return MNNVLCuteDSLConfig(
+        profiles=(
+            StaticProfile(
+                tp_size=tp_size,
+                hidden_size=HIDDEN_SIZE,
+                top_k=TOP_K,
+                dtype=torch.bfloat16,
+                finalize_routes=route(finalize),
+                all_reduce_routes=route(all_reduce),
+            ),
+        )
+    )
+
+
+def _expected_fp8(norm: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # The kernel multiplies by an IEEE reciprocal and saturates, as TRT-LLM does.
+    scaled = norm.float() * scale.float().reshape(1).reciprocal()
+    return scaled.clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+
+
+def _assert_fp8_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
 @pytest.mark.parametrize("protocol", ("ll", "bt", "ht"))
@@ -55,17 +114,18 @@ def test_static_fp8_outputs_and_replay(
 ):
     group = distributed_group
     rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
     common = dict(
-        tp_size=dist.get_world_size(group),
+        tp_size=world_size,
         tp_rank=rank,
-        max_token_num=33,
+        max_token_num=CAPACITY,
         hidden_dim=HIDDEN_SIZE,
         dtype=torch.bfloat16,
         group=group,
         top_k=TOP_K,
         rms_eps=RMS_EPS,
         weight_bias=WEIGHT_BIAS,
-        config=PROTOCOL_CONFIGS[protocol],
+        config=_single_protocol_config(protocol, world_size),
     )
     baseline = MNNVLCuteDSLAllReduceFusionWorkspace(**common)
     workspace = MNNVLCuteDSLAllReduceFusionWorkspace(
@@ -73,9 +133,12 @@ def test_static_fp8_outputs_and_replay(
         output_dtype=torch.float8_e4m3fn,
         write_norm_output=write_norm_output,
     )
+    # Patterns 4 and 12 need opposite write_norm_output settings, so the
+    # finalize half runs on the quant-only workspace and is rejected otherwise.
+    finalize_cases = (False,) if write_norm_output else (False, True)
     try:
-        for finalize in (False, True):
-            for m in (1, 7, 33):
+        for finalize in finalize_cases:
+            for m in (1, 9, 61):
                 # Residual/gamma are replicated; expert contributions vary by rank.
                 replicated = torch.Generator(device="cuda").manual_seed(7100 + m)
                 local_rng = torch.Generator(device="cuda").manual_seed(7200 + rank)
@@ -132,14 +195,20 @@ def test_static_fp8_outputs_and_replay(
                 quant = torch.empty(
                     (m, HIDDEN_SIZE), device="cuda", dtype=torch.float8_e4m3fn
                 )
-                scale = torch.tensor([0.5], device="cuda", dtype=torch.float32)
+                # One configuration passes a 0-d scale; the kernel sees a
+                # one-element view of the same storage either way.
+                scale = torch.tensor(
+                    0.37 if write_norm_output else [0.37],
+                    device="cuda",
+                    dtype=torch.float32,
+                )
                 baseline_pattern = (
                     P.kMoEFinalizeARResidualRMSNorm
                     if finalize
                     else P.kARResidualRMSNorm
                 )
                 quant_pattern = (
-                    P.kMoEFinalizeARResidualRMSNorm
+                    P.kMoEFinalizeARResidualRMSNormFP8Quant
                     if finalize
                     else P.kARResidualRMSNormOutFP8Quant
                     if write_norm_output
@@ -175,6 +244,7 @@ def test_static_fp8_outputs_and_replay(
 
                 reference()
                 assert allreduce_fusion(**quant_args).data_ptr() == quant.data_ptr()
+                _assert_fp8_equal(quant, _expected_fp8(reference_norm, scale))
                 local = (
                     _local_finalize(
                         source,
@@ -214,7 +284,9 @@ def test_static_fp8_outputs_and_replay(
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=stream):
                     allreduce_fusion(**quant_args)
-                for value in (0.5, 1 / 256, 2.0, 0.5, 1 / 256, 2.0):
+                # Inexact reciprocals (0.37, 3.0) catch an approximate divide;
+                # 1/256 drives most of the norm past the E4M3 range.
+                for value in (3.0, 1 / 256, 0.37, 3.0, 1 / 256, 0.37):
                     # Change payload and scale, and wrap the three mailbox generations.
                     source.neg_()
                     scale.fill_(value)
@@ -222,13 +294,12 @@ def test_static_fp8_outputs_and_replay(
                     quant.view(torch.uint8).fill_(0x7F)
                     graph.replay()
                     torch.cuda.synchronize()
-                    expected = (reference_norm.float() * scale.reciprocal()).clamp(
-                        -448, 448
-                    )
-                    expected = expected.to(torch.float8_e4m3fn)
-                    assert torch.equal(
-                        quant.view(torch.uint8), expected.view(torch.uint8)
-                    )
+                    expected = _expected_fp8(reference_norm, scale)
+                    _assert_fp8_equal(quant, expected)
+                    if value == 1 / 256:
+                        decoded = quant.float()
+                        assert (decoded == FP8_MAX).any()
+                        assert (decoded == -FP8_MAX).any()
                     assert torch.equal(
                         prenorm.view(torch.int16), reference_residual.view(torch.int16)
                     )
@@ -237,7 +308,24 @@ def test_static_fp8_outputs_and_replay(
                             norm.view(torch.int16), reference_norm.view(torch.int16)
                         )
 
-                for invalid in (None, 0.5, torch.ones(2, device="cuda")):
+                # A Python float and a non-FP32 tensor are converted, like the
+                # TRT-LLM and MNNVL backends do; the result must not change.
+                scale.fill_(0.37)
+                reference()
+                expected = _expected_fp8(reference_norm, scale)
+                for converted in (
+                    0.37,
+                    torch.tensor([0.37], device="cuda", dtype=torch.float64),
+                ):
+                    quant.view(torch.uint8).fill_(0x7F)
+                    allreduce_fusion(**dict(quant_args, scale_factor=converted))
+                    _assert_fp8_equal(quant, expected)
+
+                for invalid in (
+                    None,
+                    torch.ones(2, device="cuda"),
+                    torch.ones(1),
+                ):
                     with pytest.raises(ValueError, match="scale_factor"):
                         allreduce_fusion(**dict(quant_args, scale_factor=invalid))
                 with pytest.raises(ValueError, match="quant_out must have dtype"):
@@ -248,6 +336,22 @@ def test_static_fp8_outputs_and_replay(
                     allreduce_fusion(
                         **dict(quant_args, pattern=P.kARResidualRMSNormDynamicFP8Quant)
                     )
+                # BF16 patterns are not served by an FP8 workspace.
+                with pytest.raises(ValueError, match="BF16 workspace"):
+                    allreduce_fusion(
+                        **dict(quant_args, pattern=baseline_pattern, quant_out=None)
+                    )
+                if write_norm_output:
+                    with pytest.raises(ValueError, match="norm_out"):
+                        allreduce_fusion(**dict(quant_args, norm_out=None))
+                    with pytest.raises(ValueError, match="write_norm_output=False"):
+                        allreduce_fusion(
+                            **dict(
+                                quant_args,
+                                pattern=P.kARResidualRMSNormFP8Quant,
+                                norm_out=None,
+                            )
+                        )
                 torch.cuda.synchronize()
                 dist.barrier(group=group)
                 del graph, symmetric
