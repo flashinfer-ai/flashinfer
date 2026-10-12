@@ -312,7 +312,7 @@ def test_parallel_compile_into_empty_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "_INFLIGHT", {})
     monkeypatch.setattr(runner, "_AHEAD_DONE", set())
     monkeypatch.setattr(runner, "_AHEAD_MS", (1, 2))
-    compile_pool.shutdown()
+    compile_pool.POOL.shutdown()
     r = runner.get_runner()
     n, k = 256, 1024
 
@@ -339,30 +339,25 @@ def test_parallel_compile_into_empty_cache(monkeypatch, tmp_path):
                 r(inputs, tactic=tactic)
                 torch.testing.assert_close(out.float(), ref, atol=2e-3, rtol=8e-3)
     finally:
-        compile_pool.shutdown()
+        compile_pool.POOL.shutdown()
 
 
 def test_hung_compile_worker_times_out(monkeypatch):
     """A worker that never answers is killed, so preparation cannot hang."""
     import sys
 
-    from flashinfer.gemm.kernels.native_bf16_fp4 import compile_pool
+    from flashinfer.jit import cute_dsl_compile_pool
 
-    compile_pool.shutdown()
-    monkeypatch.setenv("FLASHINFER_NATIVE_W4A16_COMPILE_WORKERS", "2")
-    monkeypatch.setattr(compile_pool, "JOB_TIMEOUT_SECONDS", 1.0)
-    monkeypatch.setattr(
-        compile_pool,
-        "_WORKER_ARGV",
-        (sys.executable, "-c", "import time; time.sleep(600)"),
-    )
+    pool = cute_dsl_compile_pool.CompilePool(__name__, lambda: 2, "test")
+    pool.argv = (sys.executable, "-c", "import time; time.sleep(600)")
+    monkeypatch.setattr(cute_dsl_compile_pool, "JOB_TIMEOUT_SECONDS", 1.0)
     try:
-        futures = compile_pool.submit([[0]] * 4, "sm_120a")
+        futures = pool.submit([[0]] * 4, "sm_120a")
         errors = [fut.result(timeout=60) for fut in futures]
         assert all(errors)
         assert any("TimeoutError" in err for err in errors)
     finally:
-        compile_pool.shutdown()
+        pool.shutdown()
 
 
 def test_invalid_weight_layout_is_rejected():

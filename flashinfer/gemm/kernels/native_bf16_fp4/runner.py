@@ -10,6 +10,7 @@ from typing import Any
 import torch
 
 from ....autotuner import AutoTuner, TunableRunner, TuningConfig
+from ....jit.core import logger
 from ....utils import get_compute_capability, get_device_index
 from . import grouped, prefetch
 
@@ -131,14 +132,14 @@ def _prepare(inputs, tactics, ahead):
         _hash_source_files,
         cute_dsl_cache_disabled,
     )
-    from . import compile_pool
+    from .compile_pool import POOL
 
     a, b, _, alpha, out, enable_pdl = inputs
     m, k = a.shape
     n = b.shape[0]
     index = get_device_index(a.device)
     if (
-        compile_pool.num_workers() <= 1
+        POOL.num_workers() <= 1
         or cute_dsl_cache_disabled()
         or torch.cuda.is_current_stream_capturing()
     ):
@@ -166,13 +167,13 @@ def _prepare(inputs, tactics, ahead):
     if len(jobs) > 1:
         major, minor = get_compute_capability(a.device)
         arch = os.environ.get("CUTE_DSL_ARCH") or f"sm_{major}{minor}a"
-        futures = compile_pool.submit(jobs, arch)
+        futures = POOL.submit(jobs, arch)
         if futures is not None:
             _INFLIGHT.update(zip(keys, futures, strict=True))
     waits = [_INFLIGHT[key_of(m, t)] for t in tactics if key_of(m, t) in _INFLIGHT]
     errors = [err for fut in as_completed(waits) if (err := fut.result()) is not None]
     if errors:
-        compile_pool.logger.warning(
+        logger.warning(
             f"Native W4A16: {len(errors)} worker compiles failed, compiling "
             f"them in process. First error: {errors[0]}"
         )
