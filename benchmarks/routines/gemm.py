@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from einops import einsum
 
 import flashinfer
-from flashinfer.autotuner import autotune
+from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.testing.utils import (
     bench_gpu_time,
@@ -2183,18 +2183,11 @@ def testMmBf16(args):
         has_reference_output = True
 
     cache_path = getattr(args, "autotune_cache", None)
-    if getattr(args, "autotune", False):
-        warmup_iters = (
-            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
-        )
-        for cur_backend in backends:
-            if cur_backend in autotune_supported_backends:
-                if args.verbose >= 1:
-                    print(f"[INFO] Autotune warmup for mm_bf16: {warmup_iters} iters")
-                with autotune(True, cache=cache_path):
-                    for _ in range(warmup_iters):
-                        run_backend(cur_backend, a, b, bias, use_pdl, out_dtype)
-    elif cache_path:
+    use_autotune = getattr(args, "autotune", False)
+    warmup_iters = (
+        args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+    )
+    if not use_autotune and cache_path:
         with autotune(False, cache=cache_path):
             pass
 
@@ -2202,6 +2195,15 @@ def testMmBf16(args):
     backend_times = {backend: [] for backend in backends}
     outputs = {}
     for cur_backend in backends:
+        if use_autotune and cur_backend in autotune_supported_backends:
+            # "auto" would otherwise reuse whichever runner another backend tuned.
+            if cache_path is None:
+                AutoTuner.get().clear_cache()
+            if args.verbose >= 1:
+                print(f"[INFO] Autotune warmup for mm_bf16: {warmup_iters} iters")
+            with autotune(True, cache=cache_path):
+                for _ in range(warmup_iters):
+                    run_backend(cur_backend, a, b, bias, use_pdl, out_dtype)
         if run_refcheck:
             outputs[cur_backend] = run_backend(
                 cur_backend, a, b, bias, use_pdl, out_dtype
@@ -2575,7 +2577,7 @@ def testBmmBf16(args):
         return res
 
     def run_backend(backend, A, B, out_dtype):
-        if backend in ["cudnn", "cutlass", "auto"]:
+        if backend in ["cudnn", "cutlass", "cutile", "tgv", "cake", "auto"]:
             return flashinfer.bmm_bf16(
                 A=A,
                 B=B,
@@ -2590,22 +2592,23 @@ def testBmmBf16(args):
         reference_output = torch.bmm(A, B).to(out_dtype)
         has_reference_output = True
 
-    if getattr(args, "autotune", False):
-        warmup_iters = (
-            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
-        )
-        for cur_backend in backends:
-            if cur_backend in autotune_supported_backends:
-                if args.verbose >= 1:
-                    print(f"[INFO] Autotune warmup for bmm_bf16: {warmup_iters} iters")
-                with autotune(True):
-                    for _ in range(warmup_iters):
-                        run_backend(cur_backend, A, B, out_dtype)
+    use_autotune = getattr(args, "autotune", False)
+    warmup_iters = (
+        args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+    )
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
     outputs = {}
     for cur_backend in backends:
+        if use_autotune and cur_backend in autotune_supported_backends:
+            # "auto" would otherwise reuse whichever runner another backend tuned.
+            AutoTuner.get().clear_cache()
+            if args.verbose >= 1:
+                print(f"[INFO] Autotune warmup for bmm_bf16: {warmup_iters} iters")
+            with autotune(True):
+                for _ in range(warmup_iters):
+                    run_backend(cur_backend, A, B, out_dtype)
         if run_refcheck:
             outputs[cur_backend] = run_backend(cur_backend, A, B, out_dtype).detach()
         backend_times[cur_backend] = bench_gpu_time(
