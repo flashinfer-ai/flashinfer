@@ -16,10 +16,10 @@
 #ifndef FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 #define FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 
-// W8A16 GEMM for Blackwell (sm_100a), rung B4: FlashInfer's fork of CUTLASS's
-// mixed-input kernel (w8a16_sm100/) with two transform warpgroups and a 2SM
-// 256x256x64 tile whose converted A operand is staged in smem (env-selectable at this
-// rung; measured against the 256x128 TMEM-A tile).
+// W8A16 GEMM for Blackwell (sm_100a), rung B6: FlashInfer's fork of CUTLASS's
+// mixed-input kernel (w8a16_sm100/) with two transform warpgroups, a pipe-balanced
+// fp8 -> 16-bit converter, and two 2SM tiles (256x128 TMEM-A default, 256x256 smem-A
+// env-selectable).
 //
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
@@ -84,16 +84,25 @@ __device__ __forceinline__ uint32_t prmt_b32(uint32_t a, uint32_t b, uint32_t se
   return r;
 }
 
+// Shift by multiply so it lands on the FMA pipe (IMAD) instead of the ALU pipe (SHF);
+// with the mask applied first the per-pair convert is PRMT + LOP3 (ALU) + IMAD + HMUL2
+// (FMA), two instructions on each pipe (rung B6; rung B1 was PRMT + SHF + LOP3 + HMUL2).
+__device__ __forceinline__ uint32_t imad_shl(uint32_t a, uint32_t mul) {
+  uint32_t r;
+  asm("mad.lo.u32 %0, %1, %2, 0;" : "=r"(r) : "r"(a), "r"(mul));
+  return r;
+}
+
 // Four e4m3 bytes (little-endian in `q`) -> two bf16x2 registers, value order kept.
 // prmt selector nibbles 0x9180 / 0xB3A2: byte k into the low byte of lane k and its
-// sign replicated into the high byte (selector bit 3).  (v << 4) puts the 7 magnitude
-// bits at [10:4] and the replicated sign at [15], mask 0x87F0 keeps exactly those.
-// The exponent field then holds e4m3's raw exponent, so multiply by 2^(127 - 7) = 2^120
-// (bf16 0x7B80).  Denormals: field 0 -> bf16 denormal (m / 8) * 2^-126, times 2^120
-// = (m / 8) * 2^-6, the e4m3 denormal value.
+// sign replicated into the high byte (selector bit 3).  Masking with 0x087F keeps the
+// 7 magnitude bits and the lowest replicated-sign bit (bit 11); times 16 moves them to
+// [10:4] and [15].  The exponent field then holds e4m3's raw exponent, so multiply by
+// 2^(127 - 7) = 2^120 (bf16 0x7B80).  Denormals: field 0 -> bf16 denormal
+// (m / 8) * 2^-126, times 2^120 = (m / 8) * 2^-6, the e4m3 denormal value.
 __device__ __forceinline__ void e4m3x4_to_bf16x4(uint32_t q, uint32_t& lo, uint32_t& hi) {
-  const uint32_t lo_s = (prmt_b32(q, 0u, 0x9180u) << 4) & 0x87F087F0u;
-  const uint32_t hi_s = (prmt_b32(q, 0u, 0xB3A2u) << 4) & 0x87F087F0u;
+  const uint32_t lo_s = imad_shl(prmt_b32(q, 0u, 0x9180u) & 0x087F087Fu, 16u);
+  const uint32_t hi_s = imad_shl(prmt_b32(q, 0u, 0xB3A2u) & 0x087F087Fu, 16u);
   const uint32_t k_bits = 0x7B807B80u;  // bf16x2 {2^120, 2^120}
   const __nv_bfloat162 k = *reinterpret_cast<const __nv_bfloat162*>(&k_bits);
   __nv_bfloat162 l = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&lo_s), k);
@@ -102,11 +111,11 @@ __device__ __forceinline__ void e4m3x4_to_bf16x4(uint32_t q, uint32_t& lo, uint3
   hi = *reinterpret_cast<uint32_t*>(&h);
 }
 
-// Same for f16: (v << 7) puts the magnitude at [13:7] and the replicated sign at [15],
-// mask 0xBF80; exponent bias fix is 2^(15 - 7) = 2^8 (f16 0x5C00).
+// Same for f16: mask 0x017F keeps the magnitude and replicated-sign bit 8; times 128
+// puts them at [13:7] and [15]; exponent bias fix is 2^(15 - 7) = 2^8 (f16 0x5C00).
 __device__ __forceinline__ void e4m3x4_to_f16x4(uint32_t q, uint32_t& lo, uint32_t& hi) {
-  const uint32_t lo_s = (prmt_b32(q, 0u, 0x9180u) << 7) & 0xBF80BF80u;
-  const uint32_t hi_s = (prmt_b32(q, 0u, 0xB3A2u) << 7) & 0xBF80BF80u;
+  const uint32_t lo_s = imad_shl(prmt_b32(q, 0u, 0x9180u) & 0x017F017Fu, 128u);
+  const uint32_t hi_s = imad_shl(prmt_b32(q, 0u, 0xB3A2u) & 0x017F017Fu, 128u);
   const uint32_t k_bits = 0x5C005C00u;  // f16x2 {256, 256}
   const __half2 k = *reinterpret_cast<const __half2*>(&k_bits);
   __half2 l = __hmul2(*reinterpret_cast<const __half2*>(&lo_s), k);
