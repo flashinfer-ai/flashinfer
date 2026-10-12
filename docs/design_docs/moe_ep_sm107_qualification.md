@@ -75,8 +75,11 @@ replay without a host synchronization. Invalid routing can invalidate the
 worker's CUDA context, as with other invalid CUDA indexing operations.
 Use separate worker processes for negative device-assertion tests. Valid
 masked routes are supported; their combine slots are cleared each launch.
-This clearing and routing validation have a performance cost that belongs
-in the measured kernel and full-forward spans respectively.
+NVFP4 workspaces of the inference kernel with BF16 combine and the separate
+top-k reduce skip that clear: their reduce covers the staged rows and masks
+invalid slots as it loads them.
+This clearing (or masking) and routing validation have a performance cost
+that belongs in the measured kernel and full-forward spans respectively.
 
 The shim rounds physical token capacity up by at most three rows to keep
 four-int router loads in bounds. The public live-token limit is unchanged.
