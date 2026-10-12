@@ -214,6 +214,10 @@ from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.cake_sampling import gen_cake_sampling_module
+from .moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+    cake_sm120_megamoe_available,
+    gen_cake_sm120_megamoe_aot_modules,
+)
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
 
@@ -943,6 +947,11 @@ def gen_all_modules(
         if has_sm120:
             jit_specs.append(gen_cudnn_frost_moe_module("bf16", "sm_120a"))
             jit_specs.append(gen_fp4_quantization_sm120_module())
+            # Cake SM120 MXFP4 x MXFP8 MegaMoE (moe_ep backend sm120_mxfp4_mxfp8_bf16_cake):
+            # the binding and the default DeepSeek-V4-Flash device instances.  Both need
+            # the NCCL 2.30.7 Device API (headers + library) at build time.
+            if cake_sm120_megamoe_available():
+                jit_specs.extend(gen_cake_sm120_megamoe_aot_modules())
         if has_sm121:
             jit_specs.append(gen_fp4_quantization_sm121_module())
         if has_sm120 or has_sm121:

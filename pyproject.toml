@@ -123,6 +123,14 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
   "src/*.cu",
   "src/*.json",
 ]
+# Generated SM120 MXFP4 x MXFP8 Cake MegaMoE closure (sealed by its manifest) and
+# the hand-written binding / cubin carrier, compiled on demand.
+"flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe" = [
+  "*.md",
+  "src/*.cu",
+  "src/*.cuh",
+  "src/*.json",
+]
 # Generated SM100 BF16 rank-major mega-MoE CUDA bundle. The runtime validates
 # the manifest checksum before compiling the source on demand.
 "flashinfer.moe_ep.kernel_src.blackwell_bf16_rank_major" = [
