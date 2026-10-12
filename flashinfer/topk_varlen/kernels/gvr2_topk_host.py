@@ -2396,7 +2396,9 @@ def run_varlen(
                 # unless the kernel already emitted absolute columns)
                 idx64 = idx.to(torch.int64)
                 if not absolute_indices:
-                    idx64 = idx64 + row_starts.to(torch.int64).unsqueeze(1)
+                    # the kernels clamp a negative start to 0 (the window keeps
+                    # its length), so the gather adds the clamped start as well
+                    idx64 = idx64 + row_starts.to(torch.int64).clamp_(min=0).unsqueeze(1)
                 vals.copy_(lg.gather(1, idx64.clamp_min(0).clamp_max(npad - 1)))
                 vals.masked_fill_(idx < 0, torch.finfo(_F32).min)
             return

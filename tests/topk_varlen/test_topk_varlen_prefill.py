@@ -998,6 +998,18 @@ def test_prefill_row_starts_out_of_range():
     _host.run_varlen(lg, None, le, ref_eng, top_k=k, row_starts=rs, engine="reference")
     torch.cuda.synchronize()
     _same_selection(lg, out, ref_eng, starts=rs)
+    # returned values are read at the column the kernel ranked: the clamped
+    # start plus the window-local index (a negative start acts as 0)
+    idx_v, vals = flashinfer.top_k_varlen(lg, le, k, row_starts=rs, return_values=True)
+    torch.cuda.synchronize()
+    starts = rs.to(torch.int64).clamp(min=0)
+    for r in (0, 2, 3):
+        hit = idx_v[r] >= 0
+        cols = idx_v[r][hit].to(torch.int64) + starts[r]
+        assert torch.equal(vals[r][hit], lg[r, cols]), r
+    assert bool(
+        (vals[1] == torch.finfo(torch.float32).min).all()
+    )  # empty window: pads only
 
 
 @requires_gvr2
