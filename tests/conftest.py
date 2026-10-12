@@ -193,6 +193,9 @@ def pytest_configure(config):
         "markers", "solo: run this whole test file alone (memory-heavy)"
     )
     config.addinivalue_line(
+        "markers", "gpu_exclusive: run this whole test file alone on its assigned GPU"
+    )
+    config.addinivalue_line(
         "markers",
         "shard_group(name): keep marked nodes from one source in one pytest batch",
     )

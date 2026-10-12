@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 ALGORITHM_VERSION = "lpt-ms-v4"
 DEFAULT_CHECKPOINT_SECONDS = 1_000_000
 DEFAULT_TARGET_UNIT_SECONDS = 1_000_000
@@ -32,6 +32,7 @@ class CollectedNode:
     shard_group: str | None = None
     solo: bool = False
     long_running: bool = False
+    gpu_exclusive: bool = False
 
     @classmethod
     def from_nodeid(
@@ -42,6 +43,7 @@ class CollectedNode:
         *,
         solo: bool = False,
         long_running: bool = False,
+        gpu_exclusive: bool = False,
     ) -> "CollectedNode":
         return cls(
             nodeid=nodeid,
@@ -51,6 +53,7 @@ class CollectedNode:
             shard_group=shard_group,
             solo=solo,
             long_running=long_running,
+            gpu_exclusive=gpu_exclusive,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -62,6 +65,7 @@ class CollectedNode:
             "shard_group": self.shard_group,
             "solo": self.solo,
             "long_running": self.long_running,
+            "gpu_exclusive": self.gpu_exclusive,
         }
 
 
@@ -208,6 +212,9 @@ class Plan:
             "shard_groups": shard_groups,
             "solo_sources": solo_sources,
             "long_running_sources": long_running_sources,
+            "gpu_exclusive_sources": sorted(
+                {node.source_file for node in self.nodes if node.gpu_exclusive}
+            ),
             "units": [
                 {
                     "id": unit.id,
@@ -267,6 +274,7 @@ class Plan:
                         shard_group=node.get("shard_group"),
                         solo=bool(node.get("solo", False)),
                         long_running=bool(node.get("long_running", False)),
+                        gpu_exclusive=bool(node.get("gpu_exclusive", False)),
                     )
                     for node in value["nodes"]
                 ),
@@ -294,6 +302,7 @@ class Plan:
         long_running_sources = {
             str(source) for source in value.get("long_running_sources", [])
         }
+        gpu_exclusive_sources = set(value.get("gpu_exclusive_sources", []))
         nodes = tuple(
             CollectedNode(
                 nodeid,
@@ -304,6 +313,8 @@ class Plan:
                 source_files.get(index, source_file_for_nodeid(nodeid)) in solo_sources,
                 source_files.get(index, source_file_for_nodeid(nodeid))
                 in long_running_sources,
+                source_files.get(index, source_file_for_nodeid(nodeid))
+                in gpu_exclusive_sources,
             )
             for index, nodeid in enumerate(nodeids)
         )

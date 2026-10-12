@@ -9,7 +9,9 @@ import tempfile
 import threading
 import time
 from collections import Counter
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -522,6 +524,7 @@ def _selected_nodes(
             shard_group=node.get("shard_group"),
             solo=bool(node.get("solo", False)),
             long_running=bool(node.get("long_running", False)),
+            gpu_exclusive=bool(node.get("gpu_exclusive", False)),
         )
         for node in raw_nodes
     ]
@@ -1082,6 +1085,37 @@ class _ShardProgress:
 
 
 @dataclass
+class _GpuGate:
+    """Reserve one GPU through batch setup, execution and process cleanup."""
+
+    condition: threading.Condition = field(default_factory=threading.Condition)
+    active: int = 0
+    exclusive: bool = False
+    waiting_exclusive: int = 0
+
+    @contextmanager
+    def reserve(self, exclusive: bool) -> Iterator[None]:
+        with self.condition:
+            self.waiting_exclusive += int(exclusive)
+            try:
+                self.condition.wait_for(
+                    lambda: not self.exclusive
+                    and (self.active == 0 if exclusive else self.waiting_exclusive == 0)
+                )
+                self.active += 1
+                self.exclusive = exclusive
+            finally:
+                self.waiting_exclusive -= int(exclusive)
+        try:
+            yield
+        finally:
+            with self.condition:
+                self.active -= 1
+                self.exclusive = False
+                self.condition.notify_all()
+
+
+@dataclass
 class _ShardExecutor:
     repo_root: Path
     pytest_root: Path
@@ -1095,6 +1129,8 @@ class _ShardExecutor:
     solo_sources: frozenset[str]
     long_running_sources: frozenset[str]
     progress: _ShardProgress
+    gpu_exclusive_sources: frozenset[str] = frozenset()
+    gpu_gates: dict[str | None, _GpuGate] = field(default_factory=dict)
     long_work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
     normal_work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
     solo_units: list[Unit] = field(default_factory=list)
@@ -1106,6 +1142,7 @@ class _ShardExecutor:
     stop_workers: threading.Event = field(default_factory=threading.Event)
 
     def add_units(self, units: list[Unit]) -> None:
+        self.gpu_gates = {device: _GpuGate() for device in self.devices}
         self.all_non_solo_units = [
             unit for unit in units if not self._unit_is_solo(unit)
         ]
@@ -1197,10 +1234,17 @@ class _ShardExecutor:
                     for batch in unit.batches
                     if batch.id not in before
                 )
-                self._report_worker_task(index, unit, pending_nodes, solo=False)
                 try:
-                    self._execute_unit(index, unit, solo=False)
-                    stats.update(self._new_unit_outcomes(unit, before))
+                    exclusive = any(
+                        batch.source_file in self.gpu_exclusive_sources
+                        for batch in unit.batches
+                    )
+                    with self.gpu_gates[device].reserve(exclusive):
+                        if self.stop_workers.is_set():
+                            return
+                        self._report_worker_task(index, unit, pending_nodes, solo=False)
+                        self._execute_unit(index, unit, solo=False)
+                        stats.update(self._new_unit_outcomes(unit, before))
                 finally:
                     work.task_done()
         finally:
@@ -1620,10 +1664,7 @@ def execute_shard(
     devices = visible_devices()
     if execution.workers <= 0:
         raise RunnerStateError("workers must be positive")
-    if execution.workers > len(devices):
-        raise RunnerStateError(
-            f"requested {execution.workers} workers but only {len(devices)} visible GPU slot(s)"
-        )
+    devices = [devices[index % len(devices)] for index in range(execution.workers)]
     attempt_path, attempt = create_or_join_attempt(
         junit_dir, execution.attempt, started_at=operation_started_at
     )
@@ -1671,6 +1712,9 @@ def execute_shard(
             ),
             long_running_sources=frozenset(
                 node.source_file for node in plan.nodes if node.long_running
+            ),
+            gpu_exclusive_sources=frozenset(
+                node.source_file for node in plan.nodes if node.gpu_exclusive
             ),
             progress=_ShardProgress(
                 shard_index=execution.shard_index,

@@ -26,6 +26,10 @@ import flashinfer
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
+# GPU peak is unknown: the H100 CI resource monitor stopped early.
+pytestmark = pytest.mark.gpu_exclusive
+
+
 def head_dim_512_supported() -> bool:
     # 16-bit FA2 head_dim > 256 uses the Ampere+ large-head path.
     return get_compute_capability(torch.device("cuda:0"))[0] >= 8

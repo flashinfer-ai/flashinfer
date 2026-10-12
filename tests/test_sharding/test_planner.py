@@ -579,8 +579,14 @@ def test_soft_target_search_does_not_retry_every_intermediate_bin_count(
 
 def test_plan_serialization_stores_each_nodeid_once() -> None:
     nodes = [
-        _node("tests/test_x.py::test_known[a-very-long-parameter]", 0),
-        _node("tests/test_x.py::test_new[another-very-long-parameter]", 1),
+        CollectedNode.from_nodeid(
+            "tests/test_x.py::test_known[a-very-long-parameter]", 0, gpu_exclusive=True
+        ),
+        CollectedNode.from_nodeid(
+            "tests/test_x.py::test_new[another-very-long-parameter]",
+            1,
+            gpu_exclusive=True,
+        ),
     ]
     book = EstimateBook([DurationEstimate("profile", nodes[0].nodeid, 1.0, 1)])
     plan = build_plan(
@@ -598,7 +604,8 @@ def test_plan_serialization_stores_each_nodeid_once() -> None:
     encoded = json.dumps(serialized, sort_keys=True, separators=(",", ":"))
 
     assert Plan.from_dict(serialized) == plan
-    assert serialized["schema_version"] == 4
+    assert serialized["schema_version"] == 5
+    assert serialized["gpu_exclusive_sources"] == ["tests/test_x.py"]
     assert serialized["nodeids"] == [node.nodeid for node in nodes]
     assert "nodes" not in serialized
     assert "batch_ids" not in encoded

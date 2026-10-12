@@ -135,6 +135,23 @@ Run specific test function:
 pytest tests/attention/test_hopper.py::test_single_prefill
 ```
 
+H100 PR CI uses `scripts/task_run_unit_tests.sh --workers-per-gpu 2`: eight
+workers on four GPUs. Each worker sees one GPU. `--workers N` instead sets the
+total worker count. Both modes share the existing JIT compilation budget.
+
+Use `pytest.mark.gpu_exclusive` for files that must not share their assigned GPU;
+other GPUs can keep running. Use `pytest.mark.solo` for files that must run alone
+across the runner's allocation, including heavy host-memory or multi-GPU tests.
+Both markers apply to the whole source file, including setup and process cleanup.
+The initial H100 policy uses run 38120808880: host RSS above 128 GiB is `solo`,
+GPU memory above 32 GiB is `gpu_exclusive`. Sliding-window tests are also GPU
+exclusive because their resource monitor stopped early. These are measured
+baselines, not enforced memory limits; recheck them when test shapes change.
+
+GPU sharing can hide CPU and compilation waits; it does not imply a 2x speedup.
+Run the CPU-only coordinator checks with
+`pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
+
 ### Skipping Tests Based on CUDA Architecture
 
 Use `flashinfer.utils` functions to skip tests on unsupported GPU architectures:

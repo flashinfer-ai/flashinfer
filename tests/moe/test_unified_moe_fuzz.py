@@ -264,25 +264,15 @@ BASE_SEED = int(os.environ.get("FLASHINFER_UMOE_FUZZ_SEED", "0"))
 # so a single seed reproduces exactly one config. The repro command printed on every test uses this.
 _ONLY_SEEDS = os.environ.get("FLASHINFER_UMOE_FUZZ_ONLY_SEED", "")
 
-# --- CI gate: ON by default (FLASHINFER_UMOE_FUZZ=0 is the emergency waiver) ----------------
-# History: this suite was opt-in (FLASHINFER_UMOE_FUZZ=1) while (a) gh #3547 was open and (b) the
-# accumulated single-process run could hit `CUDA error: device-side assert triggered` ->
-# `Fatal Python error: Aborted` (2026-06-09 triage). Both are now understood (2026-07-14, full
-# default run on a B200-class SM100): #3547 is fixed (its EP-offset configs pass), and the abort
-# is root-caused mechanically -- an async device-side assert from one config poisons the CUDA
-# context and the pending c10 error escapes a destructor at interpreter shutdown
-# (std::terminate). It is not a separate Heisenbug: any assert-class *finding* ends this fuzzer's
-# pytest process after the failure is reported. The shard_group marker keeps the accumulated
-# sequence together in one pytest invocation, preserving the regression while the sharding runner
-# can still isolate failures in other groups. The historical gh #3957 finding
-# (a silent OOB write with a moving victim) was fixed by gh #4186; keeping this accumulated
-# sequence enabled is its regression coverage.
-# Set FLASHINFER_UMOE_FUZZ=0 to disable in an emergency; FLASHINFER_UMOE_FUZZ=1 (the old opt-in
-# value) still enables and is now a no-op.
-pytestmark = pytest.mark.skipif(
-    os.environ.get("FLASHINFER_UMOE_FUZZ", "1") == "0",
-    reason="unified MoE fuzzer disabled via FLASHINFER_UMOE_FUZZ=0",
-)
+# Keep accumulated cases together for CUDA-context regression coverage.
+# H100 CI peak host RSS: 313.6 GiB. Set FLASHINFER_UMOE_FUZZ=0 to disable.
+pytestmark = [
+    pytest.mark.solo,
+    pytest.mark.skipif(
+        os.environ.get("FLASHINFER_UMOE_FUZZ", "1") == "0",
+        reason="unified MoE fuzzer disabled via FLASHINFER_UMOE_FUZZ=0",
+    ),
+]
 
 # Per-backend determinism contract, established empirically (CRC across reruns) + confirmed against
 # code. A "True" backend MUST reproduce bitwise; flip to False only with evidence (and ideally an

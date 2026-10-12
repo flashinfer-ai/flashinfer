@@ -139,7 +139,30 @@ def test_default_worker_count_matches_visible_gpu_count(
 
     args = unit_test_runner._parser().parse_args(["run"])
 
-    assert args.workers == gpu_count
+    assert unit_test_runner._worker_count(args) == gpu_count
+
+
+def test_worker_count_options_and_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6,7")
+    monkeypatch.setenv("UNIT_TEST_WORKERS", "3")
+    parser = unit_test_runner._parser()
+    assert unit_test_runner._worker_count(parser.parse_args(["run"])) == 3
+    assert (
+        unit_test_runner._worker_count(
+            parser.parse_args(["run", "--workers-per-gpu", "2"])
+        )
+        == 8
+    )
+    assert (
+        unit_test_runner._worker_count(parser.parse_args(["run", "--workers", "6"]))
+        == 6
+    )
+    for arguments in (
+        ["--workers-per-gpu", "0"],
+        ["--workers", "4", "--workers-per-gpu", "2"],
+    ):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["run", *arguments])
 
 
 def test_explicit_zero_deadline_is_disabled(
@@ -316,6 +339,11 @@ def _run(
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT)
     env.update(env_override or {})
+    worker_args = (
+        []
+        if any(arg in {"--workers", "--workers-per-gpu"} for arg in extra)
+        else ["--workers", "1"]
+    )
     return subprocess.run(
         [
             sys.executable,
@@ -333,8 +361,7 @@ def _run(
             "1",
             "--target-unit-seconds",
             "1",
-            "--workers",
-            "1",
+            *worker_args,
             "--timeout-grace-seconds",
             "0",
             "--deadline-seconds",
@@ -1400,11 +1427,90 @@ def test_regular():
     assert (state / "regular-devices").read_text(encoding="utf-8") in {"0", "1"}
 
 
-@pytest.mark.parametrize("worker_count", [1, 2, 4, 8])
+def test_gpu_sharing_respects_gpu_and_runner_exclusivity(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    state = tmp_path / "gpu-state"
+    state.mkdir()
+    source = """\
+import fcntl
+import json
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+MODE = {mode!r}
+if MODE != "shared":
+    pytestmark = getattr(pytest.mark, MODE)
+
+@pytest.fixture(scope="module", autouse=True)
+def reserve_memory():
+    state = Path(os.environ["GPU_STATE"])
+    device = os.environ["CUDA_VISIBLE_DEVICES"]
+    with (state / "runner.lock").open("a") as host_lock:
+        host_mode = fcntl.LOCK_EX if MODE == "solo" else fcntl.LOCK_SH
+        fcntl.flock(host_lock, host_mode | fcntl.LOCK_NB)
+        with (state / (device + ".lock")).open("a") as gpu_lock:
+            gpu_mode = fcntl.LOCK_SH if MODE == "shared" else fcntl.LOCK_EX
+            fcntl.flock(gpu_lock, gpu_mode | fcntl.LOCK_NB)
+            start = time.time()
+            time.sleep(0.05)
+            yield
+            time.sleep(0.05)
+            (state / (Path(__file__).stem + ".json")).write_text(
+                json.dumps([MODE, device, start, time.time()])
+            )
+
+def test_case():
+    time.sleep(0.1)
+"""
+    modes = ["gpu_exclusive"] * 4 + ["shared"] * 8 + ["solo"]
+    for index, mode in enumerate(modes):
+        (suite / f"test_{index}.py").write_text(source.format(mode=mode))
+    arguments = ("run", suite, "--workers-per-gpu", "2")
+    environment = {"CUDA_VISIBLE_DEVICES": "4,6", "GPU_STATE": str(state)}
+
+    result = _run(tmp_path, *arguments, env_override=environment)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    records = [json.loads(path.read_text()) for path in state.glob("*.json")]
+    assert len(records) == len(modes)
+    assert {record[1] for record in records if record[0] == "solo"} == {"4,6"}
+    assert {record[1] for record in records if record[0] != "solo"} == {"4", "6"}
+    assert any(
+        left[1] != right[1] and max(left[2], right[2]) < min(left[3], right[3])
+        for left in records
+        for right in records
+        if left[0] == "gpu_exclusive" and right[0] != "solo"
+    ), "GPU-exclusive work blocked the other GPU"
+
+    repeated = _run(tmp_path, *arguments, env_override=environment)
+    assert repeated.returncode == 0, repeated.stdout + repeated.stderr
+    assert "PYTEST BATCH START" not in repeated.stdout
+
+
+def test_gpu_reservation_releases_after_failure() -> None:
+    gate = runner._GpuGate()
+    with pytest.raises(RuntimeError), gate.reserve(True):
+        raise RuntimeError("batch failed")
+    with gate.reserve(False):
+        assert gate.active == 1
+        assert not gate.exclusive
+    assert gate.active == 0
+
+
+@pytest.mark.parametrize("gpu_count", [1, 2, 4])
+@pytest.mark.parametrize("workers_per_gpu", [1, 2])
 def test_workers_export_disjoint_master_port_blocks_for_visible_gpu_count(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worker_count: int
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gpu_count: int,
+    workers_per_gpu: int,
 ) -> None:
     monkeypatch.delenv("MASTER_PORT", raising=False)
+    worker_count = gpu_count * workers_per_gpu
     suite = tmp_path / "suite"
     suite.mkdir()
     state = tmp_path / "port-state"
@@ -1429,14 +1535,15 @@ def test_worker_port():
     for index in range(worker_count):
         (suite / f"test_{index}.py").write_text(source, encoding="utf-8")
 
-    visible_devices = ",".join(str(index) for index in range(worker_count))
+    devices = [4 + index * 2 for index in range(gpu_count)]
+    visible_devices = ",".join(map(str, devices))
 
     result = _run(
         tmp_path,
         "run",
         suite,
-        "--workers",
-        str(worker_count),
+        "--workers-per-gpu",
+        str(workers_per_gpu),
         env_override={
             "CUDA_VISIBLE_DEVICES": visible_devices,
             "EXPECTED_WORKERS": str(worker_count),
@@ -1450,7 +1557,7 @@ def test_worker_port():
         for path in state.glob("*.port")
     }
     assert assignments == {
-        (worker_index, 29500 + worker_index * 100)
+        (devices[worker_index % gpu_count], 29500 + worker_index * 100)
         for worker_index in range(worker_count)
     }
     for _, port in assignments:

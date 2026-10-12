@@ -86,7 +86,7 @@ def test_unselected():
     assert properties["pytest_nodeid"] == selected_node
 
 
-def test_plugin_promotes_solo_and_long_running_markers_to_their_sources(
+def test_plugin_promotes_scheduling_markers_to_their_sources(
     tmp_path: Path,
 ) -> None:
     solo_file = tmp_path / "test_solo.py"
@@ -118,6 +118,14 @@ def test_same_source():
         encoding="utf-8",
     )
     collection_path = tmp_path / "collection.json"
+    gpu_file = tmp_path / "test_gpu.py"
+    gpu_file.write_text(
+        "import pytest\n"
+        "@pytest.mark.gpu_exclusive\n"
+        "def test_marked(): pass\n"
+        "def test_same_source(): pass\n",
+        encoding="utf-8",
+    )
 
     collected = _pytest(
         tmp_path,
@@ -126,6 +134,7 @@ def test_same_source():
         f"--flashinfer-collection-json={collection_path}",
         str(solo_file),
         str(long_file),
+        str(gpu_file),
     )
 
     assert collected.returncode == 0, collected.stdout + collected.stderr
@@ -142,6 +151,12 @@ def test_same_source():
     assert all(node["long_running"] is False for node in solo_nodes)
     assert all(node["long_running"] is True for node in long_nodes)
     assert all(node["solo"] is False for node in long_nodes)
+    gpu_nodes = [
+        node for node in collection["nodes"] if "test_gpu.py::" in node["nodeid"]
+    ]
+    assert len(gpu_nodes) == 2
+    assert all(node["gpu_exclusive"] for node in gpu_nodes)
+    assert all(not node["solo"] for node in gpu_nodes)
     assert "PytestUnknownMarkWarning" not in collected.stdout + collected.stderr
 
 

@@ -64,6 +64,9 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "long_running: dispatch every unit from this source before normal work",
     )
+    config.addinivalue_line(
+        "markers", "gpu_exclusive: run this source alone on its assigned GPU"
+    )
     session_start = time.time()
     state = {
         "session_start": session_start,
@@ -99,6 +102,11 @@ def pytest_collection_modifyitems(
         for item in items
         if item.get_closest_marker("long_running") is not None
     }
+    gpu_exclusive_sources = {
+        Path(str(item.path)).resolve()
+        for item in items
+        if item.get_closest_marker("gpu_exclusive") is not None
+    }
     collected = []
     for order, item in enumerate(items):
         node = CollectedNode.from_nodeid(item.nodeid, order, _marker_name(item))
@@ -116,6 +124,7 @@ def pytest_collection_modifyitems(
                 shard_group=node.shard_group,
                 solo=item_path in solo_sources,
                 long_running=item_path in long_running_sources,
+                gpu_exclusive=item_path in gpu_exclusive_sources,
             )
         )
     collection_path = config.getoption("--flashinfer-collection-json")
