@@ -1765,15 +1765,16 @@ def top_k_varlen(
         position through its page table. ``True`` without ``row_starts``
         raises ``ValueError``. Default ``False``.
     page_table : torch.Tensor, optional
-        Decode mode only: write each selected column ``c`` of request ``q`` as
-        the physical KV slot ``page_table[q, c // page_size] * page_size +
-        c % page_size`` instead of the column; ``-1`` padding is unchanged.
-        ``int32`` tensor of shape ``(num_rows // next_n, max_pages)``,
-        contiguous, one row per request, covering the buffer width
-        (``max_pages * page_size >= num_cols``); columns and ``page_size``
-        are in the units of ``logits``. Not combinable with ``pre_idx``,
-        ``row_starts`` or ``return_values``; the backends that serve it are
-        listed under ``backend``. Default ``None``.
+        Decode mode only. The request's page map: an ``int32`` tensor,
+        contiguous, with one row per request and at least
+        ``ceil(num_cols / page_size)`` columns (one entry per page of the
+        request's cache, so every column of ``logits`` maps through it);
+        columns and ``page_size`` are in the units of ``logits``. When given,
+        each selected column ``c`` of request ``q`` is written as the physical
+        KV slot ``page_table[q, c // page_size] * page_size + c % page_size``
+        instead of the column; ``-1`` padding is unchanged. Not combinable
+        with ``pre_idx``, ``row_starts`` or ``return_values``; the backends
+        that serve it are listed under ``backend``. Default ``None``.
     page_size : int, optional
         Columns per ``page_table`` entry, a power of two up to ``2**30``. Any
         value but ``None`` without ``page_table`` raises ``ValueError``.
