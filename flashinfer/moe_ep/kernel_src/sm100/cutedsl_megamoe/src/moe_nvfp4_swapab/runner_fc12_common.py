@@ -1385,8 +1385,10 @@ class Fc12TesterBase:
             fc2_output=fc2_output_cute,
             topk_scores=topk_scores_cute,
             fc1_done_counter=fc1_done_counter_cute,
-            offs=offs_cute,
             stream=stream,
+        )
+        runtime_kwargs.update(
+            self._scheduler_runtime_kwargs(offs_cute, _to_cute)
         )
         if load_balance_counter_cute is not None:
             runtime_kwargs["load_balance_counter"] = load_balance_counter_cute
@@ -1853,6 +1855,10 @@ class Fc12TesterBase:
         Default: no-op.
         """
         return fc2_fp32
+
+    def _scheduler_runtime_kwargs(self, offs_cute, to_cute) -> dict:
+        """Return the scheduler range-source runtime kwargs."""
+        return {"offs": offs_cute}
 
     def _extra_kernel_runtime_kwargs(self, to_cute) -> dict:
         """Optional kind-specific runtime kwargs appended after common tensors."""

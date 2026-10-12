@@ -43,6 +43,7 @@ inline int32_t computeLog2(int32_t val) {
   }
   return out;
 }
+
 }  // namespace
 
 // ============================ moePermute bindings ============================
@@ -364,6 +365,8 @@ void moe_sort(
     // Optional: expert counts buffer for large token counts (>1024)
     // Should be size 2 * num_experts, int32
     int64_t expert_counts_ptr,
+    // Optional persistent [num_experts] output histogram.
+    int64_t out_expert_counts_ptr,
     // Optional: explicit CUDA stream pointer for CUDA graph compatibility
     // If 0, uses TVM FFI's current stream
     int64_t cuda_stream_ptr) {
@@ -395,9 +398,8 @@ void moe_sort(
   // Not using packed format since we have explicit TopK IDs
   routingData.mPtrTopKPacked = nullptr;
 
-  // Expert counts buffer: required when num_tokens > 1024
-  // The kernel will set this to nullptr internally for small token counts
   routingData.mPtrExpertCounts = reinterpret_cast<int32_t*>(expert_counts_ptr);
+  routingData.mPtrNumTokensPerExpert = reinterpret_cast<int32_t*>(out_expert_counts_ptr);
 
   // Metadata
   routingData.mNumTokens = num_tokens;

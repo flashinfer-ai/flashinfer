@@ -48,6 +48,7 @@ class Mxfp8Bf16Fc12Tester(SwigluBf16Fc12Tester):
         misc: MiscDesc,
         *,
         weight_kind: WeightKind,
+        expert_token_range_format: Literal["offsets", "sizes"] = "offsets",
     ) -> None:
         # Do not call SwigluBf16Fc12Tester.__init__: that implementation locks
         # the dense BF16 kernel to N=256. Mixed supports N128 TMEM and the two
@@ -77,6 +78,11 @@ class Mxfp8Bf16Fc12Tester(SwigluBf16Fc12Tester):
             raise ValueError(
                 f"weight_kind must be one of {tuple(_WEIGHT_DTYPE_BY_KIND)}, "
                 f"got {weight_kind!r}."
+            )
+        if expert_token_range_format not in ("offsets", "sizes"):
+            raise ValueError(
+                "expert_token_range_format must be 'offsets' or 'sizes', got "
+                f"{expert_token_range_format!r}."
             )
         m, n, k = impl.mma_tiler_mnk
         supported_mma_tilers = (
@@ -120,6 +126,7 @@ class Mxfp8Bf16Fc12Tester(SwigluBf16Fc12Tester):
 
         self.weight_kind: WeightKind = weight_kind
         self.weight_torch_dtype = _WEIGHT_DTYPE_BY_KIND[weight_kind]
+        self.expert_token_range_format = expert_token_range_format
 
     def _validate_host_tensor_contracts(self) -> None:
         """Fail before CuTeDSL tracing when a public tensor ABI is malformed."""
@@ -440,6 +447,20 @@ class Mxfp8Bf16Fc12Tester(SwigluBf16Fc12Tester):
             "fc2_weight_sf": _to_cute(self.fc2_weight_sf),
         }
 
+    def _scheduler_runtime_kwargs(self, offs_cute, to_cute) -> dict:
+        if self.expert_token_range_format == "offsets":
+            return super()._scheduler_runtime_kwargs(offs_cute, to_cute)
+
+        expert_token_sizes = torch.empty_like(self.offs)
+        expert_token_sizes[0] = self.offs[0]
+        expert_token_sizes[1:] = self.offs[1:] - self.offs[:-1]
+        self._expert_token_sizes = expert_token_sizes
+        return {
+            "expert_token_sizes": to_cute(
+                expert_token_sizes, assumed_align=4
+            )
+        }
+
     def compute_reference(self) -> None:
         if self.activation is None or self.offs is None:
             raise RuntimeError("compute_reference requires generate_inputs first.")
@@ -577,6 +598,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="MXFP8 weight encoding; activations/handoff remain BF16.",
     )
     parser.add_argument(
+        "--expert_token_range_format",
+        choices=("offsets", "sizes"),
+        default="offsets",
+        help="Representation of the local scheduler's expert-token ranges.",
+    )
+    parser.add_argument(
         "--gate_up_clamp",
         type=float,
         default=None,
@@ -647,7 +674,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         perf_iters=args.perf_iters,
     )
     tester = Mxfp8Bf16Fc12Tester(
-        problem, impl, misc, weight_kind=args.kind
+        problem,
+        impl,
+        misc,
+        weight_kind=args.kind,
+        expert_token_range_format=args.expert_token_range_format,
     )
     tester.run()
 

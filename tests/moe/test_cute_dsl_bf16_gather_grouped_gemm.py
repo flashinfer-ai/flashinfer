@@ -82,6 +82,7 @@ def test_cute_dsl_bf16_gather_grouped_gemm(n2, k, tile_shape_mn, num_tokens, dty
         permuted_idx_to_expanded_idx,
         _total_padded,
         num_non_exiting_tiles,
+        _,
     ) = moe_sort(
         ids, scales, num_experts=num_experts, top_k=top_k, tile_tokens_dim=tile_m
     )
@@ -162,6 +163,7 @@ def test_cute_dsl_bf16_gather_grouped_gemm_swizzled_walk(swizzle_size):
         permuted_idx_to_expanded_idx,
         _total_padded,
         num_non_exiting_tiles,
+        _,
     ) = moe_sort(ids, scales, num_experts=num_experts, top_k=top_k, tile_tokens_dim=128)
     permuted_m = tile_idx_to_expert_idx.numel() * 128
 
@@ -258,6 +260,7 @@ def test_cute_dsl_bf16_gather_grouped_gemm_out_handling():
         permuted_idx_to_expanded_idx,
         _,
         num_non_exiting_tiles,
+        _,
     ) = moe_sort(
         ids, scales, num_experts=num_experts, top_k=top_k, tile_tokens_dim=tile_m
     )
@@ -395,6 +398,7 @@ def test_cute_dsl_bf16_gather_grouped_gemm_activations(
         permuted_idx_to_expanded_idx,
         _total_padded,
         num_non_exiting_tiles,
+        _,
     ) = moe_sort(
         ids, scales, num_experts=num_experts, top_k=top_k, tile_tokens_dim=tile_m
     )

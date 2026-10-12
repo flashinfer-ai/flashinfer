@@ -106,6 +106,7 @@ def test_permutation_is_a_bijection_over_local_routes(num_tokens, tile_size):
             permuted_to_expanded,
             _total,
             num_tiles_t,
+            _,
         ),
     ) = _run_moe_sort(num_tokens, tile_size, seed=7)
     num_tiles = int(num_tiles_t.item())
@@ -165,6 +166,7 @@ def test_contiguous_windows_bound_the_gather_footprint():
                 permuted_to_expanded,
                 _total,
                 num_tiles_t,
+                _,
             ),
         ) = _run_moe_sort(num_tokens, tile_size, seed=7)
         num_tiles = int(num_tiles_t.item())
