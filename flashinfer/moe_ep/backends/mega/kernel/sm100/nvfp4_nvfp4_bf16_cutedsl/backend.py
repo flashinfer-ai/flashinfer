@@ -23,7 +23,11 @@ from ......core.validation.common import (
 )
 from ......weights import MoEWeightPack
 from .config import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
-from .staging import stage_mega_moe_inputs, validate_nvfp4_forward_inputs
+from .staging import (
+    stage_mega_moe_inputs,
+    validate_fc1_activation_per_token_scale,
+    validate_nvfp4_forward_inputs,
+)
 from .weights import (
     TransformedMegaWeights,
     preprocess_mega_weights,
@@ -145,6 +149,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc1_alpha=k.fc1_alpha,
             fc2_alpha=k.fc2_alpha,
             fc1_norm_const=k.fc1_norm_const,
+            enable_fc1_activation_per_token_scale=(
+                k.enable_fc1_activation_per_token_scale
+            ),
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
         )
 
@@ -182,6 +189,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             top_k=self._kernel_config.top_k,
             quantize_input=quantize_input,
             scales=t.scales,
+        )
+        validate_fc1_activation_per_token_scale(
+            t.fc1_activation_per_token_scale,
+            num_tokens=t.hidden_states.shape[0],
+            enabled=self._kernel_config.enable_fc1_activation_per_token_scale,
         )
 
     def stage_inputs(
@@ -244,6 +256,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             if source is not None:
                 destinations.append(destination)
                 sources.append(source)
+        if t.fc1_activation_per_token_scale is not None:
+            # Validated in validate_forward (shape (num_tokens,), fp32, enabled);
+            # only the live [:num_tokens] rows of the per-token plane are staged.
+            destinations.append(workspace.fc1_activation_per_token_scale[:num_tokens])
+            sources.append(t.fc1_activation_per_token_scale)
         if sources:
             # Workspace aliases preserve the ordering of the individual copies.
             if any(
@@ -303,6 +320,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc2_alpha=workspace.fc2_alpha,
             fc1_norm_const=workspace.fc1_norm_const,
             output_activation=workspace.output_activation,
+            fc1_activation_per_token_scale=workspace.fc1_activation_per_token_scale,
         )
 
     def _prepared_thunk_state(
@@ -463,6 +481,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             epilogue_pool_key(k.fc1_alpha),
             epilogue_pool_key(k.fc2_alpha),
             epilogue_pool_key(k.fc1_norm_const),
+            k.enable_fc1_activation_per_token_scale,
             knobs_pool_key(k.knobs),
         )
 
