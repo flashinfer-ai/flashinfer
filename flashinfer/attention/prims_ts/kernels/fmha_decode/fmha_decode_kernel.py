@@ -3482,10 +3482,15 @@ def fmha_decode_launch(
     sage_v_mean_iter: cute.Pointer | None = None,
     sage_q_scale_head_stride: Int32 | None = None,
     sage_k_scale_head_stride: Int32 | None = None,
+    k_sf_head_stride: Int64 | None = None,
+    k_sf_page_stride: Int64 | None = None,
+    v_sf_head_stride: Int64 | None = None,
+    v_sf_page_stride: Int64 | None = None,
 ) -> None:
     """Standalone JIT launcher for FMHA decode TS.
 
     The ``sage_*`` scale arguments are used only by a Sage attention config.
+    NVFP4 scale head/page strides are bytes and default to compact storage.
     """
     log2_e = math.log2(math.e)
     b, h_q, h_k, s_k, d = problem_shape
@@ -3745,13 +3750,39 @@ def fmha_decode_launch(
         # The descriptor spans a physical page, but each transaction copies
         # only the semantic fragment selected by the decoded page locator.
         sf_box_tokens_outer = cfg.num_tokens_per_page // sf_r
-        sf_page_elems = Int32(sf_per_token * sf_storage_tokens_per_page)
-        sf_layout = cute.make_layout(
-            (Int32(sf_inner), Int32(sf_tokens_outer), h_k, total_pages),
-            stride=(1, Int32(sf_inner), sf_page_elems, sf_page_elems * h_k),
+        sf_head_elems = Int64(sf_per_token * sf_storage_tokens_per_page)
+        if cutlass.const_expr(k_sf_head_stride is None):
+            k_sf_head_stride = sf_head_elems
+        if cutlass.const_expr(k_sf_page_stride is None):
+            k_sf_page_stride = sf_head_elems * Int64(h_k)
+        if cutlass.const_expr(v_sf_head_stride is None):
+            v_sf_head_stride = sf_head_elems
+        if cutlass.const_expr(v_sf_page_stride is None):
+            v_sf_page_stride = sf_head_elems * Int64(h_k)
+        # FP8 scales stay byte-addressed even when TMA unpacks FP4 data.
+        # Preserve the fixed inner geometry's Int32 representation; only the
+        # independently strided head/page address arithmetic needs Int64.
+        sf_shape = (Int32(sf_inner), Int32(sf_tokens_outer), h_k, total_pages)
+        k_sf_layout = cute.make_layout(
+            sf_shape,
+            stride=(
+                1,
+                Int32(sf_inner),
+                Int64(k_sf_head_stride),
+                Int64(k_sf_page_stride),
+            ),
         )
-        k_sf_tma = cute.make_tensor(k_sf_iter, sf_layout)
-        v_sf_tma = cute.make_tensor(v_sf_iter, sf_layout)
+        v_sf_layout = cute.make_layout(
+            sf_shape,
+            stride=(
+                1,
+                Int32(sf_inner),
+                Int64(v_sf_head_stride),
+                Int64(v_sf_page_stride),
+            ),
+        )
+        k_sf_tma = cute.make_tensor(k_sf_iter, k_sf_layout)
+        v_sf_tma = cute.make_tensor(v_sf_iter, v_sf_layout)
         tma_desc_k_sf = cuda.create_tensor_map_tiled_from_view(
             k_sf_tma,
             box_dims=(sf_inner, sf_box_tokens_outer, 1, 1),
