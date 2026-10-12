@@ -2123,17 +2123,24 @@ def _prepare_sparse_output_quant(
     ):
         raise ValueError("token_positions must index cos_sin_cache")
     shape = (rows, quant.num_groups, channels)
+    # Physical storage is group-major [G, T, C] (as in vLLM and TensorRT-LLM);
+    # the public tensor is its token-major [T, G, C] view.
     if out is None:
-        out = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
+        out = torch.empty(
+            (quant.num_groups, rows, channels), dtype=torch.float8_e4m3fn, device=device
+        ).transpose(0, 1)
     if (
         out.shape != shape
         or out.dtype != torch.float8_e4m3fn
         or out.device != device
-        or not out.is_contiguous()
+        or out.stride(2) != 1
+        or out.stride(0) != channels
+        or (rows > 1 and out.stride(1) != rows * channels)
         or out.data_ptr() % 16
     ):
         raise ValueError(
-            f"out must be contiguous CUDA E4M3{shape}, aligned to 16 bytes"
+            f"out must be the [T, G, C] view of a contiguous group-major CUDA "
+            f"E4M3 [G, T, C] tensor ({shape}), aligned to 16 bytes"
         )
     scale_dtype = torch.int32 if quant.ue8m0 else torch.float32
     scale_shape = (rows, quant.num_groups, columns)
@@ -2155,7 +2162,11 @@ def _prepare_sparse_output_quant(
             f"out_scale must be 16-byte aligned CUDA {scale_dtype}{scale_shape} "
             f"with strides {scale_stride}"
         )
-    return out, scales, (out.view(-1), positions.view(-1), cos_sin, scales)
+    return (
+        out,
+        scales,
+        (out.as_strided((out.numel(),), (1,)), positions.view(-1), cos_sin, scales),
+    )
 
 
 def _resolve_sparse_mla_plan(
@@ -2709,8 +2720,11 @@ class BatchSparseMLADecodePagedTSWrapper:
         Positions must be in [0,P); validate=False leaves this to the caller.
 
         Return (out, out_scale), or (out, out_scale, lse) with return_lse=True.
-        Out is 16-byte aligned contiguous E4M3[T,G,C], where T is total query
-        tokens and C=(H/G)*512, in natural head/channel order. For K=output_quant_block_size
+        Out is the [T,G,C] view (strides (C,T*C,1)) of a 16-byte aligned
+        contiguous group-major E4M3[G,T,C] tensor, where T is total query
+        tokens and C=(H/G)*512, in natural head/channel order. Pass
+        ``torch.empty((G,T,C), dtype=torch.float8_e4m3fn).transpose(0,1)`` as
+        ``out`` to preallocate. For K=output_quant_block_size
         and N=C/K, FP32 scales have logical shape [T,G,N]; UE8M0 scales have
         shape [T,G,N/4], INT32 packing four block exponent bytes, first in the
         least significant byte (scale=2**(byte-127)). Allocate scale backing as

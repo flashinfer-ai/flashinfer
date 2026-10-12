@@ -371,6 +371,10 @@ def _dequant_output(output, scales, block_size):
         (2, 2, 24, 513, 32, "ue8m0", True, True),
         (1, 3, 64, 129, 128, "ue8m0", False, False),
         (1, 1, 128, 2049, 128, "fp32", False, False),
+        # T == G and T != G, T > 1: token-major and group-major differ here.
+        (16, 1, 128, 513, 128, "ue8m0", False, False),
+        (5, 1, 128, 513, 32, "fp32", False, False),
+        (5, 1, 16, 513, 128, "ue8m0", False, False),
         (1, 161, 64, 513, 32, "ue8m0", False, False),
         # Packed multiwave queries reuse the quantized output's shared stages.
         (2, 81, 128, 513, 32, "fp32", True, False),
@@ -453,8 +457,12 @@ def test_rope_quant_graph(
         **descales,
     )
     output, scales, lse = wrapper.run(q, kv, metadata, extra, **kwargs)
-    assert output.shape == (rows, groups, heads // groups * 512)
+    channels = heads // groups * 512
+    assert output.shape == (rows, groups, channels)
     assert output.dtype == torch.float8_e4m3fn
+    # Physical storage is group-major [G, T, C]; the public view is token-major.
+    assert output.stride() == (channels, rows * channels, 1)
+    assert output.transpose(0, 1).is_contiguous()
     padded = (rows + 3) // 4 * 4
     columns = heads // groups * 512 // block // (4 if fmt == "ue8m0" else 1)
     assert scales.shape == (rows, groups, columns)
@@ -463,7 +471,7 @@ def test_rope_quant_graph(
     output_storage = torch.empty(
         output.numel() + 16, device=output.device, dtype=output.dtype
     )
-    output = output_storage[16:].view_as(output)
+    output = output_storage[16:].view(groups, rows, channels).transpose(0, 1)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         wrapper.run(
@@ -502,7 +510,7 @@ def test_rope_quant_graph(
     bound[..., 448::2] = bx * c + by * s
     bound[..., 449::2] = by * c + bx * s
     actual, dequant_scales = _dequant_output(output, scales, block)
-    actual = actual.view(rows, heads, 512)
+    actual = actual.reshape(rows, heads, 512)
     # E4M3 RN adds at most 1/16 relative error plus half a subnormal step.
     rounding = dequant_scales.repeat_interleave(block, dim=-1).view_as(actual) / 1024
     allowed = bound + (ref.abs() + bound) / 16 + rounding + 1e-6
@@ -571,9 +579,11 @@ def test_rope_quant_scales_and_contract(block, fmt):
         )
         torch.testing.assert_close(eager_out.float(), output.float(), atol=0, rtol=0)
         torch.testing.assert_close(eager_scales, scales, atol=0, rtol=0)
-        misaligned = torch.empty(output.numel() + 1, dtype=output.dtype, device="cuda")[
-            1:
-        ].view_as(output)
+        misaligned = (
+            torch.empty(output.numel() + 1, dtype=output.dtype, device="cuda")[1:]
+            .view(2, 1, 2048)
+            .transpose(0, 1)
+        )
         with pytest.raises(ValueError, match="aligned"):
             wrapper.run(
                 q,
@@ -635,6 +645,50 @@ def test_rope_quant_scales_and_contract(block, fmt):
     )
     assert empty_out.shape == (0, 2, 2048)
     assert empty_scales.shape == (0, 2, 2048 // block // (4 if fmt == "ue8m0" else 1))
+
+
+def test_rope_quant_rejects_token_major_out():
+    """Group-major physical output: a contiguous [T, G, C] allocation is refused."""
+    rows, heads, groups = 3, 8, 2
+    q = torch.zeros((rows, 1, heads, 512), device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(4, 1, 512, device="cuda").to(torch.bfloat16)
+    indices = torch.zeros((rows, 1), device="cuda", dtype=torch.int32)
+    positions = torch.ones((rows, 1), device="cuda", dtype=torch.int32)
+    cos_sin = torch.zeros(4, 64, device="cuda")
+    cos_sin[:, :32] = 1
+    wrapper = BatchSparseMLADecodePagedTSWrapper()
+    wrapper.plan(
+        "cuda",
+        rows,
+        heads,
+        max_topk=1,
+        output_quant_block_size=128,
+        out_scale_format="fp32",
+        num_output_groups=groups,
+    )
+    metadata = prepare_sparse_mla_metadata(wrapper, q, kv, indices)
+    token_major = torch.empty(
+        (rows, groups, heads // groups * 512), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    with pytest.raises(ValueError, match="group-major"):
+        wrapper.run(
+            q,
+            kv,
+            metadata,
+            token_positions=positions,
+            cos_sin_cache=cos_sin,
+            out=token_major,
+        )
+    group_major = token_major.view(groups, rows, -1).transpose(0, 1)
+    out, _ = wrapper.run(
+        q,
+        kv,
+        metadata,
+        token_positions=positions,
+        cos_sin_cache=cos_sin,
+        out=group_major,
+    )
+    assert out.data_ptr() == group_major.data_ptr()
 
 
 def test_rope_quant_plan_options():

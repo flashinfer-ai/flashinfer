@@ -49,9 +49,10 @@ def _max_abs3(x, y, z, *, loc=None, ip=None):
 class MlaOutputQuant:
     """Static geometry; runtime args are (flat O, positions, cos/sin, scales).
 
-    O is E4M3; positions are INT32; cos/sin is FP32; scales are a token-major
-    logical view of column-major FP32 or packed INT32 storage. Rows are
-    token * H + head and columns are channels within the D512 head.
+    O is E4M3 stored group-major, physically [G, T, (H/G) * 512] (T is derived
+    from its extent); positions are INT32; cos/sin is FP32; scales are a
+    token-major logical view of column-major FP32 or packed INT32 storage.
+    Rows are token * H + head and columns are channels within the D512 head.
     """
 
     block_size: int
@@ -125,6 +126,22 @@ class MlaOutputQuant:
         out, _, _, scales = args
         token = Int64(row) // self.num_heads
         head = Int64(row) % self.num_heads
+        # Physical [G, T, (H/G) * 512] output; the 512-channel head rows of one
+        # (group, token) pair are contiguous. Planning bounds T * H below 2**31,
+        # so the row index fits Int32.
+        heads_per_group = cutlass.const_expr(self.num_heads // self.num_groups)
+        total_tokens = Int32(Int64(cute.size(out)) // (self.num_heads * 512))
+        head32 = Int32(head)
+        if cutlass.const_expr(heads_per_group & (heads_per_group - 1) == 0):
+            shift = cutlass.const_expr(heads_per_group.bit_length() - 1)
+            group = head32 >> shift
+            head_in_group = head32 & Int32(heads_per_group - 1)
+        else:
+            group = head32 // heads_per_group
+            head_in_group = head32 % heads_per_group
+        out_row = Int64(
+            (group * total_tokens + Int32(token)) * heads_per_group + head_in_group
+        )
         lane = cute.arch.thread_idx()[0] % 32
         count = cutlass.const_expr(fragment.shape[0])
         per_block = cutlass.const_expr(min(count, self.block_size))
@@ -216,7 +233,7 @@ class MlaOutputQuant:
                         destination.store(packed.load(part, 4), alignment=16)
                 else:
                     ptr = cutlass.inttoptr(
-                        (out.iterator.raw_ptr() + Int64(row) * 512 + column + v).toint(
+                        (out.iterator.raw_ptr() + out_row * 512 + column + v).toint(
                             Int64
                         ),
                         mem_space=1,

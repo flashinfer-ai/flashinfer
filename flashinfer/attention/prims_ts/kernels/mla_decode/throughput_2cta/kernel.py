@@ -1090,6 +1090,8 @@ class MlaDecodeTs:
             and cfg.is_fp8_qkv()
             and cfg.page_size == 1
             and self.num_heads == 128
+            # A 64-head TMA box spans whole head groups of the group-major output.
+            and 64 % (self.num_heads // self.output_quant.num_groups) == 0
             and self.seq_len_q == 1
             and cfg.mma_pv_tiler_mn == (128, 256)
         )
@@ -1374,14 +1376,29 @@ class MlaDecodeTs:
         if cutlass.const_expr(cfg.use_tma_output):
             flat_o = output_quant_args[0]
             output_rows = cute.size(flat_o) // (128 * 512)
+            # Group-major [G, T, (H/G) * 512] output viewed as (channel, head in
+            # group, token, group). A 64-head box covers 64 / (H/G) whole groups
+            # and fills 64 shared-memory rows in head order, so the staging
+            # layout matches the flat head-major view.
+            heads_per_group = (
+                self.output_quant.num_heads // self.output_quant.num_groups
+            )
             output_view = cute.make_tensor(
                 flat_o.iterator,
-                cute.make_layout((512, 128, output_rows), stride=(1, 512, 128 * 512)),
+                cute.make_layout(
+                    (512, heads_per_group, output_rows, self.output_quant.num_groups),
+                    stride=(
+                        1,
+                        512,
+                        heads_per_group * 512,
+                        output_rows * heads_per_group * 512,
+                    ),
+                ),
             )
             tma_desc_o = create_tensor_map_tiled_from_view(
                 output_view,
-                box_dims=(128, 64, 1),
-                stride_order=(0, 1, 2),
+                box_dims=(128, heads_per_group, 1, 64 // heads_per_group),
+                stride_order=(0, 1, 2, 3),
                 swizzle=cuda.TensorMapSwizzle.s128b,
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
