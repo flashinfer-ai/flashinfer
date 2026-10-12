@@ -33,6 +33,7 @@ from .gemm_svdquant import (
     DEFAULT_WORKSPACE_SIZE,
     _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG,
     SVDQUANT_LORA_RANK_GRANULARITY,
+    _normalize_nvfp4_quantize_smooth_inputs,
     _swizzled_sf_size,
     get_nvfp4_svdquant_module,
 )
@@ -882,6 +883,7 @@ def svdquant_linear(
             f"32 and 64, got {rank}"
         )
 
+    x, pre_quant_scale = _normalize_nvfp4_quantize_smooth_inputs(x, pre_quant_scale)
     xq = torch.empty((m, k // 2), dtype=torch.uint8, device=x.device)
     x_sf = torch.empty(
         (_swizzled_sf_size(m, k // 16),), dtype=torch.uint8, device=x.device
