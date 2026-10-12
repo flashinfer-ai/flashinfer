@@ -5,7 +5,7 @@ flashinfer.megamoe
 
 .. currentmodule:: flashinfer.megamoe
 
-SM90 expert-parallel MegaMoE with NVFP4 fused/split and MXFP4 fused kernels.
+SM90 W4A8 expert-parallel MegaMoE with NVFP4 fused/split and MXFP4 fused kernels.
 All paths use FP8 E4M3 activations and return BF16 outputs. Execution requires
 NVLink-connected Hopper GPUs and a symmetric buffer allocated collectively
 before CUDA graph capture. NVFP4 requires eight ranks; MXFP4 supports
