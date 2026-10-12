@@ -135,8 +135,6 @@ both launches. Packing, compilation and cache clearing are outside timing.
 
 </details>
 
-*H200 MiMo EP8 M4096 is pending verification: three measured batches were
-14,712.832 / 4,816.128 / 5,118.064 us; no settled latency is reported for this point.
 
 ## Validation
 
