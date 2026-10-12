@@ -1141,6 +1141,7 @@ def test_cake_ssd_combined_varlen_empty_sequences(
             assert not final[sequence].to(torch.float32).any()
 
 
+@pytest.mark.parametrize("family", ("exact", "exactpre"))
 @pytest.mark.parametrize(
     "lengths,tail,seq_idx_dtype",
     [
@@ -1150,17 +1151,31 @@ def test_cake_ssd_combined_varlen_empty_sequences(
     ],
     ids=("tail-shares-chunk", "tail-opens-chunk", "tail-shares-chunk-i64"),
 )
-def test_cake_ssd_combined_flags_out_of_range_seq_idx(lengths, tail, seq_idx_dtype):
+def test_cake_ssd_combined_flags_out_of_range_seq_idx(
+    monkeypatch, lengths, tail, seq_idx_dtype, family
+):
     """CAKE-990: ``seq_idx`` ids ``0 .. num_seqs`` with ``num_seqs`` declared
     sequences (the trailing id is out of range).  No out-of-bounds write
     (the caller's ``[num_seqs + 1]`` table receives exactly the in-range
     boundaries), the status word is set, the in-range sequences are bitwise
     those of the clean problem and correct against CuTe / fp64, and a clean
-    call afterwards leaves the reset word at 0."""
+    call afterwards leaves the reset word at 0.
+
+    The bitwise clause is a same-program statement.  CAKE-956 round 6 c9
+    picks the two-kernel program on the host from the mean chunks per item
+    (``two_kernel_family``), and that quantity counts the out-of-range tail
+    tokens too (whether an id is out of range is only known on the device),
+    so the clean and the flagged call of ``tail-shares-chunk`` would run the
+    retained start ``exact`` program and the round-6 ``exactpre`` program --
+    the same scan with different rounding.  Both calls are therefore pinned
+    to one family here, and the test runs once per family so both two-kernel
+    programs are judged."""
 
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):
         pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    monkeypatch.setattr(module, "two_kernel_family", lambda **_: family)
 
     num_seqs = len(lengths)
     total = sum(lengths)
@@ -1199,9 +1214,11 @@ def test_cake_ssd_combined_flags_out_of_range_seq_idx(lengths, tail, seq_idx_dty
     cake.seq_idx_status(reset=True)
     clean_out, clean_final = runner.run(*clean_tensors, **clean_arguments)
     assert cake.seq_idx_status() == 0
+    assert cake.last_program_name.startswith(f"{family}_")
 
     out, final = runner.run(*tensors, **flagged_arguments)
 
+    assert cake.last_program_name.startswith(f"{family}_")
     assert cake.seq_idx_status(reset=True) == 1
     # The out-of-range id closes the in-range ranges and opens none of its
     # own: table[num_seqs] is the first segment of the out-of-range tail.
@@ -1373,19 +1390,6 @@ def _skip_unless_cake_arch():
         pytest.skip("Cake SSDCombined requires SM100 or SM103")
 
 
-@pytest.mark.parametrize("initial_states", (True, False), ids=("initial", "zero"))
-@pytest.mark.parametrize(
-    "state_dtype",
-    (torch.bfloat16, torch.float16, torch.float32),
-    ids=("bf16", "f16", "f32"),
-)
-@pytest.mark.parametrize(
-    "lengths",
-    _CU_SEQLENS_LENGTHS,
-    ids=[
-        "x".join(str(length) for length in lengths) for lengths in _CU_SEQLENS_LENGTHS
-    ],
-)
 def _assert_two_forms_p6(monkeypatch, *, lengths, state_dtype, initial_states, programs):
     """P6 reading of the two packed-varlen metadata forms where they run
     different arithmetic (CAKE-956 round 6 c9): on the K fixed seeds run the
@@ -1432,6 +1436,19 @@ def _assert_two_forms_p6(monkeypatch, *, lengths, state_dtype, initial_states, p
             _assert_p6_clause(metrics, baseline[label], f"{form} form ({program}) {label}")
 
 
+@pytest.mark.parametrize("initial_states", (True, False), ids=("initial", "zero"))
+@pytest.mark.parametrize(
+    "state_dtype",
+    (torch.bfloat16, torch.float16, torch.float32),
+    ids=("bf16", "f16", "f32"),
+)
+@pytest.mark.parametrize(
+    "lengths",
+    _CU_SEQLENS_LENGTHS,
+    ids=[
+        "x".join(str(length) for length in lengths) for lengths in _CU_SEQLENS_LENGTHS
+    ],
+)
 def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     monkeypatch, lengths, state_dtype, initial_states
 ):
