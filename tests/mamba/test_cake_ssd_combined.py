@@ -5145,7 +5145,7 @@ _VARIANT_CASES = (
     # FI win_v1x64_float32 0.939 / 0.941
     ((True, True, 128, 1, 64, 1, 64, "float32"), ""),
     # round 6 (1b-b programs): f32 g4x64z 0.993 / g6x64z 0.983 / g8x64z 0.997 ring wins -> an f32 state never
-    # takes the start schedule (lane i5a steps 809b22098ffc542789a047b1 GB300 + the B200 twin)
+    # takes the start schedule (lane i5a steps 809b22098ffc542789a047b1 GB300 / 4c210f860a87eeeb876dedcb B200)
     ((True, True, 128, 4, 4 * 64, 1, 4 * 64, "float32"), ""),
     ((True, True, 128, 8, 8 * 64, 1, 8 * 64, "float32"), ""),  # nem_v8x64_float32 0.997 (tie -> ring: rule closed)
     ((True, True, 128, 64, 64 * 64, 1, 64 * 64, "float32"), ""),  # g64x64z f32 0.981
@@ -5183,12 +5183,13 @@ _VARIANT_CASES = (
     ((True, True, 8, 32, 32 * 64, 1, 32 * 64, "float32"), ""),
     # 512 work items at 64 tokens, f32 state: ring (round-6 f32 window closed)
     ((True, True, 8, 64, 64 * 64, 1, 64 * 64, "float32"), ""),
-    # round 6 (1b-b programs): every batch-2 no-z cell is a ring win or tie (GB300 gb2x50 0.995 / 0.987,
-    # gb2x75 0.995 / 0.987, gb2x60 0.987 / 0.997, short_batched_2x50 0.992 / 0.995; steps b2dfae6f4779984e576bc87f
-    # + e6235314fb13dc4f3ea8b931 and the B200 twin) -> the round-5 batched window (batch 2, 25 < tokens < 90) is retired
-    ((False, False, 128, 2, 100, 2, 50, "bfloat16"), ""),
-    ((False, False, 128, 2, 150, 2, 75, "bfloat16"), ""),
-    ((False, False, 128, 2, 120, 2, 60, "bfloat16"), ""),
+    # short_batched_2x50 1.008 / 1.005 (round 5); round 6 (1b-b programs): GB300 wins 0.987-0.995 but B200 ties
+    # 0.998-1.002 (steps b2dfae6f4779984e576bc87f / e6235314fb13dc4f3ea8b931 GB300, 46baa0c96214abfe53fe148d /
+    # e3377c73e383c429af13cd86 B200) -> not a two-arch win: the batched window stays
+    ((False, False, 128, 2, 100, 2, 50, "bfloat16"), "noring"),
+    ((False, False, 128, 2, 150, 2, 75, "bfloat16"), "noring"),  # gb2x75 1.005 / 0.993; round 6 0.987 / 0.995
+    # gb2x60 1.000 / 1.000 (tie): start
+    ((False, False, 128, 2, 120, 2, 60, "bfloat16"), "noring"),
     ((False, False, 128, 2, 50, 2, 25, "bfloat16"), ""),  # gb2x25 0.990 / 0.991
     ((False, False, 128, 2, 180, 2, 90, "bfloat16"), ""),  # gb2x90 0.987 / 0.995
     ((False, False, 128, 2, 200, 2, 100, "bfloat16"), ""),  # gb2x100 0.995 / 0.991
@@ -5201,8 +5202,8 @@ _VARIANT_CASES = (
     ((False, False, 128, 1, 1000, 1, 1000, "bfloat16"), ""),
     # gb64x128z 0.898 / 0.908
     ((False, True, 128, 64, 64 * 128, 64, 128, "bfloat16"), ""),
-    # batched calls take the ring program for every state dtype (round 6: f32 gb2x50 0.982)
-    ((False, False, 128, 2, 100, 2, 50, "float32"), ""),
+    # batched rule is dtype-independent (round 6: f32 gb2x50 0.982 GB300 / 0.995 B200 -> stays)
+    ((False, False, 128, 2, 100, 2, 50, "float32"), "noring"),
 )
 
 
@@ -5304,8 +5305,9 @@ def test_source_exact_scan_variant_selected_without_gpu(monkeypatch, case):
         num_seqs = batch = 2
         seqlen = {"batched_2x50": 50, "batched_2x128": 128, "batched_2x50_z": 50}[case]
         cu_seqlens = None
-        # round 6: batched calls always take the ring program (the batch-2 window is retired)
-        expected = "exact_bf16_batched"
+        expected = "exact_bf16_batched" + (
+            "_noring" if seqlen == 50 and not has_z else ""
+        )
     x = torch.empty((batch, seqlen, 128, 64), dtype=torch.bfloat16)
     dt = torch.empty((batch, seqlen, 128), dtype=torch.float32)
     A = torch.empty((128,), dtype=torch.float32)

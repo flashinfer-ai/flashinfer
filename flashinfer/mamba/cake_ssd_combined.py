@@ -985,7 +985,10 @@ def _render_host_source(template: str, name: str, program: _Program) -> str:
 # the pair-sum-128 mixtures, i.e. 64 tokens per sequence on average; uniform
 # 63 and 65 tokens win on both archs, so the window is exclusive of them; at
 # 64 tokens the item-count threshold is 2 sequences x 128 heads for a 16-bit
-# state (the FI-level 2 x 64 loss above).
+# state (the FI-level 2 x 64 loss above); an f32 state never takes the start
+# schedule (round-6 table below).  The batched no-z batch-2 cells at 50-75
+# tokens are the only batched readings at or beyond the band (batch 1, 3, 4, 8
+# and z calls win); 25 and 90 tokens win on both archs.
 # Only host-known quantities enter: the runner's mode / has_z / nheads /
 # state dtype and the call's batch, seqlen and sequence count
 # (``cu_seqlens.numel() - 1``, ``num_seqs`` or ``initial_states.shape[0]``);
@@ -1011,18 +1014,33 @@ def _render_host_source(template: str, name: str, program: _Program) -> str:
 #   batched, no z, batch 2 x 25 / 50 / 60 / 75 / 90 / 100 tokens: bf16 0.997 /
 #     0.995 / 0.987 / 0.995 / 0.992 / 0.995 (5 rounds 1.003 / 0.987 / 0.997 /
 #     0.987 / 0.992 / 0.985), f32 0.977 / 0.982 / - / 0.990 / 0.973 / -;
-#     short_batched_2x50 0.992 / 0.995; batch 1 / 3 / 4 / 8 x 50 0.960-0.986 ->
-#     no batched cell loses with the ring program any more: the round-5 batched
-#     window (batch 2, 25 < tokens < 90) is retired.
-#   B200 twin readings: see the lane report (work/r6/i5a) -- the rule below is
-#     the two-arch same-sign reading.
+#     short_batched_2x50 0.992 / 0.995 -> no batched cell loses on GB300 any more.
+# B200 (nsc-svg-slurm-1-gpu-49; steps 46baa0c96214abfe53fe148d bf16 3 rounds,
+# e3377c73e383c429af13cd86 bf16 5 rounds, 4c210f860a87eeeb876dedcb f32):
+#   varlen, z, 64 tokens, bf16: nseq 1 0.932; 2 / 3 / 4 / 5 1.001 / 0.985 /
+#     0.998 / 0.996 (5 rounds 0.990 / 0.989 / 0.999 / 0.996); 6 / 8 / 16 / 64
+#     1.017 / 1.012 / 1.012 / 1.006 (5 rounds 1.003 / 1.013); 63 / 65 tokens
+#     0.966 / 0.967; mixtures 1.009 / 1.009 -> same window as GB300.
+#   varlen, z, 64 tokens, f32: nseq 1 / 2 / 3 / 4 / 5 / 6 / 8 / 16 / 64 = 0.954 /
+#     0.985 / 0.974 / 0.994 / 0.983 / 0.991 / 0.995 / 0.991 / 0.969 -> ring wins
+#     beyond the band on both archs at every f32 cell the round-5 rule sent to
+#     ``_noring`` (nseq 8 a tie on both, its neighbours win on both).
+#   batched, no z, batch 2 x 25 / 50 / 60 / 75 / 90 / 100: bf16 1.000 / 1.002 /
+#     0.995 / 0.998 / 0.990 / 0.990 (5 rounds 1.005 / 0.998 / 1.000 / 0.995 /
+#     0.993 / 0.986), f32 0.993 / 0.995 / - / 0.995 / 0.984 / -;
+#     short_batched_2x50 0.995 / 1.000 -> the 50-75-token cells are ties on
+#     B200 (GB300 wins): not a two-arch win, so the batched window stays.
+# Round-6 rule change: an f32 state never takes the start schedule (the
+# bf16 / f16 varlen window and the batched window are unchanged).
 _EXACT_NORING_VARLEN_MIN_ITEMS = {  # sequences x heads, by state dtype; a state
-    # dtype absent here (f32) never takes the start schedule
+    # dtype absent here (f32, round 6) never takes the start schedule
     torch.bfloat16: 2 * 128,
     torch.float16: 2 * 128,
 }
 # exclusive bounds on tokens per sequence (average over the call)
 _EXACT_NORING_VARLEN_TOKENS = (63, 65)
+_EXACT_NORING_BATCHED_BATCH = 2
+_EXACT_NORING_BATCHED_SEQLEN = (25, 90)  # exclusive bounds
 
 
 def _exact_scan_variant(
@@ -1038,21 +1056,21 @@ def _exact_scan_variant(
 ) -> str:
     """Schedule variant of the exact-scan program for one call shape: ``""`` (the
     ring program) or ``"noring"`` (the start schedule), from host-known
-    quantities only (see the calibration tables above).  Batched calls always
-    take the ring program (round-6 recalibration); ``batch`` / ``seqlen`` stay
-    in the signature so every call site passes the complete host shape."""
+    quantities only (see the calibration tables above)."""
 
-    del batch, seqlen  # batched calls do not select on them any more
-    if not mode_varlen:
+    if mode_varlen:
+        min_items = _EXACT_NORING_VARLEN_MIN_ITEMS.get(state_dtype)
+        if min_items is None or not has_z or num_sequences * nheads < min_items:
+            return ""
+        low, high = _EXACT_NORING_VARLEN_TOKENS
+        # tokens per sequence strictly inside (low, high), in integers
+        if low * num_sequences < total_tokens < high * num_sequences:
+            return "noring"
         return ""
-    min_items = _EXACT_NORING_VARLEN_MIN_ITEMS.get(state_dtype)
-    if min_items is None or not has_z or num_sequences * nheads < min_items:
+    if has_z or batch != _EXACT_NORING_BATCHED_BATCH:
         return ""
-    low, high = _EXACT_NORING_VARLEN_TOKENS
-    # tokens per sequence strictly inside (low, high), in integers
-    if low * num_sequences < total_tokens < high * num_sequences:
-        return "noring"
-    return ""
+    low, high = _EXACT_NORING_BATCHED_SEQLEN
+    return "noring" if low < seqlen < high else ""
 
 
 @functools.cache
