@@ -670,7 +670,12 @@ def bf16_unit_weights(table: Sequence[int]) -> list[int]:
     weights: list[int] = []
     for slot in range(len(table) // UNIT_WORDS):
         words = table[slot * UNIT_WORDS : (slot + 1) * UNIT_WORDS]
-        seg_len, c, kv_blocks, q_half = words[1], words[2] & 0xFFFF, words[3] & 0xFFFF, words[5]
+        seg_len, c, kv_blocks, q_half = (
+            words[1],
+            words[2] & 0xFFFF,
+            words[3] & 0xFFFF,
+            words[5],
+        )
         unit_row0 = c * CLUSTER_Q_ROWS + (q_half >> 1) * CTA_Q_ROWS
         two_stages = q_half == 0 and seg_len - unit_row0 > CTA_Q_ROWS
         weights.append(kv_blocks * (2 if two_stages else 1))
@@ -1494,7 +1499,8 @@ class MiniMaxH3VarlenAttentionRunner:
             q_split_units=self.plan.num_q_split_units,
             attention_variant=self.attention_stage,
             dyn_sched=bool(self.plan.dyn_sched),
-            sread_unified=bool(self.plan.sread_unified) and self.arch in BF16_SREAD_ARCHES,
+            sread_unified=bool(self.plan.sread_unified)
+            and self.arch in BF16_SREAD_ARCHES,
         )
 
 
@@ -1670,7 +1676,9 @@ def prepare_minimax_h3_varlen_attention(
         # Per-plan program dispatch: the plan's ``dyn_sched`` / ``sread_unified``
         # flags and the arch filter select one of the route's BF16 attention
         # programs (``bf16_attention_stage``).
-        entry, arguments = _bind_stage(route["modules"][attention_stage], arch, main_kwargs)
+        entry, arguments = _bind_stage(
+            route["modules"][attention_stage], arch, main_kwargs
+        )
         if plan.num_combine_units > 0:
             combine_entry, combine_arguments = _bind_stage(
                 route["modules"]["combine"],
