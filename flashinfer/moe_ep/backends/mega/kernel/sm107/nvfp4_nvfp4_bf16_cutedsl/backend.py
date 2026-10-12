@@ -230,7 +230,10 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
     ) -> None:
         # One launch: route validation + int32/fp32 routing staging + tail mask.
         routed, topk_ids, topk_weights = stage_routing_plane(
-            t.topk_ids, t.topk_weights, workspace
+            t.topk_ids,
+            t.topk_weights,
+            workspace,
+            pad_mask=getattr(t, "route_padding_mask", None),
         )
         self._stage_scalars(t, workspace)
         if quantize_input:

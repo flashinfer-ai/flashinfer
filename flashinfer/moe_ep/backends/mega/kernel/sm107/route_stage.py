@@ -40,6 +40,7 @@ def _get_kernel():
         ids_out_ptr,
         w_out_ptr,
         flag_ptr,
+        pad_ptr,
         num_tokens,
         capacity,
         num_experts,
@@ -47,6 +48,7 @@ def _get_kernel():
         KP: tl.constexpr,
         BLOCK_R: tl.constexpr,
         CHECK: tl.constexpr,
+        HAS_PAD: tl.constexpr,
     ):
         pid = tl.program_id(0)
         rows = pid * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -59,6 +61,14 @@ def _get_kernel():
         offs = rows[:, None].to(tl.int64) * TOPK + cols[None, :]
         ids = tl.load(ids_ptr + offs, mask=m_live, other=-1).to(tl.int32)
         w = tl.load(w_ptr + offs, mask=m_live, other=0.0).to(tl.float32)
+        routed = live
+        if HAS_PAD:
+            # The caller's padding mask (e.g. vLLM's is_padding rows with
+            # VLLM_MOE_SKIP_PADDING) folded in: padding rows stage no routes.
+            pad = tl.load(pad_ptr + rows, mask=live, other=0) != 0
+            routed = live & ~pad
+            ids = tl.where(routed[:, None], ids, -1)
+        m_live = routed[:, None] & kmask[None, :]
         out_ids = tl.where(m_live, ids, -1)
         # Every staging store stays inside the capacity rows: the grid covers
         # cdiv(capacity, BLOCK_R) * BLOCK_R rows, so a live-only mask would
@@ -96,12 +106,25 @@ def stage_routes(
     topk_idx_out: torch.Tensor,
     topk_weights_out: torch.Tensor,
     num_experts: int,
+    pad_mask: torch.Tensor | None = None,
 ) -> bool:
     """Stage + validate the routing plane in one launch. ``False`` -> caller falls back
-    (non-CUDA or non-contiguous tensors, unexpected dtypes or shapes, topk > 16)."""
+    (non-CUDA or non-contiguous tensors, unexpected dtypes or shapes, topk > 16).
+
+    ``pad_mask`` (bool / uint8 ``[>= num_tokens]``, optional): rows where it is set stage
+    no routes (all ids -1) and are left out of the route check."""
     tensors = (topk_ids, topk_weights, topk_idx_out, topk_weights_out)
     if not all(t.is_cuda and t.is_contiguous() for t in tensors):
         return False
+    if pad_mask is not None:
+        if not (pad_mask.is_cuda and pad_mask.is_contiguous() and pad_mask.dim() == 1):
+            return False
+        if pad_mask.shape[0] < topk_ids.shape[0]:
+            return False
+        if pad_mask.dtype == torch.bool:
+            pad_mask = pad_mask.view(torch.uint8)
+        elif pad_mask.dtype != torch.uint8:
+            return False
     if topk_idx_out.dtype != torch.int32 or topk_weights_out.dtype != torch.float32:
         return False
     num_tokens, topk = topk_ids.shape
@@ -139,6 +162,7 @@ def stage_routes(
         topk_idx_out,
         topk_weights_out,
         flag,
+        pad_mask if pad_mask is not None else topk_idx_out,
         int(num_tokens),
         int(capacity),
         int(num_experts),
@@ -146,6 +170,7 @@ def stage_routes(
         KP=kp,
         BLOCK_R=block_r,
         CHECK=check,
+        HAS_PAD=pad_mask is not None,
     )
     if check:
         torch._assert_async(
