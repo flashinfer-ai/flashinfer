@@ -245,3 +245,36 @@ whitespace checks. Intermediate code splits do not imply new performance runs.
 Author and committer are sjtushenhai <1730536718@qq.com>.
 This includes the two earlier SM120 research commits. The links above use the
 rewritten commit IDs; runtime code and historical validation results are unchanged.
+
+## Incremental delivery and public-base validation (2026-10-12)
+
+This delivery appends to `f9a2ce5acf` on the same branch. All experimental
+runtime and existing test files already match the measured local sources;
+no duplicate kernel commits or unrelated ancestry are introduced.
+The per-item K16/K32/TMA/PRMT/softmax/layout/projection/LPT commits above remain
+unchanged. Author and committer remain sjtushenhai <1730536718@qq.com>.
+
+The companion SGLang branch now adds the explicit Tensor Core router,
+NVFP4 dense/shared-expert prefill, INT8 LM head, real-routing-screened MoE
+adapter and forward-hook capture-phase support. These are serving adapters;
+no FlashInfer core or CUDA kernel changes are required for this addition.
+The optional QKV-A study is retained separately and is not adopted.
+
+[New SGLang per-item commits and validation](https://github.com/sjtulizecheng/sglang/blob/5000pro_glm4.7_flash/benchmark/scheduler/OPTIMIZATION_COMMITS_20261012.md)
+list their scope and explicit opt-in requirements. The runtime remains the
+installed FlashInfer **0.6.15.post1**; only this experimental source directory
+is added to the module search path, not the whole research checkout.
+
+On RTX PRO 5000 72GB SM120, using the public community-based SGLang tree,
+both materialized-prefill tests passed (ragged/prefix/empty causal rows and
+mutated graph inputs/scales), as did the projection-policy test against the
+existing FP8 GEMM at M/N/K=1024/8960/512, 5093/8960/512, 5093/2048/1536.
+The source hashes and environment are in
+[the validation record](../../../tests/experimental/mla_fp8_sm120/results/public_base_validation_20261012.json).
+No new sanitizer or full-service benchmark was run during this delivery.
+
+The later **7.73/7.74 QPS** results are historical combined-environment C11
+measurements, including coworkers' local optimizations absent from the
+public branch. They are not verified throughput for the public branch or
+a standalone FlashInfer kernel speedup. The original baseline was C6 at
+4.27 QPS; quantization still requires independent business-quality acceptance.
