@@ -101,7 +101,7 @@ def test_jit_spec_binds_generated_source_per_arch(
 
     spec = cake_bgmv_moe.gen_cake_bgmv_moe_module(hidden_size, dtype, arch)
     uri = cake_bgmv_moe.get_cake_bgmv_moe_uri(hidden_size, dtype, arch)
-    metadata = cake_bgmv_moe._metadata(hidden_size, dtype)
+    metadata = cake_bgmv_moe._metadata(hidden_size, dtype, arch)
 
     assert spec.name == uri
     assert uri.endswith(f"_{arch}")
@@ -648,3 +648,52 @@ def test_order_remap_selector_and_workspace():
     assert not select(512, 256, 8, 128, 7168, 64, "sm90a")  # too few routes
     assert not select(8192, 4096, 8, 128, 7168, 64, "sm90a")  # beyond one CTA
     assert not select(2048, 1024, 64, 128, 7168, 64, "sm90a")  # 8192 bins
+
+
+def test_sm107a_bodies_are_selected_for_the_measured_bf16_shapes_only():
+    """The compute-capability-10.7 records exist for bf16 hidden 2688 / 3072 only."""
+
+    csrc_dir = cake_bgmv_moe._get_csrc_dir()
+    assert (
+        cake_bgmv_moe._metadata(3072, "bfloat16", "sm107a").body
+        == "cake_bgmv_moe_bf16_h3072_sm107a.cu"
+    )
+    assert (
+        cake_bgmv_moe._metadata(2688, "bfloat16", "sm107a").body
+        == "cake_bgmv_moe_bf16_h2688_sm107a.cu"
+    )
+    assert (
+        cake_bgmv_moe._metadata(3072, "float16", "sm107a").body
+        == "cake_bgmv_moe_f16_h3072.cu"
+    )
+    for arch in ("sm90a", "sm100a", "sm103a", None):
+        assert (
+            cake_bgmv_moe._metadata(3072, "bfloat16", arch).body
+            == "cake_bgmv_moe_bf16_h3072.cu"
+        )
+    assert (
+        cake_bgmv_moe._generic_metadata(32, "bfloat16").body
+        == "cake_bgmv_moe_generic_bf16_r32.cu"
+    )
+
+    def smem_lines(text):
+        return sorted(
+            line
+            for line in text.splitlines()
+            if line.startswith("#define CAKE_BGMV_MOE_") and "SMEM" in line
+        )
+
+    for hidden in (2688, 3072):
+        shared = cake_bgmv_moe._metadata(hidden, "bfloat16")
+        wide = cake_bgmv_moe._metadata(hidden, "bfloat16", "sm107a")
+        # Same kernel symbols and launch constants; only the expand B-row loads differ.
+        assert shared[1:] == wide[1:]
+        shared_body = (csrc_dir / shared.body).read_text()
+        wide_body = (csrc_dir / wide.body).read_text()
+        for symbol in wide[1:]:
+            assert symbol in wide_body
+        assert "Target: sm_107a only (256-bit B-row loads" in wide_body
+        assert "Target: sm_90a, sm_100a, sm_103a" in shared_body
+        assert "ld.global.v8.b32" in wide_body
+        assert "ld.global.v8.b32" not in shared_body
+        assert smem_lines(shared_body) == smem_lines(wide_body)
