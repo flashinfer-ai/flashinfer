@@ -3404,8 +3404,13 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
     exact = calls["exact_bf16_batched"]
     assert exact["preprocess"]["dt_softplus"] == 0
     assert exact["preprocess"]["write_seq_chunk_cumsum"] == 0
-    assert exact["preprocess_grid"] == (1, 1, 1)
+    # The fused program computes delta / cumsum in-CTA: its preprocess stage
+    # is skipped (grid 0) on a batched call.
+    assert exact["preprocess_grid"] == (0, 1, 1)
     main = exact["main"]
+    assert main["metadata_from_cu_seqlens"] == 0
+    assert main["preprocess_status"] is exact["preprocess"]["preprocess_status"]
+    assert main["cu_seqlens"] is exact["preprocess"]["cu_seqlens"]
     assert main["dt_softplus"] == 0
     assert main["checkpoint_state_count"] == checkpoint_states.shape[0]
     assert isinstance(first, tuple) and isinstance(second, tuple)
@@ -3428,12 +3433,18 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
         ("chunkpar", torch.float16, True, "chunkpar_f16_varlen"),
         ("chunkpar", torch.float32, False, "chunkpar_f32_batched"),
         ("chunkpar", torch.float32, True, "chunkpar_f32_varlen"),
+        ("exactpre", torch.bfloat16, False, "exactpre_bf16_batched"),
+        ("exactpre", torch.bfloat16, True, "exactpre_bf16_varlen"),
+        ("exactpre", torch.float16, False, "exactpre_f16_batched"),
+        ("exactpre", torch.float16, True, "exactpre_f16_varlen"),
+        ("exactpre", torch.float32, False, "exactpre_f32_batched"),
+        ("exactpre", torch.float32, True, "exactpre_f32_varlen"),
     ],
 )
 def test_source_program_name_covers_every_state_dtype(
     family, state_dtype, mode_varlen, expected
 ):
-    """Both kernel families serve every admitted input: the program follows
+    """Every kernel family serves every admitted input: the program follows
     from the family, the state dtype and the batched/packed mode alone."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
@@ -3975,6 +3986,24 @@ def test_source_host_template_binds_stage_arguments_in_loader_order():
     assert _host_prepare_arguments(template, "main") == module._MAIN_ARGS
     assert _host_run_arguments(template, "preprocess") == module._PREPROCESS_ARGS
     assert _host_run_arguments(template, "main") == module._MAIN_ARGS
+    # Both exact-scan families bind the 41 start arguments followed by the
+    # three inputs the fused kernel takes over from the preprocess; the
+    # two-kernel template differs only by its mandatory preprocess stage.
+    assert len(module._MAIN_ARGS) == 44
+    assert module._MAIN_ARGS[41:] == (
+        "cu_seqlens",
+        "metadata_from_cu_seqlens",
+        "preprocess_status",
+    )
+    exactpre_template = (module._source_dir() / module._EXACTPRE_HOST_TEMPLATE).read_text(
+        encoding="utf-8"
+    )
+    assert _host_prepare_arguments(exactpre_template, "preprocess") == module._PREPROCESS_ARGS
+    assert _host_prepare_arguments(exactpre_template, "main") == module._MAIN_ARGS
+    assert _host_run_arguments(exactpre_template, "preprocess") == module._PREPROCESS_ARGS
+    assert _host_run_arguments(exactpre_template, "main") == module._MAIN_ARGS
+    assert "if (preprocess_grid_x != 0)" in template
+    assert "if (preprocess_grid_x != 0)" not in exactpre_template
     assert module._PREPROCESS_ARGS[-1] == "preprocess_status"
     assert len(module._PREPROCESS_ARGS) == 27
     assert (
@@ -4109,17 +4138,21 @@ def test_source_program_table_names_shipped_sources():
     source_dir = module._source_dir()
 
     assert set(module._PROGRAMS) == {
-        f"{family}_{state}_{mode}"
-        for family in ("exact", "chunkpar")
-        for state in ("bf16", "f16", "f32")
-        for mode in ("batched", "varlen")
-    } | {
-        f"exact_{state}_{mode}_noring"
+        f"{family}_{state}_{mode}{variant}"
+        for family, variants in (
+            ("exact", ("", "_noring")),
+            ("exactpre", ("", "_noring")),
+            ("chunkpar", ("",)),
+        )
+        for variant in variants
         for state in ("bf16", "f16", "f32")
         for mode in ("batched", "varlen")
     }
     assert set(module._SCAN_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("exact_")
+    }
+    assert set(module._EXACTPRE_MODULES) == {
+        name for name in module._PROGRAMS if name.startswith("exactpre_")
     }
     assert set(module._CHUNKPAR_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("chunkpar_")
@@ -4142,7 +4175,13 @@ def test_source_program_table_names_shipped_sources():
             module._MAIN_ARGS_CHUNKPAR,
             module._CHUNKPAR_SMEM_BYTES,
         ),
+        "exactpre": (
+            module._EXACTPRE_HOST_TEMPLATE,
+            module._MAIN_ARGS,
+            module._EXACTPRE_SMEM_BYTES,
+        ),
     }
+    assert family_host == module._FAMILY_HOST
     templates = {
         family: (source_dir / template).read_text(encoding="utf-8")
         for family, (template, _, _) in family_host.items()
@@ -4152,8 +4191,13 @@ def test_source_program_table_names_shipped_sources():
         family, state_key, mode, *variant = name.split("_")
         template_path, main_args, smem_bytes = family_host[family]
         if variant:
-            assert (family, variant) == ("exact", ["noring"])
-            smem_bytes = module._EXACT_NORING_SMEM_BYTES
+            assert variant == ["noring"] and family in ("exact", "exactpre")
+            smem_bytes = module._VARIANT_SMEM_BYTES[(family, "noring")]
+            assert smem_bytes == (
+                module._EXACT_NORING_SMEM_BYTES
+                if family == "exact"
+                else module._EXACTPRE_NORING_SMEM_BYTES
+            )
         assert program.family == family
         assert program.host_template == template_path
         assert program.main_args == main_args
@@ -5326,3 +5370,139 @@ def test_source_exact_scan_variant_selected_without_gpu(monkeypatch, case):
     monkeypatch.setattr(module, "_load_generated_program", lambda *_: None)
     prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **kwargs)
     assert prepared.program_name == expected
+
+
+def test_source_fused_route_mirrors_the_seed_rule():
+    """``fused_selected`` reads the seed module's ``fused_route`` constants on
+    host-known quantities: batched calls with at most 1024 (sequence, head)
+    items, 16 chunks per sequence and 2048 chunk-items; packed-varlen calls
+    with at most 256 items and 512 packed chunk-items."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    fused = module.fused_selected
+
+    assert (
+        module._FUSED_ROUTE_MAX_ITEMS_BATCHED,
+        module._FUSED_ROUTE_MAX_CHUNKS_BATCHED,
+        module._FUSED_ROUTE_MAX_CHUNK_ITEMS_BATCHED,
+        module._FUSED_ROUTE_MAX_ITEMS_VARLEN,
+        module._FUSED_ROUTE_MAX_CHUNK_ITEMS_VARLEN,
+    ) == (1024, 16, 2048, 256, 512)
+    # batched: 1 x 128 heads, 16 chunks (one-wave long row) is fused; 17 chunks is not
+    assert fused(nheads=128, num_sequences=1, nchunks=16, mode_varlen=False, total_tokens=2048)
+    assert not fused(nheads=128, num_sequences=1, nchunks=17, mode_varlen=False, total_tokens=2176)
+    # 8 x 128 = 1024 items x 2 chunks = 2048 chunk-items is fused; 3 chunks is not
+    assert fused(nheads=128, num_sequences=8, nchunks=2, mode_varlen=False, total_tokens=256)
+    assert not fused(nheads=128, num_sequences=8, nchunks=3, mode_varlen=False, total_tokens=384)
+    # more than 1024 items (saturated rows) keep the two-kernel program
+    assert not fused(nheads=128, num_sequences=9, nchunks=1, mode_varlen=False, total_tokens=128)
+    assert not fused(nheads=128, num_sequences=16, nchunks=1, mode_varlen=False, total_tokens=128)
+    # varlen: 2 x 128 = 256 items with 4 packed chunks (512 chunk-items) is fused
+    assert fused(nheads=128, num_sequences=2, nchunks=4, mode_varlen=True, total_tokens=512)
+    assert not fused(nheads=128, num_sequences=2, nchunks=5, mode_varlen=True, total_tokens=513)
+    assert not fused(nheads=128, num_sequences=3, nchunks=1, mode_varlen=True, total_tokens=128)
+    assert fused(nheads=8, num_sequences=1, nchunks=8, mode_varlen=True, total_tokens=1024)
+
+
+def test_source_saturated_batched_call_keeps_the_two_kernel_program(monkeypatch):
+    """A batched call past the fused route (16 sequences x 128 heads) runs
+    the ``exactpre`` program: its preprocess writes the HBM delta / cumsum
+    (grid > 0) and its main launch leaves the fused-only inputs unused."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(module, monkeypatch, calls, nheads=128, ngroups=8)
+    batch, seqlen, nheads, ngroups = 16, 128, 128, 8
+    x = torch.empty((batch, seqlen, nheads, 64), dtype=torch.bfloat16)
+    dt = torch.empty((batch, seqlen, nheads), dtype=torch.float32)
+    A = torch.empty((nheads,), dtype=torch.float32)
+    B = torch.empty((batch, seqlen, ngroups, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+
+    runner.run(x, dt, A, B, C)
+
+    ((name, launch),) = calls
+    assert name == runner.last_program_name == "exactpre_bf16_batched"
+    assert module._PROGRAMS[name].family == "exactpre"
+    assert module._PROGRAMS[name].main_args == module._MAIN_ARGS
+    tiles = batch * nheads  # one segment per sequence at 128 tokens
+    assert launch["preprocess_grid"] == (
+        -(-tiles // module._SEGMENT_PREPROCESS_TILES_PER_BLOCK),
+        1,
+        1,
+    )
+    assert launch["main"]["metadata_from_cu_seqlens"] == 0
+    assert launch["main"]["delta_precomputed"].shape == (tiles, 128)
+
+
+def test_source_fused_varlen_triple_form_runs_the_preprocess_only_to_publish(monkeypatch):
+    """A short packed-varlen call takes the fused program; its preprocess
+    stage runs only when it derives ``seq_chunk_cumsum`` (the seq_idx triple
+    form without a caller vector) and is skipped (grid 0) when the caller
+    supplies the vector."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(module, monkeypatch, calls, has_varlen=True)
+    seqlen, num_seqs = 300, 2
+    x = torch.empty((1, seqlen, 1, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 1), dtype=torch.float32)
+    A = torch.empty((1,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 1, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    triple = {
+        "seq_idx": torch.zeros((1, seqlen), dtype=torch.int32),
+        "chunk_indices": torch.tensor([0, 1, 2], dtype=torch.int32),
+        "chunk_offsets": torch.tensor([0, 0, 0], dtype=torch.int32),
+        "num_seqs": num_seqs,
+    }
+
+    runner.run(x, dt, A, B, C, **triple)
+    name, launch = calls[-1]
+    assert name == "exact_bf16_varlen"
+    assert module._PROGRAMS[name].family == "exact"
+    assert launch["preprocess"]["write_seq_chunk_cumsum"] == 1
+    assert launch["preprocess_grid"] == (1, 1, 1)
+    assert launch["main"]["metadata_from_cu_seqlens"] == 0
+
+    vector = torch.tensor([0, 1, 3], dtype=torch.int32)
+    runner.run(x, dt, A, B, C, **triple, seq_chunk_cumsum=vector)
+    name, launch = calls[-1]
+    assert name == "exact_bf16_varlen"
+    assert launch["preprocess"]["write_seq_chunk_cumsum"] == 0
+    assert launch["preprocess_grid"] == (0, 1, 1)
+    assert launch["main"]["seq_chunk_cumsum"] is vector
+
+
+def test_source_fused_cu_seqlens_form_derives_the_metadata_in_kernel(monkeypatch):
+    """In the ``cu_seqlens`` form the fused program derives the segment
+    tables in-CTA (``metadata_from_cu_seqlens``, grid 0); a caller buffer for
+    the derived prefix sum brings the preprocess back to publish it."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(module, monkeypatch, calls, has_varlen=True)
+    seqlen = 300
+    x = torch.empty((1, seqlen, 1, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 1), dtype=torch.float32)
+    A = torch.empty((1,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 1, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    cu_seqlens = torch.tensor([0, 150, 300], dtype=torch.int32)
+
+    runner.run(x, dt, A, B, C, cu_seqlens=cu_seqlens)
+    name, launch = calls[-1]
+    assert name == "exact_bf16_varlen"
+    assert launch["preprocess_grid"] == (0, 1, 1)
+    assert launch["preprocess"]["metadata_from_cu_seqlens"] == 1
+    assert launch["main"]["metadata_from_cu_seqlens"] == 1
+    assert launch["main"]["cu_seqlens"] is launch["preprocess"]["cu_seqlens"]
+    assert launch["main"]["preprocess_status"] is launch["preprocess"]["preprocess_status"]
+
+    buffer = torch.empty(3, dtype=torch.int32)
+    runner.run(x, dt, A, B, C, cu_seqlens=cu_seqlens, seq_chunk_cumsum=buffer)
+    name, launch = calls[-1]
+    assert name == "exact_bf16_varlen"
+    assert launch["preprocess_grid"][0] >= 1
+    assert launch["preprocess"]["seq_chunk_cumsum"] is buffer
+    assert launch["main"]["seq_chunk_cumsum"] is buffer
