@@ -530,7 +530,8 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
     output dtypes, both head dimensions and the positional-encoding mode.
     :meth:`plan` and :meth:`workspace_size` reject any value that differs from
     what was compiled, and reject the inherited options that would otherwise be
-    accepted and silently ignored.
+    accepted and silently ignored. ``v_sf_swizzled`` reads the V scale factors
+    of a packed NVFP4 cache in the trtllm-gen per-page swizzle.
 
     Example
     -------
@@ -559,6 +560,7 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
         o_data_type: Optional[torch.dtype] = None,
         head_dim_qk: int = 128,
         head_dim_vo: int = 128,
+        v_sf_swizzled: bool = False,
     ) -> None:
         if pos_encoding_mode != "NONE":
             # POS_ENCODING_MODE is a compile-time constant of the customize
@@ -584,6 +586,7 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
             torch.int32,
             head_dim_qk,
             head_dim_vo,
+            v_sf_swizzled,
         )
 
         super().__init__(
