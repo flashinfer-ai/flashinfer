@@ -29,16 +29,28 @@ def _single_cutile_prefill_config():
     # Do not leak single-config tuning results into later tests in this process.
     _prefill_bsr_cutile._prefill_paged_lpt_tune_cache.clear()
 
+_CUTILE_CASES = [
+    (R, C, M, N, num_qo_heads, num_kv_heads, head_dim)
+    for R in (1, 4, 16, 128)
+    for C in (16, 128)
+    for M in (64, 128, 256)
+    for N in (64, 128, 256)
+    for num_qo_heads in (1, 4, 16)
+    for num_kv_heads in (1, 4, 16)
+    for head_dim in (128, 256)
+    if num_qo_heads % num_kv_heads == 0 and M % R == 0 and N % C == 0
+]
+
 
 # Keep dependent dimensions coupled so --full preserves the original 660 cases.
 @parametrize_product(
     {
-        "R,M": [(R, M) for R in (1, 4, 16, 128) for M in (64, 128, 256) if M % R == 0],
-        "C,N": [(C, N) for C in (16, 128) for N in (64, 128, 256) if N % C == 0],
-        "num_qo_heads,num_kv_heads": [
-            (q, kv) for q in (1, 4, 16) for kv in (1, 4, 16) if q % kv == 0
-        ],
-        "head_dim": [128, 256],
+        "R,M": sorted({(case[0], case[2]) for case in _CUTILE_CASES}),
+        "C,N": sorted({(case[1], case[3]) for case in _CUTILE_CASES}),
+        "num_qo_heads,num_kv_heads": sorted(
+            {(case[4], case[5]) for case in _CUTILE_CASES}
+        ),
+        "head_dim": sorted({case[6] for case in _CUTILE_CASES}),
     },
     regular=pairwise_product_cases,
 )
