@@ -11,8 +11,6 @@ from tests.attention.test_block_sparse import _run_block_sparse_attention_case
 if not is_cuda_tile_available():
     pytest.skip("cuda.tile not available", allow_module_level=True)
 
-pytestmark = pytest.mark.solo
-
 _CUTILE_CASES = [
     (R, C, M, N, num_qo_heads, num_kv_heads, head_dim)
     for R in (1, 4, 16, 128)
