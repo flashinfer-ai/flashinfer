@@ -3,10 +3,27 @@
 #include <time.h>
 #ifdef B12X_HAVE_LIBURING
 #include <liburing.h>
+#include <sys/resource.h>
+#endif
+/* Older liburing/kernel headers may not spell the task-run bits yet; the
+ * values are the UAPI constants and the ladder below drops them on any kernel
+ * that rejects the setup request. */
+#ifndef IORING_SETUP_COOP_TASKRUN
+#define IORING_SETUP_COOP_TASKRUN (1U << 8)
+#endif
+#ifndef IORING_SETUP_TASKRUN_FLAG
+#define IORING_SETUP_TASKRUN_FLAG (1U << 9)
 #endif
 
 #include "_row_plan.h"
 #define PLE_CAPSULE "b12x.ple_reader"
+/* miss_io.md B1: the shipped 64 slots leave the pipe ~1/6 full (derived mean
+ * in-flight ~11 at 249k IOPS), so this is the floor the reader raises a
+ * caller's queue_depth to; larger explicit requests are honoured as-is. */
+#define PLE_DEFAULT_DEPTH 256u
+/* A ring needs at least two slots to overlap a submission with a completion,
+ * and it is the depth the clamp loop stops halving at. */
+#define PLE_MIN_SLOTS 2u
 
 typedef struct ple_reader ple_reader_t;
 typedef struct {
@@ -19,6 +36,9 @@ struct ple_reader {
   bool poisoned;
   pthread_mutex_t api_mutex;
   unsigned slots_count;
+  unsigned depth_requested; /* queue_depth as passed, before the default/clamp */
+  unsigned ring_flags;      /* IORING_SETUP_* the ring actually came up with */
+  bool ring_flag_fallback;  /* the top rung of the flag ladder was rejected */
   ple_slot_t* slots;
   char* buffers;
   char *weights, *scales;
@@ -76,6 +96,7 @@ static void ple_release(ple_reader_t* reader) {
   free(reader->slots);
   free(reader->plan.fragments);
   free(reader->plan.jobs);
+  free(reader->plan.file_counts);
   pthread_mutex_destroy(&reader->api_mutex);
   free(reader);
 }
@@ -86,6 +107,112 @@ static void ple_delete(PyObject* capsule) {
     Py_BEGIN_ALLOW_THREADS ple_release(reader);
     Py_END_ALLOW_THREADS
   }
+}
+#endif
+
+#ifdef B12X_HAVE_LIBURING
+/* The ring is driven by whichever thread happens to be running the row cache,
+ * never by one dedicated task: py_ple_reader_run serialises its callers on
+ * api_mutex, but the synchronous read path (disk_table.py:856, :892 through
+ * _fetch at disk_table.py:862-865) and the speculative prefetch worker
+ * "b12x-ple-prefetch" (disk_table.py:663-675, whose _run_prefetch_job reaches
+ * the same _fetch at disk_table.py:715 without holding the disk_table.py:440
+ * lock) are different tasks, and the mutex only moves ownership between them.
+ * So IORING_SETUP_SINGLE_ISSUER is out: the kernel binds the ring to the first
+ * submitting task and answers a second one with -EEXIST, which would permanently
+ * poison a working reader, and IORING_SETUP_DEFER_TASKRUN cannot be requested
+ * without it. COOP_TASKRUN needs no single issuer and still keeps completion
+ * task work off the IPI path; TASKRUN_FLAG only advertises pending task work.
+ * Both are tried first and dropped on any kernel that rejects them. */
+static const unsigned ple_flag_ladder[] = {
+    IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG,
+    IORING_SETUP_COOP_TASKRUN,
+    0u,
+};
+
+/* Bring the ring up at the best flag set the kernel accepts. Only a rejected
+ * setup request may step down a rung: a resource error is the same error for
+ * every rung, and the caller still has to report it. */
+static int ple_ring_init(ple_reader_t* reader, unsigned entries) {
+  int error = -EINVAL;
+  for (size_t rung = 0; rung < sizeof(ple_flag_ladder) / sizeof(ple_flag_ladder[0]); rung++) {
+    struct io_uring_params params;
+    memset(&params, 0, sizeof(params));
+    params.flags = ple_flag_ladder[rung];
+    error = io_uring_queue_init_params(entries, &reader->ring, &params);
+    if (error >= 0) {
+      reader->ring_ready = true;
+      reader->ring_flags = ple_flag_ladder[rung];
+      reader->ring_flag_fallback = rung != 0;
+      return 0;
+    }
+  }
+  return error;
+}
+
+/* How many 64 KiB staging slots the locked-memory budget can cover
+ * (io_uring/rsrc.c charges registered buffers against RLIMIT_MEMLOCK). This is
+ * only an estimate to avoid a doomed first attempt: the limit is per-process
+ * and shared with every other ring, so ple_configure()'s registration remains
+ * authoritative and still halves the queue on refusal. */
+static unsigned ple_slot_budget(unsigned requested) {
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_MEMLOCK, &limit) != 0) return requested;
+  if (limit.rlim_cur == RLIM_INFINITY) return requested;
+  unsigned fits = (unsigned)(limit.rlim_cur / PLE_READ_MAX);
+  return fits < requested ? fits : requested;
+}
+
+/* Allocate and register everything one queue depth needs. Nothing is published
+ * to the reader unless every step succeeds, so the caller can simply retry at
+ * half the slots: a failed attempt leaves no ring, no pinned buffers and no
+ * dangling pointer behind. */
+static int ple_configure(ple_reader_t* reader, unsigned slots, bool* buffers_failed) {
+  char* buffers = NULL;
+  ple_slot_t* slot_array = NULL;
+  struct iovec* iovecs = NULL;
+  unsigned* free_slots = NULL;
+  *buffers_failed = false;
+  int error = posix_memalign((void**)&buffers, PLE_BLOCK, (size_t)slots * PLE_READ_MAX);
+  if (error) {
+    error = -error;
+    goto cleanup;
+  }
+  slot_array = calloc(slots, sizeof(*slot_array));
+  iovecs = calloc(slots, sizeof(*iovecs));
+  free_slots = calloc(slots, sizeof(*free_slots));
+  if (!slot_array || !iovecs || !free_slots) {
+    error = -ENOMEM;
+    goto cleanup;
+  }
+  for (unsigned i = 0; i < slots; i++) {
+    slot_array[i].buffer = buffers + (size_t)i * PLE_READ_MAX;
+    iovecs[i].iov_base = slot_array[i].buffer;
+    iovecs[i].iov_len = PLE_READ_MAX;
+  }
+  error = ple_ring_init(reader, slots);
+  if (error) goto cleanup;
+  error = io_uring_register_buffers(&reader->ring, iovecs, slots);
+  if (error < 0) {
+    *buffers_failed = true;
+    goto cleanup;
+  }
+  reader->buffers = buffers;
+  reader->slots = slot_array;
+  reader->iovecs = iovecs;
+  reader->free_slots = free_slots;
+  reader->slots_count = slots;
+  return 0;
+cleanup:
+  if (reader->ring_ready) {
+    io_uring_queue_exit(&reader->ring);
+    reader->ring_ready = false;
+  }
+  free(buffers);
+  free(slot_array);
+  free(iovecs);
+  free(free_slots);
+  return error;
 }
 #endif
 
@@ -106,9 +233,12 @@ static PyObject* py_ple_reader(PyObject* self, PyObject* args) {
       depth <= 0 || depth > 32768 || weight_bytes > PY_SSIZE_T_MAX / max_lookups ||
       scale_bytes > PY_SSIZE_T_MAX / max_lookups || max_lookups > PY_SSIZE_T_MAX / 8)
     return PyErr_Format(PyExc_ValueError, "invalid PLE reader geometry or I/O capacity");
-  /* At most ceil((row_bytes + block - 1) / block) fragments per plane. */
-  size_t per_row = (size_t)weight_bytes / PLE_BLOCK + 2;
-  if (scale_bytes) per_row += (size_t)scale_bytes / PLE_BLOCK + 2;
+  /* At most floor(row_bytes / gran) + 2 fragments per plane, sized for the
+   * smallest granularity ple_dio_gran() can report: a 512 B floor multiplies
+   * the worst-case fragment count of a wide row by PLE_BLOCK / PLE_GRAN_MIN,
+   * so the capacity bound must not assume PLE_BLOCK (_row_plan.h:6-7). */
+  size_t per_row = (size_t)weight_bytes / PLE_GRAN_MIN + 2;
+  if (scale_bytes) per_row += (size_t)scale_bytes / PLE_GRAN_MIN + 2;
   if ((size_t)max_lookups > SIZE_MAX / per_row ||
       (size_t)max_lookups * per_row > SIZE_MAX / sizeof(ple_fragment_t) ||
       (size_t)max_lookups * per_row > SIZE_MAX / sizeof(ple_job_t))
@@ -129,45 +259,45 @@ static PyObject* py_ple_reader(PyObject* self, PyObject* args) {
   reader->plan.scale_bytes = scale_bytes;
   reader->plan.max_lookups = max_lookups;
   reader->plan.capacity = (size_t)max_lookups * per_row;
-  reader->slots_count = (unsigned)depth;
-  reader->slots = calloc(reader->slots_count, sizeof(*reader->slots));
+  /* Opt this plan into the miss-IO pick: per-file statx DIOALIGN fragment
+   * floors and the density-gated fragment sort. The GDS planner shares this
+   * header and leaves the flag clear, so it keeps 4 KiB cuFile fragments. */
+  reader->plan.io_uring_pick = true;
   reader->plan.fragments = calloc(reader->plan.capacity, sizeof(*reader->plan.fragments));
   reader->plan.jobs = calloc(reader->plan.capacity, sizeof(*reader->plan.jobs));
-  error = posix_memalign((void**)&reader->buffers, PLE_BLOCK,
-                         (size_t)reader->slots_count * PLE_READ_MAX);
-  if (!reader->slots || !reader->plan.fragments || !reader->plan.jobs || error) {
+  if (!reader->plan.fragments || !reader->plan.jobs) {
     ple_release(reader);
     return PyErr_NoMemory();
   }
-  for (unsigned i = 0; i < reader->slots_count; i++) {
-    reader->slots[i].buffer = reader->buffers + (size_t)i * PLE_READ_MAX;
-  }
-  error = io_uring_queue_init(reader->slots_count, &reader->ring, 0);
-  if (error < 0) {
-    ple_release(reader);
-    return PyErr_Format(
-        PyExc_RuntimeError,
-        "io_uring initialization failed: %s; enable io_uring in the kernel/container policy",
-        strerror(-error));
-  }
-  reader->ring_ready = true;
-  reader->iovecs = calloc(reader->slots_count, sizeof(*reader->iovecs));
-  reader->free_slots = calloc(reader->slots_count, sizeof(*reader->free_slots));
-  if (!reader->iovecs || !reader->free_slots) {
-    ple_release(reader);
-    return PyErr_NoMemory();
-  }
-  for (unsigned i = 0; i < reader->slots_count; i++) {
-    reader->iovecs[i].iov_base = reader->slots[i].buffer;
-    reader->iovecs[i].iov_len = PLE_READ_MAX;
-  }
-  error = io_uring_register_buffers(&reader->ring, reader->iovecs, reader->slots_count);
-  if (error < 0) {
-    ple_release(reader);
-    return PyErr_Format(PyExc_RuntimeError,
-                        "io_uring buffer registration failed: %s; raise the locked-memory limit or "
-                        "reduce queue_depth",
-                        strerror(-error));
+  reader->depth_requested = (unsigned)depth;
+  unsigned slots =
+      reader->depth_requested < PLE_DEFAULT_DEPTH ? PLE_DEFAULT_DEPTH : reader->depth_requested;
+  unsigned budget = ple_slot_budget(slots);
+  if (budget < slots) slots = budget;
+  if (slots < PLE_MIN_SLOTS) slots = PLE_MIN_SLOTS;
+  /* Registered buffers are pinned and charged against the locked-memory limit,
+   * which is a per-process budget shared with every other ring, so the only
+   * authoritative answer is the registration itself: on refusal, keep halving
+   * the queue rather than failing the reader. A shallower ring is slower but
+   * correct, and stats report the depth that actually landed. */
+  for (;;) {
+    bool buffers_failed = false;
+    error = ple_configure(reader, slots, &buffers_failed);
+    if (!error) break;
+    if (slots <= PLE_MIN_SLOTS) {
+      ple_release(reader);
+      if (buffers_failed)
+        return PyErr_Format(PyExc_RuntimeError,
+                            "io_uring buffer registration failed: %s; raise the locked-memory "
+                            "limit or reduce queue_depth",
+                            strerror(-error));
+      return PyErr_Format(
+          PyExc_RuntimeError,
+          "io_uring initialization failed: %s; enable io_uring in the kernel/container policy",
+          strerror(-error));
+    }
+    unsigned smaller = slots / 2 < PLE_MIN_SLOTS ? PLE_MIN_SLOTS : slots / 2;
+    slots = smaller;
   }
   PyObject* capsule = PyCapsule_New(reader, PLE_CAPSULE, ple_delete);
   if (!capsule) ple_release(reader);
@@ -232,21 +362,22 @@ static PyObject* py_ple_reader_add(PyObject* self, PyObject* args) {
 }
 
 #ifdef B12X_HAVE_LIBURING
-/* Prepare a whole free-slot wave before entering the kernel. A short positive
- * submit accounts for exactly that many SQEs; retry only the remaining entries.
- * A failed submit may leave pending SQEs, so stop issuing, drain every submitted
- * CQE, and retire the ring without submitting those pending entries. */
-static void ple_submit_wave(ple_reader_t* reader, unsigned free_count, size_t* next,
-                            unsigned* outstanding) {
+/* Arm jobs into the SQ ring, popping slots off the back of the free list, and
+ * return how many were armed (free_count is handed the reduced count, so a
+ * slot is either on the free list or in flight, never both). A short positive
+ * submit accounts for exactly that many SQEs; only the remainder is re-issued.
+ * A failed submit may leave pending SQEs, so stop issuing, drain every
+ * submitted CQE, and retire the ring without submitting those pending entries. */
+static unsigned ple_prepare_wave(ple_reader_t* reader, unsigned* free_count, size_t* next) {
   size_t remaining = reader->plan.job_count - *next;
-  unsigned count = remaining < free_count ? (unsigned)remaining : free_count;
+  unsigned count = remaining < *free_count ? (unsigned)remaining : *free_count;
   for (unsigned i = 0; i < count; i++) {
-    unsigned slot = reader->free_slots[i];
+    unsigned slot = reader->free_slots[--*free_count];
     struct io_uring_sqe* sqe = io_uring_get_sqe(&reader->ring);
     if (!sqe) {
       ple_error(reader, "io_uring SQ capacity", ENOSPC);
       reader->poisoned = true;
-      return;
+      return i;
     }
     ple_job_t* job = &reader->plan.jobs[*next];
     reader->slots[slot].job = (*next)++;
@@ -255,51 +386,74 @@ static void ple_submit_wave(ple_reader_t* reader, unsigned free_count, size_t* n
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data64(sqe, slot);
   }
-  unsigned pending = count;
-  while (pending) {
+  return count;
+}
+
+/* One enter that submits every armed SQE and blocks until wait_nr completions
+ * are visible, replacing the shipped wait-one-CQE granularity: with 64 slots the
+ * wave kept only ~11 requests in flight (miss_io.md §1), so the device idled
+ * between reaps. The caller waits for half the ring, which is also the point at
+ * which refilling is worthwhile (t/io_uring batches 32 of 128 the same way). */
+static void ple_flush(ple_reader_t* reader, unsigned prepared, unsigned* outstanding,
+                      unsigned wait_nr) {
+  unsigned pending = prepared;
+  bool entered = false;
+  while (pending || !entered) {
     reader->plan.submit_calls++;
-    int result = io_uring_submit(&reader->ring);
+    int result = io_uring_submit_and_wait(&reader->ring, wait_nr);
+    entered = true;
     if (result == -EINTR) continue;
-    if (result <= 0) {
-      ple_error(reader, "io_uring submit", result < 0 ? -result : EIO);
+    if (result < 0) {
+      ple_error(reader, "io_uring submit", -result);
       reader->poisoned = true;
       return;
     }
     *outstanding += (unsigned)result;
-    pending -= (unsigned)result;
+    pending = result < (int)pending ? pending - (unsigned)result : 0;
   }
 }
 
 static void ple_uring_run(ple_reader_t* reader) {
-  unsigned outstanding = 0;
+  const unsigned batch = reader->slots_count / 2 ? reader->slots_count / 2 : 1;
+  unsigned outstanding = 0, free_count = reader->slots_count;
   size_t next = 0;
   for (unsigned i = 0; i < reader->slots_count; i++) reader->free_slots[i] = i;
-  ple_submit_wave(reader, reader->slots_count, &next, &outstanding);
-  while (outstanding) {
-    struct io_uring_cqe* cqe = NULL;
-    /* wait/peek do not submit pending SQEs when draining a failed submit. */
-    int result = io_uring_wait_cqe(&reader->ring, &cqe);
-    if (result < 0) {
-      if (result != -EINTR && result != -EAGAIN) {
+  while (outstanding || next < reader->plan.job_count) {
+    /* Refill from every slot the previous reap handed back, so the queue stays
+     * saturated across the wave instead of one completion at a time. Do not arm
+     * refill SQEs until every collected completion has been checked: an I/O
+     * error therefore leaves no speculative refill entries. */
+    unsigned prepared = 0;
+    if (!reader->poisoned && free_count && next < reader->plan.job_count &&
+        !reader->plan.failure.message[0])
+      prepared = ple_prepare_wave(reader, &free_count, &next);
+    if (reader->poisoned) {
+      /* Drain only: entering here would submit the abandoned pending SQEs. */
+      if (!outstanding) break;
+      struct io_uring_cqe* cqe = NULL;
+      int result = io_uring_wait_cqe(&reader->ring, &cqe);
+      if (result < 0 && result != -EINTR && result != -EAGAIN) {
         ple_error(reader, "io_uring completion wait", -result);
         reader->poisoned = true;
       }
-      continue;
+    } else {
+      unsigned in_flight = outstanding + prepared;
+      if (!in_flight) break; /* nothing submitted, nothing left to arm */
+      ple_flush(reader, prepared, &outstanding, in_flight < batch ? in_flight : batch);
     }
-    unsigned free_count = 0, head;
+    if (!outstanding) continue;
+    unsigned head, reaped = 0;
+    struct io_uring_cqe* cqe = NULL;
     io_uring_for_each_cqe(&reader->ring, head, cqe) {
       unsigned slot = (unsigned)io_uring_cqe_get_data64(cqe);
       int status = cqe->res;
       outstanding--;
       ple_scatter(reader, reader->slots[slot].job, reader->slots[slot].buffer, status);
       reader->free_slots[free_count++] = slot;
+      reaped++;
       if (!outstanding) break;
     }
-    io_uring_cq_advance(&reader->ring, free_count);
-    /* Do not prepare refill SQEs until every collected completion has been
-     * checked. An I/O error therefore leaves no speculative refill entries. */
-    if (!reader->plan.failure.message[0] && next < reader->plan.job_count)
-      ple_submit_wave(reader, free_count, &next, &outstanding);
+    io_uring_cq_advance(&reader->ring, reaped);
   }
   if (reader->poisoned) {
     io_uring_queue_exit(&reader->ring);
@@ -400,6 +554,11 @@ static PyObject* py_ple_reader_stats(PyObject* self, PyObject* capsule) {
   if (!reader) return NULL;
   uint64_t lookups, requested, bytes, calls, blocks, coalesced, submits, staging, metadata;
   double seconds, planning;
+  /* The queue depth that actually landed, the depth the caller asked for, the
+   * smallest per-file fragment floor in use (0 with no sources), and the
+   * IORING_SETUP_* bits the kernel accepted: the three knobs this stage can
+   * silently fall back on (clamp, statx, flag ladder) stay observable. */
+  unsigned depth_effective, depth_requested, dio_align, uring_flags;
   Py_BEGIN_ALLOW_THREADS pthread_mutex_lock(&reader->api_mutex);
   lookups = reader->plan.lookups;
   requested = reader->plan.requested_bytes;
@@ -410,13 +569,18 @@ static PyObject* py_ple_reader_stats(PyObject* self, PyObject* capsule) {
   submits = reader->plan.submit_calls;
   seconds = reader->plan.execution_seconds;
   planning = reader->plan.planning_seconds;
+  depth_effective = reader->slots_count;
+  depth_requested = reader->depth_requested;
+  dio_align = reader->plan.min_gran;
+  uring_flags = reader->ring_flags;
   staging = (uint64_t)reader->slots_count * PLE_READ_MAX;
   metadata =
       sizeof(*reader) +
       reader->plan.capacity * (sizeof(*reader->plan.fragments) + sizeof(*reader->plan.jobs)) +
       reader->slots_count * sizeof(*reader->slots) +
       reader->plan.source_count * sizeof(*reader->plan.sources) +
-      reader->plan.file_count * sizeof(*reader->plan.files);
+      reader->plan.file_count * sizeof(*reader->plan.files) +
+      reader->plan.file_counts_capacity * sizeof(*reader->plan.file_counts);
 #ifdef B12X_HAVE_LIBURING
   metadata += reader->slots_count * (sizeof(*reader->iovecs) + sizeof(*reader->free_slots));
   metadata += reader->plan.file_count * sizeof(*reader->registered_fds);
@@ -428,10 +592,13 @@ static PyObject* py_ple_reader_stats(PyObject* self, PyObject* capsule) {
 #endif
   pthread_mutex_unlock(&reader->api_mutex);
   Py_END_ALLOW_THREADS return Py_BuildValue(
-      "{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:d,s:d}", "lookups", (unsigned long long)lookups,
-      "requested_bytes", (unsigned long long)requested, "read_bytes", (unsigned long long)bytes,
-      "read_calls", (unsigned long long)calls, "unique_blocks", (unsigned long long)blocks,
-      "coalesced_reads", (unsigned long long)coalesced, "submit_calls", (unsigned long long)submits,
-      "staging_bytes", (unsigned long long)staging, "metadata_bytes", (unsigned long long)metadata,
-      "execution_seconds", seconds, "planning_seconds", planning);
+      "{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:d,s:d,s:K,s:K,s:K,s:K}", "lookups",
+      (unsigned long long)lookups, "requested_bytes", (unsigned long long)requested, "read_bytes",
+      (unsigned long long)bytes, "read_calls", (unsigned long long)calls, "unique_blocks",
+      (unsigned long long)blocks, "coalesced_reads", (unsigned long long)coalesced, "submit_calls",
+      (unsigned long long)submits, "staging_bytes", (unsigned long long)staging, "metadata_bytes",
+      (unsigned long long)metadata, "execution_seconds", seconds, "planning_seconds", planning,
+      "depth_effective", (unsigned long long)depth_effective, "depth_requested",
+      (unsigned long long)depth_requested, "dio_align", (unsigned long long)dio_align,
+      "uring_flags", (unsigned long long)uring_flags);
 }
