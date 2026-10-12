@@ -81,7 +81,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* __restrict__ nvp, int* __restrict__ out, int tiles, int total_q, int num_heads, int num_chunks, int fb, int fe)
+kernel_cake_hopper_msa_b69504a73f334511b0b0(unsigned int* __restrict__ S, int* __restrict__ nvp, int* __restrict__ out, int tiles, int total_q, int num_heads, int num_chunks, int fb, int fe)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1838,7 +1838,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls = 2139094912;
                 }
                 unsigned int key_1 = 0;
-                if (qf < __uint_as_float(cls) && cls < 4278190080u) {
+                if ((qf < __uint_as_float(cls) || __uint_as_float(cls) == qf && cls < qc) && cls < 4278190080u) {
                     key_1 = 1073741824 | (unsigned int)t0_8;
                 }
                 if (cls == qc) {
@@ -1863,7 +1863,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_13 = 2139094912;
                 }
                 unsigned int key_15 = 0;
-                if (qf < __uint_as_float(cls_13) && cls_13 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_13) || __uint_as_float(cls_13) == qf && cls_13 < qc) && cls_13 < 4278190080u) {
                     key_15 = 1073741824 | (unsigned int)(t0_8 + 1);
                 }
                 if (cls_13 == qc) {
@@ -1888,7 +1888,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_19 = 2139094912;
                 }
                 unsigned int key_21 = 0;
-                if (qf < __uint_as_float(cls_19) && cls_19 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_19) || __uint_as_float(cls_19) == qf && cls_19 < qc) && cls_19 < 4278190080u) {
                     key_21 = 1073741824 | (unsigned int)(t0_8 + 2);
                 }
                 if (cls_19 == qc) {
@@ -1913,7 +1913,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_25 = 2139094912;
                 }
                 unsigned int key_27 = 0;
-                if (qf < __uint_as_float(cls_25) && cls_25 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_25) || __uint_as_float(cls_25) == qf && cls_25 < qc) && cls_25 < 4278190080u) {
                     key_27 = 1073741824 | (unsigned int)(t0_8 + 3);
                 }
                 if (cls_25 == qc) {
@@ -1938,7 +1938,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_31 = 2139094912;
                 }
                 unsigned int key_33 = 0;
-                if (qf < __uint_as_float(cls_31) && cls_31 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_31) || __uint_as_float(cls_31) == qf && cls_31 < qc) && cls_31 < 4278190080u) {
                     key_33 = 1073741824 | (unsigned int)(t0_8 + 4);
                 }
                 if (cls_31 == qc) {
@@ -1963,7 +1963,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_37 = 2139094912;
                 }
                 unsigned int key_39 = 0;
-                if (qf < __uint_as_float(cls_37) && cls_37 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_37) || __uint_as_float(cls_37) == qf && cls_37 < qc) && cls_37 < 4278190080u) {
                     key_39 = 1073741824 | (unsigned int)(t0_8 + 5);
                 }
                 if (cls_37 == qc) {
@@ -1988,7 +1988,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_43 = 2139094912;
                 }
                 unsigned int key_45 = 0;
-                if (qf < __uint_as_float(cls_43) && cls_43 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_43) || __uint_as_float(cls_43) == qf && cls_43 < qc) && cls_43 < 4278190080u) {
                     key_45 = 1073741824 | (unsigned int)(t0_8 + 6);
                 }
                 if (cls_43 == qc) {
@@ -2013,7 +2013,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_49 = 2139094912;
                 }
                 unsigned int key_51 = 0;
-                if (qf < __uint_as_float(cls_49) && cls_49 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_49) || __uint_as_float(cls_49) == qf && cls_49 < qc) && cls_49 < 4278190080u) {
                     key_51 = 1073741824 | (unsigned int)(t0_8 + 7);
                 }
                 if (cls_49 == qc) {
@@ -2038,7 +2038,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_55 = 2139094912;
                 }
                 unsigned int key_57 = 0;
-                if (qf < __uint_as_float(cls_55) && cls_55 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_55) || __uint_as_float(cls_55) == qf && cls_55 < qc) && cls_55 < 4278190080u) {
                     key_57 = 1073741824 | (unsigned int)(t0_8 + 8);
                 }
                 if (cls_55 == qc) {
@@ -2063,7 +2063,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_61 = 2139094912;
                 }
                 unsigned int key_63 = 0;
-                if (qf < __uint_as_float(cls_61) && cls_61 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_61) || __uint_as_float(cls_61) == qf && cls_61 < qc) && cls_61 < 4278190080u) {
                     key_63 = 1073741824 | (unsigned int)(t0_8 + 9);
                 }
                 if (cls_61 == qc) {
@@ -2088,7 +2088,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_67 = 2139094912;
                 }
                 unsigned int key_69 = 0;
-                if (qf < __uint_as_float(cls_67) && cls_67 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_67) || __uint_as_float(cls_67) == qf && cls_67 < qc) && cls_67 < 4278190080u) {
                     key_69 = 1073741824 | (unsigned int)(t0_8 + 10);
                 }
                 if (cls_67 == qc) {
@@ -2113,7 +2113,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_73 = 2139094912;
                 }
                 unsigned int key_75 = 0;
-                if (qf < __uint_as_float(cls_73) && cls_73 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_73) || __uint_as_float(cls_73) == qf && cls_73 < qc) && cls_73 < 4278190080u) {
                     key_75 = 1073741824 | (unsigned int)(t0_8 + 11);
                 }
                 if (cls_73 == qc) {
@@ -2138,7 +2138,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_79 = 2139094912;
                 }
                 unsigned int key_81 = 0;
-                if (qf < __uint_as_float(cls_79) && cls_79 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_79) || __uint_as_float(cls_79) == qf && cls_79 < qc) && cls_79 < 4278190080u) {
                     key_81 = 1073741824 | (unsigned int)(t0_8 + 12);
                 }
                 if (cls_79 == qc) {
@@ -2163,7 +2163,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_85 = 2139094912;
                 }
                 unsigned int key_87 = 0;
-                if (qf < __uint_as_float(cls_85) && cls_85 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_85) || __uint_as_float(cls_85) == qf && cls_85 < qc) && cls_85 < 4278190080u) {
                     key_87 = 1073741824 | (unsigned int)(t0_8 + 13);
                 }
                 if (cls_85 == qc) {
@@ -2188,7 +2188,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_91 = 2139094912;
                 }
                 unsigned int key_93 = 0;
-                if (qf < __uint_as_float(cls_91) && cls_91 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_91) || __uint_as_float(cls_91) == qf && cls_91 < qc) && cls_91 < 4278190080u) {
                     key_93 = 1073741824 | (unsigned int)(t0_8 + 14);
                 }
                 if (cls_91 == qc) {
@@ -2213,7 +2213,7 @@ kernel_cake_hopper_msa_cde88f3f9da1a370d20d(unsigned int* __restrict__ S, int* _
                     cls_97 = 2139094912;
                 }
                 unsigned int key_99 = 0;
-                if (qf < __uint_as_float(cls_97) && cls_97 < 4278190080u) {
+                if ((qf < __uint_as_float(cls_97) || __uint_as_float(cls_97) == qf && cls_97 < qc) && cls_97 < 4278190080u) {
                     key_99 = 1073741824 | (unsigned int)(t0_8 + 15);
                 }
                 if (cls_97 == qc) {
