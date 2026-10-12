@@ -27,7 +27,12 @@ def alignment_binary(
     root = Path(__file__).resolve().parents[2]
     quantizer = (root / "csrc/nvfp4_smooth_quantize_sm100.cu").read_text()
     linear = (root / "csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu").read_text()
-    functions = "\n".join(
+    functions = _function(linear, "inline bool fits_nonnegative_int(")
+    # Keep the real empty/shape checks, intercepting work at the plan lookup.
+    lora_down = _function(linear, "void run_lora_down_cublaslt(")
+    functions += lora_down[: lora_down.index("LoraDownCublasLtState& state =")]
+    functions += "++backend_calls; }\n"
+    functions += "\n".join(
         _function(quantizer, f"void {name}(")
         for name in (
             "nvfp4_quantize_smooth",
@@ -38,6 +43,20 @@ def alignment_binary(
     )
     functions += _function(
         linear, "void nvfp4_quantize_smooth_lora_down_cublaslt_sm120("
+    )
+    header = (
+        root / "include/flashinfer/gemm/nvfp4_smooth_quantize_lora_down_sm120.cuh"
+    ).read_text()
+    large_m = _function(header, "inline cudaError_t launch_large_m_dyn_kernel(")
+    launch = large_m.index("nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel<")
+    end = large_m.index("return cudaGetLastError();", launch)
+    # Execute all real geometry checks, replacing only the CUDA launch syntax.
+    large_m = large_m[:launch] + "++backend_calls;\n" + large_m[end:]
+    functions += (
+        "\nnamespace quant { using Type = std::uint16_t; constexpr int SF_VEC_SIZE = 16; }\n"
+        "enum class DynAddress { Recompute };\n"
+        "template <int BlockThreads, bool LongK, int TileM, int TileK, DynAddress Policy, int Rank>\n"
+        + large_m
     )
     program = r"""
 #include <array>
@@ -80,12 +99,13 @@ struct TensorView {
 using cudaStream_t = int;
 using cudaError_t = int;
 constexpr int cudaSuccess = 0;
+constexpr int cudaErrorInvalidValue = 1;
 constexpr int kSm120PrefixRank = TEST_RANK;
 int backend_calls = 0;
 int getMultiProcessorCount(int) { return 1; }
 int get_stream(Device) { return 0; }
 const char* cudaGetErrorString(int) { return "CUDA stub"; }
-template<class... Args> void run_lora_down_cublaslt(Args...) { ++backend_calls; }
+int cudaGetLastError() { return cudaSuccess; }
 namespace flashinfer::gemm {
 template<class... Args> void nvfp4_smooth_quantize(Args...) { ++backend_calls; }
 template<int Rank, class... Args> int nvfp4_smooth_quantize_lora_down_sm120(Args...) {
@@ -101,7 +121,8 @@ template<int Rank, class... Args> int nvfp4_smooth_quantize_lora_down_family_sm1
     program += functions
     program += r"""
 int main(int argc, char** argv) {
-  assert(argc == 4);
+  assert(argc == 4 || argc == 5);
+  bool const empty = argc == 5;
   int const entry = std::stoi(argv[1]), index = std::stoi(argv[2]), offset = std::stoi(argv[3]);
   alignas(16) std::array<unsigned char, 512> storage{};
   std::array<TensorView, 8> inputs{{
@@ -110,6 +131,9 @@ int main(int argc, char** argv) {
     {{64, 1536}, storage.data() + 256}, {{128 * 192}, storage.data() + 320},
     {{64, TEST_RANK}, storage.data() + 384}, {{16}, storage.data() + 448}
   }};
+  if (empty) {
+    for (int i : {0, 4, 5, 6}) inputs[i].shape[0] = 0;
+  }
   inputs.at(index).pointer += offset;
   auto const& [x, pqs, scale, l2t, xq, sf, down, workspace] = inputs;
   bool rejected = false;
@@ -119,6 +143,12 @@ int main(int argc, char** argv) {
       case 1: nvfp4_quantize_smooth_lora_down_sm120_impl(x, pqs, scale, l2t, xq, sf, down, false); break;
       case 2: nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(x, pqs, scale, l2t, xq, sf, down, 0, 1, 1, 1, 0, false); break;
       case 3: nvfp4_quantize_smooth_lora_down_cublaslt_sm120(x, pqs, scale, l2t, xq, sf, down, workspace); break;
+      case 4: {
+        auto const status = launch_large_m_dyn_kernel<384, false, 32, 256, DynAddress::Recompute, TEST_RANK>(
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, x.size(0), x.size(1), 0);
+        assert(status == (empty ? cudaErrorInvalidValue : cudaSuccess));
+        break;
+      }
       default: assert(false);
     }
   } catch (std::runtime_error const& error) {
@@ -127,7 +157,7 @@ int main(int argc, char** argv) {
     assert(std::string(error.what()).find(expected) != std::string::npos);
   }
   assert(rejected == (offset % 16 != 0));
-  assert(backend_calls == (rejected ? 0 : (entry == 3 ? 2 : 1)));
+  assert(backend_calls == (rejected || empty ? 0 : (entry == 3 ? 2 : 1)));
 }
 """
     directory = tmp_path_factory.mktemp(f"sm120_alignment_rank{request.param}")
@@ -162,6 +192,31 @@ def test_native_alignment_guard_before_launch(
 ) -> None:
     result = subprocess.run(
         [str(alignment_binary), str(entry), str(index), str(offset)],
+        cwd=alignment_binary.parent,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "entry",
+    range(5),
+    ids=("quantize", "fused", "dynamic", "cublaslt", "large-m-launcher"),
+)
+def test_native_empty_prefix_skips_launch(alignment_binary: Path, entry: int) -> None:
+    result = subprocess.run(
+        [str(alignment_binary), str(entry), "0", "0", "empty"],
+        cwd=alignment_binary.parent,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_large_m_launcher_accepts_nonempty_batch(alignment_binary: Path) -> None:
+    result = subprocess.run(
+        [str(alignment_binary), "4", "0", "0"],
         cwd=alignment_binary.parent,
         capture_output=True,
         text=True,

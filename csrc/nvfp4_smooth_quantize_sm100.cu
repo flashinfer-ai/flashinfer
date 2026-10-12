@@ -113,6 +113,7 @@ void nvfp4_quantize_smooth(TensorView x, TensorView pqs, TensorView global_scale
   TVM_FFI_ICHECK_GE(sf.numel(), sfSize)
       << "sf is smaller than the required swizzled scale layout (" << sfSize << " bytes)";
 
+  if (m == 0) return;
   int const smCount = getMultiProcessorCount(x.device().device_id);
   auto stream = get_stream(x.device());
   flashinfer::gemm::nvfp4_smooth_quantize(
@@ -203,6 +204,7 @@ void nvfp4_quantize_smooth_lora_down_sm120_impl(TensorView x, TensorView pqs,
   check_sm120_prefix_inputs(x, pqs, global_scale, l2t_smoothed, xq, sf, down);
   int const m = static_cast<int>(x.size(0));
   int const k = static_cast<int>(x.size(1));
+  if (m == 0) return;
   auto stream = get_stream(x.device());
   cudaError_t const status =
       flashinfer::gemm::nvfp4_smooth_quantize_lora_down_sm120<kSm120PrefixRank>(
@@ -241,6 +243,7 @@ void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(TensorView x, TensorView pqs
   check_sm120_prefix_inputs(x, pqs, global_scale, l2t_smoothed, xq, sf, down);
   int const m = static_cast<int>(x.size(0));
   int const k = static_cast<int>(x.size(1));
+  if (m == 0) return;
   cudaStream_t stream = get_stream(x.device());
   cudaError_t status =
       flashinfer::gemm::nvfp4_smooth_quantize_lora_down_family_sm120<kSm120PrefixRank>(
