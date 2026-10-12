@@ -16,10 +16,10 @@
 #ifndef FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 #define FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 
-// W8A16 GEMM for Blackwell (sm_100a), rung B7: FlashInfer's fork of CUTLASS's
-// mixed-input kernel (w8a16_sm100/) with two transform warpgroups and two 2SM tiles,
-// 256x128x128 (converted A in TMEM) and 256x256x64 (converted A in smem), picked per
-// problem by a wave-fill cost model (W8A16Sm100PickTile).
+// W8A16 GEMM for Blackwell (sm_100a), rung B9: FlashInfer's fork of CUTLASS's
+// mixed-input kernel (w8a16_sm100/) with two transform warpgroups and three 2SM tiles,
+// 256x128x128 and 256x192x128 (converted A in TMEM) and 256x256x64 (converted A in
+// smem), picked per problem by a wave-fill cost model (W8A16Sm100PickTile).
 //
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
@@ -333,25 +333,32 @@ inline W8A16Sm100Tile W8A16Sm100TileEnv() {
   return tile;
 }
 
-// Rung B7 dispatch: wave-fill cost model between the two 2SM tiles.  Each cluster
-// owns one 256(weight rows) x tileA(activation rows) tile; the modelled time is
-// ceil(clusters needed / clusters resident) x tileA / eff, with the 256-wide tile at
-// 1.10x the per-flop efficiency of the 128-wide one (half the transform work per flop;
-// fitted on the B200 tables of rungs B3 and B4: picks the measured winner on 127 of 144
-// rows, geomean 1.006x the per-row oracle).  Narrow or short problems keep the
-// 128-wide tile (twice the clusters to fill the machine), wide + tall ones take the
-// 256-wide tile.
+// Rung B9 dispatch: wave-fill cost model over the three 2SM tiles.  Each cluster owns
+// one 256(weight rows) x tileA(activation rows) tile; the modelled time is
+// ceil(clusters needed / clusters resident) x tileA / eff, with eff = 1.00 for the
+// 128-row tile (A in TMEM, 4 transform-to-MMA stages), 1.22 for the 192-row tile (A in
+// TMEM, 2 stages, 2/3 the transform work per flop) and 1.10 for the 256-row tile (A in
+// smem, half the transform work but a 64-wide k-tile).  Constants fitted offline on the
+// B200 tables of rungs B3, B4 and B8: geomean 1.008x the per-row oracle.  Narrow or
+// short problems keep the 128-row tile (more clusters to fill the machine), everything
+// that fills the machine takes the 192-row tile, the 256-row tile wins a few very wide
+// rows.
 inline W8A16Sm100Tile W8A16Sm100PickTile(int M, int N, int K, int num_sms) {
   const W8A16Sm100Tile env = W8A16Sm100TileEnv();
   if (env != W8A16Sm100Tile::kAuto) return env;
   (void)K;
-  const int clusters = num_sms > 1 ? num_sms / 2 : 1;
+  const long long clusters = num_sms > 1 ? num_sms / 2 : 1;
   const long long w_tiles = (N + 255) / 256;
-  const long long units128 = w_tiles * ((M + 127) / 128);
-  const long long units256 = w_tiles * ((M + 255) / 256);
-  const double cost128 = static_cast<double>((units128 + clusters - 1) / clusters) * 128.0;
-  const double cost256 = static_cast<double>((units256 + clusters - 1) / clusters) * 256.0 / 1.10;
-  return cost256 < cost128 ? W8A16Sm100Tile::k2SM256x256 : W8A16Sm100Tile::k2SM256x128;
+  auto cost = [&](int tile_a, double eff) {
+    const long long units = w_tiles * ((M + tile_a - 1) / tile_a);
+    return static_cast<double>((units + clusters - 1) / clusters) * tile_a / eff;
+  };
+  const double c128 = cost(128, 1.00);
+  const double c192 = cost(192, 1.22);
+  const double c256 = cost(256, 1.10);
+  if (c192 <= c128 && c192 <= c256) return W8A16Sm100Tile::k2SM256x192;
+  if (c256 < c128) return W8A16Sm100Tile::k2SM256x256;
+  return W8A16Sm100Tile::k2SM256x128;
 }
 
 template <typename T>
