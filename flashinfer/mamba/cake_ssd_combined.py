@@ -41,8 +41,10 @@ _TARGET_ARCHS = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 _ARCH_CAPABILITIES = {arch: capability for capability, arch in _TARGET_ARCHS.items()}
 _DEVICE_DIR = Path("generated") / "device"
 # Prepared two-launch host launchers, one per kernel family: the same nine
-# ``CAKE_SSD_*`` placeholders and namespace scheme; the chunk-parallel main
-# kernel takes four more arguments (``_MAIN_ARGS_CHUNKPAR``).
+# ``CAKE_SSD_*`` placeholders and namespace scheme; the look-back chunk-parallel
+# main kernel takes six more arguments than the exact scan
+# (``_MAIN_ARGS_CHUNKPAR``), the three-phase chunk-parallel main kernel four
+# more (``_MAIN_ARGS_CHUNKPAR3``).
 _HOST_TEMPLATE = Path("generated") / "host" / "mamba_ssd_combined_sequence.cpp"
 _CHUNKPAR_HOST_TEMPLATE = (
     Path("generated") / "host" / "mamba_ssd_combined_chunk_parallel_sequence.cpp"
@@ -52,6 +54,9 @@ _CHUNKPAR_HOST_TEMPLATE = (
 # preprocess stage.
 _EXACTPRE_HOST_TEMPLATE = (
     Path("generated") / "host" / "mamba_ssd_combined_precomputed_sequence.cpp"
+)
+_CHUNKPAR3_HOST_TEMPLATE = (
+    Path("generated") / "host" / "mamba_ssd_combined_chunk_parallel3_sequence.cpp"
 )
 # Module identities the Cake export has not filled yet carry this token; such
 # a program refuses to build (``_require_exported``).
@@ -85,9 +90,10 @@ class _Program:
     stage is skipped with a grid of 0 unless it publishes packed-varlen
     metadata), ``exactpre`` (the same persistent scan reading the delta /
     cumsum its preprocess wrote to the HBM workspace: the start two-launch
-    form, same main arguments) or ``chunkpar`` (the chunk-parallel program,
-    one CTA per (chunk, head) tile); it fixes the host template and the main
-    kernel's argument order.
+    form, same main arguments), ``chunkpar`` (the look-back chunk-parallel
+    program, one CTA per SM over item-major tile ranges) or ``chunkpar3``
+    (the three-phase chunk-parallel program, one CTA per (chunk, head)
+    tile); it fixes the host template and the main kernel's argument order.
     """
 
     family: str
@@ -107,17 +113,19 @@ class _Program:
 # Generated-source identities, ``generated/device/<module>.cu``: the Cake
 # kernel symbol followed by the export's module identity hash.  This block is
 # the single place the Cake export refreshes; every program binding below
-# derives from it.  Three kernel families ship, each x {bf16, f16, f32 state}
+# derives from it.  Four kernel families ship, each x {bf16, f16, f32 state}
 # x {batched, varlen}, plus one preprocess shared by all: the fused exact scan
 # (``exact_*``, CAKE-956 round 6 item 2: delta / cumsum computed in-CTA, one
 # launch), the two-kernel exact scan (``exactpre_*``: the start pre+scan form
-# the fused route keeps for saturated / long-item calls, see
-# :func:`fused_selected`) and the chunk-parallel program (``chunkpar_*``).
-# Both exact-scan families ship two schedule variants of every program: the
-# ring program (``<family>_<state>_<mode>``) and the ``_noring`` program (the
-# same kernel built with ``epilogue_ring=False``, bitwise-identical outputs),
-# selected per call by :func:`_exact_scan_variant` from host-known shape
-# quantities.
+# the fused route keeps for saturated / long-item calls and for the seq_idx
+# triple form, see :func:`fused_selected`), the look-back chunk-parallel
+# program (``chunkpar_*``, round 6 item 1a) and the three-phase chunk-parallel
+# program (``chunkpar3_*``, the three-phase program kept as the second
+# chunk-parallel family).  Both exact-scan families ship two schedule
+# variants of every program: the ring program (``<family>_<state>_<mode>``)
+# and the ``_noring`` program (the same kernel built with
+# ``epilogue_ring=False``, bitwise-identical outputs), selected per call by
+# :func:`_exact_scan_variant` from host-known shape quantities.
 _SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_08c5aea4d0"
 _SCAN_MODULES = {
     "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_cf0cc7f97b",
@@ -134,12 +142,12 @@ _SCAN_MODULES = {
     "exact_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_3db93d8b16",
 }
 _CHUNKPAR_MODULES = {
-    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_f17431806f",
-    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_a1c231f3d6",
-    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_e2c4a6fe65",
-    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_1161b3473c",
-    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_d5600a56db",
-    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_6798faa560",
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_98f0fc8554",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_b5c75f9d8c",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_469d201864",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_941ac41a91",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_3877a47ded",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_16b6bad6a2",
 }
 _EXACTPRE_MODULES = {
     "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_4531674c62",
@@ -154,6 +162,14 @@ _EXACTPRE_MODULES = {
     "exactpre_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_noring_af40bd8812",
     "exactpre_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_noring_4cbe908403",
     "exactpre_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_noring_fd84383935",
+}
+_CHUNKPAR3_MODULES = {
+    "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_355b6083c6",
+    "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_57bc3fb493",
+    "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_e6e62e8e98",
+    "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_2ed30f3b86",
+    "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_50f79e706d",
+    "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_b61e5b4339",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -178,7 +194,8 @@ _STATE_DTYPE_KEYS = {
 # Dynamic shared memory (bytes) of each family's main kernel; refreshed by the
 # Cake export.  0 is the unfilled placeholder: the program refuses to build.
 _EXACT_SMEM_BYTES = 232320
-_CHUNKPAR_SMEM_BYTES = 232448
+_CHUNKPAR_SMEM_BYTES = 231808
+_CHUNKPAR3_SMEM_BYTES = 232448
 # Main dynamic SMEM of the exact-scan ``_noring`` programs (the start schedule
 # keeps the prefix control placement); refreshed by the Cake export with the
 # ``exact_*_noring`` table entries.
@@ -290,12 +307,68 @@ _MAIN_ARGS = (
 # bind them (only the fused program reads them); the chunk-parallel
 # signature has none of them.
 _FUSED_ONLY_MAIN_ARGS = ("cu_seqlens", "metadata_from_cu_seqlens", "preprocess_status")
-# Chunk-parallel main kernel (the ``chunkpar_*`` programs): the exact-scan
-# order with the state-operand tensor map ``h_map`` after ``out_map`` and the
-# workspace pointers ``s_work`` (f32 per-tile state increments), ``h_words``
-# (u32 view of the bf16 state operand behind ``h_map``) and ``grid_barrier``
-# (u32 ``[arrive, generation]``) after ``out_native``.
+# Chunk-parallel main kernel (the ``chunkpar_*`` programs, the round-6
+# single-pass look-back program): the exact-scan order with the state-operand
+# tensor map ``h_map`` after ``out_map``, the workspace pointers ``s_work``
+# (f32 per-tile state increments), ``agg_work`` (f32 published range
+# aggregates), ``h_words`` (u32 view of the bf16 state operand behind
+# ``h_map``) and ``grid_barrier`` (u32 ``[ticket, epoch, pad, pad, flags]``)
+# after ``out_native``, and the virtual CTA count ``vcount`` last.
 _MAIN_ARGS_CHUNKPAR = (
+    "x_map",
+    "b_map",
+    "c_map",
+    "out_map",
+    "h_map",
+    "x",
+    "dt",
+    "delta_precomputed",
+    "cumsum_precomputed",
+    "A",
+    "B_tensor",
+    "C",
+    "D",
+    "z",
+    "dt_bias",
+    "initial_states",
+    "final_states",
+    "checkpoint_states",
+    "checkpoint_token_indices",
+    "checkpoint_state_slots",
+    "seq_idx_i32",
+    "seq_idx_i64",
+    "chunk_indices",
+    "chunk_offsets",
+    "seq_chunk_cumsum",
+    "out_native",
+    "s_work",
+    "agg_work",
+    "h_words",
+    "grid_barrier",
+    "nheads",
+    "ngroups",
+    "batch",
+    "seqlen",
+    "nchunks",
+    "sequence_count",
+    "num_logical_chunks",
+    "mode_varlen",
+    "D_mode",
+    "has_z",
+    "has_initial",
+    "dt_softplus",
+    "dt_min",
+    "dt_max",
+    "write_final_states",
+    "checkpoint_state_count",
+    "vcount",
+)
+# Three-phase chunk-parallel main kernel (the ``chunkpar3_*`` programs, the
+# round-4 program kept as the second chunk-parallel family): the exact-scan
+# order with the state-operand tensor map ``h_map`` after ``out_map`` and the
+# workspace pointers ``s_work``, ``h_words`` and ``grid_barrier`` (u32
+# ``[arrive, generation]``) after ``out_native``.
+_MAIN_ARGS_CHUNKPAR3 = (
     "x_map",
     "b_map",
     "c_map",
@@ -347,6 +420,7 @@ _FAMILY_HOST = {
     "exact": (_HOST_TEMPLATE, _MAIN_ARGS, _EXACT_SMEM_BYTES),
     "chunkpar": (_CHUNKPAR_HOST_TEMPLATE, _MAIN_ARGS_CHUNKPAR, _CHUNKPAR_SMEM_BYTES),
     "exactpre": (_EXACTPRE_HOST_TEMPLATE, _MAIN_ARGS, _EXACTPRE_SMEM_BYTES),
+    "chunkpar3": (_CHUNKPAR3_HOST_TEMPLATE, _MAIN_ARGS_CHUNKPAR3, _CHUNKPAR3_SMEM_BYTES),
 }
 
 
@@ -391,6 +465,7 @@ _PROGRAMS: dict[str, _Program] = {
         *_SCAN_MODULES.items(),
         *_CHUNKPAR_MODULES.items(),
         *_EXACTPRE_MODULES.items(),
+        *_CHUNKPAR3_MODULES.items(),
     )
 }
 
@@ -543,18 +618,18 @@ def _persistent_grid_size(*, total_work: int, sm_count: int) -> int:
 _CHUNK_PARALLEL_COST_MODEL_US = {
     # (major, minor) compute capability -> calibrated constants.
     (10, 0): {  # B200, sm_100a
-        "serial_fixed": 4.99,
-        "serial_per_chunk_small": 2.556,
-        "serial_per_chunk_large": 2.758,
-        "cp_fixed": 25.0,
-        "cp_per_tile": 0.0491,
+        "serial_fixed": 4.69,
+        "serial_per_chunk_small": 2.594,
+        "serial_per_chunk_large": 2.809,
+        "cp_fixed": 23.3,
+        "cp_per_tile": 0.0513,
     },
     (10, 3): {  # B300 / GB300, sm_103a
-        "serial_fixed": 4.72,
-        "serial_per_chunk_small": 2.345,
-        "serial_per_chunk_large": 2.432,
-        "cp_fixed": 24.1,
-        "cp_per_tile": 0.0429,
+        "serial_fixed": 4.33,
+        "serial_per_chunk_small": 2.395,
+        "serial_per_chunk_large": 2.51,
+        "cp_fixed": 21.6,
+        "cp_per_tile": 0.0459,
     },
 }
 # Unmeasured capabilities use the B200 constants.
@@ -563,16 +638,71 @@ _CHUNK_PARALLEL_SMALL_ITEMS = 32
 _CHUNK_PARALLEL_LARGE_ITEMS = 128
 _CHUNK_PARALLEL_SELECTION_MARGIN = 1.05
 _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES = 256 << 20
+# Third cost arm (CAKE-956 round 6 option A): the three-phase program's own
+# calibrated constants (``CHUNK_PARALLEL_COST_MODEL_US`` of the Cake seed
+# module flashinfer_blackwell_mamba_ssd_combined_chunk_parallel_seed_v1, round
+# 4), copied verbatim; they take part in the exact-vs-chunk-parallel gate only
+# (the faster of the two chunk-parallel predictions is compared with the
+# exact scan's).
+_THREE_PHASE_COST_MODEL_US = {
+    (10, 0): {"cp_fixed": 25.0, "cp_per_tile": 0.0491},
+    (10, 3): {"cp_fixed": 24.1, "cp_per_tile": 0.0429},
+}
+# Chunk-parallel FAMILY rule inside the chunk-parallel regime, mirrored from
+# the look-back seed module (``three_phase_preferred``): the three-phase
+# program serves batched calls with at most ``_THREE_PHASE_MAX_TILES`` tiles
+# (at most ~1.7 tiles per look-back range, where the look-back's per-range
+# aggregate publish and fold dominate; measured look-back / three-phase
+# 1.05-1.32 at 128-256 tiles on B200 and GB300) or with at least
+# ``_THREE_PHASE_MIN_ITEMS`` work items and ``_THREE_PHASE_MIN_CHUNKS`` chunks
+# per item (32 items x 64 chunks: 1.02-1.03); every other chunk-parallel call
+# runs the look-back program (32 items x 16 chunks: 0.91-0.95; 16 items x
+# 32-256 chunks: 0.92-0.99).  Varlen calls stay on the look-back (three-phase
+# varlen rows measured 7-13 % slower).
+_THREE_PHASE_MAX_TILES = 256
+_THREE_PHASE_MIN_ITEMS = 32
+_THREE_PHASE_MIN_CHUNKS = 64
 # Chunk-parallel workspace per (chunk, head) tile: the f32 [64, 128] state
 # increments (32 KB) plus the bf16 [64, 128] state operand (16 KB).
 _CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE = _HEADDIM * _DSTATE * (4 + 2)
-# Grid barrier state: u32 ``[arrive, generation]``.
-_CHUNK_PARALLEL_GRID_BARRIER_WORDS = 2
-# ``auto`` applies the rule; ``always`` / ``never`` force the family.  Read on
+# Look-back device state, mirrored from the Cake seed module
+# (flashinfer_blackwell_mamba_ssd_combined_chunk_parallel_lookback_seed_v1.py):
+# the item-major tile range is split into ``vcount`` virtual CTA ranges (V =
+# the SM count the program balances against per capability; the B200 value
+# for an unmeasured capability; every floating-point result depends on
+# (inputs, V) only, never on the launch grid).  ``grid_barrier`` is u32
+# ``[TICKET, EPOCH, pad, pad, FLAG[0..SEGMENT_CAP)]`` (zeroed once per device;
+# the kernel's claim counter wraps itself, the epoch free-runs and the flags
+# carry the epoch).  ``agg_work`` holds V f32 [64, 128] range aggregates
+# followed by V f32 log-decay scalars.
+_CHUNK_PARALLEL_SEGMENT_CAP = 1024
+_CHUNK_PARALLEL_GRID_BARRIER_WORDS = 4 + _CHUNK_PARALLEL_SEGMENT_CAP
+_CHUNK_PARALLEL_VCOUNT_BY_ARCH = {(10, 0): 148, (10, 3): 152}
+_CHUNK_PARALLEL_VCOUNT_DEFAULT = (10, 0)
+_CHUNK_PARALLEL_AGG_ELEMS_PER_RANGE = _HEADDIM * _DSTATE + 1
+# Three-phase device state: u32 ``[arrive, generation]`` of its software grid
+# barrier (zeroed once per device; the arrive counter wraps to zero after
+# ``gridDim.x`` arrivals and the generation word free-runs).  Its word
+# protocol differs from the look-back's ``[ticket, epoch, ...]``, so the two
+# families never share a barrier buffer.
+_CHUNKPAR3_GRID_BARRIER_WORDS = 2
+
+
+def _chunk_parallel_vcount(capability: tuple[int, int]) -> int:
+    """The look-back program's virtual CTA count V of a compute capability."""
+
+    key = (int(capability[0]), int(capability[1]))
+    vcount = _CHUNK_PARALLEL_VCOUNT_BY_ARCH.get(
+        key, _CHUNK_PARALLEL_VCOUNT_BY_ARCH[_CHUNK_PARALLEL_VCOUNT_DEFAULT]
+    )
+    return max(1, min(int(vcount), _CHUNK_PARALLEL_SEGMENT_CAP))
+# ``auto`` applies the rule; ``always`` forces the look-back family,
+# ``three_phase`` the three-phase family, ``never`` the exact scan.  Read on
 # every unprepared eager call; ``CakeSSDCombined.prepare`` reads it once and
 # freezes it for the call shape (a captured call never reads it).
 _CHUNK_PARALLEL_ENV = "FLASHINFER_CAKE_SSD_CHUNK_PARALLEL"
-_CHUNK_PARALLEL_MODES = ("auto", "always", "never")
+_CHUNK_PARALLEL_MODES = ("auto", "always", "three_phase", "never")
+_CHUNK_PARALLEL_MODE_TEXT = ", ".join(_CHUNK_PARALLEL_MODES)
 
 
 def _chunk_parallel_mode() -> str:
@@ -582,7 +712,7 @@ def _chunk_parallel_mode() -> str:
     mode = value.strip().lower()
     if mode not in _CHUNK_PARALLEL_MODES:
         raise ValueError(
-            f"{_CHUNK_PARALLEL_ENV} must be auto, always or never; got {value!r}"
+            f"{_CHUNK_PARALLEL_ENV} must be one of {_CHUNK_PARALLEL_MODE_TEXT}; got {value!r}"
         )
     return mode
 
@@ -766,7 +896,7 @@ def selection_quantities(
     sm_count: int,
     capability: tuple[int, int],
 ) -> dict[str, Any]:
-    """The quantities the family rule reads and both programs' predicted
+    """The quantities the family rule reads and the three programs' predicted
     main-kernel times (microseconds) for one call.
 
     ``work_items`` is the exact scan's concurrency (one CTA per (sequence,
@@ -778,9 +908,12 @@ def selection_quantities(
     per-sequence counts live on the device).
     """
 
+    key = (int(capability[0]), int(capability[1]))
     model = _CHUNK_PARALLEL_COST_MODEL_US.get(
-        (int(capability[0]), int(capability[1])),
-        _CHUNK_PARALLEL_COST_MODEL_US[_CHUNK_PARALLEL_COST_MODEL_DEFAULT],
+        key, _CHUNK_PARALLEL_COST_MODEL_US[_CHUNK_PARALLEL_COST_MODEL_DEFAULT]
+    )
+    three_phase = _THREE_PHASE_COST_MODEL_US.get(
+        key, _THREE_PHASE_COST_MODEL_US[_CHUNK_PARALLEL_COST_MODEL_DEFAULT]
     )
     work_items = int(num_sequences) * int(nheads)
     tiles = int(num_segments) * int(nheads)
@@ -793,19 +926,97 @@ def selection_quantities(
     per_chunk = model["serial_per_chunk_small"] + weight * (
         model["serial_per_chunk_large"] - model["serial_per_chunk_small"]
     )
+    extra_tiles = max(0, tiles - int(sm_count))
     return {
         "work_items": work_items,
         "sm_count": int(sm_count),
         "capability": (int(capability[0]), int(capability[1])),
         "chunks": chunks,
         "tiles": tiles,
+        "mode_varlen": bool(mode_varlen),
         "workspace_bytes": tiles * _CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE,
         "predicted_us": {
             "exact_scan": model["serial_fixed"] + per_chunk * chunks,
-            "chunk_parallel": model["cp_fixed"]
-            + model["cp_per_tile"] * max(0, tiles - int(sm_count)),
+            "chunk_parallel": model["cp_fixed"] + model["cp_per_tile"] * extra_tiles,
+            "three_phase": three_phase["cp_fixed"]
+            + three_phase["cp_per_tile"] * extra_tiles,
         },
     }
+
+
+def three_phase_preferred(
+    *, work_items: int, chunks: int, tiles: int, mode_varlen: bool
+) -> bool:
+    """Inside the chunk-parallel regime: the three-phase family for batched
+    calls with at most ``_THREE_PHASE_MAX_TILES`` tiles or with at least
+    ``_THREE_PHASE_MIN_ITEMS`` work items and ``_THREE_PHASE_MIN_CHUNKS``
+    chunks per item; the look-back family otherwise."""
+
+    if mode_varlen:
+        return False
+    return int(tiles) <= _THREE_PHASE_MAX_TILES or (
+        int(work_items) >= _THREE_PHASE_MIN_ITEMS
+        and int(chunks) >= _THREE_PHASE_MIN_CHUNKS
+    )
+
+
+def chunk_parallel_family(
+    *,
+    nheads: int,
+    num_sequences: int,
+    num_segments: int,
+    nchunks: int,
+    mode_varlen: bool,
+    sm_count: int,
+    capability: tuple[int, int],
+    mode: str,
+) -> str:
+    """Family rule: ``"exact"``, ``"chunkpar"`` (look-back) or ``"chunkpar3"``
+    (three-phase).  Chunk-parallel iff fewer work items than SMs, the S/H
+    workspace fits the cap, and the faster of the two chunk-parallel
+    predictions times the selection margin still beats the exact scan's; the
+    chunk-parallel family then follows :func:`three_phase_preferred`.
+    ``mode`` is the environment override: ``always`` forces the look-back,
+    ``three_phase`` the three-phase program, ``never`` the exact scan,
+    ``auto`` applies the rule."""
+
+    if mode not in _CHUNK_PARALLEL_MODES:
+        raise ValueError(
+            f"chunk-parallel mode must be one of {_CHUNK_PARALLEL_MODE_TEXT}; got {mode!r}"
+        )
+    if mode == "always":
+        return "chunkpar"
+    if mode == "three_phase":
+        return "chunkpar3"
+    if mode == "never":
+        return "exact"
+    quantities = selection_quantities(
+        nheads=nheads,
+        num_sequences=num_sequences,
+        num_segments=num_segments,
+        nchunks=nchunks,
+        mode_varlen=mode_varlen,
+        sm_count=sm_count,
+        capability=capability,
+    )
+    predicted = quantities["predicted_us"]
+    chunk_parallel = (
+        quantities["work_items"] < quantities["sm_count"]
+        and quantities["workspace_bytes"] <= _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES
+        and min(predicted["chunk_parallel"], predicted["three_phase"])
+        * _CHUNK_PARALLEL_SELECTION_MARGIN
+        <= predicted["exact_scan"]
+    )
+    if not chunk_parallel:
+        return "exact"
+    if three_phase_preferred(
+        work_items=quantities["work_items"],
+        chunks=quantities["chunks"],
+        tiles=quantities["tiles"],
+        mode_varlen=quantities["mode_varlen"],
+    ):
+        return "chunkpar3"
+    return "chunkpar"
 
 
 def chunk_parallel_selected(
@@ -819,35 +1030,21 @@ def chunk_parallel_selected(
     capability: tuple[int, int],
     mode: str,
 ) -> bool:
-    """Family rule: chunk-parallel iff fewer work items than SMs, the S/H
-    workspace fits the cap, and its predicted main-kernel time times the
-    selection margin still beats the exact scan's.  ``mode`` is the
-    environment override: ``always`` / ``never`` force the answer, ``auto``
-    applies the rule."""
+    """Whether :func:`chunk_parallel_family` picks either chunk-parallel
+    family (the look-back or the three-phase program) for the call."""
 
-    if mode not in _CHUNK_PARALLEL_MODES:
-        raise ValueError(
-            f"chunk-parallel mode must be auto, always or never; got {mode!r}"
-        )
-    if mode == "always":
-        return True
-    if mode == "never":
-        return False
-    quantities = selection_quantities(
-        nheads=nheads,
-        num_sequences=num_sequences,
-        num_segments=num_segments,
-        nchunks=nchunks,
-        mode_varlen=mode_varlen,
-        sm_count=sm_count,
-        capability=capability,
-    )
-    predicted = quantities["predicted_us"]
     return (
-        quantities["work_items"] < quantities["sm_count"]
-        and quantities["workspace_bytes"] <= _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES
-        and predicted["chunk_parallel"] * _CHUNK_PARALLEL_SELECTION_MARGIN
-        <= predicted["exact_scan"]
+        chunk_parallel_family(
+            nheads=nheads,
+            num_sequences=num_sequences,
+            num_segments=num_segments,
+            nchunks=nchunks,
+            mode_varlen=mode_varlen,
+            sm_count=sm_count,
+            capability=capability,
+            mode=mode,
+        )
+        != "exact"
     )
 
 
@@ -1278,7 +1475,7 @@ class CakeSSDCombined:
     caller buffer for the ``cu_seqlens``-derived vector brings the fused
     program's preprocess back to publish it (two launches).
 
-    Three kernel families serve every call and are selected per call.  The
+    Four kernel families serve every call and are selected per call.  The
     fused exact scan (``exact_*`` programs) runs one persistent CTA per
     (sequence, head) item over its chunks in order and computes delta /
     cumsum in-CTA; the two-kernel exact scan (``exactpre_*``) is the same
@@ -1287,24 +1484,34 @@ class CakeSSDCombined:
     program loses on (:func:`fused_selected`: batched calls with more than
     1024 (sequence, head) items, more than 16 chunks per sequence or more
     than 2048 chunk-items; packed-varlen calls with more than 256 items or
-    more than 512 packed chunk-items).  The chunk-parallel program
-    (``chunkpar_*``) computes the same arithmetic in a different schedule --
-    one CTA per (chunk, head) tile, at most one per SM, with the inter-chunk
-    state recurrence resolved across a grid barrier -- and its output and
-    final states are bitwise identical to the exact scan's.  It is selected
-    by a calibrated cost rule (:func:`chunk_parallel_selected`: fewer
+    more than 512 packed chunk-items) and for the seq_idx triple form.  The
+    look-back chunk-parallel program (``chunkpar_*``) runs one CTA per SM
+    over item-major tile ranges with a decoupled look-back over the carried
+    state: the same arithmetic with the carried state of later ranges
+    re-associated (judged by the precision gate, not bitwise).  The
+    three-phase chunk-parallel program (``chunkpar3_*``) runs one CTA per
+    (chunk, head) tile in three phases separated by a software grid barrier;
+    its output and final states are bitwise the round-5 exact scan's (the
+    round-6 exact scan rounds differently and is judged against it by the
+    precision gate).  A chunk-parallel family is selected by a calibrated
+    cost rule (:func:`chunk_parallel_family`: fewer
     (sequence, head) items than SMs, the per-tile workspace within 256 MiB,
     and a predicted main-kernel time that beats the exact scan's by the
-    selection margin), so it serves long prefills with few heads (one
-    sequence of 32768 tokens with 8 heads runs about four times faster) and
-    never 128-head calls.  The environment variable
+    selection margin), so long prefills with few heads leave the exact scan
+    (one sequence of 32768 tokens with 8 heads runs about four times faster)
+    and 128-head calls never do; inside that regime the three-phase program
+    serves batched calls with at most 256 tiles or with at least 32 items and
+    64 chunks per item, the look-back every other call
+    (:func:`three_phase_preferred`).  The environment variable
     ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` (``auto``, the default;
-    ``always``; ``never``) forces either family; any other value is
-    rejected.  It is read on every unprepared eager call; :meth:`prepare`
-    reads it once and freezes the choice for the call shape.  The
-    chunk-parallel workspace (32 KB f32 + 16 KB bf16 per tile, grown only
-    when a call needs more tiles, plus a two-word grid-barrier state zeroed
-    once per device) is owned by the runner.  :attr:`last_program_name`
+    ``always`` = look-back; ``three_phase``; ``never`` = exact scan) forces
+    one family; any other value is rejected.  It is read on every unprepared
+    eager call; :meth:`prepare` reads it once and freezes the choice for the
+    call shape.  The chunk-parallel workspace (32 KB f32 + 16 KB bf16 per
+    tile, grown only when a call needs more tiles, shared by both
+    chunk-parallel families, plus the look-back's aggregate workspace and
+    1028-word barrier and the three-phase program's two-word barrier, each
+    zeroed once per device) is owned by the runner.  :attr:`last_program_name`
     names the program of the most recent call.
 
     Workspaces are kept per call shape in a small registry
@@ -1364,8 +1571,8 @@ class CakeSSDCombined:
     cannot report ids the caller already consumed when building the table.
     """
 
-    #: Program of the most recent :meth:`run` (``exact_*``, ``exactpre_*``
-    #: or ``chunkpar_*``); ``None`` before the first call.
+    #: Program of the most recent :meth:`run` (``exact_*``, ``exactpre_*``,
+    #: ``chunkpar_*`` or ``chunkpar3_*``); ``None`` before the first call.
     last_program_name: Optional[str] = None
     #: Uncaptured per-shape workspaces a runner keeps (least recently used
     #: evicted first); captured workspaces are pinned in addition.  Read when
@@ -1439,6 +1646,8 @@ class CakeSSDCombined:
         # ``_chunk_parallel_workspace``.
         self._chunk_parallel_buffers: dict[Optional[int], dict[str, torch.Tensor]] = {}
         self._grid_barriers: dict[Optional[int], torch.Tensor] = {}
+        self._grid_barriers3: dict[Optional[int], torch.Tensor] = {}
+        self._agg_works: dict[Optional[int], torch.Tensor] = {}
         # Per-call bookkeeping: how many allocations the most recent call made
         # (0 for a prepared shape with a static ``out``).
         self._allocations_in_last_run = 0
@@ -1597,7 +1806,7 @@ class CakeSSDCombined:
         selection_segments = (
             _segment_bound(seqlen, num_sequences) if self.has_varlen else num_segments
         )
-        chunk_parallel = chunk_parallel_selected(
+        family = chunk_parallel_family(
             nheads=self.nheads,
             num_sequences=num_sequences,
             num_segments=selection_segments,
@@ -1607,6 +1816,7 @@ class CakeSSDCombined:
             capability=capability,
             mode=key.chunk_parallel_mode,
         )
+        chunk_parallel = family != "exact"
         # The fused program is a single launch only where its preprocess
         # grid is 0: batched calls and the cu_seqlens form (the kernel
         # derives the segment tables in-CTA).  In the seq_idx triple form the
@@ -1642,7 +1852,7 @@ class CakeSSDCombined:
         )
         workspace: dict[str, Any] = {
             "program": _program_name(
-                "chunkpar" if chunk_parallel else "exact" if fused else "exactpre",
+                family if chunk_parallel else "exact" if fused else "exactpre",
                 self.state_dtype,
                 self.has_varlen,
                 variant,
@@ -1707,13 +1917,17 @@ class CakeSSDCombined:
                 ),
             )
         if chunk_parallel:
-            self._chunk_parallel_workspace(device, tile_count)
+            self._chunk_parallel_workspace(
+                device, tile_count, _chunk_parallel_vcount(capability)
+            )
         return workspace
 
     def _chunk_parallel_workspace(
-        self, device: torch.device, tiles_bound: int
+        self, device: torch.device, tiles_bound: int, vcount: int
     ) -> dict[str, torch.Tensor]:
-        """The chunk-parallel main kernel's workspace on ``device``.
+        """The chunk-parallel main kernels' workspace on ``device`` (both
+        chunk-parallel families; the three-phase family binds the same S/H
+        buffers and its own two-word barrier ``grid_barrier3``).
 
         ``s_work`` (f32 ``[tiles, 64, 128]``, the per-tile state increments,
         32 KB per tile) and ``h_work`` (bf16 ``[tiles, 64, 128]``, the state
@@ -1721,9 +1935,12 @@ class CakeSSDCombined:
         tensor map and, through ``h_words``, as its u32 view) grow only: a
         call whose tile bound exceeds the allocation replaces them, smaller
         calls reuse them (the kernel addresses tiles below the call's bound
-        only).  ``grid_barrier`` (u32 ``[arrive, generation]``) is allocated
-        zeroed once per device and never re-zeroed: the kernel's arrive
-        counter self-resets and its generation word is free-running.  A
+        only).  ``grid_barrier`` (u32 ``[ticket, epoch, pad, pad, flags]``) is
+        allocated zeroed once per device and never re-zeroed: the kernel's
+        claim counter wraps itself, its epoch word is free-running and the
+        flags carry the epoch.  ``agg_work`` (f32, ``vcount`` range aggregates
+        plus ``vcount`` scalars) is per device too; the kernel writes every
+        slot it reads within one launch, so it needs no initial value.  A
         workspace captured into a CUDA graph pins the buffers its graph
         recorded (``workspace["chunk_parallel"]``, see ``run``), so a later
         growth replaces the device's current buffers without freeing them; a
@@ -1749,7 +1966,25 @@ class CakeSSDCombined:
                 _CHUNK_PARALLEL_GRID_BARRIER_WORDS, dtype=torch.uint32, device=device
             )
             self._grid_barriers[device.index] = grid_barrier
-        return {**buffers, "grid_barrier": grid_barrier}
+        grid_barrier3 = self._grid_barriers3.get(device.index)
+        if grid_barrier3 is None:
+            self._allocating("the three-phase chunk-parallel grid barrier")
+            grid_barrier3 = torch.zeros(
+                _CHUNKPAR3_GRID_BARRIER_WORDS, dtype=torch.uint32, device=device
+            )
+            self._grid_barriers3[device.index] = grid_barrier3
+        agg_elems = int(vcount) * _CHUNK_PARALLEL_AGG_ELEMS_PER_RANGE
+        agg_work = self._agg_works.get(device.index)
+        if agg_work is None or agg_work.shape[0] < agg_elems:
+            self._allocating(f"the chunk-parallel aggregate workspace for {vcount} ranges")
+            agg_work = torch.empty(agg_elems, dtype=torch.float32, device=device)
+            self._agg_works[device.index] = agg_work
+        return {
+            **buffers,
+            "agg_work": agg_work,
+            "grid_barrier": grid_barrier,
+            "grid_barrier3": grid_barrier3,
+        }
 
     def run(
         self,
@@ -2432,7 +2667,7 @@ class CakeSSDCombined:
             )
             if not publishes_metadata:
                 preprocess_grid = (0, 1, 1)
-        if program.family == "chunkpar":
+        if program.family in ("chunkpar", "chunkpar3"):
             # One CTA per (chunk, head) tile, at most one per SM (SMEM, TMEM
             # and registers allow one CTA per SM), so every CTA is co-resident
             # for the grid barrier.  The tile bound counts workspace rows the
@@ -2531,9 +2766,10 @@ class CakeSSDCombined:
             "metadata_from_cu_seqlens": int(program.family == "exact" and from_cu_seqlens),
             "preprocess_status": preprocess_status,
         }
-        if program.family == "chunkpar":
-            # ``_MAIN_ARGS_CHUNKPAR`` has no fused input: bind exactly the
-            # chunk-parallel signature.
+        if program.family in ("chunkpar", "chunkpar3"):
+            # Neither chunk-parallel signature (``_MAIN_ARGS_CHUNKPAR``,
+            # ``_MAIN_ARGS_CHUNKPAR3``) has a fused input: bind exactly the
+            # family's signature.
             for name in _FUSED_ONLY_MAIN_ARGS:
                 del main_values[name]
         chunk_parallel: Optional[dict[str, torch.Tensor]] = None
@@ -2544,16 +2780,36 @@ class CakeSSDCombined:
             # chains store through.  A captured workspace binds the buffers
             # its graph recorded (pinned by ``run``); every other call binds
             # the device's current grow-only buffers.
+            vcount = _chunk_parallel_vcount(_ARCH_CAPABILITIES[arch])
             chunk_parallel = workspace.get("chunk_parallel")
             if chunk_parallel is None:
                 chunk_parallel = self._chunk_parallel_workspace(
-                    x.device, num_segments * self.nheads
+                    x.device, num_segments * self.nheads, vcount
+                )
+            main_values.update(
+                h_map=chunk_parallel["h_work"],
+                s_work=chunk_parallel["s_work"],
+                agg_work=chunk_parallel["agg_work"],
+                h_words=chunk_parallel["h_words"],
+                grid_barrier=chunk_parallel["grid_barrier"],
+                vcount=vcount,
+            )
+        elif program.family == "chunkpar3":
+            # The three-phase program binds the same S/H buffers (grow-only,
+            # per device; pinned per captured workspace like the look-back's)
+            # and its own two-word grid barrier.
+            chunk_parallel = workspace.get("chunk_parallel")
+            if chunk_parallel is None:
+                chunk_parallel = self._chunk_parallel_workspace(
+                    x.device,
+                    num_segments * self.nheads,
+                    _chunk_parallel_vcount(_ARCH_CAPABILITIES[arch]),
                 )
             main_values.update(
                 h_map=chunk_parallel["h_work"],
                 s_work=chunk_parallel["s_work"],
                 h_words=chunk_parallel["h_words"],
-                grid_barrier=chunk_parallel["grid_barrier"],
+                grid_barrier=chunk_parallel["grid_barrier3"],
             )
         return _LaunchPlan(
             program_name=program_name,

@@ -4165,8 +4165,8 @@ _HOST_PLACEHOLDERS = (
 
 
 def test_source_program_table_names_shipped_sources():
-    """Every program of both families binds shipped generated sources: the
-    one preprocess (one warp per tile of its block), its family's host
+    """Every program of the four families binds shipped generated sources:
+    the one preprocess (one warp per tile of its block), its family's host
     template and main dynamic SMEM, and a main kernel whose symbol is the
     module identity without its hash.  Table entries the Cake export has
     not filled fail here by name."""
@@ -4180,6 +4180,7 @@ def test_source_program_table_names_shipped_sources():
             ("exact", ("", "_noring")),
             ("exactpre", ("", "_noring")),
             ("chunkpar", ("",)),
+            ("chunkpar3", ("",)),
         )
         for variant in variants
         for state in ("bf16", "f16", "f32")
@@ -4193,6 +4194,9 @@ def test_source_program_table_names_shipped_sources():
     }
     assert set(module._CHUNKPAR_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("chunkpar_")
+    }
+    assert set(module._CHUNKPAR3_MODULES) == {
+        name for name in module._PROGRAMS if name.startswith("chunkpar3_")
     }
     pending = sorted(
         name
@@ -4216,6 +4220,11 @@ def test_source_program_table_names_shipped_sources():
             module._EXACTPRE_HOST_TEMPLATE,
             module._MAIN_ARGS,
             module._EXACTPRE_SMEM_BYTES,
+        ),
+        "chunkpar3": (
+            module._CHUNKPAR3_HOST_TEMPLATE,
+            module._MAIN_ARGS_CHUNKPAR3,
+            module._CHUNKPAR3_SMEM_BYTES,
         ),
     }
     assert family_host == module._FAMILY_HOST
@@ -4290,9 +4299,10 @@ def test_source_program_table_names_shipped_sources():
         assert "DLDataType{kDLFloat, 16, 1}" in rendered
     # One shared source per physical kernel: twelve fused exact-scan main
     # sources (six ring + six ``_noring``), twelve two-kernel ``exactpre``
-    # main sources and six chunk-parallel main sources plus the one
-    # preprocess kernel, no architecture copies and no orphans.
-    assert len(device_sources) == 31
+    # main sources, six look-back (``chunkpar``) and six three-phase
+    # (``chunkpar3``) chunk-parallel main sources plus the one preprocess
+    # kernel, no architecture copies and no orphans.
+    assert len(device_sources) == 37
     assert sorted(
         path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
     ) == sorted(path.name for path in device_sources)
@@ -4390,14 +4400,18 @@ def test_source_program_loader_builds_one_module_per_arch(monkeypatch, tmp_path)
 
 
 # ---------------------------------------------------------------------------
-# Chunk-parallel program family (``chunkpar_*``): the exact scan's arithmetic
-# in a grid-barrier-separated schedule, selected per call by the calibrated
-# cost rule mirrored from the Cake seed module.
+# Chunk-parallel program families: the look-back program (``chunkpar_*``, the
+# exact scan's arithmetic over item-major tile ranges with a decoupled
+# look-back) and the three-phase program (``chunkpar3_*``, the same arithmetic
+# in grid-barrier-separated phases, bitwise the round-5 exact scan), selected
+# per call by the calibrated cost rule and the measured-region family rule
+# mirrored from the Cake look-back seed module.
 
 _CHUNK_PARALLEL_ENV = "FLASHINFER_CAKE_SSD_CHUNK_PARALLEL"
 _SELECTION_SM_COUNT = 148
 _SELECTION_CAPABILITIES = ((10, 0), (10, 3))
-_CHUNK_PARALLEL_WORKSPACE_ARGS = ("h_map", "s_work", "h_words", "grid_barrier")
+_CHUNK_PARALLEL_WORKSPACE_ARGS = ("h_map", "s_work", "agg_work", "h_words", "grid_barrier")
+_CHUNKPAR3_WORKSPACE_ARGS = ("h_map", "s_work", "h_words", "grid_barrier")
 
 
 @pytest.fixture(autouse=True)
@@ -4436,12 +4450,38 @@ def _batched_selection(
     )
 
 
+def _family(
+    batch,
+    nheads,
+    nchunks,
+    *,
+    varlen=False,
+    sm_count=_SELECTION_SM_COUNT,
+    capability=(10, 0),
+    mode="auto",
+):
+    """``chunk_parallel_family`` of ``batch`` sequences of ``nchunks`` chunks
+    each (one segment per chunk; the varlen form passes the same counts)."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    return module.chunk_parallel_family(
+        nheads=nheads,
+        num_sequences=batch,
+        num_segments=batch * nchunks,
+        nchunks=nchunks,
+        mode_varlen=varlen,
+        sm_count=sm_count,
+        capability=capability,
+        mode=mode,
+    )
+
+
 @pytest.mark.parametrize("capability", _SELECTION_CAPABILITIES, ids=("sm100", "sm103"))
 @pytest.mark.parametrize(
     "batch,nheads,nchunks,expected",
     (
         (1, 8, 16, True),
-        (1, 8, 8, False),
+        (1, 8, 8, True),
         (1, 128, 32, False),
         (1, 8, 256, True),
         (4, 8, 64, True),
@@ -4458,11 +4498,71 @@ def test_source_chunk_parallel_selection_rule(
     scan's by the selection margin: 1 x 2048 tokens x 8 heads (16 chunks,
     128 tiles), the 32768-token few-head prefill, 4 x 8192 x 8 and -- since
     the round-4 re-fit of the constants -- 1 x 2048 x 32 (512 tiles, measured
-    chunk-parallel / exact 0.91) qualify; 8 chunks do not amortise the fixed
-    cost and 128 heads pay for 4096 tiles."""
+    chunk-parallel / exact 0.91) qualify; since the round-6 look-back
+    constants (cp_fixed 23.3 / 21.6 us) 1 x 1024 x 8 (8 chunks, 64 tiles;
+    measured look-back / exact 0.64 on B200, 0.63 on GB300) qualifies too,
+    while 128 heads pay for 4096 tiles."""
 
     selected = _batched_selection(batch, nheads, nchunks, capability=capability)
     assert selected is expected
+
+
+@pytest.mark.parametrize("capability", _SELECTION_CAPABILITIES, ids=("sm100", "sm103"))
+@pytest.mark.parametrize(
+    "batch,nheads,nchunks,varlen,expected",
+    (
+        (1, 8, 16, False, "chunkpar3"),  # perf_batched_1x16: 8 items, 128 tiles
+        (1, 8, 32, False, "chunkpar3"),  # 8 items, 256 tiles
+        (1, 8, 64, False, "chunkpar"),  # perf_batched_1x64: 512 tiles (tie, look-back)
+        (1, 8, 256, False, "chunkpar"),  # perf_batched_1x256: 2048 tiles
+        (4, 8, 16, False, "chunkpar"),  # perf_batched_4x16: 32 items x 16 chunks
+        (4, 8, 64, False, "chunkpar3"),  # perf_batched_4x64: 32 items x 64 chunks
+        (1, 32, 16, False, "chunkpar"),  # cp_b1h32c16: 32 items x 16 chunks, 512 tiles
+        (4, 8, 16, True, "chunkpar"),  # varlen never routes three-phase
+        (1, 16, 8, False, "chunkpar3"),  # b1x1024 @ 16 heads: 128 tiles
+        (1, 16, 8, True, "chunkpar"),  # v1x1024 @ 16 heads: look-back measured faster
+        (1, 16, 16, False, "chunkpar3"),  # b1x2048 @ 16 heads: 256 tiles
+        (1, 16, 32, False, "chunkpar"),  # b1x4096 @ 16 heads: 512 tiles
+        (1, 16, 64, False, "chunkpar"),  # b1x8192 @ 16 heads: 1024 tiles
+        (1, 128, 32, False, "exact"),  # 128 heads: the exact scan
+        (4, 16, 8, False, "exact"),  # 64 items x 8 chunks: exact (prediction)
+    ),
+    ids=(
+        "1x8x16",
+        "1x8x32",
+        "1x8x64",
+        "1x8x256",
+        "4x8x16",
+        "4x8x64",
+        "1x32x16",
+        "v4x8x16",
+        "1x16x8",
+        "v1x16x8",
+        "1x16x16",
+        "1x16x32",
+        "1x16x64",
+        "1x128x32",
+        "4x16x8",
+    ),
+)
+def test_source_chunk_parallel_family_rule(capability, batch, nheads, nchunks, varlen, expected):
+    """The three-way family rule at 148 SMs on both capabilities (CAKE-956
+    round 6 option A): the cost rule decides exact scan vs chunk-parallel
+    (the faster of the two chunk-parallel predictions against the exact
+    scan's), then the measured-region rule picks the chunk-parallel family --
+    the three-phase program for batched calls with at most 256 tiles or with
+    at least 32 items and 64 chunks per item, the look-back otherwise; varlen
+    calls never route to the three-phase program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert module._THREE_PHASE_MAX_TILES == 256
+    assert module._THREE_PHASE_MIN_ITEMS == 32 and module._THREE_PHASE_MIN_CHUNKS == 64
+    family = _family(batch, nheads, nchunks, varlen=varlen, capability=capability)
+    assert family == expected
+    assert _batched_selection(batch, nheads, nchunks, capability=capability) is (expected != "exact") or varlen
+    assert module.three_phase_preferred(
+        work_items=batch * nheads, chunks=nchunks, tiles=batch * nheads * nchunks, mode_varlen=varlen
+    ) is (expected == "chunkpar3") or expected == "exact"
 
 
 def test_source_chunk_parallel_selection_quantities_follow_the_cost_model():
@@ -4500,16 +4600,21 @@ def test_source_chunk_parallel_selection_quantities_follow_the_cost_model():
     )
     # 128 tiles fit the first wave of 148 SMs: the fixed cost alone.
     assert predicted["chunk_parallel"] == pytest.approx(b200["cp_fixed"])
+    three_phase = module._THREE_PHASE_COST_MODEL_US
+    assert set(three_phase) == set(_SELECTION_CAPABILITIES)
+    assert predicted["three_phase"] == pytest.approx(three_phase[(10, 0)]["cp_fixed"])
+    assert small["mode_varlen"] is False
 
-    # The calibration row: 1 x 32768 tokens x 8 heads (constants re-fit on
-    # the round-5 programs; round 4 measured 667 -> 134 us on B200 and
-    # 617 -> 124 us on B300).
+    # The calibration row: 1 x 32768 tokens x 8 heads (exact-scan side: the
+    # round-5 calibration; chunk-parallel side re-fit on the round-6 look-back
+    # program against the exact scan: measured 648 -> 223 us on B200 and
+    # 587 -> 201 us on B300 at 16 heads).
     long_prefill = quantities(8, 256, (10, 0))["predicted_us"]
-    assert long_prefill["exact_scan"] == pytest.approx(659.326)
-    assert long_prefill["chunk_parallel"] == pytest.approx(118.29)
+    assert long_prefill["exact_scan"] == pytest.approx(668.754)
+    assert long_prefill["chunk_parallel"] == pytest.approx(120.77)
     long_prefill = quantities(8, 256, (10, 3))["predicted_us"]
-    assert long_prefill["exact_scan"] == pytest.approx(605.04)
-    assert long_prefill["chunk_parallel"] == pytest.approx(105.61)
+    assert long_prefill["exact_scan"] == pytest.approx(617.45)
+    assert long_prefill["chunk_parallel"] == pytest.approx(108.81)
 
     large = quantities(128, 32, (10, 3))
     b300 = model[(10, 3)]
@@ -4518,6 +4623,9 @@ def test_source_chunk_parallel_selection_quantities_follow_the_cost_model():
     )
     assert large["predicted_us"]["chunk_parallel"] == pytest.approx(
         b300["cp_fixed"] + b300["cp_per_tile"] * (4096 - 148)
+    )
+    assert large["predicted_us"]["three_phase"] == pytest.approx(
+        three_phase[(10, 3)]["cp_fixed"] + three_phase[(10, 3)]["cp_per_tile"] * (4096 - 148)
     )
 
     # 80 work items: halfway between the small and the large per-chunk cost.
@@ -4615,23 +4723,35 @@ def test_source_chunk_parallel_workspace_cap():
 
 
 def test_source_chunk_parallel_mode_override(monkeypatch):
-    """``always`` / ``never`` force the family regardless of the rule; the
+    """``always`` (look-back) / ``three_phase`` / ``never`` (exact scan) force
+    the family regardless of the rule; the
     ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` variable is read on every call,
     trimmed and case-folded, defaults to ``auto`` and rejects any other
     value."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     assert module._CHUNK_PARALLEL_ENV == _CHUNK_PARALLEL_ENV
+    assert module._CHUNK_PARALLEL_MODES == ("auto", "always", "three_phase", "never")
     assert _batched_selection(1, 8, 8, mode="always") is True
+    assert _batched_selection(1, 8, 8, mode="three_phase") is True
     assert _batched_selection(1, 8, 256, mode="never") is False
-    with pytest.raises(ValueError, match="auto, always or never"):
+    assert _family(1, 8, 256, mode="always") == "chunkpar"
+    assert _family(1, 8, 16, mode="always") == "chunkpar"
+    assert _family(1, 8, 256, mode="three_phase") == "chunkpar3"
+    assert _family(1, 128, 32, mode="three_phase") == "chunkpar3"
+    assert _family(1, 8, 256, mode="never") == "exact"
+    with pytest.raises(ValueError, match="auto, always, three_phase, never"):
         _batched_selection(1, 8, 16, mode="sometimes")
+    with pytest.raises(ValueError, match="auto, always, three_phase, never"):
+        _family(1, 8, 16, mode="sometimes")
 
     assert module._chunk_parallel_mode() == "auto"
     for value, expected in (
         ("always", "always"),
         (" Never ", "never"),
         ("AUTO", "auto"),
+        ("three_phase", "three_phase"),
+        (" Three_Phase ", "three_phase"),
     ):
         monkeypatch.setenv(_CHUNK_PARALLEL_ENV, value)
         assert module._chunk_parallel_mode() == expected
@@ -4643,34 +4763,56 @@ def test_source_chunk_parallel_mode_override(monkeypatch):
 def test_source_chunk_parallel_main_arguments_extend_the_exact_order():
     """The chunk-parallel main kernel's parameter order (the generated host's
     positional ABI) is the exact scan's with the state-operand tensor map
-    ``h_map`` after ``out_map`` and the workspace pointers ``s_work``,
-    ``h_words``, ``grid_barrier`` after ``out_native``; each program binds
-    its family's order and host template."""
+    ``h_map`` after ``out_map``, the workspace pointers ``s_work``,
+    ``agg_work``, ``h_words``, ``grid_barrier`` after ``out_native`` and the
+    virtual CTA count ``vcount`` last; each program binds its family's order
+    and host template."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    # The 41 round-5 arguments are the order both families share: the exact
-    # families append the three fused-only inputs, chunk-parallel inserts its
-    # four workspace values and binds no fused input.
+    # The 41 round-5 arguments are the order all families share: the exact
+    # families append the three fused-only inputs; the look-back inserts its
+    # four workspace values and appends ``vcount``, the three-phase program
+    # inserts its three workspace values, and neither binds a fused input.
     fused_only = ("cu_seqlens", "metadata_from_cu_seqlens", "preprocess_status")
     assert module._MAIN_ARGS[-3:] == fused_only
     common = list(module._MAIN_ARGS[:-3])
     expected = list(common)
     expected.insert(expected.index("out_map") + 1, "h_map")
     position = expected.index("out_native") + 1
-    expected[position:position] = ["s_work", "h_words", "grid_barrier"]
+    expected[position:position] = ["s_work", "agg_work", "h_words", "grid_barrier"]
+    expected.append("vcount")
     assert tuple(expected) == module._MAIN_ARGS_CHUNKPAR
     assert len(common) == 41 and len(module._MAIN_ARGS) == 44
-    assert len(module._MAIN_ARGS_CHUNKPAR) == 45
+    assert len(module._MAIN_ARGS_CHUNKPAR) == 47
     assert set(module._MAIN_ARGS_CHUNKPAR) - set(common) == set(
         _CHUNK_PARALLEL_WORKSPACE_ARGS
-    )
+    ) | {"vcount"}
     assert not set(fused_only) & set(module._MAIN_ARGS_CHUNKPAR)
+    # The three-phase program: the exact order with ``h_map`` after ``out_map``
+    # and ``s_work``, ``h_words``, ``grid_barrier`` after ``out_native``; no
+    # fused input either.
+    expected3 = list(common)
+    expected3.insert(expected3.index("out_map") + 1, "h_map")
+    position = expected3.index("out_native") + 1
+    expected3[position:position] = ["s_work", "h_words", "grid_barrier"]
+    assert tuple(expected3) == module._MAIN_ARGS_CHUNKPAR3
+    assert len(module._MAIN_ARGS_CHUNKPAR3) == 45
+    assert set(module._MAIN_ARGS_CHUNKPAR3) - set(common) == set(_CHUNKPAR3_WORKSPACE_ARGS)
+    assert not set(fused_only) & set(module._MAIN_ARGS_CHUNKPAR3)
+    assert set(module._PROGRAMS) >= {
+        f"chunkpar3_{state}_{mode}" for state in ("bf16", "f16", "f32") for mode in ("batched", "varlen")
+    }
     for name, program in module._PROGRAMS.items():
         family = name.split("_")[0]
         assert program.family == family
         if family == "chunkpar":
             assert program.main_args == module._MAIN_ARGS_CHUNKPAR
             assert program.host_template == module._CHUNKPAR_HOST_TEMPLATE
+            assert program.main_smem_bytes == module._CHUNKPAR_SMEM_BYTES
+        elif family == "chunkpar3":
+            assert program.main_args == module._MAIN_ARGS_CHUNKPAR3
+            assert program.host_template == module._CHUNKPAR3_HOST_TEMPLATE
+            assert program.main_smem_bytes == module._CHUNKPAR3_SMEM_BYTES
         else:
             assert program.main_args == module._MAIN_ARGS
             assert program.host_template == (
@@ -4682,8 +4824,8 @@ def test_source_chunk_parallel_main_arguments_extend_the_exact_order():
 
 def test_source_chunk_parallel_launch_orders_its_main_arguments(monkeypatch):
     """``_launch_program`` orders a chunk-parallel program's main values by
-    ``_MAIN_ARGS_CHUNKPAR`` (45 values between the preprocess grid and the
-    main grid) and fails closed when the four workspace values are missing."""
+    ``_MAIN_ARGS_CHUNKPAR`` (47 values between the preprocess grid and the
+    main grid) and fails closed when the workspace values are missing."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     calls = []
@@ -4719,7 +4861,7 @@ def test_source_chunk_parallel_launch_orders_its_main_arguments(monkeypatch):
             0x1234,
         )
     ]
-    assert len(calls[0]) == 27 + 3 + 45 + 3 + 1
+    assert len(calls[0]) == 27 + 3 + 47 + 3 + 1
     exact_values = {name: object() for name in module._MAIN_ARGS}
     with pytest.raises(KeyError, match="h_map"):
         module._launch_program(
@@ -4900,12 +5042,51 @@ def test_source_chunk_parallel_host_template_binds_main_arguments_in_loader_orde
     assert f"TVM_FFI_EMBED_CUBIN({program.main.module});" in rendered
 
 
+def test_source_three_phase_host_template_binds_main_arguments_in_loader_order():
+    """The three-phase chunk-parallel host launcher is the third exported
+    template with the same nine placeholders and namespace scheme; its
+    ``Prepare`` / ``Run`` list ``_PREPROCESS_ARGS`` and ``_MAIN_ARGS_CHUNKPAR3``
+    in order, and its programs' main modules are exported (no placeholder
+    token).  Fails by name until the Cake export delivers the template."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert (
+        Path("generated/host/mamba_ssd_combined_chunk_parallel3_sequence.cpp")
+        == module._CHUNKPAR3_HOST_TEMPLATE
+    )
+    template_path = module._source_dir() / module._CHUNKPAR3_HOST_TEMPLATE
+    assert template_path.is_file(), f"{template_path} is not exported yet"
+    template = template_path.read_text(encoding="utf-8")
+
+    assert _host_prepare_arguments(template, "preprocess") == module._PREPROCESS_ARGS
+    assert _host_prepare_arguments(template, "main") == module._MAIN_ARGS_CHUNKPAR3
+    assert _host_run_arguments(template, "preprocess") == module._PREPROCESS_ARGS
+    assert _host_run_arguments(template, "main") == module._MAIN_ARGS_CHUNKPAR3
+    for placeholder in _HOST_PLACEHOLDERS:
+        assert placeholder in template, placeholder
+    assert "namespace cake_mamba_ssd_combined_host_CAKE_SSD_PROGRAM {" in template
+    assert "stream, CAKE_SSD_MAIN_SMEM_BYTESu)" in template
+    assert "LaunchEx(" not in template
+    assert "PROGRAMMATIC_STREAM_SERIALIZATION" not in template
+    for name, program in module._PROGRAMS.items():
+        if program.family != "chunkpar3":
+            continue
+        module._require_exported(name, program)
+        assert (module._source_dir() / module._DEVICE_DIR / program.main.source).is_file(), name
+    program = module._PROGRAMS["chunkpar3_bf16_varlen"]
+    rendered = module._render_host_source(template, "chunkpar3_bf16_varlen", program)
+    assert not any(placeholder in rendered for placeholder in _HOST_PLACEHOLDERS)
+    assert "namespace cake_mamba_ssd_combined_host_chunkpar3_bf16_varlen {" in rendered
+    assert f"TVM_FFI_EMBED_CUBIN({program.main.module});" in rendered
+
+
 def test_source_chunk_parallel_forward_binds_the_workspace_without_gpu(monkeypatch):
     """Forced chunk-parallel, the runner names the ``chunkpar_*`` program and
-    binds the four workspace values: ``h_map``, the contiguous bf16
+    binds the five workspace values: ``h_map``, the contiguous bf16
     ``[tiles, 64, 128]`` state operand the host wraps in a TMA descriptor;
-    ``s_work``, the f32 ``[tiles, 64, 128]`` state increments; ``h_words``,
-    the u32 view of ``h_map``'s storage; ``grid_barrier``, two u32 words
+    ``s_work``, the f32 ``[tiles, 64, 128]`` state increments; ``agg_work``,
+    the f32 range aggregates of the ``vcount`` virtual CTA ranges; ``h_words``,
+    the u32 view of ``h_map``'s storage; ``grid_barrier``, 1028 u32 words
     allocated zeroed once per device and never reset by the host.  The main
     grid is one CTA per (chunk, head) tile capped at the SM count.  The
     buffers grow only; ``never`` and the rule's own choice fall back to the
@@ -4931,7 +5112,7 @@ def test_source_chunk_parallel_forward_binds_the_workspace_without_gpu(monkeypat
     assert launch["main_grid"] == (128, 1, 1)
     main = launch["main"]
     assert set(main) == set(module._MAIN_ARGS_CHUNKPAR)
-    h_map, s_work, h_words, barrier = (
+    h_map, s_work, agg_work, h_words, barrier = (
         main[key] for key in _CHUNK_PARALLEL_WORKSPACE_ARGS
     )
     assert tuple(h_map.shape) == (128, 64, 128) and h_map.dtype == torch.bfloat16
@@ -4939,8 +5120,12 @@ def test_source_chunk_parallel_forward_binds_the_workspace_without_gpu(monkeypat
     assert tuple(s_work.shape) == (128, 64, 128) and s_work.dtype == torch.float32
     assert tuple(h_words.shape) == (128, 64, 64) and h_words.dtype == torch.uint32
     assert h_words.data_ptr() == h_map.data_ptr()
-    assert tuple(barrier.shape) == (2,) and barrier.dtype == torch.uint32
-    assert barrier.view(torch.int32).tolist() == [0, 0]
+    # sm_103a (the forwarding runner's device): V = 152 ranges.
+    assert main["vcount"] == 152 == module._CHUNK_PARALLEL_VCOUNT_BY_ARCH[(10, 3)]
+    assert tuple(agg_work.shape) == (152 * (64 * 128 + 1),)
+    assert agg_work.dtype == torch.float32
+    assert tuple(barrier.shape) == (1028,) and barrier.dtype == torch.uint32
+    assert not barrier.view(torch.int32).any()
     # One preprocess (segment, head) row per tile.
     assert launch["preprocess"]["delta"].shape[0] == 128
 
@@ -4955,7 +5140,9 @@ def test_source_chunk_parallel_forward_binds_the_workspace_without_gpu(monkeypat
     assert tuple(grown["h_map"].shape) == (2048, 64, 128)
     assert grown["h_words"].data_ptr() == grown["h_map"].data_ptr()
     assert grown["grid_barrier"] is barrier
-    assert barrier.view(torch.int32).tolist() == [0, 7]
+    assert grown["agg_work"] is agg_work
+    assert barrier.view(torch.int32)[:2].tolist() == [0, 7]
+    assert not barrier.view(torch.int32)[2:].any()
     # A shorter call reuses the larger buffers (the kernel addresses only
     # the tiles below its own bound).
     runner.run(*inputs(2048))
@@ -4976,11 +5163,41 @@ def test_source_chunk_parallel_forward_binds_the_workspace_without_gpu(monkeypat
     monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "auto")
     runner.run(*inputs(32768))  # 8 work items on 148 SMs, 256 chunks
     assert calls[-1][0] == "chunkpar_bf16_batched"
-    runner.run(*inputs(1024))  # 8 chunks: the exact scan
+    runner.run(*inputs(512))  # 4 chunks x 8 heads = 32 tiles: the exact scan
     assert calls[-1][0] == "exact_bf16_batched"
+
+    # The three-phase family: the same S/H buffers, its own two-word barrier
+    # (zeroed once per device, distinct from the look-back's 1028 words), no
+    # aggregate workspace or vcount, the same tile-capped grid.
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "three_phase")
+    runner.run(*inputs(2048))
+    name, launch = calls[-1]
+    assert name == runner.last_program_name == "chunkpar3_bf16_batched"
+    assert launch["main_grid"] == (128, 1, 1)
+    main3 = launch["main"]
+    assert set(main3) == set(module._MAIN_ARGS_CHUNKPAR3)
+    assert main3["h_map"] is grown["h_map"] and main3["s_work"] is grown["s_work"]
+    assert main3["h_words"].data_ptr() == main3["h_map"].data_ptr()
+    barrier3 = main3["grid_barrier"]
+    assert tuple(barrier3.shape) == (2,) and barrier3.dtype == torch.uint32
+    assert not barrier3.view(torch.int32).any()
+    assert barrier3 is not barrier
+    assert barrier.view(torch.int32)[:2].tolist() == [0, 7]
+    runner.run(*inputs(32768))
+    name, launch = calls[-1]
+    assert name == "chunkpar3_bf16_batched"
+    assert launch["main_grid"] == (148, 1, 1)
+    assert launch["main"]["grid_barrier"] is barrier3
+    # The rule's own choice: 8 items x 16 chunks = 128 tiles is the
+    # three-phase region, 8 items x 256 chunks the look-back's.
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "auto")
+    runner.run(*inputs(2048))
+    assert calls[-1][0] == runner.last_program_name == "chunkpar3_bf16_batched"
+    runner.run(*inputs(32768))
+    assert calls[-1][0] == "chunkpar_bf16_batched"
     monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "later")
     with pytest.raises(ValueError, match=_CHUNK_PARALLEL_ENV):
-        runner.run(*inputs(1024))
+        runner.run(*inputs(512))
 
 
 def _state_key(state_dtype):
@@ -4989,14 +5206,15 @@ def _state_key(state_dtype):
 
 
 def _forced_runs(monkeypatch, runner, tensors, arguments):
-    """The same call on the forced exact scan (``never``) and the forced
-    chunk-parallel program (``always``), per mode: the cloned output, the
-    cloned final states, the checkpoint-state table the call wrote (a fresh
-    copy of the caller's table per mode; ``None`` without checkpoints) and
-    the program the runner reports."""
+    """The same call on the forced exact scan (``never``), the forced
+    look-back program (``always``) and the forced three-phase program
+    (``three_phase``), per mode: the cloned output, the cloned final states,
+    the checkpoint-state table the call wrote (a fresh copy of the caller's
+    table per mode; ``None`` without checkpoints) and the program the runner
+    reports."""
 
     results = {}
-    for mode in ("never", "always"):
+    for mode in ("never", "always", "three_phase"):
         monkeypatch.setenv(_CHUNK_PARALLEL_ENV, mode)
         call_arguments = dict(arguments)
         checkpoint_states = arguments.get("checkpoint_states")
@@ -5016,11 +5234,12 @@ def _forced_runs(monkeypatch, runner, tensors, arguments):
 # GOAL6 numerical contract 1 (P6), clause GOAL6-A-20261012, as the FlashInfer
 # reading of the former ``chunk-parallel == exact scan`` bitwise assertions:
 # the exact-scan family changed its rounding in round 6 (prescaled decay
-# factor table, one-rounding FMA state update) while the chunk-parallel
-# family is bitwise the round-5 programs, so the chunk-parallel metrics
-# against the fp64 recurrence are the round-5 reading the exact scan is
-# judged against.  K = 8 fixed seeds per shape; the element tolerance of m1
-# is the P6 one and is not loosened.
+# factor table, one-rounding FMA state update) and the look-back program
+# (``chunkpar``) re-associates the carried state of later tile ranges, while
+# the three-phase program (``chunkpar3``) is bitwise the round-5 exact scan,
+# so its metrics against the fp64 recurrence are the round-5 reading the exact
+# scan and the look-back are judged against.  K = 8 fixed seeds per shape;
+# the element tolerance of m1 is the P6 one and is not loosened.
 _P6_SEEDS = tuple(range(8))
 _P6_METRICS = ("m1", "m2", "m3", "m4", "m5")
 
@@ -5065,7 +5284,7 @@ def _assert_p6_clause(candidate, baseline, label):
         exceed = int((cand > base).sum())
         assert cand.mean() <= base.mean() + sd, (
             f"{label}: {metric} mean {cand.mean().item():.6g} over {len(_P6_SEEDS)} "
-            f"seeds exceeds the chunk-parallel (round-5) reading "
+            f"seeds exceeds the three-phase (round-5) reading "
             f"{base.mean().item():.6g} + sd {sd.item():.6g}; per-seed exceedances "
             f"{exceed}; candidate {cand.tolist()}; baseline {base.tolist()}"
         )
@@ -5112,24 +5331,22 @@ def _checkpoint_oracle(constructor, tensors, arguments, *, sequence, start, stop
 
 def _assert_chunk_parallel_p6(monkeypatch, make_case, *, checkpoints=()):
     """The P6 reading of a chunk-parallel == exact-scan test: on the K fixed
-    seeds run the forced exact scan and the forced chunk-parallel program on
-    the same inputs (``make_case(seed)`` -> constructor, tensors, arguments,
-    oracle arguments) and judge the exact scan's metrics against the fp64
-    recurrence with the chunk-parallel program's as the round-5 reading --
-    for the output, the final states and every ``(slot, sequence, start,
-    stop)`` checkpoint."""
+    seeds run the three forced programs on the same inputs (``make_case(seed)``
+    -> constructor, tensors, arguments, oracle arguments) and judge the exact
+    scan's and the look-back program's metrics against the fp64 recurrence
+    with the three-phase program's as the round-5 reading -- for the output,
+    the final states and every ``(slot, sequence, start, stop)`` checkpoint."""
 
-    exact_metrics = {}
-    chunk_parallel_metrics = {}
+    candidates = {"never": {}, "always": {}}
+    baseline = {}
     for seed in _P6_SEEDS:
         constructor, tensors, arguments, oracle_arguments = make_case(seed)
         runner = SSDCombined(**constructor, backend="cake")
         results = _forced_runs(monkeypatch, runner, tensors, arguments)
-        exact, chunk_parallel = results["never"], results["always"]
         y, states = _fp64_reference(constructor, tensors, oracle_arguments)
         readings = [
-            ("out", exact.out, chunk_parallel.out, y),
-            ("final", exact.final, chunk_parallel.final, states),
+            ("out", lambda result: result.out, y),
+            ("final", lambda result: result.final, states),
         ]
         for slot, sequence, start, stop in checkpoints:
             oracle = _checkpoint_oracle(
@@ -5138,18 +5355,19 @@ def _assert_chunk_parallel_p6(monkeypatch, make_case, *, checkpoints=()):
             readings.append(
                 (
                     f"checkpoint[{slot}]",
-                    exact.checkpoint_states[slot],
-                    chunk_parallel.checkpoint_states[slot],
+                    lambda result, slot=slot: result.checkpoint_states[slot],
                     oracle,
                 )
             )
-        for label, exact_value, chunk_parallel_value, oracle in readings:
-            exact_metrics.setdefault(label, []).append(_p6_metrics(exact_value, oracle))
-            chunk_parallel_metrics.setdefault(label, []).append(
-                _p6_metrics(chunk_parallel_value, oracle)
+        for label, pick, oracle in readings:
+            baseline.setdefault(label, []).append(
+                _p6_metrics(pick(results["three_phase"]), oracle)
             )
-    for label in exact_metrics:
-        _assert_p6_clause(exact_metrics[label], chunk_parallel_metrics[label], label)
+            for mode, metrics in candidates.items():
+                metrics.setdefault(label, []).append(_p6_metrics(pick(results[mode]), oracle))
+    for mode, program in (("never", "exact scan"), ("always", "look-back")):
+        for label in baseline:
+            _assert_p6_clause(candidates[mode][label], baseline[label], f"{program} {label}")
 
 
 def _checkpoint_arguments(arguments, tokens, slots):
@@ -5198,13 +5416,14 @@ def _checkpoint_arguments(arguments, tokens, slots):
 def test_cake_ssd_combined_chunk_parallel_is_bitwise_the_exact_scan(
     monkeypatch, state_dtype, varlen, form, lengths
 ):
-    """The chunk-parallel program computes the exact scan's arithmetic in a
-    grid-barrier-separated schedule: forced on, its output and final states
-    meet the P6 clause against the forced exact scan's (round 6: the exact
-    scan rounds differently, bitwise equality is no longer the contract) --
-    batched calls with z, D, dt_bias, softplus, a finite clamp and initial
-    states, and packed-varlen calls in both metadata forms, for every state
-    dtype."""
+    """The chunk-parallel programs compute the exact scan's arithmetic in
+    grid-barrier-separated schedules: forced on, the three-phase program is
+    the round-5 reading and the forced exact scan's and the look-back's
+    output and final states meet the P6 clause against it (round 6: the exact
+    scan rounds differently and the look-back re-associates the carried
+    state, bitwise equality is no longer the contract) -- batched calls with
+    z, D, dt_bias, softplus, a finite clamp and initial states, and
+    packed-varlen calls in both metadata forms, for every state dtype."""
 
     _skip_unless_cake_arch()
     if varlen:
@@ -5222,14 +5441,18 @@ def test_cake_ssd_combined_chunk_parallel_is_bitwise_the_exact_scan(
     results = _forced_runs(monkeypatch, runner, tensors, arguments)
 
     exact, chunk_parallel = results["never"], results["always"]
+    three_phase = results["three_phase"]
     mode = "varlen" if varlen else "batched"
     # forced exact scan: the fused program where its preprocess grid is 0
     # (batched, cu_seqlens form), the two-kernel program in the triple form.
     family = "exactpre" if form == "triple" else "exact"
     assert exact.program == f"{family}_{_state_key(state_dtype)}_{mode}"
     assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
+    assert three_phase.program == f"chunkpar3_{_state_key(state_dtype)}_{mode}"
     assert chunk_parallel.final.dtype == state_dtype
     assert torch.isfinite(chunk_parallel.out.to(torch.float32)).all()
+    assert three_phase.final.dtype == state_dtype
+    assert torch.isfinite(three_phase.out.to(torch.float32)).all()
 
     def make_case(seed):
         if varlen:
@@ -5273,11 +5496,13 @@ def test_cake_ssd_combined_chunk_parallel_is_bitwise_the_exact_scan(
 def test_cake_ssd_combined_chunk_parallel_checkpoints_are_bitwise_the_exact_scan(
     monkeypatch, state_dtype, form, lengths, tokens, slots
 ):
-    """The chunk-parallel program's checkpoint publish is the exact scan's:
-    forced on, the state it writes into each requested slot meets the P6
-    clause against the forced exact scan's (output and final states
-    included; round 6: the exact scan rounds differently, bitwise equality
-    is no longer the contract) and the other slots stay untouched -- batched
+    """The chunk-parallel programs' checkpoint publish is the exact scan's:
+    forced on, the state the three-phase program writes into each requested
+    slot is the round-5 reading, the forced exact scan's and the look-back's
+    meet the P6 clause against it (output and final states included; round
+    6: the exact scan rounds differently and the look-back re-associates the
+    carried state, bitwise equality is no longer the contract) and the other
+    slots stay untouched -- batched
     checkpoints on the chunk grid and at a sequence end, a chunk-unaligned
     checkpoint exposed through the caller's triple and one the cu_seqlens
     preprocess inserts itself, and an on-grid cu_seqlens checkpoint.
@@ -5324,20 +5549,25 @@ def test_cake_ssd_combined_chunk_parallel_checkpoints_are_bitwise_the_exact_scan
     results = _forced_runs(monkeypatch, runner, tensors, arguments)
 
     exact, chunk_parallel = results["never"], results["always"]
+    three_phase = results["three_phase"]
     mode = "batched" if form == "batched" else "varlen"
     family = "exactpre" if form == "triple" else "exact"
     assert exact.program == f"{family}_{_state_key(state_dtype)}_{mode}"
     assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
+    assert three_phase.program == f"chunkpar3_{_state_key(state_dtype)}_{mode}"
     written = {slot for slot in slots if slot >= 0}
     for slot in range(3):
         exact_slot = exact.checkpoint_states[slot]
         chunk_parallel_slot = chunk_parallel.checkpoint_states[slot]
+        three_phase_slot = three_phase.checkpoint_states[slot]
         if slot in written:
             assert torch.isfinite(exact_slot.to(torch.float32)).all(), slot
             assert torch.isfinite(chunk_parallel_slot.to(torch.float32)).all(), slot
+            assert torch.isfinite(three_phase_slot.to(torch.float32)).all(), slot
         else:
             assert torch.isnan(exact_slot).all(), slot
             assert torch.isnan(chunk_parallel_slot).all(), slot
+            assert torch.isnan(three_phase_slot).all(), slot
     # Each written slot's oracle: the fp64 state after the sequence's prefix
     # up to its checkpoint token (batched: a per-row token index; packed
     # varlen: an absolute token index on the token axis).
@@ -5385,6 +5615,53 @@ def test_cake_ssd_combined_auto_selects_chunk_parallel_for_long_prefill(monkeypa
 
     def make_case(seed):
         case = _case(batch=1, seqlen=32768, nheads=8, ngroups=8, seed=seed)
+        return (*case, case[2])
+
+    _assert_chunk_parallel_p6(monkeypatch, make_case)
+
+
+def test_cake_ssd_combined_auto_selects_three_phase_for_a_short_few_head_prefill(monkeypatch):
+    """``auto``: one 2048-token sequence with 8 heads (8 work items, 16
+    chunks, 128 tiles) is the three-phase region of the family rule: the
+    runner selects the ``chunkpar3`` program on the device's own SM count and
+    capability, reports it as ``last_program_name``, and the forced exact
+    scan and look-back of the same call meet the P6 clause against it (the
+    round-5 reading)."""
+
+    _skip_unless_cake_arch()
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    constructor, tensors, arguments = _case(batch=1, seqlen=2048, nheads=8, ngroups=8)
+    device = tensors[0].device
+    assert (
+        module.chunk_parallel_family(
+            nheads=8,
+            num_sequences=1,
+            num_segments=16,
+            nchunks=16,
+            mode_varlen=False,
+            sm_count=torch.cuda.get_device_properties(device).multi_processor_count,
+            capability=tuple(torch.cuda.get_device_capability(device)),
+            mode="auto",
+        )
+        == "chunkpar3"
+    )
+    runner = SSDCombined(**constructor, backend="cake")
+    cake = runner._cake_runner
+    assert cake.last_program_name is None
+
+    out, final = (value.clone() for value in runner.run(*tensors, **arguments))
+
+    assert cake.last_program_name == "chunkpar3_bf16_batched"
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
+    out_exact, final_exact = runner.run(*tensors, **arguments)
+    assert cake.last_program_name == "exact_bf16_batched"
+    assert out_exact.shape == out.shape and final_exact.shape == final.shape
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "always")
+    runner.run(*tensors, **arguments)
+    assert cake.last_program_name == "chunkpar_bf16_batched"
+
+    def make_case(seed):
+        case = _case(batch=1, seqlen=2048, nheads=8, ngroups=8, seed=seed)
         return (*case, case[2])
 
     _assert_chunk_parallel_p6(monkeypatch, make_case)
@@ -5550,7 +5827,9 @@ def test_source_exact_scan_variant_programs():
             assert a.main.module != b.main.module
     assert len([name for name in module._PROGRAMS if name.startswith("exact_")]) == 12
     assert len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 12
-    assert len(module._PROGRAMS) == 30
+    assert len([name for name in module._PROGRAMS if name.startswith("chunkpar_")]) == 6
+    assert len([name for name in module._PROGRAMS if name.startswith("chunkpar3_")]) == 6
+    assert len(module._PROGRAMS) == 36
 
 
 @pytest.mark.parametrize(
