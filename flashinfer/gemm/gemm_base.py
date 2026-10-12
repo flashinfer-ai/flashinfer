@@ -706,8 +706,8 @@ def mm_bf16(
 
     pdl: bool
         Whether to use Programmatic Dependent Launch. Enabled for TGV,
-        TinyGEMM, and CuTeDSL backends. The CuTeDSL M > 32 fallback ignores
-        PDL because cuBLASLt does not expose it. Defaults to ``False``.
+        TinyGEMM, and CuTeDSL backends. The CuTeDSL backend's cuBLASLt
+        fallback ignores PDL because cuBLASLt does not expose it. Defaults to ``False``.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16, fp16, or fp32. FP16 and FP32 output are enabled
@@ -738,8 +738,10 @@ def mm_bf16(
         with at most 64 K tiles; requires CuTe DSL >= 4.7), and
         cluster Split-K otherwise. With autotuning, one call profiles the
         available low-M kernels on their supported buckets and a single
-        cuBLASLt fallback runner on each M > 32 bucket, so a single large-M
-        warm-up tunes both ranges; with bias the direct kernel is excluded.
+        cuBLASLt fallback runner on every bucket (only its heuristic's first
+        algorithm at M <= 32), so a single large-M warm-up tunes both ranges
+        and a low-M bucket where no CuTe-DSL kernel beats cuBLASLt runs
+        cuBLASLt; with bias the direct kernel is excluded.
         Direct and warp Split-K reuse compiled kernels across M for matching
         tactics, while each M bucket still tunes independently.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
@@ -2498,27 +2500,33 @@ def _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability: int):
     cublaslt_runner = get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner()
 
     class CuteDSLCublasltFallbackBf16Runner(_CuteDSLBf16Runner):
-        """cuBLASLt for M > _CUTE_DSL_BF16_MAX_M inside ``backend="cute-dsl"``.
+        """cuBLASLt inside ``backend="cute-dsl"``, for every M.
 
         A distinct class, so its records never mix with ``backend="cublaslt"``
-        tuning. The cache-key extras stay cuBLASLt's (exact shape, compute
-        dtype, bias alignment) because a tactic indexes the heuristic's
-        algorithm list for that exact shape; pdl is ignored, as in cuBLASLt.
+        tuning. A tactic indexes the heuristic's algorithm list for the exact
+        shape, so above ``_CUTE_DSL_BF16_MAX_M`` the cache-key extras stay
+        cuBLASLt's (exact shape, compute dtype, bias alignment). At low M it
+        competes with the CuTe-DSL kernels using only tactic 0, the
+        heuristic's first algorithm for whatever M runs, under the CuTe-DSL
+        extras so one winner serves its whole bucket. pdl is ignored, as in
+        cuBLASLt.
         """
 
         def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
-            a, *_ = inputs
-            return a.shape[0] > _CUTE_DSL_BF16_MAX_M
+            return True
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            if inputs[0].shape[0] <= _CUTE_DSL_BF16_MAX_M:
+                return super().get_cache_key_extras(inputs)
             return cublaslt_runner.get_cache_key_extras(inputs)
 
         def get_valid_tactics(
             self, inputs: List[torch.Tensor], profile: OptimizationProfile
         ) -> List[int]:
-            if not self.supports_inputs(inputs):
-                return []
-            return cublaslt_runner.get_valid_tactics(inputs, profile)
+            tactics = cublaslt_runner.get_valid_tactics(inputs, profile)
+            if inputs[0].shape[0] <= _CUTE_DSL_BF16_MAX_M:
+                return tactics[:1]
+            return tactics
 
         def forward(
             self,
@@ -2538,7 +2546,8 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[_CuteDSLBf16Runne
     """Return the runners of ``backend="cute-dsl"`` for ``inputs``, best first.
 
     Keep every available runner for synthesized buckets: low-M kernels serve
-    M <= 32, and only the cuBLASLt fallback offers tactics above 32.
+    M <= 32, and the cuBLASLt fallback serves every M (the only runner above
+    32).
     Runtime-supported runners come first so ``[0]`` is a valid no-autotune
     default. Within that group, prefer direct where its shape heuristic applies,
     then warp, then cluster Split-K.

@@ -233,6 +233,69 @@ def test_cublaslt_bf16_runner_zero_algos():
         runner._get_algos = original_get_algos
 
 
+def test_mm_bf16_cute_dsl_low_m_cublaslt_winner_serves_bucket(monkeypatch):
+    """A cuBLASLt winner tuned on a low-M bucket serves every M of that bucket."""
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103/SM107.")
+
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.gemm import gemm_base
+
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available.")
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    fallback = gemm_base._cute_dsl_cublaslt_fallback_bf16_gemm_runner(
+        major * 10 + minor
+    )
+    n, k = 256, 1024
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+
+    def fallback_inputs(m):
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+        out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+        return [a, b.T, None, False, out, workspace]
+
+    assert fallback.get_valid_tactics(fallback_inputs(16), None) == [0]
+    assert len(fallback.get_valid_tactics(fallback_inputs(64), None)) >= 1
+    assert fallback.get_cache_key_extras(
+        fallback_inputs(24)
+    ) == fallback.get_cache_key_extras(fallback_inputs(32))
+
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda self, runner, *args, **kwargs: 0.0 if runner is fallback else 1.0,
+    )
+    AutoTuner.get().clear_cache()
+    with autotune(True):
+        mm_bf16(
+            torch.randn((32, k), device="cuda", dtype=torch.bfloat16),
+            b.T,
+            backend="cute-dsl",
+        )
+
+    launched = []
+    original_forward = type(fallback).forward
+
+    def spy_forward(self, inputs, *args, **kwargs):
+        launched.append(inputs[0].shape[0])
+        return original_forward(self, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(type(fallback), "forward", spy_forward)
+    a = torch.randn((24, k), device="cuda", dtype=torch.bfloat16)
+    out = mm_bf16(a, b.T, backend="cute-dsl")
+    AutoTuner.get().clear_cache()
+
+    assert launched == [24]
+    cos_sim = F.cosine_similarity(
+        (a @ b.T).reshape(-1).float(), out.reshape(-1).float(), dim=0
+    )
+    assert cos_sim > 0.99
+
+
 @pytest.mark.parametrize("pdl", [False, True])
 def test_mm_bf16_cute_dsl_direct_fallback(pdl: bool):
     """The no-autotune fallback uses direct in its measured crossover band."""
