@@ -111,8 +111,9 @@ def _compile(m, n, k, dtype, has_alpha, enable_pdl, tactic):
     return build_and_load_cute_dsl_kernel(module, name, compile_fn, key_files)
 
 
-# Small-M autotuner buckets. The native kernels specialize on M, so the first
-# preparation of a shape queues the candidates of all of them behind its own.
+# Powers of two up to the small-M tactic limit, the M values a serving engine
+# usually tunes. The native kernels specialize on M, so the first preparation
+# of a shape queues the candidates of all of them behind its own.
 _AHEAD_MS = (1, 2, 4, 8, 16)
 _AHEAD_DONE: set = set()
 _INFLIGHT: dict = {}
@@ -169,10 +170,12 @@ def _prepare(inputs, tactics, ahead):
         if futures is not None:
             _INFLIGHT.update(zip(keys, futures, strict=True))
     waits = [_INFLIGHT[key_of(m, t)] for t in tactics if key_of(m, t) in _INFLIGHT]
-    for fut in as_completed(waits):
-        err = fut.result()
-        if err is not None:
-            compile_pool.logger.debug(f"Native W4A16 compile worker: {err}")
+    errors = [err for fut in as_completed(waits) if (err := fut.result()) is not None]
+    if errors:
+        compile_pool.logger.warning(
+            f"Native W4A16: {len(errors)} worker compiles failed, compiling "
+            f"them in process. First error: {errors[0]}"
+        )
     for t in tactics:
         _INFLIGHT.pop(key_of(m, t), None)
 
@@ -278,24 +281,30 @@ class NativeBf16Fp4Runner(TunableRunner):
             return prefetch.is_supported(inputs)
         return tactic == -1 or tactic in self._get_tactics(inputs, for_tuning=False)
 
-    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
-        a, b, sf, alpha, out, enable_pdl = inputs
+    def precompile_tactics(self, inputs, tactics, profile, **kwargs):
+        a, b, _, alpha, out, _ = inputs
         m, k = a.shape
-        n = b.shape[0]
-        if not self.validate_tactic(inputs, tactic):
-            raise ValueError("Invalid native W4A16 tactic")
-        if do_preparation and tactic == -1 and m <= 16:
+        if m <= 16:
+            n = b.shape[0]
             can_stage = _can_stage(inputs)
             bf16_alpha = out.dtype == torch.bfloat16 and alpha is not None
             _prepare(
                 inputs,
-                self._get_tactics(inputs, for_tuning=True),
+                [t for t in tactics if t != -1 and len(t) > 1],
                 [
                     (mm, _tactics(mm, n, k, can_stage, bf16_alpha, True))
                     for mm in _AHEAD_MS
                     if mm != m
                 ],
             )
+        return False
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        a, b, sf, alpha, out, enable_pdl = inputs
+        m, k = a.shape
+        n = b.shape[0]
+        if not self.validate_tactic(inputs, tactic):
+            raise ValueError("Invalid native W4A16 tactic")
         if tactic == ("grouped",):
             return grouped.run(a, b, sf, alpha, out, do_preparation=do_preparation)
         if tactic == ("prefetch",):

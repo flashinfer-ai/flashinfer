@@ -296,10 +296,11 @@ def test_autotuned_tactic_matches_reference(m, n, k, alpha_value, out_dtype):
 
 
 def test_parallel_compile_into_empty_cache(monkeypatch, tmp_path):
-    """Kernels compiled by the worker subprocesses, for this bucket and ahead
-    for another, land in the disk cache and match the reference."""
+    """The worker subprocesses compile this bucket's candidates, and another
+    bucket's ahead of it, into the disk cache before profiling needs them."""
     from flashinfer.gemm.kernels.native_bf16_fp4 import compile_pool, runner
     from flashinfer.jit import env as jit_env
+    from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl, _hash_source_files
 
     jit_dir = tmp_path / jit_env.FLASHINFER_JIT_DIR.relative_to(
         jit_env.FLASHINFER_BASE_DIR
@@ -314,22 +315,52 @@ def test_parallel_compile_into_empty_cache(monkeypatch, tmp_path):
     compile_pool.shutdown()
     r = runner.get_runner()
     n, k = 256, 1024
+
+    def on_disk(m, tactic):
+        module, name, compile_fn, key_files = runner._kernel_spec(
+            m, n, k, torch.bfloat16, True, True, tactic
+        )
+        return JitSpecCuteDsl(
+            module, name, compile_fn, _hash_source_files(key_files)
+        ).is_compiled
+
     try:
         for m in (1, 2):
             a, b, sf, weight = make_case(m, n, k, seed=m)
             alpha = torch.tensor([0.5], device="cuda")
             out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
             inputs = [a, b, sf, alpha, out, True]
-            r(inputs, do_preparation=True)
+            tactics = r._get_tactics(inputs, for_tuning=True)
+            assert not r.precompile_tactics(inputs, tactics, None)
+            assert all(on_disk(m, t) for t in tactics)
             ref = (a.float() @ weight.T) * 0.5
-            for tactic in r._get_tactics(inputs, for_tuning=True):
+            for tactic in tactics:
                 out.fill_(float("nan"))
                 r(inputs, tactic=tactic)
                 torch.testing.assert_close(out.float(), ref, atol=2e-3, rtol=8e-3)
-        tuned = {
-            (m, t) for m in (1, 2) for t in runner._tactics(m, n, k, True, True, True)
-        }
-        assert len(list(jit_dir.rglob("*.o"))) >= len(tuned)
+    finally:
+        compile_pool.shutdown()
+
+
+def test_hung_compile_worker_times_out(monkeypatch):
+    """A worker that never answers is killed, so preparation cannot hang."""
+    import sys
+
+    from flashinfer.gemm.kernels.native_bf16_fp4 import compile_pool
+
+    compile_pool.shutdown()
+    monkeypatch.setenv("FLASHINFER_NATIVE_W4A16_COMPILE_WORKERS", "2")
+    monkeypatch.setattr(compile_pool, "JOB_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(
+        compile_pool,
+        "_WORKER_ARGV",
+        (sys.executable, "-c", "import time; time.sleep(600)"),
+    )
+    try:
+        futures = compile_pool.submit([[0]] * 4, "sm_120a")
+        errors = [fut.result(timeout=60) for fut in futures]
+        assert all(errors)
+        assert any("TimeoutError" in err for err in errors)
     finally:
         compile_pool.shutdown()
 

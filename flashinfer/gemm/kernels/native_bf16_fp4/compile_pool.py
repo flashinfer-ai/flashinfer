@@ -8,7 +8,9 @@ cannot run on two threads of one process (its MLIR context is thread-local).
 A few worker subprocesses compile the uncached candidates in parallel and
 export them to the disk cache; this process then loads them from there. The
 workers never touch the GPU (the compile target comes from ``CUTE_DSL_ARCH``)
-and exit once the pool has been idle for ``IDLE_SECONDS``.
+and exit once the pool has been idle for ``IDLE_SECONDS``. A worker that does
+not answer a job within ``JOB_TIMEOUT_SECONDS`` is killed, and its jobs fall
+back to compiling in this process.
 
 Worker protocol: one JSON job ``[m, n, k, f16, has_alpha, enable_pdl, tactic]``
 per stdin line, answered by one stdout line: ``null`` or the error text.
@@ -18,6 +20,7 @@ import contextlib
 import json
 import os
 import queue
+import select
 import subprocess
 import sys
 import threading
@@ -28,7 +31,10 @@ from ....jit.core import logger
 # The autotuner prepares the buckets of a shape back to back; keep the
 # workers (and their imports) alive across them.
 IDLE_SECONDS = 60.0
+# One compile takes seconds; a worker silent for this long is hung.
+JOB_TIMEOUT_SECONDS = 300.0
 
+_WORKER_ARGV = (sys.executable, "-m", __name__)
 _pool = None
 _lock = threading.Lock()
 _disabled = False
@@ -48,7 +54,7 @@ class _Pool:
         env = dict(os.environ, CUTE_DSL_ARCH=arch)
         self.procs = [
             subprocess.Popen(
-                [sys.executable, "-m", __name__],
+                _WORKER_ARGV,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 env=env,
@@ -73,6 +79,9 @@ class _Pool:
             if alive:
                 try:
                     proc.stdin.write(json.dumps(job) + "\n")
+                    if not select.select([proc.stdout], [], [], JOB_TIMEOUT_SECONDS)[0]:
+                        proc.kill()
+                        raise TimeoutError(f"no reply in {JOB_TIMEOUT_SECONDS:.0f} s")
                     reply = proc.stdout.readline()
                     alive = bool(reply)
                     if alive:
