@@ -132,7 +132,7 @@ def main() -> None:
     )
     parser.add_argument("--num-pages", type=int, default=128)
     parser.add_argument("--extra-topk", type=int, default=0)
-    parser.add_argument("--extra-page-size", type=int, choices=(2, 64), default=64)
+    parser.add_argument("--extra-page-size", type=int, choices=(2, 32, 64), default=64)
     parser.add_argument("--warmup-ms", type=int, default=100)
     parser.add_argument("--measure-ms", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)

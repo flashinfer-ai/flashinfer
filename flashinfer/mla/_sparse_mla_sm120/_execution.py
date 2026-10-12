@@ -4,7 +4,10 @@ from collections.abc import Iterator, Mapping
 from types import MappingProxyType
 import functools
 
-from ...jit.mla import gen_sparse_mla_sm120_module
+from ...jit.mla import (
+    gen_sparse_mla_dsv4_nvfp4_cache_ops_module,
+    gen_sparse_mla_sm120_module,
+)
 
 K = TypeVar("K")
 
@@ -15,6 +18,7 @@ class Dsv4Nvfp4FormatInfo(TypedDict):
     bytes_per_token: int
     chunk_width: int
     page_size: int
+    runtime_page: bool
     heads: tuple[int, ...]
     topks: tuple[int, ...]
     extra_page_sizes: tuple[int, ...]
@@ -38,6 +42,12 @@ def get_sparse_mla_sm120_module() -> ExecutionPlan:
 def get_sparse_mla_dsv4_nvfp4_module() -> ExecutionPlan:
     """Compat alias: the NVFP4 route lives in the unified SM120 module."""
     return get_sparse_mla_sm120_module()
+
+
+@functools.cache
+def get_sparse_mla_dsv4_nvfp4_cache_ops_module() -> ExecutionPlan:
+    """Cache pack / append kernels, built for the current device (SM100 / SM103 / SM120 / SM121)."""
+    return gen_sparse_mla_dsv4_nvfp4_cache_ops_module().build_and_load()
 
 
 # NVFP4 exports carry a dsv4_nvfp4_ prefix in the unified module to avoid

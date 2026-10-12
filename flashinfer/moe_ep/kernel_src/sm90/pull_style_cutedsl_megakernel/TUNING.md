@@ -4,7 +4,8 @@ This document collects the performance work on the `sm90_fp8_fp8_bf16_pull_cuted
 backend: the measured microbenchmark results, the benchmark methodology
 behind those numbers, the knob surface as it exists today, and the open
 perf levers.  It is the companion to `SKILL.md` (drop-update workflow) and
-mirrors the structure of the SM100 tree's `TUNING.md`.
+mirrors the structure of the SM100 tree's `TUNING.md`.  The BF16 twin
+(`sm90_bf16_bf16_bf16_pull_cutedsl`) has its own section at the end.
 
 Unless noted otherwise, every measurement comes from a single 4x NVIDIA
 H200 141GB node (EP=4) taken in one session: the two microbenchmark tables
@@ -484,11 +485,11 @@ the drop pins `4.5.0dev0`, and 4.6.0 compiles and runs this SM90 tree.  Whether 
 tree's ">=4.6.1 perf floor" finding applies to the SM90 kernels is
 UNTESTED — worth one A/B run.
 
-**Harness.**  `benchmarks/bench_moe_ep_sm90_mega.py`, one torchrun process
+**Harness.**  `benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py`, one torchrun process
 per GPU:
 
 ```bash
-torchrun --nproc_per_node=4 benchmarks/bench_moe_ep_sm90_mega.py
+torchrun --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py
 ```
 
 Defaults: heuristic launch configs, tokens 8..32768 (13 points) ×
@@ -588,3 +589,498 @@ drop's `*_mega_us` columns are profiler-extracted kernel time only.
 7. **CUDA-graph capture** — the SM100 mega layer's warmup+capture path is
    kernel-agnostic; validate it on sm90_fp8_fp8_bf16_pull_cutedsl (`test_mega_cuda_graph`
    analog) for decode serving.
+
+## SM90 pull-style BF16 (`sm90_bf16_bf16_bf16_pull_cutedsl`)
+
+The native BF16 twin of the FP8 backend, vendored from the kernel repo's
+`moe_hopper_bf16/` (see `SKILL.md` for provenance).  Same tree, shim
+layering, NVSHMEM symmetric-heap model and runtime requirements
+(`sm90_pull_bf16_runtime_requirements` delegates to the FP8 one); config
+class `Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig`, weights via
+`preprocess_sm90_pull_bf16_mega_weights` (gate/up 8-row interleave + K-major
+relayout only; one bf16 tensor per weight leg).
+
+What differs from FP8:
+
+- **No quantization anywhere.**  bf16 dispatch payload (twice the FP8
+  dispatch bytes), BF16 WGMMA FC1/FC2 with fp32 accumulation, bf16 FC1-output
+  staging, bf16 combine wire.  Input staging is a plain copy, so the e2e
+  overhead is validation + copy only.  Shape contract: hidden % 256 == 0,
+  intermediate % 64 == 0.
+- **Tile K = 64** (FP8: 128).  From the drop table's comment: with 2-byte
+  operands a K=128 stage holds two 128 B swizzle atoms and the AB ring gets
+  only half the FP8-era stage count (M64N128: 3 vs 7 stages).  K=64 halves
+  the bytes per stage and doubles the stages, so per-stage WGMMA count,
+  bytes and MMA time match FP8 at K=128, and the N=256 / swap M128N128
+  shapes that only got 2 stages become viable.  The kernel team measured
+  K=64 ahead at 16 / 512 / 1024 tokens and within noise on the
+  padding-bound buckets, and kept the table uniform at K=64.
+- **Heuristic table keyed on tokens only** (`moe_hopper_bf16/heuristic_config.py`,
+  `select_heuristic_config(tokens)`; no scale mode): swap-AB on every
+  bucket, `epi_warps` token-back everywhere, `group_hint` 264 or
+  `ALL_EXPERTS_GROUP` (one scheduler group for all experts) up to 8192, and
+  tail-split pair tasks from 1024 up.  The drop's `BF16_TAIL_SPLIT=1` env
+  turns tail split on for every 2-CTA-token-cluster row.
+- **Knob surface** is the FP8 one minus the FP8-only axes: no `kind`,
+  `fp8_scale_mode`, `fp8_accum_mode`, dequant scales, `dedup_dispatch`,
+  `grouped_token_back` or `combine_format`; `compact_pull_buffer` is not a
+  knob (the BF16 kernel always compacts).  Geometry, `token_back_mode`,
+  `load_balance_mode`, `active_dispatch_warps`, `fc1_store_offload`,
+  `fc1_early_done_publish`, `fold_producer_warps`, `generate_c`,
+  `tail_split_pairs` and the `knobs=` field (dict / `"auto"` / `None`)
+  behave as on FP8 (`shim/tuner_bf16.py`, `shim/autotune_bf16.py`).
+- **Knob cache** is the FP8 tree's `shim/knob_cache.py`; BF16 entries are
+  keyed with `dtype="bf16"` and `fp8_scale_mode="none"`, so they never
+  collide with FP8 or SM100 entries.
+- **Host-side launch contracts** (review fixes, 2026-10-09): an empty rank
+  (0 local tokens) still launches the collective kernel with every
+  `topk_idx == -1` — it serves its experts to the peers' pulls and must
+  reach every cross-rank barrier (the former `num_tokens == 0` early
+  returns in `hopper_bf16_mega_moe` and in the frontend's `run` /
+  `warmup` / `make_launch_thunk` hung the non-empty ranks).  The frontend
+  owns that pad mask: for `num_tokens == 0` it launches the full buffer and
+  fills the routing plane with -1 before every launch, so stale rows a
+  caller left behind are never routed.  With
+  `generate_c` the shim zeroes `fc1_c` before every launch (`run` and the
+  launch thunk), since the kernel writes only live rows and an expert whose
+  count shrinks between launches would otherwise leave stale activations in
+  its pad rows.  The backend checks the two shape bounds separately
+  (hidden % 256, intermediate % 64); intermediate = 64 / 128 / 192 are
+  valid and covered by the single-GPU oracle.
+
+Bench (BF16 twin of the FP8 harness; heuristic launch configs, tokens
+8..32768, drop perf data recipe `--perf-data uniform` = dense positive
+uniform [0, 0.25) bf16, 5 s cooldown; archived to
+`benchmark_data/<date>/<date>_<time>_mega_sm90_bf16_<order>.csv`):
+
+```bash
+torchrun --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_bf16_pull_mega.py
+```
+
+Offline tune (writes the shared knob cache):
+
+```bash
+torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune --dtype sm90_bf16 \
+    --hidden 7168 --intermediate 3072 --num-experts 384 --topk 6 \
+    --max-tokens 8 512 2048
+```
+
+### Microbenchmark results (2026-10-08, heuristic launch configs, max-rank µs)
+
+One 4x NVIDIA H200 141GB node (SM clock locked at 1830 MHz, no other
+tenants), EP=4, DSV4-Pro P03 geometry (384 experts, top-6, hidden
+7168, intermediate 3072, gate_up_clamp 10), `load_balance_mode=atomic_counter`,
+warmup 3 / 20 timed iterations, 5 s cooldown before each series, default
+`--perf-data uniform`.  `compute` is the bare `MegaKernelBackend.compute(output=None)`
+launch (fused kernel + standalone TopkReduce), `e2e` the full `MoEEpLayer.forward`
+(validation + bf16 copy staging + kernel + output copy); both are the slowest
+rank's per-iteration mean.  TFLOPS = FC1+FC2 FLOPs over the slowest rank's
+compute time.  The heuristic config column is the drop table's row
+(`pp` = ping-pong, `tail` = tail-split pair tasks, `grp` = `group_hint`,
+`all` = `ALL_EXPERTS_GROUP`); every row uses swap-AB, K=64 and `epi_warps`.
+The last column is the kernel team's own number for the same row from the
+comments in `moe_hopper_bf16/heuristic_config.py` (their 4x H200 sessions,
+2026-09-09..19, clocks not stated) — a sanity anchor, not a same-session A/B.
+Raw rows: `benchmark_data/20261008/20261008_mega_sm90_bf16_heuristic.csv`
+(local archive, not committed).
+
+| tokens/rank | compute max-rank µs | e2e max-rank µs | TFLOPS (compute) | heuristic config | drop table µs |
+|------------:|--------------------:|----------------:|-----------------:|------------------|--------------:|
+| 8     |  1386.8 |  1441.6 |   4.6 | M128N16 CGA2x1, grp 264 | 1492 |
+| 16    |  2197.8 |  2129.8 |   5.8 | M128N16 CGA1x2, grp 264 | 2173 |
+| 32    |  2613.9 |  2642.4 |   9.7 | M128N8 CGA1x1, grp all | 2859 |
+| 64    |  2932.8 |  2989.2 |  17.3 | M128N8 CGA1x1, grp all | 3300 |
+| 128   |  2964.6 |  3018.6 |  34.2 | M128N8 CGA1x2, grp 264 | 3520 |
+| 256   |  3030.2 |  3089.5 |  67.0 | M128N32 CGA2x1, grp 264 | 3408 |
+| 512   |  3167.8 |  3224.4 | 128.1 | M128N64 CGA1x1, grp all | 3937 |
+| 1024  |  3283.4 |  3343.9 | 247.2 | pp M128N64 CGA1x2, grp 264, tail | 3800 |
+| 2048  |  4082.3 |  4199.1 | 397.7 | pp M128N128 CGA1x2, grp 264, tail | 3983 |
+| 4096  |  6788.8 |  6805.1 | 478.3 | pp M128N128 CGA1x2, grp 264, tail | 6592 |
+| 8192  | 12159.5 | 12256.6 | 534.1 | pp M128N128 CGA1x2, grp 264, tail | 11843 |
+| 16384 | 23476.2 | 23666.5 | 553.2 | pp M128N128 CGA1x2, tail | 22843 |
+| 32768 | 49139.9 | 49379.5 | 528.6 | pp M128N128 CGA1x2, tail | 45576 |
+
+Reading the table: the "drop table µs" column is NOT a same-session
+comparison (different nodes, mostly unlocked 1980 MHz boost clocks, and the
+drop's `mega_us` is the torch-profiler GPU time of the mega kernel alone --
+no TopkReduce, no per-iteration barrier/sync, back-to-back launches -- while
+FI `compute` is a CUDA-event window around `compute()` including the
+standalone TopkReduce and the cute launch path, barrier-aligned per
+iteration).  Re-running the drop's own harness
+(`moe_hopper_bf16/run_token_sweep_benchmark.py`, heuristic mode) on the SAME
+node and clock right after the FI sweep closes the gap:
+
+| tokens/rank | drop `max_mega_us` | drop `topk_us` | drop mega+topk | FI compute max-rank | FI vs drop |
+|------------:|-------------------:|---------------:|---------------:|--------------------:|-----------:|
+| 512   |  3122.6 |  12.8 |  3135.4 |  3167.8 | +1.0% |
+| 2048  |  4092.0 |  48.0 |  4140.0 |  4082.3 | -1.4% |
+| 8192  | 11955.2 | 190.0 | 12145.2 | 12159.5 | +0.1% |
+| 32768 | 47370.3 | 769.2 | 48139.5 | 49139.9 (median 45353.7) | +2.1% |
+
+So the vendored kernel runs at the drop's speed through the FI layer; the
+2-8% deficits against the table comments on 2048+ are the other sessions'
+boost clocks (the drop's own 32768 point measures 47370 µs today versus the
+45576 µs quoted from its 2026-09-17 node).  The 32768 FI mean is lifted by
+a few slow iterations on every rank (median 45354 µs); the e2e minus
+compute gap is 16-240 µs (and within noise at 16 tokens, where e2e came out
+68 µs below compute) — the bf16 staging is a plain copy (the FP8 backend's
+torch-composed quantization staging costs 394 µs at 8192 and 1757 µs at
+32768 tokens), so the staging-kernel lever of the FP8 "Next levers" does not
+apply here.  Against the FP8 per_tensor table above (a different session
+and node, so a ballpark only), BF16 compute is 1.75-2.0x the FP8 time on
+every bucket: twice the operand bytes and half the WGMMA rate on the
+GEMM-bound tail, twice the dispatch bytes on the latency-bound head.
+
+## Humming MXFP4 development and tuning
+
+The `sm90_fp8_mxfp4_bf16_pull_cutedsl` backend combines FP8 E4M3
+activations, packed MXFP4 weights and BF16 output in fused MegaMoE. Humming
+preprocessing runs once for the weights; the compute path retains the packed
+representation and its auxiliary data. For `E_local` experts, hidden width
+`H` and post-SwiGLU width `I`, the raw `PrequantizedMoEWeights` payloads are
+`w13[E_local,2I,H/2]` and `w2[E_local,H,I/2]`, with K32 E8M0 scales shaped
+`[E_local,2I,H/32]` and `[E_local,H,I/32]`. H and I must be multiples of 128.
+Activations carry one FP32 scale per routed row, replicated in the four-column
+communication layout.
+
+Packed weights reduce storage, but the kernel still performs weight decoding,
+auxiliary-data loads, cross-rank activation/output transfers and FC1-to-FC2
+completion tracking. The work below targets those costs and partially filled
+expert tiles. Each experiment names its own source and configuration; the
+historical A/B measurements and the later integrated measurements are separate
+sessions. Archive names refer to retained local benchmark records, not files
+vendored into the kernel tree.
+
+### Combined implementation experiments (2026-09-14)
+
+An early comparison replayed the original scalar-store implementation against
+the best-known implementation and tactic frozen before that experiment. Two
+points with distinct source snapshots were:
+
+| Tokens/rank | Original MXFP4 compute (µs) | Selected MXFP4 compute (µs) | Latency change | Faster pairs |
+|---:|---:|---:|---:|---:|
+| 512 | 1329.576 | 1298.968 | -2.302% | 6/6 |
+| 2048 | 3149.096 | 2980.008 | -5.369% | 6/6 |
+
+Four H200 GPUs on one node, EP4, H7168/I3072/E384, top-k 6, clamp 10,
+dense inputs and block-permutation routing; direct CUDA events, 10 warmups,
+50 iterations, 5-second cooldown and six alternating AB/BA rounds. Compute
+includes MegaMoE and TopkReduce. Each round takes the maximum of the four
+rank medians, then the table takes the median of six rounds. The requested
+SM clock/power settings were 1980 MHz/700 W; actual telemetry was retained.
+Both points used swap-AB M256/N64/K256, CGA2x1x1, group 512, one scheduler
+stage and non-pingpong execution; the implementation strategies varied by
+source snapshot.
+
+The original source was the `mxfp4_pfm_opt_20260909_job4199491/baseline`
+snapshot. The selected implementations were recorded as `full_stack` at
+T512 and `tail_n8` at T2048. These are combined implementation/configuration
+gains, with no isolated attribution to an individual flag. Source hashes,
+frozen tactics and paired samples are retained in
+`mxfp4_original_vs_best_20260914_v1/{policy.json,summary_t512.json,summary_t2048.json}`
+and the per-process source/command records.
+
+### Paired output stores and zero-count updates (2026-09-18)
+
+Paired BF16 output stores reuse row-address calculations and write adjacent
+values together. The MXFP4 path requires M256/N64/K256, complete channel
+clusters (`H % (256 * cluster_m) == 0`), epilogue token-back, BF16 combine,
+and neither dispatch deduplication nor in-kernel top-k reduction. Other
+layouts use scalar stores. Zero-count elision skips zero local count updates
+when dispatch deduplication is disabled; grid rendezvous, empty-expert/rank
+completion publication, system fences and reset remain in place.
+
+The `candidate-v2` diagnostic experiment used the same source with both
+changes disabled, each enabled separately, and both enabled. The fixed
+geometry was swap-AB M256/N64/K256, CGA2x1x1, non-pingpong and epilogue
+token-back. I3072/E384/EP4/top-k 6 and clamp 10 were held constant. Each row
+below is its own same-node four-H200 comparison using the six-round direct
+event protocol above and requested 1980 MHz/700 W settings.
+T2048 used group 512, atomic scheduling, folded producer warps and one active
+dispatch warp; T32 used group 132, static scheduling, unfolded producer warps
+and four active dispatch warps. Both used one scheduler stage, N8 tails off
+and whole-tile readiness. Within each row, all four arms held the complete
+tactic fixed. Compute latency in microseconds:
+
+| H | Tokens/rank | Both off (µs) | Paired stores only (µs) | Zero-count elision only (µs) | Both on (µs) |
+|---:|---:|---:|---:|---:|---:|
+| 7168 | 2048 | 3113.824 | 3051.360 | 3125.480 | 3063.496 |
+| 2048 | 32 | 1058.136 | 1069.680 | 1057.144 | 1066.584 |
+
+Paired stores lowered compute latency by 2.006% at H7168/T2048, winning all
+six pairs, but increased it by 1.091% at H2048/T32, losing all six pairs.
+Zero-count elision alone changed latency by +0.374% and -0.094%, respectively.
+The results do not support a uniform benefit or adding the individual
+percentages together. MXFP4 retains the layout-based policy; it does not add
+a token threshold from these two points. FP8's production defaults for these
+two shared helpers remain disabled.
+
+Raw samples, source identities and full fixed tactics:
+`mxfp4-fp8-generalization-20260918-v1/performance_summary.json`, cohorts
+`performance-v1` and `performance-node2-v1`. Here "both off" means two
+diagnostic controls disabled on that source, not an unmodified main baseline.
+
+### Auxiliary-data movement and completion
+
+The K256 path copies contiguous Humming auxiliary offsets in 512-byte pieces
+per M64 block, or 2048 bytes per M256 tile, instead of issuing the original
+fine-grained copies. This is specific to the MXFP4 data layout. The bulk path
+retains transaction-byte tracking and uses ordinary producer barrier arrivals;
+the non-bulk `cp.async` path retains its own completion tracking. The current
+policy enables bulk copies for non-pingpong K256. The historical combined
+results above do not isolate the contribution of this change.
+
+The completion-protocol version participates in compilation and tuning-cache
+identity, so a winner from an earlier protocol cannot silently replay. The
+MXFP4 input and post-SwiGLU quantizers also retain a finite FP32 multiplier
+for tiny nonzero values and round the inverse scale separately. Numerical
+tests use the effective Humming weights and cover normal-value equality,
+tiny values, repeated workspaces, empty routing and ordinary CUDA Graph replay.
+
+### Tail work and FC1-to-FC2 readiness
+
+Three optional strategies address different parts of the schedule:
+
+- **FC2 N8 tails** (`fc2_tail_n8=True`) use N8 math when an FC2 task has at
+  most eight valid tokens, keeping physical N64 staging and output layout.
+  Eligibility remains H7168, M256/N64/K256, non-pingpong, epilogue token-back,
+  no dispatch deduplication and no in-kernel top-k reduction.
+- **Segmented readiness** (`fc1_ready_mode="k256"`) lets FC2 wait for the
+  four K64 completion bits needed by each K256 segment. FC1 publishes those
+  bits after both data and scales are stored. Its domain remains
+  H7168/I3072/E384/EP4, CGA2x1x1 and the N8-compatible layout, with effective
+  early FC1 publication and no store offload. The 48-bit completion bitmap,
+  counter storage and workspace reset form one protocol.
+- **Tail-pair scheduling** (`tail_split_pairs=True`) reuses the scheduler's
+  pair tasks with CGA1x2x1 and whole-tile FC1 readiness. Packed weights and
+  auxiliary offsets follow that task mapping. It is considered through the
+  normal bounded candidate list, with per-candidate geometry/protocol checks
+  and no exact-model whitelist. N8 and segmented-readiness guards are separate.
+
+Segmented readiness did not improve every tested case. A 2026-09-16
+same-source A/B at T2048 used M256/N64/K256, CGA2x1x1, group 512, one scheduler
+stage, N8 tails enabled, early publication and no store offload. The only
+MXFP4 difference was `fc1_ready_mode`:
+
+| FC1 readiness | Compute (µs) | Change from whole-tile | Faster pairs |
+|:---|---:|---:|---:|
+| `tile` | 2986.760 | — | — |
+| `k256` | 3004.456 | +0.592% | 1/6 |
+
+The source was `mxfp4_final_bench_pr_20260916_v1/final_source`, on four H200
+GPUs with H7168/I3072/E384/EP4, top-k 6 and clamp 10. Dense inputs,
+block-permutation routing, direct events, 10 warmups, 50 iterations and six
+rounds matched the historical protocol; requested clocks/power were
+1980 MHz/700 W. Full tactics, per-rank binary hashes and output comparisons
+are retained in `mxfp4_t2048_ready_ab_20260916_v1/performance_v1/`.
+
+Readiness therefore remains a choice to measure. In the later bounded-list
+comparison below, `k256` was selected at T512 and T1024, while tail pairs
+with whole-tile readiness were selected at T2048 through T32768. Selection
+of a complete tactic does not isolate the speedup of any one field.
+
+### Bounded candidates and cache replay
+
+The normal MXFP4 list starts from 17 deduplicated base tactics drawn from the
+block-permutation and published-exact manifests and two H20-derived anchors.
+For H7168/I3072/E384/EP4, optional N8/readiness choices expand these to 23;
+three large-token configurations and 12 distinct tail-pair neighbors bring
+the total to 38. Every model considers the same bounded extension catalog,
+then filters candidates through tile alignment and strategy eligibility.
+Other shapes can therefore have fewer than 38 candidates. Token capacity
+changes ordering, not the union; the untuned heuristic buckets are unchanged.
+
+Online `knobs="auto"` and offline `flashinfer.moe_ep.tune` use the same
+`hopper_mxfp4_candidates` list. The default public scorer takes
+three warmups and ten synchronized `perf_counter` samples, scores each rank
+by its median and takes the maximum across ranks. `knobs=None` consults the
+cache, then the routing/token-bucket heuristic, without timing. An explicit
+complete tactic bypasses both.
+
+The winner is cached for the candidates measured, including a supplied subset
+or a reordered list. For smoke tests, set `FLASHINFER_MOE_EP_KNOB_CACHE=off`
+or use a separate cache file to preserve existing results. MXFP4 cache matching binds
+device/architecture/SM count, precision, EP size, shape, top-k, clamp, routing
+profile, format/protocol version, executable candidates and a stable cache
+namespace. Historical measurement reports are not loaded at runtime. Token
+capacity uses an exact bucket when available, otherwise the smallest larger
+bucket, otherwise the largest smaller bucket. The per-candidate eligibility
+policy is part of provenance, so widening candidate eligibility causes old
+entries to miss and the next explicit tune to consider the expanded list.
+
+### Three-precision measurements (2026-09-21)
+
+These measurements used reviewed source tree
+`5f216e4aff2beb1b679178706e574d068ae81de8`, based on main
+`6870e3fff46b1e768ad423ea48d286e6f3e250fe`. The integration at commit
+`5a22cbfe40eee83aeff6c64bc65873e4eaf39201`, based on main
+`621fd46e1497a609693d6532ed56325a4d2ce8b2`, retained byte-identical SM90 kernel
+implementation files under `src/` and the same 39 ordered candidate lists for
+this workload (13 token counts times three precisions). Subsequent review fixes
+consolidate the LDSM/conversion helpers, keep MXFP4 FC1 chunking independent
+of the FP8 environment override, and fence converted A registers before WGMMA.
+The fence fix advances the implementation version so earlier tuning records
+miss the cache. The full 13-point performance campaign was not repeated after
+these changes; this table retains the original measured source above.
+
+**Workload and selection.** Four H200 GPUs, EP4, H7168/I3072/E384, top-k 6,
+clamp 10, dense BF16 inputs, block-permutation routing and the benchmark's
+deterministic seeds. At each token count, each precision was selected from
+its existing 38-entry normal list by maximum-rank median compute time among
+candidates passing output checks. The full requested/effective winning
+tactic was then replayed in six fresh processes. Search samples do not enter
+the results. This is a bounded-list comparison, not an exhaustive sweep of
+all legal tactics or an isolated optimization A/B.
+
+**Timing.** Direct CUDA events, 10 warmups, 50 iterations, 5-second cooldown,
+32 assigned CPUs and OMP=4. All three precisions for a token count used the
+same physical node, with order reversed between rounds. Requested clock/power
+settings were 1830 MHz/700 W; actual clocks sometimes dipped and telemetry
+was retained. Token points were distributed across nodes with driver versions
+595.58.03 and 615.71.09. Comparisons between precisions are within a token
+point; the table does not assume identical sustained clocks across nodes.
+
+Compute times native `backend.compute` on prestaged inputs, including
+TopkReduce. Its statistic is the median of six rounds of the maximum of four
+rank medians. E2E times native `layer.forward` and follows the benchmark CSV's
+mean-of-rank-medians convention, then takes the median of six rounds. Weight
+preprocessing is outside both timed regions. These aggregation rules differ;
+an E2E row is not a maximum-rank statistic.
+
+**Compute latency (µs).**
+
+| Tokens/rank | FP8 blockwise | FP8 per-tensor | MXFP4 |
+|---:|---:|---:|---:|
+| 8 | 736.808 | 729.936 | 480.776 |
+| 16 | 1078.328 | 1068.216 | 671.664 |
+| 32 | 1344.160 | 1334.128 | 835.704 |
+| 64 | 1480.016 | 1470.448 | 921.112 |
+| 128 | 1541.272 | 1523.408 | 949.424 |
+| 256 | 1582.560 | 1555.040 | 1047.360 |
+| 512 | 1689.112 | 1625.584 | 1275.464 |
+| 1024 | 1778.672 | 1729.112 | 1714.552 |
+| 2048 | 2618.920 | 2237.216 | 2940.992 |
+| 4096 | 4552.544 | 3662.144 | 5241.432 |
+| 8192 | 8377.560 | 6688.640 | 9909.984 |
+| 16384 | 16015.416 | 12622.952 | 19241.640 |
+| 32768 | 31320.056 | 24693.808 | 38676.664 |
+
+**End-to-end latency (µs).**
+
+| Tokens/rank | FP8 blockwise | FP8 per-tensor | MXFP4 |
+|---:|---:|---:|---:|
+| 8 | 922.662 | 834.536 | 630.274 |
+| 16 | 1264.956 | 1170.370 | 816.756 |
+| 32 | 1529.176 | 1438.892 | 983.286 |
+| 64 | 1675.062 | 1576.062 | 1081.408 |
+| 128 | 1730.764 | 1631.078 | 1103.444 |
+| 256 | 1758.928 | 1667.904 | 1201.290 |
+| 512 | 1879.246 | 1730.584 | 1423.088 |
+| 1024 | 1979.900 | 1837.530 | 1859.116 |
+| 2048 | 2825.442 | 2331.908 | 3063.600 |
+| 4096 | 4860.190 | 3817.610 | 5530.876 |
+| 8192 | 9012.780 | 6992.558 | 10450.548 |
+| 16384 | 17391.874 | 13377.760 | 20432.704 |
+| 32768 | 34411.570 | 26254.312 | 40590.652 |
+
+MXFP4 has lower compute and E2E latency at T8 through T512 in this workload.
+At T1024, compute is close to FP8 per-tensor while MXFP4 E2E is higher than
+per-tensor. At T2048 through T32768, both FP8 modes are faster. These are
+precision/backend comparisons; they do not measure a same-precision
+before/after gain.
+
+**Selected MXFP4 tactics.** The table highlights the schedule fields; exact
+replay also requires the communication and publication controls in the
+complete requested tactic.
+
+| Tokens/rank | MMA M,N,K | Cluster M,N,K | Group | Stages | Tail pairs | N8 tail | FC1 ready |
+|---:|:---|:---|---:|---:|:---:|:---:|:---|
+| 8 | 256,16,256 | 2,1,1 | 132 | 1 | False | False | tile |
+| 16 | 256,16,256 | 2,1,1 | 512 | 1 | False | False | tile |
+| 32 | 256,16,256 | 2,1,1 | 512 | 2 | False | False | tile |
+| 64 | 256,16,256 | 2,1,1 | 132 | 1 | False | False | tile |
+| 128 | 256,16,256 | 2,1,1 | 132 | 1 | False | False | tile |
+| 256 | 256,32,128 | 1,1,1 | 330 | 1 | False | False | tile |
+| 512 | 256,64,256 | 2,1,1 | 512 | 1 | False | True | k256 |
+| 1024 | 256,64,256 | 2,1,1 | 512 | 1 | False | True | k256 |
+| 2048 | 256,64,256 | 1,2,1 | 512 | 1 | True | True | tile |
+| 4096 | 256,64,256 | 1,2,1 | 512 | 1 | True | True | tile |
+| 8192 | 256,64,256 | 1,2,1 | 528 | 1 | True | True | tile |
+| 16384 | 256,64,256 | 1,2,1 | 528 | 1 | True | True | tile |
+| 32768 | 256,64,256 | 1,2,1 | 512 | 1 | True | False | tile |
+
+Archive: `mxfp4-pr4843-review-fixes-20260921-v1/reports/` contains
+`performance.csv`, `performance-v2.json` and `winning-tactics.json`, with
+all rounds, per-point ranges, full requested/effective tactics, command
+provenance and clock observations.
+
+### Reproducing tuning and direct benchmark runs
+
+From an installed checkout, select a fresh cache path and populate it with
+the supported public MXFP4 tuner:
+
+```bash
+export FLASHINFER_MOE_EP_KNOB_CACHE=/tmp/mxfp4-tuning-cache.json
+torchrun --standalone --nproc_per_node=4 -m flashinfer.moe_ep.tune \
+  --dtype sm90_mxfp4 --routing-profile block_permutation_v1 \
+  --hidden 7168 --intermediate 3072 --num-experts 384 --topk 6 \
+  --max-tokens 8 16 32 64 128 256 512 1024 2048 4096 8192 16384 32768 \
+  --gate-up-clamp 10 --warmup-iters 3 --timed-iters 10 --seed 0
+```
+
+Use a new filename if that path already contains results. Omit `--live-tokens`
+so each capacity is measured at its full token count; the persistent cache
+has no independent live-token axis. Retain the same cache environment variable
+for the benchmark:
+
+```bash
+OMP_NUM_THREADS=4 torchrun --standalone --nproc_per_node=4 \
+  benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py \
+  --backend sm90_fp8_mxfp4_bf16_pull_cutedsl --scale-mode mxfp4_hybrid \
+  --mxfp4-tactic-source cache_or_heuristic \
+  --hidden 7168 --intermediate 3072 --num-experts 384 --top-k 6 \
+  --tokens 8,16,32,64,128,256,512,1024,2048,4096,8192,16384,32768 \
+  --gate-up-clamp 10 --routing-mode block_permutation --no-sparse-data \
+  --warmup 10 --iters 50 --cooldown-s 5 --output-csv mxfp4-benchmark.csv
+```
+
+Check the `runtime_tactic` JSON column: it contains the effective configuration;
+a cache miss uses the heuristic. For example, extract the T2048 configuration
+and replay it with the same workload and timing flags:
+
+```bash
+mxfp4_tactic=$(python - <<'PYCODE'
+import csv
+with open("mxfp4-benchmark.csv", newline="") as stream:
+    row = next(row for row in csv.DictReader(stream)
+               if row["tokens_per_rank"] == "2048" and row["status"] == "pass")
+print(row["runtime_tactic"])
+PYCODE
+)
+OMP_NUM_THREADS=4 torchrun --standalone --nproc_per_node=4 \
+  benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py \
+  --backend sm90_fp8_mxfp4_bf16_pull_cutedsl --scale-mode mxfp4_hybrid \
+  --mxfp4-knobs-json "$mxfp4_tactic" \
+  --hidden 7168 --intermediate 3072 --num-experts 384 --top-k 6 --tokens 2048 \
+  --gate-up-clamp 10 --routing-mode block_permutation --no-sparse-data \
+  --warmup 10 --iters 50 --cooldown-s 5 --output-csv mxfp4-replay.csv
+```
+
+FP8 uses `--fp8-knobs-json` with its own complete `runtime_tactic` object.
+Manual tactic flags cannot be combined with JSON replay. Use a CSV reader
+when extracting records: the JSON field contains quoted commas.
+
+The benchmark preserves the original FP8 CSV prefix and its statistics.
+`compute_max_rank_median_us` reports the maximum rank median separately;
+`routing_mode`, `routing_profile`, `routing_seed` and `compute_launch_mode`
+identify the workload. Configuration is recorded once in `runtime_tactic`.
+Compilation is absorbed by warmup; no separate cold-call timing is collected.
+The public tuner's synchronized host-clock score is different from the
+event-based selection used for the table. These commands reproduce public
+tuning and direct benchmark runs; reproducing the table's selection and
+six-process aggregation requires the archived campaign driver and its complete
+tactics. Do not treat one cache-or-heuristic run as that full campaign.
+
+For controlled comparisons, hold shape, routing, data, timed regions and
+complete tactics fixed, then run the six formal processes independently of
+selection. Record source identity and actual clocks with the samples.

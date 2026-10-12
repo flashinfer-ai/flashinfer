@@ -17,6 +17,7 @@ from typing import Literal, Optional, Sequence
 
 import torch
 import functools
+from typing_extensions import deprecated
 
 from ..api_logging import flashinfer_api
 
@@ -907,9 +908,20 @@ def moe_a2a_get_workspace_size_per_rank(
     )
 
 
+@deprecated(
+    "MoeAlltoAll is deprecated; use flashinfer.moe_ep.NVLinkOneSidedAlltoAll "
+    "(CakeAlltoAll for backend='cake'). Its implementation will "
+    "move into those classes."
+)
 class MoeAlltoAll:
     """
     Manages MoE All-to-All operations with proper workspace allocation and synchronization.
+
+    .. deprecated:: 0.7.1
+        Use :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll`
+        (:class:`flashinfer.moe_ep.CakeAlltoAll` for
+        ``backend="cake"``). The implementation of this class will move into
+        them; they will no longer wrap it.
 
     This class provides the throughput-optimized backend that supports multiple payloads
     per collective operation, explicit dispatch/combine phases, and workspace-backed tensors.

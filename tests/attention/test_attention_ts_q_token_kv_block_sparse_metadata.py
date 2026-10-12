@@ -35,12 +35,12 @@ from flashinfer.decode import (
 )
 
 
-# The sparse attention specialization targets SM100/SM103. Metadata-only tests
+# The sparse attention specialization targets SM100/SM103/SM107. Metadata-only tests
 # below remain CUDA-wide; even workspace sizing can enter the attention resolver.
 _REQUIRES_PRIMS_TS_ATTENTION = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="QToken-KvBlock-Sparse-Attention tests require SM100 or SM103",
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="QToken-KvBlock-Sparse-Attention tests require SM100, SM103 or SM107",
 )
 
 

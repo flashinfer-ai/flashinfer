@@ -15,6 +15,8 @@
 """High-throughput MNNVL protocol."""
 
 from .protocol import (
+    HT_ALL_REDUCE_GB300_H3584,
+    HT_FINALIZE_GB300_H3584_K16,
     HTAllReduceTuning,
     HTFinalizeTuning,
     HT_ALL_REDUCE_GB300_TP16_H8192,
@@ -29,6 +31,8 @@ from .protocol import (
 )
 
 __all__ = [
+    "HT_ALL_REDUCE_GB300_H3584",
+    "HT_FINALIZE_GB300_H3584_K16",
     "HT_ALL_REDUCE_GB300_TP8_H8192",
     "HT_ALL_REDUCE_GB300_TP16_H8192",
     "HT_FINALIZE_GB300_TP8_H8192_K10",

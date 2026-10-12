@@ -11,10 +11,16 @@ from typing import ClassVar, Optional, Union, cast
 
 import torch
 
+from ....autotuner import TunableRunner
 from ....jit.mla import gen_mla_module
 from ....utils import check_shape_dtype_device, get_compute_capability
-from ._capabilities import MLAPlanCapabilities, plan_capability_rejection_reason
+from ._capabilities import (
+    MLAPlanCapabilities,
+    _BackendPlanUnsupportedError,
+    plan_capability_rejection_reason,
+)
 from .._planning import _MLAPlanArguments, _audit_plan_from_wrapper_arguments
+from .._contracts import _resolve_structural_mla_input
 
 
 def _get_compute_capability(device: torch.device):
@@ -103,12 +109,102 @@ def _validate_cutlass_launch_tensors(
             )
 
 
+def _validate_cutlass_planned_page_size(page_size):
+    if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0:
+        raise ValueError(f"page_size must be a positive int, got {page_size!r}.")
+    if page_size > 128 or 128 % page_size:
+        raise _BackendPlanUnsupportedError(
+            f"cutlass backend requires page_size to divide 128, got {page_size}."
+        )
+    return 128 // page_size
+
+
+def _validate_cutlass_plan_contract(
+    *,
+    device,
+    num_heads,
+    head_dim_ckv,
+    head_dim_kpe,
+    page_size,
+    sm_scale,
+    q_data_type,
+    kv_data_type,
+    output_dtype,
+    output_scale,
+    use_profiler,
+):
+    for name, value, minimum in (
+        ("num_heads", num_heads, 1),
+        ("head_dim_ckv", head_dim_ckv, 1),
+        ("head_dim_kpe", head_dim_kpe, 0),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}.")
+    if not isinstance(sm_scale, (float, int)) or isinstance(sm_scale, bool):
+        raise TypeError("sm_scale must be a finite number.")
+    if not math.isfinite(sm_scale):
+        raise ValueError("sm_scale must be finite.")
+    for name, dtype in (("q_data_type", q_data_type), ("kv_data_type", kv_data_type)):
+        if not isinstance(dtype, torch.dtype):
+            raise TypeError(f"{name} must be a torch.dtype, got {dtype!r}.")
+    if use_profiler:
+        raise _BackendPlanUnsupportedError(
+            "use_profiler is not supported by the cutlass backend."
+        )
+    if num_heads != 128:
+        raise _BackendPlanUnsupportedError(
+            f"Expected 128 heads for cutlass backend, got {num_heads}."
+        )
+    if head_dim_ckv != 512 or head_dim_kpe != 64:
+        raise _BackendPlanUnsupportedError(
+            "cutlass backend expects head_dim_ckv=512 and head_dim_kpe=64, "
+            f"got {head_dim_ckv=} and {head_dim_kpe=}."
+        )
+    if q_data_type not in (torch.float16, torch.bfloat16):
+        raise _BackendPlanUnsupportedError(
+            "cutlass backend expects q_data_type to be torch.float16 or "
+            f"torch.bfloat16, got {q_data_type}."
+        )
+    if kv_data_type != q_data_type:
+        raise _BackendPlanUnsupportedError(
+            "cutlass backend expects kv_data_type to match q_data_type, "
+            f"got {kv_data_type=} and {q_data_type=}."
+        )
+    if output_scale == "none":
+        if output_dtype != q_data_type:
+            raise _BackendPlanUnsupportedError(
+                "cutlass unscaled output_dtype must match q_data_type, got "
+                f"{output_dtype} and {q_data_type}."
+            )
+    elif output_scale == "per-tensor":
+        if output_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            raise _BackendPlanUnsupportedError(
+                "cutlass per-tensor output scaling requires an FP8 "
+                f"output_dtype, got {output_dtype}."
+            )
+    else:
+        raise ValueError(f"unsupported cutlass output_scale {output_scale!r}.")
+    expected_sm_scale = 1.0 / math.sqrt(128 + head_dim_kpe)
+    if not math.isclose(sm_scale, expected_sm_scale, rel_tol=1e-5, abs_tol=1e-8):
+        raise _BackendPlanUnsupportedError(
+            "cutlass backend uses a fixed MLA softmax scale of "
+            f"{expected_sm_scale}, got {sm_scale}."
+        )
+    _validate_cutlass_planned_page_size(page_size)
+    major, minor = _get_compute_capability(device)
+    if major not in (10, 11):
+        raise _BackendPlanUnsupportedError(
+            "cutlass backend supports only compute capability major versions "
+            f"10 and 11, got SM{major}{minor}."
+        )
+
+
 @functools.lru_cache(maxsize=1)
 def get_mla_module():
     return gen_mla_module().build_and_load()
 
 
-class _BatchMLAPagedAttentionCutlassBackend:
+class _BatchMLAPagedAttentionCutlassBackend(TunableRunner):
     _plan_capabilities: ClassVar[MLAPlanCapabilities] = MLAPlanCapabilities(
         backend_name="cutlass",
         lse_modes=frozenset({"none"}),
@@ -125,13 +221,42 @@ class _BatchMLAPagedAttentionCutlassBackend:
         self.device = float_workspace_buffer.device
 
     @classmethod
+    def preflight_plan_from_wrapper(cls, args: _MLAPlanArguments) -> None:
+        dense = args.native_dense()  # Preserve errors from malformed caller metadata.
+        if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
+            raise _BackendPlanUnsupportedError(reason)
+        _validate_cutlass_plan_contract(
+            device=args._float_workspace_buffer.device,
+            num_heads=args.num_heads,
+            head_dim_ckv=args.head_dim_ckv,
+            head_dim_kpe=args.head_dim_kpe,
+            page_size=args.page_size,
+            sm_scale=args.sm_scale,
+            q_data_type=args.q_data_type,
+            kv_data_type=args.kv_data_type,
+            output_dtype=args.output_dtype,
+            output_scale=args.output_scale,
+            use_profiler=args.use_profiler,
+        )
+        offsets = dense.cum_seq_lens_q.to(device="cpu", dtype=torch.int64)
+        q_lens = offsets[1:] - offsets[:-1]
+        if q_lens.numel() == 0 or bool(torch.any(q_lens != 1).item()):
+            raise _BackendPlanUnsupportedError(
+                "cutlass backend requires exactly one query token per request."
+            )
+        # Causal and noncausal Q=1 have the same bottom-right mask. Capacity
+        # max_q_len may exceed one; only actual offset differences matter.
+        args.dense(
+            table_width_alignment=_validate_cutlass_planned_page_size(args.page_size)
+        )
+
+    @classmethod
     @_audit_plan_from_wrapper_arguments
     def plan_from_wrapper(
         cls, args: _MLAPlanArguments
     ) -> "_BatchMLAPagedAttentionCutlassBackend":
-        if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
-            raise ValueError(reason)
-        table_width_alignment = _validate_cutlass_page_size(args.page_size)
+        cls.preflight_plan_from_wrapper(args)
+        table_width_alignment = _validate_cutlass_planned_page_size(args.page_size)
         dense = args.dense(table_width_alignment=table_width_alignment)
         batch_size = dense.cum_seq_lens_q.shape[0] - 1
         backend = cls(args._float_workspace_buffer)
@@ -174,56 +299,19 @@ class _BatchMLAPagedAttentionCutlassBackend:
         # ---------------------------------------------------------------------------
         # Validate the CUTLASS plan contract
         # ---------------------------------------------------------------------------
-        if use_profiler:
-            raise ValueError("use_profiler is not supported by the cutlass backend.")
-        if causal:
-            raise ValueError("causal=True is not supported by the cutlass backend.")
-        if num_heads != 128:
-            raise ValueError(
-                f"Expected 128 heads for cutlass backend, got {num_heads}."
-            )
-        if head_dim_ckv != 512 or head_dim_kpe != 64:
-            raise ValueError(
-                "cutlass backend expects head_dim_ckv=512 and head_dim_kpe=64, "
-                f"got {head_dim_ckv=} and {head_dim_kpe=}."
-            )
-        if q_data_type not in (torch.float16, torch.bfloat16):
-            raise ValueError(
-                "cutlass backend expects q_data_type to be torch.float16 or "
-                f"torch.bfloat16, got {q_data_type}."
-            )
-        if kv_data_type != q_data_type:
-            raise ValueError(
-                "cutlass backend expects kv_data_type to match q_data_type, "
-                f"got {kv_data_type=} and {q_data_type=}."
-            )
-        if output_scale == "none":
-            if output_dtype != q_data_type:
-                raise ValueError(
-                    "cutlass unscaled output_dtype must match q_data_type, got "
-                    f"{output_dtype} and {q_data_type}."
-                )
-        elif output_scale == "per-tensor":
-            if output_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
-                raise ValueError(
-                    "cutlass per-tensor output scaling requires an FP8 "
-                    f"output_dtype, got {output_dtype}."
-                )
-        else:
-            raise ValueError(f"unsupported cutlass output_scale {output_scale!r}.")
-        expected_sm_scale = 1.0 / math.sqrt(128 + head_dim_kpe)
-        if not math.isclose(sm_scale, expected_sm_scale, rel_tol=1e-5, abs_tol=1e-8):
-            raise ValueError(
-                "cutlass backend uses a fixed MLA softmax scale of "
-                f"{expected_sm_scale}, got {sm_scale}."
-            )
-        _validate_cutlass_page_size(page_size)
-        major, minor = _get_compute_capability(self.device)
-        if major not in (10, 11):
-            raise ValueError(
-                "cutlass backend supports only compute capability major versions "
-                f"10 and 11, got SM{major}{minor}."
-            )
+        _validate_cutlass_plan_contract(
+            device=self.device,
+            num_heads=num_heads,
+            head_dim_ckv=head_dim_ckv,
+            head_dim_kpe=head_dim_kpe,
+            page_size=page_size,
+            sm_scale=sm_scale,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            output_dtype=output_dtype,
+            output_scale=output_scale,
+            use_profiler=use_profiler,
+        )
 
         # ---------------------------------------------------------------------------
         # Publish the validated plan state
@@ -385,6 +473,92 @@ class _BatchMLAPagedAttentionCutlassBackend:
             output_scale,
         )
         return out
+
+    # Autotuning support for the current wrapper plan.
+
+    def __hash__(self):
+        return hash(type(self))
+
+    def configure_tuning(self, *, cache_key: tuple, run_options: dict) -> None:
+        """Bind immutable options; request tensors stay in forward's inputs."""
+        if any(isinstance(value, torch.Tensor) for value in run_options.values()):
+            raise TypeError("Planned tuning options must not contain tensors.")
+        self._planned_tuning_key = cache_key
+        self._planned_run_options = dict(run_options)
+
+    def get_valid_tactics(self, inputs, profile):
+        # A packed representation can still be strided. CUTLASS uses compact
+        # strides, while other candidates can execute that valid MLA workload.
+        widths = (self._head_dim_ckv, self._head_dim_kpe)
+        query = _resolve_structural_mla_input(
+            inputs[0],
+            desired="packed",
+            widths=widths,
+            name="query",
+            expected_dtype=self._q_data_type,
+            planned_dtype_name="q_data_type",
+            split_leaf_names=("q_nope", "q_pe"),
+        )
+        cache = _resolve_structural_mla_input(
+            inputs[1],
+            desired="packed",
+            widths=widths,
+            name="KV cache",
+            expected_dtype=self._kv_data_type,
+            planned_dtype_name="kv_data_type",
+            split_leaf_names=("ckv_cache", "kpe_cache"),
+        )
+        _check_cutlass_shape(query, cache, self._kv_len, self._page_table)
+        out = inputs[2]
+        if out is not None:
+            check_shape_dtype_device(
+                out,
+                (*query.shape[:-1], self._head_dim_ckv),
+                self._output_dtype,
+                self.device,
+                "out",
+            )
+        tensors = (query, cache) if out is None else (query, cache, out)
+        for tensor in tensors:
+            if tensor.device != self.device:
+                raise ValueError(
+                    "CUTLASS launch tensors must be on the workspace device."
+                )
+        if not all(tensor.is_contiguous() for tensor in tensors):
+            return []
+        return [-1]
+
+    def get_cache_key_extras(self, inputs):
+        return ("planned", self._planned_tuning_key)
+
+    def forward(
+        self,
+        inputs,
+        tactic: int = -1,
+        do_preparation: bool = False,
+        run_options=None,
+        **kwargs,
+    ):
+        if tactic != -1:
+            raise ValueError(f"Unsupported CUTLASS MLA tactic: {tactic!r}.")
+        query, kv_cache, out, lse, sinks = inputs[:5]
+        widths = (self._head_dim_ckv, self._head_dim_kpe)
+        return self.run_from_wrapper(
+            query=_resolve_structural_mla_input(
+                query, desired="packed", widths=widths, name="query"
+            ),
+            kv_cache=_resolve_structural_mla_input(
+                kv_cache, desired="packed", widths=widths, name="KV cache"
+            ),
+            out=out,
+            lse=lse,
+            sinks=sinks,
+            profiler_buffer=None,
+            kv_len=None,
+            page_table=None,
+            ckv_scale_arr=None,
+            **(self._planned_run_options if run_options is None else run_options),
+        )
 
     @classmethod
     def run_planless(

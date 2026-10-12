@@ -66,6 +66,10 @@ MAX_VIOLATIONS_FLOOR = 4
 # One row, one partial pair of 128-row tiles (129 -> 2 tiles, 257 -> 3 tiles padded to 4) and the
 # production Ulysses-8 token count.
 M_VALUES = [1, 129, 257, 4824]
+# Engine modulation projection: AdaLN tables are column chunks of a [rows, 6 * 5376] buffer with
+# rows = 3 x unique timesteps (3 or 6 in the t2va pipeline); 12 exercises a row count above 9.
+ENGINE_TABLE_CHUNKS = 6
+ENGINE_TABLE_ROWS = [3, 6, 12]
 REFERENCE_CHUNK_ROWS = 1024
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
@@ -108,20 +112,45 @@ def make_model(device: torch.device, seed: int = 4611) -> Dict[str, torch.Tensor
     }
 
 
+def make_engine_model(
+    model: Dict[str, torch.Tensor],
+    table_rows: int,
+    device: torch.device,
+    seed: int = 4612,
+) -> Dict[str, torch.Tensor]:
+    """``model`` with its AdaLN tables replaced by column chunks 0 (shift) and 1 (scale) of a
+    ``[table_rows, 6 * 5376]`` modulation projection: row stride ``6 * 5376``, not contiguous."""
+    g = torch.Generator(device=device)
+    g.manual_seed(seed + table_rows)
+    proj = torch.empty(
+        (table_rows, ENGINE_TABLE_CHUNKS * MINIMAX_H3_HIDDEN),
+        dtype=torch.bfloat16,
+        device=device,
+    ).uniform_(-0.05, 0.05, generator=g)
+    shift = proj[:, :MINIMAX_H3_HIDDEN]
+    scale = proj[:, MINIMAX_H3_HIDDEN : 2 * MINIMAX_H3_HIDDEN]
+    assert scale.stride() == (ENGINE_TABLE_CHUNKS * MINIMAX_H3_HIDDEN, 1)
+    assert not scale.is_contiguous()
+    return {**model, "adaln_scale": scale, "adaln_shift": shift}
+
+
 def make_inputs(
-    rows: int, device: torch.device, seed: int = 4611
+    rows: int,
+    device: torch.device,
+    seed: int = 4611,
+    table_rows: int = MINIMAX_H3_ADALN_ROWS,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     g = torch.Generator(device=device)
     g.manual_seed(seed + 7919 * rows)
     x = torch.empty(
         (rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device
     ).normal_(0.0, 0.5, generator=g)
-    # "production segments": nine contiguous AdaLN segments over the rows.
+    # "production segments": ``table_rows`` contiguous AdaLN segments over the rows (int64).
     r = torch.arange(rows, dtype=torch.int64, device=device)
-    idx = torch.div(r * MINIMAX_H3_ADALN_ROWS, rows, rounding_mode="floor").clamp_max(
-        MINIMAX_H3_ADALN_ROWS - 1
+    idx = torch.div(r * table_rows, rows, rounding_mode="floor").clamp_max(
+        table_rows - 1
     )
-    return x, idx.to(torch.int32)
+    return x, idx
 
 
 # --------------------------------------------------------------------------------------------
@@ -135,9 +164,10 @@ def reference_modulated(
     norm = F.rms_norm(x, (MINIMAX_H3_HIDDEN,), x_norm_weight, eps=eps).to(
         torch.bfloat16
     )
+    table_rows = int(adaln_scale.shape[0])
     idx = adaln_index.long()
-    valid = (idx >= 0) & (idx < MINIMAX_H3_ADALN_ROWS)
-    safe = idx.clamp(0, MINIMAX_H3_ADALN_ROWS - 1)
+    valid = (idx >= 0) & (idx < table_rows)
+    safe = idx.clamp(0, table_rows - 1)
     a = torch.addcmul(
         adaln_shift.index_select(0, safe),
         norm,
@@ -283,8 +313,12 @@ def kernel_nvfp4_activation(
 # --------------------------------------------------------------------------------------------
 
 
+def _table_rows(model) -> int:
+    return int(model["adaln_scale"].shape[0])
+
+
 def run_bf16_case(rows: int, model, device) -> Dict[str, float]:
-    x, idx = make_inputs(rows, device)
+    x, idx = make_inputs(rows, device, table_rows=_table_rows(model))
     out = minimax_h3_fc1_swiglu(
         x,
         model["x_norm_weight"],
@@ -316,7 +350,7 @@ def modulated_activation_from_kernel(rows: int, model, device, x, idx) -> torch.
 
 
 def run_mxfp8_case(rows: int, model, prepared, device) -> Dict[str, float]:
-    x, idx = make_inputs(rows, device)
+    x, idx = make_inputs(rows, device, table_rows=_table_rows(model))
     w_q, w_tiles, w_deq = prepared
     workspace_q = torch.empty(
         (rows, MINIMAX_H3_HIDDEN), dtype=torch.float8_e4m3fn, device=device
@@ -363,7 +397,7 @@ def run_mxfp8_case(rows: int, model, prepared, device) -> Dict[str, float]:
 
 
 def run_nvfp4_case(rows: int, model, prepared, device) -> Dict[str, float]:
-    x, idx = make_inputs(rows, device)
+    x, idx = make_inputs(rows, device, table_rows=_table_rows(model))
     w_q, w_tiles, w_scaled, g_w = prepared
     # Static activation global scale calibrated from the reference activation of this shape.
     a_ref = reference_modulated(
@@ -471,13 +505,35 @@ def test_minimax_h3_fc1_swiglu_nvfp4(rows, model, prepared_nvfp4, device):
 
 
 @requires_blackwell
-def test_minimax_h3_fc1_swiglu_invalid_index_rows_are_zero(model, device):
+@pytest.mark.parametrize("table_rows", ENGINE_TABLE_ROWS)
+def test_minimax_h3_fc1_swiglu_bf16_engine_tables(table_rows, model, device):
+    engine = make_engine_model(model, table_rows, device)
+    run_bf16_case(257, engine, device)
+    # The strided views were passed through, not copied.
+    assert engine["adaln_scale"].stride(0) == ENGINE_TABLE_CHUNKS * MINIMAX_H3_HIDDEN
+
+
+@requires_blackwell
+def test_minimax_h3_fc1_swiglu_mxfp8_engine_tables(model, prepared_mxfp8, device):
+    run_mxfp8_case(257, make_engine_model(model, 6, device), prepared_mxfp8, device)
+
+
+@requires_blackwell
+def test_minimax_h3_fc1_swiglu_nvfp4_engine_tables(model, prepared_nvfp4, device):
+    run_nvfp4_case(257, make_engine_model(model, 6, device), prepared_nvfp4, device)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("table_rows", [3, MINIMAX_H3_ADALN_ROWS])
+def test_minimax_h3_fc1_swiglu_invalid_index_rows_are_zero(table_rows, model, device):
     rows = 300
-    x, idx = make_inputs(rows, device)
+    if table_rows != MINIMAX_H3_ADALN_ROWS:
+        model = make_engine_model(model, table_rows, device)
+    x, idx = make_inputs(rows, device, table_rows=table_rows)
     idx = idx.clone()
-    idx[:3] = torch.tensor(
-        [-1, MINIMAX_H3_ADALN_ROWS, -(2**31)], dtype=torch.int32, device=device
-    )
+    int64 = torch.iinfo(torch.int64)
+    bad = [-1, table_rows, table_rows + 1, -(2**40), 2**40, int64.min, int64.max]
+    idx[: len(bad)] = torch.tensor(bad, dtype=torch.int64, device=device)
     out = torch.full(
         (rows, MINIMAX_H3_FFN), float("nan"), dtype=torch.bfloat16, device=device
     )
@@ -492,7 +548,8 @@ def test_minimax_h3_fc1_swiglu_invalid_index_rows_are_zero(model, device):
     )
     torch.cuda.synchronize()
     assert returned.data_ptr() == out.data_ptr()
-    assert (out[:3] == 0).all()
+    assert (out[: len(bad)] == 0).all()
+    assert (out[len(bad) :] != 0).any()
     assert_within_budget(out, reference_bf16(x, model, idx), "bf16 invalid-index probe")
 
 
@@ -511,17 +568,61 @@ def test_minimax_h3_fc1_swiglu_rejects_bad_inputs(model, device):
     with pytest.raises(ValueError):
         minimax_h3_fc1_swiglu(x[:, :64], *args)
     with pytest.raises(ValueError):
-        minimax_h3_fc1_swiglu(x, *args, eps=1e-6)
-    with pytest.raises(ValueError):
-        minimax_h3_fc1_swiglu(
-            x,
-            model["x_norm_weight"],
-            model["adaln_scale"],
-            model["adaln_shift"],
-            idx.long(),
-            model["fc1_weight"],
-        )
-    with pytest.raises(ValueError):
         minimax_h3_fc1_swiglu(
             x, *args, out=torch.empty((8, 64), dtype=torch.bfloat16, device=device)
         )
+
+    def call(
+        adaln_scale=model["adaln_scale"], adaln_shift=model["adaln_shift"], index=idx
+    ):
+        minimax_h3_fc1_swiglu(
+            x,
+            model["x_norm_weight"],
+            adaln_scale,
+            adaln_shift,
+            index,
+            model["fc1_weight"],
+        )
+
+    # int32 indices are no longer part of the contract.
+    with pytest.raises(ValueError, match="adaln_index"):
+        call(index=idx.int())
+    with pytest.raises(ValueError, match="adaln_index"):
+        call(index=idx[:4])
+    # Tables: wrong dtype, mismatched row counts, non-unit last stride, odd row pitch,
+    # misaligned base pointer.
+    with pytest.raises(ValueError, match="adaln_scale"):
+        call(adaln_scale=model["adaln_scale"].half())
+    with pytest.raises(ValueError, match="same row count"):
+        call(adaln_scale=model["adaln_scale"][:3])
+    with pytest.raises(ValueError, match="unit last stride"):
+        call(
+            adaln_scale=torch.empty(
+                (MINIMAX_H3_HIDDEN, 9), dtype=torch.bfloat16, device=device
+            ).t()
+        )
+    with pytest.raises(ValueError, match="row pitch"):
+        call(
+            adaln_shift=torch.empty(
+                (9, MINIMAX_H3_HIDDEN + 4), dtype=torch.bfloat16, device=device
+            )[:, :MINIMAX_H3_HIDDEN]
+        )
+    storage = torch.empty(
+        9 * MINIMAX_H3_HIDDEN + 8, dtype=torch.bfloat16, device=device
+    )
+    misaligned = storage[4 : 4 + 9 * MINIMAX_H3_HIDDEN].view(9, MINIMAX_H3_HIDDEN)
+    assert misaligned.data_ptr() % 16 == 8
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        call(adaln_scale=misaligned)
+    # Engine-layout tables and any eps are accepted by the validation layer (no launch here).
+    from flashinfer.diffusion_ops.minimax_h3_fc1_swiglu import _check_norm_inputs
+
+    engine = make_engine_model(model, 6, device)
+    _check_norm_inputs(
+        x,
+        model["x_norm_weight"],
+        engine["adaln_scale"],
+        engine["adaln_shift"],
+        idx,
+        1e-6,
+    )

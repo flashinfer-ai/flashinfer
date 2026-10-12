@@ -19,16 +19,28 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
 )
 
 
+def _load_benchmark_module(path: Path):
+    if not path.is_file():
+        pytest.skip("requires the source-tree SM107 benchmark")
+    spec = importlib.util.spec_from_file_location("sm107_benchmark", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.fixture
 def benchmark_module():
     path = (
         Path(__file__).resolve().parents[2]
-        / "benchmarks/bench_moe_ep_sm107_block_scaled_mega.py"
+        / "benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py"
     )
-    spec = importlib.util.spec_from_file_location("sm107_benchmark", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return _load_benchmark_module(path)
+
+
+def test_missing_source_tree_benchmark_skips(tmp_path):
+    with pytest.raises(pytest.skip.Exception, match="source-tree SM107 benchmark"):
+        _load_benchmark_module(tmp_path / "missing_benchmark.py")
 
 
 def test_latency_reports_primary_and_rank0_medians(benchmark_module):

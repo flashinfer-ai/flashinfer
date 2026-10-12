@@ -4,106 +4,157 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import json
 import math
 
 import flashinfer
 import flashinfer.cake_fmha as cake_api
+import flashinfer.cake_fmha_request_ordered as request_ordered_api
+import flashinfer.jit.cake_fmha_request_ordered as request_ordered_jit
 import pytest
 import torch
 
 
-def _route(
+_EXACT_MODULE = "cake_fmha_request_ordered_paged_decode_exact"
+_FALLBACK_Q1 = "cake_fmha_request_ordered_paged_decode_fallback_q1"
+_FALLBACK_Q1_LSE = "cake_fmha_request_ordered_paged_decode_fallback_q1_lse"
+_FALLBACK_Q1_SPLIT4_LSE = "cake_fmha_request_ordered_paged_decode_fallback_q1_s4_lse"
+_EXACT_PERIOD = (8193, 57345, 73729, 81921)
+
+
+def _module(
+    *,
+    name: str,
+    kind: str,
+    route_slug: str,
+    q_len: int,
+    num_split: int,
+    write_lse: bool,
+) -> dict:
+    return {
+        "name": name,
+        "kind": kind,
+        "route_slug": route_slug,
+        "q_len": q_len,
+        "num_split": num_split,
+        "write_lse": write_lse,
+        "defines": {"Q_LEN": q_len, "NUM_SPLIT": num_split, "WRITE_LSE": int(write_lse)}
+        if kind == "persistent"
+        else {},
+    }
+
+
+def _exact_route(
     *,
     module: str,
-    route_slug: str,
-    batch: int,
+    shape: str,
+    period: tuple[int, ...],
+    count: int,
     q_len: int,
-    kv_lens: tuple[int, ...],
+    real_batch_size: int,
     request_order_case: str,
     write_lse: bool,
     grid: tuple[int, int, int],
     total_tiles: int,
-    workspace_parts: int = 1,
-    segmented_clc: bool = False,
+    workspace_parts: int,
 ) -> dict:
     return {
-        "shape": f"{route_slug}_{batch}",
-        "module_name": module,
-        "args": {
-            "q_lens": [q_len] * batch,
-            "kv_lens": list(kv_lens),
-            "real_batch_size": batch,
-            "request_order_case": request_order_case,
-            "provide_lse": write_lse,
-        },
-        "build_plan": {
-            "route_slug": route_slug,
-            "q_len": q_len,
-            "ordered": True,
-            "num_split": 2 if segmented_clc else 1,
-            "workspace_parts": workspace_parts,
-            "write_lse": write_lse,
-            "segmented_clc": segmented_clc,
-            "static_one_tile": False,
-            "grid": list(grid),
-            "total_tiles": total_tiles,
-        },
+        "shape": shape,
+        "module": module,
+        "q_len": q_len,
+        "kv_lens": {"period": list(period), "count": count},
+        "real_batch_size": real_batch_size,
+        "request_order_case": request_order_case,
+        "write_lse": write_lse,
+        "grid": list(grid),
+        "total_tiles": total_tiles,
+        "workspace_parts": workspace_parts,
     }
 
 
 def _manifest() -> dict:
-    exact_lengths = (8193, 57345, 73729, 81921)
+    """Module table in the shipped manifest schema: programs plus exact exported routes."""
+
     return {
-        "routes": [
-            _route(
-                module="cake_fmha_request_ordered_paged_decode_exact",
+        "modules": [
+            _module(
+                name=_EXACT_MODULE,
+                kind="two_wave",
                 route_slug="two_wave_q1",
-                batch=4,
                 q_len=1,
-                kv_lens=exact_lengths,
+                num_split=2,
+                write_lse=False,
+            ),
+            _module(
+                name=_FALLBACK_Q1,
+                kind="persistent",
+                route_slug="fallback_q1",
+                q_len=1,
+                num_split=1,
+                write_lse=False,
+            ),
+            _module(
+                name=_FALLBACK_Q1_LSE,
+                kind="persistent",
+                route_slug="fallback_q1_ordered_s1_lse",
+                q_len=1,
+                num_split=1,
+                write_lse=True,
+            ),
+            _module(
+                name=_FALLBACK_Q1_SPLIT4_LSE,
+                kind="persistent",
+                route_slug="fallback_q1_ordered_s4_lse",
+                q_len=1,
+                num_split=4,
+                write_lse=True,
+            ),
+        ],
+        "exact_routes": [
+            _exact_route(
+                module=_EXACT_MODULE,
+                shape="perf_ragged_b8_q1",
+                period=_EXACT_PERIOD,
+                count=8,
+                q_len=1,
+                real_batch_size=8,
                 request_order_case="length_desc",
                 write_lse=False,
-                grid=(1, 1, 4),
-                total_tiles=8,
+                grid=(1, 1, 8),
+                total_tiles=16,
                 workspace_parts=16,
-                segmented_clc=True,
             ),
-            _route(
-                module="cake_fmha_request_ordered_paged_decode_fallback_q1",
-                route_slug="fallback_q1",
-                batch=1,
+            _exact_route(
+                module=_FALLBACK_Q1_SPLIT4_LSE,
+                shape="correctness_split4_q1",
+                period=(897, 1025, 1153, 1281),
+                count=4,
                 q_len=1,
-                kv_lens=(8193,),
-                request_order_case="identity",
-                write_lse=False,
-                grid=(1, 1, 1),
-                total_tiles=1,
-            ),
-            _route(
-                module="cake_fmha_request_ordered_paged_decode_fallback_q1_lse",
-                route_slug="fallback_q1_ordered_s1_lse",
-                batch=1,
-                q_len=1,
-                kv_lens=(8193,),
-                request_order_case="identity",
+                real_batch_size=4,
+                request_order_case="random",
                 write_lse=True,
-                grid=(1, 1, 1),
-                total_tiles=1,
+                grid=(1, 4, 4),
+                total_tiles=16,
+                workspace_parts=4,
             ),
-        ]
+        ],
     }
 
 
 def test_request_order_plan_selects_exact_exported_schedule(monkeypatch) -> None:
-    monkeypatch.setattr(cake_api, "get_cake_fmha_request_ordered_manifest", _manifest)
+    monkeypatch.setattr(
+        request_ordered_api, "get_cake_fmha_request_ordered_manifest", _manifest
+    )
     plan = cake_api.plan_cake_fmha_request_ordered_paged_decode(
-        (8193, 57345, 73729, 81921),
+        _EXACT_PERIOD * 2,
         1,
     )
-    assert plan.module_name.endswith("_exact")
-    assert plan.grid == (1, 1, 4)
-    assert plan.total_tiles == 8
+    assert plan.module_name == _EXACT_MODULE
+    assert plan.batch_size == 8
+    assert plan.grid == (1, 1, 8)
+    assert plan.total_tiles == 16
     assert plan.workspace_parts == 16
+    assert plan.write_lse is False
     with pytest.raises(dataclasses.FrozenInstanceError):
         plan.total_tiles = 4
 
@@ -111,16 +162,36 @@ def test_request_order_plan_selects_exact_exported_schedule(monkeypatch) -> None
 def test_request_order_plan_uses_graph_safe_fallback_for_other_lengths(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(cake_api, "get_cake_fmha_request_ordered_manifest", _manifest)
+    monkeypatch.setattr(
+        request_ordered_api, "get_cake_fmha_request_ordered_manifest", _manifest
+    )
     plan = cake_api.plan_cake_fmha_request_ordered_paged_decode(
         (64, 128, 192),
         1,
     )
-    assert plan.module_name.endswith("_fallback_q1")
+    assert plan.module_name == _FALLBACK_Q1
     assert plan.batch_size == 3
     assert plan.grid == (1, 1, 3)
     assert plan.total_tiles == 3
     assert plan.workspace_parts == 1
+
+    # One exported period with a different request count is not an exact route.
+    truncated = cake_api.plan_cake_fmha_request_ordered_paged_decode(
+        _EXACT_PERIOD,
+        1,
+    )
+    assert truncated.module_name == _FALLBACK_Q1
+    assert truncated.grid == (1, 1, 4)
+
+    # The single-split LSE program is the fallback; the split-4 module is exact only.
+    lse_plan = cake_api.plan_cake_fmha_request_ordered_paged_decode(
+        (64, 128, 192),
+        1,
+        write_lse=True,
+    )
+    assert lse_plan.module_name == _FALLBACK_Q1_LSE
+    assert lse_plan.workspace_parts == 1
+    assert lse_plan.write_lse is True
 
 
 def test_decode_api_exposes_order_pointer_and_host_plan_at_the_end() -> None:
@@ -315,3 +386,52 @@ def test_request_ordered_public_api_graph_replays_device_permutations(
             atol=1e-2,
             rtol=1e-2,
         )
+
+
+def _shipped_manifest_copy(tmp_path) -> dict:
+    """The shipped module table, with empty stand-in sources under ``tmp_path``."""
+
+    root = request_ordered_jit._source_root()
+    payload = json.loads((root / request_ordered_jit._MANIFEST_NAME).read_text())
+    for module in payload["modules"]:
+        for key in ("device_path", "binding_path"):
+            stand_in = tmp_path.joinpath(*module[key].split("/"))
+            stand_in.parent.mkdir(parents=True, exist_ok=True)
+            stand_in.touch()
+    return payload
+
+
+def _validate_manifest(monkeypatch, tmp_path, payload: dict) -> dict:
+    (tmp_path / request_ordered_jit._MANIFEST_NAME).write_text(json.dumps(payload))
+    monkeypatch.setattr(request_ordered_jit, "_source_root", lambda: tmp_path)
+    return request_ordered_jit.get_cake_fmha_request_ordered_manifest.__wrapped__()
+
+
+def test_manifest_validator_accepts_the_shipped_module_table(
+    monkeypatch, tmp_path
+) -> None:
+    payload = _shipped_manifest_copy(tmp_path)
+    assert _validate_manifest(monkeypatch, tmp_path, payload)["modules"]
+
+
+def test_manifest_validator_rejects_defines_that_disagree_with_the_module(
+    monkeypatch, tmp_path
+) -> None:
+    payload = _shipped_manifest_copy(tmp_path)
+    module = next(module for module in payload["modules"] if module["defines"])
+    module["defines"]["Q_LEN"] = 6 if module["q_len"] == 1 else 1
+    with pytest.raises(ValueError, match="defines disagree"):
+        _validate_manifest(monkeypatch, tmp_path, payload)
+
+
+@pytest.mark.parametrize("field", ["q_len", "write_lse"])
+def test_manifest_validator_rejects_exact_routes_that_disagree_with_their_module(
+    monkeypatch, tmp_path, field: str
+) -> None:
+    payload = _shipped_manifest_copy(tmp_path)
+    route = payload["exact_routes"][0]
+    route[field] = (
+        (6 if route[field] == 1 else 1) if field == "q_len" else not route[field]
+    )
+    with pytest.raises(ValueError, match="disagrees with module"):
+        _validate_manifest(monkeypatch, tmp_path, payload)

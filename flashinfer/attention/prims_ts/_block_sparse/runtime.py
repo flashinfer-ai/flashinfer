@@ -28,7 +28,12 @@ from ..decode import (
     _validate_exact_compact_strides,
     _validate_scale,
 )
-from .common import _SIGNED_INT32_MAX, _num_sparse_pattern_heads
+from ..sage import SageAttentionParams, sage_adapter_slots, validate_sage_params
+from .common import (
+    _SIGNED_INT32_MAX,
+    _num_sparse_pattern_heads,
+    _validate_dense_contiguous_plan_inputs,
+)
 
 if TYPE_CHECKING:
     from .plan import _BlockSparsePlanState
@@ -86,13 +91,16 @@ class _BlockSparseRunArgs:
     out: torch.Tensor
     block_indptr: torch.Tensor | None
     block_indices: torch.Tensor | None
-    kv_valid_bits: torch.Tensor
+    # ``None`` for a dense run.
+    kv_valid_bits: torch.Tensor | None
     kv_valid_bits_is_live: bool
     sm_scale: float
     paged_kv: _PagedKVLaunchPayload | None
     exact_block_bits: torch.Tensor | None = None
     k_summary: torch.Tensor | None = None
     v_summary: torch.Tensor | None = None
+    # Sage scale tensors in adapter ABI order; ``None`` for unused slots.
+    sage_slots: tuple[torch.Tensor | None, ...] = sage_adapter_slots({})
 
 
 def _validate_metadata_tensor(
@@ -316,6 +324,7 @@ def validate_block_sparse_run(
     kv_valid_bits: torch.Tensor | None,
     sm_scale: float | None,
     out: torch.Tensor | None,
+    sage: SageAttentionParams | None = None,
 ) -> _BlockSparseRunArgs:
     """Validate one run and allocate only an omitted output tensor.
 
@@ -329,48 +338,67 @@ def validate_block_sparse_run(
 
     use_proxy_routes = state.use_proxy_routes
     num_kv_blocks = (state.seq_len_kv + state.kv_block_size - 1) // state.kv_block_size
-    validate_block_sparse_metadata(
-        sparse_format=state.sparse_format,
-        block_indptr=block_indptr,
-        block_indices=block_indices,
-        exact_block_bits=exact_block_bits,
-        kv_valid_bits=kv_valid_bits,
-        device=state.device,
-        batch_size=state.batch_size,
-        seq_len_q=state.seq_len_q,
-        seq_len_kv=state.seq_len_kv,
-        num_kv_heads=_num_sparse_pattern_heads(
-            state.num_kv_heads, state.share_pattern_across_kv_heads
-        ),
-        q_block_size=state.q_block_size,
-        kv_block_size=state.kv_block_size,
-        use_kv_valid_bits=state.use_kv_valid_bits,
-    )
-
-    if use_proxy_routes:
-        if k_summary is None or v_summary is None:
-            raise ValueError("K/V summaries are required when proxy routes are enabled")
-        summary_shape = (
-            state.batch_size,
-            num_kv_blocks,
-            state.num_kv_heads,
-            state.head_dim,
-        )
-        for tensor, name in ((k_summary, "k_summary"), (v_summary, "v_summary")):
-            _validate_bshd_tensor(
-                tensor,
-                name,
-                expected_shape=summary_shape,
-                expected_dtype=state.kv_dtype,
-                expected_device=state.device,
+    if not state.use_block_sparse:
+        # A dense plan takes no routing inputs.
+        _validate_dense_contiguous_plan_inputs(
+            (name, value, None)
+            for name, value in (
+                ("block_indptr", block_indptr),
+                ("block_indices", block_indices),
+                ("exact_block_bits", exact_block_bits),
+                ("k_summary", k_summary),
+                ("v_summary", v_summary),
+                ("kv_valid_bits", kv_valid_bits),
             )
-    elif k_summary is not None or v_summary is not None:
-        raise ValueError("summaries are valid only when proxy routes are enabled")
+        )
+    else:
+        validate_block_sparse_metadata(
+            sparse_format=state.sparse_format,
+            block_indptr=block_indptr,
+            block_indices=block_indices,
+            exact_block_bits=exact_block_bits,
+            kv_valid_bits=kv_valid_bits,
+            device=state.device,
+            batch_size=state.batch_size,
+            seq_len_q=state.seq_len_q,
+            seq_len_kv=state.seq_len_kv,
+            num_kv_heads=_num_sparse_pattern_heads(
+                state.num_kv_heads, state.share_pattern_across_kv_heads
+            ),
+            q_block_size=state.q_block_size,
+            kv_block_size=state.kv_block_size,
+            use_kv_valid_bits=state.use_kv_valid_bits,
+        )
+        if use_proxy_routes:
+            if k_summary is None or v_summary is None:
+                raise ValueError(
+                    "K/V summaries are required when proxy routes are enabled"
+                )
+            summary_shape = (
+                state.batch_size,
+                num_kv_blocks,
+                state.num_kv_heads,
+                state.head_dim,
+            )
+            for tensor, name, dtype in (
+                (k_summary, "k_summary", state.kv_dtype),
+                (v_summary, "v_summary", state.v_dtype),
+            ):
+                _validate_bshd_tensor(
+                    tensor,
+                    name,
+                    expected_shape=summary_shape,
+                    expected_dtype=dtype,
+                    expected_device=state.device,
+                )
+        elif k_summary is not None or v_summary is not None:
+            raise ValueError("summaries are valid only when proxy routes are enabled")
 
+    effective_kv_valid_bits: torch.Tensor | None = None
     if state.use_kv_valid_bits:
         assert kv_valid_bits is not None
         effective_kv_valid_bits = kv_valid_bits
-    else:
+    elif state.use_block_sparse:
         effective_kv_valid_bits = state.dummy_kv_valid_bits
         if effective_kv_valid_bits is None:
             raise RuntimeError("unmasked block-sparse plan is missing its dummy mask")
@@ -393,12 +421,15 @@ def validate_block_sparse_run(
             state.num_kv_heads,
             state.head_dim,
         )
-        for tensor, name in ((kv_storage.k, "k"), (kv_storage.v, "v")):
+        for tensor, name, dtype in (
+            (kv_storage.k, "k", state.kv_dtype),
+            (kv_storage.v, "v", state.v_dtype),
+        ):
             _validate_bshd_tensor(
                 tensor,
                 name,
                 expected_shape=kv_shape,
-                expected_dtype=state.kv_dtype,
+                expected_dtype=dtype,
                 expected_device=state.device,
             )
         k = kv_storage.k
@@ -430,6 +461,15 @@ def validate_block_sparse_run(
     else:
         raise TypeError("kv_storage must be _ContiguousKVStorage or _PagedKVStorage")
 
+    if (sage is None) != (state.sage is None):
+        raise ValueError(
+            "sage=SageAttentionParams(...) is required by a Sage plan and "
+            "rejected by a plan without Sage attention"
+        )
+    if sage is not None:
+        assert state.sage_scale_shapes is not None
+        validate_sage_params(sage, state.sage_scale_shapes, device=state.device)
+
     effective_scale = (
         1.0 / math.sqrt(state.head_dim)
         if sm_scale is None
@@ -459,6 +499,7 @@ def validate_block_sparse_run(
         kv_valid_bits_is_live=state.use_kv_valid_bits,
         sm_scale=effective_scale,
         paged_kv=paged_kv,
+        sage_slots=sage_adapter_slots({} if sage is None else vars(sage)),
     )
 
 
@@ -475,6 +516,7 @@ def prepare_block_sparse_run_unchecked(
     kv_valid_bits: torch.Tensor | None,
     sm_scale: float | None,
     out: torch.Tensor | None,
+    sage: SageAttentionParams | None = None,
 ) -> _BlockSparseRunArgs:
     """Canonicalize one trusted run without invoking explicit validators.
 
@@ -506,7 +548,8 @@ def prepare_block_sparse_run_unchecked(
         effective_kv_valid_bits = kv_valid_bits
     else:
         effective_kv_valid_bits = state.dummy_kv_valid_bits
-    assert effective_kv_valid_bits is not None
+    if state.use_block_sparse:
+        assert effective_kv_valid_bits is not None
     if out is None:
         out = torch.empty(
             (state.batch_size, state.seq_len_q, state.num_qo_heads, state.head_dim),
@@ -529,6 +572,7 @@ def prepare_block_sparse_run_unchecked(
         if sm_scale is None
         else float(sm_scale),
         paged_kv=paged_kv,
+        sage_slots=sage_adapter_slots({} if sage is None else vars(sage)),
     )
 
 
@@ -549,11 +593,14 @@ def record_block_sparse_run_args(
         run_args.block_indptr.record_stream(stream)
         assert run_args.block_indices is not None
         run_args.block_indices.record_stream(stream)
-    else:
-        assert run_args.exact_block_bits is not None
+    elif run_args.exact_block_bits is not None:
         run_args.exact_block_bits.record_stream(stream)
     if run_args.kv_valid_bits_is_live:
+        assert run_args.kv_valid_bits is not None
         run_args.kv_valid_bits.record_stream(stream)
+    for tensor in run_args.sage_slots:
+        if tensor is not None:
+            tensor.record_stream(stream)
     if run_args.paged_kv is not None:
         run_args.paged_kv.block_tables.record_stream(stream)
         run_args.paged_kv.seq_lens_kv.record_stream(stream)
@@ -564,10 +611,11 @@ def launch_block_sparse(
     *,
     state: "_BlockSparsePlanState",
 ) -> torch.Tensor:
-    """Invoke the layout- and route-specific ABI chosen by the frozen plan."""
+    """Invoke the adapter ABI chosen by the frozen plan.
 
-    sparse_format = state.sparse_format
-    use_proxy_routes = state.use_proxy_routes
+    Contiguous plans share one adapter; unused optional slots are ``None``.
+    """
+
     if run_args.paged_kv is not None:
         assert run_args.block_indptr is not None
         assert run_args.block_indices is not None
@@ -590,76 +638,24 @@ def launch_block_sparse(
             run_args.paged_kv.v_page_stride,
             run_args.sm_scale,
         )
-    elif sparse_format == "bsr" and not use_proxy_routes:
-        assert run_args.block_indptr is not None
-        assert run_args.block_indices is not None
-        state.compiled(
-            run_args.q,
-            run_args.k,
-            run_args.v,
-            run_args.out,
-            run_args.block_indptr,
-            run_args.block_indices,
-            run_args.kv_valid_bits,
-            state.row_route_offsets,
-            state.route_workspace,
-            state.max_blocks_per_row,
-            run_args.sm_scale,
-        )
-    elif sparse_format == "bitmask" and not use_proxy_routes:
-        assert run_args.exact_block_bits is not None
-        state.compiled(
-            run_args.q,
-            run_args.k,
-            run_args.v,
-            run_args.out,
-            run_args.exact_block_bits,
-            run_args.kv_valid_bits,
-            state.row_route_offsets,
-            state.route_workspace,
-            state.max_blocks_per_row,
-            run_args.sm_scale,
-        )
-    elif sparse_format == "bsr" and use_proxy_routes:
-        assert run_args.block_indptr is not None
-        assert run_args.block_indices is not None
-        assert run_args.k_summary is not None
-        assert run_args.v_summary is not None
-        state.compiled(
-            run_args.q,
-            run_args.k,
-            run_args.v,
-            run_args.k_summary,
-            run_args.v_summary,
-            run_args.out,
-            run_args.block_indptr,
-            run_args.block_indices,
-            run_args.kv_valid_bits,
-            state.row_route_offsets,
-            state.route_workspace,
-            state.max_blocks_per_row,
-            run_args.sm_scale,
-        )
-    elif sparse_format == "bitmask" and use_proxy_routes:
-        assert run_args.exact_block_bits is not None
-        assert run_args.k_summary is not None
-        assert run_args.v_summary is not None
-        state.compiled(
-            run_args.q,
-            run_args.k,
-            run_args.v,
-            run_args.k_summary,
-            run_args.v_summary,
-            run_args.out,
-            run_args.exact_block_bits,
-            run_args.kv_valid_bits,
-            state.row_route_offsets,
-            state.route_workspace,
-            state.max_blocks_per_row,
-            run_args.sm_scale,
-        )
     else:
-        raise AssertionError("frozen block-sparse plan has an unsupported route mode")
+        state.compiled(
+            run_args.q,
+            run_args.k,
+            run_args.v,
+            run_args.k_summary,
+            run_args.v_summary,
+            run_args.out,
+            run_args.block_indptr,
+            run_args.block_indices,
+            run_args.exact_block_bits,
+            run_args.kv_valid_bits,
+            state.row_route_offsets,
+            state.route_workspace,
+            0 if state.max_blocks_per_row is None else state.max_blocks_per_row,
+            *run_args.sage_slots,
+            run_args.sm_scale,
+        )
     return run_args.out
 
 

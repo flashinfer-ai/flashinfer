@@ -51,6 +51,12 @@ assert callable(flashinfer.prims_ts_bf16_moe)
 assert "cutlass.experimental.task_scheduling" not in sys.modules
 assert "cutlass.experimental.task_scheduling.resources" not in sys.modules
 
+from flashinfer.fused_moe import PrimsTsConfig, PrimsTsRunner
+assert PrimsTsRunner.backend_key == "prims_ts"
+assert PrimsTsConfig.supported(100)
+assert "cutlass.experimental.task_scheduling" not in sys.modules
+assert "cutlass.experimental.task_scheduling.resources" not in sys.modules
+
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
 assert DType.BF16
 assert "cutlass.experimental.task_scheduling" not in sys.modules

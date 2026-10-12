@@ -193,16 +193,19 @@ from .nvfp4_attention_sm120 import (
 )
 from .bgmv_moe import gen_bgmv_moe_module as gen_bgmv_moe_module
 from .bgmv_moe import load_bgmv_moe_module as load_bgmv_moe_module
-from .blackwell_bgmv_moe import (
-    gen_blackwell_bgmv_moe_module as gen_blackwell_bgmv_moe_module,
+from .cake_bgmv_moe import (
+    gen_cake_bgmv_moe_module as gen_cake_bgmv_moe_module,
 )
-from .blackwell_bgmv_moe import (
-    load_blackwell_bgmv_moe_module as load_blackwell_bgmv_moe_module,
+from .cake_bgmv_moe import (
+    load_cake_bgmv_moe_module as load_cake_bgmv_moe_module,
 )
 from .monomoe import gen_monomoe_module as gen_monomoe_module
 from .monomoe import load_monomoe_module as load_monomoe_module
 from .fused_moe import (
     gen_alphamoe_fused_router_module as gen_alphamoe_fused_router_module,
+)
+from .fused_moe import (
+    gen_alphamoe_nvfp4_sm100_module as gen_alphamoe_nvfp4_sm100_module,
 )
 
 

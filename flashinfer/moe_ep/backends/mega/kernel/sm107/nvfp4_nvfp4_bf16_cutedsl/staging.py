@@ -13,18 +13,23 @@ def stage_mega_moe_inputs(
     x_sf: torch.Tensor,
     topk_idx_out: torch.Tensor,
     topk_weights_out: torch.Tensor,
+    *,
+    input_norm_const: float = 1.0,
 ) -> int:
     """bf16 ``hidden_states`` -> packed NVFP4 activation + FP8-E4M3 block scales.
 
-    Torch-composed staging (the ``next/`` drop has no fused staging kernel
-    yet; quantizes with norm_const=1.0, matching the weight transform).
-    Returns the staged token count.
+    The packed data times its block scales approximates
+    ``input_norm_const * hidden_states``; fc1_alpha must compensate for this
+    normalization and any weight normalization. Returns the staged token count.
     """
     from ......kernel_src.sm107.next_cutedsl_megamoe import (
         Nvfp4BlockSize,
         ceil_div,
         quantize_nvfp4_block16,
     )
+    from ..validation import validate_input_norm_const
+
+    validate_input_norm_const(input_norm_const)
 
     num_tokens, hidden = hidden_states.shape
     capacity = x_nvfp4.shape[0]
@@ -35,7 +40,9 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    q, sf = quantize_nvfp4_block16(hidden_states.to(torch.float32))
+    q, sf = quantize_nvfp4_block16(
+        hidden_states.to(torch.float32), norm_const=input_norm_const
+    )
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     if x_sf.shape[1] < hidden_sf_cols:
