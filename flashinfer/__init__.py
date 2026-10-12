@@ -213,6 +213,8 @@ from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_bf16 as mm_bf16
 from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_nvfp4_svdquant as mm_nvfp4_svdquant
+from .gemm import mm_fp8_lora as mm_fp8_lora
+from .gemm import mm_nvfp4_lora as mm_nvfp4_lora
 from .gemm import nvfp4_quantize_smooth as nvfp4_quantize_smooth
 from .gemm import svdquant_linear as svdquant_linear
 from .gemm import mm_bf16_fp4 as mm_bf16_fp4
