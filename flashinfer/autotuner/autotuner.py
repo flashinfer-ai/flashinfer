@@ -502,11 +502,12 @@ class TuningConfig:
         profiling_repeat (int | None): Per-operation profiling repeat override.
             ``None`` uses the autotuner default. This affects measurement
             precision, not tactic compatibility or persisted cache identity.
-        use_cold_l2_graph_replay (bool): Replay the captured graph once untimed
-            (absorbing first-launch initialization), then evict L2 so the timed
-            replay starts from a cold L2, and give every launch in the graph its
-            own input copy. Requires ``use_cuda_graph``; the eviction also
-            requires ``use_cold_l2_cache``.
+        use_cold_l2_graph_replay (bool): Capture one graph with a launch per
+            profile-arena iteration and report each cold-L2 sample divided by
+            the launch count. Back-to-back launches amortize the per-sample
+            launch latency that otherwise dominates microsecond kernels.
+            Without a profile arena the graph holds one launch. Requires
+            ``use_cuda_graph`` and ``use_cold_l2_cache``.
         tensor_initializers (Tuple[Tuple[int, TensorInitializer]]): Per-input-index
             initializer closures used to synthesize profiling tensors. Each entry
             pairs an input tensor index with the closure that fills that input.
@@ -581,7 +582,9 @@ class ValueProfileArena:
         self._base_inputs = list(inputs)
         self._input_indices = unique_indices
         self._num_ring_lanes = num_ring_lanes
-        self._slot_layout: list[tuple[int, int, torch.dtype, tuple[int, ...]]] = []
+        self._slot_layout: list[
+            tuple[int, int, torch.dtype, tuple[int, ...], tuple[int, ...]]
+        ] = []
 
         lane_payload_bytes = 0
         device: torch.device | None = None
@@ -595,9 +598,12 @@ class ValueProfileArena:
                 )
             if not tensor.is_cuda:
                 raise ValueError(f"profile-arena input {input_index} must be on CUDA")
-            if not tensor.is_contiguous():
+            # preserve_format keeps strides only for non-overlapping dense
+            # tensors, which admits permuted views such as a transposed weight.
+            if torch.empty_like(tensor, device="meta").stride() != tensor.stride():
                 raise ValueError(
-                    f"profile-arena input {input_index} must be contiguous"
+                    f"profile-arena input {input_index} must be non-overlapping "
+                    "and dense"
                 )
             if device is None:
                 device = tensor.device
@@ -607,7 +613,13 @@ class ValueProfileArena:
             lane_payload_bytes = self._align(lane_payload_bytes)
             tensor_bytes = tensor.numel() * tensor.element_size()
             self._slot_layout.append(
-                (input_index, lane_payload_bytes, tensor.dtype, tuple(tensor.shape))
+                (
+                    input_index,
+                    lane_payload_bytes,
+                    tensor.dtype,
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                )
             )
             lane_payload_bytes += tensor_bytes
 
@@ -646,12 +658,12 @@ class ValueProfileArena:
         """Create one full logical input list backed by a selected arena lane."""
         lane_inputs = list(self._base_inputs)
         lane_offset = lane * self._lane_stride_bytes
-        for input_index, slot_offset, dtype, shape in self._slot_layout:
+        for input_index, slot_offset, dtype, shape, stride in self._slot_layout:
             template = self._base_inputs[input_index]
             assert isinstance(template, torch.Tensor)
             tensor_bytes = template.numel() * template.element_size()
             byte_view = arena.narrow(0, lane_offset + slot_offset, tensor_bytes)
-            lane_inputs[input_index] = byte_view.view(dtype).view(shape)
+            lane_inputs[input_index] = byte_view.view(dtype).as_strided(shape, stride)
         return lane_inputs
 
     def stage(self, inputs: list[Any]) -> None:
@@ -2788,7 +2800,9 @@ class AutoTuner:
 
         Returns:
             Execution time in milliseconds. Cold-L2 profiling returns the
-            median isolated-invocation latency; hot profiling retains the
+            median isolated-invocation latency (with
+            ``use_cold_l2_graph_replay``, the median cold-chain time per
+            launch); hot profiling retains the
             existing average over back-to-back invocations.
 
         Note:
@@ -2860,6 +2874,7 @@ class AutoTuner:
             starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
             ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
             graph = torch.cuda.CUDAGraph() if tuning_config.use_cuda_graph else None
+            chain = graph is not None and tuning_config.use_cold_l2_graph_replay
 
             def _run_once(profile_inputs):
                 runner(profile_inputs, tactic=tactic, **kwargs)
@@ -2867,7 +2882,10 @@ class AutoTuner:
             with torch.cuda.stream(stream):
                 if graph is not None:
                     with torch.cuda.graph(graph):
-                        _run_once(input_tensor_batches[-1])
+                        for profile_inputs in (
+                            input_tensor_batches if chain else input_tensor_batches[-1:]
+                        ):
+                            _run_once(profile_inputs)
                     # Exercise the captured graph before collecting samples;
                     # every measured replay below is cold independently.
                     graph.replay()
@@ -2899,21 +2917,11 @@ class AutoTuner:
             samples = [
                 start.elapsed_time(end) for start, end in zip(starts, ends, strict=True)
             ]
-            return statistics.median(samples)
+            launches = len(input_tensor_batches) if chain else 1
+            return statistics.median(samples) / launches
 
         def pure_profile(stream: torch.cuda.Stream, repeat: int) -> float:
             graph = torch.cuda.CUDAGraph()
-            l2_eviction_buffer = None
-            if (
-                tuning_config.use_cold_l2_cache
-                and tuning_config.use_cuda_graph
-                and tuning_config.use_cold_l2_graph_replay
-            ):
-                l2_eviction_buffer = torch.empty(
-                    2 * self._get_l2_cache_size_in_bytes(),
-                    dtype=torch.uint8,
-                    device=stream.device,
-                )
 
             if self._use_global_timer:
                 start_ts = torch.empty(1, dtype=torch.int64, device="cuda")
@@ -2956,16 +2964,6 @@ class AutoTuner:
                         _run_kernels()
 
                 stream.synchronize()
-                if (
-                    tuning_config.use_cuda_graph
-                    and tuning_config.use_cold_l2_graph_replay
-                ):
-                    # Exclude first-replay initialization from the timed sample.
-                    graph.replay()
-                    if l2_eviction_buffer is not None:
-                        # Restore cold-L2 state after graph initialization.
-                        l2_eviction_buffer.zero_()
-                    stream.synchronize()
 
                 # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
                 # The events_no_delay timer skips it: the eager sustained
@@ -3407,7 +3405,18 @@ class AutoTuner:
                 else None
             ),
             "l2_cache_policy",
-            "cold" if tuning_config.use_cold_l2_cache else "hot",
+            (
+                "hot"
+                if not tuning_config.use_cold_l2_cache
+                else "cold-chain"
+                if tuning_config.use_cuda_graph
+                and tuning_config.use_cold_l2_graph_replay
+                and (
+                    tuning_config.profile_arena_input_indices
+                    or tuning_config.value_aware_input_indices
+                )
+                else "cold"
+            ),
         )
 
     @staticmethod
