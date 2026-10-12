@@ -49,28 +49,33 @@ Hooks outside this directory: `include/flashinfer/trtllm/fused_moe/runner.h`
 routing call sites). Buffer allocation, workspace layout and the FFI surface are
 those of the public module.
 
-## Inventory (`flashinfer.cake_stepfun.inventory.v5`)
+## Inventory (`flashinfer.cake_stepfun.inventory.v6`)
 
 Top-level keys: `schema`, `manifest` (path of the launch manifest), optional
 `stages_manifest` (path of the generated stage-table header, see below), `files`
-(path -> SHA-256 of every generated file), `families` (FC1 families), optional
-`fc2_families` (FC2 families, same shape), `kernels`, `program_hash` (SHA-256 of
-`json.dumps({kernels, families, fc2_families, files}, sort_keys=True,
-separators=(",", ":")) + "\n"`, keys present only when the inventory has them).
+(path -> SHA-256 of every generated device unit, the two generated table headers
+and the shared device preamble `generated/cake_stepfun_moe_device_common.cuh`;
+*Generated tree* below lists what it does not cover), `families` (FC1
+families), optional `fc2_families` (FC2 families, same shape), `kernels`,
+`program_hash` (SHA-256 of `json.dumps({kernels, families, fc2_families, files},
+sort_keys=True, separators=(",", ":")) + "\n"`, keys present only when the
+inventory has them).
 
 Every `kernels[]` record carries `stage` (`routing`, `fc1`, `requant`, `fc2`,
-`finalize`), `arch` (`sm_100a` / `sm_103a`), `device` (translation unit path),
-`compile_flags`, `kernel_symbol`, `name`, `parameters` (ordered `[type, name]`
-pairs of the kernel signature), `block`, `cluster`, `dynamic_smem_bytes`,
-`min_blocks`, `source_symbol` (the Cake kernel module the unit was rendered from)
-and `template` (the exporter's stage template). Stage-specific fields:
+`finalize`), `arch` (`sm_100a` / `sm_103a`), `device` (translation unit path,
+`generated/<name>_kernel.cu`: one unit per kernel, shared by both architectures
+and compiled per target with its own `-gencode`, so the two records of a kernel
+name the same path), `compile_flags`, `kernel_symbol` and `source_symbol` (the
+Cake kernel module the unit was rendered from). A kernel's launch geometry is
+carried by its `*KernelSpec` table entry, not by the record. Stage-specific
+fields:
 
 | stage | record keys | uniqueness |
 |---|---|---|
-| `fc1`, `fc2` | `family`, `tile_n`, `output_rows_per_cta`, `block_k`, `native_config` (the trtllm-gen configuration the unit twins: on `fc2` the `bmm_*` function name, required -- the full-path tests pair each Cake tactic with it; on `fc1` the metainfo index of the twinned configuration where the module declares one, else `null`); `fc2` adds `sf_layout_a` (`none`, `linear`, `r8c4`, `r128c4`), `split_k` (1, or the cluster split-K factor) and the K-tile geometry its kernel serves, `min_k_tiles` / `k_tiles_multiple` (`1` / `1` for single-slice kernels; a split-K kernel needs `intermediate_size / block_k >= split_k`, and one that slices K into `split_k` equal ranges also `k_tiles_multiple = split_k`) | one record per (arch, stage, family, tile), every tile of the family mapping present |
-| `routing` | `variant`, `kind` (`static_block` / `dyn_block` / `coop` / `cluster`: the kernel's launch structure), `input` (`scores` / `topk_ids`), `logits_dtype` (`float32` / `bfloat16`; `none` for `topk_ids`), `min_tokens`, `max_tokens`, `grid_rule` (`fixed` / `token_blocks` / `coop_sms`), `grid`, `tokens_per_cta`, `max_expanded_per_thread`, `cooperative`, optional `pre_kernel` (`{kernel_symbol, source_symbol, parameters, device, grid, block, dynamic_smem_bytes}`: the leading kernel of the two-kernel large-token path; its `device` unit is listed in `files` and compiled with the record's `compile_flags`) | one record per (arch, stage, variant) |
-| `requant` | `variant`, `sf_layout`, `rows_per_cta`, `e4m3_max` (the FP8 e4m3 saturation bound of the requantization, 448) | one record per (arch, stage, variant) |
-| `finalize` | `variant` (`scalar` / `vector`, unique per dtype, e.g. `scalar_bf16`), `expert_weights_dtype` (`float32` / `bfloat16`), `max_top_k` | one record per (arch, stage, variant) |
+| `fc1`, `fc2` | `family`, `tile_n`, `block_k`, `native_config` (the trtllm-gen configuration the unit twins: on `fc2` the `bmm_*` function name, required -- the full-path tests pair each Cake tactic with it; on `fc1` the metainfo index of the twinned configuration where the module declares one, else `null`); `fc2` adds `split_k` (1, or the cluster split-K factor) and the K-tile geometry its kernel serves, `min_k_tiles` / `k_tiles_multiple` (`1` / `1` for single-slice kernels; a split-K kernel needs `intermediate_size / block_k >= split_k`, and one that slices K into `split_k` equal ranges also `k_tiles_multiple = split_k`) | one record per (arch, stage, family, tile), every tile of the family mapping present |
+| `routing` | `variant`, `input` (`scores` / `topk_ids`), `logits_dtype` (`float32` / `bfloat16`; `none` for `topk_ids`), `min_tokens`, `max_tokens`, optional `pre_kernel` (`{kernel_symbol, device}`: the leading kernel of the two-kernel large-token path; its `device` unit is listed in `files` and compiled with the record's `compile_flags`) | one record per (arch, stage, variant) |
+| `requant` | `variant`, `sf_layout` | one record per (arch, stage, variant) |
+| `finalize` | `variant` (`scalar` / `vector`, unique per dtype, e.g. `scalar_bf16`), `expert_weights_dtype` (`float32` / `bfloat16`) | one record per (arch, stage, variant) |
 
 A target with any kernel must have `fc1` kernels. The manifest (or the
 `stages_manifest` header) must define the kernel table of every stage the
@@ -83,10 +88,12 @@ anything.
 The manifest declares every exported kernel, renders one `EncodeTensorMap_<i>`
 thunk per TMA operand, one `Configure_<i>` thunk (dynamic shared memory
 attribute) and one `Submit_<i>` thunk per kernel that unpacks the stage's `*Args`
-structure into the kernel's parameter list, and defines a per-architecture table
-of `*KernelSpec` entries under `#if FLASHINFER_CAKE_STEPFUN_TARGET_MINOR == 0 /
-#else`. The host runners consume only the tables; the parameter order and the
-pointer-vs-descriptor form of each operand are the unit's business.
+structure into the kernel's parameter list, and defines one table of
+`*KernelSpec` entries shared by both architectures (the generated headers still
+require `FLASHINFER_CAKE_STEPFUN_TARGET_MINOR` to be defined as `0` or `3`; an
+`#error` guard rejects anything else). The host runners consume only the tables;
+the parameter order and the pointer-vs-descriptor form of each operand are the
+unit's business.
 
 The FC1 types (`TensorLayout`, `Fc1Family`, `Fc1Args`, `Fc1KernelSpec`) are
 defined in the manifest; the types of the other stages are defined in
@@ -96,6 +103,25 @@ thunks of those stages live in a second generated header
 header. Every table is `inline constexpr <Spec> k<Stage>Kernels[]` with
 `inline constexpr size_t k<Stage>KernelCount`; the field order of every `*Spec`
 is the contract (tables are rendered positionally).
+
+## Generated tree
+
+| path | role |
+|---|---|
+| `generated/<name>_kernel.cu` | one device translation unit per kernel, shared by `sm_100a` and `sm_103a`; listed in `files`; compiled per target with the record's `compile_flags` and the target's `-gencode` |
+| `generated/cake_stepfun_moe_device_common.cuh` | shared device preamble every unit includes first (typedefs, tensor-map ABI, one `#include "cake_device_helpers/..."` line per compiler helper the units use); listed in `files` |
+| `generated/cake_stepfun_generated_manifest.cuh`, `generated/cake_stepfun_generated_stages.cuh` | the launch tables described above; listed in `files` |
+| `generated/cake_stepfun_inventory.json` | this inventory |
+| `generated/cake_stepfun_moe_host_common.cuh` | launcher-helper header the exporter renders for every export with shared headers; unused here (the module launches through the generated tables) and not listed in `files`; a known exporter gap, to be omitted by a later exporter change |
+| `csrc/cake_device_helpers/cake_<helper>_<16 hex>.cuh` | content-addressed compiler helper functions, one function per file, shared by every Cake kernel family in this repository; a family whose export finds a helper already present keeps the repository's bytes and never edits the file; resolved through the `csrc` include root (the JIT adds `csrc` to every compile line), so the preamble's includes need that root on the include path |
+
+Attestation: `files` digests the units, the two table headers and the device
+preamble, and the loader checks every listed digest before compiling. The
+helper files are attested only transitively: the preamble names each helper by
+its content hash, so a helper's identity is pinned while its bytes are not (a
+hand-edited helper body under an unchanged name is not detected at load time;
+known gap). A changed helper body becomes a new file next to the old one; the
+old file stays until a later change removes it.
 
 ## Stage contracts
 

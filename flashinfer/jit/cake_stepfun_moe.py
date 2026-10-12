@@ -55,7 +55,7 @@ _MODULE_URI: dict[tuple[CakeStepFunTarget, bool], str] = {
     ("sm_103a", True): "fused_moe_cake_stepfun_full_sm103",
 }
 _INVENTORY = "cake_stepfun_inventory.json"
-_INVENTORY_SCHEMA = "flashinfer.cake_stepfun.inventory.v5"
+_INVENTORY_SCHEMA = "flashinfer.cake_stepfun.inventory.v6"
 _MANIFEST = "cake_stepfun_generated_manifest.cuh"
 _FC1_SOURCE = "cake_stepfun_fc1_runner.cu"
 _FC1_HEADER = "cake_stepfun_fc1_runner.cuh"
@@ -204,19 +204,27 @@ def _pre_kernel_device(kernel: dict, index: int, files: dict) -> str | None:
 def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInventory:
     """Read and validate the generated inventory.
 
-    The inventory (schema ``flashinfer.cake_stepfun.inventory.v5``) lists every
-    exported device translation unit with its ``stage`` (one of
-    :data:`CAKE_STEPFUN_STAGES`), ``arch``, ``device`` path, ``compile_flags`` and
-    launch metadata. ``fc1`` / ``fc2`` records are ``(family, tile_n)`` pairs declared
-    in ``families`` / ``fc2_families``; ``routing``, ``requant`` and ``finalize``
-    records carry a unique ``variant`` (routing records also their ``input`` kind
-    and, for the two-kernel large-token path, a ``pre_kernel`` unit; finalize
-    records their ``expert_weights_dtype``). Every ``fc2`` record names the
-    trtllm-gen configuration its kernel is a port of (``native_config``, a ``bmm_*``
-    function name; :func:`cake_stepfun_fc2_native_config`). ``program_hash`` seals
-    ``kernels``, ``families``, ``fc2_families`` and the per-file ``files`` digests,
-    and the generated manifest header must define the kernel table of every listed
-    stage.
+    The inventory (schema ``flashinfer.cake_stepfun.inventory.v6``) lists every
+    exported kernel once per target: one device translation unit per kernel, shared
+    by both targets and compiled per target with its own ``-gencode``, so the two
+    records of a kernel name the same ``device`` path. Every record carries its
+    ``stage`` (one of :data:`CAKE_STEPFUN_STAGES`), ``arch``, ``device`` path,
+    ``compile_flags``, ``kernel_symbol`` and ``source_symbol``. ``fc1`` / ``fc2``
+    records are ``(family, tile_n)`` pairs declared in ``families`` /
+    ``fc2_families`` (with ``block_k`` and ``native_config``; ``fc2`` adds
+    ``split_k``, ``min_k_tiles`` and ``k_tiles_multiple``); ``routing``, ``requant``
+    and ``finalize`` records carry a unique ``variant`` (routing records also their
+    ``input`` kind, ``logits_dtype``, ``min_tokens`` / ``max_tokens`` and, for the
+    two-kernel large-token path, a ``pre_kernel`` ``{kernel_symbol, device}``;
+    requant records their ``sf_layout``; finalize records their
+    ``expert_weights_dtype``). Every ``fc2`` record names the trtllm-gen
+    configuration its kernel is a port of (``native_config``, a ``bmm_*`` function
+    name; :func:`cake_stepfun_fc2_native_config`). ``files`` lists the units, the
+    two generated table headers and the shared device preamble
+    ``generated/cake_stepfun_moe_device_common.cuh`` every unit includes;
+    ``program_hash`` seals ``kernels``, ``families``, ``fc2_families`` and the
+    per-file ``files`` digests, and the generated manifest header must define the
+    kernel table of every listed stage.
     """
     csrc_dir = _get_cake_stepfun_csrc_dir() if csrc_dir is None else csrc_dir
     generated_dir = csrc_dir / "generated"

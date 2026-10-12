@@ -1305,7 +1305,7 @@ def test_stepfun_per_token_nvfp4_matches_native(num_tokens):
 # ---------------------------------------------------------------------------------------------
 
 
-def test_inventory_v5_lists_a_stage_per_kernel():
+def test_inventory_v6_lists_a_stage_per_kernel():
     """Every inventory record names its pipeline stage; fc1 is present for every target."""
     from flashinfer.jit.cake_stepfun_moe import (
         CAKE_STEPFUN_STAGES,
@@ -1323,13 +1323,13 @@ def test_inventory_v5_lists_a_stage_per_kernel():
 
 def test_inventory_rejects_a_stale_schema_id(tmp_path):
     """A generated tree of a previous schema fails with the schema error before any record is
-    read (the record contract changed under the v4 id twice; v5 makes a stale tree fail loudly)."""
+    read (the record contract changed under the v4 id twice; since v5 a stale tree fails loudly)."""
     from flashinfer.jit.cake_stepfun_moe import load_cake_stepfun_inventory
 
     csrc_dir = tmp_path / "csrc" / "fused_moe" / "cake_stepfun"
     (csrc_dir / "generated").mkdir(parents=True)
     stale = {
-        "schema": "flashinfer.cake_stepfun.inventory.v4",
+        "schema": "flashinfer.cake_stepfun.inventory.v5",
         "kernels": [{"stage": "fc1"}],
         "files": {"csrc/fused_moe/cake_stepfun/generated/x.cu": "0" * 64},
     }
@@ -1337,7 +1337,7 @@ def test_inventory_rejects_a_stale_schema_id(tmp_path):
         json.dumps(stale), encoding="utf-8"
     )
     with pytest.raises(
-        ValueError, match=r"schema must be flashinfer\.cake_stepfun\.inventory\.v5"
+        ValueError, match=r"schema must be flashinfer\.cake_stepfun\.inventory\.v6"
     ):
         load_cake_stepfun_inventory(csrc_dir)
 
