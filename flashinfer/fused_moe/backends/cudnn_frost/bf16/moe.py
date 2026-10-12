@@ -286,14 +286,11 @@ class CudnnFrostBf16MoeRunner(MoERunner):
         # workaround must not exclude their previously supported toolchains.
         if get_compute_capability(self.device) == (10, 7):
             require_moe_assembler()
-        if act.routing_input_mode not in self.supported_routing_modes:
-            raise NotImplementedError(
-                "cuDNN Frost BF16 MoE requires precomputed routing"
-            )
+        self._validate_pack_contract(act)
         x = act.hidden_states_q
         if x.ndim != 2 or x.dtype != torch.bfloat16:
             raise ValueError("cuDNN Frost BF16 MoE requires BF16 x[T,H]")
-        if act.hidden_states_scale is not None or act.per_token_scale is not None:
+        if act.hidden_states_scale is not None:
             raise ValueError("cuDNN Frost BF16 MoE does not consume activation scales")
         t, h = x.shape
         k, e = self.config.routing.top_k, self.config.routing.num_experts

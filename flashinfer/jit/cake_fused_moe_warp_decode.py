@@ -15,7 +15,8 @@ limitations under the License.
 """
 
 import functools
-from pathlib import Path
+import json
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from . import env as jit_env
@@ -166,6 +167,130 @@ def _device_sources(csrc_dir: Path, target: CakeWarpDecodeTarget) -> list[Path]:
     return sources
 
 
+def _require_dict(value: Any, context: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"Cake warp-decode export manifest {context} must be an object"
+        )
+    return value
+
+
+def _resolve_export_path(csrc_dir: Path, raw_path: Any, context: str) -> Path:
+    if not isinstance(raw_path, str) or not raw_path or "\\" in raw_path:
+        raise ValueError(
+            f"Cake warp-decode export manifest {context} must be a non-empty POSIX path"
+        )
+    parts = raw_path.split("/")
+    posix_path = PurePosixPath(raw_path)
+    if posix_path.is_absolute() or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(
+            f"Cake warp-decode export manifest {context} is not a safe relative path: "
+            f"{raw_path!r}"
+        )
+
+    repo_root = csrc_dir.parents[2].resolve()
+    resolved = (repo_root / Path(*posix_path.parts)).resolve()
+    try:
+        resolved.relative_to(repo_root)
+    except ValueError as error:
+        raise ValueError(
+            f"Cake warp-decode export manifest {context} escapes the package root: "
+            f"{raw_path!r}"
+        ) from error
+    if not resolved.is_file():
+        raise FileNotFoundError(
+            f"Cake warp-decode export manifest {context} source not found: {resolved}"
+        )
+    return resolved
+
+
+def _load_clamped_e256_sources(
+    csrc_dir: Path, target: CakeWarpDecodeTarget
+) -> list[Path]:
+    """Enable the SM100 extension only with its complete generated inventory."""
+    if target != "sm100a":
+        return []
+    directory = csrc_dir / "generated" / "dsv4_clamped_e256"
+    manifest_path = directory / "module_manifest.json"
+    if not manifest_path.is_file():
+        return []
+    manifest = _require_dict(
+        json.loads(manifest_path.read_text()), "clamped E256 modules"
+    )
+    if manifest.get("schema_version") != 1 or manifest.get("target") != "sm_100a":
+        raise ValueError("Clamped E256 inventory requires schema 1 and exact sm_100a")
+    modules = manifest.get("modules")
+    if not isinstance(modules, list) or len(modules) != 15:
+        raise ValueError("Clamped E256 inventory must contain its 15 selected modules")
+    paths: list[Path] = []
+    identifiers: set[str] = set()
+    for module in modules:
+        module = _require_dict(module, "clamped E256 module")
+        identity = module.get("id")
+        filename = module.get("file")
+        if (
+            not isinstance(identity, str)
+            or identity in identifiers
+            or not isinstance(filename, str)
+            or Path(filename).name != filename
+            or not filename.endswith(".cu")
+        ):
+            raise ValueError("Clamped E256 module identity/source path is invalid")
+        if module.get("compile_options") != ["--use_fast_math"]:
+            raise ValueError(
+                "Clamped E256 module compile options differ from the selected source"
+            )
+        if module.get("pdl") is not True or module.get("cooperative") is not False:
+            raise ValueError(
+                "Clamped E256 requires non-cooperative programmatic dependent launch"
+            )
+        identifiers.add(identity)
+        paths.append(
+            _resolve_export_path(
+                csrc_dir,
+                "csrc/fused_moe/warp_decode/generated/dsv4_clamped_e256/" + filename,
+                "clamped E256 device source",
+            )
+        )
+    if len(set(paths)) != len(paths):
+        raise ValueError("Clamped E256 inventory repeats a device source")
+    for filename in (
+        "declarations.cuh",
+        "dsv4_clamped_e256_manifest.cuh",
+        "route_metadata.json",
+    ):
+        if not (directory / filename).is_file():
+            raise FileNotFoundError(
+                f"Clamped E256 generated source missing: {directory / filename}"
+            )
+    routes = _require_dict(
+        json.loads((directory / "route_metadata.json").read_text()),
+        "clamped E256 routes",
+    )
+    rows = routes.get("routes")
+    if (
+        routes.get("schema_version") != 1
+        or not isinstance(rows, list)
+        or [row.get("T") for row in rows] != list(range(1, 33))
+    ):
+        raise ValueError("Clamped E256 inventory must cover every token count 1..32")
+    used: set[str] = set()
+    for row in rows:
+        calls = row.get("launches")
+        expected = 3 if row["T"] <= 6 else 4
+        if not isinstance(calls, list) or len(calls) != expected:
+            raise ValueError("Clamped E256 route has an incomplete launch sequence")
+        for order, call in enumerate(calls):
+            if call.get("order") != order or call.get("module_id") not in identifiers:
+                raise ValueError(
+                    "Clamped E256 route references a missing or unordered module"
+                )
+            used.add(call["module_id"])
+    if used != identifiers:
+        raise ValueError("Clamped E256 inventory contains an unselected module")
+    return paths
+
+
 def get_cake_fused_moe_warp_decode_uri(
     target: CakeWarpDecodeTarget = "sm103a",
 ) -> str:
@@ -185,7 +310,8 @@ def gen_cake_fused_moe_warp_decode_module(
     uri = get_cake_fused_moe_warp_decode_uri(target)
     csrc_dir = _get_cake_fused_moe_warp_decode_csrc_dir()
     generated_dir = csrc_dir / "generated"
-    device_sources = _device_sources(csrc_dir, target)
+    clamped_sources = _load_clamped_e256_sources(csrc_dir, target)
+    device_sources = [*_device_sources(csrc_dir, target), *clamped_sources]
     for source in (
         csrc_dir / _BINDING_SOURCE,
         generated_dir / _GENERATED_MANIFEST,
@@ -197,6 +323,7 @@ def gen_cake_fused_moe_warp_decode_module(
     target_flags = [
         *_TARGET_FLAGS[target],
         f"-DFLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR={_TARGET_MINOR[target]}",
+        f"-DFLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256={int(bool(clamped_sources))}",
     ]
     spec = gen_jit_spec(
         name=uri,

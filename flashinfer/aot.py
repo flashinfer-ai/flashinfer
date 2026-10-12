@@ -192,6 +192,7 @@ from .jit.cake_sparse_mla_sm120_dsv41_mixed import (
     cake_sparse_mla_sm120_dsv41_mixed_available,
     gen_cake_sparse_mla_sm120_dsv41_mixed_module,
 )
+from .jit.cake_concat_mla_kv_quant_fp8 import gen_concat_mla_kv_quant_fp8_aot_modules
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
@@ -678,6 +679,12 @@ def gen_all_modules(
         jit_specs.append(gen_cake_fmha_compat_module("sm100a"))
     if has_sm103a_exact:
         jit_specs.append(gen_cake_fmha_compat_module("sm103a"))
+    # Cake fused MLA context K/V pack (attention side, not MoE): one build per
+    # (exact target, head group).
+    if has_sm100a_exact:
+        jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm103a"))
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
@@ -833,6 +840,7 @@ def gen_all_modules(
             ("sm90a", "sm90a_exact"),
             ("sm100a", "sm100a_exact"),
             ("sm103a", "sm103a_exact"),
+            ("sm107a", "sm107a_exact"),
         ):
             if sm_capabilities.get(cake_bgmv_flag, False):
                 jit_specs.extend(
@@ -1364,6 +1372,7 @@ def detect_sm_capabilities():
         (10, "0f"),
         (10, "3a"),
         (10, "3f"),
+        (10, "7a"),
     }
     flash_kda_decode_sm103_arches = {(10, "3a"), (10, "3f")}
     return {
@@ -1452,6 +1461,8 @@ def detect_sm_capabilities():
         "sm103": has_sm("compute_103", "12.9"),
         "sm103a_exact": (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
         and cuda_version >= Version("12.9"),
+        "sm107a_exact": (10, "7a") in compilation_context.TARGET_CUDA_ARCHS
+        and cuda_version >= Version("13.0"),
         "sm107": has_sm("compute_107", "12.9"),
         "sm110": has_sm("compute_110", "13.0"),
         "sm120": has_sm("compute_120", "12.8"),

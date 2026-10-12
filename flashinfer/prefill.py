@@ -39,6 +39,7 @@ from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .cudnn.prefill import (
     CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE,
     _CUDNN_NATIVE_HN_SUPPORTED,
+    _cudnn_single_token_gqa_ragged_stats_broken,
     _cudnn_supports_direct_seqlens,
     CudnnPrefillGraph,
     _PrefillMetadata,
@@ -1852,7 +1853,7 @@ def _blackwell_ragged_auto_upgrade(
     cutlass_work_items: Union[int, Callable[[], int]],
     cuda_graph_enabled: bool,
     cutlass_indptr_is_int32: bool = False,
-    single_token_gqa: bool = False,
+    single_token_gqa_with_empty_rows: bool = False,
 ) -> Optional[str]:
     r"""Pick the Blackwell backend ``auto`` should upgrade FA2 to for ragged prefill.
 
@@ -1906,11 +1907,14 @@ def _blackwell_ragged_auto_upgrade(
                 # graph, where it raises instead -- so in that case cuDNN
                 # cannot serve the call and must not be selected.
                 and cudnn_indptr_is_int32
-                # cuDNN's s_q == 1 kernel packs the q heads of a kv group and
-                # writes the LSE only for the first of them (cuDNN 9.26/9.27,
-                # NVBug 6783545); the output is right, the LSE is not, and run()
-                # does not know yet whether the caller wants it.
-                and not single_token_gqa
+                # cuDNN < 9.27 mis-stores a ragged Stats tensor for s_q == 1
+                # GQA (NVBug 6783545). The plan serves the packed LSE through
+                # the unragged (b, h, 1, 1) declaration instead, which only
+                # works when every request has exactly one token; a batch
+                # that mixes zero-length and one-token requests cannot get an
+                # LSE from cuDNN there, and run() does not know yet whether
+                # the caller wants one.
+                and not single_token_gqa_with_empty_rows
             ):
                 return backend
         elif backend == "cutlass":
@@ -2274,6 +2278,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._cudnn_q_lens_buffer: Optional[torch.Tensor] = None
         self._cudnn_prepared: Optional[CudnnPrefillGraph] = None
         self._cudnn_plan: Optional[_CudnnPrefillPlan] = None
+        # cuDNN < 9.27, single-token GQA batch with zero-length requests: the
+        # packed LSE cannot be served (NVBug 6783545); run() refuses it.
+        self._cudnn_lse_unservable = False
         self._prims_backend = None
         if backend == "cute-dsl-prims":
             try:
@@ -3222,6 +3229,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._block_tables = self._cudnn_block_tables
             previous_cudnn_plan = self._cudnn_plan
             self._cudnn_plan = None
+            self._cudnn_lse_unservable = False
             if _CUDNN_GRAPH_AVAILABLE and _cudnn_supports_direct_seqlens(
                 q_data_type, mixed=True
             ):
@@ -3239,6 +3247,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     batch_offsets_stats=self._qo_indptr_buf,
                 ).resolve_from_plan(
                     q_data_type, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo
+                )
+                self._cudnn_lse_unservable = not (
+                    metadata.bind_single_token_stats_unragged(
+                        total_num_rows, num_qo_heads, num_kv_heads
+                    )
                 )
                 self._cudnn_plan = _CudnnPrefillPlan.prepare(
                     metadata, q_data_type, self.device, previous_cudnn_plan
@@ -3495,6 +3508,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
+            if return_lse and self._cudnn_lse_unservable:
+                raise NotImplementedError(
+                    "cuDNN < 9.27 mis-stores the ragged LSE for single-token "
+                    "(max q_len == 1) GQA (NVBug 6783545); it is served only when "
+                    "every request has exactly one token, and this batch has "
+                    "zero-length requests. Upgrade cuDNN or use return_lse=False"
+                )
             if q.size(0) != self._qo_indptr_last:
                 hint = ""
                 if q.numel() == self._qo_indptr_last:
@@ -3673,6 +3693,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and self._backend == "cudnn"
             and self._cudnn_plan is not None
             and self._cudnn_plan.metadata.causal == self._causal
+            # Head-major Stats places tokens through the ragged offset; a plan
+            # that dropped it (single-token GQA on cuDNN < 9.27) stages NH.
+            and self._cudnn_plan.metadata.batch_offsets_stats is not None
             and q.dtype in (torch.float16, torch.bfloat16)
             and q_scale is None
             and k_scale is None
@@ -3750,11 +3773,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._kv_layout == "NHD":
                 k_cache = k_cache.transpose(-3, -2)
                 v_cache = v_cache.transpose(-3, -2)
-            if return_lse and self._max_q_len == 1 and q.shape[1] != k_cache.shape[1]:
-                raise NotImplementedError(
-                    "cuDNN single-token GQA prefill does not write every LSE head "
-                    "(NVBug 6783545); use another backend or return_lse=False"
-                )
             if not out.is_contiguous():
                 raise ValueError("out must be contiguous for the cuDNN backend")
             if return_lse and not lse.is_contiguous():
@@ -4314,6 +4332,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._cudnn_stats_offsets: Optional[torch.Tensor] = None
         self._cudnn_prepared: Optional[CudnnPrefillGraph] = None
         self._cudnn_plan: Optional[_CudnnPrefillPlan] = None
+        # cuDNN < 9.27, single-token GQA batch with zero-length requests: the
+        # packed LSE cannot be served (NVBug 6783545); run() refuses it.
+        self._cudnn_lse_unservable = False
         self._cudnn_cpu_indptr_buffers: list[Optional[torch.Tensor]] = [None, None]
 
     def _stage_cudnn_indptr(self, source, index, non_blocking):
@@ -4964,8 +4985,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                             self._qo_indptr_buf.dtype == torch.int32
                             and self._kv_indptr_buf.dtype == torch.int32
                         ),
-                        single_token_gqa=(
-                            max_qo_len == 1 and num_qo_heads != num_kv_heads
+                        single_token_gqa_with_empty_rows=(
+                            max_qo_len == 1
+                            and num_qo_heads != num_kv_heads
+                            and total_num_rows != batch_size
+                            and _cudnn_single_token_gqa_ragged_stats_broken()
                         ),
                     )
                     if upgraded is not None:
@@ -5047,6 +5071,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._cudnn_stats_offsets = self._qo_indptr_buf
             previous_cudnn_plan = self._cudnn_plan
             self._cudnn_plan = None
+            self._cudnn_lse_unservable = False
             if _CUDNN_GRAPH_AVAILABLE and _cudnn_supports_direct_seqlens(q_data_type):
                 # run() defaults an FP8 output declaration to BF16.
                 cudnn_out_dtype = (
@@ -5069,6 +5094,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     batch_offsets_stats=self._cudnn_stats_offsets,
                 ).resolve_from_plan(
                     q_data_type, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo
+                )
+                self._cudnn_lse_unservable = not (
+                    metadata.bind_single_token_stats_unragged(
+                        total_num_rows, num_qo_heads, num_kv_heads
+                    )
                 )
                 self._cudnn_plan = _CudnnPrefillPlan.prepare(
                     metadata, q_data_type, self.device, previous_cudnn_plan
@@ -5352,6 +5382,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and self._backend == "cudnn"
             and self._cudnn_plan is not None
             and self._cudnn_plan.metadata.causal == self._causal
+            # Head-major Stats places tokens through the ragged offset; a plan
+            # that dropped it (single-token GQA on cuDNN < 9.27) stages NH.
+            and self._cudnn_plan.metadata.batch_offsets_stats is not None
             and q.dtype in (torch.float16, torch.bfloat16)
             and q_scale is None
             and k_scale is None
@@ -5611,16 +5644,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "cuDNN ragged prefill backend does not consume them; plan() "
                     "again (auto routes past cuDNN when sinks are set) or use fa2"
                 )
-            if (
-                return_lse
-                and self._max_token_per_sequence == 1
-                and q.shape[1] != k.shape[1]
-            ):
+            if return_lse and self._cudnn_lse_unservable:
                 raise NotImplementedError(
-                    "cuDNN's single-token (max q_len == 1) GQA kernel writes the "
-                    "LSE only for the first head of each kv group (cuDNN 9.26/9.27 "
-                    "bug, NVBug 6783545); use backend='auto', which routes these steps "
-                    "to another backend, or return_lse=False"
+                    "cuDNN < 9.27 mis-stores the ragged LSE for single-token "
+                    "(max q_len == 1) GQA (NVBug 6783545); it is served only when "
+                    "every request has exactly one token, and this batch has "
+                    "zero-length requests. Use backend='auto', which routes these "
+                    "steps to another backend, or return_lse=False"
                 )
             # The caller's token-unit indptrs go straight to cuDNN (mask +
             # ragged offsets, scaled in-engine); no per-call conversion kernels.
@@ -8029,15 +8059,19 @@ def minimax_h3_varlen_attention(
         Optional caller-owned contiguous BF16 ``[T, H, 128]`` output.
     cu_seqlens_host : Optional[Sequence[int]]
         Host copy of ``cu_seqlens``; when omitted the values are read back
-        from the device once to build the segment plan.
+        from the device once to resolve the segment plan.
     backend : str
         Only ``"cake"`` is supported.
 
     Returns
     -------
     torch.Tensor
-        The contiguous BF16 ``[T, H, 128]`` output (``out`` when given).  For
-        repeated launches or CUDA Graph capture use
+        The contiguous BF16 ``[T, H, 128]`` output (``out`` when given).  The
+        segment plan is cached per ``(cu_seqlens, num_heads, device, stream)``
+        (most recent 256 layouts): the first call of a layout builds and
+        uploads the plan tables, every later call re-launches with them (no
+        planning, no host-to-device copies, no allocation when ``out`` is
+        given).  For CUDA Graph capture use
         ``flashinfer.experimental.minimax_h3_varlen_attention.cake_backend.prepare_minimax_h3_varlen_attention``,
         whose runner launches with no allocation or synchronization.  See
         ``flashinfer/experimental/minimax_h3_varlen_attention/README.md``.

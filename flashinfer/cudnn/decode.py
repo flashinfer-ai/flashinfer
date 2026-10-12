@@ -8,6 +8,7 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_decode_trace
 from ..utils import log2e
 from .utils import (
+    cudnn_frontend_accepts_cuda_graph_replay_hint,
     get_cudnn_fmha_gen_module,
     get_cudnn_attention_handle,
     supports_ordered_cudnn_execution,
@@ -74,6 +75,7 @@ def _sdpa_decode_key_fn(
     q_len_per_req: int = 1,
     window_left: int = -1,
     sinks: Optional[torch.Tensor] = None,
+    is_cuda_graph_compatible: bool = False,
     stats_use_log2: bool = False,
 ):
     return (
@@ -126,6 +128,12 @@ def _sdpa_decode_key_fn(
         q_len_per_req,
         window_left,
         _tensor_layout_key(sinks),
+        # The CUDA-graph replay hint changes which plan cudnn-frontend builds
+        # first (the d256 decode tile's split-KV plan for a replaying caller),
+        # so a graph built for eager execution must not serve a captured
+        # caller or the other way round. stats_use_log2 stays last:
+        # CudnnDecodeGraph reads it as key[-1].
+        is_cuda_graph_compatible,
         stats_use_log2,
     )
 
@@ -153,9 +161,20 @@ if CUDNN_AVAILABLE:
         q_len_per_req: int = 1,
         window_left: int = -1,
         sinks: Optional[torch.Tensor] = None,
+        is_cuda_graph_compatible: bool = False,
         stats_use_log2: bool = False,
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
+
+        # A caller that captures the graph's execute into a CUDA graph pays a
+        # plan's per-execute host cost once, at capture: tell cudnn-frontend
+        # (1.31+) so its heuristics lead with the plan that is fastest on the
+        # GPU alone (the d256 decode tile's split-KV plan) instead of the one
+        # that also covers an eager caller's extra launch. The hint changes no
+        # numerics; an older frontend is not given the keyword.
+        graph_kwargs: dict[str, Any] = {}
+        if is_cuda_graph_compatible and cudnn_frontend_accepts_cuda_graph_replay_hint():
+            graph_kwargs["is_cuda_graph_replay_expected"] = True
 
         # Decode represents fixed-length queries with dense strided Q/O
         # descriptors; public batch offsets are only used by the cubin path.
@@ -166,7 +185,7 @@ if CUDNN_AVAILABLE:
         cudnn_q_data_type = cudnn.datatypes._torch_to_cudnn_data_type(q.dtype)
         cudnn_o_data_type = cudnn_q_data_type
 
-        with cudnn.graph(handle) as (g, _):
+        with cudnn.graph(handle, **graph_kwargs) as (g, _):
             if q.dim() == 3:
                 s_qo = 1
                 b, h_qo, d_qk = q.shape[0], q.shape[1], q.shape[2]
@@ -654,10 +673,11 @@ class CudnnDecodeGraph:
         out: torch.Tensor,
         lse: Optional[torch.Tensor],
         sinks: Optional[torch.Tensor],
+        is_cuda_graph_compatible: bool = False,
     ) -> bool:
         """Whether this prepared graph serves the call: same graph-cache key
-        (shapes, strides, dtypes, scale, flags, mask), out / lse keep their
-        layout, and sink presence is unchanged."""
+        (shapes, strides, dtypes, scale, flags, mask, CUDA-graph replay hint),
+        out / lse keep their layout, and sink presence is unchanged."""
         if (
             q_len_per_req != self.q_len_per_req
             or q.shape[0] != self.batch_size * q_len_per_req
@@ -697,6 +717,7 @@ class CudnnDecodeGraph:
             q_len_per_req=q_len_per_req,
             window_left=window_left,
             sinks=self.sinks_view,
+            is_cuda_graph_compatible=is_cuda_graph_compatible,
             stats_use_log2=self.requested_stats_use_log2,
         )
         return key == self.key
@@ -764,12 +785,16 @@ def prepare_cudnn_batch_decode(
     window_left: int,
     sinks: Optional[torch.Tensor],
     actual_seq_lens_q: Optional[torch.Tensor] = None,
+    is_cuda_graph_compatible: bool = False,
 ) -> CudnnDecodeGraph:
     """Validate once and build (or fetch from the graph cache) the paged-decode
     graph for this signature; steps then execute through
     :meth:`CudnnDecodeGraph.run`. Same contract as
     :func:`cudnn_batch_decode_with_kv_cache` in the paged, per-batch-length,
-    ``out``-provided form the wrappers use."""
+    ``out``-provided form the wrappers use. ``is_cuda_graph_compatible`` says
+    the caller captures :meth:`CudnnDecodeGraph.run` into a CUDA graph and
+    replays it; cudnn-frontend 1.31+ then builds the plan that is fastest on
+    the GPU alone first (see :func:`_make_decode_graph`)."""
     if not CUDNN_AVAILABLE:
         raise NotImplementedError(
             "prepare_cudnn_batch_decode requires the cuDNN graph backend"
@@ -818,6 +843,7 @@ def prepare_cudnn_batch_decode(
         q_len_per_req=q_len_per_req,
         window_left=window_left,
         sinks=sinks_view,
+        is_cuda_graph_compatible=is_cuda_graph_compatible,
     )
     kwargs["stats_use_log2"] = return_lse and supports_native_cudnn_log2(
         cudnn, q.device
@@ -1044,6 +1070,7 @@ def cudnn_batch_decode_with_kv_cache(
             q_len_per_req=q_len_per_req,
             window_left=window_left,
             sinks=sinks_view,
+            is_cuda_graph_compatible=is_cuda_graph_compatible,
             stats_use_log2=return_lse and supports_native_cudnn_log2(cudnn, q.device),
         )
         _execute_decode(

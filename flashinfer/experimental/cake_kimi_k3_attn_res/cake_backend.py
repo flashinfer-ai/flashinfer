@@ -82,6 +82,7 @@ ARCHES = tuple(sorted(set(SUPPORTED_COMPUTE_CAPABILITIES.values())))
 # ---------------------------------------------------------------------------
 _SM103_EARLY_CONSUMED_RELEASE_CELLS = frozenset(
     {
+        (256, 3),
         (256, 8),
         (512, 4),
         (512, 8),
@@ -91,6 +92,7 @@ _SM103_EARLY_CONSUMED_RELEASE_CELLS = frozenset(
         (2048, 1),
         (2048, 4),
         (2048, 8),
+        (3072, 1),
         (4096, 1),
         (4096, 2),
         (4096, 4),
@@ -100,6 +102,7 @@ _SM103_EARLY_CONSUMED_RELEASE_CELLS = frozenset(
         (4096, 8),
         (8192, 1),
         (8192, 8),
+        (12288, 1),
         (16384, 1),
         (16384, 8),
     }
@@ -121,13 +124,63 @@ _SM100_K4_NC3_D3_MIN_M = 1025
 # sm_100a dense cells that hold the consumed-stage release through the output stats.
 _SM100_HELD_CONSUMED_RELEASE_CELLS = frozenset({(4096, 5)})
 # Round r4 (direction 2): sm_100a bands just above the grid that keep the release held (K -> last M).
-_SM100_HELD_CONSUMED_RELEASE_MAX_M = {2: 768, 3: 384, 4: 255, 5: 192, 6: 192, 7: 255}
+_SM100_HELD_CONSUMED_RELEASE_MAX_M = {2: 768, 3: 384, 4: 255, 5: 192, 6: 192, 7: 192}
 # Round r4 (direction 2): sm_103a bands that release early (K -> first M).
-_SM103_EARLY_CONSUMED_RELEASE_MIN_M = {2: 768, 4: 513, 5: 384, 6: 384, 7: 256, 8: 257}
+_SM103_EARLY_CONSUMED_RELEASE_MIN_M = {2: 768, 4: 513, 5: 384, 6: 384, 7: 193, 8: 257}
 # Round r4 (K2 / K4 screening): the early-release band is bounded above where the held program wins
 # again (K2: f110 vs f011 0.985-0.991 at M768..2048, neutral at M3072 / 6144, 1.02-1.03 slower at
 # M12288 / 16384; K4: f110001 vs f010001 0.971-0.977 at M768, neutral at M1536, 1.025 slower at M3072).
 _SM103_EARLY_CONSUMED_RELEASE_MAX_M = {2: 2048, 4: 1023}
+# Round r5 mirrors of the Cake dispatcher's per-cell programs (``kimi_k3_attn_res._R5_*``): dense
+# persistent schedule cells (M, K) -> (sources_per_chunk, chunk_depth), the write twins' own schedule
+# cells, dense cells that add the prefix in BF16 outside the formula, sm_100a dense cells that release
+# early inside a held band / sm_103a dense cells that hold inside an early band, write cells that release
+# early although the write-held rule names their K, dense cells that leave the small-M table (the write
+# twin stays), small-M cluster cells.
+_R5_PERSISTENT_SCHEDULE_CELLS = {
+    "sm_100a": {
+        (256, 3): (2, 2),
+        (192, 6): (3, 2),
+        (192, 7): (3, 2),
+        (384, 2): (2, 2),
+        (512, 2): (3, 2),
+        (1024, 2): (3, 2),
+        (1536, 2): (3, 2),
+    },
+    "sm_103a": {
+        (256, 3): (2, 2),
+        (192, 6): (3, 2),
+        (192, 7): (3, 2),
+        (384, 2): (3, 2),
+        (512, 5): (3, 3),
+        (768, 5): (3, 3),
+        (1024, 5): (4, 3),
+        (768, 2): (3, 2),
+    },
+}
+_R5_WRITE_PERSISTENT_SCHEDULE_CELLS = {"sm_100a": {(1024, 4): (3, 2)}, "sm_103a": {}}
+_R5_PREFIX_BF16_ADD_CELLS = {
+    "sm_100a": frozenset({(256, 3), (192, 6), (192, 7)}),
+    "sm_103a": frozenset({(256, 3), (192, 6), (384, 2), (768, 2)}),
+}
+_SM100_R5_EARLY_CONSUMED_RELEASE_CELLS: frozenset[tuple[int, int]] = frozenset(
+    {(384, 2), (512, 2)}
+)
+_SM103_R5_HELD_CONSUMED_RELEASE_CELLS: frozenset[tuple[int, int]] = frozenset(
+    {(512, 5), (768, 5)}
+)
+_R5_WRITE_EARLY_CONSUMED_RELEASE_CELLS = {
+    "sm_100a": frozenset({(1024, 4)}),
+    "sm_103a": frozenset(),
+}
+_R5_SMALL_M_EXCLUDED_CELLS = {
+    "sm_100a": frozenset({(256, 3)}),
+    "sm_103a": frozenset({(256, 3)}),
+}
+# Dense cells above the small-M table that run the direct kernel (chunk from _R5_SMALL_M_CHUNK_CELLS).
+_R5_SMALL_M_INCLUDED_CELLS = {"sm_100a": frozenset(), "sm_103a": frozenset({(192, 5)})}
+_R5_SMALL_M_CHUNK_CELLS = {"sm_100a": {}, "sm_103a": {(192, 5): 6}}
+_R5_SMALL_M_CLUSTER_CELLS = {"sm_100a": {}, "sm_103a": {(192, 2): 2}}
 _WRITE_HELD_CONSUMED_RELEASE_MIN_M = {"sm_100a": {4: 1024}, "sm_103a": {4: 1024}}
 # K = 0 TMA route: grid multiple of the SM count on the promoted mid-M cells.
 _K0_TMA_GRID_MULTIPLIER_M = {
@@ -135,7 +188,7 @@ _K0_TMA_GRID_MULTIPLIER_M = {
     "sm_103a": {256: 2, 512: 3, 1024: 3},
 }
 _SM100_RELAXED_PRODUCER_WAIT_CELLS: frozenset[tuple[int, int]] = frozenset()
-_SM103_RELAXED_PRODUCER_WAIT_CELLS = frozenset({(4096, 5)})
+_SM103_RELAXED_PRODUCER_WAIT_CELLS = frozenset({(4096, 5), (1024, 5)})
 _NATIVE_ROUTES = (
     # name, {arch: routed M}, num_blocks, PDL modes, consumed-release policy
     (
@@ -209,10 +262,105 @@ _SMALL_M_CLUSTER: dict[str, dict[int, tuple[tuple[int, int], ...]]] = {
 
 
 def _small_m_cluster(arch: str, M: int, K: int) -> int:
+    cell = _R5_SMALL_M_CLUSTER_CELLS[arch].get((M, K))
+    if cell is not None:
+        return int(cell)
     for max_m, cluster in _SMALL_M_CLUSTER[arch].get(K, ()):
         if max_m >= M:
             return int(cluster)
     return 1
+
+
+# Mirror of ``kimi_k3_attn_res._FAST_MATH_BANDS`` (round r5): per program class ("small_m" /
+# "persistent" and their snapshot-write twins "small_m_write" / "persistent_write"), K -> inclusive
+# M bands whose program compiles with --use_fast_math (kernel key ``_fm``, schedule id ``_fastmath``;
+# the exported record carries the compile flag).
+# Round r5 (dense coverage D): a structural cell also serves the off-grid M just below it whose r4
+# program lost its only grid row to the cell (the run's grid representative WAS that row in r4), so
+# every dense M resolves to an exported program: (lo, hi) -> the r5 cell tables are consulted with
+# M = hi for lo <= M <= hi (dense programs only; the write twin keeps exact cells). sm_100a: (384,2)
+# serves 257..383, (1024,2) 769..1023, (1536,2) 1025..1535, (192,6) / (192,7) 129..191;
+# sm_103a: (192,7) 129..191. Paired check P rows at M141 / M200 / M300 / M1001 / M1300 measure them.
+_R5_CELL_RANGES: dict[str, dict[int, tuple[tuple[int, int], ...]]] = {
+    "sm_100a": {
+        2: ((257, 384), (769, 1024), (1025, 1536)),
+        6: ((129, 192),),
+        7: ((129, 192),),
+    },
+    "sm_103a": {7: ((129, 192),)},
+}
+
+
+def _cell_m(arch: str, M: int, K: int) -> int:
+    """The structural-cell M whose round-r5 tables apply to a dense row (``M`` itself outside the ranges)."""
+
+    for lo, hi in _R5_CELL_RANGES[arch].get(K, ()):
+        if lo <= M <= hi:
+            return hi
+    return M
+
+
+_FAST_MATH_BANDS = {
+    "sm_100a": {
+        "small_m": {
+            1: ((1, 512),),
+            2: ((1, 256),),
+            3: ((1, 255),),
+            4: ((1, 128),),
+            5: ((1, 128),),
+            6: ((1, 1), (5, 128)),
+            7: ((1, 128),),
+            8: ((1, 16),),
+        },
+        "persistent": {
+            1: ((768, 1536),),
+            2: ((257, 1536),),
+            3: ((256, 768),),
+            4: ((129, 1536),),
+            5: ((129, 192),),
+            6: ((129, 512),),
+            7: ((129, 512),),
+            8: ((65, 255),),
+        },
+        "small_m_write": {1: ((1, 256),), 4: ((1, 64),), 7: ((1, 64),)},
+        "persistent_write": {4: ((256, 256), (1024, 1024))},
+    },
+    "sm_103a": {
+        "small_m": {
+            0: ((1, 512),),
+            1: ((1, 512),),
+            2: ((1, 256),),
+            3: ((1, 2),),
+            4: ((1, 128),),
+            5: ((17, 128), (192, 192)),
+            6: ((1, 128),),
+            7: ((1, 128),),
+            8: ((1, 2), (6, 6)),
+        },
+        "persistent": {
+            1: ((768, 2048), (3072, 3072), (12288, 12288)),
+            2: ((384, 512), (768, 768)),
+            3: ((256, 384),),
+            4: ((129, 1023),),
+            # Three structural fm cells (512 nc3_d3, 768 nc3_d3, 1024 nc4_d3), not a sweep band: the
+            # production nc4_d2 program between them measured slower with fast-math (check P
+            # p_m700_k5 / p_m1001_k5 0.97 vs the exact program 0.98-0.99).
+            5: ((512, 512), (768, 768), (1024, 1024)),
+            6: ((192, 192),),
+            7: ((129, 384), (768, 768)),
+            8: ((512, 768), (1536, 1536)),
+        },
+        "small_m_write": {1: ((1, 256),), 4: ((1, 64),), 7: ((1, 64),)},
+        "persistent_write": {4: ((256, 256),)},
+    },
+}
+
+
+def _fast_math(gpu_arch, M, num_blocks, program):
+    return any(
+        min_m <= M <= max_m
+        for min_m, max_m in _FAST_MATH_BANDS[gpu_arch][program].get(num_blocks, ())
+    )
 
 
 # Online-softmax chunk size of the small-M programs: K -> ((max_m, sources_per_chunk), ...) bands in
@@ -227,6 +375,9 @@ _SMALL_M_CHUNK_BANDS: dict[str, dict[int, tuple[tuple[int, int], ...]]] = {
 
 def _small_m_sources_per_chunk(arch: str, M: int, K: int) -> int | None:
     default = 4 if K <= 3 else 3
+    cell = _R5_SMALL_M_CHUNK_CELLS[arch].get((M, K))
+    if cell is not None:
+        return None if int(cell) == default else int(cell)
     for max_m, sources_per_chunk in _SMALL_M_CHUNK_BANDS[arch].get(K, ()):
         if max_m >= M:
             return None if int(sources_per_chunk) == default else int(sources_per_chunk)
@@ -282,8 +433,15 @@ def _wait_policy(arch: str) -> bool:
     return arch == "sm_100a"
 
 
-def _schedule(arch: str, M: int, K: int) -> tuple[int, int]:
-    """``(sources_per_chunk, chunk_depth)`` of the persistent common path."""
+def _schedule(arch: str, M: int, K: int, write: bool = False) -> tuple[int, int]:
+    """``(sources_per_chunk, chunk_depth)`` of the persistent common path (``write``: the program the
+    snapshot-write twin is derived from; round r5 cells may give it its own schedule)."""
+    r5_cells = (
+        _R5_WRITE_PERSISTENT_SCHEDULE_CELLS if write else _R5_PERSISTENT_SCHEDULE_CELLS
+    )[arch]
+    cell = (M if write else _cell_m(arch, M, K), K)
+    if cell in r5_cells:
+        return r5_cells[cell]
     if (M, K) in _NC3_D3_CELLS[arch] or (
         arch == "sm_100a" and K == 4 and M >= _SM100_K4_NC3_D3_MIN_M
     ):
@@ -326,18 +484,30 @@ def _grid(M: int, num_sms: int, sources_per_chunk: int) -> tuple[int, str]:
 def _early_consumed_release(
     arch: str, M: int, K: int, grid_x: int, write: bool = False
 ) -> bool:
-    if write and _WRITE_HELD_CONSUMED_RELEASE_MIN_M[arch].get(K, M + 1) <= M:
+    if (
+        write
+        and _WRITE_HELD_CONSUMED_RELEASE_MIN_M[arch].get(K, M + 1) <= M
+        and (M, K) not in _R5_WRITE_EARLY_CONSUMED_RELEASE_CELLS[arch]
+    ):
         return False
     if arch == "sm_100a":
         return (
             K > 0
             and grid_x < M
             and (M, K) not in _SM100_HELD_CONSUMED_RELEASE_CELLS
-            and _SM100_HELD_CONSUMED_RELEASE_MAX_M.get(K, 0) < M
+            and (
+                (
+                    not write
+                    and (_cell_m(arch, M, K), K)
+                    in _SM100_R5_EARLY_CONSUMED_RELEASE_CELLS
+                )
+                or _SM100_HELD_CONSUMED_RELEASE_MAX_M.get(K, 0) < M
+            )
         )
     return (
         K > 0
         and grid_x < M
+        and (write or (M, K) not in _SM103_R5_HELD_CONSUMED_RELEASE_CELLS)
         and (
             (M, K) in _SM103_EARLY_CONSUMED_RELEASE_CELLS
             or (
@@ -379,9 +549,11 @@ _PERSISTENT_FLAG_PWA = 1
 _PERSISTENT_FLAG_PREFIX_BF16_ADD = 2
 _PERSISTENT_FLAG_PREFIX_ROUND_ONCE = 3
 _PERSISTENT_FLAG_ONE_TOKEN_PER_CTA = 4
-_PERSISTENT_KEY = re.compile(r"^persistent:k(\d+)_nc(\d+)_d(\d+)_f([01]+)(_write)?$")
+_PERSISTENT_KEY = re.compile(
+    r"^persistent:k(\d+)_nc(\d+)_d(\d+)_f([01]+)(_fm)?(_write)?$"
+)
 _SMALL_M_KEY = re.compile(
-    r"^small_m_(direct|cluster(\d+)):k(\d+)(?:_nc(\d+))?(_write)?$"
+    r"^small_m_(direct|cluster(\d+)):k(\d+)(?:_nc(\d+))?(_fm)?(_write)?$"
 )
 
 
@@ -415,16 +587,21 @@ def _small_m_plan(
     the module default of K), ``write_block`` = the snapshot-write variant (round r4).
     ``exact_key`` marks a registered-variant fallback of that exact plan."""
     threads = DIRECT_THREADS // cluster
+    fast_math = _fast_math(arch, M, K, "small_m_write" if write_block else "small_m")
     nc_suffix = "" if sources_per_chunk is None else f"_nc{int(sources_per_chunk)}"
+    fm_suffix = "_fastmath" if fast_math else ""
+    fm_key = "_fm" if fast_math else ""
     write_suffix = "_write" if write_block else ""
     if cluster == 1:
-        schedule_id = f"small_m_direct_cta256_regres_fp32x2{nc_suffix}{write_suffix}"
+        schedule_id = (
+            f"small_m_direct_cta256_regres_fp32x2{nc_suffix}{fm_suffix}{write_suffix}"
+        )
         grid_policy = "one_token_per_cta"
-        kernel_key = f"small_m_direct:k{K}{nc_suffix}{write_suffix}"
+        kernel_key = f"small_m_direct:k{K}{nc_suffix}{fm_key}{write_suffix}"
     else:
-        schedule_id = f"small_m_cluster{cluster}_cta{threads}_regres_fp32x2{nc_suffix}{write_suffix}"
+        schedule_id = f"small_m_cluster{cluster}_cta{threads}_regres_fp32x2{nc_suffix}{fm_suffix}{write_suffix}"
         grid_policy = f"one_token_per_cluster{cluster}"
-        kernel_key = f"small_m_cluster{cluster}:k{K}{nc_suffix}{write_suffix}"
+        kernel_key = f"small_m_cluster{cluster}:k{K}{nc_suffix}{fm_key}{write_suffix}"
     route_id = (
         f"{schedule_id}.{arch}.none_k{K}.k{K}.delta1.write{int(write_block)}.norm1."
         f"pdl{int(use_pdl)}.{grid_policy}"
@@ -456,14 +633,18 @@ def _persistent_fallback(
         if exact
         else (None, None, None)
     )
-    want_write = bool(exact and exact.group(5)) or plan.kernel_key.endswith("_write")
+    want_write = bool(exact and exact.group(6)) or plan.kernel_key.endswith("_write")
+    want_fm = bool(exact and exact.group(5)) or "_fm" in plan.kernel_key
     candidates = []
     for key in table:
         match = _PERSISTENT_KEY.match(key)
         if match is None or int(match.group(1)) != K:
             continue
-        if bool(match.group(5)) != want_write:
+        if bool(match.group(6)) != want_write:
             # the snapshot store exists only in the write variants: never cross that line
+            continue
+        if bool(match.group(5)) != want_fm:
+            # fast-math programs round differently (one BF16 ulp class): never substitute across it
             continue
         nc, depth, bits = int(match.group(2)), int(match.group(3)), match.group(4)
         score = (
@@ -486,6 +667,8 @@ def _persistent_fallback(
     else:
         grid_x, grid_policy = _grid(M, num_sms, nc)
     schedule_id = _persistent_schedule_id(nc, depth, bits)
+    if want_fm:
+        schedule_id += "_fastmath"
     if want_write:
         schedule_id += "_write"
     wait_policy = "deferred_wait_st" if _wait_policy(plan.arch) else "control_wait_st"
@@ -522,11 +705,12 @@ def _resolve_registered(plan: RoutePlan, num_sms: int, M: int) -> RoutePlan:
             return plan
         K = int(match.group(3))
         same_cluster = int(match.group(2)) if match.group(2) else 1
-        write_block = match.group(5) is not None
+        fm_key = match.group(5) or ""
+        write_block = match.group(6) is not None
         write_suffix = "_write" if write_block else ""
         for cluster in (same_cluster, 2, 4, 1):
             family = "direct" if cluster == 1 else f"cluster{cluster}"
-            if f"small_m_{family}:k{K}{write_suffix}" in table:
+            if f"small_m_{family}:k{K}{fm_key}{write_suffix}" in table:
                 return _small_m_plan(
                     plan.arch,
                     M,
@@ -671,7 +855,11 @@ def _plan_route_exact(
             use_pdl,
         )
     max_m = _SMALL_M_DIRECT_MAX_M[arch].get(K)
-    if max_m is not None and max_m >= M:
+    if (M, K) in _R5_SMALL_M_INCLUDED_CELLS[arch] or (
+        max_m is not None
+        and max_m >= M
+        and (M, K) not in _R5_SMALL_M_EXCLUDED_CELLS[arch]
+    ):
         return _small_m_plan(
             arch,
             M,
@@ -724,12 +912,13 @@ def _persistent_plan_exact(
     Cake dispatcher's persistent policies (``write``: the program the snapshot-write variant is
     derived from; it holds the release from ``_WRITE_HELD_CONSUMED_RELEASE_MIN_M``)."""
     defer = _wait_policy(arch)
-    nc, depth = _schedule(arch, M, K)
+    nc, depth = _schedule(arch, M, K, write)
     grid_x, grid_policy = _grid(M, num_sms, nc)
     ecr = _early_consumed_release(arch, M, K, grid_x, write)
     pwa = _producer_wait_acquire(arch, M, K)
     prefix_bf16_add = (
-        (
+        (not write and (_cell_m(arch, M, K), K) in _R5_PREFIX_BF16_ADD_CELLS[arch])
+        or (
             arch == "sm_100a"
             and (
                 K == 2
@@ -813,8 +1002,11 @@ def _persistent_plan_exact(
         k8_sm103_nonallocator_qk_prelude,
     )
     bits = "".join("1" if flag else "0" for flag in flags)
-    key = f"persistent:k{K}_nc{nc}_d{depth}_f{bits}"
-    schedule_id = _persistent_schedule_id(nc, depth, bits)
+    fast_math = _fast_math(arch, M, K, "persistent_write" if write else "persistent")
+    key = f"persistent:k{K}_nc{nc}_d{depth}_f{bits}" + ("_fm" if fast_math else "")
+    schedule_id = _persistent_schedule_id(nc, depth, bits) + (
+        "_fastmath" if fast_math else ""
+    )
     wait_policy = "deferred_wait_st" if defer else "control_wait_st"
     route_id = f"{schedule_id}.{arch}.{wait_policy}.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.{grid_policy}"
     return RoutePlan(

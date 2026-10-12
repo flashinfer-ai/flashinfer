@@ -3850,7 +3850,7 @@ class AutoTuner:
         inputs: list[Any],
         tuning_config: TuningConfig,
     ) -> list[list[Any]]:
-        """Create multiple input copies to flush the L2 cache between profiling iterations."""
+        """Prepare arena schedules or reuse inputs for explicitly flushed profiling."""
         if not tuning_config.use_cold_l2_cache:
             return [inputs]
 
@@ -3913,34 +3913,11 @@ class AutoTuner:
             )
             return batches
 
-        one_buffer_bytes = sum(
-            input.numel() * input.element_size()
-            if isinstance(input, torch.Tensor)
-            else 0
-            for input in inputs
-        )
-        if one_buffer_bytes <= 0:
-            logger.debug(
-                "[Autotuner] No tensor inputs or zero-sized tensors; falling back to single-batch profiling."
-            )
-            return [inputs]
-
-        num_buffers = self._get_l2_cache_size_in_bytes() * 3 // one_buffer_bytes + 1
-        num_buffers = min(num_buffers, profiling_repeat + 1)
-        # Avoid reusing a warmed batch within the timed graph.
-        if tuning_config.use_cuda_graph and tuning_config.use_cold_l2_graph_replay:
-            num_buffers = max(num_buffers, profiling_repeat)
-
-        inputs_list = [inputs]
-        for _ in range(num_buffers - 1):
-            inputs_list.append(
-                [t.clone() if isinstance(t, torch.Tensor) else t for t in inputs]
-            )
-
-        logger.debug(
-            f"[Autotuner] use_cold_l2_cache={tuning_config.use_cold_l2_cache}, use {num_buffers} different tensors for profiling"
-        )
-        return inputs_list
+        # Each measured invocation already follows an explicit L2 flush. Reuse
+        # the original tensors so profiling preserves strides, pointer alignment,
+        # and aliases (including nested split views). Tensor.clone() can compact
+        # gapped views and would measure a different layout from the caller's.
+        return [inputs]
 
     def _get_profiling_repeat(self, tuning_config: TuningConfig) -> int:
         profiling_repeat = tuning_config.profiling_repeat

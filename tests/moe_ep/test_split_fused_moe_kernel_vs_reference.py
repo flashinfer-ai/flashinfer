@@ -375,7 +375,7 @@ def test_trtllm_routed_moe_supported_architectures(config_cls, arch, expected):
         (90, False),
         (100, True),
         (103, True),
-        (107, False),
+        (107, True),
         (110, False),
         (120, False),
         (121, False),

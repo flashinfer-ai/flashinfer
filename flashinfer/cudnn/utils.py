@@ -195,3 +195,79 @@ def cudnn_frontend_serves_frost_decode(compute_capability: Tuple[int, int]) -> b
     if (tuple(version) + (0, 0, 0))[:3] < CUDNN_FRONTEND_FROST_DECODE_MIN_VERSION:
         return False
     return tuple(compute_capability) in ((10, 0), (10, 3))
+
+
+@functools.cache
+def cudnn_frontend_accepts_cuda_graph_replay_hint() -> bool:
+    """Whether the installed cudnn-frontend's ``pygraph`` takes the keyword-only
+    ``is_cuda_graph_replay_expected`` hint and its ``cudnn.graph`` helper
+    forwards graph keywords to it (1.31+).
+
+    The hint tells the frontend's heuristics that the graph's ``execute`` is
+    captured into a CUDA graph and replayed, so a plan's per-execute host
+    cost is paid once; the d256 decode tile then leads with its split-KV
+    plan. Probed from the signatures rather than the version so a frontend
+    without the keyword (or the compiled ``pygraph`` of 1.29 and older,
+    which has no Python signature) is simply not given it.
+    """
+    try:
+        import cudnn  # noqa: PLC0415 -- optional dependency, imported lazily
+    except Exception:  # noqa: BLE001 -- any import failure means "not available"
+        return False
+    try:
+        ctor = inspect.signature(cudnn.pygraph.__init__).parameters
+        helper = inspect.signature(cudnn.graph).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return "is_cuda_graph_replay_expected" in ctor and any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in helper.values()
+    )
+
+
+@functools.cache
+def cudnn_frontend_frost_runtime_available() -> bool:
+    """Whether the installed cudnn-frontend can run its FROST (CuTe-DSL) SDPA
+    engines on this install: the CuTe DSL they need is present and not below
+    the frontend's own floor (``cudnn.frost.buffers.CUTEDSL_MIN_VERSION``,
+    4.7.0 today).
+
+    Both this package and cudnn-frontend admit ``nvidia-cutlass-dsl`` 4.6.2 in
+    their dependency metadata, which is below that floor. On such an install
+    the frontend's FROST rows decline and its backend engine serves the graph
+    (~8x slower than fa2 on multi-token rows), so a performance-driven
+    ``auto`` choice must not count on the frontend version alone. The check
+    is the frontend's own (``cutedsl_state`` / ``cutedsl_too_old``, which
+    the SDPA forward engines gate on): internal DSL builds count as new
+    enough, as they do there. A frontend without those helpers (1.29 and
+    older, which have no FROST decode rows either) reports False.
+    """
+    try:
+        from cudnn.frost.buffers import (  # noqa: PLC0415 -- optional dependency
+            cutedsl_state,
+            cutedsl_too_old,
+        )
+    except Exception:  # noqa: BLE001 -- any import failure means "not available"
+        return False
+    try:
+        installed, version = cutedsl_state()
+        return bool(installed) and not cutedsl_too_old(version)
+    except Exception:  # noqa: BLE001 -- a probe that fails is a runtime that is not there
+        return False
+
+
+# cudnn-frontend 1.30 ranks its FROST decode tile ahead of the backend engine for
+# multi-token rows only from a declared 2048-token cache; below that the backend's
+# prefill-class engine goes first (~8x fa2's time). 1.31 ranks the tile first at
+# every cache length (NVIDIA/cudnn-frontend#1420).
+CUDNN_FRONTEND_SHORT_CACHE_LEAD_MIN_VERSION: Tuple[int, int, int] = (1, 31, 0)
+
+
+def cudnn_frontend_leads_short_caches() -> bool:
+    """Whether the installed cudnn-frontend ranks its decode tile first for
+    multi-token rows at every declared cache length (1.31+)."""
+    version = cudnn_frontend_version()
+    if version is None:
+        return False
+    return (tuple(version) + (0, 0, 0))[
+        :3
+    ] >= CUDNN_FRONTEND_SHORT_CACHE_LEAD_MIN_VERSION

@@ -189,13 +189,18 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count)
     grid_x, schedule_id = _expected_at(sm_count, grid_x, schedule_id)
     plan = plan_route(arch, sm_count, M, K, pdl)
     assert plan.kind == kind
-    assert plan.schedule_id == schedule_id
+    # Round r5: --use_fast_math is a program axis of the small-M / persistent programs (schedule id
+    # ``_fastmath``, kernel key ``_fm``); the rows pin the program apart from that axis.
+    assert plan.schedule_id.removesuffix("_fastmath") == schedule_id
+    assert plan.schedule_id.endswith("_fastmath") is ("_fm" in plan.kernel_key)
+    if kind in ("small_m", "persistent"):
+        assert plan.schedule_id.endswith("_fastmath") is cb._fast_math(arch, M, K, kind)
     assert plan.grid_x == grid_x
     assert plan.use_pdl is pdl
     # PDL is a launch argument of every generated program, not a program axis.
     assert "pdl" not in plan.kernel_key
     assert f".pdl{int(pdl)}." in plan.route_id
-    assert plan.route_id.startswith(schedule_id + ".")
+    assert plan.route_id.startswith(plan.schedule_id + ".")
 
 
 @pytest.mark.parametrize("pdl", (False, True))
@@ -233,7 +238,8 @@ def test_plan_route_sm103_k2_k4_consumed_release_bands(M, K, pdl, early):
     flag is the release policy; the band edges are the dispatcher / evaluator / FI mirror constants."""
     plan = plan_route("sm_103a", SM_COUNT, M, K, pdl)
     assert plan.kind == "persistent", plan
-    flags = plan.kernel_key.rsplit("_f", 1)[1]
+    # round r5: the fast-math axis (``_fm``) follows the flag tuple in the kernel key
+    flags = plan.kernel_key.removesuffix("_fm").rsplit("_f", 1)[1]
     assert (flags[0] == "1") is early, (plan.kernel_key, early)
 
 
@@ -285,11 +291,17 @@ def test_plan_route_snapshot_write_takes_the_write_variants(arch, M, K, pdl):
         cluster = cb._small_m_cluster(arch, M, K)
         nc = cb._small_m_sources_per_chunk(arch, M, K)
         nc_suffix = "" if nc is None else f"_nc{nc}"
+        fm = cb._fast_math(arch, M, K, "small_m_write")
         family = "direct" if cluster == 1 else f"cluster{cluster}"
         assert plan.kind == "small_m"
-        assert plan.kernel_key == f"small_m_{family}:k{K}{nc_suffix}_write"
+        assert (
+            plan.kernel_key
+            == f"small_m_{family}:k{K}{nc_suffix}{'_fm' if fm else ''}_write"
+        )
         assert plan.grid_x == M * cluster and plan.threads == 256 // cluster
-        assert plan.schedule_id.endswith(f"_regres_fp32x2{nc_suffix}_write")
+        assert plan.schedule_id.endswith(
+            f"_regres_fp32x2{nc_suffix}{'_fastmath' if fm else ''}_write"
+        )
     else:
         assert plan.kind == "persistent"
         assert plan.kernel_key == f"{dense.kernel_key}_write"
@@ -306,22 +318,24 @@ def test_plan_route_snapshot_write_takes_the_write_variants(arch, M, K, pdl):
 def test_snapshot_write_fallback_stays_in_the_write_family(monkeypatch):
     """A registered-variant fallback of a snapshot-write plan only ever selects another
     small-M write program (the snapshot store exists nowhere else)."""
+    # round r5: the write twin's fast-math class is part of the key; the fallback never crosses it either
+    fm = "_fm" if cb._fast_math("sm_100a", 64, 7, "small_m_write") else ""
     table = {
-        "small_m_direct:k7_write": "m1",
-        "small_m_direct:k7": "m2",
+        f"small_m_direct:k7{fm}_write": "m1",
+        f"small_m_direct:k7{fm}": "m2",
         "persistent:k7_nc4_d2_f110000000000000": "m3",
     }
     monkeypatch.setattr(cb, "KERNELS", {"sm_100a": table})
     exact = cb._plan_route_exact("sm_100a", SM_COUNT, 64, 7, False, block_write_idx=7)
     assert exact.kernel_key not in table
     resolved = cb._resolve_registered(exact, SM_COUNT, 64)
-    assert resolved.kernel_key == "small_m_direct:k7_write"
+    assert resolved.kernel_key == f"small_m_direct:k7{fm}_write"
     assert resolved.fallback_from == exact.kernel_key
     assert (
         resolved.route_id.endswith(".registered_fallback")
         and ".write1." in resolved.route_id
     )
-    monkeypatch.setattr(cb, "KERNELS", {"sm_100a": {"small_m_direct:k7": "m2"}})
+    monkeypatch.setattr(cb, "KERNELS", {"sm_100a": {f"small_m_direct:k7{fm}": "m2"}})
     unresolved = cb._resolve_registered(exact, SM_COUNT, 64)
     assert (
         unresolved.kernel_key == exact.kernel_key and unresolved.fallback_from is None
@@ -388,15 +402,22 @@ def test_small_m_table_boundary():
             }
             for m in sorted({1, max_m} | edges):
                 at = cb._plan_route_exact(arch, SM_COUNT, m, K, False)
+                if (m, K) in cb._R5_SMALL_M_EXCLUDED_CELLS[arch]:
+                    # round r5: the dense cell left the table for its persistent program
+                    assert at.kind == "persistent"
+                    continue
                 cluster = cb._small_m_cluster(arch, m, K)
                 nc = cb._small_m_sources_per_chunk(arch, m, K)
-                suffix = "" if nc is None else f"_nc{nc}"
+                fm = cb._fast_math(arch, m, K, "small_m")
+                suffix = ("" if nc is None else f"_nc{nc}") + ("_fm" if fm else "")
                 key = (
                     f"small_m_direct:k{K}{suffix}"
                     if cluster == 1
                     else f"small_m_cluster{cluster}:k{K}{suffix}"
                 )
-                assert at.schedule_id.endswith(suffix)
+                assert at.schedule_id.endswith(
+                    ("" if nc is None else f"_nc{nc}") + ("_fastmath" if fm else "")
+                )
                 assert (at.kind, at.kernel_key, at.grid_x, at.threads) == (
                     "small_m",
                     key,
@@ -415,7 +436,7 @@ def test_persistent_key_is_the_complete_flag_tuple():
     b = plan_route("sm_103a", SM_COUNT, 1024, 1, False)
     for plan in (a, b):
         assert plan.kind == "persistent"
-        assert re.fullmatch(r"persistent:k1_nc\d_d\d_f[01]{15}", plan.kernel_key)
+        assert re.fullmatch(r"persistent:k1_nc\d_d\d_f[01]{15}(_fm)?", plan.kernel_key)
     # The PDL mode only changes the launch argument and the route id.
     assert a.route_id != b.route_id
 
