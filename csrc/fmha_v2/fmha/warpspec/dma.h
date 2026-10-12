@@ -255,6 +255,7 @@ struct DMA {
                 CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling;
             if (!decode_exact_dynamic_tile_id(params, tile_id_, bidb, bidh, q_step_offset,
                                               reverse)) {
+              finish_dynamic_scheduling(params);
               break;
             }
           } else {
@@ -414,6 +415,7 @@ struct DMA {
           bool reverse =
               CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling;
           if (!decode_exact_dynamic_tile_id(params, tile_id_, bidb, bidh, q_step_offset, reverse)) {
+            finish_dynamic_scheduling(params);
             break;
           }
           local_q_tile_offset = q_step_offset * STEP_Q;
@@ -780,12 +782,24 @@ struct DMA {
       cbr_v_scratch.pop(elect_one_, v_scratch_barrier_id);         // Advance to next phase
     }
 
+    inline __device__ void finish_dynamic_scheduling(
+        bert::Fused_multihead_attention_params_v2 const& params) {
+      if (elect_one_) {
+        // Skip unused IDs, then take this CTA's terminal ID before the final wrap.
+        atomicMax(params.tile_id_counter_ptr, params.num_tiles);
+        atomicInc(params.tile_id_counter_ptr, params.num_tiles + gridDim.y - 1);
+      }
+    }
+
     inline __device__ void get_next_tile_id(
         int local_wid, int tiw, uint32_t smem_tile_id,
         bert::Fused_multihead_attention_params_v2 const& params) {
+      // Each CTA takes one terminal ID after num_tiles. The last resets the counter.
+      if (elect_one_) {
+        tile_id_ = atomicInc(params.tile_id_counter_ptr, params.num_tiles + gridDim.y - 1);
+      }
       if constexpr (DMA_GROUP_TRANSPOSE_V) {
         if (elect_one_) {
-          tile_id_ = atomicAdd(params.tile_id_counter_ptr, 1);
           sts(smem_tile_id, tile_id_);
         }
         fence_view_async_shared();
@@ -796,10 +810,6 @@ struct DMA {
         tile_id_ = __shfl_sync(0xffffffff, tile_id_, 0);
         // only one warp involved when the dma group doesn't need to transpose the v tile.
       } else {
-        if (elect_one_) {
-          // After all tile IDs, each CTA takes one terminal ID; the last resets the counter.
-          tile_id_ = atomicInc(params.tile_id_counter_ptr, params.num_tiles + gridDim.y - 1);
-        }
         tile_id_ = __shfl_sync(0xffffffff, tile_id_, 0);
       }
     }
