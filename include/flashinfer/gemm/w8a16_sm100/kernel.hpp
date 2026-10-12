@@ -230,9 +230,9 @@ public:
     MainloopLoad  = 2,
     EpilogueLoad  = 3,
     Epilogue      = 4,
-    // Transformation starts at 256 thread alignment
+    // Transformation starts at 256 thread alignment; two warpgroups (rung B3)
     Transformation = 8,
-    MainloopLoadB  = 12,
+    MainloopLoadB  = 16,
   };
 
   struct IsParticipant {

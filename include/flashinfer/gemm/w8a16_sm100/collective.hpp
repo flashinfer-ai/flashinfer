@@ -294,7 +294,11 @@ public:
   static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomScale{})) == 0, "SmemLayoutAtomScale must evenly divide tile k shape.");
 
   // Thread Counts
-  static constexpr uint32_t NumTransformationThreads = 128;
+  // Rung B3: two transform warpgroups.  Both map onto the same 128 TMEM lanes (rows);
+  // warpgroup g converts k-blocks [g * K_BLOCK_MAX / 2, (g + 1) * K_BLOCK_MAX / 2).
+  static constexpr uint32_t NumTransformationGroups = 2;
+  static constexpr uint32_t NumTransformationThreadsPerGroup = 128;
+  static constexpr uint32_t NumTransformationThreads = NumTransformationGroups * NumTransformationThreadsPerGroup;
   static constexpr uint32_t NumAccumThreads = 128; //Maintains compatibility with input_transform kernel
 
   // Get the Algorithm parameters
@@ -1004,6 +1008,15 @@ public:
     auto tArA = make_tensor<ElementA>(tAsA(_,_,_,_,0).shape());  //(Copy,#Copy),MMA_Rest,MMA_M_Rest,MMA_K_Rest (Register)
     auto tArACompute = make_tensor<ElementAMma>(tAsA(_,_,_,_,0).shape());
     constexpr int K_BLOCK_MAX = size<3>(tArA);
+    static_assert(K_BLOCK_MAX % NumTransformationGroups == 0, "k-blocks split evenly across the transform warpgroups");
+    constexpr int K_BLOCKS_PER_GROUP = K_BLOCK_MAX / NumTransformationGroups;
+    static_assert(KernelConversionMode == ConversionMode::DirectConvert,
+                  "the split transform only carries the no-scale path (scales are per-k-block tensors)");
+
+    // Which half of the k-blocks this warpgroup owns.  Dispatched to a compile-time
+    // constant below so every fragment index stays static (a runtime index into the
+    // register fragments would send them to local memory).
+    const int transform_group = (threadIdx.x % NumTransformationThreads) / NumTransformationThreadsPerGroup;
 
     uint32_t skip_wait = (k_tile_count <= 0);
     auto load2transform_flag = load2transform_pipeline.consumer_try_wait(load2transform_pipeline_consumer_state, skip_wait);
@@ -1020,26 +1033,33 @@ public:
       int transform2mma_producer_index = transform2mma_pipeline_producer_state.index(); //write stage
 
       auto curr_load2transform_pipeline_consumer_state = load2transform_pipeline_consumer_state;
-
-      // Copy the input A matrix from SMEM
-      copy(AutoVectorizingCopy{}, tAsA(_,_,_,_,load2transform_consumer_index), tArA);
-      // Copy scale/zero vector from SMEM
-      Utils::copy_scale_zeros_for_transform(partitioned_extra_info, load2transform_consumer_index);
-
-      // Loads from SMEM are done. Signal the mainloop load as early as possible
-      transform_bar.sync();
-      load2transform_pipeline.consumer_release(curr_load2transform_pipeline_consumer_state);
-
       auto curr_transform2mma_pipeline_producer_state = transform2mma_pipeline_producer_state;
 
-      // Dequantize A with scale/zero in RF
-      CUTLASS_PRAGMA_UNROLL
-      for (int k_block = 0; k_block < K_BLOCK_MAX; k_block ++){
-        Utils::dequantize_A_kblock_for_transform(tArA, tArACompute, partitioned_extra_info, k_block);
-      }
+      auto transform_half = [&](auto group) {
+        constexpr int kFirst = decltype(group)::value * K_BLOCKS_PER_GROUP;
+        // Copy this warpgroup's k-blocks of the input A matrix from SMEM
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < K_BLOCKS_PER_GROUP; ++i) {
+          copy(AutoVectorizingCopy{}, tAsA(_,_,_,kFirst + i,load2transform_consumer_index), tArA(_,_,_,kFirst + i));
+        }
 
-      // Dequantized A is stored into either Smem or Tmem
-      copy(dst_copy_A, tArACompute, tAsACompute(_,_,_,_,transform2mma_producer_index));
+        // Loads from SMEM are done (all transform warps). Signal the mainloop load as early as possible
+        transform_bar.sync();
+        load2transform_pipeline.consumer_release(curr_load2transform_pipeline_consumer_state);
+
+        // Dequantize this warpgroup's k-blocks in RF and store them into Smem or Tmem
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < K_BLOCKS_PER_GROUP; ++i) {
+          Utils::dequantize_A_kblock_for_transform(tArA, tArACompute, partitioned_extra_info, kFirst + i);
+          copy(dst_copy_A, tArACompute(_,_,_,kFirst + i), tAsACompute(_,_,_,kFirst + i,transform2mma_producer_index));
+        }
+      };
+      if (transform_group == 0) {
+        transform_half(cute::Int<0>{});
+      }
+      else {
+        transform_half(cute::Int<1>{});
+      }
 
       // fence for SMEM writes
       cutlass::arch::fence_view_async_shared();
@@ -1108,7 +1128,7 @@ public:
         fragment_compute.data() = accumulators.data().get() + cutlass::detail::find_tmem_tensor_col_offset(accumulators);
         // If operand comes from TMEM, create the TMEM_STORE based copy
         auto r2t_tiled_copy = make_tmem_copy(compute_copy_atom, fragment_compute(_,_,_,0));
-        auto thr_r2t_tiled_copy = r2t_tiled_copy.get_slice(threadIdx.x % NumTransformationThreads);
+        auto thr_r2t_tiled_copy = r2t_tiled_copy.get_slice(threadIdx.x % NumTransformationThreadsPerGroup);
         auto partitioned_tensor_input = thr_r2t_tiled_copy.partition_S(tensor_input2x); //(TMEM_STORE, TMEM_STORE_M, TMEM_STORE_N)
         auto partitioned_tensor_compute = thr_r2t_tiled_copy.partition_D(fragment_compute); //(TMEM_STORE, TMEM_STORE_M, TMEM_STORE_N)
 
@@ -1122,7 +1142,7 @@ public:
                                                      tensor_compute(_,_,_,0).layout());
 
         auto smem2reg_tiled_copy = make_tiled_copy_S(input_copy_atom, r2s_tiled_copy);
-        auto thr_r2s_tiled_copy = r2s_tiled_copy.get_slice(threadIdx.x % NumTransformationThreads);
+        auto thr_r2s_tiled_copy = r2s_tiled_copy.get_slice(threadIdx.x % NumTransformationThreadsPerGroup);
         auto partitioned_tensor_input = thr_r2s_tiled_copy.partition_S(tensor_input); //(SMEM_STORE, SMEM_STORE_M, SMEM_STORE_N)
 
         auto partitioned_tensor_compute = thr_r2s_tiled_copy.partition_D(tensor_compute_ind_sw);//(SMEM_STORE, SMEM_STORE_M, SMEM_STORE_N)

@@ -16,8 +16,10 @@
 #ifndef FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 #define FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 
-// W8A16 GEMM for Blackwell (sm_100a), rung B2: FlashInfer's fork of CUTLASS's
-// mixed-input kernel (w8a16_sm100/), behaviour-identical to rung B1 at this rung.
+// W8A16 GEMM for Blackwell (sm_100a), rung B3: FlashInfer's fork of CUTLASS's
+// mixed-input kernel (w8a16_sm100/) with two transform warpgroups (8 warps, two per
+// SM sub-partition) splitting each k-tile's k-blocks, so the conversion latency of
+// one warp is hidden by the other.
 //
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
