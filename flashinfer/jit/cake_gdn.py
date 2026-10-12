@@ -717,6 +717,66 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
     return ctas_per_state
 
 
+# The fp32-state T=1 K-major (nontranspose) bodies (`direct_fp32_t1_nontranspose_*`) are
+# routed per (architecture, batch band): the shipped `_small` body (eight CTAs per state
+# head) below 32 batch rows and the shipped large body (one CTA per state head) from 32
+# on, except that Rubin (sm_107a) runs the `mid4` twin in the small band -- four CTAs per
+# state head, each owning one Kx32 value panel over 128-byte state segments; same per-lane
+# statements and accumulation order, bitwise-identical output and state.  B200 / B300 keep
+# the shipped bodies.  Mirrors `NONTRANSPOSE_SMALL_BATCH_THRESHOLD` /
+# `NONTRANSPOSE_FP32_T1_ARCH_BODIES` / `NONTRANSPOSE_FP32_T1_CTAS_PER_STATE` /
+# `select_nontranspose_fp32_t1_body` in loom.examples.weave.gdn_decode_pretranspose (the
+# Cake tree cross-checks these copies).
+CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD = 32
+CAKE_GDN_NONTRANSPOSE_FP32_T1_BASE_SCHEDULES: dict[str, str] = {
+    "small": "gdn_decode_nontranspose_fp32_t1_small",
+    "large": "gdn_decode_nontranspose_fp32_t1",
+}
+# ((architecture, band) -> schedule of the twin the rule routes there)
+CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES: dict[tuple[str, str], str] = {
+    ("sm_107a", "small"): "gdn_decode_nontranspose_fp32_t1_mid4",
+}
+# CTAs per state head each nontranspose fp32 T=1 body launches (the host grid is B * HV
+# times this), keyed by the record's schedule.
+CAKE_GDN_NONTRANSPOSE_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
+    "gdn_decode_nontranspose_fp32_t1_small": 8,
+    "gdn_decode_nontranspose_fp32_t1": 1,
+    "gdn_decode_nontranspose_fp32_t1_mid4": 4,
+}
+
+
+def cake_gdn_nontranspose_fp32_t1_route(
+    batch_size: int, arch: CakeGDNArch
+) -> tuple[str, str]:
+    """``(schedule, route id)`` of the fp32-state T=1 K-major decode for ``batch_size`` rows on ``arch``."""
+
+    band = (
+        "small"
+        if int(batch_size) < CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD
+        else "large"
+    )
+    base = CAKE_GDN_NONTRANSPOSE_FP32_T1_BASE_SCHEDULES[band]
+    schedule = CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES.get((arch, band), base)
+    route = f"flashinfer.gdn_decode.direct_fp32_t1_nontranspose_{band}"
+    if schedule != base:
+        route += "_" + schedule.removeprefix("gdn_decode_nontranspose_fp32_t1_")
+    return schedule, route
+
+
+@functools.cache
+def cake_gdn_nontranspose_fp32_t1_ctas_per_state(variant_name: str) -> int:
+    """CTAs per state head the fp32-state T=1 K-major record ``variant_name`` launches (read from its schedule)."""
+
+    record = _kernel_record(variant_name)
+    schedule = record["source_schedule"].rsplit(":", 1)[-1]
+    ctas_per_state = CAKE_GDN_NONTRANSPOSE_FP32_T1_CTAS_PER_STATE.get(schedule)
+    if ctas_per_state is None:
+        raise CakeGDNUnsupportedError(
+            f"{variant_name!r} ({schedule}) is not an fp32-state T=1 nontranspose record"
+        )
+    return ctas_per_state
+
+
 def cake_gdn_bf16_wide_schedule(arch: CakeGDNArch, seq_len: int) -> str:
     if int(seq_len) <= 1:
         return "gdn_decode_pretranspose_mtp_t4_bf16state_wide128"
@@ -1037,12 +1097,10 @@ def select_cake_gdn_decode_variant(
             "splitv8"
         )
     elif layout == "nontranspose":
-        if batch_size < 32:
-            schedule_attr = "gdn_decode_nontranspose_fp32_t1_small"
-            route = "flashinfer.gdn_decode.direct_fp32_t1_nontranspose_small"
-        else:
-            schedule_attr = "gdn_decode_nontranspose_fp32_t1"
-            route = "flashinfer.gdn_decode.direct_fp32_t1_nontranspose_large"
+        # The body follows the batch band per architecture (sm_107a runs the `mid4`
+        # twin below 32 rows); the route id names a twin and the host reads the
+        # record's CTAs per state head for the grid.
+        schedule_attr, route = cake_gdn_nontranspose_fp32_t1_route(batch_size, arch)
     else:
         raise CakeGDNUnsupportedError(f"unsupported decode state layout {layout}")
     record = _variant_for(
