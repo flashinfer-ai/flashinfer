@@ -918,7 +918,7 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
     return cudaErrorInvalidValue;
   } else {
     // What the templated kernel asserted at compile time is a precondition here.
-    if (m < 0 || m > std::numeric_limits<int>::max() - 127 || k <= 0) {
+    if (m <= 0 || m > std::numeric_limits<int>::max() - 127 || k <= 0) {
       return cudaErrorInvalidValue;
     }
     if (k % TileK != 0) return cudaErrorInvalidValue;

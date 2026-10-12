@@ -142,7 +142,7 @@ def sm120_producer_geometry_is_valid(
     Nothing here reads a shape table: it is arithmetic on (M, K) and the
     geometry.
     """
-    if tile_k <= 0 or k % tile_k:
+    if m <= 0 or tile_k <= 0 or k % tile_k:
         return False
     if tile_k % (4 * _GEOMETRY_SF_VEC):
         return False

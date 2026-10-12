@@ -485,6 +485,7 @@ void run_lora_down_cublaslt(TensorView x, TensorView l2t_smoothed, TensorView do
   TVM_FFI_ICHECK(down.ndim() == 2 && down.size(0) == m && down.size(1) == rank)
       << "down must have shape [m, rank]";
 
+  if (m == 0) return;
   LoraDownCublasLtState& state = lora_down_cublaslt_state(x.device().device_id, m, k);
   if (m == 537 && (state.persisting_l2t_ptr != l2t_smoothed.data_ptr() ||
                    state.persisting_l2t_stream != stream)) {

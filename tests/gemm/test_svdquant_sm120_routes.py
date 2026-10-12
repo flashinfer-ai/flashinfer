@@ -24,7 +24,26 @@ from flashinfer.gemm.svdquant_sm120_routes import (
     SM120_LINEAR_ROUTE_ABI_OVERRIDES,
     SM120_LINEAR_ROUTE_V6_MKR,
     sm120_linear_route_abi_version,
+    sm120_producer_geometry_is_valid,
+    SM120_PRODUCER_GEOMETRY_LADDER,
+    SM120_RANK64_PRODUCER_GEOMETRY_LADDER,
 )
+
+
+@pytest.mark.parametrize("m", (0, -1))
+@pytest.mark.parametrize("k", (3072, 14336))
+@pytest.mark.parametrize("rank", (32, 64))
+def test_nonpositive_batches_have_no_fused_producer(m: int, k: int, rank: int) -> None:
+    geometries = (
+        SM120_RANK64_PRODUCER_GEOMETRY_LADDER
+        if rank == 64
+        else SM120_PRODUCER_GEOMETRY_LADDER
+    )
+    assert not any(
+        sm120_producer_geometry_is_valid(m, k, *geometry, rank)
+        for geometry in geometries
+    )
+    assert sm120_producer_variants(m, k, rank) == ()
 
 
 def test_route_manifest_containers_are_immutable() -> None:

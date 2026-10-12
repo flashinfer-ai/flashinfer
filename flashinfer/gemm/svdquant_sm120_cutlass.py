@@ -928,9 +928,6 @@ def svdquant_linear(
     together, so the pair is chosen on measured cost rather than independently.
     Both ranks offer fused and separate preprocessing to the autotuner.
     """
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(x.device)
-
     m, k = x.shape if x.ndim == 2 else (-1, -1)
     n = weight_fp4.shape[0] if weight_fp4.ndim == 2 else -1
     rank = l2t_smoothed.shape[1] if l2t_smoothed.ndim == 2 else -1
@@ -939,6 +936,11 @@ def svdquant_linear(
             "the SM120 CUTLASS SVDQuant linear backend supports LoRA ranks "
             f"32 and 64, got {rank}"
         )
+
+    if m == 0:
+        return torch.empty((0, n), dtype=torch.bfloat16, device=x.device)
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(x.device)
 
     x, pre_quant_scale = _normalize_nvfp4_quantize_smooth_inputs(x, pre_quant_scale)
     xq = torch.empty((m, k // 2), dtype=torch.uint8, device=x.device)

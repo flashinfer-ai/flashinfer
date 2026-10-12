@@ -46,6 +46,54 @@ class _FakeTensor:
         return f"_FakeTensor(shape={self.shape}, dtype={self.dtype})"
 
 
+@pytest.mark.parametrize("device_name", ("cpu", "cuda"))
+@pytest.mark.parametrize("rank", (32, 64))
+@pytest.mark.parametrize("k", (3072, 14336))
+@pytest.mark.parametrize("enable_pdl", (None, False, True))
+def test_empty_linear_returns_before_gpu_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+    device_name: str,
+    rank: int,
+    k: int,
+    enable_pdl: bool | None,
+) -> None:
+    if device_name == "cuda" and (
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0)
+    ):
+        pytest.skip("requires SM120")
+
+    def unexpected_work(*args: torch.Tensor | int | torch.device | None) -> None:
+        pytest.fail("empty batch reached GPU preparation or tactic selection")
+
+    for name in (
+        "device_support_pdl",
+        "_normalize_nvfp4_quantize_smooth_inputs",
+        "_sm120_max_workspace_bytes",
+        "_get_cache_buf",
+        "_cached_sm120_linear_runners",
+        "_choose_sm120_linear_runner",
+    ):
+        monkeypatch.setattr(svdquant_sm120_cutlass, name, unexpected_work)
+    device = torch.device(device_name)
+    n = 128
+    out = gemm_svdquant.svdquant_linear(
+        torch.empty((0, k), dtype=torch.bfloat16, device=device),
+        torch.empty((n, k // 2), dtype=torch.uint8, device=device),
+        torch.empty(n * k // 16, dtype=torch.uint8, device=device),
+        torch.ones(1, device=device),
+        torch.empty(k + 1, dtype=torch.bfloat16, device=device)[1:],
+        torch.empty((k, rank), dtype=torch.bfloat16, device=device),
+        torch.empty((n, rank), dtype=torch.bfloat16, device=device),
+        torch.ones(1, device=device),
+        bias=torch.empty(n, dtype=torch.bfloat16, device=device),
+        enable_pdl=enable_pdl,
+        backend="cutlass-sm120",
+    )
+    assert out.shape == (0, n)
+    assert out.dtype == torch.bfloat16
+    assert out.device.type == device_name
+
+
 def _packing_tactic(m: int, k: int) -> int:
     """A tactic whose producer variant is the one that indexes L2T prepacked.
 
