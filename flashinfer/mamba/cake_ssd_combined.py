@@ -1507,7 +1507,7 @@ def _load_generated_program(name: str, arch: str):
             cpp_sources=host_source,
             embed_cubin=cubins,
             extra_include_paths=[str(nvcc.parent.parent / "include")],
-            extra_cflags=["-O3"],
+            extra_cflags=["-O3", "-DTVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API=1"],
             extra_ldflags=["-lcuda"],
             build_directory=str(build_dir),
         )
