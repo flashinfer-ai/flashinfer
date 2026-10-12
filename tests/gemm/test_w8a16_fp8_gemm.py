@@ -78,6 +78,31 @@ def test_w8a16_fp8_gemm(m, n, k, dtype, bias, prepared):
     assert kernel_err <= max(2.0 * cast_err, floor), (kernel_err, cast_err, floor)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_w8a16_fp8_gemm_every_fp8_value(dtype):
+    """Every finite e4m3 byte (denormals included) must dequantize exactly.
+
+    act = identity over K, so out[m, n] = scale * weight[n, m] with no accumulation
+    error beyond the final 16-bit rounding; the weight table enumerates all 254
+    finite encodings (the two NaN bytes are excluded)."""
+    dev = torch.device("cuda")
+    K = 256
+    codes = torch.arange(256, dtype=torch.int32, device=dev)
+    codes = codes[
+        (codes & 0x7F) != 0x7F
+    ]  # drop the two e4m3fn NaN encodings (254 left)
+    n = 8
+    table = torch.zeros(n, K, dtype=torch.uint8, device=dev)
+    for row in range(n):
+        table[row, : codes.numel()] = codes.roll(row * 31).to(torch.uint8)
+    w_fp8 = table.view(torch.float8_e4m3fn)
+    scale = torch.tensor([3.0], dtype=torch.float32, device=dev)
+    act = torch.eye(K, device=dev, dtype=torch.float32).to(dtype)
+    out = w8a16_fp8_gemm(act, w_fp8, scale)
+    ref = (w_fp8.float() * scale).T.to(dtype)
+    assert torch.equal(out, ref), (out.float() - ref.float()).abs().max()
+
+
 def test_w8a16_fp8_gemm_3d_and_out():
     torch.manual_seed(0)
     dev = torch.device("cuda")

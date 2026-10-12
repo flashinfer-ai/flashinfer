@@ -16,7 +16,8 @@
 #ifndef FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 #define FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 
-// W8A16 GEMM for Blackwell (sm_100a), rung B0: CUTLASS mixed-input mainloop.
+// W8A16 GEMM for Blackwell (sm_100a), rung B1: CUTLASS mixed-input mainloop with
+// a bit-trick fp8 -> 16-bit converter in the transform warps.
 //
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
@@ -27,6 +28,17 @@
 // TMA lands the fp8 tile in smem, four transform warps convert it and write the
 // 16-bit copy to TMEM (K-major A path), the MMA warp issues tcgen05.mma with A
 // from TMEM and B (the activation) from smem.
+//
+// Rung B0 profile (12800x5120 M=8192): tensor pipe 70%, the four transform warps
+// (one per SM sub-partition) issue-latency bound on CUTLASS's converter, which
+// goes e4m3x2 -> f16x2 -> 2x f32 -> bf16x2 (4 dependent cvt per pair).  Rung B1
+// replaces the 4-element e4m3 -> bf16 / f16 array converter the transform warps
+// instantiate with a pure ALU path: a sign-replicating prmt places each byte in
+// its 16-bit lane with the sign extended above it, one shift + mask builds a
+// 16-bit float whose exponent field holds the raw e4m3 exponent, and one
+// bf16x2 / f16x2 multiply by 2^(bias16 - bias8) fixes the bias.  Exact for every
+// finite e4m3 value including denormals (they land as 16-bit denormals and the
+// multiply rescales them); the two e4m3fn NaN encodings come out as +-480.
 //
 // Operand mapping ("swap and transpose", as CUTLASS example 86): the narrow
 // operand must be the builder's A, so the weight [N, K] is A with M' = N, the
@@ -53,6 +65,98 @@
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/packed_stride.hpp"
+
+namespace flashinfer {
+namespace gemm {
+namespace w8a16_sm100_detail {
+
+__device__ __forceinline__ uint32_t prmt_b32(uint32_t a, uint32_t b, uint32_t sel) {
+  uint32_t r;
+  asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+  return r;
+}
+
+// Four e4m3 bytes (little-endian in `q`) -> two bf16x2 registers, value order kept.
+// prmt selector nibbles 0x9180 / 0xB3A2: byte k into the low byte of lane k and its
+// sign replicated into the high byte (selector bit 3).  (v << 4) puts the 7 magnitude
+// bits at [10:4] and the replicated sign at [15], mask 0x87F0 keeps exactly those.
+// The exponent field then holds e4m3's raw exponent, so multiply by 2^(127 - 7) = 2^120
+// (bf16 0x7B80).  Denormals: field 0 -> bf16 denormal (m / 8) * 2^-126, times 2^120
+// = (m / 8) * 2^-6, the e4m3 denormal value.
+__device__ __forceinline__ void e4m3x4_to_bf16x4(uint32_t q, uint32_t& lo, uint32_t& hi) {
+  const uint32_t lo_s = (prmt_b32(q, 0u, 0x9180u) << 4) & 0x87F087F0u;
+  const uint32_t hi_s = (prmt_b32(q, 0u, 0xB3A2u) << 4) & 0x87F087F0u;
+  const uint32_t k_bits = 0x7B807B80u;  // bf16x2 {2^120, 2^120}
+  const __nv_bfloat162 k = *reinterpret_cast<const __nv_bfloat162*>(&k_bits);
+  __nv_bfloat162 l = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&lo_s), k);
+  __nv_bfloat162 h = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&hi_s), k);
+  lo = *reinterpret_cast<uint32_t*>(&l);
+  hi = *reinterpret_cast<uint32_t*>(&h);
+}
+
+// Same for f16: (v << 7) puts the magnitude at [13:7] and the replicated sign at [15],
+// mask 0xBF80; exponent bias fix is 2^(15 - 7) = 2^8 (f16 0x5C00).
+__device__ __forceinline__ void e4m3x4_to_f16x4(uint32_t q, uint32_t& lo, uint32_t& hi) {
+  const uint32_t lo_s = (prmt_b32(q, 0u, 0x9180u) << 7) & 0xBF80BF80u;
+  const uint32_t hi_s = (prmt_b32(q, 0u, 0xB3A2u) << 7) & 0xBF80BF80u;
+  const uint32_t k_bits = 0x5C005C00u;  // f16x2 {256, 256}
+  const __half2 k = *reinterpret_cast<const __half2*>(&k_bits);
+  __half2 l = __hmul2(*reinterpret_cast<const __half2*>(&lo_s), k);
+  __half2 h = __hmul2(*reinterpret_cast<const __half2*>(&hi_s), k);
+  lo = *reinterpret_cast<uint32_t*>(&l);
+  hi = *reinterpret_cast<uint32_t*>(&h);
+}
+
+}  // namespace w8a16_sm100_detail
+}  // namespace gemm
+}  // namespace flashinfer
+
+// The mixed-input transform converts in packs of 4 (gcd(fragment, 32 / 8)); these
+// specializations are more specialized than CUTLASS's <T, float_e4m3_t, N, Round> and
+// are declared before any instantiation below, so they take over for this module only.
+namespace cutlass {
+
+template <FloatRoundStyle Round>
+struct NumericArrayConverter<cutlass::bfloat16_t, cutlass::float_e4m3_t, 4, Round> {
+  using result_element = cutlass::bfloat16_t;
+  using source_element = cutlass::float_e4m3_t;
+  using result_type = Array<result_element, 4>;
+  using source_type = Array<source_element, 4>;
+  static FloatRoundStyle const round_style = Round;
+
+  CUTLASS_DEVICE
+  static result_type convert(source_type const& source) {
+    result_type out;
+    uint32_t* o = reinterpret_cast<uint32_t*>(&out);
+    flashinfer::gemm::w8a16_sm100_detail::e4m3x4_to_bf16x4(
+        *reinterpret_cast<uint32_t const*>(&source), o[0], o[1]);
+    return out;
+  }
+  CUTLASS_DEVICE
+  result_type operator()(source_type const& s) const { return convert(s); }
+};
+
+template <FloatRoundStyle Round>
+struct NumericArrayConverter<cutlass::half_t, cutlass::float_e4m3_t, 4, Round> {
+  using result_element = cutlass::half_t;
+  using source_element = cutlass::float_e4m3_t;
+  using result_type = Array<result_element, 4>;
+  using source_type = Array<source_element, 4>;
+  static FloatRoundStyle const round_style = Round;
+
+  CUTLASS_DEVICE
+  static result_type convert(source_type const& source) {
+    result_type out;
+    uint32_t* o = reinterpret_cast<uint32_t*>(&out);
+    flashinfer::gemm::w8a16_sm100_detail::e4m3x4_to_f16x4(
+        *reinterpret_cast<uint32_t const*>(&source), o[0], o[1]);
+    return out;
+  }
+  CUTLASS_DEVICE
+  result_type operator()(source_type const& s) const { return convert(s); }
+};
+
+}  // namespace cutlass
 
 namespace flashinfer {
 namespace gemm {
