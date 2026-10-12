@@ -3787,6 +3787,7 @@ def run(
     index_ready: torch.cuda.Event | None = None,
     reuse: DraftSelectionReuse | None = None,
     cache_only: bool = False,
+    selection_only: bool = False,
 ) -> torch.Tensor | None:
     """Run one packed QSA decode transaction after main K/V writes are enqueued.
 
@@ -3796,6 +3797,11 @@ def run(
     unchanged. All input tensors retain the prepared shape/stride contract;
     query and index-query values are unused. Main K/V writes remain caller-owned.
     Cache-only execution cannot use selection-stream overlap or draft reuse.
+
+    ``selection_only=True`` updates selector state and writes each row's selected
+    original-token positions to ``binding.selected_positions`` (valid positions
+    first, then ``-1``), then returns ``None`` without attending, so a caller can
+    run its own attention over the selection. It also uses the calling stream.
 
     Main Q/K/V writes precede this call on the calling stream. By default all
     QSA work follows them on that stream. A binding with ``selection_stream``
@@ -3857,13 +3863,16 @@ def run(
         raise TypeError("QSA binding requires a prepared plan")
     if binding.state.caps.dcp_size > 1:
         raise ValueError("DCP QSA requires select() followed by attend()")
-    if cache_only and (
+    if cache_only and selection_only:
+        raise ValueError("cache-only QSA performs no selection")
+    if (cache_only or selection_only) and (
         reuse is not None
         or binding.selection_stream is not None
         or index_ready is not None
     ):
         raise ValueError(
-            "cache-only QSA requires the calling stream and no draft reuse"
+            "cache-only and selection-only QSA require the calling stream and no"
+            " draft reuse"
         )
     if reuse is not None:
         if not isinstance(reuse, DraftSelectionReuse):
@@ -3984,6 +3993,10 @@ def run(
             ],
             list(inputs.values()),
         )
+    if selection_only:
+        _run(binding, **inputs, selection_only=True)
+        _record_draft_anchors(binding, query_positions)
+        return None
     stream = binding.selection_stream
     if stream is None:
         if index_ready is not None:
