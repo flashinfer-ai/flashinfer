@@ -36,6 +36,9 @@ table and ends with this rank's head band of the whole sequence):
 
 The Ulysses communicators of B1-B3 use ``backend="auto"`` (the NVLink kernels on
 SM100 / SM103, NCCL elsewhere); the JSON records the backend they resolved.
+``--fold-barrier auto|0|1`` selects the fused arm's launch path (the
+architecture default, the separate barrier kernel, or the producer with the
+folded rendezvous); the JSON records the resolved path and its launch count.
 Timing uses ``flashinfer.testing.bench_gpu_time_with_cupti`` with a cold L2
 cache and the per-rank maximum of every sample; CUPTI unavailability is an
 error.  Every arm is checked once against the fused arm before it is timed.
@@ -68,6 +71,7 @@ EPS = 1e-6
 HIDDENS = (3072, 4096, 6144, 8192)
 S_GLOBALS = (4096, 8192, 16384, 32768, 65536, 131072)
 REPRESENTATIVE = ((4096, 16384), (8192, 16384), (4096, 65536), (8192, 65536))
+FOLD_BARRIER_CHOICES = {"auto": None, "0": False, "1": True}
 
 
 def default_schedule(local_heads: int) -> tuple[int, ...]:
@@ -183,6 +187,7 @@ def build_arms(group, device, rank, world_size, hidden, rows, args):
         max_tokens=rows,
         backend=args.backend,
         device=device,
+        fold_barrier=FOLD_BARRIER_CHOICES[args.fold_barrier],
     )
     comm_in = UlyssesCommunicator(
         group,
@@ -269,9 +274,13 @@ def build_arms(group, device, rank, world_size, hidden, rows, args):
     if world_size in (2, 4, 8):
         arms["b4_nccl"] = b4_nccl
     closers = (session.close, comm_in.close, comm_ops.close)
+    fused_info = session.describe()
     info = {
         "fused_backend": session.backend,
         "fused_backend_reason": session.backend_reason,
+        "fused_fold_barrier": fused_info.get("fold_barrier"),
+        "fused_fold_barrier_requested": fused_info.get("fold_barrier_requested"),
+        "fused_launches_per_call": fused_info.get("launches_per_call"),
         "ulysses_backend": comm_in.backend,
         "b3_schedule": list(schedule),
     }
@@ -333,6 +342,12 @@ def main():
         default="auto",
         choices=("auto", "nvlink", "nccl"),
         help="B1-B3 communicators",
+    )
+    parser.add_argument(
+        "--fold-barrier",
+        default="auto",
+        choices=tuple(FOLD_BARRIER_CHOICES),
+        help="fused arm launch path: architecture default, barrier kernel (0) or folded rendezvous (1)",
     )
     parser.add_argument("--repeat-iters", type=int, default=30)
     parser.add_argument("--warmup-iters", type=int, default=5)

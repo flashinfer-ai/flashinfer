@@ -77,11 +77,19 @@ def validate_request(
     max_tokens: int,
     num_slots: int,
     backend: str,
+    fold_barrier: Optional[bool] = None,
 ) -> None:
     """Static checks of a session request (no collective); raises ``ValueError`` on every rank alike."""
 
     if backend not in ULYSSES_BACKENDS:
         raise ValueError(f"backend must be one of {ULYSSES_BACKENDS}, got {backend!r}")
+    if fold_barrier is not None and not isinstance(fold_barrier, bool):
+        raise ValueError(f"fold_barrier must be a bool or None, got {fold_barrier!r}")
+    if fold_barrier is not None and backend == "nccl":
+        raise ValueError(
+            "fold_barrier selects the launch path of the Cake (nvlink) backend; it has no meaning with "
+            "backend='nccl'"
+        )
     if layout not in LAYOUTS:
         raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
     if dtype != torch.bfloat16:
@@ -289,6 +297,14 @@ class QkvNormRopeExchangeOverlap:
         ``"auto"`` resolves through :func:`resolve_ulysses_backend` and the device architecture.
     device : torch.device or str or int, optional
         CUDA device of this rank (``None``: the current device).
+    fold_barrier : bool, optional
+        Launch path of the Cake backend.  ``True``: the producer program with the folded cross-rank
+        rendezvous -- two launches per call (producer, wait kernel); ``False``: the separate barrier kernel
+        before the producer -- three launches.  ``None`` (default) reads the environment variable
+        ``FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER`` (``0`` / ``1`` / ``auto``) and otherwise takes the
+        architecture default: ``True`` on SM100 / SM103, ``False`` on SM90, where no folded producer is
+        delivered (so ``True`` raises there).  Both paths store identical bits.  Must be uniform across the
+        ranks of the group; not accepted with ``backend="nccl"``.
     """
 
     def __init__(
@@ -304,6 +320,7 @@ class QkvNormRopeExchangeOverlap:
         num_slots: int = 2,
         backend: str = "auto",
         device: Optional[Union[torch.device, str, int]] = None,
+        fold_barrier: Optional[bool] = None,
     ) -> None:
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError("an initialized NCCL process group is required")
@@ -322,6 +339,7 @@ class QkvNormRopeExchangeOverlap:
             max_tokens=max_tokens,
             num_slots=num_slots,
             backend=backend,
+            fold_barrier=fold_barrier,
         )
         self.device = _resolve_device(device)
         self.hidden, self.num_heads, self.head_dim = (
@@ -333,6 +351,7 @@ class QkvNormRopeExchangeOverlap:
         self.layout = layout
         self.max_tokens = int(max_tokens)
         self.num_slots = int(num_slots)
+        self.fold_barrier_requested = fold_barrier
         decision = resolve_ulysses_backend(
             backend, group, self.device
         )  # collective, rank-uniform
@@ -367,6 +386,7 @@ class QkvNormRopeExchangeOverlap:
                 layout=layout,
                 max_tokens=self.max_tokens,
                 num_slots=self.num_slots,
+                fold_barrier=fold_barrier,
             )
         else:
             self._impl = _NcclQkvExchange(
@@ -416,7 +436,8 @@ class QkvNormRopeExchangeOverlap:
         return self._impl.last_outputs()
 
     def bound_programs(self, batch: int, s_local: int) -> dict[str, str]:
-        """Cake backend: program names a ``(batch, s_local)`` call launches per stage (prepares the row eagerly)."""
+        """Cake backend: program names of every delivered stage of a ``(batch, s_local)`` call (prepares the row
+        eagerly); ``describe()["launch_sequence"]`` says which of them the launch path launches."""
 
         if self.backend != "nvlink":
             raise RuntimeError(
@@ -430,7 +451,15 @@ class QkvNormRopeExchangeOverlap:
         self._impl.poison_receive_slots()
 
     def describe(self) -> dict[str, Any]:
-        return {"backend_reason": self.backend_reason, **self._impl.describe()}
+        return {
+            "backend_reason": self.backend_reason,
+            "fold_barrier_requested": (
+                "auto"
+                if self.fold_barrier_requested is None
+                else self.fold_barrier_requested
+            ),
+            **self._impl.describe(),
+        }
 
     def close(self) -> None:
         """Release the session's resources (collective for the Cake backend)."""

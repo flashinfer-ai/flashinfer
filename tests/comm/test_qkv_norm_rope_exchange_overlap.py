@@ -17,11 +17,14 @@ Tests of the fused QKV projection + norm + RoPE + head exchange.
 
 Host-only tests check the tile plan (every destination element of a rank's
 slab is written exactly once; readiness tickets add up), the plan policy, the
-request validation and the loader tables.  The multi-GPU tests (two, four or
-eight devices of one supported architecture) check both layouts against an
-fp32 step-by-step reference including a tail row count, CUDA-graph capture and
-replay with fresh inputs and eager calls in between, two sessions in flight on
-one group, the refusals that protect a captured graph, and the NCCL path.
+request validation, the launch-path resolution (``fold_barrier``) and the
+loader tables.  The multi-GPU tests (two, four or eight devices of one
+supported architecture) check both layouts against an fp32 step-by-step
+reference including a tail row count, CUDA-graph capture and replay with fresh
+inputs and eager calls in between, two sessions in flight on one group, the
+refusals that protect a captured graph, the NCCL path, and the two launch paths
+against each other (bitwise-equal outputs; ``fold_barrier=True`` refused where
+no folded producer is delivered).
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from flashinfer.comm import cake_qkv_exchange_plan as plans
+from flashinfer.comm import cake_qkv_norm_rope_exchange_overlap as backend
 from flashinfer.comm.qkv_norm_rope_exchange_overlap import validate_request
 from flashinfer.jit import cake_qkv_norm_rope_exchange_overlap as loader
 
@@ -153,6 +157,8 @@ def test_geometry_rejects_heads_not_divisible_by_world_size():
         ({"max_tokens": 0}, "max_tokens"),
         ({"num_slots": 1}, "num_slots"),
         ({"hidden": 2048}, "num_heads"),
+        ({"fold_barrier": 1}, "fold_barrier must be a bool"),
+        ({"fold_barrier": True, "backend": "nccl"}, "no meaning with backend='nccl'"),
     ],
 )
 def test_validate_request_rejects_unsupported_requests(overrides, match):
@@ -177,6 +183,63 @@ def test_barrier_flag_words():
         assert loader.barrier_flag_words(world_size) == 2 + 4 * world_size
 
 
+def test_fold_barrier_default_table():
+    """The default launch path per architecture: folded rendezvous on SM100 / SM103, barrier kernel on SM90."""
+
+    assert loader.FOLD_BARRIER_DEFAULT_BY_ARCH == {
+        "sm_90a": False,
+        "sm_100a": True,
+        "sm_103a": True,
+    }
+    assert set(loader.FOLD_BARRIER_DEFAULT_BY_ARCH) == set(loader.ARCH_FLAGS)
+    for arch, fold in loader.FOLD_BARRIER_DEFAULT_BY_ARCH.items():
+        assert loader.default_fold_barrier(arch) is fold
+    with pytest.raises(ValueError, match="no default launch path"):
+        loader.default_fold_barrier("sm_120a")
+    assert loader.fold_producer_key(128, True, 1) == "producer_bn128_pair_fold1"
+    assert loader.fold_producer_key(256, False, 0) == "producer_bn256_fold0"
+    with pytest.raises(ValueError, match="rendezvous phase"):
+        loader.fold_producer_key(128, False, 2)
+
+
+def test_fold_barrier_resolution(monkeypatch):
+    """Keyword over environment over architecture default; ``True`` fails closed without folded producers."""
+
+    if not loader.ROUTES:
+        pytest.skip("program tables are filled by the exporter")
+    env = backend.FOLD_BARRIER_ENV
+    for arch in loader.ROUTES:
+        default = loader.default_fold_barrier(arch)
+        delivered = loader.fold_producers_delivered(arch)
+        monkeypatch.delenv(env, raising=False)
+        assert backend.resolve_fold_barrier(arch) == (default, "default")
+        assert backend.resolve_fold_barrier(arch, False) == (False, "keyword")
+        monkeypatch.setenv(env, "auto")
+        assert backend.resolve_fold_barrier(arch) == (default, "default")
+        monkeypatch.setenv(env, "0")
+        assert backend.resolve_fold_barrier(arch) == (False, "env")
+        monkeypatch.setenv(env, "1")
+        if delivered:
+            assert backend.resolve_fold_barrier(arch) == (True, "env")
+            monkeypatch.setenv(env, "0")
+            assert backend.resolve_fold_barrier(arch, True) == (True, "keyword")
+        else:
+            with pytest.raises(
+                ValueError, match="no producer program with the folded rendezvous"
+            ):
+                backend.resolve_fold_barrier(arch)
+            with pytest.raises(
+                ValueError, match="pass fold_barrier=False or leave it unset"
+            ):
+                backend.resolve_fold_barrier(arch, True)
+        monkeypatch.setenv(env, "yes")
+        with pytest.raises(ValueError, match=env):
+            backend.resolve_fold_barrier(arch)
+        monkeypatch.delenv(env, raising=False)
+        with pytest.raises(ValueError, match="bool or None"):
+            backend.resolve_fold_barrier(arch, 1)  # type: ignore[arg-type]
+
+
 def test_loader_tables_are_consistent():
     if not loader.ROUTES:
         pytest.skip("program tables are filled by the exporter")
@@ -188,14 +251,39 @@ def test_loader_tables_are_consistent():
             assert arch in record["arches"]
             assert len(record["sources"]) == 2
             if key.startswith("producer_bn"):
-                assert record["cluster"] == (
-                    [2, 1, 1] if key.endswith("_pair") else [1, 1, 1]
-                )
+                assert record["cluster"] == ([2, 1, 1] if "_pair" in key else [1, 1, 1])
                 assert set(record["args"]) >= {"A", "B", "tiles", "ready_target"}
+                if "_fold" in key:
+                    # The folded producer: the plain producer's ABI plus the rendezvous process-group
+                    # parameters before the grid, one extra warp (the rendezvous warp) per CTA.
+                    plain = loader.PROGRAMS[table[key.rsplit("_fold", 1)[0]]]
+                    assert record["args"] == (
+                        plain["args"][:-3]
+                        + ["pg_world", "pg_rank", "pg_flags"]
+                        + plain["args"][-3:]
+                    )
+                    assert record["block"] == [plain["block"][0] + 32, 1, 1]
+                    assert record["cluster"] == plain["cluster"]
+                else:
+                    assert "pg_flags" not in record["args"]
             elif key.startswith("barrier_p"):
                 assert record["args"][0] == "device_index"
             else:
                 assert record["args"][0] == "ready"
+        # Folded producers: both rendezvous phases of every routed producer where the architecture's default
+        # launch path folds the rendezvous; elsewhere none (or, once delivered, the complete set).
+        plain_keys = {
+            key for key in table if key.startswith("producer_bn") and "_fold" not in key
+        }
+        complete = {
+            f"{key}_fold{phase}" for key in plain_keys for phase in loader.FOLD_PHASES
+        }
+        fold_keys = {key for key in table if "_fold" in key}
+        if loader.default_fold_barrier(arch):
+            assert fold_keys == complete
+        else:
+            assert fold_keys in (set(), complete)
+        assert loader.fold_producers_delivered(arch) == bool(fold_keys)
         # The policy never selects a producer the architecture does not deliver.
         for hidden, world_size, rows in (
             (3072, 8, 512),
@@ -214,6 +302,9 @@ def test_loader_tables_are_consistent():
                 ),
             )
             assert loader.has_producer(arch, policy.bn, policy.pair)
+            assert loader.has_fold_producer(
+                arch, policy.bn, policy.pair
+            ) == loader.fold_producers_delivered(arch)
 
 
 # --------------------------------------------------------------------------- multi-GPU
@@ -523,7 +614,73 @@ def _run_worker(rank, world_size, port):
         finally:
             nccl.close()
 
-        # 5. Heads not divisible by the world size raise on every rank before any collective.
+        # 5. Launch paths: the architecture default against the explicit barrier path -- bitwise-equal
+        #    outputs, two versus three launches per call; fold_barrier=True fails closed where no folded
+        #    producer is delivered.
+        arch = loader.device_facts(device.index).arch
+        default_path = QkvNormRopeExchangeOverlap(
+            group,
+            hidden=hidden,
+            num_heads=heads,
+            layout="bshd",
+            max_tokens=batch * s_local,
+            backend="nvlink",
+            device=device,
+        )
+        barrier_path = QkvNormRopeExchangeOverlap(
+            group,
+            hidden=hidden,
+            num_heads=heads,
+            layout="bshd",
+            max_tokens=batch * s_local,
+            backend="nvlink",
+            device=device,
+            fold_barrier=False,
+        )
+        try:
+            default_info = default_path.describe()
+            barrier_info = barrier_path.describe()
+            assert default_info["fold_barrier"] is loader.default_fold_barrier(arch)
+            assert default_info["fold_barrier_requested"] == "auto"
+            assert default_info["launches_per_call"] == (
+                2 if default_info["fold_barrier"] else 3
+            )
+            assert barrier_info["fold_barrier"] is False
+            assert barrier_info["fold_barrier_requested"] is False
+            assert barrier_info["launches_per_call"] == 3
+            bound = default_path.bound_programs(batch, s_local)
+            assert bound == barrier_path.bound_programs(batch, s_local)
+            assert ("producer_fold0" in bound and "producer_fold1" in bound) == (
+                loader.fold_producers_delivered(arch)
+            )
+            for _round in range(3):
+                from_default = tuple(
+                    t.clone() for t in default_path(x, w_qkv, q_scale, k_scale, cos_sin)
+                )
+                from_barrier = barrier_path(x, w_qkv, q_scale, k_scale, cos_sin)
+                torch.cuda.synchronize(device)
+                _check_outputs(default_path, from_default, expected)
+                for one, other in zip(from_default, from_barrier, strict=True):
+                    assert torch.equal(one, other)
+        finally:
+            default_path.close()
+            barrier_path.close()
+        if not loader.fold_producers_delivered(arch):
+            with pytest.raises(
+                ValueError, match="no producer program with the folded rendezvous"
+            ):
+                QkvNormRopeExchangeOverlap(
+                    group,
+                    hidden=hidden,
+                    num_heads=heads,
+                    layout="bshd",
+                    max_tokens=batch * s_local,
+                    backend="nvlink",
+                    device=device,
+                    fold_barrier=True,
+                )
+
+        # 6. Heads not divisible by the world size raise on every rank before any collective.
         with pytest.raises(ValueError, match="divisible by world_size"):
             QkvNormRopeExchangeOverlap(
                 group,
