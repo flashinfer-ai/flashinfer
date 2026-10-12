@@ -13,12 +13,17 @@ if [ "$SKIP_INSTALL" = "0" ]; then
   install_flashinfer_editable
 fi
 
+# Create JUnit XML output directories for cross-lane coverage analysis
+mkdir -p junit-shard/tests/attention junit-shard/tests/utils junit-shard/tests/gemm \
+  junit-shard/tests/cli junit-shard/tests/moe junit-shard/tests/experimental \
+  junit-shard/tests
+
 # Run each test file separately to isolate CUDA memory issues
-pytest -s tests/utils/test_logits_processor.py
-pytest -s tests/cli/test_cli_cmds.py
-pytest -s tests/cli/test_cli_cmds_gpu.py
-pytest -s tests/moe/test_bgmv_moe.py
-pytest -s tests/moe/test_bgmv_moe_lora_delta.py
+pytest -s --junitxml=junit-shard/tests/utils/test_logits_processor.py.xml tests/utils/test_logits_processor.py
+pytest -s --junitxml=junit-shard/tests/cli/test_cli_cmds.py.xml tests/cli/test_cli_cmds.py
+pytest -s --junitxml=junit-shard/tests/cli/test_cli_cmds_gpu.py.xml tests/cli/test_cli_cmds_gpu.py
+pytest -s --junitxml=junit-shard/tests/moe/test_bgmv_moe.py.xml tests/moe/test_bgmv_moe.py
+pytest -s --junitxml=junit-shard/tests/moe/test_bgmv_moe_lora_delta.py.xml tests/moe/test_bgmv_moe_lora_delta.py
 
 # tests/experimental/ is excluded from `pytest tests/` by norecursedirs, so it has
 # to be named explicitly. This ONE FILE, not the directory: it covers the gating
@@ -30,4 +35,4 @@ pytest -s tests/moe/test_bgmv_moe_lora_delta.py
 # on hardware the backend may not target, against a timeout this shard never budgeted
 # for, and bypassing the per-PR declared scope that is the point of the experimental
 # lane. Backend tests stay with the targeted lane.
-pytest -s tests/experimental/test_experimental_api.py
+pytest -s --junitxml=junit-shard/tests/experimental/test_experimental_api.py.xml tests/experimental/test_experimental_api.py
