@@ -190,6 +190,23 @@ def test_live_tactics_change_pool_key_for_all_cached_backends(monkeypatch, confi
     )
     backend._ep_comm_group = object()
     monkeypatch.setattr(backend, "_tuning_cache", lambda: cache)
+    if config_name.startswith("Sm90"):
+        import sys
+
+        # SM90 now pools by the resolved frontend config. Keep this host-only
+        # test independent of the mutually exclusive SM90/SM100 kernel imports.
+        monkeypatch.setitem(
+            sys.modules,
+            "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel",
+            SimpleNamespace(
+                resolve_hopper_fp8_mega_moe_config=lambda **kwargs: tuple(
+                    sorted((key, repr(value)) for key, value in kwargs.items())
+                ),
+                _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config=mock.Mock(
+                    side_effect=AssertionError
+                ),
+            ),
+        )
     fleet = moe_ep.FleetParams(2, 64, 128)
     assert backend.live_token_buckets(fleet) == [8, 16, 32]
     keys = [

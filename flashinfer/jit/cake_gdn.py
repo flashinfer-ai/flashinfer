@@ -252,8 +252,16 @@ def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
         arch=arch,
         digest=compile_digest,
         compile_options=compile_options,
+        # The shared device header includes its helper definitions from the
+        # content-addressed ``csrc/cake_device_helpers/`` files relative to ``csrc``
+        # (root.parents[1], as the host-shim build below already passes it).
         include_paths=tuple(
-            dict.fromkeys((root / header["path"]).parent for header in headers)
+            dict.fromkeys(
+                [
+                    *((root / header["path"]).parent for header in headers),
+                    root.parents[1],
+                ]
+            )
         ),
         nvcc=nvcc,
     )
@@ -648,6 +656,57 @@ CAKE_GDN_BF16_WIDE_ARCH_BODIES: dict[str, str] = {"sm_107a": "wide128_vpre"}
 CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[str, str] = {
     "sm_107a": "gdn_decode_pretranspose_mtp_t4_splitv8_pro"
 }
+# The fp32-state T=1 pretranspose body (`..._splitv8`, route `indexed_fp32_t1_splitv8`)
+# is routed per architecture by the state-head count B*HV: Rubin (sm_107a) runs the
+# shipped `splitv8` body (TILE_V 16, eight CTAs per state head) below 256 state heads
+# and its `splitv8_tilev32` twin (TILE_V 32, four CTAs per state head; bitwise-identical
+# output, only the row -> CTA mapping changes) from 256 state heads on: 5-8.5 % faster
+# on R200 from 256 through 2048 state heads, 11-17 % slower at 32 and 128.  B200 / B300
+# keep `splitv8` at every count.  Mirrors `FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS` /
+# `FP32_T1_SPLITV8_ARCH_BANDS` / `select_fp32_t1_splitv8_route` in
+# loom.examples.weave.gdn_decode_pretranspose (the Cake tree cross-checks these copies).
+CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS = 256
+# (largest state-head count of the band or None for the open last band, body)
+CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
+    "sm_107a": (
+        (CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS - 1, "splitv8"),
+        (None, "splitv8_tilev32"),
+    ),
+}
+# CTAs per state head each fp32 T=1 body launches (the host grid is B * HV times this),
+# keyed by the record's schedule: the resolved record carries its own grid instead of a
+# fixed eight.
+CAKE_GDN_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
+    "gdn_decode_pretranspose_splitv8": 8,
+    "gdn_decode_pretranspose_splitv8_tilev32": 4,
+}
+
+
+def cake_gdn_fp32_t1_route(batch_size: int, num_v_heads: int, arch: CakeGDNArch) -> str:
+    """Body (``splitv8`` or ``splitv8_tilev32``) of the fp32-state T=1 pretranspose route for ``batch_size * num_v_heads`` state heads on ``arch``."""
+
+    bands = CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS.get(arch)
+    if bands is None:
+        return "splitv8"
+    state_heads = int(batch_size) * int(num_v_heads)
+    for max_state_heads, body in bands:
+        if max_state_heads is None or state_heads <= max_state_heads:
+            return body
+    raise AssertionError("fp32 T=1 route band tables must end with an open band")
+
+
+@functools.cache
+def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
+    """CTAs per state head the fp32-state T=1 pretranspose record ``variant_name`` launches (read from its schedule)."""
+
+    record = _kernel_record(variant_name)
+    schedule = record["source_schedule"].rsplit(":", 1)[-1]
+    ctas_per_state = CAKE_GDN_FP32_T1_CTAS_PER_STATE.get(schedule)
+    if ctas_per_state is None:
+        raise CakeGDNUnsupportedError(
+            f"{variant_name!r} ({schedule}) is not an fp32-state T=1 pretranspose record"
+        )
+    return ctas_per_state
 
 
 def cake_gdn_bf16_wide_schedule(arch: CakeGDNArch, seq_len: int) -> str:
@@ -963,8 +1022,14 @@ def select_cake_gdn_decode_variant(
             "FP32-state T=1 child contract requires state update and no cache"
         )
     if layout == "pretranspose":
-        schedule_attr = "gdn_decode_pretranspose_splitv8"
-        route = "flashinfer.gdn_decode.indexed_fp32_t1_splitv8"
+        # The body follows the state-head count per architecture (sm_107a runs the
+        # `splitv8_tilev32` twin from 256 state heads); the route id names a twin and
+        # the host reads the record's CTAs per state head for the grid.
+        body = cake_gdn_fp32_t1_route(batch_size, num_v_heads, arch)
+        schedule_attr = f"gdn_decode_pretranspose_{body}"
+        route = "flashinfer.gdn_decode.indexed_fp32_t1_splitv8" + body.removeprefix(
+            "splitv8"
+        )
     elif layout == "nontranspose":
         if batch_size < 32:
             schedule_attr = "gdn_decode_nontranspose_fp32_t1_small"

@@ -100,11 +100,8 @@ def paged_dynamic_scheduler():
 def paged_static_preferred(arch, static_route, batch, max_context_len):
     """True when ``policy.paged.dynamic_scheduler.static_windows[arch][static_route]`` has a window with
     ``batch <= max_batch`` and ``max_context_len <= max_ctx`` (``None`` = unbounded). Host-only."""
-    windows = (
-        paged_dynamic_scheduler()["static_windows"]
-        .get(str(arch), {})
-        .get(static_route, [])
-    )
+    static_windows = paged_dynamic_scheduler()["static_windows"]
+    windows = static_windows.get(str(arch), {}).get(static_route, [])
     batch, max_context_len = int(batch), int(max_context_len)
     return any(
         (max_batch is None or batch <= max_batch)
