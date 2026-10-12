@@ -247,6 +247,7 @@ from flashinfer.utils import get_compute_capability
 from tests.moe.utils import fp8_per_tensor_global_scale, fp8_per_tensor_requant_hook
 
 from tests.test_helpers.fuzz_ledger import FuzzLedger
+from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
 
 NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "160"))
 # Debug knob: comma-separated backend_key allowlist (e.g. "cute_dsl") to run a
@@ -2929,7 +2930,13 @@ def _fail(cfg: Cfg, tag: str, why: str, out=None, ref=None):
 
 
 @pytest.mark.shard_group("unified-moe-accumulated")
-@pytest.mark.parametrize("cfg", _CONFIGS, ids=[c.label for c in _CONFIGS])
+@parametrize_product(
+    {
+        "cfg": _CONFIGS,
+    },
+    regular=pairwise_product_cases,
+    ids=lambda case: case[0].label,
+)
 def test_unified_moe_fuzz(cfg):
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
@@ -3459,9 +3466,13 @@ _CACHE_VARIANTS = (
 )  # The 21-tactic block-FP8 runners make this multi-bucket stress sweep prohibitive.
 
 
-@pytest.mark.parametrize("variant", _CACHE_VARIANTS, ids=list(_CACHE_VARIANTS))
-@pytest.mark.parametrize(
-    "base", _CACHE_BASES, ids=[f"e{e}h{h}i{i}" for e, h, i in _CACHE_BASES]
+@parametrize_product(
+    {
+        "variant": _CACHE_VARIANTS,
+        "base": _CACHE_BASES,
+    },
+    regular=pairwise_product_cases,
+    ids=lambda case: f"{case[0]}-e{case[1][0]}h{case[1][1]}i{case[1][2]}",
 )
 def test_autotune_cache_coherence(base, variant):
     if not torch.cuda.is_available():
