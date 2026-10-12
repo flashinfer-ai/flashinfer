@@ -877,11 +877,14 @@ def fused_selected(
     mode_varlen: bool,
     total_tokens: int,
 ) -> bool:
-    """Exact-scan family rule: the fused program (``exact_*``) for one-wave /
+    """Exact-scan shape window: the fused program (``exact_*``) for one-wave /
     short-item calls, the two-kernel program (``exactpre_*``) otherwise.
     ``nchunks`` is the chunk count per sequence (batched); ``total_tokens`` the
     packed token count (varlen; the per-sequence lengths live on the device
-    and are not read)."""
+    and are not read).  The runner applies the window only where the fused
+    program's preprocess grid is 0 -- batched calls and the ``cu_seqlens``
+    form; the ``seq_idx`` triple form always runs the two-kernel program
+    (``_materialize_workspace``)."""
 
     items = int(num_sequences) * int(nheads)
     if not mode_varlen:
@@ -1268,12 +1271,12 @@ class CakeSSDCombined:
     ``[1, total_seqlen, nheads, 64]``), written directly by the kernels.
     Every call issues one launcher call: the preprocess (which also derives
     ``seq_chunk_cumsum`` from the packed-varlen metadata unless the caller
-    supplies a precomputed vector) followed by the scan; with the fused
-    exact-scan program the preprocess stage is skipped (grid 0) and the call
-    is one kernel, except on the packed-varlen calls where the preprocess
-    publishes metadata the fused kernel does not (the ``seq_idx`` triple form
-    deriving ``seq_chunk_cumsum``; a caller buffer for the
-    ``cu_seqlens``-derived vector).
+    supplies a precomputed vector) followed by the scan.  The fused
+    exact-scan program is selected only where its preprocess stage is skipped
+    (grid 0): batched calls and the ``cu_seqlens`` form, where the call is
+    one kernel; the ``seq_idx`` triple form runs the two-kernel program.  A
+    caller buffer for the ``cu_seqlens``-derived vector brings the fused
+    program's preprocess back to publish it (two launches).
 
     Three kernel families serve every call and are selected per call.  The
     fused exact scan (``exact_*`` programs) runs one persistent CTA per
@@ -1586,11 +1589,11 @@ class CakeSSDCombined:
         # sequence whose length is not a multiple of 128 is partial.
         lengths = torch.clamp(seqlen - chunks * _CHUNK_SIZE, max=_CHUNK_SIZE)
         tile_count = num_segments * self.nheads
-        # The family rule reads the same host quantities in both varlen
-        # metadata forms: the cu_seqlens form only knows the host segment
-        # bound, so the triple form selects on that bound too (its exact
-        # segment count still sizes the workspace) -- a call routes to the
-        # same program whichever form carries its sequence geometry.
+        # The chunk-parallel rule reads the same host quantities in both
+        # varlen metadata forms: the cu_seqlens form only knows the host
+        # segment bound, so the triple form selects on that bound too (its
+        # exact segment count still sizes the workspace).  Within the
+        # exact-scan family the form then decides fused vs two-kernel (below).
         selection_segments = (
             _segment_bound(seqlen, num_sequences) if self.has_varlen else num_segments
         )
@@ -1604,12 +1607,23 @@ class CakeSSDCombined:
             capability=capability,
             mode=key.chunk_parallel_mode,
         )
-        fused = not chunk_parallel and fused_selected(
-            nheads=self.nheads,
-            num_sequences=num_sequences,
-            nchunks=nchunks,
-            mode_varlen=self.has_varlen,
-            total_tokens=batch * seqlen,
+        # The fused program is a single launch only where its preprocess
+        # grid is 0: batched calls and the cu_seqlens form (the kernel
+        # derives the segment tables in-CTA).  In the seq_idx triple form the
+        # preprocess still runs to publish ``seq_chunk_cumsum``, and the fused
+        # main kernel then costs more than the two-kernel main kernel, so the
+        # triple form keeps the two-kernel program (round-6 FI mirror of the
+        # Cake ``fused_route`` window plus this grid-0 condition).
+        fused = (
+            not chunk_parallel
+            and (not self.has_varlen or key.from_cu_seqlens)
+            and fused_selected(
+                nheads=self.nheads,
+                num_sequences=num_sequences,
+                nchunks=nchunks,
+                mode_varlen=self.has_varlen,
+                total_tokens=batch * seqlen,
+            )
         )
         variant = (
             ""
