@@ -121,14 +121,41 @@ ARG_PLANS: dict[str, list[list[str]]] = {
     ],
 }
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_dsa_indexer_topk_02fe1c65eb89cba835b0": {
+    "cake_dsa_indexer_topk_0078a7a815dd3ae05528": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_02fe1c65eb89cba835b0_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_02fe1c65eb89cba835b0_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_0078a7a815dd3ae05528_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_0078a7a815dd3ae05528_binding.cu",
+        ],
+        "arches": ["sm_107a"],
+        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_03d703ce0f576fb5e1ba": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_03d703ce0f576fb5e1ba_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_03d703ce0f576fb5e1ba_binding.cu",
         ],
         "arches": ["sm_107a"],
         "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_04581dfcfd4b8da77e0e": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_04581dfcfd4b8da77e0e_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_04581dfcfd4b8da77e0e_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_07a9b7f678d301b6ec8f": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_07a9b7f678d301b6ec8f_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_07a9b7f678d301b6ec8f_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_0843306409e1e7fc6092": {
         "role": "scan",
@@ -139,23 +166,32 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a"],
         "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_0941c30bf15fe14a9cc3": {
+    "cake_dsa_indexer_topk_16c3c87110694f7d9ef5": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_0941c30bf15fe14a9cc3_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_0941c30bf15fe14a9cc3_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_16c3c87110694f7d9ef5_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_16c3c87110694f7d9ef5_binding.cu",
         ],
         "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
+        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_0bf75ec341ce571b7413": {
+    "cake_dsa_indexer_topk_183f566a58cfd448adc8": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_0bf75ec341ce571b7413_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_0bf75ec341ce571b7413_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_183f566a58cfd448adc8_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_183f566a58cfd448adc8_binding.cu",
         ],
-        "arches": ["sm_103a", "sm_107a"],
+        "arches": ["sm_107a"],
         "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_19f3a43b141139e9c889": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_19f3a43b141139e9c889_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_19f3a43b141139e9c889_binding.cu",
+        ],
+        "arches": ["sm_107a"],
+        "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
     },
     "cake_dsa_indexer_topk_1e987836f71bb5c3ba52": {
         "role": "scan",
@@ -166,13 +202,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_2041b86ba2e56c0591ec": {
+    "cake_dsa_indexer_topk_21194ed236fd9b34ca5c": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2041b86ba2e56c0591ec_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2041b86ba2e56c0591ec_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_21194ed236fd9b34ca5c_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_21194ed236fd9b34ca5c_binding.cu",
         ],
-        "arches": ["sm_100a"],
+        "arches": ["sm_107a"],
         "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_2581ee71bf5e5ecd2556": {
@@ -193,14 +229,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a"],
         "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_2d3c54670435ca47d9d2": {
+    "cake_dsa_indexer_topk_2a8ee36778e8e723a2db": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2d3c54670435ca47d9d2_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2d3c54670435ca47d9d2_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2a8ee36778e8e723a2db_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2a8ee36778e8e723a2db_binding.cu",
         ],
         "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
+        "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
     },
     "cake_dsa_indexer_topk_2d40b7d91582905f31c3": {
         "role": "finalize_rank",
@@ -211,20 +247,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_3006bd3aa47e016d0e03": {
+    "cake_dsa_indexer_topk_302e1fbcd75de335d203": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_3006bd3aa47e016d0e03_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_3006bd3aa47e016d0e03_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_36899ca69836524c0fc3": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_36899ca69836524c0fc3_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_36899ca69836524c0fc3_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_302e1fbcd75de335d203_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_302e1fbcd75de335d203_binding.cu",
         ],
         "arches": ["sm_107a"],
         "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
@@ -238,13 +265,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_43e6b06f87908c5b1172": {
+    "cake_dsa_indexer_topk_3d24871c62801c250a13": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_43e6b06f87908c5b1172_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_43e6b06f87908c5b1172_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_3d24871c62801c250a13_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_3d24871c62801c250a13_binding.cu",
         ],
-        "arches": ["sm_103a", "sm_107a"],
+        "arches": ["sm_107a"],
         "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_44163f96c12681e411cc": {
@@ -256,6 +283,24 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
+    "cake_dsa_indexer_topk_466abdd77cd9e3a2bbed": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_466abdd77cd9e3a2bbed_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_466abdd77cd9e3a2bbed_binding.cu",
+        ],
+        "arches": ["sm_107a"],
+        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_4ba570d7296334795923": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_4ba570d7296334795923_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_4ba570d7296334795923_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
+    },
     "cake_dsa_indexer_topk_4c792ffa06c1b93d77fa": {
         "role": "finalize",
         "sources": [
@@ -265,23 +310,32 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_4fb74943e6794f4d0b19": {
+    "cake_dsa_indexer_topk_51ea1878006e6309d084": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_4fb74943e6794f4d0b19_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_4fb74943e6794f4d0b19_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_51ea1878006e6309d084_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_51ea1878006e6309d084_binding.cu",
         ],
         "arches": ["sm_107a"],
         "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_545825470c274d10bc04": {
+    "cake_dsa_indexer_topk_5413483cf3311fde30f0": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_545825470c274d10bc04_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_545825470c274d10bc04_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5413483cf3311fde30f0_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5413483cf3311fde30f0_binding.cu",
         ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_100a", "sm_103a"],
+        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_54319ec98a91debb5537": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_54319ec98a91debb5537_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_54319ec98a91debb5537_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_55767b3e4f028548bd92": {
         "role": "finalize_rank",
@@ -301,6 +355,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
+    "cake_dsa_indexer_topk_57f29000b1d34d25491c": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_57f29000b1d34d25491c_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_57f29000b1d34d25491c_binding.cu",
+        ],
+        "arches": ["sm_107a"],
+        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
+    },
     "cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae": {
         "role": "finalize_rank",
         "sources": [
@@ -310,14 +373,32 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_5aa34f7e4d8bb3d96fde": {
+    "cake_dsa_indexer_topk_5ad452feced8e672c27a": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5aa34f7e4d8bb3d96fde_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5aa34f7e4d8bb3d96fde_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5ad452feced8e672c27a_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5ad452feced8e672c27a_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_5b000ac1fbbe1d2bd758": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5b000ac1fbbe1d2bd758_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5b000ac1fbbe1d2bd758_binding.cu",
         ],
         "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
+        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_5f64e59f766ec915c70b": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5f64e59f766ec915c70b_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5f64e59f766ec915c70b_binding.cu",
+        ],
+        "arches": ["sm_107a"],
+        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_60b4f87115fbecd243e2": {
         "role": "finalize_rank",
@@ -328,14 +409,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_6608aa8518faca0527e7": {
+    "cake_dsa_indexer_topk_675d0ddb78caa74b1b0f": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_6608aa8518faca0527e7_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_6608aa8518faca0527e7_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_675d0ddb78caa74b1b0f_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_675d0ddb78caa74b1b0f_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
+        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_69d2d7c68ccceb095540": {
         "role": "finalize_rank",
@@ -346,32 +427,23 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_6b1f075769a73ee1b176": {
+    "cake_dsa_indexer_topk_6c9c7e92e94144a6fb51": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_6b1f075769a73ee1b176_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_6b1f075769a73ee1b176_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_6ff54f38a7d43aed441b": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_6ff54f38a7d43aed441b_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_6ff54f38a7d43aed441b_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_6c9c7e92e94144a6fb51_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_6c9c7e92e94144a6fb51_binding.cu",
         ],
         "arches": ["sm_107a"],
         "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
     },
-    "cake_dsa_indexer_topk_70fbcd7e3a2abe75132b": {
+    "cake_dsa_indexer_topk_7035b336a4a4209cfd66": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_70fbcd7e3a2abe75132b_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_70fbcd7e3a2abe75132b_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_7035b336a4a4209cfd66_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_7035b336a4a4209cfd66_binding.cu",
         ],
         "arches": ["sm_107a"],
-        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
+        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_7286faf88e17986cff38": {
         "role": "finalize_rank",
@@ -382,15 +454,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_74d7c381e6a2c1219e6c": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_74d7c381e6a2c1219e6c_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_74d7c381e6a2c1219e6c_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
     "cake_dsa_indexer_topk_75842ae0f80e05addeaa": {
         "role": "finalize_rank",
         "sources": [
@@ -400,22 +463,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_7a8c782839e3650e42e3": {
+    "cake_dsa_indexer_topk_84a329cdc9c49b60663e": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_7a8c782839e3650e42e3_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_7a8c782839e3650e42e3_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_84a329cdc9c49b60663e_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_84a329cdc9c49b60663e_binding.cu",
         ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_7d171eb3a76d45726f38": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_7d171eb3a76d45726f38_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_7d171eb3a76d45726f38_binding.cu",
-        ],
-        "arches": ["sm_100a"],
+        "arches": ["sm_103a", "sm_107a"],
         "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_8a91a587122e3032ace6": {
@@ -436,15 +490,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_9463e969b9b47fe794d1": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_9463e969b9b47fe794d1_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_9463e969b9b47fe794d1_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
-    },
     "cake_dsa_indexer_topk_96c30b1f33d2a094d9b9": {
         "role": "finalize_rank",
         "sources": [
@@ -454,14 +499,23 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_9848f45ca3390e0daeef": {
+    "cake_dsa_indexer_topk_988afe38390f12e5bbc7": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_9848f45ca3390e0daeef_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_9848f45ca3390e0daeef_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_988afe38390f12e5bbc7_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_988afe38390f12e5bbc7_binding.cu",
         ],
-        "arches": ["sm_103a", "sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+        "arches": ["sm_107a"],
+        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_9930ec5efe7e98e63ad5": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_9930ec5efe7e98e63ad5_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_9930ec5efe7e98e63ad5_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
     },
     "cake_dsa_indexer_topk_9b89c92489b0e60d8ee7": {
         "role": "finalize_rank",
@@ -481,6 +535,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
+    "cake_dsa_indexer_topk_a8bb259a1b930c8383bf": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_a8bb259a1b930c8383bf_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_a8bb259a1b930c8383bf_binding.cu",
+        ],
+        "arches": ["sm_103a", "sm_107a"],
+        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+    },
     "cake_dsa_indexer_topk_aa0bedf1a5601a3c55be": {
         "role": "finalize_rank",
         "sources": [
@@ -499,23 +562,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_b136f04b21e35062077d": {
+    "cake_dsa_indexer_topk_aaf33000c051f155da63": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_b136f04b21e35062077d_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_b136f04b21e35062077d_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_aaf33000c051f155da63_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_aaf33000c051f155da63_binding.cu",
         ],
         "arches": ["sm_107a"],
-        "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_b206f52857c238bcf951": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_b206f52857c238bcf951_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_b206f52857c238bcf951_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_b8440d1d1d54917a47d7": {
         "role": "merge",
@@ -544,14 +598,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_c2598645bc5c4f2e4d18": {
+    "cake_dsa_indexer_topk_c161a63db67e3af8e906": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_c2598645bc5c4f2e4d18_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_c2598645bc5c4f2e4d18_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_c161a63db67e3af8e906_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_c161a63db67e3af8e906_binding.cu",
         ],
         "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
     },
     "cake_dsa_indexer_topk_c496f83c2e9979f7830a": {
         "role": "finalize_rank",
@@ -562,15 +616,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_c9efd59500c6c16020e6": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_c9efd59500c6c16020e6_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_c9efd59500c6c16020e6_binding.cu",
-        ],
-        "arches": ["sm_103a", "sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
     "cake_dsa_indexer_topk_cb8c20570699061f544d": {
         "role": "finalize_rank",
         "sources": [
@@ -579,15 +624,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_ced4e89bc4e74d1c752e": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_ced4e89bc4e74d1c752e_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_ced4e89bc4e74d1c752e_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
     },
     "cake_dsa_indexer_topk_cf92373ea526254d61a0": {
         "role": "finalize",
@@ -607,15 +643,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_d8608692031a9a3a49cc": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_d8608692031a9a3a49cc_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_d8608692031a9a3a49cc_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
-    },
     "cake_dsa_indexer_topk_d965d76ede39f71e674b": {
         "role": "finalize_rank",
         "sources": [
@@ -624,24 +651,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_dce69060d489ec86df87": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_dce69060d489ec86df87_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_dce69060d489ec86df87_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_df755465364eecf95460": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_df755465364eecf95460_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_df755465364eecf95460_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_e1e316281190b2a3203b": {
         "role": "finalize",
@@ -661,32 +670,23 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_e453d14c4a8923a43703": {
+    "cake_dsa_indexer_topk_e818ec29250079fb914b": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e453d14c4a8923a43703_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e453d14c4a8923a43703_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_e826f6ad8378b7725739": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e826f6ad8378b7725739_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e826f6ad8378b7725739_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_e840189671a665d54ec9": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e840189671a665d54ec9_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e840189671a665d54ec9_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e818ec29250079fb914b_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e818ec29250079fb914b_binding.cu",
         ],
         "arches": ["sm_107a"],
         "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_ebd66dea6d0305acb891": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_ebd66dea6d0305acb891_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_ebd66dea6d0305acb891_binding.cu",
+        ],
+        "arches": ["sm_107a"],
+        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_ed1192a18ca915b70af7": {
         "role": "finalize",
@@ -697,15 +697,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "launch": {"block": [128, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_efb859170a00f8c96574": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_efb859170a00f8c96574_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_efb859170a00f8c96574_binding.cu",
-        ],
-        "arches": ["sm_103a", "sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
     "cake_dsa_indexer_topk_f244c85e76fde1284ab2": {
         "role": "finalize_rank",
         "sources": [
@@ -715,11 +706,20 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_f51560d9a49f174c0ee7": {
+    "cake_dsa_indexer_topk_f4031ae0f60aafeade4f": {
         "role": "scan",
         "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_f51560d9a49f174c0ee7_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_f51560d9a49f174c0ee7_binding.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_f4031ae0f60aafeade4f_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_f4031ae0f60aafeade4f_binding.cu",
+        ],
+        "arches": ["sm_107a"],
+        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_f6a9ad865c292fc968d1": {
+        "role": "scan",
+        "sources": [
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_f6a9ad865c292fc968d1_kernel.cu",
+            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_f6a9ad865c292fc968d1_binding.cu",
         ],
         "arches": ["sm_107a"],
         "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
@@ -768,14 +768,14 @@ PROGRAM_KEYS: dict[str, dict[str, str]] = {
         "scan:l6:u1:s0:f1": "cake_dsa_indexer_topk_1e987836f71bb5c3ba52",
         "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_0843306409e1e7fc6092",
         "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_2a0be0fd36be3320b3df",
-        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_6608aa8518faca0527e7",
-        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_9463e969b9b47fe794d1",
-        "scan:split_l6:u1:s0:f0": "cake_dsa_indexer_topk_d8608692031a9a3a49cc",
-        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_b206f52857c238bcf951",
-        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_74d7c381e6a2c1219e6c",
-        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_2041b86ba2e56c0591ec",
-        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_e826f6ad8378b7725739",
-        "scan:wide:u2:s0:f1": "cake_dsa_indexer_topk_7d171eb3a76d45726f38",
+        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_9930ec5efe7e98e63ad5",
+        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_4ba570d7296334795923",
+        "scan:split_l6:u1:s0:f0": "cake_dsa_indexer_topk_5ad452feced8e672c27a",
+        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_5413483cf3311fde30f0",
+        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_54319ec98a91debb5537",
+        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_675d0ddb78caa74b1b0f",
+        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_04581dfcfd4b8da77e0e",
+        "scan:wide:u2:s0:f1": "cake_dsa_indexer_topk_07a9b7f678d301b6ec8f",
     },
     "sm_103a": {
         "finalize:t128": "cake_dsa_indexer_topk_ed1192a18ca915b70af7",
@@ -808,14 +808,16 @@ PROGRAM_KEYS: dict[str, dict[str, str]] = {
         "merge": "cake_dsa_indexer_topk_b8440d1d1d54917a47d7",
         "scan:l6:u1:s0:f0": "cake_dsa_indexer_topk_fa80099a4f529287f3be",
         "scan:l6:u1:s0:f1": "cake_dsa_indexer_topk_1e987836f71bb5c3ba52",
-        "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_efb859170a00f8c96574",
-        "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_9848f45ca3390e0daeef",
-        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_6608aa8518faca0527e7",
-        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_9463e969b9b47fe794d1",
-        "scan:split_l6:u1:s0:f0": "cake_dsa_indexer_topk_d8608692031a9a3a49cc",
-        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_43e6b06f87908c5b1172",
-        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_c9efd59500c6c16020e6",
-        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_0bf75ec341ce571b7413",
+        "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_84a329cdc9c49b60663e",
+        "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_a8bb259a1b930c8383bf",
+        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_9930ec5efe7e98e63ad5",
+        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_4ba570d7296334795923",
+        "scan:split_l6:u1:s0:f0": "cake_dsa_indexer_topk_5ad452feced8e672c27a",
+        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_5413483cf3311fde30f0",
+        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_54319ec98a91debb5537",
+        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_675d0ddb78caa74b1b0f",
+        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_04581dfcfd4b8da77e0e",
+        "scan:wide:u2:s0:f1": "cake_dsa_indexer_topk_07a9b7f678d301b6ec8f",
     },
     "sm_107a": {
         "finalize:t128": "cake_dsa_indexer_topk_ed1192a18ca915b70af7",
@@ -846,31 +848,31 @@ PROGRAM_KEYS: dict[str, dict[str, str]] = {
         "finalize_rank:t256:w8192:staged": "cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae",
         "finalize_rank:t256:w8192:staged:bulk:persist": "cake_dsa_indexer_topk_aa0bedf1a5601a3c55be",
         "merge": "cake_dsa_indexer_topk_b8440d1d1d54917a47d7",
-        "scan:l6:u1:s0:f0": "cake_dsa_indexer_topk_70fbcd7e3a2abe75132b",
-        "scan:l6:u1:s0:f1": "cake_dsa_indexer_topk_3006bd3aa47e016d0e03",
-        "scan:l6:u1:s1:f1": "cake_dsa_indexer_topk_df755465364eecf95460",
-        "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_efb859170a00f8c96574",
-        "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_9848f45ca3390e0daeef",
-        "scan:narrow:u1:s1:f1": "cake_dsa_indexer_topk_36899ca69836524c0fc3",
-        "scan:narrow:u2:s0:f0": "cake_dsa_indexer_topk_6b1f075769a73ee1b176",
-        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_b136f04b21e35062077d",
-        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_e840189671a665d54ec9",
-        "scan:pair_l6:u1:s1:f1": "cake_dsa_indexer_topk_545825470c274d10bc04",
-        "scan:pair_narrow:u1:s1:f1": "cake_dsa_indexer_topk_0941c30bf15fe14a9cc3",
-        "scan:pair_narrow:u2:s0:f0": "cake_dsa_indexer_topk_f51560d9a49f174c0ee7",
-        "scan:pair_narrow:u2:s0:f1": "cake_dsa_indexer_topk_6ff54f38a7d43aed441b",
-        "scan:pair_wide:u1:s1:f0": "cake_dsa_indexer_topk_2d3c54670435ca47d9d2",
-        "scan:pair_wide:u1:s1:f1": "cake_dsa_indexer_topk_02fe1c65eb89cba835b0",
-        "scan:pair_wide:u2:s0:f0": "cake_dsa_indexer_topk_ced4e89bc4e74d1c752e",
-        "scan:pair_wide:u2:s0:f1": "cake_dsa_indexer_topk_5aa34f7e4d8bb3d96fde",
-        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_43e6b06f87908c5b1172",
-        "scan:split_wide:u1:s0:f0": "cake_dsa_indexer_topk_7a8c782839e3650e42e3",
-        "scan:split_wide:u2:s0:f0": "cake_dsa_indexer_topk_e453d14c4a8923a43703",
-        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_c9efd59500c6c16020e6",
-        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_0bf75ec341ce571b7413",
-        "scan:wide:u1:s1:f0": "cake_dsa_indexer_topk_c2598645bc5c4f2e4d18",
-        "scan:wide:u1:s1:f1": "cake_dsa_indexer_topk_4fb74943e6794f4d0b19",
-        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_dce69060d489ec86df87",
+        "scan:l6:u1:s0:f0": "cake_dsa_indexer_topk_16c3c87110694f7d9ef5",
+        "scan:l6:u1:s0:f1": "cake_dsa_indexer_topk_aaf33000c051f155da63",
+        "scan:l6:u1:s1:f1": "cake_dsa_indexer_topk_5b000ac1fbbe1d2bd758",
+        "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_84a329cdc9c49b60663e",
+        "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_a8bb259a1b930c8383bf",
+        "scan:narrow:u1:s1:f1": "cake_dsa_indexer_topk_302e1fbcd75de335d203",
+        "scan:narrow:u2:s0:f0": "cake_dsa_indexer_topk_21194ed236fd9b34ca5c",
+        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_19f3a43b141139e9c889",
+        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_2a8ee36778e8e723a2db",
+        "scan:pair_l6:u1:s1:f1": "cake_dsa_indexer_topk_e818ec29250079fb914b",
+        "scan:pair_narrow:u1:s1:f1": "cake_dsa_indexer_topk_6c9c7e92e94144a6fb51",
+        "scan:pair_narrow:u2:s0:f0": "cake_dsa_indexer_topk_03d703ce0f576fb5e1ba",
+        "scan:pair_narrow:u2:s0:f1": "cake_dsa_indexer_topk_f4031ae0f60aafeade4f",
+        "scan:pair_wide:u1:s1:f0": "cake_dsa_indexer_topk_f6a9ad865c292fc968d1",
+        "scan:pair_wide:u1:s1:f1": "cake_dsa_indexer_topk_c161a63db67e3af8e906",
+        "scan:pair_wide:u2:s0:f0": "cake_dsa_indexer_topk_57f29000b1d34d25491c",
+        "scan:pair_wide:u2:s0:f1": "cake_dsa_indexer_topk_988afe38390f12e5bbc7",
+        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_7035b336a4a4209cfd66",
+        "scan:split_wide:u1:s0:f0": "cake_dsa_indexer_topk_ebd66dea6d0305acb891",
+        "scan:split_wide:u2:s0:f0": "cake_dsa_indexer_topk_183f566a58cfd448adc8",
+        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_3d24871c62801c250a13",
+        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_51ea1878006e6309d084",
+        "scan:wide:u1:s1:f0": "cake_dsa_indexer_topk_0078a7a815dd3ae05528",
+        "scan:wide:u1:s1:f1": "cake_dsa_indexer_topk_466abdd77cd9e3a2bbed",
+        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_5f64e59f766ec915c70b",
     },
 }
 POLICY: dict[str, dict[str, Any]] = {
@@ -952,8 +954,8 @@ POLICY: dict[str, dict[str, Any]] = {
         "snake_default": False,
         "snake_rule": None,
         "tile_unroll_default": 1,
-        "tile_unroll_factor": 1,
-        "tile_unroll_rule": None,
+        "tile_unroll_factor": 2,
+        "tile_unroll_rule": [["wide"], 256, False],
         "sample_fit_max_mean_tiles": 512.0,
         "sample_tiles_max": 32,
         "sample_tiles_short_units": 16,
