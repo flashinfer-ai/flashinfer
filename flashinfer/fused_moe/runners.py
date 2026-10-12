@@ -8845,17 +8845,6 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
 
         _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, f"{self.backend_key} MoE")
 
-    def check_support(self) -> None:
-        super().check_support()
-        # Load the moe_utils kernels once every configuration check has passed,
-        # so a rejected configuration never builds them and a build or load
-        # failure (a RuntimeError) rejects this backend during selection.
-        from .cute_dsl.moe_utils import _get_moe_utils_module
-
-        self._support_checked = False
-        _get_moe_utils_module()
-        self._support_checked = True
-
     def _check_activation_parameters(self) -> None:
         activation = self.config.activation
         if isinstance(activation, SwiGLU) and (
@@ -8869,9 +8858,10 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
             )
 
     def _build(self) -> None:
-        """Resolve the ``moe_activation`` kernel of the configured activation."""
-        from .cute_dsl.moe_utils import MoeActivationType
+        """Load the ``moe_utils`` sort, permute, activation and finalize kernels."""
+        from .cute_dsl.moe_utils import MoeActivationType, _get_moe_utils_module
 
+        _get_moe_utils_module()
         self._moe_activation_type = MoeActivationType[self.config.activation.type.name]
 
     # --- geometry and workspace -------------------------------------------

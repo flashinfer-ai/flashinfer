@@ -495,39 +495,18 @@ def test_cudnn_check_support_does_not_need_triton(monkeypatch):
         _detached_runner(key, _config(key))._check_support()
 
 
-@cudnn_bf16_required
-def test_cudnn_backend_is_rejected_when_moe_utils_fails_to_load(monkeypatch):
-    """A moe_utils build or load failure rejects the backend during selection
-    instead of aborting the layer."""
+def test_cudnn_build_requires_moe_utils(monkeypatch):
+    """The sort, permute and finalize kernels have no fallback: a failure to load
+    them (e.g. a missing downloaded header) surfaces at build."""
     import flashinfer.fused_moe.cute_dsl.moe_utils as moe_utils
 
     def unavailable():
-        raise RuntimeError("Ninja build failed.")
+        raise AssertionError("trtllmGen_bmm_export header not found")
 
     monkeypatch.setattr(moe_utils, "_get_moe_utils_module", unavailable)
-    with pytest.raises(RuntimeError, match="rejected this configuration") as info:
-        MoELayer(_config(_BF16_KEY), torch.device("cuda"))
-    assert "CudnnGroupedGemmBf16Runner: Ninja build failed." in str(info.value)
-
-
-def test_cudnn_check_support_rejects_before_building_moe_utils(monkeypatch):
-    """A rejected configuration never builds the moe_utils kernels."""
-    import flashinfer.fused_moe.cute_dsl.moe_utils as moe_utils
-
-    def build():
-        raise AssertionError("moe_utils built for a rejected configuration")
-
-    monkeypatch.setattr(moe_utils, "_get_moe_utils_module", build)
-    intermediate_sizes = dict.fromkeys(_FAMILY_KEYS, 100)
-    if _cudnn_moe_available():
-        # Past the shared checks: the block-scaled runners' own size check.
-        intermediate_sizes.update(dict.fromkeys(_BLOCK_SCALE_KEYS, 96))
-    for key, intermediate_size in intermediate_sizes.items():
-        runner = _detached_runner(
-            key, _config(key, experts=ExpertConfig(intermediate_size=intermediate_size))
-        )
-        with pytest.raises(NotImplementedError, match="intermediate_size divisible"):
-            runner.check_support()
+    runner = _detached_runner(_BF16_KEY, _config(_BF16_KEY))
+    with pytest.raises(AssertionError, match="header not found"):
+        runner._build()
 
 
 @pytest.mark.parametrize("key", _FAMILY_KEYS)
