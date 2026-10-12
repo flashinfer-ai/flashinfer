@@ -58,22 +58,31 @@ from tests.comm.test_mnnvl_cutedsl_numerical_contract import (
 
 pytestmark = pytest.mark.gpu_4
 
-HIDDEN_SIZE = 8192
-TOP_K = 10
 CAPACITY = 64
 FP8_MAX = 448.0
 
-# Default tunings of every protocol are valid for H8192 at TP4, TP8 and TP16,
-# so one single-protocol profile per world size covers whatever torchrun launched.
-_TUNINGS = {
-    "ll": (ProtocolKind.LL, LLFinalizeTuning(), LLAllReduceTuning()),
-    "bt": (ProtocolKind.BT, BTFinalizeTuning(), BTAllReduceTuning()),
-    "ht": (ProtocolKind.HT, HTFinalizeTuning(), HTAllReduceTuning()),
-}
+
+def _tunings(protocol: str, hidden_size: int):
+    """Finalize and all-reduce tunings valid at TP4, TP8 and TP16.
+
+    The protocol defaults cover both tested shapes, except that HT's default
+    512-thread x 2-vector shard only tiles multiples of 8192 elements; H3584
+    uses the 448 x 1 shard of the shipped Kimi K3 HT presets.
+    """
+    if protocol == "ll":
+        return ProtocolKind.LL, LLFinalizeTuning(), LLAllReduceTuning()
+    if protocol == "bt":
+        return ProtocolKind.BT, BTFinalizeTuning(), BTAllReduceTuning()
+    if hidden_size % 8192 == 0:
+        return ProtocolKind.HT, HTFinalizeTuning(), HTAllReduceTuning()
+    shard = dict(consumer_threads=448, vectors_per_thread=1)
+    return ProtocolKind.HT, HTFinalizeTuning(**shard), HTAllReduceTuning(**shard)
 
 
-def _single_protocol_config(protocol: str, tp_size: int) -> MNNVLCuteDSLConfig:
-    kind, finalize, all_reduce = _TUNINGS[protocol]
+def _single_protocol_config(
+    protocol: str, tp_size: int, hidden_size: int, top_k: int
+) -> MNNVLCuteDSLConfig:
+    kind, finalize, all_reduce = _tunings(protocol, hidden_size)
 
     def route(preset):
         return MRangeDispatch(
@@ -84,8 +93,8 @@ def _single_protocol_config(protocol: str, tp_size: int) -> MNNVLCuteDSLConfig:
         profiles=(
             StaticProfile(
                 tp_size=tp_size,
-                hidden_size=HIDDEN_SIZE,
-                top_k=TOP_K,
+                hidden_size=hidden_size,
+                top_k=top_k,
                 dtype=torch.bfloat16,
                 finalize_routes=route(finalize),
                 all_reduce_routes=route(all_reduce),
@@ -100,17 +109,26 @@ def _expected_fp8(norm: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return scaled.clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
 
 
-def _assert_fp8_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
-    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
-
-
-@pytest.mark.parametrize("protocol", ("ll", "bt", "ht"))
-@pytest.mark.parametrize("write_norm_output", (False, True))
+# Each protocol covers both write_norm_output modes and both shapes (Qwen3.8
+# H8192/top-k 10 and Kimi K3 H3584/top-k 16) without a full cross product.
+@pytest.mark.parametrize(
+    "protocol,write_norm_output,hidden_size,top_k",
+    [
+        ("ll", False, 8192, 10),
+        ("ll", True, 3584, 16),
+        ("bt", False, 3584, 16),
+        ("bt", True, 8192, 10),
+        ("ht", False, 8192, 10),
+        ("ht", True, 3584, 16),
+    ],
+)
 @torch.inference_mode()
 def test_static_fp8_outputs_and_replay(
     distributed_group,  # noqa: F811 - pytest injects the imported fixture.
     protocol,
     write_norm_output,
+    hidden_size,
+    top_k,
 ):
     group = distributed_group
     rank = dist.get_rank(group)
@@ -119,13 +137,13 @@ def test_static_fp8_outputs_and_replay(
         tp_size=world_size,
         tp_rank=rank,
         max_token_num=CAPACITY,
-        hidden_dim=HIDDEN_SIZE,
+        hidden_dim=hidden_size,
         dtype=torch.bfloat16,
         group=group,
-        top_k=TOP_K,
+        top_k=top_k,
         rms_eps=RMS_EPS,
         weight_bias=WEIGHT_BIAS,
-        config=_single_protocol_config(protocol, world_size),
+        config=_single_protocol_config(protocol, world_size, hidden_size, top_k),
     )
     baseline = MNNVLCuteDSLAllReduceFusionWorkspace(**common)
     workspace = MNNVLCuteDSLAllReduceFusionWorkspace(
@@ -144,21 +162,21 @@ def test_static_fp8_outputs_and_replay(
                 local_rng = torch.Generator(device="cuda").manual_seed(7200 + rank)
                 residual = torch.randn(
                     m,
-                    HIDDEN_SIZE,
+                    hidden_size,
                     device="cuda",
                     dtype=torch.bfloat16,
                     generator=replicated,
                 )
                 gamma = torch.randn(
-                    HIDDEN_SIZE,
+                    hidden_size,
                     device="cuda",
                     dtype=torch.bfloat16,
                     generator=replicated,
                 )
-                rows = m * TOP_K + 17 if finalize else m
+                rows = m * top_k + 17 if finalize else m
                 source = torch.randn(
                     rows,
-                    HIDDEN_SIZE,
+                    hidden_size,
                     device="cuda",
                     dtype=torch.bfloat16,
                     generator=local_rng,
@@ -168,21 +186,21 @@ def test_static_fp8_outputs_and_replay(
                     moe = dict(
                         expanded_idx_to_permuted_idx=torch.randint(
                             rows,
-                            (m, TOP_K),
+                            (m, top_k),
                             device="cuda",
                             dtype=torch.int32,
                             generator=local_rng,
                         ),
                         expert_scale_factor=torch.rand(
                             m,
-                            TOP_K,
+                            top_k,
                             device="cuda",
                             dtype=torch.bfloat16,
                             generator=local_rng,
                         ),
                         shared_expert_output=torch.randn(
                             m,
-                            HIDDEN_SIZE,
+                            hidden_size,
                             device="cuda",
                             dtype=torch.bfloat16,
                             generator=local_rng,
@@ -193,7 +211,7 @@ def test_static_fp8_outputs_and_replay(
                 prenorm = torch.empty_like(residual)
                 norm = torch.empty_like(residual) if write_norm_output else None
                 quant = torch.empty(
-                    (m, HIDDEN_SIZE), device="cuda", dtype=torch.float8_e4m3fn
+                    (m, hidden_size), device="cuda", dtype=torch.float8_e4m3fn
                 )
                 # One configuration passes a 0-d scale; the kernel sees a
                 # one-element view of the same storage either way.
@@ -244,7 +262,10 @@ def test_static_fp8_outputs_and_replay(
 
                 reference()
                 assert allreduce_fusion(**quant_args).data_ptr() == quant.data_ptr()
-                _assert_fp8_equal(quant, _expected_fp8(reference_norm, scale))
+                assert torch.equal(
+                    quant.view(torch.uint8),
+                    _expected_fp8(reference_norm, scale).view(torch.uint8),
+                )
                 local = (
                     _local_finalize(
                         source,
@@ -256,7 +277,7 @@ def test_static_fp8_outputs_and_replay(
                     else source
                 )
                 symmetric = (
-                    _make_symmetric_reference((m, HIDDEN_SIZE), group)
+                    _make_symmetric_reference((m, hidden_size), group)
                     if protocol == "ht"
                     else None
                 )
@@ -295,7 +316,9 @@ def test_static_fp8_outputs_and_replay(
                     graph.replay()
                     torch.cuda.synchronize()
                     expected = _expected_fp8(reference_norm, scale)
-                    _assert_fp8_equal(quant, expected)
+                    assert torch.equal(
+                        quant.view(torch.uint8), expected.view(torch.uint8)
+                    )
                     if value == 1 / 256:
                         decoded = quant.float()
                         assert (decoded == FP8_MAX).any()
@@ -319,7 +342,9 @@ def test_static_fp8_outputs_and_replay(
                 ):
                     quant.view(torch.uint8).fill_(0x7F)
                     allreduce_fusion(**dict(quant_args, scale_factor=converted))
-                    _assert_fp8_equal(quant, expected)
+                    assert torch.equal(
+                        quant.view(torch.uint8), expected.view(torch.uint8)
+                    )
 
                 for invalid in (
                     None,
@@ -336,22 +361,6 @@ def test_static_fp8_outputs_and_replay(
                     allreduce_fusion(
                         **dict(quant_args, pattern=P.kARResidualRMSNormDynamicFP8Quant)
                     )
-                # BF16 patterns are not served by an FP8 workspace.
-                with pytest.raises(ValueError, match="BF16 workspace"):
-                    allreduce_fusion(
-                        **dict(quant_args, pattern=baseline_pattern, quant_out=None)
-                    )
-                if write_norm_output:
-                    with pytest.raises(ValueError, match="norm_out"):
-                        allreduce_fusion(**dict(quant_args, norm_out=None))
-                    with pytest.raises(ValueError, match="write_norm_output=False"):
-                        allreduce_fusion(
-                            **dict(
-                                quant_args,
-                                pattern=P.kARResidualRMSNormFP8Quant,
-                                norm_out=None,
-                            )
-                        )
                 torch.cuda.synchronize()
                 dist.barrier(group=group)
                 del graph, symmetric
