@@ -40,13 +40,11 @@
     "cake_sparse_mla_dsv4_nvfp4_h80.cu",
     "cake_sparse_mla_dsv4_nvfp4_h96.cu"
   ],
-  "decode_sources_kept": true,
-  "decode_sources_kept_from_identity": "8dac14b4511fe7e3520ba132e0293dea60544902d41f5f84c5532696b5ec670d",
-  "decode_sources_kept_from_tree_commit": "6410ec5df216c0287352c628511edf9344996a24",
+  "decode_sources_kept": false,
   "decode_threads": 320,
   "entry": "cake_sparse_mla_sm120_dsv4_nvfp4_decode",
   "family": "cake_sparse_mla_sm120_dsv4_nvfp4",
-  "generated_at": "2026-10-02T12:10:10Z",
+  "generated_at": "2026-10-03T21:16:37Z",
   "generator": "sm120-dsv4-nvfp4-sparse-mla-flashinfer-export",
   "head_counts": [
     8,
@@ -62,9 +60,9 @@
   "head_dim": 512,
   "header": "cake_sparse_mla_dsv4_nvfp4_kernels.h",
   "heads_per_block": 16,
-  "identity": "7e53b649ece7e8417a6ae284a32df06ae39e535127bfe3bdd1e2f14856fa74ea",
+  "identity": "9137a41af15f6411febb18aecc9d08948133df1b6988e90e09bddc2d781bcc22",
   "identity_scope": "sha256 over sorted (file name, file text without the provenance header)",
-  "kernel_commit": "391034f4eaae572e690eea6ad777ef9641d935b7",
+  "kernel_commit": "917e54848e82bcb5c39db366caf2ec1acfa27b48",
   "kernel_tree_modified": false,
   "max_chunks_per_block": 16,
   "merge_params": [
@@ -132,7 +130,7 @@
       2
     ]
   },
-  "prefill_kernel_commit": "d35e1adf89bf7202c63196c9ace0c46e59251ba8",
+  "prefill_kernel_commit": "917e54848e82bcb5c39db366caf2ec1acfa27b48",
   "prefill_max_chunks": 16,
   "prefill_min_blocks_per_sm": 1,
   "prefill_params": [
@@ -154,12 +152,29 @@
     "extra_page_size",
     "extra_page_stride_bytes",
     "sm_scale",
-    "lse_scale"
+    "lse_scale",
+    "q_evict_first",
+    "grid_head_blocks_first"
   ],
+  "prefill_ring_stages": {
+    "1": [
+      2,
+      3
+    ],
+    "2": [
+      2
+    ],
+    "4": [
+      2
+    ]
+  },
   "prefill_smem_bytes": {
     "1": 73856,
     "2": 81536,
     "4": 96896
+  },
+  "prefill_smem_bytes_three_stages": {
+    "1": 98688
   },
   "prefill_sources": [
     "cake_sparse_mla_dsv4_nvfp4_prefill_h112.cu",
@@ -192,7 +207,7 @@
     "cake_sparse_mla_dsv4_nvfp4_prefill_h80.cu",
     "cake_sparse_mla_dsv4_nvfp4_prefill_h96.cu"
   ],
-  "tree_commit": "d35e1adf89bf7202c63196c9ace0c46e59251ba8",
+  "tree_commit": "917e54848e82bcb5c39db366caf2ec1acfa27b48",
   "two_tile_head_counts": [
     32,
     64,

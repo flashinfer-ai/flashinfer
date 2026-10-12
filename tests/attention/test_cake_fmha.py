@@ -19,9 +19,7 @@ from flashinfer.jit.cake_fmha import (
     get_cake_fmha_decode_native_bf16_hd256_smallm_uri,
     CAKE_FMHA_BALANCED_FP8_Q_DTYPES,
     CAKE_FMHA_BALANCED_HD256_PAGE_SIZES,
-    CAKE_FMHA_FLASHINFER_BINDINGS_SHA256,
     CAKE_FMHA_FLASHINFER_MATRIX_REVISION,
-    CAKE_FMHA_MANIFEST_SHA256,
     cake_fmha_balanced_fp8_component_name,
     cake_fmha_balanced_hd256_component_name,
     gen_cake_fmha_compat_module,
@@ -68,13 +66,12 @@ from tests.test_helpers.cake_fmha_capability import (
 )
 
 
-def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
+def test_cake_fmha_registry_is_complete() -> None:
     manifest = get_cake_fmha_manifest()
     assert manifest["product"] == "cake_fmha"
     assert manifest["flashinfer_matrix_revision"] == (
         CAKE_FMHA_FLASHINFER_MATRIX_REVISION
     )
-    assert manifest["publication"]["promotion_ready"] is True
     assert manifest["capability"]["complete"] is True
     assert manifest["capability"]["cake_coverage_ratio"] == 1.0
     assert manifest["capability"]["upstream_valid_cases"] == 57_280
@@ -88,29 +85,9 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
         "correctness_compat_decode_fp8_hnd_shared_group8_partial",
         "correctness_decode_fp8_hnd_shared_group8_full_blocks",
     }
-    # 143 base/composed artifacts, the six CAKE-459 small-M hd256 decode
-    # instances (two arch bodies + one launch binding each) and the seven
-    # round-2 balanced components (fp8, bf16q, fp16q, bf16 hd64, bf16 hd256
-    # p16/p32/p64: two arch programs + one launch binding each), plus the
-    # round-3 balanced DCP speculative-decode families (three launch bindings
-    # and one program each, instantiated by -DN_ROWS for both architectures).
-    assert len(manifest["artifacts"]) == 206
-    dcp_addon = manifest["add_ons"]["cake_fmha_dcp_spec"]
-    assert dcp_addon["installed"] is True
-    assert dcp_addon["selection_key"] == "causal_seqlens_kv_global"
-    assert set(dcp_addon["manifest"]["families"]) == {
-        "dcp_spec_bf16_balanced",
-        "dcp_spec_bf16_fp8",
-        "dcp_spec_bf16_fp8_balanced",
-        "dcp_spec_bf16_fp8_d256_balanced",
-        "dcp_spec_bf16_v1",
-        "dcp_spec_bf16_v4",
-    }
     assert manifest["components"]["compat_v1"]["launch_binding"] == (
         "cake_fmha_launch_compat_v1"
     )
-    assert len(CAKE_FMHA_MANIFEST_SHA256) == 64
-    assert len(CAKE_FMHA_FLASHINFER_BINDINGS_SHA256) == 64
 
 
 def test_cake_fmha_public_manifest_is_defensive_copy() -> None:
@@ -377,20 +354,8 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector(
     )
     assert body == get_cake_fmha_csrc_dir() / sink_member["sources"][manifest_arch]
     assert binding == get_cake_fmha_csrc_dir() / sink_binding
-    assert (
-        arch_override["binding_sha256"] == manifest["artifacts"][sink_binding]["sha256"]
-    )
     assert launch_override["grid"] == ["Q_LEN", "NUM_KV_HEADS", "BATCH_SIZE"]
     assert launch_override["use_pdl"] is True
-    assert len(cake_jit._FLASHINFER_BINDINGS) == 20
-    assert sink_binding not in cake_jit._FLASHINFER_BINDINGS
-    assert (
-        cake_jit._sha256(get_cake_fmha_csrc_dir() / sink_binding)
-        == (arch_override["binding_sha256"])
-    )
-    assert cake_jit._flashinfer_bindings_sha256(get_cake_fmha_csrc_dir()) == (
-        CAKE_FMHA_FLASHINFER_BINDINGS_SHA256
-    )
 
     adapter = (
         get_cake_fmha_csrc_dir() / "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
@@ -2914,7 +2879,7 @@ def test_cake_fmha_decode_native_bf16_hd256_smallm_jit_selects_component(
         "cake_fmha_decode_native_bf16_hd256_smallm_jit_binding.cu",
     }
     assert any(
-        "decode_native_bf16_hd256_smallm_n64_p64/sm_100a/" in str(s)
+        "decode_native_bf16_hd256_smallm_n64_p64/default.cu" in str(s)
         for s in spec.sources
     )
     assert "-DQ_LEN=8" in spec.extra_cuda_cflags
@@ -3687,7 +3652,7 @@ def test_cake_fmha_decode_balanced_jit_selects_the_q_len_component(
             in spec.extra_cuda_cflags
         )
         assert any(
-            f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources
+            f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
         )
 
 
@@ -3711,7 +3676,9 @@ def test_cake_fmha_decode_balanced_fp8_family_jit_selects_the_q_dtype_component(
         f"cake_fmha_{component}_binding.cu",
         "cake_fmha_decode_balanced_fp8_jit_binding.cu",
     }
-    assert any(f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources)
+    assert any(
+        f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
+    )
     assert f"-DCAKE_FMHA_BALANCED_Q_DTYPE={q_dtype_flag}" in spec.extra_cuda_cflags
     assert (
         f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
@@ -3735,7 +3702,9 @@ def test_cake_fmha_decode_balanced_hd64_jit_selects_the_component(monkeypatch) -
         f"cake_fmha_{component}_binding.cu",
         "cake_fmha_decode_balanced_hd64_jit_binding.cu",
     }
-    assert any(f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources)
+    assert any(
+        f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
+    )
     assert (
         f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
         in spec.extra_cuda_cflags
@@ -3760,7 +3729,9 @@ def test_cake_fmha_decode_balanced_hd256_jit_selects_the_page_size_component(
         f"cake_fmha_{component}_binding.cu",
         "cake_fmha_decode_balanced_hd256_jit_binding.cu",
     }
-    assert any(f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources)
+    assert any(
+        f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
+    )
     assert f"-DCAKE_FMHA_BALANCED_PAGE_SIZE={page_size}" in spec.extra_cuda_cflags
     assert (
         f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"

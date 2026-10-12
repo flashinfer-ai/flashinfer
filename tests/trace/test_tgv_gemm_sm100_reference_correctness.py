@@ -20,12 +20,10 @@ def test_tgv_gemm_sm100_reference_correctness(shape_kwargs):
     """tgv_gemm_sm100 kernel (SM100 only in practice) vs reference (a @ b + bias)."""
     from flashinfer.utils import is_sm100f_supported
 
-    # The kernel's Python gate accepts SM100 or SM103 (see
-    # gemm_base._match_sm_version) but the precompiled cubin only has an
-    # SM100 kernel image; calling on SM103 crashes with "no kernel image"
-    # inside CUDA (uncatchable via try/except). Restrict to SM100.
-    if _cc() != (10, 0):
-        pytest.skip("tgv_gemm_sm100 cubin is only built for SM100")
+    # TGV is JIT-compiled (gen_tgv_gemm_sm10x_module) for the SM100 family;
+    # its Python gate accepts SM100, SM103 and SM107.
+    if _cc() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("tgv_gemm_sm100 requires SM100, SM103 or SM107")
     if not is_sm100f_supported(torch.device("cuda")):
         pytest.skip("tgv_gemm_sm100 requires SM100f support (CUDA 12.9+)")
     from flashinfer import tgv_gemm_sm100

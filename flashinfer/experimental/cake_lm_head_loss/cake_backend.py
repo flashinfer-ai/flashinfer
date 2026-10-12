@@ -66,6 +66,46 @@ Contract
   whenever the chunk's K-slice count agrees; the ``loss`` and ``dW``
   reductions run over different chunk boundaries, hence differ by FP32
   rounding.  All rows valid: the uncompacted path (no gather, no scatter).
+* Fused dX finalize (default on unless ``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE=0``):
+  the K-slice slabs of a sliced dX GEMM are added into ``dX_acc`` by one
+  fixed-order kernel (``slab_sum``) instead of the host's chain of in-place
+  ``add_`` launches, and a compacted call's dX output boundary writes the
+  ``[T, H]`` BF16 ``dX`` in one pass (``scale_cast_scatter_bf16``: ``bf16(g *
+  dX_acc[compact row])`` on the valid rows, exact zeros elsewhere, addressed by
+  the inclusive int32 scan of the valid-row mask) instead of the flat cast, the
+  zero fill and the ``index_copy_``.  The same FP32 operations in the same
+  order: ``dX`` is bitwise the previous path's (``0`` restores that path).
+* dW side stream (``FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM``: ``auto`` (default)
+  = calls of three or more chunks, ``1`` = every multi-chunk call, ``0`` =
+  never): each chunk's weight-gradient accumulate GEMM is launched on a
+  per-device side stream forked after the chunk's ``row_grad`` (``dz`` ready)
+  and joined before the next chunk reuses the chunk buffer and before the call
+  returns, so its CTAs fill the tail wave of the chunk's dX GEMM instead of
+  queueing behind it.  Kernels, buffers, launch order per kernel and numerics
+  are unchanged (the dX GEMM writes the dX rows / slabs, the accumulate reads
+  the same ``dz`` and read-modify-writes ``dW_acc``): ``loss`` / ``logp`` /
+  ``dX`` / ``dW`` are bitwise the single-stream path's.  Two-chunk calls pay
+  the join without an overlap gain and a one-chunk call defers its only
+  accumulate to the backward, hence the ``auto`` rule (:func:`dw_side_stream`).
+* Hidden valid-row count (default on unless
+  ``FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT=0``; ``cake`` backend only): a
+  compacted call forms its valid-row index on the device (``labels >= 0`` ->
+  inclusive int32 ``cumsum`` -> ``searchsorted``), gathers chunk 0's rows of
+  ``X`` with the ``gather_rows_bf16`` kernel and runs chunk 0's logits GEMM in
+  its device-count form (``gemm_logits_mcnt`` / ``gemm_logits_nostats_mcnt``:
+  the stores bounded by the count read from device memory, the buffer extent
+  ``min(chunk_size, T)`` as ``M``) before the count reaches the host through a
+  pinned cell and a CUDA event -- the host waits for the three compaction
+  kernels and a 4-byte copy instead of a ``sum().item()`` and a ``nonzero``
+  before the first launch (:func:`_hidden_count_begin`).  Every row valid: the
+  uncompacted plan with chunk 0's GEMM already done (its ``X`` rows for the
+  weight gradient stay the input view); every row ignored: zeros without a
+  further launch; otherwise the compacted plan over the counted rows with
+  chunk 0's gather and GEMM skipped.  The same kernels per row, so ``loss`` /
+  ``logp`` / ``dX`` / ``dW`` are bitwise the shipped path's (``0`` restores
+  it).  Calls the device-count GEMM cannot serve -- an ``X`` that needs a
+  contiguous copy or whose base is not 16-byte aligned, a program without the
+  kernels -- take the shipped path.
 * ``deterministic=True`` (the only mode this backend serves): fixed sequential
   chunk order, no atomics -- bitwise reproducible ``loss``, ``logp``, ``dX``
   and ``dW`` across runs.
@@ -94,9 +134,12 @@ launching anything.
 from __future__ import annotations
 
 import ast
+import contextlib
 import functools
+import json
 import math
 import os
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
@@ -104,11 +147,14 @@ from typing import Any, Callable, Optional
 import torch
 
 from .cake_jit import (
+    BASE_STAGES,
+    GEMM_STAGES,
     MODULES,
     STAGES,
     load_cake_lm_head_loss_module,
     registered_stages,
     select_module,
+    toolchain_runs_hidden_count,
 )
 
 IGNORE_INDEX = -100
@@ -128,6 +174,10 @@ SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 # names; a kernel's argument plan selects from them).  A record with another
 # ``abi`` (a plumbing placeholder program) is not served by this backend.
 ABI_CONTRACT = "lm_head_loss_v1"
+# The hidden valid-row count serves calls of this many chunks or more (``ceil(T / chunk)``): its fixed host cost per call (the
+# plan on the count after the readback, the launches it orders) is hidden behind chunk 0's logits GEMM only from there; one- and
+# two-chunk calls measured 5-16 % slower with it than on the host-count path (same kernels, bitwise the same outputs).
+HIDDEN_COUNT_MIN_CHUNKS = 3
 SUPPORTED_ABIS = (ABI_CONTRACT,)
 
 # Geometry the kernels of a record were built for (record field ``geometry``;
@@ -142,13 +192,25 @@ GEOMETRY_DEFAULTS: dict[str, Any] = dict(
     hidden_multiple=256,  # H % hidden_multiple == 0
     ld_multiple=8,  # row stride of X in elements (16 B TMA pitch)
     labels_dtype="int64",  # element type the row kernels read (``int32`` = one host cast per call)
-    hidden=None,  # the GEMM instances are specialized to one H (None = any multiple of hidden_multiple)
+    hidden=None,  # a record pinned to one H (None = any multiple of hidden_multiple: the kernels take H as a launch scalar)
     vocab=None,  # ... and one V (None = any multiple of vocab_multiple)
     # CTAs per thread-block cluster of each GEMM (the cluster takes adjacent row tiles, so ``m_tiles`` rounds up to it;
-    # 2 = the CTA pair, 4 = two pairs sharing the B operand by multicast).  Checked against the module's launch cluster.
+    # 2 = the CTA pair, 4 = two pairs sharing the B operand by multicast).  Checked against the module's launch cluster:
+    # a module launched with a preferred cluster dimension (two pairs sharing the A operand where the GPC topology allows,
+    # a pair elsewhere) declares its required / fallback cluster here, and its grid rule counts the wider work items.
     logits_cluster_ctas=2,
     dx_cluster_ctas=2,
     dw_cluster_ctas=2,
+    # Output columns of one work item of each GEMM (the accumulator tile times the item's column tiles): ``N`` must be a
+    # multiple of it, ``N // item columns`` is the kernel's column-item count and the default ``group_n`` (the 1-D raster).
+    # A record declares its kernels' widths; the defaults (one 256-column tile) are the reference path's geometry.
+    logits_item_cols=256,
+    dx_item_cols=256,
+    dw_item_cols=256,
+    # Default raster height of each GEMM in row tiles (the ``group_m`` launch scalar when no rule or explicit knob sets one).
+    logits_group_m=32,
+    dx_group_m=16,
+    dw_group_m=8,
 )
 LABEL_DTYPES = {"int64": torch.int64, "int32": torch.int32}
 _GEOMETRY_OPTIONAL = ("hidden", "vocab")
@@ -161,18 +223,14 @@ _GEOMETRY_OPTIONAL = ("hidden", "vocab")
 # vectors ``labels`` / ``lse`` / ``logp`` / ``infer_logp`` / ``loss_weights`` /
 # ``d_in`` (indexed by ``row0 + r``), chunk-local ``d`` / ``term`` (``[C]``), the
 # ``loss_acc`` / ``loss_out`` cells and, for the casts, ``acc`` / ``g`` / ``out``.
-# Scalars: ``M`` / ``m_tiles`` / ``k_iters`` / ``first_chunk`` of the GEMMs,
-# ``rows_c`` / ``row0`` / ``V`` / ``num_tiles`` / ``mode`` / ``loss_div`` /
-# ``last_chunk`` / ``d_off`` of the row kernels, ``num_vecs`` of the casts, and
-# ``T`` / ``H`` / ``C`` for grid rules.
+# Scalars: the GEMM launch scalars ``GEMM_SCALARS`` (``M`` / ``m_tiles`` /
+# ``k_iters`` / ``first_chunk`` / ``ws_slab`` and the geometry ``ldc``, the K
+# slicing ``k_slices`` / ``k_slice_iters``, the raster ``group_m`` / ``group_n``:
+# :func:`gemm_scalars`), ``rows_c`` / ``row0`` / ``V`` / ``num_tiles`` / ``mode``
+# / ``loss_div`` / ``last_chunk`` / ``d_off`` of the row kernels, ``num_vecs`` of
+# the casts, and ``T`` / ``H`` / ``C`` for grid rules.
 STAGE_TENSORS = {
-    "gemm_logits": ("A", "B", "C", "STATS_OUT", "WS"),
-    "gemm_logits_nostats": ("A", "B", "C", "STATS_OUT", "WS"),
-    "gemm_dx": ("A", "B", "C", "STATS_OUT", "WS"),
-    "gemm_dx_s2": ("A", "B", "C", "STATS_OUT", "WS"),
-    "gemm_dx_s3": ("A", "B", "C", "STATS_OUT", "WS"),
-    "gemm_dx_s4": ("A", "B", "C", "STATS_OUT", "WS"),
-    "gemm_dw_acc": ("A", "B", "C", "STATS_OUT", "WS"),
+    **{stage: ("A", "B", "C", "STATS_OUT", "WS") for stage in GEMM_STAGES},
     "row_finalize": (
         "stats",
         "z",
@@ -189,6 +247,9 @@ STAGE_TENSORS = {
     "row_grad": ("z", "labels", "lse", "d"),
     "scale_cast_bf16": ("acc", "g", "out"),
     "scale_cast_f32": ("acc", "g", "out"),
+    "slab_sum": ("dx", "ws"),
+    "scale_cast_scatter_bf16": ("acc", "g", "scan", "idx_lo", "out"),
+    "gather_rows_bf16": ("x", "idx_lo", "count", "out"),
 }
 COMMON_TENSORS = ("workspace", "tma_descriptor_workspace")
 COMMON_SCALARS = (
@@ -206,15 +267,483 @@ COMMON_SCALARS = (
     "d_off",
     "ws_slab",
 )
-# K-sliced forms of the dX GEMM: ``gemm_dx_s<S>`` runs ``S`` K-slice work items per output tile (a
-# persistent grid with ``S`` x more items fills the last wave); slice 0 writes ``dX_acc``, slice ``s >= 1``
-# writes slab ``s - 1`` of the FP32 workspace ``WS [S - 1, rows, H]`` (``ws_slab`` = elements between
+# Launch scalars of every GEMM stage (:func:`gemm_scalars`): ``M`` / ``m_tiles`` (output rows and their row tiles,
+# rounded up to the cluster), ``k_iters`` (K steps of ``k_block``), ``first_chunk`` (store instead of accumulate),
+# ``ws_slab`` (elements between the K-slice slabs of ``WS``), ``ldc`` (the output's leading dimension: V of the logits
+# GEMM, H of the dX and weight-gradient GEMMs), ``k_slices`` / ``k_slice_iters`` (K-slice work items per tile and the K
+# steps of one), ``group_m`` (raster height in row tiles) and ``group_n`` (raster block width in column ITEMS: the whole
+# row of items for the 1-D raster).  The generated kernels take the call geometry through them, so one record serves
+# every admissible (H, V).
+GEMM_SCALARS = (
+    "M",
+    "m_tiles",
+    "k_iters",
+    "first_chunk",
+    "ws_slab",
+    "ldc",
+    "k_slices",
+    "k_slice_iters",
+    "group_m",
+    "group_n",
+)
+# K-sliced form of the dX GEMM: ``gemm_dx_s`` runs ``k_slices`` K-slice work items per output tile (a
+# persistent grid with ``k_slices`` x more items fills the last wave; the count and the slice length
+# ``k_slice_iters`` are launch scalars, 2 .. ``DX_K_SLICES_MAX``); slice 0 writes ``dX_acc``, slice ``s >= 1``
+# writes slab ``s - 1`` of the FP32 workspace ``WS [k_slices - 1, rows, H]`` (``ws_slab`` = elements between
 # slabs) and the host adds the slabs into ``dX_acc`` in fixed slab order (one RN add per element per
-# slab, no atomics).  A record registers a contiguous prefix of these; the slice count of a chunk is
-# chosen from its row count and the SM count (:func:`recommended_k_slices`).  ``WS`` of the other
-# GEMMs is an unused 16-float dummy (``ws_slab`` 0).
-DX_SLICE_STAGES = ("gemm_dx_s2", "gemm_dx_s3", "gemm_dx_s4")
+# slab, no atomics).  The slice count of a chunk is chosen from its row count and the SM count
+# (:func:`recommended_k_slices`).  ``WS`` of the other GEMMs is an unused 16-float dummy (``ws_slab`` 0).
+DX_SLICED_STAGE = "gemm_dx_s"
+# Fused weight-gradient output: the LAST chunk's ``dz_c^T @ X_c`` GEMM run in the backward (where the upstream scalar
+# gradient ``g`` is known) with the scale and the output cast fused into its epilogue, ``C = cast(g * (WS + tile))`` --
+# or ``cast(g * tile)`` for a one-chunk plan, which then has no FP32 ``[V, H]`` accumulator at all.  ``WS`` is the FP32
+# sum of the chunks before it (read, never written), ``STATS_OUT`` the ``[1]`` FP32 scale cell.  The same FP32
+# operations in the same order as ``gemm_dw_acc`` followed by ``scale_cast_*``, so the weight gradient is bitwise
+# identical; the flat ``scale_cast`` pass over ``dW`` disappears.  Selected by ``fuse_dw_cast`` (default on).
+DW_CAST_STAGES = ("gemm_dw_cast_bf16", "gemm_dw_cast_f32")
+# Fused dX finalize (``dx_finalize``, default on): ``slab_sum`` adds the FP32 K-slice slabs of a sliced dX GEMM into
+# the chunk's rows of ``dX_acc`` in ascending slab order in one launch (one RN add per element per slab -- the
+# evaluation order of the host's ``add_`` chain, ``dX_acc`` read and written once instead of once per slab), and
+# ``scale_cast_scatter_bf16`` writes a compacted call's ``[T, H]`` BF16 ``dX`` in one pass: ``bf16(g * dX_acc[scan[r]
+# - 1])`` on a valid output row ``r`` (``scan`` = the inclusive int32 count of valid rows, so ``idx[scan[r] - 1] == r``
+# exactly on the valid rows), exact zeros elsewhere -- the flat ``scale_cast``, the zero fill and the ``index_copy_``
+# of the compact rows in one kernel that writes every output element once.  Bitwise the same ``dX``.
+DX_FINALIZE_STAGES = ("slab_sum", "scale_cast_scatter_bf16")
+# Hidden valid-row count (:func:`hidden_count_default`, default on): chunk 0's rows of ``X`` are gathered by the
+# ``gather_rows_bf16`` kernel -- ``out[r] = X[idx[r]]`` for ``r < min(count, num_rows)`` with the count read from device
+# memory, exact zeros after; ``x`` is the int32 alias of ``X``'s storage span (``ld_x_words`` = the row pitch in 4-byte words),
+# ``idx_lo`` the int64 compaction index viewed as int32 pairs, ``count`` the int32 cell -- and chunk 0's logits GEMM runs in
+# its device-count form (the ``_mcnt`` variants: ``WS`` is that cell and every store is bounded by ``min(WS[0], M)`` while
+# ``M`` / ``m_tiles`` / the raster rule are the buffer extent ``min(chunk, T)``), both before the count reaches the host.
+HIDDEN_COUNT_STAGE = "gather_rows_bf16"
 K_SLICE_PENALTY = 0.01  # wave-efficiency score penalty per extra slab (the kernels' fitted per-slab cost share)
+
+# --------------------------------------------------------------------------- per-chunk instance rules
+# The GEMM instances of a record come in structural FORMS -- one stage name per kernel body the generated program carries
+# (:func:`stage_variant`: the device-count logits GEMM ``_mcnt``, the K-sliced ``_s`` / narrow-tile ``_tn256`` / 3-deep-ring
+# ``_st3`` dX GEMMs, the 2-D blocked ``_gn`` weight-gradient GEMMs) -- and take the call geometry and the rules' numeric
+# outputs as LAUNCH SCALARS (:func:`gemm_scalars`: ``ldc`` / ``k_iters`` from H and V, ``k_slices`` / ``k_slice_iters``,
+# the raster height ``group_m`` and the block width ``group_n``).  The form and the scalars of a chunk are selected by the
+# same rules the production launchers of the kernel source apply (same thresholds; an explicit knob wins) -- never by the
+# shape itself, so a record carries exactly the forms its architecture's rules can reach, at every (H, V):
+# * raster height (``group_m``): at H >= RASTER_RULE_MIN_HIDDEN a chunk of >= RASTER_RULE_MIN_ROWS rows runs the
+#   logits GEMM with the shorter grouped raster and the weight-gradient GEMMs (accumulate and fused cast) with the
+#   taller one (RASTER_WIDE_GROUPS per architecture); below that H, a chunk of >= LOGITS_LONG_RASTER_MIN_ROWS rows (31
+#   row tiles of 128) runs the logits GEMM with the shorter raster (LOGITS_LONG_RASTER_GROUPS per architecture) and a
+#   chunk of >= DW_LONG_CHUNK_MIN_ROWS rows runs the weight-gradient GEMMs with the long-chunk raster
+#   (DW_LONG_CHUNK_GROUP_M: the same height on every supported architecture); every other chunk -- the default
+#   geometry's chunks of up to 30 row tiles, short tail chunks -- keeps the GEMM's default height (the record geometry's
+#   ``<gemm>_group_m``).  Bitwise: the raster changes the tile order only.
+# * dX tile (``_tn256``): the 512-column pair tile unless H % 512 != 0 or the launch's wide work items would not fill
+#   the device's SM pairs (:func:`dx_tile_rule`, evaluated after the K-slice count), or -- on an architecture listed in
+#   DX_WIDE_MIN_EFF -- a one-slice launch below RASTER_RULE_MIN_HIDDEN whose wide items fill the SM pairs' waves below that
+#   floor (the badly quantized chunk tails); the slice count (the ``_s`` form with ``k_slices`` 2 .. DX_K_SLICES_MAX)
+#   comes from :func:`recommended_k_slices` as before.  Bitwise: the same slice boundaries and per-element K order on
+#   both tiles.
+# * dX operand ring (``_st3``): below RASTER_RULE_MIN_HIDDEN a chunk of >= DW_LONG_CHUNK_MIN_ROWS rows runs the 512-wide dX
+#   tile with the 3-deep operand ring (:func:`dx_stages_variant`, DX_LONG_CHUNK_STAGES per architecture); the 256-wide
+#   fallback keeps its depth.  Bitwise: the ring depth only changes when a stage is refilled.
+# * dW 2-D blocked raster (``_gn`` with ``group_n``): below RASTER_RULE_MIN_HIDDEN a chunk of DW_BLOCK_MIN_ROWS ..
+#   DW_BLOCK_MAX_ROWS rows runs the weight-gradient accumulate and the fp32 fused cast with column blocks of
+#   DW_BLOCK_GROUPS[arch] tiles (:func:`dw_block_variant`; the bf16 cast keeps the 1-D raster).  Bitwise: a permutation
+#   of the same tiles.
+# ``gemm_tuning`` (:func:`prepare_lm_head_loss`; ``$FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING`` as JSON for the eager
+# entry points) pins knobs explicitly per GEMM -- ``{"logits": {"group_m": 16}, "dx": {"tile_n": 256, "k_slices": 2},
+# "dw": {"group_m": 32, "group_n": 0}}``; a knob given as ``None`` pins the default -- and wins over the rule for the
+# knobs it names.  A form the record does not register fails closed (``NotImplementedError``).
+RASTER_RULE_MIN_HIDDEN = 7168  # first H whose [rows_c, H] BF16 operand panel no longer stays L2-resident at rows_c >= 2049
+RASTER_RULE_MIN_ROWS = 2049
+RASTER_WIDE_GROUPS = {
+    "sm_100a": (16, 32),
+    "sm_103a": (16, 32),
+}  # (logits group_m, weight-gradient group_m) of the wide geometries, per architecture
+DW_LONG_CHUNK_GROUP_M = 16  # weight-gradient group_m of the long chunks (>= DW_LONG_CHUNK_MIN_ROWS rows) below RASTER_RULE_MIN_HIDDEN
+DW_LONG_CHUNK_GROUPS = {
+    "sm_100a": DW_LONG_CHUNK_GROUP_M,
+    "sm_103a": DW_LONG_CHUNK_GROUP_M,
+}  # the same height on every supported architecture (the kernel source keeps a per-architecture table; the export mirrors it)
+DW_LONG_CHUNK_MIN_ROWS = 4097
+LOGITS_LONG_RASTER_GROUPS = {
+    "sm_100a": 16,
+    "sm_103a": 16,
+}  # logits group_m of the GLM-class chunks of >= LOGITS_LONG_RASTER_MIN_ROWS rows below RASTER_RULE_MIN_HIDDEN, per architecture
+LOGITS_LONG_RASTER_MIN_ROWS = (
+    3841  # 30 row tiles of 128 + 1: the first chunk size with 31 row tiles
+)
+DX_LONG_CHUNK_STAGES = {
+    "sm_100a": 3,
+    "sm_103a": 3,
+}  # operand-ring depth of the 512-wide dX tile at the long chunks (>= DW_LONG_CHUNK_MIN_ROWS rows) below RASTER_RULE_MIN_HIDDEN
+DX_WIDE_TILE_STAGES = 4  # the 512-wide dX tile's table ring depth (an explicit ``stages`` of 4 pins the default form)
+DW_BLOCK_GROUPS = {
+    "sm_100a": 12,
+    "sm_103a": 12,
+}  # column tiles per raster block of the weight-gradient accumulate / fp32 fused cast at the C 4096 chunk, per architecture
+DW_BLOCK_MIN_ROWS = RASTER_RULE_MIN_ROWS  # 2049
+DW_BLOCK_MAX_ROWS = (
+    DW_LONG_CHUNK_MIN_ROWS - 1
+)  # 4096: above, the long-chunk raster owns the instance
+DW_BLOCK_BASES = (
+    "gemm_dw_acc",
+    "gemm_dw_cast_f32",
+)  # the fp32 output streams of the weight-gradient GEMM
+DW_ITEM_COLS = 2  # column tiles of the A-sharing weight-gradient work item (a block is a multiple of them)
+DX_TILE_WIDE = 512
+DX_TILE_NARROW = 256
+DX_WIDE_MIN_EFF = {
+    "sm_100a": 0.83,
+}  # wave-efficiency floor of a one-slice 512-wide dX launch below RASTER_RULE_MIN_HIDDEN, per architecture; below it the
+#    256-wide cluster form runs the chunk (absent = the wide tile stays)
+DX_K_SLICES_MAX = 4
+GEMM_TUNING_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING"
+_TUNING_KNOBS = {
+    "logits": ("group_m",),
+    "dx": ("k_slices", "tile_n", "stages"),
+    "dw": ("group_m", "epi_store", "group_n"),
+}
+_STAGE_RE = re.compile(
+    r"(?P<base>" + "|".join(sorted(BASE_STAGES, key=len, reverse=True)) + r")"
+    r"(?P<mcnt>_mcnt)?(?P<s>_s)?(?:_tn(?P<tile>\d+))?(?:_st(?P<stages>\d+))?(?P<gn>_gn)?(?P<tma>_tma)?"
+)
+STAGE_KNOBS = ("count", "sliced", "tile_n", "stages", "blocked", "epi_store")
+
+
+def stage_variant(
+    base: str,
+    *,
+    count: bool = False,
+    sliced: bool = False,
+    tile_n: Optional[int] = None,
+    stages: Optional[int] = None,
+    blocked: bool = False,
+    epi_store: Optional[str] = None,
+) -> str:
+    """Stage name of one structural form of ``base``: the rule outputs that select a kernel body, in the fixed suffix
+    order ``_mcnt``, ``_s``, ``_tn256``, ``_st<stages>``, ``_gn``, ``_tma``; a default output (the host-bound row count,
+    one slice, the wide tile, the table ring depth, the 1-D raster, the default epilogue) adds nothing, so
+    ``stage_variant(base)`` is ``base`` itself.  ``count``: the logits GEMM whose valid-row bound is read from device
+    memory (chunk 0 of the hidden valid-row count path); ``sliced``: the dX GEMM run as ``k_slices > 1`` K-slice work
+    items per tile; ``blocked``: the weight-gradient accumulate / fp32 fused cast on the 2-D blocked raster
+    (``group_n`` set).  The slice count, the raster height and the block width themselves are launch scalars
+    (:func:`gemm_scalars`), not part of the name."""
+    if base not in BASE_STAGES:
+        raise ValueError(f"unknown base stage {base!r}")
+    name = base
+    if count:
+        if base not in ("gemm_logits", "gemm_logits_nostats"):
+            raise ValueError(
+                f"{base}: the device-count form exists for the logits GEMMs only"
+            )
+        name += "_mcnt"
+    if sliced:
+        if base != "gemm_dx":
+            raise ValueError(
+                f"{base}: the K-slice work-item form exists for gemm_dx only"
+            )
+        name += "_s"
+    if tile_n is not None and int(tile_n) != DX_TILE_WIDE:
+        if base != "gemm_dx" or int(tile_n) != DX_TILE_NARROW:
+            raise ValueError(
+                f"{base}: the only non-default dX tile is {DX_TILE_NARROW}, got {tile_n}"
+            )
+        name += f"_tn{DX_TILE_NARROW}"
+    if stages is not None and int(stages) != DX_WIDE_TILE_STAGES:
+        if (
+            base != "gemm_dx"
+            or int(stages) not in set(DX_LONG_CHUNK_STAGES.values())
+            or (tile_n is not None and int(tile_n) != DX_TILE_WIDE)
+        ):
+            raise ValueError(
+                f"{base}: the only ring-depth form is the 512-wide dX tile's {sorted(set(DX_LONG_CHUNK_STAGES.values()))}-deep ring, got {stages} (tile {tile_n})"
+            )
+        name += f"_st{int(stages)}"
+    if blocked:
+        if base not in DW_BLOCK_BASES:
+            raise ValueError(
+                f"{base}: the 2-D blocked raster exists for the weight-gradient accumulate and the fp32 fused cast only"
+            )
+        name += "_gn"
+    if epi_store is not None and epi_store != "redsm":
+        if base != "gemm_dw_acc" or epi_store != "tma":
+            raise ValueError(
+                f"{base}: the only epilogue variant is the weight-gradient accumulate's TMA reduce-add, got {epi_store!r}"
+            )
+        name += "_tma"
+    return name
+
+
+def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
+    """``(base, {count, sliced, tile_n, stages, blocked, epi_store})`` of a stage name (the inverse of
+    :func:`stage_variant`; the knob keys are ``STAGE_KNOBS``)."""
+    m = _STAGE_RE.fullmatch(stage)
+    if m is None:
+        raise ValueError(f"not a stage name of this backend: {stage!r}")
+    knobs: dict[str, Any] = dict(
+        count=bool(m["mcnt"]),
+        sliced=bool(m["s"]),
+        tile_n=int(m["tile"]) if m["tile"] else None,
+        stages=int(m["stages"]) if m["stages"] else None,
+        blocked=bool(m["gn"]),
+        epi_store="tma" if m["tma"] else None,
+    )
+    if stage_variant(m["base"], **knobs) != stage:
+        raise ValueError(f"not a stage name of this backend: {stage!r}")
+    return m["base"], knobs
+
+
+def base_stage(stage: str) -> str:
+    """The base stage a (variant) stage name instantiates."""
+    return parse_stage(stage)[0]
+
+
+def gemm_op(stage: str) -> str:
+    """``"logits"`` / ``"dx"`` / ``"dw"``: the GEMM a (variant) stage name instantiates (``ValueError`` for a row
+    kernel)."""
+    base = base_stage(stage)
+    if base in ("gemm_logits", "gemm_logits_nostats"):
+        return "logits"
+    if base == "gemm_dx":
+        return "dx"
+    if base == "gemm_dw_acc" or base in DW_CAST_STAGES:
+        return "dw"
+    raise ValueError(f"{stage!r} is not a GEMM stage")
+
+
+def raster_variant(
+    hidden: int, rows_c: int, arch: Optional[str]
+) -> Optional[tuple[Optional[int], Optional[int]]]:
+    """``(logits group_m, weight-gradient group_m)`` the raster rules select for a chunk -- ``None`` in a slot = that
+    GEMM's default raster, ``None`` altogether = the default raster for both.  At ``H >= RASTER_RULE_MIN_HIDDEN`` a chunk
+    of ``>= RASTER_RULE_MIN_ROWS`` rows takes ``RASTER_WIDE_GROUPS[arch]``; below that ``H`` a chunk of
+    ``>= LOGITS_LONG_RASTER_MIN_ROWS`` rows takes the logits height ``LOGITS_LONG_RASTER_GROUPS[arch]`` and a chunk of
+    ``>= DW_LONG_CHUNK_MIN_ROWS`` rows the weight-gradient height ``DW_LONG_CHUNK_GROUP_M``, on every supported
+    architecture."""
+    if arch is None:
+        return None
+    if int(hidden) >= RASTER_RULE_MIN_HIDDEN:
+        groups = RASTER_WIDE_GROUPS.get(arch)
+        if groups is None or int(rows_c) < RASTER_RULE_MIN_ROWS:
+            return None
+        return groups
+    logits_group = LOGITS_LONG_RASTER_GROUPS.get(arch)
+    if logits_group is None or int(rows_c) < LOGITS_LONG_RASTER_MIN_ROWS:
+        logits_group = None
+    dw_group = DW_LONG_CHUNK_GROUPS.get(arch)
+    if dw_group is None or int(rows_c) < DW_LONG_CHUNK_MIN_ROWS:
+        dw_group = None
+    if logits_group is None and dw_group is None:
+        return None
+    return (logits_group, dw_group)
+
+
+def dx_stages_variant(
+    rows_c: int, hidden: int, tile_n: Optional[int], arch: Optional[str]
+) -> Optional[int]:
+    """The dX operand-ring depth the ring rule selects for a chunk (``None`` = the table depth): ``DX_LONG_CHUNK_STAGES``
+    of the architecture for the 512-wide tile at ``>= DW_LONG_CHUNK_MIN_ROWS`` rows below ``RASTER_RULE_MIN_HIDDEN``."""
+    st = DX_LONG_CHUNK_STAGES.get(arch) if arch is not None else None
+    if (
+        st is None
+        or int(hidden) >= RASTER_RULE_MIN_HIDDEN
+        or int(rows_c) < DW_LONG_CHUNK_MIN_ROWS
+    ):
+        return None
+    if tile_n is not None and int(tile_n) != DX_TILE_WIDE:
+        return None
+    return int(st)
+
+
+def _dw_block_group(arch: Optional[str], hidden: Optional[int]) -> Optional[int]:
+    """The weight-gradient block width the block rule can select for a record (``None`` = no block form): the
+    architecture's ``DW_BLOCK_GROUPS`` entry below ``RASTER_RULE_MIN_HIDDEN`` when it tiles the ``H / 256`` column tiles
+    with whole work items and is narrower than the row of items."""
+    gn = DW_BLOCK_GROUPS.get(arch) if arch is not None else None
+    if gn is None or hidden is None or int(hidden) >= RASTER_RULE_MIN_HIDDEN:
+        return None
+    n_tiles = int(hidden) // DX_TILE_NARROW
+    if gn % DW_ITEM_COLS or n_tiles % gn or gn >= n_tiles:
+        return None
+    return int(gn)
+
+
+def dw_block_variant(rows_c: int, hidden: int, arch: Optional[str]) -> Optional[int]:
+    """The weight-gradient block width the block rule selects for a chunk (``None`` = the 1-D raster):
+    :func:`_dw_block_group` at ``DW_BLOCK_MIN_ROWS .. DW_BLOCK_MAX_ROWS`` rows."""
+    gn = _dw_block_group(arch, hidden)
+    if gn is None or not (DW_BLOCK_MIN_ROWS <= int(rows_c) <= DW_BLOCK_MAX_ROWS):
+        return None
+    return gn
+
+
+def dx_tile_rule(
+    rows_c: int,
+    hidden: int,
+    num_sms: int,
+    k_slices: int,
+    geometry: "Geometry",
+    arch: Optional[str] = None,
+) -> int:
+    """Column width of the dX GEMM's pair tile for a chunk: ``DX_TILE_WIDE`` unless ``H % 512 != 0``, or the launch's
+    wide work items -- ``(row pairs) x (H / 512) x k_slices`` -- are fewer than the device's SM pairs, or (on an
+    architecture listed in ``DX_WIDE_MIN_EFF``) a one-slice launch below ``RASTER_RULE_MIN_HIDDEN`` fills the SM pairs'
+    waves below that floor -- each takes the ``DX_TILE_NARROW`` form (the K-slice count is decided first, on the narrow
+    form's inputs, so ``dX`` is bitwise the same on both tiles).  Deterministic in the shapes, the slice count, the SM
+    count and the architecture."""
+    if int(hidden) % DX_TILE_WIDE:
+        return DX_TILE_NARROW
+    ctas = int(geometry.cta_group)
+    pairs = geometry.row_tiles(rows_c, ctas) // ctas
+    items = pairs * (int(hidden) // DX_TILE_WIDE) * max(1, int(k_slices))
+    device_pairs = max(1, int(num_sms) // ctas)
+    if items < device_pairs:
+        return DX_TILE_NARROW
+    floor = DX_WIDE_MIN_EFF.get(arch) if arch is not None else None
+    if (
+        floor is not None
+        and int(k_slices) == 1
+        and int(hidden) < RASTER_RULE_MIN_HIDDEN
+        and items / (-(-items // device_pairs) * device_pairs) < floor
+    ):
+        return DX_TILE_NARROW
+    return DX_TILE_WIDE
+
+
+def gemm_tuning_default() -> dict[str, dict[str, Any]]:
+    """The explicit GEMM knobs of ``$FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING`` (a JSON object; unset / empty = none)."""
+    raw = os.environ.get(GEMM_TUNING_ENV, "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"${GEMM_TUNING_ENV} must be a JSON object of GEMM knobs: {exc}"
+        ) from exc
+    return _resolve_gemm_tuning(value)
+
+
+def _resolve_gemm_tuning(gemm_tuning) -> dict[str, dict[str, Any]]:
+    """Validated copy of an explicit GEMM knob set (``None`` = :func:`gemm_tuning_default`)."""
+    if gemm_tuning is None:
+        return gemm_tuning_default()
+    if not isinstance(gemm_tuning, dict):
+        raise ValueError("gemm_tuning must be a dict {GEMM: {knob: value}}")
+    out: dict[str, dict[str, Any]] = {}
+    for op, knobs in gemm_tuning.items():
+        if op not in _TUNING_KNOBS:
+            raise ValueError(
+                f"gemm_tuning: unknown GEMM {op!r}; one of {sorted(_TUNING_KNOBS)}"
+            )
+        if not isinstance(knobs, dict) or set(knobs) - set(_TUNING_KNOBS[op]):
+            raise ValueError(
+                f"gemm_tuning[{op!r}] must be a dict over the knobs {_TUNING_KNOBS[op]}, got {knobs!r}"
+            )
+        out[op] = {
+            k: None if v is None else (str(v) if k == "epi_store" else int(v))
+            for k, v in knobs.items()
+        }
+    return out
+
+
+def _tuning_key(tuning: dict[str, dict[str, Any]]) -> tuple:
+    return tuple(
+        (op, tuple(sorted(knobs.items()))) for op, knobs in sorted(tuning.items())
+    )
+
+
+@dataclass(frozen=True)
+class ChunkVariants:
+    """The instance knobs of one chunk's GEMMs as the rules (or the explicit knobs) resolved them; ``None`` = the
+    default form of the base stage."""
+
+    logits_group_m: Optional[int] = None
+    dx_tile_n: Optional[int] = None  # None = DX_TILE_WIDE
+    dx_stages: Optional[int] = None  # None = the table ring depth
+    dw_group_m: Optional[int] = None
+    dw_epi_store: Optional[str] = None
+    dw_group_n: Optional[int] = None  # None = the 1-D raster
+
+
+def chunk_variants(
+    rows_c: int,
+    hidden: int,
+    num_sms: int,
+    k_slices: int,
+    geometry: "Geometry",
+    arch: Optional[str],
+    tuning: Optional[dict[str, dict[str, Any]]] = None,
+) -> ChunkVariants:
+    """Per-chunk instance knobs: the explicit ``tuning`` knob when present (``None`` pins the default), else the rule
+    of a registered program's architecture (``arch``; ``None`` -- the reference path -- plans the base stages)."""
+    tuning = tuning or {}
+    logits_t, dx_t, dw_t = (tuning.get(op, {}) for op in ("logits", "dx", "dw"))
+    raster = raster_variant(hidden, rows_c, arch)
+    logits_g = (
+        logits_t["group_m"]
+        if "group_m" in logits_t
+        else (raster[0] if raster else None)
+    )
+    dw_g = dw_t["group_m"] if "group_m" in dw_t else (raster[1] if raster else None)
+    if "tile_n" in dx_t:
+        tile = dx_t["tile_n"]
+    else:
+        tile = (
+            dx_tile_rule(rows_c, hidden, num_sms, k_slices, geometry, arch)
+            if arch is not None
+            else None
+        )
+    if "stages" in dx_t:
+        stages = dx_t["stages"]
+    else:
+        stages = (
+            dx_stages_variant(rows_c, hidden, tile, arch) if arch is not None else None
+        )
+    epi = dw_t.get(
+        "epi_store"
+    )  # no rule selects an epilogue form (the SM103 TMA reduce-add rule was retired): explicit pins only
+    if "group_n" in dw_t:
+        gn = dw_t["group_n"]
+    else:
+        gn = dw_block_variant(rows_c, hidden, arch) if arch is not None else None
+    return ChunkVariants(
+        logits_group_m=None if logits_g is None else int(logits_g),
+        dx_tile_n=None if tile is None or int(tile) == DX_TILE_WIDE else int(tile),
+        dx_stages=None
+        if stages is None or int(stages) == DX_WIDE_TILE_STAGES
+        else int(stages),
+        dw_group_m=None if dw_g is None else int(dw_g),
+        dw_epi_store=None if epi in (None, "redsm") else str(epi),
+        dw_group_n=None if gn in (None, 0) else int(gn),
+    )
+
+
+def reachable_variants(bases, arch: str, dx_max: int) -> set[str]:
+    """Every structural form the per-chunk rules can select on ``arch`` from the base GEMM stages ``bases`` for a record
+    that serves ``dx_max`` dX slices (:func:`dx_max_slices`); a program is complete for an entry when it registers them.
+    The forms do not depend on the call geometry (``H`` / ``V`` and the rules' numeric outputs are launch scalars), so a
+    record serves every admissible geometry with them."""
+    st_long = DX_LONG_CHUNK_STAGES.get(arch)
+    blocked = arch in DW_BLOCK_GROUPS
+    out: set[str] = set()
+    for base in bases:
+        if base in ("gemm_logits", "gemm_logits_nostats"):
+            # the device-count form of the hidden valid-row count path (chunk 0 at the buffer extent min(chunk, T))
+            out.add(stage_variant(base, count=True))
+        elif base == "gemm_dx":
+            for sliced in (False, True) if int(dx_max) > 1 else (False,):
+                for tile in (DX_TILE_WIDE, DX_TILE_NARROW):
+                    out.add(stage_variant(base, sliced=sliced, tile_n=tile))
+                if st_long is not None:
+                    out.add(
+                        stage_variant(
+                            base, sliced=sliced, tile_n=DX_TILE_WIDE, stages=st_long
+                        )
+                    )
+        elif base in DW_BLOCK_BASES and blocked:
+            out.add(stage_variant(base, blocked=True))
+    return out
+
+
 # Accepted spellings of the same host value (kernel side -> host side).
 CONTRACT_ALIASES = {
     "num_rows": "T",
@@ -258,6 +787,12 @@ class Geometry:
     logits_cluster_ctas: int = 2
     dx_cluster_ctas: int = 2
     dw_cluster_ctas: int = 2
+    logits_item_cols: int = 256
+    dx_item_cols: int = 256
+    dw_item_cols: int = 256
+    logits_group_m: int = 32
+    dx_group_m: int = 16
+    dw_group_m: int = 8
 
     @classmethod
     def from_record(cls, record: Optional[dict[str, Any]]) -> "Geometry":
@@ -301,11 +836,12 @@ class Geometry:
 
     def cluster_ctas_of(self, stage: str) -> Optional[int]:
         """CTAs per cluster of a GEMM stage (``None`` for the row kernels and the casts)."""
-        if stage in ("gemm_logits", "gemm_logits_nostats"):
+        base = base_stage(stage) if stage in GEMM_STAGES else stage
+        if base in ("gemm_logits", "gemm_logits_nostats"):
             return self.logits_cluster_ctas
-        if stage == "gemm_dx" or stage in DX_SLICE_STAGES:
+        if base == "gemm_dx":
             return self.dx_cluster_ctas
-        if stage == "gemm_dw_acc":
+        if base == "gemm_dw_acc" or base in DW_CAST_STAGES:
             return self.dw_cluster_ctas
         return None
 
@@ -332,14 +868,19 @@ def arch_for(device: Optional[torch.device] = None) -> Optional[str]:
     return SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
 
 
-def record_for(device: Optional[torch.device] = None) -> tuple[str, dict[str, Any]]:
-    """``(module_name, record)`` registered for ``device``; raises when absent."""
+def record_for(
+    device: Optional[torch.device] = None,
+    hidden: Optional[int] = None,
+    vocab: Optional[int] = None,
+) -> tuple[str, dict[str, Any]]:
+    """``(module_name, record)`` registered for ``device`` and the ``(hidden, vocab)`` geometry (when given; else the
+    architecture's default-geometry record, see :func:`cake_jit.select_module`); raises when absent."""
     arch = arch_for(device)
     if arch is None:
         raise ValueError(
             "the chunked LM-head + loss kernels require compute capability 10.0 or 10.3"
         )
-    name = select_module(arch)
+    name = select_module(arch, hidden, vocab)
     return name, MODULES[name]
 
 
@@ -350,19 +891,122 @@ def record_abi(record: dict[str, Any]) -> str:
     return abi
 
 
-def dx_stage(k_slices: int) -> str:
-    """Stage name of the dX GEMM with ``k_slices`` K-slice work items per output tile."""
-    return "gemm_dx" if int(k_slices) == 1 else f"gemm_dx_s{int(k_slices)}"
+def dx_stage(
+    k_slices: int, tile_n: Optional[int] = None, stages: Optional[int] = None
+) -> str:
+    """Stage name of the dX GEMM run as ``k_slices`` K-slice work items per output tile (the ``_s`` form above one;
+    ``tile_n`` = the pair tile's column width, ``None`` / ``DX_TILE_WIDE`` = the wide default; ``stages`` = the
+    operand-ring depth, ``None`` = the table depth)."""
+    if not 1 <= int(k_slices) <= DX_K_SLICES_MAX:
+        raise ValueError(
+            f"the dX GEMM runs 1 .. {DX_K_SLICES_MAX} K slices per tile, got {k_slices}"
+        )
+    return stage_variant(
+        "gemm_dx", sliced=int(k_slices) > 1, tile_n=tile_n, stages=stages
+    )
 
 
 def dx_max_slices(stages) -> int:
-    """Largest slice count the registered stages serve (``1`` + the contiguous prefix of ``DX_SLICE_STAGES``)."""
-    count = 1
-    for stage in DX_SLICE_STAGES:
-        if stage not in stages:
-            break
-        count += 1
-    return count
+    """Largest slice count the registered stages serve: ``DX_K_SLICES_MAX`` when the K-sliced form ``DX_SLICED_STAGE``
+    is registered (the count is a launch scalar of that one form), else ``1``."""
+    return DX_K_SLICES_MAX if DX_SLICED_STAGE in stages else 1
+
+
+def gemm_scalars(
+    stage: str,
+    geometry: "Geometry",
+    *,
+    hidden: int,
+    vocab: int,
+    rows_c: int,
+    k_slices: int = 1,
+    group_m: Optional[int] = None,
+    group_n: Optional[int] = None,
+    first_chunk: int = 1,
+    ws_slab: int = 0,
+) -> dict[str, int]:
+    """The launch scalars ``GEMM_SCALARS`` of one GEMM stage from the record geometry, the call geometry and the rules'
+    outputs: ``group_m`` (row tiles; ``None`` = the GEMM's default height ``<gemm>_group_m``), ``group_n`` (the
+    weight-gradient block width in column TILES, :func:`dw_block_variant`; ``None`` = the 1-D raster), ``k_slices`` of
+    the dX GEMM.  The logits GEMM always stores (``first_chunk`` 0 = no accumulate), the dX GEMM always stores its chunk's
+    rows (1); ``first_chunk`` / ``ws_slab`` are taken from the arguments for the weight-gradient / dX GEMM only.  The
+    form of ``stage`` must agree with the scalars (the ``_s`` form with ``k_slices > 1``, the ``_gn`` form with a
+    ``group_n``)."""
+    _base, knobs = parse_stage(stage)
+    op = gemm_op(stage)
+    hidden, vocab, rows_c = int(hidden), int(vocab), int(rows_c)
+    item_rows = int(getattr(geometry, f"{op}_cluster_ctas"))
+    item_cols = int(getattr(geometry, f"{op}_item_cols"))
+    ldc = vocab if op == "logits" else hidden
+    if ldc % item_cols:
+        raise ValueError(
+            f"{stage}: N = {ldc} is not a multiple of the {item_cols}-column work item"
+        )
+    n_items = ldc // item_cols
+    gm = int(getattr(geometry, f"{op}_group_m")) if group_m is None else int(group_m)
+    if gm < 1:
+        raise ValueError(f"{stage}: group_m must be positive, got {group_m}")
+    if bool(knobs["blocked"]) != (group_n is not None):
+        raise ValueError(
+            f"{stage}: the 2-D blocked form takes a group_n and the 1-D raster none, got group_n={group_n}"
+        )
+    if group_n is None:
+        gn = n_items
+    else:
+        if op != "dw" or int(group_n) < DW_ITEM_COLS or int(group_n) % DW_ITEM_COLS:
+            raise ValueError(
+                f"{stage}: group_n = {group_n} is not a positive multiple of the {DW_ITEM_COLS}-tile weight-gradient work item"
+            )
+        gn = int(group_n) // DW_ITEM_COLS
+        if gn > n_items or n_items % gn:
+            raise ValueError(
+                f"{stage}: group_n = {group_n} does not divide the {n_items} column items of N = {ldc}"
+            )
+    ks = int(k_slices)
+    if op == "dw":
+        if ks != 1:
+            raise ValueError(f"{stage}: the weight-gradient GEMM is not K-sliced")
+        k_iters = geometry.k_iters(rows_c)
+        return dict(
+            M=vocab,
+            m_tiles=geometry.row_tiles(vocab, item_rows),
+            k_iters=k_iters,
+            first_chunk=int(bool(first_chunk)),
+            ws_slab=0,
+            ldc=ldc,
+            k_slices=1,
+            k_slice_iters=k_iters,
+            group_m=gm,
+            group_n=gn,
+        )
+    k_total = hidden if op == "logits" else vocab
+    k_block = int(geometry.k_block)
+    if k_total % k_block:
+        raise ValueError(
+            f"{stage}: K = {k_total} is not a multiple of the K step {k_block}"
+        )
+    k_iters = k_total // k_block
+    if op == "logits":
+        if ks != 1:
+            raise ValueError(f"{stage}: the logits GEMM is not K-sliced")
+    elif not 1 <= ks <= DX_K_SLICES_MAX or bool(knobs["sliced"]) != (ks > 1):
+        raise ValueError(
+            f"{stage}: the K-sliced form runs 2 .. {DX_K_SLICES_MAX} slices and the plain form one, got k_slices={k_slices}"
+        )
+    if ks > k_iters:
+        raise ValueError(f"{stage}: {ks} K slices over {k_iters} K steps")
+    return dict(
+        M=rows_c,
+        m_tiles=geometry.row_tiles(rows_c, item_rows),
+        k_iters=k_iters,
+        first_chunk=0 if op == "logits" else 1,
+        ws_slab=int(ws_slab) if op == "dx" else 0,
+        ldc=ldc,
+        k_slices=ks,
+        k_slice_iters=-(-k_iters // ks) if ks > 1 else k_iters,
+        group_m=gm,
+        group_n=gn,
+    )
 
 
 def wave_efficiency(
@@ -524,18 +1168,398 @@ def compact_rows_default() -> bool:
     return os.environ.get(COMPACT_ROWS_ENV, "1") != "0"
 
 
-def valid_row_index(labels: torch.Tensor) -> Optional[torch.Tensor]:
-    """``None`` when every row is valid (or ``T == 0``: the uncompacted path, no gather cost), else the ascending int64
-    index of the valid rows (``labels >= 0``; ``-100`` is the ignore index).  Rows with a negative label contribute
-    exactly zero to the loss, ``dX`` and ``dW``, so skipping them is exact.  One device synchronization (the count) plus
-    the ``nonzero`` synchronization when rows are ignored."""
+FUSE_DW_CAST_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST"  # "0" turns the fused weight-gradient cast off
+
+
+def fuse_dw_cast_default() -> bool:
+    """Default of ``fuse_dw_cast``: the last chunk's weight-gradient GEMM runs in the backward with the upstream scale and
+    the output cast fused into its epilogue (:data:`DW_CAST_STAGES`) unless ``$FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST``
+    is ``0`` (then every chunk accumulates into the FP32 ``dW_acc`` and ``scale_cast`` casts it; bitwise the same ``dW``)."""
+    return os.environ.get(FUSE_DW_CAST_ENV, "1") != "0"
+
+
+def _resolve_fuse(fuse_dw_cast) -> bool:
+    return fuse_dw_cast_default() if fuse_dw_cast is None else bool(fuse_dw_cast)
+
+
+DX_FINALIZE_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE"  # "0" turns the fused dX finalize off (the before / after switch)
+
+
+def dx_finalize_default() -> bool:
+    """Default of ``dx_finalize``: the K-slice slabs of a sliced dX GEMM are added by the ``slab_sum`` kernel and a
+    compacted call's ``dX`` output is written by the ``scale_cast_scatter_bf16`` kernel (:data:`DX_FINALIZE_STAGES`)
+    unless ``$FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE`` is ``0`` (then the host adds the slabs with in-place ``add_``
+    launches and casts, zero-fills and ``index_copy_``-scatters the compact rows; bitwise the same ``dX``).  Read once
+    per forward; the backward follows the forward's choice through the saved valid-row mask."""
+    return os.environ.get(DX_FINALIZE_ENV, "1") != "0"
+
+
+def _resolve_dx_finalize(dx_finalize) -> bool:
+    return dx_finalize_default() if dx_finalize is None else bool(dx_finalize)
+
+
+DW_STREAM_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM"  # "0" never, "1" every multi-chunk call, "auto" (default)
+DW_STREAM_MIN_CHUNKS = 3  # the side stream pays one cross-stream join per chunk and overlaps only the chunks before a deferred last one
+_DW_STREAMS: dict[
+    int, tuple
+] = {}  # device index -> (side stream, fork event); not a tensor, outside every workspace / binding
+
+
+def dw_stream_mode() -> str:
+    """``$FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM`` as ``"0"`` (never), ``"1"`` (every multi-chunk call) or ``"auto"``
+    (the default: calls of at least :data:`DW_STREAM_MIN_CHUNKS` chunks, :func:`dw_side_stream`)."""
+    value = os.environ.get(DW_STREAM_ENV, "auto").strip().lower()
+    if value in ("0", "false", "off", "no"):
+        return "0"
+    if value in ("1", "true", "on", "yes"):
+        return "1"
+    return "auto"
+
+
+def dw_side_stream(num_chunks: int) -> bool:
+    """Whether a call of ``num_chunks`` chunks launches each chunk's weight-gradient accumulate GEMM on the per-device
+    side stream: forked right after the chunk's ``row_grad`` (``dz`` is ready; the accumulate depends on it alone, not
+    on the dX GEMM launched next) and joined before the next chunk touches the chunk buffer and before the call returns,
+    so the accumulate's CTAs fill the tail wave of the chunk's dX GEMM instead of queueing behind it (GLM-class 4096-row
+    chunks: 768 dX work items on 76 CTA pairs = 11 waves at 0.919 fill).  Measured on the same device in one process
+    (ratio of the step's GPU span to the single-stream step): four-chunk calls 0.991 / 0.995 cross-entropy / policy
+    (SM103) and 0.998 / 0.995 (SM100), eight-chunk 2048-row calls 0.996 / 0.993; two-chunk calls pay the join without an
+    overlap gain (0.999 / 1.002) and a one-chunk call defers its only accumulate to the backward -- hence the ``auto``
+    rule of :data:`DW_STREAM_MIN_CHUNKS` chunks.  Kernels, buffers, launch order per kernel and numerics are unchanged
+    (the dX GEMM writes the dX rows / slabs, the accumulate reads the same ``dz`` and read-modify-writes ``dW_acc``;
+    each kernel keeps its own order): only the launch stream differs, so every output is bitwise the single-stream
+    path's.  The per-device stream and fork event are shared by the calls on that device (one call at a time per
+    device, as the generated launches themselves)."""
+    n = int(num_chunks)
+    if n <= 1:
+        return False
+    mode = dw_stream_mode()
+    if mode == "0":
+        return False
+    if mode == "1":
+        return True
+    return n >= DW_STREAM_MIN_CHUNKS
+
+
+def _dw_stream(index: int) -> tuple:
+    """``(side stream, fork event)`` of device ``index`` (created on first use; never part of a binding or a workspace)."""
+    pair = _DW_STREAMS.get(index)
+    if pair is None:
+        pair = _DW_STREAMS[index] = (
+            torch.cuda.Stream(device=index),
+            torch.cuda.Event(),
+        )
+    return pair
+
+
+HIDDEN_COUNT_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT"  # "0" turns the hidden valid-row count off (the before / after switch)
+
+
+def hidden_count_default() -> bool:
+    """Default of the hidden valid-row count (``cake`` backend, compacted calls): the valid-row index is formed on the
+    device and chunk 0's row gather (:data:`HIDDEN_COUNT_STAGE`) and logits GEMM (its ``_mcnt`` variant, the stores
+    bounded by the count read from device memory) are launched before the count reaches the host through a pinned cell
+    and a CUDA event (:func:`_hidden_count_begin`) unless ``$FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT`` is ``0`` (then
+    :func:`valid_rows` counts and indexes on the host before the first launch; bitwise the same outputs).  Read once per
+    call."""
+    return os.environ.get(HIDDEN_COUNT_ENV, "1") != "0"
+
+
+def compaction_index(
+    labels: torch.Tensor,
+    *,
+    valid: Optional[torch.Tensor] = None,
+    pos: Optional[torch.Tensor] = None,
+    idx_full: Optional[torch.Tensor] = None,
+    ar: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The valid-row compaction on the device (no host synchronization): ``valid = labels >= 0``, ``pos`` = its
+    inclusive int32 scan and ``idx_full[k] = searchsorted(pos, k + 1)`` -- the ascending original row of the ``k``-th
+    valid row for ``k < count`` (``== valid.nonzero()``) and ``T`` for every slot after it, ``count = pos[T - 1]``.
+    Pre-allocated outputs (``valid`` bool ``[T]``, ``pos`` int32 ``[T]``, ``idx_full`` int64 ``[T]``) and the int32
+    constant ``ar = 1, 2, ..`` (``>= T`` entries; a cached prefix) keep the call at three kernels.  Returns
+    ``(valid, pos, idx_full)``."""
+    T = int(labels.numel())
+    if ar is None:
+        ar = torch.arange(1, T + 1, dtype=torch.int32, device=labels.device)
+    valid = torch.ge(labels, 0, out=valid) if valid is not None else labels >= 0
+    pos = (
+        torch.cumsum(valid, 0, dtype=torch.int32, out=pos)
+        if pos is not None
+        else torch.cumsum(valid, 0, dtype=torch.int32)
+    )
+    idx_full = (
+        torch.searchsorted(pos, ar[:T], out=idx_full)
+        if idx_full is not None
+        else torch.searchsorted(pos, ar[:T])
+    )
+    return valid, pos, idx_full
+
+
+_HIDDEN_COUNT_CELLS: dict[
+    int, tuple
+] = {}  # device index -> (pinned int32 [1] cell, event); one pair per device, reused by every call
+_HIDDEN_COUNT_ARANGE: dict[
+    int, torch.Tensor
+] = {}  # device index -> the growing int32 constant 1, 2, ... (no kernel per call)
+
+
+def _hidden_count_cell(index: int) -> tuple:
+    pair = _HIDDEN_COUNT_CELLS.get(index)
+    if pair is None:
+        pair = _HIDDEN_COUNT_CELLS[index] = (
+            torch.empty((1,), dtype=torch.int32, pin_memory=True),
+            torch.cuda.Event(),
+        )
+    return pair
+
+
+def _hidden_count_arange(index: int, T: int) -> torch.Tensor:
+    ar = _HIDDEN_COUNT_ARANGE.get(index)
+    if ar is None or ar.numel() < T:
+        cap = max(int(T), 2 * (0 if ar is None else int(ar.numel())))
+        ar = _HIDDEN_COUNT_ARANGE[index] = torch.arange(
+            1, cap + 1, dtype=torch.int32, device=torch.device("cuda", index)
+        )
+    return ar
+
+
+@dataclass
+class _HiddenCount:
+    """One call's hidden valid-row count prologue: chunk 0's buffers (written before the count is known), the
+    compaction outputs and the count once it was read back (:meth:`finish`)."""
+
+    rows0: int  # the buffer extent min(chunk, T): rows of the chunk-0 buffers, M of the device-count GEMM
+    stats: bool  # the logits GEMM form launched (True: with the row statistics)
+    stage: str  # the device-count logits stage launched
+    group_m: Optional[
+        int
+    ]  # the raster rule's height at the buffer extent (a launch scalar; None = the default)
+    valid: torch.Tensor  # bool [T]
+    idx_full: torch.Tensor  # int64 [T]: the valid rows in order, then T
+    count_host: torch.Tensor  # the pinned int32 [1] cell the count is copied into
+    event: Any  # the CUDA event recorded behind that copy
+    logits: torch.Tensor = field(
+        repr=False
+    )  # bf16 [rows0, V]: chunk 0's z, rows < min(count, rows0) written
+    stats_buf: torch.Tensor = field(repr=False)  # fp32 [rows0, num_tiles, 2]
+    x_c: torch.Tensor = field(
+        repr=False
+    )  # bf16 [rows0, H]: chunk 0's gathered X rows, exact zeros after the count
+    count: Optional[int] = None
+
+    def finish(self) -> int:
+        """Wait for the count -- the compaction kernels and the 4-byte copy; chunk 0's GEMM is already queued -- and
+        read it (once)."""
+        if self.count is None:
+            self.event.synchronize()
+            self.count = int(self.count_host[0])
+        return self.count
+
+    @property
+    def num_rows(self) -> int:
+        return int(self.valid.numel())
+
+    def row_index(self) -> Optional[torch.Tensor]:
+        """The compact int64 row index: ``None`` when every row is valid, empty when every row is ignored."""
+        count = self.finish()
+        return None if count == self.num_rows else self.idx_full[:count]
+
+
+def hidden_count_eligible(
+    problem: "Problem",
+    X: torch.Tensor,
+    record: Optional[dict[str, Any]],
+    module_name: Optional[str],
+    *,
+    stats: bool,
+) -> bool:
+    """Whether a compacted call runs the hidden valid-row count: a registered program with the gather kernel and the
+    device-count form of chunk 0's logits GEMM (its raster height at the buffer extent ``min(chunk, T)`` is a launch
+    scalar), a call of
+    :data:`HIDDEN_COUNT_MIN_CHUNKS` chunks or more (``ceil(T / chunk) >= 3``: one- and two-chunk calls cannot hide the
+    path's fixed host cost behind chunk 0's logits GEMM and run 5-16 % slower with it), an ``X`` the GEMM reads in
+    place -- a 16-byte row pitch (no contiguous copy) and a 16-byte-aligned base -- and a toolchain whose code for the
+    record's architecture runs the hidden count's schedule (:func:`cake_jit.toolchain_runs_hidden_count`: not nvcc
+    13.0.x for sm_103a).  Every other call takes the shipped :func:`valid_rows` path."""
+    rows, chunk = int(problem.num_rows), int(problem.chunk)
+    if (
+        record is None
+        or module_name is None
+        or rows <= 0
+        or (rows + chunk - 1) // chunk < HIDDEN_COUNT_MIN_CHUNKS
+        or problem.x_copy
+        or X.data_ptr() % 16
+    ):
+        return False
+    if not toolchain_runs_hidden_count(record["arch"]):
+        return False
+    stages = registered_stages(module_name)
+    stage = stage_variant("gemm_logits" if stats else "gemm_logits_nostats", count=True)
+    return HIDDEN_COUNT_STAGE in stages and stage in stages
+
+
+def _hidden_count_begin(
+    problem: "Problem",
+    X: torch.Tensor,
+    W: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    record: dict[str, Any],
+    module_name: str,
+    stats: bool,
+) -> _HiddenCount:
+    """Queue the device compaction, chunk 0's row gather and chunk 0's device-count logits GEMM of a compacted call
+    without the valid-row count on the host; the count is read back asynchronously (:meth:`_HiddenCount.finish`).
+
+    Order: (1) chunk 0's buffers at the buffer extent ``rows0 = min(chunk, T)`` -- the BF16 ``[rows0, V]`` logits
+    buffer, its row statistics and the BF16 ``[rows0, H]`` gather buffer -- and the compaction outputs; (2) the two
+    launches are bound (argument plans, grids: host work only, nothing enqueued yet); (3) ``labels >= 0`` -> ``cumsum``
+    -> ``searchsorted`` (:func:`compaction_index`), the count's ``copy_(non_blocking=True)`` into the pinned cell and
+    the event behind it; (4) the gather (rows ``< count`` of ``X`` in valid-row order, exact zeros after) and the GEMM
+    (``M`` / ``m_tiles`` / the raster rule at ``rows0``, the stores bounded by ``min(count, rows0)``) are launched.  The
+    caller resolves the plan on the count afterwards and skips chunk 0's gather and GEMM (:attr:`Plan.hidden_count`)."""
+    device = X.device
+    index = int(
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    geometry = Geometry.from_record(record)
+    T, H, V, C = (
+        int(problem.num_rows),
+        int(problem.hidden),
+        int(problem.vocab),
+        int(problem.chunk),
+    )
+    rows0 = min(C, T)
+    num_tiles = -(-V // geometry.stats_tile)
+    logits = torch.empty((rows0, V), dtype=torch.bfloat16, device=device)
+    stats_buf = torch.empty((rows0, num_tiles, 2), dtype=torch.float32, device=device)
+    x_c = torch.empty((rows0, H), dtype=torch.bfloat16, device=device)
+    Xd, Wd = X.detach(), W.detach()
+    count_host, event = _hidden_count_cell(index)
+    ar = _hidden_count_arange(index, T)
+    valid = torch.empty((T,), dtype=torch.bool, device=device)
+    pos = torch.empty((T,), dtype=torch.int32, device=device)
+    idx_full = torch.empty((T,), dtype=torch.int64, device=device)
+    count_dev = pos[T - 1 : T]
+    ld = int(Xd.stride(0))
+    raster = raster_variant(H, rows0, record["arch"])
+    group_m = None if raster is None else raster[0]
+    stage = stage_variant("gemm_logits" if stats else "gemm_logits_nostats", count=True)
+    common: dict[str, Any] = {name: None for name in COMMON_TENSORS}
+    common.update({name: 0 for name in COMMON_SCALARS})
+    common.update(
+        T=T, H=H, V=V, chunk=C, num_tiles=num_tiles, loss_div=1.0, rows_c=rows0
+    )
+    # the kernel addresses X by base pointer + ld_x_words: its storage span (padding columns included) as ONE contiguous
+    # int32 alias, so a padded-pitch X passes the launch shim's contiguity check without a copy
+    gather = dict(
+        common,
+        x=Xd.as_strided(((T - 1) * ld + H,), (1,)).view(torch.int32),
+        idx_lo=idx_full.view(torch.int32),
+        count=count_dev,
+        out=x_c.view(torch.int32),
+        ld_x_words=ld // 2,
+        row_vecs=H // geometry.cast_vec,
+        num_rows=rows0,
+    )
+    gemm = dict(
+        common,
+        A=x_c,
+        B=Wd,
+        C=logits,
+        STATS_OUT=stats_buf,
+        WS=count_dev,
+        **gemm_scalars(
+            stage, geometry, hidden=H, vocab=V, rows_c=rows0, group_m=group_m
+        ),
+    )
+    keys = ((HIDDEN_COUNT_STAGE, "hidden"), (stage, "hidden"))
+    launches = _bind_all(
+        record,
+        module_name,
+        keys,
+        {keys[0]: gather, keys[1]: gemm},
+        device,
+        geometry,
+    )
+    compaction_index(labels, valid=valid, pos=pos, idx_full=idx_full, ar=ar)
+    count_host.copy_(count_dev, non_blocking=True)
+    event.record()
+    with _ffi_stream_context(index):
+        for key in keys:
+            launch = launches[key]
+            if launch.prepare is not None:
+                launch.prepare(*launch.arguments)
+            launch()
+    return _HiddenCount(
+        rows0=rows0,
+        stats=stats,
+        stage=stage,
+        group_m=group_m,
+        valid=valid,
+        idx_full=idx_full,
+        count_host=count_host,
+        event=event,
+        logits=logits,
+        stats_buf=stats_buf,
+        x_c=x_c,
+    )
+
+
+def _hidden_count_memory(
+    memory: dict[str, Any],
+    *,
+    num_rows: int,
+    hidden: int,
+    vocab: int,
+    chunk: int,
+    stats_tile: int,
+) -> dict[str, Any]:
+    """The memory report of a call on the hidden valid-row count path: the chunk buffers and the gather buffer exist
+    at the buffer extent ``min(chunk, T)`` BEFORE the count is known -- also when the outcome is the uncompacted plan,
+    which counts no gather buffer."""
+    rows0 = min(int(chunk), max(int(num_rows), 1))
+    tiles = -(-int(vocab) // int(stats_tile))
+    temporary = dict(memory["temporary"])
+    temporary["logits"] = rows0 * int(vocab) * 2
+    temporary["stats"] = rows0 * tiles * 2 * 4
+    temporary["x_c"] = rows0 * int(hidden) * 2
+    out = dict(
+        memory,
+        temporary=temporary,
+        temporary_bytes=sum(temporary.values()),
+        gather_bytes=temporary["x_c"],
+        hidden_count=True,
+    )
+    if memory.get("saved_dz_bytes"):
+        out["saved_dz_bytes"] = rows0 * int(vocab) * 2
+    return out
+
+
+def valid_rows(
+    labels: torch.Tensor, *, mask: bool = False
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """``(row_index, row_valid)``.  ``row_index`` is ``None`` when every row is valid (or ``T == 0``: the uncompacted
+    path, no gather cost), else the ascending int64 index of the valid rows (``labels >= 0``; ``-100`` is the ignore
+    index).  Rows with a negative label contribute exactly zero to the loss, ``dX`` and ``dW``, so skipping them is
+    exact.  One device synchronization (the count) plus the ``nonzero`` synchronization when rows are ignored.
+    ``mask=True`` (the fused dX finalize of a call that produces ``dX``) also returns the already materialized bool
+    valid-row mask ``labels >= 0`` (``[T]``; :func:`finalize_dx` turns it into the inclusive int32 scan behind the
+    backward's queued GEMMs, not here in the synchronization shadow of ``nonzero``); ``None`` whenever ``row_index``
+    is."""
     T = int(labels.numel())
     if T == 0:
-        return None
+        return None, None
     valid = labels >= 0
     if int(valid.sum().item()) == T:
-        return None
-    return valid.nonzero().squeeze(1)
+        return None, None
+    return valid.nonzero().squeeze(1), (valid if mask else None)
+
+
+def valid_row_index(labels: torch.Tensor) -> Optional[torch.Tensor]:
+    """The valid-row index of :func:`valid_rows` alone (``None`` when every row is valid)."""
+    return valid_rows(labels)[0]
 
 
 def scatter_rows(
@@ -572,10 +1596,22 @@ def stages_for_entry(
     need_dx: bool = True,
     need_dw: bool = True,
     grad_weight_dtype=torch.bfloat16,
+    fuse_dw_cast: Optional[bool] = None,
+    num_chunks: Optional[int] = None,
+    dx_cast: bool = True,
 ) -> tuple[str, ...]:
-    """Stages an entry point launches (``need_dx`` / ``need_dw`` drop the GEMMs of frozen inputs)."""
+    """Stages an entry point launches (``need_dx`` / ``need_dw`` drop the GEMMs of frozen inputs).
+
+    ``fuse_dw_cast`` (default :func:`fuse_dw_cast_default`): the weight gradient's last chunk comes out of the fused
+    GEMM ``gemm_dw_cast_bf16`` / ``gemm_dw_cast_f32`` instead of the flat ``scale_cast``; ``gemm_dw_acc`` then
+    accumulates the chunks before it and is absent when ``num_chunks`` is given as 1 (unknown: kept).
+    ``dx_cast=False`` leaves the flat ``dX`` cast out: the caller finalizes ``dx_acc`` itself (the fused dX finalize of
+    a compacted log-probability backward scatters it in one pass, :func:`finalize_dx`).  The ``slab_sum`` kernel of a
+    K-sliced dX GEMM is a per-chunk instance like the dX GEMM's ``_s`` form (:attr:`Plan.stages`), not listed here.
+    """
     if entry not in ENTRIES:
         raise ValueError(f"entry must be one of {ENTRIES}")
+    fp32 = entry == "loss" and grad_weight_dtype == torch.float32
     stages = ["gemm_logits", "row_finalize"]
     if entry == "loss":
         stages.append("loss_reduce")
@@ -584,34 +1620,46 @@ def stages_for_entry(
     if need_dx or need_dw:
         stages.append("row_grad")
     if need_dx:
-        stages += ["gemm_dx", "scale_cast_bf16"]
+        stages += ["gemm_dx"] + (["scale_cast_bf16"] if dx_cast else [])
     if need_dw:
-        stages += [
-            "gemm_dw_acc",
-            "scale_cast_f32"
-            if (entry == "loss" and grad_weight_dtype == torch.float32)
-            else "scale_cast_bf16",
-        ]
+        if _resolve_fuse(fuse_dw_cast):
+            if num_chunks is None or int(num_chunks) > 1:
+                stages.append("gemm_dw_acc")
+            stages.append("gemm_dw_cast_f32" if fp32 else "gemm_dw_cast_bf16")
+        else:
+            stages += ["gemm_dw_acc", "scale_cast_f32" if fp32 else "scale_cast_bf16"]
     return tuple(s for s in STAGES if s in stages)
 
 
 def generated_program_available(
-    device: Optional[torch.device] = None, *, entry: str = "loss"
+    device: Optional[torch.device] = None,
+    *,
+    entry: str = "loss",
+    hidden: Optional[int] = None,
+    vocab: Optional[int] = None,
 ) -> bool:
-    """True when this checkout registers a contract program for ``device`` with every stage the entry point needs."""
+    """True when this checkout registers a contract program for ``device`` (and the ``(hidden, vocab)`` geometry when
+    given) with every stage the entry point needs -- the base stages plus every variant the per-chunk instance rules
+    can select for the record's geometry and architecture (:func:`reachable_variants`)."""
     arch = arch_for(device)
     if arch is None:
         return False
-    names = [n for n, r in MODULES.items() if r["arch"] == arch]
-    if len(names) != 1:
+    try:
+        name = select_module(arch, hidden, vocab)
+    except (NotImplementedError, ValueError):
         return False
-    record = MODULES[names[0]]
+    record = MODULES[name]
     if str(record.get("abi", ABI_CONTRACT)) != ABI_CONTRACT:
         return False
-    stages = registered_stages(names[0])
+    stages = registered_stages(name)
     needed = set(stages_for_entry(entry)) | set(
         stages_for_entry(entry, grad_weight_dtype=torch.float32)
     )
+    needed |= reachable_variants(needed, arch, dx_max_slices(stages))
+    if dx_finalize_default():
+        needed |= set(DX_FINALIZE_STAGES)
+    if hidden_count_default() and toolchain_runs_hidden_count(arch):
+        needed.add(HIDDEN_COUNT_STAGE)
     return all(stage in stages for stage in needed)
 
 
@@ -706,6 +1754,15 @@ def validate_lm_head_inputs(
     if vocab < 1 or vocab % geometry.vocab_multiple:
         raise ValueError(
             f"V must be a positive multiple of {geometry.vocab_multiple}, got {vocab}"
+        )
+    if hidden % geometry.dx_item_cols or hidden % geometry.dw_item_cols:
+        raise ValueError(
+            f"H must be a multiple of the {geometry.dx_item_cols}-column dX and {geometry.dw_item_cols}-column "
+            f"weight-gradient work items, got {hidden}"
+        )
+    if vocab % geometry.logits_item_cols:
+        raise ValueError(
+            f"V must be a multiple of the {geometry.logits_item_cols}-column logits work item, got {vocab}"
         )
     if geometry.hidden is not None and hidden != geometry.hidden:
         raise ValueError(
@@ -824,6 +1881,48 @@ class Plan:
     valid_rows: Optional[int] = (
         None  # rows of the compacted chunk loop (the valid rows); None = every row of the caller
     )
+    fuse_dw_cast: bool = False  # the last chunk's weight-gradient GEMM runs in the backward with the fused scale + cast
+    variants: tuple[
+        ChunkVariants, ...
+    ] = ()  # per chunk: the GEMM instance knobs the rules resolved (empty = defaults)
+    dx_finalize: bool = False  # a K-sliced dX GEMM's slabs are added by the ``slab_sum`` kernel (else the host's ``add_`` chain)
+    dx_cast: bool = True  # the backward casts ``dx_acc`` into ``dx_out`` (False: the caller finalizes ``dx_acc``, :func:`finalize_dx`)
+    # the hidden valid-row count (eager entry points): chunk 0's row gather and logits GEMM ran in device-count form before
+    # the count was known (:func:`_hidden_count_begin`), so the forward / recompute key sequences start at chunk 0's row
+    # kernels; ``hidden_logits_group_m`` is the raster rule's height at the buffer extent, ``hidden_stats`` the GEMM form
+    hidden_count: bool = False
+    hidden_logits_group_m: Optional[int] = None
+    hidden_stats: bool = True
+
+    def variants_of(self, index: int) -> ChunkVariants:
+        return self.variants[index] if self.variants else ChunkVariants()
+
+    def hidden_logits_stage(self) -> str:
+        """The device-count logits GEMM form chunk 0 ran on the hidden valid-row count path (its raster height
+        ``hidden_logits_group_m`` is a launch scalar)."""
+        return stage_variant(
+            "gemm_logits" if self.hidden_stats else "gemm_logits_nostats", count=True
+        )
+
+    def logits_stage(self, index: int, *, stats: bool = True) -> str:
+        """The logits GEMM form of chunk ``index`` (``stats=False``: the log-probability backward's recompute).  One
+        form per entry: the chunk's raster height is a launch scalar (:attr:`ChunkVariants.logits_group_m`)."""
+        self.variants_of(index)  # the chunk exists
+        return stage_variant("gemm_logits" if stats else "gemm_logits_nostats")
+
+    def dx_stage_of(self, index: int) -> str:
+        """The dX GEMM form of chunk ``index`` (K-sliced or not, its tile and ring depth; the slice count is a launch
+        scalar, :meth:`dx_slices_of`)."""
+        v = self.variants_of(index)
+        return dx_stage(self.dx_slices_of(index), v.dx_tile_n, v.dx_stages)
+
+    def dw_acc_stage(self, index: int) -> str:
+        """The weight-gradient accumulate form of chunk ``index`` (blocked when the block rule set a ``group_n``; the
+        raster height and the block width are launch scalars)."""
+        v = self.variants_of(index)
+        return stage_variant(
+            "gemm_dw_acc", blocked=v.dw_group_n is not None, epi_store=v.dw_epi_store
+        )
 
     @property
     def compact(self) -> bool:
@@ -854,24 +1953,69 @@ class Plan:
         )
 
     @property
+    def dw_deferred(self) -> bool:
+        """The last chunk's weight-gradient GEMM runs in the backward with the upstream scale and the output cast fused
+        into its epilogue (:data:`DW_CAST_STAGES`); the forward accumulates the chunks before it only."""
+        return bool(self.need_dw and self.fuse_dw_cast and self.num_chunks > 0)
+
+    @property
+    def dw_acc_needed(self) -> bool:
+        """The FP32 ``[V, H]`` accumulator exists: every unfused plan, and a fused plan of more than one chunk."""
+        return bool(self.need_dw and not (self.dw_deferred and self.num_chunks == 1))
+
+    @property
+    def last_chunk(self) -> tuple[int, int]:
+        """``(row0, rows_c)`` of the last chunk (``(0, 0)`` without chunks)."""
+        return self.chunks[-1] if self.chunks else (0, 0)
+
+    @property
     def stages(self) -> tuple[str, ...]:
         base = stages_for_entry(
             self.problem.entry,
             need_dx=self.need_dx,
             need_dw=self.need_dw,
             grad_weight_dtype=self.problem.grad_weight_dtype,
+            fuse_dw_cast=self.fuse_dw_cast,
+            num_chunks=self.num_chunks,
+            dx_cast=self.dx_cast,
         )
-        used = set(base) | (
-            {dx_stage(k) for k in self.dx_slices} if self.need_dx else set()
-        )
+        used = {s for s in base if s not in GEMM_STAGES}
+        if self.need_dx and self.dx_finalize and self.dx_ws_slabs:
+            used.add(
+                "slab_sum"
+            )  # some chunk slices its dX GEMM: its slabs are added by the kernel
+        for index in range(self.num_chunks):
+            if "gemm_logits" in base:
+                used.add(self.logits_stage(index))
+            if "gemm_logits_nostats" in base:
+                used.add(self.logits_stage(index, stats=False))
+            if "gemm_dx" in base:
+                used.add(self.dx_stage_of(index))
+            if "gemm_dw_acc" in base and not (
+                self.dw_deferred and index == self.num_chunks - 1
+            ):
+                used.add(self.dw_acc_stage(index))
+        if self.dw_deferred:
+            used.add(self.dw_cast_stage)
+        if self.hidden_count:
+            used.add(HIDDEN_COUNT_STAGE)
+            used.add(self.hidden_logits_stage())
         return tuple(s for s in STAGES if s in used)
 
     @property
     def dw_cast_stage(self) -> str:
+        """The stage that writes the final ``dW``: the fused GEMM of the deferred last chunk, else the flat cast."""
         fp32 = (
             self.problem.entry == "loss"
             and self.problem.grad_weight_dtype == torch.float32
         )
+        if self.dw_deferred:
+            v = self.variants_of(self.num_chunks - 1)
+            return stage_variant(
+                "gemm_dw_cast_f32" if fp32 else "gemm_dw_cast_bf16",
+                blocked=fp32
+                and v.dw_group_n is not None,  # the bf16 cast keeps the 1-D raster
+            )
         return "scale_cast_f32" if fp32 else "scale_cast_bf16"
 
 
@@ -885,20 +2029,69 @@ def make_plan(
     num_sms: int = 1,
     valid_rows: Optional[int] = None,
     dx_resident: Optional[int] = None,
+    fuse_dw_cast: bool = False,
+    arch: Optional[str] = None,
+    gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    dx_finalize: bool = False,
+    dx_cast: bool = True,
+    hidden_count: bool = False,
+    hidden_stats: bool = True,
 ) -> Plan:
     """The chunk schedule; ``dx_max_slices`` > 1 (K-sliced dX stages registered) picks each chunk's slice count
     (``dx_resident`` = the device's co-resident dX clusters, :func:`cluster_resident`); ``valid_rows`` (compaction)
-    chunks that many rows instead of ``T``."""
+    chunks that many rows instead of ``T``; ``fuse_dw_cast`` defers the last chunk's weight-gradient GEMM to the
+    backward with the fused scale + cast epilogue.  ``arch`` (a registered program's architecture) applies the
+    per-chunk instance rules (:func:`chunk_variants`; ``None`` = the reference path, base stages only) and
+    ``gemm_tuning`` pins knobs explicitly (already validated by the caller or :func:`_resolve_gemm_tuning`);
+    ``dx_finalize`` adds a sliced dX GEMM's slabs with the ``slab_sum`` kernel and ``dx_cast=False`` leaves ``dx_acc``
+    uncast for the caller (:func:`finalize_dx`).  ``hidden_count`` (the eager entry points' hidden valid-row count,
+    ``arch`` required): chunk 0's gather and logits GEMM already ran in device-count form (``hidden_stats``: with the
+    statistics) at the buffer extent ``min(chunk, T)``, whose raster-rule height the plan records."""
     rows = problem.num_rows if valid_rows is None else int(valid_rows)
     chunks = plan_chunks(rows, problem.chunk)
+    tuning = gemm_tuning or {}
+    dx_tuning = tuning.get("dx", {})
     slices: tuple[int, ...] = ()
-    if need_dx and int(dx_max_slices) > 1:
+    if need_dx and "k_slices" in dx_tuning:
+        # an explicit knob wins over the slice rule: a value pins that slice count, ``None`` pins the default form
+        # (one slice, the base ``gemm_dx`` stage) -- the same ``None`` semantics as every other pinned knob
+        explicit_k = 1 if dx_tuning["k_slices"] is None else int(dx_tuning["k_slices"])
+        if not 1 <= explicit_k <= int(dx_max_slices):
+            raise ValueError(
+                f"gemm_tuning dx k_slices={explicit_k}: the registered program serves 1 .. {int(dx_max_slices)} dX slices"
+            )
+        slices = tuple(explicit_k for _ in chunks)
+    elif need_dx and int(dx_max_slices) > 1:
         slices = tuple(
             recommended_k_slices(
                 rows_c, problem.hidden, num_sms, dx_max_slices, geometry, dx_resident
             )
             for _, rows_c in chunks
         )
+    variants: tuple[ChunkVariants, ...] = ()
+    if arch is not None or tuning:
+        variants = tuple(
+            chunk_variants(
+                rows_c,
+                problem.hidden,
+                num_sms,
+                slices[i] if slices else 1,
+                geometry,
+                arch,
+                tuning,
+            )
+            for i, (_, rows_c) in enumerate(chunks)
+        )
+    hidden_group: Optional[int] = None
+    if hidden_count:
+        if arch is None:
+            raise ValueError(
+                "the hidden valid-row count belongs to a registered program (arch required)"
+            )
+        raster = raster_variant(
+            problem.hidden, min(int(problem.chunk), int(problem.num_rows)), arch
+        )
+        hidden_group = None if raster is None else raster[0]
     return Plan(
         problem,
         chunks,
@@ -907,6 +2100,13 @@ def make_plan(
         geometry,
         slices,
         None if valid_rows is None else int(valid_rows),
+        bool(fuse_dw_cast),
+        variants,
+        bool(dx_finalize),
+        bool(dx_cast),
+        bool(hidden_count),
+        hidden_group,
+        bool(hidden_stats),
     )
 
 
@@ -1014,6 +2214,9 @@ def memory_report(
     scratch_bytes: int = 0,
     dx_ws_slabs: int = 0,
     valid_rows: Optional[int] = None,
+    fuse_dw_cast: Optional[bool] = None,
+    dx_finalize: Optional[bool] = None,
+    hidden_count: bool = False,
 ) -> dict[str, Any]:
     """The reporting buckets of the memory rule (bytes).
 
@@ -1036,11 +2239,34 @@ def memory_report(
     after the scatter and the compact BF16 ``dX`` rows the backward casts
     before scattering them into the ``[T, H]`` output; a contiguous copy of
     ``X`` is never needed (the gather output is contiguous).
+
+    ``fuse_dw_cast`` (default :func:`fuse_dw_cast_default`): the last chunk's
+    weight-gradient GEMM runs in the backward with the scale + cast fused, so
+    the BF16 chunk buffer holding its ``dz`` rows stays alive until the
+    backward -- the saved rows are a view of the whole ``[min(T, C), V]``
+    buffer, never a copy, so ``saved_dz_bytes`` counts that whole buffer (part
+    of the ``temporary`` chunk buffer; the eager entry points allocate it on
+    its own from the first call on, so it is also the only storage the saved
+    view keeps alive, while a prepared runner keeps it inside its workspace) --
+    and a one-chunk call has no FP32 ``dW_acc`` at all.
+
+    ``dx_finalize`` (default :func:`dx_finalize_default`): a compacted call's
+    ``dX`` is written in one pass from the accumulator, so the compact BF16
+    ``dX`` rows disappear from the temporaries; the bool valid-row mask and its
+    int32 scan (``row_valid`` / ``row_scan``, ``[T]`` each) take their place.
+
+    ``hidden_count`` (the eager entry points' hidden valid-row count): the chunk
+    buffers (``logits``, ``stats``) and the gather buffer ``x_c`` exist at the
+    buffer extent ``min(C, T)`` before the count is known -- also when the
+    outcome is the uncompacted plan -- and ``gather_bytes`` counts that buffer.
     """
     compact = valid_rows is not None
     rows = (
         int(valid_rows) if compact else int(num_rows)
     )  # rows the chunk loop processes
+    chunks = plan_chunks(rows, chunk)
+    deferred = bool(need_dw and _resolve_fuse(fuse_dw_cast) and chunks)
+    fused_dx = bool(need_dx and _resolve_dx_finalize(dx_finalize))
     layout = workspace_layout(
         rows,
         vocab,
@@ -1068,7 +2294,14 @@ def memory_report(
         temporary["row_index"] = rows * 8  # int64 valid-row index
         if entry == "logprob":
             temporary["dlogp_compact"] = rows * 4
-        if need_dx:
+        if need_dx and fused_dx:
+            temporary["row_valid"] = int(
+                num_rows
+            )  # the bool valid-row mask the fused dX finalize scatters by
+            temporary["row_scan"] = (
+                int(num_rows) * 4
+            )  # its inclusive int32 scan (formed in the backward)
+        elif need_dx:
             temporary["dx_compact"] = (
                 rows * int(hidden) * 2
             )  # the cast compact rows, transient before the scatter into dX
@@ -1089,11 +2322,41 @@ def memory_report(
     accumulators = {}
     if need_dx:
         accumulators["dX_acc"] = rows * int(hidden) * 4
-    if need_dw:
+    if need_dw and not (deferred and len(chunks) == 1):
         accumulators["dW_acc"] = int(vocab) * int(hidden) * 4
     if entry == "logprob":
         accumulators["saved_lse"] = rows * 4
     weights = {"W": int(vocab) * int(hidden) * 2, "X": int(num_rows) * int(hidden) * 2}
+    if hidden_count:
+        return _hidden_count_memory(
+            dict(
+                temporary_bytes=sum(temporary.values()),
+                temporary=temporary,
+                outputs_bytes=sum(outputs.values()),
+                outputs=outputs,
+                accumulator_bytes=sum(accumulators.values()),
+                accumulators=accumulators,
+                weights_bytes=sum(weights.values()),
+                weights=weights,
+                vocab_rows_max=min(int(chunk), max(rows, 1)),
+                chunk=int(chunk),
+                num_chunks=len(chunks),
+                compact_rows=compact,
+                valid_rows=rows,
+                gather_bytes=int(layout["x_c"][1]) if compact else 0,
+                fuse_dw_cast=deferred,
+                saved_dz_bytes=min(int(chunk), rows) * int(vocab) * 2
+                if deferred
+                else 0,
+                dx_finalize=fused_dx,
+                hidden_count=False,
+            ),
+            num_rows=int(num_rows),
+            hidden=int(hidden),
+            vocab=int(vocab),
+            chunk=int(chunk),
+            stats_tile=int(stats_tile),
+        )
     return dict(
         temporary_bytes=sum(temporary.values()),
         temporary=temporary,
@@ -1105,10 +2368,14 @@ def memory_report(
         weights=weights,
         vocab_rows_max=min(int(chunk), max(rows, 1)),
         chunk=int(chunk),
-        num_chunks=len(plan_chunks(rows, chunk)),
+        num_chunks=len(chunks),
         compact_rows=compact,
         valid_rows=rows,
         gather_bytes=int(layout["x_c"][1]) if compact else 0,
+        fuse_dw_cast=deferred,
+        saved_dz_bytes=min(int(chunk), rows) * int(vocab) * 2 if deferred else 0,
+        dx_finalize=fused_dx,
+        hidden_count=False,
     )
 
 
@@ -1126,7 +2393,9 @@ def lm_head_loss_workspace_size(
 ) -> int:
     """Workspace bytes :func:`prepare_lm_head_loss` needs for ``(T, V, C)`` on ``device`` (``hidden`` = ``H``;
     defaults to the registered program's pinned hidden size).  ``compact_rows`` adds the gather buffer of the
-    compacted path; sized for ``T`` rows it bounds every valid-row count."""
+    compacted path; sized for ``T`` rows it bounds every valid-row count -- including the K-slice slabs of a
+    compacted plan, whose tail chunk (the valid-row count modulo ``C``) may take more slices than any full-``T``
+    chunk (the slab count is taken over every possible tail row count as well)."""
     if compact_rows and not hidden and backend == "reference":
         raise ValueError(
             "lm_head_loss_workspace_size needs hidden= for the compacted path"
@@ -1142,7 +2411,7 @@ def lm_head_loss_workspace_size(
                 compact=compact_rows,
             )["total"]
         )
-    name, record = record_for(device)
+    name, record = record_for(device, hidden, int(vocab))
     stages = registered_stages(name)
     geometry = Geometry.from_record(record)
     hidden = geometry.hidden if hidden is None else int(hidden)
@@ -1160,6 +2429,12 @@ def lm_head_loss_workspace_size(
             geometry.dx_cluster_ctas,
             num_sms,
         )
+        rows_candidates = [rows_c for _, rows_c in plan_chunks(num_rows, chunk)]
+        if compact_rows:
+            # the valid-row count is unknown here: the compacted plan's tail chunk can have any row count up to one
+            # chunk; the slice rule depends on rows only through the row-tile count, so one row count per tile suffices
+            cap = min(int(num_rows), int(chunk))
+            rows_candidates += list(range(1, cap + 1, int(geometry.row_tile))) + [cap]
         slabs = (
             max(
                 (
@@ -1171,7 +2446,7 @@ def lm_head_loss_workspace_size(
                         geometry,
                         resident,
                     )
-                    for _, rows_c in plan_chunks(num_rows, chunk)
+                    for rows_c in rows_candidates
                 ),
                 default=1,
             )
@@ -1393,6 +2668,16 @@ def _device_constants(index: int) -> dict[str, torch.Tensor]:
     }
 
 
+def _unit_scale(device: torch.device) -> torch.Tensor:
+    """The ``[1] = 1.0`` fp32 scale of a cast whose incoming gradient is ``None`` (the log-probability
+    entry's dX finalize): the per-device cached cell on CUDA -- a per-call ``torch.ones`` would be one
+    fill launch inside the backward -- and a fresh cell elsewhere (the reference backend on the host)."""
+    if device.type == "cuda":
+        index = torch.cuda.current_device() if device.index is None else device.index
+        return _device_constants(int(index))["unit_scale"]
+    return torch.ones((1,), dtype=torch.float32, device=device)
+
+
 def _ffi_stream_context(index: int):
     """tvm-ffi environment-stream context for torch's current stream on device ``index``."""
     import tvm_ffi
@@ -1407,6 +2692,73 @@ def _ffi_stream_context(index: int):
         else torch.cuda.current_stream(index).cuda_stream
     )
     return tvm_ffi.use_raw_stream(device, raw)
+
+
+def side_stream_schedule(plan: Plan, keys: tuple) -> Optional[tuple]:
+    """Side-stream placement of :func:`dw_side_stream` over a launch-key sequence: ``None`` when the plan has no ``dW``,
+    too few chunks for the rule, or the sequence has no per-chunk accumulate (the loss entry's cast keys); else the
+    positions ``(joins, forks, sides)`` -- the first key of every chunk after the first and the first key after the last
+    chunk's keys (the caller's stream waits for the side stream: the chunk buffer is about to be reused / read), each
+    chunk's ``row_grad`` key (the fork event is recorded after it) and the per-chunk ``dW`` accumulate keys (launched
+    on the side stream after it waited for the fork).  A deferred last chunk's cast GEMM and the flat casts stay on
+    the caller's stream; the sequence always ends with a join."""
+    if not (plan.need_dw and dw_side_stream(plan.num_chunks)):
+        return None
+    chunk_keys = [
+        (pos, stage, index)
+        for pos, (stage, index) in enumerate(keys)
+        if isinstance(index, int) and not isinstance(index, bool)
+    ]
+    sides = frozenset(
+        pos for pos, stage, index in chunk_keys if stage == plan.dw_acc_stage(index)
+    )
+    if not sides:
+        return None
+    joins, forks, seen = set(), set(), set()
+    for pos, stage, index in chunk_keys:
+        if index not in seen:
+            seen.add(index)
+            if index > 0:
+                joins.add(pos)
+        if stage == "row_grad":
+            forks.add(pos)
+    after = chunk_keys[-1][0] + 1
+    if after < len(keys):
+        joins.add(after)
+    return frozenset(joins), frozenset(forks), sides
+
+
+def _run_keys(
+    plan: Plan, device_index: int, keys: tuple, run_key: Callable[[Any], None]
+) -> None:
+    """Run the launch keys in order on the caller's stream; with the placement of :func:`side_stream_schedule` the
+    per-chunk ``dW`` accumulates go to the side stream.  The generated launches take tvm-ffi's environment stream, so a
+    side launch enters its own stream context and the caller's context is re-entered afterwards (no nesting)."""
+    schedule = side_stream_schedule(plan, keys)
+    if schedule is None:
+        with _ffi_stream_context(device_index):
+            for key in keys:
+                run_key(key)
+        return
+    joins, forks, sides = schedule
+    side, fork = _dw_stream(device_index)
+    main = torch.cuda.current_stream(device_index)
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(_ffi_stream_context(device_index))
+        for pos, key in enumerate(keys):
+            if pos in joins:
+                main.wait_stream(side)
+            if pos in sides:
+                stack.close()
+                side.wait_event(fork)
+                with torch.cuda.stream(side), _ffi_stream_context(device_index):
+                    run_key(key)
+                stack.enter_context(_ffi_stream_context(device_index))
+                continue
+            run_key(key)
+            if pos in forks:
+                fork.record(main)
+    main.wait_stream(side)
 
 
 # ---------------------------------------------------------------------------
@@ -1477,6 +2829,10 @@ def stage_values(
             d_off=0,
         )
         return values
+    if stage == "scale_cast_scatter_bf16":
+        raise ValueError(
+            "scale_cast_scatter_bf16 is bound by finalize_dx at the dX output boundary, not by the chunk loop"
+        )
     if stage in ("scale_cast_bf16", "scale_cast_f32"):
         acc = t["dx_acc"] if index == "dx" else t["dw_acc"]
         out = t["dx_out"] if index == "dx" else t["dw_out"]
@@ -1509,9 +2865,19 @@ def stage_values(
     x_chunk = (
         t["x_c"][:rows_c] if plan.compact else t["X"][row0:stop]
     )  # compacted: the chunk's gathered valid rows
+    if t.get("x_last") is not None and index == plan.num_chunks - 1:
+        x_chunk = t[
+            "x_last"
+        ]  # the eager backward of a deferred plan: the saved view of the last chunk's X rows
     logits = t["logits"]
     dz_chunk = logits[:rows_c]
-    if stage in ("gemm_logits", "gemm_logits_nostats"):
+    base = base_stage(stage) if stage in GEMM_STAGES else stage
+    if base in ("gemm_logits", "gemm_logits_nostats"):
+        want = plan.logits_stage(index, stats=base == "gemm_logits")
+        if stage != want:
+            raise ValueError(
+                f"chunk {index} plans the logits GEMM {want!r}; stage {stage!r} was requested"
+            )
         # ``C`` is the chunk's [rows_c, V] rows of the logits workspace: the TMA-store epilogue's tensor map takes its
         # row extent from it (rows >= rows_c are clipped, never written); a pointer store sees the same base address
         values.update(
@@ -1520,18 +2886,23 @@ def stage_values(
             C=logits[:rows_c],
             STATS_OUT=t["stats"],
             WS=t["f32_dummy"],
-            M=int(rows_c),
-            m_tiles=g.row_tiles(rows_c, g.logits_cluster_ctas),
-            k_iters=1,
-            first_chunk=0,
+            **gemm_scalars(
+                stage,
+                g,
+                hidden=p.hidden,
+                vocab=p.vocab,
+                rows_c=rows_c,
+                group_m=plan.variants_of(index).logits_group_m,
+            ),
         )
-    elif stage == "gemm_dx" or stage in DX_SLICE_STAGES:
+    elif base == "gemm_dx":
         # every token chunk writes its own rows of dX_acc: the first K chunk of the GEMM always stores (first_chunk=1);
         # the K-sliced forms write slices >= 1 into the ``dx_ws`` slabs (added by ``dx_reduce`` afterwards)
         k = plan.dx_slices_of(index)
-        if stage != dx_stage(k):
+        want = plan.dx_stage_of(index)
+        if stage != want:
             raise ValueError(
-                f"chunk {index} plans {k} dX slice(s); stage {stage!r} was requested"
+                f"chunk {index} plans {k} dX slice(s) as {want!r}; stage {stage!r} was requested"
             )
         ws = t["dx_ws"] if k > 1 else t["f32_dummy"]
         values.update(
@@ -1540,11 +2911,30 @@ def stage_values(
             C=t["dx_acc"][row0:stop],
             STATS_OUT=t["stats"],
             WS=ws,
-            M=int(rows_c),
-            m_tiles=g.row_tiles(rows_c, g.dx_cluster_ctas),
-            k_iters=1,
-            first_chunk=1,
-            ws_slab=int(ws.stride(0)) if k > 1 else 0,
+            **gemm_scalars(
+                stage,
+                g,
+                hidden=p.hidden,
+                vocab=p.vocab,
+                rows_c=rows_c,
+                k_slices=k,
+                ws_slab=int(ws.stride(0)) if k > 1 else 0,
+            ),
+        )
+    elif stage == "slab_sum":
+        # the fused dX finalize's slab reduction of the K-sliced dX GEMM: one kernel over the chunk's rows of dX_acc
+        k = plan.dx_slices_of(index)
+        if not plan.dx_finalize or k <= 1:
+            raise ValueError(
+                f"slab_sum belongs to a K-sliced dX GEMM of a plan with dx_finalize (chunk {index}: {k} slice(s))"
+            )
+        ws = t["dx_ws"]
+        values.update(
+            dx=t["dx_acc"][row0:stop],
+            ws=ws,
+            ws_slab=int(ws.stride(0)),
+            num_vecs=int(rows_c * p.hidden // g.cast_vec),
+            n_slabs=int(k - 1),
         )
     elif (
         stage == "dx_reduce"
@@ -1552,17 +2942,59 @@ def stage_values(
         values.update(
             acc=t["dx_acc"][row0:stop], ws=t["dx_ws"], k_slices=plan.dx_slices_of(index)
         )
-    elif stage == "gemm_dw_acc":
+    elif base == "gemm_dw_acc":
+        want = plan.dw_acc_stage(index)
+        if stage != want:
+            raise ValueError(
+                f"chunk {index} plans the weight-gradient accumulate {want!r}; stage {stage!r} was requested"
+            )
+        v = plan.variants_of(index)
         values.update(
             A=dz_chunk,
             B=x_chunk,
             C=t["dw_acc"],
             STATS_OUT=t["stats"],
             WS=t["f32_dummy"],
-            M=int(p.vocab),
-            m_tiles=g.row_tiles(p.vocab, g.dw_cluster_ctas),
-            k_iters=g.k_iters(rows_c),
-            first_chunk=first,
+            **gemm_scalars(
+                stage,
+                g,
+                hidden=p.hidden,
+                vocab=p.vocab,
+                rows_c=rows_c,
+                group_m=v.dw_group_m,
+                group_n=v.dw_group_n,
+                first_chunk=first,
+            ),
+        )
+    elif base in DW_CAST_STAGES:
+        # the deferred last chunk (backward): the same GEMM as ``gemm_dw_acc`` with the upstream scale and the output cast
+        # fused into its epilogue -- ``C`` is the final ``dW``, ``WS`` the read-only FP32 sum of the chunks before it (a
+        # dummy for a one-chunk plan, whose ``first_chunk`` form stores ``cast(g * tile)``), ``STATS_OUT`` the scale cell
+        if not plan.dw_deferred or not last:
+            raise ValueError(
+                f"stage {stage!r} belongs to the last chunk of a plan with fuse_dw_cast (chunk {index} of {plan.num_chunks})"
+            )
+        if stage != plan.dw_cast_stage:
+            raise ValueError(
+                f"plan casts its weight gradient through {plan.dw_cast_stage!r}; stage {stage!r} was requested"
+            )
+        v = plan.variants_of(index)
+        values.update(
+            A=dz_chunk,
+            B=x_chunk,
+            C=t["dw_out"],
+            STATS_OUT=t["grad_scale"] if p.entry == "loss" else t["unit_scale"],
+            WS=t["dw_acc"] if plan.num_chunks > 1 else t["f32_dummy"],
+            **gemm_scalars(
+                stage,
+                g,
+                hidden=p.hidden,
+                vocab=p.vocab,
+                rows_c=rows_c,
+                group_m=v.dw_group_m,
+                group_n=v.dw_group_n if base == "gemm_dw_cast_f32" else None,
+                first_chunk=int(plan.num_chunks == 1),
+            ),
         )
     elif stage == "row_finalize":
         d = t["d"]
@@ -1612,24 +3044,34 @@ def forward_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
     ):
         keys += [("gather_rows", "infer_logp"), ("gather_rows", "loss_weights")]
     for index in range(plan.num_chunks):
-        if plan.compact:
+        # the hidden valid-row count: chunk 0's rows were gathered and its logits GEMM queued before the count was known
+        queued = plan.hidden_count and index == 0
+        if plan.compact and not queued:
             keys.append(("gather_rows", index))
-        keys += [("gemm_logits", index), ("row_finalize", index)]
+        if not queued:
+            keys.append((plan.logits_stage(index), index))
+        keys.append(("row_finalize", index))
         if plan.problem.entry == "loss":
             keys.append(("loss_reduce", index))
             if plan.need_dx or plan.need_dw:
                 keys.append(("row_grad", index))
             if plan.need_dx:
                 keys += _dx_keys(plan, index)
-            if plan.need_dw:
-                keys.append(("gemm_dw_acc", index))
+            if plan.need_dw and not (plan.dw_deferred and index == plan.num_chunks - 1):
+                keys.append(
+                    (plan.dw_acc_stage(index), index)
+                )  # a deferred last chunk runs in the backward (cast_keys)
     return tuple(keys)
 
 
 def _dx_keys(plan: Plan, index: int) -> list:
-    """The dX GEMM of chunk ``index`` (its K-sliced form plus the host slab reduction when the plan slices it)."""
+    """The dX GEMM of chunk ``index`` plus, when the plan slices it, the slab reduction: the ``slab_sum`` kernel of the
+    fused dX finalize or the host's ``add_`` chain (``dx_reduce``)."""
     k = plan.dx_slices_of(index)
-    return [(dx_stage(k), index)] + ([("dx_reduce", index)] if k > 1 else [])
+    if k <= 1:
+        return [(plan.dx_stage_of(index), index)]
+    reduce = "slab_sum" if plan.dx_finalize else "dx_reduce"
+    return [(plan.dx_stage_of(index), index), (reduce, index)]
 
 
 def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
@@ -1638,22 +3080,41 @@ def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
     if plan.compact:
         keys.append(("gather_rows", "d_in"))
     for index in range(plan.num_chunks):
-        if plan.compact:
+        queued = (
+            plan.hidden_count and index == 0
+        )  # the hidden valid-row count: chunk 0's recompute is already queued
+        if plan.compact and not queued:
             keys.append(("gather_rows", index))
-        keys += [("gemm_logits_nostats", index), ("row_grad", index)]
+        if not queued:
+            keys.append((plan.logits_stage(index, stats=False), index))
+        keys.append(("row_grad", index))
         if plan.need_dx:
             keys += _dx_keys(plan, index)
         if plan.need_dw:
-            keys.append(("gemm_dw_acc", index))
+            if plan.dw_deferred and index == plan.num_chunks - 1:
+                keys.append(
+                    (plan.dw_cast_stage, index)
+                )  # the scale is 1 here: the GEMM writes the final BF16 dW
+            else:
+                keys.append((plan.dw_acc_stage(index), index))
     return tuple(keys)
 
 
 def cast_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
+    """Launch keys of the output casts: the flat ``dX`` cast and, for ``dW``, the flat cast of the accumulator or -- when
+    the plan defers its last chunk -- that chunk's fused GEMM (its ``X`` rows gathered again first when the rows are
+    compacted; the log-probability backward runs it inside :func:`recompute_keys` instead)."""
     keys: list[tuple[str, Any]] = []
-    if plan.need_dx:
+    if plan.need_dx and plan.dx_cast:
         keys.append(("scale_cast_bf16", "dx"))
     if plan.need_dw:
-        keys.append((plan.dw_cast_stage, "dw"))
+        if not plan.dw_deferred:
+            keys.append((plan.dw_cast_stage, "dw"))
+        elif plan.problem.entry == "loss":
+            last = plan.num_chunks - 1
+            if plan.compact:
+                keys.append(("gather_rows", last))
+            keys.append((plan.dw_cast_stage, last))
     return tuple(keys)
 
 
@@ -1682,7 +3143,7 @@ class ReferenceEngine:
     """
 
     def run(self, stage: str, values: dict[str, Any]) -> None:
-        getattr(self, stage)(values)
+        getattr(self, stage if hasattr(self, stage) else base_stage(stage))(values)
 
     @staticmethod
     def _rows(values: dict[str, Any]) -> tuple[int, int]:
@@ -1791,13 +3252,27 @@ class ReferenceEngine:
     def gemm_dx(values: dict[str, Any]) -> None:
         values["C"].copy_(_mm_fp32(values["A"], values["B"]))
 
-    gemm_dx_s2 = gemm_dx_s3 = gemm_dx_s4 = (
-        gemm_dx  # the reference path never slices K (one product per chunk)
-    )
+    gemm_dx_s = gemm_dx  # the reference path never slices K (one product per chunk)
 
     @staticmethod
     def dx_reduce(values: dict[str, Any]) -> None:
         _dx_reduce(values)
+
+    @staticmethod
+    def slab_sum(values: dict[str, Any]) -> None:
+        # the fused dX finalize's slab reduction: the same fixed-order FP32 adds as ``dx_reduce``
+        dx, ws = values["dx"], values["ws"]
+        for slab in range(int(values["n_slabs"])):
+            dx.add_(ws[slab, : dx.shape[0]])
+
+    @staticmethod
+    def scale_cast_scatter_bf16(values: dict[str, Any]) -> None:
+        # ``out[idx] = bf16(g * acc)``, exact zeros elsewhere (``idx_lo`` is the int32 view of the int64 index)
+        idx = values["idx_lo"].view(torch.int64)
+        out = values["out"]
+        out.zero_()
+        if idx.numel():
+            out.index_copy_(0, idx, (values["acc"] * values["g"]).to(out.dtype))
 
     @staticmethod
     def gemm_dw_acc(values: dict[str, Any]) -> None:
@@ -1806,6 +3281,18 @@ class ReferenceEngine:
             values["C"].copy_(product)
         else:
             values["C"].add_(product)
+
+    @staticmethod
+    def gemm_dw_cast_bf16(values: dict[str, Any]) -> None:
+        product = _mm_fp32(values["A"].t(), values["B"])
+        acc = (
+            product if int(values["first_chunk"]) else values["WS"] + product
+        )  # the FP32 accumulate of gemm_dw_acc (one RN add per element), WS never written
+        values["C"].copy_(
+            acc * values["STATS_OUT"]
+        )  # scale_cast's FP32 multiply, one rounding at the copy
+
+    gemm_dw_cast_f32 = gemm_dw_cast_bf16
 
     @staticmethod
     def scale_cast_bf16(values: dict[str, Any]) -> None:
@@ -1827,7 +3314,10 @@ class LmHeadLossRunner:
     returns ``(loss [1], logp [T])`` while filling ``dx_acc`` (FP32 ``[T, H]``)
     and ``dw_acc`` (FP32 ``[V, H]``); ``backward(grad)`` casts ``dX = bf16(g *
     dX_acc)`` into ``dx_out`` and ``dW = cast(g * dW_acc)`` into ``dw_out``
-    (``g`` from the ``[1]`` FP32 ``grad_scale`` cell; ``None`` = 1).
+    (``g`` from the ``[1]`` FP32 ``grad_scale`` cell; ``None`` = 1); with
+    ``fuse_dw_cast`` the last chunk's weight-gradient GEMM runs there instead
+    and writes ``dw_out = cast(g * (dw_acc + dz_c^T @ X_c))`` from its
+    epilogue (that chunk's ``dz`` stays in the workspace between the calls).
     Log-probability entry: ``forward()`` returns ``(logp, lse)``;
     ``backward()`` reads ``dlogp`` (the bound FP32 ``[T]`` tensor
     ``tensors["d_in"]``, masked to valid rows by the row kernel), recomputes
@@ -1927,13 +3417,15 @@ class LmHeadLossRunner:
     def _run(self, keys: tuple) -> None:
         if self.backend == "cake":
             self.prepare_tma()
-            with _ffi_stream_context(self.device_index):
-                for key in keys:
-                    host = HOST_STAGES.get(key[0])
-                    if host is not None:
-                        host(self.values[key])
-                    else:
-                        self.launches[key]()
+
+            def run_key(key) -> None:
+                host = HOST_STAGES.get(key[0])
+                if host is not None:
+                    host(self.values[key])
+                else:
+                    self.launches[key]()
+
+            _run_keys(self.plan, self.device_index, keys, run_key)
         else:
             for key in keys:
                 host = HOST_STAGES.get(key[0])
@@ -1972,7 +3464,10 @@ class LmHeadLossRunner:
         else:
             t["grad_scale"].copy_(grad.reshape(1).to(torch.float32))
         self._run(self.backward_order)
-        return t.get("dx_out"), t.get("dw_out")
+        dx = (
+            t.get("dx_out") if self.plan.dx_cast else t.get("dx_acc")
+        )  # dx_cast=False: the caller finalizes the accumulator
+        return dx, t.get("dw_out")
 
     def step(self, grad: Optional[torch.Tensor] = None):
         self.forward()
@@ -2074,6 +3569,10 @@ def prepare_lm_head_loss(
     lse: Optional[torch.Tensor] = None,
     backend: str = "cake",
     compact_rows=False,
+    fuse_dw_cast: Optional[bool] = None,
+    gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    dx_finalize: Optional[bool] = None,
+    dx_cast: bool = True,
 ) -> LmHeadLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -2092,16 +3591,41 @@ def prepare_lm_head_loss(
     bound or allocated as compact ``[T_v]`` / ``[T_v, H]`` tensors, the row
     operands are gathered per step and every row ignored is rejected (the
     eager entry points return zeros for it).
+
+    ``fuse_dw_cast`` (default :func:`fuse_dw_cast_default`): the last chunk's
+    weight-gradient GEMM runs in ``backward()`` with the scale + cast fused
+    (``dw_acc`` is then the FP32 sum of the chunks before it and absent for a
+    one-chunk plan); the chunk buffer must not be overwritten between
+    ``forward()`` and ``backward()``.
+
+    The registered program of the ``(H, V)`` geometry is selected
+    (:func:`record_for`) and each chunk's GEMM instance variants follow the
+    per-chunk rules of its architecture (:func:`chunk_variants`);
+    ``gemm_tuning`` (default :func:`gemm_tuning_default`) pins knobs
+    explicitly, e.g. ``{"logits": {"group_m": 16}}``.
+
+    ``dx_finalize`` (default :func:`dx_finalize_default`): a K-sliced dX GEMM's
+    slabs are added into ``dx_acc`` by the ``slab_sum`` kernel instead of the
+    host's ``add_`` chain (bitwise the same accumulator).  ``dx_cast=False``
+    leaves the flat ``dX`` cast out of ``backward()``, which then returns
+    ``dx_acc`` for the caller to finalize (:func:`finalize_dx`: the fused dX
+    finalize of a compacted :func:`backward_logprob`); ``dx_out`` is then
+    neither bound nor allocated.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     device = X.device
     record = None
     module_name = None
+    tuning = _resolve_gemm_tuning(gemm_tuning)
     if backend == "cake":
         if not X.is_cuda:
             raise ValueError("the cake backend needs CUDA tensors")
-        module_name, record = record_for(device)
+        module_name, record = record_for(
+            device,
+            int(X.shape[-1]) if X.ndim == 2 else None,
+            int(W.shape[0]) if W.ndim == 2 else None,
+        )
         record_abi(record)
     geometry = Geometry.from_record(record)
     problem = validate_lm_head_inputs(
@@ -2179,6 +3703,11 @@ def prepare_lm_head_loss(
         num_sms=num_sms,
         valid_rows=None if row_index is None else int(row_index.numel()),
         dx_resident=dx_resident,
+        fuse_dw_cast=_resolve_fuse(fuse_dw_cast) if need_dw else False,
+        arch=record["arch"] if record is not None else None,
+        gemm_tuning=tuning,
+        dx_finalize=bool(need_dx and _resolve_dx_finalize(dx_finalize)),
+        dx_cast=bool(dx_cast),
     )
     missing = [s for s in plan.stages if s not in stages]
     if missing:
@@ -2276,14 +3805,18 @@ def prepare_lm_head_loss(
             t["d_in"] = d_in
     if plan.need_dx:
         t["dx_acc"] = output(dx_acc, "dx_acc", (rows_loop, H), torch.float32)
-        t["dx_out"] = output(dx_out, "dx_out", (rows_loop, H), torch.bfloat16)
+        if plan.dx_cast:
+            t["dx_out"] = output(dx_out, "dx_out", (rows_loop, H), torch.bfloat16)
     if plan.need_dw:
-        t["dw_acc"] = output(dw_acc, "dw_acc", (V, H), torch.float32)
+        if plan.dw_acc_needed:
+            t["dw_acc"] = output(dw_acc, "dw_acc", (V, H), torch.float32)
         t["dw_out"] = output(
             dw_out,
             "dw_out",
             (V, H),
-            torch.float32 if plan.dw_cast_stage == "scale_cast_f32" else torch.bfloat16,
+            torch.float32
+            if plan.dw_cast_stage in ("scale_cast_f32", "gemm_dw_cast_f32")
+            else torch.bfloat16,
         )
     if layout.get("workspace"):
         t["workspace"] = _carve(
@@ -2323,6 +3856,8 @@ def prepare_lm_head_loss(
         scratch_bytes=scratch_bytes,
         dx_ws_slabs=plan.dx_ws_slabs,
         valid_rows=plan.valid_rows,
+        fuse_dw_cast=plan.fuse_dw_cast,
+        dx_finalize=plan.dx_finalize,
     )
     if device.type == "cuda":
         device_index = int(
@@ -2396,10 +3931,19 @@ def forward_binding_key(
     grad_weight_dtype,
     entry,
     valid_rows=None,
+    fuse_dw_cast=False,
+    gemm_tuning=None,
+    dx_finalize=False,
+    hidden_count=False,
 ) -> tuple:
     """Cache key of a forward binding: ``(data_ptr, shape, stride, dtype)`` of every
     input plus every option that shapes the argument plans; ``valid_rows`` is the
-    compacted row count (a label-dependent fact of the plan; ``None`` = uncompacted)."""
+    compacted row count (a label-dependent fact of the plan; ``None`` = uncompacted);
+    ``fuse_dw_cast`` the resolved weight-gradient form; ``gemm_tuning`` the explicit
+    GEMM knobs (``None`` = the environment's, :func:`gemm_tuning_default`);
+    ``dx_finalize`` the resolved dX finalize form (the slab reduction's launches differ);
+    ``hidden_count`` whether chunk 0's gather and logits GEMM ran before the plan
+    (the remembered sequence starts at chunk 0's row kernels)."""
     return (
         "fwd",
         entry,
@@ -2415,11 +3959,28 @@ def forward_binding_key(
         bool(need_dw),
         grad_weight_dtype,
         None if valid_rows is None else int(valid_rows),
+        bool(fuse_dw_cast),
+        _tuning_key(_resolve_gemm_tuning(gemm_tuning)),
+        bool(dx_finalize),
+        bool(hidden_count),
     )
 
 
 def logprob_backward_binding_key(
-    X, W, labels, lse, dlogp, *, chunk_size, need_dx, need_dw, valid_rows=None
+    X,
+    W,
+    labels,
+    lse,
+    dlogp,
+    *,
+    chunk_size,
+    need_dx,
+    need_dw,
+    valid_rows=None,
+    fuse_dw_cast=False,
+    gemm_tuning=None,
+    dx_finalize=False,
+    hidden_count=False,
 ) -> tuple:
     return (
         "bwd",
@@ -2433,6 +3994,10 @@ def logprob_backward_binding_key(
         bool(need_dx),
         bool(need_dw),
         None if valid_rows is None else int(valid_rows),
+        bool(fuse_dw_cast),
+        _tuning_key(_resolve_gemm_tuning(gemm_tuning)),
+        bool(dx_finalize),
+        bool(hidden_count),
     )
 
 
@@ -2458,24 +4023,55 @@ class _Binding:
     memory: dict = field(default_factory=dict, repr=False)
 
     @classmethod
-    def from_runner(cls, runner: LmHeadLossRunner) -> "_Binding":
+    def from_runner(
+        cls, runner: LmHeadLossRunner, hidden: Optional[_HiddenCount] = None
+    ) -> "_Binding":
+        """``hidden`` (the eager entry points' hidden valid-row count): the runner was prepared on the counted rows
+        after chunk 0's gather and logits GEMM ran in device-count form; the remembered plan records that and its
+        launch sequences start at chunk 0's row kernels (the runner's chunk-0 gather / GEMM launches are dropped)."""
         if runner.backend != "cake":
             raise ValueError("only cake-backend runners are remembered")
         t = runner.tensors
         owned = {name: torch.empty_like(t[name]) for name in _OWNED_VALUES if name in t}
+        plan, memory = runner.plan, runner.memory
+        forward_order, backward_order = runner.forward_order, runner.backward_order
+        if hidden is not None:
+            p = plan.problem
+            plan = replace(
+                plan,
+                hidden_count=True,
+                hidden_logits_group_m=hidden.group_m,
+                hidden_stats=hidden.stats,
+            )
+            forward_order = forward_keys(plan)
+            backward_order = (
+                recompute_keys(plan) if p.entry == "logprob" else ()
+            ) + cast_keys(plan)
+            memory = _hidden_count_memory(
+                memory,
+                num_rows=p.num_rows,
+                hidden=p.hidden,
+                vocab=p.vocab,
+                chunk=p.chunk,
+                stats_tile=plan.geometry.stats_tile,
+            )
+        # the hidden-count path drops the runner's chunk-0 gather / GEMM launches (not in either sequence)
+        keep = None if hidden is None else set(forward_order) | set(backward_order)
         return cls(
-            plan=runner.plan,
+            plan=plan,
             device=t["X"].device,
             device_index=runner.device_index,
             launches={
-                key: launch.templated() for key, launch in runner.launches.items()
+                key: launch.templated()
+                for key, launch in runner.launches.items()
+                if keep is None or key in keep
             },
-            forward_order=runner.forward_order,
-            backward_order=runner.backward_order,
+            forward_order=forward_order,
+            backward_order=backward_order,
             owned=owned,
             owned_bytes=sum(v.numel() * v.element_size() for v in owned.values()),
             layout=runner.layout,
-            memory=runner.memory,
+            memory=memory,
         )
 
     def holds_no_tensor(self) -> bool:
@@ -2485,16 +4081,25 @@ class _Binding:
             for a in launch.arguments
         )
 
-    def _scratch(self, t: dict[str, Any]) -> None:
-        """Per-call temporaries from the caching allocator into ``t`` (the runner's regions, minus the owned ones)."""
+    def _scratch(
+        self, t: dict[str, Any], hidden: Optional[_HiddenCount] = None
+    ) -> None:
+        """Per-call temporaries from the caching allocator into ``t`` (the runner's regions, minus the owned ones);
+        with ``hidden`` the chunk buffers are the prologue's (chunk 0's logits / statistics / gathered rows already in
+        them, ``min(chunk, T)`` rows) -- the entry points check that a hidden-count plan gets its prologue."""
         p = self.plan.problem
         rows = self.layout["logits"][1] // (p.vocab * 2)
-        t["logits"] = torch.empty(
-            (rows, p.vocab), dtype=torch.bfloat16, device=self.device
-        )
-        t["stats"] = torch.empty(
-            (rows, self.plan.num_tiles, 2), dtype=torch.float32, device=self.device
-        )
+        if hidden is not None:
+            t["logits"], t["stats"] = hidden.logits, hidden.stats_buf
+        else:
+            t["logits"] = torch.empty(
+                (rows, p.vocab), dtype=torch.bfloat16, device=self.device
+            )
+            t["stats"] = torch.empty(
+                (rows, self.plan.num_tiles, 2),
+                dtype=torch.float32,
+                device=self.device,
+            )
         t["d"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
         t["term"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
         t["loss_acc"] = torch.empty((1,), dtype=torch.float64, device=self.device)
@@ -2509,11 +4114,22 @@ class _Binding:
                 device=self.device,
             )
         if self.plan.compact:
-            t["x_c"] = torch.empty(
-                (rows, p.hidden), dtype=torch.bfloat16, device=self.device
+            t["x_c"] = (
+                hidden.x_c
+                if hidden is not None
+                else torch.empty(
+                    (rows, p.hidden), dtype=torch.bfloat16, device=self.device
+                )
             )
         for name, tensor in self.owned.items():
             t[name] = tensor
+
+    def _check_hidden(self, hidden: Optional[_HiddenCount]) -> None:
+        """A plan of the hidden valid-row count serves calls that ran the prologue, the shipped plan the others."""
+        if (hidden is not None) != self.plan.hidden_count:
+            raise ValueError(
+                "the remembered binding was planned for the other valid-row count path"
+            )
 
     def _compact(self, t: dict[str, Any], row_index: Optional[torch.Tensor]) -> None:
         """Check the call's valid-row index against the remembered plan and bind it."""
@@ -2528,36 +4144,38 @@ class _Binding:
             t["row_index"] = row_index
 
     def _launch(self, keys: tuple, t: dict[str, Any]) -> None:
-        with _ffi_stream_context(self.device_index):
-            for key in keys:
-                host = HOST_STAGES.get(key[0])
-                if host is not None:
-                    host(stage_values(key[0], t, self.plan, key[1]))
-                    continue
-                launch = self.launches[key]
-                arguments = launch.arguments_for(
-                    stage_values(key[0], t, self.plan, key[1])
-                )
-                if (
-                    launch.prepare is not None
-                ):  # descriptors of a pointer-ABI stage see the fresh tensors
-                    launch.prepare(*arguments)
-                launch.entry(*arguments)
+        def run_key(key) -> None:
+            host = HOST_STAGES.get(key[0])
+            if host is not None:
+                host(stage_values(key[0], t, self.plan, key[1]))
+                return
+            launch = self.launches[key]
+            arguments = launch.arguments_for(stage_values(key[0], t, self.plan, key[1]))
+            if (
+                launch.prepare is not None
+            ):  # descriptors of a pointer-ABI stage see the fresh tensors
+                launch.prepare(*arguments)
+            launch.entry(*arguments)
 
-    def forward(self, X, W, labels, infer_logp, loss_weights, row_index=None):
+        _run_keys(self.plan, self.device_index, keys, run_key)
+
+    def forward(
+        self, X, W, labels, infer_logp, loss_weights, row_index=None, hidden=None
+    ):
         p, plan = self.plan.problem, self.plan
         T, H, V = (
             plan.rows,
             p.hidden,
             p.vocab,
         )  # rows of the chunk loop (the valid rows when compacted)
+        self._check_hidden(hidden)
         t: dict[str, Any] = dict(
             X=_prepare_x(X, p, plan.compact),
             W=W,
             labels=_prepare_labels(labels, plan.geometry, row_index),
         )
         self._compact(t, row_index)
-        self._scratch(t)
+        self._scratch(t, hidden)
         t["lse"] = torch.empty((T,), dtype=torch.float32, device=self.device)
         t["logp"] = torch.empty((T,), dtype=torch.float32, device=self.device)
         if p.entry == "loss":
@@ -2579,18 +4197,25 @@ class _Binding:
                 t["dx_acc"] = torch.empty(
                     (T, H), dtype=torch.float32, device=self.device
                 )
-            if plan.need_dw:
+            if plan.dw_acc_needed:
                 t["dw_acc"] = torch.empty(
                     (V, H), dtype=torch.float32, device=self.device
                 )
         self._launch(self.forward_order, t)
         if p.entry == "loss":
-            return t["loss"], t["logp"], t.get("dx_acc"), t.get("dw_acc")
+            return (
+                t["loss"],
+                t["logp"],
+                t.get("dx_acc"),
+                t.get("dw_acc"),
+                _deferred_operands(plan, t),
+            )
         return t["logp"], t["lse"]
 
-    def backward_logprob(self, X, W, labels, lse, dlogp, row_index=None):
+    def backward_logprob(self, X, W, labels, lse, dlogp, row_index=None, hidden=None):
         p, plan = self.plan.problem, self.plan
         T, H, V = plan.rows, p.hidden, p.vocab
+        self._check_hidden(hidden)
         t: dict[str, Any] = dict(
             X=_prepare_x(X, p, plan.compact),
             W=W,
@@ -2603,15 +4228,42 @@ class _Binding:
             t["d_in"] = torch.empty((T,), dtype=torch.float32, device=self.device)
         else:
             t["d_in"] = dlogp
-        self._scratch(t)
+        self._scratch(t, hidden)
         if plan.need_dx:
             t["dx_acc"] = torch.empty((T, H), dtype=torch.float32, device=self.device)
-            t["dx_out"] = torch.empty((T, H), dtype=torch.bfloat16, device=self.device)
+            if plan.dx_cast:
+                t["dx_out"] = torch.empty(
+                    (T, H), dtype=torch.bfloat16, device=self.device
+                )
         if plan.need_dw:
-            t["dw_acc"] = torch.empty((V, H), dtype=torch.float32, device=self.device)
+            if plan.dw_acc_needed:
+                t["dw_acc"] = torch.empty(
+                    (V, H), dtype=torch.float32, device=self.device
+                )
             t["dw_out"] = torch.empty((V, H), dtype=torch.bfloat16, device=self.device)
         self._launch(self.backward_order, t)
-        return t.get("dx_out"), t.get("dw_out")
+        dx = (
+            t.get("dx_out") if plan.dx_cast else t.get("dx_acc")
+        )  # dx_cast=False: the caller finalizes the accumulator
+        return dx, t.get("dw_out")
+
+
+def _deferred_operands(plan: Plan, t: dict[str, Any]) -> tuple:
+    """``(dz_last, x_last, x_src, x_idx)`` of a deferred plan after its forward: the last chunk's BF16 ``dz`` rows of the
+    chunk buffer and its ``X`` rows -- a view of the launched ``X`` (uncompacted) or the ``X`` plus the chunk's int64
+    row index, gathered again in the backward (compacted) -- so no ``[rows, H]`` copy outlives the forward.  The ``dz``
+    rows are a view too: the whole ``[min(T, C), V]`` chunk buffer stays alive until the backward (what
+    :func:`memory_report` reports as ``saved_dz_bytes``) rather than paying a tail copy per step; the eager entry points
+    launch through the templated binding from the first call on, so that buffer is a per-call allocation of its own and
+    the view pins nothing else (a prepared runner keeps the chunk's ``dz`` inside its workspace).  All ``None`` for an
+    undeferred plan."""
+    if not plan.dw_deferred:
+        return None, None, None, None
+    row0, rows_c = plan.last_chunk
+    dz_last = t["logits"][:rows_c]
+    if plan.compact:
+        return dz_last, None, t["X"], t["row_index"][row0 : row0 + rows_c]
+    return dz_last, t["X"][row0 : row0 + rows_c], None, None
 
 
 class BindingCache:
@@ -2684,7 +4336,39 @@ class ForwardResult:
     row_index: Optional[torch.Tensor] = (
         None  # int64 [T_v] valid-row index when the chunk loop was compacted (None otherwise)
     )
+    # the bool [T] valid-row mask when the compacted forward ran with the fused dX finalize (None otherwise): the
+    # backward follows the forward's choice through it and forms the inclusive scan the scatter kernel reads
+    row_valid: Optional[torch.Tensor] = None
     num_rows: int = 0  # T, the caller's row count
+    # Deferred weight gradient (``fuse_dw_cast``, loss entry): the last chunk's BF16 ``dz`` rows (a view of the chunk
+    # buffer) and its ``X`` rows -- ``x_last`` (a view of ``X``) on the uncompacted path, ``x_src`` / ``x_idx`` (``X`` and
+    # the chunk's int64 row index, gathered in the backward) when compacted.  ``backward_loss`` finishes ``dW`` from them;
+    # ``dw_acc`` then holds the chunks before the last one and is ``None`` for a one-chunk call.
+    dz_last: Optional[torch.Tensor] = None
+    x_last: Optional[torch.Tensor] = None
+    x_src: Optional[torch.Tensor] = None
+    x_idx: Optional[torch.Tensor] = None
+
+    def backward(self, grad=None, *, grad_weight_dtype=torch.bfloat16, backend=None):
+        """``(dX, dW)`` of this forward through :func:`backward_loss` (``grad`` = the upstream scalar, ``None`` = 1)."""
+        if self.loss is None:
+            raise ValueError(
+                "ForwardResult.backward belongs to the loss entry (use backward_logprob)"
+            )
+        return backward_loss(
+            self.dx_acc,
+            self.dw_acc,
+            grad,
+            grad_weight_dtype=grad_weight_dtype,
+            backend=self.backend if backend is None else backend,
+            row_index=self.row_index,
+            num_rows=self.num_rows,
+            dz_last=self.dz_last,
+            x_last=self.x_last,
+            x_src=self.x_src,
+            x_idx=self.x_idx,
+            row_valid=self.row_valid,
+        )
 
 
 def _empty_forward(
@@ -2694,6 +4378,7 @@ def _empty_forward(
     need_dx: bool,
     need_dw: bool,
     row_index: Optional[torch.Tensor] = None,
+    row_valid: Optional[torch.Tensor] = None,
 ) -> ForwardResult:
     """Zeros without binding or launching: ``T == 0``, or every row ignored (``row_index`` empty)."""
     device = X.device
@@ -2725,6 +4410,7 @@ def _empty_forward(
             else None,
             memory=memory,
             row_index=row_index,
+            row_valid=row_valid,
             num_rows=T,
         )
     return ForwardResult(
@@ -2739,6 +4425,28 @@ def _empty_forward(
 
 def _resolve_compact(compact_rows) -> bool:
     return compact_rows_default() if compact_rows is None else bool(compact_rows)
+
+
+def _hidden_count(
+    problem: Problem,
+    X: torch.Tensor,
+    W: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    backend: str,
+    compact: bool,
+    stats: bool,
+) -> Optional[_HiddenCount]:
+    """The hidden valid-row count prologue of a compacted ``cake`` call when the switch is on and the call is eligible
+    (:func:`hidden_count_eligible`); ``None`` = the shipped :func:`valid_rows` path."""
+    if not (compact and backend == "cake" and hidden_count_default()):
+        return None
+    module_name, record = record_for(X.device, problem.hidden, problem.vocab)
+    if not hidden_count_eligible(problem, X, record, module_name, stats=stats):
+        return None
+    return _hidden_count_begin(
+        problem, X, W, labels, record=record, module_name=module_name, stats=stats
+    )
 
 
 def forward_loss(
@@ -2757,19 +4465,28 @@ def forward_loss(
     deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
+    fuse_dw_cast: Optional[bool] = None,
 ) -> ForwardResult:
     """Forward of the loss entry: ``loss`` (FP32 scalar), ``logp`` (FP32 ``[T]``) and the
     FP32 gradient accumulators ``dx_acc`` / ``dw_acc`` of the trainable inputs.
 
     The first call for an input binding validates and binds through
-    :func:`prepare_lm_head_loss`; later calls with the same binding take the
-    remembered launches (:data:`BINDING_CACHE`).  A call without rows returns
+    :func:`prepare_lm_head_loss` and launches through the templated binding it
+    remembers (:data:`BINDING_CACHE`); later calls with the same binding take
+    the remembered launches directly.  A call without rows returns
     loss 0, an empty ``logp`` and zero accumulators without binding or launching.
     ``compact_rows`` (default :func:`compact_rows_default`) chunks over the valid
     rows only: ``logp`` comes back scattered to ``[T]``, ``dx_acc`` is the compact
     ``[T_v, H]`` (``row_index`` / ``num_rows`` of the result restore ``[T, H]``
     through :func:`backward_loss`); every row ignored returns zeros without
-    binding or launching.
+    binding or launching.  ``fuse_dw_cast`` (default :func:`fuse_dw_cast_default`):
+    the last chunk's weight-gradient GEMM is deferred to :func:`backward_loss`
+    (``dw_acc`` holds the chunks before it, ``None`` for a one-chunk call; the
+    result carries that chunk's operands ``dz_last`` / ``x_last`` / ``x_src`` /
+    ``x_idx``).  The fused dX finalize (:func:`dx_finalize_default`, read once
+    here) adds a sliced dX GEMM's slabs with the ``slab_sum`` kernel and, on a
+    compacted call, keeps the valid-row mask (``row_valid``) for
+    :func:`backward_loss`'s one-pass scatter of ``dX``.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
@@ -2789,12 +4506,32 @@ def forward_loss(
     T = problem.num_rows
     if T == 0:
         return _empty_forward(problem, X, need_dx=need_dx, need_dw=need_dw)
-    row_index = valid_row_index(labels) if _resolve_compact(compact_rows) else None
+    fused_dx = bool(
+        need_dx and dx_finalize_default()
+    )  # read once per call; the backward follows it through row_valid
+    compact = _resolve_compact(compact_rows)
+    hc = _hidden_count(
+        problem, X, W, labels, backend=backend, compact=compact, stats=True
+    )
+    if hc is not None:
+        # the hidden valid-row count: chunk 0's gather and logits GEMM are queued; the count arrives through the pinned cell
+        row_index = hc.row_index()
+        row_valid = hc.valid if (row_index is not None and fused_dx) else None
+    else:
+        row_index, row_valid = (
+            valid_rows(labels, mask=fused_dx) if compact else (None, None)
+        )
     if row_index is not None and row_index.numel() == 0:  # every row ignored
         return _empty_forward(
-            problem, X, need_dx=need_dx, need_dw=need_dw, row_index=row_index
+            problem,
+            X,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            row_index=row_index,
+            row_valid=row_valid,
         )
-    valid_rows = None if row_index is None else int(row_index.numel())
+    valid_count = None if row_index is None else int(row_index.numel())
+    fuse = bool(need_dw and _resolve_fuse(fuse_dw_cast))
     common = dict(
         objective=objective,
         loss_div=problem.loss_div,
@@ -2809,13 +4546,22 @@ def forward_loss(
     key = None
     if backend == "cake" and cache.enabled:
         key = forward_binding_key(
-            X, W, labels, entry="loss", valid_rows=valid_rows, **common
+            X,
+            W,
+            labels,
+            entry="loss",
+            valid_rows=valid_count,
+            fuse_dw_cast=fuse,
+            dx_finalize=fused_dx,
+            hidden_count=hc is not None,
+            **common,
         )
         binding = cache.lookup(key)
         if binding is not None:
-            loss, logp, dx_acc, dw_acc = binding.forward(
-                X, W, labels, infer_logp, loss_weights, row_index
+            loss, logp, dx_acc, dw_acc, deferred = binding.forward(
+                X, W, labels, infer_logp, loss_weights, row_index, hc
             )
+            dz_last, x_last, x_src, x_idx = deferred
             return ForwardResult(
                 loss=loss.reshape(()),
                 logp=scatter_rows(logp, row_index, T),
@@ -2824,7 +4570,12 @@ def forward_loss(
                 memory=binding.memory,
                 backend=backend,
                 row_index=row_index,
+                row_valid=row_valid,
                 num_rows=T,
+                dz_last=dz_last,
+                x_last=x_last,
+                x_src=x_src,
+                x_idx=x_idx,
             )
     runner = prepare_lm_head_loss(
         X,
@@ -2834,20 +4585,43 @@ def forward_loss(
         entry="loss",
         backend=backend,
         compact_rows=False if row_index is None else row_index,
+        fuse_dw_cast=fuse,
+        dx_finalize=fused_dx,
         **common,
     )
-    loss, logp = runner.forward()
-    if key is not None:
-        cache.remember(key, _Binding.from_runner(runner))
+    if backend == "cake":
+        # The first call launches through the templated binding too: its per-call temporaries come from the caching
+        # allocator, so the deferred ``dz`` rows keep the chunk buffer alive and nothing else -- a view into the
+        # runner's single workspace allocation would pin the whole workspace until the backward.  The runner (and its
+        # workspace) is dropped here; only the binding survives.
+        binding = _Binding.from_runner(runner, hc)
+        del runner
+        if key is not None:
+            cache.remember(key, binding)
+        loss, logp, dx_acc, dw_acc, deferred = binding.forward(
+            X, W, labels, infer_logp, loss_weights, row_index, hc
+        )
+        memory = binding.memory
+    else:
+        loss, logp = runner.forward()
+        dx_acc, dw_acc = runner.dx_acc, runner.dw_acc
+        deferred = _deferred_operands(runner.plan, runner.tensors)
+        memory = runner.memory
+    dz_last, x_last, x_src, x_idx = deferred
     return ForwardResult(
         loss=loss.reshape(()),
         logp=scatter_rows(logp, row_index, T),
-        dx_acc=runner.dx_acc,
-        dw_acc=runner.dw_acc,
-        memory=runner.memory,
+        dx_acc=dx_acc,
+        dw_acc=dw_acc,
+        memory=memory,
         backend=backend,
         row_index=row_index,
+        row_valid=row_valid,
         num_rows=T,
+        dz_last=dz_last,
+        x_last=x_last,
+        x_src=x_src,
+        x_idx=x_idx,
     )
 
 
@@ -2871,7 +4645,7 @@ def scale_cast(
     if acc.numel() == 0:
         return out
     g = (
-        torch.ones((1,), dtype=torch.float32, device=acc.device)
+        _unit_scale(acc.device)
         if grad is None
         else grad.detach().reshape(1).to(device=acc.device, dtype=torch.float32)
     )
@@ -2914,6 +4688,268 @@ def scale_cast(
     return out
 
 
+def scale_cast_scatter(
+    acc: torch.Tensor,
+    grad: Optional[torch.Tensor],
+    row_index: torch.Tensor,
+    scan: torch.Tensor,
+    num_rows: int,
+    *,
+    backend: str = "cake",
+) -> torch.Tensor:
+    """``scatter_rows(bf16(g * acc), row_index, num_rows)`` as ONE new BF16 ``[num_rows, H]`` tensor written in one
+    pass: ``bf16(g * acc[compact row])`` on the valid rows, exact zeros elsewhere.  ``acc`` is the compact FP32
+    ``[T_v, H]`` accumulator (never written), ``row_index`` its ascending int64 original rows, ``scan`` the inclusive
+    int32 count of valid rows (``cumsum(labels >= 0)``: ``scan[r] - 1`` is the compact row of a valid output row
+    ``r``, which the kernel validates through ``row_index[scan[r] - 1] == r``), ``g`` = ``grad`` (``None`` = 1).  The
+    same FP32 multiply and BF16 rounding as :func:`scale_cast`, so the valid rows are bitwise the flat cast's; every
+    output element is written exactly once.  ``T_v == 0`` (every row ignored) is one zero fill: the kernel reads a
+    candidate compact row for every output row and would have none."""
+    if acc.dtype != torch.float32 or acc.ndim != 2 or not acc.is_contiguous():
+        raise ValueError("the accumulator must be a contiguous FP32 [T_v, H] tensor")
+    T_v, H = (int(s) for s in acc.shape)
+    num_rows = int(num_rows)
+    if (
+        row_index.dtype != torch.int64
+        or tuple(row_index.shape) != (T_v,)
+        or not row_index.is_contiguous()
+        or row_index.device != acc.device
+    ):
+        raise ValueError(
+            f"row_index must be a contiguous int64 [{T_v}] tensor on the accumulator's device"
+        )
+    if (
+        scan.dtype != torch.int32
+        or tuple(scan.shape) != (num_rows,)
+        or not scan.is_contiguous()
+        or scan.device != acc.device
+    ):
+        raise ValueError(
+            f"scan must be a contiguous int32 [{num_rows}] tensor on the accumulator's device"
+        )
+    if T_v > num_rows:
+        raise ValueError(
+            f"the accumulator has more rows ({T_v}) than the output ({num_rows})"
+        )
+    out = torch.empty((num_rows, H), dtype=torch.bfloat16, device=acc.device)
+    if out.numel() == 0:
+        return out
+    if T_v == 0:
+        out.zero_()
+        return out
+    g = (
+        _unit_scale(acc.device)
+        if grad is None
+        else grad.detach().reshape(1).to(device=acc.device, dtype=torch.float32)
+    )
+    if backend == "reference":
+        out.zero_()
+        out.index_copy_(0, row_index, (acc * g).to(torch.bfloat16))
+        return out
+    module_name, record = record_for(acc.device)
+    record_abi(record)
+    geometry = Geometry.from_record(record)
+    stage = "scale_cast_scatter_bf16"
+    if stage not in record:
+        raise NotImplementedError(
+            f"the registered program {module_name!r} lacks the stage {stage!r}"
+        )
+    if H % geometry.cast_vec:
+        raise ValueError(
+            f"the scatter needs a row width of a multiple of {geometry.cast_vec} elements"
+        )
+    values: dict[str, Any] = {name: None for name in COMMON_TENSORS}
+    values.update({name: 0 for name in COMMON_SCALARS})
+    values.update(
+        acc=acc,
+        g=g,
+        scan=scan,
+        idx_lo=row_index.view(
+            torch.int32
+        ),  # the low int32 word of each int64 index (stride 2)
+        out=out,
+        row_vecs=int(H // geometry.cast_vec),
+        num_rows=num_rows,
+        loss_div=1.0,
+    )
+    launches = _bind_all(
+        record,
+        module_name,
+        ((stage, "eager"),),
+        {(stage, "eager"): values},
+        acc.device,
+        geometry,
+    )
+    launch = launches[(stage, "eager")]
+    index = (
+        acc.device.index
+        if acc.device.index is not None
+        else torch.cuda.current_device()
+    )
+    with _ffi_stream_context(int(index)):
+        if launch.prepare is not None:
+            launch.prepare(*launch.arguments)
+        launch()
+    return out
+
+
+def finalize_dx(
+    acc: torch.Tensor,
+    grad: Optional[torch.Tensor],
+    row_index: Optional[torch.Tensor],
+    row_valid: Optional[torch.Tensor],
+    num_rows: Optional[int],
+    *,
+    backend: str = "cake",
+) -> torch.Tensor:
+    """The dX output boundary: ``bf16(g * acc)`` restored to the caller's ``[num_rows, H]`` rows.  Every row valid
+    (``row_index`` None): :func:`scale_cast`, already one pass over every row.  Compacted rows with the forward's
+    valid-row mask (``row_valid``: the fused dX finalize): the inclusive int32 scan -- one ``cumsum``, issued here
+    behind the backward's queued GEMMs -- and one :func:`scale_cast_scatter` launch.  Compacted rows without the mask
+    (the forward ran with ``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE=0``): the flat cast, then :func:`scatter_rows`
+    (zero fill + ``index_copy_``).  All three produce the same bits."""
+    if row_index is None:
+        return scale_cast(acc, grad, torch.bfloat16, backend=backend)
+    if num_rows is None:
+        raise ValueError("finalize_dx needs num_rows (the caller's T) with row_index")
+    if row_valid is None:
+        return scatter_rows(
+            scale_cast(acc, grad, torch.bfloat16, backend=backend),
+            row_index,
+            int(num_rows),
+        )
+    if row_valid.dtype != torch.bool or tuple(row_valid.shape) != (int(num_rows),):
+        raise ValueError(f"row_valid must be the bool [{int(num_rows)}] valid-row mask")
+    scan = torch.cumsum(row_valid, 0, dtype=torch.int32)
+    return scale_cast_scatter(
+        acc, grad, row_index, scan, int(num_rows), backend=backend
+    )
+
+
+def dw_cast(
+    dz_last: torch.Tensor,
+    x_rows: torch.Tensor,
+    dw_acc: Optional[torch.Tensor],
+    grad: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    *,
+    backend: str = "cake",
+) -> torch.Tensor:
+    """The deferred last chunk's weight gradient as a new tensor: ``cast(g * (dw_acc + dz_last^T @ x_rows))``, or
+    ``cast(g * dz_last^T @ x_rows)`` when ``dw_acc`` is ``None`` (a one-chunk call), through the fused GEMM
+    (:data:`DW_CAST_STAGES`); ``dw_acc`` is read, never written (repeatable).  ``dz_last`` BF16 ``[rows, V]``
+    contiguous, ``x_rows`` BF16 ``[rows, H]`` with a 16-byte row pitch (else copied), ``g`` = ``grad`` (``None`` = 1)."""
+    if out_dtype not in GRAD_WEIGHT_DTYPES:
+        raise ValueError("the cast produces bfloat16 or float32")
+    if (
+        dz_last.dtype != torch.bfloat16
+        or dz_last.ndim != 2
+        or not dz_last.is_contiguous()
+    ):
+        raise ValueError("dz_last must be a contiguous BF16 [rows, V] tensor")
+    rows, V = dz_last.shape
+    if (
+        x_rows.dtype != torch.bfloat16
+        or x_rows.ndim != 2
+        or x_rows.shape[0] != rows
+        or x_rows.stride(1) != 1
+    ):
+        raise ValueError("x_rows must be a BF16 [rows, H] tensor with contiguous rows")
+    if x_rows.stride(0) % 8 or x_rows.data_ptr() % 16:
+        x_rows = x_rows.contiguous()
+    H = int(x_rows.shape[1])
+    if dw_acc is not None and (
+        dw_acc.dtype != torch.float32
+        or tuple(dw_acc.shape) != (V, H)
+        or not dw_acc.is_contiguous()
+    ):
+        raise ValueError(
+            "dw_acc must be a contiguous FP32 [V, H] tensor (or None for a one-chunk call)"
+        )
+    device = dz_last.device
+    out = torch.empty((V, H), dtype=out_dtype, device=device)
+    if rows == 0:
+        return out.zero_()
+    g = (
+        _unit_scale(device)
+        if grad is None
+        else grad.detach().reshape(1).to(device=device, dtype=torch.float32)
+    )
+    if backend == "reference":
+        product = _mm_fp32(dz_last.t(), x_rows)
+        acc = product if dw_acc is None else dw_acc + product
+        out.copy_(acc * g)
+        return out
+    module_name, record = record_for(device, H, int(V))
+    record_abi(record)
+    # the last chunk's form and scalars: the raster / block rules of the record's architecture on this chunk's rows, or
+    # the explicit knobs (the block rule and knob apply to the fp32 cast only; the bf16 cast keeps the 1-D raster)
+    fp32 = out_dtype == torch.float32
+    dw_tuning = _resolve_gemm_tuning(None).get("dw", {})
+    raster = raster_variant(H, int(rows), record["arch"])
+    group_m = (
+        dw_tuning["group_m"]
+        if "group_m" in dw_tuning
+        else (raster[1] if raster else None)
+    )
+    group_n = None
+    if fp32:
+        group_n = (
+            dw_tuning["group_n"]
+            if "group_n" in dw_tuning
+            else dw_block_variant(int(rows), H, record["arch"])
+        )
+        group_n = None if group_n in (None, 0) else int(group_n)
+    stage = stage_variant(
+        "gemm_dw_cast_f32" if fp32 else "gemm_dw_cast_bf16",
+        blocked=group_n is not None,
+    )
+    if stage not in registered_stages(module_name):
+        raise NotImplementedError(
+            f"the registered program {module_name!r} lacks the stage {stage!r} (fuse_dw_cast)"
+        )
+    geometry = Geometry.from_record(record)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    values: dict[str, Any] = {name: None for name in COMMON_TENSORS}
+    values.update({name: 0 for name in COMMON_SCALARS})
+    values.update(
+        A=dz_last,
+        B=x_rows,
+        C=out,
+        STATS_OUT=g,
+        WS=dw_acc if dw_acc is not None else _device_constants(int(index))["f32_dummy"],
+        rows_c=int(rows),
+        T=int(rows),
+        H=H,
+        V=int(V),
+        loss_div=1.0,
+        **gemm_scalars(
+            stage,
+            geometry,
+            hidden=H,
+            vocab=int(V),
+            rows_c=int(rows),
+            group_m=group_m,
+            group_n=group_n,
+            first_chunk=int(dw_acc is None),
+        ),
+    )
+    launches = _bind_all(
+        record,
+        module_name,
+        ((stage, "eager"),),
+        {(stage, "eager"): values},
+        device,
+        geometry,
+    )
+    launch = launches[(stage, "eager")]
+    with _ffi_stream_context(int(index)):
+        if launch.prepare is not None:
+            launch.prepare(*launch.arguments)
+        launch()
+    return out
+
+
 def backward_loss(
     dx_acc: Optional[torch.Tensor],
     dw_acc: Optional[torch.Tensor],
@@ -2923,27 +4959,45 @@ def backward_loss(
     backend: str = "cake",
     row_index: Optional[torch.Tensor] = None,
     num_rows: Optional[int] = None,
+    dz_last: Optional[torch.Tensor] = None,
+    x_last: Optional[torch.Tensor] = None,
+    x_src: Optional[torch.Tensor] = None,
+    x_idx: Optional[torch.Tensor] = None,
+    row_valid: Optional[torch.Tensor] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward of the loss entry from the saved accumulators: ``(dX, dW)`` = ``bf16(g * dX_acc)``,
     ``cast(g * dW_acc)``; the accumulators are read, never written (repeatable).  A compacted forward
     (``ForwardResult.row_index`` / ``num_rows``): the compact rows are cast once, then scattered into a
-    zero BF16 ``[T, H]``."""
-    dx = (
-        None
-        if dx_acc is None
-        else scale_cast(dx_acc, grad, torch.bfloat16, backend=backend)
-    )
-    if dx is not None and row_index is not None:
-        if num_rows is None:
+    zero BF16 ``[T, H]``.  A deferred weight gradient (``fuse_dw_cast``; ``ForwardResult.dz_last`` with
+    ``x_last`` or ``x_src`` / ``x_idx``): ``dW = cast(g * (dW_acc + dz_last^T @ X_last))`` through the fused
+    GEMM (:func:`dw_cast`), ``dW_acc`` being the chunks before the last one or ``None``;
+    :meth:`ForwardResult.backward` passes everything.  ``row_valid`` (``ForwardResult.row_valid``, the
+    valid-row mask of a compacted forward that ran with the fused dX finalize) selects the one-pass
+    scale-cast-scatter of the compact rows (:func:`finalize_dx`); without it the compact rows are cast,
+    then scattered into a zero BF16 ``[T, H]``.  Both give the same bits."""
+    dx = None
+    if dx_acc is not None:
+        if row_index is not None and num_rows is None:
             raise ValueError(
                 "backward_loss needs num_rows (the caller's T) with row_index"
             )
-        dx = scatter_rows(dx, row_index, int(num_rows))
-    dw = (
-        None
-        if dw_acc is None
-        else scale_cast(dw_acc, grad, grad_weight_dtype, backend=backend)
-    )
+        dx = finalize_dx(dx_acc, grad, row_index, row_valid, num_rows, backend=backend)
+    if dz_last is not None:
+        if x_last is None:
+            if x_src is None or x_idx is None:
+                raise ValueError(
+                    "a deferred weight gradient needs x_last, or x_src with the chunk's row index x_idx"
+                )
+            x_last = torch.index_select(
+                x_src, 0, x_idx
+            )  # the compacted chunk's rows, gathered again
+        dw = dw_cast(dz_last, x_last, dw_acc, grad, grad_weight_dtype, backend=backend)
+    else:
+        dw = (
+            None
+            if dw_acc is None
+            else scale_cast(dw_acc, grad, grad_weight_dtype, backend=backend)
+        )
     return dx, dw
 
 
@@ -2972,7 +5026,14 @@ def forward_logprob(
     T = problem.num_rows
     if T == 0:
         return _empty_forward(problem, X, need_dx=False, need_dw=False)
-    row_index = valid_row_index(labels) if _resolve_compact(compact_rows) else None
+    compact = _resolve_compact(compact_rows)
+    hc = _hidden_count(
+        problem, X, W, labels, backend=backend, compact=compact, stats=True
+    )
+    if hc is not None:
+        row_index = hc.row_index()
+    else:
+        row_index = valid_row_index(labels) if compact else None
     if row_index is not None and row_index.numel() == 0:  # every row ignored
         return _empty_forward(
             problem, X, need_dx=False, need_dw=False, row_index=row_index
@@ -2995,10 +5056,11 @@ def forward_logprob(
             grad_weight_dtype=torch.bfloat16,
             entry="logprob",
             valid_rows=valid_rows,
+            hidden_count=hc is not None,
         )
         binding = cache.lookup(key)
         if binding is not None:
-            logp, lse = binding.forward(X, W, labels, None, None, row_index)
+            logp, lse = binding.forward(X, W, labels, None, None, row_index, hc)
             return ForwardResult(
                 loss=None,
                 logp=scatter_rows(logp, row_index, T),
@@ -3020,14 +5082,25 @@ def forward_logprob(
         backend=backend,
         compact_rows=False if row_index is None else row_index,
     )
-    logp, lse = runner.forward()
-    if key is not None:
-        cache.remember(key, _Binding.from_runner(runner))
+    if hc is not None:
+        # the hidden valid-row count: chunk 0's logits already sit in the prologue's buffers, so the first call launches
+        # through the templated binding too (the runner's own workspace is never written)
+        binding = _Binding.from_runner(runner, hc)
+        del runner
+        if key is not None:
+            cache.remember(key, binding)
+        logp, lse = binding.forward(X, W, labels, None, None, row_index, hc)
+        memory = binding.memory
+    else:
+        logp, lse = runner.forward()
+        if key is not None:
+            cache.remember(key, _Binding.from_runner(runner))
+        memory = runner.memory
     return ForwardResult(
         loss=None,
         logp=scatter_rows(logp, row_index, T),
         lse=lse,
-        memory=runner.memory,
+        memory=memory,
         backend=backend,
         row_index=row_index,
         num_rows=T,
@@ -3047,13 +5120,16 @@ def backward_logprob(
     deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
+    fuse_dw_cast: Optional[bool] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward of the log-probability entry: recompute each chunk's logits, ``dz = dlogp_t *
     (1[v = y_t] - softmax)`` (ignored rows zero), then ``dX`` (BF16) and ``dW`` (BF16) through
     the FP32 accumulators.  ``(None, None)`` when neither input is trainable.  ``compact_rows``
     must match the forward's: the valid-row index is recomputed from ``labels`` (identical to the
     forward's), ``lse`` is then the forward's compact ``[T_v]`` statistic and ``dX`` comes back
-    scattered to ``[T, H]``; every row ignored returns zeros without launching."""
+    scattered to ``[T, H]``; every row ignored returns zeros without launching.  ``fuse_dw_cast``
+    (default :func:`fuse_dw_cast_default`): the last chunk's weight-gradient GEMM writes the final BF16
+    ``dW`` from its epilogue (the scale is 1 here)."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_inputs(
@@ -3067,9 +5143,19 @@ def backward_logprob(
     if not (need_dx or need_dw):
         return None, None
     T, H, V = problem.num_rows, problem.hidden, problem.vocab
-    row_index = (
-        valid_row_index(labels) if (T and _resolve_compact(compact_rows)) else None
+    fused_dx = bool(need_dx and dx_finalize_default())  # read once per call
+    compact = bool(T and _resolve_compact(compact_rows))
+    hc = _hidden_count(
+        problem, X, W, labels, backend=backend, compact=compact, stats=False
     )
+    if hc is not None:
+        # the hidden valid-row count: chunk 0's gather and its recompute GEMM (no statistics) are queued
+        row_index = hc.row_index()
+        row_valid = hc.valid if (row_index is not None and fused_dx) else None
+    else:
+        row_index, row_valid = (
+            valid_rows(labels, mask=fused_dx) if compact else (None, None)
+        )
     rows = T if row_index is None else int(row_index.numel())
     if rows == 0:  # no rows, or every row ignored
         return (
@@ -3084,7 +5170,19 @@ def backward_logprob(
     dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
     cache = BINDING_CACHE
     key = None
-    valid_rows = None if row_index is None else rows
+    valid_count = None if row_index is None else rows
+    fuse = bool(need_dw and _resolve_fuse(fuse_dw_cast))
+    # the fused dX finalize of a compacted backward: the runner leaves dx_acc uncast and finalize_dx writes the [T, H]
+    # dX in one pass (uncompacted: the in-loop flat cast is already one pass over every row)
+    dx_cast = not (fused_dx and row_index is not None)
+
+    def finish_dx(dx):
+        if dx is None:
+            return None
+        if dx_cast:
+            return scatter_rows(dx, row_index, T)
+        return finalize_dx(dx, None, row_index, row_valid, T, backend=backend)
+
     if backend == "cake" and cache.enabled:
         key = logprob_backward_binding_key(
             X,
@@ -3095,12 +5193,15 @@ def backward_logprob(
             chunk_size=chunk_size,
             need_dx=need_dx,
             need_dw=need_dw,
-            valid_rows=valid_rows,
+            valid_rows=valid_count,
+            fuse_dw_cast=fuse,
+            dx_finalize=fused_dx,
+            hidden_count=hc is not None,
         )
         binding = cache.lookup(key)
         if binding is not None:
-            dx, dw = binding.backward_logprob(X, W, labels, lse, dlogp, row_index)
-            return (None if dx is None else scatter_rows(dx, row_index, T)), dw
+            dx, dw = binding.backward_logprob(X, W, labels, lse, dlogp, row_index, hc)
+            return finish_dx(dx), dw
     runner = prepare_lm_head_loss(
         X,
         W,
@@ -3114,11 +5215,21 @@ def backward_logprob(
         lse=lse,
         backend=backend,
         compact_rows=False if row_index is None else row_index,
+        fuse_dw_cast=fuse,
+        dx_finalize=fused_dx,
+        dx_cast=dx_cast,
     )
+    if hc is not None:
+        binding = _Binding.from_runner(runner, hc)
+        del runner
+        if key is not None:
+            cache.remember(key, binding)
+        dx, dw = binding.backward_logprob(X, W, labels, lse, dlogp, row_index, hc)
+        return finish_dx(dx), dw
     dx, dw = runner.backward()
     if key is not None:
         cache.remember(key, _Binding.from_runner(runner))
-    return (None if dx is None else scatter_rows(dx, row_index, T)), dw
+    return finish_dx(dx), dw
 
 
 # ---------------------------------------------------------------------------
@@ -3145,6 +5256,7 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
         deterministic,
         backend,
         compact_rows,
+        fuse_dw_cast,
     ):
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         result = forward_loss(
@@ -3162,16 +5274,25 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
             deterministic=deterministic,
             backend=backend,
             compact_rows=compact_rows,
+            fuse_dw_cast=fuse_dw_cast,
         )
         ctx.set_materialize_grads(False)
         ctx.dx_acc, ctx.dw_acc = (
             result.dx_acc,
             result.dw_acc,
         )  # saved state, never mutated
+        # the deferred weight gradient's operands: the last chunk's dz rows and its X rows, the latter a view of the
+        # input X (or X itself with the chunk's row index when compacted) -- saved through the autograd context so an
+        # in-place write to X between the forward and the backward raises PyTorch's saved-tensor version error
+        # instead of yielding a stale dW
+        ctx.save_for_backward(result.dz_last, result.x_last, result.x_src, result.x_idx)
         ctx.row_index, ctx.num_rows = (
             result.row_index,
             int(X.shape[0]),
         )  # compacted: dx_acc holds the rows of row_index
+        ctx.row_valid = (
+            result.row_valid
+        )  # the fused dX finalize's valid-row mask (None otherwise)
         ctx.grad_weight_dtype = grad_weight_dtype
         ctx.backend = backend
         ctx.empty = X.shape[0] == 0 or (
@@ -3182,7 +5303,7 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_loss, grad_logp=None):
-        none = (None,) * 13
+        none = (None,) * 14
         if grad_loss is None:
             return none
         if ctx.empty:  # T == 0 or every row ignored: zero gradients without binding or launching a program
@@ -3205,6 +5326,7 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
                 )
             )
             return (dx, dw) + none[2:]
+        dz_last, x_last, x_src, x_idx = ctx.saved_tensors
         dx, dw = backward_loss(
             ctx.dx_acc,
             ctx.dw_acc,
@@ -3213,6 +5335,11 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
             backend=ctx.backend,
             row_index=ctx.row_index,
             num_rows=ctx.num_rows,
+            dz_last=dz_last,
+            x_last=x_last,
+            x_src=x_src,
+            x_idx=x_idx,
+            row_valid=ctx.row_valid,
         )
         return (dx, dw) + none[2:]
 
@@ -3221,7 +5348,17 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
     """Entry (b): the forward saves the row statistic; the backward recomputes the logits."""
 
     @staticmethod
-    def forward(ctx, X, W, labels, chunk_size, deterministic, backend, compact_rows):
+    def forward(
+        ctx,
+        X,
+        W,
+        labels,
+        chunk_size,
+        deterministic,
+        backend,
+        compact_rows,
+        fuse_dw_cast,
+    ):
         compact = _resolve_compact(
             compact_rows
         )  # resolved once: the backward recomputes the same valid-row index
@@ -3242,12 +5379,13 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
             backend,
             compact,
         )
+        ctx.fuse_dw_cast = _resolve_fuse(fuse_dw_cast)
         return result.logp
 
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
-            return None, None, None, None, None, None, None
+            return (None,) * 8
         X, W, labels, lse = ctx.saved_tensors
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         dx, dw = backward_logprob(
@@ -3262,8 +5400,9 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
             deterministic=ctx.deterministic,
             backend=ctx.backend,
             compact_rows=ctx.compact,
+            fuse_dw_cast=ctx.fuse_dw_cast,
         )
-        return dx, dw, None, None, None, None, None
+        return (dx, dw) + (None,) * 6
 
 
 def chunked_lm_head_loss(
@@ -3281,6 +5420,7 @@ def chunked_lm_head_loss(
     deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
+    fuse_dw_cast: Optional[bool] = None,
 ):
     """Differentiable chunked LM-head + loss (see the module docstring); returns the FP32 scalar
     ``loss`` and, with ``return_logp``, the detached FP32 ``logp [T]``.
@@ -3292,7 +5432,14 @@ def chunked_lm_head_loss(
     torch.float32, row_index=result.row_index, num_rows=result.num_rows)`` for
     an FP32 weight gradient.  ``compact_rows`` (default
     :func:`compact_rows_default`): chunk over the valid rows only; the ``dX``
-    rows of ignored tokens are exact zeros either way.
+    rows of ignored tokens are exact zeros either way.  ``fuse_dw_cast`` (default
+    :func:`fuse_dw_cast_default`): the last chunk's weight-gradient GEMM runs in
+    the backward with the upstream scale and the cast fused into its epilogue
+    (bitwise the same ``dW``, one pass over ``dW`` fewer; a one-chunk call
+    keeps no FP32 ``dW`` accumulator).  The fused dX finalize
+    (``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE``, on unless ``0``) adds a
+    sliced dX GEMM's slabs with one kernel and writes a compacted call's
+    ``[T, H]`` ``dX`` in one pass (bitwise the same ``dX``).
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
@@ -3318,6 +5465,7 @@ def chunked_lm_head_loss(
         deterministic,
         backend,
         compact_rows,
+        fuse_dw_cast,
     )
     return (loss, logp.detach()) if return_logp else loss
 
@@ -3331,11 +5479,19 @@ def chunked_lm_head_logprob(
     deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
+    fuse_dw_cast: Optional[bool] = None,
 ) -> torch.Tensor:
     """Differentiable FP32 ``logp [T]`` (0 on ignored rows) for arbitrary downstream losses;
-    ``compact_rows`` as in :func:`chunked_lm_head_loss`."""
+    ``compact_rows`` / ``fuse_dw_cast`` as in :func:`chunked_lm_head_loss`."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     return ChunkedLmHeadLogprobFunction.apply(
-        X, W, labels, int(chunk_size), deterministic, backend, compact_rows
+        X,
+        W,
+        labels,
+        int(chunk_size),
+        deterministic,
+        backend,
+        compact_rows,
+        fuse_dw_cast,
     )

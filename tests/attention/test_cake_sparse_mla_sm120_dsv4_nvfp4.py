@@ -272,18 +272,23 @@ def test_cake_plan_head_tiles_rules() -> None:
     assert plan(num_tokens=8, num_heads=96, topk=512, num_sms=188) == 1
     assert plan(num_tokens=16, num_heads=96, topk=1024, num_sms=188) == 2
     assert plan(num_tokens=4, num_heads=128, topk=1024, num_sms=188) == 1
-    # GB10 (48 SMs): full-wave two-chunk rows pair only for H = 32 or while the one-tile
-    # grid is at most two waves; >= 4 chunks pair at a full wave; sub-wave rules unchanged.
+    # GB10 (48 SMs): full-wave two-chunk rows pair for H = 32, while the one-tile grid is
+    # at most two waves, and again beyond eight waves (one tile only in between); >= 4
+    # chunks pair at a full wave; sub-wave H = 64 is inclusive at 2/3 of the SMs.
     assert plan(num_tokens=32, num_heads=32, topk=128, num_sms=48) == 2
     assert plan(num_tokens=128, num_heads=32, topk=128, num_sms=48) == 2
     assert plan(num_tokens=8, num_heads=128, topk=128, num_sms=48) == 2
     assert plan(num_tokens=12, num_heads=128, topk=128, num_sms=48) == 2
     assert plan(num_tokens=32, num_heads=64, topk=128, num_sms=48) == 1
     assert plan(num_tokens=32, num_heads=128, topk=128, num_sms=48) == 1
-    assert plan(num_tokens=128, num_heads=96, topk=128, num_sms=48) == 1
+    assert plan(num_tokens=64, num_heads=96, topk=128, num_sms=48) == 1
+    assert plan(num_tokens=128, num_heads=64, topk=128, num_sms=48) == 2
+    assert plan(num_tokens=128, num_heads=128, topk=128, num_sms=48) == 2
     assert plan(num_tokens=8, num_heads=128, topk=128, extra_topk=128, num_sms=48) == 2
     assert plan(num_tokens=32, num_heads=64, topk=512, num_sms=48) == 2
-    assert plan(num_tokens=8, num_heads=64, topk=512, num_sms=48) == 1
+    assert plan(num_tokens=8, num_heads=64, topk=512, num_sms=48) == 2
+    assert plan(num_tokens=8, num_heads=64, topk=512, num_sms=188) == 1
+    assert plan(num_tokens=2, num_heads=64, topk=512, num_sms=48) == 1
     assert plan(num_tokens=8, num_heads=32, topk=512, num_sms=48) == 2
     assert plan(num_tokens=1, num_heads=128, topk=512, num_sms=48) == 1
 

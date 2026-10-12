@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from flashinfer.experimental.sm110_xqa.jit import get_manifest
+from flashinfer.experimental.sm110_xqa.jit import FROZEN, ROUTES
 from flashinfer.sm110_xqa import attention, prepare
 
 
@@ -140,16 +140,15 @@ def test_decode_runtime_partitions_and_counter_replay(partition_tokens, capacity
     lengths = [0, 65, capacity]
     seq = torch.tensor(lengths, device="cuda", dtype=torch.int32)
     plan = prepare(q, kv, seq, partition_tokens=partition_tokens)
-    manifest = get_manifest()
-    producer = manifest["routes"]["decode_fp16_contiguous"]
+    producer = FROZEN["decode_fp16_contiguous"]
     partitions = (capacity + partition_tokens - 1) // partition_tokens
     expected_route = (
         producer["single_partition_route"]
         if partitions == 1 and producer["merge_stats_cache"]
         else "decode_fp16_contiguous"
     )
-    assert plan.route == expected_route
-    assert manifest["routes"][plan.route]["merge_stats_cache"] == (
+    assert plan.route == expected_route == plan.program
+    assert FROZEN[plan.route]["merge_stats_cache"] == (
         producer["merge_stats_cache"] and partitions > 1
     )
     expected = _oracle(q[:, None], kv.float(), lengths)[:, 0]
@@ -189,7 +188,7 @@ def test_decode_caller_workspace_is_initialized_once_at_prepare():
 
 
 def test_decode_stats_cache_rejects_misaligned_caller_statistics():
-    if not get_manifest()["routes"]["decode_fp16_contiguous"]["merge_stats_cache"]:
+    if not FROZEN["decode_fp16_contiguous"]["merge_stats_cache"]:
         pytest.skip("requires a frozen stats-cache producer")
     q = _sample((1, 32, 128))
     kv = _sample((1, 2, 4, 257, 128), seed=53)
@@ -391,7 +390,7 @@ def test_auto_routes_fp8_even_tiles_to_pair(batch, queries, ratio, fp8, paged):
     prepared, _, _ = _prepare_auto(queries, ratio, fp8, paged)
     layout = "paged" if paged else "contiguous"
     assert prepared.route == f"tree_fp8_{layout}_pair"
-    assert get_manifest()["routes"][prepared.route]["kernel"] == "pair"
+    assert prepared.program == ROUTES[f"{prepared.route}__even"]
 
 
 @pytest.mark.parametrize("fp8,paged", CACHE_MODES)
@@ -403,7 +402,8 @@ def test_auto_routes_the_other_shapes_to_tmem(batch, queries, ratio, fp8, paged)
     precision = "fp8" if fp8 else "fp16"
     layout = "paged" if paged else "contiguous"
     assert prepared.route == f"tree_{precision}_{layout}_tmem"
-    assert get_manifest()["routes"][prepared.route]["kernel"] == "tmem"
+    form = "even" if _q_tiles(queries, ratio) % 2 == 0 else "odd"
+    assert prepared.program == ROUTES[f"{prepared.route}__{form}"]
     expected = _oracle(q, dense, [256], _mask(queries, 1, "causal"))
     torch.testing.assert_close(prepared.run(), expected, atol=1e-2, rtol=1e-2)
 
@@ -563,7 +563,7 @@ def test_prepared_decode_nondefault_stream_and_graph_replay(partition_tokens):
     preparation_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(preparation_stream):
         plan = prepare(q, kv, seq, partition_tokens=partition_tokens)
-    producer = get_manifest()["routes"]["decode_fp16_contiguous"]
+    producer = FROZEN["decode_fp16_contiguous"]
     expected_route = (
         producer["single_partition_route"]
         if partition_tokens >= 512 and producer["merge_stats_cache"]

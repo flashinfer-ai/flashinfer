@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+from collections import OrderedDict
 import math
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -158,46 +159,69 @@ class MiniMaxH3VarlenPlan:
         self.unit_table = i32(unit_table or [0, 0])
 
 
-_PLANS: Dict[Tuple, MiniMaxH3VarlenPlan] = {}
-_WORKSPACES: Dict[Tuple[int, str], torch.Tensor] = {}
+# Most recently used segment plans (device tables) and per-(device, stream) workspace sets.  Both are
+# bounded: the oldest entry is evicted once the limit is reached, so varying segment layouts cannot grow
+# device memory without bound.
+_MAX_PLANS = 256
+_MAX_WORKSPACE_SETS = 8
+_PLANS: "OrderedDict[Tuple, MiniMaxH3VarlenPlan]" = OrderedDict()
+_WORKSPACES: "OrderedDict[Tuple[int, int], Dict[str, torch.Tensor]]" = OrderedDict()
 
 
 def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
+@functools.cache
+def _sm_count(index: int) -> int:
+    return torch.cuda.get_device_properties(index).multi_processor_count
+
+
 def _plan(
     bounds: Tuple[int, ...], num_heads: int, device: torch.device
 ) -> MiniMaxH3VarlenPlan:
     index = _device_index(device)
-    num_ctas = torch.cuda.get_device_properties(index).multi_processor_count
+    num_ctas = _sm_count(index)
     key = (bounds, num_heads, index, num_ctas)
     plan = _PLANS.get(key)
     if plan is None:
-        if len(_PLANS) >= 256:
-            _PLANS.clear()
+        while len(_PLANS) >= _MAX_PLANS:
+            _PLANS.popitem(last=False)
         plan = MiniMaxH3VarlenPlan(
             bounds, num_heads, torch.device("cuda", index), num_ctas
         )
         _PLANS[key] = plan
+    else:
+        _PLANS.move_to_end(key)
     return plan
 
 
 def _workspace(index: int, name: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
-    """Grow-only per-device buffer (the quantized operands and scales are rewritten every call)."""
+    """Grow-only buffer ``name`` of the (device, current stream) workspace set.
 
-    key = (index, name)
-    buffer = _WORKSPACES.get(key)
+    The quantized operands and scales are rewritten every call, so buffers are shared between calls on
+    the same stream; concurrent streams get their own set (no cross-stream reuse races).
+    """
+
+    key = (index, torch.cuda.current_stream(index).cuda_stream)
+    buffers = _WORKSPACES.get(key)
+    if buffers is None:
+        while len(_WORKSPACES) >= _MAX_WORKSPACE_SETS:
+            _WORKSPACES.popitem(last=False)
+        buffers = _WORKSPACES[key] = {}
+    else:
+        _WORKSPACES.move_to_end(key)
+    buffer = buffers.get(name)
     if buffer is None or buffer.numel() < numel:
         buffer = torch.empty(
             max(numel, 16), dtype=dtype, device=torch.device("cuda", index)
         )
-        _WORKSPACES[key] = buffer
+        buffers[name] = buffer
     return buffer
 
 
 def workspace_bytes(tokens: int, num_heads: int, num_segments: int) -> int:
-    """Bytes of the per-device workspace the operator needs for ``tokens`` packed rows."""
+    """Bytes of the (device, stream) workspace set the operator needs for ``tokens`` packed rows."""
 
     padded = max(1, _ceil_div(tokens, _BLOCK_N)) * _BLOCK_N
     q8 = k8 = tokens * num_heads * MINIMAX_H3_HEAD_DIM
@@ -340,7 +364,8 @@ def minimax_h3_sm120_varlen_attention_fp8(
     Both QK^T and PV run ``mma.sync.m16n8k32 kind::f8f6f4``; the output is rounded to BF16
     once.  One runtime-variable kernel set serves any ``tokens`` and any segment lengths
     (including empty segments and lengths below one tile); the quantized operands live in a
-    grow-only per-device workspace (``workspace_bytes``).
+    grow-only workspace per (device, stream) (``workspace_bytes``); the most recent 8 stream sets
+    and 256 segment plans are kept.
 
     Parameters
     ----------
@@ -354,7 +379,7 @@ def minimax_h3_sm120_varlen_attention_fp8(
         Optional pre-allocated output of the same shape/dtype as ``q``; allocated when omitted.
     cu_seqlens_host : Optional[Sequence[int]]
         Host copy of ``cu_seqlens`` (avoids a synchronizing device-to-host copy).  The
-        segment plan is cached per ``(cu_seqlens, heads, device)``.
+        segment plan is cached per ``(cu_seqlens, heads, device)`` (most recent 256).
     softmax_scale : Optional[float]
         Softmax scale; defaults to ``1 / sqrt(128)``.
 

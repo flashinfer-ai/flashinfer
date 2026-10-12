@@ -37,6 +37,9 @@ from flashinfer.mla._sparse_mla_sm120._cake_dsv4_nvfp4 import (
     cake_sparse_mla_sm120_dsv4_nvfp4_format_info,
     cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks,
     cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill,
+    cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_grid_head_blocks_first,
+    cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_q_evict_first,
+    cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages,
     cake_sparse_mla_sm120_dsv4_nvfp4_prefill,
     cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles,
     cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel,
@@ -86,6 +89,8 @@ def test_cake_prefill_format_info() -> None:
     assert cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(96) == (1, 2)
     assert cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(80) == (1,)
     assert cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(24) == ()
+    # ring depths exported per head-tile count: the one-tile instance has a three-stage form
+    assert info["prefill_ring_stages"] == {1: (2, 3), 2: (2,), 4: (2,)}
 
 
 def test_cake_plan_prefill_rules() -> None:
@@ -133,6 +138,58 @@ def test_cake_plan_prefill_rules() -> None:
         plan(num_tokens=128, num_heads=24, topk=512, num_sms=188)
     with pytest.raises(ValueError, match="num_sms"):
         plan(num_tokens=128, num_heads=128, topk=512, num_sms=0)
+
+
+def test_cake_plan_prefill_stages_rules() -> None:
+    stages = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages
+    # three cp.async stages only for the one-tile instance from 8 chunks (512 candidates) per token
+    assert stages(head_tiles=1, topk=512, num_tokens=128) == 3
+    assert stages(head_tiles=1, topk=448, num_tokens=8192) == 2
+    assert stages(head_tiles=1, topk=128, num_tokens=8192) == 2
+    assert stages(head_tiles=2, topk=512, num_tokens=8192) == 2
+    assert stages(head_tiles=4, topk=1024, num_tokens=8192) == 2
+    # dual-cache lists below 16 chunks keep two stages below 512 tokens
+    assert (
+        stages(head_tiles=1, topk=512, extra_topk=128, dual=True, num_tokens=128) == 2
+    )
+    assert (
+        stages(head_tiles=1, topk=512, extra_topk=128, dual=True, num_tokens=511) == 2
+    )
+    assert (
+        stages(head_tiles=1, topk=512, extra_topk=128, dual=True, num_tokens=512) == 3
+    )
+    assert (
+        stages(head_tiles=1, topk=512, extra_topk=512, dual=True, num_tokens=128) == 3
+    )
+    assert (
+        stages(head_tiles=1, topk=512, extra_topk=128, dual=False, num_tokens=128) == 3
+    )
+
+
+def test_cake_plan_prefill_grid_order_rules() -> None:
+    grid = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_grid_head_blocks_first
+    # head blocks first (the head blocks of one token are adjacent CTAs) up to 4 chunks of 64 candidates per block
+    assert grid(head_tiles=4, topk=128, num_tokens=128) is True
+    assert grid(head_tiles=4, topk=256, num_tokens=8192) is True
+    assert grid(head_tiles=4, topk=128, extra_topk=128, num_tokens=128) is True
+    assert grid(head_tiles=1, topk=256, num_tokens=1) is True
+    assert grid(head_tiles=4, topk=512, num_tokens=128) is False
+    assert grid(head_tiles=2, topk=512, num_tokens=8192) is False
+    assert grid(head_tiles=4, topk=128, extra_topk=512, num_tokens=8192) is False
+    assert grid(head_tiles=4, topk=320, num_tokens=128) is False  # 5 chunks
+    # grid.y cap: head blocks first puts the token count in grid.y (CUDA limit 65535) -> tokens first beyond it
+    assert grid(head_tiles=4, topk=128, num_tokens=65535) is True
+    assert grid(head_tiles=4, topk=128, num_tokens=65536) is False
+    assert grid(head_tiles=1, topk=64, num_tokens=100000) is False
+
+
+def test_cake_plan_prefill_q_evict_first_rules() -> None:
+    qef = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_q_evict_first
+    assert qef(num_tokens=1) is False
+    assert qef(num_tokens=128) is False
+    assert qef(num_tokens=511) is False
+    assert qef(num_tokens=512) is True
+    assert qef(num_tokens=8192) is True
 
 
 def test_cake_select_kernel_rules() -> None:
@@ -228,6 +285,49 @@ def test_cake_prefill_planner_parity_with_kernel_module() -> None:
         assert cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(
             topk, extra_topk
         ) == mod.max_chunks(topk, extra_topk)
+    # Ring depth and query L2 policy mirror the module's planner over the measured grid.
+    assert mod.PLAN_NUM_STAGES_MIN_CHUNKS == 8
+    assert mod.PLAN_NUM_STAGES_DUAL_MIN_CHUNKS == 16
+    assert mod.PLAN_NUM_STAGES_DUAL_MIN_TOKENS == 512
+    assert mod.PLAN_Q_EVICT_MIN_TOKENS == 512
+    assert mod.PLAN_GRID_HB_FIRST_MAX_CHUNKS == 4
+    assert mod.PLAN_GRID_HB_FIRST_MAX_TOKENS == 65535
+    for num_tokens in (1, 128, 511, 512, 2048, 8192, 65535, 65536):
+        assert cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_q_evict_first(
+            num_tokens=num_tokens
+        ) == mod.plan_q_evict_first(num_tokens)
+        for head_tiles in (1, 2, 4):
+            for topk, extra_topk, dual in (
+                (128, 0, False),
+                (448, 0, False),
+                (512, 0, False),
+                (512, 128, True),
+                (512, 512, True),
+                (1024, 0, False),
+            ):
+                assert cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages(
+                    head_tiles=head_tiles,
+                    topk=topk,
+                    extra_topk=extra_topk,
+                    dual=dual,
+                    num_tokens=num_tokens,
+                ) == mod.plan_num_stages(
+                    head_tiles,
+                    mod.max_chunks(topk, extra_topk),
+                    dual=dual,
+                    num_tokens=num_tokens,
+                ), (num_tokens, head_tiles, topk, extra_topk, dual)
+                assert (
+                    cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_grid_head_blocks_first(
+                        head_tiles=head_tiles,
+                        topk=topk,
+                        extra_topk=extra_topk,
+                        num_tokens=num_tokens,
+                    )
+                    == mod.plan_grid_head_blocks_first(
+                        head_tiles, mod.max_chunks(topk, extra_topk), num_tokens
+                    )
+                ), (num_tokens, head_tiles, topk, extra_topk)
     # The decode / prefill crossover and the tile choice mirror the module's planner on both
     # sm_120a SKUs (188 / 170 SMs) over the measured token, head and candidate grid.
     for num_sms in (188, 170):
@@ -462,6 +562,49 @@ def test_cake_prefill_token_counts(num_tokens: int) -> None:
     assert plan["num_ctas"] == items
     torch.testing.assert_close(output, reference, **_OUT_TOL)
     torch.testing.assert_close(out_lse, reference_lse, **_LSE_TOL)
+
+
+def test_cake_prefill_grid_y_cap_matches_split_launch() -> None:
+    """Above 65535 tokens the planner and the binding keep the token-major grid.
+
+    CUDA caps grid.y at 65535, so the head-blocks-first order of short candidate lists cannot carry the
+    token count there.  The 65536-token launch (tokens first by the cap) must be bitwise equal to the two
+    32768-token halves, which launch head blocks first.
+    """
+
+    _require_sm120()
+    torch.manual_seed(20261103)
+    num_tokens, num_heads, topk, page_size, num_pages = 65536, 16, 64, 64, 64
+    q = _query(num_tokens, num_heads)
+    cache = nvfp4_quantize_pack_sparse_mla_cache(_latent(num_pages, page_size))
+    indices = torch.randint(
+        0, num_pages * page_size, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    output = torch.empty_like(q)
+    out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device="cuda")
+    plan = cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
+        q, cache, indices, output, out_lse, _D**-0.5
+    )
+    assert plan["grid_head_blocks_first"] is False
+    half = num_tokens // 2
+    parts, part_lse = [], []
+    for lo in (0, half):
+        part = torch.empty(half, num_heads, _D, dtype=q.dtype, device="cuda")
+        lse = torch.empty(half, num_heads, dtype=torch.float32, device="cuda")
+        part_plan = cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
+            q[lo : lo + half].contiguous(),
+            cache,
+            indices[lo : lo + half].contiguous(),
+            part,
+            lse,
+            _D**-0.5,
+        )
+        assert part_plan["grid_head_blocks_first"] is True
+        parts.append(part)
+        part_lse.append(lse)
+    torch.cuda.synchronize()
+    assert torch.equal(output, torch.cat(parts))
+    assert torch.equal(out_lse, torch.cat(part_lse))
 
 
 @pytest.mark.parametrize("layout", ["NHD", "3D", "padded"])

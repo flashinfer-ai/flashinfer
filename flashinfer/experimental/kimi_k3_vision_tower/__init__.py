@@ -15,8 +15,8 @@ limitations under the License.
 """
 
 # Experimental Cake backend: the Kimi-K3 vision tower (MoonViT-3D encoder +
-# PatchMergerV2) for SM100 / SM103 (flashinfer-ai/flashinfer#4568, tracker
-# #4254).  The public entry points are ``flashinfer.kimi_k3_vision``
+# PatchMergerV2) for SM100 / SM103 (flashinfer-ai/flashinfer#4568).  The
+# public entry points are ``flashinfer.kimi_k3_vision``
 # (``kimi_k3_vision_tower`` and ``prepare_kimi_k3_vision_tower``); the host
 # plan, weight preparation, JIT registration and the generated sources live in
 # this package.

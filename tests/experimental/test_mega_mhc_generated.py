@@ -1,9 +1,12 @@
-"""Independent fused mHC values, scale bytes, current stream and graph epochs."""
+"""Independent fused mHC values, scale bytes, any token count, current stream and graph epochs."""
 
 import pytest
 import torch
 from flashinfer.experimental.deepgemm_mega_mhc import mega_mhc as _runtime
 from flashinfer.mega_mhc import prepare_mega_mhc
+
+EXPORTED_TOKENS = (1, 64, 65, 200, 1025, 4096)
+HELD_OUT_TOKENS = (3, 100, 257, 384, 448, 1000, 2048, 5000)
 
 
 def inputs(tokens, shifted):
@@ -173,29 +176,14 @@ def _skip_unless_exported():
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
     try:
-        arch = _runtime.device_arch(torch.device("cuda"))
+        _runtime.device_facts(torch.cuda.current_device())
     except RuntimeError as error:
         pytest.skip(str(error))
-    sms = torch.cuda.get_device_properties(0).multi_processor_count
-    if sms not in _runtime.supported_num_sms(arch):
-        pytest.skip(
-            f"The exported {arch} schedules cover {_runtime.supported_num_sms(arch)} SMs, "
-            f"this device has {sms}"
-        )
 
 
-@pytest.mark.parametrize("tokens", (1, 64, 65, 200, 1025, 4096))
-@pytest.mark.parametrize("shifted", (False, True))
-@pytest.mark.parametrize("layout", ("col", "extra"))
-def test_fused_values_scales_and_changed_input_replay(tokens, shifted, layout):
-    _skip_unless_exported()
-    values = inputs(tokens, shifted)
-    plan = prepare_mega_mhc(**values, sf_layout=layout)
-    expected = reference(values, layout)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
+def _replay_identical(plan, expected, stream, repeats):
     first = None
-    for _ in range(3):
+    for _ in range(repeats):
         with torch.cuda.stream(stream):
             poison(plan.outputs)
             plan.run()
@@ -213,6 +201,19 @@ def test_fused_values_scales_and_changed_input_replay(tokens, shifted, layout):
                         value.float(), first[name].float(), atol=0, rtol=0
                     )
         stream.wait_stream(torch.cuda.current_stream())
+
+
+@pytest.mark.parametrize("tokens", EXPORTED_TOKENS)
+@pytest.mark.parametrize("shifted", (False, True))
+@pytest.mark.parametrize("layout", ("col", "extra"))
+def test_fused_values_scales_and_changed_input_replay(tokens, shifted, layout):
+    _skip_unless_exported()
+    values = inputs(tokens, shifted)
+    plan = prepare_mega_mhc(**values, sf_layout=layout)
+    expected = reference(values, layout)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    _replay_identical(plan, expected, stream, 3)
     if not (tokens in (65, 1025) or (shifted and tokens in (1, 64, 200))):
         return
     graphs = []
@@ -240,7 +241,7 @@ def test_fused_values_scales_and_changed_input_replay(tokens, shifted, layout):
         stream.synchronize()
         check(plan.outputs, expected)
         current = plan.launch_epochs.cpu().tolist()
-        # Epoch storage always covers the route's full SM count (148 or 152).
+        # Epoch storage always covers the device's full SM count.
         assert len(current) == plan.config["num_sms"]
         assert len(set(current[:active])) == 1
         assert all(
@@ -250,3 +251,37 @@ def test_fused_values_scales_and_changed_input_replay(tokens, shifted, layout):
         assert current[active:] == previous[active:]
         previous = current
         stream.wait_stream(torch.cuda.current_stream())
+
+
+@pytest.mark.parametrize("tokens", HELD_OUT_TOKENS)
+@pytest.mark.parametrize("shifted", (False, True))
+@pytest.mark.parametrize("layout", ("col", "extra"))
+def test_any_token_count(tokens, shifted, layout):
+    """Token counts outside the exported denominator route by split class, not by exact count."""
+    _skip_unless_exported()
+    values = inputs(tokens, shifted)
+    plan = prepare_mega_mhc(**values, sf_layout=layout)
+    _arch, sms = _runtime.device_facts(torch.cuda.current_device())
+    assert plan.config["num_splits"] == _runtime.num_splits(tokens, 5120, sms)
+    assert plan.config["num_sms"] == sms
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    _replay_identical(plan, reference(values, layout), stream, 2)
+
+
+@pytest.mark.parametrize("tokens", (1, 200, 384))
+def test_deterministic_mode_uses_sixteen_splits(tokens):
+    _skip_unless_exported()
+    values = inputs(tokens, True)
+    plan = prepare_mega_mhc(**values, sf_layout="col", deterministic=True)
+    assert plan.config["num_splits"] == 16
+    assert plan.config["num_launch_sms"] == plan.config["num_sms"]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    _replay_identical(plan, reference(values, "col"), stream, 2)
+
+
+def test_bf16_only_layout_is_not_exported():
+    _skip_unless_exported()
+    with pytest.raises(NotImplementedError):
+        prepare_mega_mhc(**inputs(64, False), sf_layout="bf16")

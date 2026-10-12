@@ -14,12 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import re
+
 import pytest
 import torch
 
 from flashinfer import NVFP44Over6Config, SfLayout, nvfp4_quantize
 from flashinfer.experimental.cake_nvfp4_per_token import cake_backend as cb
-from flashinfer.experimental.cake_nvfp4_per_token.cake_jit import KERNELS, MODULES
+from flashinfer.experimental.cake_nvfp4_per_token.cake_jit import (
+    ARCHES,
+    DEFINITIONS,
+    KERNELS,
+    MODULES,
+    gen_cake_nvfp4_per_token_module,
+    kernel_definitions,
+    kernel_module_name,
+)
 
 FLT_MAX = 3.4028234663852886e38
 GLOBAL_SCALE_INV = 1.0 / (448.0 * 6.0)
@@ -61,19 +71,235 @@ def test_cta_config_rules():
     assert cb.cta_config(28672, 8192) == (256, 3)
 
 
+def _registered(plan, arch):
+    """The plan's kernel resolves to a generated program of ``arch``."""
+    assert plan.kernel_key in KERNELS[arch], plan.kernel_key
+    return plan
+
+
+def test_quantizer_takes_the_static_k_instance_below_the_row_limit():
+    """Contiguous row sets of fewer than STATIC_M_LIMIT tokens at a row width of
+    the validated set take the instance with the row width compiled in; a larger
+    row set, another row width or a row-strided view takes the runtime-geometry
+    instance of the same CTA shape.  A single row has no stride, so M == 1 takes
+    the compiled-in instance even through a strided view.  The widths of one CTA
+    shape share one program and differ only in its K_STATIC definition, and the
+    tier spans two CTA shapes per width: the small-row shape and the one
+    cta_config picks for the whole LARGE_ROW_MIN_M .. STATIC_M_LIMIT range."""
+    for k in cb.STATIC_K:
+        for m in (1, 8, 16, 130, cb.LARGE_ROW_MIN_M, 2048, cb.STATIC_M_LIMIT - 1):
+            plan = _registered(
+                cb.quant_plan(m, k, True, True, "sm_100a", 148), "sm_100a"
+            )
+            assert plan.k_static == k and plan.kernel_key.endswith(f"_k{k}")
+            assert DEFINITIONS[plan.kernel_key] == {"K_STATIC": k}
+            runtime_key = plan.kernel_key.removesuffix(f"_k{k}")
+            assert runtime_key not in DEFINITIONS
+            for arch in ARCHES:
+                # one delivered source per CTA shape: every width of the shape names the
+                # same module and differs only in its K_STATIC definition
+                family = {
+                    key: module
+                    for key, module in KERNELS[arch].items()
+                    if key.startswith(f"{runtime_key}_k")
+                }
+                assert plan.kernel_key in family
+                assert len(set(family.values())) == 1, family
+                # the runtime-geometry program of the same CTA shape, where the matrix
+                # reaches one, is a different source: it takes the width as an argument
+                if runtime_key in KERNELS[arch]:
+                    assert KERNELS[arch][runtime_key] not in set(family.values())
+            # A strided view cannot take the compiled-in instance (the program assumes
+            # contiguous rows); the runtime-geometry sibling it falls back to exists only
+            # where the validated matrix reaches that CTA shape -- see
+            # test_row_strided_activation_at_a_new_width_names_its_missing_program.
+            strided = cb.quant_plan(
+                m, k, True, True, "sm_100a", 148, x_row_stride=k + 16
+            )
+            if m == 1:
+                assert strided == plan
+            else:
+                assert strided.kernel_key == runtime_key and strided.k_static is None
+        # the row counts of the tier span exactly two CTA shapes per width
+        shapes = {
+            cb.cta_config(k, m) for m in (1, 8, 16, 130, 511, cb.LARGE_ROW_MIN_M, 2048)
+        }
+        assert len(shapes) <= 3, (k, shapes)
+    # the widths of one CTA shape are one program (the tier's widths span two shapes)
+    by_shape: dict[tuple[int, int, int], set[str]] = {}
+    for k in cb.STATIC_K:
+        single = cb.quant_plan(1, k, True, True, "sm_100a", 148)
+        shape = (single.threads, single.blocks_per_thread, single.min_blocks)
+        by_shape.setdefault(shape, set()).add(KERNELS["sm_100a"][single.kernel_key])
+    assert len(by_shape) == 2 and all(len(p) == 1 for p in by_shape.values()), by_shape
+    big = _registered(
+        cb.quant_plan(cb.STATIC_M_LIMIT, 7168, True, False, "sm_100a", 148), "sm_100a"
+    )
+    assert big.k_static is None and "_k" not in big.kernel_key
+    other = _registered(
+        cb.quant_plan(1, 7168 + 16 * 32, True, False, "sm_100a", 148), "sm_100a"
+    )
+    assert other.k_static is None
+
+
+def test_row_strided_activation_at_a_new_width_names_its_missing_program():
+    """A row-strided activation cannot take the compiled-in instance -- the program assumes
+    contiguous rows -- so it falls back to the runtime-geometry key of the same CTA shape.
+    The CTA shapes that only the new widths reach (K = 2688 / 4096 at or above
+    LARGE_ROW_MIN_M) have no runtime-geometry program in this package, and the dispatcher
+    names the missing key instead of mis-dispatching.  Generating the runtime-geometry
+    sibling of those shapes is a recorded follow-up."""
+    named = 0
+    for k in (2688, 4096):
+        for m in (cb.LARGE_ROW_MIN_M, 2048, cb.STATIC_M_LIMIT - 1):
+            plan = cb.quant_plan(m, k, True, False, "sm_100a", 148, x_row_stride=k + 16)
+            assert plan.k_static is None
+            if plan.kernel_key in KERNELS["sm_100a"]:
+                continue
+            named += 1
+            with pytest.raises(
+                NotImplementedError, match=r"quant:t\d+_b\d+_mb\d+_bf16"
+            ):
+                kernel_module_name("sm_100a", plan.kernel_key)
+    assert (
+        named > 0
+    )  # recorded follow-up: runtime-geometry sibling of the new CTA shapes
+
+
 def test_quant_plan_grid_and_keys():
-    plan = cb.quant_plan(257, 7168, True, False, "sm_100a", 148)
+    plan = _registered(cb.quant_plan(257, 7168, True, False, "sm_100a", 148), "sm_100a")
     assert plan.grid == 384 and plan.padded_rows == 384 and plan.padded_cols == 448
-    assert plan.kernel_key == "quant:k7168_t256_mb3_bf16"
+    assert plan.threads == 256 and plan.blocks_per_thread == 2
+    # fp16 input with the per-token scale folded into the GEMM alpha: the plan
+    # resolves, but no fp16-input folded quantizer is generated (bf16 fold and
+    # fp16 unfolded programs exist); the dispatcher names the missing program.
     fold = cb.quant_plan(257, 7168, False, True, "sm_100a", 148)
-    assert fold.kernel_key == "quant:k7168_t256_mb3_f16_fold"
-    wide = cb.quant_plan(8192, 7168, True, False, "sm_103a", 152)
+    assert fold.kernel_key != plan.kernel_key
+    assert "_f16_fold" in fold.kernel_key
+    with pytest.raises(NotImplementedError, match=r"quant:.*_f16_fold"):
+        kernel_module_name("sm_100a", fold.kernel_key)
+    wide = _registered(
+        cb.quant_plan(8192, 7168, True, False, "sm_103a", 152), "sm_103a"
+    )
     # One CTA per padded row regardless of the SM count.
     assert wide.threads == 128 and wide.min_blocks == 8 and wide.grid == 8192
-    assert wide.kernel_key == "quant:k7168_t128_mb8_bf16"
-    assert cb.quant_plan(1, 28672, True, False, "sm_100a", 148).grid == 128
+    assert (
+        _registered(
+            cb.quant_plan(1, 28672, True, False, "sm_100a", 148), "sm_100a"
+        ).grid
+        == 128
+    )
+    # One program per CTA shape (threads, register blocks per thread, occupancy):
+    # K = 2688 and 4096 resolve to one shape, 7168 and 8192 to another.  The widths of
+    # the static tier share that shape's program and differ in K_STATIC; a width outside
+    # the tier takes the shape's runtime-geometry program, which is a second source.
+    by_shape: dict[tuple[int, int, int], set[str]] = {}
+    for k in (2688, 4096, 7168, 8192):
+        plan = _registered(
+            cb.quant_plan(130, k, True, False, "sm_100a", 148), "sm_100a"
+        )
+        shape = (plan.threads, plan.blocks_per_thread, plan.min_blocks)
+        by_shape.setdefault(shape, set()).add(plan.kernel_key)
+    assert len(by_shape) == 2, by_shape
+    for shape, keys in by_shape.items():
+        static = {KERNELS["sm_100a"][key] for key in keys if re.search(r"_k\d+$", key)}
+        runtime = {
+            KERNELS["sm_100a"][key] for key in keys if not re.search(r"_k\d+$", key)
+        }
+        assert len(static) <= 1 and len(runtime) <= 1, (shape, keys)
+        assert not (static & runtime), (shape, keys)
     with pytest.raises(ValueError):
         cb.quant_plan(8, 100, True, False, "sm_100a", 148)
+
+
+# Row lengths of the validated matrix and dense token counts around every
+# dispatch boundary (single row, one wave, two CTAs per SM, the many-CTA split).
+REACHABLE_K = cb.VALIDATED_QUANTIZE_K + cb.VALIDATED_OFF_MATRIX_QUANTIZE_K
+REACHABLE_M = tuple(range(1, 33)) + (
+    *range(48, 160, 4),
+    *range(160, 600, 16),
+    *(1000, 1024, 2047, 2048, 2049, 4096, 4097, 8191, 8192, 8193, 16384, 65536),
+)
+
+
+@pytest.mark.parametrize(
+    "arch,sm_count", [("sm_100a", 148), ("sm_103a", 152), ("sm_100a", 132)]
+)
+def test_every_reachable_bf16_quantizer_shape_has_a_program(arch, sm_count):
+    """The dispatch is total for bf16 activations: every CTA shape it selects over
+    the validated row lengths and any token count resolves to a generated program
+    (K and the row stride are kernel arguments, so the set is the CTA shapes)."""
+    shapes = set()
+    for k in REACHABLE_K:
+        for m in REACHABLE_M:
+            for fold in (False, True):
+                plan = _registered(
+                    cb.quant_plan(m, k, True, fold, arch, sm_count), arch
+                )
+                shapes.add(plan.kernel_key)
+    assert shapes <= set(KERNELS[arch])
+
+
+def test_f16_quantizer_shapes_match_the_validated_f16_rows():
+    """fp16 activations are generated for the validated fp16 rows (K = 7168 at
+    256 threads, scale not folded); every other fp16 shape names its missing
+    program instead of mis-dispatching."""
+    for m in cb.VALIDATED_F16_INPUT_ROWS:
+        _registered(cb.quant_plan(m, 7168, False, False, "sm_100a", 148), "sm_100a")
+    unregistered = 0
+    for k in REACHABLE_K:
+        for m in REACHABLE_M:
+            for fold in (False, True):
+                plan = cb.quant_plan(m, k, False, fold, "sm_100a", 148)
+                if plan.kernel_key in KERNELS["sm_100a"]:
+                    continue
+                unregistered += 1
+                with pytest.raises(
+                    NotImplementedError, match=r"quant:t\d+_b\d+_mb\d+_f16"
+                ):
+                    kernel_module_name("sm_100a", plan.kernel_key)
+    assert unregistered > 0  # recorded follow-up: fp16 input beyond the validated rows
+
+
+def test_static_k_programs_are_built_with_their_compile_line_definition():
+    """A program whose delivered source declares K_STATIC a downstream specialization
+    must never be compiled without it: the source carries the name value-free behind an
+    #error guard, so every build of it has to come from a kernel key whose definitions
+    the registry resolves.  The JIT spec of each such key must carry -DK_STATIC=<K> and
+    name the value, so the two widths of one program do not share a build directory."""
+    specialized = {
+        name
+        for name in MODULES
+        if any(
+            "K_STATIC" in dict(kernel_definitions(key))
+            for arch in ARCHES
+            for key, module in KERNELS.get(arch, {}).items()
+            if module == name
+        )
+    }
+    assert specialized, "no program declares a compile-line definition"
+    for arch in ARCHES:
+        for key, module in KERNELS[arch].items():
+            definitions = kernel_definitions(key)
+            width = re.search(r"_k(\d+)$", key)
+            if width is None:
+                assert not definitions, (key, definitions)
+                continue
+            assert dict(definitions) == {"K_STATIC": int(width.group(1))}, (
+                key,
+                definitions,
+            )
+            spec = gen_cake_nvfp4_per_token_module(module, arch, definitions)
+            flags = " ".join(spec.extra_cuda_cflags)
+            assert f"-DK_STATIC={width.group(1)}" in flags, (key, flags)
+            assert f"k_static{width.group(1)}" in spec.name, (key, spec.name)
+            plain = gen_cake_nvfp4_per_token_module(module, arch)
+            assert plain.name != spec.name, (key, spec.name)
+    # every specialized program is reached only through keys that define the name
+    for arch in ARCHES:
+        for key, module in KERNELS[arch].items():
+            if module in specialized:
+                assert "K_STATIC" in dict(kernel_definitions(key)), (arch, key)
 
 
 @pytest.mark.parametrize("arch", cb.ARCHES)
@@ -85,7 +311,7 @@ def test_required_kernel_keys_are_registered_when_programs_exist(arch):
         missing = sorted(set(required) - set(KERNELS[arch]))
         assert not missing, f"{arch} lacks {missing}"
         for module_name in KERNELS[arch].values():
-            assert MODULES[module_name]["arch"] == arch
+            assert arch in MODULES[module_name]["arches"]
 
 
 # ---------------------------------------------------------------------------
@@ -97,9 +323,6 @@ def _require_program():
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
     device = torch.device("cuda", 0)
-    capability = torch.cuda.get_device_capability(device)
-    if capability not in cb.SUPPORTED_COMPUTE_CAPABILITIES:
-        pytest.skip("the cake per-token NVFP4 quantizer requires SM100/SM103")
     if not cb.generated_program_available(device):
         pytest.skip("no generated per-token NVFP4 program registered for this GPU")
     return device
@@ -199,12 +422,21 @@ def _check_against_reference(x, gs_inv, out_scale, fp4, sf, scale):
 
 # The validated matrix (cake_backend.validated_problems): bf16 activations on
 # every K x M x fold; fp16 activations on the validated fp16 rows of K=7168 only.
-_QUANT_CASES = [
-    (m, k, torch.bfloat16, fold)
-    for fold in (False, True)
-    for k in (7168, 16384)
-    for m in (1, 17, 130, 257, 4097)
-] + [(m, 7168, torch.float16, False) for m in cb.VALIDATED_F16_INPUT_ROWS]
+_QUANT_CASES = (
+    [
+        (m, k, torch.bfloat16, fold)
+        for fold in (False, True)
+        for k in (7168, 16384)
+        for m in (1, 17, 130, 257, 4097)
+    ]
+    + [(m, 7168, torch.float16, False) for m in cb.VALIDATED_F16_INPUT_ROWS]
+    # Row lengths outside the measured families and the token counts between tiles.
+    + [
+        (m, k, torch.bfloat16, False)
+        for k in (2688, 4096)
+        for m in (1, 9, 16, 130, 2048)
+    ]
+)
 
 
 @pytest.mark.parametrize("m,k,dtype,fold", _QUANT_CASES)
@@ -237,6 +469,50 @@ def test_quantize_matches_reference_and_cute_dsl(m, k, dtype, fold):
         assert torch.equal(p_fp4, fp4)
         assert torch.equal(p_sf.reshape(-1), sf.reshape(-1))
         assert torch.equal(p_scale, scale)
+
+
+# K = 2688 / 4096 are covered at M = 1 only: a single row has no stride, so it keeps the
+# compiled-in instance.  Multi-row strided sets at those widths fall back to a runtime-geometry
+# program the package does not carry -- see
+# test_row_strided_activation_at_a_new_width_names_its_missing_program.
+@pytest.mark.parametrize("k,m", [(7168, 130), (7168, 8), (2688, 1), (4096, 1)])
+def test_quantize_reads_row_strided_activations_in_place(k, m):
+    device = _require_program()
+    g = torch.Generator(device=device).manual_seed(500 + m + k)
+    full = torch.randn(m, k + 64, device=device, dtype=torch.bfloat16, generator=g)
+    x = full[:, :k]  # row stride k + 64 elements
+    assert m == 1 or not x.is_contiguous()  # a single row is contiguous at any stride
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    want = nvfp4_quantize(
+        x.contiguous(), gs_inv, per_token_activation=True, backend="cake"
+    )
+    torch.cuda.synchronize()
+    data_ptr = full.data_ptr()
+    got = nvfp4_quantize(x, gs_inv, per_token_activation=True, backend="cake")
+    torch.cuda.synchronize()
+    assert full.data_ptr() == data_ptr
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(a.reshape(-1), b.reshape(-1))
+    _check_against_reference(x, gs_inv, None, *got)
+
+
+def test_quantize_repeated_call_allocates_only_its_outputs():
+    device = _require_program()
+    m, k = 257, 7168
+    g = torch.Generator(device=device).manual_seed(11)
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16, generator=g)
+    call = lambda: nvfp4_quantize(  # noqa: E731
+        x, GLOBAL_SCALE_INV, per_token_activation=True, backend="cake"
+    )
+    call()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    outputs = call()
+    torch.cuda.synchronize()
+    # fp4 codes, block scales and per-token scales: nothing else per call.
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] - before == 3
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    _check_against_reference(x, gs_inv, None, *outputs)
 
 
 def test_prepared_runner_graph_replay_and_no_allocation():

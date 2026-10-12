@@ -37,6 +37,8 @@ from ..jit.cake_fused_kda_decode import (
     CakeFusedKDADecodeStateIndicesMode,
     CakeFusedKDADecodeTarget,
     CakeFusedKDADecodeVariant,
+    cake_fused_kda_decode_grid,
+    cake_fused_kda_decode_lower_bound_log2,
     get_cake_fused_kda_decode_variants,
     load_cake_fused_kda_decode_module,
     select_cake_fused_kda_decode_variant,
@@ -675,6 +677,18 @@ def _get_compiled_kernel(state_dtype, lower_bound, norm_eps, packed_t1=False):
     return direct_kernel
 
 
+@functools.cache
+def _device_sm_count(device_index: int) -> int:
+    """Multiprocessor count of one CUDA device, queried once per process."""
+
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+def _device_index(device) -> int:
+    index = device.index
+    return torch.cuda.current_device() if index is None else int(index)
+
+
 def _check_cuda_tensor(name, tensor, dtype):
     if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
         raise ValueError(f"{name} must be a CUDA tensor")
@@ -761,24 +775,63 @@ def _run_cake_variant(
     lower_bound,
     norm_eps,
 ) -> None:
+    """Submit the selected generated program on the caller-owned tensors.
+
+    Every buffer is the caller's storage (no staging, no allocation, no views):
+    padded rows and cache slots travel as the caller's strided tensors plus
+    their explicit strides, and the generated binding checks that layout.
+    Repeated-slot programs take the whole row set in one call: their binding
+    walks the rows in order with one launch each (grid ``(H, 1, 1)``, same
+    stream) so a slot shared by several rows observes every earlier update.
+    """
+
     module = load_cake_fused_kda_decode_module(variant.name, variant.target)
-    module.run(
-        x,
-        weight,
-        conv_state,
-        raw_gate,
-        raw_beta,
-        A_log,
-        dt_bias,
-        state_indices,
-        state,
-        output_gate,
-        norm_weight,
-        output,
-        int(lower_bound is not None),
-        0.0 if lower_bound is None else float(lower_bound),
-        float(norm_eps),
+    entry = getattr(module, variant.ffi_entry)
+    num_rows = int(x.shape[0])
+    num_heads = int(x.shape[1]) // (3 * _HEAD_DIM)
+    device_index = _device_index(x.device)
+    grid = cake_fused_kda_decode_grid(
+        variant,
+        num_heads=num_heads,
+        num_rows=num_rows,
+        sm_count=_device_sm_count(device_index),
     )
+    bindings = {
+        "grid_x": grid[0],
+        "grid_y": grid[1],
+        "grid_z": grid[2],
+        "device_index": device_index,
+        "x": x,
+        "weight": weight,
+        "conv_state": conv_state,
+        "raw_gate": raw_gate,
+        "raw_beta": raw_beta,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "state_indices": state_indices,
+        "state": state,
+        "output_gate": output_gate,
+        "norm_weight": norm_weight,
+        "output": output,
+        "x_row_stride": int(x.stride(0)),
+        "conv_slot_stride": int(conv_state.stride(0)),
+        "beta_row_stride": int(raw_beta.stride(1)),
+        "state_slot_stride": int(state.stride(0)),
+        "output_gate_row_stride": int(output_gate.stride(0)),
+        "H": num_heads,
+        "rows": num_rows,
+        "use_lower_bound": int(lower_bound is not None),
+        "lower_bound_log2": cake_fused_kda_decode_lower_bound_log2(lower_bound),
+        "norm_eps": float(norm_eps),
+    }
+    try:
+        arguments = [bindings[name] for _kind, name in variant.arg_plan]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Cake fused KDA program {variant.module} binds {exc.args[0]!r}, "
+            "which this host does not declare"
+        ) from None
+    entry(*arguments)
 
 
 @torch.no_grad()

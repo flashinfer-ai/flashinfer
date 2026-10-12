@@ -83,8 +83,9 @@ python next/export_src.py \
 sha256sum next/export_src.py
 ```
 
-The current selection includes the generic and GenPhase inference kernels;
-GenPhase is vendored for a separate FlashInfer integration. Select additional
+The current selection includes the generic and GenPhase inference kernels.
+Select GenPhase with `kernel_variant="genphase"` and preserve its fixed cluster
+and bulk-store requirements when adapting the launcher. Select additional
 kernels when their FlashInfer integration is included in the update.
 The export may include dependencies from other kernel families; record their
 source mappings rather than manually removing them.
@@ -138,10 +139,11 @@ change.
 
 ### 5. Carry supported changes through the FlashInfer API
 
-New supported knobs may require changes in `Sm107BlockScaledMoeConfig`, both
+New supported knobs may require changes in `Sm107BlockScaledMoeConfig`, all three
 SM107 backend config dataclasses, workspace construction/pool keys, validation,
-and package exports. Inspect both NVFP4 and MXFP8 consumers. An optional upstream
-field need not become a public knob unless the integration intends to support it.
+and package exports. Inspect NVFP4, MXFP8, and MXFP4-weight consumers. An optional
+upstream field need not become a public knob unless the integration intends to
+support it.
 
 Update heuristic profiles, candidate enumeration and cache keys when kernel
 semantics or legal configurations change. Bump the backend revision in both
@@ -149,10 +151,10 @@ cache lookup and recording when old entries are no longer valid. Require rank
 agreement and numerical qualification of tuning winners; do not reuse a cache
 across incompatible precision, routing-weight or reduction policies.
 
-`+combine_nvfp4` and `+combine_mxfp8` are future integration work: the current
-wrapper selects BF16 combine. Exposing the existing quantized-combine paths
-requires configuration, correctly sized payload/scale buffers, reduction and
-output handling, cache/pool identities, numerical tests and benchmark variants.
+`combine_dtype="nvfp4"` and `combine_dtype="mxfp8"` select quantized combine
+with the generic inference kernel; BF16 remains the default. Preserve payload
+and scale slot clearing, separate reduction, and cache/pool identities. Add
+numerical and benchmark coverage when changing either format.
 Check those requirements against the upstream kernel interface. Report each
 combine format as a separate variant alongside BF16 combine and `+ikr`.
 

@@ -55,10 +55,11 @@ destination map the reference dK/dV is mapped the same way).
 
 ``--host-us`` measures the host side of the eager entry points (``forward``,
 ``backward``, the public ``dsa_sparse_attention`` forward / autograd backward /
-step) as wall-clock microseconds per call with the GPU running asynchronously,
-alternating the binding cache off / on inside one process (``--host-rounds``
-rounds of ``--host-calls`` calls each), and checks that both paths produce the
-same results and the same kernel-only time.
+step) and of a prepared runner as wall-clock microseconds per call with the GPU
+running asynchronously (``--host-rounds`` rounds of ``--host-calls`` calls
+each, the order of the entry points rotated every round and recorded per
+round), and checks that both paths produce the same results and the same
+kernel-only time.
 
 Usage::
 
@@ -87,7 +88,10 @@ from flashinfer.dsa_sparse_attention import (  # noqa: E402
     dsa_sparse_attention,
     dsa_sparse_attention_varlen,
 )
-from flashinfer.experimental.cake_dsa_train import cake_backend  # noqa: E402
+from flashinfer.experimental.cake_dsa_train import (  # noqa: E402
+    cake_backend,
+    cake_jit,
+)
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 from tests.test_helpers.cake_dsa_train_reference import (  # noqa: E402
     D_LATENT,
@@ -119,17 +123,17 @@ for _s in (65536, 131072, 196608):
 # segments alternating a full document and the tail of a long prefix,
 #   cu_seqlens_q = [0, 1777, 3532, 5655, 7765, 9888, 11998, 14121, 16231]
 #   cu_seqlens_k = [0, 1777, 58619, 60742, 128665, 130788, 198711, 200834, 268757]
-# (T 16231, Tkv 268757, max_seqlen_q 2123, max_seqlen_k 67923); packed_glm_b is its
-# deterministic sibling (T 16172, Tkv 267520,
-#   cu_seqlens_q = [0, 1770, 3518, 5634, 7736, 9852, 11954, 14070, 16172]
-#   cu_seqlens_k = [0, 1770, 58390, 60506, 128100, 130216, 197810, 199926, 267520]).
+# (T 16231, Tkv 268757, max_seqlen_q 2123, max_seqlen_k 67923); packed_glm_b is the
+# second recorded batch (T 16172, Tkv 267520, max_seqlen_q 2027, max_seqlen_k 64853,
+#   cu_seqlens_q = [0, 2027, 4043, 6070, 8086, 10113, 12129, 14156, 16172]
+#   cu_seqlens_k = [0, 2027, 66880, 68907, 133760, 135787, 200640, 202667, 267520]).
 GLM_A = (
     [1777, 1755, 2123, 2110, 2123, 2110, 2123, 2110],
     [1777, 56842, 2123, 67923, 2123, 67923, 2123, 67923],
 )
 GLM_B = (
-    [1770, 1748, 2116, 2102, 2116, 2102, 2116, 2102],
-    [1770, 56620, 2116, 67594, 2116, 67594, 2116, 67594],
+    [2027, 2016, 2027, 2016, 2027, 2016, 2027, 2016],
+    [2027, 64853, 2027, 64853, 2027, 64853, 2027, 64853],
 )
 ROWS["packed_glm_a"] = GLM_A
 ROWS["packed_glm_b"] = GLM_B
@@ -139,9 +143,95 @@ ROWS["doc_16231"] = ([16231], [16231])  # one document at the recorded token cou
 ROWS["doc_4095"] = ([4095], [4095])  # tile / chunk boundary
 ROWS["doc_4097"] = ([4097], [4097])
 
+
+# GB200 trainer-trace rows (round 2 of issue #5675): the recorded dK/dV destination buffers have FEWER rows than the
+# KV buffer (268,757 key rows into 260,611 fp32 rows for batch a, 267,520 into 259,412 for batch b -- 3.03 % of the key
+# rows share a destination), and the backward runs in 4096-query chunks over the whole packed key row.
+GLM_DST_ROWS = {"glm_a": (GLM_A[1], 260611), "glm_b": (GLM_B[1], 259412)}
+
+
+def dst_map_rows(seq_k, dst_rows):
+    """Destination row of every key row (Python ints, ``sum(seq_k)`` long) of the overlap map that reproduces a recorded
+    destination-row count: segment ``i > 0`` aliases its first ``d_i`` key rows onto the previous segment's last ``d_i``
+    destination rows (``sum d_i = sum(seq_k) - dst_rows``, split over segments ``1..N-1`` in proportion to their key
+    counts, largest remainder), fresh rows follow in natural order."""
+    seq_k = [int(x) for x in seq_k]
+    S, dups = sum(seq_k), sum(seq_k) - int(dst_rows)
+    if dups < 0 or (dups and len(seq_k) < 2):
+        raise ValueError(
+            f"dst_map_rows: {dst_rows} destination rows for {S} key rows in {len(seq_k)} segment(s)"
+        )
+    weight = sum(seq_k[1:])
+    raw = [dups * lk / weight for lk in seq_k[1:]] if weight else []
+    d = [0] + [int(x) for x in raw]
+    for i in sorted(
+        range(1, len(seq_k)), key=lambda i: raw[i - 1] - int(raw[i - 1]), reverse=True
+    )[: dups - sum(d)]:
+        d[i] += 1
+    for i in range(1, len(seq_k)):
+        if d[i] > min(seq_k[i], seq_k[i - 1]):
+            raise ValueError(
+                f"dst_map_rows: segment {i} would alias {d[i]} rows, more than min({seq_k[i]}, {seq_k[i - 1]})"
+            )
+    out, next_row = [], 0
+    for lk, di in zip(seq_k, d, strict=True):
+        out.extend(
+            range(next_row - di, next_row)
+        )  # aliased onto the previous segment's last di rows
+        out.extend(range(next_row, next_row + lk - di))
+        next_row += lk - di
+    assert next_row == int(dst_rows) and len(out) == S
+    return out
+
+
+def bwd_chunk(seq_q, seq_k, q0, q1):
+    """Segment lists ``(seq_q, seq_k)`` of one backward chunk of a packed batch: the chunk's queries ``[q0, q1)`` of the
+    packed query row over the FULL key row (the recorded trainer runs the backward of a 16k-query batch in 4096-query
+    chunks).  Documents outside the chunk keep their key rows as 0-query segments; a document the chunk splits becomes
+    ``(n, keys up to its last own key)`` + ``(0, the rest)``."""
+    seq_q, seq_k = [int(x) for x in seq_q], [int(x) for x in seq_k]
+    out_q, out_k, cu = [], [], 0
+    for lq, lk in zip(seq_q, seq_k, strict=True):
+        lo, hi = (
+            max(q0, cu),
+            min(q1, cu + lq),
+        )  # the chunk's queries of this document (packed positions)
+        n = max(0, hi - lo)
+        if n == 0:
+            out_q.append(0)
+            out_k.append(lk)
+        else:
+            own_last = (lk - lq) + (
+                hi - cu
+            )  # keys up to the last own key of the chunk's queries
+            out_q.append(n)
+            out_k.append(own_last)
+            if own_last < lk:
+                out_q.append(0)
+                out_k.append(lk - own_last)
+        cu += lq
+    if sum(out_q) != q1 - q0 or sum(out_k) != sum(seq_k):
+        raise ValueError(
+            f"bwd_chunk: queries [{q0}, {q1}) do not fit the batch ({sum(seq_q)} queries)"
+        )
+    return out_q, out_k
+
+
+ROWS["packed_glm_a_dstmap"] = (
+    GLM_A  # the recorded batch a with its dK/dV destination map (ROW_LAYOUTS)
+)
+ROWS["packed_glm_b_dstmap"] = GLM_B
+ROWS["packed_glm_a_s704_dstmap"] = GLM_A
+ROWS["packed_glm_b_s704_dstmap"] = GLM_B
+ROWS["chunk_4096x268757"] = bwd_chunk(
+    *GLM_A, 0, 4096
+)  # the recorded 4096-query backward chunks
+ROWS["chunk_3943x268757"] = bwd_chunk(*GLM_A, 12288, 16231)
+ROWS["chunk_3884x267520"] = bwd_chunk(*GLM_B, 12288, 16172)
+
 Q_LAYOUTS = ("packed576", "pre256")
 KV_STRIDES = (D_QK, 704)
-DST_MAPS = ("none", "identity", "perm")
+DST_MAPS = ("none", "identity", "perm", "glm_a", "glm_b")
 DEFAULT_LAYOUT = dict(
     q_layout="packed576", kv_stride=D_QK, dkv_acc=False, dkv_dst_map="none"
 )
@@ -157,6 +247,21 @@ ROW_LAYOUTS = {
     "doc_16231": TRAINER_LAYOUT,
     "doc_4095": TRAINER_LAYOUT,
     "doc_4097": TRAINER_LAYOUT,
+    "packed_glm_a_dstmap": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_a"},
+    "packed_glm_b_dstmap": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_b"},
+    "packed_glm_a_s704_dstmap": {
+        **TRAINER_LAYOUT,
+        "kv_stride": 704,
+        "dkv_dst_map": "glm_a",
+    },
+    "packed_glm_b_s704_dstmap": {
+        **TRAINER_LAYOUT,
+        "kv_stride": 704,
+        "dkv_dst_map": "glm_b",
+    },
+    "chunk_4096x268757": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_a"},
+    "chunk_3943x268757": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_a"},
+    "chunk_3884x267520": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_b"},
 }
 # --preset: one GLM-5.2 row in the trainer layout
 PRESETS = {
@@ -256,6 +361,9 @@ class Layout:
             "none",
         )
         self.total_q, self.total_k = inp.total_q, inp.total_k
+        self.dkv_rows = (
+            inp.total_k
+        )  # rows of dkv_acc (fewer than the key rows with a recorded map)
         device = inp.q_latent.device
         self.q_latent, self.q_rope = inp.q_latent, inp.q_rope
         self.kv_latent, self.k_rope = inp.kv_latent, inp.k_rope
@@ -288,6 +396,16 @@ class Layout:
             ndup = min(8, inp.total_k // 2)
             perm[1 : 2 * ndup : 2] = perm[0 : 2 * ndup : 2]
             self.dst_map = perm.to(torch.int32).contiguous()
+        elif dkv_dst_map in GLM_DST_ROWS:
+            seq_k, rows = GLM_DST_ROWS[dkv_dst_map]
+            if sum(seq_k) != inp.total_k:
+                raise ValueError(
+                    f"dkv_dst_map {dkv_dst_map!r} is defined for {sum(seq_k)} key rows, this row has {inp.total_k}"
+                )
+            self.dst_map = torch.tensor(
+                dst_map_rows(seq_k, rows), dtype=torch.int32, device=device
+            )
+            self.dkv_rows = rows
 
     def describe(self):
         return dict(
@@ -307,7 +425,7 @@ class Layout:
         step), so it counts in the step time and in the peak memory of every arm.
         """
         return torch.zeros(
-            self.total_k, D_QK, dtype=torch.float32, device=self.q_latent.device
+            self.dkv_rows, D_QK, dtype=torch.float32, device=self.q_latent.device
         )
 
     def accumulate(self, dkv_acc, dkv_latent, dk_rope):
@@ -332,7 +450,9 @@ class Layout:
         idx = self.dst_map.long()
         for key in ("dkv_latent", "dk_rope"):
             t = ref[key]
-            ref[key] = torch.zeros_like(t).index_add_(0, idx, t)
+            ref[key] = torch.zeros(
+                (self.dkv_rows,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device
+            ).index_add_(0, idx, t)
         return ref
 
 
@@ -426,16 +546,13 @@ class ArmCake:
         if self.runner is not None:
             return dict(
                 module=self.runner.module_name,
-                abi=self.runner.abi,
                 stages=list(self.runner.stages),
                 entry="prepare_dsa_train",
             )
-        module_name, record = cake_backend.record_for(self.inp.q_latent.device)
-        stages = getattr(cake_backend, "registered_stages", lambda _m: ())(module_name)
+        module_name, _record = cake_backend.record_for(self.inp.q_latent.device)
         return dict(
             module=module_name,
-            abi=cake_backend.record_abi(record),
-            stages=list(stages),
+            stages=list(cake_jit.registered_stages()),
             entry="dsa_sparse_attention_varlen",
             layout=self.layout.describe(),
         )
@@ -789,7 +906,7 @@ def measure_accuracy(arm, inp, layout):
         )
         if layout.dst_map is not None and "dkv_acc" in grads:
             hit = torch.zeros(
-                layout.total_k, dtype=torch.bool, device=layout.dst_map.device
+                layout.dkv_rows, dtype=torch.bool, device=layout.dst_map.device
             )
             hit[layout.dst_map.long()] = True
             record["dst_rows_unused"] = int((~hit).sum().item())
@@ -912,16 +1029,14 @@ def _host_us_per_call(fn, calls):
 
 
 def measure_host_path(inp, *, calls, rounds, kernel_steps):
-    """Host microseconds per call of the eager entry points with the binding cache off / on.
+    """Host microseconds per call of the eager entry points against the prepared runner.
 
-    Each round measures every entry point in both modes back to back (off
-    first), so the two modes see the same process state; the medians over the
-    rounds are reported.  Also checks that both modes give the same results
-    (``out``, ``lse``, ``dq_*`` bitwise; ``dkv_*`` within the ``red.global``
-    run-to-run spread) and reports the CUPTI kernel-only medians of both.
+    Each round measures every entry point back to back, so they see the same
+    process state; the medians over the rounds are reported.  Also checks that
+    the eager path and the runner give the same results (``out``, ``lse``,
+    ``dq_*`` bitwise; ``dkv_*`` within the ``red.global`` run-to-run spread)
+    and reports the CUPTI kernel-only medians of both.
     """
-    cache = cake_backend.BINDING_CACHE
-    was_enabled = cache.enabled
     args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
     backward_available = cake_backend.generated_program_available(
         inp.q_latent.device, backward=True
@@ -931,6 +1046,11 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
         dsa_sparse_attention(*args)  # the experimental banner fires once per process
     leaves = [t.detach().clone().requires_grad_() for t in args[:4]]
     saved = cake_backend.forward(*args)
+    runner = cake_backend.prepare_dsa_train(
+        *args,
+        dout=inp.dout if backward_available else None,
+        backward=backward_available,
+    )
     torch.cuda.synchronize()
 
     def eager_forward():
@@ -938,6 +1058,12 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
 
     def eager_backward():
         return cake_backend.backward(*args, saved[0], saved[2], saved[1], inp.dout)
+
+    def runner_forward():
+        return runner.forward()
+
+    def runner_backward():
+        return runner.backward()
 
     def public_forward():
         return dsa_sparse_attention(*leaves, inp.idx_global)
@@ -951,91 +1077,77 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
         out = dsa_sparse_attention(*leaves, inp.idx_global)
         return torch.autograd.grad(out, leaves, inp.dout)
 
-    entry_points = [("forward", eager_forward), ("public_forward", public_forward)]
+    entry_points = [
+        ("forward", eager_forward),
+        ("runner_forward", runner_forward),
+        ("public_forward", public_forward),
+    ]
     if backward_available:
         entry_points += [
             ("backward", eager_backward),
+            ("runner_backward", runner_backward),
             ("public_backward", public_backward),
             ("autograd_step", autograd_step),
         ]
-    samples = {name: {"off": [], "on": []} for name, _ in entry_points}
-    lookups = {
-        name: [] for name, _ in entry_points
-    }  # (hits, misses) of the measured cache-on calls
+    samples = {name: [] for name, _ in entry_points}
+    orders = []
+    for r in range(rounds):
+        # rotate the measurement order every round so no entry point always runs
+        # first (cache state and clock drift would otherwise favour one position)
+        start = r % len(entry_points)
+        order = entry_points[start:] + entry_points[:start]
+        orders.append([name for name, _ in order])
+        for name, fn in order:
+            fn()  # warm the entry point; measured calls follow
+            samples[name].append(_host_us_per_call(fn, calls))
+    # same results from both paths
+    e_fwd = eager_forward()
+    r_fwd = runner_forward()
+    e_bwd = eager_backward() if backward_available else None
+    r_bwd = runner_backward() if backward_available else None
+    torch.cuda.synchronize()
+    same = dict(
+        out=torch.equal(e_fwd[0], r_fwd[0]), lse=torch.equal(e_fwd[1], r_fwd[1])
+    )
+    if backward_available:
+        same.update(
+            dq_latent=torch.equal(e_bwd[0], r_bwd[0]),
+            dq_rope=torch.equal(e_bwd[1], r_bwd[1]),
+            dkv_latent_rel_l2=rel_l2(e_bwd[2], r_bwd[2]),
+            dk_rope_rel_l2=rel_l2(e_bwd[3], r_bwd[3]),
+        )
+    del e_fwd, r_fwd, e_bwd, r_bwd
+    # kernel-only time of both paths (CUPTI, per-iteration GPU span)
+    kernel_ms = {}
     try:
-        for _ in range(rounds):
-            for mode in ("off", "on"):
-                cache.enabled = mode == "on"
-                for name, fn in entry_points:
-                    fn()  # the first call of a mode binds (a miss); measured calls follow
-                    hits, misses = cache.hits, cache.misses
-                    samples[name][mode].append(_host_us_per_call(fn, calls))
-                    if mode == "on":
-                        lookups[name].append((cache.hits - hits, cache.misses - misses))
-        # same results from both paths
-        cache.enabled = False
-        off_fwd = eager_forward()
-        off_bwd = eager_backward() if backward_available else None
-        cache.enabled = True
-        on_fwd = eager_forward()
-        on_bwd = eager_backward() if backward_available else None
-        torch.cuda.synchronize()
-        same = dict(
-            out=torch.equal(off_fwd[0], on_fwd[0]),
-            lse=torch.equal(off_fwd[1], on_fwd[1]),
-        )
+        for mode, fwd, bwd in (
+            ("eager", eager_forward, eager_backward),
+            ("runner", runner_forward, runner_backward),
+        ):
+            kernel_ms[mode] = dict(forward=median_ms(fwd, kernel_steps))
+            if backward_available:
+                kernel_ms[mode]["backward"] = median_ms(bwd, kernel_steps)
         if backward_available:
-            same.update(
-                dq_latent=torch.equal(off_bwd[0], on_bwd[0]),
-                dq_rope=torch.equal(off_bwd[1], on_bwd[1]),
-                dkv_latent_rel_l2=rel_l2(off_bwd[2], on_bwd[2]),
-                dk_rope_rel_l2=rel_l2(off_bwd[3], on_bwd[3]),
-            )
-        del off_fwd, off_bwd, on_fwd, on_bwd
-        # kernel-only time of both paths (CUPTI, per-iteration GPU span)
-        kernel_ms = {}
-        try:
-            for mode in ("off", "on"):
-                cache.enabled = mode == "on"
-                kernel_ms[mode] = dict(forward=median_ms(eager_forward, kernel_steps))
-                if backward_available:
-                    kernel_ms[mode]["backward"] = median_ms(
-                        eager_backward, kernel_steps
-                    )
-                    kernel_ms[mode]["autograd_step"] = median_ms(
-                        autograd_step, kernel_steps
-                    )
-        except Exception as exc:  # the host figures stand on their own when CUPTI tracing is unavailable
-            kernel_ms["error"] = f"{type(exc).__name__}: {exc}"
-    finally:
-        cache.enabled = was_enabled
+            kernel_ms["eager"]["autograd_step"] = median_ms(autograd_step, kernel_steps)
+    except (
+        Exception
+    ) as exc:  # the host figures stand on their own when CUPTI tracing is unavailable
+        kernel_ms["error"] = f"{type(exc).__name__}: {exc}"
     host_us = {
-        name: {
-            mode: dict(
-                median=float(statistics.median(v)),
-                min=float(min(v)),
-                rounds=[float(x) for x in v],
-            )
-            for mode, v in modes.items()
-        }
-        for name, modes in samples.items()
-    }
-    for name, hm in lookups.items():
-        host_us[name]["on"]["lookups"] = dict(
-            hits=sum(h for h, _ in hm), misses=sum(m for _, m in hm)
+        name: dict(
+            median=float(statistics.median(v)),
+            min=float(min(v)),
+            rounds=[float(x) for x in v],
         )
+        for name, v in samples.items()
+    }
     return dict(
         calls=calls,
         rounds=rounds,
+        order_per_round=orders,
         host_us=host_us,
         same_results=same,
         kernel_ms=kernel_ms,
-        cache=dict(
-            hits=cache.hits,
-            misses=cache.misses,
-            bindings=len(cache),
-            owned_bytes=cache.owned_bytes,
-        ),
     )
 
 
@@ -1058,12 +1170,9 @@ def run_host_path(args, results):
             )
             print(f"{row:22s} host path failed: {entry['error']}", flush=True)
         else:
-            for name, modes in entry["host_us"].items():
-                off, on = modes["off"]["median"], modes["on"]["median"]
-                lk = modes["on"]["lookups"]
+            for name, stats in entry["host_us"].items():
                 print(
-                    f"{row:22s} {name:16s} host us/call  cache off {off:8.1f}  cache on {on:8.1f}  ({off / on:5.2f}x)"
-                    f"  lookups hit {lk['hits']} miss {lk['misses']}",
+                    f"{row:22s} {name:16s} host us/call  median {stats['median']:8.1f}  min {stats['min']:8.1f}",
                     flush=True,
                 )
             print(
@@ -1072,8 +1181,7 @@ def run_host_path(args, results):
             )
             for mode, ms in entry["kernel_ms"].items():
                 print(
-                    f"{row:22s} kernel-only ms (cache {mode}): {json.dumps(ms)}",
-                    flush=True,
+                    f"{row:22s} kernel-only ms ({mode}): {json.dumps(ms)}", flush=True
                 )
         entry["row"] = row
         results["host_path"].append(entry)
@@ -1123,8 +1231,10 @@ def main():
         "--dkv-dst-map",
         choices=DST_MAPS,
         default=None,
-        help="destination-row map of dkv_acc: identity (explicit arange) or perm (a "
-        "permutation with duplicated destinations); needs --dkv-acc",
+        help="destination-row map of dkv_acc: identity (explicit arange), perm (a "
+        "permutation with duplicated destinations) or glm_a / glm_b (the recorded "
+        "trainer maps: 268,757 / 267,520 key rows onto 260,611 / 259,412 fp32 rows; "
+        "only for the rows of that batch); needs --dkv-acc",
     )
     parser.add_argument("--arms", default="cake,flashmla_cudnn,fa4")
     parser.add_argument("--steps", type=int, default=20)
@@ -1136,7 +1246,7 @@ def main():
     parser.add_argument(
         "--host-us",
         action="store_true",
-        help="host microseconds per call, binding cache off / on",
+        help="host microseconds per call, eager entry points and prepared runner",
     )
     parser.add_argument("--host-calls", type=int, default=20)
     parser.add_argument("--host-rounds", type=int, default=3)
@@ -1150,16 +1260,28 @@ def main():
         parser.error(f"unknown arms {unknown}; choose from {sorted(ARMS)}")
     if args.rows is None:
         args.rows = PRESETS[args.preset]["rows"] if args.preset else list(ROWS)
-    # every layout the run will build (one per perf row, plus the accuracy layout) must carry dkv_acc when a
-    # destination map is set -- Layout() raises otherwise, which would abort the run after the first rows
-    planned = [(row, resolve_layout(row, args)) for row in args.rows]
+    # every layout the run will build (one per perf row, plus the accuracy cases) must carry dkv_acc when a
+    # destination map is set, and a recorded glm_* map must match the key-row count of the inputs it is applied
+    # to -- Layout() raises otherwise, which would abort the run after rows (or the whole perf run) have been timed
+    planned = [(row, resolve_layout(row, args), sum(ROWS[row][1])) for row in args.rows]
     if args.accuracy:
-        planned.append(("accuracy", resolve_layout(None, args)))
-    for name, layout in planned:
-        if layout.get("dkv_dst_map", "none") != "none" and not layout.get("dkv_acc"):
+        accuracy_layout = resolve_layout(None, args)
+        planned += [
+            (f"accuracy case {case!r}", accuracy_layout, sum(spec["seq_k"]))
+            for case, spec in ACCURACY_CASES.items()
+        ]
+    for name, layout, total_k in planned:
+        dst_map = layout.get("dkv_dst_map", "none")
+        if dst_map != "none" and not layout.get("dkv_acc"):
             parser.error(
                 f"--dkv-dst-map needs dkv_acc, but the layout of {name!r} resolves without it "
                 "(add --dkv-acc or pick rows / a preset that enable it)"
+            )
+        if dst_map in GLM_DST_ROWS and sum(GLM_DST_ROWS[dst_map][0]) != total_k:
+            parser.error(
+                f"--dkv-dst-map {dst_map} is recorded for {sum(GLM_DST_ROWS[dst_map][0])} key rows, "
+                f"but {name} has {total_k} (the glm_* maps fit only the rows of their batch; "
+                "the accuracy cases use 4096-key inputs)"
             )
     device = torch.device(args.device)
     if device.index is None:  # torch >= 2.13 requires an index here

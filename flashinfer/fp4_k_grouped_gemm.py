@@ -18,8 +18,6 @@ def prepare_fp4_k_grouped_gemm(
     accumulate=False,
     num_stages=7,
     out=None,
-    grouped_layout=None,
-    descriptor_workspace=None,
 ):
     """Prepare independently reduced A_g @ B_g.T products, optionally adding to out.
 
@@ -27,13 +25,13 @@ def prepare_fp4_k_grouped_gemm(
     E2M1 nibbles store even K low; each group pads independently to k_alignment.
     Padding must contain zero. Scales contain four UE8M0 bytes per int32/uint32
     word: [sum(padded_K)/128, physical_M] and [sum(padded_K)/128,N], packed-K
-    major, one scale per32 K. Empty groups overwrite zero or preserve initial C.
+    major, one scale per 32 K. Empty groups overwrite zero or preserve initial C.
     Output storage is [groups,physical_M,N]; plan.output retains its logical-M view.
     accumulate=True requires FP32 and initialized caller-owned out. Each run adds
-    once in-place; it never resets output. PSUM metadata stores physical group
-    starts plus logical K; padded layout stores each group's padded K length.
-    Preparation may allocate and read metadata. run() is current-stream and graph
-    replay safe. Nonempty shapes must have an exported schedule in the catalog.
+    once in-place; it never resets output. Any group count and any per-group K
+    is accepted; the plan derives the kernel's group metadata from group_ks,
+    k_alignment and use_psum_layout. Preparation may allocate. run() is
+    current-stream and graph replay safe.
     """
     from .experimental.deepgemm_kgroup_gemm.kgroup_gemm import GroupedFP4Plan
 
@@ -50,6 +48,4 @@ def prepare_fp4_k_grouped_gemm(
         accumulate=accumulate,
         num_stages=num_stages,
         out=out,
-        grouped_layout=grouped_layout,
-        descriptor_workspace=descriptor_workspace,
     )

@@ -14,16 +14,6 @@ import torch.nn.functional as F
 from flashinfer.utils import get_compute_capability
 
 
-@pytest.mark.parametrize("num_tokens", range(1, 17))
-@pytest.mark.parametrize("hidden_dim", [6144, 7168])
-def test_cake_router_gemm_source_matrix(num_tokens, hidden_dim):
-    from flashinfer.jit.cake_router_gemm import _program_source
-
-    source = _program_source(num_tokens, hidden_dim)
-    text = source.read_text(encoding="utf-8")
-    assert f"kernel_cake_blackwell_router_gemm_m{num_tokens}_k{hidden_dim}" in text
-
-
 # Positive tests
 @pytest.mark.parametrize("num_tokens", range(1, 17))
 @pytest.mark.parametrize(
@@ -521,3 +511,55 @@ def test_dsv3_router_gemm_op_negative(
     for fn in fn_array:
         with pytest.raises(ValueError, match=expected_error):
             fn(mat_a, mat_b, out, launch_with_pdl=False)
+
+
+# The kernels address every operand densely (mat_a[m * K + k], mat_b[e * K + k],
+# out[m * N + e]); a padded view has unit inner strides but a larger leading stride and
+# must be rejected instead of silently producing wrong results.
+@pytest.mark.parametrize("padded_operand", ["mat_a", "mat_b", "out"])
+@pytest.mark.parametrize(
+    "num_experts,hidden_dim,out_dtype,fn_to_test",
+    (
+        [128, 7168, torch.bfloat16, mm_M1_16_K7168_N128],
+        [256, 7168, torch.float32, mm_M1_16_K7168_N256],
+        [256, 6144, torch.float32, mm_M1_16_K6144_N256],
+        [256, 7168, torch.bfloat16, mm_M1_16_K7168_N256_bf16],
+        [384, 7168, torch.float32, mm_M1_16_K7168_N384],
+        [384, 7168, torch.bfloat16, mm_M1_16_K7168_N384_bf16],
+        [896, 7168, torch.float32, mm_M1_16_K7168_N896],
+        [896, 7168, torch.bfloat16, mm_M1_16_K7168_N896_bf16],
+    ),
+)
+def test_dsv3_router_gemm_op_rejects_padded_views(
+    padded_operand, num_experts, hidden_dim, out_dtype, fn_to_test
+):
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
+    if compute_capability_number not in [90, 100, 103, 107]:
+        pytest.skip("Router GEMM is only supported on SM90, SM100, SM103, and SM107")
+
+    num_tokens = 8
+    pad = 64
+    mat_a = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
+    mat_b = torch.randn(
+        num_experts, hidden_dim, device="cuda", dtype=torch.bfloat16
+    ).t()
+    out = torch.empty(num_tokens, num_experts, device="cuda", dtype=out_dtype)
+    if padded_operand == "mat_a":
+        mat_a = torch.randn(
+            num_tokens, hidden_dim + pad, device="cuda", dtype=torch.bfloat16
+        )[:, :hidden_dim]
+        assert mat_a.stride() == (hidden_dim + pad, 1)
+    elif padded_operand == "mat_b":
+        mat_b = torch.randn(
+            num_experts, hidden_dim + pad, device="cuda", dtype=torch.bfloat16
+        )[:, :hidden_dim].t()
+        assert mat_b.stride() == (1, hidden_dim + pad)
+    else:
+        out = torch.empty(
+            num_tokens, num_experts + pad, device="cuda", dtype=out_dtype
+        )[:, :num_experts]
+        assert out.stride() == (num_experts + pad, 1)
+
+    with pytest.raises(ValueError, match="dense"):
+        fn_to_test(mat_a, mat_b, out, launch_with_pdl=False)

@@ -462,13 +462,16 @@ class ArmCake(ArmAutograd):
     def __init__(self, inp, *, entry, chunk):
         super().__init__(inp, entry=entry, chunk=chunk)
         device = inp.X.device
-        if not cake_backend.generated_program_available(device, entry=entry):
+        hidden, vocab = int(inp.X.shape[1]), int(inp.W.shape[0])
+        if not cake_backend.generated_program_available(
+            device, entry=entry, hidden=hidden, vocab=vocab
+        ):
             capability = torch.cuda.get_device_capability(device)
             raise RuntimeError(
-                f"generated chunked LM-head program ({entry} entry) not registered for compute capability "
-                f"{capability[0]}.{capability[1]} in this checkout"
+                f"generated chunked LM-head program ({entry} entry, H {hidden}, V {vocab}) not registered for "
+                f"compute capability {capability[0]}.{capability[1]} in this checkout"
             )
-        self.module_name, record = cake_backend.record_for(device)
+        self.module_name, record = cake_backend.record_for(device, hidden, vocab)
         self.abi = cake_backend.record_abi(record)
 
     def versions(self):
@@ -477,7 +480,8 @@ class ArmCake(ArmAutograd):
             abi=self.abi,
             stages=list(cake_backend.stages_for_entry(self.entry)),
             compact_rows=cake_backend.compact_rows_default(),
-        )  # valid-row compaction (the labels carry ignored rows)
+            fuse_dw_cast=cake_backend.fuse_dw_cast_default(),
+        )  # valid-row compaction (the labels carry ignored rows); fused weight-gradient cast
 
     def forward(self):
         inp = self.inp

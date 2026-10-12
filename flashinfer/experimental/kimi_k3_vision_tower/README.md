@@ -4,7 +4,7 @@ Both the API and its Cake backend are experimental and may change without
 backward compatibility. Calling the API explicitly opts into the experimental
 feature and emits FlashInfer's experimental API warning. There is no automatic
 backend selection. Tracking: flashinfer-ai/flashinfer#4568 (Kimi-K3 vision
-tower + PatchMergerV2 kernels), tracker #4254.
+tower + PatchMergerV2 kernels).
 
 `flashinfer.kimi_k3_vision.kimi_k3_vision_tower(pixel_values, grid_thws,
 weights, out=None)` runs the complete vision path of `nvidia/Kimi-K3-NVFP4`
@@ -87,8 +87,8 @@ dependency edge, and the numerics are identical.
 [4096, 4096]`, `merger_proj1 [7168, 4096]`, `post_norm [7168]` and `layers`
 = 27 x `{"norm0": [1024], "wqkv": [4608, 1024], "wo": [1024, 1536], "norm1":
 [1024], "fc0": [4096, 1024], "fc1": [1024, 4096]}`. Prepare it once per model
-with `prepare_kimi_k3_vision_weights` (patch-projection padding, contiguous
-copies; the RMSNorm weights are not folded into the GEMM weights: a folded
+with `prepare_kimi_k3_vision_weights` (patch-projection padding; every
+other parameter must be a contiguous bf16 tensor and is referenced, not copied; the RMSNorm weights are not folded into the GEMM weights: a folded
 `bf16(W * w_norm)` is a fixed weight perturbation the HF chain does not have,
 so the norm weight is applied on the activation side, `xw = bf16(x * w_next)`,
 by the residual epilogues); the dict form is prepared on every call.
@@ -133,9 +133,13 @@ allocation in `launch()`. Benchmark against the HF torch chain with the
 FlashInfer ragged BF16 attention route:
 `benchmarks/bench_cake_kimi_k3_vision_tower.py`.
 
-The generated sources under `csrc/cake_kimi_k3_vision_tower/<arch>/` and the
-`MODULES` / `KERNELS` registries in `cake_jit.py` are written by the Cake
-generated-program export (`exports/kimi_k3_vision_tower/export.py` in the Cake
-repository); do not edit them by hand. Every module is an exact-architecture
-program compiled with FlashInfer's `sm100a` / `sm103a` flag sets; on a device
-without a registered program the entry points raise `NotImplementedError`.
+The generated sources under `csrc/cake_kimi_k3_vision_tower/` and the
+`MODULES` / `ARG_PLANS` / `KERNELS` registries in `cake_jit.py` are written by
+the Cake generated-program export; do not edit them by hand. One source pair
+is one program, built for every architecture it lists (`MODULES[name]["arches"]`)
+with FlashInfer's exact `sm100a` / `sm103a` flag set of the device it runs on;
+the attention kernels are separate programs per architecture (SM103 drains the
+scores with `tcgen05.ld.red`), and the plain one-tile / two-tile-split attention
+forms exist on SM103 only because the plan rule selects them there alone. On a
+device without a registered program the entry points raise
+`NotImplementedError`.

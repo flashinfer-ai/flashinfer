@@ -48,6 +48,7 @@ enum class Geometry : uint8_t {
   kH2048I512E512K10,
   kH2048I1536E60K4,
   kH6144I1536E192K4,
+  kH4096I2048E256K6,
   kH2560I768E384K4,
   kH2048I768E128K8,
   kH4096I1536E128K8,
@@ -56,6 +57,11 @@ enum class Geometry : uint8_t {
   kH3072I1536E256K8,
   kH6144I3072E128K4,
   kH3584I3072E896K16,
+  // Sharded per-partition slices (tensor-parallel expert shards).
+  kH4096I512E512K10,
+  kH4096I256E512K10,
+  kH3072I768E256K8,
+  kH3072I384E256K8,
 };
 
 enum class Activation : uint8_t {
@@ -75,6 +81,9 @@ enum class RoutePacker : uint8_t {
   kE64Scan1,
   kE64Scan2,
   kGeneral,
+  kExpertOrder,
+  kSortedShort,
+  kCountRank,
   // The packed route tables are derived inside the persistent FC1 prologue;
   // the graph has no route_pack launch and FC1/FC2 re-arm their own workfeeds.
   kFusedFc1,
@@ -85,6 +94,8 @@ enum class Fc1Schedule : uint8_t {
   kPersistent,
   kPersistentDeviceWorkfeed,
   kPersistentPaddedScaleDeviceWorkfeed,
+  kPersistentExpertOrder,
+  kPersistentMetadataPublication,
   kPersistentEarlySfbDeviceWorkfeed,
 };
 
@@ -93,6 +104,8 @@ enum class Fc2Schedule : uint8_t {
   kRouteParallelK512DeviceWorkfeed,
   kRouteParallelK768K96,
   kRouteParallelK768K96PaddedScale,
+  kRouteParallelK512,
+  kImmutableWeightPrefill,
   kRouteParallelK512Stage5DeviceWorkfeed,
   kRouteParallelK512MmaU2DeviceWorkfeed,
 };
@@ -127,7 +140,8 @@ constexpr bool IsGeometry(const Shape& shape, int32_t hidden_size, int32_t inter
 
 constexpr Activation ActivationForGeometry(Geometry geometry) {
   if (geometry == Geometry::kH6144I1536E192K4) return Activation::kSiLU;
-  if (geometry == Geometry::kH6144I3072E128K4) return Activation::kSwiGLUParameterized;
+  if (geometry == Geometry::kH6144I3072E128K4 ||
+      geometry == Geometry::kH4096I2048E256K6) return Activation::kSwiGLUParameterized;
   if (geometry == Geometry::kH3584I3072E896K16) return Activation::kSiTU;
   return Activation::kSwiGLU;
 }
@@ -142,7 +156,14 @@ constexpr int32_t Gemm1WeightRows(const Shape& shape, const Schedule& schedule) 
 // Only the Qwen3-30B geometry participates: sm_103a T8..T32 and sm_100a T10..T32
 // (sm_103a T1..T7 and sm_100a T1..T9 stay on their direct routes).
 constexpr bool IsFusedRoutePackRow(Target target, const Shape& shape) {
-  if (!IsGeometry(shape, 2048, 768, 128, 8) || shape.num_tokens > 32) return false;
+  if (shape.num_tokens < 1 || shape.num_tokens > 32) return false;
+  // Sharded TP slices (Qwen3.5-397B TP2/TP4, MiniMax-M2 TP2/TP4): both targets fuse every
+  // token count.
+  if (IsGeometry(shape, 4096, 512, 512, 10) || IsGeometry(shape, 4096, 256, 512, 10) ||
+      IsGeometry(shape, 3072, 768, 256, 8) || IsGeometry(shape, 3072, 384, 256, 8)) {
+    return true;
+  }
+  if (!IsGeometry(shape, 2048, 768, 128, 8)) return false;
   return (target == Target::kSm103a && shape.num_tokens >= 8) ||
          (target == Target::kSm100a && shape.num_tokens >= 10);
 }
@@ -179,6 +200,14 @@ constexpr Schedule SelectAdditionalDirectSchedule(const Shape& shape) {
     geometry = Geometry::kH6144I3072E128K4;
   } else if (IsGeometry(shape, 3584, 3072, 896, 16)) {
     geometry = Geometry::kH3584I3072E896K16;
+  } else if (IsGeometry(shape, 4096, 512, 512, 10)) {
+    geometry = Geometry::kH4096I512E512K10;
+  } else if (IsGeometry(shape, 4096, 256, 512, 10)) {
+    geometry = Geometry::kH4096I256E512K10;
+  } else if (IsGeometry(shape, 3072, 768, 256, 8)) {
+    geometry = Geometry::kH3072I768E256K8;
+  } else if (IsGeometry(shape, 3072, 384, 256, 8)) {
+    geometry = Geometry::kH3072I384E256K8;
   } else {
     return UnsupportedSchedule();
   }
@@ -430,12 +459,64 @@ constexpr Schedule SelectSm103aSchedule(const Shape& shape) {
             0};
   }
 
+  // Sharded TP slices: fused route packing + metadata-prefetch K256 device-workfeed FC2 on every
+  // token count (calibrated against the official trtllm-gen peer on GB300).
+  if (IsGeometry(shape, 4096, 512, 512, 10) && (shape.num_tokens >= 1 && shape.num_tokens <= 32)) {
+    return {true, Geometry::kH4096I512E512K10, RouteLayout::kGpuPacked,
+            RoutePacker::kFusedFc1, Fc1Schedule::kPersistentDeviceWorkfeed,
+            Fc2Schedule::kRouteParallelK256, 128, 4, 144};
+  }
+  if (IsGeometry(shape, 4096, 256, 512, 10) && (shape.num_tokens >= 1 && shape.num_tokens <= 32)) {
+    return {true, Geometry::kH4096I256E512K10, RouteLayout::kGpuPacked,
+            RoutePacker::kFusedFc1, Fc1Schedule::kPersistentDeviceWorkfeed,
+            Fc2Schedule::kRouteParallelK256, 128, 4, 144};
+  }
+  if (IsGeometry(shape, 3072, 768, 256, 8) && (shape.num_tokens >= 1 && shape.num_tokens <= 32)) {
+    return {true, Geometry::kH3072I768E256K8, RouteLayout::kGpuPacked,
+            RoutePacker::kFusedFc1, Fc1Schedule::kPersistentDeviceWorkfeed,
+            Fc2Schedule::kRouteParallelK256, 128, 4, 144};
+  }
+  if (IsGeometry(shape, 3072, 384, 256, 8) && (shape.num_tokens >= 1 && shape.num_tokens <= 32)) {
+    return {true, Geometry::kH3072I384E256K8, RouteLayout::kGpuPacked,
+            RoutePacker::kFusedFc1, Fc1Schedule::kPersistentDeviceWorkfeed,
+            Fc2Schedule::kRouteParallelK256, 128, 4, 144};
+  }
+
   return SelectAdditionalDirectSchedule(shape);
 }
 
 constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
   if (shape.num_tokens < 1 || shape.num_tokens > kMaximumTokens) {
     return UnsupportedSchedule();
+  }
+
+  if (IsGeometry(shape, 4096, 2048, 256, 6)) {
+    // Fixed top-k6 finalizers do not use the generic unroll/workfeed fields.
+    if (shape.num_tokens <= 8) {
+      const bool ordered = shape.num_tokens >= 7;
+      return {true,
+              Geometry::kH4096I2048E256K6,
+              RouteLayout::kDirect,
+              ordered ? RoutePacker::kExpertOrder : RoutePacker::kNone,
+              ordered ? Fc1Schedule::kPersistentExpertOrder : Fc1Schedule::kPersistent,
+              Fc2Schedule::kRouteParallelK512,
+              128,
+              0,
+              0};
+    }
+    const RoutePacker planner = shape.num_tokens <= 10 ? RoutePacker::kSortedShort
+                                : (shape.num_tokens == 11 || shape.num_tokens == 23)
+                                    ? RoutePacker::kCountRank
+                                    : RoutePacker::kGeneral;
+    return {true,
+            Geometry::kH4096I2048E256K6,
+            RouteLayout::kGpuPacked,
+            planner,
+            Fc1Schedule::kPersistentMetadataPublication,
+            Fc2Schedule::kImmutableWeightPrefill,
+            128,
+            0,
+            0};
   }
 
   if (IsGeometry(shape, 6144, 3072, 128, 4) &&
@@ -612,6 +693,30 @@ constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
             0};
   }
 
+  // Sharded TP slices: fused route packing + metadata-prefetch K256 device-workfeed FC2 with the
+  // L2 evict-first weight streams on every token count (calibrated against the official
+  // trtllm-gen peer on B200).
+  if (IsGeometry(shape, 4096, 512, 512, 10) && (shape.num_tokens >= 1 && shape.num_tokens <= 32)) {
+    return {true, Geometry::kH4096I512E512K10, RouteLayout::kGpuPacked,
+            RoutePacker::kFusedFc1, Fc1Schedule::kPersistentDeviceWorkfeed,
+            Fc2Schedule::kRouteParallelK256, 128, 4, 144};
+  }
+  if (IsGeometry(shape, 4096, 256, 512, 10) && (shape.num_tokens >= 1 && shape.num_tokens <= 32)) {
+    return {true, Geometry::kH4096I256E512K10, RouteLayout::kGpuPacked,
+            RoutePacker::kFusedFc1, Fc1Schedule::kPersistentDeviceWorkfeed,
+            Fc2Schedule::kRouteParallelK256, 128, 4, 144};
+  }
+  if (IsGeometry(shape, 3072, 768, 256, 8) && (shape.num_tokens >= 1 && shape.num_tokens <= 32)) {
+    return {true, Geometry::kH3072I768E256K8, RouteLayout::kGpuPacked,
+            RoutePacker::kFusedFc1, Fc1Schedule::kPersistentDeviceWorkfeed,
+            Fc2Schedule::kRouteParallelK256, 128, 4, 144};
+  }
+  if (IsGeometry(shape, 3072, 384, 256, 8) && (shape.num_tokens >= 1 && shape.num_tokens <= 32)) {
+    return {true, Geometry::kH3072I384E256K8, RouteLayout::kGpuPacked,
+            RoutePacker::kFusedFc1, Fc1Schedule::kPersistentDeviceWorkfeed,
+            Fc2Schedule::kRouteParallelK256, 128, 4, 144};
+  }
+
   return SelectAdditionalDirectSchedule(shape);
 }
 
@@ -662,6 +767,14 @@ static_assert(SelectSm100aSchedule(Q30Shape(32)).route_packer == RoutePacker::kF
 static_assert(!SelectSm100aSchedule(Q30Shape(33)).supported);
 static_assert(!IsFusedRoutePackRow(Target::kSm100a, Q30Shape(9)));
 static_assert(!IsFusedRoutePackRow(Target::kSm103a, {11, 2048, 768, 128, 64, 8}));
+static_assert(IsFusedRoutePackRow(Target::kSm100a, {1, 4096, 512, 512, 512, 10}));
+static_assert(IsFusedRoutePackRow(Target::kSm103a, {32, 3072, 384, 256, 256, 8}));
+static_assert(SelectSm100aSchedule({1, 4096, 256, 512, 512, 10}).route_packer == RoutePacker::kFusedFc1);
+static_assert(SelectSm100aSchedule({1, 4096, 256, 512, 512, 10}).fc1 == Fc1Schedule::kPersistentDeviceWorkfeed);
+static_assert(SelectSm100aSchedule({32, 3072, 768, 256, 256, 8}).fc2 == Fc2Schedule::kRouteParallelK256);
+static_assert(SelectSm100aSchedule({32, 3072, 768, 256, 256, 8}).workfeed_ctas == 144);
+static_assert(SelectSm103aSchedule({16, 4096, 512, 512, 512, 10}).route_packer == RoutePacker::kFusedFc1);
+static_assert(SelectSm103aSchedule({16, 4096, 512, 512, 512, 10}).workfeed_ctas == 144);
 
 // Compile-time boundary tests keep the public policy stable even before the
 // generated kernel inventory is present.
@@ -868,6 +981,33 @@ constexpr bool CheckPublicBoundaries(Shape shape, Geometry geometry,
             schedule.fc2 != Fc2Schedule::kRouteParallelK512Stage5DeviceWorkfeed ||
             schedule.finalize_threads != 128 || schedule.finalize_unroll != 4 ||
             schedule.workfeed_ctas != 144) return false;
+      } else if (geometry == Geometry::kH4096I512E512K10 && (tokens >= 1 && tokens <= 32)) {
+        if (!schedule.supported || schedule.geometry != geometry ||
+            ActivationForGeometry(geometry) != activation ||
+            schedule.route_layout != RouteLayout::kGpuPacked ||
+            schedule.route_packer != RoutePacker::kFusedFc1 ||
+            schedule.fc1 != Fc1Schedule::kPersistentDeviceWorkfeed ||
+            schedule.fc2 != Fc2Schedule::kRouteParallelK256 ||
+            schedule.finalize_threads != 128 || schedule.finalize_unroll != 4 ||
+            schedule.workfeed_ctas != 144) return false;
+      } else if (geometry == Geometry::kH4096I256E512K10 && (tokens >= 1 && tokens <= 32)) {
+        if (!schedule.supported || schedule.geometry != geometry ||
+            ActivationForGeometry(geometry) != activation ||
+            schedule.route_layout != RouteLayout::kGpuPacked ||
+            schedule.route_packer != RoutePacker::kFusedFc1 ||
+            schedule.fc1 != Fc1Schedule::kPersistentDeviceWorkfeed ||
+            schedule.fc2 != Fc2Schedule::kRouteParallelK256 ||
+            schedule.finalize_threads != 128 || schedule.finalize_unroll != 4 ||
+            schedule.workfeed_ctas != 144) return false;
+      } else if ((geometry == Geometry::kH3072I768E256K8 || geometry == Geometry::kH3072I384E256K8) && (tokens >= 1 && tokens <= 32)) {
+        if (!schedule.supported || schedule.geometry != geometry ||
+            ActivationForGeometry(geometry) != activation ||
+            schedule.route_layout != RouteLayout::kGpuPacked ||
+            schedule.route_packer != RoutePacker::kFusedFc1 ||
+            schedule.fc1 != Fc1Schedule::kPersistentDeviceWorkfeed ||
+            schedule.fc2 != Fc2Schedule::kRouteParallelK256 ||
+            schedule.finalize_threads != 128 || schedule.finalize_unroll != 4 ||
+            schedule.workfeed_ctas != 144) return false;
       } else if (!schedule.supported || schedule.geometry != geometry ||
                  ActivationForGeometry(geometry) != activation ||
                  schedule.route_layout != RouteLayout::kDirect ||
@@ -893,6 +1033,10 @@ static_assert(CheckPublicBoundaries({1, 6144, 3072, 128, 128, 4}, Geometry::kH61
                                     Activation::kSwiGLUParameterized));
 static_assert(CheckPublicBoundaries({1, 3584, 3072, 896, 896, 16}, Geometry::kH3584I3072E896K16,
                                     Activation::kSiTU, true));
+static_assert(CheckPublicBoundaries({1, 4096, 512, 512, 512, 10}, Geometry::kH4096I512E512K10));
+static_assert(CheckPublicBoundaries({1, 4096, 256, 512, 512, 10}, Geometry::kH4096I256E512K10));
+static_assert(CheckPublicBoundaries({1, 3072, 768, 256, 256, 8}, Geometry::kH3072I768E256K8));
+static_assert(CheckPublicBoundaries({1, 3072, 384, 256, 256, 8}, Geometry::kH3072I384E256K8));
 static_assert(!SelectSm100aSchedule({1, 2048, 768, 128, 64, 8}).supported);
 static_assert(!SelectSm103aSchedule({1, 2048, 768, 128, 128, 4}).supported);
 
@@ -970,6 +1114,8 @@ struct KernelLaunch {
   bool spread_cluster;
   KernelSubmit submit;
   const void* arguments;
+  // Negative means no launch-local preference.
+  int preferred_shared_memory_carveout = -1;
 };
 
 using LaunchVisitor = void (*)(const KernelLaunch&, void*);

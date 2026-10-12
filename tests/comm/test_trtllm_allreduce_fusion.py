@@ -422,6 +422,83 @@ def _run_correctness_worker(
         dist.destroy_process_group(group=group)
 
 
+def _run_twoshot_growing_grid_worker(
+    world_size,
+    rank,
+    dtype,
+    hidden_dim,
+    distributed_init_port,
+    small_token_num,
+    large_token_num,
+    gpu_offset=0,
+):
+    # Back-to-back two-shot calls whose grid grows (small -> large token count),
+    # with no host synchronization in between, as in a model forward pass.
+    device = torch.device(f"cuda:{rank + gpu_offset}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{distributed_init_port}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+    )
+    workspace = None
+    try:
+        workspace = comm.create_allreduce_fusion_workspace(
+            backend="trtllm",
+            world_size=world_size,
+            rank=rank,
+            max_token_num=MAX_TOKEN_NUM,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            comm_backend=TorchDistBackend(),
+        )
+        token_nums = [small_token_num, large_token_num, large_token_num] * 4
+        # Every rank generates every rank's input so it can build the reference.
+        inputs = []
+        for i, token_num in enumerate(token_nums):
+            per_rank = []
+            for r in range(world_size):
+                gen = torch.Generator(device=device).manual_seed(1000 * i + r)
+                per_rank.append(
+                    torch.randn(token_num, hidden_dim, generator=gen, device=device).to(
+                        dtype
+                    )
+                )
+            inputs.append(per_rank)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        outputs = []
+        for i in range(len(token_nums)):
+            out = torch.empty_like(inputs[i][rank])
+            comm.allreduce_fusion(
+                input=inputs[i][rank],
+                workspace=workspace,
+                pattern=comm.AllReduceFusionPattern.kAllReduce,
+                output=out,
+                use_oneshot=False,
+            )
+            outputs.append(out)
+        torch.cuda.synchronize()
+
+        for i, token_num in enumerate(token_nums):
+            ref = torch.stack([x.float() for x in inputs[i]]).sum(0)
+            torch.testing.assert_close(
+                outputs[i].float(),
+                ref,
+                atol=0.1,
+                rtol=3e-2,
+                msg=lambda m, i=i, t=token_num: f"rank {rank} call {i} (T={t}): {m}",
+            )
+    finally:
+        dist.barrier()
+        if workspace is not None:
+            workspace.destroy()
+        dist.destroy_process_group()
+
+
 def get_open_port() -> int:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -466,6 +543,86 @@ def multi_process_parallel(
         assert procs[i].exitcode == 0, (
             f"Process {i} failed with exit code {procs[i].exitcode}"
         )
+
+
+def _run_fp32_twoshot_worker(
+    world_size,
+    rank,
+    dtype,
+    hidden_dim,
+    distributed_init_port,
+    max_token_num,
+    gpu_offset=0,
+):
+    # Two-shot at the workspace's max_token_num: the kernel writes
+    # 2 * token_num * hidden_dim elements into each rank's buffer.
+    device = torch.device(f"cuda:{rank + gpu_offset}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{distributed_init_port}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+    )
+    workspace = None
+    try:
+        workspace = comm.create_allreduce_fusion_workspace(
+            backend="trtllm",
+            world_size=world_size,
+            rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            comm_backend=TorchDistBackend(),
+        )
+        assert workspace.is_buffer_size_sufficient(
+            world_size, max_token_num, hidden_dim, dtype
+        )
+        inputs = [
+            torch.randn(
+                max_token_num,
+                hidden_dim,
+                generator=torch.Generator(device=device).manual_seed(r),
+                device=device,
+                dtype=dtype,
+            )
+            for r in range(world_size)
+        ]
+        out = torch.empty_like(inputs[rank])
+        comm.allreduce_fusion(
+            input=inputs[rank],
+            workspace=workspace,
+            pattern=comm.AllReduceFusionPattern.kAllReduce,
+            output=out,
+            use_oneshot=False,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            out, torch.stack(inputs).sum(0), atol=1e-4, rtol=1e-4
+        )
+    finally:
+        dist.barrier()
+        if workspace is not None:
+            workspace.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_trtllm_allreduce_fusion_fp32_twoshot_max_tokens(world_size):
+    """fp32 two-shot at max_token_num must fit in the workspace (sized per element)."""
+    available_gpus = torch.cuda.device_count()
+    if world_size > available_gpus:
+        pytest.skip(
+            f"world_size {world_size} is greater than available_gpus {available_gpus}"
+        )
+    multi_process_parallel(
+        world_size,
+        torch.float32,
+        4096,
+        _run_fp32_twoshot_worker,
+        target_args=(1024,),
+    )
 
 
 # Run as: python tests/comm/test_trtllm_allreduce_fusion.py
@@ -542,6 +699,28 @@ def test_trtllm_allreduce_fusion_gpu_offset(world_size, dtype, legacy_api):
         gpu_offset=gpu_offset,
     )
     print(f"gpu_offset allreduce fusion tp={world_size} ({api_str} API): OK")
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("hidden_dim", [4096, 7168])
+def test_trtllm_allreduce_fusion_twoshot_growing_grid(world_size, hidden_dim):
+    """Two-shot calls whose grid grows between calls must not pass the barrier early.
+
+    Each block of the barrier also writes the flags of the CTAs that are not
+    launched, so that a later launch with a larger grid sees the current flag.
+    """
+    available_gpus = torch.cuda.device_count()
+    if world_size > available_gpus:
+        pytest.skip(
+            f"world_size {world_size} is greater than available_gpus {available_gpus}"
+        )
+    multi_process_parallel(
+        world_size,
+        torch.bfloat16,
+        hidden_dim,
+        _run_twoshot_growing_grid_worker,
+        target_args=(world_size + 1, 256),
+    )
 
 
 if __name__ == "__main__":

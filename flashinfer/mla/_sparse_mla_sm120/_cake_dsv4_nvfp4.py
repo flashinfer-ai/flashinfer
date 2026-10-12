@@ -113,6 +113,13 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_format_info() -> dict:
         "prefill_max_chunks": int(
             manifest.get("prefill_max_chunks", manifest["max_chunks_per_block"])
         ),
+        # cp.async ring depths with an exported instance per head-tile count (older manifests: two stages only).
+        "prefill_ring_stages": {
+            int(ht): tuple(int(st) for st in stages)
+            for ht, stages in manifest.get(
+                "prefill_ring_stages", {"1": (2,), "2": (2,), "4": (2,)}
+            ).items()
+        },
         "prefill_kernel_commit": manifest.get("prefill_kernel_commit"),
     }
 
@@ -150,16 +157,40 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
       least 8 chunks; H >= 96 pairs only with at least 16 chunks at
       ``ctas >= SMs / 3``.
 
-    GB10 (SM121, 48 SMs; ``num_sms < 64``) differs only at a full wave with two
+    GB10 (SM121, 48 SMs; ``num_sms < 64``) differs at a full wave with two
     chunks: a two-chunk CTA gathers too little to pay for the doubled serial MMA
     of two tiles once the one-tile grid is more than two waves (H = 64 and
     H = 128 at 32 tokens: one tile 2-3 % faster), while up to two waves the
     pair still folds the partial second wave into one resident wave (H = 128 at
     8 tokens: 1.04-1.07x) and H = 32 always pairs because one CTA then covers
-    the token's whole head set (1.05-1.07x).  Rows with >= 4 chunks pair at a
-    full wave on both; the sub-wave rules are the same on both.
+    the token's whole head set (1.05-1.07x); beyond eight one-tile waves the
+    pair wins again (H = 64 at 128 tokens 1.04-1.05x, H = 128 flat), so the
+    one-tile band is ``2 waves < ctas <= 8 waves``.  Rows with >= 4 chunks
+    pair at a full wave on both.  Sub-wave, the H = 64 band is inclusive at
+    ``ctas == 2/3 SMs`` on GB10 (32 CTAs of 8 chunks: two tiles 1.03-1.04x;
+    GB202 never lands exactly on 2/3 of its SM count); every other sub-wave
+    rule is the same on both.
 
     Head counts not divisible by 32 have no two-tile instance.
+
+    Parameters
+    ----------
+    num_tokens : int
+        Query tokens in the call (``q.shape[0]``).
+    num_heads : int
+        Query heads per token (``q.shape[1]``).
+    topk : int
+        Candidate slots per token in the main cache (``indices.shape[1]``).
+    extra_topk : int, optional
+        Candidate slots per token in the second (compressed) cache; ``0`` without one.
+    num_sms : int
+        Streaming multiprocessors of the target device; keys the thresholds on which the two
+        sm_120a SKUs disagree (``torch.cuda.get_device_properties(d).multi_processor_count``).
+
+    Returns
+    -------
+    int
+        ``1`` or ``2`` sixteen-head tiles per decode CTA.
     """
 
     info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
@@ -170,12 +201,13 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
         return 1
     ctas = int(num_tokens) * (num_heads // hpb)
     chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
+    small_die = num_sms < _SMALL_DIE_SMS
     if ctas >= num_sms:
         if (
-            num_sms < _SMALL_DIE_SMS
+            small_die
             and chunks <= 2
             and num_heads > 2 * hpb
-            and ctas > 2 * num_sms
+            and 2 * num_sms < ctas <= 8 * num_sms
         ):
             return 1
         return 2
@@ -184,7 +216,8 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
     if num_heads == 2 * hpb:
         return 2 if ctas >= two_thirds or (chunks >= 8 and ctas >= third) else 1
     if num_heads == 4 * hpb:
-        return 2 if chunks >= 8 and third <= ctas < two_thirds else 1
+        upper = ctas < two_thirds or (small_die and ctas == two_thirds)
+        return 2 if chunks >= 8 and third <= ctas and upper else 1
     return 2 if chunks >= 16 and ctas >= third else 1
 
 
@@ -229,6 +262,29 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
     * at least two chunks per CTA also for a lone CTA (one chunk per CTA is
       4-10 % slower than two);
     * no wave-quantization split on a full grid (16-chunk rows are flat).
+
+    Parameters
+    ----------
+    num_tokens : int
+        Query tokens in the call (``q.shape[0]``).
+    num_heads : int
+        Query heads per token (``q.shape[1]``).
+    topk : int
+        Candidate slots per token in the main cache (``indices.shape[1]``).
+    extra_topk : int, optional
+        Candidate slots per token in the second (compressed) cache; ``0`` without one.
+    num_sms : int
+        Streaming multiprocessors of the target device; keys the thresholds on which the two
+        sm_120a SKUs disagree (``torch.cuda.get_device_properties(d).multi_processor_count``).
+    max_splits : int, optional
+        Upper bound on ``num_splits``.
+    head_tiles : int, optional
+        Sixteen-head tiles per CTA the grid is counted in (``1`` or ``2``).
+
+    Returns
+    -------
+    tuple[int, int]
+        ``(num_splits, chunks_per_block)``.
     """
 
     info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
@@ -329,7 +385,24 @@ def _resolve_plan(
 def cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes(
     num_tokens: int, num_heads: int, topk: int, extra_topk: int = 0
 ) -> int:
-    """Workspace bytes that cover every split plan of this shape (partials + LSE + alignment slack)."""
+    """Workspace bytes that cover every split plan of this shape (partials + LSE + alignment slack).
+
+    Parameters
+    ----------
+    num_tokens : int
+        Query tokens in the call (``q.shape[0]``).
+    num_heads : int
+        Query heads per token (``q.shape[1]``).
+    topk : int
+        Candidate slots per token in the main cache (``indices.shape[1]``).
+    extra_topk : int, optional
+        Candidate slots per token in the second (compressed) cache; ``0`` without one.
+
+    Returns
+    -------
+    int
+        Bytes of caller-owned scratch that cover every split plan of the shape.
+    """
 
     chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
     rows = int(num_tokens) * int(num_heads)
@@ -378,7 +451,78 @@ _PREFILL_POLICY: Dict[str, int] = {
     "two_tile_h128_heads": 128,
     "two_tile_k512_band_lo": 512,
     "two_tile_k512_band_hi": 640,
+    # One-tile prefill ring depth: a third cp.async stage from this many 64-candidate chunks per token (+1-2 % on the
+    # K512 rows of both SKUs); dual-cache lists below ``ring_three_stages_dual_min_chunks`` chunks and below
+    # ``ring_three_stages_dual_min_tokens`` tokens keep two stages (the third stage costs 1.2 % there).
+    "ring_three_stages_min_chunks": 8,
+    "ring_three_stages_dual_min_chunks": 16,
+    "ring_three_stages_dual_min_tokens": 512,
+    # L2 evict-first on the BF16 query loads from this many tokens (+5-9 % on long prefills; single-wave
+    # T=128 rows lose 2-3 % with it).
+    "q_evict_first_min_tokens": 512,
+    # Grid order: head-blocks-first (the head blocks of one token are adjacent CTAs and re-use the gathered rows in
+    # L2) for launches with at most this many 64-candidate chunks per block (+3-12 % on the K128 / K256 rows of the
+    # RTX 5090); longer lists keep the token-major grid (short DRAM-latency-bound rows lose with fewer distinct rows
+    # in flight).
+    "grid_head_blocks_first_max_chunks": 4,
+    # Head-blocks-first puts the token count in grid.y, which CUDA caps at 65535; longer prefills keep the token-major
+    # grid (the binding applies the same cap before it builds the launch grid).
+    "grid_head_blocks_first_max_tokens": 65535,
 }
+
+
+def cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages(
+    *,
+    head_tiles: int,
+    topk: int,
+    extra_topk: int = 0,
+    dual: bool = False,
+    num_tokens: int,
+) -> int:
+    """cp.async ring depth (2 or 3) of one prefill launch (mirrors the kernel module's ``plan_num_stages``).
+
+    Three stages only for the one-tile instance with at least ``ring_three_stages_min_chunks`` chunks per
+    token; dual-cache lists with fewer than ``ring_three_stages_dual_min_chunks`` chunks and fewer than
+    ``ring_three_stages_dual_min_tokens`` tokens keep two.  Never asks for an instance the export lacks.
+    """
+
+    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
+    policy = _PREFILL_POLICY
+    ht = int(head_tiles)
+    chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
+    if ht != 1 or chunks < policy["ring_three_stages_min_chunks"]:
+        return 2
+    if (
+        dual
+        and chunks < policy["ring_three_stages_dual_min_chunks"]
+        and int(num_tokens) < policy["ring_three_stages_dual_min_tokens"]
+    ):
+        return 2
+    return 3 if 3 in info["prefill_ring_stages"].get(ht, (2,)) else 2
+
+
+def cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_grid_head_blocks_first(
+    *, head_tiles: int, topk: int, extra_topk: int = 0, num_tokens: int
+) -> bool:
+    """Grid order of one prefill launch (mirrors the kernel module's ``plan_grid_head_blocks_first``): head blocks
+    first for candidate lists of at most ``grid_head_blocks_first_max_chunks`` chunks and at most
+    ``grid_head_blocks_first_max_tokens`` tokens (the CUDA grid.y limit), tokens first otherwise."""
+
+    del head_tiles  # the rule is keyed on the chunk and token counts (kept in the signature for the planner mirror)
+    chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
+    policy = _PREFILL_POLICY
+    return (
+        chunks <= policy["grid_head_blocks_first_max_chunks"]
+        and int(num_tokens) <= policy["grid_head_blocks_first_max_tokens"]
+    )
+
+
+def cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_q_evict_first(
+    *, num_tokens: int
+) -> bool:
+    """L2 evict-first on the query loads from ``q_evict_first_min_tokens`` tokens (mirrors ``plan_q_evict_first``)."""
+
+    return int(num_tokens) >= _PREFILL_POLICY["q_evict_first_min_tokens"]
 
 
 def cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(
@@ -413,6 +557,25 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
     639 candidates on the large die (RTX PRO 6000), where it is 128 tokens.
     Narrower head counts take their largest instance at every token count: two
     tiles for 32 heads, one tile for 16 and 48 heads.
+
+    Parameters
+    ----------
+    num_tokens : int
+        Query tokens in the call (``q.shape[0]``).
+    num_heads : int
+        Query heads per token (``q.shape[1]``).
+    topk : int
+        Candidate slots per token in the main cache (``indices.shape[1]``).
+    extra_topk : int, optional
+        Candidate slots per token in the second (compressed) cache; ``0`` without one.
+    num_sms : int
+        Streaming multiprocessors of the target device; keys the thresholds on which the two
+        sm_120a SKUs disagree (``torch.cuda.get_device_properties(d).multi_processor_count``).
+
+    Returns
+    -------
+    int
+        ``head_tiles`` for the prefill launch: ``1``, ``2`` or ``4`` sixteen-head tiles per CTA.
     """
 
     info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
@@ -473,6 +636,25 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel(
 
     ``num_sms`` keys the thresholds on which the two sm_120a SKUs disagree
     (the decode split planner's wave structure follows the SM count).
+
+    Parameters
+    ----------
+    num_tokens : int
+        Query tokens in the call (``q.shape[0]``).
+    num_heads : int
+        Query heads per token (``q.shape[1]``).
+    topk : int
+        Candidate slots per token in the main cache (``indices.shape[1]``).
+    extra_topk : int, optional
+        Candidate slots per token in the second (compressed) cache; ``0`` without one.
+    num_sms : int
+        Streaming multiprocessors of the target device; keys the thresholds on which the two
+        sm_120a SKUs disagree (``torch.cuda.get_device_properties(d).multi_processor_count``).
+
+    Returns
+    -------
+    str
+        ``"decode"`` or ``"prefill"``.
     """
 
     info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
@@ -666,6 +848,9 @@ def get_cake_sparse_mla_sm120_dsv4_nvfp4_module():
         head_tiles: int,
         sm_scale: float,
         lse_scale: float,
+        num_stages: int,
+        q_evict_first: int,
+        grid_head_blocks_first: int,
     ) -> None:
         prefill_entry(
             q,
@@ -685,6 +870,9 @@ def get_cake_sparse_mla_sm120_dsv4_nvfp4_module():
             head_tiles,
             sm_scale,
             lse_scale,
+            num_stages,
+            q_evict_first,
+            grid_head_blocks_first,
         )
 
     @register_fake_op("flashinfer::cake_sparse_mla_sm120_dsv4_nvfp4_prefill")
@@ -816,6 +1004,53 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_decode(
     them with ``cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks`` splits to cover
     every plan.  ``head_tiles`` (1 or 2, head counts divisible by 32) and
     ``num_splits`` override the planners.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        ``[T, H, 512]`` contiguous CUDA BF16 queries (448 NoPE dims, then 64 RoPE dims).
+    kv_cache : torch.Tensor
+        Paged NVFP4 cache, ``uint8`` with 384 bytes per token: ``[num_pages, page_size, 384]``,
+        HND ``[num_pages, 1, page_size, 384]`` or NHD ``[num_pages, page_size, 1, 384]``; page size and
+        page stride are read from the view at runtime.
+    indices : torch.Tensor
+        ``[T, topk]`` (or ``[T, 1, topk]``) int32 candidate slots into ``kv_cache``; ``-1`` masks a slot.
+    output : torch.Tensor
+        ``[T, H, 512]`` contiguous BF16 attention output, written in place.
+    out_lse : torch.Tensor
+        ``[T, H]`` contiguous float32, written in place with the base-2 log-sum-exp times ``lse_scale``.
+    sm_scale : float
+        Softmax scale applied to the QK logits.
+    topk_length : torch.Tensor, optional
+        1-D int32 with at least ``T`` entries: valid candidates per token in ``indices``
+        (every slot when omitted).
+    attn_sink : torch.Tensor, optional
+        1-D float32 with at least ``H`` entries: per-head attention-sink value that joins the
+        softmax normalisation.
+    extra_kv_cache : torch.Tensor, optional
+        Second (compressed) cache in the same format; used together with ``extra_indices``.
+    extra_indices : torch.Tensor, optional
+        ``[T, extra_topk]`` int32 slots into ``extra_kv_cache``; required with it.
+    extra_topk_length : torch.Tensor, optional
+        1-D int32 with at least ``T`` entries: valid candidates per token in ``extra_indices``.
+    mid_out : torch.Tensor, optional
+        ``[T, H, >= num_splits, 512]`` contiguous BF16 split partials; required when the plan splits.
+    mid_lse : torch.Tensor, optional
+        ``[T, H, >= num_splits]`` contiguous float32 split log-sum-exps; required with ``mid_out``.
+    lse_scale : float, optional
+        Multiplier applied to the base-2 log-sum-exp written to ``out_lse``.
+    num_splits : int, optional
+        Overrides :func:`cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits`.
+    max_splits : int, optional
+        Upper bound for the split planner.
+    head_tiles : int, optional
+        Overrides :func:`cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles`: ``1`` or ``2``
+        (head counts divisible by 32).
+
+    Returns
+    -------
+    dict[str, int]
+        The resolved plan ``{"head_tiles", "num_splits", "chunks_per_block"}``.
     """
 
     p = _prepare_inputs(
@@ -928,6 +1163,45 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
     ``{"head_tiles", "num_ctas"}`` (one CTA per (token, head block) item);
     ``head_tiles`` (see :func:`cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles`)
     overrides :func:`cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill`.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        ``[T, H, 512]`` contiguous CUDA BF16 queries (448 NoPE dims, then 64 RoPE dims).
+    kv_cache : torch.Tensor
+        Paged NVFP4 cache, ``uint8`` with 384 bytes per token: ``[num_pages, page_size, 384]``,
+        HND ``[num_pages, 1, page_size, 384]`` or NHD ``[num_pages, page_size, 1, 384]``; page size and
+        page stride are read from the view at runtime.
+    indices : torch.Tensor
+        ``[T, topk]`` (or ``[T, 1, topk]``) int32 candidate slots into ``kv_cache``; ``-1`` masks a slot.
+    output : torch.Tensor
+        ``[T, H, 512]`` contiguous BF16 attention output, written in place.
+    out_lse : torch.Tensor
+        ``[T, H]`` contiguous float32, written in place with the base-2 log-sum-exp times ``lse_scale``.
+    sm_scale : float
+        Softmax scale applied to the QK logits.
+    topk_length : torch.Tensor, optional
+        1-D int32 with at least ``T`` entries: valid candidates per token in ``indices``
+        (every slot when omitted).
+    attn_sink : torch.Tensor, optional
+        1-D float32 with at least ``H`` entries: per-head attention-sink value that joins the
+        softmax normalisation.
+    extra_kv_cache : torch.Tensor, optional
+        Second (compressed) cache in the same format; used together with ``extra_indices``.
+    extra_indices : torch.Tensor, optional
+        ``[T, extra_topk]`` int32 slots into ``extra_kv_cache``; required with it.
+    extra_topk_length : torch.Tensor, optional
+        1-D int32 with at least ``T`` entries: valid candidates per token in ``extra_indices``.
+    lse_scale : float, optional
+        Multiplier applied to the base-2 log-sum-exp written to ``out_lse``.
+    head_tiles : int, optional
+        Overrides :func:`cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill` with one of the head
+        count's instances (see :func:`cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles`).
+
+    Returns
+    -------
+    dict[str, int]
+        The resolved plan ``{"head_tiles", "num_ctas"}``.
     """
 
     p = _prepare_inputs(
@@ -971,6 +1245,24 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
             f"head_tiles={ht} is not valid for the {p.num_heads}-head prefill (choices {tiles})"
         )
     items = p.num_tokens * (p.num_heads // (info["heads_per_block"] * ht))
+    num_stages = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages(
+        head_tiles=ht,
+        topk=p.topk,
+        extra_topk=p.extra_topk,
+        dual=p.extra_flat is not None,
+        num_tokens=p.num_tokens,
+    )
+    q_evict_first = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_q_evict_first(
+        num_tokens=p.num_tokens
+    )
+    grid_head_blocks_first = (
+        cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_grid_head_blocks_first(
+            head_tiles=ht,
+            topk=p.topk,
+            extra_topk=p.extra_topk,
+            num_tokens=p.num_tokens,
+        )
+    )
     get_cake_sparse_mla_sm120_dsv4_nvfp4_module().prefill(
         q,
         p.kv_flat,
@@ -989,8 +1281,17 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
         ht,
         float(sm_scale),
         float(lse_scale),
+        num_stages,
+        1 if q_evict_first else 0,
+        1 if grid_head_blocks_first else 0,
     )
-    return {"head_tiles": ht, "num_ctas": items}
+    return {
+        "head_tiles": ht,
+        "num_ctas": items,
+        "num_stages": num_stages,
+        "q_evict_first": bool(q_evict_first),
+        "grid_head_blocks_first": bool(grid_head_blocks_first),
+    }
 
 
 @supported_compute_capability([120, 121])

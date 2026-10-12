@@ -524,8 +524,10 @@ def _assert_fp8_groupwise_group_cute_dsl(
     group_counts, n, k, use_non_default_stream=False, use_out=False
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability not in [(10, 0), (10, 3)]:
-        pytest.skip("The contiguous grouped CuTe-DSL kernel requires SM100 or SM103")
+    if compute_capability not in [(10, 0), (10, 3), (10, 7)]:
+        pytest.skip(
+            "The contiguous grouped CuTe-DSL kernel requires SM100, SM103 or SM107"
+        )
     if not is_cute_dsl_available():
         pytest.skip("nvidia-cutlass-dsl is not available")
 
@@ -606,8 +608,8 @@ def test_fp8_groupwise_group_cute_dsl_partial_final_m(group_counts, n, k, use_ou
 
 def _require_grouped_cute_dsl(device="cuda"):
     """Skip unsupported environments before importing the optional kernel."""
-    if get_compute_capability(torch.device(device)) not in [(10, 0), (10, 3)]:
-        pytest.skip("Requires SM100 or SM103")
+    if get_compute_capability(torch.device(device)) not in [(10, 0), (10, 3), (10, 7)]:
+        pytest.skip("Requires SM100, SM103 or SM107")
     if not is_cute_dsl_available():
         pytest.skip("nvidia-cutlass-dsl is not available")
 
@@ -966,17 +968,31 @@ def test_grouped_cute_dsl_concurrent_cache_miss(monkeypatch, k):
 @pytest.mark.parametrize("nk", [(128, 512), (512, 128), (4096, 7168), (7168, 2048)])
 @pytest.mark.parametrize("group_size", [1, 4, 8, 64, 128, 256])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("backend", ["deepgemm", "cake"])
 def test_fp8_groupwise_batch_deepgemm_masked(
     m,
     nk,
     group_size,
     out_dtype,
+    backend,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip(
             "batch_deepgemm_fp8_nt_groupwise is only supported on SM100, SM103, SM107."
         )
+    cc = compute_capability[0] * 10 + compute_capability[1]
+    if not batch_deepgemm_fp8_nt_groupwise.is_backend_supported(backend, cc):
+        pytest.skip(
+            f"batch_deepgemm_fp8_nt_groupwise backend {backend} does not support SM{cc}"
+        )
+    if backend == "cake":
+        from flashinfer.gemm.cake_batch_deepgemm_fp8 import (
+            is_batch_deepgemm_fp8_nt_groupwise_cake_available,
+        )
+
+        if not is_batch_deepgemm_fp8_nt_groupwise_cake_available(torch.device("cuda")):
+            pytest.skip("no generated Cake batch DeepGEMM program for this device")
     torch.random.manual_seed(0)
     n, k = nk
     a = torch.randn((group_size, m, k), device="cuda", dtype=torch.float32)
@@ -1002,6 +1018,7 @@ def test_fp8_groupwise_batch_deepgemm_masked(
         masked_m,
         expected_m,
         out_dtype=out_dtype,
+        backend=backend,
     )
     for i in range(group_size):
         torch.testing.assert_close(
@@ -1109,4 +1126,6 @@ if __name__ == "__main__":
     test_fp8_groupwise_gemm(8192, 8192, 8192, "K", backend="cutlass")
     test_fp8_groupwise_group_gemm(4, 128, 256, 2, "MN", torch.bfloat16)
     test_fp8_groupwise_group_deepgemm(256, (128, 512), 4, torch.bfloat16)
-    test_fp8_groupwise_batch_deepgemm_masked(256, (128, 512), 8, torch.bfloat16)
+    test_fp8_groupwise_batch_deepgemm_masked(
+        256, (128, 512), 8, torch.bfloat16, "deepgemm"
+    )

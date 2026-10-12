@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Benchmark the experimental Cake NVFP4 paged-KV MSA decode on SM100/SM103.
+"""Benchmark the experimental Cake NVFP4 paged-KV MSA decode on SM100/SM103/SM107.
 
-Times ``flashinfer.msa_ops.prepare_msa_nvfp4_sparse_decode`` (one persistent
-generated kernel) against ``msa_sparse_decode_attention`` on the same planar
+Times ``flashinfer.msa_ops.prepare_msa_nvfp4_sparse_decode`` (the generated
+persistent or short-item program) against ``msa_sparse_decode_attention`` on the same planar
 NVFP4 pages, top-k 16 selections and queries, with CUPTI and a cold L2 between
 iterations.  The rows are the MiniMax-M3 decode matrix used to qualify the
 program: tensor-parallel ranks 1/2/4/8 (64/32/16/8 query heads over 4/2/1/1 KV
@@ -39,9 +39,6 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashinfer.experimental.msa_nvfp4_decode.cake_backend import (  # noqa: E402
-    msa_nvfp4_decode_workspace_size,
-)
 from flashinfer.msa_ops import (  # noqa: E402
     msa_sparse_decode_attention,
     prepare_msa_nvfp4_sparse_decode,
@@ -106,11 +103,6 @@ def bench_row(name, batch, kv, num_kv_heads, group, seqlen_q, ragged, *, device,
         device=device,
         seed=seed,
     )
-    workspace = torch.empty(
-        msa_nvfp4_decode_workspace_size(batch, num_kv_heads, device, seqlen_q=seqlen_q),
-        dtype=torch.uint8,
-        device=device,
-    )
     out_cake = torch.empty_like(inputs["q"])
     runner = prepare_msa_nvfp4_sparse_decode(
         inputs["q"],
@@ -123,7 +115,6 @@ def bench_row(name, batch, kv, num_kv_heads, group, seqlen_q, ragged, *, device,
         seqused_k=inputs["seqused_k"],
         k_global_scale=inputs["k_global_scale"],
         v_global_scale=inputs["v_global_scale"],
-        workspace_buffer=workspace,
         seqlen_q=seqlen_q,
         softmax_scale=inputs["softmax_scale"],
         out=out_cake,
@@ -165,7 +156,9 @@ def bench_row(name, batch, kv, num_kv_heads, group, seqlen_q, ragged, *, device,
         seqlen_q=seqlen_q,
         ragged=ragged,
         items=items,
+        route=runner.route,
         splits=runner.splits,
+        tail=runner.tail,
         cake_us=cake_us,
         route_us=route_us,
         max_abs_diff_vs_route=max_abs,

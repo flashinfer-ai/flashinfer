@@ -61,12 +61,13 @@ def test_default_tactic_rules():
         assert cb.default_tactic(17, 2112, 7168, sm_count)["split_k"] == 2
     assert cb.default_tactic(17, 1536, 7168, 132)["split_k"] == 2
     assert set(cb.CLUSTER_CAPACITY_BY_SM_COUNT) == {148, 152}
-    # One 128-token tile over one wave of 128-wide weight tiles runs without the L2 promotion on
-    # both parts (7168x18432 M = 128: 144 tiles); the two-wave 8192x28672 row keeps it.
+    # One 128-token tile over 128-wide weight tiles runs without the L2 promotion on both
+    # parts (7168x18432 M = 128: 144 tiles, one wave; 8192x28672 M = 128 on 148 SMs: two
+    # waves of the same program).
     for sm_count in (148, 152):
         t = cb.default_tactic(128, 18432, 7168, sm_count)
         assert t["tile_n"] == 128 and t["l2_promo"] is None and "two_cta" not in t
-    assert cb.default_tactic(128, 28672, 8192, 148)["l2_promo"] == "l2_256b"
+    assert cb.default_tactic(128, 28672, 8192, 148)["l2_promo"] is None
     # More weight tiles than SMs: shallow K; two CTAs per SM on the 8-token tile or on
     # the 152-SM part, one CTA per SM for the 32-token tile on 148 SMs.
     t = cb.default_tactic(8, 28672, 8192, 148)
@@ -90,9 +91,7 @@ def test_default_tactic_rules():
         and not t["deep_k"]
     )
     assert (
-        t["a_hint"] is None
-        and t["b_hint"] == "evict_first"
-        and t["l2_promo"] == "l2_256b"
+        t["a_hint"] is None and t["b_hint"] == "evict_first" and t["l2_promo"] is None
     )
     t = cb.default_tactic(128, 28672, 8192, 152)
     assert t["tile_n"] == 192 and "two_cta" not in t and t["l2_promo"] == "l2_256b"
@@ -160,36 +159,53 @@ def test_default_tactic_rules():
     assert t["two_cta"] and t["sched"] == "clc" and "raster_group" not in t
 
 
-def test_gemm_kernel_key_and_plan():
-    t = cb.default_tactic(8192, 7168, 16384, 148)
-    assert cb.gemm_kernel_key(t, False) == "gemm:m256_2cta_bf16_aL_bL_l2256b_g16_clc"
-    plan = cb.gemm_plan(8192, 7168, 16384, False, "sm_100a", 148)
+def _registered(plan, arch):
+    """The plan's kernel resolves to a generated program of ``arch``."""
+    assert plan.kernel_key in KERNELS[arch], plan.kernel_key
+    return plan
+
+
+def test_gemm_plan_geometry():
+    plan = _registered(
+        cb.gemm_plan(8192, 7168, 16384, False, "sm_100a", 148), "sm_100a"
+    )
+    assert plan.tactic["two_cta"] and plan.tactic["sched"] == "clc"
     assert plan.tok_tile == 256 and plan.w_tile == 256
     assert plan.tok_tiles == 32 and plan.w_tiles == 28
     assert plan.grid == 2 * plan.num_tiles  # CLC launches the whole tile domain
-    t = cb.default_tactic(1, 2112, 7168, 148)
-    assert cb.gemm_kernel_key(t, True) == "gemm:n8_sk4_f16_l2256b"
-    plan = cb.gemm_plan(1, 2112, 7168, True, "sm_100a", 148)
+    plan = _registered(cb.gemm_plan(1, 2112, 7168, True, "sm_100a", 148), "sm_100a")
     assert plan.tok_tile == 8 and plan.w_tile == 128 and plan.num_tiles == 17
-    assert plan.grid == 4 * 17
+    assert plan.grid == 4 * 17  # four K slices per weight tile
     # Half-M pairs: 64 token rows per CTA, 128 per pair tile.
-    plan = cb.gemm_plan(130, 2112, 7168, False, "sm_100a", 148)
-    assert plan.kernel_key == "gemm:m64_2cta_hm_bf16_bF_l2256b"
-    assert plan.tok_tile == 128 and plan.tok_tiles == 2 and plan.num_tiles == 66
-    assert plan.grid == 2 * min(74, plan.num_tiles)
-    plan = cb.gemm_plan(128, 2112, 7168, False, "sm_100a", 148)
-    assert plan.kernel_key == "gemm:m64_2cta_hm_bf16_bF_l2256b"
-    assert plan.tok_tiles == 1 and plan.w_tiles == 33 and plan.grid == 2 * 33
-    plan = cb.gemm_plan(257, 2112, 7168, False, "sm_100a", 148)
-    assert plan.kernel_key == "gemm:m64_2cta_bf16_bF_l2256b" and plan.tok_tile == 256
-    plan = cb.gemm_plan(128, 18432, 7168, False, "sm_100a", 148)
-    assert plan.kernel_key == "gemm:m128_bf16_bF"
+    plan = _registered(cb.gemm_plan(130, 2112, 7168, False, "sm_100a", 148), "sm_100a")
+    assert plan.tactic["half_m"] and plan.tok_tile == 128 and plan.tok_tiles == 2
+    assert plan.num_tiles == 66 and plan.grid == 2 * min(74, plan.num_tiles)
+    plan = _registered(cb.gemm_plan(128, 2112, 7168, False, "sm_100a", 148), "sm_100a")
+    assert plan.tactic["half_m"] and plan.tok_tiles == 1 and plan.w_tiles == 33
+    assert plan.grid == 2 * 33
+    plan = _registered(cb.gemm_plan(257, 2112, 7168, False, "sm_100a", 148), "sm_100a")
+    assert "half_m" not in plan.tactic and plan.tok_tile == 256
+    plan = _registered(cb.gemm_plan(128, 18432, 7168, False, "sm_100a", 148), "sm_100a")
     assert plan.w_tiles == 144 and plan.amc == 1 and plan.grid == 144
-    plan = cb.gemm_plan(8, 28672, 8192, False, "sm_100a", 148)
-    assert plan.kernel_key == "gemm:n8_bf16_aF_l2256b_o2"
+    plan = _registered(cb.gemm_plan(8, 28672, 8192, False, "sm_100a", 148), "sm_100a")
     assert plan.num_tiles == 224 and plan.grid == 224  # min(2 x 148, 224)
-    plan = cb.gemm_plan(8, 18432, 7168, True, "sm_103a", 152)
-    assert plan.kernel_key == "gemm:n8_k512_f16_aF_l2256b_s3" and plan.grid == 144
+    plan = _registered(cb.gemm_plan(8, 18432, 7168, True, "sm_103a", 152), "sm_103a")
+    assert plan.grid == 144
+    # The small token counts between the swapped-orientation tiles and an off-matrix
+    # (K, N) pair resolve to registered programs on every architecture, including a part
+    # whose SM count is outside the validated set.
+    for arch, sm_count in (("sm_100a", 148), ("sm_103a", 152), ("sm_100a", 132)):
+        for n, k in ((2112, 7168), (8192, 8192), (18432, 7168), (3200, 4096)):
+            for m in (9, 12, 16):
+                _registered(cb.gemm_plan(m, n, k, False, arch, sm_count), arch)
+    # Rows past the small-token tiles are generated for the validated SM count of each
+    # architecture (:func:`required_kernel_keys`).  A part with a different SM count can
+    # resolve such a row to a tile the package does not carry -- the plain 2-CTA m192
+    # schedule, which the stream-K tail replaces at 148 and 152 SMs -- and the backend
+    # then names the missing key instead of launching something else.
+    for arch, sm_count in (("sm_100a", 148), ("sm_103a", 152)):
+        for n, k in ((2112, 7168), (8192, 8192), (18432, 7168), (3200, 4096)):
+            _registered(cb.gemm_plan(300, n, k, False, arch, sm_count), arch)
     # Stream-K tail of the static 2-CTA schedule: each tile of the partial last wave is cut into
     # equal K slices over consecutive pairs; the plan resolves the slice count into the tactic
     # (it is baked into the program) and carries the geometry the kernel re-derives.
@@ -315,9 +331,6 @@ def _require_program():
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
     device = torch.device("cuda", 0)
-    capability = torch.cuda.get_device_capability(device)
-    if capability not in cb.SUPPORTED_COMPUTE_CAPABILITIES:
-        pytest.skip("the cake per-token NVFP4 GEMM requires SM100/SM103")
     if not cb.generated_program_available(device):
         pytest.skip("no generated per-token NVFP4 program registered for this GPU")
     return device
@@ -338,7 +351,7 @@ def _dequantize(fp4, sf):
     return (e2m1[nib].view(rows, k // 16, 16) * scales[:, :, None]).view(rows, k)
 
 
-def _operands(m, n, k, x_dtype, device, seed):
+def _operands(m, n, k, x_dtype, device, seed, fold=None):
     g = torch.Generator(device=device).manual_seed(seed)
     x = torch.randn(m, k, device=device, dtype=x_dtype, generator=g)
     w = torch.randn(n, k, device=device, dtype=torch.bfloat16, generator=g)
@@ -348,9 +361,13 @@ def _operands(m, n, k, x_dtype, device, seed):
     )
     gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
     w_scale = (1.0 / w_global_sf).reshape(1).float()
-    if x_dtype == torch.float16:
-        # The validated fp16-activation rows quantize without the folded output
-        # scale; fold the weight scale into alpha on the host instead.
+    if fold is None:
+        fold = x_dtype == torch.bfloat16
+    if not fold:
+        # The validated fp16-activation rows (and the off-matrix K rows, whose
+        # folded-scale quantizer programs are a recorded follow-up) quantize
+        # without the folded output scale; fold the weight scale into alpha on
+        # the host instead.
         a_fp4, a_sf, alpha = nvfp4_quantize(
             x, gs_inv, per_token_activation=True, backend="cake"
         )
@@ -374,9 +391,18 @@ def _assert_matches(out, ref):
 
 # Every M below 33 runs the swapped orientation (alpha along the MMA N extent);
 # larger M the m orientation (alpha per accumulator row); 17 / 130 / 257 are tails.
-@pytest.mark.parametrize("m", [1, 8, 17, 32, 130, 257, 512])
+# The 16-token tiles of M in 9..16 are registered for bf16 output (the validated
+# coverage rows); their fp16-output variants are a recorded follow-up (see below).
+@pytest.mark.parametrize(
+    "m,out_dtype",
+    [
+        (m, dt)
+        for m in (1, 8, 17, 32, 130, 257, 512)
+        for dt in (torch.bfloat16, torch.float16)
+    ]
+    + [(m, torch.bfloat16) for m in (9, 12, 16)],
+)
 @pytest.mark.parametrize("n,k", [(2112, 7168)])
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_mm_fp4_cake_matches_reference(m, n, k, out_dtype):
     device = _require_program()
     x, w, a_fp4, a_sf, alpha, w_fp4, w_sf, _, _ = _operands(
@@ -414,6 +440,10 @@ def test_mm_fp4_cake_matches_reference(m, n, k, out_dtype):
         (257, 2112, 7168, torch.float16),  # fp16 activations (validated f16 row)
         (130, 8192, 8192, torch.bfloat16),  # 2-CTA m orientation
         (1000, 2112, 7168, torch.bfloat16),  # ragged M, grouped raster
+        (9, 8192, 8192, torch.bfloat16),  # 16-token swapped tile, wide N
+        (16, 18432, 7168, torch.bfloat16),  # 16-token tile, deep K
+        (16, 3200, 4096, torch.bfloat16),  # (K, N) outside the measured families
+        (300, 3200, 4096, torch.bfloat16),  # off-matrix, m orientation
     ],
 )
 def test_mm_fp4_cake_routes(m, n, k, x_dtype):
@@ -474,6 +504,56 @@ def test_prepared_chain_runner_graph_replay_and_no_allocation():
         ref = _dequantize(ws.fp4, ws.sf) @ _dequantize(w_fp4, w_sf).T
         ref = ref * ws.scale[:, None]
         _assert_matches(out, ref)
+
+
+@pytest.mark.parametrize("m", [9, 12, 16])
+def test_mm_fp4_cake_fp16_output_small_m_names_the_missing_program(m):
+    # The fp16-output 16-token swapped-orientation programs are not generated yet:
+    # the backend raises at preparation and names the kernel key it would need.
+    device = _require_program()
+    n, k = 2112, 7168
+    _, _, a_fp4, a_sf, alpha, w_fp4, w_sf, _, _ = _operands(
+        m, n, k, torch.bfloat16, device, seed=300 + m
+    )
+    with pytest.raises(NotImplementedError, match=r"gemm:n16_.*_f16"):
+        mm_fp4(a_fp4, w_fp4.T, a_sf, w_sf.T, alpha, torch.float16, backend="cake")
+
+
+def test_quantize_fold_off_matrix_k_runs():
+    # The folded-output-scale quantizer of the one-block-per-thread 256-thread CTA
+    # shape (K = 4096 at M > 1) is generated: the scale fold matches the reference.
+    device = _require_program()
+    x = torch.randn(16, 4096, device=device, dtype=torch.bfloat16)
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    out_scale = torch.tensor([0.5], dtype=torch.float32, device=device)
+    fp4, sf, scale = nvfp4_quantize(
+        x, gs_inv, per_token_activation=True, backend="cake", out_scale=out_scale
+    )
+    _, _, plain_scale = nvfp4_quantize(
+        x, gs_inv, per_token_activation=True, backend="cake"
+    )
+    torch.testing.assert_close(scale, plain_scale * 0.5, rtol=0, atol=0)
+
+
+def test_mm_fp4_cake_repeated_call_allocates_only_its_output():
+    device = _require_program()
+    m, n, k = 130, 2112, 7168
+    _, _, a_fp4, a_sf, alpha, w_fp4, w_sf, _, _ = _operands(
+        m, n, k, torch.bfloat16, device, seed=9
+    )
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+    call = lambda: mm_fp4(  # noqa: E731
+        a_fp4, w_fp4.T, a_sf, w_sf.T, alpha, torch.bfloat16, out, backend="cake"
+    )
+    call()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    for _ in range(3):
+        call()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+    ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
+    _assert_matches(out, ref)
 
 
 def test_scalar_alpha_and_bad_layouts_are_rejected():

@@ -1,87 +1,41 @@
 """Prepared v3 full pipeline and grouped FP4 compute surfaces on SM100a/SM103a."""
 
-import functools
 import json
 from pathlib import Path
+
+from ..deepgemm_common import load_catalog
 from .preparation import prepare_pipeline_bindings, build_tile_lists
 
+LABEL = "Generated MegaMoE v3"
 
-_ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
-
-@functools.cache
-def _catalog():
-    return json.loads(Path(__file__).with_name("catalog.json").read_text())
+def catalog():
+    """The family catalog (schema ``mega_moe_v3.v3``): one program per schedule,
+    compiled for every listed architecture; the pipeline programs take the SM
+    count from the compile line (``-DNUM_CTAS=<physical SMs>``)."""
+    return load_catalog(Path(__file__).with_name("catalog.json"), label=LABEL)
 
 
 def device_arch(device):
     """Exact generated-program architecture for ``device`` (raises when none is catalogued)."""
-    import torch
-
-    device = torch.device(device)
-    catalogued = sorted(_catalog()["arches"])
-    if device.type != "cuda":
-        raise RuntimeError("Generated MegaMoE v3 requires a CUDA device")
-    capability = tuple(torch.cuda.get_device_capability(device))
-    arch = _ARCHES.get(capability)
-    if arch is None or arch not in catalogued:
-        raise RuntimeError(
-            f"Generated MegaMoE v3 has no exported programs for compute capability "
-            f"{capability}; catalogued architectures: {catalogued}"
-        )
-    return arch
-
-
-@functools.cache
-def device_sm_count(device_index):
-    """Physical SM count of ``cuda:device_index`` (queried once per process)."""
-    import torch
-
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
+    return catalog().device_arch(device)
 
 
 def supported_num_sms(arch):
     """SM counts with catalogued routes for ``arch``."""
-    routes = _catalog()["arches"][arch]["routes"].values()
-    return sorted({route["num_sms"] for route in routes})
+    return list(catalog().supported_num_sms(arch))
 
 
-def _nvcc_flags(arch):
-    from flashinfer.jit.core import sm100a_nvcc_flags, sm103a_nvcc_flags
-
-    return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
-
-
-def jit_spec(arch, name):
-    """JIT spec of catalogued program ``name`` for ``arch`` (not built)."""
-    from flashinfer.jit import env
-    from flashinfer.jit.core import gen_jit_spec
-
-    record = _catalog()["arches"][arch]["programs"][name]
-    return gen_jit_spec(
-        name=name,
-        sources=[
-            env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
-        ],
-        extra_cuda_cflags=[
-            *_nvcc_flags(arch),
-            *record["compile_flags"],
-            "--device-entity-has-hidden-visibility=false",
-        ],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
-        use_fast_math=False,
-    )
+def stage_program(stage, arch):
+    """Program name of a route stage on ``arch``: shared, or one of a per-architecture pair."""
+    program = stage["program"]
+    return program if isinstance(program, str) else program[arch]
 
 
-@functools.cache
-def load_program(arch, name):
-    spec = jit_spec(arch, name)
-    record = _catalog()["arches"][arch]["programs"][name]
-    return spec.build_and_load(), {
-        **record,
-        "library_path": str(spec.get_library_path()),
-    }
+def load_program(arch, name, num_sms):
+    """Build and load program ``name`` for ``arch``; ``NUM_CTAS`` is the route's SM count."""
+    definitions = catalog().definitions(arch, name, {"NUM_CTAS": int(num_sms)})
+    return catalog().load_program(arch, name, definitions)
 
 
 def key(surface, args):
@@ -108,9 +62,9 @@ def key(surface, args):
 
 
 def _route(arch, surface, args):
-    """Catalogued ``arch`` route for ``surface``/``args``; unknown routes raise."""
+    """Catalogued route for ``surface``/``args``; unknown routes raise."""
     try:
-        return _catalog()["arches"][arch]["routes"][key(surface, args)]
+        return catalog().routes(arch)[key(surface, args)]
     except KeyError as error:
         raise RuntimeError(
             f"No exported {arch} {surface} schedule for {args}"
@@ -119,23 +73,21 @@ def _route(arch, surface, args):
 
 def _route_arch(route, device):
     """Architecture of ``device``; it must carry the SM count ``route`` was generated for."""
-    import torch
-
     arch = device_arch(device)
-    sms = device_sm_count(torch.device(device).index)
-    if sms != route["num_sms"]:
+    sms = catalog().device_num_sms(device, arch)
+    if sms != route["num_sms"][arch]:
         raise RuntimeError(
             f"The exported {arch} {route['metadata']['surface']} schedule was generated "
-            f"for {route['num_sms']} physical SMs; this device has {sms}"
+            f"for {route['num_sms'][arch]} physical SMs; this device has {sms}"
         )
     return arch
 
 
 class _Stage:
-    def __init__(self, arch, program, bindings):
+    def __init__(self, arch, program, num_sms, bindings):
         import torch
 
-        module, record = load_program(arch, program)
+        module, record = load_program(arch, program, num_sms)
         self.bindings = dict(bindings)
         grid = self.bindings.pop("grid")
         self.bindings.update(grid_x=grid[0], grid_y=grid[1], grid_z=grid[2])
@@ -208,13 +160,19 @@ class V3Plan:
             if isinstance(v, torch.Tensor)
         )
         self.arch = _route_arch(route, t.device)
+        self.num_sms = route["num_sms"][self.arch]
         self.route, self.outputs = route, outputs
         self.reset_storage, self.reset_buffers = reset_storage, tuple(reset_buffers)
         # Declared per architecture by the exported catalog route; absent means
         # the original host-reset lifecycle.
         self.self_cleaning = bool(route["metadata"].get("self_cleaning", False))
         stages = {
-            s["name"]: _Stage(self.arch, s["program"], stage_bindings[s["name"]])
+            s["name"]: _Stage(
+                self.arch,
+                stage_program(s, self.arch),
+                self.num_sms,
+                stage_bindings[s["name"]],
+            )
             for s in route["stages"]
         }
         self.preparation_stages = tuple(stages[name] for name in preparation)
@@ -297,9 +255,10 @@ def bind_prepared(
         for v in b.values()
         if isinstance(v, torch.Tensor)
     )
-    route = _route(device_arch(t.device), surface, args)
+    arch = device_arch(t.device)
+    route = _route(arch, surface, args)
     main = stage_bindings[route["stages"][-1]["name"]]
-    if tuple(main["grid"]) != tuple(route["metadata"]["grid"]):
+    if tuple(main["grid"]) != tuple(route["grid"][arch]):
         raise ValueError("No exported scheduling specialization for this prepared grid")
     return V3Plan(
         route,
@@ -324,10 +283,10 @@ def prepare_pipeline(inputs):
     counter workspace is allocated zeroed and the self-cleaning kernel never
     needs it zeroed again.
     """
-    device = inputs["x_fp8_packed"].device
-    route = _route(device_arch(device), "pipeline", inputs)
+    arch = device_arch(inputs["x_fp8_packed"].device)
+    route = _route(arch, "pipeline", inputs)
     # The persistent grid derives from the SM count the route was generated for.
-    data = prepare_pipeline_bindings(inputs, route["num_sms"])
+    data = prepare_pipeline_bindings(inputs, route["num_sms"][arch])
     return bind_prepared(
         "pipeline",
         inputs,
@@ -360,10 +319,11 @@ def prepare_grouped_l2(
     args = dict(
         num_experts=e, per_expert_M=list(per_expert_M), hidden=n, intermediate=k
     )
-    route = _route(device_arch(A.device), "grouped_l2", args)
+    arch = device_arch(A.device)
+    route = _route(arch, "grouped_l2", args)
     tiles = te.numel()
     main = dict(
-        grid=tuple(route["metadata"]["grid"]),
+        grid=tuple(route["grid"][arch]),
         A=A.view(torch.uint8),
         B=B.view(torch.uint8),
         SFA=packed_a,

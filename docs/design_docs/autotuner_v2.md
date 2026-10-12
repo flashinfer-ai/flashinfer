@@ -163,6 +163,20 @@ derived from it (`eager` → event timing with no delay kernel; otherwise standa
 under different policies land in different directories and never overwrite each other — which is
 what closes the eager-warmup / graph-serving aliasing.
 
+Each newly tuned entry also records an optional `profiling_policy` payload: the effective
+CUDA-graph replay count (or `null` without graphs) and hot-/cold-L2 policy after context
+and measurement overrides. These inherited settings are not fully represented by the manifest.
+When `choose_one` can profile, it reuses a managed winner only when this provenance matches,
+including after preload, reload, and promotion to the root/environment-partitioned memory
+cache. A missing or different policy is a profiling miss, not deletion; replay, bare inference,
+and direct `search_cache` lookups still accept the winner, even inside a tuning context.
+Entries without provenance are retuned by `choose_one` even under the default policy, including
+after a same-version build upgrade that leaves the environment directory unchanged.
+Retuning updates the same entry and its decoded memo only when the winning runner's key is
+unchanged. If a different runner wins, it is published under that runner's key; the previous
+runner's entry remains, as before. This is an additive v2 field, not a new schema, manifest
+identity, or operation key. Legacy v1 file-policy gating is unchanged.
+
 `"auto"` currently preserves legacy behavior. Flipping the default to `"cuda_graph"` (the
 dominant serving mode) is gated on validating capture-safety across the op suite.
 

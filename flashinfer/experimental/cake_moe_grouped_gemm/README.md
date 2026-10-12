@@ -57,9 +57,10 @@ print(dw_launch.record_name, dw_launch.plan)
 ```
 
 `prepare_grouped_gemm_*` validates, allocates the output (when not given) and
-the caller-owned workspaces, binds the generated program, encodes its TMA
-descriptors once (outside CUDA Graph capture) and returns a
-`GroupedGemmLaunch`. `launch()` performs no allocation and no host
+the weight-gradient workspaces, resolves the route and binds the generated
+programs, and returns a `GroupedGemmLaunch`. `launch()` passes the operands'
+TMA descriptors by value (the binding encodes them on the host from the bound
+tensors' metadata at every launch), performs no allocation and no host
 synchronisation. Prepare a new launch when a shape, dtype or tensor binding
 changes; the one-shot helpers prepare on every call.
 
@@ -102,27 +103,35 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   runs. The tile raster inside a group follows the per-wave operand footprint
   (`wgrad_raster_rows`).
 - Workspaces (allocated at preparation, retained by the launch object): the
-  per-CTA TMA descriptor slots of the weight gradient, its fp32 tail partials,
-  and one caller-owned descriptor workspace per pointer-ABI stage.
+  per-CTA TMA descriptor slots of the weight gradient and its fp32 tail
+  partials. The operand descriptors are launch arguments; there is no
+  descriptor workspace and no descriptor upload kernel.
 
 `GroupedGemmLaunch.plan` exposes `grid`, `tile_k`, `tail_splits`,
 `raster_rows` and `launches` for inspection and tests.
 
 ## Build targets and layout
 
-The programs are exact-architecture tcgen05 payloads: one registered module
-per architecture (`sm_100a`, `sm_103a`, `sm_107a`), compiled with FlashInfer's
-exact flag sets. Which of them can be built follows
-`FLASHINFER_CUDA_ARCH_LIST` (or the visible devices) through
-`flashinfer.compilation_context`; the loader never probes `nvcc` or the device.
-Generated sources live under `csrc/cake_moe_grouped_gemm/<arch>/` in this
-package (device and host-binding translation units per stage) and are
-registered in `cake_jit.MODULES`; the JIT cache name carries each stage's
-sealed closure identity. Until the export is delivered the registry is empty
-and every helper raises `NotImplementedError` naming the missing program.
+The programs are exact-architecture tcgen05 payloads compiled with
+FlashInfer's exact flag sets for `sm_100a`, `sm_103a` and `sm_107a`. Each
+physical program (`fwd`, `dgrad`, the weight-gradient main kernel for bf16 and
+fp32 outputs with a 256- or 512-wide k tile, and the weight-gradient
+tail-reduce for bf16 and fp32 outputs) has one kernel and one host-binding
+translation unit under `csrc/cake_moe_grouped_gemm/`, shared by the three
+architectures: the single architecture-dependent line is folded under
+`__CUDA_ARCH__`, and the tail-reduce k tile is a compile-line specialization
+(`-DWGRAD_TILE=256|512`). `cake_jit.PROGRAMS` lists each program once
+(sources, compile flags, FFI entry, argument plan, launch geometry and its
+per-architecture closure identity); `cake_jit.ROUTES` maps each public route
+(operation, output dtype, k tile) to its stage programs and specializations.
+The JIT cache name carries the exact target and the closure identity. Which
+targets can be built follows `FLASHINFER_CUDA_ARCH_LIST` (or the visible
+devices) through `flashinfer.compilation_context`; the loader never probes
+`nvcc` or the device. The 512-wide weight-gradient tile is registered for
+`sm_100a` and `sm_103a`.
 
-Measured architectures and the public performance summary are added with the
-generated programs.
+Measured on B200 (`sm_100a`), GB300 (`sm_103a`) and R200 (`sm_107a`); the
+performance summary is in the delivery pull requests.
 
 ## Tests and benchmark
 

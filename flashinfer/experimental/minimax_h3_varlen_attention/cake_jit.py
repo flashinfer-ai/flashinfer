@@ -25,12 +25,19 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 # Explicit target-owned registration of the generated programs.
 #
-# ``MODULES`` holds one record per physical generated module (a kernel plus
-# its host binding): translation units, compile flags, FFI entry, argument
-# plan and closure identity.  ``ROUTES`` maps ``"<variant>__<arch>"`` to the
-# ordered stage -> module assignment of that program family:
+# ``MODULES`` holds one record per physical generated program (one kernel
+# source plus its host binding, shared by every architecture in ``arches``):
+# translation units, compile flags, FFI entry, argument plan and closure
+# identity.  Architecture-specific lowering (the SM103 ``tcgen05.ld.red``
+# score drain against the SM100 packed-polynomial exp2 emulation, the BF16
+# per-architecture schedule) lives inside the one source under exact
+# ``__CUDA_ARCH__`` regions, so a program is compiled once per exact target
+# (``sm100a_nvcc_flags`` / ``sm103a_nvcc_flags``) and the JIT caches one
+# library per (program, arch).  ``ROUTES`` maps ``"<variant>__<arch>"`` to the
+# ordered stage -> program assignment of that program family:
 #
-# * ``bf16``          stages ``("attention", "combine")``
+# * ``bf16``          stages ``("attention", "attention_dyn", "attention_sread", "combine")``
+#                     on sm_100a and ``("attention", "attention_dyn", "combine")`` on sm_103a
 # * ``nvfp4_fp4pv``   stages ``("quantize", "attention", "attention_split", "combine")``
 # * ``nvfp4_fp8pv``   stages ``("amax", "quantize", "attention", "attention_split", "combine")``
 #
@@ -38,26 +45,158 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # (``minimax_h3_varlen_nvfp4_quantize_qkv`` / ``..._quantize_qk_fp8v``); the
 # fp8 route precedes it with ``amax`` (``minimax_h3_varlen_v_amax_partial``,
 # one partial ``max|V|`` per CTA, folded by the quantizer, which is that
-# kernel's programmatic dependent launch); the
-# NVFP4 routes carry two attention programs, the dense ``attention`` (no
-# K/V-split code; bound for plans without split units) and
-# ``attention_split`` (reads the unit's K/V block range and writes partial
-# rows; bound when the plan has split units) -- the runner binds exactly one
-# of them per plan -- and both bindings carry the programmatic dependent
-# launch attribute; ``combine`` is the shared K/V-split merge kernel
-# (``minimax_h3_varlen_split_combine``) that finishes the units the host
-# planner split over their K/V range (skipped by the runner when a plan has no
-# split units).  Every module is an exact-arch program (the
-# sm_100a NVFP4 attention uses the hybrid exp2 recipe, sm_103a
-# ``tcgen05.ld.red``).  Both literals are populated verbatim by the
-# generated-program export; do not edit them by hand.
+# kernel's programmatic dependent launch); the NVFP4 routes carry two
+# attention programs, the dense ``attention`` (no K/V-split code; bound for
+# plans without split units) and ``attention_split`` (reads the unit's K/V
+# block range and writes partial rows; bound when the plan has split units)
+# -- the runner binds exactly one of them per plan -- and both bindings carry
+# the programmatic dependent launch attribute; the BF16 route carries three
+# bitwise-identical attention programs selected per plan by the host planner
+# (``cake_backend.build_bf16_segment_plan``): ``attention`` (the static
+# schedule), ``attention_dyn`` (the dynamic whole-unit ticket scheduler of the
+# long multi-wave plans) and, on ``BF16_SREAD_ARCHES`` only, ``attention_sread``
+# (the publish-tail cut of the remaining plans); ``combine`` is the shared
+# K/V-split merge kernel (``minimax_h3_varlen_split_combine``) that finishes
+# the units the host planner split over their K/V range (skipped by the
+# runner when a plan has no split units).  Both literals are populated
+# verbatim by the generated-program export; do not edit them by hand.
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_minimax_h3_varlen_attention_09d2c9ea5209af5c2d70": {
-        "arch": "sm_103a",
+    "cake_minimax_h3_varlen_attention_01e6cf096b287e594899": {
+        "arches": ["sm_100a", "sm_103a"],
         "role": "kernel",
         "sources": [
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_09d2c9ea5209af5c2d70_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_09d2c9ea5209af5c2d70_binding.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_01e6cf096b287e594899_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_01e6cf096b287e594899_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "K"],
+            ["tma_buffer", "Vt"],
+            ["tma_buffer", "SFQ"],
+            ["tma_buffer", "SFK"],
+            ["tma_buffer", "SFVtLo"],
+            ["tma_buffer", "SFVtHi"],
+            ["buffer", "O"],
+            ["buffer", "cl_head"],
+            ["buffer", "cl_seg_begin"],
+            ["buffer", "cl_seg_len"],
+            ["buffer", "cl_kv_base"],
+            ["buffer", "cl_q_block"],
+            ["parameter", "total_clusters"],
+            ["parameter", "heads"],
+            ["parameter", "PB"],
+            ["parameter", "softmax_scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": {
+            "sm_100a": "c44ed454ac7baeb18aba978ce11a468c45401acf273b481ecee53ef68053c9f2",
+            "sm_103a": "91d4a124e1c3efc8e845c2f6ec93615517d9165770d00a451860a2eb83c20a28",
+        },
+    },
+    "cake_minimax_h3_varlen_attention_08e428db13e7c3896d64": {
+        "arches": ["sm_100a"],
+        "role": "kernel",
+        "sources": [
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_08e428db13e7c3896d64_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_08e428db13e7c3896d64_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "K"],
+            ["tma_buffer", "V"],
+            ["tma_buffer", "O"],
+            ["buffer", "O_raw"],
+            ["buffer", "unit_table"],
+            ["buffer", "partial_O"],
+            ["buffer", "partial_ML"],
+            ["parameter", "total_tiles"],
+            ["parameter", "num_heads"],
+            ["parameter", "softmax_scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": {
+            "sm_100a": "0d0898df7073da04ae63d270a4118f25a3057e6d35d973606f4ad13bf917167f",
+        },
+    },
+    "cake_minimax_h3_varlen_attention_1350b7d87b8bb2dc9c46": {
+        "arches": ["sm_100a", "sm_103a"],
+        "role": "kernel",
+        "sources": [
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_1350b7d87b8bb2dc9c46_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_1350b7d87b8bb2dc9c46_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "K"],
+            ["tma_buffer", "V"],
+            ["tma_buffer", "O"],
+            ["buffer", "O_raw"],
+            ["buffer", "unit_table"],
+            ["buffer", "partial_O"],
+            ["buffer", "partial_ML"],
+            ["parameter", "total_tiles"],
+            ["parameter", "num_heads"],
+            ["parameter", "softmax_scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": {
+            "sm_100a": "c110396f0072bdefdafea3c20787d9f8235df7b2296654b6828bd9b2a63a2da1",
+            "sm_103a": "8163c27a8faf1136b10e365321a36845fe04ab623b9099e223194a99fdbe2e57",
+        },
+    },
+    "cake_minimax_h3_varlen_attention_4b8d9db1ca486cd41383": {
+        "arches": ["sm_100a", "sm_103a"],
+        "role": "kernel",
+        "sources": [
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_4b8d9db1ca486cd41383_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_4b8d9db1ca486cd41383_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "K"],
+            ["tma_buffer", "V"],
+            ["tma_buffer", "SFQ"],
+            ["tma_buffer", "SFK"],
+            ["buffer", "O"],
+            ["buffer", "v_amax"],
+            ["buffer", "cl_head"],
+            ["buffer", "cl_seg_begin"],
+            ["buffer", "cl_seg_len"],
+            ["buffer", "cl_kv_base"],
+            ["buffer", "cl_q_block"],
+            ["parameter", "total_clusters"],
+            ["parameter", "heads"],
+            ["parameter", "PB"],
+            ["parameter", "softmax_scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": {
+            "sm_100a": "f6474a8b636bea0a652822fe24bc49f9e2607ffa03d95f84650678101a741d47",
+            "sm_103a": "32b00613ab7c158e4b203836b9b2ac4715f46ee52d56443fb44a9e96286feaf7",
+        },
+    },
+    "cake_minimax_h3_varlen_attention_571c1ac46e3fe6d8842d": {
+        "arches": ["sm_100a", "sm_103a"],
+        "role": "kernel",
+        "sources": [
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_571c1ac46e3fe6d8842d_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_571c1ac46e3fe6d8842d_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -70,111 +209,85 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "4862ba65aa4c28ec98c60edb1412f741c51f037881316426b42e0c65f453e68b",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": {
+            "sm_100a": "392eb57d169f6b6d2625ad7ec6fa7b3133582cd0cc8712b72ec0c6b00d10c070",
+            "sm_103a": "2b66442c37e47563d1fdcad9bb864209ac3adaf90191157c821fe91deb0b3e04",
+        },
     },
-    "cake_minimax_h3_varlen_attention_0e4830f8fd365c118d4f": {
-        "arch": "sm_103a",
+    "cake_minimax_h3_varlen_attention_579b1fc2756eec97f194": {
+        "arches": ["sm_100a", "sm_103a"],
         "role": "kernel",
         "sources": [
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_0e4830f8fd365c118d4f_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_0e4830f8fd365c118d4f_binding.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_579b1fc2756eec97f194_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_579b1fc2756eec97f194_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
-            ["tma_buffer", "Q"],
-            ["tma_buffer", "K"],
-            ["tma_buffer", "V"],
-            ["tma_buffer", "SFQ"],
-            ["tma_buffer", "SFK"],
-            ["buffer", "O"],
-            ["buffer", "v_amax"],
-            ["buffer", "cl_head"],
-            ["buffer", "cl_seg_begin"],
-            ["buffer", "cl_seg_len"],
-            ["buffer", "cl_kv_base"],
-            ["buffer", "cl_q_block"],
-            ["parameter", "total_clusters"],
-            ["parameter", "heads"],
-            ["parameter", "PB"],
-            ["parameter", "softmax_scale_log2"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "55a3ad8e2476d649ec249502c8c97d129ef5db8bc03649ff03264280009265de",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_minimax_h3_varlen_attention_167e2767ad20213a59b1": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_167e2767ad20213a59b1_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_167e2767ad20213a59b1_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "Q"],
-            ["tma_buffer", "K"],
-            ["tma_buffer", "V"],
-            ["tma_buffer", "SFQ"],
-            ["tma_buffer", "SFK"],
-            ["buffer", "O"],
-            ["buffer", "v_amax"],
-            ["buffer", "cl_head"],
-            ["buffer", "cl_seg_begin"],
-            ["buffer", "cl_seg_len"],
-            ["buffer", "cl_kv_base"],
-            ["buffer", "cl_q_block"],
-            ["parameter", "total_clusters"],
-            ["parameter", "heads"],
-            ["parameter", "PB"],
-            ["parameter", "softmax_scale_log2"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "d25951d96025810f7031475e470b4419a83369a7dc683e9513dca3c81850b965",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_minimax_h3_varlen_attention_27aad524c1ac040acff4": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_27aad524c1ac040acff4_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_27aad524c1ac040acff4_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "Q"],
-            ["buffer", "Q_raw"],
-            ["tma_buffer", "K"],
-            ["tma_buffer", "V"],
-            ["buffer", "O"],
-            ["buffer", "seg_begin"],
-            ["buffer", "seg_len"],
-            ["buffer", "unit_table"],
             ["buffer", "partial_O"],
             ["buffer", "partial_ML"],
-            ["parameter", "total_tiles"],
+            ["buffer", "combine_table"],
+            ["buffer", "seg_begin"],
+            ["buffer", "seg_len"],
+            ["buffer", "O"],
             ["parameter", "num_heads"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": {
+            "sm_100a": "803ba298e93e90880a693406d8e9f86ee7bc0a281a469e97e46c13b88aca4afa",
+            "sm_103a": "6c9355cdeea1fb6824e89ea90adf4776e6f4d445e9fcfb212656689660c2d960",
+        },
+    },
+    "cake_minimax_h3_varlen_attention_660bd18545042b7ed2e1": {
+        "arches": ["sm_100a", "sm_103a"],
+        "role": "kernel",
+        "sources": [
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_660bd18545042b7ed2e1_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_660bd18545042b7ed2e1_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "K"],
+            ["tma_buffer", "Vt"],
+            ["tma_buffer", "SFQ"],
+            ["tma_buffer", "SFK"],
+            ["tma_buffer", "SFVtLo"],
+            ["tma_buffer", "SFVtHi"],
+            ["buffer", "O"],
+            ["buffer", "cl_head"],
+            ["buffer", "cl_seg_begin"],
+            ["buffer", "cl_seg_len"],
+            ["buffer", "cl_kv_base"],
+            ["buffer", "cl_q_block"],
+            ["buffer", "cl_kv_begin"],
+            ["buffer", "cl_kv_blocks"],
+            ["buffer", "cl_ws_slot"],
+            ["buffer", "partial_O"],
+            ["buffer", "partial_ML"],
+            ["parameter", "num_tiles"],
+            ["parameter", "total_clusters"],
+            ["parameter", "heads"],
+            ["parameter", "PB"],
             ["parameter", "softmax_scale_log2"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "b29fe1b52cdda36a45f5ae8087dcbd0c44fa7be1147e2d828f286d56b7163299",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": {
+            "sm_100a": "d002516a0825cc26cf0cb7e1f2d9a727cd5ec231a268c2401bcbe43246b9ef57",
+            "sm_103a": "a12402fd78c910fda087d75cd0720382f66abe243a71dfcabd319d9db23ce3a8",
+        },
     },
-    "cake_minimax_h3_varlen_attention_330521b5d6cd0a93df49": {
-        "arch": "sm_103a",
+    "cake_minimax_h3_varlen_attention_a0106039a66d9a80b786": {
+        "arches": ["sm_100a", "sm_103a"],
         "role": "kernel",
         "sources": [
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_330521b5d6cd0a93df49_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_330521b5d6cd0a93df49_binding.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_a0106039a66d9a80b786_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_a0106039a66d9a80b786_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -205,36 +318,17 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "ba485be97a568ac61ddbdfa5cb520d882b41225d042fd1eab07a3860e9c7e116",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": {
+            "sm_100a": "fb4721104c044955e6ba990546c19ee671d85345711e47e42420602eac5b35e6",
+            "sm_103a": "632fa6d57eeb8619e444e07d3c3c85a685e81a56ef361a7ae548a1392a8dd575",
+        },
     },
-    "cake_minimax_h3_varlen_attention_530411d4fd6f12553109": {
-        "arch": "sm_100a",
+    "cake_minimax_h3_varlen_attention_ccba90ddf663625098b1": {
+        "arches": ["sm_100a", "sm_103a"],
         "role": "kernel",
         "sources": [
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_530411d4fd6f12553109_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_530411d4fd6f12553109_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "v"],
-            ["buffer", "v_amax_partial"],
-            ["parameter", "num_vectors"],
-            ["parameter", "num_chunks"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "162f956cdb1167b9198fc7056bfdea0df5d0e8e4f48515fe7b3353ec14e6f8ef",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_minimax_h3_varlen_attention_557c0fe57677e7688034": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_557c0fe57677e7688034_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_557c0fe57677e7688034_binding.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_ccba90ddf663625098b1_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_ccba90ddf663625098b1_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -257,26 +351,59 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "b18a222cb1c5a90bcfefbf15cc0d9b00a00edbbf5c80e0bdc3b85e4c02e64568",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": {
+            "sm_100a": "271e14bdbe5bad5caaca4847a34e421c7bfd9e9c5fd54b2ae326325de86560e1",
+            "sm_103a": "7473fd6cd22069bb035c7e0b476a5be3ba90019634f6370ed7680341742b1dd8",
+        },
     },
-    "cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887": {
-        "arch": "sm_103a",
+    "cake_minimax_h3_varlen_attention_cd9b0982c132645f17d1": {
+        "arches": ["sm_100a", "sm_103a"],
         "role": "kernel",
         "sources": [
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887_binding.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_cd9b0982c132645f17d1_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_cd9b0982c132645f17d1_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "k"],
+            ["buffer", "v"],
+            ["buffer", "q_fp4"],
+            ["buffer", "k_fp4"],
+            ["buffer", "q_scale"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_fp4_t"],
+            ["buffer", "v_scale_lo"],
+            ["buffer", "v_scale_hi"],
+            ["buffer", "block_token"],
+            ["buffer", "block_valid"],
+            ["parameter", "heads"],
+            ["parameter", "PB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": {
+            "sm_100a": "def5c9688aa9a26e1e3c8e732e219664495d9a420aa1ec2622f7381658eeb608",
+            "sm_103a": "033b1bc990e878eb2162996cbd6ee547162a46354f0f460ecb7398fa7aabe034",
+        },
+    },
+    "cake_minimax_h3_varlen_attention_dcc6cea1370b3bfaec30": {
+        "arches": ["sm_100a", "sm_103a"],
+        "role": "kernel",
+        "sources": [
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_dcc6cea1370b3bfaec30_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_dcc6cea1370b3bfaec30_binding.cu",
         ],
         "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "Q"],
-            ["buffer", "Q_raw"],
             ["tma_buffer", "K"],
             ["tma_buffer", "V"],
-            ["buffer", "O"],
-            ["buffer", "seg_begin"],
-            ["buffer", "seg_len"],
+            ["tma_buffer", "O"],
+            ["buffer", "O_raw"],
             ["buffer", "unit_table"],
             ["buffer", "partial_O"],
             ["buffer", "partial_ML"],
@@ -287,355 +414,32 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "b5034be139710382448fc275864993118528bb3129255a795f093861a41dbe04",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_minimax_h3_varlen_attention_78e74a16416a7d27c9f8": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_78e74a16416a7d27c9f8_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_78e74a16416a7d27c9f8_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "Q"],
-            ["tma_buffer", "K"],
-            ["tma_buffer", "Vt"],
-            ["tma_buffer", "SFQ"],
-            ["tma_buffer", "SFK"],
-            ["tma_buffer", "SFVtLo"],
-            ["tma_buffer", "SFVtHi"],
-            ["buffer", "O"],
-            ["buffer", "cl_head"],
-            ["buffer", "cl_seg_begin"],
-            ["buffer", "cl_seg_len"],
-            ["buffer", "cl_kv_base"],
-            ["buffer", "cl_q_block"],
-            ["buffer", "cl_kv_begin"],
-            ["buffer", "cl_kv_blocks"],
-            ["buffer", "cl_ws_slot"],
-            ["buffer", "partial_O"],
-            ["buffer", "partial_ML"],
-            ["parameter", "num_tiles"],
-            ["parameter", "total_clusters"],
-            ["parameter", "heads"],
-            ["parameter", "PB"],
-            ["parameter", "softmax_scale_log2"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "fe47213d5e6b1c52e5acde6cfb1be771b995a6c7f85893374fefc3195bd1833d",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_minimax_h3_varlen_attention_79cc755a24fa6f9758c8": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_79cc755a24fa6f9758c8_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_79cc755a24fa6f9758c8_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "partial_O"],
-            ["buffer", "partial_ML"],
-            ["buffer", "combine_table"],
-            ["buffer", "seg_begin"],
-            ["buffer", "seg_len"],
-            ["buffer", "O"],
-            ["parameter", "num_heads"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "f704e2e9b8c8d9a37927496935df9d0f2a7a8e1864e51c2f631c6a878f53ca3b",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_minimax_h3_varlen_attention_7dd4710e5471034647d6": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_7dd4710e5471034647d6_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_7dd4710e5471034647d6_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "Q"],
-            ["tma_buffer", "K"],
-            ["tma_buffer", "V"],
-            ["tma_buffer", "SFQ"],
-            ["tma_buffer", "SFK"],
-            ["buffer", "O"],
-            ["buffer", "v_amax"],
-            ["buffer", "cl_head"],
-            ["buffer", "cl_seg_begin"],
-            ["buffer", "cl_seg_len"],
-            ["buffer", "cl_kv_base"],
-            ["buffer", "cl_q_block"],
-            ["buffer", "cl_kv_begin"],
-            ["buffer", "cl_kv_blocks"],
-            ["buffer", "cl_ws_slot"],
-            ["buffer", "partial_O"],
-            ["buffer", "partial_ML"],
-            ["parameter", "num_tiles"],
-            ["parameter", "total_clusters"],
-            ["parameter", "heads"],
-            ["parameter", "PB"],
-            ["parameter", "softmax_scale_log2"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "776d8d99939d4f8ef34f7f92616752ce86161a46e3c13d53de8d57d6cd9067e6",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_minimax_h3_varlen_attention_a9de8bf510ed0bfbb02a": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_a9de8bf510ed0bfbb02a_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_a9de8bf510ed0bfbb02a_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "Q"],
-            ["tma_buffer", "K"],
-            ["tma_buffer", "Vt"],
-            ["tma_buffer", "SFQ"],
-            ["tma_buffer", "SFK"],
-            ["tma_buffer", "SFVtLo"],
-            ["tma_buffer", "SFVtHi"],
-            ["buffer", "O"],
-            ["buffer", "cl_head"],
-            ["buffer", "cl_seg_begin"],
-            ["buffer", "cl_seg_len"],
-            ["buffer", "cl_kv_base"],
-            ["buffer", "cl_q_block"],
-            ["buffer", "cl_kv_begin"],
-            ["buffer", "cl_kv_blocks"],
-            ["buffer", "cl_ws_slot"],
-            ["buffer", "partial_O"],
-            ["buffer", "partial_ML"],
-            ["parameter", "num_tiles"],
-            ["parameter", "total_clusters"],
-            ["parameter", "heads"],
-            ["parameter", "PB"],
-            ["parameter", "softmax_scale_log2"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "da314f71be42553d5f9b961030bdfe2ff95ea25157dfae2159de369195a54c50",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_minimax_h3_varlen_attention_b117806ae1ee4e7876de": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_b117806ae1ee4e7876de_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_b117806ae1ee4e7876de_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "Q"],
-            ["tma_buffer", "K"],
-            ["tma_buffer", "Vt"],
-            ["tma_buffer", "SFQ"],
-            ["tma_buffer", "SFK"],
-            ["tma_buffer", "SFVtLo"],
-            ["tma_buffer", "SFVtHi"],
-            ["buffer", "O"],
-            ["buffer", "cl_head"],
-            ["buffer", "cl_seg_begin"],
-            ["buffer", "cl_seg_len"],
-            ["buffer", "cl_kv_base"],
-            ["buffer", "cl_q_block"],
-            ["parameter", "total_clusters"],
-            ["parameter", "heads"],
-            ["parameter", "PB"],
-            ["parameter", "softmax_scale_log2"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "b15c062da7291c3cec8d1880324b10b8000cd0c7ac5f6a26ef81d0705887e3a8",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_minimax_h3_varlen_attention_b5202869834cd7822fb1": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_b5202869834cd7822fb1_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_b5202869834cd7822fb1_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "partial_O"],
-            ["buffer", "partial_ML"],
-            ["buffer", "combine_table"],
-            ["buffer", "seg_begin"],
-            ["buffer", "seg_len"],
-            ["buffer", "O"],
-            ["parameter", "num_heads"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "4d4e7cb2d794176103f5a6688187bf931f134ddd0d22cb066cd1b2e94c4c7a1f",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_minimax_h3_varlen_attention_bb24687b0d61491f8d5d": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_bb24687b0d61491f8d5d_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_bb24687b0d61491f8d5d_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "Q"],
-            ["tma_buffer", "K"],
-            ["tma_buffer", "Vt"],
-            ["tma_buffer", "SFQ"],
-            ["tma_buffer", "SFK"],
-            ["tma_buffer", "SFVtLo"],
-            ["tma_buffer", "SFVtHi"],
-            ["buffer", "O"],
-            ["buffer", "cl_head"],
-            ["buffer", "cl_seg_begin"],
-            ["buffer", "cl_seg_len"],
-            ["buffer", "cl_kv_base"],
-            ["buffer", "cl_q_block"],
-            ["parameter", "total_clusters"],
-            ["parameter", "heads"],
-            ["parameter", "PB"],
-            ["parameter", "softmax_scale_log2"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "99e320ece176ac74c73143f4fc833db3328b8d64f7a47592413ffce4f7878912",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_minimax_h3_varlen_attention_c175a6b3704c50592480": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_c175a6b3704c50592480_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_c175a6b3704c50592480_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "q"],
-            ["buffer", "k"],
-            ["buffer", "v"],
-            ["buffer", "q_fp4"],
-            ["buffer", "k_fp4"],
-            ["buffer", "q_scale"],
-            ["buffer", "k_scale"],
-            ["buffer", "v_fp8"],
-            ["buffer", "v_amax"],
-            ["buffer", "v_amax_partial"],
-            ["buffer", "block_token"],
-            ["buffer", "block_valid"],
-            ["parameter", "heads"],
-            ["parameter", "PB"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "f9990b56bd2835a2899989bb58930feb41e06b58570ee9690bc41112c84916eb",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_minimax_h3_varlen_attention_c91aa0cff6efdec01179": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_c91aa0cff6efdec01179_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_103a/cake_minimax_h3_varlen_attention_c91aa0cff6efdec01179_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "q"],
-            ["buffer", "k"],
-            ["buffer", "v"],
-            ["buffer", "q_fp4"],
-            ["buffer", "k_fp4"],
-            ["buffer", "q_scale"],
-            ["buffer", "k_scale"],
-            ["buffer", "v_fp4_t"],
-            ["buffer", "v_scale_lo"],
-            ["buffer", "v_scale_hi"],
-            ["buffer", "block_token"],
-            ["buffer", "block_valid"],
-            ["parameter", "heads"],
-            ["parameter", "PB"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "083d2fda59c1be45619ccddf1d1b79d2162197466da06e8489d5e0e05930c099",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_minimax_h3_varlen_attention_e70c217406e9eafae840": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_e70c217406e9eafae840_kernel.cu",
-            "cake_minimax_h3_varlen_attention/sm_100a/cake_minimax_h3_varlen_attention_e70c217406e9eafae840_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "q"],
-            ["buffer", "k"],
-            ["buffer", "v"],
-            ["buffer", "q_fp4"],
-            ["buffer", "k_fp4"],
-            ["buffer", "q_scale"],
-            ["buffer", "k_scale"],
-            ["buffer", "v_fp4_t"],
-            ["buffer", "v_scale_lo"],
-            ["buffer", "v_scale_hi"],
-            ["buffer", "block_token"],
-            ["buffer", "block_valid"],
-            ["parameter", "heads"],
-            ["parameter", "PB"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "3bb08ae9bdc287e537bf567f7ec1e99a42a9fc015eef2e080bbe776157165668",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": {
+            "sm_100a": "9016b513e9c6a9fa213ccd64dab904a7ced02a96e40fd892010cc1e99d4e0255",
+            "sm_103a": "1e57f1ee2d9bdfa5b0ea1ab99c720fb9beeb84702ad1040ef9f3c30cf79905c4",
+        },
     },
 }
 ROUTES: dict[str, dict[str, Any]] = {
     "bf16__sm_100a": {
         "arch": "sm_100a",
         "variant": "bf16",
-        "stages": ["attention", "combine"],
+        "stages": ["attention", "attention_dyn", "attention_sread", "combine"],
         "modules": {
-            "attention": "cake_minimax_h3_varlen_attention_27aad524c1ac040acff4",
-            "combine": "cake_minimax_h3_varlen_attention_b5202869834cd7822fb1",
+            "attention": "cake_minimax_h3_varlen_attention_dcc6cea1370b3bfaec30",
+            "attention_dyn": "cake_minimax_h3_varlen_attention_1350b7d87b8bb2dc9c46",
+            "attention_sread": "cake_minimax_h3_varlen_attention_08e428db13e7c3896d64",
+            "combine": "cake_minimax_h3_varlen_attention_579b1fc2756eec97f194",
         },
     },
     "bf16__sm_103a": {
         "arch": "sm_103a",
         "variant": "bf16",
-        "stages": ["attention", "combine"],
+        "stages": ["attention", "attention_dyn", "combine"],
         "modules": {
-            "attention": "cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887",
-            "combine": "cake_minimax_h3_varlen_attention_79cc755a24fa6f9758c8",
+            "attention": "cake_minimax_h3_varlen_attention_dcc6cea1370b3bfaec30",
+            "attention_dyn": "cake_minimax_h3_varlen_attention_1350b7d87b8bb2dc9c46",
+            "combine": "cake_minimax_h3_varlen_attention_579b1fc2756eec97f194",
         },
     },
     "nvfp4_fp4pv__sm_100a": {
@@ -643,10 +447,10 @@ ROUTES: dict[str, dict[str, Any]] = {
         "variant": "nvfp4_fp4pv",
         "stages": ["quantize", "attention", "attention_split", "combine"],
         "modules": {
-            "quantize": "cake_minimax_h3_varlen_attention_e70c217406e9eafae840",
-            "attention": "cake_minimax_h3_varlen_attention_bb24687b0d61491f8d5d",
-            "attention_split": "cake_minimax_h3_varlen_attention_78e74a16416a7d27c9f8",
-            "combine": "cake_minimax_h3_varlen_attention_b5202869834cd7822fb1",
+            "quantize": "cake_minimax_h3_varlen_attention_cd9b0982c132645f17d1",
+            "attention": "cake_minimax_h3_varlen_attention_01e6cf096b287e594899",
+            "attention_split": "cake_minimax_h3_varlen_attention_660bd18545042b7ed2e1",
+            "combine": "cake_minimax_h3_varlen_attention_579b1fc2756eec97f194",
         },
     },
     "nvfp4_fp4pv__sm_103a": {
@@ -654,10 +458,10 @@ ROUTES: dict[str, dict[str, Any]] = {
         "variant": "nvfp4_fp4pv",
         "stages": ["quantize", "attention", "attention_split", "combine"],
         "modules": {
-            "quantize": "cake_minimax_h3_varlen_attention_c91aa0cff6efdec01179",
-            "attention": "cake_minimax_h3_varlen_attention_b117806ae1ee4e7876de",
-            "attention_split": "cake_minimax_h3_varlen_attention_a9de8bf510ed0bfbb02a",
-            "combine": "cake_minimax_h3_varlen_attention_79cc755a24fa6f9758c8",
+            "quantize": "cake_minimax_h3_varlen_attention_cd9b0982c132645f17d1",
+            "attention": "cake_minimax_h3_varlen_attention_01e6cf096b287e594899",
+            "attention_split": "cake_minimax_h3_varlen_attention_660bd18545042b7ed2e1",
+            "combine": "cake_minimax_h3_varlen_attention_579b1fc2756eec97f194",
         },
     },
     "nvfp4_fp8pv__sm_100a": {
@@ -665,11 +469,11 @@ ROUTES: dict[str, dict[str, Any]] = {
         "variant": "nvfp4_fp8pv",
         "stages": ["amax", "quantize", "attention", "attention_split", "combine"],
         "modules": {
-            "amax": "cake_minimax_h3_varlen_attention_530411d4fd6f12553109",
-            "quantize": "cake_minimax_h3_varlen_attention_c175a6b3704c50592480",
-            "attention": "cake_minimax_h3_varlen_attention_167e2767ad20213a59b1",
-            "attention_split": "cake_minimax_h3_varlen_attention_7dd4710e5471034647d6",
-            "combine": "cake_minimax_h3_varlen_attention_b5202869834cd7822fb1",
+            "amax": "cake_minimax_h3_varlen_attention_571c1ac46e3fe6d8842d",
+            "quantize": "cake_minimax_h3_varlen_attention_ccba90ddf663625098b1",
+            "attention": "cake_minimax_h3_varlen_attention_4b8d9db1ca486cd41383",
+            "attention_split": "cake_minimax_h3_varlen_attention_a0106039a66d9a80b786",
+            "combine": "cake_minimax_h3_varlen_attention_579b1fc2756eec97f194",
         },
     },
     "nvfp4_fp8pv__sm_103a": {
@@ -677,18 +481,18 @@ ROUTES: dict[str, dict[str, Any]] = {
         "variant": "nvfp4_fp8pv",
         "stages": ["amax", "quantize", "attention", "attention_split", "combine"],
         "modules": {
-            "amax": "cake_minimax_h3_varlen_attention_09d2c9ea5209af5c2d70",
-            "quantize": "cake_minimax_h3_varlen_attention_557c0fe57677e7688034",
-            "attention": "cake_minimax_h3_varlen_attention_0e4830f8fd365c118d4f",
-            "attention_split": "cake_minimax_h3_varlen_attention_330521b5d6cd0a93df49",
-            "combine": "cake_minimax_h3_varlen_attention_79cc755a24fa6f9758c8",
+            "amax": "cake_minimax_h3_varlen_attention_571c1ac46e3fe6d8842d",
+            "quantize": "cake_minimax_h3_varlen_attention_ccba90ddf663625098b1",
+            "attention": "cake_minimax_h3_varlen_attention_4b8d9db1ca486cd41383",
+            "attention_split": "cake_minimax_h3_varlen_attention_a0106039a66d9a80b786",
+            "combine": "cake_minimax_h3_varlen_attention_579b1fc2756eec97f194",
         },
     },
 }
 
 VARIANTS = ("bf16", "nvfp4_fp4pv", "nvfp4_fp8pv")
 STAGES = {
-    "bf16": ("attention", "combine"),
+    "bf16": ("attention", "attention_dyn", "attention_sread", "combine"),
     "nvfp4_fp4pv": ("quantize", "attention", "attention_split", "combine"),
     "nvfp4_fp8pv": ("amax", "quantize", "attention", "attention_split", "combine"),
 }
@@ -696,6 +500,18 @@ ARCH_NVCC_FLAGS = {
     "sm_100a": sm100a_nvcc_flags,
     "sm_103a": sm103a_nvcc_flags,
 }
+# Architectures whose BF16 route carries the ``attention_sread`` program (the
+# Cake planner's ``SREAD_UNIFIED_DISPATCH_ARCHS``); the other routes bind the
+# static program for the plans that are not dynamically scheduled.
+BF16_SREAD_ARCHES = ("sm_100a",)
+
+
+def stages_for(variant: str, arch: str) -> tuple[str, ...]:
+    """The ordered stages of ``variant`` on ``arch``."""
+    stages = STAGES[variant]
+    if variant == "bf16" and arch not in BF16_SREAD_ARCHES:
+        stages = tuple(s for s in stages if s != "attention_sread")
+    return stages
 
 
 def route_name(variant: str, arch: str) -> str:
@@ -713,11 +529,17 @@ def select_route(variant: str, arch: str) -> dict[str, Any]:
             f"for {arch} is not registered in this checkout yet "
             "(see flashinfer-ai/flashinfer#4532)"
         )
-    if tuple(record["stages"]) != STAGES[variant]:
+    if tuple(record["stages"]) != stages_for(variant, arch):
         raise RuntimeError(
             f"registered route {route_name(variant, arch)!r} has stages "
-            f"{tuple(record['stages'])!r}, expected {STAGES[variant]!r}"
+            f"{tuple(record['stages'])!r}, expected {stages_for(variant, arch)!r}"
         )
+    for stage, module in record["modules"].items():
+        if arch not in MODULES[module]["arches"]:
+            raise RuntimeError(
+                f"route {route_name(variant, arch)!r} stage {stage!r} names program "
+                f"{module!r}, which is not built for {arch}"
+            )
     return record
 
 
@@ -741,15 +563,21 @@ def _header_dirs():
 
 
 @functools.cache
-def gen_cake_minimax_h3_varlen_attention_module(name: str):
+def gen_cake_minimax_h3_varlen_attention_module(name: str, arch: str):
+    """JIT spec of program ``name`` compiled for the exact target ``arch``."""
     record = MODULES[name]
+    if arch not in record["arches"]:
+        raise ValueError(
+            f"program {name!r} is not built for {arch!r}: {record['arches']}"
+        )
     root = Path(__file__).resolve().parent / "csrc"
     sources = [root / relative for relative in record["sources"]]
+    # ``closure_sha256[arch]`` is the export's module receipt identity for this target.
     return gen_jit_spec(
-        name=f"{name}_" + record["closure_sha256"][:20],
+        name=f"{name}_{arch}_" + record["closure_sha256"][arch][:20],
         sources=sources,
         extra_cuda_cflags=[
-            *ARCH_NVCC_FLAGS[record["arch"]],
+            *ARCH_NVCC_FLAGS[arch],
             *record["compile_flags"],
         ],
         extra_ldflags=["-lcuda"],
@@ -759,5 +587,5 @@ def gen_cake_minimax_h3_varlen_attention_module(name: str):
 
 
 @functools.cache
-def load_cake_minimax_h3_varlen_attention_module(name: str):
-    return gen_cake_minimax_h3_varlen_attention_module(name).build_and_load()
+def load_cake_minimax_h3_varlen_attention_module(name: str, arch: str):
+    return gen_cake_minimax_h3_varlen_attention_module(name, arch).build_and_load()
