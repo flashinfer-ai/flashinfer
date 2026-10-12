@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """SM90 (Hopper) pull-style CuTeDSL mega-kernel package for moe_ep.
 
-Public API for the ``moe_ep`` backends over the SM90 FP8 mega kernel
-(``Sm90MegaMoEFp8Kernel`` / ``Sm90MegaMoESwapABFp8Kernel``).  This tree is a
+Public API for the ``moe_ep`` backends over the SM90 FP8 and Humming MXFP4
+mega kernels (``Sm90MegaMoEFp8Kernel``, ``Sm90MegaMoESwapABFp8Kernel``, and
+``Sm90MegaMoESwapABMxfp4Fp8Kernel``).  This tree is a
 FORK of the SM100 package (``kernel_src/sm100/cutedsl_megamoe``): the kernel
 team's SM90 work branched from the same repo, so ``src/`` duplicates the
 shared runtime (``common``, ``src``, ``moe_nvfp4_swapab``) at the SM90 drop's
@@ -11,7 +12,8 @@ revision.  The two trees are separate backends and are mutually exclusive per
 process (see ``shim/_paths.py``).
 
 Layering (same rules as the SM100 package — see SKILL.md):
-- ``src/`` is a verbatim kernel-team drop; never edit it.
+- ``src/`` contains the kernel drop and local FP8/MXFP4 extensions described
+  in SKILL.md; do not mix drops.
 - ``shim/`` is the only layer that imports the raw ``src/`` packages.
 - moe_ep backends import from this ``__init__`` only.
 
@@ -34,11 +36,24 @@ from __future__ import annotations
 # packages (moe_hopper_fp8, common, ...).  ``bootstrap_paths`` is re-exported
 # here so callers (e.g. core runtime) reach it through this public boundary.
 from .shim import (
+    MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
+    MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE,
+    MXFP4_TUNING_ROUTING_PROFILES,
+    MXFP4_TUNING_TOKEN_BUCKETS,
     MegaMoEHopperFp8Config,
+    Mxfp4RoutingProfile,
     autotune_hopper_fp8_mega_moe,
+    autotune_hopper_mxfp4_mega_moe,
     autotune_knobs,
     default_knobs,
     hopper_fp8_candidates,
+    hopper_mxfp4_default_tactic,
+    hopper_mxfp4_candidates,
+    is_hopper_mxfp4_tactic_shape_compatible,
+    is_valid_hopper_mxfp4_tactic,
+    normalize_hopper_mxfp4_routing_profile,
+    require_hopper_mxfp4_fused_tuning_device,
+    validate_hopper_mxfp4_tactic,
     is_valid,
     iter_candidates,
     knob_cache_path,
@@ -49,18 +64,32 @@ from .shim import (
     MegaMoEHopperFp8Frontend,
     MegaMoEHopperFp8Inputs,
     MegaMoEHopperFp8SymmBuffer,
+    MegaMoEHopperMxfp4Config,
+    MegaMoEHopperMxfp4Frontend,
+    MegaMoEHopperMxfp4Inputs,
+    MegaMoEHopperMxfp4SymmBuffer,
     TransformedFp8Weights,
+    TransformedMxfp4Weights,
+    _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config,
+    _get_symm_buffer_for_hopper_mxfp4_mega_moe_from_resolved_config,
+    _resolve_hopper_mxfp4_mega_moe_config,
     bootstrap_paths,
     create_dummy_hopper_fp8_inputs,
     finalize_dist,
     get_symm_buffer_for_hopper_fp8_mega_moe,
+    get_symm_buffer_for_hopper_mxfp4_mega_moe,
     hopper_fp8_mega_launch_thunk,
     hopper_fp8_mega_moe,
+    hopper_mxfp4_mega_launch_thunk,
+    hopper_mxfp4_mega_moe,
+    resolve_hopper_mxfp4_knobs,
     init_dist,
+    resolve_hopper_fp8_mega_moe_config,
 )
 
 # Backward-compatible name with the SM100 package's convention:
-# ``create_dummy_inputs`` means this tree's (only) dtype, hopper fp8.
+# ``create_dummy_inputs`` retains the pre-MXFP4 convention and means Hopper
+# ordinary FP8; MXFP4 callers use the explicitly named fused API.
 create_dummy_inputs = create_dummy_hopper_fp8_inputs
 
 # Raw-kernel helpers/constants/reference (FP8 quant helpers, block constants,
@@ -76,6 +105,7 @@ _LAZY_HELPERS = (
     "Fp8WeightScaleBlockK",
     "Fp8WeightScaleBlockN",
     "_stack_byte_reinterpretable_tensors",
+    "_swiglu_pair_hw_match_cuda",
     "ceil_div",
     "compute_megamoe_reference_fp8",
     "create_fp8_tensor",
@@ -100,11 +130,24 @@ def __getattr__(name):  # PEP 562
 
 __all__ = [
     *_LAZY_HELPERS,
+    "MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE",
+    "MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE",
+    "MXFP4_TUNING_ROUTING_PROFILES",
+    "MXFP4_TUNING_TOKEN_BUCKETS",
     "MegaMoEHopperFp8Config",
+    "Mxfp4RoutingProfile",
     "autotune_hopper_fp8_mega_moe",
+    "autotune_hopper_mxfp4_mega_moe",
     "autotune_knobs",
     "default_knobs",
     "hopper_fp8_candidates",
+    "hopper_mxfp4_default_tactic",
+    "hopper_mxfp4_candidates",
+    "is_hopper_mxfp4_tactic_shape_compatible",
+    "is_valid_hopper_mxfp4_tactic",
+    "normalize_hopper_mxfp4_routing_profile",
+    "require_hopper_mxfp4_fused_tuning_device",
+    "validate_hopper_mxfp4_tactic",
     "is_valid",
     "iter_candidates",
     "knob_cache_path",
@@ -115,13 +158,26 @@ __all__ = [
     "MegaMoEHopperFp8Frontend",
     "MegaMoEHopperFp8Inputs",
     "MegaMoEHopperFp8SymmBuffer",
+    "MegaMoEHopperMxfp4Config",
+    "MegaMoEHopperMxfp4Frontend",
+    "MegaMoEHopperMxfp4Inputs",
+    "MegaMoEHopperMxfp4SymmBuffer",
     "TransformedFp8Weights",
+    "TransformedMxfp4Weights",
+    "_get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config",
+    "_get_symm_buffer_for_hopper_mxfp4_mega_moe_from_resolved_config",
+    "_resolve_hopper_mxfp4_mega_moe_config",
     "bootstrap_paths",
     "create_dummy_hopper_fp8_inputs",
     "create_dummy_inputs",
     "finalize_dist",
     "get_symm_buffer_for_hopper_fp8_mega_moe",
+    "get_symm_buffer_for_hopper_mxfp4_mega_moe",
     "hopper_fp8_mega_launch_thunk",
     "hopper_fp8_mega_moe",
+    "hopper_mxfp4_mega_launch_thunk",
+    "hopper_mxfp4_mega_moe",
+    "resolve_hopper_mxfp4_knobs",
     "init_dist",
+    "resolve_hopper_fp8_mega_moe_config",
 ]

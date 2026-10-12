@@ -16,11 +16,8 @@ The two trees are **separate backends**:
 - drops are updated independently; never "sync" shared files across the trees.
 
 Current drop: kernel repo commit `c3e2c2a` ("Add token-based launch
-heuristics for Hopper FP8 MegaMoE", 2026-08), **minus commit `4f9c042`**
-("Add Green Context execution", reverted by decision — no
-`green_context.py`, no `execution_phase` kwarg, no `split_*` workspace
-regions / token_comm bodies).  Re-exclude that commit's content when
-syncing future drops.
+heuristics for Hopper FP8 MegaMoE", 2026-08), **minus commit `4f9c042`**.
+Preserve this exclusion when syncing future drops.
 
 Local extensions pending upstream (re-apply when syncing a drop that has
 not picked them up):
@@ -112,6 +109,9 @@ not picked them up):
   arrival counts scale with it, and the base kernels route the idle warps
   straight to kernel_tail).  Touches `kernel_fp8_glu_fc12{,_swapab}.py`
   (dispatch-body gating) too; the drop tree still hardcodes 4.
+- Humming MXFP4: adds packed MXFP4 weights on top of the FP8 implementation
+  from #4688 and #5338, reusing its dispatch, scheduling and reduction code.
+  See [TUNING.md](TUNING.md) for configurations and reproduction commands.
 
 ## Layout
 
@@ -129,13 +129,15 @@ kernel_src/sm90/pull_style_cutedsl_megakernel/
 │   ├── _paths.py           ← adds sibling src/ to sys.path + sibling-tree exclusivity guard
 │   ├── comm.py             ← dist/NVSHMEM bootstrap, sym heap, launch-cache state
 │   ├── hopper_fp8.py       ← SM90 FP8 frontend (config, symm buffer, compute entry)
+│   ├── hopper_mxfp4.py     ← fused Humming MXFP4 frontend
 │   └── kernel_helpers.py   ← lazy re-export point for raw-kernel helpers/reference
 ├── SKILL.md                ← this file (drop-update workflow)
 └── TUNING.md               ← measured perf vs the kernel drop's reference sweep,
                               benchmark methodology, knob surface, next levers
 ```
 
-The kernel classes are `Sm90MegaMoEFp8Kernel` and `Sm90MegaMoESwapABFp8Kernel`
+The kernel classes are `Sm90MegaMoEFp8Kernel`, `Sm90MegaMoESwapABFp8Kernel`,
+and `Sm90MegaMoESwapABMxfp4Fp8Kernel`
 in `src/moe_hopper_fp8/megamoe_kernel_fp8.py` (FP8 E4M3/E5M2, per-tensor or
 blockwise scaling, native or swap-A/B layouts).
 
@@ -147,7 +149,8 @@ for kernel construct/launch kwargs (`run_kernel()`) when writing the shim.
 ## When the kernel team drops a new version of src/
 
 Same workflow as `kernel_src/sm100/cutedsl_megamoe/SKILL.md`, with this tree's
-package set:
+package set. Reapply the local extensions above and validate FP8 and MXFP4
+correctness, ordinary Graph replay, tuning, and cache isolation:
 
 ```bash
 rm -rf flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/{common,src,moe_nvfp4_swapab,moe_hopper_fp8}
