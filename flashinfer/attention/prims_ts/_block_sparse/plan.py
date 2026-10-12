@@ -35,7 +35,8 @@ from .config import (
     _BlockSparseStaticProfile,
     _resolve_block_sparse_launch_spec,
 )
-from .prepared import _BlockSparseRouteLayout, _SageScaleLayout
+from ..sage import _SageScaleLayout
+from .prepared import _BlockSparseRouteLayout
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")

@@ -35,11 +35,7 @@ from ..._block_sparse.common import (
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
-from ..._block_sparse.prepared import (
-    _SAGE_ATOM_MIN_WORDS,
-    _SAGE_ATOM_TOKENS,
-    _SageScaleLayout,
-)
+from ...sage import _SAGE_ATOM_MIN_WORDS, _SAGE_ATOM_TOKENS, _SageScaleLayout
 from ...split_kv_mode_policy import select_split_kv_modes
 from ..tcgen05_compat import ldtm_stat_supported
 from .fmha_decode_constants import (

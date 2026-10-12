@@ -31,7 +31,8 @@ from .common import (
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
-from .prepared import _BlockSparseRouteLayout, _SageScaleLayout
+from ..sage import _SageScaleLayout
+from .prepared import _BlockSparseRouteLayout
 
 if TYPE_CHECKING:
     from ..kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig

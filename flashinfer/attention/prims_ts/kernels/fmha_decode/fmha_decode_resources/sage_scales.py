@@ -63,13 +63,10 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ...._block_sparse.prepared import (
-    _FLOAT4_WORDS,
     _PREPARED_ROUTE_IS_PROXY_FLAG,
-    _SAGE_ATOM_TOKENS,
     _BlockSparseRouteLayout,
-    _SageKSection,
 )
-from ....sage import flat_scale_slot
+from ....sage import _FLOAT4_WORDS, _SAGE_ATOM_TOKENS, _SageKSection, flat_scale_slot
 from ...stage import FmhaStage
 from ..fmha_decode_config import FmhaDecodeConfig
 from ..fmha_decode_constants import KV_KIND_K

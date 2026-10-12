@@ -32,13 +32,13 @@ from cuda.bindings import driver as cuda_drv
 
 from flashinfer.utils import ceil_div
 
-from ..._block_sparse.prepared import (
+from ...sage import (
     _FLOAT4_WORDS,
     _SAGE_ATOM_TOKENS,
     _SageKSection,
     _SageScaleLayout,
+    log2_block_size,
 )
-from ...sage import log2_block_size
 from .fmha_decode_config import FmhaDecodeConfig
 from .fmha_decode_resources.helpers_common import (
     _q_row_token_and_local_head,
