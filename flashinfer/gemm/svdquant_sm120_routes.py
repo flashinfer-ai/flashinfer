@@ -8,7 +8,7 @@ somebody edits. What remains here is what a tactic cannot be derived from: which
 runners a shape may offer, which prefix carries which producer route, and the ABI
 versions that name a persisted record.
 
-`tests/gemm/test_svdquant_sm120_routes.py` holds a guard that fails if a
+`tests/gemm/test_nvfp4_svdquant_host.py` holds a guard that fails if a
 shape-keyed tactic table reappears in this package.
 """
 
