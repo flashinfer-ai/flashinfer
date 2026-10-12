@@ -36,6 +36,7 @@ class GPUTelemetry:
     ]
 
     def __init__(self, prefix, gpu_uuid, interval_ms):
+        """Probe GPU query support and start sampling at the supplied prefix."""
         self.prefix = Path(prefix)
         self.prefix.parent.mkdir(parents=True, exist_ok=True)
         if not gpu_uuid.startswith("GPU-"):
@@ -76,6 +77,7 @@ class GPUTelemetry:
 
     @contextmanager
     def phase(self, **metadata):
+        """Yield mutable phase metadata and record its wall-time bounds on exit."""
         if self.process.poll() is not None:
             raise RuntimeError("GPU sampler exited; inspect telemetry .stderr")
         record = dict(metadata, start_epoch_s=time.time())
@@ -88,6 +90,7 @@ class GPUTelemetry:
             self.markers.flush()
 
     def close(self):
+        """Stop sampling and write per-phase clock, power, and temperature summaries."""
         failed = self.process.poll() is not None
         if not failed:
             self.process.terminate()

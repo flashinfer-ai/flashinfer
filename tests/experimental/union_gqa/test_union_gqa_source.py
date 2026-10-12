@@ -27,6 +27,7 @@ _CSRC = _PACKAGE / "csrc" / "sm100a"
 
 
 def test_union_gqa_is_a_standalone_source_bundle() -> None:
+    """Check that the source bundle is complete and contains no Torch bindings."""
     expected = {
         "union_gqa_mma_noelect.cuh",
         "union_gqa_prefill.cu",
@@ -46,6 +47,7 @@ def test_union_gqa_is_a_standalone_source_bundle() -> None:
 
 
 def test_block_index_contract_is_64_tokens() -> None:
+    """Check that sparse indices denote 64-token blocks in the kernel source."""
     source = (_CSRC / "union_gqa_prefill.cu").read_text(encoding="utf-8")
     assert "static constexpr int BLOCK_SIZE = 64;" in source
     assert "static constexpr int B_N = BLOCK_SIZE;" in source
@@ -56,6 +58,7 @@ def test_block_index_contract_is_64_tokens() -> None:
 
 
 def test_partial_epilogue_uses_64_bit_output_offset() -> None:
+    """Check that partial-tile stores compute output offsets with 64-bit arithmetic."""
     source = (_CSRC / "union_gqa_prefill.cu").read_text(encoding="utf-8")
     assert "const int64_t out_idx" in source
     assert "static_cast<int64_t>(global_token) * params.h_q * D_V" in source
@@ -63,22 +66,26 @@ def test_partial_epilogue_uses_64_bit_output_offset() -> None:
 
 
 def test_cutlass_derived_mma_atoms_retain_bsd_license() -> None:
+    """Check that derived MMA atoms retain their CUTLASS attribution and BSD license."""
     source = (_CSRC / "union_gqa_mma_noelect.cuh").read_text(encoding="utf-8")
     assert "SPDX-License-Identifier: BSD-3-Clause" in source
     assert "Derived from CuTe's SM100_MMA_F16BF16_{SS,TS} atoms" in source
 
 
 def test_experimental_backend_is_not_registered_for_aot() -> None:
+    """Check that the experimental backend stays outside AOT registration."""
     source = (_ROOT / "flashinfer" / "aot.py").read_text(encoding="utf-8")
     assert "union_gqa" not in source
 
 
 def test_package_data_includes_cuda_sources() -> None:
+    """Check that package data includes the experimental CUDA source bundle."""
     source = (_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert '"flashinfer.experimental.union_gqa" = ["csrc/**"]' in source
 
 
 def test_jit_module_uses_body_and_binding_translation_units(tmp_path: Path) -> None:
+    """Check JIT source selection and SM100a compiler flags without loading backends."""
     # Construct the JIT spec without importing the top-level package, which
     # initializes unrelated GPU backends.
     script = textwrap.dedent(

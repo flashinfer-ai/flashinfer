@@ -67,6 +67,7 @@ def local_runtime_compat():
     spec.loader.exec_module(module)
 
     def record_ready(stream):
+        """Record and return a CUDA event on the supplied planning stream."""
         event = torch.cuda.Event()
         event.record(stream)
         return event
@@ -96,6 +97,7 @@ def check_reference(q, k, v, indices, outputs):
 
 
 def main():
+    """Parse comparison options and manage telemetry and compatibility adapters."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seq-lens", default=",".join(map(str, GRID_SEQ_LENS)))
     parser.add_argument(
@@ -174,6 +176,7 @@ def main():
 
 
 def run_grid(args, seq_lens, ratios, writer, telemetry):
+    """Check reference outputs and write timing rows for each backend and workload."""
     for seq_len in seq_lens:
         torch.manual_seed(42)
         full_len = HISTORY_TOKENS + seq_len
@@ -214,6 +217,7 @@ def run_grid(args, seq_lens, ratios, writer, telemetry):
             run_union = make_union_runner(q_full, k, v, indices, out_full)
 
             def run_primsts():
+                """Run planned Prims-TS attention into the preallocated output."""
                 wrapper.run(q_b, k_b, v_b, indptr, columns, out=out_b)
 
             # Compilation diagnostics belong on stderr, preserving valid CSV output.
@@ -230,6 +234,7 @@ def run_grid(args, seq_lens, ratios, writer, telemetry):
                     continue
 
                 def phase(kind, **extra):
+                    """Create an optional phase for this backend and workload."""
                     return (
                         telemetry.phase(
                             phase=kind,

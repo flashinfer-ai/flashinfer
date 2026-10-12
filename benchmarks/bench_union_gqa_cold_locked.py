@@ -22,6 +22,7 @@ import sys
 
 
 def validate_clocks(path, sm_clock, memory_clock, tolerance, expected_cases):
+    """Validate cold-cache timing coverage and return phases grouped by case."""
     phases = json.loads(path.read_text())
     groups = {}
     for phase in phases:
@@ -72,6 +73,7 @@ def read_measurements(path):
 
 
 def make_report(destination, expected_cases, sm_clock, memory_clock, tolerance):
+    """Validate both backends and write cold-cache comparison CSV and Markdown."""
     measurements = {}
     for backend in ("union", "primsts"):
         validate_clocks(
@@ -147,6 +149,7 @@ def make_report(destination, expected_cases, sm_clock, memory_clock, tolerance):
 
 
 def main():
+    """Run both backends with locked clocks and optionally update the README table."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--sm-clock", type=int, default=1500)
@@ -241,11 +244,13 @@ def main():
         ).hexdigest()
 
     def save():
+        """Persist benchmark metadata and GPU control command records."""
         (destination / "metadata.json").write_text(
             json.dumps(metadata, indent=2) + "\n"
         )
 
     def control(arguments, privileged=False):
+        """Run a GPU control command, record its result, and raise on failure."""
         prefix = ["sudo", "-n"] if privileged and os.geteuid() != 0 else []
         command = prefix + ["nvidia-smi", f"--id={args.gpu}", *arguments]
         result = subprocess.run(command, capture_output=True, text=True, timeout=20)
@@ -282,6 +287,7 @@ def main():
     process = None
 
     def interrupted(signum, frame):
+        """Raise KeyboardInterrupt so signal handling reaches clock cleanup."""
         raise KeyboardInterrupt
 
     for sig in (signal.SIGINT, signal.SIGTERM):

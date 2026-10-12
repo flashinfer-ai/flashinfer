@@ -21,6 +21,7 @@ import sys
 
 
 def summarize(source, destination, target_mhz, tolerance_mhz):
+    """Write grouped timing metrics and return clock validity with summary rows."""
     phases = json.loads(source.read_text())
     timing = [phase for phase in phases if phase["phase"] == "timing"]
     if not timing:
@@ -71,6 +72,7 @@ def summarize(source, destination, target_mhz, tolerance_mhz):
 
 
 def stop_benchmark(process):
+    """Terminate the benchmark process group, escalating after a timeout."""
     if process.poll() is None:
         os.killpg(process.pid, signal.SIGTERM)
         try:
@@ -81,6 +83,7 @@ def stop_benchmark(process):
 
 
 def main():
+    """Run warm and cold benchmarks with locked SM clocks and validate telemetry."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu", default="0", help="nvidia-smi index or GPU UUID")
     parser.add_argument("--sm-clock", type=int, default=1500)
@@ -145,6 +148,7 @@ def main():
     records = []
 
     def control(arguments, privileged=False):
+        """Run a GPU control command, save its result, and raise on failure."""
         prefix = ["sudo", "-n"] if privileged and os.geteuid() != 0 else []
         command = prefix + ["nvidia-smi", f"--id={args.gpu}"] + arguments
         result = subprocess.run(command, capture_output=True, text=True, timeout=20)
@@ -207,6 +211,7 @@ def main():
     environment.setdefault("FLASHINFER_WORKSPACE_BASE", "/tmp/union_gqa_telemetry_jit")
 
     def interrupted(signum, frame):
+        """Raise KeyboardInterrupt so signal handling reaches benchmark cleanup."""
         raise KeyboardInterrupt
 
     for sig in (signal.SIGINT, signal.SIGTERM):

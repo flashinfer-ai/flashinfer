@@ -41,6 +41,7 @@ def _check_tensor(
     dtype: torch.dtype,
     device: torch.device,
 ) -> None:
+    """Validate tensor type, rank, dtype, device, and contiguous storage."""
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
     if tensor.ndim != ndim:
@@ -54,6 +55,7 @@ def _check_tensor(
 
 
 def _check_tma_alignment(tensor: torch.Tensor, name: str) -> None:
+    """Reject tensors whose data pointers lack the required 16-byte alignment."""
     if tensor.data_ptr() % 16 != 0:
         raise ValueError(f"{name} must be 16-byte aligned")
 

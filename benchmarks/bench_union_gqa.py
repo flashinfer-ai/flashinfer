@@ -83,6 +83,7 @@ class Result:
 
 
 def _int_list(value: str) -> list[int]:
+    """Parse a comma-separated list of integer benchmark dimensions."""
     result = [int(item) for item in value.split(",")]
     if not result:
         raise argparse.ArgumentTypeError("list must not be empty")
@@ -90,6 +91,7 @@ def _int_list(value: str) -> list[int]:
 
 
 def _float_list(value: str) -> list[float]:
+    """Parse comma-separated sharing ratios and require values in [0, 1]."""
     result = [float(item) for item in value.split(",")]
     if not result or any(item < 0.0 or item > 1.0 for item in result):
         raise argparse.ArgumentTypeError("sharing ratios must be in [0, 1]")
@@ -170,6 +172,7 @@ def _run_case(
     unified_timer: bool = False,
     warm_gap_cycles: int = 0,
 ) -> Result:
+    """Validate and time one fixed-history workload, returning its metrics."""
     torch.manual_seed(seed)
     num_qo_heads = 16 * num_kv_heads
     full_len = HISTORY_TOKENS + seq_len
@@ -200,6 +203,7 @@ def _run_case(
     )
 
     def phase(name, **extra):
+        """Create an optional telemetry phase with the current workload metadata."""
         return (
             telemetry.phase(
                 phase=name,
@@ -274,6 +278,7 @@ def _run_case(
 
 
 def main() -> None:
+    """Parse benchmark options and print metrics for the requested workload grid."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seq-lens", type=_int_list, default=GRID_SEQ_LENS)
     parser.add_argument("--topk-blocks", type=_int_list, default=[16])

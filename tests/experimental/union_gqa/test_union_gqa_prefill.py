@@ -32,6 +32,7 @@ BLOCK_SIZE = 64
 
 
 def test_public_entry_point_is_experimental() -> None:
+    """Verify that the public prefill entry point is marked experimental."""
     assert union_gqa_prefill.is_experimental
 
 
@@ -40,6 +41,7 @@ def test_public_entry_point_is_experimental() -> None:
 def test_union_gqa_rejects_unsupported_softmax_scale(
     scale: float, direct_binding: bool
 ) -> None:
+    """Check that Python and direct bindings reject unsupported softmax scales."""
     _require_sm100()
     q = torch.zeros(1, 16, 128, dtype=torch.bfloat16, device="cuda")
     k = torch.zeros(1, 1, 128, dtype=torch.bfloat16, device="cuda")
@@ -57,6 +59,7 @@ def test_union_gqa_rejects_unsupported_softmax_scale(
 
 
 def test_union_gqa_row_max_has_no_finite_floor() -> None:
+    """Check softmax accuracy when all valid logits are extremely negative."""
     _require_sm100()
     seq_len = 65
     q = torch.full((seq_len, 16, 128), 1e15, dtype=torch.bfloat16, device="cuda")
@@ -84,6 +87,7 @@ def test_union_gqa_row_max_has_no_finite_floor() -> None:
 
 
 def test_union_gqa_row_max_first_valid_tile_after_empty_tile() -> None:
+    """Check softmax initialization when an empty tile precedes the first valid tile."""
     _require_sm100()
     seq_len = 130
     q = torch.full((seq_len, 16, 128), 1e15, dtype=torch.bfloat16, device="cuda")
@@ -113,6 +117,7 @@ def test_union_gqa_row_max_first_valid_tile_after_empty_tile() -> None:
 
 
 def _require_sm100() -> None:
+    """Skip GPU tests unless exact SM100 hardware and CUDA 12.8+ are available."""
     if not torch.cuda.is_available():
         pytest.skip("union_gqa correctness requires a CUDA GPU")
     if torch.cuda.get_device_capability() != (10, 0):
@@ -154,6 +159,7 @@ def _build_indices(
     topk_blocks: int,
     pattern: str,
 ) -> torch.Tensor:
+    """Build padded per-token CUDA block indices for the requested mask pattern."""
     rows: list[list[list[int]]] = []
     for seq_len in lengths:
         num_blocks = max(1, math.ceil(seq_len / BLOCK_SIZE))
@@ -193,6 +199,7 @@ def _reference(
     cu_seqlens_q: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
+    """Compute FP32 causal sparse attention, returning zeros for fully masked rows."""
     total_q, num_qo_heads, _ = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_qo_heads // num_kv_heads
@@ -236,6 +243,7 @@ def _reference_single_kv_head_rows(
     query_positions: list[int],
     softmax_scale: float,
 ) -> torch.Tensor:
+    """Compute selected query rows with FP32 attention for a single KV head."""
     rows = []
     seq_len = q.shape[0]
     for query_pos in query_positions:
@@ -300,6 +308,7 @@ def test_union_gqa_prefill_matches_reference(
     pattern: str,
     scale: float,
 ) -> None:
+    """Compare sparse prefill against the reference across shapes and mask patterns."""
     _require_sm100()
     torch.manual_seed(7)
     total_q = sum(lengths)
@@ -333,6 +342,7 @@ def test_union_gqa_prefill_matches_reference(
 
 
 def test_union_gqa_max_union_capacity_matches_reference() -> None:
+    """Check reference accuracy at the maximum eight-query union capacity."""
     _require_sm100()
     torch.manual_seed(11)
     seq_len = 8192
@@ -357,6 +367,7 @@ def test_union_gqa_max_union_capacity_matches_reference() -> None:
 
 
 def test_union_gqa_persistent_cta_phase_reuse_matches_reference() -> None:
+    """Check persistent CTA phase reuse across multiple waves against FP32 rows."""
     if _run_persistent_case_in_child(
         "test_union_gqa_persistent_cta_phase_reuse_matches_reference"
     ):
@@ -393,6 +404,7 @@ def test_union_gqa_persistent_cta_phase_reuse_matches_reference() -> None:
 
 
 def test_union_gqa_persistent_cta_crosses_kv_head_and_partial_stage() -> None:
+    """Check persistent work across KV heads and a partially filled query stage."""
     if _run_persistent_case_in_child(
         "test_union_gqa_persistent_cta_crosses_kv_head_and_partial_stage"
     ):
@@ -448,6 +460,7 @@ def test_union_gqa_persistent_cta_crosses_kv_head_and_partial_stage() -> None:
 
 
 def test_union_gqa_persistent_cta_skips_invalid_work() -> None:
+    """Check persistent CTA reuse when valid work alternates with empty query tiles."""
     if _run_persistent_case_in_child(
         "test_union_gqa_persistent_cta_skips_invalid_work"
     ):
@@ -674,6 +687,7 @@ def test_union_gqa_partial_epilogue_uses_64_bit_output_offset() -> None:
 
 
 def test_union_gqa_accepts_cpu_cu_seqlens() -> None:
+    """Check that CPU and CUDA sequence offsets produce matching outputs."""
     _require_sm100()
     torch.manual_seed(13)
     seq_len = 65
@@ -692,6 +706,7 @@ def test_union_gqa_accepts_cpu_cu_seqlens() -> None:
 
 @pytest.mark.parametrize("offsets", ([0, 2], [1, 1], [0, -1, 1], [0, 1, 0]))
 def test_union_gqa_rejects_invalid_cpu_cu_seqlens(offsets: list[int]) -> None:
+    """Check that malformed CPU sequence offsets raise a validation error."""
     _require_sm100()
     q = torch.zeros(1, 16, 128, dtype=torch.bfloat16, device="cuda")
     k = torch.zeros(1, 1, 128, dtype=torch.bfloat16, device="cuda")
@@ -703,6 +718,7 @@ def test_union_gqa_rejects_invalid_cpu_cu_seqlens(offsets: list[int]) -> None:
 
 
 def test_union_gqa_rejects_partially_overlapping_output() -> None:
+    """Check that output storage cannot partially overlap the query tensor."""
     _require_sm100()
     q_storage = torch.zeros(16 * 128 + 1, dtype=torch.bfloat16, device="cuda")
     q = q_storage[:-1].view(1, 16, 128)
@@ -716,6 +732,7 @@ def test_union_gqa_rejects_partially_overlapping_output() -> None:
 
 
 def test_union_gqa_rejects_misaligned_tma_tensors() -> None:
+    """Check Python and direct binding alignment errors in an isolated CUDA process."""
     child_device = os.environ.get("FLASHINFER_UNION_GQA_ALIGNMENT_CHILD")
     if child_device is None:
         _require_sm100()
@@ -742,6 +759,7 @@ def test_union_gqa_rejects_misaligned_tma_tensors() -> None:
     _require_sm100()
 
     def misaligned_bf16(shape: tuple[int, ...]) -> torch.Tensor:
+        """Create a contiguous CUDA BF16 tensor with a two-byte misalignment."""
         storage = torch.zeros(math.prod(shape) + 1, dtype=torch.bfloat16, device="cuda")
         tensor = storage[1:].view(shape)
         assert tensor.is_contiguous()
@@ -792,6 +810,7 @@ def test_union_gqa_rejects_misaligned_tma_tensors() -> None:
 def test_union_gqa_rejects_output_overlapping_index_inputs(
     aliased_input: str, direct_ffi: bool
 ) -> None:
+    """Check that output cannot alias block indices or sequence offsets."""
     _require_sm100()
     q = torch.zeros(1, 16, 128, dtype=torch.bfloat16, device="cuda")
     k = torch.zeros(1, 1, 128, dtype=torch.bfloat16, device="cuda")
@@ -815,6 +834,7 @@ def test_union_gqa_rejects_output_overlapping_index_inputs(
 
 
 def test_union_gqa_rejects_underestimated_cpu_max_seqlen() -> None:
+    """Check that CPU offsets expose an underestimated maximum sequence length."""
     _require_sm100()
     q = torch.zeros(2, 16, 128, dtype=torch.bfloat16, device="cuda")
     k = torch.zeros(2, 1, 128, dtype=torch.bfloat16, device="cuda")
@@ -826,6 +846,7 @@ def test_union_gqa_rejects_underestimated_cpu_max_seqlen() -> None:
 
 
 def test_union_gqa_invalid_cuda_cu_seqlens_fails_before_output_store() -> None:
+    """Check that invalid CUDA sequence offsets trigger an error in a child process."""
     _require_sm100()
     # A device trap poisons the CUDA context, so exercise it in another process.
     script = textwrap.dedent(
@@ -859,6 +880,7 @@ def test_union_gqa_invalid_cuda_cu_seqlens_fails_before_output_store() -> None:
 
 @pytest.mark.parametrize("similarity_ratio", [1.0, 0.875, 0.75, 0.5, 0.0])
 def test_token_similarity_ratio_pattern(similarity_ratio: float) -> None:
+    """Check adjacent-token block overlap and repetition of the similarity pattern."""
     topk_blocks = 8
     indices, stride, effective_ratio = _build_token_similarity_indices(
         32, 1, topk_blocks, similarity_ratio, "cpu"
@@ -903,6 +925,7 @@ def test_union_gqa_token_similarity_ratio_matches_reference(
 
 
 def test_union_gqa_cuda_graph_replay() -> None:
+    """Check that graph capture and replay reuse output storage and preserve results."""
     _require_sm100()
     seq_len = 129
     q = torch.randn(seq_len, 16, 128, dtype=torch.bfloat16, device="cuda") * 0.3

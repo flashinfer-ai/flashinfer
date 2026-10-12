@@ -20,6 +20,7 @@ HISTORY_TOKENS = 8192
 
 
 def _stride(sharing_ratio, topk_blocks):
+    """Validate sharing and top-k, returning the exact integer block stride."""
     if not 1 <= topk_blocks <= 16:
         raise ValueError("topk_blocks must be in [1, 16]")
     if not 0 <= sharing_ratio <= 1:
@@ -72,6 +73,7 @@ def validate_history_indices(indices, sharing_ratio, topk_blocks=16):
 
 @functools.cache
 def _benchmark_module():
+    """Cache the compiled kernel that skips scheduling history-prefix queries."""
     from flashinfer.experimental.union_gqa.jit import gen_union_gqa_module
 
     return gen_union_gqa_module(benchmark_q_prefix=HISTORY_TOKENS).build_and_load()
@@ -101,6 +103,7 @@ def make_union_runner(q, k, v, indices, out):
     cu = torch.tensor([0, full_len], dtype=torch.int32, device=q.device)
 
     def run():
+        """Run sparse prefill for the query suffix into the captured output."""
         module.run(q, k, v, pattern, cu, out, 128**-0.5, full_len)
 
     return run

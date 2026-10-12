@@ -24,6 +24,7 @@ from flashinfer import union_gqa_prefill
 
 
 def main() -> None:
+    """Run experimental BF16 sparse prefill and print the output tensor metadata."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--topk-blocks", type=int, default=8)
