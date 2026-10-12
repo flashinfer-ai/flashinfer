@@ -1386,6 +1386,27 @@ def atomic_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None) -> Int3
 
 
 @dsl_user_op
+def atomic_add_global_acq_rel_i32(
+    addr: Int64, val: Int32, *, loc=None, ip=None
+) -> Int32:
+    """GPU-scope acquire-release int32 atomic add. Returns old value."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int64(addr).ir_value(loc=loc, ip=ip),
+                Int32(val).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.acq_rel.gpu.global.add.s32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def red_add_global_release_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
     """No-return global int32 add with a GPU-scope release fence."""
     llvm.inline_asm(
