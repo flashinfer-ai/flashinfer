@@ -3945,7 +3945,9 @@ def test_source_direct_preprocess_and_sequence_argument_order():
         1,
         0x1234,
     )
-    assert len(bound) == 27 + 3 + 41 + 3 + 1
+    # 44 main values: the 41 round-5 arguments plus the three fused-only inputs
+    # (round-6 exact signature; both exact-scan families bind them).
+    assert len(bound) == 27 + 3 + 44 + 3 + 1
 
     assert module._persistent_grid_size(total_work=256, sm_count=148) == 128
     assert module._persistent_grid_size(total_work=384, sm_count=148) == 128
@@ -4209,9 +4211,13 @@ def test_source_program_table_names_shipped_sources():
         assert program.main.module.startswith(
             program.main.kernel.removeprefix("kernel_") + "_"
         )
-        # The symbol's trailing identity is ``<state>_<mode>[_<variant>]``.
+        # The symbol's trailing identity is
+        # ``<state>_<mode>[_precomputed][_<variant>]`` (``_precomputed``: the
+        # two-kernel exactpre programs).
         assert program.main.kernel.endswith(
-            f"_{state_key}_{mode}" + "".join(f"_{part}" for part in variant)
+            f"_{state_key}_{mode}"
+            + ("_precomputed" if family == "exactpre" else "")
+            + "".join(f"_{part}" for part in variant)
         )
         assert program.preprocess.threads > 0 and program.main.threads == 512
         assert not program.preprocess.fast_math and program.main.fast_math
@@ -4606,15 +4612,23 @@ def test_source_chunk_parallel_main_arguments_extend_the_exact_order():
     its family's order and host template."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    expected = list(module._MAIN_ARGS)
+    # The 41 round-5 arguments are the order both families share: the exact
+    # families append the three fused-only inputs, chunk-parallel inserts its
+    # four workspace values and binds no fused input.
+    fused_only = ("cu_seqlens", "metadata_from_cu_seqlens", "preprocess_status")
+    assert module._MAIN_ARGS[-3:] == fused_only
+    common = list(module._MAIN_ARGS[:-3])
+    expected = list(common)
     expected.insert(expected.index("out_map") + 1, "h_map")
     position = expected.index("out_native") + 1
     expected[position:position] = ["s_work", "h_words", "grid_barrier"]
     assert tuple(expected) == module._MAIN_ARGS_CHUNKPAR
-    assert len(module._MAIN_ARGS) == 41 and len(module._MAIN_ARGS_CHUNKPAR) == 45
-    assert set(module._MAIN_ARGS_CHUNKPAR) - set(module._MAIN_ARGS) == set(
+    assert len(common) == 41 and len(module._MAIN_ARGS) == 44
+    assert len(module._MAIN_ARGS_CHUNKPAR) == 45
+    assert set(module._MAIN_ARGS_CHUNKPAR) - set(common) == set(
         _CHUNK_PARALLEL_WORKSPACE_ARGS
     )
+    assert not set(fused_only) & set(module._MAIN_ARGS_CHUNKPAR)
     for name, program in module._PROGRAMS.items():
         family = name.split("_")[0]
         assert program.family == family
@@ -4623,7 +4637,11 @@ def test_source_chunk_parallel_main_arguments_extend_the_exact_order():
             assert program.host_template == module._CHUNKPAR_HOST_TEMPLATE
         else:
             assert program.main_args == module._MAIN_ARGS
-            assert program.host_template == module._HOST_TEMPLATE
+            assert program.host_template == (
+                module._EXACTPRE_HOST_TEMPLATE
+                if family == "exactpre"
+                else module._HOST_TEMPLATE
+            )
 
 
 def test_source_chunk_parallel_launch_orders_its_main_arguments(monkeypatch):
@@ -4957,6 +4975,145 @@ def _forced_runs(monkeypatch, runner, tensors, arguments):
     return results
 
 
+# GOAL6 numerical contract 1 (P6), clause GOAL6-A-20261012, as the FlashInfer
+# reading of the former ``chunk-parallel == exact scan`` bitwise assertions:
+# the exact-scan family changed its rounding in round 6 (prescaled decay
+# factor table, one-rounding FMA state update) while the chunk-parallel
+# family is bitwise the round-5 programs, so the chunk-parallel metrics
+# against the fp64 recurrence are the round-5 reading the exact scan is
+# judged against.  K = 8 fixed seeds per shape; the element tolerance of m1
+# is the P6 one and is not loosened.
+_P6_SEEDS = tuple(range(8))
+_P6_METRICS = ("m1", "m2", "m3", "m4", "m5")
+
+
+def _p6_metrics(actual, oracle):
+    """The P6 metrics of ``actual`` against the fp64 ``oracle``: m1 outliers
+    beyond ``1e-2 + 1e-2 |o|``, m2 worst distance to ``RN(o)`` in ulps of the
+    output dtype, m3 p99.9 and m4 RMS of ``|c - o| / (1 + |o|)``, m5 max
+    ``|c - o|``; ``actual`` must be finite."""
+
+    f64 = torch.float64
+    o = oracle.to(f64).reshape(-1)
+    c = actual.to(f64).reshape(-1)
+    assert torch.isfinite(c).all(), "non-finite output"
+    err = (c - o).abs()
+    rn = oracle.to(actual.dtype).to(f64).reshape(-1)
+    info = torch.finfo(actual.dtype)
+    ulp = torch.exp2(torch.floor(torch.log2(rn.abs().clamp(min=info.tiny)))) * info.eps
+    e = err / (1.0 + o.abs())
+    n = o.numel()
+    k = n - math.ceil(0.999 * n) + 1
+    return {
+        "m1": float((err > _ATOL + _RTOL * o.abs()).sum()),
+        "m2": float(((c - rn).abs() / ulp).max()),
+        "m3": float(torch.kthvalue(e, n - k + 1).values),
+        "m4": float(torch.sqrt((e * e).sum() / n)),
+        "m5": float(err.max()),
+    }
+
+
+def _assert_p6_clause(candidate, baseline, label):
+    """Clause GOAL6-A-20261012: per metric, the K-seed mean of the candidate
+    is at most the baseline's mean plus one baseline seed-to-seed
+    (population) standard deviation; per-seed exceedances are disclosed in
+    the failure text."""
+
+    assert len(candidate) == len(baseline) == len(_P6_SEEDS)
+    for metric in _P6_METRICS:
+        cand = torch.tensor([m[metric] for m in candidate], dtype=torch.float64)
+        base = torch.tensor([m[metric] for m in baseline], dtype=torch.float64)
+        sd = base.std(unbiased=False)
+        exceed = int((cand > base).sum())
+        assert cand.mean() <= base.mean() + sd, (
+            f"{label}: {metric} mean {cand.mean().item():.6g} over {len(_P6_SEEDS)} "
+            f"seeds exceeds the chunk-parallel (round-5) reading "
+            f"{base.mean().item():.6g} + sd {sd.item():.6g}; per-seed exceedances "
+            f"{exceed}; candidate {cand.tolist()}; baseline {base.tolist()}"
+        )
+
+
+def _checkpoint_oracle(constructor, tensors, arguments, *, sequence, start, stop):
+    """fp64 state of ``sequence`` after the tokens ``[start, stop)`` of its
+    row (batched: the row is the sequence; packed varlen: the token axis),
+    scanned from its initial state -- the oracle of a checkpoint there."""
+
+    x, dt, A, B, C = tensors
+    row = slice(0, 1) if constructor["has_varlen"] else slice(sequence, sequence + 1)
+    window = slice(start, stop)
+    prefix_tensors = (
+        x[row, window].contiguous(),
+        dt[row, window].contiguous(),
+        A,
+        B[row, window].contiguous(),
+        C[row, window].contiguous(),
+    )
+    prefix_arguments = {
+        **arguments,
+        "seq_idx": None,
+        "chunk_indices": None,
+        "chunk_offsets": None,
+        "seq_chunk_cumsum": None,
+        "cu_seqlens": None,
+        "checkpoint_token_indices": None,
+        "checkpoint_state_slots": None,
+        "checkpoint_states": None,
+    }
+    prefix_arguments.pop("num_seqs", None)
+    if arguments.get("z") is not None:
+        prefix_arguments["z"] = arguments["z"][row, window].contiguous()
+    if arguments.get("initial_states") is not None:
+        prefix_arguments["initial_states"] = arguments["initial_states"][
+            sequence : sequence + 1
+        ].contiguous()
+    _, states = _fp64_reference(
+        {**constructor, "has_varlen": False}, prefix_tensors, prefix_arguments
+    )
+    return states[0]
+
+
+def _assert_chunk_parallel_p6(monkeypatch, make_case, *, checkpoints=()):
+    """The P6 reading of a chunk-parallel == exact-scan test: on the K fixed
+    seeds run the forced exact scan and the forced chunk-parallel program on
+    the same inputs (``make_case(seed)`` -> constructor, tensors, arguments,
+    oracle arguments) and judge the exact scan's metrics against the fp64
+    recurrence with the chunk-parallel program's as the round-5 reading --
+    for the output, the final states and every ``(slot, sequence, start,
+    stop)`` checkpoint."""
+
+    exact_metrics = {}
+    chunk_parallel_metrics = {}
+    for seed in _P6_SEEDS:
+        constructor, tensors, arguments, oracle_arguments = make_case(seed)
+        runner = SSDCombined(**constructor, backend="cake")
+        results = _forced_runs(monkeypatch, runner, tensors, arguments)
+        exact, chunk_parallel = results["never"], results["always"]
+        y, states = _fp64_reference(constructor, tensors, oracle_arguments)
+        readings = [
+            ("out", exact.out, chunk_parallel.out, y),
+            ("final", exact.final, chunk_parallel.final, states),
+        ]
+        for slot, sequence, start, stop in checkpoints:
+            oracle = _checkpoint_oracle(
+                constructor, tensors, arguments, sequence=sequence, start=start, stop=stop
+            )
+            readings.append(
+                (
+                    f"checkpoint[{slot}]",
+                    exact.checkpoint_states[slot],
+                    chunk_parallel.checkpoint_states[slot],
+                    oracle,
+                )
+            )
+        for label, exact_value, chunk_parallel_value, oracle in readings:
+            exact_metrics.setdefault(label, []).append(_p6_metrics(exact_value, oracle))
+            chunk_parallel_metrics.setdefault(label, []).append(
+                _p6_metrics(chunk_parallel_value, oracle)
+            )
+    for label in exact_metrics:
+        _assert_p6_clause(exact_metrics[label], chunk_parallel_metrics[label], label)
+
+
 def _checkpoint_arguments(arguments, tokens, slots):
     """``arguments`` plus one checkpoint request per sequence: the absolute
     token index a sequence checkpoints at (``-1``: none) and the slot it
@@ -5005,9 +5162,11 @@ def test_cake_ssd_combined_chunk_parallel_is_bitwise_the_exact_scan(
 ):
     """The chunk-parallel program computes the exact scan's arithmetic in a
     grid-barrier-separated schedule: forced on, its output and final states
-    are bitwise the forced exact scan's -- batched calls with z, D, dt_bias,
-    softplus, a finite clamp and initial states, and packed-varlen calls in
-    both metadata forms, for every state dtype."""
+    meet the P6 clause against the forced exact scan's (round 6: the exact
+    scan rounds differently, bitwise equality is no longer the contract) --
+    batched calls with z, D, dt_bias, softplus, a finite clamp and initial
+    states, and packed-varlen calls in both metadata forms, for every state
+    dtype."""
 
     _skip_unless_cake_arch()
     if varlen:
@@ -5030,10 +5189,27 @@ def test_cake_ssd_combined_chunk_parallel_is_bitwise_the_exact_scan(
     assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
     assert chunk_parallel.final.dtype == state_dtype
     assert torch.isfinite(chunk_parallel.out.to(torch.float32)).all()
-    assert torch.equal(chunk_parallel.out, exact.out), (
-        "chunk-parallel output differs from the exact scan"
-    )
-    assert torch.equal(chunk_parallel.final, exact.final)
+
+    def make_case(seed):
+        if varlen:
+            case_constructor, case_tensors, case_arguments = _case(
+                state_dtype=state_dtype, varlen=True, lengths=lengths, seed=seed
+            )
+            oracle_arguments = {
+                **case_arguments,
+                "seq_idx": _varlen_metadata(lengths, torch.int32)[0],
+                "num_seqs": len(lengths),
+            }
+            if form == "cu_seqlens":
+                case_arguments = _cu_seqlens_arguments(case_arguments, lengths)
+        else:
+            case_constructor, case_tensors, case_arguments = _case(
+                state_dtype=state_dtype, batch=2, seqlen=1024, seed=seed
+            )
+            oracle_arguments = case_arguments
+        return case_constructor, case_tensors, case_arguments, oracle_arguments
+
+    _assert_chunk_parallel_p6(monkeypatch, make_case)
 
 
 @pytest.mark.parametrize(
@@ -5057,38 +5233,51 @@ def test_cake_ssd_combined_chunk_parallel_checkpoints_are_bitwise_the_exact_scan
     monkeypatch, state_dtype, form, lengths, tokens, slots
 ):
     """The chunk-parallel program's checkpoint publish is the exact scan's:
-    forced on, the state it writes into each requested slot is bitwise the
-    forced exact scan's (output and final states included) and the other
-    slots stay untouched -- batched checkpoints on the chunk grid and at a
-    sequence end, a chunk-unaligned checkpoint exposed through the caller's
-    triple and one the cu_seqlens preprocess inserts itself, and an on-grid
-    cu_seqlens checkpoint.  ``auto`` routes checkpoint calls like any other
-    call, so the chunk-parallel path must serve them exactly."""
+    forced on, the state it writes into each requested slot meets the P6
+    clause against the forced exact scan's (output and final states
+    included; round 6: the exact scan rounds differently, bitwise equality
+    is no longer the contract) and the other slots stay untouched -- batched
+    checkpoints on the chunk grid and at a sequence end, a chunk-unaligned
+    checkpoint exposed through the caller's triple and one the cu_seqlens
+    preprocess inserts itself, and an on-grid cu_seqlens checkpoint.
+    ``auto`` routes checkpoint calls like any other call, so the
+    chunk-parallel path must serve them exactly."""
 
     _skip_unless_cake_arch()
-    if form == "batched":
-        constructor, tensors, arguments = _case(
-            state_dtype=state_dtype, batch=2, seqlen=1024
-        )
-    else:
-        constructor, tensors, arguments = _case(
-            state_dtype=state_dtype, varlen=True, lengths=lengths
-        )
-        if form == "cu_seqlens":
-            arguments = _cu_seqlens_arguments(arguments, lengths)
-        else:
-            # The triple must expose every checkpoint as a logical chunk end;
-            # the runner derives the sequence prefix sum on the device.
-            chunk_indices, chunk_offsets = _logical_chunk_metadata(
-                lengths, tuple(token for token in tokens if token >= 0)
+
+    def make_case(seed):
+        if form == "batched":
+            case_constructor, case_tensors, case_arguments = _case(
+                state_dtype=state_dtype, batch=2, seqlen=1024, seed=seed
             )
-            arguments = {
-                **arguments,
-                "chunk_indices": chunk_indices,
-                "chunk_offsets": chunk_offsets,
-                "seq_chunk_cumsum": None,
+            oracle_arguments = case_arguments
+        else:
+            case_constructor, case_tensors, case_arguments = _case(
+                state_dtype=state_dtype, varlen=True, lengths=lengths, seed=seed
+            )
+            oracle_arguments = {
+                **case_arguments,
+                "seq_idx": _varlen_metadata(lengths, torch.int32)[0],
+                "num_seqs": len(lengths),
             }
-    arguments = _checkpoint_arguments(arguments, tokens, slots)
+            if form == "cu_seqlens":
+                case_arguments = _cu_seqlens_arguments(case_arguments, lengths)
+            else:
+                # The triple must expose every checkpoint as a logical chunk
+                # end; the runner derives the sequence prefix sum on the device.
+                chunk_indices, chunk_offsets = _logical_chunk_metadata(
+                    lengths, tuple(token for token in tokens if token >= 0)
+                )
+                case_arguments = {
+                    **case_arguments,
+                    "chunk_indices": chunk_indices,
+                    "chunk_offsets": chunk_offsets,
+                    "seq_chunk_cumsum": None,
+                }
+        case_arguments = _checkpoint_arguments(case_arguments, tokens, slots)
+        return case_constructor, case_tensors, case_arguments, oracle_arguments
+
+    constructor, tensors, arguments, _ = make_case(7)
     runner = SSDCombined(**constructor, backend="cake")
 
     results = _forced_runs(monkeypatch, runner, tensors, arguments)
@@ -5097,27 +5286,34 @@ def test_cake_ssd_combined_chunk_parallel_checkpoints_are_bitwise_the_exact_scan
     mode = "batched" if form == "batched" else "varlen"
     assert exact.program == f"exact_{_state_key(state_dtype)}_{mode}"
     assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
-    assert torch.equal(chunk_parallel.out, exact.out)
-    assert torch.equal(chunk_parallel.final, exact.final)
     written = {slot for slot in slots if slot >= 0}
     for slot in range(3):
         exact_slot = exact.checkpoint_states[slot]
         chunk_parallel_slot = chunk_parallel.checkpoint_states[slot]
         if slot in written:
             assert torch.isfinite(exact_slot.to(torch.float32)).all(), slot
-            assert torch.equal(chunk_parallel_slot, exact_slot), (
-                f"chunk-parallel checkpoint slot {slot} differs from the exact scan"
-            )
+            assert torch.isfinite(chunk_parallel_slot.to(torch.float32)).all(), slot
         else:
             assert torch.isnan(exact_slot).all(), slot
             assert torch.isnan(chunk_parallel_slot).all(), slot
+    # Each written slot's oracle: the fp64 state after the sequence's prefix
+    # up to its checkpoint token (batched: a per-row token index; packed
+    # varlen: an absolute token index on the token axis).
+    checkpoints = []
+    for sequence, (token, slot) in enumerate(zip(tokens, slots)):
+        if slot < 0:
+            continue
+        start = 0 if form == "batched" else sum(lengths[:sequence])
+        checkpoints.append((slot, sequence, start, token))
+    _assert_chunk_parallel_p6(monkeypatch, make_case, checkpoints=tuple(checkpoints))
 
 
 def test_cake_ssd_combined_auto_selects_chunk_parallel_for_long_prefill(monkeypatch):
     """``auto``: one 32768-token sequence with 8 heads (8 work items, 2048
     tiles) selects the chunk-parallel program on the device's own SM count
-    and capability, reports it as ``last_program_name`` and is bitwise the
-    forced exact scan."""
+    and capability, reports it as ``last_program_name`` and meets the P6
+    clause against the forced exact scan (the two-kernel ``exactpre``
+    program: 256 chunks per sequence exceed the fused window)."""
 
     _skip_unless_cake_arch()
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
@@ -5142,8 +5338,14 @@ def test_cake_ssd_combined_auto_selects_chunk_parallel_for_long_prefill(monkeypa
     assert cake.last_program_name == "chunkpar_bf16_batched"
     monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
     out_exact, final_exact = runner.run(*tensors, **arguments)
-    assert cake.last_program_name == "exact_bf16_batched"
-    assert torch.equal(out, out_exact) and torch.equal(final, final_exact)
+    assert cake.last_program_name == "exactpre_bf16_batched"
+    assert out_exact.shape == out.shape and final_exact.shape == final.shape
+
+    def make_case(seed):
+        case = _case(batch=1, seqlen=32768, nheads=8, ngroups=8, seed=seed)
+        return (*case, case[2])
+
+    _assert_chunk_parallel_p6(monkeypatch, make_case)
 
 
 def test_cake_ssd_combined_auto_keeps_the_exact_scan_for_many_heads(monkeypatch):
@@ -5305,7 +5507,8 @@ def test_source_exact_scan_variant_programs():
             assert b.main_smem_bytes == module._EXACT_NORING_SMEM_BYTES
             assert a.main.module != b.main.module
     assert len([name for name in module._PROGRAMS if name.startswith("exact_")]) == 12
-    assert len(module._PROGRAMS) == 18
+    assert len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 12
+    assert len(module._PROGRAMS) == 30
 
 
 @pytest.mark.parametrize(
@@ -5344,14 +5547,27 @@ def test_source_exact_scan_variant_selected_without_gpu(monkeypatch, case):
         ]
         num_seqs, batch, seqlen = 8, 1, 8 * tokens
         cu_seqlens = torch.arange(0, (num_seqs + 1) * tokens, tokens, dtype=torch.int32)
-        expected = "exact_bf16_varlen" + ("_noring" if tokens == 64 and has_z else "")
+        suffix = "_noring" if tokens == 64 and has_z else ""
     else:
         num_seqs = batch = 2
         seqlen = {"batched_2x50": 50, "batched_2x128": 128, "batched_2x50_z": 50}[case]
         cu_seqlens = None
-        expected = "exact_bf16_batched" + (
-            "_noring" if seqlen == 50 and not has_z else ""
-        )
+        suffix = "_noring" if seqlen == 50 and not has_z else ""
+    # 8 packed sequences x 128 heads = 1024 items exceed the fused varlen window
+    # (256 items): those calls run the two-kernel ``exactpre`` program; the
+    # batched calls (256 items, one chunk) run the fused ``exact`` program.
+    fused = module.fused_selected(
+        nheads=128,
+        num_sequences=num_seqs,
+        nchunks=-(-seqlen // 128),
+        mode_varlen=varlen,
+        total_tokens=batch * seqlen,
+    )
+    assert fused == (not varlen)
+    expected = (
+        f"{'exact' if fused else 'exactpre'}_bf16_{'varlen' if varlen else 'batched'}"
+        + suffix
+    )
     x = torch.empty((batch, seqlen, 128, 64), dtype=torch.bfloat16)
     dt = torch.empty((batch, seqlen, 128), dtype=torch.float32)
     A = torch.empty((128,), dtype=torch.float32)
@@ -5500,7 +5716,16 @@ def test_source_fused_cu_seqlens_form_derives_the_metadata_in_kernel(monkeypatch
     assert launch["main"]["preprocess_status"] is launch["preprocess"]["preprocess_status"]
 
     buffer = torch.empty(3, dtype=torch.int32)
-    runner.run(x, dt, A, B, C, cu_seqlens=cu_seqlens, seq_chunk_cumsum=buffer)
+    runner.run(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        cu_seqlens=cu_seqlens,
+        seq_chunk_cumsum=buffer,
+        update_seq_chunk_cumsum=True,
+    )
     name, launch = calls[-1]
     assert name == "exact_bf16_varlen"
     assert launch["preprocess_grid"][0] >= 1

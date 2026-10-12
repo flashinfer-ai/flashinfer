@@ -286,6 +286,10 @@ _MAIN_ARGS = (
     "metadata_from_cu_seqlens",
     "preprocess_status",
 )
+# The fused-only inputs that close ``_MAIN_ARGS``: both exact-scan families
+# bind them (only the fused program reads them); the chunk-parallel
+# signature has none of them.
+_FUSED_ONLY_MAIN_ARGS = ("cu_seqlens", "metadata_from_cu_seqlens", "preprocess_status")
 # Chunk-parallel main kernel (the ``chunkpar_*`` programs): the exact-scan
 # order with the state-operand tensor map ``h_map`` after ``out_map`` and the
 # workspace pointers ``s_work`` (f32 per-tile state increments), ``h_words``
@@ -2504,6 +2508,11 @@ class CakeSSDCombined:
             "metadata_from_cu_seqlens": int(program.family == "exact" and from_cu_seqlens),
             "preprocess_status": preprocess_status,
         }
+        if program.family == "chunkpar":
+            # ``_MAIN_ARGS_CHUNKPAR`` has no fused input: bind exactly the
+            # chunk-parallel signature.
+            for name in _FUSED_ONLY_MAIN_ARGS:
+                del main_values[name]
         chunk_parallel: Optional[dict[str, torch.Tensor]] = None
         if program.family == "chunkpar":
             # The state operand workspace is bound twice: as the ``h_map``
