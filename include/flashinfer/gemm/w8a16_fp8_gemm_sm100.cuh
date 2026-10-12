@@ -16,10 +16,10 @@
 #ifndef FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 #define FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
 
-// W8A16 GEMM for Blackwell (sm_100a), rung B4: FlashInfer's fork of CUTLASS's
-// mixed-input kernel (w8a16_sm100/) with two transform warpgroups and a 2SM
-// 256x256x64 tile whose converted A operand is staged in smem (env-selectable at this
-// rung; measured against the 256x128 TMEM-A tile).
+// W8A16 GEMM for Blackwell (sm_100a), rung B7: FlashInfer's fork of CUTLASS's
+// mixed-input kernel (w8a16_sm100/) with two transform warpgroups and two 2SM tiles,
+// 256x128x128 (converted A in TMEM) and 256x256x64 (converted A in smem), picked per
+// problem by a wave-fill cost model (W8A16Sm100PickTile).
 //
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
@@ -323,18 +323,30 @@ inline W8A16Sm100Tile W8A16Sm100TileEnv() {
   return tile;
 }
 
-inline W8A16Sm100Tile W8A16Sm100PickTile(int M, int N, int K) {
+// Rung B7 dispatch: wave-fill cost model between the two 2SM tiles.  Each cluster
+// owns one 256(weight rows) x tileA(activation rows) tile; the modelled time is
+// ceil(clusters needed / clusters resident) x tileA / eff, with the 256-wide tile at
+// 1.10x the per-flop efficiency of the 128-wide one (half the transform work per flop;
+// fitted on the B200 tables of rungs B3 and B4: picks the measured winner on 127 of 144
+// rows, geomean 1.006x the per-row oracle).  Narrow or short problems keep the
+// 128-wide tile (twice the clusters to fill the machine), wide + tall ones take the
+// 256-wide tile.
+inline W8A16Sm100Tile W8A16Sm100PickTile(int M, int N, int K, int num_sms) {
   const W8A16Sm100Tile env = W8A16Sm100TileEnv();
   if (env != W8A16Sm100Tile::kAuto) return env;
-  (void)M;
-  (void)N;
   (void)K;
-  return W8A16Sm100Tile::k2SM256x128;
+  const int clusters = num_sms > 1 ? num_sms / 2 : 1;
+  const long long w_tiles = (N + 255) / 256;
+  const long long units128 = w_tiles * ((M + 127) / 128);
+  const long long units256 = w_tiles * ((M + 255) / 256);
+  const double cost128 = static_cast<double>((units128 + clusters - 1) / clusters) * 128.0;
+  const double cost256 = static_cast<double>((units256 + clusters - 1) / clusters) * 256.0 / 1.10;
+  return cost256 < cost128 ? W8A16Sm100Tile::k2SM256x256 : W8A16Sm100Tile::k2SM256x128;
 }
 
 template <typename T>
 size_t W8A16Fp8GemmSm100WorkspaceBytes(int M, int N, int K, int device_id, int num_sms) {
-  switch (W8A16Sm100PickTile(M, N, K)) {
+  switch (W8A16Sm100PickTile(M, N, K, num_sms)) {
     case W8A16Sm100Tile::k1SM128x128:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg1SM128x128>::WorkspaceBytes(M, N, K, device_id,
                                                                         num_sms);
@@ -352,7 +364,7 @@ cudaError_t W8A16Fp8GemmSm100(const T* act, const __nv_fp8_e4m3* weight, const f
                               const T* bias, T* out, int M, int N, int K, void* workspace,
                               size_t workspace_bytes, int device_id, int num_sms,
                               cudaStream_t stream) {
-  switch (W8A16Sm100PickTile(M, N, K)) {
+  switch (W8A16Sm100PickTile(M, N, K, num_sms)) {
     case W8A16Sm100Tile::k1SM128x128:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg1SM128x128>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,
