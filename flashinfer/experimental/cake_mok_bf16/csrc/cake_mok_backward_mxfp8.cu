@@ -1105,8 +1105,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                 __syncthreads();
                 int _min_15 = ((tokens - (macro + 1) * macro_size) < (macro_size) ? (tokens - (macro + 1) * macro_size) : (macro_size));
                 int next_rows = _min_15;
+                int next_tasks = next_rows / 128 * ((hidden + 511) / 512);
                 #pragma unroll 1
-                for (int task_2 = cluster * 2 + cta_rank_0; task_2 < next_rows / 128 * ((hidden + 511) / 512); task_2 += comm_sms) {
+                for (int task_2 = cluster * 2 + cta_rank_0; task_2 < next_tasks; task_2 += comm_sms) {
                     unsigned int phase_bits_2 = dispatch_bits;
                     int col_blocks_2 = (hidden + 511) / 512;
                     int macro_offset_2 = (macro + 1) * macro_size;
@@ -1138,11 +1139,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             mbarrier_arrive_expect_tx(dispatch_arrived_addr, _cta_count_2 * chunk_bytes_3);
                         }
                         __syncthreads();
-                        if (tid < 128) {
-                            dispatch_weights[tid] = ((peer_3 >= 0) ? weights[row_4 + tid] : 0.0f);
-                        }
                         if (peer_3 >= 0) {
-                            cp_async_bulk_gmem2smem(dispatch_smem_addr + (unsigned int)(tid * 512 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_3])) + ((unsigned long long)((unsigned long long)(peer_token_1 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_1 * 512)) * (unsigned long long)2)), chunk_cols_2 * 2, dispatch_arrived_addr);
+                            cp_async_bulk_gmem2smem(dispatch_smem_addr + (unsigned int)(tid * 512 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_3])) + ((unsigned long long)((unsigned long long)(peer_token_1 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_1 * 512)) * (unsigned long long)2)), chunk_cols_2 * 2, dispatch_arrived_addr);
                         } else if (tid < 128) {
                             #pragma unroll
                             for (int vec_1 = 0; vec_1 < 64; vec_1++) {
@@ -1183,20 +1181,6 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             uint32_t _prmt_b32_1;
                                             asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_b32_1) : "r"(pair_1[0]), "r"(pair_1[1]), "r"(merge_sel_1));
                                             unsigned int merged_1 = _prmt_b32_1;
-                                            uint32_t _bf16x2_scale_1;
-                                            {
-                                                uint32_t _bf16x2_pair_2 = merged_1;
-                                                float _bf16x2_lo_2;
-                                                float _bf16x2_hi_2;
-                                                asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_lo_2) : "h"((uint16_t)(_bf16x2_pair_2 & 0xFFFFu)));
-                                                asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_hi_2) : "h"((uint16_t)(_bf16x2_pair_2 >> 16)));
-                                                _bf16x2_lo_2 *= dispatch_weights[src_row_1];
-                                                _bf16x2_hi_2 *= dispatch_weights[src_row_1 + 1];
-                                                uint32_t _bf16x2_out_2;
-                                                asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_bf16x2_out_2) : "f"(_bf16x2_hi_2), "f"(_bf16x2_lo_2));
-                                                _bf16x2_scale_1 = _bf16x2_out_2;
-                                            }
-                                            merged_1 = _bf16x2_scale_1;
                                             t_words_1[k_4] = merged_1;
                                         }
                                         unsigned int t_packed_1[8];
@@ -1341,37 +1325,40 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 if (tid == 0) {
                                     int col128_1 = col_block_1 * 4 + subtile_1;
                                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                    tma_store_2d((&dy_disp_fp8), col128_1 * 128, row_4, dispatch_quant_addr + (unsigned int)(subtile_1 % 2 * 4096 * 4));
-                                    tma_store_3d((&dy_sc_r), 0, (row_block_1 * (hidden / 128) + col128_1) * 32, 0, dispatch_quant_addr + (unsigned int)((8192 + subtile_1 % 2 * 128) * 4));
-                                    tma_store_2d((&dy_disp_fp8_t), row_4, col128_1 * 128, dispatch_quant_addr + (unsigned int)((8448 + subtile_1 % 2 * 4096) * 4));
-                                    tma_store_3d((&dy_sc_t_r), 0, (col128_1 * macro_row_blocks + row_block_1) * 32, 0, dispatch_quant_addr + (unsigned int)((16640 + subtile_1 % 2 * 128) * 4));
+                                    tma_store_2d((&x_disp_fp8), col128_1 * 128, row_4, dispatch_quant_addr + (unsigned int)(subtile_1 % 2 * 4096 * 4));
+                                    tma_store_3d((&x_sc_r), 0, (row_block_1 * (hidden / 128) + col128_1) * 32, 0, dispatch_quant_addr + (unsigned int)((8192 + subtile_1 % 2 * 128) * 4));
+                                    tma_store_2d((&x_disp_fp8_t), row_4, col128_1 * 128, dispatch_quant_addr + (unsigned int)((8448 + subtile_1 % 2 * 4096) * 4));
+                                    tma_store_3d((&x_sc_t_r), 0, (col128_1 * macro_row_blocks + row_block_1) * 32, 0, dispatch_quant_addr + (unsigned int)((16640 + subtile_1 % 2 * 128) * 4));
                                     asm volatile("cp.async.bulk.commit_group;");
                                 }
                             }
                         }
                         if (tid == 0) {
                             asm volatile("cp.async.bulk.wait_group 0;");
-                            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(dy_ready)) + ((macro_offset_2 + row_4) / mini_size))), "r"(static_cast<unsigned int>(1)) : "memory");
+                            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(replay_x)) + ((macro_offset_2 + row_4) / mini_size))), "r"(static_cast<unsigned int>(1)) : "memory");
                         }
                         __syncthreads();
                     }
                     dispatch_bits = phase_bits_2;
-                    unsigned int phase_bits_0 = dispatch_bits;
-                    int col_blocks_1_1 = (hidden + 511) / 512;
-                    int macro_offset_2_1 = (macro + 1) * macro_size;
-                    int _min_20 = ((macro_size) < (tokens - macro_offset_2_1) ? (macro_size) : (tokens - macro_offset_2_1));
+                }
+                #pragma unroll 1
+                for (int task_3 = cluster * 2 + cta_rank_0; task_3 < next_tasks; task_3 += comm_sms) {
+                    unsigned int phase_bits_3 = dispatch_bits;
+                    int col_blocks_3 = (hidden + 511) / 512;
+                    int macro_offset_3 = (macro + 1) * macro_size;
+                    int _min_20 = ((macro_size) < (tokens - macro_offset_3) ? (macro_size) : (tokens - macro_offset_3));
                     int macro_tokens_3 = _min_20;
-                    if (task_2 < macro_tokens_3 / 128 * col_blocks_1_1) {
-                        int row_5 = task_2 / col_blocks_1_1 * 128;
-                        int col_block_2 = task_2 % col_blocks_1_1;
+                    if (task_3 < macro_tokens_3 / 128 * col_blocks_3) {
+                        int row_5 = task_3 / col_blocks_3 * 128;
+                        int col_block_2 = task_3 % col_blocks_3;
                         int _min_21 = ((512) < (hidden - col_block_2 * 512) ? (512) : (hidden - col_block_2 * 512));
                         int chunk_cols_3 = _min_21;
                         unsigned int chunk_bytes_4 = (unsigned int)(chunk_cols_3 * 2);
                         int peer_4 = -1;
                         int peer_token_2 = -1;
                         if (tid < 128) {
-                            peer_4 = schedule_rank[macro_offset_2_1 + row_5 + tid];
-                            peer_token_2 = schedule_token[macro_offset_2_1 + row_5 + tid];
+                            peer_4 = schedule_rank[macro_offset_3 + row_5 + tid];
+                            peer_token_2 = schedule_token[macro_offset_3 + row_5 + tid];
                         }
                         uint32_t _cta_count_3 = __syncthreads_count(peer_4 >= 0);
                         if (tid == 0) {
@@ -1387,16 +1374,19 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             mbarrier_arrive_expect_tx(dispatch_arrived_addr, _cta_count_3 * chunk_bytes_4);
                         }
                         __syncthreads();
+                        if (tid < 128) {
+                            dispatch_weights[tid] = ((peer_4 >= 0) ? weights[row_5 + tid] : 0.0f);
+                        }
                         if (peer_4 >= 0) {
-                            cp_async_bulk_gmem2smem(dispatch_smem_addr + (unsigned int)(tid * 512 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_4])) + ((unsigned long long)((unsigned long long)(peer_token_2 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_2 * 512)) * (unsigned long long)2)), chunk_cols_3 * 2, dispatch_arrived_addr);
+                            cp_async_bulk_gmem2smem(dispatch_smem_addr + (unsigned int)(tid * 512 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_4])) + ((unsigned long long)((unsigned long long)(peer_token_2 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_2 * 512)) * (unsigned long long)2)), chunk_cols_3 * 2, dispatch_arrived_addr);
                         } else if (tid < 128) {
                             #pragma unroll
                             for (int vec_2 = 0; vec_2 < 64; vec_2++) {
                                 asm volatile("st.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"((uint64_t)(reinterpret_cast<uint8_t*>(dispatch_smem) + (tid * 1024 + vec_2 * 16))), "r"(static_cast<uint32_t>((unsigned int)0)), "r"(static_cast<uint32_t>((unsigned int)0)), "r"(static_cast<uint32_t>((unsigned int)0)), "r"(static_cast<uint32_t>((unsigned int)0)) : "memory");
                             }
                         }
-                        mbarrier_wait(dispatch_arrived_addr, phase_bits_0 & 1);
-                        phase_bits_0 = phase_bits_0 ^ 1;
+                        mbarrier_wait(dispatch_arrived_addr, phase_bits_3 & 1);
+                        phase_bits_3 = phase_bits_3 ^ 1;
                         float inv_e4m3_max_2 = 0.002232142857f;
                         float scale_floor_2 = 1e-12f;
                         int row_block_2 = row_5 / 128;
@@ -1429,6 +1419,20 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             uint32_t _prmt_b32_2;
                                             asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_b32_2) : "r"(pair_2[0]), "r"(pair_2[1]), "r"(merge_sel_2));
                                             unsigned int merged_2 = _prmt_b32_2;
+                                            uint32_t _bf16x2_scale_1;
+                                            {
+                                                uint32_t _bf16x2_pair_2 = merged_2;
+                                                float _bf16x2_lo_2;
+                                                float _bf16x2_hi_2;
+                                                asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_lo_2) : "h"((uint16_t)(_bf16x2_pair_2 & 0xFFFFu)));
+                                                asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_hi_2) : "h"((uint16_t)(_bf16x2_pair_2 >> 16)));
+                                                _bf16x2_lo_2 *= dispatch_weights[src_row_2];
+                                                _bf16x2_hi_2 *= dispatch_weights[src_row_2 + 1];
+                                                uint32_t _bf16x2_out_2;
+                                                asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_bf16x2_out_2) : "f"(_bf16x2_hi_2), "f"(_bf16x2_lo_2));
+                                                _bf16x2_scale_1 = _bf16x2_out_2;
+                                            }
+                                            merged_2 = _bf16x2_scale_1;
                                             t_words_2[k_8] = merged_2;
                                         }
                                         unsigned int t_packed_2[8];
@@ -1573,28 +1577,28 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 if (tid == 0) {
                                     int col128_2 = col_block_2 * 4 + subtile_2;
                                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                    tma_store_2d((&x_disp_fp8), col128_2 * 128, row_5, dispatch_quant_addr + (unsigned int)(subtile_2 % 2 * 4096 * 4));
-                                    tma_store_3d((&x_sc_r), 0, (row_block_2 * (hidden / 128) + col128_2) * 32, 0, dispatch_quant_addr + (unsigned int)((8192 + subtile_2 % 2 * 128) * 4));
-                                    tma_store_2d((&x_disp_fp8_t), row_5, col128_2 * 128, dispatch_quant_addr + (unsigned int)((8448 + subtile_2 % 2 * 4096) * 4));
-                                    tma_store_3d((&x_sc_t_r), 0, (col128_2 * macro_row_blocks + row_block_2) * 32, 0, dispatch_quant_addr + (unsigned int)((16640 + subtile_2 % 2 * 128) * 4));
+                                    tma_store_2d((&dy_disp_fp8), col128_2 * 128, row_5, dispatch_quant_addr + (unsigned int)(subtile_2 % 2 * 4096 * 4));
+                                    tma_store_3d((&dy_sc_r), 0, (row_block_2 * (hidden / 128) + col128_2) * 32, 0, dispatch_quant_addr + (unsigned int)((8192 + subtile_2 % 2 * 128) * 4));
+                                    tma_store_2d((&dy_disp_fp8_t), row_5, col128_2 * 128, dispatch_quant_addr + (unsigned int)((8448 + subtile_2 % 2 * 4096) * 4));
+                                    tma_store_3d((&dy_sc_t_r), 0, (col128_2 * macro_row_blocks + row_block_2) * 32, 0, dispatch_quant_addr + (unsigned int)((16640 + subtile_2 % 2 * 128) * 4));
                                     asm volatile("cp.async.bulk.commit_group;");
                                 }
                             }
                         }
                         if (tid == 0) {
                             asm volatile("cp.async.bulk.wait_group 0;");
-                            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(replay_x)) + ((macro_offset_2_1 + row_5) / mini_size))), "r"(static_cast<unsigned int>(1)) : "memory");
+                            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(dy_ready)) + ((macro_offset_3 + row_5) / mini_size))), "r"(static_cast<unsigned int>(1)) : "memory");
                         }
                         __syncthreads();
                     }
-                    dispatch_bits = phase_bits_0;
+                    dispatch_bits = phase_bits_3;
                 }
             }
         }
     } else {
         int iteration = 0;
         int kind = -1;
-        int task_3 = 0;
+        int task_4 = 0;
         int macro_1 = 0;
         int mini_1 = 0;
         int shared = 0;
@@ -1671,7 +1675,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
             }
         }
         kind = kind_0;
-        task_3 = task_1_1;
+        task_4 = task_1_1;
         macro_1 = macro_2;
         mini_1 = mini_3;
         shared = shared_4;
@@ -1700,9 +1704,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
             int shared_down_0 = shared_rows * (intermediate / 256);
             if (shared != 0) {
                 if (kind == 0) {
-                    int col_blocks_3 = hidden / 256;
+                    int col_blocks_4 = hidden / 256;
                     {
-                        col_blocks_3 = intermediate / 256;
+                        col_blocks_4 = intermediate / 256;
                     }
                     int x = -1;
                     int y = -1;
@@ -1711,17 +1715,17 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                     int k_end = 0;
                     int first = 0;
                     int row_blocks = (local_tokens + 255) / 256;
-                    if (task_3 < row_blocks * col_blocks_3) {
-                        int supergroup = task_3 / (row_blocks * 8);
-                        int full_cols = col_blocks_3 / 8 * 8;
+                    if (task_4 < row_blocks * col_blocks_4) {
+                        int supergroup = task_4 / (row_blocks * 8);
+                        int full_cols = col_blocks_4 / 8 * 8;
                         int row_6 = 0;
                         int col_1 = 0;
-                        if (task_3 < row_blocks * full_cols) {
-                            row_6 = task_3 % (row_blocks * 8) / 8;
-                            col_1 = supergroup * 8 + task_3 % 8;
+                        if (task_4 < row_blocks * full_cols) {
+                            row_6 = task_4 % (row_blocks * 8) / 8;
+                            col_1 = supergroup * 8 + task_4 % 8;
                         } else {
-                            row_6 = (task_3 - row_blocks * full_cols) / (col_blocks_3 - full_cols);
-                            col_1 = full_cols + (task_3 - row_blocks * full_cols) % (col_blocks_3 - full_cols);
+                            row_6 = (task_4 - row_blocks * full_cols) / (col_blocks_4 - full_cols);
+                            col_1 = full_cols + (task_4 - row_blocks * full_cols) % (col_blocks_4 - full_cols);
                         }
                         if ((supergroup & 1) != 0) {
                             row_6 = row_blocks - row_6 - 1;
@@ -1730,7 +1734,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         y = col_1;
                         expert = 0;
                     }
-                    unsigned int phase_bits_3 = gemm_phase;
+                    unsigned int phase_bits_4 = gemm_phase;
                     int global_mini = 0;
                     int macro_rows = 0;
                     int iterations = hidden / 64;
@@ -1749,7 +1753,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 int ring = 0;
                                 #pragma unroll 1
                                 for (int idx = 0; idx < iterations; idx++) {
-                                    mbarrier_wait(gemm_finished_addr + (ring) * 8, phase_bits_3 >> (unsigned int)(16 + ring) & 1);
+                                    mbarrier_wait(gemm_finished_addr + (ring) * 8, phase_bits_4 >> (unsigned int)(16 + ring) & 1);
                                     asm volatile(
                                         "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
@@ -1760,7 +1764,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                         :: "r"(b_ab_addr + (unsigned int)(ring * 16384)), "l"((&wd_s)), "r"(0), "r"(idx * 64), "r"(y * 4 + cta_rank_0 * 2), "r"(expert), "r"(0),
                                            "r"(((gemm_arrived_addr + (ring) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
-                                    phase_bits_3 = phase_bits_3 ^ (unsigned int)(1 << 16 + ring);
+                                    phase_bits_4 = phase_bits_4 ^ (unsigned int)(1 << 16 + ring);
                                     ring = (ring + 1) % 6;
                                 }
                             }
@@ -1770,13 +1774,13 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             if (warp == 4) {
                                 if (elect_sync()) {
                                     int ring_1 = 0;
-                                    mbarrier_wait(output_finished_addr, phase_bits_3 >> 22 & 1);
-                                    phase_bits_3 = phase_bits_3 ^ 4194304;
+                                    mbarrier_wait(output_finished_addr, phase_bits_4 >> 22 & 1);
+                                    phase_bits_4 = phase_bits_4 ^ 4194304;
                                     asm volatile("tcgen05.fence::after_thread_sync;");
                                     #pragma unroll 1
                                     for (int idx_1 = 0; idx_1 < iterations; idx_1++) {
                                         mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_1) * 8, 65536);
-                                        mbarrier_wait(gemm_arrived_addr + (ring_1) * 8, phase_bits_3 >> (unsigned int)ring_1 & 1);
+                                        mbarrier_wait(gemm_arrived_addr + (ring_1) * 8, phase_bits_4 >> (unsigned int)ring_1 & 1);
                                         int _mma_a_lo_0 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_1) * 1024;
                                         int _mma_b_lo_0 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_1) * 1024;
                                         asm volatile(
@@ -1814,15 +1818,15 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
             "}\n"
             :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_accumulator), "r"(((idx_1 == 0) ? 0 : 1)));
                                         tcgen05_commit_cg2_multicast(gemm_finished_addr + (ring_1) * 8, (uint16_t)(3));
-                                        phase_bits_3 = phase_bits_3 ^ (unsigned int)(1 << ring_1);
+                                        phase_bits_4 = phase_bits_4 ^ (unsigned int)(1 << ring_1);
                                         ring_1 = (ring_1 + 1) % 6;
                                     }
                                     tcgen05_commit_cg2_multicast(output_arrived_addr, (uint16_t)(3));
                                 }
                             }
                         } else if (tid < 128) {
-                            mbarrier_wait(output_arrived_addr, phase_bits_3 >> 6 & 1);
-                            phase_bits_3 = phase_bits_3 ^ 64;
+                            mbarrier_wait(output_arrived_addr, phase_bits_4 >> 6 & 1);
+                            phase_bits_4 = phase_bits_4 ^ 64;
                             unsigned int packed[128];
                             #pragma unroll
                             for (int chunk = 0; chunk < 8; chunk++) {
@@ -1904,26 +1908,26 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             }
                         }
                     }
-                    gemm_phase = phase_bits_3;
+                    gemm_phase = phase_bits_4;
                 } else if (kind == 1) {
-                    unsigned int phase_bits_4 = swiglu_phase;
-                    int col_blocks_4 = intermediate / 128;
-                    int num_tiles = ((local_tokens + 255) / 256 * 256 + 127) / 128 * col_blocks_4;
+                    unsigned int phase_bits_5 = swiglu_phase;
+                    int col_blocks_5 = intermediate / 128;
+                    int num_tiles = ((local_tokens + 255) / 256 * 256 + 127) / 128 * col_blocks_5;
                     int macro_row_offset = 0;
-                    int first_tile_1 = task_3 * 4 + cta_rank_0 * 2;
+                    int first_tile_1 = task_4 * 4 + cta_rank_0 * 2;
                     int tile_end = num_tiles;
                     if (first_tile_1 < tile_end) {
-                        int first_row_1 = first_tile_1 / col_blocks_4;
-                        int first_col_1 = first_tile_1 % col_blocks_4;
+                        int first_row_1 = first_tile_1 / col_blocks_5;
+                        int first_col_1 = first_tile_1 % col_blocks_5;
                         if (tid == 0) {
                             #pragma unroll
                             for (int stage_4 = 0; stage_4 < 2; stage_4++) {
                                 if (tile_end > first_tile_1 + stage_4) {
                                     int row_8 = first_row_1;
                                     int col_3 = first_col_1 + stage_4;
-                                    if (col_3 >= col_blocks_4) {
+                                    if (col_3 >= col_blocks_5) {
                                         row_8 = row_8 + 1;
-                                        col_3 = col_3 - col_blocks_4;
+                                        col_3 = col_3 - col_blocks_5;
                                     }
                                     mbarrier_arrive_expect_tx(swiglu_arrived_addr + (stage_4) * 8, 98304);
                                     int parent = row_8 / 2 * (intermediate / 256) + col_3 / 2;
@@ -1955,13 +1959,13 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         #pragma unroll
                         for (int stage_5 = 0; stage_5 < 2; stage_5++) {
                             if (tile_end > first_tile_1 + stage_5) {
-                                mbarrier_wait(swiglu_arrived_addr + (stage_5) * 8, phase_bits_4 >> (unsigned int)stage_5 & 1);
-                                phase_bits_4 = phase_bits_4 ^ (unsigned int)(1 << stage_5);
+                                mbarrier_wait(swiglu_arrived_addr + (stage_5) * 8, phase_bits_5 >> (unsigned int)stage_5 & 1);
+                                phase_bits_5 = phase_bits_5 ^ (unsigned int)(1 << stage_5);
                                 int row_9 = first_row_1;
                                 int col_4 = first_col_1 + stage_5;
-                                if (col_4 >= col_blocks_4) {
+                                if (col_4 >= col_blocks_5) {
                                     row_9 = row_9 + 1;
-                                    col_4 = col_4 - col_blocks_4;
+                                    col_4 = col_4 - col_blocks_5;
                                 }
                                 float gate[64];
                                 float up[64];
@@ -2227,7 +2231,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             for (int stage_6 = 0; stage_6 < 2; stage_6++) {
                                 if (tile_end > first_tile_1 + stage_6) {
                                     int row_10 = first_row_1;
-                                    if (col_blocks_4 <= first_col_1 + stage_6) {
+                                    if (col_blocks_5 <= first_col_1 + stage_6) {
                                         row_10 = row_10 + 1;
                                     }
                                     asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(dg_ready)) + (row_10 / 2))), "r"(static_cast<unsigned int>(1)) : "memory");
@@ -2237,12 +2241,12 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                     }
                     if (tid == 0) {
                     }
-                    swiglu_phase = phase_bits_4;
+                    swiglu_phase = phase_bits_5;
                 } else {
                     if (kind == 2) {
-                        int col_blocks_5 = intermediate / 256;
+                        int col_blocks_6 = intermediate / 256;
                         {
-                            col_blocks_5 = hidden / 256;
+                            col_blocks_6 = hidden / 256;
                         }
                         int x_1 = -1;
                         int y_1 = -1;
@@ -2251,17 +2255,17 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         int k_end_1 = 0;
                         int first_1 = 0;
                         int row_blocks_1 = (local_tokens + 255) / 256;
-                        if (task_3 < row_blocks_1 * col_blocks_5) {
-                            int supergroup_1 = task_3 / (row_blocks_1 * 8);
-                            int full_cols_1 = col_blocks_5 / 8 * 8;
+                        if (task_4 < row_blocks_1 * col_blocks_6) {
+                            int supergroup_1 = task_4 / (row_blocks_1 * 8);
+                            int full_cols_1 = col_blocks_6 / 8 * 8;
                             int row_11 = 0;
                             int col_5 = 0;
-                            if (task_3 < row_blocks_1 * full_cols_1) {
-                                row_11 = task_3 % (row_blocks_1 * 8) / 8;
-                                col_5 = supergroup_1 * 8 + task_3 % 8;
+                            if (task_4 < row_blocks_1 * full_cols_1) {
+                                row_11 = task_4 % (row_blocks_1 * 8) / 8;
+                                col_5 = supergroup_1 * 8 + task_4 % 8;
                             } else {
-                                row_11 = (task_3 - row_blocks_1 * full_cols_1) / (col_blocks_5 - full_cols_1);
-                                col_5 = full_cols_1 + (task_3 - row_blocks_1 * full_cols_1) % (col_blocks_5 - full_cols_1);
+                                row_11 = (task_4 - row_blocks_1 * full_cols_1) / (col_blocks_6 - full_cols_1);
+                                col_5 = full_cols_1 + (task_4 - row_blocks_1 * full_cols_1) % (col_blocks_6 - full_cols_1);
                             }
                             if ((supergroup_1 & 1) != 0) {
                                 row_11 = row_blocks_1 - row_11 - 1;
@@ -2270,7 +2274,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             y_1 = col_5;
                             expert_1 = 0;
                         }
-                        unsigned int phase_bits_5 = gemm_phase;
+                        unsigned int phase_bits_6 = gemm_phase;
                         int global_mini_1 = 0;
                         int macro_rows_1 = 0;
                         int iterations_1 = intermediate / 64 + intermediate / 64;
@@ -2302,7 +2306,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     int ring_2 = 0;
                                     #pragma unroll 1
                                     for (int idx_2 = 0; idx_2 < iterations_1; idx_2++) {
-                                        mbarrier_wait(gemm_finished_addr + (ring_2) * 8, phase_bits_5 >> (unsigned int)(16 + ring_2) & 1);
+                                        mbarrier_wait(gemm_finished_addr + (ring_2) * 8, phase_bits_6 >> (unsigned int)(16 + ring_2) & 1);
                                         if (idx_2 < intermediate / 64) {
                                             asm volatile(
                                                 "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
@@ -2326,7 +2330,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 :: "r"(b_ab_addr + (unsigned int)(ring_2 * 16384)), "l"((&wu_s)), "r"(0), "r"((idx_2 - intermediate / 64) * 64), "r"(y_1 * 4 + cta_rank_0 * 2), "r"(expert_1), "r"(0),
                                                    "r"(((gemm_arrived_addr + (ring_2) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
                                         }
-                                        phase_bits_5 = phase_bits_5 ^ (unsigned int)(1 << 16 + ring_2);
+                                        phase_bits_6 = phase_bits_6 ^ (unsigned int)(1 << 16 + ring_2);
                                         ring_2 = (ring_2 + 1) % 6;
                                     }
                                 }
@@ -2336,13 +2340,13 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 if (warp == 4) {
                                     if (elect_sync()) {
                                         int ring_3 = 0;
-                                        mbarrier_wait(output_finished_addr, phase_bits_5 >> 22 & 1);
-                                        phase_bits_5 = phase_bits_5 ^ 4194304;
+                                        mbarrier_wait(output_finished_addr, phase_bits_6 >> 22 & 1);
+                                        phase_bits_6 = phase_bits_6 ^ 4194304;
                                         asm volatile("tcgen05.fence::after_thread_sync;");
                                         #pragma unroll 1
                                         for (int idx_3 = 0; idx_3 < iterations_1; idx_3++) {
                                             mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_3) * 8, 65536);
-                                            mbarrier_wait(gemm_arrived_addr + (ring_3) * 8, phase_bits_5 >> (unsigned int)ring_3 & 1);
+                                            mbarrier_wait(gemm_arrived_addr + (ring_3) * 8, phase_bits_6 >> (unsigned int)ring_3 & 1);
                                             int _mma_a_lo_1 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_3) * 1024;
                                             int _mma_b_lo_1 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_3) * 1024;
                                             asm volatile(
@@ -2380,15 +2384,15 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
             "}\n"
             :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"(tmem_accumulator), "r"(((idx_3 == 0) ? 0 : 1)));
                                             tcgen05_commit_cg2_multicast(gemm_finished_addr + (ring_3) * 8, (uint16_t)(3));
-                                            phase_bits_5 = phase_bits_5 ^ (unsigned int)(1 << ring_3);
+                                            phase_bits_6 = phase_bits_6 ^ (unsigned int)(1 << ring_3);
                                             ring_3 = (ring_3 + 1) % 6;
                                         }
                                         tcgen05_commit_cg2_multicast(output_arrived_addr, (uint16_t)(3));
                                     }
                                 }
                             } else if (tid < 128) {
-                                mbarrier_wait(output_arrived_addr, phase_bits_5 >> 6 & 1);
-                                phase_bits_5 = phase_bits_5 ^ 64;
+                                mbarrier_wait(output_arrived_addr, phase_bits_6 >> 6 & 1);
+                                phase_bits_6 = phase_bits_6 ^ 64;
                                 unsigned int packed_11[128];
                                 #pragma unroll
                                 for (int chunk_2 = 0; chunk_2 < 8; chunk_2++) {
@@ -2465,11 +2469,11 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 }
                             }
                         }
-                        gemm_phase = phase_bits_5;
+                        gemm_phase = phase_bits_6;
                     } else if (kind == 3) {
-                        int col_blocks_6 = local_tokens / 256;
+                        int col_blocks_7 = local_tokens / 256;
                         {
-                            col_blocks_6 = intermediate / 256;
+                            col_blocks_7 = intermediate / 256;
                         }
                         int x_2 = -1;
                         int y_2 = -1;
@@ -2479,20 +2483,20 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         int first_2 = 0;
                         int row_blocks_2 = hidden / 256;
                         int expert_idx = 0;
-                        int local_task = task_3;
+                        int local_task = task_4;
                         k_end_2 = local_tokens;
                         first_2 = 1;
                         if (k_start_2 < k_end_2) {
                             int supergroup_2 = local_task / (row_blocks_2 * 8);
-                            int full_cols_2 = col_blocks_6 / 8 * 8;
+                            int full_cols_2 = col_blocks_7 / 8 * 8;
                             int row_13 = 0;
                             int col_7 = 0;
                             if (local_task < row_blocks_2 * full_cols_2) {
                                 row_13 = local_task % (row_blocks_2 * 8) / 8;
                                 col_7 = supergroup_2 * 8 + local_task % 8;
                             } else {
-                                row_13 = (local_task - row_blocks_2 * full_cols_2) / (col_blocks_6 - full_cols_2);
-                                col_7 = full_cols_2 + (local_task - row_blocks_2 * full_cols_2) % (col_blocks_6 - full_cols_2);
+                                row_13 = (local_task - row_blocks_2 * full_cols_2) / (col_blocks_7 - full_cols_2);
+                                col_7 = full_cols_2 + (local_task - row_blocks_2 * full_cols_2) % (col_blocks_7 - full_cols_2);
                             }
                             if ((supergroup_2 & 1) != 0) {
                                 row_13 = row_blocks_2 - row_13 - 1;
@@ -2501,7 +2505,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             y_2 = col_7;
                             expert_2 = expert_idx;
                         }
-                        unsigned int phase_bits_6 = gemm_phase;
+                        unsigned int phase_bits_7 = gemm_phase;
                         int global_mini_2 = 0;
                         int macro_rows_2 = 0;
                         int iterations_2 = hidden / 64;
@@ -2524,7 +2528,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             int input_rows = _min_33;
                                             int input_count = (input_rows + 127) / 128 * ((hidden + 511) / 512);
                                         }
-                                        mbarrier_wait(gemm_finished_addr + (ring_4) * 8, phase_bits_6 >> (unsigned int)(16 + ring_4) & 1);
+                                        mbarrier_wait(gemm_finished_addr + (ring_4) * 8, phase_bits_7 >> (unsigned int)(16 + ring_4) & 1);
                                         int local_row = k_start_2 + idx_4 * 64;
                                         asm volatile(
                                             "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
@@ -2536,7 +2540,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                             :: "r"(b_ab_addr + (unsigned int)(ring_4 * 16384)), "l"((&h_atb_s)), "r"(0), "r"(local_row), "r"(y_2 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
                                                "r"(((gemm_arrived_addr + (ring_4) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
-                                        phase_bits_6 = phase_bits_6 ^ (unsigned int)(1 << 16 + ring_4);
+                                        phase_bits_7 = phase_bits_7 ^ (unsigned int)(1 << 16 + ring_4);
                                         ring_4 = (ring_4 + 1) % 6;
                                     }
                                 }
@@ -2546,13 +2550,13 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 if (warp == 4) {
                                     if (elect_sync()) {
                                         int ring_5 = 0;
-                                        mbarrier_wait(output_finished_addr, phase_bits_6 >> 22 & 1);
-                                        phase_bits_6 = phase_bits_6 ^ 4194304;
+                                        mbarrier_wait(output_finished_addr, phase_bits_7 >> 22 & 1);
+                                        phase_bits_7 = phase_bits_7 ^ 4194304;
                                         asm volatile("tcgen05.fence::after_thread_sync;");
                                         #pragma unroll 1
                                         for (int idx_5 = 0; idx_5 < iterations_2; idx_5++) {
                                             mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_5) * 8, 65536);
-                                            mbarrier_wait(gemm_arrived_addr + (ring_5) * 8, phase_bits_6 >> (unsigned int)ring_5 & 1);
+                                            mbarrier_wait(gemm_arrived_addr + (ring_5) * 8, phase_bits_7 >> (unsigned int)ring_5 & 1);
                                             int _mma_a_lo_2 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_5) * 1024;
                                             int _mma_b_lo_2 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_5) * 1024;
                                             asm volatile(
@@ -2590,15 +2594,15 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
             "}\n"
             :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"(tmem_accumulator), "r"(((idx_5 == 0) ? 0 : 1)));
                                             tcgen05_commit_cg2_multicast(gemm_finished_addr + (ring_5) * 8, (uint16_t)(3));
-                                            phase_bits_6 = phase_bits_6 ^ (unsigned int)(1 << ring_5);
+                                            phase_bits_7 = phase_bits_7 ^ (unsigned int)(1 << ring_5);
                                             ring_5 = (ring_5 + 1) % 6;
                                         }
                                         tcgen05_commit_cg2_multicast(output_arrived_addr, (uint16_t)(3));
                                     }
                                 }
                             } else if (tid < 128) {
-                                mbarrier_wait(output_arrived_addr, phase_bits_6 >> 6 & 1);
-                                phase_bits_6 = phase_bits_6 ^ 64;
+                                mbarrier_wait(output_arrived_addr, phase_bits_7 >> 6 & 1);
+                                phase_bits_7 = phase_bits_7 ^ 64;
                                 unsigned int packed_12[128];
                                 #pragma unroll
                                 for (int chunk_4 = 0; chunk_4 < 8; chunk_4++) {
@@ -2685,12 +2689,12 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 }
                             }
                         }
-                        gemm_phase = phase_bits_6;
+                        gemm_phase = phase_bits_7;
                     } else {
                         if (kind == 4) {
-                            int col_blocks_7 = local_tokens / 256;
+                            int col_blocks_8 = local_tokens / 256;
                             {
-                                col_blocks_7 = hidden / 256;
+                                col_blocks_8 = hidden / 256;
                             }
                             int x_3 = -1;
                             int y_3 = -1;
@@ -2700,20 +2704,20 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             int first_3 = 0;
                             int row_blocks_3 = intermediate / 256;
                             int expert_idx_1 = 0;
-                            int local_task_1 = task_3;
+                            int local_task_1 = task_4;
                             k_end_3 = local_tokens;
                             first_3 = 1;
                             if (k_start_3 < k_end_3) {
                                 int supergroup_3 = local_task_1 / (row_blocks_3 * 8);
-                                int full_cols_3 = col_blocks_7 / 8 * 8;
+                                int full_cols_3 = col_blocks_8 / 8 * 8;
                                 int row_15 = 0;
                                 int col_9 = 0;
                                 if (local_task_1 < row_blocks_3 * full_cols_3) {
                                     row_15 = local_task_1 % (row_blocks_3 * 8) / 8;
                                     col_9 = supergroup_3 * 8 + local_task_1 % 8;
                                 } else {
-                                    row_15 = (local_task_1 - row_blocks_3 * full_cols_3) / (col_blocks_7 - full_cols_3);
-                                    col_9 = full_cols_3 + (local_task_1 - row_blocks_3 * full_cols_3) % (col_blocks_7 - full_cols_3);
+                                    row_15 = (local_task_1 - row_blocks_3 * full_cols_3) / (col_blocks_8 - full_cols_3);
+                                    col_9 = full_cols_3 + (local_task_1 - row_blocks_3 * full_cols_3) % (col_blocks_8 - full_cols_3);
                                 }
                                 if ((supergroup_3 & 1) != 0) {
                                     row_15 = row_blocks_3 - row_15 - 1;
@@ -2722,7 +2726,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 y_3 = col_9;
                                 expert_3 = expert_idx_1;
                             }
-                            unsigned int phase_bits_7 = gemm_phase;
+                            unsigned int phase_bits_8 = gemm_phase;
                             int global_mini_3 = 0;
                             int macro_rows_3 = 0;
                             int iterations_3 = intermediate / 64;
@@ -2758,7 +2762,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 int input_rows_1 = _min_36;
                                                 int input_count_1 = (input_rows_1 + 127) / 128 * ((hidden + 511) / 512);
                                             }
-                                            mbarrier_wait(gemm_finished_addr + (ring_6) * 8, phase_bits_7 >> (unsigned int)(16 + ring_6) & 1);
+                                            mbarrier_wait(gemm_finished_addr + (ring_6) * 8, phase_bits_8 >> (unsigned int)(16 + ring_6) & 1);
                                             int local_row_1 = k_start_3 + idx_6 * 64;
                                             asm volatile(
                                                 "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
@@ -2770,7 +2774,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                                 :: "r"(b_ab_addr + (unsigned int)(ring_6 * 16384)), "l"((&x_atb_s)), "r"(0), "r"(local_row_1), "r"(y_3 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
                                                    "r"(((gemm_arrived_addr + (ring_6) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
-                                            phase_bits_7 = phase_bits_7 ^ (unsigned int)(1 << 16 + ring_6);
+                                            phase_bits_8 = phase_bits_8 ^ (unsigned int)(1 << 16 + ring_6);
                                             ring_6 = (ring_6 + 1) % 6;
                                         }
                                     }
@@ -2780,13 +2784,13 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     if (warp == 4) {
                                         if (elect_sync()) {
                                             int ring_7 = 0;
-                                            mbarrier_wait(output_finished_addr, phase_bits_7 >> 22 & 1);
-                                            phase_bits_7 = phase_bits_7 ^ 4194304;
+                                            mbarrier_wait(output_finished_addr, phase_bits_8 >> 22 & 1);
+                                            phase_bits_8 = phase_bits_8 ^ 4194304;
                                             asm volatile("tcgen05.fence::after_thread_sync;");
                                             #pragma unroll 1
                                             for (int idx_7 = 0; idx_7 < iterations_3; idx_7++) {
                                                 mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_7) * 8, 65536);
-                                                mbarrier_wait(gemm_arrived_addr + (ring_7) * 8, phase_bits_7 >> (unsigned int)ring_7 & 1);
+                                                mbarrier_wait(gemm_arrived_addr + (ring_7) * 8, phase_bits_8 >> (unsigned int)ring_7 & 1);
                                                 int _mma_a_lo_3 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_7) * 1024;
                                                 int _mma_b_lo_3 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_7) * 1024;
                                                 asm volatile(
@@ -2824,15 +2828,15 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
             "}\n"
             :: "r"(_mma_a_lo_3), "r"(_mma_b_lo_3), "r"(tmem_accumulator), "r"(((idx_7 == 0) ? 0 : 1)));
                                                 tcgen05_commit_cg2_multicast(gemm_finished_addr + (ring_7) * 8, (uint16_t)(3));
-                                                phase_bits_7 = phase_bits_7 ^ (unsigned int)(1 << ring_7);
+                                                phase_bits_8 = phase_bits_8 ^ (unsigned int)(1 << ring_7);
                                                 ring_7 = (ring_7 + 1) % 6;
                                             }
                                             tcgen05_commit_cg2_multicast(output_arrived_addr, (uint16_t)(3));
                                         }
                                     }
                                 } else if (tid < 128) {
-                                    mbarrier_wait(output_arrived_addr, phase_bits_7 >> 6 & 1);
-                                    phase_bits_7 = phase_bits_7 ^ 64;
+                                    mbarrier_wait(output_arrived_addr, phase_bits_8 >> 6 & 1);
+                                    phase_bits_8 = phase_bits_8 ^ 64;
                                     unsigned int packed_13[128];
                                     #pragma unroll
                                     for (int chunk_6 = 0; chunk_6 < 8; chunk_6++) {
@@ -2919,11 +2923,11 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     }
                                 }
                             }
-                            gemm_phase = phase_bits_7;
+                            gemm_phase = phase_bits_8;
                         } else if (kind == 5) {
-                            int col_blocks_8 = local_tokens / 256;
+                            int col_blocks_9 = local_tokens / 256;
                             {
-                                col_blocks_8 = hidden / 256;
+                                col_blocks_9 = hidden / 256;
                             }
                             int x_4 = -1;
                             int y_4 = -1;
@@ -2933,20 +2937,20 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             int first_4 = 0;
                             int row_blocks_4 = intermediate / 256;
                             int expert_idx_2 = 0;
-                            int local_task_2 = task_3;
+                            int local_task_2 = task_4;
                             k_end_4 = local_tokens;
                             first_4 = 1;
                             if (k_start_4 < k_end_4) {
                                 int supergroup_4 = local_task_2 / (row_blocks_4 * 8);
-                                int full_cols_4 = col_blocks_8 / 8 * 8;
+                                int full_cols_4 = col_blocks_9 / 8 * 8;
                                 int row_17 = 0;
                                 int col_11 = 0;
                                 if (local_task_2 < row_blocks_4 * full_cols_4) {
                                     row_17 = local_task_2 % (row_blocks_4 * 8) / 8;
                                     col_11 = supergroup_4 * 8 + local_task_2 % 8;
                                 } else {
-                                    row_17 = (local_task_2 - row_blocks_4 * full_cols_4) / (col_blocks_8 - full_cols_4);
-                                    col_11 = full_cols_4 + (local_task_2 - row_blocks_4 * full_cols_4) % (col_blocks_8 - full_cols_4);
+                                    row_17 = (local_task_2 - row_blocks_4 * full_cols_4) / (col_blocks_9 - full_cols_4);
+                                    col_11 = full_cols_4 + (local_task_2 - row_blocks_4 * full_cols_4) % (col_blocks_9 - full_cols_4);
                                 }
                                 if ((supergroup_4 & 1) != 0) {
                                     row_17 = row_blocks_4 - row_17 - 1;
@@ -2955,7 +2959,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 y_4 = col_11;
                                 expert_4 = expert_idx_2;
                             }
-                            unsigned int phase_bits_8 = gemm_phase;
+                            unsigned int phase_bits_9 = gemm_phase;
                             int global_mini_4 = 0;
                             int macro_rows_4 = 0;
                             int iterations_4 = intermediate / 64;
@@ -2991,7 +2995,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 int input_rows_2 = _min_39;
                                                 int input_count_2 = (input_rows_2 + 127) / 128 * ((hidden + 511) / 512);
                                             }
-                                            mbarrier_wait(gemm_finished_addr + (ring_8) * 8, phase_bits_8 >> (unsigned int)(16 + ring_8) & 1);
+                                            mbarrier_wait(gemm_finished_addr + (ring_8) * 8, phase_bits_9 >> (unsigned int)(16 + ring_8) & 1);
                                             int local_row_2 = k_start_4 + idx_8 * 64;
                                             asm volatile(
                                                 "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
@@ -3003,7 +3007,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                                 :: "r"(b_ab_addr + (unsigned int)(ring_8 * 16384)), "l"((&x_atb_s)), "r"(0), "r"(local_row_2), "r"(y_4 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
                                                    "r"(((gemm_arrived_addr + (ring_8) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
-                                            phase_bits_8 = phase_bits_8 ^ (unsigned int)(1 << 16 + ring_8);
+                                            phase_bits_9 = phase_bits_9 ^ (unsigned int)(1 << 16 + ring_8);
                                             ring_8 = (ring_8 + 1) % 6;
                                         }
                                     }
@@ -3013,13 +3017,13 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     if (warp == 4) {
                                         if (elect_sync()) {
                                             int ring_9 = 0;
-                                            mbarrier_wait(output_finished_addr, phase_bits_8 >> 22 & 1);
-                                            phase_bits_8 = phase_bits_8 ^ 4194304;
+                                            mbarrier_wait(output_finished_addr, phase_bits_9 >> 22 & 1);
+                                            phase_bits_9 = phase_bits_9 ^ 4194304;
                                             asm volatile("tcgen05.fence::after_thread_sync;");
                                             #pragma unroll 1
                                             for (int idx_9 = 0; idx_9 < iterations_4; idx_9++) {
                                                 mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_9) * 8, 65536);
-                                                mbarrier_wait(gemm_arrived_addr + (ring_9) * 8, phase_bits_8 >> (unsigned int)ring_9 & 1);
+                                                mbarrier_wait(gemm_arrived_addr + (ring_9) * 8, phase_bits_9 >> (unsigned int)ring_9 & 1);
                                                 int _mma_a_lo_4 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_9) * 1024;
                                                 int _mma_b_lo_4 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_9) * 1024;
                                                 asm volatile(
@@ -3057,15 +3061,15 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
             "}\n"
             :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_4), "r"(tmem_accumulator), "r"(((idx_9 == 0) ? 0 : 1)));
                                                 tcgen05_commit_cg2_multicast(gemm_finished_addr + (ring_9) * 8, (uint16_t)(3));
-                                                phase_bits_8 = phase_bits_8 ^ (unsigned int)(1 << ring_9);
+                                                phase_bits_9 = phase_bits_9 ^ (unsigned int)(1 << ring_9);
                                                 ring_9 = (ring_9 + 1) % 6;
                                             }
                                             tcgen05_commit_cg2_multicast(output_arrived_addr, (uint16_t)(3));
                                         }
                                     }
                                 } else if (tid < 128) {
-                                    mbarrier_wait(output_arrived_addr, phase_bits_8 >> 6 & 1);
-                                    phase_bits_8 = phase_bits_8 ^ 64;
+                                    mbarrier_wait(output_arrived_addr, phase_bits_9 >> 6 & 1);
+                                    phase_bits_9 = phase_bits_9 ^ 64;
                                     unsigned int packed_14[128];
                                     #pragma unroll
                                     for (int chunk_8 = 0; chunk_8 < 8; chunk_8++) {
@@ -3152,12 +3156,12 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     }
                                 }
                             }
-                            gemm_phase = phase_bits_8;
+                            gemm_phase = phase_bits_9;
                         }
                     }
                 }
             } else if (kind == 6) {
-                int col_blocks_9 = intermediate / 256;
+                int col_blocks_10 = intermediate / 256;
                 int x_5 = -1;
                 int y_5 = -1;
                 int expert_5 = -1;
@@ -3166,7 +3170,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                 int first_5 = 0;
                 int first_block = (macro_1 * (macro_size / mini_size) + mini_1) * (mini_size / 256);
                 int offset_7 = 0;
-                int remaining = task_3;
+                int remaining = task_4;
                 #pragma unroll 1
                 for (int index = 0; index < experts; index++) {
                     int blocks = counts[index] / 256;
@@ -3175,18 +3179,18 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                     int _min_41 = ((first_block + mini_size / 256) < (offset_7 + blocks) ? (first_block + mini_size / 256) : (offset_7 + blocks));
                     int _max_13 = ((0) > (_min_41 - first_row_2) ? (0) : (_min_41 - first_row_2));
                     int rows_3 = _max_13;
-                    int tasks = rows_3 * col_blocks_9;
+                    int tasks = rows_3 * col_blocks_10;
                     if (remaining < tasks) {
                         int supergroup_5 = remaining / (rows_3 * 8);
-                        int full_cols_5 = col_blocks_9 / 8 * 8;
+                        int full_cols_5 = col_blocks_10 / 8 * 8;
                         int row_19 = 0;
                         int col_13 = 0;
                         if (remaining < rows_3 * full_cols_5) {
                             row_19 = remaining % (rows_3 * 8) / 8;
                             col_13 = supergroup_5 * 8 + remaining % 8;
                         } else {
-                            row_19 = (remaining - rows_3 * full_cols_5) / (col_blocks_9 - full_cols_5);
-                            col_13 = full_cols_5 + (remaining - rows_3 * full_cols_5) % (col_blocks_9 - full_cols_5);
+                            row_19 = (remaining - rows_3 * full_cols_5) / (col_blocks_10 - full_cols_5);
+                            col_13 = full_cols_5 + (remaining - rows_3 * full_cols_5) % (col_blocks_10 - full_cols_5);
                         }
                         if ((supergroup_5 & 1) != 0) {
                             row_19 = rows_3 - row_19 - 1;
@@ -3199,7 +3203,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                     remaining = remaining - tasks;
                     offset_7 = offset_7 + blocks;
                 }
-                unsigned int phase_bits_9 = gemm_phase;
+                unsigned int phase_bits_10 = gemm_phase;
                 int global_mini_5 = macro_1 * (macro_size / mini_size) + mini_1;
                 int macro_rows_5 = macro_1 * (macro_size / 256);
                 int iterations_5 = hidden / 128;
@@ -3233,7 +3237,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             int ring_10 = 0;
                             #pragma unroll 1
                             for (int idx_10 = 0; idx_10 < iterations_5; idx_10++) {
-                                mbarrier_wait(gemm_finished_addr + (ring_10) * 8, phase_bits_9 >> (unsigned int)(16 + ring_10) & 1);
+                                mbarrier_wait(gemm_finished_addr + (ring_10) * 8, phase_bits_10 >> (unsigned int)(16 + ring_10) & 1);
                                 asm volatile(
                                     "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                     " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
@@ -3244,7 +3248,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                     :: "r"(b_fp8_smem_addr + (unsigned int)(ring_10 * 16384)), "l"((&wg_r)), "r"(0), "r"(y_5 * 256 + cta_rank_0 * 128), "r"(idx_10), "r"(expert_5), "r"(0),
                                        "r"(((gemm_arrived_addr + (ring_10) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
-                                phase_bits_9 = phase_bits_9 ^ (unsigned int)(1 << 16 + ring_10);
+                                phase_bits_10 = phase_bits_10 ^ (unsigned int)(1 << 16 + ring_10);
                                 ring_10 = (ring_10 + 1) % 6;
                             }
                         }
@@ -3275,7 +3279,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 int ring_11 = 0;
                                 #pragma unroll 1
                                 for (int idx_11 = 0; idx_11 < iterations_5; idx_11++) {
-                                    mbarrier_wait(scales_finished_addr + (ring_11) * 8, phase_bits_9 >> (unsigned int)(23 + ring_11) & 1);
+                                    mbarrier_wait(scales_finished_addr + (ring_11) * 8, phase_bits_10 >> (unsigned int)(23 + ring_11) & 1);
                                     int a_tile = (x_5 * 2 + cta_rank_0) * k_blocks + idx_11;
                                     int b_tile = (expert_5 * n_blocks + y_5 * 2 + cta_rank_0) * k_blocks + idx_11;
                                     asm volatile(
@@ -3288,7 +3292,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                                         :: "r"(b_sc_smem_addr + (unsigned int)(ring_11 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&wg_sc_r)), "r"(0), "r"(b_tile * 32), "r"(0),
                                            "r"(((scales_arrived_addr + (ring_11) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)) : "memory");
-                                    phase_bits_9 = phase_bits_9 ^ (unsigned int)(1 << 23 + ring_11);
+                                    phase_bits_10 = phase_bits_10 ^ (unsigned int)(1 << 23 + ring_11);
                                     ring_11 = (ring_11 + 1) % 6;
                                 }
                             }
@@ -3297,19 +3301,19 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         if (warp == 4) {
                             if (elect_sync()) {
                                 int ring_12 = 0;
-                                mbarrier_wait(output_finished_addr, phase_bits_9 >> 22 & 1);
-                                phase_bits_9 = phase_bits_9 ^ 4194304;
+                                mbarrier_wait(output_finished_addr, phase_bits_10 >> 22 & 1);
+                                phase_bits_10 = phase_bits_10 ^ 4194304;
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 #pragma unroll 1
                                 for (int idx_12 = 0; idx_12 < iterations_5; idx_12++) {
                                     mbarrier_arrive_expect_tx(scales_arrived_addr + (ring_12) * 8, 3072);
-                                    mbarrier_wait(scales_arrived_addr + (ring_12) * 8, phase_bits_9 >> (unsigned int)(7 + ring_12) & 1);
+                                    mbarrier_wait(scales_arrived_addr + (ring_12) * 8, phase_bits_10 >> (unsigned int)(7 + ring_12) & 1);
                                     tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_a + ring_12 * 4, make_sf_cp_desc_sbo128(a_sc_smem_addr + (unsigned int)(ring_12 * 512)));
                                     tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_b + ring_12 * 8, make_sf_cp_desc_sbo128(b_sc_smem_addr + (unsigned int)(ring_12 * 1024)));
                                     tcgen05_cp_32x128b_warpx4_cta2((tmem_sf_b + ring_12 * 8 + 4), make_sf_cp_desc_sbo128((b_sc_smem_addr + (unsigned int)(ring_12 * 1024) + 512)));
                                     tcgen05_commit_cg2_multicast(scales_finished_addr + (ring_12) * 8, (uint16_t)(3));
                                     mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_12) * 8, 65536);
-                                    mbarrier_wait(gemm_arrived_addr + (ring_12) * 8, phase_bits_9 >> (unsigned int)ring_12 & 1);
+                                    mbarrier_wait(gemm_arrived_addr + (ring_12) * 8, phase_bits_10 >> (unsigned int)ring_12 & 1);
                                     int _mma_a_lo_5 = (((a_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_12) * 1024;
                                     int _mma_b_lo_5 = (((b_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_12) * 1024;
                                     {
@@ -3326,8 +3330,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             (0x10c00000U | ((3) << 29) | ((3) << 4)), tmem_sf_a + ring_12 * 4, tmem_sf_b + ring_12 * 8, 1);
                                     }
                                     tcgen05_commit_cg2_multicast(gemm_finished_addr + (ring_12) * 8, (uint16_t)(3));
-                                    phase_bits_9 = phase_bits_9 ^ (unsigned int)(1 << ring_12);
-                                    phase_bits_9 = phase_bits_9 ^ (unsigned int)(1 << 7 + ring_12);
+                                    phase_bits_10 = phase_bits_10 ^ (unsigned int)(1 << ring_12);
+                                    phase_bits_10 = phase_bits_10 ^ (unsigned int)(1 << 7 + ring_12);
                                     ring_12 = (ring_12 + 1) % 6;
                                 }
                                 tcgen05_commit_cg2_multicast(output_arrived_addr, (uint16_t)(3));
@@ -3335,8 +3339,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         }
                     } else {
                         if (tid < 128) {
-                            mbarrier_wait(output_arrived_addr, phase_bits_9 >> 6 & 1);
-                            phase_bits_9 = phase_bits_9 ^ 64;
+                            mbarrier_wait(output_arrived_addr, phase_bits_10 >> 6 & 1);
+                            phase_bits_10 = phase_bits_10 ^ 64;
                             int tile_row = tid;
                             float inv_e4m3_max_3 = 0.002232142857f;
                             float scale_floor_3 = 1e-12f;
@@ -3472,10 +3476,10 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         }
                     }
                 }
-                gemm_phase = phase_bits_9;
+                gemm_phase = phase_bits_10;
             } else {
                 if (kind == 7) {
-                    int col_blocks_10 = intermediate / 256;
+                    int col_blocks_11 = intermediate / 256;
                     int x_6 = -1;
                     int y_6 = -1;
                     int expert_6 = -1;
@@ -3484,7 +3488,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                     int first_6 = 0;
                     int first_block_1 = (macro_1 * (macro_size / mini_size) + mini_1) * (mini_size / 256);
                     int offset_8 = 0;
-                    int remaining_1 = task_3;
+                    int remaining_1 = task_4;
                     #pragma unroll 1
                     for (int index_1 = 0; index_1 < experts; index_1++) {
                         int blocks_1 = counts[index_1] / 256;
@@ -3493,18 +3497,18 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         int _min_44 = ((first_block_1 + mini_size / 256) < (offset_8 + blocks_1) ? (first_block_1 + mini_size / 256) : (offset_8 + blocks_1));
                         int _max_18 = ((0) > (_min_44 - first_row_3) ? (0) : (_min_44 - first_row_3));
                         int rows_4 = _max_18;
-                        int tasks_1 = rows_4 * col_blocks_10;
+                        int tasks_1 = rows_4 * col_blocks_11;
                         if (remaining_1 < tasks_1) {
                             int supergroup_6 = remaining_1 / (rows_4 * 8);
-                            int full_cols_6 = col_blocks_10 / 8 * 8;
+                            int full_cols_6 = col_blocks_11 / 8 * 8;
                             int row_20 = 0;
                             int col_14 = 0;
                             if (remaining_1 < rows_4 * full_cols_6) {
                                 row_20 = remaining_1 % (rows_4 * 8) / 8;
                                 col_14 = supergroup_6 * 8 + remaining_1 % 8;
                             } else {
-                                row_20 = (remaining_1 - rows_4 * full_cols_6) / (col_blocks_10 - full_cols_6);
-                                col_14 = full_cols_6 + (remaining_1 - rows_4 * full_cols_6) % (col_blocks_10 - full_cols_6);
+                                row_20 = (remaining_1 - rows_4 * full_cols_6) / (col_blocks_11 - full_cols_6);
+                                col_14 = full_cols_6 + (remaining_1 - rows_4 * full_cols_6) % (col_blocks_11 - full_cols_6);
                             }
                             if ((supergroup_6 & 1) != 0) {
                                 row_20 = rows_4 - row_20 - 1;
@@ -3517,7 +3521,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         remaining_1 = remaining_1 - tasks_1;
                         offset_8 = offset_8 + blocks_1;
                     }
-                    unsigned int phase_bits_10 = gemm_phase;
+                    unsigned int phase_bits_11 = gemm_phase;
                     int global_mini_6 = macro_1 * (macro_size / mini_size) + mini_1;
                     int macro_rows_6 = macro_1 * (macro_size / 256);
                     int iterations_6 = hidden / 128;
@@ -3551,7 +3555,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 int ring_13 = 0;
                                 #pragma unroll 1
                                 for (int idx_13 = 0; idx_13 < iterations_6; idx_13++) {
-                                    mbarrier_wait(gemm_finished_addr + (ring_13) * 8, phase_bits_10 >> (unsigned int)(16 + ring_13) & 1);
+                                    mbarrier_wait(gemm_finished_addr + (ring_13) * 8, phase_bits_11 >> (unsigned int)(16 + ring_13) & 1);
                                     asm volatile(
                                         "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
@@ -3562,7 +3566,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                         :: "r"(b_fp8_smem_addr + (unsigned int)(ring_13 * 16384)), "l"((&wu_r)), "r"(0), "r"(y_6 * 256 + cta_rank_0 * 128), "r"(idx_13), "r"(expert_6), "r"(0),
                                            "r"(((gemm_arrived_addr + (ring_13) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
-                                    phase_bits_10 = phase_bits_10 ^ (unsigned int)(1 << 16 + ring_13);
+                                    phase_bits_11 = phase_bits_11 ^ (unsigned int)(1 << 16 + ring_13);
                                     ring_13 = (ring_13 + 1) % 6;
                                 }
                             }
@@ -3593,7 +3597,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     int ring_14 = 0;
                                     #pragma unroll 1
                                     for (int idx_14 = 0; idx_14 < iterations_6; idx_14++) {
-                                        mbarrier_wait(scales_finished_addr + (ring_14) * 8, phase_bits_10 >> (unsigned int)(23 + ring_14) & 1);
+                                        mbarrier_wait(scales_finished_addr + (ring_14) * 8, phase_bits_11 >> (unsigned int)(23 + ring_14) & 1);
                                         int a_tile_1 = (x_6 * 2 + cta_rank_0) * k_blocks_1 + idx_14;
                                         int b_tile_1 = (expert_6 * n_blocks_1 + y_6 * 2 + cta_rank_0) * k_blocks_1 + idx_14;
                                         asm volatile(
@@ -3606,7 +3610,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                                             :: "r"(b_sc_smem_addr + (unsigned int)(ring_14 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&wu_sc_r)), "r"(0), "r"(b_tile_1 * 32), "r"(0),
                                                "r"(((scales_arrived_addr + (ring_14) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)) : "memory");
-                                        phase_bits_10 = phase_bits_10 ^ (unsigned int)(1 << 23 + ring_14);
+                                        phase_bits_11 = phase_bits_11 ^ (unsigned int)(1 << 23 + ring_14);
                                         ring_14 = (ring_14 + 1) % 6;
                                     }
                                 }
@@ -3615,19 +3619,19 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             if (warp == 4) {
                                 if (elect_sync()) {
                                     int ring_15 = 0;
-                                    mbarrier_wait(output_finished_addr, phase_bits_10 >> 22 & 1);
-                                    phase_bits_10 = phase_bits_10 ^ 4194304;
+                                    mbarrier_wait(output_finished_addr, phase_bits_11 >> 22 & 1);
+                                    phase_bits_11 = phase_bits_11 ^ 4194304;
                                     asm volatile("tcgen05.fence::after_thread_sync;");
                                     #pragma unroll 1
                                     for (int idx_15 = 0; idx_15 < iterations_6; idx_15++) {
                                         mbarrier_arrive_expect_tx(scales_arrived_addr + (ring_15) * 8, 3072);
-                                        mbarrier_wait(scales_arrived_addr + (ring_15) * 8, phase_bits_10 >> (unsigned int)(7 + ring_15) & 1);
+                                        mbarrier_wait(scales_arrived_addr + (ring_15) * 8, phase_bits_11 >> (unsigned int)(7 + ring_15) & 1);
                                         tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_a + ring_15 * 4, make_sf_cp_desc_sbo128(a_sc_smem_addr + (unsigned int)(ring_15 * 512)));
                                         tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_b + ring_15 * 8, make_sf_cp_desc_sbo128(b_sc_smem_addr + (unsigned int)(ring_15 * 1024)));
                                         tcgen05_cp_32x128b_warpx4_cta2((tmem_sf_b + ring_15 * 8 + 4), make_sf_cp_desc_sbo128((b_sc_smem_addr + (unsigned int)(ring_15 * 1024) + 512)));
                                         tcgen05_commit_cg2_multicast(scales_finished_addr + (ring_15) * 8, (uint16_t)(3));
                                         mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_15) * 8, 65536);
-                                        mbarrier_wait(gemm_arrived_addr + (ring_15) * 8, phase_bits_10 >> (unsigned int)ring_15 & 1);
+                                        mbarrier_wait(gemm_arrived_addr + (ring_15) * 8, phase_bits_11 >> (unsigned int)ring_15 & 1);
                                         int _mma_a_lo_6 = (((a_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_15) * 1024;
                                         int _mma_b_lo_6 = (((b_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_15) * 1024;
                                         {
@@ -3644,8 +3648,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 (0x10c00000U | ((3) << 29) | ((3) << 4)), tmem_sf_a + ring_15 * 4, tmem_sf_b + ring_15 * 8, 1);
                                         }
                                         tcgen05_commit_cg2_multicast(gemm_finished_addr + (ring_15) * 8, (uint16_t)(3));
-                                        phase_bits_10 = phase_bits_10 ^ (unsigned int)(1 << ring_15);
-                                        phase_bits_10 = phase_bits_10 ^ (unsigned int)(1 << 7 + ring_15);
+                                        phase_bits_11 = phase_bits_11 ^ (unsigned int)(1 << ring_15);
+                                        phase_bits_11 = phase_bits_11 ^ (unsigned int)(1 << 7 + ring_15);
                                         ring_15 = (ring_15 + 1) % 6;
                                     }
                                     tcgen05_commit_cg2_multicast(output_arrived_addr, (uint16_t)(3));
@@ -3653,8 +3657,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             }
                         } else {
                             if (tid < 128) {
-                                mbarrier_wait(output_arrived_addr, phase_bits_10 >> 6 & 1);
-                                phase_bits_10 = phase_bits_10 ^ 64;
+                                mbarrier_wait(output_arrived_addr, phase_bits_11 >> 6 & 1);
+                                phase_bits_11 = phase_bits_11 ^ 64;
                                 int tile_row_1 = tid;
                                 float inv_e4m3_max_4 = 0.002232142857f;
                                 float scale_floor_4 = 1e-12f;
@@ -3790,30 +3794,30 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             }
                         }
                     }
-                    gemm_phase = phase_bits_10;
+                    gemm_phase = phase_bits_11;
                 } else if (kind == 8) {
-                    unsigned int phase_bits_11 = replay_phase;
-                    int col_blocks_11 = intermediate / 128;
-                    int num_tiles_1 = (tokens + 127) / 128 * col_blocks_11;
+                    unsigned int phase_bits_12 = replay_phase;
+                    int col_blocks_12 = intermediate / 128;
+                    int num_tiles_1 = (tokens + 127) / 128 * col_blocks_12;
                     int macro_row_offset_1 = macro_1 * (macro_size / 128);
                     int macro_row_blocks_1 = macro_size / 128;
                     int global_mini_7 = macro_1 * (macro_size / mini_size) + mini_1;
-                    int mini_tiles = mini_size / 128 * col_blocks_11;
-                    int first_tile_2 = task_3 * 6 + cta_rank_0 * 3 + global_mini_7 * mini_tiles;
+                    int mini_tiles = mini_size / 128 * col_blocks_12;
+                    int first_tile_2 = task_4 * 6 + cta_rank_0 * 3 + global_mini_7 * mini_tiles;
                     int _min_47 = ((num_tiles_1) < ((global_mini_7 + 1) * mini_tiles) ? (num_tiles_1) : ((global_mini_7 + 1) * mini_tiles));
                     int tile_end_1 = _min_47;
                     if (first_tile_2 < tile_end_1) {
-                        int first_row_4 = first_tile_2 / col_blocks_11;
-                        int first_col_2 = first_tile_2 % col_blocks_11;
+                        int first_row_4 = first_tile_2 / col_blocks_12;
+                        int first_col_2 = first_tile_2 % col_blocks_12;
                         if (tid == 0) {
                             #pragma unroll
                             for (int stage_7 = 0; stage_7 < 3; stage_7++) {
                                 if (tile_end_1 > first_tile_2 + stage_7) {
                                     int row_21 = first_row_4;
                                     int col_15 = first_col_2 + stage_7;
-                                    if (col_15 >= col_blocks_11) {
+                                    if (col_15 >= col_blocks_12) {
                                         row_21 = row_21 + 1;
-                                        col_15 = col_15 - col_blocks_11;
+                                        col_15 = col_15 - col_blocks_12;
                                     }
                                     mbarrier_arrive_expect_tx(replay_arrived_addr + (stage_7) * 8, 65536);
                                     int parent_1 = row_21 / 2 * (intermediate / 256) + col_15 / 2;
@@ -3843,13 +3847,13 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         #pragma unroll 1
                         for (int stage_8 = 0; stage_8 < 3; stage_8++) {
                             if (tile_end_1 > first_tile_2 + stage_8) {
-                                mbarrier_wait(replay_arrived_addr + (stage_8) * 8, phase_bits_11 >> (unsigned int)stage_8 & 1);
-                                phase_bits_11 = phase_bits_11 ^ (unsigned int)(1 << stage_8);
+                                mbarrier_wait(replay_arrived_addr + (stage_8) * 8, phase_bits_12 >> (unsigned int)stage_8 & 1);
+                                phase_bits_12 = phase_bits_12 ^ (unsigned int)(1 << stage_8);
                                 int row_22 = first_row_4;
                                 int col_16 = first_col_2 + stage_8;
-                                if (col_16 >= col_blocks_11) {
+                                if (col_16 >= col_blocks_12) {
                                     row_22 = row_22 + 1;
-                                    col_16 = col_16 - col_blocks_11;
+                                    col_16 = col_16 - col_blocks_12;
                                 }
                                 if (swiglu_clamped != 0) {
                                     #pragma unroll
@@ -4061,7 +4065,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     int local_row_3 = row_22 - macro_row_offset_1;
                                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                                     tma_store_2d((&h_fp8_r), col_16 * 128, local_row_3 * 128, gate_flat_addr + (unsigned int)(stage_8 * 32768));
-                                    tma_store_3d((&h_sc_r), 0, (local_row_3 * col_blocks_11 + col_16) * 32, 0, gate_flat_addr + (unsigned int)(stage_8 * 32768) + 16384);
+                                    tma_store_3d((&h_sc_r), 0, (local_row_3 * col_blocks_12 + col_16) * 32, 0, gate_flat_addr + (unsigned int)(stage_8 * 32768) + 16384);
                                     tma_store_2d((&h_fp8_t_r), local_row_3 * 128, col_16 * 128, up_flat_addr + (unsigned int)(stage_8 * 32768));
                                     tma_store_3d((&h_sc_t_r), 0, (col_16 * macro_row_blocks_1 + local_row_3) * 32, 0, up_flat_addr + (unsigned int)(stage_8 * 32768) + 16384);
                                     asm volatile("cp.async.bulk.commit_group;");
@@ -4074,7 +4078,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             for (int stage_9 = 0; stage_9 < 3; stage_9++) {
                                 if (tile_end_1 > first_tile_2 + stage_9) {
                                     int row_23 = first_row_4;
-                                    if (col_blocks_11 <= first_col_2 + stage_9) {
+                                    if (col_blocks_12 <= first_col_2 + stage_9) {
                                         row_23 = row_23 + 1;
                                     }
                                     asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(replay_h)) + (row_23 / 2))), "r"(static_cast<unsigned int>(1)) : "memory");
@@ -4082,10 +4086,10 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             }
                         }
                     }
-                    replay_phase = phase_bits_11;
+                    replay_phase = phase_bits_12;
                 } else {
                     if (kind == 0) {
-                        int col_blocks_12 = intermediate / 256;
+                        int col_blocks_13 = intermediate / 256;
                         int x_7 = -1;
                         int y_7 = -1;
                         int expert_7 = -1;
@@ -4094,7 +4098,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         int first_7 = 0;
                         int first_block_2 = (macro_1 * (macro_size / mini_size) + mini_1) * (mini_size / 256);
                         int offset_9 = 0;
-                        int remaining_2 = task_3;
+                        int remaining_2 = task_4;
                         #pragma unroll 1
                         for (int index_2 = 0; index_2 < experts; index_2++) {
                             int blocks_2 = counts[index_2] / 256;
@@ -4103,18 +4107,18 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             int _min_52 = ((first_block_2 + mini_size / 256) < (offset_9 + blocks_2) ? (first_block_2 + mini_size / 256) : (offset_9 + blocks_2));
                             int _max_27 = ((0) > (_min_52 - first_row_5) ? (0) : (_min_52 - first_row_5));
                             int rows_5 = _max_27;
-                            int tasks_2 = rows_5 * col_blocks_12;
+                            int tasks_2 = rows_5 * col_blocks_13;
                             if (remaining_2 < tasks_2) {
                                 int supergroup_7 = remaining_2 / (rows_5 * 8);
-                                int full_cols_7 = col_blocks_12 / 8 * 8;
+                                int full_cols_7 = col_blocks_13 / 8 * 8;
                                 int row_24 = 0;
                                 int col_17 = 0;
                                 if (remaining_2 < rows_5 * full_cols_7) {
                                     row_24 = remaining_2 % (rows_5 * 8) / 8;
                                     col_17 = supergroup_7 * 8 + remaining_2 % 8;
                                 } else {
-                                    row_24 = (remaining_2 - rows_5 * full_cols_7) / (col_blocks_12 - full_cols_7);
-                                    col_17 = full_cols_7 + (remaining_2 - rows_5 * full_cols_7) % (col_blocks_12 - full_cols_7);
+                                    row_24 = (remaining_2 - rows_5 * full_cols_7) / (col_blocks_13 - full_cols_7);
+                                    col_17 = full_cols_7 + (remaining_2 - rows_5 * full_cols_7) % (col_blocks_13 - full_cols_7);
                                 }
                                 if ((supergroup_7 & 1) != 0) {
                                     row_24 = rows_5 - row_24 - 1;
@@ -4127,7 +4131,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             remaining_2 = remaining_2 - tasks_2;
                             offset_9 = offset_9 + blocks_2;
                         }
-                        unsigned int phase_bits_12 = gemm_phase;
+                        unsigned int phase_bits_13 = gemm_phase;
                         int global_mini_8 = macro_1 * (macro_size / mini_size) + mini_1;
                         int macro_rows_7 = macro_1 * (macro_size / 256);
                         int iterations_7 = hidden / 128;
@@ -4165,7 +4169,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     int ring_16 = 0;
                                     #pragma unroll 1
                                     for (int idx_16 = 0; idx_16 < iterations_7; idx_16++) {
-                                        mbarrier_wait(gemm_finished_addr + (ring_16) * 8, phase_bits_12 >> (unsigned int)(16 + ring_16) & 1);
+                                        mbarrier_wait(gemm_finished_addr + (ring_16) * 8, phase_bits_13 >> (unsigned int)(16 + ring_16) & 1);
                                         asm volatile(
                                             "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                             " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
@@ -4176,7 +4180,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                             :: "r"(b_fp8_smem_addr + (unsigned int)(ring_16 * 16384)), "l"((&wd_t_r)), "r"(0), "r"(y_7 * 256 + cta_rank_0 * 128), "r"(idx_16), "r"(expert_7), "r"(0),
                                                "r"(((gemm_arrived_addr + (ring_16) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
-                                        phase_bits_12 = phase_bits_12 ^ (unsigned int)(1 << 16 + ring_16);
+                                        phase_bits_13 = phase_bits_13 ^ (unsigned int)(1 << 16 + ring_16);
                                         ring_16 = (ring_16 + 1) % 6;
                                     }
                                 }
@@ -4207,7 +4211,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         int ring_17 = 0;
                                         #pragma unroll 1
                                         for (int idx_17 = 0; idx_17 < iterations_7; idx_17++) {
-                                            mbarrier_wait(scales_finished_addr + (ring_17) * 8, phase_bits_12 >> (unsigned int)(23 + ring_17) & 1);
+                                            mbarrier_wait(scales_finished_addr + (ring_17) * 8, phase_bits_13 >> (unsigned int)(23 + ring_17) & 1);
                                             int a_tile_2 = (x_7 * 2 + cta_rank_0) * k_blocks_2 + idx_17;
                                             int b_tile_2 = (expert_7 * n_blocks_2 + y_7 * 2 + cta_rank_0) * k_blocks_2 + idx_17;
                                             asm volatile(
@@ -4220,7 +4224,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                                                 :: "r"(b_sc_smem_addr + (unsigned int)(ring_17 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&wd_t_sc_r)), "r"(0), "r"(b_tile_2 * 32), "r"(0),
                                                    "r"(((scales_arrived_addr + (ring_17) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)) : "memory");
-                                            phase_bits_12 = phase_bits_12 ^ (unsigned int)(1 << 23 + ring_17);
+                                            phase_bits_13 = phase_bits_13 ^ (unsigned int)(1 << 23 + ring_17);
                                             ring_17 = (ring_17 + 1) % 6;
                                         }
                                     }
@@ -4229,19 +4233,19 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 if (warp == 4) {
                                     if (elect_sync()) {
                                         int ring_18 = 0;
-                                        mbarrier_wait(output_finished_addr, phase_bits_12 >> 22 & 1);
-                                        phase_bits_12 = phase_bits_12 ^ 4194304;
+                                        mbarrier_wait(output_finished_addr, phase_bits_13 >> 22 & 1);
+                                        phase_bits_13 = phase_bits_13 ^ 4194304;
                                         asm volatile("tcgen05.fence::after_thread_sync;");
                                         #pragma unroll 1
                                         for (int idx_18 = 0; idx_18 < iterations_7; idx_18++) {
                                             mbarrier_arrive_expect_tx(scales_arrived_addr + (ring_18) * 8, 3072);
-                                            mbarrier_wait(scales_arrived_addr + (ring_18) * 8, phase_bits_12 >> (unsigned int)(7 + ring_18) & 1);
+                                            mbarrier_wait(scales_arrived_addr + (ring_18) * 8, phase_bits_13 >> (unsigned int)(7 + ring_18) & 1);
                                             tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_a + ring_18 * 4, make_sf_cp_desc_sbo128(a_sc_smem_addr + (unsigned int)(ring_18 * 512)));
                                             tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_b + ring_18 * 8, make_sf_cp_desc_sbo128(b_sc_smem_addr + (unsigned int)(ring_18 * 1024)));
                                             tcgen05_cp_32x128b_warpx4_cta2((tmem_sf_b + ring_18 * 8 + 4), make_sf_cp_desc_sbo128((b_sc_smem_addr + (unsigned int)(ring_18 * 1024) + 512)));
                                             tcgen05_commit_cg2_multicast(scales_finished_addr + (ring_18) * 8, (uint16_t)(3));
                                             mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_18) * 8, 65536);
-                                            mbarrier_wait(gemm_arrived_addr + (ring_18) * 8, phase_bits_12 >> (unsigned int)ring_18 & 1);
+                                            mbarrier_wait(gemm_arrived_addr + (ring_18) * 8, phase_bits_13 >> (unsigned int)ring_18 & 1);
                                             int _mma_a_lo_7 = (((a_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_18) * 1024;
                                             int _mma_b_lo_7 = (((b_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_18) * 1024;
                                             {
@@ -4258,8 +4262,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     (0x10c00000U | ((3) << 29) | ((3) << 4)), tmem_sf_a + ring_18 * 4, tmem_sf_b + ring_18 * 8, 1);
                                             }
                                             tcgen05_commit_cg2_multicast(gemm_finished_addr + (ring_18) * 8, (uint16_t)(3));
-                                            phase_bits_12 = phase_bits_12 ^ (unsigned int)(1 << ring_18);
-                                            phase_bits_12 = phase_bits_12 ^ (unsigned int)(1 << 7 + ring_18);
+                                            phase_bits_13 = phase_bits_13 ^ (unsigned int)(1 << ring_18);
+                                            phase_bits_13 = phase_bits_13 ^ (unsigned int)(1 << 7 + ring_18);
                                             ring_18 = (ring_18 + 1) % 6;
                                         }
                                         tcgen05_commit_cg2_multicast(output_arrived_addr, (uint16_t)(3));
@@ -4267,8 +4271,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 }
                             } else {
                                 if (tid < 128) {
-                                    mbarrier_wait(output_arrived_addr, phase_bits_12 >> 6 & 1);
-                                    phase_bits_12 = phase_bits_12 ^ 64;
+                                    mbarrier_wait(output_arrived_addr, phase_bits_13 >> 6 & 1);
+                                    phase_bits_13 = phase_bits_13 ^ 64;
                                     unsigned int packed_17[128];
                                     #pragma unroll
                                     for (int chunk_10 = 0; chunk_10 < 8; chunk_10++) {
@@ -4359,30 +4363,30 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 }
                             }
                         }
-                        gemm_phase = phase_bits_12;
+                        gemm_phase = phase_bits_13;
                     } else if (kind == 1) {
-                        unsigned int phase_bits_13 = swiglu_phase;
-                        int col_blocks_13 = intermediate / 128;
-                        int num_tiles_2 = (tokens + 127) / 128 * col_blocks_13;
+                        unsigned int phase_bits_14 = swiglu_phase;
+                        int col_blocks_14 = intermediate / 128;
+                        int num_tiles_2 = (tokens + 127) / 128 * col_blocks_14;
                         int macro_row_offset_2 = macro_1 * (macro_size / 128);
                         int macro_row_blocks_2 = macro_size / 128;
                         int global_mini_9 = macro_1 * (macro_size / mini_size) + mini_1;
-                        int mini_tiles_1 = mini_size / 128 * col_blocks_13;
-                        int first_tile_3 = task_3 * 4 + cta_rank_0 * 2 + global_mini_9 * mini_tiles_1;
+                        int mini_tiles_1 = mini_size / 128 * col_blocks_14;
+                        int first_tile_3 = task_4 * 4 + cta_rank_0 * 2 + global_mini_9 * mini_tiles_1;
                         int _min_56 = ((num_tiles_2) < ((global_mini_9 + 1) * mini_tiles_1) ? (num_tiles_2) : ((global_mini_9 + 1) * mini_tiles_1));
                         int tile_end_2 = _min_56;
                         if (first_tile_3 < tile_end_2) {
-                            int first_row_6 = first_tile_3 / col_blocks_13;
-                            int first_col_3 = first_tile_3 % col_blocks_13;
+                            int first_row_6 = first_tile_3 / col_blocks_14;
+                            int first_col_3 = first_tile_3 % col_blocks_14;
                             if (tid == 0) {
                                 #pragma unroll
                                 for (int stage_10 = 0; stage_10 < 2; stage_10++) {
                                     if (tile_end_2 > first_tile_3 + stage_10) {
                                         int row_26 = first_row_6;
                                         int col_19 = first_col_3 + stage_10;
-                                        if (col_19 >= col_blocks_13) {
+                                        if (col_19 >= col_blocks_14) {
                                             row_26 = row_26 + 1;
-                                            col_19 = col_19 - col_blocks_13;
+                                            col_19 = col_19 - col_blocks_14;
                                         }
                                         mbarrier_arrive_expect_tx(swiglu_arrived_addr + (stage_10) * 8, 66560);
                                         int parent_2 = row_26 / 2 * (intermediate / 256) + col_19 / 2;
@@ -4410,7 +4414,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             asm volatile("fence.acquire.gpu;" ::: "memory");
                                         }
                                         int local_block = row_26 - macro_row_offset_2;
-                                        int scale_tile = (local_block * col_blocks_13 + col_19) * 32;
+                                        int scale_tile = (local_block * col_blocks_14 + col_19) * 32;
                                         asm volatile(
                                             "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                                             " [%0], [%1, {%2, %3}], [%4];"
@@ -4445,14 +4449,14 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 if (tile_end_2 > first_tile_3 + stage_11) {
                                     int row_27 = first_row_6;
                                     int col_20 = first_col_3 + stage_11;
-                                    if (col_20 >= col_blocks_13) {
+                                    if (col_20 >= col_blocks_14) {
                                         row_27 = row_27 + 1;
-                                        col_20 = col_20 - col_blocks_13;
+                                        col_20 = col_20 - col_blocks_14;
                                     }
                                     int local_block_1 = row_27 - macro_row_offset_2;
                                     int local_row_4 = local_block_1 * 128 + tile_row_2;
-                                    mbarrier_wait(swiglu_arrived_addr + (stage_11) * 8, phase_bits_13 >> (unsigned int)stage_11 & 1);
-                                    phase_bits_13 = phase_bits_13 ^ (unsigned int)(1 << stage_11);
+                                    mbarrier_wait(swiglu_arrived_addr + (stage_11) * 8, phase_bits_14 >> (unsigned int)stage_11 & 1);
+                                    phase_bits_14 = phase_bits_14 ^ (unsigned int)(1 << stage_11);
                                     int32_t _relaxed_ld_38;
                                     asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_38) : "l"(schedule_rank + (row_27 * 128 + tile_row_2)) : "memory");
                                     int peer_5 = _relaxed_ld_38;
@@ -4733,7 +4737,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     }
                                     __syncthreads();
                                     if (tid == 0) {
-                                        int scale_tile_1 = (local_block_1 * col_blocks_13 + col_20) * 32;
+                                        int scale_tile_1 = (local_block_1 * col_blocks_14 + col_20) * 32;
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                                         tma_store_2d((&dg_fp8_r), col_20 * 128, local_block_1 * 128, q_flat_addr + 65536 + (unsigned int)(stage_11 * 16384));
                                         tma_store_3d((&dg_sc_r), 0, scale_tile_1, 0, q_flat_addr + 131072 + (unsigned int)(stage_11 * 512));
@@ -4837,7 +4841,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     }
                                     if (half_15 == 0 && peer_5 >= 0) {
                                         router_gradient = router_gradient + q_router[stage_11 * 128 + tile_row_2];
-                                        partials[local_row_4 * col_blocks_13 + col_20] = router_gradient;
+                                        partials[local_row_4 * col_blocks_14 + col_20] = router_gradient;
                                     }
                                     if (stage_11 == 1) {
                                         if (tid == 0) {
@@ -4857,7 +4861,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 for (int stage_12 = 0; stage_12 < 2; stage_12++) {
                                     if (tile_end_2 > first_tile_3 + stage_12) {
                                         int row_28 = first_row_6;
-                                        if (col_blocks_13 <= first_col_3 + stage_12) {
+                                        if (col_blocks_14 <= first_col_3 + stage_12) {
                                             row_28 = row_28 + 1;
                                         }
                                         asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(dg_ready)) + (shared_rows + row_28 / 2))), "r"(static_cast<unsigned int>(1)) : "memory");
@@ -4871,10 +4875,10 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_1))), "r"(static_cast<unsigned int>(1)) : "memory");
                             }
                         }
-                        swiglu_phase = phase_bits_13;
+                        swiglu_phase = phase_bits_14;
                     } else {
                         if (kind == 2) {
-                            int col_blocks_14 = hidden / 256;
+                            int col_blocks_15 = hidden / 256;
                             int x_8 = -1;
                             int y_8 = -1;
                             int expert_8 = -1;
@@ -4883,7 +4887,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             int first_8 = 0;
                             int first_block_3 = (macro_1 * (macro_size / mini_size) + mini_1) * (mini_size / 256);
                             int offset_10 = 0;
-                            int remaining_3 = task_3;
+                            int remaining_3 = task_4;
                             #pragma unroll 1
                             for (int index_3 = 0; index_3 < experts; index_3++) {
                                 int blocks_3 = counts[index_3] / 256;
@@ -4892,18 +4896,18 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 int _min_61 = ((first_block_3 + mini_size / 256) < (offset_10 + blocks_3) ? (first_block_3 + mini_size / 256) : (offset_10 + blocks_3));
                                 int _max_36 = ((0) > (_min_61 - first_row_7) ? (0) : (_min_61 - first_row_7));
                                 int rows_6 = _max_36;
-                                int tasks_3 = rows_6 * col_blocks_14;
+                                int tasks_3 = rows_6 * col_blocks_15;
                                 if (remaining_3 < tasks_3) {
                                     int supergroup_8 = remaining_3 / (rows_6 * 8);
-                                    int full_cols_8 = col_blocks_14 / 8 * 8;
+                                    int full_cols_8 = col_blocks_15 / 8 * 8;
                                     int row_29 = 0;
                                     int col_21 = 0;
                                     if (remaining_3 < rows_6 * full_cols_8) {
                                         row_29 = remaining_3 % (rows_6 * 8) / 8;
                                         col_21 = supergroup_8 * 8 + remaining_3 % 8;
                                     } else {
-                                        row_29 = (remaining_3 - rows_6 * full_cols_8) / (col_blocks_14 - full_cols_8);
-                                        col_21 = full_cols_8 + (remaining_3 - rows_6 * full_cols_8) % (col_blocks_14 - full_cols_8);
+                                        row_29 = (remaining_3 - rows_6 * full_cols_8) / (col_blocks_15 - full_cols_8);
+                                        col_21 = full_cols_8 + (remaining_3 - rows_6 * full_cols_8) % (col_blocks_15 - full_cols_8);
                                     }
                                     if ((supergroup_8 & 1) != 0) {
                                         row_29 = rows_6 - row_29 - 1;
@@ -4916,7 +4920,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 remaining_3 = remaining_3 - tasks_3;
                                 offset_10 = offset_10 + blocks_3;
                             }
-                            unsigned int phase_bits_14 = gemm_phase;
+                            unsigned int phase_bits_15 = gemm_phase;
                             int global_mini_10 = macro_1 * (macro_size / mini_size) + mini_1;
                             int macro_rows_8 = macro_1 * (macro_size / 256);
                             int iterations_8 = intermediate / 128 + intermediate / 128;
@@ -4954,7 +4958,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         int ring_19 = 0;
                                         #pragma unroll 1
                                         for (int idx_19 = 0; idx_19 < iterations_8; idx_19++) {
-                                            mbarrier_wait(gemm_finished_addr + (ring_19) * 8, phase_bits_14 >> (unsigned int)(16 + ring_19) & 1);
+                                            mbarrier_wait(gemm_finished_addr + (ring_19) * 8, phase_bits_15 >> (unsigned int)(16 + ring_19) & 1);
                                             if (idx_19 < intermediate / 128) {
                                                 asm volatile(
                                                     "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
@@ -4978,7 +4982,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     :: "r"(b_fp8_smem_addr + (unsigned int)(ring_19 * 16384)), "l"((&wu_t_r)), "r"(0), "r"(y_8 * 256 + cta_rank_0 * 128), "r"(idx_19 - intermediate / 128), "r"(expert_8), "r"(0),
                                                        "r"(((gemm_arrived_addr + (ring_19) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
                                             }
-                                            phase_bits_14 = phase_bits_14 ^ (unsigned int)(1 << 16 + ring_19);
+                                            phase_bits_15 = phase_bits_15 ^ (unsigned int)(1 << 16 + ring_19);
                                             ring_19 = (ring_19 + 1) % 6;
                                         }
                                     }
@@ -5009,7 +5013,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             int ring_20 = 0;
                                             #pragma unroll 1
                                             for (int idx_20 = 0; idx_20 < iterations_8; idx_20++) {
-                                                mbarrier_wait(scales_finished_addr + (ring_20) * 8, phase_bits_14 >> (unsigned int)(23 + ring_20) & 1);
+                                                mbarrier_wait(scales_finished_addr + (ring_20) * 8, phase_bits_15 >> (unsigned int)(23 + ring_20) & 1);
                                                 if (idx_20 < intermediate / 128) {
                                                     int a_tile_3 = (x_8 * 2 + cta_rank_0) * k_blocks_3 + idx_20;
                                                     int b_tile_3 = (expert_8 * n_blocks_3 + y_8 * 2 + cta_rank_0) * k_blocks_3 + idx_20;
@@ -5037,7 +5041,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                         :: "r"(b_sc_smem_addr + (unsigned int)(ring_20 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&wu_t_sc_r)), "r"(0), "r"(b_tile_4 * 32), "r"(0),
                                                            "r"(((scales_arrived_addr + (ring_20) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)) : "memory");
                                                 }
-                                                phase_bits_14 = phase_bits_14 ^ (unsigned int)(1 << 23 + ring_20);
+                                                phase_bits_15 = phase_bits_15 ^ (unsigned int)(1 << 23 + ring_20);
                                                 ring_20 = (ring_20 + 1) % 6;
                                             }
                                         }
@@ -5046,19 +5050,19 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     if (warp == 4) {
                                         if (elect_sync()) {
                                             int ring_21 = 0;
-                                            mbarrier_wait(output_finished_addr, phase_bits_14 >> 22 & 1);
-                                            phase_bits_14 = phase_bits_14 ^ 4194304;
+                                            mbarrier_wait(output_finished_addr, phase_bits_15 >> 22 & 1);
+                                            phase_bits_15 = phase_bits_15 ^ 4194304;
                                             asm volatile("tcgen05.fence::after_thread_sync;");
                                             #pragma unroll 1
                                             for (int idx_21 = 0; idx_21 < iterations_8; idx_21++) {
                                                 mbarrier_arrive_expect_tx(scales_arrived_addr + (ring_21) * 8, 3072);
-                                                mbarrier_wait(scales_arrived_addr + (ring_21) * 8, phase_bits_14 >> (unsigned int)(7 + ring_21) & 1);
+                                                mbarrier_wait(scales_arrived_addr + (ring_21) * 8, phase_bits_15 >> (unsigned int)(7 + ring_21) & 1);
                                                 tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_a + ring_21 * 4, make_sf_cp_desc_sbo128(a_sc_smem_addr + (unsigned int)(ring_21 * 512)));
                                                 tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_b + ring_21 * 8, make_sf_cp_desc_sbo128(b_sc_smem_addr + (unsigned int)(ring_21 * 1024)));
                                                 tcgen05_cp_32x128b_warpx4_cta2((tmem_sf_b + ring_21 * 8 + 4), make_sf_cp_desc_sbo128((b_sc_smem_addr + (unsigned int)(ring_21 * 1024) + 512)));
                                                 tcgen05_commit_cg2_multicast(scales_finished_addr + (ring_21) * 8, (uint16_t)(3));
                                                 mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_21) * 8, 65536);
-                                                mbarrier_wait(gemm_arrived_addr + (ring_21) * 8, phase_bits_14 >> (unsigned int)ring_21 & 1);
+                                                mbarrier_wait(gemm_arrived_addr + (ring_21) * 8, phase_bits_15 >> (unsigned int)ring_21 & 1);
                                                 int _mma_a_lo_8 = (((a_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_21) * 1024;
                                                 int _mma_b_lo_8 = (((b_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_21) * 1024;
                                                 {
@@ -5075,8 +5079,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                         (0x10c00000U | ((3) << 29) | ((3) << 4)), tmem_sf_a + ring_21 * 4, tmem_sf_b + ring_21 * 8, 1);
                                                 }
                                                 tcgen05_commit_cg2_multicast(gemm_finished_addr + (ring_21) * 8, (uint16_t)(3));
-                                                phase_bits_14 = phase_bits_14 ^ (unsigned int)(1 << ring_21);
-                                                phase_bits_14 = phase_bits_14 ^ (unsigned int)(1 << 7 + ring_21);
+                                                phase_bits_15 = phase_bits_15 ^ (unsigned int)(1 << ring_21);
+                                                phase_bits_15 = phase_bits_15 ^ (unsigned int)(1 << 7 + ring_21);
                                                 ring_21 = (ring_21 + 1) % 6;
                                             }
                                             tcgen05_commit_cg2_multicast(output_arrived_addr, (uint16_t)(3));
@@ -5084,8 +5088,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     }
                                 } else {
                                     if (tid < 128) {
-                                        mbarrier_wait(output_arrived_addr, phase_bits_14 >> 6 & 1);
-                                        phase_bits_14 = phase_bits_14 ^ 64;
+                                        mbarrier_wait(output_arrived_addr, phase_bits_15 >> 6 & 1);
+                                        phase_bits_15 = phase_bits_15 ^ 64;
                                         unsigned int packed_18[128];
                                         #pragma unroll
                                         for (int chunk_12 = 0; chunk_12 < 8; chunk_12++) {
@@ -5176,11 +5180,11 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     }
                                 }
                             }
-                            gemm_phase = phase_bits_14;
+                            gemm_phase = phase_bits_15;
                         } else if (kind == 3) {
-                            int col_blocks_15 = macro_size / 256;
+                            int col_blocks_16 = macro_size / 256;
                             {
-                                col_blocks_15 = intermediate / 256;
+                                col_blocks_16 = intermediate / 256;
                             }
                             int x_9 = -1;
                             int y_9 = -1;
@@ -5190,9 +5194,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             int first_9 = 0;
                             int row_blocks_5 = hidden / 256;
                             int expert_idx_3 = 0;
-                            int local_task_3 = task_3;
-                            expert_idx_3 = task_3 / (row_blocks_5 * col_blocks_15);
-                            local_task_3 = task_3 % (row_blocks_5 * col_blocks_15);
+                            int local_task_3 = task_4;
+                            expert_idx_3 = task_4 / (row_blocks_5 * col_blocks_16);
+                            local_task_3 = task_4 % (row_blocks_5 * col_blocks_16);
                             int offset_11 = 0;
                             #pragma unroll 1
                             for (int index_4 = 0; index_4 < expert_idx_3; index_4++) {
@@ -5206,15 +5210,15 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             first_9 = (int)(k_start_9 == offset_11);
                             if (k_start_9 < k_end_9) {
                                 int supergroup_9 = local_task_3 / (row_blocks_5 * 8);
-                                int full_cols_9 = col_blocks_15 / 8 * 8;
+                                int full_cols_9 = col_blocks_16 / 8 * 8;
                                 int row_31 = 0;
                                 int col_23 = 0;
                                 if (local_task_3 < row_blocks_5 * full_cols_9) {
                                     row_31 = local_task_3 % (row_blocks_5 * 8) / 8;
                                     col_23 = supergroup_9 * 8 + local_task_3 % 8;
                                 } else {
-                                    row_31 = (local_task_3 - row_blocks_5 * full_cols_9) / (col_blocks_15 - full_cols_9);
-                                    col_23 = full_cols_9 + (local_task_3 - row_blocks_5 * full_cols_9) % (col_blocks_15 - full_cols_9);
+                                    row_31 = (local_task_3 - row_blocks_5 * full_cols_9) / (col_blocks_16 - full_cols_9);
+                                    col_23 = full_cols_9 + (local_task_3 - row_blocks_5 * full_cols_9) % (col_blocks_16 - full_cols_9);
                                 }
                                 if ((supergroup_9 & 1) != 0) {
                                     row_31 = row_blocks_5 - row_31 - 1;
@@ -5223,7 +5227,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 y_9 = col_23;
                                 expert_9 = expert_idx_3;
                             }
-                            unsigned int phase_bits_15 = gemm_phase;
+                            unsigned int phase_bits_16 = gemm_phase;
                             int global_mini_11 = macro_1 * (macro_size / mini_size);
                             int macro_rows_9 = macro_1 * (macro_size / 256);
                             int iterations_9 = hidden / 128;
@@ -5279,7 +5283,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     asm volatile("fence.acquire.gpu;" ::: "memory");
                                                 }
                                             }
-                                            mbarrier_wait(gemm_finished_addr + (ring_22) * 8, phase_bits_15 >> (unsigned int)(16 + ring_22) & 1);
+                                            mbarrier_wait(gemm_finished_addr + (ring_22) * 8, phase_bits_16 >> (unsigned int)(16 + ring_22) & 1);
                                             int k_tile = (k_start_9 + idx_22 * 128 - macro_1 * macro_size) / 128;
                                             asm volatile(
                                                 "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
@@ -5291,7 +5295,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                                 :: "r"(b_fp8_smem_addr + (unsigned int)(ring_22 * 16384)), "l"((&h_t_r)), "r"(0), "r"(y_9 * 256 + cta_rank_0 * 128), "r"(k_tile), "r"(0), "r"(0),
                                                    "r"(((gemm_arrived_addr + (ring_22) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
-                                            phase_bits_15 = phase_bits_15 ^ (unsigned int)(1 << 16 + ring_22);
+                                            phase_bits_16 = phase_bits_16 ^ (unsigned int)(1 << 16 + ring_22);
                                             ring_22 = (ring_22 + 1) % 6;
                                         }
                                     }
@@ -5338,7 +5342,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                         asm volatile("fence.acquire.gpu;" ::: "memory");
                                                     }
                                                 }
-                                                mbarrier_wait(scales_finished_addr + (ring_23) * 8, phase_bits_15 >> (unsigned int)(23 + ring_23) & 1);
+                                                mbarrier_wait(scales_finished_addr + (ring_23) * 8, phase_bits_16 >> (unsigned int)(23 + ring_23) & 1);
                                                 int k_tile_1 = (k_start_9 + idx_23 * 128 - macro_1 * macro_size) / 128;
                                                 int a_tile_5 = (x_9 * 2 + cta_rank_0) * k_blocks_4 + k_tile_1;
                                                 int b_tile_5 = (y_9 * 2 + cta_rank_0) * k_blocks_4 + k_tile_1;
@@ -5352,7 +5356,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                                                     :: "r"(b_sc_smem_addr + (unsigned int)(ring_23 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&h_sc_t_r)), "r"(0), "r"(b_tile_5 * 32), "r"(0),
                                                        "r"(((scales_arrived_addr + (ring_23) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)) : "memory");
-                                                phase_bits_15 = phase_bits_15 ^ (unsigned int)(1 << 23 + ring_23);
+                                                phase_bits_16 = phase_bits_16 ^ (unsigned int)(1 << 23 + ring_23);
                                                 ring_23 = (ring_23 + 1) % 6;
                                             }
                                         }
@@ -5361,19 +5365,19 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     if (warp == 4) {
                                         if (elect_sync()) {
                                             int ring_24 = 0;
-                                            mbarrier_wait(output_finished_addr, phase_bits_15 >> 22 & 1);
-                                            phase_bits_15 = phase_bits_15 ^ 4194304;
+                                            mbarrier_wait(output_finished_addr, phase_bits_16 >> 22 & 1);
+                                            phase_bits_16 = phase_bits_16 ^ 4194304;
                                             asm volatile("tcgen05.fence::after_thread_sync;");
                                             #pragma unroll 1
                                             for (int idx_24 = 0; idx_24 < iterations_9; idx_24++) {
                                                 mbarrier_arrive_expect_tx(scales_arrived_addr + (ring_24) * 8, 3072);
-                                                mbarrier_wait(scales_arrived_addr + (ring_24) * 8, phase_bits_15 >> (unsigned int)(7 + ring_24) & 1);
+                                                mbarrier_wait(scales_arrived_addr + (ring_24) * 8, phase_bits_16 >> (unsigned int)(7 + ring_24) & 1);
                                                 tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_a + ring_24 * 4, make_sf_cp_desc_sbo128(a_sc_smem_addr + (unsigned int)(ring_24 * 512)));
                                                 tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_b + ring_24 * 8, make_sf_cp_desc_sbo128(b_sc_smem_addr + (unsigned int)(ring_24 * 1024)));
                                                 tcgen05_cp_32x128b_warpx4_cta2((tmem_sf_b + ring_24 * 8 + 4), make_sf_cp_desc_sbo128((b_sc_smem_addr + (unsigned int)(ring_24 * 1024) + 512)));
                                                 tcgen05_commit_cg2_multicast(scales_finished_addr + (ring_24) * 8, (uint16_t)(3));
                                                 mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_24) * 8, 65536);
-                                                mbarrier_wait(gemm_arrived_addr + (ring_24) * 8, phase_bits_15 >> (unsigned int)ring_24 & 1);
+                                                mbarrier_wait(gemm_arrived_addr + (ring_24) * 8, phase_bits_16 >> (unsigned int)ring_24 & 1);
                                                 int _mma_a_lo_9 = (((a_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_24) * 1024;
                                                 int _mma_b_lo_9 = (((b_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_24) * 1024;
                                                 {
@@ -5390,8 +5394,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                         (0x10c00000U | ((3) << 29) | ((3) << 4)), tmem_sf_a + ring_24 * 4, tmem_sf_b + ring_24 * 8, 1);
                                                 }
                                                 tcgen05_commit_cg2_multicast(gemm_finished_addr + (ring_24) * 8, (uint16_t)(3));
-                                                phase_bits_15 = phase_bits_15 ^ (unsigned int)(1 << ring_24);
-                                                phase_bits_15 = phase_bits_15 ^ (unsigned int)(1 << 7 + ring_24);
+                                                phase_bits_16 = phase_bits_16 ^ (unsigned int)(1 << ring_24);
+                                                phase_bits_16 = phase_bits_16 ^ (unsigned int)(1 << 7 + ring_24);
                                                 ring_24 = (ring_24 + 1) % 6;
                                             }
                                             tcgen05_commit_cg2_multicast(output_arrived_addr, (uint16_t)(3));
@@ -5399,8 +5403,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     }
                                 } else {
                                     if (tid < 128) {
-                                        mbarrier_wait(output_arrived_addr, phase_bits_15 >> 6 & 1);
-                                        phase_bits_15 = phase_bits_15 ^ 64;
+                                        mbarrier_wait(output_arrived_addr, phase_bits_16 >> 6 & 1);
+                                        phase_bits_16 = phase_bits_16 ^ 64;
                                         unsigned int packed_19[128];
                                         #pragma unroll
                                         for (int chunk_14 = 0; chunk_14 < 8; chunk_14++) {
@@ -5496,12 +5500,12 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     }
                                 }
                             }
-                            gemm_phase = phase_bits_15;
+                            gemm_phase = phase_bits_16;
                         } else {
                             if (kind == 4) {
-                                int col_blocks_16 = macro_size / 256;
+                                int col_blocks_17 = macro_size / 256;
                                 {
-                                    col_blocks_16 = hidden / 256;
+                                    col_blocks_17 = hidden / 256;
                                 }
                                 int x_10 = -1;
                                 int y_10 = -1;
@@ -5511,9 +5515,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 int first_10 = 0;
                                 int row_blocks_6 = intermediate / 256;
                                 int expert_idx_4 = 0;
-                                int local_task_4 = task_3;
-                                expert_idx_4 = task_3 / (row_blocks_6 * col_blocks_16);
-                                local_task_4 = task_3 % (row_blocks_6 * col_blocks_16);
+                                int local_task_4 = task_4;
+                                expert_idx_4 = task_4 / (row_blocks_6 * col_blocks_17);
+                                local_task_4 = task_4 % (row_blocks_6 * col_blocks_17);
                                 int offset_12 = 0;
                                 #pragma unroll 1
                                 for (int index_5 = 0; index_5 < expert_idx_4; index_5++) {
@@ -5527,15 +5531,15 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 first_10 = (int)(k_start_10 == offset_12);
                                 if (k_start_10 < k_end_10) {
                                     int supergroup_10 = local_task_4 / (row_blocks_6 * 8);
-                                    int full_cols_10 = col_blocks_16 / 8 * 8;
+                                    int full_cols_10 = col_blocks_17 / 8 * 8;
                                     int row_33 = 0;
                                     int col_25 = 0;
                                     if (local_task_4 < row_blocks_6 * full_cols_10) {
                                         row_33 = local_task_4 % (row_blocks_6 * 8) / 8;
                                         col_25 = supergroup_10 * 8 + local_task_4 % 8;
                                     } else {
-                                        row_33 = (local_task_4 - row_blocks_6 * full_cols_10) / (col_blocks_16 - full_cols_10);
-                                        col_25 = full_cols_10 + (local_task_4 - row_blocks_6 * full_cols_10) % (col_blocks_16 - full_cols_10);
+                                        row_33 = (local_task_4 - row_blocks_6 * full_cols_10) / (col_blocks_17 - full_cols_10);
+                                        col_25 = full_cols_10 + (local_task_4 - row_blocks_6 * full_cols_10) % (col_blocks_17 - full_cols_10);
                                     }
                                     if ((supergroup_10 & 1) != 0) {
                                         row_33 = row_blocks_6 - row_33 - 1;
@@ -5544,7 +5548,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     y_10 = col_25;
                                     expert_10 = expert_idx_4;
                                 }
-                                unsigned int phase_bits_16 = gemm_phase;
+                                unsigned int phase_bits_17 = gemm_phase;
                                 int global_mini_12 = macro_1 * (macro_size / mini_size);
                                 int macro_rows_10 = macro_1 * (macro_size / 256);
                                 int iterations_10 = intermediate / 128;
@@ -5600,7 +5604,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                         asm volatile("fence.acquire.gpu;" ::: "memory");
                                                     }
                                                 }
-                                                mbarrier_wait(gemm_finished_addr + (ring_25) * 8, phase_bits_16 >> (unsigned int)(16 + ring_25) & 1);
+                                                mbarrier_wait(gemm_finished_addr + (ring_25) * 8, phase_bits_17 >> (unsigned int)(16 + ring_25) & 1);
                                                 int k_tile_2 = (k_start_10 + idx_25 * 128 - macro_1 * macro_size) / 128;
                                                 asm volatile(
                                                     "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
@@ -5612,7 +5616,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                                     :: "r"(b_fp8_smem_addr + (unsigned int)(ring_25 * 16384)), "l"((&x_t_r)), "r"(0), "r"(y_10 * 256 + cta_rank_0 * 128), "r"(k_tile_2), "r"(0), "r"(0),
                                                        "r"(((gemm_arrived_addr + (ring_25) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
-                                                phase_bits_16 = phase_bits_16 ^ (unsigned int)(1 << 16 + ring_25);
+                                                phase_bits_17 = phase_bits_17 ^ (unsigned int)(1 << 16 + ring_25);
                                                 ring_25 = (ring_25 + 1) % 6;
                                             }
                                         }
@@ -5659,7 +5663,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                             asm volatile("fence.acquire.gpu;" ::: "memory");
                                                         }
                                                     }
-                                                    mbarrier_wait(scales_finished_addr + (ring_26) * 8, phase_bits_16 >> (unsigned int)(23 + ring_26) & 1);
+                                                    mbarrier_wait(scales_finished_addr + (ring_26) * 8, phase_bits_17 >> (unsigned int)(23 + ring_26) & 1);
                                                     int k_tile_3 = (k_start_10 + idx_26 * 128 - macro_1 * macro_size) / 128;
                                                     int a_tile_6 = (x_10 * 2 + cta_rank_0) * k_blocks_5 + k_tile_3;
                                                     int b_tile_6 = (y_10 * 2 + cta_rank_0) * k_blocks_5 + k_tile_3;
@@ -5673,7 +5677,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                         " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                                                         :: "r"(b_sc_smem_addr + (unsigned int)(ring_26 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&x_sc_t_r)), "r"(0), "r"(b_tile_6 * 32), "r"(0),
                                                            "r"(((scales_arrived_addr + (ring_26) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)) : "memory");
-                                                    phase_bits_16 = phase_bits_16 ^ (unsigned int)(1 << 23 + ring_26);
+                                                    phase_bits_17 = phase_bits_17 ^ (unsigned int)(1 << 23 + ring_26);
                                                     ring_26 = (ring_26 + 1) % 6;
                                                 }
                                             }
@@ -5682,19 +5686,19 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         if (warp == 4) {
                                             if (elect_sync()) {
                                                 int ring_27 = 0;
-                                                mbarrier_wait(output_finished_addr, phase_bits_16 >> 22 & 1);
-                                                phase_bits_16 = phase_bits_16 ^ 4194304;
+                                                mbarrier_wait(output_finished_addr, phase_bits_17 >> 22 & 1);
+                                                phase_bits_17 = phase_bits_17 ^ 4194304;
                                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                                 #pragma unroll 1
                                                 for (int idx_27 = 0; idx_27 < iterations_10; idx_27++) {
                                                     mbarrier_arrive_expect_tx(scales_arrived_addr + (ring_27) * 8, 3072);
-                                                    mbarrier_wait(scales_arrived_addr + (ring_27) * 8, phase_bits_16 >> (unsigned int)(7 + ring_27) & 1);
+                                                    mbarrier_wait(scales_arrived_addr + (ring_27) * 8, phase_bits_17 >> (unsigned int)(7 + ring_27) & 1);
                                                     tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_a + ring_27 * 4, make_sf_cp_desc_sbo128(a_sc_smem_addr + (unsigned int)(ring_27 * 512)));
                                                     tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_b + ring_27 * 8, make_sf_cp_desc_sbo128(b_sc_smem_addr + (unsigned int)(ring_27 * 1024)));
                                                     tcgen05_cp_32x128b_warpx4_cta2((tmem_sf_b + ring_27 * 8 + 4), make_sf_cp_desc_sbo128((b_sc_smem_addr + (unsigned int)(ring_27 * 1024) + 512)));
                                                     tcgen05_commit_cg2_multicast(scales_finished_addr + (ring_27) * 8, (uint16_t)(3));
                                                     mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_27) * 8, 65536);
-                                                    mbarrier_wait(gemm_arrived_addr + (ring_27) * 8, phase_bits_16 >> (unsigned int)ring_27 & 1);
+                                                    mbarrier_wait(gemm_arrived_addr + (ring_27) * 8, phase_bits_17 >> (unsigned int)ring_27 & 1);
                                                     int _mma_a_lo_10 = (((a_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_27) * 1024;
                                                     int _mma_b_lo_10 = (((b_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_27) * 1024;
                                                     {
@@ -5711,8 +5715,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                             (0x10c00000U | ((3) << 29) | ((3) << 4)), tmem_sf_a + ring_27 * 4, tmem_sf_b + ring_27 * 8, 1);
                                                     }
                                                     tcgen05_commit_cg2_multicast(gemm_finished_addr + (ring_27) * 8, (uint16_t)(3));
-                                                    phase_bits_16 = phase_bits_16 ^ (unsigned int)(1 << ring_27);
-                                                    phase_bits_16 = phase_bits_16 ^ (unsigned int)(1 << 7 + ring_27);
+                                                    phase_bits_17 = phase_bits_17 ^ (unsigned int)(1 << ring_27);
+                                                    phase_bits_17 = phase_bits_17 ^ (unsigned int)(1 << 7 + ring_27);
                                                     ring_27 = (ring_27 + 1) % 6;
                                                 }
                                                 tcgen05_commit_cg2_multicast(output_arrived_addr, (uint16_t)(3));
@@ -5720,8 +5724,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         }
                                     } else {
                                         if (tid < 128) {
-                                            mbarrier_wait(output_arrived_addr, phase_bits_16 >> 6 & 1);
-                                            phase_bits_16 = phase_bits_16 ^ 64;
+                                            mbarrier_wait(output_arrived_addr, phase_bits_17 >> 6 & 1);
+                                            phase_bits_17 = phase_bits_17 ^ 64;
                                             unsigned int packed_20[128];
                                             #pragma unroll
                                             for (int chunk_16 = 0; chunk_16 < 8; chunk_16++) {
@@ -5817,11 +5821,11 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         }
                                     }
                                 }
-                                gemm_phase = phase_bits_16;
+                                gemm_phase = phase_bits_17;
                             } else if (kind == 5) {
-                                int col_blocks_17 = macro_size / 256;
+                                int col_blocks_18 = macro_size / 256;
                                 {
-                                    col_blocks_17 = hidden / 256;
+                                    col_blocks_18 = hidden / 256;
                                 }
                                 int x_11 = -1;
                                 int y_11 = -1;
@@ -5831,9 +5835,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 int first_11 = 0;
                                 int row_blocks_7 = intermediate / 256;
                                 int expert_idx_5 = 0;
-                                int local_task_5 = task_3;
-                                expert_idx_5 = task_3 / (row_blocks_7 * col_blocks_17);
-                                local_task_5 = task_3 % (row_blocks_7 * col_blocks_17);
+                                int local_task_5 = task_4;
+                                expert_idx_5 = task_4 / (row_blocks_7 * col_blocks_18);
+                                local_task_5 = task_4 % (row_blocks_7 * col_blocks_18);
                                 int offset_13 = 0;
                                 #pragma unroll 1
                                 for (int index_6 = 0; index_6 < expert_idx_5; index_6++) {
@@ -5847,15 +5851,15 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 first_11 = (int)(k_start_11 == offset_13);
                                 if (k_start_11 < k_end_11) {
                                     int supergroup_11 = local_task_5 / (row_blocks_7 * 8);
-                                    int full_cols_11 = col_blocks_17 / 8 * 8;
+                                    int full_cols_11 = col_blocks_18 / 8 * 8;
                                     int row_35 = 0;
                                     int col_27 = 0;
                                     if (local_task_5 < row_blocks_7 * full_cols_11) {
                                         row_35 = local_task_5 % (row_blocks_7 * 8) / 8;
                                         col_27 = supergroup_11 * 8 + local_task_5 % 8;
                                     } else {
-                                        row_35 = (local_task_5 - row_blocks_7 * full_cols_11) / (col_blocks_17 - full_cols_11);
-                                        col_27 = full_cols_11 + (local_task_5 - row_blocks_7 * full_cols_11) % (col_blocks_17 - full_cols_11);
+                                        row_35 = (local_task_5 - row_blocks_7 * full_cols_11) / (col_blocks_18 - full_cols_11);
+                                        col_27 = full_cols_11 + (local_task_5 - row_blocks_7 * full_cols_11) % (col_blocks_18 - full_cols_11);
                                     }
                                     if ((supergroup_11 & 1) != 0) {
                                         row_35 = row_blocks_7 - row_35 - 1;
@@ -5864,7 +5868,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     y_11 = col_27;
                                     expert_11 = expert_idx_5;
                                 }
-                                unsigned int phase_bits_17 = gemm_phase;
+                                unsigned int phase_bits_18 = gemm_phase;
                                 int global_mini_13 = macro_1 * (macro_size / mini_size);
                                 int macro_rows_11 = macro_1 * (macro_size / 256);
                                 int iterations_11 = intermediate / 128;
@@ -5920,7 +5924,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                         asm volatile("fence.acquire.gpu;" ::: "memory");
                                                     }
                                                 }
-                                                mbarrier_wait(gemm_finished_addr + (ring_28) * 8, phase_bits_17 >> (unsigned int)(16 + ring_28) & 1);
+                                                mbarrier_wait(gemm_finished_addr + (ring_28) * 8, phase_bits_18 >> (unsigned int)(16 + ring_28) & 1);
                                                 int k_tile_4 = (k_start_11 + idx_28 * 128 - macro_1 * macro_size) / 128;
                                                 asm volatile(
                                                     "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
@@ -5932,7 +5936,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                                     :: "r"(b_fp8_smem_addr + (unsigned int)(ring_28 * 16384)), "l"((&x_t_r)), "r"(0), "r"(y_11 * 256 + cta_rank_0 * 128), "r"(k_tile_4), "r"(0), "r"(0),
                                                        "r"(((gemm_arrived_addr + (ring_28) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
-                                                phase_bits_17 = phase_bits_17 ^ (unsigned int)(1 << 16 + ring_28);
+                                                phase_bits_18 = phase_bits_18 ^ (unsigned int)(1 << 16 + ring_28);
                                                 ring_28 = (ring_28 + 1) % 6;
                                             }
                                         }
@@ -5979,7 +5983,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                             asm volatile("fence.acquire.gpu;" ::: "memory");
                                                         }
                                                     }
-                                                    mbarrier_wait(scales_finished_addr + (ring_29) * 8, phase_bits_17 >> (unsigned int)(23 + ring_29) & 1);
+                                                    mbarrier_wait(scales_finished_addr + (ring_29) * 8, phase_bits_18 >> (unsigned int)(23 + ring_29) & 1);
                                                     int k_tile_5 = (k_start_11 + idx_29 * 128 - macro_1 * macro_size) / 128;
                                                     int a_tile_7 = (x_11 * 2 + cta_rank_0) * k_blocks_6 + k_tile_5;
                                                     int b_tile_7 = (y_11 * 2 + cta_rank_0) * k_blocks_6 + k_tile_5;
@@ -5993,7 +5997,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                         " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                                                         :: "r"(b_sc_smem_addr + (unsigned int)(ring_29 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&x_sc_t_r)), "r"(0), "r"(b_tile_7 * 32), "r"(0),
                                                            "r"(((scales_arrived_addr + (ring_29) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)) : "memory");
-                                                    phase_bits_17 = phase_bits_17 ^ (unsigned int)(1 << 23 + ring_29);
+                                                    phase_bits_18 = phase_bits_18 ^ (unsigned int)(1 << 23 + ring_29);
                                                     ring_29 = (ring_29 + 1) % 6;
                                                 }
                                             }
@@ -6002,19 +6006,19 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         if (warp == 4) {
                                             if (elect_sync()) {
                                                 int ring_30 = 0;
-                                                mbarrier_wait(output_finished_addr, phase_bits_17 >> 22 & 1);
-                                                phase_bits_17 = phase_bits_17 ^ 4194304;
+                                                mbarrier_wait(output_finished_addr, phase_bits_18 >> 22 & 1);
+                                                phase_bits_18 = phase_bits_18 ^ 4194304;
                                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                                 #pragma unroll 1
                                                 for (int idx_30 = 0; idx_30 < iterations_11; idx_30++) {
                                                     mbarrier_arrive_expect_tx(scales_arrived_addr + (ring_30) * 8, 3072);
-                                                    mbarrier_wait(scales_arrived_addr + (ring_30) * 8, phase_bits_17 >> (unsigned int)(7 + ring_30) & 1);
+                                                    mbarrier_wait(scales_arrived_addr + (ring_30) * 8, phase_bits_18 >> (unsigned int)(7 + ring_30) & 1);
                                                     tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_a + ring_30 * 4, make_sf_cp_desc_sbo128(a_sc_smem_addr + (unsigned int)(ring_30 * 512)));
                                                     tcgen05_cp_32x128b_warpx4_cta2(tmem_sf_b + ring_30 * 8, make_sf_cp_desc_sbo128(b_sc_smem_addr + (unsigned int)(ring_30 * 1024)));
                                                     tcgen05_cp_32x128b_warpx4_cta2((tmem_sf_b + ring_30 * 8 + 4), make_sf_cp_desc_sbo128((b_sc_smem_addr + (unsigned int)(ring_30 * 1024) + 512)));
                                                     tcgen05_commit_cg2_multicast(scales_finished_addr + (ring_30) * 8, (uint16_t)(3));
                                                     mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_30) * 8, 65536);
-                                                    mbarrier_wait(gemm_arrived_addr + (ring_30) * 8, phase_bits_17 >> (unsigned int)ring_30 & 1);
+                                                    mbarrier_wait(gemm_arrived_addr + (ring_30) * 8, phase_bits_18 >> (unsigned int)ring_30 & 1);
                                                     int _mma_a_lo_11 = (((a_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_30) * 1024;
                                                     int _mma_b_lo_11 = (((b_fp8_smem_addr) >> 4) & 0x3FFF) + (ring_30) * 1024;
                                                     {
@@ -6031,8 +6035,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                             (0x10c00000U | ((3) << 29) | ((3) << 4)), tmem_sf_a + ring_30 * 4, tmem_sf_b + ring_30 * 8, 1);
                                                     }
                                                     tcgen05_commit_cg2_multicast(gemm_finished_addr + (ring_30) * 8, (uint16_t)(3));
-                                                    phase_bits_17 = phase_bits_17 ^ (unsigned int)(1 << ring_30);
-                                                    phase_bits_17 = phase_bits_17 ^ (unsigned int)(1 << 7 + ring_30);
+                                                    phase_bits_18 = phase_bits_18 ^ (unsigned int)(1 << ring_30);
+                                                    phase_bits_18 = phase_bits_18 ^ (unsigned int)(1 << 7 + ring_30);
                                                     ring_30 = (ring_30 + 1) % 6;
                                                 }
                                                 tcgen05_commit_cg2_multicast(output_arrived_addr, (uint16_t)(3));
@@ -6040,8 +6044,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         }
                                     } else {
                                         if (tid < 128) {
-                                            mbarrier_wait(output_arrived_addr, phase_bits_17 >> 6 & 1);
-                                            phase_bits_17 = phase_bits_17 ^ 64;
+                                            mbarrier_wait(output_arrived_addr, phase_bits_18 >> 6 & 1);
+                                            phase_bits_18 = phase_bits_18 ^ 64;
                                             unsigned int packed_21[128];
                                             #pragma unroll
                                             for (int chunk_18 = 0; chunk_18 < 8; chunk_18++) {
@@ -6137,7 +6141,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         }
                                     }
                                 }
-                                gemm_phase = phase_bits_17;
+                                gemm_phase = phase_bits_18;
                             }
                         }
                     }
@@ -6252,7 +6256,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                 asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
             }
             kind = kind_1;
-            task_3 = task_2_1;
+            task_4 = task_2_1;
             macro_1 = macro_3;
             mini_1 = mini_4;
             shared = shared_5;
