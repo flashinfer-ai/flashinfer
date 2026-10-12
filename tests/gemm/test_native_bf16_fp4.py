@@ -295,6 +295,45 @@ def test_autotuned_tactic_matches_reference(m, n, k, alpha_value, out_dtype):
     torch.testing.assert_close(result.float(), ref, atol=2e-3, rtol=8e-3)
 
 
+def test_parallel_compile_into_empty_cache(monkeypatch, tmp_path):
+    """Kernels compiled by the worker subprocesses, for this bucket and ahead
+    for another, land in the disk cache and match the reference."""
+    from flashinfer.gemm.kernels.native_bf16_fp4 import compile_pool, runner
+    from flashinfer.jit import env as jit_env
+
+    jit_dir = tmp_path / jit_env.FLASHINFER_JIT_DIR.relative_to(
+        jit_env.FLASHINFER_BASE_DIR
+    )
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(tmp_path))
+    monkeypatch.setenv("FLASHINFER_NATIVE_W4A16_COMPILE_WORKERS", "4")
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", jit_dir)
+    monkeypatch.setattr(runner, "_COMPILED", {})
+    monkeypatch.setattr(runner, "_INFLIGHT", {})
+    monkeypatch.setattr(runner, "_AHEAD_DONE", set())
+    monkeypatch.setattr(runner, "_AHEAD_MS", (1, 2))
+    compile_pool.shutdown()
+    r = runner.get_runner()
+    n, k = 256, 1024
+    try:
+        for m in (1, 2):
+            a, b, sf, weight = make_case(m, n, k, seed=m)
+            alpha = torch.tensor([0.5], device="cuda")
+            out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+            inputs = [a, b, sf, alpha, out, True]
+            r(inputs, do_preparation=True)
+            ref = (a.float() @ weight.T) * 0.5
+            for tactic in r._get_tactics(inputs, for_tuning=True):
+                out.fill_(float("nan"))
+                r(inputs, tactic=tactic)
+                torch.testing.assert_close(out.float(), ref, atol=2e-3, rtol=8e-3)
+        tuned = {
+            (m, t) for m in (1, 2) for t in runner._tactics(m, n, k, True, True, True)
+        }
+        assert len(list(jit_dir.rglob("*.o"))) >= len(tuned)
+    finally:
+        compile_pool.shutdown()
+
+
 def test_invalid_weight_layout_is_rejected():
     """A prepared int32 tile bank must never be interpreted as canonical bytes."""
     a, b, sf, _ = make_case(1, 128, 128)
