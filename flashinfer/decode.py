@@ -5058,7 +5058,8 @@ def fast_decode_plan(
     )
 
     indptr_host = (
-        global_override_indptr_cpu
+        # Normalized: the planner reads this as a raw pointer (#5260).
+        global_override_indptr_cpu.contiguous()
         if global_override_indptr_cpu is not None
         else indptr.cpu()
     )

@@ -301,3 +301,67 @@ def test_fast_decode_plan_noncontiguous_metadata():
         )
         outs.append(wrapper.run(q, kv_cache))
     _assert_same(*outs)
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_ragged_prefill_plan_noncontiguous_indptr_cpu_override(backend):
+    """The optional host copies (``qo_indptr_cpu`` / ``kv_indptr_cpu``) go
+    straight to the planner, so they need normalizing too."""
+    _skip_unsupported(backend)
+    torch.manual_seed(0)
+    qo_indptr, kv_indptr = _indptr(QO_LENS), _indptr(KV_LENS)
+    q = torch.randn(
+        int(qo_indptr[-1]), NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    k = torch.randn(
+        int(kv_indptr[-1]), NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v = torch.randn_like(k)
+
+    outs = []
+    for make in (lambda t: t, _strided):
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            _workspace(), "NHD", backend=backend
+        )
+        wrapper.plan(
+            qo_indptr.cuda(),
+            kv_indptr.cuda(),
+            NUM_QO_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            causal=True,
+            q_data_type=DTYPE,
+            qo_indptr_cpu=make(qo_indptr),
+            kv_indptr_cpu=make(kv_indptr),
+        )
+        outs.append(wrapper.run(q, k, v))
+    _assert_same(*outs)
+
+
+def test_fast_decode_plan_noncontiguous_indptr_override():
+    """``global_override_indptr_cpu`` replaces the host indptr the planner reads."""
+    torch.manual_seed(0)
+    kv_indptr, kv_indices, last_page_len, kv_cache = _paged_metadata()
+    q = torch.randn(len(KV_LENS), NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+
+    outs = []
+    for make in (lambda t: t, _strided):
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            _workspace(), "NHD", backend="fa2"
+        )
+        args = (kv_indptr.cuda(), kv_indices.cuda(), last_page_len.cuda())
+        wrapper.plan(
+            *args, NUM_QO_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE, q_data_type=DTYPE
+        )
+        flashinfer.decode.fast_decode_plan(
+            wrapper,
+            *args,
+            NUM_QO_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            PAGE_SIZE,
+            q_data_type=DTYPE,
+            global_override_indptr_cpu=make(kv_indptr),
+        )
+        outs.append(wrapper.run(q, kv_cache))
+    _assert_same(*outs)
