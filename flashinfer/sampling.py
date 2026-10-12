@@ -284,6 +284,7 @@ def get_sampling_module():
         seed_val: int,
         maybe_offset_arr: Optional[torch.Tensor],
         offset_val: int,
+        row_independent_rng: bool = False,
     ) -> None:
         module.chain_speculative_sampling(
             draft_probs,
@@ -297,6 +298,7 @@ def get_sampling_module():
             seed_val,
             maybe_offset_arr,
             offset_val,
+            row_independent_rng,
         )
 
     @chain_speculative_sampling_out.register_fake
@@ -880,6 +882,7 @@ def get_sampling_module():
         generator: Optional[torch.Generator],
         seed: Optional[Union[int, torch.Tensor]] = None,
         offset: Optional[Union[int, torch.Tensor]] = None,
+        row_independent_rng: bool = False,
     ) -> torch.Tensor:
         device = draft_probs.device
         draft_probs = draft_probs.float()
@@ -911,6 +914,7 @@ def get_sampling_module():
             seed_val,
             maybe_offset_arr,
             offset_val,
+            row_independent_rng,
         )
         return output_token_ids
 
@@ -923,6 +927,9 @@ def get_sampling_module():
         output_emitted_draft_token_num: torch.Tensor,
         deterministic: bool,
         generator: Optional[torch.Generator],
+        seed: Optional[Union[int, torch.Tensor]] = None,
+        offset: Optional[Union[int, torch.Tensor]] = None,
+        row_independent_rng: bool = False,
     ) -> torch.Tensor:
         b, n = draft_token_ids.shape
         device = draft_token_ids.device
@@ -2424,6 +2431,7 @@ def chain_speculative_sampling(
     generator: Optional[torch.Generator] = None,
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
+    row_independent_rng: bool = False,
 ) -> torch.Tensor:
     r"""Fused-GPU kernel for speculative sampling for sequence generation (proposed in
     paper `Accelerating Large Language Model Decoding with Speculative Sampling <https://arxiv.org/pdf/2302.01318>`_),
@@ -2486,6 +2494,11 @@ def chain_speculative_sampling(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+
+    row_independent_rng: bool
+        Draw every row from Philox subsequence zero, so each row's stream depends only on
+        its own seed and offset: a batch samples exactly as one launch per row would.
+        Rows stay independent of each other only through distinct per-row seeds or offsets.
 
     Returns
     -------
@@ -2554,5 +2567,6 @@ def chain_speculative_sampling(
         generator,
         seed,
         offset,
+        row_independent_rng,
     )
     return output_token_ids, output_accepted_token_num, output_emitted_draft_token_num

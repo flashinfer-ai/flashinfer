@@ -1889,7 +1889,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
     DType* draft_probs, IdType* draft_token_ids, DType* target_probs, IdType* output_token_ids,
     IdType* output_accepted_token_num, IdType* output_emitted_draft_token_num,
     uint32_t num_speculative_tokens, uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
-    uint64_t* offset_arr, uint64_t offset_val, uint32_t seed_stride, uint32_t offset_stride) {
+    uint64_t* offset_arr, uint64_t offset_val, uint32_t seed_stride, uint32_t offset_stride,
+    bool row_independent_rng) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
 
@@ -1897,8 +1898,10 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
   uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
   uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
+  // Row-independent streams draw every row from subsequence zero, so a row's samples depend
+  // only on its own seed and offset, not on its batch position.
   curandStatePhilox4_32_10_t curand_state;
-  curand_init(philox_seed, bx, philox_offset, &curand_state);
+  curand_init(philox_seed, row_independent_rng ? 0 : bx, philox_offset, &curand_state);
 
   extern __shared__ __align__(
       alignof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
@@ -2029,7 +2032,7 @@ cudaError_t ChainSpeculativeSampling(
     IdType* output_accepted_token_num, IdType* output_emitted_draft_token_num, uint32_t batch_size,
     uint32_t num_speculative_tokens, uint32_t d, bool deterministic, uint64_t* seed_arr,
     uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0,
-    uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
+    uint32_t seed_stride = 0, uint32_t offset_stride = 0, bool row_independent_rng = false) {
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -2050,7 +2053,8 @@ cudaError_t ChainSpeculativeSampling(
                     &offset_arr,
                     &offset_val,
                     &seed_stride,
-                    &offset_stride};
+                    &offset_stride,
+                    &row_independent_rng};
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
           auto kernel = ChainSpeculativeSampling<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE,

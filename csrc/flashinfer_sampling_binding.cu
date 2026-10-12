@@ -76,7 +76,8 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
                                 TensorView output_accepted_token_num,
                                 TensorView output_emitted_draft_token_num, bool deterministic,
                                 Optional<TensorView> maybe_seed_arr, uint64_t seed_val,
-                                Optional<TensorView> maybe_offset_arr, uint64_t offset_val);
+                                Optional<TensorView> maybe_offset_arr, uint64_t offset_val,
+                                bool row_independent_rng);
 
 // Softmax
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(softmax, softmax);

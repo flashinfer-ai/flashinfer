@@ -1722,3 +1722,38 @@ def test_per_request_param_indexed_by_row(api, remap, expanded):
         else:
             # rows 0 and 2 keep their argmax alone, and row i's argmax is class i.
             assert counts[row_idx].item() == lanes, (remap, lane, counts)
+
+
+@pytest.mark.parametrize("batch_size", [2, 7, 32])
+@pytest.mark.parametrize("num_speculate_tokens", [1, 3, 5])
+def test_chain_speculative_sampling_row_independent_rng_matches_single_row_launches(
+    batch_size, num_speculate_tokens
+):
+    vocab_size = 4096
+    torch.manual_seed(batch_size * 10 + num_speculate_tokens)
+    draft_probs = torch.softmax(
+        torch.randn(batch_size, num_speculate_tokens, vocab_size, device="cuda:0"), dim=-1
+    )
+    target_probs = torch.softmax(
+        torch.randn(batch_size, num_speculate_tokens + 1, vocab_size, device="cuda:0"), dim=-1
+    )
+    draft_token_ids = torch.multinomial(draft_probs.view(-1, vocab_size), 1).view(
+        batch_size, num_speculate_tokens
+    ).int()
+    seed = torch.randint(0, 2**62, (batch_size,), dtype=torch.int64, device="cuda:0")
+    offset = torch.randint(0, 2**20, (batch_size,), dtype=torch.int64, device="cuda:0") * 4
+
+    batched, batched_accepted, batched_emitted = flashinfer.sampling.chain_speculative_sampling(
+        draft_probs, draft_token_ids, target_probs, seed=seed, offset=offset, row_independent_rng=True
+    )
+    for row in range(batch_size):
+        single, accepted, emitted = flashinfer.sampling.chain_speculative_sampling(
+            draft_probs[row : row + 1],
+            draft_token_ids[row : row + 1],
+            target_probs[row : row + 1],
+            seed=seed[row : row + 1],
+            offset=offset[row : row + 1],
+        )
+        assert torch.equal(batched[row : row + 1], single)
+        assert torch.equal(batched_accepted[row : row + 1], accepted)
+        assert torch.equal(batched_emitted[row : row + 1], emitted)
