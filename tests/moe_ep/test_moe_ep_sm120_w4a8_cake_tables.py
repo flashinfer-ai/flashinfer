@@ -19,9 +19,12 @@ in slot order, so every feasible per-pair table (all GIN, all LSA, LSA inside
 each host and GIN across, or the probe's choice) must produce bit-identical
 outputs for the same inputs.  Each table gets its own layer (and transport
 session), created and destroyed in turn; infeasible tables on the launched
-topology (``all_lsa`` across hosts, ``all_gin`` without a GIN transport) are
-skipped.  ``lsa_pairs`` (LSA only between ranks 2i and 2i+1, e.g. the two GPUs
-behind one PCIe switch) runs the copier instances with a single copier CTA.  Run in its own torchrun session:
+topology (``all_lsa`` across hosts or PCIe sockets, any GIN cell without a GIN
+transport) are skipped.  ``lsa_pairs`` (LSA only between ranks 2i and 2i+1, e.g.
+the two GPUs behind one PCIe switch) runs the copier instances with a single
+copier CTA.  Whenever the topology offers GIN and at least one load/store pair
+(and more than two ranks), at least one mixed table -- LSA and GIN cells in the
+same launch -- must run.  ``-rA`` prints the tables that ran.  Run in its own torchrun session:
 
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_sm120_w4a8_cake_tables.py \
         -m "gpu_4 and arch_sm120" -v
@@ -34,6 +37,10 @@ import os
 import pytest
 import torch
 
+from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_transport import (
+    TRANSPORT_GIN,
+    TRANSPORT_LSA,
+)
 from tests.moe_ep.test_moe_ep_sm120_w4a8_cake_mega import (
     HIDDEN,
     Oracle,
@@ -86,7 +93,12 @@ def _run_table(rank, world_size, weights, variant, table):
     torch.cuda.synchronize()
     assert layer._kernel.protocol_error(layer._workspace) == 0
     ws = layer._workspace
-    info = (ws.transport_table.name, ws.copiers_active, ws.transport_table.count(1))
+    info = (
+        ws.transport_table.name,
+        ws.copiers_active,
+        ws.transport_table.count(TRANSPORT_LSA),
+        ws.transport_table.count(TRANSPORT_GIN),
+    )
     layer.destroy()
     dist.barrier()
     return outputs, info
@@ -116,22 +128,30 @@ def test_outputs_are_bitwise_identical_across_transport_tables(variant) -> None:
         else:
             skipped[table] = info
     assert len(results) >= 2, f"fewer than two feasible tables: {sorted(results)}"
-    # Every LSA-bearing table either ran on the copier instances or was rejected because the
-    # launched topology has no load/store path for one of its pairs.
+    # Every table either ran (LSA-bearing ones on the copier instances) or was rejected
+    # because the launched topology has no load/store path or no GIN for one of its pairs.
+    infeasible = ("not load/store reachable", "GIN is unavailable")
+    for name, reason in skipped.items():
+        assert any(text in reason for text in infeasible), (name, reason)
     for name in ("all_lsa", "lsa_where_reachable", "lsa_pairs"):
         if name in results:
-            _, copiers, lsa_cells = results[name][1]
+            _, copiers, lsa_cells, _ = results[name][1]
             assert copiers == (lsa_cells > 0), (name, results[name][1])
             assert name == "lsa_where_reachable" or lsa_cells > 0, (name, lsa_cells)
-        else:
-            assert "not load/store reachable" in skipped[name], (name, skipped[name])
+    mixed = sorted(n for n, (_, info) in results.items() if info[2] and info[3])
+    gin_ok = "all_gin" in results
+    lsa_ok = any(results[n][1][2] for n in results)
     if rank == 0:
         print(
             "tables:",
             {n: info for n, (_, info) in results.items()},
             "skipped:",
             sorted(skipped),
+            "mixed:",
+            mixed,
         )
+    if gin_ok and lsa_ok and world_size > 2:
+        assert mixed, f"no mixed LSA + GIN table ran: {sorted(results)}"
     names = sorted(results)
     baseline = results[names[0]][0]
     for name in names[1:]:
