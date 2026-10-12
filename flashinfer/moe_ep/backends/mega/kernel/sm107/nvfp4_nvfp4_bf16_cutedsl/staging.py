@@ -15,12 +15,16 @@ def stage_mega_moe_inputs(
     topk_weights_out: torch.Tensor,
     *,
     input_norm_const: float = 1.0,
+    routes_staged: bool = False,
 ) -> int:
     """bf16 ``hidden_states`` -> packed NVFP4 activation + FP8-E4M3 block scales.
 
     The packed data times its block scales approximates
     ``input_norm_const * hidden_states``; fc1_alpha must compensate for this
     normalization and any weight normalization. Returns the staged token count.
+    ``routes_staged=True``: the routing plane (``topk_idx_out`` /
+    ``topk_weights_out``, capacity tail included) was already written by the
+    one-launch route staging, so it is not copied again.
     """
     from ......kernel_src.sm107.next_cutedsl_megamoe import (
         Nvfp4BlockSize,
@@ -54,10 +58,11 @@ def stage_mega_moe_inputs(
     x_nvfp4[:num_tokens].view(torch.uint8).copy_(q.view(torch.uint8))
     x_sf[:num_tokens].view(torch.uint8).zero_()
     x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(sf.view(torch.uint8))
-    topk_idx_out[:num_tokens].copy_(topk_ids.to(torch.int32))
-    topk_weights_out[:num_tokens].copy_(topk_weights.to(torch.float32))
-    if num_tokens < capacity:
-        topk_idx_out[num_tokens:capacity].fill_(-1)
+    if not routes_staged:
+        topk_idx_out[:num_tokens].copy_(topk_ids.to(torch.int32))
+        topk_weights_out[:num_tokens].copy_(topk_weights.to(torch.float32))
+        if num_tokens < capacity:
+            topk_idx_out[num_tokens:capacity].fill_(-1)
     return num_tokens
 
 

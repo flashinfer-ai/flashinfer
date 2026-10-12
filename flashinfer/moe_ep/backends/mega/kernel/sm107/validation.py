@@ -206,3 +206,24 @@ def validate_weight_layout(weight, scale, *, scale_dtype) -> None:
         raise MoEEpConfigError("SM107 weights and scales must be on the same device")
     if weight.data_ptr() % 16 or scale.data_ptr() % 16:
         raise MoEEpConfigError("SM107 weights and scales must be 16-byte aligned")
+
+
+def stage_routing_plane(topk_ids, topk_weights, workspace):
+    """Stage (+ validate) the routing plane.
+
+    Returns ``(routed, ids, weights)``: ``routed`` is True when the one-launch Triton path
+    wrote the workspace plane; otherwise ``ids`` / ``weights`` are the tensors the caller
+    copies (after the torch route validation)."""
+    from .route_stage import stage_routes
+
+    num_experts = workspace.config.num_total_experts
+    routed = stage_routes(
+        topk_ids,
+        topk_weights,
+        workspace.topk_idx,
+        workspace.topk_weights,
+        num_experts,
+    )
+    if not routed:
+        validate_routing_values(topk_ids, topk_weights, num_experts)
+    return routed, topk_ids, topk_weights

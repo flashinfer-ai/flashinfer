@@ -71,7 +71,11 @@ topology. See the [NVSHMEM environment variable reference](https://docs.nvidia.c
 | Determinism | In-kernel FC2 reduction is opt-in and requires early routing weights; repeatability must be characterized separately |
 
 Routing value checks use device assertions so they remain active on graph
-replay without a host synchronization. Invalid routing can invalidate the
+replay without a host synchronization. The NVFP4 backend's one-launch route
+staging folds these checks into its kernel;
+`FLASHINFER_SM107_MEGA_CHECK_ROUTES=0` compiles them out for routers that
+already guarantee valid routes, and inputs that fall back to the torch
+staging are always validated. Invalid routing can invalidate the
 worker's CUDA context, as with other invalid CUDA indexing operations.
 Use separate worker processes for negative device-assertion tests. Valid
 masked routes are supported; their combine slots are cleared each launch.
