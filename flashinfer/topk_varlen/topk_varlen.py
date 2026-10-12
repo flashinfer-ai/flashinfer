@@ -1772,9 +1772,9 @@ def top_k_varlen(
         columns and ``page_size`` are in the units of ``logits``. When given,
         each selected column ``c`` of request ``q`` is written as the physical
         KV slot ``page_table[q, c // page_size] * page_size + c % page_size``
-        instead of the column; ``-1`` padding is unchanged. Not combinable
-        with ``pre_idx``, ``row_starts`` or ``return_values``; the backends
-        that serve it are listed under ``backend``. Default ``None``.
+        instead of the column; ``-1`` padding is unchanged. The backends that
+        serve it, and their limits, are listed under ``backend``. Default
+        ``None``.
     page_size : int, optional
         Columns per ``page_table`` entry, a power of two up to ``2**30``. Any
         value but ``None`` without ``page_table`` raises ``ValueError``.
@@ -1886,8 +1886,10 @@ def top_k_varlen(
                               them must then be re-captured after a fresh
                               warm-up. A caller-provided ``"gvr2_workspace"``
                               (see ``workspace``) replaces the slab. Paged
-                              output (``page_table``) is decode mode only and
-                              hint-free; ``page_size`` is part of its warm-up
+                              output (``page_table``) is decode mode only,
+                              hint-free (no ``pre_idx``) and indices only (no
+                              ``return_values``); ``page_size`` is part of its
+                              warm-up
                               key, so warm up each paged geometry with one
                               eager paged call on the capturing stream.
         ``"radix_cutlass"`` — Masked CUTLASS radix top-K.
