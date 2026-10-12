@@ -610,4 +610,43 @@ def test_comm_sms_defaults_follow_the_device_generation():
     # The measured per-generation rows (backend README); a change here is a shipping change.
     assert mok.COMM_SMS_DEFAULTS[(10, 0)] == {"bf16": (20, 24), "mxfp8": (40, 32)}
     assert mok.COMM_SMS_DEFAULTS[(10, 3)] == {"bf16": (24, 28), "mxfp8": (40, 32)}
+
+
+def test_select_comm_split_is_host_only_and_threshold_driven():
+    """The imbalance-aware split is a pure function of the observed per-rank loads:
+    hot when the largest load is at least threshold x the mean load, else base."""
+    from flashinfer.experimental.cake_mok_bf16.backend import select_comm_split
+
+    base, hot = (20, 24), (24, 28)
+    assert select_comm_split([100, 100, 100, 100], base, hot, 1.5) == base
+    assert (
+        select_comm_split([200, 100, 100, 100], base, hot, 1.5) == hot
+    )  # 200 * 4 / 500 = 1.6
+    assert select_comm_split([150, 100, 100, 100], base, hot, 1.5) == base  # 1.33
+    assert select_comm_split([150, 50, 50, 50], base, hot, 1.5) == hot  # 2.0
+    assert select_comm_split([0, 0, 0, 0], base, hot, 1.5) == base
+    assert select_comm_split((), base, hot, 1.5) == base
+    assert select_comm_split([200, 100, 100, 100], base, None, 1.5) == base
+    loads = torch.tensor([300, 100, 100, 100], dtype=torch.int32)
+    assert select_comm_split(loads, base, hot, 1.5) == hot
+    assert select_comm_split(loads, base, [24, 28], 1.5) == hot
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_imbalance_comm_sms_rows_follow_the_device_generation():
+    """Only generations/precisions with a measured gain have an imbalance row; the
+    others keep the fixed split (``None``)."""
+    from flashinfer import mok
+
+    cc = tuple(torch.cuda.get_device_capability(0))
+    expected = mok.IMBALANCE_COMM_SMS.get(cc, {})
+    for precision in ("bf16", "mxfp8"):
+        assert mok.imbalance_comm_sms(
+            precision, torch.device("cuda", 0)
+        ) == expected.get(precision)
+    with pytest.raises(ValueError, match="precision must be one of"):
+        mok.imbalance_comm_sms("fp8")
+    # The measured row (backend README); a change here is a shipping change.
+    assert mok.IMBALANCE_COMM_SMS == {(10, 0): {"bf16": (24, 28)}}
+    assert mok.IMBALANCE_THRESHOLD == 1.5
     assert mok.COMM_SMS_DEFAULTS[(10, 7)] == {"bf16": (40, 32), "mxfp8": (72, 64)}

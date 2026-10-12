@@ -131,6 +131,17 @@ for unequal lengths, empty ranks, count changes and graph reuse.
   20.54, 48/40 20.72, 56/40 21.13, 64/48 21.86, 72/64 23.71, checkpoint 40/32 25.41, 56/40
   25.98, 72/64 28.41). Generations without their own row use the B200 values. Pass
   `precision="mxfp8"` to the factory for an MXFP8 workload, or set the counts explicitly.
+  Imbalance-aware split (`MoKConfig.imbalance_comm_sms` / `imbalance_threshold`, factory
+  argument `imbalance_comm_sms="auto"`): each step every rank counts the gathered expert IDs
+  per owning rank on device and copies the counts into pinned host memory behind a CUDA
+  event (no host synchronization, identical on every rank; skipped during graph capture);
+  while the hottest rank's load is at least 1.5 x the mean load the launches use the
+  generation's imbalance split instead of the fixed one, so balanced steps are unchanged.
+  Measured row: B200 BF16 24 / 28 (EP8 GLM-5.2 checkpoint step with one rank's experts at
+  twice the routing probability, 8 GPUs, complete step against the reference, two rounds:
+  fixed 20/24 -0.89 % / +0.20 %, fixed 24/28 -1.33 % / -1.06 %, 20/28 +0.82 % / +0.36 %,
+  24/28 with recompute 28 -0.87 % / -0.84 %, uniform control at 20/24 -3.45 % / -2.97 %).
+  `CAKE_MOK_COMM_SPLIT_LOG=1` prints each split change per rank to stderr.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.
 - An EP16 workload can use 16,384 source tokens per rank (262,144 global), hidden width

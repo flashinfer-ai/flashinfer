@@ -6,6 +6,8 @@
 
 from dataclasses import dataclass, replace
 import math
+import os
+import sys
 
 import torch
 import torch.distributed as dist
@@ -62,6 +64,25 @@ def context_defined_rows(config, context):
     schedule = context.schedule
     routed = min(config.macrobatch_size, int(schedule.num_tokens.item()))
     return routed, schedule.num_source_tokens
+
+
+def select_comm_split(loads, base, hot, threshold):
+    """Communication-SM split for an observed per-rank routed-row ``loads`` sequence.
+
+    Returns ``hot`` when ``hot`` is set and the largest load is at least ``threshold``
+    times the mean load (``sum(loads) / len(loads)``), else ``base``. Host-only;
+    ``loads`` may be a list, a tuple or a CPU tensor. No observation yet or a zero
+    total load (every rank empty) keeps ``base``.
+    """
+    if hot is None:
+        return tuple(base)
+    values = [int(v) for v in loads]
+    total = sum(values)
+    if not values or total <= 0:
+        return tuple(base)
+    if max(values) * len(values) >= threshold * total:
+        return tuple(hot)
+    return tuple(base)
 
 
 # (EP, local experts, top-k) layouts with exported scheduler kernels: the toy
@@ -127,6 +148,7 @@ class MoKFunctional:
         self.backward_kernel = MoKBackward()
         self.epilogues = MoKEpilogues(topk)
         self._mxfp8 = {}
+        self._load_state = {}  # id(native workspace) -> asynchronous routed-load observation
         if mxfp8:
             for role in ("forward", "backward"):
                 self._mxfp8_kernel(role)
@@ -285,6 +307,33 @@ class MoKFunctional:
                 raise ValueError(
                     "Communication-SM counts must be positive, even and leave compute SMs"
                 )
+        if config.imbalance_comm_sms is not None:
+            hot = config.imbalance_comm_sms
+            if (
+                not isinstance(hot, (tuple, list))
+                or len(hot) != 2
+                or any(
+                    type(count) is not int
+                    or count <= 0
+                    or count % 2
+                    or count >= properties.multi_processor_count
+                    for count in hot
+                )
+            ):
+                raise ValueError(
+                    "imbalance_comm_sms must be two positive, even communication-SM counts "
+                    "that leave compute SMs"
+                )
+            threshold = config.imbalance_threshold
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or not math.isfinite(threshold)
+                or threshold <= 1.0
+            ):
+                raise ValueError(
+                    "imbalance_threshold must be a finite number above 1.0"
+                )
         if (
             type(config.minibatch_size) is not int
             or config.minibatch_size <= 0
@@ -339,6 +388,7 @@ class MoKFunctional:
             workspace.schedule_capacity,
             workspace.ep_rank,
         )
+        self._observe_load(workspace, config)
         if owner is not None:
             return MoKSourceSchedule(
                 peer_rank=rank,
@@ -354,6 +404,89 @@ class MoKFunctional:
             num_tokens=count,
             tokens_per_expert=counts,
         )
+
+    def _load_entry(self, workspace, create):
+        entry = self._load_state.get(id(workspace))
+        if entry is None and create:
+            ep = workspace.ep_size
+            entry = {
+                "host": [
+                    torch.empty(ep, dtype=torch.int32, pin_memory=True)
+                    for _ in range(2)
+                ],
+                "events": [torch.cuda.Event() for _ in range(2)],
+                "slot": 0,
+                "pending": None,
+                "loads": (),
+                "ratio": None,
+                "split": None,
+                "changes": 0,
+            }
+            self._load_state[id(workspace)] = entry
+        return entry
+
+    def _observe_load(self, workspace, config):
+        """Queue an asynchronous observation of the per-rank routed-row load.
+
+        Every rank counts the gathered expert IDs per owning rank (expert id // local
+        experts; ``-1`` padding excluded) on device and copies the counts into pinned
+        host memory behind a CUDA event: no host synchronization. ``_comm_split`` reads
+        the latest completed observation, so a split change takes effect from the first
+        later launch whose event has completed (the backward of the same step in
+        practice). Skipped during CUDA Graph capture: captured launches keep the split
+        in force at capture time.
+        """
+        if (
+            config.imbalance_comm_sms is None
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        entry = self._load_entry(workspace, create=True)
+        routes = workspace.all_gather_top_experts_buffer.reshape(-1)
+        owner = torch.where(
+            routes >= 0, routes // self.local_experts, workspace.ep_size
+        )
+        loads = torch.zeros(
+            workspace.ep_size + 1, dtype=torch.int32, device=routes.device
+        )
+        loads.scatter_add_(0, owner.to(torch.int64), torch.ones_like(routes))
+        slot = entry["slot"] ^ 1
+        entry["host"][slot].copy_(loads[: workspace.ep_size], non_blocking=True)
+        entry["events"][slot].record()
+        entry["slot"], entry["pending"] = slot, slot
+
+    def _comm_split(self, config, workspace):
+        """(forward, backward) communication-SM counts of the next launch."""
+        base = (config.fwd_num_comm_sms, config.bwd_num_comm_sms)
+        if config.imbalance_comm_sms is None:
+            return base
+        capturing = torch.cuda.is_current_stream_capturing()
+        entry = self._load_entry(workspace, create=not capturing)
+        if entry is None:
+            return base
+        pending = entry["pending"]
+        if pending is not None and not capturing and entry["events"][pending].query():
+            loads = entry["host"][pending].tolist()
+            total = sum(loads)
+            entry["loads"] = loads
+            entry["ratio"] = max(loads) * len(loads) / total if total > 0 else None
+            entry["pending"] = None
+        split = select_comm_split(
+            entry["loads"], base, config.imbalance_comm_sms, config.imbalance_threshold
+        )
+        if split != entry["split"]:
+            entry["split"] = split
+            entry["changes"] += 1
+            if os.environ.get("CAKE_MOK_COMM_SPLIT_LOG"):
+                ratio = entry["ratio"]
+                print(
+                    f"[cake_mok_bf16 rank {workspace.ep_rank}] communication split -> "
+                    f"{split} (max/mean routed load "
+                    f"{'n/a' if ratio is None else f'{ratio:.3f}'}, change {entry['changes']})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return split
 
     @staticmethod
     def _schedule(schedule):
@@ -431,6 +564,7 @@ class MoKFunctional:
         self._copy_source(workspace.router_weight_buffer, router_weights)
         self._barrier(workspace)
         kernel = self._mxfp8_kernel("forward") if mxfp8 else self.forward_kernel
+        fwd_comm_sms, _ = self._comm_split(config, workspace)
         values = kernel(
             self._rows(workspace.x_buffer, source_count),
             workspace.x_buffer_ptrs,
@@ -445,7 +579,7 @@ class MoKFunctional:
             *self._schedule(schedule),
             workspace.topk,
             swiglu_limit,
-            config.fwd_num_comm_sms,
+            fwd_comm_sms,
             config.macrobatch_size,
             config.minibatch_size,
             source_rows=source_count,
@@ -536,6 +670,7 @@ class MoKFunctional:
         self._barrier(workspace)
         # The down weights are unused placeholders in recompute mode.
         kernel = self._mxfp8_kernel("forward") if mxfp8 else self.forward_kernel
+        fwd_comm_sms, _ = self._comm_split(config, workspace)
         values = kernel(
             self._rows(workspace.x_buffer, source_count),
             workspace.x_buffer_ptrs,
@@ -550,7 +685,7 @@ class MoKFunctional:
             *self._schedule(schedule),
             workspace.topk,
             swiglu_limit,
-            config.fwd_num_comm_sms
+            fwd_comm_sms
             if config.recompute_num_comm_sms is None
             else config.recompute_num_comm_sms,
             config.macrobatch_size,
@@ -610,6 +745,7 @@ class MoKFunctional:
         self._copy_source(workspace.x_buffer, x)
         self._copy_source(workspace.router_weight_buffer, router_weights)
         self._barrier(workspace)
+        _, bwd_comm_sms = self._comm_split(config, workspace)
         if mxfp8:
             return self._backward_mxfp8(
                 config,
@@ -622,6 +758,7 @@ class MoKFunctional:
                 routed,
                 swiglu_limit,
                 wgrad_f32,
+                bwd_comm_sms,
             )
         values = self.backward_kernel(
             self._rows(workspace.d_y_buffer, source_count),
@@ -650,7 +787,7 @@ class MoKFunctional:
             *self._schedule(schedule),
             workspace.topk,
             swiglu_limit,
-            config.bwd_num_comm_sms,
+            bwd_comm_sms,
             config.macrobatch_size,
             config.minibatch_size,
             source_rows=source_count,
@@ -687,6 +824,7 @@ class MoKFunctional:
         routed,
         swiglu_limit,
         wgrad_f32,
+        bwd_comm_sms,
     ):
         kernel = self._mxfp8_kernel("backward_f32" if wgrad_f32 else "backward")
         values = kernel(
@@ -716,7 +854,7 @@ class MoKFunctional:
             *self._schedule(schedule),
             workspace.topk,
             swiglu_limit,
-            config.bwd_num_comm_sms,
+            bwd_comm_sms,
             config.macrobatch_size,
             config.minibatch_size,
             source_rows=source_count,

@@ -90,6 +90,35 @@ def comm_sms_defaults(precision, device=None):
     return COMM_SMS_DEFAULTS.get(cc, table)[precision]
 
 
+# Imbalance-aware communication split: when the hottest rank's routed-row load, observed on
+# the gathered expert IDs of each step, reaches IMBALANCE_THRESHOLD x the mean per-rank load,
+# the launches switch to this (forward, backward) split; uniform routing (ratio ~1.0) never
+# switches, so the defaults above stay in force for balanced steps. Only generations and
+# precisions with a measured gain have a row (backend README): B200 BF16, EP8 GLM-5.2
+# imbalanced checkpoint step (one rank's experts at twice the routing probability), complete
+# training step against the reference — fixed 20 / 24: -0.89 % / +0.20 %, fixed 24 / 28:
+# -1.33 % / -1.06 % (two rounds).
+IMBALANCE_COMM_SMS = {
+    (10, 0): {"bf16": (24, 28)},
+}
+IMBALANCE_THRESHOLD = 1.5
+
+
+def imbalance_comm_sms(precision, device=None):
+    """(forward, backward) split used under imbalanced routing for ``precision`` on
+    ``device``, or ``None`` when its generation has no measured row (fixed split kept).
+    """
+    import torch
+
+    if precision not in COMM_SMS_DEFAULTS[_COMM_SMS_FALLBACK_ARCH]:
+        raise ValueError(
+            f"precision must be one of {sorted(COMM_SMS_DEFAULTS[_COMM_SMS_FALLBACK_ARCH])}, "
+            f"got {precision!r}"
+        )
+    cc = tuple(torch.cuda.get_device_capability(device))
+    return IMBALANCE_COMM_SMS.get(cc, {}).get(precision)
+
+
 @flashinfer_experimental_api
 def create_mok_bf16_workspace(
     *,
@@ -105,6 +134,8 @@ def create_mok_bf16_workspace(
     macrobatch_size=32768,
     schedule_capacity_multiplier=3 / 16,
     precision="bf16",
+    imbalance_comm_sms="auto",
+    imbalance_threshold=IMBALANCE_THRESHOLD,
 ):
     """Collectively create a caller-owned ``(config, workspace)`` pair.
 
@@ -124,6 +155,14 @@ def create_mok_bf16_workspace(
     complete steps use 40 / 32 (BF16) and 72 / 64 (MXFP8). The precision only
     selects these defaults; the kernels a call runs are chosen by the weights
     passed to it.
+
+    ``imbalance_comm_sms`` is the (forward, backward) split the launches switch to
+    while the hottest rank's routed-row load is at least ``imbalance_threshold``
+    times the mean per-rank load (observed on the gathered expert IDs of each step
+    without a host synchronization; identical on every rank). ``"auto"`` takes the
+    measured row of the device generation (:func:`imbalance_comm_sms`; B200 BF16:
+    24 / 28, no row elsewhere), ``None`` keeps the fixed split, a pair sets it.
+    Balanced steps never switch, so the defaults above stay in force for them.
     """
     from .experimental.cake_mok_bf16.workspace import MoKConfig
     from .experimental.cake_mok_bf16.backend import create_source_workspace
@@ -133,9 +172,19 @@ def create_mok_bf16_workspace(
         fwd_num_comm_sms = default_fwd
     if bwd_num_comm_sms is None:
         bwd_num_comm_sms = default_bwd
+    if isinstance(imbalance_comm_sms, str):
+        if imbalance_comm_sms != "auto":
+            raise ValueError(
+                'imbalance_comm_sms must be "auto", None or a (forward, backward) pair'
+            )
+        imbalance_comm_sms = globals()["imbalance_comm_sms"](precision, device)
+    elif imbalance_comm_sms is not None:
+        imbalance_comm_sms = tuple(imbalance_comm_sms)
     config = MoKConfig(
         fwd_num_comm_sms=fwd_num_comm_sms,
         bwd_num_comm_sms=bwd_num_comm_sms,
+        imbalance_comm_sms=imbalance_comm_sms,
+        imbalance_threshold=imbalance_threshold,
         minibatch_size=minibatch_size,
         macrobatch_size=macrobatch_size,
         schedule_capacity_multiplier=schedule_capacity_multiplier,

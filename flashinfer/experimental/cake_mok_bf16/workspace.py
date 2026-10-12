@@ -24,6 +24,15 @@ class MoKConfig:
     # (the recompute runs the full dispatch but no down projections and no combine, so its balance
     # point differs from the full forward's).
     recompute_num_comm_sms: int | None = None
+    # Imbalance-aware communication split: when the hottest rank's routed-row load observed on
+    # the gathered expert IDs reaches ``imbalance_threshold`` x the mean per-rank load, the
+    # launches use these (forward, backward) communication-SM counts instead of the fixed
+    # ``fwd_num_comm_sms`` / ``bwd_num_comm_sms`` (the recompute launch follows the forward count
+    # unless ``recompute_num_comm_sms`` is set). ``None`` keeps the fixed split. The load is
+    # observed asynchronously (pinned copy behind a CUDA event, no host synchronization) and is
+    # identical on every rank; see ``MoKFunctional._comm_split``.
+    imbalance_comm_sms: tuple[int, int] | None = None
+    imbalance_threshold: float = 1.5
     minibatch_size: int = 4096
     macrobatch_size: int = 131072
     schedule_capacity_multiplier: float = 0.5
