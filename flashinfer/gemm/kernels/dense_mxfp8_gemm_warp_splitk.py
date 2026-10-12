@@ -589,6 +589,10 @@ class CpAsyncMxFp8WarpSplitKKernel:
         sf_k_words = cute.size(weight, mode=[1]) * 2 // _SF_WORD_K
 
         if warp_idx < _A_LOADER_WARPS:
+            # Under PDL the weights and their scales may be written by the
+            # preceding kernel, so the weight loaders wait for it as well.
+            if const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_wait()
             # Tile 0 has no mbarrier dependency: issue it before the init handshake
             # so its DRAM latency overlaps init and the CTA barrier.
             _issue_weight_tile(

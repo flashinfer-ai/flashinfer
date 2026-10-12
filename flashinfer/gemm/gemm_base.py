@@ -6431,12 +6431,15 @@ def _cute_dsl_gemm_mxfp8_runner(
             m = a.shape[0]
             n = b.shape[1]
             real_k = a.shape[1]
-            if (
-                warp_splitk_supports is not None
-                and m <= 8
-                and warp_splitk_supports(inputs)
-            ):
-                return []
+            warp_serves = warp_splitk_supports is not None and warp_splitk_supports(
+                inputs
+            )
+            if warp_serves and m <= 8:
+                # Keep the default tactic as the fallback if every warp split-K
+                # tactic fails to profile.
+                return [
+                    (split_k_kernel_cls.mma_tiler_mn_for_m(m), (1, 1), True, False, 1)
+                ]
             ab_dtype = cutlass.Float8E4M3FN
             base_tactics = _get_sm100_block_scaled_tactics(
                 m=m,
@@ -6453,9 +6456,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                 return valid_tactics
 
             for split_k_slices in split_k_kernel_cls.SUPPORTED_SPLIT_K_SLICES:
-                if split_k_slices == 4 and m > 16:
-                    continue
-                if warp_splitk_supports is not None and real_k < 4096:
+                if warp_serves and real_k < 4096:
                     continue
                 if split_k_kernel_cls.is_valid_tactic(
                     m,

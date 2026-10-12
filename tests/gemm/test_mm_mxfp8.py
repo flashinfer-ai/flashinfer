@@ -9,6 +9,7 @@ from flashinfer import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
 )
+from flashinfer.autotuner import AutoTuner
 from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.gemm import gemm_base
 from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
@@ -316,6 +317,7 @@ def test_mm_mxfp8_b12x_decode_m(m, n, k):
     )
 
 
+@pytest.mark.parametrize("auto_tuning", [False, True])
 @pytest.mark.parametrize(
     "m,k",
     [
@@ -325,7 +327,10 @@ def test_mm_mxfp8_b12x_decode_m(m, n, k):
         (32, 2048),
     ],
 )
-def test_mm_mxfp8_cute_dsl_low_m(m, k):
+def test_mm_mxfp8_cute_dsl_low_m(m, k, auto_tuning):
+    if not auto_tuning:
+        # A cached winner would replace the untuned default runner and tactic.
+        AutoTuner.get().clear_cache()
     _run_mm_mxfp8(
         m,
         256,
@@ -333,9 +338,121 @@ def test_mm_mxfp8_cute_dsl_low_m(m, k):
         torch.bfloat16,
         torch.bfloat16,
         "cute-dsl",
-        auto_tuning=True,
+        auto_tuning=auto_tuning,
         provide_out=True,
     )
+
+
+# Triggers the dependent launch first, spins, and only then writes the weight and
+# its scales, so a dependent GEMM that reads them before griddepcontrol.wait sees
+# the NaN bytes left in the buffers.
+_PDL_PRODUCER_CUDA = r"""
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <torch/extension.h>
+
+#include <cstdint>
+
+__global__ void trigger_then_write_kernel(uint8_t* w_out, const uint8_t* w_in, int64_t w_n,
+                                          uint8_t* s_out, const uint8_t* s_in, int64_t s_n,
+                                          int64_t spin_cycles) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+  int64_t start = clock64();
+  while (clock64() - start < spin_cycles) {
+  }
+  int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < w_n;
+       i += stride) {
+    w_out[i] = w_in[i];
+  }
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < s_n;
+       i += stride) {
+    s_out[i] = s_in[i];
+  }
+}
+
+void pdl_delayed_producer(at::Tensor w_out, at::Tensor w_in, at::Tensor s_out,
+                          at::Tensor s_in, int64_t spin_cycles) {
+  TORCH_CHECK(w_out.numel() * w_out.element_size() == w_in.numel() * w_in.element_size());
+  TORCH_CHECK(s_out.numel() * s_out.element_size() == s_in.numel() * s_in.element_size());
+  trigger_then_write_kernel<<<64, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      static_cast<uint8_t*>(w_out.data_ptr()), static_cast<const uint8_t*>(w_in.data_ptr()),
+      w_out.numel() * w_out.element_size(), static_cast<uint8_t*>(s_out.data_ptr()),
+      static_cast<const uint8_t*>(s_in.data_ptr()), s_out.numel() * s_out.element_size(),
+      spin_cycles);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+"""
+
+
+@pytest.mark.parametrize("auto_tuning", [False, True])
+@pytest.mark.parametrize("m,n,k", [(1, 1152, 1536), (16, 2304, 2048), (32, 256, 2048)])
+def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
+    """The cute-dsl GEMM launches with PDL; it must not read the weight or its
+    scales before the kernel that writes them has finished."""
+    _skip_if_unsupported("cute-dsl")
+    from torch.utils.cpp_extension import load_inline
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    producer = load_inline(
+        name="test_mm_mxfp8_pdl_producer",
+        cpp_sources=[
+            "void pdl_delayed_producer(at::Tensor w_out, at::Tensor w_in, "
+            "at::Tensor s_out, at::Tensor s_in, int64_t spin_cycles);"
+        ],
+        cuda_sources=[_PDL_PRODUCER_CUDA],
+        extra_cuda_cflags=[
+            f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+        ],
+        functions=["pdl_delayed_producer"],
+        verbose=False,
+    )
+
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
+    )
+    reference = torch.mm(input, weight.T)
+    # NaN in E4M3 (0x7F) and in E8M0 (0xFF): a stale read poisons the output.
+    stale_weight = torch.empty_like(weight_mxfp8)
+    stale_scale = torch.empty_like(weight_scale)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+
+    if not auto_tuning:
+        AutoTuner.get().clear_cache()
+    else:
+        with autotune(True):
+            mm_mxfp8(
+                input_mxfp8,
+                weight_mxfp8.T,
+                input_scale,
+                weight_scale,
+                out=out,
+                backend="cute-dsl",
+            )
+    for _ in range(5):
+        stale_weight.view(torch.uint8).fill_(0x7F)
+        stale_scale.view(torch.uint8).fill_(0xFF)
+        torch.cuda.synchronize()
+        producer.pdl_delayed_producer(
+            stale_weight, weight_mxfp8, stale_scale, weight_scale, 4_000_000
+        )
+        mm_mxfp8(
+            input_mxfp8,
+            stale_weight.T,
+            input_scale,
+            stale_scale,
+            out=out,
+            backend="cute-dsl",
+        )
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all(), (
+            "the GEMM read the weight before it was written"
+        )
+        _assert_cosine_similarity(reference, out)
 
 
 @pytest.mark.arch_rubin
