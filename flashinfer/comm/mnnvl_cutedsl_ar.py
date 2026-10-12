@@ -80,6 +80,30 @@ def _warn_pdl_mismatch(
         )
 
 
+_ALL_REDUCE_PATTERNS = (
+    AllReduceFusionPattern.kARResidualRMSNorm,
+    AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
+    AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
+)
+_FINALIZE_PATTERNS = (
+    AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm,
+    AllReduceFusionPattern.kMoEFinalizeARResidualRMSNormFP8Quant,
+)
+# Patterns served by a BF16 workspace, and by an FP8 workspace for each
+# write_norm_output setting.
+_BF16_PATTERNS = (
+    AllReduceFusionPattern.kARResidualRMSNorm,
+    AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm,
+)
+_FP8_PATTERNS = {
+    False: (
+        AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
+        AllReduceFusionPattern.kMoEFinalizeARResidualRMSNormFP8Quant,
+    ),
+    True: (AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,),
+}
+
+
 class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     """Compiled LL, BT, and HT protocols for one static problem shape.
 
@@ -87,12 +111,15 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     the first invocation. Calls using the same workspace must not overlap.
     Feature-disabled tensor slots use internal placeholders that are not read.
 
-    Reference static FP8 specialization: set ``output_dtype=torch.float8_e4m3fn``.
-    Inputs, communication buffers, residual outputs and norm weights remain BF16.
-    ``write_norm_output=True`` additionally materializes the BF16 norm result.
-    Output mode is fixed when kernels compile; use a separate workspace for a
-    different mode. Existing shape profiles are reused without retuning.
-    FP8 output requires ``apply_rms_norm=True``.
+    Static per-tensor FP8 output: set ``output_dtype=torch.float8_e4m3fn`` to
+    serve ``kARResidualRMSNormFP8Quant`` and
+    ``kMoEFinalizeARResidualRMSNormFP8Quant``, or additionally
+    ``write_norm_output=True`` to serve ``kARResidualRMSNormOutFP8Quant``, which
+    also writes the BF16 norm. Inputs, communication buffers, residual outputs
+    and norm weights stay BF16. The output mode is fixed when the kernels
+    compile, so a model that needs both BF16 and FP8 outputs uses one workspace
+    per mode. Existing shape profiles are reused without retuning. FP8 output
+    requires ``apply_rms_norm=True``.
 
     ``apply_rms_norm=False`` compiles the collective without its normalisation:
     the chain stops after finalize, shared-expert add, all-reduce and the
@@ -296,7 +323,7 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         return tunings
 
     def _uses_pdl(self, pattern: int, m: int) -> bool:
-        if pattern == AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm:
+        if pattern in _FINALIZE_PATTERNS:
             target = self.profile.finalize_routes.select(m)
         elif pattern in (
             AllReduceFusionPattern.kARResidualRMSNorm,
@@ -409,9 +436,8 @@ def _prepare_output_tensors(
     scale_factor: torch.Tensor | float | None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     """Validate the compiled output mode and select primary/companion buffers."""
-    p = AllReduceFusionPattern
     if workspace.output_dtype == torch.bfloat16:
-        if pattern not in (p.kARResidualRMSNorm, p.kMoEFinalizeARResidualRMSNorm):
+        if pattern not in _BF16_PATTERNS:
             raise ValueError(
                 "FP8 patterns require a workspace with output_dtype=float8_e4m3fn"
             )
@@ -419,33 +445,25 @@ def _prepare_output_tensors(
             raise ValueError("BF16 workspace does not accept quant_out or scale_factor")
         return norm_out, None, None
 
-    if pattern == p.kARResidualRMSNorm:
+    if pattern not in _FP8_PATTERNS[workspace.write_norm_output]:
+        if pattern in _BF16_PATTERNS:
+            raise ValueError(
+                "Patterns 1 and 7 produce BF16 output and need a BF16 workspace; "
+                "use kARResidualRMSNormFP8Quant or "
+                "kMoEFinalizeARResidualRMSNormFP8Quant for FP8 output"
+            )
+        required = not workspace.write_norm_output
         raise ValueError(
-            "FP8 workspace requires an FP8 pattern or the MoE finalize pattern"
+            f"This pattern requires a workspace with write_norm_output={required}"
         )
-    if pattern == p.kARResidualRMSNormFP8Quant and workspace.write_norm_output:
-        raise ValueError("Pattern 2 requires write_norm_output=False")
-    if pattern == p.kARResidualRMSNormOutFP8Quant and not workspace.write_norm_output:
-        raise ValueError("Pattern 4 requires write_norm_output=True")
+    if workspace.write_norm_output and norm_out is None:
+        raise ValueError(
+            "kARResidualRMSNormOutFP8Quant returns quant_out, so the BF16 norm "
+            "is only observable through a caller-provided norm_out"
+        )
     if not workspace.write_norm_output and norm_out is not None:
         raise ValueError("norm_out requires write_norm_output=True")
-    if not isinstance(scale_factor, torch.Tensor):
-        raise ValueError(
-            "Static FP8 requires scale_factor as a device FP32 scalar tensor"
-        )
-    if scale_factor.shape not in (torch.Size([]), torch.Size([1])):
-        raise ValueError("scale_factor must be a scalar or have shape (1,)")
-    _check_tensor(
-        scale_factor,
-        "scale_factor",
-        shape=tuple(scale_factor.shape),
-        dtype=torch.float32,
-        device=device,
-        alignment=4,
-    )
-    # No .item(): the caller supplies a finite positive value, identical across
-    # ranks. Keep its device address live so capture/replay can update the scale.
-    device_scale = scale_factor.reshape(1)
+    device_scale = _device_scale(scale_factor, device)
     if quant_out is not None:
         _check_tensor(
             quant_out,
@@ -459,11 +477,32 @@ def _prepare_output_tensors(
         quant_out = torch.empty(
             (m, workspace.hidden_dim), dtype=torch.float8_e4m3fn, device=device
         )
-    if workspace.write_norm_output and norm_out is None:
-        norm_out = torch.empty(
-            (m, workspace.hidden_dim), dtype=torch.bfloat16, device=device
-        )
     return quant_out, norm_out, device_scale
+
+
+def _device_scale(
+    scale_factor: torch.Tensor | float | None, device: torch.device
+) -> torch.Tensor:
+    """Return the static FP8 scale as a one-element FP32 tensor on ``device``.
+
+    An FP32 device tensor is used in place (no copy), so a CUDA graph that
+    captured this call reads its current value on every replay. Any other
+    tensor is cast, and the cast is recorded with the call during capture. A
+    Python float becomes a constant of the captured graph.
+    """
+    if scale_factor is None:
+        raise ValueError("FP8 output requires scale_factor")
+    if not isinstance(scale_factor, torch.Tensor):
+        return torch.tensor([float(scale_factor)], dtype=torch.float32, device=device)
+    if scale_factor.numel() != 1:
+        raise ValueError("scale_factor must contain exactly one element")
+    if scale_factor.device != device:
+        raise ValueError(f"scale_factor must be on {device}")
+    if scale_factor.dtype != torch.float32:
+        scale_factor = scale_factor.to(torch.float32)
+    # reshape() of a one-element tensor is a view, so in-place updates of the
+    # caller's tensor stay visible to the kernel.
+    return scale_factor.reshape(1)
 
 
 def _mnnvl_cutedsl_allreduce_fusion(
@@ -498,12 +537,7 @@ def _mnnvl_cutedsl_allreduce_fusion(
         raise RuntimeError(
             "The MNNVLCuteDSLAllReduceFusionWorkspace has been destroyed"
         )
-    if pattern not in (
-        AllReduceFusionPattern.kARResidualRMSNorm,
-        AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
-        AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
-        AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm,
-    ):
+    if pattern not in _ALL_REDUCE_PATTERNS and pattern not in _FINALIZE_PATTERNS:
         raise NotImplementedError("Unsupported MNNVL CuTe DSL fusion pattern")
     unsupported = [
         name
@@ -560,11 +594,7 @@ def _mnnvl_cutedsl_allreduce_fusion(
     else:
         rms_gamma = workspace._gamma_placeholder
 
-    if pattern in (
-        AllReduceFusionPattern.kARResidualRMSNorm,
-        AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
-        AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
-    ):
+    if pattern in _ALL_REDUCE_PATTERNS:
         if any(
             value is not None
             for value in (
@@ -636,7 +666,7 @@ def _mnnvl_cutedsl_allreduce_fusion(
         )
         return result if workspace.apply_rms_norm else residual_out
 
-    if pattern == AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm:
+    if pattern in _FINALIZE_PATTERNS:
         if expanded_idx_to_permuted_idx is None:
             raise ValueError("expanded_idx_to_permuted_idx is required")
         if expert_scale_factor is None:

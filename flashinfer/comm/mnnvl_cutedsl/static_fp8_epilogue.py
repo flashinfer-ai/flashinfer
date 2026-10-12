@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reference static E4M3 epilogue shared by the LL, BT, and HT protocols.
+"""Static per-tensor E4M3 epilogue shared by the LL, BT, and HT protocols.
 
-Source-only prototype: not GPU-compiled or numerically validated. The packed
-BF16 argument preserves the existing norm rounding point before quantization.
+The norm is rounded to BF16 before quantization, matching the TRT-LLM and MNNVL
+FP8 epilogues, which also quantize the BF16 norm.
 """
 
 import cutlass
@@ -38,11 +38,14 @@ def store_rmsnorm_output(
     output_scale: cute.Tensor | None,
     norm_output_bf16: cute.Tensor | None,
 ) -> None:
-    """Store eight normalized values, optionally quantizing with q = norm / s.
+    """Store eight normalized values, optionally quantizing them to E4M3.
 
-    ``s`` is a positive finite device FP32 scalar shared by all tokens/ranks.
-    It is an input dequantization scale, not a scale estimated by this kernel.
-    The output element type and optional companion are compile-time choices.
+    The FP8 path computes ``q = norm * (1 / s)`` with a round-to-nearest,
+    saturating conversion, as TRT-LLM and MNNVL do. ``s`` is a positive finite
+    FP32 scalar in device memory, shared by all tokens and ranks; it is the
+    dequantization scale supplied by the caller, not one estimated here. The
+    output element type and the optional BF16 companion are compile-time
+    choices.
     """
     if cutlass.const_expr(output.element_type == Float8E4M3FN):
         # Read on the device, after the caller's existing dependency waits.
