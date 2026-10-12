@@ -333,16 +333,17 @@ def _make_cute_state(
     ("rows", "expected"),
     (
         (1, ("tp2_remote_push", 64, 36)),
-        (2, ("tp2_remote_push_stream", 128, 36)),
-        (4, ("tp2_remote_push_stream", 256, 36)),
-        (6, ("tp2_remote_push", 64, 16)),
-        (8, ("tp2_remote_push", 256, 32)),
-        (16, ("tp2_remote_push_stream", 64, 36)),
-        (24, ("tp2_remote_push_stream", 128, 32)),
-        (32, ("tp2_remote_push", 128, 16)),
-        (128, ("tp2_remote_push", 128, 16)),
-        (256, ("tp2_remote_push", 128, 16)),
-        (512, ("tp2_remote_push", 128, 16)),
+        (2, ("tp2_remote_push_simple", 128, 8)),
+        (3, ("tp2_remote_push_simple", 128, 12)),
+        (4, ("tp2_remote_push_simple", 128, 16)),
+        (6, ("tp2_remote_push_simple", 128, 24)),
+        (8, ("tp2_remote_push_simple", 128, 32)),
+        (16, ("tp2_remote_push_simple", 128, 36)),
+        (24, ("tp2_remote_push_simple", 128, 36)),
+        (32, ("tp2_remote_push_simple", 128, 36)),
+        (128, ("tp2_remote_push_simple", 128, 36)),
+        (256, ("tp2_remote_push_simple", 128, 36)),
+        (512, ("tp2_remote_push_simple", 128, 36)),
     ),
 )
 def test_plain_tp2_remote_push_uses_qualified_geometry(
@@ -424,8 +425,8 @@ def test_plain_graph_plan_freezes_prepared_channel_contract(monkeypatch) -> None
     state.eager_buffer_bytes = 0
     state.plain_remote_push_region_packs = 0
 
-    assert plan.transport == "tp2_remote_push"
-    assert (plan.threads, plan.blocks) == (64, 16)
+    assert plan.transport == "tp2_remote_push_simple"
+    assert (plan.threads, plan.blocks) == (128, 24)
     assert plan.eager_buffer_bytes == TP2_PLAIN_REMOTE_PUSH_MAX_BYTES
     assert plan.transport_policy[2] is True
     assert plan.remote_push_region_packs > 0
@@ -459,14 +460,14 @@ def test_prepare_plain_graph_all_reduce_retains_immutable_plan(monkeypatch) -> N
 
     key = backend._plain_graph_plan_key(inp)
     plan = state.plain_graph_plans[key]
-    assert plan.transport == "tp2_remote_push"
-    assert (plan.threads, plan.blocks) == (64, 16)
+    assert plan.transport == "tp2_remote_push_simple"
+    assert (plan.threads, plan.blocks) == (128, 24)
     assert launchers[0]._transport == "pull"
     assert not launchers[0]._device_slot_selection
     assert [
         (launcher._device_slot_selection, launcher._slot_bias, launcher._transport)
         for launcher in launchers[1:]
-    ] == [(True, 0, "tp2_remote_push"), (True, 1, "tp2_remote_push")]
+    ] == [(True, 0, "tp2_remote_push_simple"), (True, 1, "tp2_remote_push_simple")]
 
 
 def test_capture_binds_unseen_shape_for_a_prepared_launcher(monkeypatch) -> None:
@@ -499,13 +500,13 @@ def test_capture_binds_unseen_shape_for_a_prepared_launcher(monkeypatch) -> None
     backend.all_reduce(7, inp, torch.empty_like(inp), 0, 0)
 
     key = backend._plain_graph_plan_key(inp)
-    assert state.plain_graph_plans[key].transport == "tp2_remote_push"
+    assert state.plain_graph_plans[key].transport == "tp2_remote_push_simple"
     assert (
         state.plain_graph_plans[key].threads,
         state.plain_graph_plans[key].blocks,
     ) == (
-        64,
-        16,
+        128,
+        20,
     )
     assert len(launches) == 1
 

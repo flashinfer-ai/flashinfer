@@ -29,6 +29,7 @@ from b12x._lib.intrinsics import (
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
+from ._dcp_cute_common import _membar_sys
 from ._cute_intrinsics import (
     add_bf16x2,
     add_f16x2,
@@ -190,6 +191,7 @@ class _OneshotLaunch(_PackedMath):
             "pull",
             "tp2_remote_push",
             "tp2_remote_push_stream",
+            "tp2_remote_push_simple",
         ):
             raise ValueError(f"invalid plain oneshot transport {transport!r}")
         if transport.startswith("tp2_remote_push") and (
@@ -386,6 +388,86 @@ class _OneshotLaunch(_PackedMath):
             # records not touched by this shape.
             expected_generation = generation + Uint32(2)
 
+            if cutlass.const_expr(self._transport == "tp2_remote_push_simple"):
+                # Match NCCL Simple publication: the payload crosses PCIe once,
+                # 16 bytes per pack, and each CTA then raises one generation line
+                # after a system fence. LL records take 32 bytes per pack, so the
+                # last lines of the incoming capacity hold the CTA flags. A flag
+                # validates only on this generation in every lane, which neither
+                # an older flag nor an LL record carries.
+                flag_offset = (
+                    plain_capacity_packs * Int64(32)
+                    - Int64(_MAX_BLOCKS * 16)
+                    + Int64(bidx) * Int64(16)
+                )
+                publish_index = index
+                while publish_index < size_packs:
+                    words = ld_global_v4_u32(
+                        input_base + Int64(publish_index) * Int64(16)
+                    )
+                    st_global_v4_u32(
+                        peer_write_base + Int64(publish_index) * Int64(16),
+                        words[0],
+                        words[1],
+                        words[2],
+                        words[3],
+                    )
+                    publish_index += stride
+                cute.arch.sync_threads()
+                if Int32(tidx) == Int32(0):
+                    _membar_sys()
+                    st_relaxed_sys_global_v4_u32(
+                        peer_write_base + flag_offset,
+                        expected_generation,
+                        expected_generation,
+                        expected_generation,
+                        expected_generation,
+                    )
+                    flag = ld_relaxed_sys_global_v4_u32(local_poll_base + flag_offset)
+                    waiting = (
+                        (flag[0] ^ expected_generation)
+                        | (flag[1] ^ expected_generation)
+                        | (flag[2] ^ expected_generation)
+                        | (flag[3] ^ expected_generation)
+                    )
+                    while waiting != Uint32(0):
+                        flag = ld_relaxed_sys_global_v4_u32(
+                            local_poll_base + flag_offset
+                        )
+                        waiting = (
+                            (flag[0] ^ expected_generation)
+                            | (flag[1] ^ expected_generation)
+                            | (flag[2] ^ expected_generation)
+                            | (flag[3] ^ expected_generation)
+                        )
+                    _membar_sys()
+                cute.arch.sync_threads()
+                while index < size_packs:
+                    local_words = ld_global_v4_u32(
+                        input_base + Int64(index) * Int64(16)
+                    )
+                    peer_words = ld_relaxed_sys_global_v4_u32(
+                        local_poll_base + Int64(index) * Int64(16)
+                    )
+                    packed_sum = cute.make_rmem_tensor((4,), cutlass.Uint32)
+                    for word in cutlass.range_constexpr(4):
+                        if cutlass.const_expr(self._dtype_name == "float16"):
+                            packed_sum[word] = add_f16x2(
+                                local_words[word], peer_words[word]
+                            )
+                        else:
+                            packed_sum[word] = add_bf16x2(
+                                local_words[word], peer_words[word]
+                            )
+                    st_global_v4_u32(
+                        output_base + Int64(index) * Int64(16),
+                        packed_sum[0],
+                        packed_sum[1],
+                        packed_sum[2],
+                        packed_sum[3],
+                    )
+                    index += stride
+
             if cutlass.const_expr(self._transport == "tp2_remote_push"):
                 publish_index = index
                 while publish_index < size_packs:
@@ -414,34 +496,26 @@ class _OneshotLaunch(_PackedMath):
                     )
                     publish_index += stride
 
-            while index < size_packs:
-                local_words = ld_global_v4_u32(input_base + Int64(index) * Int64(16))
-                if cutlass.const_expr(self._transport == "tp2_remote_push_stream"):
-                    peer_line_address = peer_write_base + Int64(index) * Int64(32)
-                    st_relaxed_sys_global_v4_u32(
-                        peer_line_address,
-                        local_words[0],
-                        expected_generation,
-                        local_words[1],
-                        expected_generation,
-                    )
-                    st_relaxed_sys_global_v4_u32(
-                        peer_line_address + Int64(16),
-                        local_words[2],
-                        expected_generation,
-                        local_words[3],
-                        expected_generation,
-                    )
-                line_address = local_poll_base + Int64(index) * Int64(32)
-                line0 = ld_relaxed_sys_global_v4_u32(line_address)
-                line1 = ld_relaxed_sys_global_v4_u32(line_address + Int64(16))
-                waiting = (
-                    (line0[1] ^ expected_generation)
-                    | (line0[3] ^ expected_generation)
-                    | (line1[1] ^ expected_generation)
-                    | (line1[3] ^ expected_generation)
-                )
-                while waiting != Uint32(0):
+            if cutlass.const_expr(self._transport != "tp2_remote_push_simple"):
+                while index < size_packs:
+                    local_words = ld_global_v4_u32(input_base + Int64(index) * Int64(16))
+                    if cutlass.const_expr(self._transport == "tp2_remote_push_stream"):
+                        peer_line_address = peer_write_base + Int64(index) * Int64(32)
+                        st_relaxed_sys_global_v4_u32(
+                            peer_line_address,
+                            local_words[0],
+                            expected_generation,
+                            local_words[1],
+                            expected_generation,
+                        )
+                        st_relaxed_sys_global_v4_u32(
+                            peer_line_address + Int64(16),
+                            local_words[2],
+                            expected_generation,
+                            local_words[3],
+                            expected_generation,
+                        )
+                    line_address = local_poll_base + Int64(index) * Int64(32)
                     line0 = ld_relaxed_sys_global_v4_u32(line_address)
                     line1 = ld_relaxed_sys_global_v4_u32(line_address + Int64(16))
                     waiting = (
@@ -450,25 +524,34 @@ class _OneshotLaunch(_PackedMath):
                         | (line1[1] ^ expected_generation)
                         | (line1[3] ^ expected_generation)
                     )
-                peer_words = (line0[0], line0[2], line1[0], line1[2])
-                packed_sum = cute.make_rmem_tensor((4,), cutlass.Uint32)
-                for word in cutlass.range_constexpr(4):
-                    if cutlass.const_expr(self._dtype_name == "float16"):
-                        packed_sum[word] = add_f16x2(
-                            local_words[word], peer_words[word]
+                    while waiting != Uint32(0):
+                        line0 = ld_relaxed_sys_global_v4_u32(line_address)
+                        line1 = ld_relaxed_sys_global_v4_u32(line_address + Int64(16))
+                        waiting = (
+                            (line0[1] ^ expected_generation)
+                            | (line0[3] ^ expected_generation)
+                            | (line1[1] ^ expected_generation)
+                            | (line1[3] ^ expected_generation)
                         )
-                    else:
-                        packed_sum[word] = add_bf16x2(
-                            local_words[word], peer_words[word]
-                        )
-                st_global_v4_u32(
-                    output_base + Int64(index) * Int64(16),
-                    packed_sum[0],
-                    packed_sum[1],
-                    packed_sum[2],
-                    packed_sum[3],
-                )
-                index += stride
+                    peer_words = (line0[0], line0[2], line1[0], line1[2])
+                    packed_sum = cute.make_rmem_tensor((4,), cutlass.Uint32)
+                    for word in cutlass.range_constexpr(4):
+                        if cutlass.const_expr(self._dtype_name == "float16"):
+                            packed_sum[word] = add_f16x2(
+                                local_words[word], peer_words[word]
+                            )
+                        else:
+                            packed_sum[word] = add_bf16x2(
+                                local_words[word], peer_words[word]
+                            )
+                    st_global_v4_u32(
+                        output_base + Int64(index) * Int64(16),
+                        packed_sum[0],
+                        packed_sum[1],
+                        packed_sum[2],
+                        packed_sum[3],
+                    )
+                    index += stride
 
             if generation == Uint32(_PLAIN_GRAPH_LAST_EPOCH):
                 # Matching CTAs finish reading before either rank clears records.

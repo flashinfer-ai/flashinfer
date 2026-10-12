@@ -28,6 +28,7 @@ DEFAULT_MAX_SIZE = 8 * 1024 * 1024
 DEFAULT_RANK_DATA_BYTES = 8 * 1024 * 1024
 TP2_PLAIN_REMOTE_PUSH_MAX_ROWS = 512
 TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_ROWS = 64
+_TP2_SIMPLE_THREADS = 128
 TP2_PLAIN_REMOTE_PUSH_HIDDEN_SIZE = 4096
 TP2_PLAIN_REMOTE_PUSH_MAX_BYTES = (
     TP2_PLAIN_REMOTE_PUSH_MAX_ROWS
@@ -1541,7 +1542,7 @@ class _CuTeOneshotBackend:
         inp: torch.Tensor,
         *,
         graph_channel: bool,
-    ) -> Optional[tuple[int, int, bool]]:
+    ) -> Optional[tuple[int, int, str]]:
         """Return TP2 peer-push geometry for a graph-owned plain all-reduce.
 
         The protocol requires device-selected alternating slots, which are
@@ -1561,25 +1562,12 @@ class _CuTeOneshotBackend:
         rows = _tp2_plain_remote_push_rows(inp)
         if rows is None or inp.numel() * inp.element_size() > state.eager_buffer_bytes:
             return None
+        # LL records double the bytes on PCIe, which only one-row latency repays.
+        # Larger reductions publish Simple payloads with one flag per CTA.
         if rows == 1:
-            return 64, 36, False
-        if rows == 2:
-            return 128, 36, True
-        if rows <= 4:
-            return 256, 36, True
-        if rows <= 6:
-            return 64, 16, False
-        if rows <= 8:
-            return 256, 32, False
-        if rows <= 14:
-            return 64, 16, False
-        if rows <= 16:
-            return 64, 36, True
-        if rows <= 22:
-            return 128, 16, False
-        if rows <= 24:
-            return 128, 32, True
-        return 128, 16, False
+            return 64, 36, "ll"
+        packs = inp.numel() * inp.element_size() // 16
+        return _TP2_SIMPLE_THREADS, min(36, -(-packs // _TP2_SIMPLE_THREADS)), "simple"
 
     @classmethod
     def _plain_launch_config(
@@ -1597,8 +1585,12 @@ class _CuTeOneshotBackend:
             graph_channel=graph_channel,
         )
         if remote_push is not None:
-            threads, blocks, stream_mode = remote_push
-            transport = "tp2_remote_push_stream" if stream_mode else "tp2_remote_push"
+            threads, blocks, mode = remote_push
+            transport = {
+                "ll": "tp2_remote_push",
+                "stream": "tp2_remote_push_stream",
+                "simple": "tp2_remote_push_simple",
+            }[mode]
             return transport, threads, blocks
         threads, blocks = cls._launch_geometry(inp.numel() * inp.element_size() // 16)
         return "pull", threads, blocks
