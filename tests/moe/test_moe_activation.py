@@ -81,3 +81,43 @@ def test_moe_activation(num_rows, tile_size, interm_size, activation, dtype):
     torch.testing.assert_close(
         out.float(), _reference(x, activation, interm_size), rtol=1e-2, atol=1e-2
     )
+
+
+@pytest.mark.parametrize("activation", list(MoeActivationType))
+@pytest.mark.parametrize("interm_size", [64, 1536])
+@pytest.mark.parametrize(("num_tiles", "num_live_tiles"), [(24, 20), (2048, 2000)])
+def test_moe_activation_skips_inactive_rows(
+    num_tiles, num_live_tiles, interm_size, activation
+):
+    """Rows at or past their tile's ``mn_limit`` and tiles past
+    ``num_non_exiting_tiles`` keep their previous values."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    tile_size = 16
+    num_rows = num_tiles * tile_size
+    gated = activation in _GATED_REFERENCE
+    x = torch.randn(
+        num_rows,
+        interm_size * (2 if gated else 1),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    fill = -7.0
+    out = torch.full((num_rows, interm_size), fill, dtype=torch.bfloat16, device=device)
+    # Tile t holds (5 * t) % (tile_size + 1) rows: empty, partial and full tiles,
+    # including tiles past the live count that would otherwise be written.
+    tiles = torch.arange(num_tiles, device=device)
+    mn_limit = (tiles * tile_size + (5 * tiles) % (tile_size + 1)).to(torch.int32)
+    num_live = torch.tensor([num_live_tiles], dtype=torch.int32, device=device)
+
+    moe_activation(x, out, mn_limit, num_live, activation, num_rows, tile_size)
+
+    rows = torch.arange(num_rows, device=device)
+    active = (rows < num_live_tiles * tile_size) & (rows < mn_limit[rows // tile_size])
+    torch.testing.assert_close(
+        out[active].float(),
+        _reference(x[active], activation, interm_size),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    assert torch.all(out[~active] == fill)
