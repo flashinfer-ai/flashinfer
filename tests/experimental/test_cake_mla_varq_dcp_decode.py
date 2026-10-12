@@ -17,7 +17,7 @@ limitations under the License.
 # Correctness tests for the experimental Cake compact variable-query MLA decode
 # with static decode context parallelism (DCP).  Fixtures, cyclic rank packing,
 # the global-coordinate reference, the natural-log cross-rank merge and the
-# tolerances mirror tests/attention/test_cute_dsl_mla_dcp.py.
+# tolerances mirror tests/attention/cute_dsl/test_cute_dsl_mla_dcp.py.
 
 import gc
 import math

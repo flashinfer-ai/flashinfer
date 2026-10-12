@@ -43,7 +43,7 @@ from flashinfer import (
 )
 from tests.test_helpers.utils_fp4 import nvfp4_global_encode_scale_te
 
-from . import utils as moe_utils
+from .. import utils as moe_utils
 
 _CUTLASS_MOE_SUPPORTED_ARCHES = {
     (8, 9),

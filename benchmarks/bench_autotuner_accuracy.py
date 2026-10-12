@@ -146,7 +146,7 @@ def build_cutlass_moe_fp8(num_tokens, hidden=4096, inter=2048, experts=64, top_k
     known probe-realism caveat (#3622) applies and is exactly what the
     op-level track will improve.
     """
-    from tests.moe.test_trtllm_cutlass_fused_moe import (
+    from tests.moe.cutlass.test_trtllm_cutlass_fused_moe import (
         cast_to_representable,
         compute_routing,
         dynamic_per_tensor_fp8_quant,

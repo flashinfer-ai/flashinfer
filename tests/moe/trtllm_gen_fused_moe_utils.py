@@ -3794,7 +3794,7 @@ RENORMALIZE_ROUTING_CONFIGS = [
     # only Renormalize — the method production models (GPT-OSS, Qwen3,
     # Qwen3-Next, Mixtral) route with. Routing math for Default / SigmoidRenorm
     # / MiniMax2 (incl. routed_scaling and bias handling) is covered densely by
-    # tests/moe/test_trtllm_gen_routing.py against the same host oracles, and
+    # tests/moe/trtllm_gen/test_trtllm_gen_routing.py against the same host oracles, and
     # their from-logits launcher plumbing keeps smoke coverage via
     # test_trtllm_gen_fused_moe.py::test_routing_dtype_flexibility. See
     # docs/design_docs/moe_routing_test_decomposition.md.

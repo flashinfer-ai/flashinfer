@@ -8359,7 +8359,7 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
         block_sparse_attention,
         block_sparse_attention_with_paged_kv_cache,
     )
-    from tests.attention.test_attention_ts_block_sparse import (
+    from tests.attention.prims_ts.test_attention_ts_block_sparse import (
         _Case,
         _make_bsr,
         _make_exact_block_bits,

@@ -366,6 +366,6 @@ The public accuracy, layout, mask, variable-Q, page-size, dtype, CUDA-graph,
 split-KV, and resource-safety coverage lives in:
 
 ```bash
-pytest -q tests/attention/test_attention_ts_decode.py
+pytest -q tests/attention/prims_ts/test_attention_ts_decode.py
 pytest -q tests/trace/test_fi_trace_template_consistency.py
 ```

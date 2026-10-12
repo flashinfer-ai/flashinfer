@@ -133,7 +133,7 @@ QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # 576, post absorption
 PAGE_SIZE = 64
 SEQ_LEN = 256
 # The kernel scales the QK product by bmm1_scale; use the pre-absorption head dim,
-# matching tests/attention/test_trtllm_gen_mla.py.
+# matching tests/attention/trtllm_gen/test_trtllm_gen_mla.py.
 BMM1_SCALE = 1.0 / ((QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM) ** 0.5)
 
 _FP8 = torch.float8_e4m3fn
@@ -175,7 +175,7 @@ def _mla_decode_inputs(
     torch.manual_seed(seed)
     # torch.randn has no fp8 kernel, so every tensor is drawn in fp32 and cast.
     # e4m3 keeps 3 mantissa bits and saturates early, so fp8 inputs are damped
-    # first -- same conditioning as tests/attention/test_cute_dsl_mla_decode.py.
+    # first -- same conditioning as tests/attention/cute_dsl/test_cute_dsl_mla_decode.py.
     # The bf16 multiplier is exactly 1.0, leaving those draws bit-identical.
     damp = 0.1 if dtype == _FP8 else 1.0
 

@@ -189,13 +189,13 @@ def test_trtllm_mxint4_moe_valid_hidden_size_matches_dequant_reference(
 
     from flashinfer import ActivationType
 
-    from .trtllm_gen_fused_moe_utils import (
+    from ..trtllm_gen_fused_moe_utils import (
         MxInt4BlockScaleMoe,
         mxint4_quantize,
         routing_reference_renormalize,
         run_moe_reference_mxint4,
     )
-    from .utils import check_accuracy
+    from ..utils import check_accuracy
 
     torch.manual_seed(0)
     device = torch.device("cuda:0")
@@ -366,13 +366,13 @@ def test_trtllm_mxint4_moe_valid_intermediate_size_matches_dequant_reference(
 
     from flashinfer import ActivationType
 
-    from .trtllm_gen_fused_moe_utils import (
+    from ..trtllm_gen_fused_moe_utils import (
         MxInt4BlockScaleMoe,
         mxint4_quantize,
         routing_reference_renormalize,
         run_moe_reference_mxint4,
     )
-    from .utils import check_accuracy
+    from ..utils import check_accuracy
 
     torch.manual_seed(0)
     device = torch.device("cuda:0")
@@ -551,13 +551,13 @@ def test_trtllm_fp4_mxfp4_moe_valid_intermediate_size_matches_dequant_reference(
     from flashinfer import ActivationType
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
 
-    from .trtllm_gen_fused_moe_utils import (
+    from ..trtllm_gen_fused_moe_utils import (
         FP4Moe,
         moe_args,
         routing_reference_renormalize,
         run_moe_reference_fp4,
     )
-    from .utils import QuantMode, check_accuracy
+    from ..utils import QuantMode, check_accuracy
 
     torch.manual_seed(0)
     device = torch.device("cuda:0")
@@ -767,14 +767,14 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
         get_w2_permute_indices_with_cache,
     )
 
-    from .trtllm_gen_fused_moe_utils import (
+    from ..trtllm_gen_fused_moe_utils import (
         FP4Moe,
         moe_args,
         quant_fp4_batches,
         routing_reference_renormalize,
         run_moe_reference_fp4,
     )
-    from .utils import QuantMode, check_accuracy
+    from ..utils import QuantMode, check_accuracy
 
     torch.manual_seed(0)
     device = torch.device("cuda:0")
@@ -1080,13 +1080,13 @@ def test_trtllm_fp4_mxfp4_moe_unaligned_valid_dims(which, valid_size):
     from flashinfer import ActivationType
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
 
-    from .trtllm_gen_fused_moe_utils import (
+    from ..trtllm_gen_fused_moe_utils import (
         FP4Moe,
         moe_args,
         routing_reference_renormalize,
         run_moe_reference_fp4,
     )
-    from .utils import QuantMode, check_accuracy
+    from ..utils import QuantMode, check_accuracy
 
     torch.manual_seed(0)
     device = torch.device("cuda:0")

@@ -52,7 +52,7 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
 )
 from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.utils import get_compute_capability
-from .utils import (
+from ..utils import (
     check_accuracy,
     compute_reference_moe_fp4,
     create_moe_tensors,
@@ -4822,7 +4822,7 @@ def test_localized_moe_matches_full_width(
     from flashinfer import autotune, cute_dsl_fused_moe
     from flashinfer.cute_dsl import is_rubin_cute_dsl_available
 
-    from .utils import interleave_linear_and_gate
+    from ..utils import interleave_linear_and_gate
 
     if not is_rubin_cute_dsl_available():
         pytest.skip("Rubin requires CuTe DSL 4.8")

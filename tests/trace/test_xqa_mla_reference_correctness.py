@@ -74,7 +74,7 @@ def test_xqa_mla_reference_correctness(shape_kwargs):
     )
     # XQA MLA quantizes Q and the KV cache to FP8 internally; a few outlier
     # positions land on tied FP8 rounding boundaries. Matches the pass-ratio
-    # metric the existing tests/attention/test_xqa.py uses for the same op:
+    # metric the existing tests/attention/trtllm_gen/test_xqa.py uses for the same op:
     # >=95% of elements within (atol=0.05, rtol=0.05).
     _check(
         xqa_mla_trace,

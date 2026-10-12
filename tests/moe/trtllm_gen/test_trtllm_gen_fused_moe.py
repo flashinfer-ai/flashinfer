@@ -265,7 +265,7 @@ def test_sigmoid_routing(
             id="nemotron_3_super",
         ),
         # Routing-shape variety (kimi_k2 384/8, DSLite 72/6, GLM4_MoE 160/8 —
-        # all n_groups=1) moved to tests/moe/test_trtllm_gen_routing.py::
+        # all n_groups=1) moved to tests/moe/trtllm_gen/test_trtllm_gen_routing.py::
         # test_deepseekv3_routing; multiplying those configs against the full
         # quant x layout x activation grid added no GEMM coverage beyond the
         # DSv3 and nemotron_3_super representatives kept here. See

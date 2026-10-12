@@ -309,6 +309,6 @@ runtime K pruning, split-KV reduction, output/workspace contracts, and CUDA
 graphs:
 
 ```bash
-pytest -q tests/attention/test_attention_ts_mla_decode.py
+pytest -q tests/attention/prims_ts/test_attention_ts_mla_decode.py
 pytest -q tests/trace/test_fi_trace_template_consistency.py
 ```

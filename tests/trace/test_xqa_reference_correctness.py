@@ -68,7 +68,7 @@ def test_xqa_reference_correctness(shape_kwargs):
         inputs["page_table"],
         seq_lens_ref,
     )
-    # Matches tests/attention/test_xqa.py: >=98% of elements within
+    # Matches tests/attention/trtllm_gen/test_xqa.py: >=98% of elements within
     # (atol=0.05, rtol=0.05).
     _check(
         xqa_trace,

@@ -80,7 +80,7 @@ def test_trtllm_batch_decode_mla_reference_correctness(shape_kwargs):
         bmm1_scale=bmm1_scale,
         bmm2_scale=1.0,
     )
-    # Matches tests/attention/test_cute_dsl_mla_decode.py element-wise tol.
+    # Matches tests/attention/cute_dsl/test_cute_dsl_mla_decode.py element-wise tol.
     _check(
         trtllm_batch_decode_mla_dense_trace,
         ref_out,

@@ -56,7 +56,7 @@ from flashinfer.fused_moe.core import Fp8QuantizationType
 from flashinfer.prims_ts.utils import is_prims_ts_available
 from flashinfer.utils import device_support_pdl, get_compute_capability
 
-from .trtllm_gen_fused_moe_utils import (
+from ..trtllm_gen_fused_moe_utils import (
     FP4Moe,
     FP8BlockScaleMoe,
     MoeGemmBackend,
@@ -317,7 +317,7 @@ def test_trtllm_gen_routed_fused_moe_format_parity(
 # Routed-vs-logits parity on the dense grid: shape fan-out kept to the
 # boundary corners (shape breadth is fuzzed in tests/moe/test_unified_moe_fuzz.py),
 # and the routing axes are pinned to one method and one input format: varying
-# them only varies host-side reference math that tests/moe/test_trtllm_gen_routing.py
+# them only varies host-side reference math that tests/moe/trtllm_gen/test_trtllm_gen_routing.py
 # covers directly against the same oracles, and the routed entry-point plumbing
 # for every method/format is smoke-checked by
 # test_trtllm_gen_routed_fused_moe_format_parity above.

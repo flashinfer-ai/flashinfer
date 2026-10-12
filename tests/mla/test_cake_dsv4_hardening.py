@@ -37,7 +37,7 @@ from flashinfer.utils import get_compute_capability
 def _load_reference_module():
     try:
         return importlib.import_module(
-            "tests.attention.test_trtllm_gen_sparse_mla_dsv4"
+            "tests.attention.trtllm_gen.test_trtllm_gen_sparse_mla_dsv4"
         )
     except ModuleNotFoundError:
         path = (

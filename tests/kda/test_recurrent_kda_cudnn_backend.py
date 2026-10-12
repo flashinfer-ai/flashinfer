@@ -24,7 +24,7 @@ Two oracles:
   own backends do not accept, and the one that shares no code with either
   kernel.
 
-The graph-cache-key tests follow ``tests/attention/test_cudnn_graph_cache_key.py``.
+The graph-cache-key tests follow ``tests/attention/cudnn/test_cudnn_graph_cache_key.py``.
 KDA puts the most host scalars in the key of any of the three families --
 ``scale``, ``use_qk_l2norm``, ``use_beta_sigmoid``, ``safe_gate``,
 ``gate_lower_bound`` -- and each is baked into the built graph, so each gets a

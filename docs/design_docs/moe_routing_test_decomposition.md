@@ -31,7 +31,7 @@ Split `(routing methods) × (other params)` into
    fraction of the fused module's time.
 2. Routing math is tested densely against the existing host oracles
    (`routing_reference_*` in `tests/moe/trtllm_gen_fused_moe_utils.py`) in
-   `tests/moe/test_trtllm_gen_routing.py`. Routing kernels are tiny, so a
+   `tests/moe/trtllm_gen/test_trtllm_gen_routing.py`. Routing kernels are tiny, so a
    dense matrix here is cheap.
 3. The fused tests pin the routing-method axis to one or two representatives,
    plus a small per-(method × launcher) from-logits smoke grid that guards the
@@ -43,7 +43,7 @@ Split `(routing methods) × (other params)` into
 
 | New coverage for… | Goes in |
 |---|---|
-| a routing method, `top_k`/`num_experts`/group shape, logits or bias dtype, `tile_tokens_dim`, load skew, expert-parallel shard | `tests/moe/test_trtllm_gen_routing.py` |
+| a routing method, `top_k`/`num_experts`/group shape, logits or bias dtype, `tile_tokens_dim`, load skew, expert-parallel shard | `tests/moe/trtllm_gen/test_trtllm_gen_routing.py` |
 | a quant mode, weight layout, activation, GEMM shape | the fused matrices, at the **pinned** routing method |
 | the routing→GEMM interface for a method that has no standalone launcher coverage | the from-logits smoke grids (`..._format_parity`, `test_routing_dtype_flexibility`) |
 

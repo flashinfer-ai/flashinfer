@@ -51,12 +51,12 @@ from flashinfer.utils import (
     last_positive_power_of_2,
 )
 
-from . import utils as moe_utils
+from .. import utils as moe_utils
 from .test_trtllm_gen_per_token_moe import (
     test_routed_fused_moe as _run_per_token_nvfp4_accuracy_case,
 )
 
-from .trtllm_gen_fused_moe_utils import (
+from ..trtllm_gen_fused_moe_utils import (
     FP8BlockScaleMoe,
     QuantMode,
     routing_reference_renormalize,

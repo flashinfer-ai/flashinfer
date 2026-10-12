@@ -15,7 +15,7 @@ import torch
 # ---------------------------------------------------------------------------
 # Direct kernel loading (bypass flashinfer.__init__.py import chain)
 # ---------------------------------------------------------------------------
-_REPO = pathlib.Path(__file__).resolve().parent.parent.parent
+_REPO = pathlib.Path(__file__).resolve().parents[3]
 
 
 def _load_module(name, rel_path):
