@@ -333,6 +333,43 @@ def _nvfp4_svdquant_gemm_runners(
     return [_nvfp4_svdquant_gemm_runner(enable_pdl, device, rank)]
 
 
+def _svdquant_tactic_fits_workspace(
+    module,
+    shape: tuple[int, int, int, int],
+    workspace: torch.Tensor,
+    tactic: int,
+) -> bool:
+    workspace_size = getattr(module, "nvfp4_svdquant_gemm_workspace_size", None)
+    if workspace_size is None:
+        # SM100 manages workspace inside its launcher and has no query interface.
+        return True
+    if tactic == -1:
+        tactic = int(module.nvfp4_svdquant_gemm_fallback_tactic(*shape))
+    if not 0 <= tactic < module.nvfp4_svdquant_gemm_tactic_num():
+        return False
+    return bool(module.nvfp4_svdquant_gemm_can_implement(*shape, tactic)) and (
+        int(workspace_size(*shape[:3], tactic))
+        <= workspace.numel() * workspace.element_size()
+    )
+
+
+def _svdquant_workspace_safe_tactic(
+    runner: TunableRunner, inputs: List[torch.Tensor], tactic: int
+) -> int:
+    """Also protect fallback and legacy cache paths that bypass revalidation."""
+    validate = getattr(runner, "validate_tactic", None)
+    if validate is None or validate(inputs, tactic):
+        return tactic
+    profile = OptimizationProfile(
+        shapes=[list(t.shape) if t is not None else [] for t in inputs],
+        tensor_initializers=[None] * len(inputs),
+    )
+    for candidate in runner.get_valid_tactics(inputs, profile):
+        if validate(inputs, candidate):
+            return candidate
+    raise RuntimeError("No feasible SVDQuant tactic fits the provisioned workspace")
+
+
 def _sm120_linear_tactics(module, inputs: List[torch.Tensor]) -> List[int]:
     """Consumer rows crossed with the producer configurations this shape admits.
 
@@ -390,6 +427,12 @@ def _sm120_fused_linear_runner(
     module = get_nvfp4_svdquant_sm120_module(rank)
 
     class Sm120FusedLinearRunner(TunableRunner):
+        def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
+            row, _ = _sm120_unpack_tactic(tactic)
+            return _svdquant_tactic_fits_workspace(
+                module, _sm120_linear_inputs_shape(inputs), inputs[-1], row
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -469,6 +512,11 @@ def _sm120_cutlass_linear_runner(
     module = get_nvfp4_svdquant_sm120_module(rank)
 
     class Sm120CutlassLinearRunner(TunableRunner):
+        def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
+            return _svdquant_tactic_fits_workspace(
+                module, _sm120_linear_inputs_shape(inputs), inputs[-1], tactic
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -706,6 +754,8 @@ def _choose_sm120_linear_runner(
         rank,
         enable_pdl,
         has_bias,
+        # A resized buffer must revalidate the winner before bypassing the tuner.
+        inputs[-1].numel() * inputs[-1].element_size(),
     )
     if not tuner.is_tuning_mode:
         cached = _SM120_LINEAR_DISPATCH_CACHE.get(cache_key)
@@ -719,6 +769,7 @@ def _choose_sm120_linear_runner(
         tuning_config,
         inputs,
     )
+    tactic = _svdquant_workspace_safe_tactic(runner, inputs, tactic)
     if tactic >= 0:
         runner_id = next(
             index for index, candidate in enumerate(runners) if candidate is runner
@@ -761,6 +812,11 @@ def _nvfp4_svdquant_gemm_runner(
     module = _get_nvfp4_svdquant_module_for_device(device, lora_rank)
 
     class Nvfp4SvdquantGemmRunner(TunableRunner):
+        def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
+            a, b, _, _, _, d = inputs[:6]
+            shape = (a.shape[0], b.shape[0], a.shape[1] * 2, d.shape[1])
+            return _svdquant_tactic_fits_workspace(module, shape, inputs[-1], tactic)
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -846,6 +902,7 @@ def mm_nvfp4_svdquant(
         _svdquant_tuning_config("sm120"),
         inputs,
     )
+    tactic = _svdquant_workspace_safe_tactic(runner, inputs, tactic)
     runner(inputs=inputs, tactic=tactic)
     return out
 
