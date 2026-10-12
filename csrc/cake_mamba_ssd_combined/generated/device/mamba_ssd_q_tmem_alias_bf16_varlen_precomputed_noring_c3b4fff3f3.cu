@@ -238,7 +238,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_mamba_ssd_q_tmem_alias_f16_varlen_precomputed_noring(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __half* __restrict__ initial_states, __half* __restrict__ final_states, __half* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count, int* __restrict__ cu_seqlens, int metadata_from_cu_seqlens, int* __restrict__ preprocess_status)
+kernel_mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_noring(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ initial_states, __nv_bfloat16* __restrict__ final_states, __nv_bfloat16* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count, int* __restrict__ cu_seqlens, int metadata_from_cu_seqlens, int* __restrict__ preprocess_status)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -865,8 +865,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_precomputed_noring(const __grid_constan
             unsigned int state_stage_1 = 0;
             int taddr_0 = taddr;
             float state_values[64];
-            unsigned int _phase_state_read_released = 1;
             unsigned int _phase_aux_full = 0;
+            unsigned int _phase_state_read_released = 1;
             unsigned int _phase_bc_full_2 = 0;
             unsigned int _phase_cb_full = 0;
             unsigned int _phase_state_delta_full_0 = 0;
@@ -932,6 +932,16 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_precomputed_noring(const __grid_constan
                         segment_limit_1 = chunk_tokens_1;
                     }
                     {
+                        mbarrier_wait(aux_full_addr + (input_stage_4) * 8, _phase_aux_full);
+                        float last_cumsum = smem_cumsum_all[input_stage_4 * 128 + (unsigned int)(segment_limit_1 - 1)];
+                        int factor_token_1 = warp % 4 * 32 + lane;
+                        float factor_value = 0.0f;
+                        if (factor_token_1 >= segment_offset_1 && factor_token_1 < segment_limit_1) {
+                            float _exp2_1 = approx_exp2((last_cumsum - smem_cumsum_all[input_stage_4 * 128 + (unsigned int)factor_token_1]) * 1.4426950408889634f);
+                            factor_value = _exp2_1;
+                            factor_value *= smem_delta_all[input_stage_4 * 128 + (unsigned int)factor_token_1];
+                        }
+                        smem_bscale[factor_token_1] = factor_value;
                         mbarrier_wait(state_read_released_addr + (state_stage_1) * 8, _phase_state_read_released);
                         #pragma unroll
                         for (int dim_chunk_1 = 0; dim_chunk_1 < 2; dim_chunk_1++) {
@@ -970,19 +980,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_precomputed_noring(const __grid_constan
                                 mbarrier_arrive(state_operand_full_addr + (state_stage_1) * 8);
                             }
                         }
-                        mbarrier_wait(aux_full_addr + (input_stage_4) * 8, _phase_aux_full);
                         mbarrier_wait(bc_full_addr + (input_stage_4) * 8, _phase_bc_full_2);
-                        float last_cumsum = smem_cumsum_all[input_stage_4 * 128 + (unsigned int)(segment_limit_1 - 1)];
                         mbarrier_wait(cb_full_addr + (acc_stage_1) * 8, _phase_cb_full);
-                        int factor_token_1 = warp % 4 * 32 + lane;
-                        float factor_value = 0.0f;
-                        if (factor_token_1 >= segment_offset_1 && factor_token_1 < segment_limit_1) {
-                            float _exp2_1 = approx_exp2((last_cumsum - smem_cumsum_all[input_stage_4 * 128 + (unsigned int)factor_token_1]) * 1.4426950408889634f);
-                            factor_value = _exp2_1;
-                            factor_value *= smem_delta_all[input_stage_4 * 128 + (unsigned int)factor_token_1];
-                        }
-                        smem_bscale[factor_token_1] = factor_value;
-                        asm volatile("barrier.sync 8, 128;" ::: "memory");
                         int b_state_base = (warp % 4 * 4 + lane / 8) * 8;
                         int b_col_lane = lane % 8;
                         int b_plane_row = b_state_base / 64 * 128;

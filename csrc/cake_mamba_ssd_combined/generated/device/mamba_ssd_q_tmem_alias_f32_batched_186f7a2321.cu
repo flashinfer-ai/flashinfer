@@ -1404,8 +1404,8 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched(const __grid_constant__ CUtensorMap x_
             unsigned int state_stage_1 = 0;
             int taddr_0 = taddr;
             float state_values[64];
-            unsigned int _phase_state_read_released = 1;
             unsigned int _phase_aux_full = 0;
+            unsigned int _phase_state_read_released = 1;
             unsigned int _phase_bc_full_2 = 0;
             unsigned int _phase_cb_full = 0;
             unsigned int _phase_state_delta_full_0 = 0;
@@ -1454,6 +1454,16 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched(const __grid_constant__ CUtensorMap x_
                         chunk_tokens_1 = 128;
                     }
                     {
+                        mbarrier_wait(aux_full_addr + (input_stage_4) * 8, _phase_aux_full);
+                        float last_cumsum = smem_cumsum_all[input_stage_4 * 128 + (unsigned int)(segment_limit_1 - 1)];
+                        int factor_token = warp % 4 * 32 + lane;
+                        float factor_value = 0.0f;
+                        if (factor_token >= segment_offset_2 && factor_token < segment_limit_1) {
+                            float _exp2_3 = approx_exp2((last_cumsum - smem_cumsum_all[input_stage_4 * 128 + (unsigned int)factor_token]) * 1.4426950408889634f);
+                            factor_value = _exp2_3;
+                            factor_value *= smem_delta_all[input_stage_4 * 128 + (unsigned int)factor_token];
+                        }
+                        smem_bscale[factor_token] = factor_value;
                         mbarrier_wait(state_read_released_addr + (state_stage_1) * 8, _phase_state_read_released);
                         #pragma unroll
                         for (int dim_chunk_1 = 0; dim_chunk_1 < 2; dim_chunk_1++) {
@@ -1492,19 +1502,8 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched(const __grid_constant__ CUtensorMap x_
                                 mbarrier_arrive(state_operand_full_addr + (state_stage_1) * 8);
                             }
                         }
-                        mbarrier_wait(aux_full_addr + (input_stage_4) * 8, _phase_aux_full);
                         mbarrier_wait(bc_full_addr + (input_stage_4) * 8, _phase_bc_full_2);
-                        float last_cumsum = smem_cumsum_all[input_stage_4 * 128 + (unsigned int)(segment_limit_1 - 1)];
                         mbarrier_wait(cb_full_addr + (acc_stage_1) * 8, _phase_cb_full);
-                        int factor_token = warp % 4 * 32 + lane;
-                        float factor_value = 0.0f;
-                        if (factor_token >= segment_offset_2 && factor_token < segment_limit_1) {
-                            float _exp2_3 = approx_exp2((last_cumsum - smem_cumsum_all[input_stage_4 * 128 + (unsigned int)factor_token]) * 1.4426950408889634f);
-                            factor_value = _exp2_3;
-                            factor_value *= smem_delta_all[input_stage_4 * 128 + (unsigned int)factor_token];
-                        }
-                        smem_bscale[factor_token] = factor_value;
-                        asm volatile("barrier.sync 8, 128;" ::: "memory");
                         int b_state_base = (warp % 4 * 4 + lane / 8) * 8;
                         int b_col_lane = lane % 8;
                         int b_plane_row = b_state_base / 64 * 128;
