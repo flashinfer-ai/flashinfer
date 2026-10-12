@@ -4345,12 +4345,13 @@ def test_source_program_table_names_shipped_sources():
             )
             assert state_check in rendered, state_check
         assert "DLDataType{kDLFloat, 16, 1}" in rendered
-    # One shared source per physical kernel: twelve fused exact-scan main
-    # sources (six ring + six ``_noring``), twelve two-kernel ``exactpre``
-    # main sources, six look-back (``chunkpar``) and six three-phase
-    # (``chunkpar3``) chunk-parallel main sources plus the one preprocess
-    # kernel, no architecture copies and no orphans.
-    assert len(device_sources) == 37
+    # One shared source per physical kernel: twelve retained start ``exact``
+    # main sources (six ring + six ``_noring``), twelve fused ``exactfused``
+    # main sources, twelve two-kernel ``exactpre`` main sources, six
+    # look-back (``chunkpar``) and six three-phase (``chunkpar3``)
+    # chunk-parallel main sources plus the one preprocess kernel, no
+    # architecture copies and no orphans.
+    assert len(device_sources) == 49
     assert sorted(
         path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
     ) == sorted(path.name for path in device_sources)
@@ -5963,7 +5964,9 @@ def test_source_exact_scan_variant_selected_without_gpu(monkeypatch, case):
     )
     assert fused == (not varlen)
     two_kernel = module.two_kernel_family(
-        mode_varlen=varlen, num_sequences=num_seqs, seqlen=batch * seqlen
+        mode_varlen=varlen,
+        num_sequences=num_seqs,
+        seqlen=batch * seqlen if varlen else seqlen,  # varlen: the packed token count
     )
     assert two_kernel == "exact"  # 64- and 128-token sequences: one chunk per item
     expected = (

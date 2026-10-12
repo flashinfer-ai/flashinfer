@@ -214,7 +214,7 @@ def test_prepared_run_replays_bitwise_from_a_cuda_graph(monkeypatch, form):
 
     assert isinstance(prepared, PreparedSSDCombined)
     assert not cake.is_captured(prepared)
-    family = "chunkpar" if form == "chunk_parallel" else "exact"
+    family = "chunkpar" if form == "chunk_parallel" else "exactfused"
     mode = "varlen" if form == "cu_seqlens" else "batched"
     assert prepared.program_name == f"{family}_bf16_{mode}"
     assert cake.last_program_name is None  # prepare launched nothing
@@ -285,7 +285,7 @@ def test_capture_of_an_unseen_shape_or_unlaunched_program_is_refused():
 
     runner.run(*tensors, **arguments, out=out)
     torch.cuda.synchronize()
-    assert cake.last_program_name == "exact_bf16_batched"
+    assert cake.last_program_name == "exactfused_bf16_batched"
 
 
 @requires_blackwell
@@ -591,12 +591,12 @@ def test_prepare_resolves_the_shape_without_launching_without_gpu(monkeypatch):
     # Preparing the shape again re-reads the override and re-uses the buffer.
     monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
     again = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, return_final_states=True)
-    assert again.program_name == "exact_bf16_batched"
+    assert again.program_name == "exactfused_bf16_batched"
     assert again.workspace_key.chunk_parallel_mode == "never"
     assert len(runner._workspaces) == 2
     monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "later")
     runner.run(x, dt, A, B, C, out=out, return_final_states=True)
-    assert calls[-1][0] == "exact_bf16_batched"
+    assert calls[-1][0] == "exactfused_bf16_batched"
     assert runner._allocations_in_last_run == 0
     # An unprepared shape reads the environment on every call.
     with pytest.raises(ValueError, match=_CHUNK_PARALLEL_ENV):
