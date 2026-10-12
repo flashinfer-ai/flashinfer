@@ -74,7 +74,7 @@ using tvm::ffi::TensorView;
 
 // 4D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
-inline CUtensorMap EncodeTma_tmap_q_fb9fb1ba496b(const TensorView& t) {
+inline CUtensorMap EncodeTma_tmap_q_2a50cecfe3df(const TensorView& t) {
   TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
       << "TMA source 'tmap_q' must have at least 3 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
@@ -90,7 +90,7 @@ inline CUtensorMap EncodeTma_tmap_q_fb9fb1ba496b(const TensorView& t) {
   uint64_t global_dim[4] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(d3)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
       << "TMA descriptor for 'tmap_q' resolved a non-positive global dim";
-  uint32_t box_dim[4] = {64u, 128u, 1u, 1u};
+  uint32_t box_dim[4] = {64u, 16u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ", " << box_dim[3] << ") exceeds resolved global dims for 'tmap_q'";
   int64_t carrier_stride_0 = d1;
@@ -308,6 +308,66 @@ inline CUtensorMap EncodeTma_tmap_out_7c058bce5f95(const TensorView& t) {
 }
 
 
+// 4D TMA descriptor for buffer 'tmap_q' — compiled from the
+// descriptor's std.Expr global_dim/global_strides/checks record.
+inline CUtensorMap EncodeTma_tmap_q_fb9fb1ba496b(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
+      << "TMA source 'tmap_q' must have at least 3 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
+      << "TMA source 'tmap_q' must have unit innermost stride, got " << t.stride(-1);
+  int64_t d1 = t.size(t.ndim() - 1);
+  int64_t d2 = t.size(t.ndim() - 2);
+  int64_t d3 = t.size(t.ndim() - 3);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
+      << "TMA source 'tmap_q' trailing dims must be positive";
+  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
+      << "TMA source 'tmap_q' extent " << d1
+      << " must divide exactly by " << 64;
+  uint64_t global_dim[4] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(d3)};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved a non-positive global dim";
+  uint32_t box_dim[4] = {64u, 128u, 1u, 1u};
+  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
+      << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ", " << box_dim[3] << ") exceeds resolved global dims for 'tmap_q'";
+  int64_t carrier_stride_0 = d1;
+  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 1 negative";
+  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 1 zero while global dimension 1 is not 1";
+  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 1 to a non-whole-byte offset";
+  int64_t carrier_stride_1 = 64;
+  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 2 negative";
+  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 2 zero while global dimension 2 is not 1";
+  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 2 to a non-whole-byte offset";
+  int64_t carrier_stride_2 = (d2 * d1);
+  TVM_FFI_CHECK(carrier_stride_2 >= 0, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 3 negative";
+  TVM_FFI_CHECK(carrier_stride_2 != 0 || global_dim[3] == 1, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 3 zero while global dimension 3 is not 1";
+  TVM_FFI_CHECK((carrier_stride_2 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 3 to a non-whole-byte offset";
+  uint64_t global_strides[3] = {
+      (uint64_t)((carrier_stride_0 * 16) / 8),
+      (uint64_t)((carrier_stride_1 * 16) / 8),
+      (uint64_t)((carrier_stride_2 * 16) / 8),
+  };
+  uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
+  CUtensorMap tm{};
+  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
+  CUresult r = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
+      << "cuTensorMapEncodeTiled (4D, 'tmap_q') failed: CUresult=" << (int)r;
+  return tm;
+}
+
+
 // 2D TMA descriptor for buffer 'tmap_g4d' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_tmap_g4d_e6b6cc9c7fed(const TensorView& t) {
@@ -480,66 +540,6 @@ inline CUtensorMap EncodeTma_tmap_g4fx_b01a76ec021f(const TensorView& t) {
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (2D, 'tmap_g4fx') failed: CUresult=" << (int)r;
-  return tm;
-}
-
-
-// 4D TMA descriptor for buffer 'tmap_q' — compiled from the
-// descriptor's std.Expr global_dim/global_strides/checks record.
-inline CUtensorMap EncodeTma_tmap_q_2a50cecfe3df(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
-      << "TMA source 'tmap_q' must have at least 3 dimensions, got ndim=" << t.ndim();
-  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
-      << "TMA source 'tmap_q' must have unit innermost stride, got " << t.stride(-1);
-  int64_t d1 = t.size(t.ndim() - 1);
-  int64_t d2 = t.size(t.ndim() - 2);
-  int64_t d3 = t.size(t.ndim() - 3);
-  TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
-      << "TMA source 'tmap_q' trailing dims must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'tmap_q' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[4] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(d3)};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved a non-positive global dim";
-  uint32_t box_dim[4] = {64u, 16u, 1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
-      << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ", " << box_dim[3] << ") exceeds resolved global dims for 'tmap_q'";
-  int64_t carrier_stride_0 = d1;
-  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 1 negative";
-  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 1 zero while global dimension 1 is not 1";
-  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 1 to a non-whole-byte offset";
-  int64_t carrier_stride_1 = 64;
-  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 2 negative";
-  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 2 zero while global dimension 2 is not 1";
-  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 2 to a non-whole-byte offset";
-  int64_t carrier_stride_2 = (d2 * d1);
-  TVM_FFI_CHECK(carrier_stride_2 >= 0, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 3 negative";
-  TVM_FFI_CHECK(carrier_stride_2 != 0 || global_dim[3] == 1, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 3 zero while global dimension 3 is not 1";
-  TVM_FFI_CHECK((carrier_stride_2 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 3 to a non-whole-byte offset";
-  uint64_t global_strides[3] = {
-      (uint64_t)((carrier_stride_0 * 16) / 8),
-      (uint64_t)((carrier_stride_1 * 16) / 8),
-      (uint64_t)((carrier_stride_2 * 16) / 8),
-  };
-  uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  CUtensorMap tm{};
-  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
-  CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (4D, 'tmap_q') failed: CUresult=" << (int)r;
   return tm;
 }
 

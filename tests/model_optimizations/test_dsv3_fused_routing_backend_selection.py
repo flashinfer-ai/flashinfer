@@ -26,7 +26,7 @@ def _supported(**overrides):
     return _is_cake_dsv3_fused_routing_supported(**params)
 
 
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 @pytest.mark.parametrize("score_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("bias_dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_cake_backend_accepts_contract_dtype_and_arch_union(
@@ -123,6 +123,7 @@ def test_fused_topk_deepseek_backend_capability_metadata():
     assert not fused_routing.fused_topk_deepseek.is_backend_supported("cake", 90)
     assert fused_routing.fused_topk_deepseek.is_backend_supported("cake", 100)
     assert fused_routing.fused_topk_deepseek.is_backend_supported("cake", 103)
+    assert fused_routing.fused_topk_deepseek.is_backend_supported("cake", 107)
 
 
 def test_cake_backend_check_queries_device_capability_once(monkeypatch):
