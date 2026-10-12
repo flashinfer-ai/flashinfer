@@ -618,10 +618,48 @@ def _native_space_for_tile(native, native_packed, tile: int):
     return space
 
 
+# ``_t128x{tile}x{block_k}`` of a trtllm-gen batched-GEMM configuration name: its token tile and K tile.
+_NATIVE_CONFIG_GEOMETRY = re.compile(r"_t128x(\d+)x(\d+)")
+
+
+def _native_config_geometry(name: str) -> tuple[int, int]:
+    match = _NATIVE_CONFIG_GEOMETRY.search(name)
+    assert match, name
+    return int(match.group(1)), int(match.group(2))
+
+
+def _native_twin_tile(cake, cake_fc2: int, tile: int) -> int:
+    """The native tile the full-path FC2 component ``cake_fc2`` of a Cake tactic of ``tile``
+    is twinned with.
+
+    An exact twin names a configuration of its own tile. A Cake-only tile (no trtllm-gen
+    configuration of that tile exists -- the two-CTA bf16 / fp8 tile-256 units, whose native
+    export stops at tile 128) names its *structural parent*: the configuration of the smaller
+    tile it is a geometry variant of (same per-element MMA sequence and epilogue arithmetic;
+    only data movement, stage depth and the TMEM / SMEM layout differ), which divides the Cake
+    tile. The native comparison of such a tactic is the native pair of the parent tile on the
+    same tokens -- the kernel the native autotuner runs where the Cake-only tile is not in the
+    native ladder.
+    """
+    from flashinfer.jit.cake_stepfun_moe import cake_stepfun_fc2_native_config
+
+    moe_op = cake._module.moe_op
+    symbol = str(moe_op.cake_stepfun_fc2_kernel_symbol(int(cake_fc2)))
+    twin_tile, _block_k = _native_config_geometry(
+        cake_stepfun_fc2_native_config(cake.target, symbol)
+    )
+    assert twin_tile == tile or (twin_tile < tile and tile % twin_tile == 0), (
+        symbol,
+        tile,
+        twin_tile,
+    )
+    return twin_tile
+
+
 def _native_twin_tactic(
     native, native_packed, cake, cake_space, tactic, full_path: bool
 ):
-    """The native tactic twinned with the Cake tactic ``tactic`` (same tile).
+    """The native tactic twinned with the Cake tactic ``tactic``.
 
     Both twins pair the tile's default native FC1 configuration (the anchor's FC1: every
     exported Cake FC1 kernel is a port of it, which the FC1-only tests pin) with an FC2
@@ -630,24 +668,31 @@ def _native_twin_tactic(
     (:meth:`CakeStepFunRunner.native_fc2_twin`); it need not be the tile's native default
     (the mxfp8 tile-8 unit twins the kernel the native autotuner picks for the StepFun
     shape). With the native FC2 (FC1-only module) it is the very FC2 configuration the Cake
-    tactic runs.
+    tactic runs. The twin's tile is the Cake tile, or the structural parent tile of a
+    Cake-only FC2 unit (:func:`_native_twin_tile`): the twin tactic's first coordinate names
+    the tile the native arm ran.
     """
     tile = int(tactic[0])
-    native_space = _native_space_for_tile(native, native_packed, tile)
-    anchor = native_space.anchor(tile)
     identity = (tile, int(tactic[1]))
     cake_fc2 = next(
         t.fc2
         for t in cake_space.all_tactics()
         if tuple(int(v) for v in t.tactic) == identity
     )
-    fc2 = cake.native_fc2_twin(cake_fc2) if full_path else cake_fc2
+    if full_path:
+        twin_tile = _native_twin_tile(cake, cake_fc2, tile)
+        fc2 = cake.native_fc2_twin(cake_fc2)
+    else:
+        twin_tile, fc2 = tile, cake_fc2
+    native_space = _native_space_for_tile(native, native_packed, twin_tile)
+    anchor = native_space.anchor(twin_tile)
     try:
-        twin = native_space.compose(tile, anchor.fc1, fc2)
+        twin = native_space.compose(twin_tile, anchor.fc1, fc2)
     except RuntimeError:
+        parent = "" if twin_tile == tile else f", Cake-only tile {tile} twinned with native tile {twin_tile}"
         pytest.fail(
-            f"no native tactic pairs the default FC1 configuration {anchor.fc1} of tile {tile} "
-            f"with FC2 configuration {fc2} (Cake tactic {list(tactic)})"
+            f"no native tactic pairs the default FC1 configuration {anchor.fc1} of tile {twin_tile} "
+            f"with FC2 configuration {fc2} (Cake tactic {list(tactic)}{parent})"
         )
     return [int(v) for v in twin.tactic]
 
@@ -1131,11 +1176,11 @@ def test_stepfun_reproduces_native_fc1_twin_bitwise(
         if not torch.equal(output, twin_output):
             diff = (output.float() - twin_output.float()).abs().max().item()
             matches = _bitwise_matches(
-                native, native_packed, native_kwargs, tactic[0], output
+                native, native_packed, native_kwargs, twin[0], output
             )
             pytest.fail(
                 f"{precision} T={num_tokens}: Cake tactic {tactic} differs from its native twin "
-                f"{twin} (max |diff| {diff}); native (tactic, FC1, FC2) of tile {tactic[0]} "
+                f"{twin} (max |diff| {diff}); native (tactic, FC1, FC2) of tile {twin[0]} "
                 f"matching bitwise: {matches or 'none'}"
             )
 
@@ -1291,12 +1336,12 @@ def test_stepfun_per_token_nvfp4_matches_native(num_tokens):
     if not torch.equal(default, twin_outputs[twin]):
         diff = (default.float() - twin_outputs[twin].float()).abs().max().item()
         matches = _bitwise_matches(
-            native, native_packed, native_kwargs, default_tactic[0], default
+            native, native_packed, native_kwargs, twin[0], default
         )
         pytest.fail(
             f"nvfp4_bf16tok T={num_tokens}: the default Cake tactic {default_tactic} differs "
             f"from its native twin {list(twin)} (max |diff| {diff}); native (tactic, FC1, FC2) "
-            f"of tile {default_tactic[0]} matching bitwise: {matches or 'none'}"
+            f"of tile {twin[0]} matching bitwise: {matches or 'none'}"
         )
 
 
@@ -1373,7 +1418,9 @@ def test_inventory_fc2_records_declare_the_k_tile_geometry_they_serve():
 def test_inventory_fc2_records_declare_their_native_twin():
     """Every FC2 record names the trtllm-gen configuration its kernel is a port of (the
     full-path bitwise tests pair each Cake tactic with that configuration), and the name
-    carries the record's tile and K-tile geometry."""
+    carries the record's K-tile geometry and its tile -- or, for a Cake-only tile with no
+    trtllm-gen configuration of its own (the two-CTA bf16 / fp8 tile-256 units), the
+    structural parent tile that divides it (:func:`_native_twin_tile`)."""
     from flashinfer.jit.cake_stepfun_moe import (
         cake_stepfun_fc2_native_config,
         load_cake_stepfun_inventory,
@@ -1391,7 +1438,10 @@ def test_inventory_fc2_records_declare_their_native_twin():
         assert isinstance(name, str) and name.startswith("bmm_"), record[
             "kernel_symbol"
         ]
-        assert f"_t128x{record['tile_n']}x{record['block_k']}" in name, (
+        twin_tile, twin_block_k = _native_config_geometry(name)
+        tile_n = int(record["tile_n"])
+        assert twin_block_k == int(record["block_k"]), (record["kernel_symbol"], name)
+        assert twin_tile == tile_n or (twin_tile < tile_n and tile_n % twin_tile == 0), (
             record["kernel_symbol"],
             name,
         )
@@ -1567,12 +1617,12 @@ def test_full_path_matches_native_pipeline(
             if not torch.equal(output, twin_output):
                 diff = (output.float() - twin_output.float()).abs().max().item()
                 matches = _bitwise_matches(
-                    native, native_packed, native_kwargs, tactic[0], output
+                    native, native_packed, native_kwargs, twin[0], output
                 )
                 pytest.fail(
                     f"{precision} T={num_tokens} limit={limit_mode} {regime} set {input_set}: "
                     f"Cake tactic {tactic} differs from its native twin {list(twin)} (max "
-                    f"|diff| {diff}); native (tactic, FC1, FC2) of tile {tactic[0]} matching "
+                    f"|diff| {diff}); native (tactic, FC1, FC2) of tile {twin[0]} matching "
                     f"bitwise: {matches or 'none'}"
                 )
 
@@ -1936,12 +1986,12 @@ def test_full_path_precomputed_ids_matches_native_pipeline(
         if not torch.equal(output, twin_output):
             diff = (output.float() - twin_output.float()).abs().max().item()
             matches = _bitwise_matches(
-                native, native_packed, native_kwargs, tactic[0], output
+                native, native_packed, native_kwargs, twin[0], output
             )
             pytest.fail(
                 f"{precision} T={num_tokens} {weights_dtype} weights: Cake tactic {tactic} "
                 f"differs from its native twin {twin} (max |diff| {diff}); native "
-                f"(tactic, FC1, FC2) of tile {tactic[0]} matching bitwise: "
+                f"(tactic, FC1, FC2) of tile {twin[0]} matching bitwise: "
                 f"{matches or 'none'}"
             )
 
