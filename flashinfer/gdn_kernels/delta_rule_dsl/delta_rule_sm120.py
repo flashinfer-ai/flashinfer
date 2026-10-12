@@ -723,6 +723,27 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
     # Called by Math WGs (tidx >= 128) for one block iteration.
 
     @cute.jit
+    def _gemm_upper_triangular_b(self, t_a, t_b, t_acc):
+        """Multiply with the upper-triangular B used by NewV/O2 (K16, N8)."""
+        atom = cute.make_mma_atom(
+            warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16))
+        )
+        # partition_B stores (N,K). A tile is all zero when 8*n+7 < 16*k.
+        # Keep increasing K order for each output, including diagonal tiles.
+        for k in cutlass.range_constexpr(cute.size(t_b, mode=[2])):
+            for n in cutlass.range_constexpr(cute.size(t_b, mode=[1])):
+                if cutlass.const_expr(n >= 2 * k):
+                    b = t_b[None, n, k]
+                    b = cute.make_tensor(
+                        b.iterator, cute.append(b.layout, cute.make_layout(1))
+                    )
+                    c = t_acc[None, None, n]
+                    c = cute.make_tensor(
+                        c.iterator, cute.append(c.layout, cute.make_layout(1))
+                    )
+                    cute.gemm(atom, c, t_a[None, None, k], b, c)
+
+    @cute.jit
     def compute_loop_body(
         self,
         # Smem tensors (staged; caller indexes the active stage)
@@ -1018,7 +1039,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         self._math_order_wait(wg_idx)
         cute.copy(newv_tiled_copy_B, tNewVsB, tNewVrB_cv)
         tNewVrC.fill(self.acc_dtype(0.0))
-        cute.gemm(newv_tiled_mma, tNewVrC, tNewVrA, tNewVrB, tNewVrC)
+        self._gemm_upper_triangular_b(tNewVrA, tNewVrB, tNewVrC)
         self._math_order_notify(wg_idx)
         v_pipeline.consumer_release(v_consumer_state)
         v_consumer_state.advance()
@@ -1027,7 +1048,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         tOrNewV = SM80.make_acc_into_op(tNewVrC, o2_tiled_mma, self.dtype)
         self._math_order_wait(wg_idx)
         cute.copy(o2_tiled_copy_B, tOsQK, tOrQK_cv)
-        cute.gemm(o2_tiled_mma, tOrO, tOrNewV, tOrQK, tOrO)
+        self._gemm_upper_triangular_b(tOrNewV, tOrQK, tOrO)
         self._math_order_notify(wg_idx)
 
         # ── O store to smem ───────────────────────────────────────────────────
