@@ -88,19 +88,18 @@ _MAX_RING_BYTES = 128 * 1024
 def _e8m0_byte_to_f32(words, byte_idx: int, *, loc=None, ip=None):
     """FP32 value of the E8M0 scale in byte ``byte_idx`` (compile-time) of ``words``.
 
-    ``2**(e - 127)`` is the FP32 whose exponent field is ``e``: one ``prmt`` with an
-    immediate selector extracts the byte, one ``shl`` places it (a ``bfe`` with a
-    runtime position lowers to ~5 SASS instructions). The encodings ``0``
-    (2**-127, subnormal in FP32) and ``255`` (NaN) are not special-cased:
-    ``mxfp8_quantize`` never emits them for a block with nonzero data.
+    ``cvt.rn.bf16x2.ue8m0x2`` decodes a byte pair exactly, including ``0``
+    (2**-127, subnormal) and ``255`` (NaN); widening the selected BF16 to FP32 is
+    one shift or mask.
     """
-    selector = 0x4440 | byte_idx  # byte ``byte_idx`` of the word, upper bytes zero
+    half = "hi" if byte_idx >= 2 else "lo"
+    widen = "and.b32 $0, t, 0xFFFF0000;" if byte_idx % 2 else "shl.b32 $0, t, 16;"
     return cutlass.Float32(
         llvm.inline_asm(
             cutlass.Float32.mlir_type,
             [cutlass.Int32(words).ir_value(loc=loc, ip=ip)],
-            f"{{ .reg .b32 t; prmt.b32 t, $1, 0, {selector}; shl.b32 t, t, 23; "
-            "mov.b32 $0, t; }",
+            "{ .reg .b16 lo, hi; .reg .b32 t; mov.b32 {lo, hi}, $1; "
+            f"cvt.rn.bf16x2.ue8m0x2 t, {half}; {widen} }}",
             "=f,r",
             has_side_effects=False,
             is_align_stack=False,
@@ -110,18 +109,23 @@ def _e8m0_byte_to_f32(words, byte_idx: int, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _fma_f32(a, b, c, *, loc=None, ip=None):
-    """``a * b + c`` as one ``fma.rn.f32`` rather than relying on contraction."""
+def _fma_scaled_f32(partial, w_scale, x_scale, acc, *, loc=None, ip=None):
+    """``acc + partial * (w_scale * x_scale)`` as ``mul.rn.f32`` + ``fma.rn.f32``.
+
+    Explicit, non-FTZ instructions: subnormal scales and products are kept, and
+    the FMA does not depend on contraction.
+    """
     return cutlass.Float32(
         llvm.inline_asm(
             cutlass.Float32.mlir_type,
             [
-                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
-                cutlass.Float32(b).ir_value(loc=loc, ip=ip),
-                cutlass.Float32(c).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(partial).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(w_scale).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(x_scale).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(acc).ir_value(loc=loc, ip=ip),
             ],
-            "fma.rn.f32 $0, $1, $2, $3;",
-            "=f,f,f,f",
+            "{ .reg .f32 s; mul.rn.f32 s, $2, $3; fma.rn.f32 $0, $1, s, $4; }",
+            "=f,f,f,f,f",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -856,9 +860,11 @@ class CpAsyncMxFp8WarpSplitKKernel:
                                 a_unpacked[m_iter], b_unpacked[n_iter]
                             )
                             for i in cutlass.range_constexpr(4):
-                                scale = w_scale[m_iter][i // 2] * x_scale[n_iter][i % 2]
-                                acc[acc_base + i] = _fma_f32(
-                                    block_acc[i], scale, acc[acc_base + i]
+                                acc[acc_base + i] = _fma_scaled_f32(
+                                    block_acc[i],
+                                    w_scale[m_iter][i // 2],
+                                    x_scale[n_iter][i % 2],
+                                    acc[acc_base + i],
                                 )
                 if const_expr(reuse_stages):
                     with cute.arch.elect_one():

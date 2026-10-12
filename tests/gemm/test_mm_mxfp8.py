@@ -343,6 +343,46 @@ def test_mm_mxfp8_cute_dsl_low_m(m, k, auto_tuning):
     )
 
 
+@pytest.mark.parametrize(
+    "a_scale,b_scale,expected",
+    [
+        # E8M0 0x00 is 2**-127 (subnormal in FP32), not zero.
+        (0x00, 0xFE, 256.0),
+        # E8M0 0xFF is NaN.
+        (0x7F, 0xFF, float("nan")),
+    ],
+)
+def test_mm_mxfp8_cute_dsl_special_scale_encodings(a_scale, b_scale, expected):
+    _skip_if_unsupported("cute-dsl")
+    m, n, k = 1, 128, 256
+    # Only the tensor shapes come from the quantizer; data and scales are set below.
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        torch.ones([m, k], device="cuda", dtype=torch.bfloat16),
+        torch.ones([n, k], device="cuda", dtype=torch.bfloat16),
+        SfLayout.layout_128x4,
+        SfLayout.layout_128x4,
+        "cute-dsl",
+    )
+    input_mxfp8.view(torch.uint8).fill_(0x38)  # E4M3 1.0
+    weight_mxfp8.view(torch.uint8).fill_(0x38)
+    input_scale.fill_(a_scale)
+    weight_scale.fill_(b_scale)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    # The untuned default for this shape is the warp split-K runner.
+    AutoTuner.get().clear_cache()
+    mm_mxfp8(
+        input_mxfp8,
+        weight_mxfp8.T,
+        input_scale,
+        weight_scale,
+        out=out,
+        backend="cute-dsl",
+    )
+    torch.testing.assert_close(
+        out.float(), torch.full_like(out, expected, dtype=torch.float32), equal_nan=True
+    )
+
+
 # Triggers the dependent launch first, spins, and only then writes the weight and
 # its scales, so a dependent GEMM that reads them before griddepcontrol.wait sees
 # the NaN bytes left in the buffers.
