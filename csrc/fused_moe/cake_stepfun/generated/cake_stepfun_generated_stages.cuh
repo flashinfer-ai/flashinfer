@@ -46,553 +46,552 @@ inline int RoutingPaddingLog2(int tile_tokens_dim) {
   return (1 << out) == tile_tokens_dim ? out : -1;
 }
 
-#if FLASHINFER_CAKE_STEPFUN_TARGET_MINOR == 0
 extern "C" {
 __global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_5d497c022b3121baa7bc(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_13ef27099f70919fde9d(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(160) void
-kernel_cake_stepfun_moe_59f2ccd008075fbae26e(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_cbc6d8a29d292959c190(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(192) void
-kernel_cake_stepfun_moe_74655bc1486ce1cae45b(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_ca5282161623d9d7394e(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(224) void
-kernel_cake_stepfun_moe_88ac7eb73282d3206a69(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_07402c503062028f9e1d(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_db5456e145d4939a2e1e(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_772ecbc2f4e757d385e4(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(288) void
-kernel_cake_stepfun_moe_b590908426c1c0693edb(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_a67908d0c5fcd8454728(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(320) void
-kernel_cake_stepfun_moe_88f786003bb426b51678(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_5d45b5d9446582dd8661(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(352) void
-kernel_cake_stepfun_moe_1bb5ff30eadf218d33ec(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_c0dbfed098d8cc2e3ffc(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(384) void
-kernel_cake_stepfun_moe_3d85a7851e4a4b126063(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_612a700bda6f4e809dba(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(416) void
-kernel_cake_stepfun_moe_cd624e8bbfa0ce02a02a(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_f5cc5e40e364fe364f4b(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(448) void
-kernel_cake_stepfun_moe_89db675671aad2917781(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_789e03a3bff69c9b619f(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(480) void
-kernel_cake_stepfun_moe_0f7f87fa1b4b852dc99b(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_417b95163aa6fae5376b(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(512) void
-kernel_cake_stepfun_moe_08748360fc777410bd26(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_2b14465997af909033f8(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(256) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_42572957e314e61df9a4(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_f4d4162245b9b9e3ffe9(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(512) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_44d673847e47df4dc0fb(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_fe61e6fc1f312ba6f31c(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(1024) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_e8671c79a27f76189728(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_d10e8930ab9cadf68e78(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_2f9ee4e8be42125eeb91(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_bdb0eb69f0f9cd62c05f(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_ba9c0a74856f80a542a1(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_d25ae28257a188357ccf(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_7686d9d4ff9e7f8c0dfa(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_9caa263e6abbc6cbc854(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(160) void
-kernel_cake_stepfun_moe_68d303630b7c0b041739(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_5b9ca4aac5b42ad9590d(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(192) void
-kernel_cake_stepfun_moe_5b2219ed109e227a6ff0(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_af393f768a551a149bbe(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(224) void
-kernel_cake_stepfun_moe_a22d99e07fca533868b6(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_64716cf04132ce273596(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_2419be8d3eff3fda3b91(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_df7787d7246f9f50c289(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(288) void
-kernel_cake_stepfun_moe_2ee3c8aa43620a207237(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_f816d94e576baa5f9b4e(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(320) void
-kernel_cake_stepfun_moe_3c622750f7550d229c56(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_d976dead97f45620ed56(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(352) void
-kernel_cake_stepfun_moe_bf8d153405e9759c604a(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_f14199de5c36d6bf31d9(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(384) void
-kernel_cake_stepfun_moe_87cedd0037c2bdfa0dfb(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_97904ed7a026d5ee7ef8(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(416) void
-kernel_cake_stepfun_moe_4b7520ac8b08c2f2bb5a(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_f301c02af43fb09ccf0c(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(448) void
-kernel_cake_stepfun_moe_c9607584511bc6a37c7a(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_091bad10790f4002a096(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(480) void
-kernel_cake_stepfun_moe_96d9890105b0df6ec028(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_9356e99300ccce7d3af0(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(512) void
-kernel_cake_stepfun_moe_3c0d704a58031033ddc7(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_26f37a230d0b954bb303(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(256) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_b5bc77be4deb197a7b75(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_c5ed7b23db8a32f0d108(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(512) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_3ba47363bc549e552ab8(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_59ab97bb010c903b6d07(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(1024) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_4ddbd5c115568a9446be(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_539c2607615a595194e3(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_9eda65542b380393db7e(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_89f41d913ef082c72cdf(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_5454b9a4a5f54896beaa(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_54d54b073652ba13f9bd(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_62d0b63793eef4aa7cd6(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_136e1bcaa61133a5dde5(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(160) void
-kernel_cake_stepfun_moe_987302c5b8076c38111b(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_d52ff133c6c1d5fecc54(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(192) void
-kernel_cake_stepfun_moe_1aced9d00ef0e05d4f48(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_5d19669e310441438403(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(224) void
-kernel_cake_stepfun_moe_5591201f165bff724988(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_331396b597bd68555840(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_e68b0706145361b0eca4(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_5f600fc8d0d3df23cd3c(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(288) void
-kernel_cake_stepfun_moe_19f1b20c079ab6510552(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_04f1afe651503345b2e5(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(320) void
-kernel_cake_stepfun_moe_2b116ee0ed4fc04b0f25(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_c099a948b9a2fb8047c7(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(352) void
-kernel_cake_stepfun_moe_33c9f658be08283f6fb1(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_bc97f6d498f0c23749c0(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(384) void
-kernel_cake_stepfun_moe_9affff8e12ece450c671(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_d630c24fd003dfc00e4a(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(416) void
-kernel_cake_stepfun_moe_5e5a64305ce55e36db37(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_fd1f76bfd10d3767c1de(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(448) void
-kernel_cake_stepfun_moe_c19b7d586c54f7517656(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_cfc3d7dfef0eabf831e0(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(480) void
-kernel_cake_stepfun_moe_c99a026bfe030449fa59(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_c0d5976b2844c2722c03(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(512) void
-kernel_cake_stepfun_moe_0a97bccfdf12d568692b(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_7e852887f0b9209b0865(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(256) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_9466f8696d0b1e140d79(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_92dddc0ce59ace7077e7(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(512) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_2d42b5790247e3f1528a(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_1e6e380afafd28b6f80b(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(1024) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_fe585fd9938b58b7e060(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
+kernel_cake_stepfun_moe_dbeabca03d806742d8ba(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
 __global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_d3e0ae408d93c61df65b(const __nv_bfloat16* input, const int* expanded_idx_to_permuted_idx, uint8_t* out_fp4, uint8_t* out_sf, float* per_token_scale, float global_scale_inv, int m, int n);
+kernel_cake_stepfun_moe_ccc262572f126178b683(const __nv_bfloat16* input, const int* expanded_idx_to_permuted_idx, uint8_t* out_fp4, uint8_t* out_sf, float* per_token_scale, float global_scale_inv, int m, int n);
 __global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_b00d03ce4e9864a859c1(const __nv_bfloat16* input, const int* expanded_idx_to_permuted_idx, uint8_t* out_fp4, uint8_t* out_sf, float* per_token_scale, float global_scale_inv, int m, int n);
+kernel_cake_stepfun_moe_0dd0c8cb2c802b0669be(const __nv_bfloat16* input, const int* expanded_idx_to_permuted_idx, uint8_t* out_fp4, uint8_t* out_sf, float* per_token_scale, float global_scale_inv, int m, int n);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_7e307e6cf096f8af9c96(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_a22e677aa9375e3a9114(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_03439ade37282ad914d9(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_71f509d6d16530dc4ee8(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_c070d9d6297bf762e60f(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_00f4a7d682620456e7cb(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_912d29a3014995de1640(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_f8d3a1110e7ad5b7e95a(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_45706e18c8b40433425c(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_183c4607d92556cbca24(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_fb20f7b0c35a34721cff(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
+kernel_cake_stepfun_moe_2121480f115acbb07c20(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_2698365b7b61416875a9(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
+kernel_cake_stepfun_moe_5012055d1d388fab17b6(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_1b552a504edc888d422f(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
+kernel_cake_stepfun_moe_46c723df778ea3c4e453(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_a24359682d0a55b3038c(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
+kernel_cake_stepfun_moe_f3fff41025a1e2c89bb9(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(384, 1) void
-kernel_cake_stepfun_moe_14a59aeadd658a3d238b(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
+kernel_cake_stepfun_moe_8042e5d54cc5b6dab6b1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(384, 1) void
-kernel_cake_stepfun_moe_f156bb432fb64f67ffb7(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_cccdf12c3b625d65ee32(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(384, 1) void
-kernel_cake_stepfun_moe_e865ee961b3f89936a6c(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_cce8c62e37cf58167f2b(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(384, 1) void
-kernel_cake_stepfun_moe_6ef10c3128bfb83ae871(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_0082547d0ef842c2bc6b(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_4274db38451222730366(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_bd253b6d19bdecf1f63a(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_b01d035195388b3694dd(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_49f12bfa7a4b7c3edd83(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256, 1) void
-kernel_cake_stepfun_moe_9d996c7f2fd948467a02(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_509886a46166edc2cffc(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256, 1) void
-kernel_cake_stepfun_moe_b1443b50feefbf64838e(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_4549d5031106f3c00ffc(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256, 1) void
-kernel_cake_stepfun_moe_2c84fe3ee6d13647c6c0(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_27a6dbc9062b94c4d1ab(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_18b6bb9b7692125ad170(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_7474b34a0e275e8eb57c(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_db2c05b92ef08570d536(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_c53ed492dc2fd2732230(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_4663053456735314d120(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_388ba7f9799bc9857fac(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_3ca45a0b10f091071eb8(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_91a60d947467eec6e14e(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_f587262650339bd130db(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_6e957b6d7a7cf7a87286(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_993c7f624161dfb8436f(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_73a47503421f02df6c08(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_b3a0562098d726a99e48(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_842a1ffe30c69df2d6a2(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_907d4a3712ead198d375(const __nv_bfloat16* in_ptr, const __nv_bfloat16* expert_weights, __nv_bfloat16* out_ptr, const int* expanded_idx_to_permuted_idx, int hidden_dim, int hidden_dim_padded, int num_tokens, int top_k);
+kernel_cake_stepfun_moe_8d683ca206faf6662791(const __nv_bfloat16* in_ptr, const __nv_bfloat16* expert_weights, __nv_bfloat16* out_ptr, const int* expanded_idx_to_permuted_idx, int hidden_dim, int hidden_dim_padded, int num_tokens, int top_k);
 __global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_22c47e8ec3ef42e59c19(const __nv_bfloat16* in_ptr, const __nv_bfloat16* expert_weights, __nv_bfloat16* out_ptr, const int* expanded_idx_to_permuted_idx, int hidden_dim, int hidden_dim_padded, int num_tokens, int top_k);
+kernel_cake_stepfun_moe_bb4e1ba57ae6f146542d(const __nv_bfloat16* in_ptr, const __nv_bfloat16* expert_weights, __nv_bfloat16* out_ptr, const int* expanded_idx_to_permuted_idx, int hidden_dim, int hidden_dim_padded, int num_tokens, int top_k);
 __global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_e679816ba0bd10cc0a54(const __nv_bfloat16* in_ptr, const float* expert_weights, __nv_bfloat16* out_ptr, const int* expanded_idx_to_permuted_idx, int hidden_dim, int hidden_dim_padded, int num_tokens, int top_k);
+kernel_cake_stepfun_moe_ad6d394d57e0a9ad2f0c(const __nv_bfloat16* in_ptr, const float* expert_weights, __nv_bfloat16* out_ptr, const int* expanded_idx_to_permuted_idx, int hidden_dim, int hidden_dim_padded, int num_tokens, int top_k);
 __global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_f3fec476ec2197a284c2(const __nv_bfloat16* in_ptr, const float* expert_weights, __nv_bfloat16* out_ptr, const int* expanded_idx_to_permuted_idx, int hidden_dim, int hidden_dim_padded, int num_tokens, int top_k);
+kernel_cake_stepfun_moe_60fe1ef6ee2f3abc3a98(const __nv_bfloat16* in_ptr, const float* expert_weights, __nv_bfloat16* out_ptr, const int* expanded_idx_to_permuted_idx, int hidden_dim, int hidden_dim_padded, int num_tokens, int top_k);
 }  // extern "C"
 
 inline cudaError_t Configure_100(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_5d497c022b3121baa7bc, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_13ef27099f70919fde9d, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_100(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_5d497c022b3121baa7bc, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_13ef27099f70919fde9d, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_101(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_59f2ccd008075fbae26e, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_cbc6d8a29d292959c190, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_101(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_59f2ccd008075fbae26e, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_cbc6d8a29d292959c190, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_102(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_74655bc1486ce1cae45b, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_ca5282161623d9d7394e, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_102(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_74655bc1486ce1cae45b, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_ca5282161623d9d7394e, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_103(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_88ac7eb73282d3206a69, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_07402c503062028f9e1d, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_103(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_88ac7eb73282d3206a69, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_07402c503062028f9e1d, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_104(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_db5456e145d4939a2e1e, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_772ecbc2f4e757d385e4, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_104(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_db5456e145d4939a2e1e, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_772ecbc2f4e757d385e4, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_105(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_b590908426c1c0693edb, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_a67908d0c5fcd8454728, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_105(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_b590908426c1c0693edb, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_a67908d0c5fcd8454728, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_106(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_88f786003bb426b51678, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_5d45b5d9446582dd8661, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_106(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_88f786003bb426b51678, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_5d45b5d9446582dd8661, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_107(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_1bb5ff30eadf218d33ec, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_c0dbfed098d8cc2e3ffc, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_107(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_1bb5ff30eadf218d33ec, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_c0dbfed098d8cc2e3ffc, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_108(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_3d85a7851e4a4b126063, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_612a700bda6f4e809dba, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_108(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_3d85a7851e4a4b126063, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_612a700bda6f4e809dba, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_109(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_cd624e8bbfa0ce02a02a, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f5cc5e40e364fe364f4b, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_109(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_cd624e8bbfa0ce02a02a, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f5cc5e40e364fe364f4b, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_110(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_89db675671aad2917781, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_789e03a3bff69c9b619f, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_110(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_89db675671aad2917781, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_789e03a3bff69c9b619f, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_111(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_0f7f87fa1b4b852dc99b, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_417b95163aa6fae5376b, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_111(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_0f7f87fa1b4b852dc99b, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_417b95163aa6fae5376b, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_112(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_08748360fc777410bd26, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_2b14465997af909033f8, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_112(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_08748360fc777410bd26, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_2b14465997af909033f8, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_113(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_42572957e314e61df9a4, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f4d4162245b9b9e3ffe9, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_113(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_42572957e314e61df9a4, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f4d4162245b9b9e3ffe9, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_114(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_44d673847e47df4dc0fb, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_fe61e6fc1f312ba6f31c, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_114(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_44d673847e47df4dc0fb, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_fe61e6fc1f312ba6f31c, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_115(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_e8671c79a27f76189728, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_d10e8930ab9cadf68e78, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_115(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_e8671c79a27f76189728, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_d10e8930ab9cadf68e78, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_116(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_2f9ee4e8be42125eeb91, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_bdb0eb69f0f9cd62c05f, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_116(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_2f9ee4e8be42125eeb91, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_bdb0eb69f0f9cd62c05f, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_117(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_ba9c0a74856f80a542a1, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_d25ae28257a188357ccf, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_117(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_ba9c0a74856f80a542a1, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_d25ae28257a188357ccf, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_118(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_7686d9d4ff9e7f8c0dfa, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_9caa263e6abbc6cbc854, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_118(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_7686d9d4ff9e7f8c0dfa, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_9caa263e6abbc6cbc854, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_119(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_68d303630b7c0b041739, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_5b9ca4aac5b42ad9590d, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_119(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_68d303630b7c0b041739, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_5b9ca4aac5b42ad9590d, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_120(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_5b2219ed109e227a6ff0, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_af393f768a551a149bbe, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_120(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_5b2219ed109e227a6ff0, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_af393f768a551a149bbe, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_121(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_a22d99e07fca533868b6, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_64716cf04132ce273596, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_121(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_a22d99e07fca533868b6, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_64716cf04132ce273596, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_122(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_2419be8d3eff3fda3b91, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_df7787d7246f9f50c289, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_122(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_2419be8d3eff3fda3b91, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_df7787d7246f9f50c289, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_123(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_2ee3c8aa43620a207237, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f816d94e576baa5f9b4e, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_123(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_2ee3c8aa43620a207237, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f816d94e576baa5f9b4e, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_124(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_3c622750f7550d229c56, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_d976dead97f45620ed56, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_124(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_3c622750f7550d229c56, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_d976dead97f45620ed56, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_125(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_bf8d153405e9759c604a, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f14199de5c36d6bf31d9, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_125(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_bf8d153405e9759c604a, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f14199de5c36d6bf31d9, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_126(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_87cedd0037c2bdfa0dfb, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_97904ed7a026d5ee7ef8, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_126(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_87cedd0037c2bdfa0dfb, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_97904ed7a026d5ee7ef8, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_127(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_4b7520ac8b08c2f2bb5a, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f301c02af43fb09ccf0c, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_127(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_4b7520ac8b08c2f2bb5a, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f301c02af43fb09ccf0c, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_128(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_c9607584511bc6a37c7a, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_091bad10790f4002a096, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_128(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_c9607584511bc6a37c7a, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_091bad10790f4002a096, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_129(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_96d9890105b0df6ec028, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_9356e99300ccce7d3af0, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_129(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_96d9890105b0df6ec028, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_9356e99300ccce7d3af0, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_130(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_3c0d704a58031033ddc7, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_26f37a230d0b954bb303, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_130(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_3c0d704a58031033ddc7, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_26f37a230d0b954bb303, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_131(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_b5bc77be4deb197a7b75, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_c5ed7b23db8a32f0d108, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_131(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_b5bc77be4deb197a7b75, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_c5ed7b23db8a32f0d108, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_132(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_3ba47363bc549e552ab8, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_59ab97bb010c903b6d07, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_132(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_3ba47363bc549e552ab8, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_59ab97bb010c903b6d07, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_133(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_4ddbd5c115568a9446be, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_539c2607615a595194e3, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_133(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_4ddbd5c115568a9446be, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_539c2607615a595194e3, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_134(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_9eda65542b380393db7e, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_89f41d913ef082c72cdf, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_134(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_9eda65542b380393db7e, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_89f41d913ef082c72cdf, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_135(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_5454b9a4a5f54896beaa, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_54d54b073652ba13f9bd, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_135(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_5454b9a4a5f54896beaa, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_54d54b073652ba13f9bd, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_136(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_62d0b63793eef4aa7cd6, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_136e1bcaa61133a5dde5, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_136(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_62d0b63793eef4aa7cd6, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_136e1bcaa61133a5dde5, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_137(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_987302c5b8076c38111b, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_d52ff133c6c1d5fecc54, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_137(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_987302c5b8076c38111b, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_d52ff133c6c1d5fecc54, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_138(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_1aced9d00ef0e05d4f48, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_5d19669e310441438403, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_138(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_1aced9d00ef0e05d4f48, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_5d19669e310441438403, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_139(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_5591201f165bff724988, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_331396b597bd68555840, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_139(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_5591201f165bff724988, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_331396b597bd68555840, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_140(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_e68b0706145361b0eca4, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_5f600fc8d0d3df23cd3c, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_140(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_e68b0706145361b0eca4, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_5f600fc8d0d3df23cd3c, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_141(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_19f1b20c079ab6510552, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_04f1afe651503345b2e5, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_141(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_19f1b20c079ab6510552, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_04f1afe651503345b2e5, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_142(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_2b116ee0ed4fc04b0f25, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_c099a948b9a2fb8047c7, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_142(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_2b116ee0ed4fc04b0f25, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_c099a948b9a2fb8047c7, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_143(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_33c9f658be08283f6fb1, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_bc97f6d498f0c23749c0, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_143(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_33c9f658be08283f6fb1, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_bc97f6d498f0c23749c0, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_144(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_9affff8e12ece450c671, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_d630c24fd003dfc00e4a, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_144(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_9affff8e12ece450c671, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_d630c24fd003dfc00e4a, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_145(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_5e5a64305ce55e36db37, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_fd1f76bfd10d3767c1de, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_145(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_5e5a64305ce55e36db37, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_fd1f76bfd10d3767c1de, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_146(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_c19b7d586c54f7517656, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_cfc3d7dfef0eabf831e0, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_146(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_c19b7d586c54f7517656, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_cfc3d7dfef0eabf831e0, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_147(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_c99a026bfe030449fa59, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_c0d5976b2844c2722c03, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_147(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_c99a026bfe030449fa59, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_c0d5976b2844c2722c03, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_148(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_0a97bccfdf12d568692b, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_7e852887f0b9209b0865, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_148(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_0a97bccfdf12d568692b, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_7e852887f0b9209b0865, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_149(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_9466f8696d0b1e140d79, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_92dddc0ce59ace7077e7, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_149(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_9466f8696d0b1e140d79, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_92dddc0ce59ace7077e7, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_150(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_2d42b5790247e3f1528a, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_1e6e380afafd28b6f80b, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_150(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_2d42b5790247e3f1528a, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_1e6e380afafd28b6f80b, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_151(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_fe585fd9938b58b7e060, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_dbeabca03d806742d8ba, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_151(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_fe585fd9938b58b7e060, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_dbeabca03d806742d8ba, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
 }
 inline cudaError_t Configure_300(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_d3e0ae408d93c61df65b, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_ccc262572f126178b683, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_300(const cudaLaunchConfig_t* config, const RequantArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_d3e0ae408d93c61df65b, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<uint8_t*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<uint8_t*>(const_cast<void*>(static_cast<const void*>(args.output_scale))), reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.per_token_scale))), args.global_scale_inv, args.num_expanded, args.inner_dim);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_ccc262572f126178b683, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<uint8_t*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<uint8_t*>(const_cast<void*>(static_cast<const void*>(args.output_scale))), reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.per_token_scale))), args.global_scale_inv, args.num_expanded, args.inner_dim);
 }
 inline cudaError_t Configure_301(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_b00d03ce4e9864a859c1, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_0dd0c8cb2c802b0669be, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_301(const cudaLaunchConfig_t* config, const RequantArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_b00d03ce4e9864a859c1, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<uint8_t*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<uint8_t*>(const_cast<void*>(static_cast<const void*>(args.output_scale))), reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.per_token_scale))), args.global_scale_inv, args.num_expanded, args.inner_dim);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_0dd0c8cb2c802b0669be, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<uint8_t*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<uint8_t*>(const_cast<void*>(static_cast<const void*>(args.output_scale))), reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.per_token_scale))), args.global_scale_inv, args.num_expanded, args.inner_dim);
 }
 inline bool EncodeTensorMap_400_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -692,11 +691,11 @@ inline bool EncodeTensorMap_400_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_400(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_7e307e6cf096f8af9c96, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_a22e677aa9375e3a9114, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_400(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_7e307e6cf096f8af9c96, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_a22e677aa9375e3a9114, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_401_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -796,11 +795,11 @@ inline bool EncodeTensorMap_401_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_401(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_03439ade37282ad914d9, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_71f509d6d16530dc4ee8, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_401(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_03439ade37282ad914d9, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_71f509d6d16530dc4ee8, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_402_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -900,11 +899,11 @@ inline bool EncodeTensorMap_402_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_402(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_c070d9d6297bf762e60f, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_00f4a7d682620456e7cb, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_402(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_c070d9d6297bf762e60f, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_00f4a7d682620456e7cb, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_403_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -1004,11 +1003,11 @@ inline bool EncodeTensorMap_403_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_403(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_912d29a3014995de1640, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f8d3a1110e7ad5b7e95a, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_403(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_912d29a3014995de1640, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f8d3a1110e7ad5b7e95a, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_404_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -1111,11 +1110,11 @@ inline bool EncodeTensorMap_404_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_404(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_45706e18c8b40433425c, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_183c4607d92556cbca24, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_404(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_45706e18c8b40433425c, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_183c4607d92556cbca24, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_405_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -1215,11 +1214,11 @@ inline bool EncodeTensorMap_405_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_405(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_fb20f7b0c35a34721cff, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_2121480f115acbb07c20, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_405(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_fb20f7b0c35a34721cff, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_2121480f115acbb07c20, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
 }
 inline bool EncodeTensorMap_406_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -1319,11 +1318,11 @@ inline bool EncodeTensorMap_406_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_406(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_2698365b7b61416875a9, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_5012055d1d388fab17b6, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_406(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_2698365b7b61416875a9, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_5012055d1d388fab17b6, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
 }
 inline bool EncodeTensorMap_407_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -1423,11 +1422,11 @@ inline bool EncodeTensorMap_407_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_407(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_1b552a504edc888d422f, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_46c723df778ea3c4e453, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_407(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_1b552a504edc888d422f, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_46c723df778ea3c4e453, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
 }
 inline bool EncodeTensorMap_408_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -1527,11 +1526,11 @@ inline bool EncodeTensorMap_408_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_408(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_a24359682d0a55b3038c, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f3fff41025a1e2c89bb9, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_408(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_a24359682d0a55b3038c, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f3fff41025a1e2c89bb9, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
 }
 inline bool EncodeTensorMap_409_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -1634,11 +1633,11 @@ inline bool EncodeTensorMap_409_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_409(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_14a59aeadd658a3d238b, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_8042e5d54cc5b6dab6b1, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_409(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_14a59aeadd658a3d238b, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_8042e5d54cc5b6dab6b1, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
 }
 inline bool EncodeTensorMap_410_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
@@ -1682,11 +1681,11 @@ inline bool EncodeTensorMap_410_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_410(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f156bb432fb64f67ffb7, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_cccdf12c3b625d65ee32, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_410(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f156bb432fb64f67ffb7, args.A, static_cast<__nv_bfloat16*>(args.B_ptr), args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_cccdf12c3b625d65ee32, args.A, static_cast<__nv_bfloat16*>(args.B_ptr), args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_411_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
@@ -1730,11 +1729,11 @@ inline bool EncodeTensorMap_411_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_411(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_e865ee961b3f89936a6c, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_cce8c62e37cf58167f2b, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_411(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_e865ee961b3f89936a6c, args.A, static_cast<__nv_bfloat16*>(args.B_ptr), args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_cce8c62e37cf58167f2b, args.A, static_cast<__nv_bfloat16*>(args.B_ptr), args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_412_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
@@ -1778,11 +1777,11 @@ inline bool EncodeTensorMap_412_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_412(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_6ef10c3128bfb83ae871, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_0082547d0ef842c2bc6b, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_412(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_6ef10c3128bfb83ae871, args.A, static_cast<__nv_bfloat16*>(args.B_ptr), args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_0082547d0ef842c2bc6b, args.A, static_cast<__nv_bfloat16*>(args.B_ptr), args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_413_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
@@ -1843,11 +1842,11 @@ inline bool EncodeTensorMap_413_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_413(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_4274db38451222730366, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_bd253b6d19bdecf1f63a, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_413(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_4274db38451222730366, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_bd253b6d19bdecf1f63a, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_414_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
@@ -1908,11 +1907,11 @@ inline bool EncodeTensorMap_414_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_414(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_b01d035195388b3694dd, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_49f12bfa7a4b7c3edd83, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_414(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_b01d035195388b3694dd, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_49f12bfa7a4b7c3edd83, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_415_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -1967,11 +1966,11 @@ inline bool EncodeTensorMap_415_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_415(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_9d996c7f2fd948467a02, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_509886a46166edc2cffc, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_415(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_9d996c7f2fd948467a02, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_509886a46166edc2cffc, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_416_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -2026,11 +2025,11 @@ inline bool EncodeTensorMap_416_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_416(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_b1443b50feefbf64838e, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_4549d5031106f3c00ffc, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_416(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_b1443b50feefbf64838e, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_4549d5031106f3c00ffc, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_417_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -2085,11 +2084,11 @@ inline bool EncodeTensorMap_417_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_417(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_2c84fe3ee6d13647c6c0, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_27a6dbc9062b94c4d1ab, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_417(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_2c84fe3ee6d13647c6c0, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_27a6dbc9062b94c4d1ab, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_418_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -2144,11 +2143,11 @@ inline bool EncodeTensorMap_418_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_418(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_18b6bb9b7692125ad170, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_7474b34a0e275e8eb57c, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_418(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_18b6bb9b7692125ad170, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_7474b34a0e275e8eb57c, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_419_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -2203,11 +2202,11 @@ inline bool EncodeTensorMap_419_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_419(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_db2c05b92ef08570d536, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_c53ed492dc2fd2732230, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_419(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_db2c05b92ef08570d536, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_c53ed492dc2fd2732230, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_420_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -2307,11 +2306,11 @@ inline bool EncodeTensorMap_420_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_420(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_4663053456735314d120, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_388ba7f9799bc9857fac, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_420(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_4663053456735314d120, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_388ba7f9799bc9857fac, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_421_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -2411,11 +2410,11 @@ inline bool EncodeTensorMap_421_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_421(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_3ca45a0b10f091071eb8, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_91a60d947467eec6e14e, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_421(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_3ca45a0b10f091071eb8, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_91a60d947467eec6e14e, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_422_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -2515,11 +2514,11 @@ inline bool EncodeTensorMap_422_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_422(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f587262650339bd130db, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_6e957b6d7a7cf7a87286, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_422(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f587262650339bd130db, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_6e957b6d7a7cf7a87286, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_423_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -2619,11 +2618,11 @@ inline bool EncodeTensorMap_423_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_423(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_993c7f624161dfb8436f, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_73a47503421f02df6c08, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_423(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_993c7f624161dfb8436f, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_73a47503421f02df6c08, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_424_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -2726,2948 +2725,136 @@ inline bool EncodeTensorMap_424_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_424(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_b3a0562098d726a99e48, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_842a1ffe30c69df2d6a2, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_424(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_b3a0562098d726a99e48, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_842a1ffe30c69df2d6a2, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline cudaError_t Configure_500(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_907d4a3712ead198d375, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_8d683ca206faf6662791, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_500(const cudaLaunchConfig_t* config, const FinalizeArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_907d4a3712ead198d375, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.expert_weights))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), args.hidden_dim, args.hidden_dim_padded, args.num_tokens, args.top_k);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_8d683ca206faf6662791, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.expert_weights))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), args.hidden_dim, args.hidden_dim_padded, args.num_tokens, args.top_k);
 }
 inline cudaError_t Configure_501(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_22c47e8ec3ef42e59c19, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_bb4e1ba57ae6f146542d, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_501(const cudaLaunchConfig_t* config, const FinalizeArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_22c47e8ec3ef42e59c19, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.expert_weights))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), args.hidden_dim, args.hidden_dim_padded, args.num_tokens, args.top_k);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_bb4e1ba57ae6f146542d, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.expert_weights))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), args.hidden_dim, args.hidden_dim_padded, args.num_tokens, args.top_k);
 }
 inline cudaError_t Configure_502(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_e679816ba0bd10cc0a54, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_ad6d394d57e0a9ad2f0c, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_502(const cudaLaunchConfig_t* config, const FinalizeArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_e679816ba0bd10cc0a54, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.expert_weights))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), args.hidden_dim, args.hidden_dim_padded, args.num_tokens, args.top_k);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_ad6d394d57e0a9ad2f0c, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.expert_weights))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), args.hidden_dim, args.hidden_dim_padded, args.num_tokens, args.top_k);
 }
 inline cudaError_t Configure_503(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f3fec476ec2197a284c2, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_60fe1ef6ee2f3abc3a98, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_503(const cudaLaunchConfig_t* config, const FinalizeArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f3fec476ec2197a284c2, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.expert_weights))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), args.hidden_dim, args.hidden_dim_padded, args.num_tokens, args.top_k);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_60fe1ef6ee2f3abc3a98, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.expert_weights))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), args.hidden_dim, args.hidden_dim_padded, args.num_tokens, args.top_k);
 }
 
 inline constexpr RoutingKernelSpec kRoutingKernels[] = {
-    {"kernel_cake_stepfun_moe_5d497c022b3121baa7bc", RoutingInput::kScores, 1, 1, 4, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {128u, 1u, 1u}, {1u, 1u, 1u}, false, false, 1152u, &Configure_100, &Submit_100, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_59f2ccd008075fbae26e", RoutingInput::kScores, 1, 5, 5, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {160u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2176u, &Configure_101, &Submit_101, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_74655bc1486ce1cae45b", RoutingInput::kScores, 1, 6, 6, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {192u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2560u, &Configure_102, &Submit_102, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_88ac7eb73282d3206a69", RoutingInput::kScores, 1, 7, 7, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {224u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2944u, &Configure_103, &Submit_103, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_db5456e145d4939a2e1e", RoutingInput::kScores, 1, 8, 8, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3328u, &Configure_104, &Submit_104, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_b590908426c1c0693edb", RoutingInput::kScores, 1, 9, 9, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {288u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3712u, &Configure_105, &Submit_105, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_88f786003bb426b51678", RoutingInput::kScores, 1, 10, 10, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {320u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4096u, &Configure_106, &Submit_106, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_1bb5ff30eadf218d33ec", RoutingInput::kScores, 1, 11, 11, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {352u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4480u, &Configure_107, &Submit_107, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_3d85a7851e4a4b126063", RoutingInput::kScores, 1, 12, 12, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {384u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4864u, &Configure_108, &Submit_108, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_cd624e8bbfa0ce02a02a", RoutingInput::kScores, 1, 13, 13, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {416u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5248u, &Configure_109, &Submit_109, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_89db675671aad2917781", RoutingInput::kScores, 1, 14, 14, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {448u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5632u, &Configure_110, &Submit_110, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_0f7f87fa1b4b852dc99b", RoutingInput::kScores, 1, 15, 15, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {480u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6016u, &Configure_111, &Submit_111, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_08748360fc777410bd26", RoutingInput::kScores, 1, 16, 16, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {512u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6400u, &Configure_112, &Submit_112, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_42572957e314e61df9a4", RoutingInput::kScores, 1, 17, 64, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {256u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1408u, &Configure_113, &Submit_113, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_44d673847e47df4dc0fb", RoutingInput::kScores, 1, 65, 128, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {512u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1664u, &Configure_114, &Submit_114, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_e8671c79a27f76189728", RoutingInput::kScores, 1, 129, 256, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {1024u, 1u, 1u}, {8u, 1u, 1u}, false, false, 2176u, &Configure_115, &Submit_115, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_ba9c0a74856f80a542a1", RoutingInput::kScores, 1, 257, 1073741824, RoutingGrid::kCoopSms, {0u, 0u, 0u}, 0, 64, {128u, 1u, 1u}, {1u, 1u, 1u}, false, true, 1152u, &Configure_117, &Submit_117, "kernel_cake_stepfun_moe_2f9ee4e8be42125eeb91", {1024u, 1u, 1u}, {128u, 1u, 1u}, 0u, &Configure_116, &Submit_116},
-    {"kernel_cake_stepfun_moe_7686d9d4ff9e7f8c0dfa", RoutingInput::kScores, 0, 1, 4, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {128u, 1u, 1u}, {1u, 1u, 1u}, false, false, 1152u, &Configure_118, &Submit_118, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_68d303630b7c0b041739", RoutingInput::kScores, 0, 5, 5, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {160u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2176u, &Configure_119, &Submit_119, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_5b2219ed109e227a6ff0", RoutingInput::kScores, 0, 6, 6, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {192u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2560u, &Configure_120, &Submit_120, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_a22d99e07fca533868b6", RoutingInput::kScores, 0, 7, 7, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {224u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2944u, &Configure_121, &Submit_121, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_2419be8d3eff3fda3b91", RoutingInput::kScores, 0, 8, 8, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3328u, &Configure_122, &Submit_122, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_2ee3c8aa43620a207237", RoutingInput::kScores, 0, 9, 9, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {288u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3712u, &Configure_123, &Submit_123, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_3c622750f7550d229c56", RoutingInput::kScores, 0, 10, 10, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {320u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4096u, &Configure_124, &Submit_124, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_bf8d153405e9759c604a", RoutingInput::kScores, 0, 11, 11, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {352u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4480u, &Configure_125, &Submit_125, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_87cedd0037c2bdfa0dfb", RoutingInput::kScores, 0, 12, 12, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {384u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4864u, &Configure_126, &Submit_126, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_4b7520ac8b08c2f2bb5a", RoutingInput::kScores, 0, 13, 13, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {416u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5248u, &Configure_127, &Submit_127, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_c9607584511bc6a37c7a", RoutingInput::kScores, 0, 14, 14, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {448u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5632u, &Configure_128, &Submit_128, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_96d9890105b0df6ec028", RoutingInput::kScores, 0, 15, 15, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {480u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6016u, &Configure_129, &Submit_129, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_3c0d704a58031033ddc7", RoutingInput::kScores, 0, 16, 16, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {512u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6400u, &Configure_130, &Submit_130, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_b5bc77be4deb197a7b75", RoutingInput::kScores, 0, 17, 64, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {256u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1664u, &Configure_131, &Submit_131, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_3ba47363bc549e552ab8", RoutingInput::kScores, 0, 65, 128, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {512u, 1u, 1u}, {8u, 1u, 1u}, false, false, 2176u, &Configure_132, &Submit_132, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_4ddbd5c115568a9446be", RoutingInput::kScores, 0, 129, 256, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {1024u, 1u, 1u}, {8u, 1u, 1u}, false, false, 3200u, &Configure_133, &Submit_133, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_5454b9a4a5f54896beaa", RoutingInput::kScores, 0, 257, 1073741824, RoutingGrid::kCoopSms, {0u, 0u, 0u}, 0, 64, {128u, 1u, 1u}, {1u, 1u, 1u}, false, true, 1152u, &Configure_135, &Submit_135, "kernel_cake_stepfun_moe_9eda65542b380393db7e", {1024u, 1u, 1u}, {128u, 1u, 1u}, 0u, &Configure_134, &Submit_134},
-    {"kernel_cake_stepfun_moe_62d0b63793eef4aa7cd6", RoutingInput::kTopKIds, -1, 1, 4, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {128u, 1u, 1u}, {1u, 1u, 1u}, false, false, 1152u, &Configure_136, &Submit_136, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_987302c5b8076c38111b", RoutingInput::kTopKIds, -1, 5, 5, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {160u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2176u, &Configure_137, &Submit_137, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_1aced9d00ef0e05d4f48", RoutingInput::kTopKIds, -1, 6, 6, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {192u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2560u, &Configure_138, &Submit_138, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_5591201f165bff724988", RoutingInput::kTopKIds, -1, 7, 7, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {224u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2944u, &Configure_139, &Submit_139, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_e68b0706145361b0eca4", RoutingInput::kTopKIds, -1, 8, 8, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3328u, &Configure_140, &Submit_140, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_19f1b20c079ab6510552", RoutingInput::kTopKIds, -1, 9, 9, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {288u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3712u, &Configure_141, &Submit_141, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_2b116ee0ed4fc04b0f25", RoutingInput::kTopKIds, -1, 10, 10, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {320u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4096u, &Configure_142, &Submit_142, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_33c9f658be08283f6fb1", RoutingInput::kTopKIds, -1, 11, 11, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {352u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4480u, &Configure_143, &Submit_143, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_9affff8e12ece450c671", RoutingInput::kTopKIds, -1, 12, 12, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {384u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4864u, &Configure_144, &Submit_144, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_5e5a64305ce55e36db37", RoutingInput::kTopKIds, -1, 13, 13, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {416u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5248u, &Configure_145, &Submit_145, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_c19b7d586c54f7517656", RoutingInput::kTopKIds, -1, 14, 14, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {448u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5632u, &Configure_146, &Submit_146, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_c99a026bfe030449fa59", RoutingInput::kTopKIds, -1, 15, 15, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {480u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6016u, &Configure_147, &Submit_147, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_0a97bccfdf12d568692b", RoutingInput::kTopKIds, -1, 16, 16, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {512u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6400u, &Configure_148, &Submit_148, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_9466f8696d0b1e140d79", RoutingInput::kTopKIds, -1, 17, 64, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {256u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1408u, &Configure_149, &Submit_149, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_2d42b5790247e3f1528a", RoutingInput::kTopKIds, -1, 65, 128, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {512u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1664u, &Configure_150, &Submit_150, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_fe585fd9938b58b7e060", RoutingInput::kTopKIds, -1, 129, 8192, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {1024u, 1u, 1u}, {8u, 1u, 1u}, false, false, 2176u, &Configure_151, &Submit_151, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_13ef27099f70919fde9d", RoutingInput::kScores, 1, 1, 4, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {128u, 1u, 1u}, {1u, 1u, 1u}, false, false, 1152u, &Configure_100, &Submit_100, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_cbc6d8a29d292959c190", RoutingInput::kScores, 1, 5, 5, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {160u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2176u, &Configure_101, &Submit_101, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_ca5282161623d9d7394e", RoutingInput::kScores, 1, 6, 6, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {192u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2560u, &Configure_102, &Submit_102, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_07402c503062028f9e1d", RoutingInput::kScores, 1, 7, 7, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {224u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2944u, &Configure_103, &Submit_103, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_772ecbc2f4e757d385e4", RoutingInput::kScores, 1, 8, 8, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3328u, &Configure_104, &Submit_104, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_a67908d0c5fcd8454728", RoutingInput::kScores, 1, 9, 9, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {288u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3712u, &Configure_105, &Submit_105, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_5d45b5d9446582dd8661", RoutingInput::kScores, 1, 10, 10, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {320u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4096u, &Configure_106, &Submit_106, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_c0dbfed098d8cc2e3ffc", RoutingInput::kScores, 1, 11, 11, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {352u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4480u, &Configure_107, &Submit_107, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_612a700bda6f4e809dba", RoutingInput::kScores, 1, 12, 12, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {384u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4864u, &Configure_108, &Submit_108, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_f5cc5e40e364fe364f4b", RoutingInput::kScores, 1, 13, 13, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {416u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5248u, &Configure_109, &Submit_109, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_789e03a3bff69c9b619f", RoutingInput::kScores, 1, 14, 14, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {448u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5632u, &Configure_110, &Submit_110, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_417b95163aa6fae5376b", RoutingInput::kScores, 1, 15, 15, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {480u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6016u, &Configure_111, &Submit_111, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_2b14465997af909033f8", RoutingInput::kScores, 1, 16, 16, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {512u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6400u, &Configure_112, &Submit_112, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_f4d4162245b9b9e3ffe9", RoutingInput::kScores, 1, 17, 64, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {256u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1408u, &Configure_113, &Submit_113, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_fe61e6fc1f312ba6f31c", RoutingInput::kScores, 1, 65, 128, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {512u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1664u, &Configure_114, &Submit_114, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_d10e8930ab9cadf68e78", RoutingInput::kScores, 1, 129, 256, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {1024u, 1u, 1u}, {8u, 1u, 1u}, false, false, 2176u, &Configure_115, &Submit_115, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_d25ae28257a188357ccf", RoutingInput::kScores, 1, 257, 1073741824, RoutingGrid::kCoopSms, {0u, 0u, 0u}, 0, 64, {128u, 1u, 1u}, {1u, 1u, 1u}, false, true, 1152u, &Configure_117, &Submit_117, "kernel_cake_stepfun_moe_bdb0eb69f0f9cd62c05f", {1024u, 1u, 1u}, {128u, 1u, 1u}, 0u, &Configure_116, &Submit_116},
+    {"kernel_cake_stepfun_moe_9caa263e6abbc6cbc854", RoutingInput::kScores, 0, 1, 4, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {128u, 1u, 1u}, {1u, 1u, 1u}, false, false, 1152u, &Configure_118, &Submit_118, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_5b9ca4aac5b42ad9590d", RoutingInput::kScores, 0, 5, 5, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {160u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2176u, &Configure_119, &Submit_119, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_af393f768a551a149bbe", RoutingInput::kScores, 0, 6, 6, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {192u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2560u, &Configure_120, &Submit_120, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_64716cf04132ce273596", RoutingInput::kScores, 0, 7, 7, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {224u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2944u, &Configure_121, &Submit_121, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_df7787d7246f9f50c289", RoutingInput::kScores, 0, 8, 8, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3328u, &Configure_122, &Submit_122, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_f816d94e576baa5f9b4e", RoutingInput::kScores, 0, 9, 9, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {288u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3712u, &Configure_123, &Submit_123, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_d976dead97f45620ed56", RoutingInput::kScores, 0, 10, 10, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {320u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4096u, &Configure_124, &Submit_124, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_f14199de5c36d6bf31d9", RoutingInput::kScores, 0, 11, 11, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {352u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4480u, &Configure_125, &Submit_125, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_97904ed7a026d5ee7ef8", RoutingInput::kScores, 0, 12, 12, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {384u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4864u, &Configure_126, &Submit_126, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_f301c02af43fb09ccf0c", RoutingInput::kScores, 0, 13, 13, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {416u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5248u, &Configure_127, &Submit_127, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_091bad10790f4002a096", RoutingInput::kScores, 0, 14, 14, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {448u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5632u, &Configure_128, &Submit_128, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_9356e99300ccce7d3af0", RoutingInput::kScores, 0, 15, 15, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {480u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6016u, &Configure_129, &Submit_129, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_26f37a230d0b954bb303", RoutingInput::kScores, 0, 16, 16, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {512u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6400u, &Configure_130, &Submit_130, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_c5ed7b23db8a32f0d108", RoutingInput::kScores, 0, 17, 64, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {256u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1664u, &Configure_131, &Submit_131, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_59ab97bb010c903b6d07", RoutingInput::kScores, 0, 65, 128, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {512u, 1u, 1u}, {8u, 1u, 1u}, false, false, 2176u, &Configure_132, &Submit_132, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_539c2607615a595194e3", RoutingInput::kScores, 0, 129, 256, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {1024u, 1u, 1u}, {8u, 1u, 1u}, false, false, 3200u, &Configure_133, &Submit_133, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_54d54b073652ba13f9bd", RoutingInput::kScores, 0, 257, 1073741824, RoutingGrid::kCoopSms, {0u, 0u, 0u}, 0, 64, {128u, 1u, 1u}, {1u, 1u, 1u}, false, true, 1152u, &Configure_135, &Submit_135, "kernel_cake_stepfun_moe_89f41d913ef082c72cdf", {1024u, 1u, 1u}, {128u, 1u, 1u}, 0u, &Configure_134, &Submit_134},
+    {"kernel_cake_stepfun_moe_136e1bcaa61133a5dde5", RoutingInput::kTopKIds, -1, 1, 4, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {128u, 1u, 1u}, {1u, 1u, 1u}, false, false, 1152u, &Configure_136, &Submit_136, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_d52ff133c6c1d5fecc54", RoutingInput::kTopKIds, -1, 5, 5, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {160u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2176u, &Configure_137, &Submit_137, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_5d19669e310441438403", RoutingInput::kTopKIds, -1, 6, 6, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {192u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2560u, &Configure_138, &Submit_138, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_331396b597bd68555840", RoutingInput::kTopKIds, -1, 7, 7, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {224u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2944u, &Configure_139, &Submit_139, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_5f600fc8d0d3df23cd3c", RoutingInput::kTopKIds, -1, 8, 8, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3328u, &Configure_140, &Submit_140, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_04f1afe651503345b2e5", RoutingInput::kTopKIds, -1, 9, 9, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {288u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3712u, &Configure_141, &Submit_141, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_c099a948b9a2fb8047c7", RoutingInput::kTopKIds, -1, 10, 10, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {320u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4096u, &Configure_142, &Submit_142, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_bc97f6d498f0c23749c0", RoutingInput::kTopKIds, -1, 11, 11, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {352u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4480u, &Configure_143, &Submit_143, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_d630c24fd003dfc00e4a", RoutingInput::kTopKIds, -1, 12, 12, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {384u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4864u, &Configure_144, &Submit_144, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_fd1f76bfd10d3767c1de", RoutingInput::kTopKIds, -1, 13, 13, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {416u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5248u, &Configure_145, &Submit_145, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_cfc3d7dfef0eabf831e0", RoutingInput::kTopKIds, -1, 14, 14, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {448u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5632u, &Configure_146, &Submit_146, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_c0d5976b2844c2722c03", RoutingInput::kTopKIds, -1, 15, 15, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {480u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6016u, &Configure_147, &Submit_147, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_7e852887f0b9209b0865", RoutingInput::kTopKIds, -1, 16, 16, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {512u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6400u, &Configure_148, &Submit_148, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_92dddc0ce59ace7077e7", RoutingInput::kTopKIds, -1, 17, 64, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {256u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1408u, &Configure_149, &Submit_149, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_1e6e380afafd28b6f80b", RoutingInput::kTopKIds, -1, 65, 128, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {512u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1664u, &Configure_150, &Submit_150, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
+    {"kernel_cake_stepfun_moe_dbeabca03d806742d8ba", RoutingInput::kTopKIds, -1, 129, 8192, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {1024u, 1u, 1u}, {8u, 1u, 1u}, false, false, 2176u, &Configure_151, &Submit_151, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
 };
 inline constexpr size_t kRoutingKernelCount = 50;
 
 inline constexpr RequantKernelSpec kRequantKernels[] = {
-    {"kernel_cake_stepfun_moe_d3e0ae408d93c61df65b", SfLayout::kR8c4, 448, 1, {128u, 1u, 1u}, 0u, &Configure_300, &Submit_300},
-    {"kernel_cake_stepfun_moe_b00d03ce4e9864a859c1", SfLayout::kR128c4, 448, 1, {128u, 1u, 1u}, 0u, &Configure_301, &Submit_301},
+    {"kernel_cake_stepfun_moe_ccc262572f126178b683", SfLayout::kR8c4, 448, 1, {128u, 1u, 1u}, 0u, &Configure_300, &Submit_300},
+    {"kernel_cake_stepfun_moe_0dd0c8cb2c802b0669be", SfLayout::kR128c4, 448, 1, {128u, 1u, 1u}, 0u, &Configure_301, &Submit_301},
 };
 inline constexpr size_t kRequantKernelCount = 2;
 
 inline constexpr Fc2KernelSpec kFc2Kernels[] = {
-    {"kernel_cake_stepfun_moe_7e307e6cf096f8af9c96", 0, 8, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_400_A, &EncodeTensorMap_400_B, &EncodeTensorMap_400_SFA, &EncodeTensorMap_400_SFB, &EncodeTensorMap_400_C, &Configure_400, &Submit_400},
-    {"kernel_cake_stepfun_moe_03439ade37282ad914d9", 0, 16, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 202368u, &EncodeTensorMap_401_A, &EncodeTensorMap_401_B, &EncodeTensorMap_401_SFA, &EncodeTensorMap_401_SFB, &EncodeTensorMap_401_C, &Configure_401, &Submit_401},
-    {"kernel_cake_stepfun_moe_c070d9d6297bf762e60f", 0, 32, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 219264u, &EncodeTensorMap_402_A, &EncodeTensorMap_402_B, &EncodeTensorMap_402_SFA, &EncodeTensorMap_402_SFB, &EncodeTensorMap_402_C, &Configure_402, &Submit_402},
-    {"kernel_cake_stepfun_moe_912d29a3014995de1640", 0, 64, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_403_A, &EncodeTensorMap_403_B, &EncodeTensorMap_403_SFA, &EncodeTensorMap_403_SFB, &EncodeTensorMap_403_C, &Configure_403, &Submit_403},
-    {"kernel_cake_stepfun_moe_45706e18c8b40433425c", 0, 256, 128, 256, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 220288u, &EncodeTensorMap_404_A, &EncodeTensorMap_404_B, &EncodeTensorMap_404_SFA, &EncodeTensorMap_404_SFB, &EncodeTensorMap_404_C, &Configure_404, &Submit_404},
-    {"kernel_cake_stepfun_moe_fb20f7b0c35a34721cff", 1, 8, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_405_A, &EncodeTensorMap_405_B, &EncodeTensorMap_405_SFA, &EncodeTensorMap_405_SFB, &EncodeTensorMap_405_C, &Configure_405, &Submit_405},
-    {"kernel_cake_stepfun_moe_2698365b7b61416875a9", 1, 16, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 212608u, &EncodeTensorMap_406_A, &EncodeTensorMap_406_B, &EncodeTensorMap_406_SFA, &EncodeTensorMap_406_SFB, &EncodeTensorMap_406_C, &Configure_406, &Submit_406},
-    {"kernel_cake_stepfun_moe_1b552a504edc888d422f", 1, 32, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 177280u, &EncodeTensorMap_407_A, &EncodeTensorMap_407_B, &EncodeTensorMap_407_SFA, &EncodeTensorMap_407_SFB, &EncodeTensorMap_407_C, &Configure_407, &Submit_407},
-    {"kernel_cake_stepfun_moe_a24359682d0a55b3038c", 1, 64, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_408_A, &EncodeTensorMap_408_B, &EncodeTensorMap_408_SFA, &EncodeTensorMap_408_SFB, &EncodeTensorMap_408_C, &Configure_408, &Submit_408},
-    {"kernel_cake_stepfun_moe_14a59aeadd658a3d238b", 1, 256, 128, 256, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 184448u, &EncodeTensorMap_409_A, &EncodeTensorMap_409_B, &EncodeTensorMap_409_SFA, &EncodeTensorMap_409_SFB, &EncodeTensorMap_409_C, &Configure_409, &Submit_409},
-    {"kernel_cake_stepfun_moe_f156bb432fb64f67ffb7", 2, 8, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_410_A, nullptr, nullptr, nullptr, &EncodeTensorMap_410_C, &Configure_410, &Submit_410},
-    {"kernel_cake_stepfun_moe_e865ee961b3f89936a6c", 2, 16, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_411_A, nullptr, nullptr, nullptr, &EncodeTensorMap_411_C, &Configure_411, &Submit_411},
-    {"kernel_cake_stepfun_moe_6ef10c3128bfb83ae871", 2, 32, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_412_A, nullptr, nullptr, nullptr, &EncodeTensorMap_412_C, &Configure_412, &Submit_412},
-    {"kernel_cake_stepfun_moe_4274db38451222730366", 2, 64, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 222336u, &EncodeTensorMap_413_A, &EncodeTensorMap_413_B, nullptr, nullptr, &EncodeTensorMap_413_C, &Configure_413, &Submit_413},
-    {"kernel_cake_stepfun_moe_b01d035195388b3694dd", 2, 128, 128, 64, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 214144u, &EncodeTensorMap_414_A, &EncodeTensorMap_414_B, nullptr, nullptr, &EncodeTensorMap_414_C, &Configure_414, &Submit_414},
-    {"kernel_cake_stepfun_moe_9d996c7f2fd948467a02", 3, 8, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_415_A, &EncodeTensorMap_415_B, nullptr, nullptr, &EncodeTensorMap_415_C, &Configure_415, &Submit_415},
-    {"kernel_cake_stepfun_moe_b1443b50feefbf64838e", 3, 16, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_416_A, &EncodeTensorMap_416_B, nullptr, nullptr, &EncodeTensorMap_416_C, &Configure_416, &Submit_416},
-    {"kernel_cake_stepfun_moe_2c84fe3ee6d13647c6c0", 3, 32, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_417_A, &EncodeTensorMap_417_B, nullptr, nullptr, &EncodeTensorMap_417_C, &Configure_417, &Submit_417},
-    {"kernel_cake_stepfun_moe_18b6bb9b7692125ad170", 3, 64, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_418_A, &EncodeTensorMap_418_B, nullptr, nullptr, &EncodeTensorMap_418_C, &Configure_418, &Submit_418},
-    {"kernel_cake_stepfun_moe_db2c05b92ef08570d536", 3, 128, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_419_A, &EncodeTensorMap_419_B, nullptr, nullptr, &EncodeTensorMap_419_C, &Configure_419, &Submit_419},
-    {"kernel_cake_stepfun_moe_4663053456735314d120", 4, 8, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 147072u, &EncodeTensorMap_420_A, &EncodeTensorMap_420_B, &EncodeTensorMap_420_SFA, &EncodeTensorMap_420_SFB, &EncodeTensorMap_420_C, &Configure_420, &Submit_420},
-    {"kernel_cake_stepfun_moe_3ca45a0b10f091071eb8", 4, 16, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 119296u, &EncodeTensorMap_421_A, &EncodeTensorMap_421_B, &EncodeTensorMap_421_SFA, &EncodeTensorMap_421_SFB, &EncodeTensorMap_421_C, &Configure_421, &Submit_421},
-    {"kernel_cake_stepfun_moe_f587262650339bd130db", 4, 32, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 136064u, &EncodeTensorMap_422_A, &EncodeTensorMap_422_B, &EncodeTensorMap_422_SFA, &EncodeTensorMap_422_SFB, &EncodeTensorMap_422_C, &Configure_422, &Submit_422},
-    {"kernel_cake_stepfun_moe_993c7f624161dfb8436f", 4, 64, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 187520u, &EncodeTensorMap_423_A, &EncodeTensorMap_423_B, &EncodeTensorMap_423_SFA, &EncodeTensorMap_423_SFB, &EncodeTensorMap_423_C, &Configure_423, &Submit_423},
-    {"kernel_cake_stepfun_moe_b3a0562098d726a99e48", 4, 256, 128, 128, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 189056u, &EncodeTensorMap_424_A, &EncodeTensorMap_424_B, &EncodeTensorMap_424_SFA, &EncodeTensorMap_424_SFB, &EncodeTensorMap_424_C, &Configure_424, &Submit_424},
+    {"kernel_cake_stepfun_moe_a22e677aa9375e3a9114", 0, 8, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_400_A, &EncodeTensorMap_400_B, &EncodeTensorMap_400_SFA, &EncodeTensorMap_400_SFB, &EncodeTensorMap_400_C, &Configure_400, &Submit_400},
+    {"kernel_cake_stepfun_moe_71f509d6d16530dc4ee8", 0, 16, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 202368u, &EncodeTensorMap_401_A, &EncodeTensorMap_401_B, &EncodeTensorMap_401_SFA, &EncodeTensorMap_401_SFB, &EncodeTensorMap_401_C, &Configure_401, &Submit_401},
+    {"kernel_cake_stepfun_moe_00f4a7d682620456e7cb", 0, 32, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 219264u, &EncodeTensorMap_402_A, &EncodeTensorMap_402_B, &EncodeTensorMap_402_SFA, &EncodeTensorMap_402_SFB, &EncodeTensorMap_402_C, &Configure_402, &Submit_402},
+    {"kernel_cake_stepfun_moe_f8d3a1110e7ad5b7e95a", 0, 64, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_403_A, &EncodeTensorMap_403_B, &EncodeTensorMap_403_SFA, &EncodeTensorMap_403_SFB, &EncodeTensorMap_403_C, &Configure_403, &Submit_403},
+    {"kernel_cake_stepfun_moe_183c4607d92556cbca24", 0, 256, 128, 256, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 220288u, &EncodeTensorMap_404_A, &EncodeTensorMap_404_B, &EncodeTensorMap_404_SFA, &EncodeTensorMap_404_SFB, &EncodeTensorMap_404_C, &Configure_404, &Submit_404},
+    {"kernel_cake_stepfun_moe_2121480f115acbb07c20", 1, 8, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_405_A, &EncodeTensorMap_405_B, &EncodeTensorMap_405_SFA, &EncodeTensorMap_405_SFB, &EncodeTensorMap_405_C, &Configure_405, &Submit_405},
+    {"kernel_cake_stepfun_moe_5012055d1d388fab17b6", 1, 16, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 212608u, &EncodeTensorMap_406_A, &EncodeTensorMap_406_B, &EncodeTensorMap_406_SFA, &EncodeTensorMap_406_SFB, &EncodeTensorMap_406_C, &Configure_406, &Submit_406},
+    {"kernel_cake_stepfun_moe_46c723df778ea3c4e453", 1, 32, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 177280u, &EncodeTensorMap_407_A, &EncodeTensorMap_407_B, &EncodeTensorMap_407_SFA, &EncodeTensorMap_407_SFB, &EncodeTensorMap_407_C, &Configure_407, &Submit_407},
+    {"kernel_cake_stepfun_moe_f3fff41025a1e2c89bb9", 1, 64, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_408_A, &EncodeTensorMap_408_B, &EncodeTensorMap_408_SFA, &EncodeTensorMap_408_SFB, &EncodeTensorMap_408_C, &Configure_408, &Submit_408},
+    {"kernel_cake_stepfun_moe_8042e5d54cc5b6dab6b1", 1, 256, 128, 256, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 184448u, &EncodeTensorMap_409_A, &EncodeTensorMap_409_B, &EncodeTensorMap_409_SFA, &EncodeTensorMap_409_SFB, &EncodeTensorMap_409_C, &Configure_409, &Submit_409},
+    {"kernel_cake_stepfun_moe_cccdf12c3b625d65ee32", 2, 8, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_410_A, nullptr, nullptr, nullptr, &EncodeTensorMap_410_C, &Configure_410, &Submit_410},
+    {"kernel_cake_stepfun_moe_cce8c62e37cf58167f2b", 2, 16, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_411_A, nullptr, nullptr, nullptr, &EncodeTensorMap_411_C, &Configure_411, &Submit_411},
+    {"kernel_cake_stepfun_moe_0082547d0ef842c2bc6b", 2, 32, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_412_A, nullptr, nullptr, nullptr, &EncodeTensorMap_412_C, &Configure_412, &Submit_412},
+    {"kernel_cake_stepfun_moe_bd253b6d19bdecf1f63a", 2, 64, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 222336u, &EncodeTensorMap_413_A, &EncodeTensorMap_413_B, nullptr, nullptr, &EncodeTensorMap_413_C, &Configure_413, &Submit_413},
+    {"kernel_cake_stepfun_moe_49f12bfa7a4b7c3edd83", 2, 128, 128, 64, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 214144u, &EncodeTensorMap_414_A, &EncodeTensorMap_414_B, nullptr, nullptr, &EncodeTensorMap_414_C, &Configure_414, &Submit_414},
+    {"kernel_cake_stepfun_moe_509886a46166edc2cffc", 3, 8, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_415_A, &EncodeTensorMap_415_B, nullptr, nullptr, &EncodeTensorMap_415_C, &Configure_415, &Submit_415},
+    {"kernel_cake_stepfun_moe_4549d5031106f3c00ffc", 3, 16, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_416_A, &EncodeTensorMap_416_B, nullptr, nullptr, &EncodeTensorMap_416_C, &Configure_416, &Submit_416},
+    {"kernel_cake_stepfun_moe_27a6dbc9062b94c4d1ab", 3, 32, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_417_A, &EncodeTensorMap_417_B, nullptr, nullptr, &EncodeTensorMap_417_C, &Configure_417, &Submit_417},
+    {"kernel_cake_stepfun_moe_7474b34a0e275e8eb57c", 3, 64, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_418_A, &EncodeTensorMap_418_B, nullptr, nullptr, &EncodeTensorMap_418_C, &Configure_418, &Submit_418},
+    {"kernel_cake_stepfun_moe_c53ed492dc2fd2732230", 3, 128, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_419_A, &EncodeTensorMap_419_B, nullptr, nullptr, &EncodeTensorMap_419_C, &Configure_419, &Submit_419},
+    {"kernel_cake_stepfun_moe_388ba7f9799bc9857fac", 4, 8, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 147072u, &EncodeTensorMap_420_A, &EncodeTensorMap_420_B, &EncodeTensorMap_420_SFA, &EncodeTensorMap_420_SFB, &EncodeTensorMap_420_C, &Configure_420, &Submit_420},
+    {"kernel_cake_stepfun_moe_91a60d947467eec6e14e", 4, 16, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 119296u, &EncodeTensorMap_421_A, &EncodeTensorMap_421_B, &EncodeTensorMap_421_SFA, &EncodeTensorMap_421_SFB, &EncodeTensorMap_421_C, &Configure_421, &Submit_421},
+    {"kernel_cake_stepfun_moe_6e957b6d7a7cf7a87286", 4, 32, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 136064u, &EncodeTensorMap_422_A, &EncodeTensorMap_422_B, &EncodeTensorMap_422_SFA, &EncodeTensorMap_422_SFB, &EncodeTensorMap_422_C, &Configure_422, &Submit_422},
+    {"kernel_cake_stepfun_moe_73a47503421f02df6c08", 4, 64, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 187520u, &EncodeTensorMap_423_A, &EncodeTensorMap_423_B, &EncodeTensorMap_423_SFA, &EncodeTensorMap_423_SFB, &EncodeTensorMap_423_C, &Configure_423, &Submit_423},
+    {"kernel_cake_stepfun_moe_842a1ffe30c69df2d6a2", 4, 256, 128, 128, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 189056u, &EncodeTensorMap_424_A, &EncodeTensorMap_424_B, &EncodeTensorMap_424_SFA, &EncodeTensorMap_424_SFB, &EncodeTensorMap_424_C, &Configure_424, &Submit_424},
 };
 inline constexpr size_t kFc2KernelCount = 25;
 
 inline constexpr FinalizeKernelSpec kFinalizeKernels[] = {
-    {"kernel_cake_stepfun_moe_907d4a3712ead198d375", FinalizeVariant::kScalar, 1, 0, {256u, 1u, 1u}, 0u, &Configure_500, &Submit_500},
-    {"kernel_cake_stepfun_moe_22c47e8ec3ef42e59c19", FinalizeVariant::kVector, 1, 64, {256u, 1u, 1u}, 0u, &Configure_501, &Submit_501},
-    {"kernel_cake_stepfun_moe_e679816ba0bd10cc0a54", FinalizeVariant::kScalar, 0, 0, {256u, 1u, 1u}, 0u, &Configure_502, &Submit_502},
-    {"kernel_cake_stepfun_moe_f3fec476ec2197a284c2", FinalizeVariant::kVector, 0, 64, {256u, 1u, 1u}, 0u, &Configure_503, &Submit_503},
+    {"kernel_cake_stepfun_moe_8d683ca206faf6662791", FinalizeVariant::kScalar, 1, 0, {256u, 1u, 1u}, 0u, &Configure_500, &Submit_500},
+    {"kernel_cake_stepfun_moe_bb4e1ba57ae6f146542d", FinalizeVariant::kVector, 1, 64, {256u, 1u, 1u}, 0u, &Configure_501, &Submit_501},
+    {"kernel_cake_stepfun_moe_ad6d394d57e0a9ad2f0c", FinalizeVariant::kScalar, 0, 0, {256u, 1u, 1u}, 0u, &Configure_502, &Submit_502},
+    {"kernel_cake_stepfun_moe_60fe1ef6ee2f3abc3a98", FinalizeVariant::kVector, 0, 64, {256u, 1u, 1u}, 0u, &Configure_503, &Submit_503},
 };
 inline constexpr size_t kFinalizeKernelCount = 4;
-#else
-extern "C" {
-__global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_f6db189f91c5e003a9d0(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(160) void
-kernel_cake_stepfun_moe_b7e803755d9b58c2dbe5(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(192) void
-kernel_cake_stepfun_moe_666d53bb4b88781be487(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(224) void
-kernel_cake_stepfun_moe_95f04f0d545b821c576b(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_3416b585f702ba2a79fd(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(288) void
-kernel_cake_stepfun_moe_f8cb2db2af57dc64e050(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(320) void
-kernel_cake_stepfun_moe_9698e0be02bbb17239e5(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(352) void
-kernel_cake_stepfun_moe_6c127784b228dab22aca(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(384) void
-kernel_cake_stepfun_moe_b512c3314eac2108c732(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(416) void
-kernel_cake_stepfun_moe_e6fbe234a967f072fcaf(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(448) void
-kernel_cake_stepfun_moe_bef3789bb898932ae388(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(480) void
-kernel_cake_stepfun_moe_6bbf7a4ede351b2f7ef1(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(512) void
-kernel_cake_stepfun_moe_9185490832e17a9fdc0c(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(256) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_6d1a5f461682de030bfd(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(512) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_38696e7ad9181ad83969(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(1024) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_bf66c919f7da5cb2751e(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_35f6542b00410e3f5da3(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_7cb781b47d2f76c61d52(__nv_bfloat16* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_0abc60578470049d3f6e(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(160) void
-kernel_cake_stepfun_moe_5e4da1660916570a581f(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(192) void
-kernel_cake_stepfun_moe_1947a94187f8ee03b2e4(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(224) void
-kernel_cake_stepfun_moe_fc0a91abc51214f6e30b(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_07b7246cc5d6b743a3d9(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(288) void
-kernel_cake_stepfun_moe_191be9d6627f61c74399(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(320) void
-kernel_cake_stepfun_moe_b46f5248b99bc877f45b(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(352) void
-kernel_cake_stepfun_moe_73e95fec16b9cd9cf4c7(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(384) void
-kernel_cake_stepfun_moe_0aa98628b9b138cb40e1(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(416) void
-kernel_cake_stepfun_moe_8e512ae88eded2ebe9d9(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(448) void
-kernel_cake_stepfun_moe_824d0dc0ea585ecd39f5(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(480) void
-kernel_cake_stepfun_moe_e18e212d5e00bb5ac622(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(512) void
-kernel_cake_stepfun_moe_22db5e0c80f8d231c573(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(256) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_f89c22b02c6efc99b556(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(512) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_643daf40a381ee883913(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(1024) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_f21e412b24e864a4c42d(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_834cf2e6177909ebe3cf(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_3c34af4512f55ece9bce(float* __restrict__ scores, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_74a883ee81a5a7a71afe(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(160) void
-kernel_cake_stepfun_moe_19a8d15bcd5b69500a9f(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(192) void
-kernel_cake_stepfun_moe_903322a1182678f8c5a6(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(224) void
-kernel_cake_stepfun_moe_446bbf3a2349b82500b7(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_1a82c683b9d4701d3b2e(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(288) void
-kernel_cake_stepfun_moe_28780573f0f77b8bfc10(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(320) void
-kernel_cake_stepfun_moe_51c2a2c41a573c5853a8(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(352) void
-kernel_cake_stepfun_moe_83cc3b5a748565af216b(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(384) void
-kernel_cake_stepfun_moe_8f312fbd48e0ad2133a6(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(416) void
-kernel_cake_stepfun_moe_bbb97d2f3c86f1650889(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(448) void
-kernel_cake_stepfun_moe_645cf787d54637889f59(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(480) void
-kernel_cake_stepfun_moe_0729b75c10ed0894f67d(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(512) void
-kernel_cake_stepfun_moe_dd40501c58070fe4cc9d(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(256) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_6f311759e88c9784d7e3(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(512) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_61f8e293d7716673f730(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(1024) __cluster_dims__(8,1,1) void
-kernel_cake_stepfun_moe_19d3fcc5639a3429f030(int* __restrict__ topk_ids, __nv_bfloat16* __restrict__ topk_weights, int* __restrict__ topk_packed, int* __restrict__ expert_counts, int* __restrict__ permuted_idx_size, int* __restrict__ expanded_idx_to_permuted_idx, int* __restrict__ permuted_idx_to_token_idx, int* __restrict__ cta_idx_xy_to_batch_idx, int* __restrict__ cta_idx_xy_to_mn_limit, int* __restrict__ num_non_exiting_ctas, int num_tokens, int num_experts, int top_k, int padding_log2, int tile_tokens_dim, int local_experts_start_idx, int local_experts_stride_log2, int num_local_experts);
-__global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_605ffa44779d0ef8f7bf(const __nv_bfloat16* input, const int* expanded_idx_to_permuted_idx, uint8_t* out_fp4, uint8_t* out_sf, float* per_token_scale, float global_scale_inv, int m, int n);
-__global__ __launch_bounds__(128) void
-kernel_cake_stepfun_moe_4ac44ab155c24a1c92af(const __nv_bfloat16* input, const int* expanded_idx_to_permuted_idx, uint8_t* out_fp4, uint8_t* out_sf, float* per_token_scale, float global_scale_inv, int m, int n);
-__global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_f15b03620764c9921992(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_03ab936fc03af7ca0767(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_e783c28ddaf724f593e2(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_c46c754002fd060b999b(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_146c52e55633aa54c03d(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_bd0e987a1f7e07217db9(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
-__global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_b8aaba5e43bd46c3ae64(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
-__global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_d9363e9654a8a8d95903(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
-__global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_ba836ad3306fa5f84c0c(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
-__global__ __launch_bounds__(384, 1) void
-kernel_cake_stepfun_moe_6b2bef20b5050fb8aa9f(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
-__global__ __launch_bounds__(384, 1) void
-kernel_cake_stepfun_moe_857135818095adc9fd58(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(384, 1) void
-kernel_cake_stepfun_moe_868d1faf353798351cc9(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(384, 1) void
-kernel_cake_stepfun_moe_8d838fb048c9ddc0030a(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_5739c61e36314d9db110(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_34d77327f0acbadee3bc(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(256, 1) void
-kernel_cake_stepfun_moe_69e06239bbfbd993b39c(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(256, 1) void
-kernel_cake_stepfun_moe_a6c8142dc285a799f0aa(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(256, 1) void
-kernel_cake_stepfun_moe_ffa52b9609f8d1a29bdd(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_0b4b02630174fed171bb(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_928567739254478e465f(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_127d66f9d46db171450b(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_4e63d48586c2a22cd33e(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_842c6778a4ae53f14365(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_a9ded3648c22c84e6829(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_39ac8bc269e664d32473(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_19bde6f92abf676718e0(const __nv_bfloat16* in_ptr, const __nv_bfloat16* expert_weights, __nv_bfloat16* out_ptr, const int* expanded_idx_to_permuted_idx, int hidden_dim, int hidden_dim_padded, int num_tokens, int top_k);
-__global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_e9576ce404ae69872fdc(const __nv_bfloat16* in_ptr, const __nv_bfloat16* expert_weights, __nv_bfloat16* out_ptr, const int* expanded_idx_to_permuted_idx, int hidden_dim, int hidden_dim_padded, int num_tokens, int top_k);
-__global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_069150e7152a500085a4(const __nv_bfloat16* in_ptr, const float* expert_weights, __nv_bfloat16* out_ptr, const int* expanded_idx_to_permuted_idx, int hidden_dim, int hidden_dim_padded, int num_tokens, int top_k);
-__global__ __launch_bounds__(256) void
-kernel_cake_stepfun_moe_3d1c9533403b62b59904(const __nv_bfloat16* in_ptr, const float* expert_weights, __nv_bfloat16* out_ptr, const int* expanded_idx_to_permuted_idx, int hidden_dim, int hidden_dim_padded, int num_tokens, int top_k);
-}  // extern "C"
-
-inline cudaError_t Configure_1100(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f6db189f91c5e003a9d0, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1100(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f6db189f91c5e003a9d0, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1101(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_b7e803755d9b58c2dbe5, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1101(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_b7e803755d9b58c2dbe5, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1102(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_666d53bb4b88781be487, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1102(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_666d53bb4b88781be487, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1103(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_95f04f0d545b821c576b, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1103(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_95f04f0d545b821c576b, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1104(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_3416b585f702ba2a79fd, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1104(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_3416b585f702ba2a79fd, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1105(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f8cb2db2af57dc64e050, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1105(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f8cb2db2af57dc64e050, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1106(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_9698e0be02bbb17239e5, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1106(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_9698e0be02bbb17239e5, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1107(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_6c127784b228dab22aca, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1107(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_6c127784b228dab22aca, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1108(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_b512c3314eac2108c732, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1108(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_b512c3314eac2108c732, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1109(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_e6fbe234a967f072fcaf, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1109(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_e6fbe234a967f072fcaf, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1110(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_bef3789bb898932ae388, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1110(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_bef3789bb898932ae388, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1111(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_6bbf7a4ede351b2f7ef1, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1111(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_6bbf7a4ede351b2f7ef1, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1112(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_9185490832e17a9fdc0c, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1112(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_9185490832e17a9fdc0c, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1113(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_6d1a5f461682de030bfd, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1113(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_6d1a5f461682de030bfd, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1114(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_38696e7ad9181ad83969, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1114(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_38696e7ad9181ad83969, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1115(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_bf66c919f7da5cb2751e, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1115(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_bf66c919f7da5cb2751e, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1116(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_35f6542b00410e3f5da3, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1116(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_35f6542b00410e3f5da3, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1117(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_7cb781b47d2f76c61d52, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1117(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_7cb781b47d2f76c61d52, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1118(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_0abc60578470049d3f6e, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1118(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_0abc60578470049d3f6e, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1119(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_5e4da1660916570a581f, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1119(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_5e4da1660916570a581f, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1120(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_1947a94187f8ee03b2e4, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1120(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_1947a94187f8ee03b2e4, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1121(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_fc0a91abc51214f6e30b, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1121(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_fc0a91abc51214f6e30b, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1122(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_07b7246cc5d6b743a3d9, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1122(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_07b7246cc5d6b743a3d9, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1123(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_191be9d6627f61c74399, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1123(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_191be9d6627f61c74399, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1124(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_b46f5248b99bc877f45b, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1124(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_b46f5248b99bc877f45b, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1125(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_73e95fec16b9cd9cf4c7, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1125(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_73e95fec16b9cd9cf4c7, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1126(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_0aa98628b9b138cb40e1, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1126(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_0aa98628b9b138cb40e1, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1127(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_8e512ae88eded2ebe9d9, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1127(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_8e512ae88eded2ebe9d9, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1128(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_824d0dc0ea585ecd39f5, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1128(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_824d0dc0ea585ecd39f5, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1129(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_e18e212d5e00bb5ac622, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1129(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_e18e212d5e00bb5ac622, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1130(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_22db5e0c80f8d231c573, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1130(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_22db5e0c80f8d231c573, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1131(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f89c22b02c6efc99b556, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1131(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f89c22b02c6efc99b556, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1132(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_643daf40a381ee883913, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1132(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_643daf40a381ee883913, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1133(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f21e412b24e864a4c42d, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1133(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f21e412b24e864a4c42d, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1134(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_834cf2e6177909ebe3cf, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1134(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_834cf2e6177909ebe3cf, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1135(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_3c34af4512f55ece9bce, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1135(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_3c34af4512f55ece9bce, reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.routing_logits))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1136(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_74a883ee81a5a7a71afe, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1136(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_74a883ee81a5a7a71afe, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1137(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_19a8d15bcd5b69500a9f, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1137(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_19a8d15bcd5b69500a9f, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1138(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_903322a1182678f8c5a6, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1138(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_903322a1182678f8c5a6, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1139(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_446bbf3a2349b82500b7, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1139(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_446bbf3a2349b82500b7, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1140(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_1a82c683b9d4701d3b2e, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1140(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_1a82c683b9d4701d3b2e, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1141(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_28780573f0f77b8bfc10, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1141(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_28780573f0f77b8bfc10, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1142(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_51c2a2c41a573c5853a8, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1142(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_51c2a2c41a573c5853a8, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1143(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_83cc3b5a748565af216b, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1143(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_83cc3b5a748565af216b, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1144(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_8f312fbd48e0ad2133a6, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1144(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_8f312fbd48e0ad2133a6, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1145(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_bbb97d2f3c86f1650889, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1145(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_bbb97d2f3c86f1650889, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1146(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_645cf787d54637889f59, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1146(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_645cf787d54637889f59, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1147(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_0729b75c10ed0894f67d, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1147(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_0729b75c10ed0894f67d, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1148(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_dd40501c58070fe4cc9d, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1148(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_dd40501c58070fe4cc9d, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1149(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_6f311759e88c9784d7e3, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1149(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_6f311759e88c9784d7e3, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1150(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_61f8e293d7716673f730, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1150(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_61f8e293d7716673f730, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1151(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_19d3fcc5639a3429f030, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1151(const cudaLaunchConfig_t* config, const RoutingArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_19d3fcc5639a3429f030, reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_ids))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.topk_weights))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.topk_packed))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expert_count_histogram))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.total_num_padded_tokens))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.permuted_idx_to_token_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_batch_idx))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.cta_idx_xy_to_mn_limit))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.num_non_exiting_ctas))), args.num_tokens, args.num_experts, args.top_k, RoutingPaddingLog2(args.tile_tokens_dim), args.tile_tokens_dim, args.local_expert_offset, 0, args.local_num_experts);
-}
-inline cudaError_t Configure_1300(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_605ffa44779d0ef8f7bf, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1300(const cudaLaunchConfig_t* config, const RequantArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_605ffa44779d0ef8f7bf, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<uint8_t*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<uint8_t*>(const_cast<void*>(static_cast<const void*>(args.output_scale))), reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.per_token_scale))), args.global_scale_inv, args.num_expanded, args.inner_dim);
-}
-inline cudaError_t Configure_1301(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_4ac44ab155c24a1c92af, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1301(const cudaLaunchConfig_t* config, const RequantArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_4ac44ab155c24a1c92af, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), reinterpret_cast<uint8_t*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<uint8_t*>(const_cast<void*>(static_cast<const void*>(args.output_scale))), reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.per_token_scale))), args.global_scale_inv, args.num_expanded, args.inner_dim);
-}
-inline bool EncodeTensorMap_1400_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1400_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 8u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1400_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1400_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 3) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 8u, 1u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1400_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1400(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_f15b03620764c9921992, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1400(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_f15b03620764c9921992, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1401_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1401_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(16), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 8u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1401_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1401_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 3) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 8u <= global_dim[1] && 2u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 8u, 2u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1401_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(16), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 16u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 16u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1401(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_03ab936fc03af7ca0767, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1401(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_03ab936fc03af7ca0767, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1402_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1402_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(32), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 16u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 16u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1402_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1402_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 3) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 8u <= global_dim[1] && 4u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 8u, 4u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1402_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(32), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 32u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1402(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_e783c28ddaf724f593e2, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1402(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_e783c28ddaf724f593e2, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1403_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1403_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(64), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 64u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1403_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1403_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 3) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 8u <= global_dim[1] && 8u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 8u, 8u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1403_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(64), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1403(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_c46c754002fd060b999b, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1403(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_c46c754002fd060b999b, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1404_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1404_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(256), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1404_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 4u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 4u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1404_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 4u <= global_dim[2] && 2u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 4u, 2u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1404_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(256), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1404(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_146c52e55633aa54c03d, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1404(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_146c52e55633aa54c03d, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1405_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1405_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 8u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1405_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1405_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 3) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 8u, 1u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1405_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1405(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_bd0e987a1f7e07217db9, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1405(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_bd0e987a1f7e07217db9, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
-}
-inline bool EncodeTensorMap_1406_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1406_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(16), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 16u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 16u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1406_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1406_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 3) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 8u <= global_dim[1] && 2u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 8u, 2u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1406_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(16), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 16u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 16u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1406(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_b8aaba5e43bd46c3ae64, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1406(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_b8aaba5e43bd46c3ae64, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
-}
-inline bool EncodeTensorMap_1407_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1407_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(32), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 16u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 16u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1407_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1407_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 3) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 8u <= global_dim[1] && 4u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 8u, 4u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1407_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(32), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 32u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1407(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_d9363e9654a8a8d95903, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1407(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_d9363e9654a8a8d95903, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
-}
-inline bool EncodeTensorMap_1408_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1408_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(64), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 64u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1408_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1408_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 3) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 8u <= global_dim[1] && 8u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 8u, 8u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1408_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(64), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1408(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_ba836ad3306fa5f84c0c, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1408(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_ba836ad3306fa5f84c0c, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
-}
-inline bool EncodeTensorMap_1409_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1409_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(256), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 256u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 256u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1409_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 4u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 4u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1409_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 4u <= global_dim[2] && 2u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 4u, 2u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1409_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(256), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1409(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_6b2bef20b5050fb8aa9f, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1409(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_6b2bef20b5050fb8aa9f, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
-}
-inline bool EncodeTensorMap_1410_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t outer3 = static_cast<int64_t>(tensor.elements) / (d1 * d2 * d3);
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(outer3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>(((s3) * 16) / 8), static_cast<uint64_t>(((s4) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 128u, 2u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1410_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1410(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_857135818095adc9fd58, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1410(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_857135818095adc9fd58, args.A, static_cast<__nv_bfloat16*>(args.B_ptr), args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1411_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t outer3 = static_cast<int64_t>(tensor.elements) / (d1 * d2 * d3);
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(outer3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>(((s3) * 16) / 8), static_cast<uint64_t>(((s4) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 128u, 2u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1411_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(16), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 16u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 16u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1411(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_868d1faf353798351cc9, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1411(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_868d1faf353798351cc9, args.A, static_cast<__nv_bfloat16*>(args.B_ptr), args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1412_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t outer3 = static_cast<int64_t>(tensor.elements) / (d1 * d2 * d3);
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(outer3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>(((s3) * 16) / 8), static_cast<uint64_t>(((s4) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 128u, 2u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1412_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(32), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 32u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1412(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_8d838fb048c9ddc0030a, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1412(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_8d838fb048c9ddc0030a, args.A, static_cast<__nv_bfloat16*>(args.B_ptr), args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1413_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t outer3 = static_cast<int64_t>(tensor.elements) / (d1 * d2 * d3);
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(outer3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>(((s3) * 16) / 8), static_cast<uint64_t>(((s4) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 128u, 2u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1413_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(64), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 32u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1413_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(64), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1413(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_5739c61e36314d9db110, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1413(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_5739c61e36314d9db110, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1414_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t outer3 = static_cast<int64_t>(tensor.elements) / (d1 * d2 * d3);
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(outer3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>(((s3) * 16) / 8), static_cast<uint64_t>(((s4) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1414_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(128), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1414_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(128), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1414(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_34d77327f0acbadee3bc, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1414(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_34d77327f0acbadee3bc, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1415_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1415_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 8u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1415_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1415(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_69e06239bbfbd993b39c, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1415(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_69e06239bbfbd993b39c, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1416_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1416_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(16), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 16u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 16u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1416_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(16), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 16u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 16u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1416(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_a6c8142dc285a799f0aa, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1416(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_a6c8142dc285a799f0aa, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1417_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1417_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(32), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 32u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1417_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(32), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 32u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1417(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_ffa52b9609f8d1a29bdd, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1417(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_ffa52b9609f8d1a29bdd, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1418_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1418_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(64), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 32u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1418_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(64), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1418(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_0b4b02630174fed171bb, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1418(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_0b4b02630174fed171bb, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1419_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1419_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(128), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 64u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1419_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(128), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 32u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1419(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_928567739254478e465f, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1419(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_928567739254478e465f, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1420_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1420_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 8u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1420_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 2u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1420_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 3) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 2u, 1u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1420_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1420(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_127d66f9d46db171450b, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1420(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_127d66f9d46db171450b, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1421_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1421_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(16), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 16u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 16u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1421_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 2u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1421_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 3) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 2u <= global_dim[1] && 2u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 2u, 2u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1421_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(16), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 16u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 16u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1421(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_4e63d48586c2a22cd33e, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1421(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_4e63d48586c2a22cd33e, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1422_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1422_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(32), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 32u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1422_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 2u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1422_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 3) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 2u <= global_dim[1] && 4u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 2u, 4u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1422_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(32), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 32u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1422(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_842c6778a4ae53f14365, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1422(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_842c6778a4ae53f14365, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1423_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1423_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(64), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 32u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1423_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 2u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1423_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 3) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 2u, 8u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1423_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(64), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1423(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_a9ded3648c22c84e6829, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1423(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_a9ded3648c22c84e6829, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline bool EncodeTensorMap_1424_A(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  if (!(((d1 % 128)) == (0))) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1424_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(256), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 8) / 8), static_cast<uint64_t>(((s2) * 8) / 8)};
-  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1424_SFA(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1424_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
-  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
-  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
-  if (s3 <= 0) return false;
-  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
-  if (s4 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[2] && 2u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 1u, 2u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1424_C(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(256), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline cudaError_t Configure_1424(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_39ac8bc269e664d32473, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1424(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_39ac8bc269e664d32473, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-inline cudaError_t Configure_1500(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_19bde6f92abf676718e0, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1500(const cudaLaunchConfig_t* config, const FinalizeArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_19bde6f92abf676718e0, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.expert_weights))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), args.hidden_dim, args.hidden_dim_padded, args.num_tokens, args.top_k);
-}
-inline cudaError_t Configure_1501(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_e9576ce404ae69872fdc, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1501(const cudaLaunchConfig_t* config, const FinalizeArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_e9576ce404ae69872fdc, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.expert_weights))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), args.hidden_dim, args.hidden_dim_padded, args.num_tokens, args.top_k);
-}
-inline cudaError_t Configure_1502(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_069150e7152a500085a4, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1502(const cudaLaunchConfig_t* config, const FinalizeArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_069150e7152a500085a4, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.expert_weights))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), args.hidden_dim, args.hidden_dim_padded, args.num_tokens, args.top_k);
-}
-inline cudaError_t Configure_1503(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_3d1c9533403b62b59904, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dynamic_smem_bytes));
-}
-inline cudaError_t Submit_1503(const cudaLaunchConfig_t* config, const FinalizeArgs& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_3d1c9533403b62b59904, reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.input))), reinterpret_cast<float*>(const_cast<void*>(static_cast<const void*>(args.expert_weights))), reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(static_cast<const void*>(args.output))), reinterpret_cast<int*>(const_cast<void*>(static_cast<const void*>(args.expanded_idx_to_permuted_idx))), args.hidden_dim, args.hidden_dim_padded, args.num_tokens, args.top_k);
-}
-
-inline constexpr RoutingKernelSpec kRoutingKernels[] = {
-    {"kernel_cake_stepfun_moe_f6db189f91c5e003a9d0", RoutingInput::kScores, 1, 1, 4, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {128u, 1u, 1u}, {1u, 1u, 1u}, false, false, 1152u, &Configure_1100, &Submit_1100, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_b7e803755d9b58c2dbe5", RoutingInput::kScores, 1, 5, 5, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {160u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2176u, &Configure_1101, &Submit_1101, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_666d53bb4b88781be487", RoutingInput::kScores, 1, 6, 6, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {192u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2560u, &Configure_1102, &Submit_1102, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_95f04f0d545b821c576b", RoutingInput::kScores, 1, 7, 7, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {224u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2944u, &Configure_1103, &Submit_1103, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_3416b585f702ba2a79fd", RoutingInput::kScores, 1, 8, 8, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3328u, &Configure_1104, &Submit_1104, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_f8cb2db2af57dc64e050", RoutingInput::kScores, 1, 9, 9, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {288u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3712u, &Configure_1105, &Submit_1105, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_9698e0be02bbb17239e5", RoutingInput::kScores, 1, 10, 10, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {320u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4096u, &Configure_1106, &Submit_1106, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_6c127784b228dab22aca", RoutingInput::kScores, 1, 11, 11, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {352u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4480u, &Configure_1107, &Submit_1107, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_b512c3314eac2108c732", RoutingInput::kScores, 1, 12, 12, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {384u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4864u, &Configure_1108, &Submit_1108, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_e6fbe234a967f072fcaf", RoutingInput::kScores, 1, 13, 13, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {416u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5248u, &Configure_1109, &Submit_1109, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_bef3789bb898932ae388", RoutingInput::kScores, 1, 14, 14, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {448u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5632u, &Configure_1110, &Submit_1110, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_6bbf7a4ede351b2f7ef1", RoutingInput::kScores, 1, 15, 15, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {480u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6016u, &Configure_1111, &Submit_1111, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_9185490832e17a9fdc0c", RoutingInput::kScores, 1, 16, 16, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {512u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6400u, &Configure_1112, &Submit_1112, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_6d1a5f461682de030bfd", RoutingInput::kScores, 1, 17, 64, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {256u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1408u, &Configure_1113, &Submit_1113, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_38696e7ad9181ad83969", RoutingInput::kScores, 1, 65, 128, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {512u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1664u, &Configure_1114, &Submit_1114, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_bf66c919f7da5cb2751e", RoutingInput::kScores, 1, 129, 256, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {1024u, 1u, 1u}, {8u, 1u, 1u}, false, false, 2176u, &Configure_1115, &Submit_1115, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_7cb781b47d2f76c61d52", RoutingInput::kScores, 1, 257, 1073741824, RoutingGrid::kCoopSms, {0u, 0u, 0u}, 0, 64, {128u, 1u, 1u}, {1u, 1u, 1u}, false, true, 1152u, &Configure_1117, &Submit_1117, "kernel_cake_stepfun_moe_35f6542b00410e3f5da3", {1024u, 1u, 1u}, {128u, 1u, 1u}, 0u, &Configure_1116, &Submit_1116},
-    {"kernel_cake_stepfun_moe_0abc60578470049d3f6e", RoutingInput::kScores, 0, 1, 4, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {128u, 1u, 1u}, {1u, 1u, 1u}, false, false, 1152u, &Configure_1118, &Submit_1118, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_5e4da1660916570a581f", RoutingInput::kScores, 0, 5, 5, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {160u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2176u, &Configure_1119, &Submit_1119, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_1947a94187f8ee03b2e4", RoutingInput::kScores, 0, 6, 6, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {192u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2560u, &Configure_1120, &Submit_1120, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_fc0a91abc51214f6e30b", RoutingInput::kScores, 0, 7, 7, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {224u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2944u, &Configure_1121, &Submit_1121, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_07b7246cc5d6b743a3d9", RoutingInput::kScores, 0, 8, 8, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3328u, &Configure_1122, &Submit_1122, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_191be9d6627f61c74399", RoutingInput::kScores, 0, 9, 9, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {288u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3712u, &Configure_1123, &Submit_1123, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_b46f5248b99bc877f45b", RoutingInput::kScores, 0, 10, 10, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {320u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4096u, &Configure_1124, &Submit_1124, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_73e95fec16b9cd9cf4c7", RoutingInput::kScores, 0, 11, 11, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {352u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4480u, &Configure_1125, &Submit_1125, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_0aa98628b9b138cb40e1", RoutingInput::kScores, 0, 12, 12, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {384u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4864u, &Configure_1126, &Submit_1126, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_8e512ae88eded2ebe9d9", RoutingInput::kScores, 0, 13, 13, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {416u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5248u, &Configure_1127, &Submit_1127, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_824d0dc0ea585ecd39f5", RoutingInput::kScores, 0, 14, 14, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {448u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5632u, &Configure_1128, &Submit_1128, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_e18e212d5e00bb5ac622", RoutingInput::kScores, 0, 15, 15, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {480u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6016u, &Configure_1129, &Submit_1129, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_22db5e0c80f8d231c573", RoutingInput::kScores, 0, 16, 16, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {512u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6400u, &Configure_1130, &Submit_1130, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_f89c22b02c6efc99b556", RoutingInput::kScores, 0, 17, 64, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {256u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1664u, &Configure_1131, &Submit_1131, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_643daf40a381ee883913", RoutingInput::kScores, 0, 65, 128, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {512u, 1u, 1u}, {8u, 1u, 1u}, false, false, 2176u, &Configure_1132, &Submit_1132, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_f21e412b24e864a4c42d", RoutingInput::kScores, 0, 129, 256, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {1024u, 1u, 1u}, {8u, 1u, 1u}, false, false, 3200u, &Configure_1133, &Submit_1133, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_3c34af4512f55ece9bce", RoutingInput::kScores, 0, 257, 1073741824, RoutingGrid::kCoopSms, {0u, 0u, 0u}, 0, 64, {128u, 1u, 1u}, {1u, 1u, 1u}, false, true, 1152u, &Configure_1135, &Submit_1135, "kernel_cake_stepfun_moe_834cf2e6177909ebe3cf", {1024u, 1u, 1u}, {128u, 1u, 1u}, 0u, &Configure_1134, &Submit_1134},
-    {"kernel_cake_stepfun_moe_74a883ee81a5a7a71afe", RoutingInput::kTopKIds, -1, 1, 4, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {128u, 1u, 1u}, {1u, 1u, 1u}, false, false, 1152u, &Configure_1136, &Submit_1136, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_19a8d15bcd5b69500a9f", RoutingInput::kTopKIds, -1, 5, 5, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {160u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2176u, &Configure_1137, &Submit_1137, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_903322a1182678f8c5a6", RoutingInput::kTopKIds, -1, 6, 6, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {192u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2560u, &Configure_1138, &Submit_1138, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_446bbf3a2349b82500b7", RoutingInput::kTopKIds, -1, 7, 7, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {224u, 1u, 1u}, {1u, 1u, 1u}, false, false, 2944u, &Configure_1139, &Submit_1139, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_1a82c683b9d4701d3b2e", RoutingInput::kTopKIds, -1, 8, 8, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3328u, &Configure_1140, &Submit_1140, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_28780573f0f77b8bfc10", RoutingInput::kTopKIds, -1, 9, 9, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {288u, 1u, 1u}, {1u, 1u, 1u}, false, false, 3712u, &Configure_1141, &Submit_1141, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_51c2a2c41a573c5853a8", RoutingInput::kTopKIds, -1, 10, 10, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {320u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4096u, &Configure_1142, &Submit_1142, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_83cc3b5a748565af216b", RoutingInput::kTopKIds, -1, 11, 11, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {352u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4480u, &Configure_1143, &Submit_1143, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_8f312fbd48e0ad2133a6", RoutingInput::kTopKIds, -1, 12, 12, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {384u, 1u, 1u}, {1u, 1u, 1u}, false, false, 4864u, &Configure_1144, &Submit_1144, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_bbb97d2f3c86f1650889", RoutingInput::kTopKIds, -1, 13, 13, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {416u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5248u, &Configure_1145, &Submit_1145, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_645cf787d54637889f59", RoutingInput::kTopKIds, -1, 14, 14, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {448u, 1u, 1u}, {1u, 1u, 1u}, false, false, 5632u, &Configure_1146, &Submit_1146, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_0729b75c10ed0894f67d", RoutingInput::kTopKIds, -1, 15, 15, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {480u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6016u, &Configure_1147, &Submit_1147, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_dd40501c58070fe4cc9d", RoutingInput::kTopKIds, -1, 16, 16, RoutingGrid::kFixed, {1u, 1u, 1u}, 0, 0, {512u, 1u, 1u}, {1u, 1u, 1u}, false, false, 6400u, &Configure_1148, &Submit_1148, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_6f311759e88c9784d7e3", RoutingInput::kTopKIds, -1, 17, 64, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {256u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1408u, &Configure_1149, &Submit_1149, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_61f8e293d7716673f730", RoutingInput::kTopKIds, -1, 65, 128, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {512u, 1u, 1u}, {8u, 1u, 1u}, false, false, 1664u, &Configure_1150, &Submit_1150, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-    {"kernel_cake_stepfun_moe_19d3fcc5639a3429f030", RoutingInput::kTopKIds, -1, 129, 8192, RoutingGrid::kFixed, {8u, 1u, 1u}, 0, 8, {1024u, 1u, 1u}, {8u, 1u, 1u}, false, false, 2176u, &Configure_1151, &Submit_1151, nullptr, {0u, 0u, 0u}, {0u, 0u, 0u}, 0u, nullptr, nullptr},
-};
-inline constexpr size_t kRoutingKernelCount = 50;
-
-inline constexpr RequantKernelSpec kRequantKernels[] = {
-    {"kernel_cake_stepfun_moe_605ffa44779d0ef8f7bf", SfLayout::kR8c4, 448, 1, {128u, 1u, 1u}, 0u, &Configure_1300, &Submit_1300},
-    {"kernel_cake_stepfun_moe_4ac44ab155c24a1c92af", SfLayout::kR128c4, 448, 1, {128u, 1u, 1u}, 0u, &Configure_1301, &Submit_1301},
-};
-inline constexpr size_t kRequantKernelCount = 2;
-
-inline constexpr Fc2KernelSpec kFc2Kernels[] = {
-    {"kernel_cake_stepfun_moe_f15b03620764c9921992", 0, 8, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_1400_A, &EncodeTensorMap_1400_B, &EncodeTensorMap_1400_SFA, &EncodeTensorMap_1400_SFB, &EncodeTensorMap_1400_C, &Configure_1400, &Submit_1400},
-    {"kernel_cake_stepfun_moe_03ab936fc03af7ca0767", 0, 16, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 202368u, &EncodeTensorMap_1401_A, &EncodeTensorMap_1401_B, &EncodeTensorMap_1401_SFA, &EncodeTensorMap_1401_SFB, &EncodeTensorMap_1401_C, &Configure_1401, &Submit_1401},
-    {"kernel_cake_stepfun_moe_e783c28ddaf724f593e2", 0, 32, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 219264u, &EncodeTensorMap_1402_A, &EncodeTensorMap_1402_B, &EncodeTensorMap_1402_SFA, &EncodeTensorMap_1402_SFB, &EncodeTensorMap_1402_C, &Configure_1402, &Submit_1402},
-    {"kernel_cake_stepfun_moe_c46c754002fd060b999b", 0, 64, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_1403_A, &EncodeTensorMap_1403_B, &EncodeTensorMap_1403_SFA, &EncodeTensorMap_1403_SFB, &EncodeTensorMap_1403_C, &Configure_1403, &Submit_1403},
-    {"kernel_cake_stepfun_moe_146c52e55633aa54c03d", 0, 256, 128, 256, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 220288u, &EncodeTensorMap_1404_A, &EncodeTensorMap_1404_B, &EncodeTensorMap_1404_SFA, &EncodeTensorMap_1404_SFB, &EncodeTensorMap_1404_C, &Configure_1404, &Submit_1404},
-    {"kernel_cake_stepfun_moe_bd0e987a1f7e07217db9", 1, 8, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_1405_A, &EncodeTensorMap_1405_B, &EncodeTensorMap_1405_SFA, &EncodeTensorMap_1405_SFB, &EncodeTensorMap_1405_C, &Configure_1405, &Submit_1405},
-    {"kernel_cake_stepfun_moe_b8aaba5e43bd46c3ae64", 1, 16, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 212608u, &EncodeTensorMap_1406_A, &EncodeTensorMap_1406_B, &EncodeTensorMap_1406_SFA, &EncodeTensorMap_1406_SFB, &EncodeTensorMap_1406_C, &Configure_1406, &Submit_1406},
-    {"kernel_cake_stepfun_moe_d9363e9654a8a8d95903", 1, 32, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 177280u, &EncodeTensorMap_1407_A, &EncodeTensorMap_1407_B, &EncodeTensorMap_1407_SFA, &EncodeTensorMap_1407_SFB, &EncodeTensorMap_1407_C, &Configure_1407, &Submit_1407},
-    {"kernel_cake_stepfun_moe_ba836ad3306fa5f84c0c", 1, 64, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_1408_A, &EncodeTensorMap_1408_B, &EncodeTensorMap_1408_SFA, &EncodeTensorMap_1408_SFB, &EncodeTensorMap_1408_C, &Configure_1408, &Submit_1408},
-    {"kernel_cake_stepfun_moe_6b2bef20b5050fb8aa9f", 1, 256, 128, 256, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 184448u, &EncodeTensorMap_1409_A, &EncodeTensorMap_1409_B, &EncodeTensorMap_1409_SFA, &EncodeTensorMap_1409_SFB, &EncodeTensorMap_1409_C, &Configure_1409, &Submit_1409},
-    {"kernel_cake_stepfun_moe_857135818095adc9fd58", 2, 8, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_1410_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1410_C, &Configure_1410, &Submit_1410},
-    {"kernel_cake_stepfun_moe_868d1faf353798351cc9", 2, 16, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_1411_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1411_C, &Configure_1411, &Submit_1411},
-    {"kernel_cake_stepfun_moe_8d838fb048c9ddc0030a", 2, 32, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_1412_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1412_C, &Configure_1412, &Submit_1412},
-    {"kernel_cake_stepfun_moe_5739c61e36314d9db110", 2, 64, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 222336u, &EncodeTensorMap_1413_A, &EncodeTensorMap_1413_B, nullptr, nullptr, &EncodeTensorMap_1413_C, &Configure_1413, &Submit_1413},
-    {"kernel_cake_stepfun_moe_34d77327f0acbadee3bc", 2, 128, 128, 64, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 214144u, &EncodeTensorMap_1414_A, &EncodeTensorMap_1414_B, nullptr, nullptr, &EncodeTensorMap_1414_C, &Configure_1414, &Submit_1414},
-    {"kernel_cake_stepfun_moe_69e06239bbfbd993b39c", 3, 8, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_1415_A, &EncodeTensorMap_1415_B, nullptr, nullptr, &EncodeTensorMap_1415_C, &Configure_1415, &Submit_1415},
-    {"kernel_cake_stepfun_moe_a6c8142dc285a799f0aa", 3, 16, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_1416_A, &EncodeTensorMap_1416_B, nullptr, nullptr, &EncodeTensorMap_1416_C, &Configure_1416, &Submit_1416},
-    {"kernel_cake_stepfun_moe_ffa52b9609f8d1a29bdd", 3, 32, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_1417_A, &EncodeTensorMap_1417_B, nullptr, nullptr, &EncodeTensorMap_1417_C, &Configure_1417, &Submit_1417},
-    {"kernel_cake_stepfun_moe_0b4b02630174fed171bb", 3, 64, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_1418_A, &EncodeTensorMap_1418_B, nullptr, nullptr, &EncodeTensorMap_1418_C, &Configure_1418, &Submit_1418},
-    {"kernel_cake_stepfun_moe_928567739254478e465f", 3, 128, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_1419_A, &EncodeTensorMap_1419_B, nullptr, nullptr, &EncodeTensorMap_1419_C, &Configure_1419, &Submit_1419},
-    {"kernel_cake_stepfun_moe_127d66f9d46db171450b", 4, 8, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 147072u, &EncodeTensorMap_1420_A, &EncodeTensorMap_1420_B, &EncodeTensorMap_1420_SFA, &EncodeTensorMap_1420_SFB, &EncodeTensorMap_1420_C, &Configure_1420, &Submit_1420},
-    {"kernel_cake_stepfun_moe_4e63d48586c2a22cd33e", 4, 16, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 119296u, &EncodeTensorMap_1421_A, &EncodeTensorMap_1421_B, &EncodeTensorMap_1421_SFA, &EncodeTensorMap_1421_SFB, &EncodeTensorMap_1421_C, &Configure_1421, &Submit_1421},
-    {"kernel_cake_stepfun_moe_842c6778a4ae53f14365", 4, 32, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 136064u, &EncodeTensorMap_1422_A, &EncodeTensorMap_1422_B, &EncodeTensorMap_1422_SFA, &EncodeTensorMap_1422_SFB, &EncodeTensorMap_1422_C, &Configure_1422, &Submit_1422},
-    {"kernel_cake_stepfun_moe_a9ded3648c22c84e6829", 4, 64, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 187520u, &EncodeTensorMap_1423_A, &EncodeTensorMap_1423_B, &EncodeTensorMap_1423_SFA, &EncodeTensorMap_1423_SFB, &EncodeTensorMap_1423_C, &Configure_1423, &Submit_1423},
-    {"kernel_cake_stepfun_moe_39ac8bc269e664d32473", 4, 256, 128, 128, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 189056u, &EncodeTensorMap_1424_A, &EncodeTensorMap_1424_B, &EncodeTensorMap_1424_SFA, &EncodeTensorMap_1424_SFB, &EncodeTensorMap_1424_C, &Configure_1424, &Submit_1424},
-};
-inline constexpr size_t kFc2KernelCount = 25;
-
-inline constexpr FinalizeKernelSpec kFinalizeKernels[] = {
-    {"kernel_cake_stepfun_moe_19bde6f92abf676718e0", FinalizeVariant::kScalar, 1, 0, {256u, 1u, 1u}, 0u, &Configure_1500, &Submit_1500},
-    {"kernel_cake_stepfun_moe_e9576ce404ae69872fdc", FinalizeVariant::kVector, 1, 64, {256u, 1u, 1u}, 0u, &Configure_1501, &Submit_1501},
-    {"kernel_cake_stepfun_moe_069150e7152a500085a4", FinalizeVariant::kScalar, 0, 0, {256u, 1u, 1u}, 0u, &Configure_1502, &Submit_1502},
-    {"kernel_cake_stepfun_moe_3d1c9533403b62b59904", FinalizeVariant::kVector, 0, 64, {256u, 1u, 1u}, 0u, &Configure_1503, &Submit_1503},
-};
-inline constexpr size_t kFinalizeKernelCount = 4;
-#endif
 
 }  // namespace flashinfer::cake_stepfun::generated
