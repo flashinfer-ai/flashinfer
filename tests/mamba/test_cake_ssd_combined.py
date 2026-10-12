@@ -16,6 +16,7 @@ limitations under the License.
 
 import hashlib
 import importlib
+import os
 import importlib.util
 import inspect
 import math
@@ -1402,6 +1403,11 @@ def _assert_two_forms_p6(monkeypatch, *, lengths, state_dtype, initial_states, p
 
     candidates = {"cu_seqlens": {}, "triple": {}}
     baseline = {}
+    # The forced modes below are scoped to this helper: the caller's later
+    # calls must run the runner's own program choice again (round 6 c9 B200
+    # fitests: a leaked ``three_phase`` made the caller's seq_idx ride-along
+    # call run the three-phase program and fail its bitwise clause).
+    prior_mode = os.environ.get(_CHUNK_PARALLEL_ENV)
     for seed in _P6_SEEDS:
         constructor, tensors, arguments = _case(
             varlen=True,
@@ -1430,6 +1436,10 @@ def _assert_two_forms_p6(monkeypatch, *, lengths, state_dtype, initial_states, p
             candidates["cu_seqlens"].setdefault(label, []).append(_p6_metrics(cu, oracle))
             candidates["triple"].setdefault(label, []).append(_p6_metrics(triple, oracle))
             baseline.setdefault(label, []).append(_p6_metrics(base, oracle))
+    if prior_mode is None:
+        monkeypatch.delenv(_CHUNK_PARALLEL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_CHUNK_PARALLEL_ENV, prior_mode)
     for form, readings in candidates.items():
         program = programs[0 if form == "cu_seqlens" else 1]
         for label, metrics in readings.items():
@@ -1550,6 +1560,9 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     # seq_idx riding along (callers that still build it) changes nothing.
     out_ride, final_ride = runner.run(
         *tensors, **_cu_seqlens_arguments(arguments, lengths, keep_seq_idx=True)
+    )
+    assert cake.last_program_name == program_cu, (
+        f"seq_idx riding along ran {cake.last_program_name}, the cu_seqlens form {program_cu}"
     )
     assert torch.equal(out_ride, out) and torch.equal(final_ride, final)
     # The public functional entry takes the same form (it infers the state
@@ -5349,6 +5362,9 @@ def _forced_runs(monkeypatch, runner, tensors, arguments):
     reports."""
 
     results = {}
+    # The forced modes are scoped to this helper; the caller's later calls
+    # run the runner's own program choice again.
+    prior_mode = os.environ.get(_CHUNK_PARALLEL_ENV)
     for mode in ("never", "always", "three_phase"):
         monkeypatch.setenv(_CHUNK_PARALLEL_ENV, mode)
         call_arguments = dict(arguments)
@@ -5363,6 +5379,10 @@ def _forced_runs(monkeypatch, runner, tensors, arguments):
             checkpoint_states=checkpoint_states,
             program=runner._cake_runner.last_program_name,
         )
+    if prior_mode is None:
+        monkeypatch.delenv(_CHUNK_PARALLEL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_CHUNK_PARALLEL_ENV, prior_mode)
     return results
 
 
