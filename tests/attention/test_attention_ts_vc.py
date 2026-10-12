@@ -536,6 +536,7 @@ def test_vc_run_rejects_mismatched_operands():
         qk8.run(ops8.q, ops8.k, ops8.v, vc=good, validate=False)
 
 
+@_REQUIRES_CONTEXT_GPU
 def test_one_shot_vc_config_requires_the_operands():
     """A one-shot recipe without operands has nothing to run."""
     q = torch.empty((1, 256, 1, _HEAD_DIM), dtype=torch.bfloat16)

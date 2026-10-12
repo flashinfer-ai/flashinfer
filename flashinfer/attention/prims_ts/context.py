@@ -2645,8 +2645,11 @@ class BatchPrefillTSWrapper:
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
 
-        ``vc_config`` selects the VC-Attention-QK16 recipe. Q and K stay bf16
-        and V is E4M3, stored as per-128-token-tile residuals whose bf16 tile
+        ``vc_config`` selects a VC-Attention recipe and the planned Q/K dtype
+        picks its Q/K side. bf16 or fp16 Q/K runs VC-Attention-QK16 and E4M3
+        Q/K runs VC-Attention-QK8, whose Hadamard-rotated, per-block scaled Q
+        and K need ``vc.q_scale`` and ``vc.k_scale`` on every :meth:`run`. V is
+        E4M3 in both, stored as per-128-token-tile residuals whose bf16 tile
         means the kernel restores. Every :meth:`run` then supplies the permuted
         K, the E4M3 V and ``vc=VCAttentionParams(...)``.
 
@@ -2699,8 +2702,9 @@ class BatchPrefillTSWrapper:
         output_scale : float
             Scale applied to the attention output.
         vc_config : VCAttentionConfig, optional
-            The VC-Attention-QK16 recipe. Requires fixed dense tensors, head_dim
-            128, equal Q and K/V head counts, bf16 Q/K and E4M3 V.
+            A VC-Attention recipe. Requires fixed dense tensors, head_dim 128,
+            equal Q and K/V head counts and E4M3 V. bf16 or fp16 Q/K selects
+            VC-Attention-QK16, E4M3 Q/K selects VC-Attention-QK8.
         """
 
         resolved_out_dtype = q_dtype if out_dtype is None else out_dtype
@@ -2894,7 +2898,7 @@ class BatchPrefillTSWrapper:
         if (vc is None) == (geometry.vc is not None):
             raise ValueError(
                 "vc=VCAttentionParams(...) is required by a VC plan and rejected "
-                "by a plan without VC-Attention-QK16"
+                "by a plan without vc_config"
             )
         vc_output_scale: Optional[torch.Tensor] = None
         vc_ctrl = state.vc_ctrl_on

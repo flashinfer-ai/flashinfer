@@ -310,6 +310,7 @@ class VCAttentionOperands:
     perm: torch.Tensor | None  # [B, H, S_k] int64 token permutation
     demean: bool = True  # whether the means were subtracted (else zero)
     repair_tiles: int = 0
+    seq_len_kv: int | None = None  # K/V tokens before the repair tiles and padding
     q: torch.Tensor | None = None  # [B, S_q, H, D] E4M3 rotated Q (QK8)
     q_scale: torch.Tensor | None = None  # [H, flat_scale_numel(B, S_q, q_block)] fp32
     k_scale: torch.Tensor | None = None  # [H, flat_scale_numel(B, S_k, 128)] fp32
@@ -536,8 +537,8 @@ def vc_quantize(
     residuals and the packed bf16 mean operand. Requires CUDA bf16/fp16 inputs
     with head_dim 128.
     """
-    if k.dim() != 4 or k.shape != v.shape:
-        raise ValueError("k and v must be [B, S, H, D] with matching shapes")
+    if k.dim() != 4 or k.shape != v.shape or k.dtype != v.dtype:
+        raise ValueError("k and v must be [B, S, H, D] with matching shapes and dtype")
     _check_prepare_inputs(k)
     from .kernels.vc_prepare import vc_prepare
 
@@ -583,8 +584,17 @@ def vc_quantize_fp8(
     of two in [1, 256] through ``VCAttentionConfig``). Values are prepared as
     in ``vc_quantize``. Requires CUDA bf16/fp16 inputs with head_dim 128.
     """
-    if q.dim() != 4 or k.shape != v.shape or q.shape[0] != k.shape[0]:
-        raise ValueError("q, k, v must be [B, S, H, D] with matching batch and heads")
+    if (
+        q.dim() != 4
+        or k.shape != v.shape
+        or q.shape[0] != k.shape[0]
+        or q.shape[2:] != k.shape[2:]
+        or q.dtype != k.dtype
+        or k.dtype != v.dtype
+    ):
+        raise ValueError(
+            "q, k, v must be [B, S, H, D] with matching batch, heads, head_dim and dtype"
+        )
     if q_block_size != VC_K_BLOCK_SIZE:
         raise ValueError(
             f"vc_quantize_fp8 quantizes Q per {VC_K_BLOCK_SIZE}-token block, "
@@ -630,8 +640,18 @@ def vc_quantize_repair(
     (under QK8 re-centred, rotated and quantized with the repair tile's own
     scale) with the E4M3 residual of the value.
     """
-    if k.dim() != 4 or k.shape != v.shape:
-        raise ValueError("k and v must be [B, S, H, D] with matching shapes")
+    if k.dim() != 4 or k.shape != v.shape or k.dtype != v.dtype:
+        raise ValueError("k and v must be [B, S, H, D] with matching shapes and dtype")
+    if q is not None and (
+        q.dim() != 4
+        or q.shape[0] != k.shape[0]
+        or q.shape[2:] != k.shape[2:]
+        or q.dtype != k.dtype
+    ):
+        raise ValueError(
+            "q must be [B, S, H, D] with the batch, heads, head_dim and dtype of k"
+        )
+    _check_prepare_inputs(k)
     from .kernels.vc_prepare import (
         vc_prepare,
         vc_prepare_fp8,
@@ -640,9 +660,10 @@ def vc_quantize_repair(
 
     b, s_k, h, d = k.shape
     repair_tiles = vc_repair_tiles(s_k, budget)
+    k = k.contiguous()
     if q is None:
         k_all, v_all, v_scale, _, _, energy = vc_prepare(
-            k.contiguous(),
+            k,
             v.contiguous(),
             None,
             demean=False,
@@ -652,7 +673,7 @@ def vc_quantize_repair(
     else:
         q8, k_all, v_all, q_scale, k_scale, v_scale, _, _, energy = vc_prepare_fp8(
             q.contiguous(),
-            k.contiguous(),
+            k,
             v.contiguous(),
             None,
             demean=False,
@@ -684,6 +705,7 @@ def vc_quantize_repair(
         perm=None,
         demean=False,
         repair_tiles=repair_tiles,
+        seq_len_kv=s_k,
         q=q8,
         q_scale=q_scale,
         k_scale=k_scale,
@@ -816,12 +838,12 @@ def vc_reference(
         # Repair rows add to the numerator only, the zero padding of the partial
         # last tile is masked, and the denominator runs over the original tokens.
         repair = ops.repair_tiles * VC_K_BLOCK_SIZE
-        s_orig = s_k - repair
-        whole = s_orig // VC_K_BLOCK_SIZE * VC_K_BLOCK_SIZE
+        whole = ops.seq_len_kv // VC_K_BLOCK_SIZE * VC_K_BLOCK_SIZE
+        end = ops.seq_len_kv + repair
         row = torch.arange(s_k, device=k.device)
-        original = (row < whole) | ((row >= whole + repair) & (row < s_orig + repair))
+        original = (row < whole) | ((row >= whole + repair) & (row < end))
         scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * sm_scale
-        scores = scores.masked_fill(row >= s_orig + repair, -torch.inf)
+        scores = scores.masked_fill(row >= end, -torch.inf)
         weights = torch.exp(scores - scores.amax(dim=-1, keepdim=True))
         out = torch.einsum("bhqk,bkhd->bqhd", weights, v)
         denom = weights[..., original].sum(dim=-1).permute(0, 2, 1)  # [B, Sq, H]
