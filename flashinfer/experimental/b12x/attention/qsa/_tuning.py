@@ -49,6 +49,7 @@ class QsaQuery:
     dcp_rank: int = 0
     cp_kv_cache_interleave_size: int = 1
     attention_splits: int = 0
+    score_workspace_bytes: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "abi", FrozenMapping(self.abi))
@@ -83,6 +84,7 @@ class QsaQuery:
             "dcp_rank": self.dcp_rank,
             "cp_kv_cache_interleave_size": self.cp_kv_cache_interleave_size,
             "attention_splits": self.attention_splits,
+            "score_workspace_bytes": self.score_workspace_bytes,
             "abi": self.abi,
         }
 
@@ -133,11 +135,21 @@ def _validate_attention_splits(value: int) -> None:
         raise ValueError("QSA attention_splits must be 0 or a power of two up to 64")
 
 
+def _validate_score_workspace_bytes(value: int | None) -> None:
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError("QSA score_workspace_bytes must be an integer or None")
+    if value <= 0:
+        raise ValueError("QSA score_workspace_bytes must be positive")
+
+
 def _validate_query(
     query: QsaQuery,
     _device: DeviceIdentity | None,
 ) -> None:
     _validate_attention_splits(query.attention_splits)
+    _validate_score_workspace_bytes(query.score_workspace_bytes)
     if query.q_dtype != "bfloat16":
         raise ValueError("QSA requires BF16 queries")
     if query.kv_dtype not in ("bfloat16", "float8_e4m3fn"):

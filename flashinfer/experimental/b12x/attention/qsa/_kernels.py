@@ -533,6 +533,138 @@ def _score_representatives_kernel(
     )
 
 
+@triton.jit(do_not_specialize=["num_rows"])
+def _score_representatives_tiled_kernel(
+    prepared_query,
+    query_positions,
+    request_ids,
+    sequence_lengths,
+    compressed_cache,
+    compressed_block_table,
+    scores,
+    eligible_counts,
+    merge_lengths,
+    compressed_page_stride,
+    compressed_token_stride,
+    compressed_table_stride,
+    score_row_stride,
+    num_rows,
+    MAX_GROUPS: tl.constexpr,
+    GROUP_OFFSET: tl.constexpr,
+    GROUP_COUNT: tl.constexpr,
+    GROUP_BUDGET: tl.constexpr,
+    INDEX_HEADS: tl.constexpr,
+    INDEX_HEAD_DIM: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    COMPRESSED_PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
+    TILE_ROWS: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    GROUP_TILES: tl.constexpr,
+):
+    # One tensor-core product scores a tile of groups for a tile of query rows,
+    # so each key tile is read once per row tile instead of once per row.
+    HEADS_PADDED: tl.constexpr = triton.next_power_of_2(INDEX_HEADS)
+    BLOCK_D: tl.constexpr = max(16, triton.next_power_of_2(INDEX_HEAD_DIM))
+    rows = tl.program_id(0) * TILE_ROWS + tl.arange(0, TILE_ROWS)
+    row_mask = rows < num_rows
+    request = tl.load(request_ids + rows, mask=row_mask, other=-1).to(tl.int64)
+    position = tl.load(query_positions + rows, mask=row_mask, other=0).to(tl.int64)
+    real_request = request >= 0
+    sequence_length = tl.load(
+        sequence_lengths + request,
+        mask=real_request,
+        other=0,
+    ).to(tl.int64)
+    global_eligible = tl.minimum(
+        (position + 1) // COMPRESS_RATIO,
+        sequence_length // COMPRESS_RATIO,
+    )
+    if DCP_SIZE == 1:
+        eligible = global_eligible
+    else:
+        group_interleave = CP_INTERLEAVE // COMPRESS_RATIO
+        dcp_round = DCP_SIZE * group_interleave
+        complete_rounds = global_eligible // dcp_round
+        remainder = global_eligible - complete_rounds * dcp_round
+        rank_remainder = tl.minimum(
+            tl.maximum(remainder - DCP_RANK * group_interleave, 0),
+            group_interleave,
+        )
+        eligible = complete_rounds * group_interleave + rank_remainder
+    eligible = tl.minimum(eligible, MAX_GROUPS)
+    eligible = tl.where(real_request, eligible, 0)
+    carry_count = tl.minimum(tl.minimum(eligible, GROUP_OFFSET), GROUP_BUDGET)
+    chunk_eligible = tl.minimum(tl.maximum(eligible - GROUP_OFFSET, 0), GROUP_COUNT)
+    if tl.program_id(1) == 0:
+        tl.store(eligible_counts + rows, eligible, mask=row_mask)
+        tl.store(merge_lengths + rows, carry_count + chunk_eligible, mask=row_mask)
+    first_local = tl.program_id(1) * (BLOCK_G * GROUP_TILES)
+    # Selection reads only each row's first merge_lengths columns, so groups
+    # past a row's eligible count are neither scored nor stored.
+    remaining = row_mask & (chunk_eligible > first_local)
+    if tl.max(remaining.to(tl.int32), axis=0) == 0:
+        return
+    dims = tl.arange(0, BLOCK_D)
+    lanes = tl.arange(0, TILE_ROWS * HEADS_PADDED)
+    query_rows = tl.program_id(0) * TILE_ROWS + lanes // HEADS_PADDED
+    heads = lanes % HEADS_PADDED
+    query = tl.load(
+        prepared_query
+        + (query_rows[None, :].to(tl.int64) * INDEX_HEADS + heads[None, :])
+        * INDEX_HEAD_DIM
+        + dims[:, None],
+        mask=(heads[None, :] < INDEX_HEADS)
+        & (query_rows[None, :] < num_rows)
+        & (dims[:, None] < INDEX_HEAD_DIM),
+        other=0.0,
+    )
+    local_offsets = tl.arange(0, BLOCK_G)
+    score_rows = rows.to(tl.int64) * score_row_stride + carry_count
+    # Rows of one request are contiguous, so a tile usually holds one request;
+    # a tile spanning several scores each request's keys in turn.
+    while tl.max(remaining.to(tl.int32), axis=0) > 0:
+        current = tl.min(tl.where(remaining, request, 0x7FFFFFFFFFFFFFFF), axis=0)
+        member = remaining & (request == current)
+        limit = tl.max(tl.where(member, chunk_eligible, 0), axis=0)
+        tile_end = tl.minimum(first_local + BLOCK_G * GROUP_TILES, limit)
+        for tile_start in tl.range(first_local, tile_end, BLOCK_G, num_stages=2):
+            local_groups = tile_start + local_offsets
+            groups = GROUP_OFFSET + local_groups
+            physical_pages = tl.load(
+                compressed_block_table
+                + current * compressed_table_stride
+                + (groups // COMPRESSED_PAGE_SIZE).to(tl.int64),
+                mask=local_groups < limit,
+                other=-1,
+            ).to(tl.int64)
+            valid = (local_groups < limit) & (physical_pages >= 0)
+            keys = tl.load(
+                compressed_cache
+                + physical_pages[:, None] * compressed_page_stride
+                + (groups % COMPRESSED_PAGE_SIZE)[:, None].to(tl.int64)
+                * compressed_token_stride
+                + dims[None, :],
+                mask=valid[:, None] & (dims[None, :] < INDEX_HEAD_DIM),
+                other=0.0,
+            )
+            dot = tl.dot(keys, query, out_dtype=tl.float32)
+            score = tl.sum(
+                tl.maximum(tl.reshape(dot, (BLOCK_G, TILE_ROWS, HEADS_PADDED)), 0.0),
+                axis=2,
+            )
+            score *= 1.0 / math.sqrt(INDEX_HEAD_DIM)
+            score = tl.where(valid[:, None], score, -float("inf"))
+            tl.store(
+                scores + score_rows[None, :] + local_groups[:, None],
+                score,
+                mask=member[None, :] & (local_groups[:, None] < chunk_eligible[None, :]),
+            )
+        remaining = remaining & ~member
+
+
 @triton.jit
 def _stage_topk_carry_kernel(
     prior_values,
@@ -771,6 +903,7 @@ _SUPPORT_KERNEL_KEYS = {
     _compress_completed_groups_kernel: "compress_completed_groups",
     _commit_raw_ring_kernel: "commit_raw_ring",
     _score_representatives_kernel: "score_representatives",
+    _score_representatives_tiled_kernel: "score_representatives_tiled",
     _stage_topk_carry_kernel: "stage_topk_carry",
     _remap_topk_group_ids_kernel: "remap_topk_group_ids",
     _copy_stable_topk_kernel: "stable_topk_copy",
@@ -788,6 +921,12 @@ def _support_kernel_key(kernel: object, constexprs: Mapping[str, object]) -> str
     # Planned score chunks have distinct static offsets and final chunk sizes.
     if kernel is _score_representatives_kernel:
         key = f"{key}/groups-{int(constexprs['GROUP_COUNT'])}"
+    if kernel is _score_representatives_tiled_kernel:
+        key = f"{key}/groups-{int(constexprs['GROUP_COUNT'])}"
+        key = (
+            f"{key}/tile-{int(constexprs['TILE_ROWS'])}x{int(constexprs['BLOCK_G'])}"
+            f"x{int(constexprs['GROUP_TILES'])}"
+        )
     if "GROUP_OFFSET" in constexprs:
         key = f"{key}/offset-{int(constexprs['GROUP_OFFSET'])}"
     return key
@@ -1081,6 +1220,80 @@ def launch_score_representatives(
     )
 
 
+# (largest row count, rows per tile, groups per tile, tiles per program, warps);
+# the first entry covering a launch's rows runs it. Few rows spread groups over
+# more programs to shorten the dependent load chain; prefill shares key tiles.
+_TILED_SCORE_CONFIGS = (
+    (16, 8, 32, 1, 4),
+    (64, 8, 32, 2, 4),
+    (256, 8, 32, 8, 4),
+    (None, 32, 64, 16, 4),
+)
+
+
+def launch_score_representatives_tiled(
+    *,
+    prepared_query: torch.Tensor,
+    query_positions: torch.Tensor,
+    request_ids: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compressed_cache: torch.Tensor,
+    compressed_block_table: torch.Tensor,
+    scores: torch.Tensor,
+    eligible_counts: torch.Tensor,
+    merge_lengths: torch.Tensor,
+    group_offset: int,
+    group_count: int,
+    caps,
+) -> None:
+    rows = int(prepared_query.shape[0])
+    context = _support_launch_context.get()
+    # Preparation compiles every configuration: one plan serves both decode
+    # rows and prefill chunks.
+    compiling = context is not None and context[1]
+    for limit, tile_rows, block_g, group_tiles, warps in _TILED_SCORE_CONFIGS:
+        selected = limit is None or rows <= limit
+        if selected or compiling:
+            _launch_triton(
+                _score_representatives_tiled_kernel,
+                (
+                    triton.cdiv(rows, tile_rows),
+                    triton.cdiv(int(group_count), block_g * group_tiles),
+                ),
+                prepared_query,
+                query_positions,
+                request_ids,
+                sequence_lengths,
+                compressed_cache,
+                compressed_block_table,
+                scores,
+                eligible_counts,
+                merge_lengths,
+                int(compressed_cache.stride(0)),
+                int(compressed_cache.stride(1)),
+                int(compressed_block_table.stride(0)),
+                int(scores.stride(0)),
+                rows,
+                MAX_GROUPS=int(caps.max_groups),
+                GROUP_OFFSET=int(group_offset),
+                GROUP_COUNT=int(group_count),
+                GROUP_BUDGET=int(caps.group_budget),
+                INDEX_HEADS=int(caps.index_heads),
+                INDEX_HEAD_DIM=int(caps.index_head_dim),
+                COMPRESS_RATIO=int(caps.compress_ratio),
+                COMPRESSED_PAGE_SIZE=int(caps.compressed_page_size),
+                DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+                DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+                CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
+                TILE_ROWS=tile_rows,
+                BLOCK_G=block_g,
+                GROUP_TILES=group_tiles,
+                num_warps=warps,
+            )
+        if selected and not compiling:
+            return
+
+
 def launch_stage_topk_carry(
     *,
     prior_values: torch.Tensor,
@@ -1274,6 +1487,7 @@ _SUPPORT_WRAPPER_NAMES = (
     "launch_compress_completed_groups",
     "launch_commit_raw_ring",
     "launch_score_representatives",
+    "launch_score_representatives_tiled",
     "launch_stage_topk_carry",
     "launch_topk_groups",
     "launch_remap_topk_group_ids",
@@ -1294,6 +1508,7 @@ __all__ = [
     "launch_compress_completed_groups",
     "launch_commit_raw_ring",
     "launch_score_representatives",
+    "launch_score_representatives_tiled",
     "launch_stage_topk_carry",
     "launch_topk_groups",
     "launch_remap_topk_group_ids",

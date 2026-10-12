@@ -1813,14 +1813,13 @@ def test_qsa_cute_scores_preserve_strides_masks_and_null_pages(
 
 @pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize("keys_kind", ["random", "zero_ties", "ordered_ties"])
-def test_qsa_cute_scores_preserve_chunked_selection_and_attention_graph_replay(
+def test_qsa_tiled_scores_preserve_chunked_selection_and_attention_graph_replay(
     monkeypatch,
     keys_kind: str,
     overlap: bool,
 ) -> None:
     """Score replacement preserves the complete state/selection/read transaction."""
     import b12x.attention.qsa._kernels as kernel_module
-    import b12x.attention.qsa._score_cute as cute_module
 
     device = require_sm120()
     monkeypatch.setattr(
@@ -1889,15 +1888,17 @@ def test_qsa_cute_scores_preserve_chunked_selection_and_attention_graph_replay(
         binding.output.fill_(23)
 
     scalar_launch = kernel_module.launch_score_representatives
-    cute_launch = cute_module.launch_score_representatives
+    tiled_launch = kernel_module.launch_score_representatives_tiled
 
     def scalar_reference(*, _prepared=None, **kwargs):
         # The independent scalar oracle resolves its own Triton programs;
-        # the binding's prepared scorer belongs to the CuTe implementation.
+        # the binding's prepared scorer is the tiled implementation.
         return scalar_launch(**kwargs)
 
     with monkeypatch.context() as patch:
-        patch.setattr(cute_module, "launch_score_representatives", scalar_reference)
+        patch.setattr(
+            kernel_module, "launch_score_representatives_tiled", scalar_reference
+        )
         reset()
         expected_output = invoke().clone()
         expected_positions = binding.selected_positions.clone()
@@ -1905,7 +1906,7 @@ def test_qsa_cute_scores_preserve_chunked_selection_and_attention_graph_replay(
     assert torch.isfinite(expected_output[0]).all()
     assert expected_output[0].abs().max() > 0
     with monkeypatch.context() as patch:
-        patch.setattr(cute_module, "launch_score_representatives", cute_launch)
+        patch.setattr(kernel_module, "launch_score_representatives_tiled", tiled_launch)
         reset()
         invoke()
         reset()
@@ -1968,6 +1969,112 @@ def test_qsa_paged_representative_scores_match_fp32_reference() -> None:
     assert eligible.item() == 5 and lengths.item() == 5
     torch.testing.assert_close(scores, expected_scores, rtol=1e-3, atol=1e-3)
 
+
+
+
+@pytest.mark.parametrize(
+    ("score_workspace_bytes", "chunks", "width"),
+    [(None, 9, 8192), (512 * 1024 * 1024, 3, 32768), (1024 * 1024 * 1024, 1, 65536)],
+)
+def test_qsa_score_workspace_bound_sets_selection_chunks(
+    score_workspace_bytes, chunks, width
+) -> None:
+    from b12x.preparation.types import FrozenMapping
+
+    caps = _caps(
+        "cuda:0",
+        max_q_rows=4096,
+        max_seq_len=262144,
+        main_page_size=64,
+        compressed_page_size=16,
+        num_main_cache_pages=4096,
+        num_compressed_cache_pages=4096,
+        score_workspace_bytes=score_workspace_bytes,
+    )
+    query = qsa_contract._query_from_caps(caps, FrozenMapping())
+    assert qsa_contract._caps_from_query(query, ordinal=0) == caps
+    _, chunk_groups, workspace_width, num_chunks, *_ = qsa_contract._scratch_layout(caps)
+    assert (num_chunks, workspace_width) == (chunks, width)
+    assert chunk_groups * num_chunks >= caps.max_groups
+
+@pytest.mark.parametrize(
+    ("rows_per_request", "group_offset"),
+    [(3, 0), (16, 0), (64, 0), (300, 0), (300, 40)],
+)
+@pytest.mark.parametrize("dcp_size", [1, 2])
+def test_qsa_tiled_scores_match_scalar_oracle(
+    rows_per_request: int, group_offset: int, dcp_size: int
+) -> None:
+    """Tiles of rows spanning several requests, holes, and idle rows score exactly."""
+    from b12x.attention.qsa._kernels import (
+        launch_score_representatives,
+        launch_score_representatives_tiled,
+    )
+
+    device = require_sm120()
+    caps = _caps(
+        device,
+        max_batch=3,
+        max_q_rows=3 * rows_per_request + 5,
+        max_seq_len=4096,
+        num_main_cache_pages=256,
+        num_compressed_cache_pages=256,
+        main_page_size=64,
+        compressed_page_size=16,
+        index_heads=4,
+        dcp_size=dcp_size,
+        cp_kv_cache_interleave_size=4 if dcp_size > 1 else 1,
+    )
+    generator = torch.Generator(device="cpu").manual_seed(98911)
+    cache = torch.randn(
+        (256, 16, caps.index_head_dim), generator=generator
+    ).to(device=device, dtype=torch.bfloat16)
+    table = torch.randperm(256, generator=generator)[: 3 * 64].view(3, 64)
+    table[1, 5] = -1
+    table = table.to(device=device, dtype=torch.int32)
+    lengths = (4000, 1500, 2100)
+    request_ids, positions = [], []
+    for request, length in enumerate(lengths):
+        request_ids += [request] * rows_per_request
+        positions += range(length - rows_per_request, length)
+    request_ids += [-1] * 5
+    positions += [0] * 5
+    rows = len(request_ids)
+    query = torch.randn(
+        (rows, caps.index_heads, caps.index_head_dim), generator=generator
+    ).to(device=device, dtype=torch.bfloat16)
+    group_count = 600
+    width = caps.group_budget + group_count
+    results = []
+    for launch in (launch_score_representatives, launch_score_representatives_tiled):
+        scores = torch.full((rows, width), float("nan"), device=device)
+        eligible = torch.full((rows,), -7, dtype=torch.int32, device=device)
+        merge = torch.full((rows,), -7, dtype=torch.int32, device=device)
+        launch(
+            prepared_query=query,
+            query_positions=torch.tensor(positions, dtype=torch.int64, device=device),
+            request_ids=torch.tensor(request_ids, dtype=torch.int32, device=device),
+            sequence_lengths=torch.tensor(lengths, dtype=torch.int32, device=device),
+            compressed_cache=cache,
+            compressed_block_table=table,
+            scores=scores,
+            eligible_counts=eligible,
+            merge_lengths=merge,
+            group_offset=group_offset,
+            group_count=group_count,
+            caps=caps,
+        )
+        results.append((scores, eligible, merge))
+    (expected, expected_eligible, expected_merge), (actual, eligible, merge) = results
+    assert torch.equal(eligible, expected_eligible)
+    assert torch.equal(merge, expected_merge)
+    carry = torch.clamp(
+        torch.clamp(expected_eligible, max=group_offset), max=caps.group_budget
+    )
+    columns = torch.arange(width, device=device)
+    read = (columns >= carry[:, None]) & (columns < expected_merge[:, None])
+    assert read.any()
+    torch.testing.assert_close(actual[read], expected[read], rtol=1e-6, atol=1e-6)
 
 @pytest.mark.parametrize(
     ("rank", "expected_eligible"), [(0, 1), (1, 0), (2, 0), (3, 0)]

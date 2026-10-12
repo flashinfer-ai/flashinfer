@@ -246,7 +246,7 @@ def _assert_launch_slices(calls, operands, caps):
 def test_combined_slices_attention_without_slicing_selector(
     monkeypatch, splits, rows, dcp_size, kv_heads
 ):
-    from b12x.attention.qsa import _kernels, _score_cute, _sparse_gqa
+    from b12x.attention.qsa import _kernels, _sparse_gqa
 
     caps = _caps(
         kv_heads=kv_heads,
@@ -264,6 +264,7 @@ def test_combined_slices_attention_without_slicing_selector(
         "launch_commit_raw_ring",
         "launch_expand_selected_groups",
         "launch_expand_global_selected_groups",
+        "launch_score_representatives_tiled",
         "launch_stabilize_topk",
         "launch_stage_topk_carry",
         "launch_topk_groups",
@@ -273,9 +274,6 @@ def test_combined_slices_attention_without_slicing_selector(
         _kernels,
         "launch_prepare_index_query",
         lambda **kwargs: selector_rows.append(kwargs["index_query"].shape[0]),
-    )
-    monkeypatch.setattr(
-        _score_cute, "launch_score_representatives", lambda **kwargs: None
     )
     monkeypatch.setattr(
         _sparse_gqa, "launch_sparse_paged_gqa", lambda **kwargs: calls.append(kwargs)

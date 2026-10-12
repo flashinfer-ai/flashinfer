@@ -27,7 +27,13 @@ from ...preparation.types import (
     plan_from_handle,
     require_prepared,
 )
-from ._tuning import QsaConfig, QsaQuery, TUNING, _validate_attention_splits
+from ._tuning import (
+    QsaConfig,
+    QsaQuery,
+    TUNING,
+    _validate_attention_splits,
+    _validate_score_workspace_bytes,
+)
 from ._sparse_gqa_cute_config import split_row_limit
 
 _ALIGN_BYTES = 256
@@ -209,6 +215,11 @@ class Caps:
     row capacity, with at most 64 attention rows per launch. Selector capacity
     is unchanged. Fixed partitions use FP32 partial outputs and a merge even
     for one split; the policy is part of the prepared query identity.
+
+    ``score_workspace_bytes`` bounds the FP32 representative-score workspace
+    (None selects the 128 MiB default). Selection scores a sequence's groups in
+    as many chunks as that bound requires, so a larger bound trades scratch
+    memory for fewer selection passes.
     """
 
     device: torch.device | str
@@ -240,9 +251,11 @@ class Caps:
     dcp_rank: int = 0
     cp_kv_cache_interleave_size: int = 1
     attention_splits: int = 0
+    score_workspace_bytes: int | None = None
 
     def __post_init__(self) -> None:
         _validate_attention_splits(self.attention_splits)
+        _validate_score_workspace_bytes(self.score_workspace_bytes)
         object.__setattr__(self, "device", _canonical_device(self.device))
         if self.device.type != "cuda":
             raise ValueError(f"QSA decode requires a CUDA device, got {self.device}")
@@ -498,7 +511,6 @@ class QsaPrograms:
     """
 
     support: Mapping[str, object]
-    score: object
     sparse: Mapping[str, object]
     sparse_draft: Mapping[str, object]
     draft: Mapping[str, object]
@@ -506,7 +518,6 @@ class QsaPrograms:
     def __post_init__(self) -> None:
         objects = (
             *self.support.values(),
-            self.score,
             *self.sparse.values(),
             *self.sparse_draft.values(),
             *self.draft.values(),
@@ -842,7 +853,8 @@ def _scratch_layout(
     workspace_q_rows = int(caps.max_q_rows)
     score_width_limit = max(
         1,
-        _SCORE_WORKSPACE_LIMIT_BYTES // (workspace_q_rows * torch.float32.itemsize),
+        int(caps.score_workspace_bytes or _SCORE_WORKSPACE_LIMIT_BYTES)
+        // (workspace_q_rows * torch.float32.itemsize),
     )
     score_width_limit = min(
         score_width_limit,
@@ -1226,6 +1238,7 @@ def _query_from_caps(caps: Caps, invocation: FrozenMapping) -> QsaQuery:
         dcp_rank=caps.dcp_rank,
         cp_kv_cache_interleave_size=caps.cp_kv_cache_interleave_size,
         attention_splits=caps.attention_splits,
+        score_workspace_bytes=caps.score_workspace_bytes,
         abi=abi,
     )
 
@@ -1294,6 +1307,7 @@ def _caps_from_query(query: QsaQuery, *, ordinal: int) -> Caps:
         dcp_rank=query.dcp_rank,
         cp_kv_cache_interleave_size=query.cp_kv_cache_interleave_size,
         attention_splits=query.attention_splits,
+        score_workspace_bytes=query.score_workspace_bytes,
     )
 
 
@@ -1319,7 +1333,6 @@ def compile_qsa(
     """
     from ._draft_selection import _prepare_kernel, _record_kernel
     from ._kernels import _support_context
-    from ._score_cute import compile_score_representatives
     from ._sparse_gqa import compile_sparse_paged_gqa
     from ..._lib.compile_plan import launch_triton
     import triton
@@ -1456,65 +1469,6 @@ def compile_qsa(
             torch.int64,
             "rope_positions",
         )
-        prepared = _scratch_view(
-            scratch,
-            offset_bytes=layout.prepared_query_offset_bytes,
-            shape=(state.workspace_q_rows, caps.index_heads, caps.index_head_dim),
-            dtype=torch.bfloat16,
-        )
-        scores = _scratch_view(
-            scratch,
-            offset_bytes=layout.score_offset_bytes,
-            shape=(state.workspace_q_rows, state.score_workspace_width),
-            dtype=torch.float32,
-        )
-        eligible = _scratch_view(
-            scratch,
-            offset_bytes=layout.eligible_counts_offset_bytes,
-            shape=(state.workspace_q_rows,),
-            dtype=torch.int32,
-        )
-        merge = _scratch_view(
-            scratch,
-            offset_bytes=layout.merge_lengths_offset_bytes,
-            shape=(state.workspace_q_rows,),
-            dtype=torch.int32,
-        )
-        kernel_caps = _KernelCaps(
-            max_batch=caps.max_batch,
-            max_seq_len=caps.max_seq_len,
-            compressed_page_size=caps.compressed_page_size,
-            q_heads=caps.q_heads,
-            kv_heads=caps.kv_heads,
-            head_dim=caps.head_dim,
-            index_heads=caps.index_heads,
-            index_head_dim=caps.index_head_dim,
-            index_rotary_dim=caps.index_rotary_dim,
-            compress_ratio=caps.compress_ratio,
-            budget=caps.budget,
-            position_axes=caps.position_axes,
-            mrope_sections=caps.mrope_sections,
-            mrope_interleaved=caps.mrope_interleaved,
-            rms_norm_eps=caps.rms_norm_eps,
-            raw_ring_capacity=caps.raw_ring_capacity,
-            max_speculative_tokens=caps.max_speculative_tokens,
-            dcp_size=caps.dcp_size,
-            dcp_rank=caps.dcp_rank,
-            cp_kv_cache_interleave_size=caps.cp_kv_cache_interleave_size,
-            attention_splits=caps.attention_splits,
-        )
-        score = compile_score_representatives(
-            prepared_query=prepared,
-            query_positions=positions,
-            request_ids=request_ids,
-            sequence_lengths=sequence_lengths,
-            compressed_cache=compressed,
-            compressed_block_table=compressed_table,
-            scores=scores,
-            eligible_counts=eligible,
-            merge_lengths=merge,
-            caps=kernel_caps,
-        )
         sparse = compile_sparse_paged_gqa(
             query=q,
             key_cache=main_k,
@@ -1607,7 +1561,7 @@ def compile_qsa(
                 dcp_rank=caps.dcp_rank,
                 cp_kv_cache_interleave_size=caps.cp_kv_cache_interleave_size,
                 attention_splits=caps.attention_splits,
-                programs=SimpleNamespace(support=support, score=score, sparse=sparse),
+                programs=SimpleNamespace(support=support, sparse=sparse),
             )
         if not support:
             raise RuntimeError("QSA support compilation produced no native programs")
@@ -1655,11 +1609,8 @@ def compile_qsa(
                 ),
                 num_warps=4,
             )
-        else:
-            draft["disabled"] = score
     return QsaPrograms(
         support=support,
-        score=score,
         sparse=sparse,
         sparse_draft=sparse_draft,
         draft=draft,
@@ -2679,12 +2630,12 @@ def _qsa_decode_impl(
         launch_expand_global_selected_groups,
         launch_expand_selected_groups,
         launch_prepare_index_query,
+        launch_score_representatives_tiled,
         launch_stabilize_topk,
         launch_stage_topk_carry,
         launch_topk_groups,
         launch_commit_raw_ring,
     )
-    from ._score_cute import launch_score_representatives
 
     # Completion consumes the old ring before the current suffix can wrap it.
     launch_compress_completed_groups(
@@ -2780,7 +2731,7 @@ def _qsa_decode_impl(
                     group_budget=group_budget,
                     _prepared=None if programs is None else programs.support,
                 )
-            launch_score_representatives(
+            launch_score_representatives_tiled(
                 prepared_query=chunk_prepared,
                 query_positions=chunk_positions,
                 request_ids=chunk_request_ids,
@@ -2793,7 +2744,7 @@ def _qsa_decode_impl(
                 group_offset=group_offset,
                 group_count=group_count,
                 caps=caps,
-                _prepared=None if programs is None else programs.score,
+                _prepared=None if programs is None else programs.support,
             )
             launch_topk_groups(
                 scores=chunk_scores,
