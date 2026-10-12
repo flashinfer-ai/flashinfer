@@ -1,0 +1,87 @@
+{
+  "provenance": "Extracted FI/FLA measurements from user-supplied historical log; not a new GPU run; log has no kernel source hash.",
+  "gpu": "NVIDIA RTX 6000D",
+  "model_config": "27B TP1",
+  "h_qk": 16,
+  "h_v": 48,
+  "head_dim": 128,
+  "dtype": "bfloat16 (per supplied benchmark source)",
+  "versions": {
+    "torch": "2.13.0+cu130",
+    "fla": "0.5.2",
+    "flashinfer": "0.6.18",
+    "tilelang_profiler": "0.1.9"
+  },
+  "backend": "cudagraph",
+  "warmup_argument": 10,
+  "repeats_argument": 100,
+  "relative_l2_threshold": 0.02,
+  "original_method": "FI wrapper includes exp(g), initial-state transpose/contiguous, cu conversion and final-state transpose/contiguous. Original accuracy reference requests FLA chunk_size=32 on SM120; FLA timing uses its default. The new standalone harness fixes one explicit FLA chunk size for both and uses PyTorch events/CUDAGraph with call-count warmup/repeats; rerun before comparing new and historical numbers.",
+  "rows": [
+    {
+      "tokens": 2048,
+      "fuse_ms": 0.391,
+      "fla_ms": 0.271,
+      "cp_ms": 0.362,
+      "p32_ms": 0.227,
+      "fuse_output_rel_l2": 0.00586,
+      "fuse_state_rel_l2": 0.005332,
+      "cp_output_rel_l2": 0.005856,
+      "cp_state_rel_l2": 0.005338,
+      "p32_output_rel_l2": 0.005657,
+      "p32_state_rel_l2": 0.005062
+    },
+    {
+      "tokens": 4096,
+      "fuse_ms": 0.778,
+      "fla_ms": 0.608,
+      "cp_ms": 0.552,
+      "p32_ms": 0.421,
+      "fuse_output_rel_l2": 0.006043,
+      "fuse_state_rel_l2": 0.005337,
+      "cp_output_rel_l2": 0.006018,
+      "cp_state_rel_l2": 0.00532,
+      "p32_output_rel_l2": 0.005828,
+      "p32_state_rel_l2": 0.005071
+    },
+    {
+      "tokens": 8192,
+      "fuse_ms": 1.547,
+      "fla_ms": 1.251,
+      "cp_ms": 1.093,
+      "p32_ms": 0.814,
+      "fuse_output_rel_l2": 0.006134,
+      "fuse_state_rel_l2": 0.005301,
+      "cp_output_rel_l2": 0.006129,
+      "cp_state_rel_l2": 0.00533,
+      "p32_output_rel_l2": 0.005933,
+      "p32_state_rel_l2": 0.005049
+    },
+    {
+      "tokens": 16384,
+      "fuse_ms": 3.083,
+      "fla_ms": 2.538,
+      "cp_ms": 2.005,
+      "p32_ms": 1.618,
+      "fuse_output_rel_l2": 0.006185,
+      "fuse_state_rel_l2": 0.005334,
+      "cp_output_rel_l2": 0.006184,
+      "cp_state_rel_l2": 0.005337,
+      "p32_output_rel_l2": 0.005981,
+      "p32_state_rel_l2": 0.005056
+    },
+    {
+      "tokens": 32768,
+      "fuse_ms": 6.095,
+      "fla_ms": 5.148,
+      "cp_ms": 3.99,
+      "p32_ms": 3.272,
+      "fuse_output_rel_l2": 0.00621,
+      "fuse_state_rel_l2": 0.005331,
+      "cp_output_rel_l2": 0.006212,
+      "cp_state_rel_l2": 0.005311,
+      "p32_output_rel_l2": 0.006007,
+      "p32_state_rel_l2": 0.005063
+    }
+  ]
+}

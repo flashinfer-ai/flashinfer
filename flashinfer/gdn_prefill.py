@@ -991,6 +991,11 @@ def chunk_gated_delta_rule(
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
+    - ``FLASHINFER_GDN_SM120_PIPELINE32=1`` opts the non-CP SM120 DSL path
+      into 32-token chunks. Use ``backend="flashinfer", use_cp=False`` to
+      select that path explicitly. It requires D=128, contiguous FP16/BF16
+      Q/K/V and FP32 state; state pools and in-kernel QK normalization are
+      unsupported. Default dispatch and CP implementations are unchanged.
     - Requires SM90 (Hopper) or SM100 (Blackwell) architecture. The SM100
       path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp`` supports
       structurally legal equal-head, GQA, and GVA shapes on CUDA 12.8,
@@ -1499,7 +1504,24 @@ def chunk_gated_delta_rule(
             output_state = torch.empty(
                 output_state_shape, dtype=torch.float32, device=device
             )
-        chunk_gated_delta_rule_sm120(
+        from .gdn_kernels.delta_rule_dsl.sm120_pipeline32_dispatch import (
+            sm120_pipeline32_prefill_enabled,
+        )
+
+        sm120_prefill = chunk_gated_delta_rule_sm120
+        sm120_kwargs = {"state_indices": state_indices}
+        if sm120_pipeline32_prefill_enabled():
+            if state_indices is not None or use_qk_l2norm_in_kernel:
+                raise NotImplementedError(
+                    "SM120 pipeline32 does not support state_indices or in-kernel QK normalization"
+                )
+            from .gdn_kernels.delta_rule_dsl.delta_rule_sm120_pipeline32 import (
+                delta_rule_prefill_pipeline32,
+            )
+
+            sm120_prefill = delta_rule_prefill_pipeline32
+            sm120_kwargs = {}
+        sm120_prefill(
             output,
             output_state,
             q,
@@ -1513,7 +1535,7 @@ def chunk_gated_delta_rule(
             state_checkpoints,
             checkpoint_cu_starts,
             checkpoint_every_n_tokens,
-            state_indices=state_indices,
+            **sm120_kwargs,
         )
     elif _arch_major == 9:
         # SM90 Hopper path (CuTe DSL kernel)
