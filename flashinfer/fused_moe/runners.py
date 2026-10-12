@@ -8675,6 +8675,9 @@ class B12xW4A16Runner(_B12xRunner):
 _BLOCK_SCALE_TILE = 128
 # Expert-segment tile of the BF16 and FP8 runners: the smallest moe_sort tile.
 _PLAIN_SEGMENT_ROWS = 16
+# The largest expert count and top-k moe_sort's routing kernels are compiled for.
+_MOE_SORT_MAX_EXPERTS = 2048
+_MOE_SORT_MAX_TOP_K = 32
 
 # (gemm1, gemm2) plan indices of the fallback tactic
 _FALLBACK_STAGE_TACTIC: tuple[int, int] = (-1, -1)
@@ -8828,14 +8831,30 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
                 f"{type(self).__name__} requires intermediate_size divisible by 8 "
                 f"(the moe_activation kernel), got {intermediate_size}."
             )
+        routing = self.config.routing
+        if (
+            routing.num_experts > _MOE_SORT_MAX_EXPERTS
+            or routing.top_k > _MOE_SORT_MAX_TOP_K
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} routes with moe_sort, which supports up to "
+                f"{_MOE_SORT_MAX_EXPERTS} experts and top_k {_MOE_SORT_MAX_TOP_K}, "
+                f"got num_experts={routing.num_experts}, top_k={routing.top_k}."
+            )
         from ..grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION, _check_cudnn_version
 
         _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, f"{self.backend_key} MoE")
-        # Load the moe_utils kernels here, so a build or load failure (a
-        # RuntimeError) rejects this backend during selection.
+
+    def check_support(self) -> None:
+        super().check_support()
+        # Load the moe_utils kernels once every configuration check has passed,
+        # so a rejected configuration never builds them and a build or load
+        # failure (a RuntimeError) rejects this backend during selection.
         from .cute_dsl.moe_utils import _get_moe_utils_module
 
+        self._support_checked = False
         _get_moe_utils_module()
+        self._support_checked = True
 
     def _check_activation_parameters(self) -> None:
         activation = self.config.activation

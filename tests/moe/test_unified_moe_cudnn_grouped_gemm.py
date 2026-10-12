@@ -405,6 +405,9 @@ def test_cudnn_check_support_rejects_unsupported_options():
             _detached_runner(
                 key, _config(key, experts=ExpertConfig(intermediate_size=100))
             )._check_support()
+        for routing in (dict(num_experts=4096), dict(num_experts=64, top_k=33)):
+            with pytest.raises(NotImplementedError, match="routes with moe_sort"):
+                _detached_runner(key, _config(key, **routing))._check_support()
         quant = _FAMILIES[key].quant
         with pytest.raises(NotImplementedError, match="per_token_scale"):
             _detached_runner(
@@ -505,6 +508,26 @@ def test_cudnn_backend_is_rejected_when_moe_utils_fails_to_load(monkeypatch):
     with pytest.raises(RuntimeError, match="rejected this configuration") as info:
         MoELayer(_config(_BF16_KEY), torch.device("cuda"))
     assert "CudnnGroupedGemmBf16Runner: Ninja build failed." in str(info.value)
+
+
+def test_cudnn_check_support_rejects_before_building_moe_utils(monkeypatch):
+    """A rejected configuration never builds the moe_utils kernels."""
+    import flashinfer.fused_moe.cute_dsl.moe_utils as moe_utils
+
+    def build():
+        raise AssertionError("moe_utils built for a rejected configuration")
+
+    monkeypatch.setattr(moe_utils, "_get_moe_utils_module", build)
+    intermediate_sizes = dict.fromkeys(_FAMILY_KEYS, 100)
+    if _cudnn_moe_available():
+        # Past the shared checks: the block-scaled runners' own size check.
+        intermediate_sizes.update(dict.fromkeys(_BLOCK_SCALE_KEYS, 96))
+    for key, intermediate_size in intermediate_sizes.items():
+        runner = _detached_runner(
+            key, _config(key, experts=ExpertConfig(intermediate_size=intermediate_size))
+        )
+        with pytest.raises(NotImplementedError, match="intermediate_size divisible"):
+            runner.check_support()
 
 
 @pytest.mark.parametrize("key", _FAMILY_KEYS)
