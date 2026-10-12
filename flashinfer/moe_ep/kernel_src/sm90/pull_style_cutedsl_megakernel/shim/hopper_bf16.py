@@ -31,7 +31,15 @@ import dataclasses
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Literal, Optional, Tuple  # noqa: F401
+from typing import (  # noqa: F401
+    Any,
+    Callable,
+    Dict,
+    Literal,
+    Optional,
+    Tuple,
+    TypeAlias,
+)
 
 import torch
 
@@ -921,7 +929,9 @@ class MegaMoEHopperBf16Frontend:
 # Kernel-ready weight leg: ONE K-major bf16 tensor (no scale planes).
 # fc1: (E, hidden, 2 * intermediate) with hidden stride-1;
 # fc2: (E, intermediate, hidden) with intermediate stride-1.
-TransformedBf16Weights = torch.Tensor
+# Explicit ``TypeAlias``: without torch stubs ``torch.Tensor`` is ``Any`` to
+# mypy, and a bare assignment would be rejected as a variable used as a type.
+TransformedBf16Weights: TypeAlias = torch.Tensor
 
 
 def init_dist() -> Tuple[int, int]:
