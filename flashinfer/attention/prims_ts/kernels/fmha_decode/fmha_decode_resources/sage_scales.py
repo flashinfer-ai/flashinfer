@@ -29,9 +29,12 @@ Each softmax lane loads its row's ``sfQ`` word once per work tile
 tiles, which the load warp produces after each K tile with ``cp.async``
 copies under the ring's ``AsyncLoad`` commit: the tile's atoms, a dense
 tile's or a block-sparse route's, from the prepared scales
-(``_copy_atom_scales``). Both softmax passes read the waited stage in place,
-one K32 fragment at a time with loads of at most 16 bytes, so attention never
-addresses ``k_scale`` itself.
+(``_copy_atom_scales``). After the softmax task waits a stage,
+``open_stage`` publishes the stage's shared-memory offset as a task-local
+value that the schedule routes into the max pass and the P pass; both read
+the stage in place through ``sage_k_view`` and ``load_sage_k_fragment``, one
+K32 fragment at a time with loads of at most 16 bytes, so attention never
+addresses ``k_scale`` itself and no other resource holds the ring.
 
 :class:`SageVScalesResource` stages the work tile's per-channel V scales
 (and means) in SMEM once per tile, while no output is pending, so the
@@ -40,6 +43,7 @@ waiting on global loads.
 """
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
@@ -53,6 +57,8 @@ from cutlass.experimental.task_scheduling.memory import (
 )
 from cutlass.experimental.task_scheduling.resources import (
     StageInfo,
+    TaskLocalVariable,
+    consumer_work,
     producer_work,
 )
 
@@ -415,6 +421,79 @@ def load_staged_v_channel_scales(
     return scales, means
 
 
+def sage_k_half_words(cfg: FmhaDecodeConfig, proxy: bool = False) -> int:
+    """Return one route kind's stage words of one spatial half's atoms."""
+    tile_atoms = cfg.tile_size_kv // cfg.keeps_atom_tokens
+    atoms_per_half = tile_atoms // cfg.keeps_spatial_halves
+    return atoms_per_half * sage_k_section(cfg, proxy).atom_words
+
+
+@cute.jit
+def sage_k_view(
+    cfg: Constexpr[FmhaDecodeConfig],
+    context: ResourceContext,
+    stage_bytes: Int32,
+    warp_grp_thread_idx: Int32,
+    factor: Float32 | None,
+    proxy_kind: Constexpr[bool] = False,
+):
+    """Return a pass's view of a waited ring stage: the lane's half pointer and ``factor``.
+
+    ``stage_bytes`` is the stage's offset in the CTA's shared memory, as
+    ``SageKScalesResource.open_stage`` publishes it; ``factor``, if any, is
+    multiplied into every word ``load_sage_k_fragment`` returns.
+    """
+    stage_words = cutlass.Array(
+        context.smem_base.data_ptr() + stage_bytes,
+        dtype=Float32,
+        shape=(sage_k_stage_words(cfg),),
+        addrspace=3,
+    ).data_ptr()
+    half = _keeps_spatial_half(cfg, warp_grp_thread_idx)
+    return stage_words + half * Int32(sage_k_half_words(cfg, proxy_kind)), factor
+
+
+@cute.jit
+def load_sage_k_fragment(
+    cfg: Constexpr[FmhaDecodeConfig],
+    view,
+    fragment_idx: Int32,
+    proxy_kind: Constexpr[bool] = False,
+) -> cutlass.Array:
+    """Return ``factor * sfK`` of one fragment's ``groups`` words of ``view``.
+
+    Fragment ``f`` reads words ``(f % 2) * groups`` onward of atom ``f // 2``
+    of the half; an unpadded atom's words are contiguous, so that is word ``f
+    * groups`` of the half. The loads, at most 16 bytes each, issue ahead of
+    the fragment's score wait in the callers.
+    """
+    groups = cfg.sage_k_groups_per_fragment(proxy_kind)
+    values = cutlass.Array(Float32, groups, space=cutlass.AddressSpace.rmem)
+    half_ptr, factor = view
+    fragments_per_atom = cfg.keeps_fragments_per_atom
+    section = sage_k_section(cfg, proxy_kind)
+    if cutlass.const_expr(section.atom_words == section.words_per_atom):
+        words_ptr = half_ptr + fragment_idx * Int32(groups)
+    else:
+        atom_position = fragment_idx // Int32(fragments_per_atom)
+        words_ptr = (
+            half_ptr
+            + atom_position * Int32(section.atom_words)
+            + fragment_idx % Int32(fragments_per_atom) * Int32(groups)
+        )
+    width = min(groups, 4)
+    for word in cutlass.range_constexpr(0, groups, width):
+        loaded = (words_ptr + Int32(word)).load(count=width, alignment=width * 4)
+        for elem in cutlass.range_constexpr(width):
+            values[word + elem] = Float32(loaded[elem])
+    if cutlass.const_expr(factor is not None):
+        if cutlass.const_expr(groups == 1):
+            values[0] = Float32(values[0]) * factor
+        else:
+            scale_pairs_in_place(values, factor, groups)
+    return values
+
+
 @dataclass(kw_only=True)
 class SageKScalesResource(DecodeGenResourceBase):
     """One softmax instance's ring of ``sfK`` tiles, produced by the load warp.
@@ -423,11 +502,21 @@ class SageKScalesResource(DecodeGenResourceBase):
     The load warp fills it after the tile's K copy with ``cp.async`` copies of
     the tile's atoms from the prepared scales, a block-sparse route's
     (``copy_route``) or a dense tile's (``copy_tile``), and the pipeline's
-    ``AsyncLoad`` commit completes the stage once they land. The softmax reads
-    the waited stage in place and releases it after its last pass that reads
-    the words.
+    ``AsyncLoad`` commit completes the stage once they land. The softmax waits
+    a stage, takes its offset from ``open_stage``, reads it in place through
+    ``sage_k_view`` and ``load_sage_k_fragment`` in the max pass and the P
+    pass, and releases it after the last pass that reads the words.
     """
 
+    _task_local_specs: ClassVar[tuple[tuple, ...]] = (
+        (
+            "stage_bytes",
+            Int32,
+            Int32(0),
+            "Shared-memory offset of the waited ``sfK`` ring stage.",
+        ),
+    )
+    stage_bytes: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     cfg: Constexpr[FmhaDecodeConfig] = None
     inst_id: Constexpr[int] = 0
     route_layout: Constexpr[_BlockSparseRouteLayout | None] = None
@@ -455,11 +544,6 @@ class SageKScalesResource(DecodeGenResourceBase):
     def tile_atoms(self) -> int:
         """Return the atoms of one KV tile."""
         return self.cfg.tile_size_kv // self.cfg.keeps_atom_tokens
-
-    def half_words(self, proxy: bool = False) -> int:
-        """Return one route kind's stage words of one spatial half's atoms."""
-        atoms_per_half = self.tile_atoms // self.cfg.keeps_spatial_halves
-        return atoms_per_half * sage_k_section(self.cfg, proxy).atom_words
 
     def get_smem_requirements(self) -> list[SmemAllocation]:
         """Allocate the ring."""
@@ -578,14 +662,6 @@ class SageKScalesResource(DecodeGenResourceBase):
     # -- storage helpers ---------------------------------------------------
 
     @cute.jit
-    def _lane_half(self, stage_info: StageInfo) -> Int32:
-        """Return the spatial half of the calling softmax thread."""
-        warp_grp_thread_idx = Int32(
-            _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
-        )
-        return _keeps_spatial_half(self.cfg, warp_grp_thread_idx)
-
-    @cute.jit
     def _ring(self, context: ResourceContext) -> cutlass.Array:
         """Return the ring as an FP32 SMEM array."""
         return cutlass.Array(
@@ -595,59 +671,15 @@ class SageKScalesResource(DecodeGenResourceBase):
             addrspace=3,
         )
 
-    # -- pass-side reads ---------------------------------------------------
+    # -- consumer steps ----------------------------------------------------
 
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=stage_bytes)
     @cute.jit
-    def open(
-        self,
-        stage_info: StageInfo,
-        factor: Float32 | None,
-        proxy_kind: Constexpr[bool] = False,
-    ):
-        """Return a pass's view of the waited stage: the lane's half pointer and ``factor``."""
-        half_ptr = (
-            self._ring(stage_info.context).data_ptr()
-            + Int32(self.consumer_work_stage) * Int32(self.tile_words)
-            + self._lane_half(stage_info) * Int32(self.half_words(proxy_kind))
+    def open_stage(self, stage_info: StageInfo) -> Int32:
+        """Publish the waited stage's shared-memory offset for the passes that read it."""
+        return Int32(self._alloc.offset) + Int32(self.consumer_work_stage) * Int32(
+            self.tile_words * 4
         )
-        return half_ptr, factor
-
-    @cute.jit
-    def fragment(
-        self, view, fragment_idx: Int32, proxy_kind: Constexpr[bool] = False
-    ) -> cutlass.Array:
-        """Return ``factor * sfK`` of one fragment's ``groups`` words.
-
-        Fragment ``f`` reads words ``(f % 2) * groups`` onward of atom ``f //
-        2`` of the half; an unpadded atom's words are contiguous, so that is
-        word ``f * groups`` of the half. The loads, at most 16 bytes each,
-        issue ahead of the fragment's score wait in the callers.
-        """
-        groups = self.cfg.sage_k_groups_per_fragment(proxy_kind)
-        values = cutlass.Array(Float32, groups, space=cutlass.AddressSpace.rmem)
-        half_ptr, factor = view
-        fragments_per_atom = self.cfg.keeps_fragments_per_atom
-        section = sage_k_section(self.cfg, proxy_kind)
-        if cutlass.const_expr(section.atom_words == section.words_per_atom):
-            words_ptr = half_ptr + fragment_idx * Int32(groups)
-        else:
-            atom_position = fragment_idx // Int32(fragments_per_atom)
-            words_ptr = (
-                half_ptr
-                + atom_position * Int32(section.atom_words)
-                + fragment_idx % Int32(fragments_per_atom) * Int32(groups)
-            )
-        width = min(groups, 4)
-        for word in cutlass.range_constexpr(0, groups, width):
-            loaded = (words_ptr + Int32(word)).load(count=width, alignment=width * 4)
-            for elem in cutlass.range_constexpr(width):
-                values[word + elem] = Float32(loaded[elem])
-        if cutlass.const_expr(factor is not None):
-            if cutlass.const_expr(groups == 1):
-                values[0] = Float32(values[0]) * factor
-            else:
-                scale_pairs_in_place(values, factor, groups)
-        return values
 
 
 @dataclass(kw_only=True)

@@ -3232,7 +3232,10 @@ def _softmax_schedule_body(
             ) = sparse_softmax_metadata.load_route()
             sparse_softmax_metadata.release()
         if cutlass.const_expr(use_sage):
+            # ConsWait/ConsWork: the tile's ``sfK`` words; both passes read
+            # the waited stage through its routed offset.
             sage_k_scales.wait()
+            sage_k_stage_bytes = sage_k_scales.open_stage()
         # ConsWait/ConsWork: load S from TMEM and compute the tile max.
         tmem_s.wait()
         softmax_loop_kwargs = dict(
@@ -3243,6 +3246,7 @@ def _softmax_schedule_body(
         )
         if cutlass.const_expr(cfg.use_sage_attention):
             softmax_loop_kwargs["sage_q_scale"] = sage_q_scale
+            softmax_loop_kwargs["sage_k_stage_bytes"] = sage_k_stage_bytes
         if use_sparse:
             softmax_loop_kwargs.update(
                 sparse_origin0=sparse_origin0,
@@ -3279,6 +3283,7 @@ def _softmax_schedule_body(
             p_fragments_kwargs = dict(new_max_arr=new_max_arr)
             if cutlass.const_expr(cfg.use_sage_attention):
                 p_fragments_kwargs["sage_q_scale"] = sage_q_scale
+                p_fragments_kwargs["sage_k_stage_bytes"] = sage_k_stage_bytes
             if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
                 p_fragments_kwargs["route_flags"] = sparse_route_flags
             compute_p_fragments(**p_fragments_kwargs)

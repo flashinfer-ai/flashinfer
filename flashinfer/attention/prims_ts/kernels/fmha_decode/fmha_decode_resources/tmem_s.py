@@ -96,7 +96,7 @@ from .helpers_common import (
 from .smem_block_sparse_metadata import (
     _swaps_forwards_packed_route_full,
 )
-from .sage_scales import SageKScalesResource, load_q_scale, sage_sequence_words
+from .sage_scales import load_q_scale, load_sage_k_fragment, sage_k_view, sage_sequence_words
 from .helpers_kv_tile_idx import (
     resolve_keeps_tile_context,
     _kv_tile_is_fully_unmasked_for_q_group,
@@ -281,7 +281,6 @@ class TmemSResource(DecodeGenResourceBase):
     score_seed_owner: Constexpr["TmemSResource | None"] = None
     _seed_alloc: Constexpr[SmemAllocation | None] = None
     # The instance's ``sfK`` words of every tile and route kind.
-    sage_k_scales: SageKScalesResource | None = None
     old_max_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     sum_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     new_max_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -2264,8 +2263,13 @@ class TmemSResource(DecodeGenResourceBase):
         new_max_arr: cutlass.Array,
         s_arr: cutlass.Array,
         sage_q_scale: Float32,
+        sage_k_stage_bytes: Int32,
     ) -> tuple[object, object, object, object]:
-        """Consume S with per-group Sage scales and publish the dequantized max."""
+        """Consume S with per-group Sage scales and publish the dequantized max.
+
+        ``sage_k_stage_bytes`` is the waited ``sfK`` ring stage, routed from
+        ``SageKScalesResource.open_stage``.
+        """
 
         assert self.cfg.use_sage_attention
         return self._compute_softmax_loop_keeps_fragments(
@@ -2276,6 +2280,7 @@ class TmemSResource(DecodeGenResourceBase):
             s_arr=s_arr,
             use_sparse=False,
             sage_q_scale=sage_q_scale,
+            sage_k_stage_bytes=sage_k_stage_bytes,
         )
 
     @consumer_work(
@@ -2388,6 +2393,7 @@ class TmemSResource(DecodeGenResourceBase):
         sparse_token_word2: Uint32 | None = None,
         sparse_token_word3: Uint32 | None = None,
         sage_q_scale: Float32 | None = None,
+        sage_k_stage_bytes: Int32 | None = None,
     ) -> tuple[object, object, object, object]:
         """Mask streamed K32 score fragments in place and reduce their max.
 
@@ -2611,10 +2617,20 @@ class TmemSResource(DecodeGenResourceBase):
         scales_view = None
         summary_view = None
         if cutlass.const_expr(cfg.use_sage_attention):
-            scales_view = self.sage_k_scales.open(stage_info, None)
+            warp_grp_thread_idx = Int32(
+                _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+            )
+            scales_view = sage_k_view(
+                cfg, stage_info.context, sage_k_stage_bytes, warp_grp_thread_idx, None
+            )
             if cutlass.const_expr(mixed_scales):
-                summary_view = self.sage_k_scales.open(
-                    stage_info, None, proxy_kind=True
+                summary_view = sage_k_view(
+                    cfg,
+                    stage_info.context,
+                    sage_k_stage_bytes,
+                    warp_grp_thread_idx,
+                    None,
+                    proxy_kind=True,
                 )
 
         if warp_scores_are_unmasked:
@@ -2622,8 +2638,8 @@ class TmemSResource(DecodeGenResourceBase):
                 if cutlass.const_expr(cfg.use_sage_attention):
                     # Issued ahead of the score load so an SMEM read hides
                     # behind the TMEM wait.
-                    fragment_scales = self.sage_k_scales.fragment(
-                        scales_view, Int32(fragment_idx)
+                    fragment_scales = load_sage_k_fragment(
+                        cfg, scales_view, Int32(fragment_idx)
                     )
                 fragment_addr = score_tmem_addr + Int32(fragment_idx * fragment_regs)
                 if cutlass.const_expr(loads_group_maxima):
@@ -2794,10 +2810,9 @@ class TmemSResource(DecodeGenResourceBase):
     ) -> None:
         """Mask, fold and write back every fragment in one rolled loop.
 
-        ``scales_view`` is ``sage_k_scales`` opened in the geometry of the
-        route kind ``proxy_kind`` names; the resource is read from ``self``
-        because a local would be flattened as a loop-carried value. The keep
-        words rotate down one entry per fragment, so the body reads
+        ``scales_view`` is the waited ``sfK`` stage opened in the geometry of
+        the route kind ``proxy_kind`` names (``sage_k_view``). The keep words
+        rotate down one entry per fragment, so the body reads
         ``keep_words[0]``.
 
         Cleared keep bits become ``-inf`` with Sage, else ``-FLT_MAX``. The
@@ -2815,8 +2830,8 @@ class TmemSResource(DecodeGenResourceBase):
         for fragment in cutlass.range(num_fragments, unroll=1):
             fragment_scales = None
             if cutlass.const_expr(cfg.use_sage_attention):
-                fragment_scales = self.sage_k_scales.fragment(
-                    scales_view, Int32(fragment), proxy_kind
+                fragment_scales = load_sage_k_fragment(
+                    cfg, scales_view, Int32(fragment), proxy_kind
                 )
             keep_word = Uint32(keep_words[0])
             fragment_addr = score_tmem_addr + Int32(fragment) * Int32(fragment_regs)
@@ -3043,6 +3058,7 @@ class TmemSResource(DecodeGenResourceBase):
         sparse_token_word2: Uint32,
         sparse_token_word3: Uint32,
         sage_q_scale: Float32,
+        sage_k_stage_bytes: Int32,
     ) -> tuple[object, object, object, object]:
         """Consume one routed S payload with per-group Sage scales."""
 
@@ -3062,6 +3078,7 @@ class TmemSResource(DecodeGenResourceBase):
             sparse_token_word2=sparse_token_word2,
             sparse_token_word3=sparse_token_word3,
             sage_q_scale=sage_q_scale,
+            sage_k_stage_bytes=sage_k_stage_bytes,
         )
 
     @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))

@@ -82,7 +82,7 @@ from .helpers_softmax import (
     _pack_float4_to_fp8_e4m3,
     _pack_float4_to_fp8_e4m3_inline,
 )
-from .sage_scales import SageKScalesResource
+from .sage_scales import load_sage_k_fragment, sage_k_view
 from .tmem_s import TmemSResource
 
 
@@ -138,7 +138,6 @@ class SmemPResource(DecodeGenResourceBase):
     tmem_s_ref: Constexpr[TmemSResource] = None
     tmem_o_ref: Constexpr[object] = None
     # The instance's ``sfK`` words, shared with the S resource.
-    sage_k_scales: SageKScalesResource | None = None
     _alloc: Constexpr[SmemAllocation | None] = None
     _fragment_ready_alloc: Constexpr[SmemAllocation | None] = None
     _tmem_alloc: Constexpr[TmemAllocation | None] = None
@@ -369,14 +368,20 @@ class SmemPResource(DecodeGenResourceBase):
         *,
         new_max_arr: cutlass.Array,
         sage_q_scale: Float32,
+        sage_k_stage_bytes: Int32,
     ) -> None:
-        """Stream every K32 fragment with per-group Sage dequantization scales."""
+        """Stream every K32 fragment with per-group Sage dequantization scales.
+
+        ``sage_k_stage_bytes`` is the waited ``sfK`` ring stage, routed from
+        ``SageKScalesResource.open_stage``.
+        """
         assert self.cfg.use_sage_attention
         self._compute_p_fragments_impl(
             stage_info,
             new_max_arr=new_max_arr,
             route_is_proxy=cutlass.Boolean(False),
             sage_q_scale=sage_q_scale,
+            sage_k_stage_bytes=sage_k_stage_bytes,
         )
 
     @producer_work
@@ -405,6 +410,7 @@ class SmemPResource(DecodeGenResourceBase):
         new_max_arr: cutlass.Array,
         route_flags: Int32,
         sage_q_scale: Float32,
+        sage_k_stage_bytes: Int32,
     ) -> None:
         """Stream exact or proxy K32 fragments with per-group Sage scales."""
         assert self.cfg.use_block_sparse_proxy_routes and self.cfg.use_sage_attention
@@ -413,6 +419,7 @@ class SmemPResource(DecodeGenResourceBase):
             new_max_arr=new_max_arr,
             route_is_proxy=_route_is_proxy(route_flags),
             sage_q_scale=sage_q_scale,
+            sage_k_stage_bytes=sage_k_stage_bytes,
         )
 
     @cute.jit
@@ -423,6 +430,7 @@ class SmemPResource(DecodeGenResourceBase):
         new_max_arr: cutlass.Array,
         route_is_proxy: cutlass.Boolean,
         sage_q_scale: Float32 | None = None,
+        sage_k_stage_bytes: Int32 | None = None,
     ) -> None:
         """Reload, exponentiate, and publish all K32 fragments in a rolled loop.
 
@@ -469,7 +477,17 @@ class SmemPResource(DecodeGenResourceBase):
         if cutlass.const_expr(cfg.use_sage_attention):
             exp_scale = self.scale_softmax_log2 * sage_q_scale
             if cutlass.const_expr(uses_words):
-                words_view = self.sage_k_scales.open(stage_info, exp_scale)
+                words_view = sage_k_view(
+                    cfg,
+                    stage_info.context,
+                    sage_k_stage_bytes,
+                    Int32(
+                        _decode_gen_task_cache(stage_info)[
+                            _TASK_CACHE_WARP_GRP_THREAD_IDX
+                        ]
+                    ),
+                    exp_scale,
+                )
             else:
                 row_multipliers = cutlass.Array(
                     Float32, 1, space=cutlass.AddressSpace.rmem
@@ -593,10 +611,9 @@ class SmemPResource(DecodeGenResourceBase):
         """Copy one fragment's ``c * sfQ * sfK_g`` words into ``words``.
 
         A constant-indexed register copy, so the in-place loads can issue a
-        fragment ahead of the FFMAs that read them. The resource is read from
-        ``self`` because a local would be flattened as a loop-carried value.
+        fragment ahead of the FFMAs that read them.
         """
-        fragment_words = self.sage_k_scales.fragment(words_view, fragment)
+        fragment_words = load_sage_k_fragment(self.cfg, words_view, fragment)
         groups: Constexpr[int] = self.cfg.sage_k_groups_per_fragment()
         for group_idx in cutlass.range_constexpr(groups):
             words[group_idx] = fragment_words[group_idx]

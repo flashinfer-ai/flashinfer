@@ -1281,7 +1281,6 @@ def _build_decode_gen_schedule(
         b_idx=b_idx,
         num_heads_kv=num_heads_kv,
         sync_barrier_id=0,
-        sage_k_scales=sage_k_scales0,
         name="tmemS0",
         sage_scales_ptr=sage_scales_ptr,
     )
@@ -1302,7 +1301,6 @@ def _build_decode_gen_schedule(
             num_heads_kv=num_heads_kv,
             sync_barrier_id=1,
             score_seed_owner=tmem_s0,
-            sage_k_scales=sage_k_scales1,
             name="tmemS1",
             sage_scales_ptr=sage_scales_ptr,
         )
@@ -1325,7 +1323,6 @@ def _build_decode_gen_schedule(
         cfg=cfg,
         scale_softmax_log2=scale_softmax_log2,
         use_variable_seqlens_kv=use_runtime_seqlens_kv,
-        sage_k_scales=sage_k_scales0,
         name="smemP0",
     )
     smem_p1 = None
@@ -1336,7 +1333,6 @@ def _build_decode_gen_schedule(
             cfg=cfg,
             scale_softmax_log2=scale_softmax_log2,
             use_variable_seqlens_kv=use_runtime_seqlens_kv,
-            sage_k_scales=sage_k_scales1,
             name="smemP1",
         )
 
@@ -1430,7 +1426,7 @@ def _build_decode_gen_schedule(
         active_splits_kv=active_splits_kv,
         static_full_split_prefix=static_full_split_prefix,
         name="tmemCorr0",
-        sage_v_scales=sage_v_scales,
+        sage_v_scales_ref=sage_v_scales,
     )
     tmem_corr0.tmem_o_ref = tmem_o
     tmem_corr0.softmax_local0_ref = tmem_softmax_local0
@@ -1459,7 +1455,7 @@ def _build_decode_gen_schedule(
             active_splits_kv=active_splits_kv,
             static_full_split_prefix=static_full_split_prefix,
             name="tmemCorr1",
-            sage_v_scales=sage_v_scales,
+            sage_v_scales_ref=sage_v_scales,
         )
         tmem_corr1.smem_p0_ref = smem_p0
         tmem_corr1.smem_p1_ref = smem_p1

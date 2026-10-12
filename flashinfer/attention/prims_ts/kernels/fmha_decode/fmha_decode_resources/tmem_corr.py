@@ -121,9 +121,10 @@ class TmemCorrResource(DecodeGenResourceBase):
     partial_stats_ptr: cute.Pointer = None
     split_kv_counter_ptr: cute.Pointer = None
     attention_sinks_ptr: cute.Pointer = None
-    # The correction task's staged ``sfV`` / ``v_mean`` resource; ``None``
+    # The ``sfV`` / ``v_mean`` block the correction task stages per work tile;
+    # the schedule waits and releases it, the epilogue only reads it. ``None``
     # without Sage attention.
-    sage_v_scales: SageVScalesResource | None = None
+    sage_v_scales_ref: Constexpr[SageVScalesResource | None] = None
     seqlens_kv: cute.Pointer = None
     max_seq_len_kv: Constexpr[int] = 0
     seq_len_q: Int32 = None
@@ -216,7 +217,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         )
         self._sage_v_scales = _placeholder_smem_array(
             Float32,
-            self.sage_v_scales.entries if self.sage_v_scales is not None else 1,
+            self.sage_v_scales_ref.entries if self.sage_v_scales_ref is not None else 1,
         )
 
     def _owns_final_epilogue(self) -> bool:
@@ -960,7 +961,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         cfg = self.cfg
         if cutlass.const_expr(not cfg.use_sage_attention):
             return norm_scale
-        v_scales, v_means = self.sage_v_scales.channel_scales(
+        v_scales, v_means = self.sage_v_scales_ref.channel_scales(
             self._sage_v_scales, first_col=first_col, count=count
         )
         if cutlass.const_expr(cfg.sage_v_mean):
@@ -1332,9 +1333,9 @@ class TmemCorrResource(DecodeGenResourceBase):
         if cutlass.const_expr(
             context is not None
             and context.smem_base is not None
-            and self.sage_v_scales is not None
+            and self.sage_v_scales_ref is not None
         ):
-            self._sage_v_scales = self.sage_v_scales.staged(context)
+            self._sage_v_scales = self.sage_v_scales_ref.staged(context)
         return {}
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
