@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include <cstdint>
+#include <limits>
 
 #include "flashinfer/gemm/nvfp4_smooth_quantize_sm100.cuh"
 #if defined(FLASHINFER_ENABLE_SVDQ_SM120_K1_K2_FUSION)
@@ -87,6 +88,10 @@ void nvfp4_quantize_smooth(TensorView x, TensorView pqs, TensorView global_scale
   CHECK_DEVICE(sf, x);
 
   TVM_FFI_ICHECK_EQ(x.ndim(), 2) << "x must be [m, n]";
+  TVM_FFI_ICHECK(x.size(0) >= 0 && x.size(0) <= std::numeric_limits<int>::max())
+      << "m must fit in int32";
+  TVM_FFI_ICHECK(x.size(1) >= 0 && x.size(1) <= std::numeric_limits<int>::max())
+      << "n must fit in int32";
   int const m = static_cast<int>(x.size(0));
   int const n = static_cast<int>(x.size(1));
   TVM_FFI_ICHECK_EQ(n % 16, 0) << "n must be divisible by 16 (NVFP4 SF vector size)";
@@ -99,7 +104,7 @@ void nvfp4_quantize_smooth(TensorView x, TensorView pqs, TensorView global_scale
   // Swizzled 128x4 SF layout: rows padded to a multiple of 128, SF columns (n/16) to a multiple
   // of 4.
   int64_t const sfSize =
-      static_cast<int64_t>((m + 128 - 1) / 128 * 128) * ((n / 16 + 4 - 1) / 4 * 4);
+      (static_cast<int64_t>(m) + 127) / 128 * 128 * ((n / 16 + 3) / 4 * 4);
   TVM_FFI_ICHECK_GE(sf.numel(), sfSize)
       << "sf is smaller than the required swizzled scale layout (" << sfSize << " bytes)";
 
@@ -156,6 +161,10 @@ void check_sm120_prefix_inputs(TensorView x, TensorView pqs, TensorView global_s
   CHECK_DEVICE(down, x);
 
   TVM_FFI_ICHECK_EQ(x.ndim(), 2) << "x must be 2-D [m, k]";
+  TVM_FFI_ICHECK(x.size(0) >= 0 && x.size(0) <= std::numeric_limits<int>::max() - 127)
+      << "m padded to a multiple of 128 must fit in int32";
+  TVM_FFI_ICHECK(x.size(1) >= 0 && x.size(1) <= std::numeric_limits<int>::max())
+      << "k must fit in int32";
   int const m = static_cast<int>(x.size(0));
   int const k = static_cast<int>(x.size(1));
   TVM_FFI_ICHECK_EQ(pqs.numel(), k) << "pqs must have k elements";
@@ -167,7 +176,7 @@ void check_sm120_prefix_inputs(TensorView x, TensorView pqs, TensorView global_s
   TVM_FFI_ICHECK_EQ(xq.ndim(), 2) << "xq must be [m, k/2]";
   TVM_FFI_ICHECK_EQ(xq.size(0), m) << "xq must be [m, k/2]";
   TVM_FFI_ICHECK_EQ(xq.size(1), k / 2) << "xq must be [m, k/2]";
-  int64_t const sfSize = static_cast<int64_t>((m + 127) / 128 * 128) * (k / 16);
+  int64_t const sfSize = (static_cast<int64_t>(m) + 127) / 128 * 128 * (k / 16);
   TVM_FFI_ICHECK_GE(sf.numel(), sfSize)
       << "sf is smaller than the required swizzled scale layout (" << sfSize << " bytes)";
   TVM_FFI_ICHECK_EQ(down.ndim(), 2) << "down must be [m, rank]";

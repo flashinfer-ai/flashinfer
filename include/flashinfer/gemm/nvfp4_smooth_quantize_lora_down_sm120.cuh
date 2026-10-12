@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <limits>
 
 #include "flashinfer/gemm/nvfp4_smooth_quantize_sm100.cuh"
 
@@ -295,15 +296,16 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
   constexpr int kDownWarps = BlockThreads / 32;
   int const kSfCols = K / quant::SF_VEC_SIZE;
   int const kDownKPerWarp = K / kDownWarps;
-  int const kL2PrefetchLines = K * kRank * static_cast<int>(sizeof(quant::Type)) / kL2PrefetchBytes;
+  std::int64_t const kL2PrefetchLines =
+      static_cast<std::int64_t>(K) * kRank * sizeof(quant::Type) / kL2PrefetchBytes;
   constexpr int kNFragments = DownTileCols / kMmaN;
   constexpr int kDownNTiles = kRank / DownTileCols;
   constexpr int kDownElements = 16 * DownTileCols;
 
   int const block = static_cast<int>(blockIdx.x);
   if (block < kQuantBlocks) {
-    for (int line = block * BlockThreads + static_cast<int>(threadIdx.x); line < kL2PrefetchLines;
-         line += kQuantBlocks * BlockThreads) {
+    for (std::int64_t line = static_cast<std::int64_t>(block) * BlockThreads + threadIdx.x;
+         line < kL2PrefetchLines; line += static_cast<std::int64_t>(kQuantBlocks) * BlockThreads) {
       std::uint8_t const* prefetch_address =
           reinterpret_cast<std::uint8_t const*>(l2t_smoothed) + line * kL2PrefetchBytes;
       asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_address));
@@ -312,7 +314,7 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
     float const scale = global_scale[0];
     int const row_base = block * RowsPerQuantBlock;
     int const kWorkItems = RowsPerQuantBlock * kSfCols;
-    for (int item = static_cast<int>(threadIdx.x); item < kWorkItems; item += BlockThreads) {
+    for (std::int64_t item = threadIdx.x; item < kWorkItems; item += BlockThreads) {
       int const row_offset = item / kSfCols;
       int const sf_col = item - row_offset * kSfCols;
       int const row = row_base + row_offset;
@@ -378,24 +380,29 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
     std::uint32_t a2 = 0u;
     std::uint32_t a3 = 0u;
     if (a_row < M) {
-      quant::Type const* a_base = x + a_row * K + k_base + pair_col;
+      quant::Type const* a_base = x + static_cast<std::int64_t>(a_row) * K + k_base + pair_col;
       a0 = base::load_bf16_pair(a_base);
       a2 = base::load_bf16_pair(a_base + 8);
     }
     if (a_row + 8 < M) {
-      quant::Type const* a_upper = x + (a_row + 8) * K + k_base + pair_col;
+      quant::Type const* a_upper =
+          x + (static_cast<std::int64_t>(a_row) + 8) * K + k_base + pair_col;
       a1 = base::load_bf16_pair(a_upper);
       a3 = base::load_bf16_pair(a_upper + 8);
     }
 
-    quant::Type const* b_base = l2t_smoothed + (k_base + pair_col) * kRank + b_col;
+    quant::Type const* b_base =
+        l2t_smoothed + (static_cast<std::int64_t>(k_base) + pair_col) * kRank + b_col;
 #pragma unroll
     for (int fragment = 0; fragment < kNFragments; ++fragment) {
       std::uint32_t b0;
       std::uint32_t b1;
       if constexpr (PackedL2T) {
-        int const packed_index =
-            (((k_base / 16 * kDownNTiles + tile_n) * kNFragments + fragment) * 32) + lane;
+        std::int64_t const packed_index =
+            (((static_cast<std::int64_t>(k_base) / 16 * kDownNTiles + tile_n) * kNFragments +
+              fragment) *
+             32) +
+            lane;
         uint2 const packed_b = reinterpret_cast<uint2 const*>(l2t_smoothed)[packed_index];
         b0 = packed_b.x;
         b1 = packed_b.y;
@@ -430,7 +437,7 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
     int const row = tile_m * 16 + element / DownTileCols;
     int const col = tile_n * DownTileCols + element % DownTileCols;
     if (row < M) {
-      down[row * kRank + col] = __float2bfloat16_rn(accum);
+      down[static_cast<std::int64_t>(row) * kRank + col] = __float2bfloat16_rn(accum);
     }
   }
 #else
@@ -458,7 +465,10 @@ inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quan
     return cudaErrorInvalidValue;
   } else {
     // What SmallMLaunchGeometry asserted at compile time is a precondition here.
-    if (m <= 0 || RowsPerQuantBlock <= 0) return cudaErrorInvalidValue;
+    if (m <= 0 || m > std::numeric_limits<int>::max() - 127 || k <= 0 ||
+        RowsPerQuantBlock <= 0) {
+      return cudaErrorInvalidValue;
+    }
     if (k % kDownWarps || (k / kDownWarps) % 16) return cudaErrorInvalidValue;
     if (k % (4 * quant::SF_VEC_SIZE)) return cudaErrorInvalidValue;
     int const padded_m = (m + 127) / 128 * 128;
@@ -647,9 +657,10 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
   }
   if constexpr (LongK) {
     constexpr int kL2PrefetchBytes = 128;
-    int const kL2Bytes = K * kRank * static_cast<int>(sizeof(quant::Type));
-    int const kL2PrefetchLines = kL2Bytes / kL2PrefetchBytes;
-    int const prefetch_line = static_cast<int>(blockIdx.x) * BlockThreads + thread;
+    std::int64_t const kL2Bytes = static_cast<std::int64_t>(K) * kRank * sizeof(quant::Type);
+    std::int64_t const kL2PrefetchLines = kL2Bytes / kL2PrefetchBytes;
+    std::int64_t const prefetch_line =
+        static_cast<std::int64_t>(blockIdx.x) * BlockThreads + thread;
     if (prefetch_line < kL2PrefetchLines) {
       std::uint8_t const* prefetch_address =
           reinterpret_cast<std::uint8_t const*>(l2t_smoothed) + prefetch_line * kL2PrefetchBytes;
@@ -715,7 +726,7 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
 
         int const b_col = warp * 8 + group;
         int const b_row = tile_k + local_k + pair_col;
-        quant::Type const* b_base = l2t_smoothed + b_row * kRank + b_col;
+        quant::Type const* b_base = l2t_smoothed + static_cast<std::int64_t>(b_row) * kRank + b_col;
         std::uint32_t const b0 = base::pack_bf16_pair(b_base, b_base + kRank);
         std::uint32_t const b1 = base::pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
         base::mma_m16n8k16_row_col(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
@@ -827,49 +838,49 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
     int const row1 = row0 + 8;
     int const col = warp * 8 + pair_col;
     if (row0 < M) {
-      store_down_pair<kUsePackedDownStore>(down + row0 * kRank + col, d0, d1);
+      store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row0) * kRank + col, d0, d1);
     }
     if (row1 < M) {
-      store_down_pair<kUsePackedDownStore>(down + row1 * kRank + col, d2, d3);
+      store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row1) * kRank + col, d2, d3);
     }
     if constexpr (kKernelTileM >= 32) {
       int const row2 = row0 + 16;
       int const row3 = row0 + 24;
       if (row2 < M) {
-        store_down_pair<kUsePackedDownStore>(down + row2 * kRank + col, d4, d5);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row2) * kRank + col, d4, d5);
       }
       if (row3 < M) {
-        store_down_pair<kUsePackedDownStore>(down + row3 * kRank + col, d6, d7);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row3) * kRank + col, d6, d7);
       }
     }
     if constexpr (kKernelTileM >= 48) {
       int const row4 = row0 + 32;
       int const row5 = row0 + 40;
       if (row4 < M) {
-        store_down_pair<kUsePackedDownStore>(down + row4 * kRank + col, d8, d9);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row4) * kRank + col, d8, d9);
       }
       if (row5 < M) {
-        store_down_pair<kUsePackedDownStore>(down + row5 * kRank + col, d10, d11);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row5) * kRank + col, d10, d11);
       }
     }
     if constexpr (kKernelTileM >= 64) {
       int const row6 = row0 + 48;
       int const row7 = row0 + 56;
       if (row6 < M) {
-        store_down_pair<kUsePackedDownStore>(down + row6 * kRank + col, d12, d13);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row6) * kRank + col, d12, d13);
       }
       if (row7 < M) {
-        store_down_pair<kUsePackedDownStore>(down + row7 * kRank + col, d14, d15);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row7) * kRank + col, d14, d15);
       }
     }
     if constexpr (kKernelTileM >= 80) {
       int const row8 = row0 + 64;
       int const row9 = row0 + 72;
       if (row8 < M) {
-        store_down_pair<kUsePackedDownStore>(down + row8 * kRank + col, d16, d17);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row8) * kRank + col, d16, d17);
       }
       if (row9 < M) {
-        store_down_pair<kUsePackedDownStore>(down + row9 * kRank + col, d18, d19);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row9) * kRank + col, d18, d19);
       }
     }
   }
@@ -907,13 +918,18 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
     return cudaErrorInvalidValue;
   } else {
     // What the templated kernel asserted at compile time is a precondition here.
+    if (m < 0 || m > std::numeric_limits<int>::max() - 127 || k <= 0) {
+      return cudaErrorInvalidValue;
+    }
     if (k % TileK != 0) return cudaErrorInvalidValue;
     if (LongK != (k >= 8192)) return cudaErrorInvalidValue;
     int const padded_m = (m + 127) / 128 * 128;
     int const grid_blocks = (padded_m + kKernelTileM - 1) / kKernelTileM;
     if constexpr (LongK) {
-      int const l2_lines = k * kRank * static_cast<int>(sizeof(quant::Type)) / 128;
-      if (grid_blocks * BlockThreads < l2_lines) return cudaErrorInvalidValue;
+      std::int64_t const l2_lines = static_cast<std::int64_t>(k) * kRank * sizeof(quant::Type) / 128;
+      if (static_cast<std::int64_t>(grid_blocks) * BlockThreads < l2_lines) {
+        return cudaErrorInvalidValue;
+      }
     }
     nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel<BlockThreads, LongK, kKernelTileM,
                                                              TileK, Policy, Rank>
