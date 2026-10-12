@@ -1889,9 +1889,8 @@ def top_k_varlen(
                               output (``page_table``) is decode mode only,
                               hint-free (no ``pre_idx``) and indices only (no
                               ``return_values``); ``page_size`` is part of its
-                              warm-up
-                              key, so warm up each paged geometry with one
-                              eager paged call on the capturing stream.
+                              warm-up key, so warm up each paged geometry with
+                              one eager paged call on the capturing stream.
         ``"radix_cutlass"`` — Masked CUTLASS radix top-K.
                               Every GPU FlashInfer supports (SM75 and up).
                               fp32, bf16 or fp16; contiguous ``logits``; no
