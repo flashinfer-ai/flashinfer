@@ -712,6 +712,8 @@ class MegaMoEBf16Nvfp4SymmBuffer:
     )
     fc1_norm_const: Optional[torch.Tensor] = None
     _use_fc1_norm_const: bool = False
+    _unfinalized_route_map: torch.Tensor | None = None
+    _unfinalized_weights: torch.Tensor | None = None
 
     @property
     def kernel_combine_output(self) -> torch.Tensor:
@@ -724,6 +726,8 @@ class MegaMoEBf16Nvfp4SymmBuffer:
     def destroy(self) -> None:
         if not self._destroyed:
             self._staging_inputs = None
+            self._unfinalized_route_map = None
+            self._unfinalized_weights = None
             self._frontend.release()
             for root in self._sym_roots:
                 free_sym_tensor(root)

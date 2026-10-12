@@ -127,7 +127,6 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             hidden_size=fleet_params.token_hidden_size,
             kind=k.kind,
             fp8_scale_mode=k.fp8_scale_mode,
-            gate_up_clamp=_resolve_gate_up_clamp(k),
             fc1_activation_dequant_scale=k.fc1_activation_dequant_scale,
             fc2_activation_dequant_scale=k.fc2_activation_dequant_scale,
         )
@@ -163,6 +162,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
             fp8_scale_mode=k.fp8_scale_mode,
+            gate_up_clamp=_resolve_gate_up_clamp(k),
         )
 
     def _has_explicit_geometry(self) -> bool:
