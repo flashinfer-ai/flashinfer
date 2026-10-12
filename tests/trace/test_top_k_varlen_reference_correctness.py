@@ -4,15 +4,18 @@ import pytest
 import torch
 
 from tests.trace.reference_utils import _check
+from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
-@pytest.mark.parametrize(
-    "shape_kwargs",
-    [
-        dict(batch_size=8, max_seq_len=4096, top_k=512),
-        dict(batch_size=32, max_seq_len=8192, top_k=1024),
-    ],
+@parametrize_product(
+    {
+        "shape_kwargs": [
+            dict(batch_size=8, max_seq_len=4096, top_k=512),
+            dict(batch_size=32, max_seq_len=8192, top_k=1024),
+        ],
+    },
+    regular=pairwise_product_cases,
 )
 def test_top_k_varlen_reference_correctness(shape_kwargs):
     """flashinfer.top_k_varlen (radix_cutlass backend) vs reference."""
