@@ -525,6 +525,7 @@ def _selected_nodes(
             solo=bool(node.get("solo", False)),
             long_running=bool(node.get("long_running", False)),
             gpu_exclusive=bool(node.get("gpu_exclusive", False)),
+            host_memory_heavy=bool(node.get("host_memory_heavy", False)),
         )
         for node in raw_nodes
     ]
@@ -1085,33 +1086,47 @@ class _ShardProgress:
 
 
 @dataclass
-class _GpuGate:
-    """Reserve one GPU through batch setup, execution and process cleanup."""
+class _ResourceGate:
+    """Acquire host and GPU capacity together; keep light work concurrent."""
 
     condition: threading.Condition = field(default_factory=threading.Condition)
-    active: int = 0
-    exclusive: bool = False
-    waiting_exclusive: int = 0
+    active: Counter[str | None] = field(default_factory=Counter)
+    exclusive: set[str | None] = field(default_factory=set)
+    waiting_exclusive: Counter[str | None] = field(default_factory=Counter)
+    host_heavy_active: bool = False
 
     @contextmanager
-    def reserve(self, exclusive: bool) -> Iterator[None]:
+    def reserve(
+        self, device: str | None, *, gpu_exclusive: bool, host_memory_heavy: bool
+    ) -> Iterator[None]:
         with self.condition:
-            self.waiting_exclusive += int(exclusive)
+            self.waiting_exclusive[device] += int(gpu_exclusive)
             try:
                 self.condition.wait_for(
-                    lambda: not self.exclusive
-                    and (self.active == 0 if exclusive else self.waiting_exclusive == 0)
+                    lambda: not (host_memory_heavy and self.host_heavy_active)
+                    and device not in self.exclusive
+                    and (
+                        self.active[device] == 0
+                        if gpu_exclusive
+                        else self.waiting_exclusive[device] == 0
+                    )
                 )
-                self.active += 1
-                self.exclusive = exclusive
+                self.active[device] += 1
+                if gpu_exclusive:
+                    self.exclusive.add(device)
+                if host_memory_heavy:
+                    self.host_heavy_active = True
             finally:
-                self.waiting_exclusive -= int(exclusive)
+                self.waiting_exclusive[device] -= int(gpu_exclusive)
         try:
             yield
         finally:
             with self.condition:
-                self.active -= 1
-                self.exclusive = False
+                self.active[device] -= 1
+                if gpu_exclusive:
+                    self.exclusive.remove(device)
+                if host_memory_heavy:
+                    self.host_heavy_active = False
                 self.condition.notify_all()
 
 
@@ -1130,7 +1145,8 @@ class _ShardExecutor:
     long_running_sources: frozenset[str]
     progress: _ShardProgress
     gpu_exclusive_sources: frozenset[str] = frozenset()
-    gpu_gates: dict[str | None, _GpuGate] = field(default_factory=dict)
+    host_memory_heavy_sources: frozenset[str] = frozenset()
+    resource_gate: _ResourceGate = field(default_factory=_ResourceGate)
     long_work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
     normal_work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
     solo_units: list[Unit] = field(default_factory=list)
@@ -1142,7 +1158,6 @@ class _ShardExecutor:
     stop_workers: threading.Event = field(default_factory=threading.Event)
 
     def add_units(self, units: list[Unit]) -> None:
-        self.gpu_gates = {device: _GpuGate() for device in self.devices}
         self.all_non_solo_units = [
             unit for unit in units if not self._unit_is_solo(unit)
         ]
@@ -1235,13 +1250,30 @@ class _ShardExecutor:
                     if batch.id not in before
                 )
                 try:
-                    exclusive = any(
+                    gpu_exclusive = any(
                         batch.source_file in self.gpu_exclusive_sources
                         for batch in unit.batches
                     )
-                    with self.gpu_gates[device].reserve(exclusive):
+                    host_memory_heavy = any(
+                        batch.source_file in self.host_memory_heavy_sources
+                        for batch in unit.batches
+                    )
+                    wait_started = time.monotonic()
+                    with self.resource_gate.reserve(
+                        device,
+                        gpu_exclusive=gpu_exclusive,
+                        host_memory_heavy=host_memory_heavy,
+                    ):
                         if self.stop_workers.is_set():
                             return
+                        waited = time.monotonic() - wait_started
+                        if waited >= 1:
+                            write_console(
+                                f"RESOURCE WAIT worker={index} device={device} "
+                                f"source={unit.batches[0].source_file} "
+                                f"elapsed={waited:.3f}s gpu_exclusive={gpu_exclusive} "
+                                f"host_memory_heavy={host_memory_heavy}"
+                            )
                         self._report_worker_task(index, unit, pending_nodes, solo=False)
                         self._execute_unit(index, unit, solo=False)
                         stats.update(self._new_unit_outcomes(unit, before))
@@ -1324,7 +1356,9 @@ class _ShardExecutor:
 
     def _unit_is_long_running(self, unit: Unit) -> bool:
         return any(
-            batch.source_file in self.long_running_sources for batch in unit.batches
+            batch.source_file in self.long_running_sources
+            or batch.source_file in self.host_memory_heavy_sources
+            for batch in unit.batches
         )
 
     def _non_solo_finalized(self) -> bool:
@@ -1715,6 +1749,9 @@ def execute_shard(
             ),
             gpu_exclusive_sources=frozenset(
                 node.source_file for node in plan.nodes if node.gpu_exclusive
+            ),
+            host_memory_heavy_sources=frozenset(
+                node.source_file for node in plan.nodes if node.host_memory_heavy
             ),
             progress=_ShardProgress(
                 shard_index=execution.shard_index,

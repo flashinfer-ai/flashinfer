@@ -1427,7 +1427,7 @@ def test_regular():
     assert (state / "regular-devices").read_text(encoding="utf-8") in {"0", "1"}
 
 
-def test_gpu_sharing_respects_gpu_and_runner_exclusivity(tmp_path: Path) -> None:
+def test_gpu_sharing_respects_gpu_host_and_runner_exclusivity(tmp_path: Path) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
     state = tmp_path / "gpu-state"
@@ -1437,6 +1437,7 @@ import fcntl
 import json
 import os
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
@@ -1449,13 +1450,24 @@ if MODE != "shared":
 def reserve_memory():
     state = Path(os.environ["GPU_STATE"])
     device = os.environ["CUDA_VISIBLE_DEVICES"]
-    with (state / "runner.lock").open("a") as host_lock:
+    with ExitStack() as stack:
+        host_lock = stack.enter_context((state / "runner.lock").open("a"))
         host_mode = fcntl.LOCK_EX if MODE == "solo" else fcntl.LOCK_SH
         fcntl.flock(host_lock, host_mode | fcntl.LOCK_NB)
+        if MODE == "host_memory_heavy":
+            heavy_lock = stack.enter_context((state / "host-heavy.lock").open("a"))
+            fcntl.flock(heavy_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         with (state / (device + ".lock")).open("a") as gpu_lock:
-            gpu_mode = fcntl.LOCK_SH if MODE == "shared" else fcntl.LOCK_EX
+            gpu_mode = fcntl.LOCK_EX if MODE in ("solo", "gpu_exclusive") else fcntl.LOCK_SH
             fcntl.flock(gpu_lock, gpu_mode | fcntl.LOCK_NB)
             start = time.time()
+            if MODE == "shared":
+                (state / "light-seen").touch()
+            if MODE == "host_memory_heavy":
+                deadline = time.monotonic() + 10
+                while not (state / "light-seen").exists():
+                    assert time.monotonic() < deadline, "host-heavy work blocked light work"
+                    time.sleep(0.01)
             time.sleep(0.05)
             yield
             time.sleep(0.05)
@@ -1466,7 +1478,9 @@ def reserve_memory():
 def test_case():
     time.sleep(0.1)
 """
-    modes = ["gpu_exclusive"] * 4 + ["shared"] * 8 + ["solo"]
+    modes = (
+        ["host_memory_heavy"] * 2 + ["gpu_exclusive"] * 4 + ["shared"] * 8 + ["solo"]
+    )
     for index, mode in enumerate(modes):
         (suite / f"test_{index}.py").write_text(source.format(mode=mode))
     arguments = ("run", suite, "--workers-per-gpu", "2")
@@ -1485,20 +1499,71 @@ def test_case():
         for right in records
         if left[0] == "gpu_exclusive" and right[0] != "solo"
     ), "GPU-exclusive work blocked the other GPU"
+    assert any(
+        max(left[2], right[2]) < min(left[3], right[3])
+        for left in records
+        for right in records
+        if left[0] == "host_memory_heavy" and right[0] == "shared"
+    ), "Host-heavy work blocked light work"
 
     repeated = _run(tmp_path, *arguments, env_override=environment)
     assert repeated.returncode == 0, repeated.stdout + repeated.stderr
     assert "PYTEST BATCH START" not in repeated.stdout
 
 
-def test_gpu_reservation_releases_after_failure() -> None:
-    gate = runner._GpuGate()
-    with pytest.raises(RuntimeError), gate.reserve(True):
+def test_resource_reservation_releases_after_failure() -> None:
+    gate = runner._ResourceGate()
+    with (
+        pytest.raises(RuntimeError),
+        gate.reserve("4", gpu_exclusive=True, host_memory_heavy=True),
+    ):
         raise RuntimeError("batch failed")
-    with gate.reserve(False):
-        assert gate.active == 1
+    with gate.reserve("4", gpu_exclusive=False, host_memory_heavy=True):
+        assert gate.active["4"] == 1
         assert not gate.exclusive
-    assert gate.active == 0
+    assert gate.active["4"] == 0
+    assert not gate.host_heavy_active
+
+
+def test_gpu_wait_does_not_reserve_host_capacity() -> None:
+    gate = runner._ResourceGate()
+    host_started = threading.Event()
+
+    def host_job(device: str) -> None:
+        with gate.reserve(device, gpu_exclusive=True, host_memory_heavy=True):
+            if device == "6":
+                host_started.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        with gate.reserve("4", gpu_exclusive=True, host_memory_heavy=False):
+            blocked = pool.submit(host_job, "4")
+            deadline = time.monotonic() + 2
+            while True:
+                with gate.condition:
+                    if gate.waiting_exclusive["4"]:
+                        break
+                assert time.monotonic() < deadline, "GPU waiter did not start"
+                time.sleep(0.01)
+            free = pool.submit(host_job, "6")
+            assert host_started.wait(2), "GPU waiter reserved the host slot"
+            assert not blocked.done()
+        blocked.result(timeout=2)
+        free.result(timeout=2)
+
+
+def test_host_heavy_file_starts_before_larger_light_file(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_light.py").write_text("def test_one(): pass\ndef test_two(): pass\n")
+    (suite / "test_heavy.py").write_text(
+        "import pytest\npytestmark = pytest.mark.host_memory_heavy\n"
+        "def test_one(): pass\n"
+    )
+    result = _run(tmp_path, "run", suite)
+    assert result.returncode == 0, result.stdout + result.stderr
+    tasks = [line for line in result.stdout.splitlines() if "WORKER TASK" in line]
+    assert "test_heavy.py" in tasks[0]
+    assert all("solo=false" in line for line in tasks)
 
 
 @pytest.mark.parametrize("gpu_count", [1, 2, 4])

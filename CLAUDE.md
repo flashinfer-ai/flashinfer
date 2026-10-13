@@ -140,13 +140,18 @@ workers on four GPUs. Each worker sees one GPU. `--workers N` instead sets the
 total worker count. Both modes share the existing JIT compilation budget.
 
 Use `pytest.mark.gpu_exclusive` for files that must not share their assigned GPU;
-other GPUs can keep running. Use `pytest.mark.solo` for files that must run alone
-across the runner's allocation, including heavy host-memory or multi-GPU tests.
-Both markers apply to the whole source file, including setup and process cleanup.
-The initial H100 policy uses run 38120808880: host RSS above 128 GiB is `solo`,
-GPU memory above 32 GiB is `gpu_exclusive`. Sliding-window tests are also GPU
-exclusive because their resource monitor stopped early. These are measured
-baselines, not enforced memory limits; recheck them when test shapes change.
+other GPUs can keep running. `pytest.mark.host_memory_heavy` front-loads files
+and permits only one marked file at a time, while lighter files keep running.
+Reserve `pytest.mark.solo` for files that must run alone across the allocation.
+These markers cover setup, execution and process cleanup. Host and GPU capacity
+are acquired together, so a file waiting for a GPU cannot hold the host slot.
+
+The H100 policy uses runs 38120808880 and 38310310922: files above 128 GiB host
+RSS are `host_memory_heavy`; files above 32 GiB GPU memory are `gpu_exclusive`.
+The second run measured sliding-window GPU memory at 2 GiB, so it can share.
+These markers are measured baselines, not enforced memory limits. Cold JIT
+compilation can move the host-memory peak between files; recheck both traces.
+`RESOURCE WAIT` records waits of at least one second before a unit starts.
 
 GPU sharing can hide CPU and compilation waits; it does not imply a 2x speedup.
 Run the CPU-only coordinator checks with

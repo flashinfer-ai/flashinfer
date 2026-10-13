@@ -126,6 +126,14 @@ def test_same_source():
         "def test_same_source(): pass\n",
         encoding="utf-8",
     )
+    host_file = tmp_path / "test_host.py"
+    host_file.write_text(
+        "import pytest\n"
+        "@pytest.mark.host_memory_heavy\n"
+        "def test_marked(): pass\n"
+        "def test_same_source(): pass\n",
+        encoding="utf-8",
+    )
 
     collected = _pytest(
         tmp_path,
@@ -135,6 +143,7 @@ def test_same_source():
         str(solo_file),
         str(long_file),
         str(gpu_file),
+        str(host_file),
     )
 
     assert collected.returncode == 0, collected.stdout + collected.stderr
@@ -157,6 +166,12 @@ def test_same_source():
     assert len(gpu_nodes) == 2
     assert all(node["gpu_exclusive"] for node in gpu_nodes)
     assert all(not node["solo"] for node in gpu_nodes)
+    host_nodes = [
+        node for node in collection["nodes"] if "test_host.py::" in node["nodeid"]
+    ]
+    assert len(host_nodes) == 2
+    assert all(node["host_memory_heavy"] for node in host_nodes)
+    assert all(not node["solo"] and not node["gpu_exclusive"] for node in host_nodes)
     assert "PytestUnknownMarkWarning" not in collected.stdout + collected.stderr
 
 

@@ -67,6 +67,10 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers", "gpu_exclusive: run this source alone on its assigned GPU"
     )
+    config.addinivalue_line(
+        "markers",
+        "host_memory_heavy: serialize this source with other host-heavy sources",
+    )
     session_start = time.time()
     state = {
         "session_start": session_start,
@@ -107,6 +111,11 @@ def pytest_collection_modifyitems(
         for item in items
         if item.get_closest_marker("gpu_exclusive") is not None
     }
+    host_memory_heavy_sources = {
+        Path(str(item.path)).resolve()
+        for item in items
+        if item.get_closest_marker("host_memory_heavy") is not None
+    }
     collected = []
     for order, item in enumerate(items):
         node = CollectedNode.from_nodeid(item.nodeid, order, _marker_name(item))
@@ -125,6 +134,7 @@ def pytest_collection_modifyitems(
                 solo=item_path in solo_sources,
                 long_running=item_path in long_running_sources,
                 gpu_exclusive=item_path in gpu_exclusive_sources,
+                host_memory_heavy=item_path in host_memory_heavy_sources,
             )
         )
     collection_path = config.getoption("--flashinfer-collection-json")

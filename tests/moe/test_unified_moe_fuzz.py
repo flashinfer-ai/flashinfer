@@ -267,7 +267,7 @@ _ONLY_SEEDS = os.environ.get("FLASHINFER_UMOE_FUZZ_ONLY_SEED", "")
 # Keep accumulated cases together for CUDA-context regression coverage.
 # H100 CI peak host RSS: 313.6 GiB. Set FLASHINFER_UMOE_FUZZ=0 to disable.
 pytestmark = [
-    pytest.mark.solo,
+    pytest.mark.host_memory_heavy,
     pytest.mark.skipif(
         os.environ.get("FLASHINFER_UMOE_FUZZ", "1") == "0",
         reason="unified MoE fuzzer disabled via FLASHINFER_UMOE_FUZZ=0",
