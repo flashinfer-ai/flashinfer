@@ -991,6 +991,7 @@ def sampling_from_logits(
 ) -> torch.Tensor:
     r"""Fused GPU kernel for category sampling from logits. It's equivalent to sampling
     from the probabilities obtained by applying softmax to :attr:`logits`.
+
     Parameters
     ----------
     logits: torch.Tensor
@@ -1029,11 +1030,13 @@ def sampling_from_logits(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+
     Returns
     -------
     samples: torch.Tensor
         Sampled categories, shape (batch_size,). It's equivalent to sampling from
         :attr:`logits` after applying softmax.
+
     Examples
     --------
     >>> import torch

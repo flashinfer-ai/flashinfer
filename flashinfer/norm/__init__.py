@@ -595,6 +595,7 @@ def layernorm(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     r"""Layer normalization.
+
     Parameters
     ----------
     input: torch.Tensor

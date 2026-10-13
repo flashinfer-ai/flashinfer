@@ -161,6 +161,8 @@ class PcieIpcAllReduceWorkspace:
         directory). Give the same path to both, or a tuned result will not be
         found by the next process.
 
+    Notes
+    -----
     Launch configurations start from a seed default that is workable rather
     than fast (see :mod:`~flashinfer.comm.pcie_ipc_policy`). Tune once to
     replace it with measurements from this machine; the result is persisted and

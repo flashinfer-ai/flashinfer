@@ -650,6 +650,8 @@ class BlockSparseAttentionWrapper:
             Sage FP8 quantization scale for ``v``, shape ``(num_qo_heads, head_dim)``,
             float32. See ``q_scale``.
 
+        Notes
+        -----
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple kernel runs.
