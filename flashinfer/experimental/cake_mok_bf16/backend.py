@@ -62,6 +62,26 @@ class MoKForwardContext(native.MoKForwardContext):
     schedule: native.MoKSchedule
 
 
+def count_routed_load(routes, ep_size, local_experts):
+    """Routed rows per owning rank over the gathered expert ids ``routes``.
+
+    ``routes`` may have any shape; an id ``e`` in ``[0, ep_size * local_experts)``
+    is owned by rank ``e // local_experts``. Negative ids (padding) and ids at or
+    beyond the limit are not counted. Returns an int64 tensor of ``ep_size``
+    counts on the device of ``routes``.
+
+    Compare-and-reduce rather than ``scatter_add_`` or ``torch.bincount``:
+    ``scatter_add_`` issues one global atomic per id on ``ep_size`` addresses
+    and serialises there, and ``bincount`` sizes its output from ``max()`` on
+    the host, a device synchronization. This form has neither; its transient is
+    an ``ep_size`` x ``ids`` boolean tensor.
+    """
+    flat = routes.reshape(-1)
+    owner = torch.div(flat, local_experts, rounding_mode="floor")
+    ranks = torch.arange(ep_size, device=flat.device, dtype=owner.dtype)
+    return (owner.unsqueeze(0) == ranks.unsqueeze(1)).sum(dim=1)
+
+
 def select_comm_split(loads, base, hot, threshold):
     """Communication-SM split for an observed per-rank routed-row ``loads`` sequence.
 
@@ -368,7 +388,7 @@ class MoKFunctional:
         if entry is None and create:
             entry = {
                 "host": [
-                    torch.empty(workspace.ep_size, dtype=torch.int32, pin_memory=True)
+                    torch.empty(workspace.ep_size, dtype=torch.int64, pin_memory=True)
                     for _ in range(2)
                 ],
                 "events": [torch.cuda.Event() for _ in range(2)],
@@ -383,9 +403,9 @@ class MoKFunctional:
     def _observe_load(self, workspace, config):
         """Queue an asynchronous observation of the per-rank routed-row load.
 
-        Every rank counts the gathered expert IDs per owning rank (expert id //
-        local experts; padding and invalid IDs excluded) on device and copies
-        the counts into pinned host memory behind a CUDA event: no host
+        Every rank counts the gathered expert IDs per owning rank
+        (``count_routed_load``: padding and invalid IDs excluded) on device and
+        copies the counts into pinned host memory behind a CUDA event: no host
         synchronization. ``_comm_split`` reads the latest completed observation,
         so a split change takes effect from the first later launch whose event
         has completed. Skipped during CUDA Graph capture: captured launches keep
@@ -397,18 +417,13 @@ class MoKFunctional:
         ):
             return
         entry = self._load_entry(workspace, create=True)
-        routes = workspace.all_gather_top_experts_buffer.reshape(-1)
-        owner = torch.where(
-            (routes >= 0) & (routes < workspace.ep_size * self.local_experts),
-            routes // self.local_experts,
+        loads = count_routed_load(
+            workspace.all_gather_top_experts_buffer,
             workspace.ep_size,
+            self.local_experts,
         )
-        loads = torch.zeros(
-            workspace.ep_size + 1, dtype=torch.int32, device=routes.device
-        )
-        loads.scatter_add_(0, owner.to(torch.int64), torch.ones_like(routes))
         slot = entry["slot"] ^ 1
-        entry["host"][slot].copy_(loads[: workspace.ep_size], non_blocking=True)
+        entry["host"][slot].copy_(loads, non_blocking=True)
         entry["events"][slot].record()
         entry["slot"] = entry["pending"] = slot
 

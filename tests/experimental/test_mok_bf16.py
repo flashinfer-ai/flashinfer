@@ -427,6 +427,27 @@ def test_epilogues(topk, tokens, hidden):
     assert torch.equal(epilogues.backward(shared, routed), expected_dx.bfloat16())
 
 
+def test_count_routed_load_matches_a_reference_count():
+    """Host-only: the per-rank load histogram counts the valid gathered ids by
+    owning rank and ignores padding (-1) and out-of-range ids."""
+    from flashinfer.experimental.cake_mok_bf16.backend import count_routed_load
+
+    ep_size, local_experts = 4, 3
+    routes = torch.tensor(
+        [[0, 5, 11, -1], [3, 3, 12, -7], [8, 9, 10, 11], [-1, -1, -1, 2]],
+        dtype=torch.int32,
+    )
+    expected = [0] * ep_size
+    for e in routes.reshape(-1).tolist():
+        if 0 <= e < ep_size * local_experts:
+            expected[e // local_experts] += 1
+    loads = count_routed_load(routes, ep_size, local_experts)
+    assert loads.dtype == torch.int64
+    assert loads.tolist() == expected == [2, 3, 1, 4]
+    empty = torch.full((6,), -1, dtype=torch.int32)
+    assert count_routed_load(empty, ep_size, local_experts).tolist() == [0] * ep_size
+
+
 def test_select_comm_split_decision_table():
     """Host-only: the imbalance-aware split is a pure function of the observed
     per-rank loads, ``hot`` when max load >= threshold x mean load, else ``base``."""
