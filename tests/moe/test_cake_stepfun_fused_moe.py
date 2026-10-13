@@ -689,7 +689,11 @@ def _native_twin_tactic(
     try:
         twin = native_space.compose(twin_tile, anchor.fc1, fc2)
     except RuntimeError:
-        parent = "" if twin_tile == tile else f", Cake-only tile {tile} twinned with native tile {twin_tile}"
+        parent = (
+            ""
+            if twin_tile == tile
+            else f", Cake-only tile {tile} twinned with native tile {twin_tile}"
+        )
         pytest.fail(
             f"no native tactic pairs the default FC1 configuration {anchor.fc1} of tile {twin_tile} "
             f"with FC2 configuration {fc2} (Cake tactic {list(tactic)}{parent})"
@@ -1441,7 +1445,9 @@ def test_inventory_fc2_records_declare_their_native_twin():
         twin_tile, twin_block_k = _native_config_geometry(name)
         tile_n = int(record["tile_n"])
         assert twin_block_k == int(record["block_k"]), (record["kernel_symbol"], name)
-        assert twin_tile == tile_n or (twin_tile < tile_n and tile_n % twin_tile == 0), (
+        assert twin_tile == tile_n or (
+            twin_tile < tile_n and tile_n % twin_tile == 0
+        ), (
             record["kernel_symbol"],
             name,
         )
