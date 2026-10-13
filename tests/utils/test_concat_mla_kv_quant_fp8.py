@@ -186,16 +186,16 @@ def _assert_fused_byte_exact(T, H, backend="auto"):
         (1, 12, 2, 1, 3),
         (1536, 12, 2, 576, 3),
         (2048, 12, 2, 768, 3),
-        (2049, 12, 3, 513, 2),  # 6 pairs: three per warp (3 + 3, not 4 + 2)
-        (66048, 12, 3, 16512, 2),
-        (4096, 18, 3, 1536, 3),  # 9 pairs: three per warp over three warps
+        (2049, 12, 4, 513, 2),  # 6 pairs: 4 + 2 (the register budget's maximum first)
+        (66048, 12, 4, 16512, 2),
+        (4096, 18, 4, 1536, 3),  # 9 pairs: 4 + 4 + 1 over three warps
         (1536, 24, 2, 1152, 6),
         (16384, 24, 4, 6144, 3),
         (65536, 96, 4, 98304, 12),
         (1, 128, 2, 4, 32),
         (65536, 128, 4, 131072, 16),
         (131072, 128, 4, 262144, 16),
-        (4096, 10, 3, 1024, 2),  # 5 pairs: three then two per warp (not 4 + 1)
+        (4096, 10, 4, 1024, 2),  # 5 pairs: 4 + 1
         (4096, 13, 4, 1024, 2),  # 7 pairs, odd head count (last pair half predicated)
     ],
 )
@@ -321,7 +321,7 @@ def test_byte_exact(T, H, backend):
     """Both fused backends, and the auto route, are byte-exact. 12 heads is the
     specialized kernel's unrolled variant (and auto's pick); 8 heads its
     runtime-head-count variant (auto picks Cake). Cake: 12 heads is two pairs
-    per warp up to 2048 tokens, three above; 8 heads two, then four."""
+    per warp up to 2048 tokens, 4 + 2 above; 8 heads two, then four."""
     _assert_fused_byte_exact(T, H, backend)
 
 
