@@ -46,6 +46,8 @@ QSC = 16.0  # Q prescale before fp8 quantization
 LOG2E = 1.4426950408889634
 KVBYTES = PG * D  # bytes of one fp8 (128,128) tile
 NEG = 1.0e30  # mask sentinel (finite: keeps the running max finite)
+F8_LO = -448.0  # e4m3 finite range; clamping maps NaN into it
+F8_HI = 448.0
 OSTR = 136  # padded bf16 row stride of the smem epilogue buffer
 SPAD = 144  # padded fp8 smem row stride in the transpose pre-pass
 
@@ -145,7 +147,15 @@ class VTranspose:
             kc = 4 * (cutlass.Int32(tidx) // D) + kci
             r0 = 32 * (kc // 2) + (kc % 2)
             for i in cutlass.range_constexpr(16):
-                vb[0, i] = sInC[r0 + 8 * (i % 4) + 2 * (i // 4)]
+                # Defensive NaN clamp on V. The causal mask only sanitizes the
+                # SCORES; a NaN in V survives it because 0 * NaN = NaN in the PV
+                # matmul, so page bytes past seqused_k would poison the output.
+                # fmax(NaN, x) returns x (IEEE maxNum). Cheap here: the transpose
+                # is a memory-bound copy run once per page, not once per
+                # (page, query-tile) visit.
+                xv = cutlass.Float32(sInC[r0 + 8 * (i % 4) + 2 * (i // 4)])
+                xv = cute.arch.fmin(cute.arch.fmax(xv, F8_LO), F8_HI)
+                vb[0, i] = xv.to(f8)
             cute.autovec_copy(vb, cute.make_tensor(sOut + d * SPAD + kc * 16, l16))
 
         cute.arch.sync_threads()
@@ -173,11 +183,20 @@ def _acc_to_fp8_A(acc):
 # --- plain-Python (undecorated) helpers: trace-time loops, safe to call from
 # --- inside a dynamic `if` where range_constexpr is rejected.
 def _mask_half(i, acc_s, klim):
-    """Causal mask for row half i: column 8k+q of this thread is >= klim."""
+    """Causal mask for row half i: column 8k+q of this thread is >= klim.
+
+    The block that straddles the end of the sequence carries page bytes past
+    seqused_k which may be NaN, and NaN + -NEG is still NaN, so the additive mask
+    alone leaks it into the softmax. An fmax clamp ahead of it clears the NaN.
+    """
     f32 = cutlass.Float32
     for k in range(PG // 8):
         for q in range(2):
             e = 4 * k + 2 * i + q
+            # Clamp first: fmax(NaN, x) returns x (IEEE maxNum), so this clears a
+            # NaN read from page bytes past seqused_k. The additive mask below is
+            # unchanged -- NaN + -NEG would have stayed NaN.
+            acc_s[e] = cute.arch.fmax(f32(acc_s[e]), f32(-NEG))
             acc_s[e] = acc_s[e] + cute.arch.fmin(
                 f32(0.0), (klim - float(8 * k + q)) * f32(NEG)
             )
@@ -219,7 +238,22 @@ class MsaSparseAttnFp8:
 
     @cute.jit
     def __call__(
-        self, pq, pkv, pvt, pidx, ppt, ppfx, po, tq, npg, sq, gps, mpg, ngrp, stream
+        self,
+        pq,
+        pkv,
+        pvt,
+        pidx,
+        ppt,
+        ppfx,
+        psk,
+        po,
+        tq,
+        npg,
+        sq,
+        gps,
+        mpg,
+        ngrp,
+        stream,
     ):
         f8 = self.f8
         mQ = _bf16t(pq, tq, self.hq)
@@ -228,6 +262,7 @@ class MsaSparseAttnFp8:
         mIdx = _i32t(pidx, (self.hkv, tq, TOPK), (tq * TOPK, TOPK, 1))
         mPT = _i32t(ppt, (16, mpg), (mpg, 1))
         mPfx = _i32t(ppfx, 16, 1)
+        mSeq = _i32t(psk, 16, 1)
         qk_mma = sm90_utils.make_trivial_tiled_mma(
             f8,
             f8,
@@ -313,6 +348,7 @@ class MsaSparseAttnFp8:
             mIdx,
             mPT,
             mPfx,
+            mSeq,
             mO,
             lQ,
             lK,
@@ -360,7 +396,15 @@ class MsaSparseAttnFp8:
             kc = 4 * (cutlass.Int32(tidx) // D) + kci
             r0 = 32 * (kc // 2) + (kc % 2)
             for i in cutlass.range_constexpr(16):
-                vb[0, i] = sInC[r0 + 8 * (i % 4) + 2 * (i // 4)]
+                # Defensive NaN clamp on V. The causal mask only sanitizes the
+                # SCORES; a NaN in V survives it because 0 * NaN = NaN in the PV
+                # matmul, so page bytes past seqused_k would poison the output.
+                # fmax(NaN, x) returns x (IEEE maxNum). Cheap here: the transpose
+                # is a memory-bound copy run once per page, not once per
+                # (page, query-tile) visit.
+                xv = cutlass.Float32(sInC[r0 + 8 * (i % 4) + 2 * (i // 4)])
+                xv = cute.arch.fmin(cute.arch.fmax(xv, F8_LO), F8_HI)
+                vb[0, i] = xv.to(f8)
             cute.autovec_copy(vb, cute.make_tensor(sOut + d * SPAD + kc * 16, l16))
 
         cute.arch.sync_threads()
@@ -385,6 +429,7 @@ class MsaSparseAttnFp8:
         mIdx,
         mPT,
         mPfx,
+        mSeq,
         mO,
         lQ,
         lK,
@@ -482,12 +527,27 @@ class MsaSparseAttnFp8:
         # -- the KV cache is many times L2 on the long-context shapes.
         ent = cutlass.Int32(tidx) % nt
         v0 = cutlass.Int32(-1)
+        # Largest KV block this tile can causally see. qbase + nvalid - 1 is the
+        # last query position in the group, and prefix_lens was built as
+        # seqused_k - qlen, so this is exactly (seqused_k - 1) // PG for the final
+        # group. Selected blocks above it contribute nothing after the causal
+        # mask, so admitting them only costs a TMA page fetch and a WGMMA -- and
+        # makes the kernel read page bytes past the end of the sequence, which
+        # are uninitialized and may be NaN.
+        # Two different bounds, and we need the tighter of both:
+        #   causal   -- a query at p sees keys 0..p
+        #   validity -- KV past seqused_k is uninitialized page memory
+        # prefix_lens is only seqused_k - qlen when the dispatcher derives it; an
+        # explicit q_offset breaks that, so take seqused_k from the caller rather
+        # than rederiving it.
+        kmax = cutlass.min(qbase + nvalid - 1, mSeq[b] - 1) // PG
         if tidx < nent:
             umsk[tidx] = cutlass.Int32(0)
             if ent < nvalid:
                 v1 = mIdx[hkv, tok0 + ent, cutlass.Int32(tidx) // nt]
                 if v1 >= 0:
-                    v0 = v1
+                    if v1 <= kmax:
+                        v0 = v1
         if v0 >= 0:
             cute.arch.atomic_or(
                 ubits.iterator + (v0 >> 5), cutlass.Int32(1) << (v0 & 31), scope="cta"
@@ -748,6 +808,7 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
     pidx = _I64(q2k_indices.data_ptr())
     ppt = _I64(page_table.data_ptr())
     ppfx = _I64(prefix_lens.data_ptr())
+    psk = _I64(seqused_k.data_ptr())
     po = _I64(out.data_ptr())
     if plan is None:
         hq, hkv, npg, tq, nb, mpg = (int(v) for v in sig)
@@ -769,6 +830,7 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
                 pidx,
                 ppt,
                 ppfx,
+                psk,
                 po,
                 Tq,
                 Npg,
@@ -790,6 +852,7 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
         pidx,
         ppt,
         ppfx,
+        psk,
         po,
         Tq,
         Npg,
