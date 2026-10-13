@@ -1741,25 +1741,110 @@ def test_nvfp4_cutedsl_mega_kernel_is_registered():
     assert kernel.kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
 
-def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
-    """The TRT-LLM-import knobs are plumbed through the FI backend config."""
-    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+@pytest.mark.parametrize(
+    "config_name,kernel_name",
+    [
+        (
+            "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+            "sm100_nvfp4_nvfp4_bf16_cutedsl",
+        ),
+        (
+            "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
+            "sm100_bf16_bf16_bf16_cutedsl",
+        ),
+        (
+            "Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+            "sm100_bf16_nvfp4_bf16_cutedsl",
+        ),
+    ],
+)
+def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
+    """Caller finalization is an explicit opt-in for each CuTe-DSL backend."""
+    from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
-    cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+    config_cls = getattr(moe_ep, config_name)
+    cfg = config_cls(
         intermediate_size=128,
         top_k=2,
         enable_in_kernel_fc2_reduce=True,
     )
-    assert cfg.combine_dtype == "bf16"
-    assert create_mega_kernel(cfg).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
+    assert cfg.do_finalize is True
+    kernel = create_mega_kernel(cfg)
+    assert kernel.kernel_name() == kernel_name
+    assert not kernel.supports_unfinalized_output
 
-    cfg_q = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+    cfg_unfinalized = config_cls(
         intermediate_size=128,
         top_k=2,
-        combine_dtype="nvfp4",
+        do_finalize=False,
     )
-    assert create_mega_kernel(cfg_q).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
+    assert create_mega_kernel(cfg_unfinalized).supports_unfinalized_output
+
+    if kernel_name == "sm100_nvfp4_nvfp4_bf16_cutedsl":
+        assert cfg.combine_dtype == "bf16"
+        cfg_q = config_cls(intermediate_size=128, top_k=2, combine_dtype="nvfp4")
+        assert create_mega_kernel(cfg_q).kernel_name() == kernel_name
+
+
+@pytest.mark.parametrize(
+    "incompatible",
+    [
+        {"enable_in_kernel_fc2_reduce": True},
+        {"knobs": "auto"},
+    ],
+)
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+    ],
+)
+def test_cutedsl_deferred_output_rejects_incompatible_modes(config_name, incompatible):
+    from flashinfer import moe_ep
+
+    with pytest.raises(ValueError, match="do_finalize=False requires"):
+        getattr(moe_ep, config_name)(
+            intermediate_size=128,
+            top_k=2,
+            do_finalize=False,
+            **incompatible,
+        )
+
+
+def test_nvfp4_deferred_output_rejects_quantized_combine():
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+
+    with pytest.raises(ValueError, match="do_finalize=False requires"):
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128, top_k=2, do_finalize=False, combine_dtype="mxfp8"
+        )
+
+
+def test_w4a16_deferred_frontend_preserves_mode_when_applying_knobs():
+    import dataclasses
+
+    from flashinfer.moe_ep.cute_dsl.megamoe import bf16_nvfp4
+
+    config = bf16_nvfp4.MegaMoEBf16Nvfp4Config(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=7,
+        num_topk=2,
+        num_total_experts=2,
+        hidden=128,
+        intermediate=128,
+        defer_topk_reduce=True,
+    )
+    with pytest.raises(ValueError, match="defer_topk_reduce requires"):
+        dataclasses.replace(config, enable_in_kernel_fc2_reduce=True)
+    frontend = bf16_nvfp4.MegaMoEBf16Nvfp4Frontend(config)
+    frontend.apply_knobs({"defer_topk_reduce": False})
+    assert frontend.config.defer_topk_reduce
+    with pytest.raises(ValueError, match="unsupported BF16/NVFP4 MegaMoE knobs"):
+        frontend.apply_knobs({"in_kernel_fc2_reduce": True})
 
 
 def test_nvfp4_cutedsl_config_validates_situ():

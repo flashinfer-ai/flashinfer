@@ -706,7 +706,11 @@ def test_per_request_tensors_and_routes():
         (8, 262144, 50): (8, 16, True),  # +1.5 % vs best
         (16, 262144, 50): (4, 16, True),  # +2.8 % vs best
         (32, 262144, 50): (2, 32, True),
-        (64, 262144, 50): (2, 32, True),
+        (64, 262144, 50): (
+            1,
+            32,
+            True,
+        ),  # round-11 M4 one-wave cluster-1 re-pick (was (2, 32, True))
         (128, 262144, 50): (1, 32, True),
     }.items():
         assert pick(pb, pv, sm_count=132, top_k_max=pk) == want, (pb, pv, pk, 132)
@@ -2930,9 +2934,12 @@ def test_slab_tail_build_matches_spec_build():
 
 
 def test_cuda_graph_capture_never_registers_the_generator():
-    """A captured default-generator call must not read the generator inside the capture: PyTorch would register it
-    with the graph and every replay would run two ``FillFunctor`` kernels (host-side round-9 lever C4).  The replays
-    stay bitwise reproducible, the generator is untouched by the capture, and distinct captures get distinct offsets."""
+    """A captured default-generator call must not touch the generator inside the capture: a capture that consumed or
+    advanced it records a whole-graph Philox increment, and every replay then runs two ``FillFunctor`` refresh kernels
+    (host-side round-9 lever C4).  The replays stay bitwise reproducible, the generator is untouched by the captures
+    and by the replays, and distinct captures get distinct offsets.  The replay-time fills are checked at the
+    dispatcher level (``aten::fill_``), which needs no CUPTI; the kernel-name check is evidence only where CUPTI
+    reports the replay (torch 2.13+cu129 on GB300 reported no CUDA events)."""
     _require_supported_device()
     probs = _probs(4, 32768)
     gen = torch.cuda.default_generators[torch.cuda.current_device()]
@@ -2969,12 +2976,24 @@ def test_cuda_graph_capture_never_registers_the_generator():
     first = out.clone()
     from torch.profiler import ProfilerActivity, profile
 
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         g.replay()
         torch.cuda.synchronize()
-    names = [e.name for e in prof.events() if e.device_type.name == "CUDA"]
-    assert names and not any("FillFunctor" in n for n in names), names
+        sentinel = out.clone()  # proves the profiler recorded this window
+    events = list(prof.events())
+    cpu_names = [e.name for e in events if e.device_type.name == "CPU"]
+    cuda_names = [e.name for e in events if e.device_type.name == "CUDA"]
+    # A capture that consumed or advanced the default generator (the pre-round-9 ``get_state`` + ``set_state`` path)
+    # records a whole-graph increment, and every replay then runs ``replay_prologue``: two eager ``fill_`` ops
+    # (``FillFunctor`` kernels) refresh the seed / offset words the graph reads and the host offset advances by that
+    # increment.  The dispatcher-level ``aten::fill_`` events and the host state are checked without CUPTI; the kernel
+    # names are evidence only where CUPTI reports the replay (torch 2.13+cu129 on GB300 reported no CUDA events).
+    assert "aten::clone" in cpu_names, cpu_names
+    assert not any(n.startswith("aten::fill") for n in cpu_names), cpu_names
+    assert not any("FillFunctor" in n for n in cuda_names), cuda_names
+    assert torch.equal(gen.get_state(), after_warmup)  # unchanged after two replays
     assert torch.equal(out, first)
+    assert torch.equal(sentinel, first)
     assert bool(torch.all((out >= 0) & (out < probs.shape[1])))
 
 
@@ -3030,6 +3049,28 @@ def test_one_wave_e16_repick_policy():
     assert cs.choose_stage1(
         1, 128256, sm_count=148, smem_limit=smem, top_k_max=10, two_launch=False
     ) == (8, 32, True)
+
+
+def test_one_wave_c1_repick_policy():
+    """Round-11 M4 (H100, sm 132): a small-k one-wave cluster-2 ept-32 stream pick on a 16-chunk row yields to the
+    cluster-1 ept-32 stream from the measured batch on; smaller batches, shorter rows, large k and the other wave
+    tables keep the ranked pick."""
+    assert cs._ONE_WAVE_C1_REPICK_MIN_BATCH_BY_SM_COUNT == {132: 64}
+    assert cs._ONE_WAVE_C1_REPICK_MIN_CHUNKS == 16
+    smem = 232448
+    pick = lambda b, v, k, two=False, sm=132: cs.choose_stage1(
+        b, v, sm_count=sm, smem_limit=smem, top_k_max=k, two_launch=two
+    )
+    for k in (10, 50, 64, None):
+        assert pick(64, 262144, k) == (1, 32, True), k
+        assert pick(66, 262144, k) == (1, 32, True), k
+    assert pick(32, 262144, 10) == (2, 32, True)
+    assert pick(63, 262144, 10) == (2, 32, True)
+    assert pick(128, 262144, 10) == (1, 32, True)
+    assert pick(64, 151936, 10) == (2, 16, True)
+    assert pick(64, 128256, 50) == (2, 16, True)
+    assert pick(64, 262144, 1000, True) == (2, 16, True)
+    assert pick(64, 262144, 10, sm=212) == (2, 32, True)
 
 
 def test_leader_push_build_matches_pull_build():
@@ -3397,6 +3438,7 @@ def test_local_select_build_matches_leader_push_build():
         (9, 0): 10,
         (10, 0): 20,
         (10, 3): 32,
+        (10, 7): 20,
     }
     for cap, kmax in cs._LOCAL_SELECT_MAX_K_BY_CAPABILITY.items():
         for flags in (fused_sp, fused_cs):
@@ -3417,8 +3459,37 @@ def test_local_select_build_matches_leader_push_build():
         cs._local_select_flag(8, 32, True, fused_sp, 32, None) == cs._FLAG_LOCAL_SELECT
     )
     assert cs._local_select_flag(8, 32, True, fused_sp, 33, None) == 0
-    for cap in ((10, 7), (12, 0)):
-        assert cs._local_select_flag(8, 32, True, fused_sp, 10, cap) == 0
+    # round 11 (lever M4): a one-chunk row (V128256 on the cluster-8 ept-32 stream) takes the local select up to the
+    # one-chunk cap on 10.0 / 10.3; two-chunk rows, an unknown vocabulary and the other capabilities keep the capability cap
+    assert cs._LOCAL_SELECT_ONE_CHUNK_MAX_K_BY_CAPABILITY == {(10, 0): 64, (10, 3): 64}
+    for k in (33, 50, 64):
+        assert (
+            cs._local_select_flag(8, 32, True, fused_sp, k, (10, 3), 128256)
+            == cs._FLAG_LOCAL_SELECT
+        )
+        assert cs._local_select_flag(8, 32, True, fused_sp, k, (10, 3), 151936) == 0
+        assert cs._local_select_flag(8, 32, True, fused_sp, k, (10, 3)) == 0
+        assert (
+            cs._local_select_flag(8, 32, True, fused_sp, k, (10, 0), 128256)
+            == cs._FLAG_LOCAL_SELECT
+        )
+        assert cs._local_select_flag(8, 32, True, fused_sp, k, (10, 0), 151936) == 0
+        assert cs._local_select_flag(8, 32, True, fused_sp, k, (10, 0)) == 0
+        assert cs._local_select_flag(8, 32, True, fused_cs, k, (9, 0), 128256) == 0
+    assert cs._local_select_flag(8, 32, True, fused_sp, 65, (10, 3), 128256) == 0
+    assert cs._local_select_flag(8, 32, True, fused_sp, 65, (10, 0), 128256) == 0
+    assert (
+        cs._local_select_flag(8, 32, True, fused_sp, 64, None, 128256)
+        == cs._FLAG_LOCAL_SELECT
+    )
+    assert cs._local_select_flag(8, 32, True, fused_sp, 64, None, 262144) == 0
+    assert cs._local_select_flag(8, 32, True, fused_sp, 10, (12, 0)) == 0
+    # round 11 (lever M4): R200 takes it up to k 20 on every leader-push sample cell (cliff into the fallback from k 24)
+    assert (
+        cs._local_select_flag(8, 16, True, fused_cs, 20, (10, 7))
+        == cs._FLAG_LOCAL_SELECT
+    )
+    assert cs._local_select_flag(8, 16, True, fused_cs, 21, (10, 7)) == 0
     assert cs._local_select_flag(8, 16, True, fused_cs, 11, (9, 0)) == 0
     # never without bit 9, without a sample bit, without bit 0, with the whole-CTA tail, or on a single CTA / resident
     assert (
@@ -3496,6 +3567,26 @@ def test_local_select_build_matches_leader_push_build():
     )
     assert cs._leader_push_flag(8, 32, True, fused_sp, 2 * span, (10, 3), False) == 0
     assert cs._leader_push_flag(8, 32, True, fused_sp, 3 * span, (10, 3), True) == 0
+    # round 11 (lever M4-lb): the two-chunk speculative-sample row (V151936 on cluster-8 ept-32) at B <= 2, k <= 50
+    # reaches the leader push on 10.0 without the local select; larger batches / top-k, one-chunk rows, the coarse
+    # build and the other capabilities keep the chunk rule
+    sb_reach = cs._leader_push_small_batch_reach
+    for cap in ((10, 0), None):
+        assert sb_reach(8, 32, True, fused_sp, 50, 151936, 1, cap)
+        assert sb_reach(8, 32, True, fused_sp, 50, 151936, 2, cap)
+        assert not sb_reach(8, 32, True, fused_sp, 50, 151936, 4, cap)
+        assert not sb_reach(8, 32, True, fused_sp, 51, 151936, 1, cap)
+        assert not sb_reach(8, 32, True, fused_sp, 50, 128256, 1, cap)
+        assert not sb_reach(8, 32, True, fused_cs, 50, 151936, 1, cap)
+        assert (
+            cs._leader_push_flag(8, 32, True, fused_sp, 151936, cap, False, True)
+            == cs._FLAG_LEADER_PUSH
+        )
+    for cap in ((9, 0), (10, 3), (10, 7), (12, 0)):
+        assert not sb_reach(8, 32, True, fused_sp, 50, 151936, 1, cap)
+    assert (
+        cs._leader_push_flag(8, 32, True, fused_sp, 151936, (10, 0), False, False) == 0
+    )
     assert (
         cs._leader_push_flag(
             8, 32, True, cs._FLAG_FUSE_BLOCK_TAIL, 2 * span, (10, 3), True
@@ -3520,7 +3611,13 @@ def test_local_select_build_matches_leader_push_build():
             assert plan.stream and plan.cluster > 1
             assert flags & cs._FLAG_FUSE_TAIL and flags & cs._FLAG_LEADER_PUSH
             assert flags & (cs._FLAG_SPEC_SAMPLE | cs._FLAG_COARSE_SAMPLE)
-            assert k <= cs._LOCAL_SELECT_MAX_K_BY_CAPABILITY[cap]
+            k_cap = cs._LOCAL_SELECT_MAX_K_BY_CAPABILITY[cap]
+            chunks = -(-vocab // (cs._THREADS * plan.ept * plan.cluster))
+            if chunks == 1:  # round 11: one-chunk rows take the one-chunk cap
+                k_cap = max(
+                    k_cap, cs._LOCAL_SELECT_ONE_CHUNK_MAX_K_BY_CAPABILITY.get(cap, 0)
+                )
+            assert k <= k_cap
         elif (
             flags & cs._FLAG_FUSE_TAIL
             and flags & cs._FLAG_LEADER_PUSH
