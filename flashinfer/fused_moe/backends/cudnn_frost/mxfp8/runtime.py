@@ -275,6 +275,8 @@ def _launch_arguments(
     activation_scales=None,
     gemm_scales=None,
 ):
+    if gemm_scales is None:
+        raise ValueError("gemm_scales must be provided for MXFP8 launch arguments")
     s, k = tokens.shape
     e, n, _ = weights[0].shape
     token = tokens.unsqueeze(0).permute(1, 2, 0)
