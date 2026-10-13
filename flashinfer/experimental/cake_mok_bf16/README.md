@@ -164,11 +164,17 @@ to recreate the workspace.
   copies the counts into pinned host memory behind a CUDA event (no host
   synchronization; the gathered IDs are identical on every rank; skipped during
   graph capture). While the hottest rank's load is at least `imbalance_threshold`
-  (1.5) x the mean load, the later launches use the (forward, backward) imbalance
+  (4) x the mean load, the later launches use the (forward, backward) imbalance
   split; balanced steps are unchanged. Measured row (`IMBALANCE_COMM_SMS`): B200
-  BF16 24 / 28, from an EP8 complete training step with one rank's experts at
-  twice the routing probability, two rounds against the reference (fixed 20 / 24
-  -0.89 % / +0.20 %, fixed 24 / 28 -1.33 % / -1.06 %); no row elsewhere.
+  BF16 24 / 28, from EP8 complete training steps, two rounds on one node, step
+  time against the fixed 20 / 24 on this package's backward programs: hottest
+  rank at 5.6x / 7.4x the mean routed load -1.0 / -1.7 % and -1.2 / -1.3 %;
+  hottest rank at 3.0x (one rank's experts at twice the routing probability)
+  +0.4 / +0.7 % (full step), +0.5 / +0.8 % (checkpoint step) and +0.6 / +1.6 %
+  with ragged source rows, where the fixed split is therefore kept. The
+  threshold sits between the measured 3.0x and 5.6x (the crossover in between is
+  not measured; with 4 ranks the ratio reaches 4 only when one rank carries
+  every routed row). No row elsewhere.
   `CAKE_MOK_COMM_SPLIT_LOG=1` prints each split change per rank to stderr.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.

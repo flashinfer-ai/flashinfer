@@ -8,15 +8,20 @@ MOK_PRECISIONS = ("bf16", "mxfp8")
 
 # Imbalance-aware communication split, keyed by device compute capability and
 # routed precision. Only generations with a measured gain have a row; "auto"
-# resolves to None (the fixed split) elsewhere. B200 BF16: EP8 complete training
-# step with one rank's experts at twice the routing probability, against the
-# reference, two rounds: fixed 20 / 24 -0.89 % / +0.20 %, fixed 24 / 28
-# -1.33 % / -1.06 %. Balanced steps never switch, so the fixed split stays in
-# force for them.
+# resolves to None (the fixed split) elsewhere. B200 BF16 row 24 / 28: EP8
+# complete training steps, two rounds on one node, step time against the fixed
+# 20 / 24 on this package's backward programs. Hottest rank at 5.6x / 7.4x the
+# mean routed load: -1.0 / -1.7 % and -1.2 / -1.3 %. Hottest rank at 3.0x (one
+# rank's experts at twice the routing probability): +0.4 / +0.7 % (full step),
+# +0.5 / +0.8 % (checkpoint step) and +0.6 / +1.6 % with ragged source rows, so
+# the fixed split is faster there. IMBALANCE_THRESHOLD therefore sits between
+# the measured 3.0x and 5.6x; the crossover in between is not measured, and
+# with 4 ranks the ratio reaches 4 only when one rank carries every routed row.
+# Balanced steps never switch, so the fixed split stays in force for them.
 IMBALANCE_COMM_SMS = {
     (10, 0): {"bf16": (24, 28)},
 }
-IMBALANCE_THRESHOLD = 1.5
+IMBALANCE_THRESHOLD = 4.0
 
 
 def resolve_imbalance_comm_sms(precision, device=None):
@@ -112,8 +117,11 @@ def create_mok_bf16_workspace(
     on every rank). ``"auto"`` (default) takes the measured row of the device
     generation for ``precision`` (:func:`resolve_imbalance_comm_sms`; B200 BF16:
     24 / 28, no row elsewhere, so the fixed split stays in force there), ``None``
-    keeps the fixed split and a pair sets it. ``precision`` only selects that row. Balanced steps
-    never switch. ``CAKE_MOK_COMM_SPLIT_LOG=1`` prints each split change.
+    keeps the fixed split and a pair sets it. ``precision`` only selects that row.
+    The default ``imbalance_threshold`` (:data:`IMBALANCE_THRESHOLD`, 4) lies
+    between the measured 3x load ratio, where the fixed split is faster, and
+    5.6x, where the imbalance split gains 1-2 %. Balanced steps never switch.
+    ``CAKE_MOK_COMM_SPLIT_LOG=1`` prints each split change.
     """
     from .experimental.cake_mok_bf16.workspace import MoKConfig
     from .experimental.cake_mok_bf16.backend import create_source_workspace

@@ -28,9 +28,11 @@ class MoKConfig:
     # recompute launch follows the forward count. The load is observed without
     # a host synchronization (pinned copy behind a CUDA event) and is identical
     # on every rank. ``None`` keeps the fixed split; see
-    # ``MoKFunctional._comm_split``.
+    # ``MoKFunctional._comm_split``. The threshold default follows
+    # ``flashinfer.mok.IMBALANCE_THRESHOLD``: on B200 BF16 the imbalance split
+    # pays from about 5.6x the mean load, while at 3x the fixed split is faster.
     imbalance_comm_sms: tuple[int, int] | None = None
-    imbalance_threshold: float = 1.5
+    imbalance_threshold: float = 4.0
     minibatch_size: int = 4096
     macrobatch_size: int = 131072
     schedule_capacity_multiplier: float = 0.5
