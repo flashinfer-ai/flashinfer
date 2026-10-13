@@ -37,9 +37,9 @@ class _GraphSafeDLPack:
 
 def to_cute(tensor: torch.Tensor, alignment: int) -> cute.Tensor:
     if tensor.dtype == torch.float8_e4m3fn:
-        # Some supported PyTorch versions cannot export FP8 through DLPack.
-        # Export the same storage as bytes, then restore the CuTe element type.
-        # Keep the graph-safe adapter: exporting must not synchronize streams.
+        # CuTe DSL's from_dlpack has no Float8E4M3FN entry in its dtype map
+        # (NVIDIA/cutlass#3716). Export the same storage as bytes and restore
+        # the element type; keep the graph-safe adapter so export never syncs.
         result = from_dlpack(
             _GraphSafeDLPack(tensor.view(torch.uint8).detach()),
             assumed_align=alignment,
