@@ -1152,6 +1152,114 @@ def test_moe_nvfp4(
     torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
 
 
+def test_moe_nvfp4_pinned_4over6_requires_nvfp4():
+    """A pinned recipe on a non-NVFP4 call is refused before any device work."""
+    num_experts, hidden, inter = 4, 64, 32
+    with pytest.raises(ValueError, match="NVFP4"):
+        fused_moe.cutlass_fused_moe(
+            torch.empty((2, hidden), dtype=torch.bfloat16),
+            torch.zeros((2, 1), dtype=torch.int32),
+            torch.ones((2, 1), dtype=torch.float32),
+            torch.empty((num_experts, 2 * inter, hidden), dtype=torch.bfloat16),
+            torch.empty((num_experts, hidden, inter), dtype=torch.bfloat16),
+            torch.bfloat16,
+            quant_scales=[],
+            nvfp4_4over6=NVFP44Over6Config(),
+        )
+
+
+def _nvfp4_recipe_case(device):
+    """Small NVFP4×NVFP4 call with unquantized BF16 input, so both CUTLASS
+    activation quantizations (GEMM1 input and GEMM2 input) run in-kernel."""
+    torch.manual_seed(42)
+    e, m, n, k = 8, 64, 512, 1024
+    w1 = torch.randn((e, 2 * n, k), device=device, dtype=torch.bfloat16) / 10
+    w2 = torch.randn((e, k, n), device=device, dtype=torch.bfloat16) / 10
+    w1_q = torch.empty((e, 2 * n, k // 2), device=device, dtype=torch.uint8)
+    w2_q = torch.empty((e, k, n // 2), device=device, dtype=torch.uint8)
+    w1_sf = torch.empty((e, 2 * n, k // 16), device=device, dtype=torch.float8_e4m3fn)
+    w2_sf = torch.empty((e, k, n // 16), device=device, dtype=torch.float8_e4m3fn)
+    w1_gs = torch.empty((e,), device=device, dtype=torch.float32)
+    w2_gs = torch.empty((e,), device=device, dtype=torch.float32)
+    # Weights are caller-quantized, so their recipe is independent of the
+    # in-kernel one; quantize them with 4over6 off.
+    with moe_utils.nvfp4_4over6_env(False):
+        for expert in range(e):
+            w1_gs[expert] = nvfp4_global_encode_scale_te(
+                w1[expert].abs().max().float(), None
+            )
+            w2_gs[expert] = nvfp4_global_encode_scale_te(
+                w2[expert].abs().max().float(), None
+            )
+            w1_q[expert], w1_sf[expert] = fp4_quantize(w1[expert], w1_gs[expert])
+            w2_q[expert], w2_sf[expert] = fp4_quantize(w2[expert], w2_gs[expert])
+    x = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    a1_gs = torch.tensor(1.0, device=device, dtype=torch.float32)
+    a2_gs = torch.tensor(1.0, device=device, dtype=torch.float32)
+    routing_weights, selected_experts = compute_routing(
+        torch.randn((m, e), device=device, dtype=torch.bfloat16), 2
+    )
+    return dict(
+        input=x,
+        token_selected_experts=selected_experts.to(torch.int),
+        token_final_scales=routing_weights,
+        fc1_expert_weights=w1_q.view(torch.long),
+        fc2_expert_weights=w2_q.view(torch.long),
+        output_dtype=torch.bfloat16,
+        quant_scales=[
+            a1_gs,
+            w1_sf.view(torch.int32),
+            1.0 / (a1_gs * w1_gs),
+            a2_gs,
+            w2_sf.view(torch.int32),
+            1.0 / (a2_gs * w2_gs),
+        ],
+    )
+
+
+# The autouse fixture keys on ``use_4over6`` and pins every
+# FLASHINFER_NVFP4_4OVER6* variable, so the environment legs differ only in
+# the on/off switch (and E4M3_USE_256 for the second recipe).
+@pytest.mark.parametrize("use_4over6", [True])
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        pytest.param(NVFP44Over6Config(), id="e4m3_max448"),
+        pytest.param(NVFP44Over6Config(e4m3_max=256), id="e4m3_max256"),
+    ],
+)
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
+    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
+)
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_nvfp4_pinned_recipe_matches_env(recipe, use_4over6):
+    """``nvfp4_4over6=`` selects, bit for bit, the quantizer the environment
+    selects, and ``None`` ignores an environment that turns 4over6 on."""
+    device = torch.device("cuda:0")
+    kwargs = _nvfp4_recipe_case(device)
+
+    def run(**extra):
+        # The flat call returns [output, ...]; read the caller-owned buffer.
+        out = torch.empty_like(kwargs["input"])
+        fused_moe.cutlass_fused_moe(**kwargs, output=out, **extra)
+        torch.cuda.synchronize()
+        return out
+
+    e4m3_use_256 = "1" if recipe.e4m3_max == 256 else "0"
+    with moe_utils.env_var("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", e4m3_use_256):
+        env_on = run()
+        none_under_env_on = run(nvfp4_4over6=None)
+    with moe_utils.nvfp4_4over6_env(False):
+        env_off = run()
+        pinned_under_env_off = run(nvfp4_4over6=recipe)
+
+    # The recipe must change the output, or the equalities below are vacuous.
+    assert not torch.equal(env_on, env_off)
+    assert torch.equal(pinned_under_env_off, env_on)
+    assert torch.equal(none_under_env_on, env_off)
+
+
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", EP_NUM_EXPERTS)

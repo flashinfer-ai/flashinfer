@@ -20,8 +20,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import contextlib
-import os
 from typing import Dict
 
 import pytest
@@ -63,19 +61,6 @@ cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 
 # The 4-over-6 x per-token-scaling matrix is the coverage here (only file exercising
 # it); shape fan-out kept to boundary corners.
-@contextlib.contextmanager
-def _env(name: str, value: str):
-    saved = os.environ.get(name)
-    os.environ[name] = value
-    try:
-        yield
-    finally:
-        if saved is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = saved
-
-
 def _skip_unless_sm10x(device: torch.device) -> None:
     if get_compute_capability(device)[0] not in [10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
@@ -468,7 +453,7 @@ def test_pinned_recipe_matches_env(recipe: NVFP44Over6Config, use_4over6: bool):
         return out.clone()
 
     e4m3_use_256 = "1" if recipe.e4m3_max == 256 else "0"
-    with _env("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", e4m3_use_256):
+    with moe_utils.env_var("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", e4m3_use_256):
         env_on = run()
         none_under_env_on = run(nvfp4_4over6=None)
     with moe_utils.nvfp4_4over6_env(False):

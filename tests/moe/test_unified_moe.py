@@ -60,7 +60,6 @@ from flashinfer.fused_moe import (
     BackendOptions,
     CuteDslConfig,
     CuteDslRunner,
-    CutlassNvfp4Runner,
     PrimsTsRunner,
     CutlassBf16Config,
     CutlassBf16Runner,
@@ -2094,16 +2093,14 @@ class TestRunner4Over6Support:
         assert runner.check_support() is None
 
     @pytest.mark.parametrize("setting", [None, NVFP44Over6Config()], ids=repr)
-    @pytest.mark.parametrize("runner_cls", [CutlassNvfp4Runner, PrimsTsRunner])
-    def test_non_opted_in_runner_rejects_explicit_recipe(self, runner_cls, setting):
-        """The real not-opted-in backends, not just the synthetic one.
+    def test_prims_ts_runner_rejects_explicit_recipe(self, setting):
+        """The real not-opted-in backend, not just the synthetic one.
 
-        CUTLASS's GEMM2-input quantizer still reads the environment (#5719);
-        Prims-TS has no GEMM2-input requantization step at all (its FC1
-        epilogue emits NVFP4 on every tactic). Both must refuse an explicit
-        value rather than drop it.
+        Prims-TS has no GEMM2-input requantization step (its FC1 epilogue
+        emits NVFP4 on every tactic), so it must refuse an explicit value
+        rather than drop it.
         """
-        runner = runner_cls.__new__(runner_cls)
+        runner = PrimsTsRunner.__new__(PrimsTsRunner)
         runner.config = self._config(setting)
         runner.device = torch.device("cuda")
         with pytest.raises(NotImplementedError, match="nvfp4_4over6"):
