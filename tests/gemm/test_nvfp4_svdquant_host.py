@@ -56,7 +56,10 @@ def auto_backend_case(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRe
     """Run real public dispatch and tuning with CPU kernels and deterministic timings."""
     import flashinfer.cute_dsl
     import flashinfer.utils
+    from flashinfer.gemm import svdquant_sm120_auto
 
+    svdquant_sm120_auto._auto_runners.cache_clear()
+    request.addfinalizer(svdquant_sm120_auto._auto_runners.cache_clear)
     tuner = AutoTuner()
     monkeypatch.setattr(AutoTuner, "_instance", tuner)
     monkeypatch.setattr(flashinfer.utils, "get_compute_capability", lambda _: (12, 0))
@@ -3682,3 +3685,107 @@ def test_cublaslt_plan_cache_growth_and_failure_cleanup(
         [str(plan_cache_binary), str(failure_stage)], capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("operation", ["gemm", "linear"])
+def test_auto_replay_reuses_native_runner(auto_backend_case, operation):
+    from flashinfer import autotune
+
+    # Given a tuned native winner, repeated calls must reuse its loaded runner.
+    _, call, profiles, builds, _ = auto_backend_case
+    with autotune(True):
+        call(operation)
+    builds.clear()
+    profiles.clear()
+    # When the same operation is served from the tuning cache.
+    result = call(operation)
+    # Then replay executes correctly without rebuilding or profiling candidates.
+    assert torch.all(result == 2)
+    assert not builds
+    assert not profiles
+
+
+@pytest.mark.parametrize("operation", ["gemm", "linear"])
+def test_auto_reused_runners_observe_tuner_cache_clear(auto_backend_case, operation):
+    from flashinfer import autotune
+
+    tuner, call, _, builds, _ = auto_backend_case
+    with autotune(True):
+        assert torch.all(call(operation) == 2)
+    builds.clear()
+    tuner.clear_cache()
+    assert torch.all(call(operation) == 1)
+    assert not builds
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "weight_k",
+        "weight_stride",
+        "sf_size",
+        "sf_stride",
+        "alpha_empty",
+        "l1_rank",
+        "l1_stride",
+        "bias_size",
+        "device",
+    ],
+)
+def test_auto_linear_metadata_checks_reject_invalid_storage(auto_backend_case, invalid):
+    _, call, profiles, builds, operands = auto_backend_case
+    n, k_packed = operands[1].shape
+    match invalid:
+        case "weight_k":
+            operands[1] = operands[1][:, : k_packed // 2].contiguous()
+        case "weight_stride":
+            operands[1] = torch.zeros(n, k_packed * 2, dtype=torch.uint8)[:, ::2]
+        case "sf_size":
+            operands[2] = operands[2][:-1]
+        case "sf_stride":
+            operands[2] = torch.zeros(operands[2].numel() * 2, dtype=torch.uint8)[::2]
+        case "alpha_empty":
+            operands[3] = operands[3][:0]
+        case "l1_rank":
+            operands[6] = operands[6][:, :16].contiguous()
+        case "l1_stride":
+            operands[6] = torch.ones(n, 64, dtype=torch.bfloat16)[:, ::2]
+        case "bias_size":
+            operands[8] = torch.ones(n + 1, dtype=torch.bfloat16)
+        case "device":
+            operands[3] = torch.ones(1, device="meta")
+    with pytest.raises(ValueError):
+        call("linear")
+    assert not profiles and not builds
+
+
+def test_auto_linear_allocates_scratch_only_for_execution(
+    auto_backend_case, monkeypatch
+):
+    from flashinfer import autotune
+
+    # Given a cached native linear winner and an allocator observer.
+    _, call, _, _, operands = auto_backend_case
+    with autotune(True):
+        call("linear")
+    allocations: list[tuple[tuple[int, ...], torch.dtype]] = []
+    empty = torch.empty
+
+    def record_empty(*args, **kwargs):
+        result = empty(*args, **kwargs)
+        allocations.append((tuple(result.shape), result.dtype))
+        return result
+
+    monkeypatch.setattr(torch, "empty", record_empty)
+    # When serving a cached winner, metadata checks must not allocate scratch.
+    result = call("linear")
+    # Then each intermediate is allocated exactly once for execution.
+    m, k = operands[0].shape
+    rank = operands[5].shape[1]
+    assert torch.all(result == 2)
+    for allocation in (
+        ((m, k // 2), torch.uint8),
+        ((gemm_svdquant._swizzled_sf_size(m, k // 16),), torch.uint8),
+        ((m, rank), torch.bfloat16),
+    ):
+        assert allocations.count(allocation) == 1, (allocation, allocations)
