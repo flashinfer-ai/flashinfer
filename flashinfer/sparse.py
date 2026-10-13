@@ -72,7 +72,9 @@ def union_gqa_prefill(
     block_indices : torch.Tensor
         Int32 tensor with shape
         ``(total_q, num_kv_heads, topk_blocks)``. ``topk_blocks`` must be in
-        ``[1, 16]``.
+        ``[1, 16]``. Negative entries are padding. The non-negative block IDs
+        of one query and KV head must be unique; duplicates are not detected
+        and can produce incorrect output.
     cu_seqlens_q : torch.Tensor
         Int32 cumulative sequence lengths with shape ``(batch_size + 1,)``.
         Values must start at zero, end at ``total_q``, and be nondecreasing.

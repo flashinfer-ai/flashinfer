@@ -134,9 +134,17 @@ def _run_persistent_case_in_child(test_name: str) -> bool:
     child_device = os.environ.get("FLASHINFER_UNION_GQA_TEST_DEVICE")
     if child_device is not None:
         torch.cuda.set_device(int(child_device))
+        import flashinfer.experimental.union_gqa.jit as union_jit
+
+        module = union_jit.gen_union_gqa_module().load()
+        union_jit.load_union_gqa_module = lambda: module
         return False
 
     _require_sm100()
+    from flashinfer.experimental.union_gqa.jit import get_union_gqa_module
+
+    # Populate the shared disk cache before the child's execution timeout starts.
+    get_union_gqa_module()
     env = os.environ.copy()
     env["FLASHINFER_UNION_GQA_TEST_DEVICE"] = str(torch.cuda.current_device())
     try:
@@ -642,6 +650,45 @@ def test_union_gqa_metadata_wait_survives_late_warp(tmp_path: Path) -> None:
         + env.get("PYTHONPATH", "")
     )
     env["FLASHINFER_WORKSPACE_BASE"] = str(tmp_path / "workspace")
+    # Compile the patched module separately; the execution child reuses its
+    # sources and disk cache without repeating the patch or touching timestamps.
+    execution_start = script.index("torch.manual_seed(29)")
+    compile_script = script[:execution_start] + "union_jit.get_union_gqa_module()\n"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            compile_script,
+            str(source_dir),
+            str(tmp_path),
+            str(torch.cuda.current_device()),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=900,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    script = (
+        textwrap.dedent(
+            """
+        from pathlib import Path
+        import sys
+        import torch
+        import flashinfer.experimental.union_gqa.jit as union_jit
+        from flashinfer import union_gqa_prefill
+
+        torch.cuda.set_device(int(sys.argv[3]))
+        copy_root = Path(sys.argv[2]) / "csrc"
+        union_jit._get_union_gqa_csrc_dir = lambda: copy_root
+        union_jit._UNION_GQA_URI = "union_gqa_prefill_sm100a_late_metadata_test"
+        module = union_jit.gen_union_gqa_module().load()
+        union_jit.load_union_gqa_module = lambda: module
+        """
+        )
+        + script[execution_start:]
+    )
     try:
         result = subprocess.run(
             [
@@ -848,14 +895,21 @@ def test_union_gqa_rejects_underestimated_cpu_max_seqlen() -> None:
 def test_union_gqa_invalid_cuda_cu_seqlens_fails_before_output_store() -> None:
     """Check that invalid CUDA sequence offsets trigger an error in a child process."""
     _require_sm100()
+    from flashinfer.experimental.union_gqa.jit import get_union_gqa_module
+
+    # Keep a cold JIT build outside the child process's execution timeout.
+    get_union_gqa_module()
     # A device trap poisons the CUDA context, so exercise it in another process.
     script = textwrap.dedent(
         """
         import sys
         import torch
+        import flashinfer.experimental.union_gqa.jit as union_jit
         from flashinfer import union_gqa_prefill
 
         torch.cuda.set_device(int(sys.argv[1]))
+        module = union_jit.gen_union_gqa_module().load()
+        union_jit.load_union_gqa_module = lambda: module
         q = torch.zeros(1, 16, 128, dtype=torch.bfloat16, device="cuda")
         k = torch.zeros(1, 1, 128, dtype=torch.bfloat16, device="cuda")
         indices = torch.zeros(1, 1, 1, dtype=torch.int32, device="cuda")

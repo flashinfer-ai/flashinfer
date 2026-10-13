@@ -44,6 +44,7 @@ from flashinfer.testing.utils import bench_gpu_time
 from benchmarks.union_gqa_telemetry import GPUTelemetry
 from benchmarks.union_gqa_workload import (
     HISTORY_TOKENS,
+    _stride,
     make_history_indices,
     make_union_runner,
     validate_history_indices,
@@ -335,10 +336,19 @@ def main() -> None:
         raise RuntimeError("bench_union_gqa.py requires exact SM100")
     if args.num_kv_heads <= 0:
         parser.error("--num-kv-heads must be positive")
-    if any(value <= 0 for value in args.seq_lens):
-        parser.error("--seq-lens values must be positive")
+    if any(value <= 0 or value % Q_STAGE_TOKENS for value in args.seq_lens):
+        parser.error("--seq-lens values must be positive and divisible by 8")
     if any(value <= 0 or value > 16 for value in args.topk_blocks):
         parser.error("--topk-blocks values must be in [1, 16]")
+    for sharing_ratio in args.sharing_ratios:
+        for topk_blocks in args.topk_blocks:
+            try:
+                _stride(sharing_ratio, topk_blocks)
+            except ValueError as exc:
+                parser.error(
+                    f"--sharing-ratios {sharing_ratio} with --topk-blocks "
+                    f"{topk_blocks}: {exc}"
+                )
     if min(args.dry_run_iters, args.repeat_iters, args.rounds) <= 0:
         parser.error("--dry-run-iters, --repeat-iters and --rounds must be positive")
     if not math.isfinite(args.preheat_ms) or args.preheat_ms < 0:

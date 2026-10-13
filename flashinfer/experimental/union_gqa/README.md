@@ -7,11 +7,12 @@ heads of one query token provides 16 query rows, leaving many rows unused in
 64- or 128-row Blackwell attention tiles. Combining several tokens can fill
 the tile, but their independently selected KV blocks require per-token sparse
 masking rather than the shared key selection of a dense attention tile.
-We compare against [Experimental Task-Scheduled Attention](flashinfer/attention/prims_ts/README.md),
+We compare against [Experimental Task-Scheduled Attention](../../attention/prims_ts/README.md),
 referred to as PrimsTS below (from its source directory, `prims_ts`).
 **In the SM100 benchmark below, Union-GQA is 1.04x to 4.01x faster than
 PrimsTS across all tested query lengths when adjacent-query top-k KV-block
-similarity (the selected-block sharing ratio) exceeds 50%.**
+similarity (the selected-block sharing ratio) is strictly above 50%
+(56.25% and higher in the tested grid).**
 
 We observed that adjacent queries share some selected KV-block indices,
 motivating Union-GQA's design. High KV-index sharing between adjacent queries
