@@ -158,6 +158,18 @@ to recreate the workspace.
   hidden width that is a multiple of 512. Common physical source capacity is
   aligned for tiles/metadata and is at least 512 rows. Communication-SM counts
   are positive and even, leaving compute SMs available.
+- Imbalance-aware split (`MoKConfig.imbalance_comm_sms` / `imbalance_threshold`;
+  factory default `imbalance_comm_sms="auto"`, `None` keeps the fixed split): every
+  `build_schedule` counts the gathered expert IDs per owning rank on device and
+  copies the counts into pinned host memory behind a CUDA event (no host
+  synchronization; the gathered IDs are identical on every rank; skipped during
+  graph capture). While the hottest rank's load is at least `imbalance_threshold`
+  (1.5) x the mean load, the later launches use the (forward, backward) imbalance
+  split; balanced steps are unchanged. Measured row (`IMBALANCE_COMM_SMS`): B200
+  BF16 24 / 28, from an EP8 complete training step with one rank's experts at
+  twice the routing probability, two rounds against the reference (fixed 20 / 24
+  -0.89 % / +0.20 %, fixed 24 / 28 -1.33 % / -1.06 %); no row elsewhere.
+  `CAKE_MOK_COMM_SPLIT_LOG=1` prints each split change per rank to stderr.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.
 - Routed weight gradients are summed across macrobatches in BF16 (or in the

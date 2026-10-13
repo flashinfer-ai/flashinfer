@@ -425,3 +425,76 @@ def test_epilogues(topk, tokens, hidden):
         rtol=1e-2,
     )
     assert torch.equal(epilogues.backward(shared, routed), expected_dx.bfloat16())
+
+
+def test_select_comm_split_decision_table():
+    """Host-only: the imbalance-aware split is a pure function of the observed
+    per-rank loads, ``hot`` when max load >= threshold x mean load, else ``base``."""
+    from flashinfer.experimental.cake_mok_bf16.backend import select_comm_split
+
+    base, hot = (20, 24), (24, 28)
+    assert select_comm_split([100, 100, 100, 100], base, hot, 1.5) == base  # 1.0
+    assert select_comm_split([150, 100, 100, 100], base, hot, 1.5) == base  # 1.33
+    assert select_comm_split([200, 100, 100, 100], base, hot, 1.5) == hot  # 1.6
+    assert select_comm_split([150, 50, 50, 50], base, hot, 1.5) == hot  # 2.0
+    assert select_comm_split([3, 1], base, hot, 1.5) == hot  # exactly 1.5
+    assert select_comm_split([0, 0, 0, 0], base, hot, 1.5) == base  # every rank empty
+    assert select_comm_split((), base, hot, 1.5) == base  # no observation yet
+    assert select_comm_split([200, 100, 100, 100], base, None, 1.5) == base
+    loads = torch.tensor([300, 100, 100, 100], dtype=torch.int32)
+    assert select_comm_split(loads, base, hot, 1.5) == hot
+    assert select_comm_split(loads, base, [24, 28], 1.5) == (24, 28)
+
+
+@pytest.mark.parametrize(
+    "capability,precision,expected",
+    [
+        ((10, 0), "bf16", (24, 28)),
+        ((10, 0), "mxfp8", None),
+        ((10, 3), "bf16", None),
+        ((10, 7), "bf16", None),
+        ((12, 0), "bf16", None),
+    ],
+)
+def test_imbalance_comm_sms_auto_follows_the_device_generation(
+    monkeypatch, capability, precision, expected
+):
+    """Host-only: ``"auto"`` resolves through the per-generation table; generations
+    and precisions without a measured row keep the fixed split (``None``)."""
+    from flashinfer import mok
+
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: capability
+    )
+    assert mok.resolve_imbalance_comm_sms(precision) == expected
+
+
+def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
+    """Host-only: the config default disables the imbalance split, the facade
+    default ``"auto"`` resolves the measured row of the device generation, and
+    malformed arguments are rejected before any collective."""
+    import inspect
+
+    from flashinfer import mok
+    from flashinfer.experimental.cake_mok_bf16.workspace import MoKConfig
+
+    config = MoKConfig()
+    assert config.imbalance_comm_sms is None
+    assert config.imbalance_threshold == 1.5
+    facade = inspect.signature(mok.create_mok_bf16_workspace).parameters
+    assert facade["imbalance_comm_sms"].default == "auto"
+    assert facade["imbalance_threshold"].default == 1.5
+    # The measured row (backend README); a change here is a shipping change.
+    assert mok.IMBALANCE_COMM_SMS == {(10, 0): {"bf16": (24, 28)}}
+    assert mok.IMBALANCE_THRESHOLD == 1.5
+    with pytest.raises(ValueError, match="precision must be one of"):
+        mok.resolve_imbalance_comm_sms("fp8")
+    kwargs = dict(
+        group=None, device=None, num_local_tokens=512, hidden_size=256, topk=2
+    )
+    with pytest.raises(ValueError, match='"auto"'):
+        mok.create_mok_bf16_workspace(imbalance_comm_sms="fast", **kwargs)
+    with pytest.raises(ValueError, match="pair"):
+        mok.create_mok_bf16_workspace(imbalance_comm_sms=(24,), **kwargs)
+    with pytest.raises(ValueError, match="precision must be one of"):
+        mok.create_mok_bf16_workspace(precision="fp8", **kwargs)
