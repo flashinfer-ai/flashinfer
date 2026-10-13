@@ -156,13 +156,8 @@ def _extract_skip_reasons_from_xml(xml_path: Path, source_file: str) -> list[str
             # pytest classnames use dots; source files use slashes.
             nodeid = classname.replace(".", "/") + ".py"
         # Check whether this testcase belongs to the source file we care about.
-        if not nodeid.startswith(source_file.rstrip(".py").replace(".py", "")):
-            # More robust: just check the source_file prefix.
-            if not (
-                nodeid.startswith(source_file)
-                or nodeid.startswith(source_file.split("::")[0])
-            ):
-                continue
+        if nodeid.split("::", 1)[0] != source_file:
+            continue
         skipped_el = testcase.find("./skipped")
         if skipped_el is None:
             continue
