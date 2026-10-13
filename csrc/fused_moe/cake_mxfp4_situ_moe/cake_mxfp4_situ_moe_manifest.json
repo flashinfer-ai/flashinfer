@@ -16,7 +16,7 @@
   "contract": {
     "arch": "sm_103a",
     "backend": "cake",
-    "cake_revision": "9316cbf49bd21548735f2d9720f2375b883a5c69",
+    "cake_revision": "acf3ba642c1039f44b4b86709b897ef4ab1a62cc",
     "carried_rows": {
       "cake": [
         "ep8_r3_t00001_uniform_cycle",
@@ -2209,6 +2209,136 @@
         "use_pdl": true,
         "use_row_group": false
       },
+      "gemm2_dense_finalize_n192_c12_rg": {
+        "a_mcast": true,
+        "a_offset": 0,
+        "a_part_bytes": 8192,
+        "a_part_rows": 64,
+        "a_stage_bytes": 16384,
+        "ab_free_count": 2,
+        "ab_tx_bytes": 30208,
+        "acc_buf_stride": 192,
+        "acc_cols": 384,
+        "acc_early_release_subtile": 1,
+        "b_offset": 65536,
+        "b_rows": 192,
+        "b_stage_bytes": 24576,
+        "backends": [
+          "cuda_cpp",
+          "cutedsl"
+        ],
+        "c_offset": 169984,
+        "c_row_bytes": 400,
+        "c_stage_bytes": 51200,
+        "c_stages": 1,
+        "cluster_n": 2,
+        "cta_group": 1,
+        "epi_issue_all_warps": true,
+        "epi_issue_warps": 4,
+        "epi_pair": false,
+        "footer_dep_launch": true,
+        "gate": "e2e_registry",
+        "half_atoms_per_tile": 3,
+        "info_offset": 221184,
+        "kind": "gemm2_dense",
+        "mcast_mask": 3,
+        "meta_scale_offset": 222256,
+        "meta_tok_offset": 221232,
+        "n_tile": 192,
+        "num_ab_stage": 4,
+        "num_acc_stage": 2,
+        "overlap_acc": false,
+        "pdl_trigger_early": false,
+        "plan_selected": false,
+        "raster_along_m": false,
+        "raster_auto": false,
+        "registry": "kimi_k3_mxfp4_situ_gemm2_dense_n192_c12_rg",
+        "row_group": true,
+        "sched_mode_offset": 223280,
+        "sfa_col": 384,
+        "sfa_offset": 163840,
+        "sfa_part_bytes": 256,
+        "sfa_part_d1": 2,
+        "sfa_stage_bytes": 512,
+        "sfb_atoms": 2,
+        "sfb_col": 388,
+        "sfb_offset": 165888,
+        "sfb_op_width": 6,
+        "sfb_shift_dynamic": true,
+        "sfb_stage_bytes": 1024,
+        "sfb_width": 8,
+        "smem_bytes": 223280,
+        "template": "gemm2_dense_finalize_n192_c12_rg",
+        "token": "dense_n192_c12_rg",
+        "two_cta": false,
+        "use_pdl": true,
+        "use_row_group": true
+      },
+      "gemm2_dense_finalize_n192_c12_rg_rauto": {
+        "a_mcast": true,
+        "a_offset": 0,
+        "a_part_bytes": 8192,
+        "a_part_rows": 64,
+        "a_stage_bytes": 16384,
+        "ab_free_count": 2,
+        "ab_tx_bytes": 30208,
+        "acc_buf_stride": 192,
+        "acc_cols": 384,
+        "acc_early_release_subtile": 1,
+        "b_offset": 65536,
+        "b_rows": 192,
+        "b_stage_bytes": 24576,
+        "backends": [
+          "cuda_cpp",
+          "cutedsl"
+        ],
+        "c_offset": 169984,
+        "c_row_bytes": 400,
+        "c_stage_bytes": 51200,
+        "c_stages": 1,
+        "cluster_n": 2,
+        "cta_group": 1,
+        "epi_issue_all_warps": true,
+        "epi_issue_warps": 4,
+        "epi_pair": false,
+        "footer_dep_launch": true,
+        "gate": "e2e_registry",
+        "half_atoms_per_tile": 3,
+        "info_offset": 221184,
+        "kind": "gemm2_dense",
+        "mcast_mask": 3,
+        "meta_scale_offset": 222256,
+        "meta_tok_offset": 221232,
+        "n_tile": 192,
+        "num_ab_stage": 4,
+        "num_acc_stage": 2,
+        "overlap_acc": false,
+        "pdl_trigger_early": false,
+        "plan_selected": false,
+        "raster_along_m": "auto",
+        "raster_auto": true,
+        "registry": "kimi_k3_mxfp4_situ_gemm2_dense_n192_c12_rg_rauto",
+        "row_group": true,
+        "sched_mode_offset": 223280,
+        "sfa_col": 384,
+        "sfa_offset": 163840,
+        "sfa_part_bytes": 256,
+        "sfa_part_d1": 2,
+        "sfa_stage_bytes": 512,
+        "sfb_atoms": 2,
+        "sfb_col": 388,
+        "sfb_offset": 165888,
+        "sfb_op_width": 6,
+        "sfb_shift_dynamic": true,
+        "sfb_stage_bytes": 1024,
+        "sfb_width": 8,
+        "smem_bytes": 223296,
+        "template": "gemm2_dense_finalize_n192_c12_rg_rauto",
+        "token": "dense_n192_c12_rg_rauto",
+        "two_cta": false,
+        "use_pdl": true,
+        "use_row_group": true
+      },
       "gemm2_dense_finalize_n192_nopdl": {
         "a_mcast": false,
         "a_offset": 0,
@@ -3118,6 +3248,20 @@
         "two_cta": false,
         "use_pdl": true,
         "use_row_group": true
+      },
+      "gemm2_gate": {
+        "backends": [
+          "cuda_cpp",
+          "cutedsl"
+        ],
+        "gate": "e2e_registry",
+        "kind": "gemm2_gate",
+        "pdl": true,
+        "plan_selected": true,
+        "registry": "kimi_k3_mxfp4_situ_gemm2_gate",
+        "template": "kimi_k3_mxfp4_situ_gemm2_gate",
+        "token": "gemm2_gate",
+        "use_pdl": true
       },
       "gemm2_swapab_finalize_n128": {
         "ab_tx_bytes": 25088,
@@ -4634,10 +4778,10 @@
         "sha256": "52efa38cfb80f529162f86f08584026cb8146869020e227cb1232f46ba3e44da"
       },
       {
-        "bytes": 249631,
+        "bytes": 272087,
         "kind": "integration",
         "path": "flashinfer/fused_moe/cake/cake_mxfp4_situ_moe_plan.py",
-        "sha256": "5f2e54b01ac23abd2ce85e960157f67b462b1bb0227a891f4f9c85bf08a4523d"
+        "sha256": "509445f86eb810e7d6314e562e47cc712920439db2ceb9d486e7619e52f0d321"
       },
       {
         "bytes": 454,
@@ -4646,10 +4790,10 @@
         "sha256": "d6f4222142ed25eb12b0c557d85a02d33eaff68b81caef95deee0347fd5ceb49"
       },
       {
-        "bytes": 58582,
+        "bytes": 59639,
         "kind": "integration",
         "path": "tests/moe/test_cake_mxfp4_situ_moe.py",
-        "sha256": "018342e8b45afc0d8c755548b2f7a3c73e5ee120f05ea2e2622cb50dda852816"
+        "sha256": "d873a9e55267e7abeb06fadb082ac6458ec621431162ec205464b2be918e8a58"
       }
     ],
     "integration_status": "complete: kernel modules, host plan, kernel loader, tests and docs page rendered; plan parity and coverage checked",
@@ -4720,10 +4864,10 @@
         "sha256": "209f7d0f79347a81cc8999134002b74722e181e4667a5b9c105bcd730f57c9a8"
       },
       {
-        "bytes": 19347,
+        "bytes": 19985,
         "kind": "shared",
         "path": "docs/api/cake_mxfp4_situ_moe.rst",
-        "sha256": "02e7591b4e5ea17f697030752f8853872d94ba39ed3bd492beae7529db48383d"
+        "sha256": "8bdd3bf3917fe7f9589f37e5133b6552fe60c20a1598bbfb93154b7dc644caa2"
       }
     ],
     "sibling_backend_forms": {},
@@ -4755,6 +4899,8 @@
       "gemm1_dense_situ_m256_n256_2cta_rowgroup",
       "gemm1_swapab_situ_n16",
       "gemm2_dense_finalize_n128",
+      "gemm2_dense_finalize_n192_c12_rg",
+      "gemm2_dense_finalize_n192_c12_rg_rauto",
       "gemm2_dense_finalize_n256_2cta_rg",
       "gemm2_dense_finalize_n256_c12_rg",
       "gemm2_dense_finalize_n256_rg",
@@ -4907,6 +5053,18 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_1b5b09ca500e2f2771be_kernel.cu",
       "sha256": "437d6f72a24719ad601cb3bf4e9f4af037d65c99f1f9e9512dd411fcdd7a799c"
+    },
+    {
+      "bytes": 7884,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_1c0edcae325d6ffbe30f_binding.cu",
+      "sha256": "3fb45bd6b9da81e07c89f055bc38dbe68d3f58f615cbe1b165dfea9ad02b9da1"
+    },
+    {
+      "bytes": 10242,
+      "kind": "device_source",
+      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_1c0edcae325d6ffbe30f_kernel.cu",
+      "sha256": "111c5a656c25651eef705e18b1edc8a377651584f39ba5e900b44c24093ee0b1"
     },
     {
       "bytes": 15470,
@@ -5221,6 +5379,18 @@
       "sha256": "63ac47cc3b706d9752be61b19c6960b9c4d362555ab608b0b55ac46c737c37ab"
     },
     {
+      "bytes": 23757,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_532108760f8d7356aa7a_binding.cu",
+      "sha256": "934457291381b322ba6cc09d4576221bebffac456faf64bad0002ef8581462ba"
+    },
+    {
+      "bytes": 62753,
+      "kind": "device_source",
+      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_532108760f8d7356aa7a_kernel.cu",
+      "sha256": "00152230aeb464ff7c4510518c52f827597a6753fe3b6fd31b04dc51bfd1a826"
+    },
+    {
       "bytes": 21061,
       "kind": "tvm_ffi_binding",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_5780e563e92e1db149c3_binding.cu",
@@ -5519,6 +5689,18 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_a3432afc4783d3588ceb_kernel.cu",
       "sha256": "cd72b440e1d5447ea7c1470f0d4894f627ae0bab4cb30a0795e13d423a5f9306"
+    },
+    {
+      "bytes": 23757,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_a44940897ad0284d10ff_binding.cu",
+      "sha256": "4538a4572a42d7f77a3c30cf8add7217aea2e2e562de684c7435a9ecec7d0a51"
+    },
+    {
+      "bytes": 65214,
+      "kind": "device_source",
+      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_a44940897ad0284d10ff_kernel.cu",
+      "sha256": "c99e9d8da5fa9030cda076005dc71a47dab188d031b40990991b50646a8733c5"
     },
     {
       "bytes": 21040,
@@ -8566,6 +8748,164 @@
         "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_1b5b09ca500e2f2771be_binding.cu",
         "compile_separately": true,
         "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_1b5b09ca500e2f2771be_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "tile_expert"
+        ],
+        [
+          "buffer",
+          "alt_expert"
+        ],
+        [
+          "buffer",
+          "base_active"
+        ],
+        [
+          "buffer",
+          "alt_active"
+        ],
+        [
+          "buffer",
+          "wide_list"
+        ],
+        [
+          "buffer",
+          "wide_count"
+        ],
+        [
+          "buffer",
+          "alt_wide_list"
+        ],
+        [
+          "buffer",
+          "alt_wide_count"
+        ],
+        [
+          "buffer",
+          "narrow_count"
+        ],
+        [
+          "buffer",
+          "gate"
+        ],
+        [
+          "parameter",
+          "min_windows"
+        ],
+        [
+          "parameter",
+          "every_group_vote"
+        ],
+        [
+          "parameter",
+          "wide_list_vote"
+        ],
+        [
+          "parameter",
+          "distinct_threshold"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "7998d6f77367f06b47a742fb8a59e7871ea5f7692bc5643616c82e69fff9d22e",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 10242,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_1c0edcae325d6ffbe30f_kernel.cu",
+          "sha256": "111c5a656c25651eef705e18b1edc8a377651584f39ba5e900b44c24093ee0b1"
+        },
+        {
+          "bytes": 7884,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_1c0edcae325d6ffbe30f_binding.cu",
+          "sha256": "3fb45bd6b9da81e07c89f055bc38dbe68d3f58f615cbe1b165dfea9ad02b9da1"
+        }
+      ],
+      "closure_sha256": "f0f6f13df5617387eabf5286d4987418b67064f0726de2f046f83b1c67a3590a",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_1c0edcae325d6ffbe30f",
+      "launch": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 0,
+        "max_persistent_clusters": null,
+        "persistent_ctas_per_sm": 1,
+        "use_pdl": true
+      },
+      "module_ident": "cake_mxfp4_situ_moe_1c0edcae325d6ffbe30f_sm_103a",
+      "name": "cake_mxfp4_situ_moe_1c0edcae325d6ffbe30f",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "form": {
+          "backends": [
+            "cuda_cpp",
+            "cutedsl"
+          ],
+          "gate": "e2e_registry",
+          "kind": "gemm2_gate",
+          "pdl": true,
+          "plan_selected": true,
+          "registry": "kimi_k3_mxfp4_situ_gemm2_gate",
+          "use_pdl": true
+        },
+        "source_identity": "1c0edcae325d6ffbe30ff7b54834130423d9f2e7a06676fe6cd6d5d237bd0043",
+        "stage": "gemm2_gate",
+        "template": "kimi_k3_mxfp4_situ_gemm2_gate"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "persistent_ctas_per_sm": 1,
+        "physical_schedule": "resolved_final_ir",
+        "schedule_identity": "b55f23254ec028a37fcabb499ad5e190401641abbe9c93b5b7598c91f1060a18",
+        "source_arch": "sm_103a",
+        "source_cluster_scheduling_policy": "spread",
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": true,
+        "validate": true
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
+      "translation_units": {
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_1c0edcae325d6ffbe30f_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_1c0edcae325d6ffbe30f_kernel.cu"
       }
     },
     {
@@ -14621,6 +14961,231 @@
         ],
         [
           "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "buffer",
+          "tile_idx_to_expert_idx"
+        ],
+        [
+          "buffer",
+          "tile_idx_to_mn_limit"
+        ],
+        [
+          "buffer",
+          "num_non_exiting_tiles"
+        ],
+        [
+          "buffer",
+          "alpha"
+        ],
+        [
+          "buffer",
+          "permuted_idx_to_expanded_idx"
+        ],
+        [
+          "buffer",
+          "token_final_scales"
+        ],
+        [
+          "buffer",
+          "tile_idx_to_row_group"
+        ],
+        [
+          "parameter",
+          "num_m_tiles"
+        ],
+        [
+          "parameter",
+          "num_n_tiles"
+        ],
+        [
+          "parameter",
+          "k_tiles"
+        ],
+        [
+          "parameter",
+          "out_cols"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "buffer",
+          "dbg"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "b24c72e10afd43f6b77a5f68d503b6227a41bd8fc3d973560ce0f240ef40c3d0",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 62753,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_532108760f8d7356aa7a_kernel.cu",
+          "sha256": "00152230aeb464ff7c4510518c52f827597a6753fe3b6fd31b04dc51bfd1a826"
+        },
+        {
+          "bytes": 23757,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_532108760f8d7356aa7a_binding.cu",
+          "sha256": "934457291381b322ba6cc09d4576221bebffac456faf64bad0002ef8581462ba"
+        }
+      ],
+      "closure_sha256": "d961bf6e310f82725c34e70e17654363c98b676af3ed1958541541ce3c3a7687",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_532108760f8d7356aa7a",
+      "launch": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "cluster": [
+          2,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 224384,
+        "max_persistent_clusters": null,
+        "persistent_ctas_per_sm": 1,
+        "use_pdl": true
+      },
+      "module_ident": "cake_mxfp4_situ_moe_532108760f8d7356aa7a_sm_103a",
+      "name": "cake_mxfp4_situ_moe_532108760f8d7356aa7a",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "form": {
+          "a_mcast": true,
+          "a_offset": 0,
+          "a_part_bytes": 8192,
+          "a_part_rows": 64,
+          "a_stage_bytes": 16384,
+          "ab_free_count": 2,
+          "ab_tx_bytes": 30208,
+          "acc_buf_stride": 192,
+          "acc_cols": 384,
+          "acc_early_release_subtile": 1,
+          "b_offset": 65536,
+          "b_rows": 192,
+          "b_stage_bytes": 24576,
+          "backends": [
+            "cuda_cpp",
+            "cutedsl"
+          ],
+          "c_offset": 169984,
+          "c_row_bytes": 400,
+          "c_stage_bytes": 51200,
+          "c_stages": 1,
+          "cluster_n": 2,
+          "cta_group": 1,
+          "epi_issue_all_warps": true,
+          "epi_issue_warps": 4,
+          "epi_pair": false,
+          "footer_dep_launch": true,
+          "gate": "e2e_registry",
+          "half_atoms_per_tile": 3,
+          "info_offset": 221184,
+          "kind": "gemm2_dense",
+          "mcast_mask": 3,
+          "meta_scale_offset": 222256,
+          "meta_tok_offset": 221232,
+          "n_tile": 192,
+          "num_ab_stage": 4,
+          "num_acc_stage": 2,
+          "overlap_acc": false,
+          "pdl_trigger_early": false,
+          "plan_selected": false,
+          "raster_along_m": false,
+          "raster_auto": false,
+          "registry": "kimi_k3_mxfp4_situ_gemm2_dense_n192_c12_rg",
+          "row_group": true,
+          "sched_mode_offset": 223280,
+          "sfa_col": 384,
+          "sfa_offset": 163840,
+          "sfa_part_bytes": 256,
+          "sfa_part_d1": 2,
+          "sfa_stage_bytes": 512,
+          "sfb_atoms": 2,
+          "sfb_col": 388,
+          "sfb_offset": 165888,
+          "sfb_op_width": 6,
+          "sfb_shift_dynamic": true,
+          "sfb_stage_bytes": 1024,
+          "sfb_width": 8,
+          "smem_bytes": 223280,
+          "two_cta": false,
+          "use_pdl": true,
+          "use_row_group": true
+        },
+        "source_identity": "532108760f8d7356aa7a96f4a46cb9542c25192d7bd97b9f22a339aaacdfffa5",
+        "stage": "gemm2_dense_finalize_n192_c12_rg",
+        "template": "gemm2_dense_finalize_n192_c12_rg"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "persistent_ctas_per_sm": 1,
+        "physical_schedule": "resolved_final_ir",
+        "schedule_identity": "df778903a0cbf7320f06012d7102f10b6e8b358ed3d9e03fc7f3be29ef6eb001",
+        "source_arch": "sm_103a",
+        "source_cluster_scheduling_policy": "spread",
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": true,
+        "validate": true
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
+      "translation_units": {
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_532108760f8d7356aa7a_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_532108760f8d7356aa7a_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
           "SFA"
         ],
         [
@@ -20122,6 +20687,231 @@
         "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_a3432afc4783d3588ceb_binding.cu",
         "compile_separately": true,
         "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_a3432afc4783d3588ceb_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "buffer",
+          "tile_idx_to_expert_idx"
+        ],
+        [
+          "buffer",
+          "tile_idx_to_mn_limit"
+        ],
+        [
+          "buffer",
+          "num_non_exiting_tiles"
+        ],
+        [
+          "buffer",
+          "alpha"
+        ],
+        [
+          "buffer",
+          "permuted_idx_to_expanded_idx"
+        ],
+        [
+          "buffer",
+          "token_final_scales"
+        ],
+        [
+          "buffer",
+          "tile_idx_to_row_group"
+        ],
+        [
+          "parameter",
+          "num_m_tiles"
+        ],
+        [
+          "parameter",
+          "num_n_tiles"
+        ],
+        [
+          "parameter",
+          "k_tiles"
+        ],
+        [
+          "parameter",
+          "out_cols"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "buffer",
+          "dbg"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "b24c72e10afd43f6b77a5f68d503b6227a41bd8fc3d973560ce0f240ef40c3d0",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 65214,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_a44940897ad0284d10ff_kernel.cu",
+          "sha256": "c99e9d8da5fa9030cda076005dc71a47dab188d031b40990991b50646a8733c5"
+        },
+        {
+          "bytes": 23757,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_a44940897ad0284d10ff_binding.cu",
+          "sha256": "4538a4572a42d7f77a3c30cf8add7217aea2e2e562de684c7435a9ecec7d0a51"
+        }
+      ],
+      "closure_sha256": "bafa9d18b23e4668c1142d5fc4422a82514c2f8dc4318aa6b3f6652ddb6116ab",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_a44940897ad0284d10ff",
+      "launch": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "cluster": [
+          2,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 224384,
+        "max_persistent_clusters": null,
+        "persistent_ctas_per_sm": 1,
+        "use_pdl": true
+      },
+      "module_ident": "cake_mxfp4_situ_moe_a44940897ad0284d10ff_sm_103a",
+      "name": "cake_mxfp4_situ_moe_a44940897ad0284d10ff",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "form": {
+          "a_mcast": true,
+          "a_offset": 0,
+          "a_part_bytes": 8192,
+          "a_part_rows": 64,
+          "a_stage_bytes": 16384,
+          "ab_free_count": 2,
+          "ab_tx_bytes": 30208,
+          "acc_buf_stride": 192,
+          "acc_cols": 384,
+          "acc_early_release_subtile": 1,
+          "b_offset": 65536,
+          "b_rows": 192,
+          "b_stage_bytes": 24576,
+          "backends": [
+            "cuda_cpp",
+            "cutedsl"
+          ],
+          "c_offset": 169984,
+          "c_row_bytes": 400,
+          "c_stage_bytes": 51200,
+          "c_stages": 1,
+          "cluster_n": 2,
+          "cta_group": 1,
+          "epi_issue_all_warps": true,
+          "epi_issue_warps": 4,
+          "epi_pair": false,
+          "footer_dep_launch": true,
+          "gate": "e2e_registry",
+          "half_atoms_per_tile": 3,
+          "info_offset": 221184,
+          "kind": "gemm2_dense",
+          "mcast_mask": 3,
+          "meta_scale_offset": 222256,
+          "meta_tok_offset": 221232,
+          "n_tile": 192,
+          "num_ab_stage": 4,
+          "num_acc_stage": 2,
+          "overlap_acc": false,
+          "pdl_trigger_early": false,
+          "plan_selected": false,
+          "raster_along_m": "auto",
+          "raster_auto": true,
+          "registry": "kimi_k3_mxfp4_situ_gemm2_dense_n192_c12_rg_rauto",
+          "row_group": true,
+          "sched_mode_offset": 223280,
+          "sfa_col": 384,
+          "sfa_offset": 163840,
+          "sfa_part_bytes": 256,
+          "sfa_part_d1": 2,
+          "sfa_stage_bytes": 512,
+          "sfb_atoms": 2,
+          "sfb_col": 388,
+          "sfb_offset": 165888,
+          "sfb_op_width": 6,
+          "sfb_shift_dynamic": true,
+          "sfb_stage_bytes": 1024,
+          "sfb_width": 8,
+          "smem_bytes": 223296,
+          "two_cta": false,
+          "use_pdl": true,
+          "use_row_group": true
+        },
+        "source_identity": "a44940897ad0284d10ff0201ff681c3d05f171e5cc2bf4d9e01652f73f4b5f0a",
+        "stage": "gemm2_dense_finalize_n192_c12_rg_rauto",
+        "template": "gemm2_dense_finalize_n192_c12_rg_rauto"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "persistent_ctas_per_sm": 1,
+        "physical_schedule": "resolved_final_ir",
+        "schedule_identity": "a6d197576c2c6620840f4ad2995feb2c661385fc5e208c113926d266c838ae68",
+        "source_arch": "sm_103a",
+        "source_cluster_scheduling_policy": "spread",
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": true,
+        "validate": true
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
+      "translation_units": {
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_a44940897ad0284d10ff_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cuda/sm_103a/cake_mxfp4_situ_moe_a44940897ad0284d10ff_kernel.cu"
       }
     },
     {
@@ -30474,7 +31264,7 @@
   ],
   "name": "cake_mxfp4_situ_moe",
   "producer": "cake",
-  "producer_revision": "9316cbf49bd21548735f2d9720f2375b883a5c69",
+  "producer_revision": "acf3ba642c1039f44b4b86709b897ef4ab1a62cc",
   "public_namespace": "cake",
   "retained_target_device_helpers": [],
   "schema": "cake.library_export.v5",

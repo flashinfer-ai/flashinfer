@@ -198,6 +198,13 @@ Q + paged K/V
     -> direct O, or split-KV partials -> reduction -> O
 ```
 
+Profiles that stream score fragments (KV256 tiles, block-sparse routes and
+8-bit Q128/KV128) choose their softmax arithmetic per architecture. SM100
+evaluates a quarter of each fragment's exponentials as FMA polynomials to
+offload MUFU. SM103, with twice the MUFU ex2 rate, keeps every exponential on
+MUFU, and its unmasked max pass takes fragment maxima (or Sage scale-group
+maxima) from LDTM.STAT instead of a register reduction.
+
 Eligible nonsplit work that exceeds one resident SM wave uses CLC-persistent
 scheduling. A scheduler warp discovers each schedule token once and broadcasts it to
 the worker tasks. Underfilled fixed- or packed-Q grids may instead split the
@@ -220,6 +227,9 @@ requires its captured address and shape to remain stable.
 | [`fmha_decode_tasks.py`](fmha_decode_tasks.py) | Ordered load, MMA, softmax, correction, store, and scheduler work |
 | [`fmha_decode_resources/`](fmha_decode_resources/) | GMEM/SMEM/TMEM resources and pipeline state |
 | [`reduction.py`](reduction.py) | Separate split-KV reduction |
+| [`block_sparse_prepare.py`](block_sparse_prepare.py) | Prepare of a block-sparse plan's compact route records from BSR or bitmask inputs |
+| [`block_sparse_inspect.py`](block_sparse_inspect.py) | One-shot validation of canonical BSR and live paged metadata |
+| [`sage_prepare.py`](sage_prepare.py) | Gather of a Sage plan's scales into the buffer the attention kernel reads |
 
 ## Example
 

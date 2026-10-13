@@ -95,7 +95,11 @@ form (no contract row is in this class).  Every other row reports
 ``decision.path`` is not in ``EXECUTABLE_PATHS`` (the ``two_stage`` finalize
 on MoE-TP rows of 17 to 127 tokens is traced but not enqueued by this chain).
 The two-stream ``mixed192`` chain serves the MoE-TP rows of 8192 tokens and
-above.  Callers that need a hard answer before ``plan`` check
+above; from 16384 tokens its finalize stage is static and decided on the
+device: a one-warp ``gemm2_gate`` kernel after ``moe_sort`` reads the sort
+tables and writes the item count every finalize launch of both paths keys off,
+so the unselected path's kernels exit on zero items and the host enqueues the
+same kernels on every run.  Callers that need a hard answer before ``plan`` check
 ``decision.path in EXECUTABLE_PATHS`` as well as ``decision.supported``.
 The dense grouped-GEMM path above ``swapab_max_tokens``, the split two-stage
 path and the hybrid path run through their own executable chains (see
@@ -241,6 +245,14 @@ not on a contract row).
      - gemm2_dense
      - cake, cake_cute
      - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n192_c12_rg``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n192_c12_rg_rauto``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
    * - ``gemm1_dense_situ_m128_n256``
      - gemm1_dense
      - cake, cake_cute
@@ -355,6 +367,10 @@ not on a contract row).
      - ``e2e_registry``
    * - ``finalize_top8_split``
      - finalize
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_gate``
+     - gemm2_gate
      - cake, cake_cute
      - ``e2e_registry``
    * - ``gemm2_swapab_finalize_n8_m2``
