@@ -183,8 +183,10 @@ def cp_delta_rule_t_precompute_dsl_sm100(
 
 
 @functools.cache
-def _get_mn_precompute_kernel(kernel_dtype, cu_seqlens_dtype):
-    return CPDeltaRuleMNPrecomputeUtcmma1Sm100(kernel_dtype, cu_seqlens_dtype)
+def _get_mn_precompute_kernel(kernel_dtype, cu_seqlens_dtype, head_size, head_size_v):
+    return CPDeltaRuleMNPrecomputeUtcmma1Sm100(
+        kernel_dtype, cu_seqlens_dtype, head_size, head_size_v
+    )
 
 
 def cp_delta_rule_mn_precompute_dsl_sm100(
@@ -208,11 +210,11 @@ def cp_delta_rule_mn_precompute_dsl_sm100(
     if not _skip_check:
         if k.ndim != 3:
             raise RuntimeError(
-                f"k must have shape (total_seqlen, num_k_heads, D), got {tuple(k.shape)}"
+                f"k must have shape (total_seqlen, num_k_heads, DimK), got {tuple(k.shape)}"
             )
-        if v.ndim != 3 or v.shape[0] != k.shape[0] or v.shape[2] != k.shape[2]:
+        if v.ndim != 3 or v.shape[0] != k.shape[0]:
             raise RuntimeError(
-                f"v must have shape (total_seqlen, num_v_heads, D), got {tuple(v.shape)}"
+                f"v must have shape (total_seqlen, num_v_heads, DimV), got {tuple(v.shape)}"
             )
         if alpha.ndim != 2 or alpha.shape[0] != k.shape[0]:
             raise RuntimeError(
@@ -234,8 +236,8 @@ def cp_delta_rule_mn_precompute_dsl_sm100(
         raise RuntimeError("max_seqlen must be provided")
     if not _skip_check and max_seqlen <= 0:
         raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
-    _, num_k_heads, d = k.shape
-    num_v_heads = v.shape[1]
+    _, num_k_heads, dk = k.shape
+    _, num_v_heads, dv = v.shape
     num_sab_heads = alpha.shape[1]
     if not _skip_check:
         if num_sab_heads < num_k_heads or num_sab_heads % num_k_heads != 0:
@@ -255,9 +257,10 @@ def cp_delta_rule_mn_precompute_dsl_sm100(
         )
     total_cp_chunks = workspace_num_chunks_host(cu_seqlens, cp_chunk_len, total_seqlen)
     if not _skip_check:
-        if d != 128:
+        if (dk, dv) not in ((128, 128), (128, 64)):
             raise RuntimeError(
-                f"CPDeltaRuleMNPrecomputeSm100 only supports D=128, got {d}"
+                "CPDeltaRuleMNPrecomputeSm100 only supports (DimK, DimV) in "
+                f"{{(128, 128), (128, 64)}}, got {(dk, dv)}"
             )
         if k.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
@@ -276,18 +279,23 @@ def cp_delta_rule_mn_precompute_dsl_sm100(
                 raise RuntimeError(f"{name} must be contiguous")
 
     max_cp_chunks_per_seq = max_num_chunks_host(max_seqlen, cp_chunk_len)
-    k_tma = k.as_strided((d, total_seqlen, num_k_heads), (1, num_k_heads * d, d))
-    v_tma = v.as_strided((d, total_seqlen, num_v_heads), (1, num_v_heads * d, d))
+    k_tma = k.as_strided((dk, total_seqlen, num_k_heads), (1, num_k_heads * dk, dk))
+    v_tma = v.as_strided((dv, total_seqlen, num_v_heads), (1, num_v_heads * dv, dv))
     t_tma = t.as_strided(
         (64, 64, num_sab_heads, total_t_blocks),
         (64, 1, 64 * 64, num_sab_heads * 64 * 64),
     )
-    workspace_shape = (total_cp_chunks, num_sab_heads, d, d)
     transfer_t = _get_cp_workspace(
-        "gdn_cp_sm100_local_transfer", workspace_shape, torch.float32, device
+        "gdn_cp_sm100_local_transfer",
+        (total_cp_chunks, num_sab_heads, dk, dk),
+        torch.float32,
+        device,
     )
     state_t = _get_cp_workspace(
-        "gdn_cp_sm100_local_state", workspace_shape, torch.float32, device
+        "gdn_cp_sm100_local_state",
+        (total_cp_chunks, num_sab_heads, dv, dk),
+        torch.float32,
+        device,
     )
     if total_cp_chunks == 0:
         return transfer_t, state_t
@@ -301,7 +309,7 @@ def cp_delta_rule_mn_precompute_dsl_sm100(
         else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     )
     kernel = _get_mn_precompute_kernel(
-        kernel_dtype, _cu_seqlens_dtype(cu_seqlens.dtype)
+        kernel_dtype, _cu_seqlens_dtype(cu_seqlens.dtype), dk, dv
     )
     compile_options = _blackwell_compile_options(device)
     compiled = get_cached_compile(kernel, compile_options)

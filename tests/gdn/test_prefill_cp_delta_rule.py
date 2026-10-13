@@ -315,6 +315,7 @@ def test_cp_delta_rule_t_precompute_varlen_tail_is_projected(
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("head_size_v", [128, 64])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("num_heads", [1, 2])
 @pytest.mark.parametrize("gate_baseline", [0.9, 0.99, 0.9995])
@@ -335,13 +336,15 @@ def test_cp_delta_rule_mn_precompute(
     cp_chunk_len,
     num_heads,
     gate_baseline,
+    head_size_v,
     seed=int(os.environ.get("SEED", "0")),
 ):
     _skip_if_cp_unsupported()
+    head_size = 128
+    _skip_if_head_sizes_unsupported(head_size, head_size_v)
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = getattr(torch, dtype)
-    head_size = 128
     block_size = 64
     total_seqlen = sum(seq_lens)
     max_seqlen = max(seq_lens)
@@ -349,7 +352,13 @@ def test_cp_delta_rule_mn_precompute(
 
     with torch.device(device):
         _, k, v = qkv_factory(
-            seq_lens, num_heads, num_heads, num_heads, head_size, dtype=dtype
+            seq_lens,
+            num_heads,
+            num_heads,
+            num_heads,
+            head_size,
+            dtype=dtype,
+            head_size_v=head_size_v,
         )
     k = torch.nn.functional.normalize(k.float(), p=2.0, dim=-1).to(dtype).contiguous()
     v = v.contiguous()
@@ -371,13 +380,11 @@ def test_cp_delta_rule_mn_precompute(
     )
     torch.cuda.synchronize()
 
-    assert our_transfer.shape == (
-        workspace_num_chunks_host(cu_seqlens.cpu(), cp_chunk_len, total_seqlen),
-        num_heads,
-        head_size,
-        head_size,
+    total_cp_chunks = workspace_num_chunks_host(
+        cu_seqlens.cpu(), cp_chunk_len, total_seqlen
     )
-    assert our_state.shape == our_transfer.shape
+    assert our_transfer.shape == (total_cp_chunks, num_heads, head_size, head_size)
+    assert our_state.shape == (total_cp_chunks, num_heads, head_size_v, head_size)
 
     for seq_idx, seq_len in enumerate(seq_lens):
         seq_start = int(cu_seqlens[seq_idx].item())

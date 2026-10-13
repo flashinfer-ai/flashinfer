@@ -556,7 +556,7 @@ def precompute_blockwise_cp_delta_rule_t(
 @torch.inference_mode
 def blockwise_cp_delta_rule_pre_transposed(
     k: torch.Tensor,  # [chunk_len, num_heads, head_size]
-    v: torch.Tensor,  # [chunk_len, num_heads, head_size]
+    v: torch.Tensor,  # [chunk_len, num_heads, head_size_v]
     alpha: torch.Tensor,  # [chunk_len, num_heads]
     t: torch.Tensor,  # [num_blocks, num_heads, block_size, block_size], signed gamma-sandwiched
     *,
@@ -576,6 +576,7 @@ def blockwise_cp_delta_rule_pre_transposed(
     chunk_len = k.size(0)
     num_heads = k.size(1)
     head_size = k.size(2)
+    head_size_v = v.size(2)
     num_blocks = (chunk_len + block_size - 1) // block_size
     assert t.shape == (num_blocks, num_heads, block_size, block_size)
 
@@ -584,7 +585,7 @@ def blockwise_cp_delta_rule_pre_transposed(
     )
     transfer_t_HKK = eye_HKK.clone()
     state_t_HKV = torch.zeros(
-        (num_heads, head_size, head_size), dtype=kv_dtype, device=k.device
+        (num_heads, head_size_v, head_size), dtype=kv_dtype, device=k.device
     )
 
     for blk_idx, blk_offset in enumerate(range(0, chunk_len, block_size)):
@@ -598,7 +599,7 @@ def blockwise_cp_delta_rule_pre_transposed(
                 (block_size, num_heads, head_size), dtype=k.dtype, device=k.device
             )
             v_SHV = torch.zeros(
-                (block_size, num_heads, head_size), dtype=v.dtype, device=v.device
+                (block_size, num_heads, head_size_v), dtype=v.dtype, device=v.device
             )
             alpha_SH = torch.ones(
                 (block_size, num_heads), dtype=alpha.dtype, device=alpha.device
