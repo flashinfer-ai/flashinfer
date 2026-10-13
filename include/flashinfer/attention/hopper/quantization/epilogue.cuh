@@ -204,7 +204,8 @@ struct FP8CollectiveEpilogue {
 
     static_assert(CTA_Q <= NUM_MMA_THREADS);
     if (epilogue_params.lse_ptr) {  // don't write to LSE if it's nullptr
-      if (thread_idx < qo_len - qo_tile_idx * CTA_Q) {
+      // Only the first CTA_Q threads own rows of this tile; the others would write the next tile.
+      if (thread_idx < CTA_Q && thread_idx < qo_len - qo_tile_idx * CTA_Q) {
         gLSE(thread_idx) = -math::inf;
       }
     }

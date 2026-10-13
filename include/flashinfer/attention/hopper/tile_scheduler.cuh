@@ -15,6 +15,8 @@ namespace flashinfer {
 
 struct SingleTileScheduler {
  public:
+  static constexpr bool kSplitKV = false;
+
   // Host side kernel arguments
   struct Arguments {
     int const num_qo_tiles, num_qo_heads, qo_len, kv_len;
@@ -49,6 +51,9 @@ struct SingleTileScheduler {
       return cute::tuple{q_tile_idx,      qo_head_idx,   kv_head_idx,   /*qo_indptr=*/0,
                          /*kv_indptr=*/0, params.qo_len, params.kv_len, /*batch_idx=*/0};
     }
+
+    CUTLASS_DEVICE
+    cute::tuple<int, int> get_kv_chunk(Params const& params) const { return {0, 1}; }
   };
 
   CUTLASS_DEVICE
@@ -77,15 +82,20 @@ struct SingleTileScheduler {
   }
 };
 
-template <typename IdType>
+template <typename IdType, bool SPLIT_KV = false>
 struct BatchPrefillPersistentTileScheduler {
  public:
+  static constexpr bool kSplitKV = SPLIT_KV;
+
   // Host side kernel arguments
   struct Arguments {
     IdType *work_indptr, *head_indices, *qo_tile_indices, *qo_indptr, *kv_indptr, *qo_lens,
         *kv_lens, *batch_indices;
     cutlass::FastDivmod group_size_fastdiv;
     int num_qo_heads;  // placeholder
+    // Split-KV: per-work KV chunk index, nullptr when the plan does not split KV.
+    IdType* kv_chunk_indices = nullptr;
+    int num_kv_chunks = 1;
   };
 
   // Device side kernel params
@@ -93,12 +103,15 @@ struct BatchPrefillPersistentTileScheduler {
     IdType *work_indptr, *head_indices, *qo_tile_indices, *qo_indptr, *kv_indptr, *qo_lens,
         *kv_lens, *batch_indices;
     cutlass::FastDivmod group_size_fastdiv;
+    IdType* kv_chunk_indices;
+    int num_kv_chunks;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
-    return {args.work_indptr, args.head_indices,  args.qo_tile_indices,
-            args.qo_indptr,   args.kv_indptr,     args.qo_lens,
-            args.kv_lens,     args.batch_indices, args.group_size_fastdiv};
+    return {args.work_indptr,      args.head_indices,  args.qo_tile_indices,
+            args.qo_indptr,        args.kv_indptr,     args.qo_lens,
+            args.kv_lens,          args.batch_indices, args.group_size_fastdiv,
+            args.kv_chunk_indices, args.num_kv_chunks};
   }
 
   static dim3 get_grid_dim(Arguments const& args, int num_sm) { return {(unsigned)num_sm}; }
@@ -123,6 +136,17 @@ struct BatchPrefillPersistentTileScheduler {
     auto get_block_coord(Params const& params) const {
       return cute::tuple{q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr,
                          kv_indptr,  qo_len,      kv_len,      batch_idx};
+    }
+
+    // Returns (chunk index, number of chunks) of the KV range this work covers. Without split-KV
+    // this folds to constants, leaving the unsplit kernel unchanged.
+    CUTLASS_DEVICE
+    cute::tuple<int, int> get_kv_chunk(Params const& params) const {
+      if constexpr (SPLIT_KV) {
+        return {int(params.kv_chunk_indices[ptr_begin + counter]), params.num_kv_chunks};
+      } else {
+        return {0, 1};
+      }
     }
   };
 
@@ -201,12 +225,17 @@ struct BatchPrefillPersistentTileScheduler {
 template <typename IdType>
 struct BatchPrefillTileScheduler {
  public:
+  static constexpr bool kSplitKV = false;
+
   // Host side kernel arguments
   struct Arguments {
     IdType *work_indptr, *head_indices, *qo_tile_indices, *qo_indptr, *kv_indptr, *qo_lens,
         *kv_lens, *batch_indices;  // head_indices is a placeholder
     cutlass::FastDivmod group_size_fastdiv;
     int num_qo_heads;
+    // Split-KV is not supported with a shared schedule, these are placeholders.
+    IdType* kv_chunk_indices = nullptr;
+    int num_kv_chunks = 1;
   };
 
   // Device side kernel params
@@ -248,6 +277,9 @@ struct BatchPrefillTileScheduler {
       return cute::tuple{q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr,
                          kv_indptr,  qo_len,      kv_len,      batch_idx};
     }
+
+    CUTLASS_DEVICE
+    cute::tuple<int, int> get_kv_chunk(Params const& params) const { return {0, 1}; }
   };
 
   CUTLASS_DEVICE

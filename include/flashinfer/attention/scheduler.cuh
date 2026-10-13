@@ -1002,6 +1002,12 @@ struct PrefillPlanSM90Info {
   int64_t work_indptr_offset;
   int64_t batch_indices_offset;
   bool same_schedule_for_all_heads;
+  // Split-KV: number of KV chunks per query tile (1 disables split-KV), the per-work chunk
+  // indices, and the partial output / LSE buffers in the float workspace.
+  int64_t num_kv_chunks;
+  int64_t kv_chunk_indices_offset;
+  int64_t tmp_o_offset;
+  int64_t tmp_lse_offset;
 
   PrefillPlanSM90Info()
       : qo_tile_indices_offset(0),
@@ -1012,20 +1018,26 @@ struct PrefillPlanSM90Info {
         head_indices_offset(0),
         work_indptr_offset(0),
         batch_indices_offset(0),
-        same_schedule_for_all_heads(false) {}
+        same_schedule_for_all_heads(false),
+        num_kv_chunks(1),
+        kv_chunk_indices_offset(0),
+        tmp_o_offset(0),
+        tmp_lse_offset(0) {}
 
   // convert PrefillPlanSM90Info to std::vector<int64_t>
   std::vector<int64_t> ToVector() const {
-    return {qo_tile_indices_offset, qo_indptr_offset,     kv_indptr_offset,
-            qo_len_offset,          kv_len_offset,        head_indices_offset,
-            work_indptr_offset,     batch_indices_offset, same_schedule_for_all_heads};
+    return {qo_tile_indices_offset, qo_indptr_offset,        kv_indptr_offset,
+            qo_len_offset,          kv_len_offset,           head_indices_offset,
+            work_indptr_offset,     batch_indices_offset,    same_schedule_for_all_heads,
+            num_kv_chunks,          kv_chunk_indices_offset, tmp_o_offset,
+            tmp_lse_offset};
   }
 
   // From std::vector<int64_t> to PrefillPlanSM90Info
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 9) {
+    if (vec.size() != 13) {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 9, but got " << vec.size();
+      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 13, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     qo_tile_indices_offset = vec[0];
@@ -1037,17 +1049,63 @@ struct PrefillPlanSM90Info {
     work_indptr_offset = vec[6];
     batch_indices_offset = vec[7];
     same_schedule_for_all_heads = vec[8];
+    num_kv_chunks = vec[9];
+    kv_chunk_indices_offset = vec[10];
+    tmp_o_offset = vec[11];
+    tmp_lse_offset = vec[12];
   }
 };
 
+/*!
+ * \brief Pick the number of KV chunks for the SM90 prefill plan.
+ * \details Split-KV pays off when the unsplit plan leaves SMs idle or ends in a partial wave,
+ *   e.g. a short query chunk against a long prefix with few heads per GPU. Every work is modeled
+ *   as the longest one (its KV tiles plus a fixed prologue/epilogue cost) and the makespan as
+ *   the number of waves times the work cost. Power-of-two chunk counts and the constants below
+ *   were chosen from GH200 sweeps over uniform and mixed batches.
+ * \param num_works Number of (query tile, head) works of the unsplit plan.
+ * \param max_kv_tiles KV tiles of the longest work.
+ * \param num_sms Number of persistent CTAs.
+ */
+inline int PrefillSM90NumKVChunks(int64_t num_works, int max_kv_tiles, int num_sms) {
+  // With several full waves the tail is small relative to the merge cost.
+  if (num_works <= 0 || num_works >= 4 * int64_t(num_sms)) {
+    return 1;
+  }
+  constexpr int kMaxKVChunks = 16;
+  // Per-work prologue/epilogue and merge kernel costs, in KV tiles.
+  constexpr double kWorkOverheadTiles = 2.0;
+  constexpr double kMergeOverheadTiles = 2.0;
+  auto makespan = [&](int c) {
+    return double(ceil_div(num_works * c, int64_t(num_sms))) *
+               (double(max_kv_tiles) / c + kWorkOverheadTiles) +
+           (c > 1 ? kMergeOverheadTiles : 0.0);
+  };
+  const double unsplit_cost = makespan(1);
+  double best_cost = unsplit_cost;
+  int best_chunks = 1;
+  // Keep at least two KV tiles per chunk of the longest work.
+  for (int c = 2; c <= std::min(kMaxKVChunks, max_kv_tiles / 2); c *= 2) {
+    const double cost = makespan(c);
+    if (cost < best_cost) {
+      best_cost = cost;
+      best_chunks = c;
+    }
+  }
+  return best_cost < 0.9 * unsplit_cost ? best_chunks : 1;
+}
+
 template <typename IdType>
-inline cudaError_t PrefillSM90Plan(
-    void* float_buffer, size_t float_workspace_size_in_bytes, void* int_buffer,
-    void* page_locked_int_buffer, size_t int_workspace_size_in_bytes,
-    PrefillPlanSM90Info& plan_info, IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
-    uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
-    uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size, bool causal,
-    bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream) {
+inline cudaError_t PrefillSM90Plan(void* float_buffer, size_t float_workspace_size_in_bytes,
+                                   void* int_buffer, void* page_locked_int_buffer,
+                                   size_t int_workspace_size_in_bytes,
+                                   PrefillPlanSM90Info& plan_info, IdType* qo_indptr_h,
+                                   IdType* kv_indptr_h, IdType* kv_len_arr_h,
+                                   uint32_t total_num_rows, uint32_t batch_size,
+                                   uint32_t num_qo_heads, uint32_t num_kv_heads,
+                                   uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
+                                   bool causal, bool enable_cuda_graph, uint32_t sizeof_dtype_o,
+                                   cudaStream_t stream, bool allow_split_kv = false) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -1098,25 +1156,60 @@ inline cudaError_t PrefillSM90Plan(
   int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
   plan_info.same_schedule_for_all_heads = max_num_works_per_head > 4096;
 
+  // Split the KV range of every work into num_kv_chunks chunks when the unsplit plan leaves SMs
+  // idle; the partial outputs are merged after the kernel.
+  int num_kv_chunks = 1;
+  if (allow_split_kv && !enable_cuda_graph && !plan_info.same_schedule_for_all_heads) {
+    // Cost model granularity, close to the KV tile sizes of the SM90 kernels.
+    constexpr int kModelTileKV = 128;
+    int64_t num_works = 0;
+    int max_kv_tiles = 0;
+    bool splittable = batch_size > 0;
+    for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
+      if (qo_len == 0) continue;
+      num_works += int64_t(ceil_div(qo_len, cta_tile_q)) * num_qo_heads;
+      // Every query row must see at least one key, or its merged LSE would be undefined.
+      if (kv_len == 0 || (causal && kv_len < qo_len)) splittable = false;
+      max_kv_tiles = std::max(max_kv_tiles, ceil_div(kv_len, kModelTileKV));
+    }
+    if (splittable) {
+      num_kv_chunks = PrefillSM90NumKVChunks(num_works, max_kv_tiles, num_sm90_ctas);
+    }
+    size_t tmp_bytes = size_t(num_kv_chunks) * total_num_rows * num_qo_heads *
+                       (head_dim_vo * sizeof_dtype_o + sizeof(float));
+    if (tmp_bytes + 1024 > float_workspace_size_in_bytes) {
+      num_kv_chunks = 1;
+    }
+  }
+  plan_info.num_kv_chunks = num_kv_chunks;
+  std::vector<std::vector<IdType>> cta_kv_chunk_indices(num_sm90_ctas, std::vector<IdType>());
+
   for (int qo_head_idx = 0;
        qo_head_idx < (plan_info.same_schedule_for_all_heads ? 1 : num_qo_heads); ++qo_head_idx) {
     for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
       int num_qo_tiles = ceil_div(qo_len, cta_tile_q);
       for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-        auto [cta_idx, accum_cost] = cta_cost_heap.pop();
         // NOTE(Zihao): our current FA3 implementation do not fuse query and group heads
         // so the group_size in cost_function is always 1
         int effective_kv_len =
             causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
                    : kv_len;
-        cta_cost_heap.insert({cta_idx, accum_cost + cost_function(cta_tile_q, effective_kv_len)});
-        cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
-        cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);
-        cta_qo_len[cta_idx].push_back(qo_len);
-        cta_kv_indptr[cta_idx].push_back(kv_indptr_h[i]);
-        cta_kv_len[cta_idx].push_back(kv_len);
-        cta_head_indices[cta_idx].push_back(qo_head_idx);
-        cta_batch_indices[cta_idx].push_back(i);
+        for (int chunk_idx = 0; chunk_idx < num_kv_chunks; ++chunk_idx) {
+          auto [cta_idx, accum_cost] = cta_cost_heap.pop();
+          cta_cost_heap.insert(
+              {cta_idx,
+               accum_cost + cost_function(cta_tile_q, ceil_div(effective_kv_len, num_kv_chunks))});
+          cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
+          cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);
+          cta_qo_len[cta_idx].push_back(qo_len);
+          cta_kv_indptr[cta_idx].push_back(kv_indptr_h[i]);
+          cta_kv_len[cta_idx].push_back(kv_len);
+          cta_head_indices[cta_idx].push_back(qo_head_idx);
+          cta_batch_indices[cta_idx].push_back(i);
+          if (num_kv_chunks > 1) {
+            cta_kv_chunk_indices[cta_idx].push_back(chunk_idx);
+          }
+        }
       }
     }
   }
@@ -1161,6 +1254,17 @@ inline cudaError_t PrefillSM90Plan(
       sizeof(IdType) * (num_sm90_ctas + 1), 16, "batch_prefill_sm90_work_indptr");
   plan_info.batch_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_batch_indices");
+  if (num_kv_chunks > 1) {
+    plan_info.kv_chunk_indices_offset = int_allocator.aligned_alloc_offset(
+        sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_kv_chunk_indices");
+    AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
+    plan_info.tmp_o_offset = float_allocator.aligned_alloc_offset(
+        size_t(num_kv_chunks) * total_num_rows * num_qo_heads * head_dim_vo * sizeof_dtype_o, 16,
+        "batch_prefill_sm90_tmp_o");
+    plan_info.tmp_lse_offset = float_allocator.aligned_alloc_offset(
+        size_t(num_kv_chunks) * total_num_rows * num_qo_heads * sizeof(float), 16,
+        "batch_prefill_sm90_tmp_lse");
+  }
 
   IdType* qo_tile_indices_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_tile_indices_offset);
@@ -1185,6 +1289,12 @@ inline cudaError_t PrefillSM90Plan(
   std::copy(head_indices_vec.begin(), head_indices_vec.end(), head_indices_h);
   std::copy(work_indptr_vec.begin(), work_indptr_vec.end(), work_indptr_h);
   std::copy(batch_indices_vec.begin(), batch_indices_vec.end(), batch_indices_h);
+  if (num_kv_chunks > 1) {
+    auto kv_chunk_indices_vec = flatten(cta_kv_chunk_indices, total_num_works);
+    IdType* kv_chunk_indices_h =
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_chunk_indices_offset);
+    std::copy(kv_chunk_indices_vec.begin(), kv_chunk_indices_vec.end(), kv_chunk_indices_h);
+  }
 
   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,

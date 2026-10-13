@@ -173,8 +173,8 @@ struct SparseCollectiveMainloop {
     return num_kv_tiles;
   }
 
-  template <bool LEFT_SLIDING_WINDOW, typename BlockCoord, typename Scheduler,
-            typename SharedStorage>
+  template <bool LEFT_SLIDING_WINDOW, bool SPLIT_KV = false, typename BlockCoord,
+            typename Scheduler, typename SharedStorage>
   CUTLASS_DEVICE void load(Params const& mainloop_params, MainloopPipeline pipeline_k,
                            MainloopPipeline pipeline_v, PipelineState& smem_pipe_write_k,
                            PipelineState& smem_pipe_write_v, SharedStorage& shared_storage,
@@ -182,7 +182,8 @@ struct SparseCollectiveMainloop {
                            typename Scheduler::WorkTileInfo& work_tile_info,
                            BlockCoord const& block_coord, int work_idx,
                            const int num_kv_tiles_outside_items_window = 0,
-                           const int num_kv_tiles_prefix = 0) {
+                           const int num_kv_tiles_prefix = 0, int kv_tile_begin = 0,
+                           int kv_tile_end = -1) {
     int thread_idx = threadIdx.x;
     int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (thread_idx / 32) % 4, 0);
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
@@ -205,12 +206,17 @@ struct SparseCollectiveMainloop {
                       group_modes<0, 2>(gQ_x));  // (TMA), (TMA)
 
     int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
-    int kv_tile_idx = num_kv_tiles - 1;
     int swa_begin_kv_tile_idx = 0;
     if constexpr (LEFT_SLIDING_WINDOW) {
       swa_begin_kv_tile_idx = get_swa_begin_kv_tile_idx<CTA_Q, CTA_KV>(mainloop_params.window_left,
                                                                        q_tile_idx, qo_len, kv_len);
     }
+    if constexpr (SPLIT_KV) {
+      // Split-KV restricts the loads to the KV tiles in [kv_tile_begin, kv_tile_end).
+      num_kv_tiles = kv_tile_end;
+      swa_begin_kv_tile_idx = std::max(swa_begin_kv_tile_idx, kv_tile_begin);
+    }
+    int kv_tile_idx = num_kv_tiles - 1;
 
     constexpr int HEAD_DIM_QK = get<2>(TileShape_QKD{});
     constexpr int HEAD_DIM_VO = get<1>(TileShape_PDV{});
@@ -422,11 +428,13 @@ struct SparseCollectiveMainloop {
       }
       scheduler.prefetch_next_work(scheduler_params, work_tile_info);
 
-      // load first v tile (tile 0)
+      // load the last v tile (tile 0, or the first tile of the KV chunk with split-KV)
       {
-        prefetch_kv_offset(0, false);
+        int last_v_tile_idx = SPLIT_KV ? kv_tile_idx : 0;
+        prefetch_kv_offset(last_v_tile_idx, false);
         pipeline_v.producer_acquire(smem_pipe_write_v);
-        load_kv_with_gather(tVsV, tVcV, V_ptr_base, 0, smem_pipe_write_v.index(), false);
+        load_kv_with_gather(tVsV, tVcV, V_ptr_base, last_v_tile_idx, smem_pipe_write_v.index(),
+                            false);
         pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
         ++smem_pipe_write_v;
       }

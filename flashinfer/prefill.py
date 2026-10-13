@@ -188,6 +188,12 @@ def _finish_lse(
     return lse_out
 
 
+def _fa3_split_kv_planned(backend: str, plan_info) -> bool:
+    """Whether an FA3 plan splits the KV range and merges partial outputs after the kernel."""
+    # Entry 9 of the SM90 plan info is the number of KV chunks.
+    return backend == "fa3" and plan_info is not None and plan_info[9] > 1
+
+
 def _split_scale_param(scale):
     """Split scale parameter into tensor and scalar components.
 
@@ -2747,6 +2753,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+            With the ``fa3`` backend, split-KV partitions the KV range of each query tile when
+            the plan would otherwise leave SMs idle; it is never used when ``use_cuda_graph``
+            is enabled, and ``True`` disables it.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -3130,6 +3139,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
                 args.append(0)  # uniform_q_len
+            else:
+                # FA3 splits KV only for the built-in softmax variants.
+                args.append(
+                    disable_split_kv
+                    or prefix_len_ptr is not None
+                    or self._jit_module is not None
+                )
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -3860,6 +3876,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
         else:
             if self._backend != "trtllm-gen":
                 assert self._plan_info is not None, "plan info is not initialized"
+            # The FA3 split-KV merge writes a contiguous output, stage strided ones.
+            strided_out = None
+            if not out.is_contiguous() and _fa3_split_kv_planned(
+                self._backend, self._plan_info
+            ):
+                strided_out, out = (
+                    out,
+                    torch.empty_like(out, memory_format=torch.contiguous_format),
+                )
             run_args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -3980,6 +4005,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 assert self._trtllm_gen_multi_ctas_kv_counter_buffer is not None
             assert self._cached_module is not None, "cached module is not initialized"
             self._cached_module.paged_run(*run_args)
+            if strided_out is not None:
+                out = strided_out.copy_(out)
 
             is_float_one = isinstance(v_scale, float) and v_scale == 1.0
             if v_scale is not None and not is_float_one:
@@ -4521,6 +4548,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+            With the ``fa3`` backend, split-KV partitions the KV range of each query tile when
+            the plan would otherwise leave SMs idle; it is never used when ``use_cuda_graph``
+            is enabled, and ``True`` disables it.
         seq_lens: Optional[torch.Tensor]
             Only used by the cudnn backend. A 1D int32 tensor with the kv sequence length
             of each prompt, shape: ``[batch_size]``. Optional: cuDNN derives it from ``kv_indptr``.
@@ -5162,6 +5192,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
                 args.append(0)  # uniform_q_len
+            else:
+                # FA3 splits KV only for the built-in softmax variants.
+                args.append(
+                    disable_split_kv
+                    or prefix_len_ptr is not None
+                    or self._jit_module is not None
+                )
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -5804,6 +5841,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             else:
                 mask_mode = MaskMode.NON_CAUSAL.value
 
+        # The FA3 split-KV merge writes a contiguous output, stage strided ones.
+        strided_out = None
+        if not out.is_contiguous() and _fa3_split_kv_planned(
+            self._backend, self._plan_info
+        ):
+            strided_out, out = (
+                out,
+                torch.empty_like(out, memory_format=torch.contiguous_format),
+            )
         run_args = [
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -5856,6 +5902,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         assert self._cached_module is not None, "cached module is not initialized"
         self._cached_module.ragged_run(*run_args)
+        if strided_out is not None:
+            out = strided_out.copy_(out)
 
         # Apply global V calibration after attention, without changing the LSE.
         is_float_one = isinstance(v_scale, float) and v_scale == 1.0
