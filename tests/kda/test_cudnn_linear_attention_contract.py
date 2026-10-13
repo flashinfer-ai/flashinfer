@@ -192,3 +192,48 @@ def test_kda_preserves_inference_tensor_mutation_rules(
         else:
             with pytest.raises(RuntimeError, match="[Ii]nference[Mm]ode"):
                 adapter.cudnn_recurrent_kda(q, q, q, q, torch.ones(7, 2), **kwargs)
+
+
+def _pool_inputs():
+    q = torch.ones(1, 8, 2, 64, dtype=torch.bfloat16)
+    return dict(
+        q=q,
+        k=q.clone(),
+        v=q.clone(),
+        g=q.clone(),
+        beta=torch.ones(1, 8, 2, dtype=torch.bfloat16),
+        initial_state=torch.zeros(6, 2, 64, 64),
+        state_indices=torch.tensor([4, 1], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 3, 8], dtype=torch.int32),
+        use_qk_l2norm_in_kernel=False,
+    )
+
+
+def test_kda_pool_requires_new_frontend_before_any_state_write(monkeypatch, adapter):
+    monkeypatch.setattr(adapter.cudnn, "__version__", "1.30.0")
+    inputs = _pool_inputs()
+    before = inputs["initial_state"].clone()
+    with pytest.raises(RuntimeError, match="KDA state pools.*1.31"):
+        adapter.cudnn_recurrent_kda(**inputs)
+    torch.testing.assert_close(inputs["initial_state"], before)
+
+
+def test_kda_pool_declining_plan_does_not_retry_with_compact_scratch(
+    monkeypatch, adapter
+):
+    monkeypatch.setattr(adapter.cudnn, "__version__", "1.31.0")
+    calls = []
+
+    def decline(*args, **kwargs):
+        calls.append(kwargs)
+        raise NotImplementedError("pool plan is unavailable")
+
+    monkeypatch.setattr(adapter, "_create_la_graph", decline)
+    inputs = _pool_inputs()
+    before = inputs["initial_state"].clone()
+    with pytest.raises(NotImplementedError, match="pool plan is unavailable"):
+        adapter.cudnn_recurrent_kda(**inputs)
+    assert len(calls) == 1
+    assert calls[0]["state_indices"] is inputs["state_indices"]
+    assert calls[0]["overwrite_initial_state"]
+    torch.testing.assert_close(inputs["initial_state"], before)

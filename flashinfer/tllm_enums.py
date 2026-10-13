@@ -78,6 +78,9 @@ class ActivationType(IntEnum):
     Identity = 9
     Situ = 10
     InvalidType = 11
+    # CUTLASS-backend only. Keep this after InvalidType so existing activation
+    # values remain stable for the TRT-LLM backend.
+    ClampedRelu2 = 12
 
     # Eval-safe repr — see ``RoutingMethodType.__repr__``.
     def __repr__(self) -> str:

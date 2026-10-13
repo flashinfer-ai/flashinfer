@@ -20,26 +20,32 @@
 // includes (cooperative groups) stay in the kernels that use them.
 #pragma once
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
+typedef signed char int8_t;
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int uint32_t;
 #if defined(__CUDACC_RTC__)
 typedef unsigned long long uint64_t;
 #else
-typedef unsigned long      uint64_t;
+typedef unsigned long uint64_t;
 #endif
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
+typedef signed int int32_t;
+typedef short int int16_t;
 template <typename T, int Capacity = 8>
-struct __align__(16) CakePeerPointerTable { T* ptrs[Capacity]; };
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+struct __align__(16) CakePeerPointerTable {
+  T* ptrs[Capacity];
+};
+struct __align__(64) CakeTensorMap64 {
+  uint64_t opaque[16];
+};
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 
 #if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+typedef struct __align__(128) {
+  uint64_t opaque[16];
+} CUtensorMap;
 #else
 #include <cuda.h>
 #endif
@@ -47,133 +53,22 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-
 #include <math_constants.h>
 
-__device__ __forceinline__ uint32_t elect_sync() {
-    uint32_t pred = 0;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred %%px;\n\t"
-        "elect.sync _|%%px, %1;\n\t"
-        "@%%px mov.s32 %0, 1;\n\t"
-        "}\n"
-        : "+r"(pred)
-        : "r"(0xFFFFFFFF));
-    return pred;
-}
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-        :: "r"(mbar_addr), "r"(count) : "memory");
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    uint32_t ticks = 0x989680;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE;\n\t"
-        "bra.uni LAB_WAIT;\n\t"
-        "DONE:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void tcgen05_mma_f16(
-    int taddr, uint64_t a_desc, uint64_t b_desc,
-    uint32_t i_desc, int enable_input_d) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t"
-        "}\n"
-        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(enable_input_d)
-         : "memory");
-}
-
+#include "cake_device_helpers/cake_elect_sync_1ee8cd91025d8932.cuh"
+#include "cake_device_helpers/cake_mbarrier_init_15e581aef85ee586.cuh"
+#include "cake_device_helpers/cake_mbarrier_try_wait_ff90a180b11cb94a.cuh"
+#include "cake_device_helpers/cake_mbarrier_wait_1e3d55a069121d78.cuh"
+#include "cake_device_helpers/cake_mbarrier_wait_token_ab979b5719cba616.cuh"
+#include "cake_device_helpers/cake_tcgen05_mma_f16_03fde8c1cbf058c8.cuh"
 union MmaSmemDesc {
-    uint64_t u64;
-    uint32_t u32[2];
+  uint64_t u64;
+  uint32_t u32[2];
 };
-
-__device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
-    MmaSmemDesc tmp;
-    tmp.u64 = smem_desc;
-    tmp.u32[0] += offset;
-    smem_desc = tmp.u64;
-}
-
-__device__ __forceinline__ void elect_commit(int mbar_addr) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred leader;\n\t"
-        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-        "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%0];\n\t"
-        "}\n"
-        :: "r"(mbar_addr));
-}
-
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-    asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
-__device__ __forceinline__ void tma_3d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4}], [%5];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
-           "r"(mbar_addr) : "memory");
-}
-
-__device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x8.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-        : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]),
-          "=f"(dst[4]), "=f"(dst[5]), "=f"(dst[6]), "=f"(dst[7])
-        : "r"(tmem_addr));
-}
-
-__device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
-    uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
-        : "=r"(result) : "r"(val));
-    return result;
-}
+#include "cake_device_helpers/cake_elect_commit_8131fdc67daf4d23.cuh"
+#include "cake_device_helpers/cake_incr_smem_desc_lo_4429b045244f74bc.cuh"
+#include "cake_device_helpers/cake_make_warp_uniform_26e432f3ff129648.cuh"
+#include "cake_device_helpers/cake_mbarrier_arrive_71ef360c3ac78eb7.cuh"
+#include "cake_device_helpers/cake_mbarrier_arrive_expect_tx_54ce59d489f69526.cuh"
+#include "cake_device_helpers/cake_tma_3d_gmem2smem_7df1e07811f83fc6.cuh"
+#include "cake_device_helpers/cake_tmem_ld_x8_38cb8e5e57da80f2.cuh"

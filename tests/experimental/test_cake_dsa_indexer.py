@@ -26,6 +26,7 @@ import contextlib
 import os
 import warnings
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -64,6 +65,7 @@ from flashinfer.experimental.cake_dsa_indexer.cake_policy import (
     stage_slug,
 )
 
+from tests.test_helpers import cake_dsa_indexer_program_levers as levers
 from tests.test_helpers import cake_dsa_indexer_reference as ref
 
 FULL = os.environ.get("FLASHINFER_CAKE_DSA_INDEXER_FULL", "0") not in (
@@ -360,7 +362,12 @@ def test_registry_records_are_well_formed():
             assert stage_slug(key).isidentifier(), key
             if key.startswith("scan:pair_"):
                 assert record["launch"]["cluster"] == [2, 1, 1], (arch, key)
-        assert set(cake_jit.PROGRAM_LEVERS[arch]) == set(scan_keys), arch
+        assert set(levers.PROGRAM_LEVERS[arch]) == set(scan_keys), arch
+        fields = {frozenset(record) for record in levers.PROGRAM_LEVERS[arch].values()}
+        assert len(fields) == 1, arch  # one lever record shape per architecture
+        assert {"kind", "block_q", "tile_unroll", "snake", "sample_fit"} <= next(
+            iter(fields)
+        ), arch
         for top_k in (1, 256, 1024, 2048, 4096):
             assert finalize_key(policy.finalize_threads_for(top_k)) in keys, (
                 arch,
@@ -2159,3 +2166,60 @@ def test_persistent_rank_finalize_follows_the_architecture_cap():
             2048, True, False, False, False
         )  # a form of the bulk program
         assert not on.finalize_rank_persistent_for(2048, False, False, False, False)
+
+
+def test_device_facts_are_queried_once_per_device(monkeypatch):
+    """Compute capability and SM count are process-immutable: one ``get_device_properties`` per device index, the
+    index-less device forms still resolve the current device on every call, and a CPU device is still refused."""
+    _require_program()
+    index = torch.cuda.current_device()
+    device = torch.device("cuda", index)
+    capability = tuple(torch.cuda.get_device_capability(device))
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    monkeypatch.setattr(cake_backend, "_DEVICE_FACTS", {})
+    properties = mock.Mock(wraps=torch.cuda.get_device_properties)
+    capabilities = mock.Mock(wraps=torch.cuda.get_device_capability)
+    current = mock.Mock(wraps=torch.cuda.current_device)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capabilities)
+    monkeypatch.setattr(torch.cuda, "current_device", current)
+    for dev in (device, torch.device("cuda"), None, index, f"cuda:{index}"):
+        for _ in range(3):
+            assert arch_for(dev) == SUPPORTED_COMPUTE_CAPABILITIES[capability]
+            plan = plan_dsa_indexer_topk(1024, 4096, 1, top_k=256, device=dev)
+            assert plan.grid == sms
+            assert (
+                dsa_indexer_workspace_size(1024, 4096, 1, top_k=256, device=dev)
+                == plan.workspace_bytes
+            )
+    assert properties.call_count == 1 and capabilities.call_count == 0
+    assert {index: (capability, sms)} == cake_backend._DEVICE_FACTS
+    # the index-less forms resolve the current device per call
+    assert current.call_count >= 6
+    with pytest.raises(ValueError, match="cuda device"):
+        arch_for(torch.device("cpu"))
+
+
+def test_prepared_calls_perform_no_device_queries_after_warm_up(monkeypatch):
+    """After the first call on a device the eager and the prepared paths run without a device-property query."""
+    _require_program()
+    inputs = ref.make_random_inputs(
+        [200, 300], [200, 2500], top_k=128, seed=70, device="cuda"
+    )
+    expected = _run(inputs)
+    boom = mock.Mock(side_effect=AssertionError("device query on the hot path"))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", boom)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", boom)
+    again = _run(inputs)
+    runner = prepare_dsa_indexer_topk(
+        inputs.q,
+        inputs.k,
+        inputs.w,
+        inputs.cu_seqlens_q,
+        inputs.cu_seqlens_k,
+        **inputs.kwargs(),
+    )
+    captured = runner()
+    torch.cuda.synchronize()
+    assert boom.call_count == 0
+    assert ref.same_bits(again, expected) and ref.same_bits(captured, expected)
