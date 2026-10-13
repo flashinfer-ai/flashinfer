@@ -90,7 +90,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_hopper_msa_a1f633af55af85825cec(unsigned int* __restrict__ S, int* __restrict__ nvp, int* __restrict__ out, int tiles, int total_q, int num_heads, int num_chunks, int fb, int fe)
+kernel_cake_hopper_msa_6cb5d34de4ca68b77be8(unsigned int* __restrict__ S, int* __restrict__ nvp, int* __restrict__ out, int tiles, int total_q, int num_heads, int num_chunks, int fb, int fe)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1813,7 +1813,12 @@ kernel_cake_hopper_msa_a1f633af55af85825cec(unsigned int* __restrict__ S, int* _
             int fc7 = _ffs_0 - 1;
             fm7 = fm7 & fm7 - 1;
             unsigned int qf7 = qcol[fc7];
-            float qff = __uint_as_float(qf7);
+            int thr = 2147483647;
+            if (qf7 != 4294967295u) {
+                unsigned int img = qf7 ^ (unsigned int)((int)qf7 >> 31) & 2147483647;
+                thr = (int)img;
+            }
+            int thr2 = thr;
             int limv = limc[fc7];
             long long cbase2 = (long long)head * (long long)tiles * nq64 + (long long)(blockIdx.x * 32 + fc7);
             int lane_1 = tid_1 & 31;
@@ -1928,7 +1933,8 @@ kernel_cake_hopper_msa_a1f633af55af85825cec(unsigned int* __restrict__ S, int* _
                 unsigned int u3 = __as_u32(sc3);
                 unsigned int cls3 = u3 & 4294965248u;
                 unsigned int key3 = 0;
-                if ((qff < __uint_as_float(cls3) || __uint_as_float(cls3) == qff && cls3 < qf7) && cls3 < 4278190080u) {
+                unsigned int img_1 = cls3 ^ (unsigned int)((int)cls3 >> 31) & 2147483647;
+                if (thr2 < (int)img_1) {
                     key3 = 1073741824 | (unsigned int)t4_4_4;
                 }
                 if (cls3 == qf7) {
@@ -1965,7 +1971,8 @@ kernel_cake_hopper_msa_a1f633af55af85825cec(unsigned int* __restrict__ S, int* _
                 unsigned int u3_1 = __as_u32(sc3_1);
                 unsigned int cls3_1 = u3_1 & 4294965248u;
                 unsigned int key3_1 = 0;
-                if ((qff < __uint_as_float(cls3_1) || __uint_as_float(cls3_1) == qff && cls3_1 < qf7) && cls3_1 < 4278190080u) {
+                unsigned int img_2 = cls3_1 ^ (unsigned int)((int)cls3_1 >> 31) & 2147483647;
+                if (thr2 < (int)img_2) {
                     key3_1 = 1073741824 | (unsigned int)t4_4_5;
                 }
                 if (cls3_1 == qf7) {
@@ -2002,7 +2009,8 @@ kernel_cake_hopper_msa_a1f633af55af85825cec(unsigned int* __restrict__ S, int* _
                 unsigned int u3_2 = __as_u32(sc3_2);
                 unsigned int cls3_2 = u3_2 & 4294965248u;
                 unsigned int key3_2 = 0;
-                if ((qff < __uint_as_float(cls3_2) || __uint_as_float(cls3_2) == qff && cls3_2 < qf7) && cls3_2 < 4278190080u) {
+                unsigned int img_3 = cls3_2 ^ (unsigned int)((int)cls3_2 >> 31) & 2147483647;
+                if (thr2 < (int)img_3) {
                     key3_2 = 1073741824 | (unsigned int)t4_4_6;
                 }
                 if (cls3_2 == qf7) {
@@ -2039,7 +2047,8 @@ kernel_cake_hopper_msa_a1f633af55af85825cec(unsigned int* __restrict__ S, int* _
                 unsigned int u3_3 = __as_u32(sc3_3);
                 unsigned int cls3_3 = u3_3 & 4294965248u;
                 unsigned int key3_3 = 0;
-                if ((qff < __uint_as_float(cls3_3) || __uint_as_float(cls3_3) == qff && cls3_3 < qf7) && cls3_3 < 4278190080u) {
+                unsigned int img_4 = cls3_3 ^ (unsigned int)((int)cls3_3 >> 31) & 2147483647;
+                if (thr2 < (int)img_4) {
                     key3_3 = 1073741824 | (unsigned int)t4_4_7;
                 }
                 if (cls3_3 == qf7) {
@@ -2261,18 +2270,24 @@ kernel_cake_hopper_msa_a1f633af55af85825cec(unsigned int* __restrict__ S, int* _
                     asm volatile("" ::: "memory");
                     int t0_6 = (j_1 * 16 + w) * 16;
                     int t0_7 = t0_6;
-                    float qf = __uint_as_float(qc);
+                    int thr_1 = 2147483647;
+                    if (qc != 4294967295u) {
+                        unsigned int img_5 = qc ^ (unsigned int)((int)qc >> 31) & 2147483647;
+                        thr_1 = (int)img_5;
+                    }
+                    int thr_8 = thr_1;
                     float sc_5 = __uint_as_float(cb2[0]);
                     float _fmax_235 = fmaxf(sc_5, -1.7014118346046923e+38f);
                     sc_5 = _fmax_235;
                     float _min_203 = fminf(sc_5, 1.7014118346046923e+38f);
                     sc_5 = _min_203;
                     sc_5 = sc_5;
-                    float sc_8_1 = sc_5;
-                    unsigned int u = __as_u32(sc_8_1);
+                    float sc_9 = sc_5;
+                    unsigned int u = __as_u32(sc_9);
                     unsigned int cls = u & 4294965248u;
                     unsigned int key_1 = 0;
-                    if ((qf < __uint_as_float(cls) || __uint_as_float(cls) == qf && cls < qc) && cls < 4278190080u) {
+                    unsigned int img_6 = cls ^ (unsigned int)((int)cls >> 31) & 2147483647;
+                    if (thr_8 < (int)img_6) {
                         key_1 = 1073741824 | (unsigned int)t0_7;
                     }
                     if (cls == qc) {
@@ -2280,276 +2295,291 @@ kernel_cake_hopper_msa_a1f633af55af85825cec(unsigned int* __restrict__ S, int* _
                         key_1 = 536870912 | lowb << 11 | (unsigned int)t0_7;
                     }
                     kb2[0] = __uint_as_float(key_1);
-                    float sc_9 = __uint_as_float(cb2[1]);
-                    float _fmax_236 = fmaxf(sc_9, -1.7014118346046923e+38f);
-                    sc_9 = _fmax_236;
-                    float _min_204 = fminf(sc_9, 1.7014118346046923e+38f);
-                    sc_9 = _min_204;
-                    sc_9 = sc_9;
-                    float sc_10_1 = sc_9;
-                    unsigned int u_11 = __as_u32(sc_10_1);
-                    unsigned int cls_12 = u_11 & 4294965248u;
-                    unsigned int key_13 = 0;
-                    if ((qf < __uint_as_float(cls_12) || __uint_as_float(cls_12) == qf && cls_12 < qc) && cls_12 < 4278190080u) {
-                        key_13 = 1073741824 | (unsigned int)(t0_7 + 1);
+                    float sc_10_1 = __uint_as_float(cb2[1]);
+                    float _fmax_236 = fmaxf(sc_10_1, -1.7014118346046923e+38f);
+                    sc_10_1 = _fmax_236;
+                    float _min_204 = fminf(sc_10_1, 1.7014118346046923e+38f);
+                    sc_10_1 = _min_204;
+                    sc_10_1 = sc_10_1;
+                    float sc_11_1 = sc_10_1;
+                    unsigned int u_12 = __as_u32(sc_11_1);
+                    unsigned int cls_13 = u_12 & 4294965248u;
+                    unsigned int key_14 = 0;
+                    unsigned int img_15 = cls_13 ^ (unsigned int)((int)cls_13 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_15) {
+                        key_14 = 1073741824 | (unsigned int)(t0_7 + 1);
                     }
-                    if (cls_12 == qc) {
-                        unsigned int lowb_1 = (u_11 ^ (unsigned int)((int)u_11 >> 31) & 2047) & 2047;
-                        key_13 = 536870912 | lowb_1 << 11 | (unsigned int)(t0_7 + 1);
+                    if (cls_13 == qc) {
+                        unsigned int lowb_1 = (u_12 ^ (unsigned int)((int)u_12 >> 31) & 2047) & 2047;
+                        key_14 = 536870912 | lowb_1 << 11 | (unsigned int)(t0_7 + 1);
                     }
-                    kb2[1] = __uint_as_float(key_13);
-                    float sc_14_1 = __uint_as_float(cb2[2]);
-                    float _fmax_237 = fmaxf(sc_14_1, -1.7014118346046923e+38f);
-                    sc_14_1 = _fmax_237;
-                    float _min_205 = fminf(sc_14_1, 1.7014118346046923e+38f);
-                    sc_14_1 = _min_205;
-                    sc_14_1 = sc_14_1;
-                    float sc_15 = sc_14_1;
-                    unsigned int u_16 = __as_u32(sc_15);
-                    unsigned int cls_17 = u_16 & 4294965248u;
-                    unsigned int key_18_1 = 0;
-                    if ((qf < __uint_as_float(cls_17) || __uint_as_float(cls_17) == qf && cls_17 < qc) && cls_17 < 4278190080u) {
-                        key_18_1 = 1073741824 | (unsigned int)(t0_7 + 2);
+                    kb2[1] = __uint_as_float(key_14);
+                    float sc_16_1 = __uint_as_float(cb2[2]);
+                    float _fmax_237 = fmaxf(sc_16_1, -1.7014118346046923e+38f);
+                    sc_16_1 = _fmax_237;
+                    float _min_205 = fminf(sc_16_1, 1.7014118346046923e+38f);
+                    sc_16_1 = _min_205;
+                    sc_16_1 = sc_16_1;
+                    float sc_17_1 = sc_16_1;
+                    unsigned int u_18 = __as_u32(sc_17_1);
+                    unsigned int cls_19 = u_18 & 4294965248u;
+                    unsigned int key_20 = 0;
+                    unsigned int img_21 = cls_19 ^ (unsigned int)((int)cls_19 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_21) {
+                        key_20 = 1073741824 | (unsigned int)(t0_7 + 2);
                     }
-                    if (cls_17 == qc) {
-                        unsigned int lowb_2 = (u_16 ^ (unsigned int)((int)u_16 >> 31) & 2047) & 2047;
-                        key_18_1 = 536870912 | lowb_2 << 11 | (unsigned int)(t0_7 + 2);
+                    if (cls_19 == qc) {
+                        unsigned int lowb_2 = (u_18 ^ (unsigned int)((int)u_18 >> 31) & 2047) & 2047;
+                        key_20 = 536870912 | lowb_2 << 11 | (unsigned int)(t0_7 + 2);
                     }
-                    kb2[2] = __uint_as_float(key_18_1);
-                    float sc_19_1 = __uint_as_float(cb2[3]);
-                    float _fmax_238 = fmaxf(sc_19_1, -1.7014118346046923e+38f);
-                    sc_19_1 = _fmax_238;
-                    float _min_206 = fminf(sc_19_1, 1.7014118346046923e+38f);
-                    sc_19_1 = _min_206;
-                    sc_19_1 = sc_19_1;
-                    float sc_20_1 = sc_19_1;
-                    unsigned int u_21 = __as_u32(sc_20_1);
-                    unsigned int cls_22 = u_21 & 4294965248u;
-                    unsigned int key_23 = 0;
-                    if ((qf < __uint_as_float(cls_22) || __uint_as_float(cls_22) == qf && cls_22 < qc) && cls_22 < 4278190080u) {
-                        key_23 = 1073741824 | (unsigned int)(t0_7 + 3);
+                    kb2[2] = __uint_as_float(key_20);
+                    float sc_22_1 = __uint_as_float(cb2[3]);
+                    float _fmax_238 = fmaxf(sc_22_1, -1.7014118346046923e+38f);
+                    sc_22_1 = _fmax_238;
+                    float _min_206 = fminf(sc_22_1, 1.7014118346046923e+38f);
+                    sc_22_1 = _min_206;
+                    sc_22_1 = sc_22_1;
+                    float sc_23_1 = sc_22_1;
+                    unsigned int u_24 = __as_u32(sc_23_1);
+                    unsigned int cls_25 = u_24 & 4294965248u;
+                    unsigned int key_26 = 0;
+                    unsigned int img_27 = cls_25 ^ (unsigned int)((int)cls_25 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_27) {
+                        key_26 = 1073741824 | (unsigned int)(t0_7 + 3);
                     }
-                    if (cls_22 == qc) {
-                        unsigned int lowb_3 = (u_21 ^ (unsigned int)((int)u_21 >> 31) & 2047) & 2047;
-                        key_23 = 536870912 | lowb_3 << 11 | (unsigned int)(t0_7 + 3);
+                    if (cls_25 == qc) {
+                        unsigned int lowb_3 = (u_24 ^ (unsigned int)((int)u_24 >> 31) & 2047) & 2047;
+                        key_26 = 536870912 | lowb_3 << 11 | (unsigned int)(t0_7 + 3);
                     }
-                    kb2[3] = __uint_as_float(key_23);
-                    float sc_24 = __uint_as_float(cb2[4]);
-                    float _fmax_239 = fmaxf(sc_24, -1.7014118346046923e+38f);
-                    sc_24 = _fmax_239;
-                    float _min_207 = fminf(sc_24, 1.7014118346046923e+38f);
-                    sc_24 = _min_207;
-                    sc_24 = sc_24;
-                    float sc_25_1 = sc_24;
-                    unsigned int u_26 = __as_u32(sc_25_1);
-                    unsigned int cls_27 = u_26 & 4294965248u;
-                    unsigned int key_28 = 0;
-                    if ((qf < __uint_as_float(cls_27) || __uint_as_float(cls_27) == qf && cls_27 < qc) && cls_27 < 4278190080u) {
-                        key_28 = 1073741824 | (unsigned int)(t0_7 + 4);
+                    kb2[3] = __uint_as_float(key_26);
+                    float sc_28_1 = __uint_as_float(cb2[4]);
+                    float _fmax_239 = fmaxf(sc_28_1, -1.7014118346046923e+38f);
+                    sc_28_1 = _fmax_239;
+                    float _min_207 = fminf(sc_28_1, 1.7014118346046923e+38f);
+                    sc_28_1 = _min_207;
+                    sc_28_1 = sc_28_1;
+                    float sc_29_1 = sc_28_1;
+                    unsigned int u_30 = __as_u32(sc_29_1);
+                    unsigned int cls_31 = u_30 & 4294965248u;
+                    unsigned int key_32 = 0;
+                    unsigned int img_33 = cls_31 ^ (unsigned int)((int)cls_31 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_33) {
+                        key_32 = 1073741824 | (unsigned int)(t0_7 + 4);
                     }
-                    if (cls_27 == qc) {
-                        unsigned int lowb_4 = (u_26 ^ (unsigned int)((int)u_26 >> 31) & 2047) & 2047;
-                        key_28 = 536870912 | lowb_4 << 11 | (unsigned int)(t0_7 + 4);
+                    if (cls_31 == qc) {
+                        unsigned int lowb_4 = (u_30 ^ (unsigned int)((int)u_30 >> 31) & 2047) & 2047;
+                        key_32 = 536870912 | lowb_4 << 11 | (unsigned int)(t0_7 + 4);
                     }
-                    kb2[4] = __uint_as_float(key_28);
-                    float sc_29_1 = __uint_as_float(cb2[5]);
-                    float _fmax_240 = fmaxf(sc_29_1, -1.7014118346046923e+38f);
-                    sc_29_1 = _fmax_240;
-                    float _min_208 = fminf(sc_29_1, 1.7014118346046923e+38f);
-                    sc_29_1 = _min_208;
-                    sc_29_1 = sc_29_1;
-                    float sc_30 = sc_29_1;
-                    unsigned int u_31 = __as_u32(sc_30);
-                    unsigned int cls_32 = u_31 & 4294965248u;
-                    unsigned int key_33_1 = 0;
-                    if ((qf < __uint_as_float(cls_32) || __uint_as_float(cls_32) == qf && cls_32 < qc) && cls_32 < 4278190080u) {
-                        key_33_1 = 1073741824 | (unsigned int)(t0_7 + 5);
-                    }
-                    if (cls_32 == qc) {
-                        unsigned int lowb_5 = (u_31 ^ (unsigned int)((int)u_31 >> 31) & 2047) & 2047;
-                        key_33_1 = 536870912 | lowb_5 << 11 | (unsigned int)(t0_7 + 5);
-                    }
-                    kb2[5] = __uint_as_float(key_33_1);
-                    float sc_34_1 = __uint_as_float(cb2[6]);
-                    float _fmax_241 = fmaxf(sc_34_1, -1.7014118346046923e+38f);
-                    sc_34_1 = _fmax_241;
-                    float _min_209 = fminf(sc_34_1, 1.7014118346046923e+38f);
-                    sc_34_1 = _min_209;
+                    kb2[4] = __uint_as_float(key_32);
+                    float sc_34_1 = __uint_as_float(cb2[5]);
+                    float _fmax_240 = fmaxf(sc_34_1, -1.7014118346046923e+38f);
+                    sc_34_1 = _fmax_240;
+                    float _min_208 = fminf(sc_34_1, 1.7014118346046923e+38f);
+                    sc_34_1 = _min_208;
                     sc_34_1 = sc_34_1;
                     float sc_35_1 = sc_34_1;
                     unsigned int u_36 = __as_u32(sc_35_1);
                     unsigned int cls_37 = u_36 & 4294965248u;
                     unsigned int key_38 = 0;
-                    if ((qf < __uint_as_float(cls_37) || __uint_as_float(cls_37) == qf && cls_37 < qc) && cls_37 < 4278190080u) {
-                        key_38 = 1073741824 | (unsigned int)(t0_7 + 6);
+                    unsigned int img_39 = cls_37 ^ (unsigned int)((int)cls_37 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_39) {
+                        key_38 = 1073741824 | (unsigned int)(t0_7 + 5);
                     }
                     if (cls_37 == qc) {
-                        unsigned int lowb_6 = (u_36 ^ (unsigned int)((int)u_36 >> 31) & 2047) & 2047;
-                        key_38 = 536870912 | lowb_6 << 11 | (unsigned int)(t0_7 + 6);
+                        unsigned int lowb_5 = (u_36 ^ (unsigned int)((int)u_36 >> 31) & 2047) & 2047;
+                        key_38 = 536870912 | lowb_5 << 11 | (unsigned int)(t0_7 + 5);
                     }
-                    kb2[6] = __uint_as_float(key_38);
-                    float sc_39 = __uint_as_float(cb2[7]);
-                    float _fmax_242 = fmaxf(sc_39, -1.7014118346046923e+38f);
-                    sc_39 = _fmax_242;
-                    float _min_210 = fminf(sc_39, 1.7014118346046923e+38f);
-                    sc_39 = _min_210;
-                    sc_39 = sc_39;
-                    float sc_40_1 = sc_39;
-                    unsigned int u_41 = __as_u32(sc_40_1);
-                    unsigned int cls_42 = u_41 & 4294965248u;
-                    unsigned int key_43 = 0;
-                    if ((qf < __uint_as_float(cls_42) || __uint_as_float(cls_42) == qf && cls_42 < qc) && cls_42 < 4278190080u) {
-                        key_43 = 1073741824 | (unsigned int)(t0_7 + 7);
+                    kb2[5] = __uint_as_float(key_38);
+                    float sc_40_1 = __uint_as_float(cb2[6]);
+                    float _fmax_241 = fmaxf(sc_40_1, -1.7014118346046923e+38f);
+                    sc_40_1 = _fmax_241;
+                    float _min_209 = fminf(sc_40_1, 1.7014118346046923e+38f);
+                    sc_40_1 = _min_209;
+                    sc_40_1 = sc_40_1;
+                    float sc_41_1 = sc_40_1;
+                    unsigned int u_42 = __as_u32(sc_41_1);
+                    unsigned int cls_43 = u_42 & 4294965248u;
+                    unsigned int key_44 = 0;
+                    unsigned int img_45 = cls_43 ^ (unsigned int)((int)cls_43 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_45) {
+                        key_44 = 1073741824 | (unsigned int)(t0_7 + 6);
                     }
-                    if (cls_42 == qc) {
-                        unsigned int lowb_7 = (u_41 ^ (unsigned int)((int)u_41 >> 31) & 2047) & 2047;
-                        key_43 = 536870912 | lowb_7 << 11 | (unsigned int)(t0_7 + 7);
+                    if (cls_43 == qc) {
+                        unsigned int lowb_6 = (u_42 ^ (unsigned int)((int)u_42 >> 31) & 2047) & 2047;
+                        key_44 = 536870912 | lowb_6 << 11 | (unsigned int)(t0_7 + 6);
                     }
-                    kb2[7] = __uint_as_float(key_43);
-                    float sc_44_1 = __uint_as_float(cb2[8]);
-                    float _fmax_243 = fmaxf(sc_44_1, -1.7014118346046923e+38f);
-                    sc_44_1 = _fmax_243;
-                    float _min_211 = fminf(sc_44_1, 1.7014118346046923e+38f);
-                    sc_44_1 = _min_211;
-                    sc_44_1 = sc_44_1;
-                    float sc_45 = sc_44_1;
-                    unsigned int u_46 = __as_u32(sc_45);
-                    unsigned int cls_47 = u_46 & 4294965248u;
-                    unsigned int key_48_1 = 0;
-                    if ((qf < __uint_as_float(cls_47) || __uint_as_float(cls_47) == qf && cls_47 < qc) && cls_47 < 4278190080u) {
-                        key_48_1 = 1073741824 | (unsigned int)(t0_7 + 8);
+                    kb2[6] = __uint_as_float(key_44);
+                    float sc_46_1 = __uint_as_float(cb2[7]);
+                    float _fmax_242 = fmaxf(sc_46_1, -1.7014118346046923e+38f);
+                    sc_46_1 = _fmax_242;
+                    float _min_210 = fminf(sc_46_1, 1.7014118346046923e+38f);
+                    sc_46_1 = _min_210;
+                    sc_46_1 = sc_46_1;
+                    float sc_47_1 = sc_46_1;
+                    unsigned int u_48 = __as_u32(sc_47_1);
+                    unsigned int cls_49 = u_48 & 4294965248u;
+                    unsigned int key_50 = 0;
+                    unsigned int img_51 = cls_49 ^ (unsigned int)((int)cls_49 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_51) {
+                        key_50 = 1073741824 | (unsigned int)(t0_7 + 7);
                     }
-                    if (cls_47 == qc) {
-                        unsigned int lowb_8 = (u_46 ^ (unsigned int)((int)u_46 >> 31) & 2047) & 2047;
-                        key_48_1 = 536870912 | lowb_8 << 11 | (unsigned int)(t0_7 + 8);
+                    if (cls_49 == qc) {
+                        unsigned int lowb_7 = (u_48 ^ (unsigned int)((int)u_48 >> 31) & 2047) & 2047;
+                        key_50 = 536870912 | lowb_7 << 11 | (unsigned int)(t0_7 + 7);
                     }
-                    kb2[8] = __uint_as_float(key_48_1);
-                    float sc_49_1 = __uint_as_float(cb2[9]);
-                    float _fmax_244 = fmaxf(sc_49_1, -1.7014118346046923e+38f);
-                    sc_49_1 = _fmax_244;
-                    float _min_212 = fminf(sc_49_1, 1.7014118346046923e+38f);
-                    sc_49_1 = _min_212;
-                    sc_49_1 = sc_49_1;
-                    float sc_50_1 = sc_49_1;
-                    unsigned int u_51 = __as_u32(sc_50_1);
-                    unsigned int cls_52 = u_51 & 4294965248u;
-                    unsigned int key_53 = 0;
-                    if ((qf < __uint_as_float(cls_52) || __uint_as_float(cls_52) == qf && cls_52 < qc) && cls_52 < 4278190080u) {
-                        key_53 = 1073741824 | (unsigned int)(t0_7 + 9);
+                    kb2[7] = __uint_as_float(key_50);
+                    float sc_52 = __uint_as_float(cb2[8]);
+                    float _fmax_243 = fmaxf(sc_52, -1.7014118346046923e+38f);
+                    sc_52 = _fmax_243;
+                    float _min_211 = fminf(sc_52, 1.7014118346046923e+38f);
+                    sc_52 = _min_211;
+                    sc_52 = sc_52;
+                    float sc_53 = sc_52;
+                    unsigned int u_54 = __as_u32(sc_53);
+                    unsigned int cls_55 = u_54 & 4294965248u;
+                    unsigned int key_56 = 0;
+                    unsigned int img_57 = cls_55 ^ (unsigned int)((int)cls_55 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_57) {
+                        key_56 = 1073741824 | (unsigned int)(t0_7 + 8);
                     }
-                    if (cls_52 == qc) {
-                        unsigned int lowb_9 = (u_51 ^ (unsigned int)((int)u_51 >> 31) & 2047) & 2047;
-                        key_53 = 536870912 | lowb_9 << 11 | (unsigned int)(t0_7 + 9);
+                    if (cls_55 == qc) {
+                        unsigned int lowb_8 = (u_54 ^ (unsigned int)((int)u_54 >> 31) & 2047) & 2047;
+                        key_56 = 536870912 | lowb_8 << 11 | (unsigned int)(t0_7 + 8);
                     }
-                    kb2[9] = __uint_as_float(key_53);
-                    float sc_54 = __uint_as_float(cb2[10]);
-                    float _fmax_245 = fmaxf(sc_54, -1.7014118346046923e+38f);
-                    sc_54 = _fmax_245;
-                    float _min_213 = fminf(sc_54, 1.7014118346046923e+38f);
-                    sc_54 = _min_213;
-                    sc_54 = sc_54;
-                    float sc_55 = sc_54;
-                    unsigned int u_56 = __as_u32(sc_55);
-                    unsigned int cls_57 = u_56 & 4294965248u;
-                    unsigned int key_58 = 0;
-                    if ((qf < __uint_as_float(cls_57) || __uint_as_float(cls_57) == qf && cls_57 < qc) && cls_57 < 4278190080u) {
-                        key_58 = 1073741824 | (unsigned int)(t0_7 + 10);
+                    kb2[8] = __uint_as_float(key_56);
+                    float sc_58 = __uint_as_float(cb2[9]);
+                    float _fmax_244 = fmaxf(sc_58, -1.7014118346046923e+38f);
+                    sc_58 = _fmax_244;
+                    float _min_212 = fminf(sc_58, 1.7014118346046923e+38f);
+                    sc_58 = _min_212;
+                    sc_58 = sc_58;
+                    float sc_59 = sc_58;
+                    unsigned int u_60 = __as_u32(sc_59);
+                    unsigned int cls_61 = u_60 & 4294965248u;
+                    unsigned int key_62 = 0;
+                    unsigned int img_63 = cls_61 ^ (unsigned int)((int)cls_61 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_63) {
+                        key_62 = 1073741824 | (unsigned int)(t0_7 + 9);
                     }
-                    if (cls_57 == qc) {
-                        unsigned int lowb_10 = (u_56 ^ (unsigned int)((int)u_56 >> 31) & 2047) & 2047;
-                        key_58 = 536870912 | lowb_10 << 11 | (unsigned int)(t0_7 + 10);
+                    if (cls_61 == qc) {
+                        unsigned int lowb_9 = (u_60 ^ (unsigned int)((int)u_60 >> 31) & 2047) & 2047;
+                        key_62 = 536870912 | lowb_9 << 11 | (unsigned int)(t0_7 + 9);
                     }
-                    kb2[10] = __uint_as_float(key_58);
-                    float sc_59 = __uint_as_float(cb2[11]);
-                    float _fmax_246 = fmaxf(sc_59, -1.7014118346046923e+38f);
-                    sc_59 = _fmax_246;
-                    float _min_214 = fminf(sc_59, 1.7014118346046923e+38f);
-                    sc_59 = _min_214;
-                    sc_59 = sc_59;
-                    float sc_60 = sc_59;
-                    unsigned int u_61 = __as_u32(sc_60);
-                    unsigned int cls_62 = u_61 & 4294965248u;
-                    unsigned int key_63 = 0;
-                    if ((qf < __uint_as_float(cls_62) || __uint_as_float(cls_62) == qf && cls_62 < qc) && cls_62 < 4278190080u) {
-                        key_63 = 1073741824 | (unsigned int)(t0_7 + 11);
-                    }
-                    if (cls_62 == qc) {
-                        unsigned int lowb_11 = (u_61 ^ (unsigned int)((int)u_61 >> 31) & 2047) & 2047;
-                        key_63 = 536870912 | lowb_11 << 11 | (unsigned int)(t0_7 + 11);
-                    }
-                    kb2[11] = __uint_as_float(key_63);
-                    float sc_64 = __uint_as_float(cb2[12]);
-                    float _fmax_247 = fmaxf(sc_64, -1.7014118346046923e+38f);
-                    sc_64 = _fmax_247;
-                    float _min_215 = fminf(sc_64, 1.7014118346046923e+38f);
-                    sc_64 = _min_215;
+                    kb2[9] = __uint_as_float(key_62);
+                    float sc_64 = __uint_as_float(cb2[10]);
+                    float _fmax_245 = fmaxf(sc_64, -1.7014118346046923e+38f);
+                    sc_64 = _fmax_245;
+                    float _min_213 = fminf(sc_64, 1.7014118346046923e+38f);
+                    sc_64 = _min_213;
                     sc_64 = sc_64;
                     float sc_65 = sc_64;
                     unsigned int u_66 = __as_u32(sc_65);
                     unsigned int cls_67 = u_66 & 4294965248u;
                     unsigned int key_68 = 0;
-                    if ((qf < __uint_as_float(cls_67) || __uint_as_float(cls_67) == qf && cls_67 < qc) && cls_67 < 4278190080u) {
-                        key_68 = 1073741824 | (unsigned int)(t0_7 + 12);
+                    unsigned int img_69 = cls_67 ^ (unsigned int)((int)cls_67 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_69) {
+                        key_68 = 1073741824 | (unsigned int)(t0_7 + 10);
                     }
                     if (cls_67 == qc) {
-                        unsigned int lowb_12 = (u_66 ^ (unsigned int)((int)u_66 >> 31) & 2047) & 2047;
-                        key_68 = 536870912 | lowb_12 << 11 | (unsigned int)(t0_7 + 12);
+                        unsigned int lowb_10 = (u_66 ^ (unsigned int)((int)u_66 >> 31) & 2047) & 2047;
+                        key_68 = 536870912 | lowb_10 << 11 | (unsigned int)(t0_7 + 10);
                     }
-                    kb2[12] = __uint_as_float(key_68);
-                    float sc_69 = __uint_as_float(cb2[13]);
-                    float _fmax_248 = fmaxf(sc_69, -1.7014118346046923e+38f);
-                    sc_69 = _fmax_248;
-                    float _min_216 = fminf(sc_69, 1.7014118346046923e+38f);
-                    sc_69 = _min_216;
-                    sc_69 = sc_69;
-                    float sc_70 = sc_69;
-                    unsigned int u_71 = __as_u32(sc_70);
-                    unsigned int cls_72 = u_71 & 4294965248u;
-                    unsigned int key_73 = 0;
-                    if ((qf < __uint_as_float(cls_72) || __uint_as_float(cls_72) == qf && cls_72 < qc) && cls_72 < 4278190080u) {
-                        key_73 = 1073741824 | (unsigned int)(t0_7 + 13);
+                    kb2[10] = __uint_as_float(key_68);
+                    float sc_70 = __uint_as_float(cb2[11]);
+                    float _fmax_246 = fmaxf(sc_70, -1.7014118346046923e+38f);
+                    sc_70 = _fmax_246;
+                    float _min_214 = fminf(sc_70, 1.7014118346046923e+38f);
+                    sc_70 = _min_214;
+                    sc_70 = sc_70;
+                    float sc_71 = sc_70;
+                    unsigned int u_72 = __as_u32(sc_71);
+                    unsigned int cls_73 = u_72 & 4294965248u;
+                    unsigned int key_74 = 0;
+                    unsigned int img_75 = cls_73 ^ (unsigned int)((int)cls_73 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_75) {
+                        key_74 = 1073741824 | (unsigned int)(t0_7 + 11);
                     }
-                    if (cls_72 == qc) {
-                        unsigned int lowb_13 = (u_71 ^ (unsigned int)((int)u_71 >> 31) & 2047) & 2047;
-                        key_73 = 536870912 | lowb_13 << 11 | (unsigned int)(t0_7 + 13);
+                    if (cls_73 == qc) {
+                        unsigned int lowb_11 = (u_72 ^ (unsigned int)((int)u_72 >> 31) & 2047) & 2047;
+                        key_74 = 536870912 | lowb_11 << 11 | (unsigned int)(t0_7 + 11);
                     }
-                    kb2[13] = __uint_as_float(key_73);
-                    float sc_74 = __uint_as_float(cb2[14]);
-                    float _fmax_249 = fmaxf(sc_74, -1.7014118346046923e+38f);
-                    sc_74 = _fmax_249;
-                    float _min_217 = fminf(sc_74, 1.7014118346046923e+38f);
-                    sc_74 = _min_217;
-                    sc_74 = sc_74;
-                    float sc_75 = sc_74;
-                    unsigned int u_76 = __as_u32(sc_75);
-                    unsigned int cls_77 = u_76 & 4294965248u;
-                    unsigned int key_78 = 0;
-                    if ((qf < __uint_as_float(cls_77) || __uint_as_float(cls_77) == qf && cls_77 < qc) && cls_77 < 4278190080u) {
-                        key_78 = 1073741824 | (unsigned int)(t0_7 + 14);
+                    kb2[11] = __uint_as_float(key_74);
+                    float sc_76 = __uint_as_float(cb2[12]);
+                    float _fmax_247 = fmaxf(sc_76, -1.7014118346046923e+38f);
+                    sc_76 = _fmax_247;
+                    float _min_215 = fminf(sc_76, 1.7014118346046923e+38f);
+                    sc_76 = _min_215;
+                    sc_76 = sc_76;
+                    float sc_77 = sc_76;
+                    unsigned int u_78 = __as_u32(sc_77);
+                    unsigned int cls_79 = u_78 & 4294965248u;
+                    unsigned int key_80 = 0;
+                    unsigned int img_81 = cls_79 ^ (unsigned int)((int)cls_79 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_81) {
+                        key_80 = 1073741824 | (unsigned int)(t0_7 + 12);
                     }
-                    if (cls_77 == qc) {
-                        unsigned int lowb_14 = (u_76 ^ (unsigned int)((int)u_76 >> 31) & 2047) & 2047;
-                        key_78 = 536870912 | lowb_14 << 11 | (unsigned int)(t0_7 + 14);
+                    if (cls_79 == qc) {
+                        unsigned int lowb_12 = (u_78 ^ (unsigned int)((int)u_78 >> 31) & 2047) & 2047;
+                        key_80 = 536870912 | lowb_12 << 11 | (unsigned int)(t0_7 + 12);
                     }
-                    kb2[14] = __uint_as_float(key_78);
-                    float sc_79 = __uint_as_float(cb2[15]);
-                    float _fmax_250 = fmaxf(sc_79, -1.7014118346046923e+38f);
-                    sc_79 = _fmax_250;
-                    float _min_218 = fminf(sc_79, 1.7014118346046923e+38f);
-                    sc_79 = _min_218;
-                    sc_79 = sc_79;
-                    float sc_80 = sc_79;
-                    unsigned int u_81 = __as_u32(sc_80);
-                    unsigned int cls_82 = u_81 & 4294965248u;
-                    unsigned int key_83 = 0;
-                    if ((qf < __uint_as_float(cls_82) || __uint_as_float(cls_82) == qf && cls_82 < qc) && cls_82 < 4278190080u) {
-                        key_83 = 1073741824 | (unsigned int)(t0_7 + 15);
+                    kb2[12] = __uint_as_float(key_80);
+                    float sc_82 = __uint_as_float(cb2[13]);
+                    float _fmax_248 = fmaxf(sc_82, -1.7014118346046923e+38f);
+                    sc_82 = _fmax_248;
+                    float _min_216 = fminf(sc_82, 1.7014118346046923e+38f);
+                    sc_82 = _min_216;
+                    sc_82 = sc_82;
+                    float sc_83 = sc_82;
+                    unsigned int u_84 = __as_u32(sc_83);
+                    unsigned int cls_85 = u_84 & 4294965248u;
+                    unsigned int key_86 = 0;
+                    unsigned int img_87 = cls_85 ^ (unsigned int)((int)cls_85 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_87) {
+                        key_86 = 1073741824 | (unsigned int)(t0_7 + 13);
                     }
-                    if (cls_82 == qc) {
-                        unsigned int lowb_15 = (u_81 ^ (unsigned int)((int)u_81 >> 31) & 2047) & 2047;
-                        key_83 = 536870912 | lowb_15 << 11 | (unsigned int)(t0_7 + 15);
+                    if (cls_85 == qc) {
+                        unsigned int lowb_13 = (u_84 ^ (unsigned int)((int)u_84 >> 31) & 2047) & 2047;
+                        key_86 = 536870912 | lowb_13 << 11 | (unsigned int)(t0_7 + 13);
                     }
-                    kb2[15] = __uint_as_float(key_83);
+                    kb2[13] = __uint_as_float(key_86);
+                    float sc_88 = __uint_as_float(cb2[14]);
+                    float _fmax_249 = fmaxf(sc_88, -1.7014118346046923e+38f);
+                    sc_88 = _fmax_249;
+                    float _min_217 = fminf(sc_88, 1.7014118346046923e+38f);
+                    sc_88 = _min_217;
+                    sc_88 = sc_88;
+                    float sc_89 = sc_88;
+                    unsigned int u_90 = __as_u32(sc_89);
+                    unsigned int cls_91 = u_90 & 4294965248u;
+                    unsigned int key_92 = 0;
+                    unsigned int img_93 = cls_91 ^ (unsigned int)((int)cls_91 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_93) {
+                        key_92 = 1073741824 | (unsigned int)(t0_7 + 14);
+                    }
+                    if (cls_91 == qc) {
+                        unsigned int lowb_14 = (u_90 ^ (unsigned int)((int)u_90 >> 31) & 2047) & 2047;
+                        key_92 = 536870912 | lowb_14 << 11 | (unsigned int)(t0_7 + 14);
+                    }
+                    kb2[14] = __uint_as_float(key_92);
+                    float sc_94 = __uint_as_float(cb2[15]);
+                    float _fmax_250 = fmaxf(sc_94, -1.7014118346046923e+38f);
+                    sc_94 = _fmax_250;
+                    float _min_218 = fminf(sc_94, 1.7014118346046923e+38f);
+                    sc_94 = _min_218;
+                    sc_94 = sc_94;
+                    float sc_95 = sc_94;
+                    unsigned int u_96 = __as_u32(sc_95);
+                    unsigned int cls_97 = u_96 & 4294965248u;
+                    unsigned int key_98 = 0;
+                    unsigned int img_99 = cls_97 ^ (unsigned int)((int)cls_97 >> 31) & 2147483647;
+                    if (thr_8 < (int)img_99) {
+                        key_98 = 1073741824 | (unsigned int)(t0_7 + 15);
+                    }
+                    if (cls_97 == qc) {
+                        unsigned int lowb_15 = (u_96 ^ (unsigned int)((int)u_96 >> 31) & 2047) & 2047;
+                        key_98 = 536870912 | lowb_15 << 11 | (unsigned int)(t0_7 + 15);
+                    }
+                    kb2[15] = __uint_as_float(key_98);
                     unsigned int nzc = 0;
                     nzc = nzc | __as_u32(kb2[0]);
                     nzc = nzc | __as_u32(kb2[1]);
