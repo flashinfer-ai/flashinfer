@@ -496,7 +496,7 @@ def quantized_all_reduce(
     so world_size must be a power of 2 up to 16.
 
     Best suited for tensors >= 2MB where NVLink bandwidth dominates. For
-    smaller tensors, torch.ops.symm_mem.multimem_all_reduce_ or
+    smaller tensors, ``torch.ops.symm_mem.multimem_all_reduce_`` or
     flashinfer.comm.allreduce_fusion may be faster due to lower fixed overhead.
 
     Note:
