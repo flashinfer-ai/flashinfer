@@ -50,12 +50,13 @@ def test_nvfp4_fused_staging_matches_torch(monkeypatch, dtype, norm):
             monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", enabled)
             stage_mega_moe_inputs(x, scores, ids, *out, input_norm_const=norm)
         torch.cuda.synchronize()
-        torch.testing.assert_close(
-            unpack_fp4_to_f32(actual[0][:live]),
-            unpack_fp4_to_f32(expected[0][:live]),
-            rtol=0,
-            atol=0,
-        )
+        if live:
+            torch.testing.assert_close(
+                unpack_fp4_to_f32(actual[0][:live]),
+                unpack_fp4_to_f32(expected[0][:live]),
+                rtol=0,
+                atol=0,
+            )
         assert torch.equal(
             actual[1][:live].view(torch.uint8), expected[1][:live].view(torch.uint8)
         )
