@@ -6,8 +6,10 @@ stock DeepGEMM by asking ``dense_route_available(H, Q, K, arch=device_arch)``; t
 arch, a withheld tier is not (its record may exist for another arch).  The one-split ``:short`` routes
 (K <= ``policy.dense_short.max_kv``, two or more query blocks) are the exception: a withheld ``:short`` call
 is served by the tier route of its query count, never by the stock kernel.  These tests pin that contract
-against the shipped catalog itself and against a synthetic catalog whose architectures disagree.  No device,
-no JIT.
+against the shipped catalog itself and against a synthetic catalog whose architectures disagree.  The KV
+length rule is each route record's (``kv_min`` and the per-architecture ``kv_alignment``): the single-launch
+fused ``fp8:qle128:short`` and ``fp8:qle2048:short`` routes take any K on every architecture, the other 32-head
+FP8 tiers keep whole 256-row blocks except where the catalog publishes 1 for an architecture.  No device, no JIT.
 """
 
 import copy
@@ -71,7 +73,9 @@ def _h64_catalog(shipped):
             **template,
             "num_heads": 64,
             "block_q": 2,
-            "kv_alignment": 1,
+            # 64-head programs take any K >= 1 on every architecture (the record's per-arch rule and kv_min).
+            "kv_alignment": {arch: 1 for arch in catalog["arches"]},
+            "kv_min": 1,
             "clean_logits": "raw",
             "stages": [["logits", "cake_deepgemm_dense_mqa_fixture"]],
         }
@@ -182,13 +186,56 @@ def test_dense_route_available_follows_the_per_arch_admission(catalog_variant, r
 
 def test_dense_route_available_rejects_out_of_contract_points(catalog_variant):
     """Points no catalog can serve are rejected without raising on every arch: zero queries, zero keys,
-    foreign head counts, an unaligned 32-head KV length; 32-head routes need no arch."""
+    foreign head counts, a KV length below the route record's ``kv_min`` and an unaligned KV length on a
+    32-head tier whose record keeps 256-row blocks on every architecture (``fp8:partial:le2048`` above the
+    fused bound); the single-launch fused ``fp8:qle128:short`` (1 < Q <= 128, K <= ``policy.fused_qle128_max_kv``)
+    and ``fp8:qle2048:short`` (128 < Q <= 2048, K <= ``policy.fused_qle2048_max_kv[arch]`` -- a per-arch bound)
+    routes take any K on every architecture, so an unaligned point is served exactly where the published
+    ``single_launch_precedence`` of its tier serves it by a fused route (the ``dense_mqa.v9`` scan classes keep
+    whole blocks).  32-head routes need no arch where the architectures agree."""
+    catalog = _runtime._catalog()
+    routes = catalog["routes"]
+    bounds = catalog["policy"]["fused_qle2048_max_kv"]
+    above = (
+        max(int(v) for v in bounds.values()) + 13
+    )  # unaligned, past both fused Q <= 2048 bounds
+    assert all(
+        int(v) == 256 for v in routes["fp8:partial:le2048"]["kv_alignment"].values()
+    )
+    assert int(routes["fp8:full:le2048"]["kv_min"]) == 256
+    assert int(routes["fp8:qle2048:short"]["kv_min"]) == 1
     for arch in (None, *_arches()):
         assert not dense_mqa.dense_route_available(64, 0, 4137, arch=arch)
         assert not dense_mqa.dense_route_available(64, 37, 0, arch=arch)
+        # a head count the catalog does not export is not served: False, not an error
         assert not dense_mqa.dense_route_available(16, 16, 4096, arch=arch)
-        assert not dense_mqa.dense_route_available(32, 16, 4100, arch=arch)
+        assert not dense_mqa.dense_route_available(32, 129, above, arch=arch)
+        assert not dense_mqa.dense_route_available(32, 2052, 200, arch=arch)
         assert dense_mqa.dense_route_available(32, 16, 4096, arch=arch)
+        assert dense_mqa.dense_route_available(32, 1024, 33803, arch=arch)
+    # an unaligned (or sub-block) 32-head point follows its SERVED route's record: served by a fused tiered route
+    # (any K) where the tier's published order puts ``qle`` first, else by the v9 scan class (whole blocks: stock)
+    for arch in _arches():
+        for queries, keys in (
+            (16, 4100),
+            (37, 4137),
+            (129, 4100),
+            (132, 200),
+            (3, 100),
+        ):
+            served = _runtime.served_route("fp8", queries, keys, arch=arch)
+            record = routes[served]
+            expected = (
+                keys >= int(record["kv_min"])
+                and keys % int(record["kv_alignment"][arch]) == 0
+            )
+            assert (
+                dense_mqa.dense_route_available(32, queries, keys, arch=arch)
+                == expected
+            ), (arch, queries, keys, served)
+            assert expected == served.startswith(
+                ("fp8:qle128:short", "fp8:qle2048:short")
+            ), (arch, queries, keys, served)
 
 
 def test_plan_refuses_a_withheld_route_by_name(monkeypatch):

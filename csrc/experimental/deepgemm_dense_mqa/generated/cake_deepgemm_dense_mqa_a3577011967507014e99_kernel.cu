@@ -51,7 +51,7 @@
 #define K_NEXT_N 4
 #define K_NEXT_N_ATOM 2
 #define K_NUM_NEXT_N_ATOMS 2
-#define K_CHUNK_SPLITS 16
+#define K_CHUNK_SPLITS 8
 #define K_NUM_HEADS 64
 #define K_UMMA_N 128
 #define K_Q_TILE_ROWS 128
@@ -64,7 +64,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_deepgemm_dense_mqa_b2253be6241d71881582(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table, int block_table_stride, int batch_size, int num_sms, int stride_logits, unsigned int* __restrict__ sched_counters)
+kernel_cake_deepgemm_dense_mqa_a3577011967507014e99(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table, int block_table_stride, int batch_size, int num_sms, int stride_logits, unsigned int* __restrict__ sched_counters)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -443,11 +443,12 @@ kernel_cake_deepgemm_dense_mqa_b2253be6241d71881582(const __grid_constant__ CUte
                     for (int atom = 0; atom < K_NUM_NEXT_N_ATOMS; atom++) {
                         int tok_base = req * K_NEXT_N + atom * K_NEXT_N_ATOM;
                         mbarrier_wait(q_full_addr + (mt_q_stage) * 8, _phase_q_full);
-                        float weights_reg[K_Q_TILE_ROWS];
-                        int w_base = mt_q_stage * (unsigned int)K_Q_TILE_ROWS;
+                        float weights_reg[128];
                         #pragma unroll
-                        for (int wi = 0; wi < K_Q_TILE_ROWS; wi++) {
-                            weights_reg[wi] = smem_weights[w_base + wi];
+                        for (int wj = 0; wj < 32; wj++) {
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&weights_reg[4 * wj])), "=r"(*reinterpret_cast<uint32_t*>(&weights_reg[(4 * wj) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&weights_reg[(4 * wj) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&weights_reg[(4 * wj) + 3]))
+                                : "r"(smem_weights_addr + mt_q_stage * 512 + (unsigned int)(16 * wj)));
                         }
                         int ctx_qi[K_NEXT_N_ATOM];
                         #pragma unroll
@@ -608,10 +609,26 @@ kernel_cake_deepgemm_dense_mqa_b2253be6241d71881582(const __grid_constant__ CUte
                             }
                             mbarrier_wait(kv_empty_addr + (lk_stage) * 8, _phase_kv_empty);
                             if (elect_sync()) {
-                                #pragma unroll
-                                for (int i_3 = 0; i_3 < K_NUM_BLOCKS_PER_SPLIT; i_3++) {
-                                    tma_3d_gmem2smem(smem_kv_addr + lk_stage * 32768 + (unsigned int)(i_3 * (K_BLOCK_KV * 128)), (&KV), 0, 0, page_idx_reg[i_3], kv_full_addr + (lk_stage) * 8);
-                                    tma_2d_gmem2smem(smem_kv_scales_addr + lk_stage * 1024 + (unsigned int)(i_3 * (K_BLOCK_KV * 4)), (&KV_scales), K_SCALE_TAIL_F32, page_idx_reg[i_3], kv_full_addr + (lk_stage) * 8);
+                                if (_atom == K_NUM_NEXT_N_ATOMS - 1) {
+                                    #pragma unroll
+                                    for (int i_3 = 0; i_3 < K_NUM_BLOCKS_PER_SPLIT; i_3++) {
+                                        asm volatile(
+                                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                            :: "r"(smem_kv_addr + lk_stage * 32768 + (unsigned int)(i_3 * (K_BLOCK_KV * 128))), "l"((&KV)), "r"(0), "r"(0), "r"(page_idx_reg[i_3]),
+                                               "r"(kv_full_addr + (lk_stage) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                                        asm volatile(
+                                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                                            :: "r"(smem_kv_scales_addr + lk_stage * 1024 + (unsigned int)(i_3 * (K_BLOCK_KV * 4))), "l"((&KV_scales)), "r"(K_SCALE_TAIL_F32), "r"(page_idx_reg[i_3]),
+                                               "r"(kv_full_addr + (lk_stage) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                                    }
+                                } else {
+                                    #pragma unroll
+                                    for (int i_4 = 0; i_4 < K_NUM_BLOCKS_PER_SPLIT; i_4++) {
+                                        tma_3d_gmem2smem(smem_kv_addr + lk_stage * 32768 + (unsigned int)(i_4 * (K_BLOCK_KV * 128)), (&KV), 0, 0, page_idx_reg[i_4], kv_full_addr + (lk_stage) * 8);
+                                        tma_2d_gmem2smem(smem_kv_scales_addr + lk_stage * 1024 + (unsigned int)(i_4 * (K_BLOCK_KV * 4)), (&KV_scales), K_SCALE_TAIL_F32, page_idx_reg[i_4], kv_full_addr + (lk_stage) * 8);
+                                    }
                                 }
                                 mbarrier_arrive_expect_tx(kv_full_addr + (lk_stage) * 8, 33792);
                             }
