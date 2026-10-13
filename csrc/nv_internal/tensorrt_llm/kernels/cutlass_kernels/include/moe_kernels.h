@@ -121,6 +121,8 @@ struct ActivationParams {
   // SiTU-GLU per-expert tanh scales; nullptr uses the SituAdaptor compile-time defaults.
   float const* situ_beta = nullptr;
   float const* situ_linear_beta = nullptr;
+  // Model-wide scalar used only by the fused ClampedRelu2 epilogue.
+  float const* clamped_relu2_limit = nullptr;
 
   explicit ActivationParams(ActivationType activation_type) : activation_type(activation_type) {
     TLLM_CHECK_WITH_INFO(
@@ -137,6 +139,12 @@ struct ActivationParams {
         swiglu_limit(swiglu_limit),
         situ_beta(situ_beta),
         situ_linear_beta(situ_linear_beta) {}
+
+  static ActivationParams ClampedRelu2(float const* limit) {
+    ActivationParams params(ActivationType::ClampedRelu2);
+    params.clamped_relu2_limit = limit;
+    return params;
+  }
 
   // TODO Port everything properly and get rid of these implicit conversions
   operator ActivationType() const { return activation_type; }
@@ -1159,6 +1167,15 @@ struct GemmProfilerBackend {
   TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType mScalingType{};
 
  private:
+  bool profilesClampedRelu2Epilogue() const {
+    bool const is_mxfp8 = mUseMxfp8ActScaling && mDType == nvinfer1::DataType::kFP8 &&
+                          mWType == nvinfer1::DataType::kFP8;
+    bool const is_bf16 = mDType == nvinfer1::DataType::kBF16 && mWType == nvinfer1::DataType::kBF16;
+    return mSM >= 100 && mSM < 110 && mGemmToProfile == GemmToProfile::GEMM_1 &&
+           mActivationType == ActivationType::ClampedRelu2 && !mBias && !mUseLora &&
+           !mMinLatencyMode && (is_mxfp8 || is_bf16);
+  }
+
   bool isNativeWfp4Afp8Family() const {
     return mSM >= 100 && mDType == nvinfer1::DataType::kFP8 &&
            (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
