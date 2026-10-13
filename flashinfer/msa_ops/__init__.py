@@ -22,6 +22,7 @@ from .proxy_score import (
 )
 from .sparse_prefill import msa_sparse_attention
 from .sparse_decode import (
+    msa_packed_fp8_sparse_decode,
     msa_sparse_decode_attention,
     prepare_msa_nvfp4_sparse_decode,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "SUPPORTS_PACKED_KV",
     "msa_decode_nvfp4_specialized_stats",
     "msa_decode_nvfp4_specialized_warmup",
+    "msa_packed_fp8_sparse_decode",
     "msa_prefill_nvfp4_specialized_stats",
     "msa_prefill_nvfp4_specialized_warmup",
     "msa_proxy_score",
