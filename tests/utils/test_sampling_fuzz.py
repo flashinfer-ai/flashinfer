@@ -1,36 +1,14 @@
 """Seeded correctness fuzzer for flashinfer's probability-sampling entry points.
 
-Covers ``sampling_from_probs``, ``top_k`` / ``top_p`` / ``top_k_top_p_sampling_from_probs``
-(both ``filter_apply_order`` values), and the ``indices``, per-request-threshold and
-``seed`` / ``offset`` / ``generator`` paths those APIs expose. The oracle is an
-independent float64 PyTorch reference -- it never calls flashinfer and does not mirror
-the kernel's rejection loop.
+Covers top-k, top-p and combined filtering, int32/int64 indices, per-request
+thresholds and RNG replay. An independent float64 reference bounds the legal
+support: top-k ties permit several answers; only top-p gets a float32 mass allowance.
+Seeded cases check support, output metadata and replay. Frozen distributions also
+check probability mass with a chi-square and effect-size gate; its false-positive
+budget is nominal, not a finite-sample guarantee.
 
-The reference brackets each row instead of pinning it to one answer, because the
-documented contract leaves two things to the implementation:
-
-* ``top_k_renorm_probs`` promises "keep the top-k probabilities"; ``test_sampling.py``
-  reads that as "at least k, at most everything tied with the k-th largest". So the
-  may-draw mask keeps every class at least as likely as the k-th largest, while the
-  must-draw mask only requires the classes that every such implementation has to keep.
-  Both are computed on the float32 values that are handed to the kernel, compared
-  exactly: top-k is a rank test, so no tolerance belongs here.
-* The top-p nucleus is a cumulative-mass comparison the kernel performs in float32,
-  so the mass threshold -- and only that -- carries a float32 boundary allowance.
-
-Two layers run over that bracket. ``test_sampling_fuzz`` draws a few thousand samples
-per seeded case and checks that every draw lands in the may-draw support, that every
-class the must-draw support requires with a high enough expected count is drawn, that
-the shape / dtype / index range are right, and that a fixed seed/offset (or generator
-state) replays exactly. ``test_sampling_distribution`` runs a Pearson chi-square
-goodness-of-fit with an effect-size gate over a frozen set of constructed
-distributions, to catch a kernel whose support is right but whose probability mass is
-wrong; the family-wise false-positive budget is nominal (asymptotic chi-square, split
-by Bonferroni), and the machinery is checked against ``torch.multinomial`` first.
-
-The reference, the statistical machinery and the generator are exercised on CPU; only
-the tests that call flashinfer need a GPU. A failing case prints a single-seed repro
-command.
+Reference and statistics tests run on CPU. Kernel tests require CUDA and print a
+single-seed reproduction command on failure.
 """
 
 from __future__ import annotations
@@ -51,12 +29,9 @@ NUM_CASES = int(
     os.environ.get("FLASHINFER_SAMPLING_FUZZ_NUM_CASES", str(_DEFAULT_NUM_CASES))
 )
 BASE_SEED = int(os.environ.get("FLASHINFER_SAMPLING_FUZZ_SEED", "0"))
-# Comma-separated seeds -> run only those cases; the repro command printed on failure
-# uses this so a single seed reproduces one case exactly.
+# Comma-separated seeds, also used by the failure's reproduction command.
 _ONLY_SEEDS = os.environ.get("FLASHINFER_SAMPLING_FUZZ_ONLY_SEED", "")
 
-# Only the tests that launch a kernel need CUDA; the reference, the goodness-of-fit
-# machinery and the case generator are plain CPU tensor code and run anywhere.
 _GPU_ONLY = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA not available"
 )
@@ -79,10 +54,7 @@ def _flashinfer():
 def _fp32_mass_eps(vocab: int) -> float:
     """Boundary allowance for a float32 cumulative sum over up to ``vocab`` terms.
 
-    float32 has a unit roundoff of 2**-24; a running sum of ``vocab`` terms carries a
-    worst-case absolute error of about ``vocab * 2**-24``. Only the top-p mass
-    threshold is loosened by this. It is an engineering allowance for these small
-    rows, not a proven error bound for the kernel at large vocabularies.
+    Used only for top-p on these small rows, not as a proven kernel error bound.
     """
     return vocab * 2.0**-24
 
@@ -107,11 +79,7 @@ def reference_top_k_pivot(probs_row: torch.Tensor, top_k: int) -> torch.Tensor:
 
 
 def reference_top_k_support(probs_row: torch.Tensor, top_k: int) -> torch.Tensor:
-    """Every class at least as likely as the k-th largest (the largest legal support).
-
-    No tolerance: top-k is a rank test over the stored float32 values and the kernel
-    compares them exactly.
-    """
+    """Tie-inclusive top-k support, comparing stored values without tolerance."""
     return probs_row >= reference_top_k_pivot(probs_row, top_k)
 
 
@@ -173,10 +141,7 @@ def reference_top_k_renorm_sums(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``(smallest, largest)`` mass a legal top-k filter can leave to renormalize by.
 
-    ``top_k_first`` runs top-p on the renormalized row, so which tied classes the
-    top-k stage kept moves the top-p boundary. Keeping the fewest legal classes gives
-    the largest renormalized masses (the tightest nucleus), keeping all of them the
-    smallest (the widest nucleus).
+    In ``top_k_first``, retaining more tied classes widens the subsequent nucleus.
     """
     pivot = reference_top_k_pivot(probs_row, top_k)
     above = probs_row > pivot
@@ -213,14 +178,9 @@ def reference_support_bounds(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``(may_draw, must_draw)`` for one row.
 
-    ``may_draw`` is a superset of every support the documented contract permits, so a
-    draw outside it is a defect. ``must_draw`` is a subset of all of them, so a class
-    it contains has to be reachable. They differ exactly where the contract leaves a
-    choice: classes tied with the k-th largest probability, and the class that crosses
-    the top-p mass threshold within the float32 allowance ``shift``.
-
-    Both are intersected with the positive-mass classes, so a zero-probability class is
-    excluded even for a no-op threshold.
+    ``may_draw`` contains every legal support; ``must_draw`` is shared by all of
+    them. They differ at top-k ties and top-p boundaries within ``shift``.
+    Zero-probability classes are always excluded.
     """
     positive = probs_row > 0
     if api == "sampling_from_probs":
@@ -290,11 +250,8 @@ class GofResult:
 def chi_square_gof(counts: torch.Tensor, target: torch.Tensor) -> GofResult:
     """Pearson goodness-of-fit of ``counts`` against ``target``, tail bins merged.
 
-    The p-value is the nominal asymptotic chi-square tail, not an exact finite-sample
-    false-positive rate. Anything that would make the statistic meaningless -- a
-    malformed target, non-integer or negative counts, draws on a zero-target class, or
-    a merge that leaves no degrees of freedom -- raises instead of returning a number
-    a caller would compare against a threshold.
+    The p-value is asymptotic, not an exact finite-sample error rate.
+    Invalid inputs or insufficient degrees of freedom raise ValueError.
     """
     counts = counts.to("cpu", torch.float64)
     target = target.to("cpu", torch.float64)
@@ -644,11 +601,8 @@ def _run_case(cfg: Cfg) -> None:
     nd = cfg.num_dist
     seed = 0xA5A5 + cfg.seed
 
-    # Per-distribution reference. may_draw: a draw may not land outside it.
-    # must_draw: every firmly-included class with enough expected draws must appear.
-    # floor: a lower bound on each class's probability -- renormalizing on the largest
-    # legal support gives the largest denominator, so no boundary or tie choice can
-    # make the real probability smaller than this.
+    # Renormalizing on the largest legal support gives a lower probability bound,
+    # regardless of which tied or boundary classes the kernel keeps.
     shift = _fp32_mass_eps(cfg.vocab)
     may = torch.zeros(nd, cfg.vocab, dtype=torch.bool)
     must = torch.zeros(nd, cfg.vocab, dtype=torch.bool)
@@ -701,10 +655,8 @@ def _run_case(cfg: Cfg) -> None:
             category="row_threshold" if wrong_row_signature else "support",
         )
 
-    # Mirror: a required class with a high enough expected count must appear. The count
-    # uses the probability floor above, so a boundary or tie choice cannot inflate it.
-    # A floor-expected count of 64 bounds one class's miss probability by exp(-64)
-    # under independent draws; at most num_dist * vocab classes are checked.
+    # An expected count of at least 64 bounds a required class's miss probability
+    # by exp(-64) under independent draws; at most num_dist * vocab are checked.
     n_per_row = torch.bincount(dist_idx.long(), minlength=nd)
     obs = torch.zeros(nd * cfg.vocab, dtype=torch.long, device=_DEVICE)
     obs.scatter_add_(
@@ -984,10 +936,7 @@ def test_sampling_distribution(sc, indices_dtype):
 
 
 def test_statistical_machinery():
-    """Sanity-check the gof gate: it must not fire on correct data and must fire on a bias
-    above the declared detection floor. Both halves are deterministic under a fixed
-    generator; this is an observation at these settings, not a proof of the nominal
-    rate. The multi-seed calibration lives in the offline sweep, not here."""
+    """Check correct and biased draws with a fixed seed, not the nominal error rate."""
     targets = [
         _geometric(4, 4, 0.6),
         _geometric(8, 8, 0.7),
@@ -1082,10 +1031,7 @@ def test_reference_self_consistency():
 def test_top_k_boundary_is_exact(api, order, row, k, may, must):
     """A sampler that drops the unique k-th class must be caught.
 
-    Loosening the top-k pivot by the float32 mass allowance would leave the second
-    case's pivot class out of the must-draw mask, and the first case's too, so a
-    kernel that kept only k-1 classes would pass. top-k compares stored values
-    exactly, so the pivot moves only for a real tie.
+    Applying the top-p tolerance here would let a k-1 sampler pass.
     """
     p = reference_normalize(torch.tensor(row, dtype=_DTYPE))
     shift = _fp32_mass_eps(len(row))
