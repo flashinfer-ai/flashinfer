@@ -287,8 +287,8 @@ CuTe DSL implementations for a strict ordinary multi-token prefill subset.
     specific to the CuTe DSL backend, and fixes the sequence count and packed
     token extent after the first warmup run. Its planning implementation lives
     in ``flashinfer.experimental.kda_prefill_wrapper``; it contains no kernels
-    of its own and dispatches to stable AOT-registered kernels. The package
-    also includes a README. ``examples/experimental/kda_prefill_wrapper.py``
+    of its own, and the kernels it dispatches to are the stable AOT-registered
+    ones, alongside a package README. ``examples/experimental/kda_prefill_wrapper.py``
     is a runnable plan-and-run example. See
     `#5069 <https://github.com/flashinfer-ai/flashinfer/issues/5069>`_ for the
     graduation plan.
@@ -366,7 +366,7 @@ allowlist.
 The dense beta-TMA BT16 one-wave route uses the S9 chain schedule when both
 value-split CTAs for every task fit in one device wave.
 
-At a maximum sequence length of 16 or fewer, generic head counts use a one-stage
+At maximum sequence length 16 or below, generic head counts use a one-stage
 N16 retrace with one four-warp prepare owner. It preserves the variable-shape
 N16 arithmetic while reducing the CTA from 32 to 16 warps. H12 keeps its
 dedicated scalar-beta N16 schedule.
@@ -488,7 +488,7 @@ diagonal factors, and independent prepare/chain descriptor storage. The
 workspace binds to the device and CUDA stream of its first ``recurrent_kda``
 call.
 Warm it eagerly on the intended capture stream with the exact Q, K, V, G,
-beta, and output tensors, then synchronize that stream before capture. For the SM100-family Cake path,
+beta, and output tensors, then synchronize that stream before capture. For SM100-family Cake,
 packed graphs must also pass preallocated int64 ``cu_seqlens`` and int32
 ``seq_order``. The warm call prepares descriptors; capture accepts only the
 exact warmed pointer, shape, stride, and dtype signature and performs no

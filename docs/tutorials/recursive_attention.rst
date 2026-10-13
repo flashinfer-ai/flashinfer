@@ -24,7 +24,7 @@ We can also generalize the value on index :math:`i` to index set :math:`I`:
     \mathbf{v}(I) = \sum_{i\in I}\textrm{softmax}(s_i) \mathbf{v}_i = \frac{\sum_{i\in I}\exp\left(s_i\right)\mathbf{v}_i}{\exp(s(I))}
 
 The :math:`softmax` function is restricted to the index set :math:`I`. Note that :math:`\mathbf{v}(\{1,2,\cdots, n\})` is the self-attention output of the entire sequence.
-The *attention state* of the index set :math:`I` can be defined as a tuple :math:`(s(I), \mathbf{v}(I))`, and we can then define a binary **merge** operator :math:`\oplus` for two attention states as follows (in practice, we subtract the maximum value from :math:`s` to guarantee numerical stability, but omit this here for simplicity):
+The *attention state* of the index set :math:`I` can be defined as a tuple :math:`(s(I), \mathbf{v}(I))`, then we can define a binary **merge** operator :math:`\oplus` of two attention states (in practice, we subtract the maximum from :math:`s` for numerical stability and omit it here for simplicity):
 
 .. math::
 

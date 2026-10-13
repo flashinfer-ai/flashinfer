@@ -115,8 +115,8 @@ repeated profiling.
 Saving Tuned Configs
 ^^^^^^^^^^^^^^^^^^^^
 
-Pass a file path to ``cache`` when tuning. On exit, profiled configs are written to that file when the cache
-metadata is compatible with the current environment; otherwise, a definite metadata mismatch prevents overwriting it.
+Pass a file path to ``cache`` when tuning. On exit, profiled configs are
+written to that file unless existing cache metadata definitely conflicts with the current environment:
 
 .. code-block:: python
 
@@ -207,8 +207,8 @@ The benchmark harness supports config caching via the ``--autotune_cache`` flag.
 Cache File Format
 ^^^^^^^^^^^^^^^^^
 
-The cache file is a plain JSON dictionary. Each non-metadata key is a string representation of
-``(custom_op, runner_class_name, optimization_profile)`` and each value is
+The cache file is a plain JSON dictionary. Each non-metadata key is a string representation
+of ``(custom_op, runner_class_name, optimization_profile)`` and each value is
 ``[runner_class_name, tactic]``. The reserved ``_metadata`` key contains environment metadata:
 
 .. code-block:: json

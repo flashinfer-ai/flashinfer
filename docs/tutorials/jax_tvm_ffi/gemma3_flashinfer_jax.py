@@ -52,7 +52,7 @@ Hardware and software requirements
    * - Python packages
      - ``jax``, ``jax-tvm-ffi``, ``flashinfer``, ``torch``, ``safetensors``, ``huggingface_hub``, ``transformers``
    * - HuggingFace
-     - Hugging Face account with the Gemma 3 licence accepted - `request access <https://huggingface.co/google/gemma-3-1b-it>`_
+     - Account with Gemma 3 licence accepted - `request access <https://huggingface.co/google/gemma-3-1b-it>`_
 """
 
 # %%
