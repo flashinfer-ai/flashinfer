@@ -18,13 +18,13 @@ from flashinfer.autotune_cache import MeasurementPolicy
 from flashinfer.autotuner import AutoTuner, _tactic_to_json
 
 
-Backend = Literal["cute-dsl", "cutlass-sm120"]
+Backend = Literal["cute-dsl", "cutlass-sm120", "auto"]
 Operation = Literal["gemm", "linear"]
 TuningL2 = Literal["operator", "warm", "cold"]
 JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 )
-BACKENDS: Final[tuple[Backend, ...]] = ("cute-dsl", "cutlass-sm120")
+BACKENDS: Final[tuple[Backend, ...]] = ("cute-dsl", "cutlass-sm120", "auto")
 REDUCTION_ELEMENTS: Final = 1 << 20
 
 
@@ -62,7 +62,7 @@ def tuning_context(
 def tuning_precision(
     *, repeat: int | None = None, replays: int | None = None
 ) -> Iterator[None]:
-    """Scope benchmark precision across tuning and replay for both backends."""
+    """Scope benchmark precision across tuning and replay for all backends."""
     if repeat is None and replays is None:
         yield
         return
@@ -192,7 +192,9 @@ def _quantize(
     return packed.view(torch.uint8), sf.view(torch.uint8).reshape(-1)
 
 
-def build_case(shape: tuple[int, int, int], seed: int, bias: bool) -> Case:
+def build_case(
+    shape: tuple[int, int, int], seed: int, bias: bool, rank: int = 32
+) -> Case:
     m, n, k = shape
     generator = torch.Generator(device="cuda").manual_seed(seed)
 
@@ -212,8 +214,8 @@ def build_case(shape: tuple[int, int, int], seed: int, bias: bool) -> Case:
     wq, w_sf = _quantize(weight, weight_scale)
     del weight
     alpha = (global_sf * weight_scale).reciprocal()
-    l2t = (pqs[:, None] * random(32, k).mul_(k**-0.25).t()).contiguous()
-    l1 = (random(n, 32).mul_(32**-0.25).float() / alpha).to(torch.bfloat16)
+    l2t = (pqs[:, None] * random(rank, k).mul_(k**-0.25).t()).contiguous()
+    l1 = (random(n, rank).mul_(rank**-0.25).float() / alpha).to(torch.bfloat16)
     down = torch.mm(x, l2t)
     bias_tensor = random(1, n).flatten() if bias else None
     return Case(

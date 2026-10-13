@@ -1,11 +1,11 @@
-"""Compare explicit SM120 SVDQuant backends with identical inputs on one GPU.
+"""Compare explicit and automatic SM120 SVDQuant backends on one GPU.
 
 Examples (run from the repository root):
     python benchmarks/bench_svdquant_sm120_backends.py --output small.jsonl
     python benchmarks/bench_svdquant_sm120_backends.py --all-shapes --output all.jsonl
     python benchmarks/bench_svdquant_sm120_backends.py --shape 537x5376x7168 --cold-l2
 
-Timings are CUDA-event measurements of graph device work, with five alternating
+Timings are CUDA-event measurements of graph device work, with five rotating
 backend-order trials by default. GEMM uses a preallocated output; linear covers
 the public chain, including operations captured while allocating its output.
 Warm samples report a graph batch's mean time per operation. Cold samples time
@@ -16,10 +16,13 @@ output match records a null SQNR.
 --tuning-l2 selects the tuning policy independently of the measurement's
 --cold-l2 switch; operator preserves each operator's default tuning behavior.
 --tuning-repeat and --tuning-replays optionally control profiling precision for
-both backends; omitted values preserve the autotuner/operator defaults.
+all backends; omitted values preserve the autotuner/operator defaults.
 For sustained warm profiling, use --tuning-l2 warm --tuning-repeat 64
 --tuning-replays 5. tuning_time_s includes first-use compilation, profiling,
 and synchronization, making the cost of additional profiling visible.
+Use --rank 64 for rank-64 coverage, --untuned for default dispatch, and --eager
+for completed warm-batch wall time including Python dispatch and allocation.
+Run --untuned in a fresh process to avoid reusing in-memory tuned winners.
 """
 
 import gc
@@ -81,8 +84,28 @@ def _measure_cold_graph(call: Call, warmup_ms: int, repeat_ms: int) -> list[floa
 
 
 def measure(
-    call: Call, graph_calls: int, cold_l2: bool, warmup_ms: int, repeat_ms: int
+    call: Call,
+    graph_calls: int,
+    cold_l2: bool,
+    warmup_ms: int,
+    repeat_ms: int,
+    eager: bool = False,
 ) -> list[float]:
+    if eager:
+        samples_us = []
+        for duration, collect in ((warmup_ms, False), (repeat_ms, True)):
+            elapsed_ms = 0.0
+            while elapsed_ms < duration:
+                torch.cuda.synchronize()
+                started = time.perf_counter()
+                for _ in range(graph_calls):
+                    call()
+                torch.cuda.synchronize()
+                elapsed = time.perf_counter() - started
+                elapsed_ms += elapsed * 1000.0
+                if collect:
+                    samples_us.append(elapsed * 1e6 / graph_calls)
+        return samples_us
     if cold_l2:
         samples = _measure_cold_graph(call, warmup_ms, repeat_ms)
     else:
@@ -119,12 +142,13 @@ def run_operation(
     for backend, call in calls.items():
         print(f"TUNE {shape} {operation}/{backend}", file=sys.stderr, flush=True)
         tuning_started = time.perf_counter()
-        with tuning_context(policy, tuning=True):
+        with tuning_context(policy, tuning=not options.untuned):
             call()
         torch.cuda.synchronize()
         tuning_time_s[backend] = time.perf_counter() - tuning_started
     with tuning_context(policy, tuning=False):
         accuracy = compare_outputs(calls["cute-dsl"](), calls["cutlass-sm120"]())
+        auto_accuracy = compare_outputs(calls["cute-dsl"](), calls["auto"]())
         graph_calls = (
             1
             if options.cold_l2
@@ -138,7 +162,10 @@ def run_operation(
         orders = []
         trial_windows = []
         for trial in range(options.trials):
-            order = BACKENDS if trial % 2 == 0 else tuple(reversed(BACKENDS))
+            offset = trial % len(BACKENDS)
+            order = BACKENDS[offset:] + BACKENDS[:offset]
+            if trial % 2:
+                order = tuple(reversed(order))
             orders.append(order)
             windows: dict[Backend, dict[str, int]] = {}
             trial_windows.append(windows)
@@ -151,6 +178,7 @@ def run_operation(
                         options.cold_l2,
                         options.warmup_ms,
                         options.repeat_ms,
+                        options.eager,
                     )
                 )
                 windows[backend] = {
@@ -166,18 +194,20 @@ def run_operation(
             for backend, trials in trial_medians.items()
         }
         record = {
-            "schema_version": 2,
+            "schema_version": 3,
             "environment": asdict(env),
             "shape": shape,
             "operation": operation,
-            "rank": 32,
+            "rank": case.l2t.shape[1],
             "bias": options.bias,
             "seed": options.seed,
             "enable_pdl": options.enable_pdl,
             "inference_mode": options.inference_mode,
-            "timer": "cuda-event-graph",
+            "timer": "host-wall-eager" if options.eager else "cuda-event-graph",
             "sample_observable": (
-                "isolated_graph_replay_elapsed_us"
+                "completed_eager_batch_elapsed_us_divided_by_calls"
+                if options.eager
+                else "isolated_graph_replay_elapsed_us"
                 if options.cold_l2
                 else "graph_replay_elapsed_us_divided_by_graph_calls"
             ),
@@ -192,6 +222,7 @@ def run_operation(
             ),
             "l2_flush_in_timed_region": False,
             "tuning_l2": options.tuning_l2,
+            "autotuned": not options.untuned,
             "tuning_policy": asdict(policy) if policy is not None else None,
             "tuning_repeat": options.tuning_repeat,
             "tuning_replays": options.tuning_replays,
@@ -203,10 +234,13 @@ def run_operation(
             "trial_order": orders,
             "trial_windows": trial_windows,
             "accuracy": asdict(accuracy),
+            "auto_accuracy": asdict(auto_accuracy),
             "samples_us": samples,
             "trial_medians_us": trial_medians,
             "median_us": medians,
             "cutlass_speedup": medians["cute-dsl"] / medians["cutlass-sm120"],
+            "auto_over_best_explicit": medians["auto"]
+            / min(medians["cute-dsl"], medians["cutlass-sm120"]),
         }
         stream.write(json.dumps(record, allow_nan=False) + "\n")
         stream.flush()
@@ -244,13 +278,14 @@ def main() -> None:
         output_context as stream,
     ):
         for shape in options.shapes:
-            with context():
-                case = build_case(shape, options.seed, options.bias)
-                for operation in options.operations:
-                    run_operation(case, shape, operation, options, env, stream)
-                del case
-            gc.collect()
-            torch.cuda.empty_cache()
+            for rank in options.ranks:
+                with context():
+                    case = build_case(shape, options.seed, options.bias, rank)
+                    for operation in options.operations:
+                        run_operation(case, shape, operation, options, env, stream)
+                    del case
+                gc.collect()
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

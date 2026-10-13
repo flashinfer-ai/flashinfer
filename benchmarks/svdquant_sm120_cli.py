@@ -35,6 +35,9 @@ class Options:
     inference_mode: bool
     bias: bool
     enable_pdl: bool
+    ranks: tuple[int, ...]
+    untuned: bool
+    eager: bool
 
 
 def parse_shape(text: str) -> ShapeCase:
@@ -69,6 +72,15 @@ def parse_options(
     )
     parser.add_argument("--output", type=Path, help="JSONL file; default: stdout")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--rank", type=int, choices=(32, 64), action="append")
+    parser.add_argument(
+        "--untuned", action="store_true", help="measure defaults without autotuning"
+    )
+    parser.add_argument(
+        "--eager",
+        action="store_true",
+        help="measure completed eager batches with a host wall clock",
+    )
     parser.add_argument("--trials", type=int, default=5)
     parser.add_argument(
         "--graph-calls",
@@ -95,12 +107,12 @@ def parse_options(
     parser.add_argument(
         "--tuning-repeat",
         type=int,
-        help="override the autotuner's default profiling call count for both backends",
+        help="override the autotuner's default profiling call count for all backends",
     )
     parser.add_argument(
         "--tuning-replays",
         type=int,
-        help="override CUDA-graph profiling replays for both backends",
+        help="override CUDA-graph profiling replays for all backends",
     )
     parser.add_argument(
         "--inference-mode", action="store_true", help="default: torch.no_grad"
@@ -113,6 +125,10 @@ def parse_options(
         help="use the SM120 public API default (on); --no-enable-pdl disables it",
     )
     args = parser.parse_args(argv)
+    if args.eager and args.cold_l2:
+        parser.error(
+            "--eager measures warm batches and cannot be combined with --cold-l2"
+        )
     if any(
         value is not None and value <= 0
         for value in (args.tuning_repeat, args.tuning_replays)
@@ -153,4 +169,7 @@ def parse_options(
         args.inference_mode,
         not args.no_bias,
         args.enable_pdl,
+        tuple(dict.fromkeys(args.rank or (32,))),
+        args.untuned,
+        args.eager,
     )

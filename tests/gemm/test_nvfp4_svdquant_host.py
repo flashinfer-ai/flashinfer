@@ -2684,6 +2684,44 @@ def test_precision_options_do_not_change_cache_policy(
     assert options.tuning_l2 == "operator"
 
 
+def test_benchmark_selects_rank_and_untuned_eager_mode(benchmark_modules) -> None:
+    cli, _ = benchmark_modules
+    options = cli.parse_options(["--rank", "64", "--untuned", "--eager"])
+    assert (options.ranks, options.untuned, options.eager) == ((64,), True, True)
+
+
+def test_benchmark_records_auto_latency_and_actual_rank(
+    benchmark_modules, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+    import json
+
+    cli, helpers = benchmark_modules
+    bench = importlib.import_module("bench_svdquant_sm120_backends")
+    tensor = torch.ones(2, 32)
+    case = helpers.Case(*([tensor] * 8), torch.ones(32, 64), *([tensor] * 3))
+    seen = []
+
+    def make_call(case, operation, backend, enable_pdl):
+        seen.append(backend)
+        return helpers.Call(lambda: tensor, ())
+
+    monkeypatch.setattr(bench, "make_call", make_call)
+    monkeypatch.setattr(bench, "measure", lambda *args: [2.0, 2.0, 2.0])
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    env = helpers.Environment(
+        "now", "cpu", "test", (12, 0), 1, 1, "test", "test", None, "test"
+    )
+    output = io.StringIO()
+    bench.run_operation(case, (2, 32, 32), "linear", cli.parse_options([]), env, output)
+    record = json.loads(output.getvalue())
+    assert seen == ["cute-dsl", "cutlass-sm120", "auto"]
+    assert record["rank"] == 64
+    assert record["median_us"]["auto"] == 2.0
+    assert record["auto_over_best_explicit"] == 1.0
+    assert record["auto_accuracy"]["exact_match"]
+
+
 @pytest.mark.parametrize("flag", ["--tuning-repeat", "--tuning-replays"])
 @pytest.mark.parametrize("value", ["0", "-1"])
 def test_precision_counts_must_be_positive(
