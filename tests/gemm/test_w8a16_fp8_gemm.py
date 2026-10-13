@@ -125,3 +125,32 @@ def test_w8a16_fp8_gemm_rejects_bad_inputs():
         w8a16_fp8_gemm(act, w_fp8.to(torch.bfloat16), scale)
     with pytest.raises(ValueError):
         w8a16_fp8_gemm(act[:, :32], w_fp8, scale)
+
+
+@pytest.mark.parametrize(
+    "algo", ["2sm256x128", "2sm256x192", "2sm256x256", "1sm128x128", "2sm256x128_splitk"]
+)
+@pytest.mark.parametrize("m,n,k", [(1024, 1024, 5120), (200, 1024, 5120), (4096, 128, 5120)])
+@pytest.mark.parametrize("bias", [False, True])
+def test_w8a16_fp8_gemm_algo(algo, m, n, k, bias):
+    """Every Blackwell kernel variant reachable through ``algo`` must agree with the
+    cast-copy reference; ``algo`` is rejected on other architectures."""
+    dev = torch.device("cuda")
+    torch.manual_seed(0)
+    act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+    b = torch.randn(n, device=dev, dtype=torch.bfloat16) if bias else None
+    if get_compute_capability(dev)[0] != 10:
+        with pytest.raises(ValueError):
+            w8a16_fp8_gemm(act, w_fp8, scale, bias=b, algo=algo)
+        return
+    out = w8a16_fp8_gemm(act, w_fp8, scale, bias=b, algo=algo)
+    ref32 = act.float() @ (w_fp8.float() * scale).T
+    if b is not None:
+        ref32 = ref32 + b.float()
+    cast_err = (_cast_copy_reference(act, w_fp8, scale, b).float() - ref32).abs().max().item()
+    err = (out.float() - ref32).abs().max().item()
+    assert torch.isfinite(out.float()).all()
+    assert err <= max(2.0 * cast_err, 2e-3 * ref32.abs().max().item()), (algo, err, cast_err)
+    with pytest.raises(ValueError):
+        w8a16_fp8_gemm(act, w_fp8, scale, algo="nope")

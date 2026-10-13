@@ -20,9 +20,13 @@
 using namespace flashinfer;
 
 // out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
+// `algo` selects the kernel variant on Blackwell; the Hopper launcher keeps its own
+// tile / split-K cost model (env overrides FLASHINFER_W8A16_FP8_TILE / _SPLITS) and
+// only accepts 0 (auto) here.
 void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorView scale,
                     ffi::Optional<TensorView> bias, bool weight_prepared,
-                    ffi::Optional<TensorView> workspace) {
+                    ffi::Optional<TensorView> workspace, int64_t algo) {
+  TVM_FFI_ICHECK(algo == 0) << "algo is Blackwell-only; the Hopper launcher picks the tile";
   CHECK_INPUT(act);     // [M, K], fp16/bf16, contiguous
   CHECK_INPUT(weight);  // [N, K], fp8 e4m3, contiguous
   CHECK_INPUT(out);     // [M, N], act dtype, contiguous
@@ -88,7 +92,9 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
 }
 
 // Workspace (bytes) the split-K path needs for this problem; 0 when it does not split.
-int64_t w8a16_fp8_gemm_workspace_bytes(int64_t M, int64_t N, int64_t K, int64_t device_id) {
+int64_t w8a16_fp8_gemm_workspace_bytes(int64_t M, int64_t N, int64_t K, int64_t device_id,
+                                       int64_t algo) {
+  TVM_FFI_ICHECK(algo == 0) << "algo is Blackwell-only; the Hopper launcher picks the tile";
   int num_sms = 0;
   cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, static_cast<int>(device_id));
   return gemm::W8A16Fp8GemmWorkspaceBytes(static_cast<int>(M), static_cast<int>(N),

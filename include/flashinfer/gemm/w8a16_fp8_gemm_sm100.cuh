@@ -53,6 +53,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -209,6 +210,42 @@ struct NumericArrayConverter<cutlass::half_t, cutlass::float_e4m3_t, 4, Round> {
 namespace flashinfer {
 namespace gemm {
 
+// Split-K reduce: out[i] = T(sum_s ws[s][i] * scale + bias[i % N]), 8 elements per
+// thread (two 16 B loads per split, one 16 B store).  Requires N % 8 == 0 (the launcher
+// checks it) and M * N % 8 == 0, which follows.
+template <typename T>
+__global__ void W8A16Sm100SplitKReduceKernel(const float* __restrict__ ws, int splits,
+                                             const float* __restrict__ scale,
+                                             const T* __restrict__ bias, T* __restrict__ out,
+                                             int64_t mn, int N) {
+  const int64_t i = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 8;
+  if (i >= mn) return;
+  float acc[8];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) acc[e] = 0.f;
+  for (int sp = 0; sp < splits; ++sp) {
+    const float4* src = reinterpret_cast<const float4*>(ws + static_cast<int64_t>(sp) * mn + i);
+    const float4 a = src[0], b = src[1];
+    acc[0] += a.x;
+    acc[1] += a.y;
+    acc[2] += a.z;
+    acc[3] += a.w;
+    acc[4] += b.x;
+    acc[5] += b.y;
+    acc[6] += b.z;
+    acc[7] += b.w;
+  }
+  const float sc = *scale;
+  const int n = static_cast<int>(i % N);
+  alignas(16) T v[8];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    const float bb = bias != nullptr ? static_cast<float>(bias[n + e]) : 0.f;
+    v[e] = static_cast<T>(acc[e] * sc + bb);
+  }
+  *reinterpret_cast<uint4*>(out + i) = *reinterpret_cast<const uint4*>(v);
+}
+
 template <typename T>
 struct W8A16Sm100CutlassType;
 template <>
@@ -253,11 +290,17 @@ using W8A16Sm100Cfg2SM256x256 = W8A16Sm100Cfg<256, 256, 64, 2, true, true>;
 // 2/3 the transform work per flop of 256x128 on the skeleton whose no-convert ceiling is 99%.
 using W8A16Sm100Cfg2SM256x192 = W8A16Sm100Cfg<256, 192, 128, 2, true>;
 
-template <typename T, typename Cfg>
+// Rung B12: split-K.  With kSplitK the kernel runs as a *batch* of `splits` GEMMs over
+// K-slices in one launch (batch stride = the slice length along K for A and B, one
+// M x N fp32 partial per batch for D), so an under-filled grid becomes `splits` times as
+// many tiles for the persistent scheduler; W8A16Sm100SplitKReduceKernel then sums the
+// partials, applies the per-tensor scale and the bias and casts.  Scale and bias are
+// deferred to the reduce (alpha = 1 here) so the partials are plain accumulators.
+template <typename T, typename Cfg, bool kSplitK = false>
 struct W8A16Sm100Gemm {
   using ElementW = cutlass::float_e4m3_t;
   using ElementAct = typename W8A16Sm100CutlassType<T>::type;
-  using ElementD = ElementAct;
+  using ElementD = std::conditional_t<kSplitK, float, ElementAct>;
   using ElementBias = ElementAct;
   using ElementAccumulator = float;
   using ElementCompute = float;
@@ -273,15 +316,21 @@ struct W8A16Sm100Gemm {
   static constexpr int kAlignD = 128 / cutlass::sizeof_bits<ElementD>::value;    // 8
 
   // D = alpha * acc + bias[row]; alpha is the per-tensor weight scale, bias is per M' (= N).
-  using FusionOp =
+  // Split-K partials: D = acc (fp32), scale and bias applied in the reduce kernel.
+  using FusionOp = std::conditional_t<
+      kSplitK, cutlass::epilogue::fusion::LinearCombination<float, float, void, float>,
       cutlass::epilogue::fusion::LinCombPerRowBias<ElementD, ElementCompute, ElementBias, ElementD,
-                                                   float, kAlignD>;
+                                                   float, kAlignD>>;
 
+  // fp32 partials double the epilogue's smem per stage (the auto tile is 128x32 for bf16:
+  // 18 KB; fp32 would be 33 KB and overshoot the 227 KB budget by 1 KB next to the 6/4
+  // mainloop stages), so the split-K variant uses a 128x16 epilogue tile.
+  using EpilogueTile = std::conditional_t<kSplitK, cute::Shape<cute::_128, cute::_16>,
+                                          cutlass::epilogue::collective::EpilogueTileAuto>;
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, typename Cfg::TileShape,
-      typename Cfg::ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
-      ElementAccumulator, ElementCompute, void, LayoutD, kAlignD, ElementD, LayoutD, kAlignD,
-      typename Cfg::EpilogueSchedule, FusionOp>::CollectiveOp;
+      typename Cfg::ClusterShape, EpilogueTile, ElementAccumulator, ElementCompute, void, LayoutD,
+      kAlignD, ElementD, LayoutD, kAlignD, typename Cfg::EpilogueSchedule, FusionOp>::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, cute::tuple<ElementW>, LayoutA, kAlignA,
@@ -299,12 +348,23 @@ struct W8A16Sm100Gemm {
   using StrideB = typename GemmKernel::StrideB;
   using StrideD = typename GemmKernel::StrideD;
 
+  // `splits` > 1 only with kSplitK: problem {N, M, K / splits, splits}, A and B batch
+  // stride = K / splits elements (the next K-slice), D batch stride = M * N (the next
+  // fp32 partial in `out`).  Row strides stay the full K, so TMA walks the sliced
+  // operands in place.
   static typename Gemm::Arguments MakeArguments(const T* act, const __nv_fp8_e4m3* weight,
-                                                const float* scale, const T* bias, T* out, int M,
-                                                int N, int K, int device_id, int num_sms) {
+                                                const float* scale, const T* bias, void* out,
+                                                int M, int N, int K, int device_id, int num_sms,
+                                                int splits = 1) {
+    const int kc = K / splits;
     StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(N, K, 1));
     StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(M, K, 1));
     StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(N, M, 1));
+    if (splits > 1) {
+      cute::get<2>(stride_a) = kc;
+      cute::get<2>(stride_b) = kc;
+      cute::get<2>(stride_d) = static_cast<int64_t>(M) * N;
+    }
 
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = device_id;
@@ -312,7 +372,7 @@ struct W8A16Sm100Gemm {
 
     typename Gemm::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGemm,
-        {N, M, K, 1},
+        {N, M, kc, splits},
         {reinterpret_cast<const ElementW*>(weight), stride_a,
          reinterpret_cast<const ElementAct*>(act), stride_b},
         {{}, nullptr, stride_d, reinterpret_cast<ElementD*>(out), stride_d},
@@ -320,23 +380,46 @@ struct W8A16Sm100Gemm {
     auto& fusion = args.epilogue.thread;
     fusion.alpha = 1.0f;
     fusion.beta = 0.0f;
-    fusion.alpha_ptr = scale;  // per-tensor weight scale, read on device
-    fusion.beta_ptr = nullptr;
-    fusion.bias_ptr = reinterpret_cast<const ElementBias*>(bias);  // nullptr -> 0
-    fusion.dBias = {cute::_1{}, cute::_0{}, 0};
+    if constexpr (!kSplitK) {
+      fusion.alpha_ptr = scale;  // per-tensor weight scale, read on device
+      fusion.beta_ptr = nullptr;
+      fusion.bias_ptr = reinterpret_cast<const ElementBias*>(bias);  // nullptr -> 0
+      fusion.dBias = {cute::_1{}, cute::_0{}, 0};
+    } else {
+      (void)scale;
+      (void)bias;
+    }
     return args;
   }
 
-  static size_t WorkspaceBytes(int M, int N, int K, int device_id, int num_sms) {
-    auto args =
-        MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, device_id, num_sms);
-    return Gemm::get_workspace_size(args);
+  static size_t PartialsBytes(int M, int N, int splits) {
+    return kSplitK && splits > 1 ? static_cast<size_t>(splits) * M * N * sizeof(float) : 0;
+  }
+
+  // CUTLASS workspace (persistent scheduler: usually 0) rounded to 256 B, then the
+  // fp32 partials for split-K.
+  static size_t WorkspaceBytes(int M, int N, int K, int device_id, int num_sms, int splits = 1) {
+    auto args = MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, device_id,
+                              num_sms, splits);
+    const size_t cutlass_ws = (Gemm::get_workspace_size(args) + 255) / 256 * 256;
+    return cutlass_ws + PartialsBytes(M, N, splits);
   }
 
   static cudaError_t Run(const T* act, const __nv_fp8_e4m3* weight, const float* scale,
                          const T* bias, T* out, int M, int N, int K, void* workspace,
-                         size_t workspace_bytes, int device_id, int num_sms, cudaStream_t stream) {
-    auto args = MakeArguments(act, weight, scale, bias, out, M, N, K, device_id, num_sms);
+                         size_t workspace_bytes, int device_id, int num_sms, cudaStream_t stream,
+                         int splits = 1) {
+    if (kSplitK && (splits < 2 || K % (splits * Cfg::kK) != 0)) return cudaErrorInvalidValue;
+    void* d_out = out;
+    size_t cutlass_ws = 0;
+    if constexpr (kSplitK) {
+      auto probe = MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, device_id,
+                                 num_sms, splits);
+      cutlass_ws = (Gemm::get_workspace_size(probe) + 255) / 256 * 256;
+      if (cutlass_ws + PartialsBytes(M, N, splits) > workspace_bytes) return cudaErrorInvalidValue;
+      d_out = static_cast<char*>(workspace) + cutlass_ws;
+    }
+    auto args = MakeArguments(act, weight, scale, bias, d_out, M, N, K, device_id, num_sms, splits);
     Gemm gemm;
     if (Gemm::get_workspace_size(args) > workspace_bytes) return cudaErrorInvalidValue;
     if (gemm.can_implement(args) != cutlass::Status::kSuccess) return cudaErrorNotSupported;
@@ -346,20 +429,38 @@ struct W8A16Sm100Gemm {
     if (gemm.run(stream, nullptr, /*launch_with_pdl=*/false) != cutlass::Status::kSuccess) {
       return cudaErrorLaunchFailure;
     }
+    if constexpr (kSplitK) {
+      const int64_t mn = static_cast<int64_t>(M) * N;
+      const int threads = 256;
+      const int64_t blocks = (mn / 8 + threads - 1) / threads;
+      W8A16Sm100SplitKReduceKernel<T><<<static_cast<unsigned>(blocks), threads, 0, stream>>>(
+          static_cast<const float*>(d_out), splits, scale, bias, out, mn, N);
+      return cudaGetLastError();
+    }
     return cudaSuccess;
   }
 };
 
+// Tile codes.  The numeric values are the public `algo` codes of the Python op
+// (`flashinfer.gemm.w8a16_fp8_gemm(..., algo=...)`), so they must not change.
 enum class W8A16Sm100Tile {
   kAuto,
   k2SM256x128 = 1,
   k1SM128x128 = 2,
   k2SM256x256 = 3,
-  k2SM256x192 = 4
+  k2SM256x192 = 4,
+  k2SM256x128SplitK = 5  // rung B12: 256x128 tile, batched K-slices + fp32 reduce
 };
+constexpr int kW8A16Sm100MaxTileCode = 5;
+constexpr int kW8A16Sm100MaxSplits = 8;
+
+inline W8A16Sm100Tile W8A16Sm100TileFromCode(int code) {
+  return (code >= 1 && code <= kW8A16Sm100MaxTileCode) ? static_cast<W8A16Sm100Tile>(code)
+                                                      : W8A16Sm100Tile::kAuto;
+}
 
 // FLASHINFER_W8A16_FP8_TILE_SM100 = "2sm256x128" | "1sm128x128" | "2sm256x256" |
-// "2sm256x192" pins the tile; read once.
+// "2sm256x192" | "2sm256x128_splitk" pins the tile; read once.
 inline W8A16Sm100Tile W8A16Sm100TileEnv() {
   static const W8A16Sm100Tile tile = [] {
     const char* s = std::getenv("FLASHINFER_W8A16_FP8_TILE_SM100");
@@ -368,24 +469,82 @@ inline W8A16Sm100Tile W8A16Sm100TileEnv() {
     if (std::strcmp(s, "1sm128x128") == 0) return W8A16Sm100Tile::k1SM128x128;
     if (std::strcmp(s, "2sm256x256") == 0) return W8A16Sm100Tile::k2SM256x256;
     if (std::strcmp(s, "2sm256x192") == 0) return W8A16Sm100Tile::k2SM256x192;
+    if (std::strcmp(s, "2sm256x128_splitk") == 0) return W8A16Sm100Tile::k2SM256x128SplitK;
     return W8A16Sm100Tile::kAuto;
   }();
   return tile;
 }
 
-// Rung B9 dispatch: wave-fill cost model over the three 2SM tiles.  Each cluster owns
-// one 256(weight rows) x tileA(activation rows) tile; the modelled time is
-// ceil(clusters needed / clusters resident) x tileA / eff, with eff = 1.00 for the
-// 128-row tile (A in TMEM, 4 transform-to-MMA stages), 1.22 for the 192-row tile (A in
-// TMEM, 2 stages, 2/3 the transform work per flop) and 1.10 for the 256-row tile (A in
-// smem, half the transform work but a 64-wide k-tile).  Constants fitted offline on the
-// B200 tables of rungs B3, B4 and B8: geomean 1.008x the per-row oracle.  Narrow or
-// short problems keep the 128-row tile (more clusters to fill the machine), everything
-// that fills the machine takes the 192-row tile, the 256-row tile wins a few very wide
-// rows.
-inline W8A16Sm100Tile W8A16Sm100PickTile(int M, int N, int K, int num_sms) {
+// Split count for the 256x128 2SM tile (rung B12).  Two cases split, both from the
+// back-to-back per-M sweeps of Mon 12 Oct 2026:
+//   1. an under-filled grid, fewer cluster tiles than half the resident clusters:
+//      the largest split that still fits in one wave (every cluster gets at most one
+//      K-slice; the und.kv rows, 8..64 tiles on 74 clusters, run 1.3-1.8x faster);
+//   2. a long K (>= 100 k-tiles) whose partial last wave the split removes: the
+//      smallest split that keeps >= 50 k-tiles per slice and cuts the modelled
+//      mainloop (waves x k-tiles per slice) by at least 15% (mlp.down at M=1024,
+//      K=25600: 160 tiles = 2.2 waves, 8% faster split 4-5 ways).
+// Short-K problems never split: the fp32 partials (one M x N write and read per slice)
+// cost more than the fill buys (attn.out / gen.qkv / mlp.down at K <= 8192 lose 5-25%).
+// Every K-slice is a whole number of 128-deep k-tiles (all batches share one slice
+// length) and at most kW8A16Sm100MaxSplits slices.  1 = do not split.
+inline int W8A16Sm100SplitK(int M, int N, int K, int num_sms) {
+  if (K % 128 != 0) return 1;
+  const long long clusters = num_sms > 1 ? num_sms / 2 : 1;
+  const long long units = static_cast<long long>((N + 255) / 256) * ((M + 127) / 128);
+  const int ktiles = K / 128;
+  if (units * 2 <= clusters) {
+    int best = 1;
+    for (int s = 2; s <= kW8A16Sm100MaxSplits; ++s) {
+      if (ktiles % s != 0 || ktiles / s < 2 || units * s > clusters) continue;
+      best = s;
+    }
+    return best;
+  }
+  if (ktiles >= 100) {
+    const long long waves1 = (units + clusters - 1) / clusters;
+    for (int s = 2; s <= kW8A16Sm100MaxSplits; ++s) {
+      if (ktiles % s != 0 || ktiles / s < 50) continue;
+      const long long waves = (units * s + clusters - 1) / clusters;
+      if (waves * (ktiles / s) * 100 <= waves1 * ktiles * 85) return s;
+    }
+  }
+  return 1;
+}
+
+// Split count actually used by the split-K variant: the model's choice, or, when the
+// variant is forced through `algo` on a grid the model would not split, the smallest
+// s >= 2 that divides the k-tile count.  0 = K cannot be split (fewer than 2 k-tiles).
+inline int W8A16Sm100SplitsFor(int M, int N, int K, int num_sms) {
+  const int s = W8A16Sm100SplitK(M, N, K, num_sms);
+  if (s >= 2) return s;
+  const int ktiles = K / 128;
+  if (K % 128 != 0 || ktiles < 2) return 0;
+  for (int c = 2; c <= kW8A16Sm100MaxSplits; ++c) {
+    if (ktiles % c == 0) return c;
+  }
+  return 0;
+}
+
+// `algo` is the caller's tile code (0 = auto); an explicit code wins over the env
+// override, which wins over the cost model.
+inline W8A16Sm100Tile W8A16Sm100PickTile(int M, int N, int K, int num_sms, int algo = 0) {
+  const W8A16Sm100Tile forced = W8A16Sm100TileFromCode(algo);
+  if (forced != W8A16Sm100Tile::kAuto) return forced;
   const W8A16Sm100Tile env = W8A16Sm100TileEnv();
   if (env != W8A16Sm100Tile::kAuto) return env;
+  // Rung B12: under-filled grids and long-K partial waves split K instead of choosing
+  // between tiles; see W8A16Sm100SplitK.
+  if (W8A16Sm100SplitK(M, N, K, num_sms) > 1) return W8A16Sm100Tile::k2SM256x128SplitK;
+
+  // Rung B11 refit (native converter, rung B10): with the convert off the critical path
+  // the 192-row tile's advantage shrinks to a few percent (eff 1.22 -> 1.02) and the
+  // 256x256 smem-A tile loses on every one of the 144 benchmark rows, so it is no
+  // longer picked (it stays reachable through `algo`).  Fitted on three back-to-back
+  // sweeps of all tiles (geomean model pick / per-row oracle 1.025, the B9 constants
+  // gave 1.040).  The 1SM 128x128 tile never wins once the per-M classes are measured
+  // in isolation (its apparent wins were thermal noise of the full-table sweep), so it
+  // is `algo`-only as well.
   (void)K;
   const long long clusters = num_sms > 1 ? num_sms / 2 : 1;
   const long long w_tiles = (N + 255) / 256;
@@ -394,16 +553,18 @@ inline W8A16Sm100Tile W8A16Sm100PickTile(int M, int N, int K, int num_sms) {
     return static_cast<double>((units + clusters - 1) / clusters) * tile_a / eff;
   };
   const double c128 = cost(128, 1.00);
-  const double c192 = cost(192, 1.22);
-  const double c256 = cost(256, 1.10);
-  if (c192 <= c128 && c192 <= c256) return W8A16Sm100Tile::k2SM256x192;
-  if (c256 < c128) return W8A16Sm100Tile::k2SM256x256;
+  const double c192 = cost(192, 1.02);
+  if (c192 <= c128) return W8A16Sm100Tile::k2SM256x192;
   return W8A16Sm100Tile::k2SM256x128;
 }
 
 template <typename T>
-size_t W8A16Fp8GemmSm100WorkspaceBytes(int M, int N, int K, int device_id, int num_sms) {
-  switch (W8A16Sm100PickTile(M, N, K, num_sms)) {
+size_t W8A16Fp8GemmSm100WorkspaceBytes(int M, int N, int K, int device_id, int num_sms,
+                                       int algo = 0) {
+  switch (W8A16Sm100PickTile(M, N, K, num_sms, algo)) {
+    case W8A16Sm100Tile::k2SM256x128SplitK:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, true>::WorkspaceBytes(
+          M, N, K, device_id, num_sms, std::max(2, W8A16Sm100SplitsFor(M, N, K, num_sms)));
     case W8A16Sm100Tile::k1SM128x128:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg1SM128x128>::WorkspaceBytes(M, N, K, device_id,
                                                                         num_sms);
@@ -423,8 +584,15 @@ template <typename T>
 cudaError_t W8A16Fp8GemmSm100(const T* act, const __nv_fp8_e4m3* weight, const float* scale,
                               const T* bias, T* out, int M, int N, int K, void* workspace,
                               size_t workspace_bytes, int device_id, int num_sms,
-                              cudaStream_t stream) {
-  switch (W8A16Sm100PickTile(M, N, K, num_sms)) {
+                              cudaStream_t stream, int algo = 0) {
+  switch (W8A16Sm100PickTile(M, N, K, num_sms, algo)) {
+    case W8A16Sm100Tile::k2SM256x128SplitK: {
+      const int splits = W8A16Sm100SplitsFor(M, N, K, num_sms);
+      if (splits < 2) return cudaErrorNotSupported;
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, true>::Run(
+          act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
+          stream, splits);
+    }
     case W8A16Sm100Tile::k1SM128x128:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg1SM128x128>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,

@@ -351,9 +351,11 @@ def make_kernel(
     scale: torch.Tensor,
     bias,
     prepared: bool = False,
+    algo: str | None = None,
 ) -> Callable[[], torch.Tensor] | None:
     """FlashInfer kernel; ``prepared`` uses the opt-in prepared weight layout
-    (the one-time ``prepare_w8a16_fp8_weight`` copy is done here, untimed)."""
+    (the one-time ``prepare_w8a16_fp8_weight`` copy is done here, untimed);
+    ``algo`` pins a Blackwell kernel variant (``--algo``)."""
     try:
         from flashinfer.gemm import prepare_w8a16_fp8_weight, w8a16_fp8_gemm
     except ImportError as e:
@@ -364,7 +366,7 @@ def make_kernel(
 
     def run() -> torch.Tensor:
         return w8a16_fp8_gemm(
-            act, w_use, scale, bias=bias, out=out, weight_prepared=prepared
+            act, w_use, scale, bias=bias, out=out, weight_prepared=prepared, algo=algo
         )
 
     return run
@@ -428,12 +430,10 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
         impls["cast"] = make_cast_copy(act, w_fp8, scale, bias)
     if "cublas" in args.impls:
         impls["cublas"] = make_cublas(act, w_deq, bias)
-    for name, prepared in (("kernel", False), ("kernel_prep", True)):
-        if name not in args.impls:
-            continue
+    for name, prepared, algo in _kernel_variants(args):
         if prepared and torch.cuda.get_device_capability()[0] != 9:
             continue  # prepared weight layout is Hopper-only
-        fn = make_kernel(act, w_fp8, scale, bias, prepared=prepared)
+        fn = make_kernel(act, w_fp8, scale, bias, prepared=prepared, algo=algo)
         if fn is None:
             print(
                 "# WARNING: flashinfer.gemm.w8a16_fp8_gemm not available; "
@@ -455,7 +455,7 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
         us[name], _, _ = _time_kernel(args, lambda: fn(), tag)
 
     passed: bool | None = None
-    kernel_cols = [c for c in ("kernel", "kernel_prep") if c in impls]
+    kernel_cols = [c for c in impls if c.startswith("kernel")]
     if kernel_cols:
         # Both the kernel and the cast-copy differ from fp32 only by 16-bit
         # accumulation order; demand the kernel be no worse than that path
@@ -496,14 +496,31 @@ def _ratio(num: float | None, den: float | None) -> str:
     return f"{r:7.3f}" if r < 0.1 else f"{r:7.2f}"
 
 
+def _kernel_variants(args) -> list[tuple[str, bool, str | None]]:
+    """(column name, prepared, algo) for every kernel column requested.  With
+    ``--algo a b ...`` the ``kernel`` column becomes one ``kernel:<algo>`` column per
+    algo, all measured back to back on the same tensors (the fair way to compare
+    variants under free-running clocks)."""
+    out: list[tuple[str, bool, str | None]] = []
+    if "kernel" in args.impls:
+        if args.algo:
+            out += [(f"kernel:{a}", False, None if a == "auto" else a) for a in args.algo]
+        else:
+            out.append(("kernel", False, None))
+    if "kernel_prep" in args.impls:
+        out.append(("kernel_prep", True, None))
+    return out
+
+
 def _impl_cols(args) -> list[str]:
-    return [i for i in ("cast", "cublas", "kernel", "kernel_prep") if i in args.impls]
+    cols = [i for i in ("cast", "cublas") if i in args.impls]
+    return cols + [name for name, _, _ in _kernel_variants(args)]
 
 
 def table_header(args) -> str:
     hdr = f"{'layer':<12}{'tp':>3}{'M':>7}{'N':>7}{'K':>7}"
     for i in _impl_cols(args):
-        hdr += f"{i + ' us':>15}"
+        hdr += f"{i + ' us':>{max(15, len(i) + 4)}}"
     hdr += f"{'TFLOP/s':>9}{'GB/s(W8)':>10}{'vs cast':>8}{'vs cublas':>10}"
     hdr += f"{'max|err|':>10}{'max rel':>10}{'cast|err|':>10}{'gate':>6}"
     return hdr + "\n" + "-" * len(hdr)
@@ -512,7 +529,8 @@ def table_header(args) -> str:
 def format_row(r: Row, args) -> str:
     # Throughput columns describe the kernel when it ran, else the cast path.
     primary = next(
-        (c for c in ("kernel_prep", "kernel", "cublas", "cast") if c in r.us), "cast"
+        (c for c in _impl_cols(args) if c.startswith("kernel")),
+        next((c for c in ("cublas", "cast") if c in r.us), "cast"),
     )
     t = r.us.get(primary)
     flops = 2.0 * r.m * r.n * r.k
@@ -520,7 +538,7 @@ def format_row(r: Row, args) -> str:
     gbs = (r.n * r.k) / (t * 1e-6) / 1e9 if t else float("nan")
     line = f"{r.layer:<12}{r.tp:>3}{r.m:>7}{r.n:>7}{r.k:>7}"
     for i in _impl_cols(args):
-        line += f"  {_fmt_us(r.us.get(i))}"
+        line += f"  {_fmt_us(r.us.get(i)):>{max(13, len(i) + 2)}}"
     line += f"{tflops:9.1f}{gbs:10.1f}"
     line += f" {_ratio(r.us.get('cast'), r.us.get(primary))}"
     line += f"   {_ratio(r.us.get('cublas'), r.us.get(primary))}"
@@ -538,6 +556,7 @@ def print_table(rows: list[Row], args) -> None:
 
 
 def write_csv(rows: list[Row], path: str, args) -> None:
+    variants = [name for name, _, _ in _kernel_variants(args) if name.startswith("kernel:")]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(
@@ -560,6 +579,8 @@ def write_csv(rows: list[Row], path: str, args) -> None:
                 "cast_max_rel",
                 "gate",
             ]
+            + [f"{v}_us" for v in variants]
+            + [f"{v}_max_abs" for v in variants]
         )
         for r in rows:
             w.writerow(
@@ -582,6 +603,8 @@ def write_csv(rows: list[Row], path: str, args) -> None:
                     r.max_rel.get("cast", ""),
                     "" if r.passed is None else ("ok" if r.passed else "FAIL"),
                 ]
+                + [r.us.get(v, "") for v in variants]
+                + [r.max_abs.get(v, "") for v in variants]
             )
 
 
@@ -639,6 +662,15 @@ def parse_args(argv=None):
         type=float,
         default=2e-3,
         help="absolute floor on the gate as a fraction of max|ref|",
+    )
+    p.add_argument(
+        "--algo",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Blackwell only: one kernel:<algo> column per listed variant (auto, "
+        "2sm256x128, 2sm256x192, 2sm256x256, 1sm128x128), measured back to back; "
+        "default: a single kernel column with the launcher's model",
     )
     p.add_argument("--csv", type=str, default=None)
     return p.parse_args(argv)

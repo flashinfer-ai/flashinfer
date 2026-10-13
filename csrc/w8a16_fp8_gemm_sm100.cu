@@ -22,9 +22,11 @@ using namespace flashinfer;
 // Blackwell (sm_100a) launcher: same contract as w8a16_fp8_gemm (csrc/w8a16_fp8_gemm.cu),
 // minus the Hopper-only prepared weight layout.
 // out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
+// `algo` is the tile code (0 = cost model, 1..4 = W8A16Sm100Tile); see
+// flashinfer.gemm.w8a16_fp8_gemm's `algo` argument.
 void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorView scale,
                     ffi::Optional<TensorView> bias, bool weight_prepared,
-                    ffi::Optional<TensorView> workspace) {
+                    ffi::Optional<TensorView> workspace, int64_t algo) {
   CHECK_INPUT(act);     // [M, K], fp16/bf16, contiguous
   CHECK_INPUT(weight);  // [N, K], fp8 e4m3, contiguous
   CHECK_INPUT(out);     // [M, N], act dtype, contiguous
@@ -36,6 +38,8 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
   CHECK_DIM(2, weight);
   CHECK_DIM(2, out);
   TVM_FFI_ICHECK(!weight_prepared) << "weight_prepared is a Hopper-only layout";
+  TVM_FFI_ICHECK(algo >= 0 && algo <= gemm::kW8A16Sm100MaxTileCode)
+      << "algo must be 0 (auto) or a tile code 1.." << gemm::kW8A16Sm100MaxTileCode;
 
   const int64_t M = act.size(0);
   const int64_t K = act.size(1);
@@ -85,7 +89,8 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
         static_cast<const __nv_fp8_e4m3*>(weight.data_ptr()),
         static_cast<const float*>(scale.data_ptr()), static_cast<const c_type*>(bias_ptr),
         static_cast<c_type*>(out.data_ptr()), static_cast<int>(M), static_cast<int>(N),
-        static_cast<int>(K), ws_ptr, ws_bytes, device_id, num_sms, stream);
+        static_cast<int>(K), ws_ptr, ws_bytes, device_id, num_sms, stream,
+        static_cast<int>(algo));
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "w8a16_fp8_gemm (sm100) failed with error code " << cudaGetErrorString(status);
     return true;
@@ -93,11 +98,12 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
 }
 
 // Workspace (bytes) the CUTLASS kernel needs for this problem; 0 for the persistent scheduler.
-int64_t w8a16_fp8_gemm_workspace_bytes(int64_t M, int64_t N, int64_t K, int64_t device_id) {
+int64_t w8a16_fp8_gemm_workspace_bytes(int64_t M, int64_t N, int64_t K, int64_t device_id,
+                                       int64_t algo) {
   int num_sms = 0;
   cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, static_cast<int>(device_id));
   // Both activation dtypes share the mainloop/epilogue layout; bf16 sizes the workspace.
   return static_cast<int64_t>(gemm::W8A16Fp8GemmSm100WorkspaceBytes<__nv_bfloat16>(
       static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), static_cast<int>(device_id),
-      num_sms));
+      num_sms, static_cast<int>(algo)));
 }

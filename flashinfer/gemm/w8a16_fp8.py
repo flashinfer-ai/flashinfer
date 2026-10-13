@@ -54,9 +54,10 @@ def _w8a16_fp8_gemm_impl(
     bias: Optional[torch.Tensor],
     weight_prepared: bool,
     workspace: Optional[torch.Tensor],
+    algo: int,
 ) -> None:
     get_w8a16_fp8_gemm_module(act.device).w8a16_fp8_gemm(
-        out, act, weight, weight_scale, bias, weight_prepared, workspace
+        out, act, weight, weight_scale, bias, weight_prepared, workspace, algo
     )
 
 
@@ -69,18 +70,44 @@ def _w8a16_fp8_gemm_impl_fake(
     bias: Optional[torch.Tensor],
     weight_prepared: bool,
     workspace: Optional[torch.Tensor],
+    algo: int,
 ) -> None:
     pass
 
 
 @functools.cache
-def _workspace_bytes(m: int, n: int, k: int, device_index: int) -> int:
+def _workspace_bytes(m: int, n: int, k: int, device_index: int, algo: int) -> int:
     """Bytes of workspace this problem needs on this device (0 = none)."""
     return int(
         get_w8a16_fp8_gemm_module(
             torch.device("cuda", device_index)
-        ).w8a16_fp8_gemm_workspace_bytes(m, n, k, device_index)
+        ).w8a16_fp8_gemm_workspace_bytes(m, n, k, device_index, algo)
     )
+
+
+# Blackwell kernel variants selectable through ``algo``.  The codes are the
+# W8A16Sm100Tile enum values in include/flashinfer/gemm/w8a16_fp8_gemm_sm100.cuh.
+W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
+    "auto": 0,
+    "2sm256x128": 1,
+    "1sm128x128": 2,
+    "2sm256x256": 3,
+    "2sm256x192": 4,
+    "2sm256x128_splitk": 5,
+}
+
+
+def _algo_code(algo: Optional[str], device: torch.device) -> int:
+    if algo is None or algo == "auto":
+        return 0
+    if get_compute_capability(device)[0] != 10:
+        raise ValueError("algo is only selectable on Blackwell (sm_100a); use algo=None")
+    try:
+        return W8A16_FP8_GEMM_ALGOS_SM100[algo]
+    except KeyError:
+        raise ValueError(
+            f"unknown algo {algo!r}; one of {sorted(W8A16_FP8_GEMM_ALGOS_SM100)}"
+        ) from None
 
 
 def prepare_w8a16_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -113,6 +140,7 @@ def w8a16_fp8_gemm(
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     weight_prepared: bool = False,
+    algo: Optional[str] = None,
 ) -> torch.Tensor:
     r"""Linear layer with an FP8 e4m3 weight and a 16-bit activation (W8A16).
 
@@ -179,6 +207,7 @@ def w8a16_fp8_gemm(
     if weight_scale.dtype != torch.float32:
         weight_scale = weight_scale.to(torch.float32)
     weight_scale = weight_scale.reshape(1)
+    algo_code = _algo_code(algo, act.device)
 
     lead_shape = act.shape[:-1]
     act2d = act.reshape(-1, k)
@@ -192,13 +221,13 @@ def w8a16_fp8_gemm(
     out2d = out.reshape(-1, n)
     # Under-filled grids run split-K through an fp32 workspace; the kernel
     # decides, this only sizes the buffer (0 bytes = single pass).
-    ws_bytes = _workspace_bytes(act2d.shape[0], n, k, act.device.index or 0)
+    ws_bytes = _workspace_bytes(act2d.shape[0], n, k, act.device.index or 0, algo_code)
     workspace = (
         torch.empty(ws_bytes // 4, dtype=torch.float32, device=act.device)
         if ws_bytes > 0
         else None
     )
     _w8a16_fp8_gemm_impl(
-        out2d, act2d, weight, weight_scale, bias, weight_prepared, workspace
+        out2d, act2d, weight, weight_scale, bias, weight_prepared, workspace, algo_code
     )
     return out

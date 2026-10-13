@@ -139,7 +139,62 @@ builder's A (M' = N), the activation `[M, K]` is B (N' = M), D `[M', N']` column
 `out[M, N]` row-major; the per-tensor scale is the epilogue alpha (device pointer), the bias
 a per-row broadcast in the fused epilogue.
 
-## Final state (rung B10)
+## Final state (rung B12)
+
+Geometric mean of per-row time ratios over the 24 rows of each M class, B200
+(umb-b200-261, 148 SMs), free-running clocks, CUDA 13.6, torch 2.12, Mon 12 Oct 2026.
+Every variant is measured back to back on the same tensors (`bench --algo auto
+2sm256x128 2sm256x192 1sm128x128 2sm256x128_splitk`), one M class per process, two
+passes, per-row minimum.  (A single pass over the whole 144-row table is 5% median /
+20% p90 noisy between repeats on this box: the large-M rows heat the part and the
+small rows that follow swing; one M class per pass brings that to 2% / 11%.)
+
+| M | auto / cuBLAS | oracle / cuBLAS | 256x128 | 256x192 | 1SM 128x128 | 256x128 split-K | auto / oracle |
+|---|---|---|---|---|---|---|---|
+| 1024 | 1.10 | 1.09 | 1.17 | 1.34 | 1.25 | 1.23 | 1.01 |
+| 2048 | 1.04 | 1.03 | 1.10 | 1.15 | 1.20 | 1.29 | 1.01 |
+| 4096 | 0.99 | 0.98 | 1.01 | 1.08 | 1.12 | 1.26 | 1.01 |
+| 8192 | 0.99 | 0.98 | 1.01 | 1.03 | 1.11 | 1.32 | 1.01 |
+| 44160 | 1.02 | 0.99 | 1.03 | 1.02 | 1.10 | 1.34 | 1.03 |
+| 88320 | 1.05 | 1.03 | 1.06 | 1.05 | 1.15 | 1.40 | 1.02 |
+
+Overall auto / cuBLAS 1.029, oracle (best variant per row) / cuBLAS 1.015, auto / oracle
+1.014; 68 of 144 rows have a variant at or under cuBLAS.  Who wins per row: the 256x128
+tile 71, 256x192 53, split-K 16 (all at M <= 8192, mostly the narrow und.kv rows and
+M=1024), the 1SM tile 4 (within noise of the 2SM tiles).  Rows still > 10% behind
+cuBLAS: a few M=1024 rows with K <= 5120 (attn.out, gen.qkv, mlp.down at TP 2-8: one
+partial wave and too short a K to split profitably) and the widest power-bound rows
+(mlp.gate_up N=25600 at M >= 44160, 1.25-1.30x, clocks at ~1.2 GHz).
+
+### Knobs and the `algo` argument
+
+`flashinfer.gemm.w8a16_fp8_gemm(..., algo=)` (Blackwell) pins a variant per call:
+`"2sm256x128"`, `"2sm256x192"`, `"2sm256x256"`, `"1sm128x128"`, `"2sm256x128_splitk"`;
+`None` / `"auto"` is the launcher's model.  The codes are the `W8A16Sm100Tile` enum
+values.  `FLASHINFER_W8A16_FP8_TILE_SM100` still pins a tile process-wide (same names).
+The benchmark takes `--algo a b ...` and emits one `kernel:<algo>` column per variant,
+measured back to back; that is what the tables above come from.
+
+### The dispatcher after rungs B11 / B12 (`W8A16Sm100PickTile`)
+
+1. Split-K (rung B12, 256x128 tile, `W8A16Sm100SplitK`): (a) fewer cluster tiles than
+   half the resident clusters: the largest split that still fits in one wave; (b) K >=
+   100 k-tiles and a partial last wave: the smallest split with >= 50 k-tiles per slice
+   that cuts waves x k-tiles-per-slice by >= 15%.  Short-K problems never split (the fp32
+   partials cost more than the fill buys).
+2. Otherwise the wave-fill cost model between 256x128 (eff 1.00) and 256x192 (eff 1.02,
+   refit from the B9 value of 1.22 once the native convert took the transform off the
+   critical path).  The 256x256 smem-A tile lost every row and is `algo`-only; so is
+   the 1SM tile.
+
+Split-K runs the mixed-input kernel as one batched launch over K-slices (batch stride =
+slice length for A and B, one fp32 M x N partial per slice for D, alpha = 1), then
+`W8A16Sm100SplitKReduceKernel` sums the slices, applies the per-tensor scale and the
+bias and casts; the fp32 epilogue uses a 128x16 epilogue tile to stay inside the
+227 KB smem budget next to the 6/4 mainloop stages.
+
+### Rung B10 state, for the record
+
 
 Geometric mean of per-row time ratios over the 24 rows of each M class, B200
 (umb-b200-261, 148 SMs), free-running clocks, auto dispatch.  Per row the minimum
@@ -220,7 +275,10 @@ oracle).
 | B7 | 82c8b2f34 | dispatch between 256x128 and 256x256 by a wave-fill cost model | WIN: 1.46 / 1.31 / 1.20 / 1.22 / 1.21 / 1.18 |
 | B8 | 3c32207a4 | 2SM 256x192x128 tile with A in TMEM (2 acc stages x 192 + 2 A stages x 64 = 512 TMEM cols) | WIN: 91.9% active / 89.1% elapsed on 12800x5120 M=8192; best tile on 20-22 of 24 rows at M >= 8192 |
 | B9 | 62885dae2 | three-way dispatch | WIN: 1.40 / 1.13 / 1.10 / 1.09 / 1.11 / 1.10 x cuBLAS |
-| B10 | (this commit) | native `cvt.rn.bf16x2.e4m3x2` / `cvt.rn.f16x2.e4m3x2` converter (one F2FP per pair; ALU path kept behind `W8A16_FORCE_ALU_CONVERT` and for nvcc < 13.2) | WIN: 1.24 / 1.06 / 1.03 / 1.02 / 1.03 / 1.04 x cuBLAS, 0.928x B9 time |
+| B10 | d24ed43a9 | native `cvt.rn.bf16x2.e4m3x2` / `cvt.rn.f16x2.e4m3x2` converter (one F2FP per pair; ALU path kept behind `W8A16_FORCE_ALU_CONVERT` and for nvcc < 13.2) | WIN: 1.24 / 1.06 / 1.03 / 1.02 / 1.03 / 1.04 x cuBLAS, 0.928x B9 time |
+
+| B11 | (this commit) | `algo` argument on the Python op (codes 1-5, FFI `int64 algo`), `bench --algo a b ...` back-to-back columns, dispatcher refit: 256x192 eff 1.22 -> 1.02, 256x256 dropped from auto | WIN: auto / oracle 1.040 -> 1.014 |
+| B12 | (this commit) | batched split-K for the 256x128 tile (fp32 partials + reduce kernel, 128x16 fp32 epilogue tile), split rule for under-filled grids and long-K partial waves | WIN: M=1024 1.24 -> 1.10 x cuBLAS, M=2048 1.06 -> 1.04, und.kv rows 1.3-1.8x -> ~1.0x |
 
 ### Why B10 works (PerfSim, gb100 model, Mon 12 Oct 2026)
 
@@ -255,4 +313,8 @@ same conclusion came independently out of the Kernel Factory campaign on this ke
 ## Results directory
 
 `/home/scratch.ishovkun_gpu/w8a16-results/blackwell/`: `rungB<N>_*_b200_full.csv`,
-`rungB<N>_ncu_*.txt`, `rungB5_sass.txt` / `rungB6_sass.txt` (cuobjdump of the module).
+`rungB<N>_ncu_*.txt`, `rungB5_sass.txt` / `rungB6_sass.txt` (cuobjdump of the module),
+`sweepB12d_b200_r<M>_<i>.csv` (the per-M back-to-back variant sweeps behind the B12
+table; `sweepB11i_*`, `sweepB12*_*` are the noisier whole-table sweeps).  Plots:
+`plots/w8a16_b200_plots.py` in the main checkout renders the ladder figures from these
+CSVs.
