@@ -161,7 +161,9 @@ def _page_table(
     elif order == "identity":
         physical = torch.arange(num_pages, dtype=torch.int32)
     else:
-        raise ValueError(f"page_table_order must be one of {PAGE_TABLE_ORDERS}, got {order!r}")
+        raise ValueError(
+            f"page_table_order must be one of {PAGE_TABLE_ORDERS}, got {order!r}"
+        )
     cursor = 0
     for request, count in enumerate(counts):
         page_table[request, :count] = physical[cursor : cursor + count]
@@ -188,7 +190,9 @@ def overlap_selection(
     history_n = int(own_pages[0])
     slots = [min(topk, int(own) + 1) - 1 for own in own_pages]
     shared_n = min(history_n, int(round(float(overlap) * (topk - 1))))
-    history = torch.randperm(history_n, generator=generator).tolist() if history_n else []
+    history = (
+        torch.randperm(history_n, generator=generator).tolist() if history_n else []
+    )
     shared = history[:shared_n]
     pool = history[shared_n:]
     cursor = 0
@@ -200,7 +204,10 @@ def overlap_selection(
         scanned = 0
         while need > 0 and pool and scanned < len(pool):
             if cursor >= len(pool):
-                pool = [pool[j] for j in torch.randperm(len(pool), generator=generator).tolist()]
+                pool = [
+                    pool[j]
+                    for j in torch.randperm(len(pool), generator=generator).tolist()
+                ]
                 cursor = 0
             candidate = pool[cursor]
             cursor += 1
@@ -250,7 +257,9 @@ def build_decode_inputs(
     if batch == 0 or int(seq_lens.min()) < seqlen_q:
         raise ValueError("every request needs at least seqlen_q KV tokens")
     if page_table_order not in PAGE_TABLE_ORDERS:
-        raise ValueError(f"page_table_order must be one of {PAGE_TABLE_ORDERS}, got {page_table_order!r}")
+        raise ValueError(
+            f"page_table_order must be one of {PAGE_TABLE_ORDERS}, got {page_table_order!r}"
+        )
     if q_overlap_fraction is not None and not 0.0 <= float(q_overlap_fraction) <= 1.0:
         raise ValueError("q_overlap_fraction must be in [0, 1]")
     num_q_heads = num_kv_heads * group_size
@@ -315,7 +324,9 @@ def build_decode_inputs(
                     select, own_pages, float(q_overlap_fraction), topk
                 )
                 for row, chosen in zip(rows, selections, strict=True):
-                    q2k[head, row, : len(chosen)] = torch.tensor(chosen, dtype=torch.int32)
+                    q2k[head, row, : len(chosen)] = torch.tensor(
+                        chosen, dtype=torch.int32
+                    )
 
     return dict(
         q=q,

@@ -280,10 +280,14 @@ def test_public_entry_routes_only_to_cake():
 
 @pytest.mark.parametrize("value", [False, True, "auto"])
 def test_use_cache_hit_accepts_exactly_its_three_values(value):
-    assert validate_use_cache_hit(value) is value or validate_use_cache_hit(value) == value
+    assert (
+        validate_use_cache_hit(value) is value or validate_use_cache_hit(value) == value
+    )
 
 
-@pytest.mark.parametrize("value", [0, 1, "True", "false", "Auto", "AUTO", None, 1.0, "", b"auto"])
+@pytest.mark.parametrize(
+    "value", [0, 1, "True", "false", "Auto", "AUTO", None, 1.0, "", b"auto"]
+)
 def test_use_cache_hit_rejects_everything_else(value):
     with pytest.raises(ValueError, match="use_cache_hit"):
         validate_use_cache_hit(value)
@@ -353,7 +357,12 @@ def test_use_cache_hit_true_refuses_a_seqlen_q_outside_the_domain():
         (32, 160, 32, 4),
         (64, 148, 32, 2),  # tp2 batch 32: 64 x 2 = 128 fits, 64 x 4 = 256 does not
         (64, 160, 32, 2),
-        (128, 148, 32, 1),  # tp4 batch 128 / tp2 batch 64: the units alone exceed half the part
+        (
+            128,
+            148,
+            32,
+            1,
+        ),  # tp4 batch 128 / tp2 batch 64: the units alone exceed half the part
         (128, 160, 32, 1),
         (256, 148, 32, 1),
         (8, 148, 4, 4),  # kv900 (8 pages, 4 pairs): at most one pair per CTA
@@ -374,20 +383,26 @@ def test_union_split_factor_rule(units, num_sms, pairs_max, expected):
 def test_union_plan_rule():
     # 8 requests x 2 KV heads at seqlen_q 4 and 1200 pages (64 ids cap -> 32 pairs): 16 units,
     # eight-way clusters (16 x 8 = 128 CTAs fit one wave), 128 CTAs.
-    assert union_plan(total_q=32, seqlen_q=4, num_kv_heads=2, max_pages=1200, num_sms=148) == (
+    assert union_plan(
+        total_q=32, seqlen_q=4, num_kv_heads=2, max_pages=1200, num_sms=148
+    ) == (
         4,
         8,
         16,
         (128, 1, 1),
     )
     # seqlen_q 3 runs the width-4 program; the unsplit grid is persistent over min(units, SMs).
-    assert union_plan(total_q=384, seqlen_q=3, num_kv_heads=2, max_pages=64, num_sms=148) == (
+    assert union_plan(
+        total_q=384, seqlen_q=3, num_kv_heads=2, max_pages=64, num_sms=148
+    ) == (
         4,
         1,
         256,
         (148, 1, 1),
     )
-    assert union_plan(total_q=384, seqlen_q=3, num_kv_heads=2, max_pages=64, num_sms=160) == (
+    assert union_plan(
+        total_q=384, seqlen_q=3, num_kv_heads=2, max_pages=64, num_sms=160
+    ) == (
         4,
         1,
         256,
@@ -395,7 +410,9 @@ def test_union_plan_rule():
     )
     # seqlen_q 2: the width-2 program, 32 ids cap -> 16 pairs; 64 units: 64 x 2 = 128 CTAs
     # fit one wave, 64 x 4 = 256 do not -> two-way clusters, 128 CTAs.
-    assert union_plan(total_q=64, seqlen_q=2, num_kv_heads=2, max_pages=64, num_sms=148) == (
+    assert union_plan(
+        total_q=64, seqlen_q=2, num_kv_heads=2, max_pages=64, num_sms=148
+    ) == (
         2,
         2,
         64,
@@ -947,7 +964,11 @@ def _run_union(
         max_pages=inputs["max_pages"],
         num_sms=_device_sms(),
     )
-    assert (runner.union_q, runner.splits, runner.num_ctas) == (union_q, splits, grid[0])
+    assert (runner.union_q, runner.splits, runner.num_ctas) == (
+        union_q,
+        splits,
+        grid[0],
+    )
     assert runner.program == cake_jit.select_union_program(
         runner.arch, union_q=runner.union_q, splits=runner.splits
     )
@@ -967,18 +988,74 @@ def _run_union(
 @pytest.mark.parametrize(
     "seq_lens,num_kv_heads,seqlen_q,overlap,page_table_order,scales",
     [
-        ([8192] * 8, 2, 4, 0.5, "identity", None),  # tp2 batch 8: 16 units, eight-way clusters
-        ([8192] * 8, 2, 4, 0.0, "identity", None),  # disjoint selections: |U| = 64 per unit
+        (
+            [8192] * 8,
+            2,
+            4,
+            0.5,
+            "identity",
+            None,
+        ),  # tp2 batch 8: 16 units, eight-way clusters
+        (
+            [8192] * 8,
+            2,
+            4,
+            0.0,
+            "identity",
+            None,
+        ),  # disjoint selections: |U| = 64 per unit
         ([8192] * 8, 2, 4, 1.0, "identity", None),  # identical history: |U| = 16 + 3
-        ([8192] * 8, 2, 3, 0.75, "identity", None),  # seqlen_q 3: width-4 program, phantom token
-        ([2200] * 3, 2, 2, 0.5, "shuffled", None),  # width-2 program, 18 pages, 24-token page tail
+        (
+            [8192] * 8,
+            2,
+            3,
+            0.75,
+            "identity",
+            None,
+        ),  # seqlen_q 3: width-4 program, phantom token
+        (
+            [2200] * 3,
+            2,
+            2,
+            0.5,
+            "shuffled",
+            None,
+        ),  # width-2 program, 18 pages, 24-token page tail
         ([2200] * 3, 1, 4, 0.5, "shared_prefix", None),  # tp4, shared-prefix page table
-        ([900] * 4, 2, 4, 0.5, "identity", None),  # fewer than sixteen visible pages, -1 tails
-        ([153600] * 2, 2, 4, 0.75, "identity", None),  # 1200 pages per request, eight-way clusters
-        ([8192] * 64, 2, 4, 0.0, "identity", None),  # 128 units: the unsplit persistent program
+        (
+            [900] * 4,
+            2,
+            4,
+            0.5,
+            "identity",
+            None,
+        ),  # fewer than sixteen visible pages, -1 tails
+        (
+            [153600] * 2,
+            2,
+            4,
+            0.75,
+            "identity",
+            None,
+        ),  # 1200 pages per request, eight-way clusters
+        (
+            [8192] * 64,
+            2,
+            4,
+            0.0,
+            "identity",
+            None,
+        ),  # 128 units: the unsplit persistent program
         ([8192] * 8, 4, 4, 1.0, "identity", None),  # tp1 geometry (64 query heads)
         ([8192] * 8, 1, 4, 0.0, "identity", None),  # tp4 geometry (16 query heads)
-        ([5000, 130, 300, 2049], 2, 4, 0.5, "shuffled", None),  # ragged, requests within one page
+        (
+            [5000, 130, 300, 2049],
+            2,
+            4,
+            0.5,
+            "shuffled",
+            None,
+        ),  # ragged, requests within one page
         ([8192] * 8, 2, 4, 0.5, "identity", (1.75, 0.6)),  # non-unit global scales
     ],
 )
@@ -999,7 +1076,9 @@ def test_union_decode_matches_the_fp32_oracle(
     )
 
 
-def _union_batch_requesting(splits: int, num_sms: int, num_kv_heads: int, union_q: int) -> int:
+def _union_batch_requesting(
+    splits: int, num_sms: int, num_kv_heads: int, union_q: int
+) -> int:
     """Smallest batch of 8K-token requests whose ``batch * num_kv_heads`` units make
     ``union_split_factor`` pick ``splits`` on a ``num_sms`` part, or 0 when the part
     cannot request that factor with whole requests (checked, not assumed)."""
@@ -1010,7 +1089,11 @@ def _union_batch_requesting(splits: int, num_sms: int, num_kv_heads: int, union_
         units = num_sms // splits // num_kv_heads * num_kv_heads
     if units < num_kv_heads:
         return 0
-    return units // num_kv_heads if union_split_factor(units, num_sms, pairs) == splits else 0
+    return (
+        units // num_kv_heads
+        if union_split_factor(units, num_sms, pairs) == splits
+        else 0
+    )
 
 
 def test_every_union_program_runs_on_the_attached_part():
@@ -1028,7 +1111,11 @@ def test_every_union_program_runs_on_the_attached_part():
         _inputs, runner = _run_union(
             [8192] * batch, 2, seqlen_q=union_q, overlap=0.5, seed=200 + batch + union_q
         )
-        assert (runner.union_q, runner.splits) == (union_q, splits), (batch, num_sms, runner)
+        assert (runner.union_q, runner.splits) == (union_q, splits), (
+            batch,
+            num_sms,
+            runner,
+        )
         seen.add((union_q, splits))
     assert seen == set(cake_jit.registered_union_pairs(arch)), (num_sms, seen)
 
@@ -1054,7 +1141,12 @@ def test_auto_resolves_to_the_per_token_programs():
     only an explicit ``True`` reaches the union program."""
     _require_program()
     inputs = build_decode_inputs(
-        [8192] * 8, num_kv_heads=2, seqlen_q=4, device="cuda", seed=63, q_overlap_fraction=0.5
+        [8192] * 8,
+        num_kv_heads=2,
+        seqlen_q=4,
+        device="cuda",
+        seed=63,
+        q_overlap_fraction=0.5,
     )
     auto = _prepare(inputs)
     plain = _prepare(inputs, use_cache_hit=False)
@@ -1084,7 +1176,9 @@ def test_union_output_is_independent_of_sibling_selections():
     unchanged (masked-out union pages leave no trace)."""
     _require_union_program()
     seq_lens, num_kv_heads, seqlen_q = [8192] * 8, 2, 4
-    inputs, runner = _run_union(seq_lens, num_kv_heads, seqlen_q=seqlen_q, overlap=0.5, seed=71)
+    inputs, runner = _run_union(
+        seq_lens, num_kv_heads, seqlen_q=seqlen_q, overlap=0.5, seed=71
+    )
     out_a = runner.out.clone()
     lse_a = runner.lse.clone()
     probe = torch.tensor(
@@ -1135,7 +1229,9 @@ def test_union_graph_replay_follows_new_queries_and_selections():
     gen = torch.Generator(device="cuda").manual_seed(2027)
     for step in range(3):
         inputs["q"].copy_(
-            torch.randn(inputs["q"].shape, generator=gen, device="cuda").to(torch.bfloat16)
+            torch.randn(inputs["q"].shape, generator=gen, device="cuda").to(
+                torch.bfloat16
+            )
         )
         if step:
             fresh = build_decode_inputs(
@@ -1189,7 +1285,9 @@ def test_use_cache_hit_true_under_capture_requires_a_built_program():
         with torch.cuda.graph(graph, stream=stream):
             # Built by the eager preparation above: binding under capture is allowed and
             # the captured launch is the union program.
-            captured = _prepare(inputs, out=runner.out, lse=runner.lse, use_cache_hit=True)
+            captured = _prepare(
+                inputs, out=runner.out, lse=runner.lse, use_cache_hit=True
+            )
             assert (captured.route, captured.program) == ("union", runner.program)
             captured()
             # Forget the built program for the rest of the capture (real registry state,
@@ -1202,7 +1300,9 @@ def test_use_cache_hit_true_under_capture_requires_a_built_program():
                 cake_jit._LOADED[key] = module
             # The per-token routes are not subject to the union capture rule.
             assert (
-                _prepare(inputs, out=runner.out, lse=runner.lse, use_cache_hit=False).route
+                _prepare(
+                    inputs, out=runner.out, lse=runner.lse, use_cache_hit=False
+                ).route
                 == per_token.route
             )
     torch.cuda.synchronize()

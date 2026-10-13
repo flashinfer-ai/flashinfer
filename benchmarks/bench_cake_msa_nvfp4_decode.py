@@ -132,14 +132,29 @@ def _prepare(inputs, out, use_cache_hit):
 
 
 def bench_row(
-    name, batch, kv, num_kv_heads, group, seqlen_q, ragged, overlap, *, arms, device, seed
+    name,
+    batch,
+    kv,
+    num_kv_heads,
+    group,
+    seqlen_q,
+    ragged,
+    overlap,
+    *,
+    arms,
+    device,
+    seed,
 ):
     seq_lens = (
         ragged_lengths(batch, kv, seqlen_q, seed)
         if ragged and batch > 1
         else [kv] * batch
     )
-    extra = {} if overlap is None else dict(q_overlap_fraction=overlap, page_table_order="identity")
+    extra = (
+        {}
+        if overlap is None
+        else dict(q_overlap_fraction=overlap, page_table_order="identity")
+    )
     inputs = build_decode_inputs(
         seq_lens,
         num_kv_heads=num_kv_heads,
@@ -260,7 +275,9 @@ def main():
     for row in rows:
         for record in bench_row(*row, arms=arms, device=device, seed=args.seed):
             route_cell = (
-                f"{record['route_us']:9.2f}" if record["route_us"] is not None else f"{'declined':>9s}"
+                f"{record['route_us']:9.2f}"
+                if record["route_us"] is not None
+                else f"{'declined':>9s}"
             )
             if record["cake_us"] is None:
                 print(

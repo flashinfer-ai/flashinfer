@@ -282,11 +282,7 @@ def union_split_factor(total_units: int, num_sms: int, union_pairs_max: int) -> 
     if max_pairs < 4 or units * 2 > int(num_sms):
         return 1
     splits = 1
-    while (
-        splits < 8
-        and splits * 2 <= max_pairs
-        and units * splits * 2 <= int(num_sms)
-    ):
+    while splits < 8 and splits * 2 <= max_pairs and units * splits * 2 <= int(num_sms):
         splits *= 2
     return splits
 
