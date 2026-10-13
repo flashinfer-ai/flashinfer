@@ -23,7 +23,12 @@ from ..api_logging import flashinfer_api
 from ..jit.cake_minimax_h3_sm120_quant_pre_attention import (
     gen_minimax_h3_sm120_quant_pre_attention_module,
 )
-from ..utils import register_custom_op, register_fake_op, supported_compute_capability
+from ..utils import (
+    get_compute_capability,
+    register_custom_op,
+    register_fake_op,
+    supported_compute_capability,
+)
 
 MINIMAX_H3_HIDDEN = 5376
 MINIMAX_H3_NUM_HEADS = 56
@@ -53,6 +58,15 @@ class MiniMaxH3PreAttentionOutput(NamedTuple):
     q_sf: Optional[torch.Tensor] = None
     k_sf: Optional[torch.Tensor] = None
     v_sf: Optional[torch.Tensor] = None
+
+
+def _require_sm120(device: torch.device) -> None:
+    major, minor = get_compute_capability(device)
+    if (major, minor) != (12, 0):
+        raise NotImplementedError(
+            "MiniMax-H3 SM120 quantized pre-attention is built for compute capability 12.0 "
+            f"(RTX 5090 / RTX PRO 6000 Blackwell) only, got {major}.{minor}"
+        )
 
 
 @functools.cache
@@ -117,6 +131,7 @@ def _check_common(
 ) -> Tuple[int, torch.device]:
     rows = _check_rows(x)
     device = x.device
+    _require_sm120(device)
     _require("x", x, torch.bfloat16, (rows, MINIMAX_H3_HIDDEN), device)
     _require(
         "x_norm_weight", x_norm_weight, torch.bfloat16, (MINIMAX_H3_HIDDEN,), device
