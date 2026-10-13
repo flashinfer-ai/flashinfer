@@ -819,8 +819,9 @@ def trtllm_allreduce_fusion(
     - scale_factor: the scale factor. For cudaGraphs safety, it should be a tensor.
     - layout_code: the layout code.
     - metadata: optional workspace metadata dict from create_ipc_workspace_for_all_reduce_fusion.
-                If provided, it validates that token_num <= max_token_num, world_size == tp_size,
-                and hidden_dim == workspace hidden_dim. Raises ValueError if validation fails.
+                If provided, it validates that world_size == tp_size, the FP32 Lamport mode matches
+                the input dtype, and token_num * hidden_dim does not exceed
+                max_token_num * metadata["hidden_dim"]. Raises ValueError if validation fails.
     - block_quant_group_size: group size (in elements along hidden_dim) for per-token-group
                               block-wise FP8 quantization patterns
                               (e.g. ``kPerTokenGroupFP8Packed`` / DeepSeek-style FP8 with

@@ -9374,7 +9374,7 @@ def mm_fp4(
 
     Notes
     -----
-    When the cudnn/cutlass backend is used, both a and b should be quantized with nvfp4_quantize using the 128x4 scale factor layout and do_shuffle=False.
+    When the cudnn/cutlass backend is used, both a and b should use the 128x4 scale factor layout: nvfp4_quantize(..., do_shuffle=False) when use_nvfp4=True, or mxfp4_quantize(...) when use_nvfp4=False.
     When trtllm backend is used, b must be quantized with 128x4 layout and `do_shuffle=True`. a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`) and `do_shuffle=False`.
     When cute_dsl backend is used, both a and b should be quantized with 128x4 scale factor layout:
     nvfp4_quantize(..., do_shuffle=False) for NVFP4, or mxfp4_quantize(...) for MXFP4.

@@ -31,7 +31,7 @@ We use Ragged Tensor to store the variable length Q/K/V tensors in FlashInfer fo
   :align: center
   :alt: Data structure of Ragged KV-Cache.
 
-In Ragged Tensor, the Q/K/V tensors for all requests are packed into a single ``data`` tensor without padding.
+In Ragged Tensor, Q, K, and V are stored in separate ``data`` tensors, with values from all requests packed without padding.
 We use an ``indptr`` array (``num_requests+1`` elements, the first element is always zero)
 to store the information of variable sequence lengths of each request
 (``indptr[i+1]-indptr[i]`` is the sequence length of request ``i``), the ``data`` tensor has
@@ -118,7 +118,7 @@ sequence length of request ``i`` is ``page_size * (len(page_indices[i]) - 1) + l
 The overall ``kv_indptr`` array (with length ``num_requests+1``) can be computed as:
 ``[0, len(page_indices[0]), len(page_indices[0])+len(page_indices[1]), ...]``.
 The overall ``kv_page_indices`` array (with length ``kv_indptr[-1]``) is the concatenation of all requests' ``page_indices``.
-The overall ``kv_last_page_lens`` array (with length ``num_requests``) is the concatenation of all requests' ``last_page_len``.
+The overall ``kv_last_page_len`` array (with length ``num_requests``) is the concatenation of all requests' ``last_page_len``.
 
 The ``kv_data`` tensor can be either a single 5-D tensor or a tuple of 4-D tensors.
 When stored in a single tensor, ``kv_data`` has the following shape:
@@ -142,7 +142,7 @@ where ``max_num_pages`` is the maximum number of pages used by all requests, ``p
 we fit into each page. ``2`` in single tensor storage means K/V (first one for keys, the second one for values).
 
 .. note::
-  ``indptr`` arrays across the flashinfer library should be of type ``int32``. Arrays of type ``int64`` can cause indexing errors. This is also true of the ``kv_page_indices`` and ``kv_last_page_lens`` arrays.
+  ``indptr`` arrays across the flashinfer library should be of type ``int32``. Arrays of type ``int64`` can cause indexing errors. This is also true of the ``kv_page_indices`` and ``kv_last_page_len`` arrays.
 
 .. _mla-page-layout:
 

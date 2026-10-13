@@ -1710,7 +1710,7 @@ def top_k_top_p_sampling_from_logits(
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
-        Whether to check for NaNs in :attr:`probs`; the default is ``False``.
+        Whether to check the probabilities derived from ``logits`` for NaNs; the default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
