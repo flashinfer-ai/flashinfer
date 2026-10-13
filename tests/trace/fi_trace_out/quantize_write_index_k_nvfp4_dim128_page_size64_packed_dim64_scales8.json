@@ -1,0 +1,94 @@
+{
+  "name": "quantize_write_index_k_nvfp4_dim128_page_size64_packed_dim64_scales8",
+  "description": "Indexer keys quantized to NVFP4 (E4M3 scale per 16 values) and written at their slots of a 64-key paged cache.",
+  "op_type": "quantize_write_index_k_nvfp4",
+  "tags": [
+    "fi_api:flashinfer.attn_scores.single_head.quantize_write_index_k_nvfp4",
+    "arch:sm100",
+    "arch:sm103"
+  ],
+  "axes": {
+    "tokens": {
+      "type": "var",
+      "description": "Keys to write."
+    },
+    "dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Key dimension."
+    },
+    "slots": {
+      "type": "var",
+      "description": "Slot mapping entries, one or more per key."
+    },
+    "pages": {
+      "type": "var",
+      "description": "Key cache pages."
+    },
+    "page_size": {
+      "type": "const",
+      "value": 64,
+      "description": "Keys per page."
+    },
+    "packed_dim": {
+      "type": "const",
+      "value": 64,
+      "description": "Packed NVFP4 bytes per key."
+    },
+    "scales": {
+      "type": "const",
+      "value": 8,
+      "description": "E4M3 scales per key, one per 16 values."
+    }
+  },
+  "inputs": {
+    "key": {
+      "shape": [
+        "tokens",
+        "dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "slots": {
+      "shape": [
+        "slots"
+      ],
+      "dtype": "int64"
+    },
+    "key_cache": {
+      "shape": [
+        "pages",
+        "page_size",
+        "packed_dim"
+      ],
+      "dtype": "uint8"
+    },
+    "key_scales": {
+      "shape": [
+        "pages",
+        "page_size",
+        "scales"
+      ],
+      "dtype": "float8_e4m3fn"
+    }
+  },
+  "outputs": {
+    "key_cache": {
+      "shape": [
+        "pages",
+        "page_size",
+        "packed_dim"
+      ],
+      "dtype": "uint8"
+    },
+    "key_scales": {
+      "shape": [
+        "pages",
+        "page_size",
+        "scales"
+      ],
+      "dtype": "float8_e4m3fn"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}
