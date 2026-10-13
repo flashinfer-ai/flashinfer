@@ -954,6 +954,97 @@ def test_moe_a2a_dispatch_moe_combine(distribution, top_k, use_lora):
     safe_run(moe_a2a_dispatch_moe_combine_test_impl, distribution, top_k, use_lora)
 
 
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("in_workspace", [False, True])
+@pytest.mark.parametrize("low_precision", [False, True])
+def test_mixed_dispatch_preserves_combine(capture, in_workspace, low_precision):
+    """A wider dispatch must not overwrite a peer's previous combine (#6069)."""
+    comm = MPI.COMM_WORLD
+    rank, ep_size = comm.Get_rank(), comm.Get_size()
+    if ep_size not in (4, 8):
+        pytest.skip("Requires four or eight MPI ranks")
+    node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+    torch.cuda.set_device(node_comm.Get_rank())
+    if not mnnvl_available():
+        pytest.skip("Requires MNNVL")
+    mapping = Mapping(
+        rank=rank,
+        world_size=ep_size,
+        tp_size=ep_size,
+        moe_ep_size=ep_size,
+        gpus_per_node=node_comm.Get_size(),
+    )
+    hidden, capacity, top_k = 6144, 32768, 8
+    first = MoeAlltoAll(mapping, capacity, top_k, 256, hidden_size=hidden)
+    second = MoeAlltoAll(mapping, capacity, top_k, 256, hidden_size=hidden)
+    assert first.workspace.data_ptr() == second.workspace.data_ptr()
+    ids = torch.arange(top_k, device="cuda", dtype=torch.int32)
+    ids = ((ids % ep_size) * (256 // ep_size) + ids // ep_size).repeat(capacity, 1)
+    scales = torch.full((capacity, top_k), 1 / top_k, device="cuda")
+    small = torch.full((capacity, hidden // 2), 85, dtype=torch.uint8, device="cuda")
+    sf = torch.ones((capacity, hidden // 16), dtype=torch.uint8, device="cuda")
+    big = torch.full(
+        (capacity, hidden), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    expert = torch.full(
+        (ep_size, capacity, hidden), rank + 1, dtype=torch.bfloat16, device="cuda"
+    )
+    lengths_list = [
+        [266, 9, 19034, 9] * (ep_size // 4),
+        [266, 9, 19034, 9] * (ep_size // 4),
+        [0, 1, 32, 0] * (ep_size // 4),
+        [9, 0, capacity, 1] * (ep_size // 4),
+        [1, 9, 64, 0] * (ep_size // 4),
+        [1, 9, 64, 0] * (ep_size // 4),
+    ]
+
+    def rounds():
+        checks = []
+        for i, lengths in enumerate(lengths_list):
+            count, maximum = lengths[rank], max(lengths)
+            a2a = first if i % 2 == 0 else second
+            payloads = [small[:count], sf[:count]] if i % 2 == 0 else [big[:count]]
+            a2a.dispatch(ids[:count], payloads + [ids[:count], scales[:count]], maximum)
+            if in_workspace:
+                payload = a2a.get_combine_payload_tensor_in_workspace(
+                    maximum, hidden, torch.bfloat16
+                )
+                payload.fill_(rank + 1)
+            else:
+                payload = expert.view(-1, hidden)[: ep_size * maximum].view(
+                    ep_size, maximum, hidden
+                )
+            if rank == 2:
+                torch.cuda._sleep(200000)
+            output = a2a.combine(
+                payload,
+                maximum,
+                payload_in_workspace=in_workspace,
+                use_low_precision=low_precision,
+            )
+            checks.append(output.eq(ep_size * (ep_size + 1) // 2).all())
+        return torch.stack(checks)
+
+    rounds()
+    torch.cuda.synchronize()
+    comm.Barrier()
+    records = []
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            checks = rounds()
+        for _ in range(20):
+            graph.replay()
+            records.append(checks.clone())
+    else:
+        for _ in range(20):
+            records.append(rounds())
+    failures = (~torch.stack(records)).nonzero().cpu().tolist()
+    all_failures = comm.allgather(failures)
+    first._reset_workspace()
+    assert not any(all_failures), all_failures
+
+
 if __name__ == "__main__":
     # Run with: mpirun -n 4 python -m pytest tests/comm/test_mnnvl_moe_alltoall.py -v
     pytest.main([__file__, "-v", "-s"])

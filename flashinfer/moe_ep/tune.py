@@ -173,6 +173,19 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="also sweep in_kernel_fc2_reduce candidates",
     )
     parser.add_argument(
+        "--do-finalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="finalize expert outputs; disable to leave finalization to the caller "
+        "after EP communication completes (SM100 NVFP4)",
+    )
+    parser.add_argument(
+        "--apply-topk-in-fc1",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="apply routing weights in FC1; disable for post-FC2 weighting (SM100 NVFP4)",
+    )
+    parser.add_argument(
         "--max-candidates",
         type=int,
         default=None,
@@ -184,9 +197,9 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="live token count to stage and time (default: the bucket size). "
         "Use a decode-like count (e.g. 256) to tune for decode steps while "
-        "keeping the engine's buffer bucket; the cache entry is still keyed "
-        "on --max-tokens, so write decode-tuned winners to a separate cache "
-        "file (FLASHINFER_MOE_EP_KNOB_CACHE). For sm90_mxfp4, an explicit "
+        "keeping the engine's buffer bucket. The measured count is recorded as "
+        "live_tokens in JSON; entries are keyed by capacity and live tokens, so "
+        "multiple workloads can share one cache file. For sm90_mxfp4, an explicit "
         "value must equal every --max-tokens bucket.",
     )
     parser.add_argument(
@@ -342,6 +355,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             backend = "bf16_mxfp8_bf16_cutedsl"
         else:
             backend = "mxfp8_mxfp8_bf16_cutedsl"
+
+    if not args.do_finalize or not args.apply_topk_in_fc1:
+        if family != "sm100" or args.dtype != "nvfp4":
+            print(
+                "caller finalization and routing-weight placement require SM100 NVFP4",
+                file=sys.stderr,
+            )
+            return 2
+        if args.allow_nondeterministic:
+            print(
+                "--allow-nondeterministic requires --do-finalize and FC1 routing weights",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.do_finalize and args.combine_dtype != "bf16":
+            print("--no-do-finalize requires --combine-dtype bf16", file=sys.stderr)
+            return 2
 
     if family != "sm107" and args.combine_dtype != "bf16" and args.dtype != "nvfp4":
         print("--combine-dtype requires SM100 NVFP4 or SM107", file=sys.stderr)

@@ -1520,10 +1520,13 @@ class CudnnGroupedGemmBf16Config:
       ``m_indptr`` layout, gather the activations, GEMM1, the typed activation,
       GEMM2 and the finalize, on :func:`flashinfer.grouped_mm.grouped_mm_bf16`.
     - Activations: raw ``bfloat16 [M, H]`` (``M`` tokens of hidden size ``H``).
+    - ``hidden_size`` and ``intermediate_size`` must be multiples of 8.
     - Weights: :meth:`prepare_weights` takes the canonical ``[up, gate]`` BF16
-      weights and stores the fc1 rows as ``[gate, up]``.
-    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM90, SM100,
-      SM103 and SM107, torch ops elsewhere.
+      weights as they are.
+    - Permute and finalize: FlashInfer's ``moe_sort``, ``moe_permute`` and
+      ``moe_unpermute`` kernels.
+    - Activation functions: SwiGLU with default scalars, GeGLU, GELU, ReLU, SiLU
+      and Identity, on FlashInfer's ``moe_activation`` kernel.
     - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
       ``[gemm2_out, expert_weights, token_to_row]`` for the caller to combine.
     - Expert parallelism: assignments to non-local experts are masked out.
@@ -1581,10 +1584,14 @@ class CudnnGroupedGemmFp8PerTensorConfig:
       ``hidden_states_scale=None``.
     - Weights: :meth:`prepare_weights` takes both static multipliers and folds
       them into the view.
-    - The fused Triton SwiGLU kernel requantizes the intermediate, so SwiGLU with
-      default scalars is the only supported activation.
-    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM90, SM100,
-      SM103 and SM107, torch ops elsewhere.
+    - The BF16 intermediate is requantized to E4M3 with the static
+      ``intermediate_scale_global`` multiplier before GEMM2.
+    - ``hidden_size`` must be a multiple of 16 and ``intermediate_size`` a
+      multiple of 8.
+    - Permute and finalize: FlashInfer's ``moe_sort``, ``moe_permute`` and
+      ``moe_unpermute`` kernels.
+    - Activation functions: SwiGLU with default scalars, GeGLU, GELU, ReLU, SiLU
+      and Identity, on FlashInfer's ``moe_activation`` kernel.
     - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
       ``[gemm2_out, expert_weights, token_to_row]``.
     - Expert parallelism: assignments to non-local experts are masked out.
@@ -1651,8 +1658,10 @@ class CudnnGroupedGemmMxfp8Config:
     - Weights: E4M3 with UE8M0 block scales per expert (see
       :meth:`prepare_weights`).
     - ``hidden_size`` and ``intermediate_size`` must be multiples of 128.
-    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM100, SM103 and
-      SM107, torch ops elsewhere.
+    - Permute and finalize: FlashInfer's ``moe_sort``, ``moe_permute`` and
+      ``moe_unpermute`` kernels.
+    - Activation functions: SwiGLU with default scalars, GeGLU, GELU, ReLU, SiLU
+      and Identity, on FlashInfer's ``moe_activation`` kernel.
     - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
       ``[gemm2_out, expert_weights, token_to_row]``.
     - Expert parallelism: assignments to non-local experts are masked out.
@@ -1728,8 +1737,10 @@ class CudnnGroupedGemmNvfp4Config:
       expert's global dequant; GEMM2's is applied by the finalize, or to the
       unfinalized rows.
     - ``hidden_size`` and ``intermediate_size`` must be multiples of 128.
-    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM100, SM103 and
-      SM107, torch ops elsewhere.
+    - Permute and finalize: FlashInfer's ``moe_sort``, ``moe_permute`` and
+      ``moe_unpermute`` kernels.
+    - Activation functions: SwiGLU with default scalars, GeGLU, GELU, ReLU, SiLU
+      and Identity, on FlashInfer's ``moe_activation`` kernel.
     - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
       ``[gemm2_out, expert_weights, token_to_row]``.
     - Expert parallelism: assignments to non-local experts are masked out.

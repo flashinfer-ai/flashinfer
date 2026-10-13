@@ -28,6 +28,9 @@
 #define SMEM_SCALES_OFF 1024
 #define SMEM_SCALES_STAGE_BYTES 2048
 #define SMEM_SCALES_STRIDE 2048
+#define SMEM_TICKETS_OFF 216064
+#define SMEM_TICKETS_STAGE_BYTES 8
+#define SMEM_TICKETS_STRIDE 8
 #define SMEM_SMEM_Q0_OFF 3072
 #define SMEM_SMEM_Q0_STAGE_BYTES 32768
 #define SMEM_SMEM_Q0_STRIDE 32768
@@ -43,7 +46,7 @@
 #define SMEM_SMEM_V_OFF 68608
 #define SMEM_SMEM_V_STAGE_BYTES 16384
 #define SMEM_SMEM_V_STRIDE 16384
-#define SMEM_TOTAL 216064
+#define SMEM_TOTAL 216192
 #if __CUDA_ARCH__ == 1000
 #define USE_TMEM_LD_RED 0
 #else
@@ -57,7 +60,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, __nv_bfloat16* __restrict__ O_raw, int* __restrict__ unit_table, __half* __restrict__ partial_O, float* __restrict__ partial_ML, unsigned int total_tiles, int num_heads, float softmax_scale_log2)
+kernel_cake_minimax_h3_varlen_attention_1350b7d87b8bb2dc9c46(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, __nv_bfloat16* __restrict__ O_raw, int* __restrict__ unit_table, __half* __restrict__ partial_O, float* __restrict__ partial_ML, unsigned int total_tiles, int num_heads, float softmax_scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -85,6 +88,9 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
     #define s_read_addr (mbar_base + 176)
     #define o_full_addr (mbar_base + 192)
     #define pv0_done_addr (mbar_base + 208)
+    #define tk_full_addr (mbar_base + 216)
+    #define tk_empty_addr (mbar_base + 232)
+    #define tk_go_addr (mbar_base + 248)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -98,6 +104,8 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
     // Kernel setup ops
     float* scales = reinterpret_cast<float*>(smem_raw + SMEM_SCALES_OFF);
     const int scales_addr = smem + SMEM_SCALES_OFF;
+    int* tickets = reinterpret_cast<int*>(smem_raw + SMEM_TICKETS_OFF);
+    const int tickets_addr = smem + SMEM_TICKETS_OFF;
     __nv_bfloat16* smem_q0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_Q0_OFF);
     const int smem_q0_addr = smem + SMEM_SMEM_Q0_OFF;
     __nv_bfloat16* smem_q1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_Q1_OFF);
@@ -108,9 +116,13 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
     const int smem_kv_addr = smem + SMEM_SMEM_KV_OFF;
     __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_V_OFF);
     const int smem_v_addr = smem + SMEM_SMEM_V_OFF;
+    if (warp == 13) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
+    if (warp == 13) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
+    if (warp == 13) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&V))) : "memory"); }
+    if (warp == 13) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&O))) : "memory"); }
 
-    // Mbarrier init (12 pipeline groups, 0 ordered-sequence groups, 27 barriers)
-    // Mbarriers at smem_raw[0..216)
+    // Mbarrier init (15 pipeline groups, 0 ordered-sequence groups, 33 barriers)
+    // Mbarriers at smem_raw[0..264)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -155,27 +167,41 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
             mbarrier_init(smem + 200, 1);
             // pv0_done: 1 barriers, init_count=128
             mbarrier_init(smem + 208, 128);
+            // tk_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 216, 1);
+            mbarrier_init(smem + 224, 1);
+            // tk_empty: 2 barriers, init_count=512
+            mbarrier_init(smem + 232, 512);
+            mbarrier_init(smem + 240, 512);
+            // tk_go: 2 barriers, init_count=1
+            mbarrier_init(smem + 248, 1);
+            mbarrier_init(smem + 256, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
-    __syncwarp();
-
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
+    // Kernel pre-TMEM ops
+    int rec = cluster_id * 8;
+    int doc_begin = unit_table[rec];
+    int doc_len = unit_table[rec + 1];
+    int packed = unit_table[rec + 2];
+    int kv_words = unit_table[rec + 3];
+    int ws_slot = unit_table[rec + 4];
+    int q_half = unit_table[rec + 5];
+
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 216);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 264);
     if (warp == 0) {
-        int _tmem_hold = smem + 216;
+        int _tmem_hold = smem + 264;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
     }
 
     __syncthreads();
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
     const int taddr = tmem_addr_storage[0];
@@ -210,13 +236,6 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
             int nxt_kv_words;
             int nxt_ws_slot;
             int nxt_q_half;
-            int rec = cluster_id * 8;
-            int doc_begin = unit_table[rec];
-            int doc_len = unit_table[rec + 1];
-            int packed = unit_table[rec + 2];
-            int kv_words = unit_table[rec + 3];
-            int ws_slot = unit_table[rec + 4];
-            int q_half = unit_table[rec + 5];
             nxt_doc_begin = doc_begin;
             nxt_doc_len = doc_len;
             nxt_packed = packed;
@@ -227,7 +246,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
             unsigned int _phase_s_full = 0;
             unsigned int _phase_pv0_done_0 = 0;
             #pragma unroll 1
-            for (unsigned int tile_idx = cluster_id; tile_idx < total_tiles; tile_idx += num_clusters) {
+            for (unsigned int tile_idx = cluster_id; tile_idx < total_tiles; tile_idx++) {
                 int doc_begin_0 = nxt_doc_begin;
                 int doc_len_1 = nxt_doc_len;
                 int ws_slot_2 = nxt_ws_slot;
@@ -238,20 +257,9 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                 int unit_row0 = c * 512 + (nxt_q_half >> 1) * 256;
                 int full_rows = ((doc_len_1 - unit_row0 > 256) ? 1 : 0);
                 int two_stages = ((nxt_q_half == 0) ? full_rows : 0);
-                unsigned int nxt_tile = tile_idx + num_clusters;
-                int rec_3 = nxt_tile * 8;
-                int doc_begin_4 = unit_table[rec_3];
-                int doc_len_5 = unit_table[rec_3 + 1];
-                int packed_6 = unit_table[rec_3 + 2];
-                int kv_words_7 = unit_table[rec_3 + 3];
-                int ws_slot_8 = unit_table[rec_3 + 4];
-                int q_half_9 = unit_table[rec_3 + 5];
-                nxt_doc_begin = doc_begin_4;
-                nxt_doc_len = doc_len_5;
-                nxt_packed = packed_6;
-                nxt_kv_words = kv_words_7;
-                nxt_ws_slot = ws_slot_8;
-                nxt_q_half = q_half_9;
+                unsigned int tk_slot = tile_idx - cluster_id + 1 & 1;
+                unsigned int tk_parity = tile_idx - cluster_id >> 1 & 1;
+                unsigned int nxt_tile;
                 int active = ((stage == 0) ? 1 : two_stages);
                 if (active == 1) {
                     int tail_base = doc_len_1 - n_begin * BLOCK_N;
@@ -264,11 +272,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                     #pragma unroll 1
                     for (unsigned int n_iter = 0; n_iter < num_n_blocks; n_iter++) {
                         int n_block = (unsigned int)(num_n_blocks - 1) - n_iter;
-#if __CUDA_ARCH__ == 1000
-                        mbarrier_wait_hint(s_full_addr + (stage) * 8, _phase_s_full, 1000000);
-#else
                         mbarrier_wait(s_full_addr + (stage) * 8, _phase_s_full);
-#endif
                         _phase_s_full ^= 1;
                         int s_addr = taddr + (unsigned int)tmem_s_off + (unsigned int)(warp % 4 * 32 << 16);
                         float sv[128];
@@ -2154,6 +2158,24 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                         float2 total_sum = add_f32x2(sum01, sum23);
                         row_sum = row_sum * acc_scale + total_sum.x + total_sum.y;
                     }
+                    mbarrier_wait(tk_full_addr + (tk_slot) * 8, tk_parity);
+                    nxt_tile = tickets[tk_slot];
+                    asm volatile(
+                        "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0];"
+                        :: "r"((tk_empty_addr + (tk_slot) * 8) & 0xFEFFFFFF) : "memory");
+                    int rec_0 = nxt_tile * 8;
+                    int doc_begin_1 = unit_table[rec_0];
+                    int doc_len_2 = unit_table[rec_0 + 1];
+                    int packed_3 = unit_table[rec_0 + 2];
+                    int kv_words_4 = unit_table[rec_0 + 3];
+                    int ws_slot_5 = unit_table[rec_0 + 4];
+                    int q_half_6 = unit_table[rec_0 + 5];
+                    nxt_doc_begin = doc_begin_1;
+                    nxt_doc_len = doc_len_2;
+                    nxt_packed = packed_3;
+                    nxt_kv_words = kv_words_4;
+                    nxt_ws_slot = ws_slot_5;
+                    nxt_q_half = q_half_6;
                     if (stage == 0 && two_stages == 1) {
                         mbarrier_arrive(s_read_addr + (stage) * 8);
                     }
@@ -2165,6 +2187,37 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                         asm volatile("barrier.sync 2, 256;" ::: "memory");
                     }
                 }
+                if (active == 0) {
+                    mbarrier_wait(tk_full_addr + (tk_slot) * 8, tk_parity);
+                    nxt_tile = tickets[tk_slot];
+                    asm volatile(
+                        "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0];"
+                        :: "r"((tk_empty_addr + (tk_slot) * 8) & 0xFEFFFFFF) : "memory");
+                    int rec_0_1 = nxt_tile * 8;
+                    int doc_begin_1_1 = unit_table[rec_0_1];
+                    int doc_len_2_1 = unit_table[rec_0_1 + 1];
+                    int packed_3_1 = unit_table[rec_0_1 + 2];
+                    int kv_words_4_1 = unit_table[rec_0_1 + 3];
+                    int ws_slot_5_1 = unit_table[rec_0_1 + 4];
+                    int q_half_6_1 = unit_table[rec_0_1 + 5];
+                    nxt_doc_begin = doc_begin_1_1;
+                    nxt_doc_len = doc_len_2_1;
+                    nxt_packed = packed_3_1;
+                    nxt_kv_words = kv_words_4_1;
+                    nxt_ws_slot = ws_slot_5_1;
+                    nxt_q_half = q_half_6_1;
+                }
+                if (nxt_tile >= total_tiles) {
+                    break;
+                }
+            }
+            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+            asm volatile("tcgen05.fence::before_thread_sync;");
+            asm volatile("barrier.sync 9, 384;" ::: "memory");
+            if (warp == 0) {
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+                asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(512));
             }
         }
     }
@@ -2178,25 +2231,18 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
             int nxt_kv_words_1;
             int nxt_ws_slot_1;
             int nxt_q_half_1;
-            int rec_1 = cluster_id * 8;
-            int doc_begin_1 = unit_table[rec_1];
-            int doc_len_2 = unit_table[rec_1 + 1];
-            int packed_1 = unit_table[rec_1 + 2];
-            int kv_words_1 = unit_table[rec_1 + 3];
-            int ws_slot_1 = unit_table[rec_1 + 4];
-            int q_half_1 = unit_table[rec_1 + 5];
-            nxt_doc_begin_1 = doc_begin_1;
-            nxt_doc_len_1 = doc_len_2;
-            nxt_packed_1 = packed_1;
-            nxt_kv_words_1 = kv_words_1;
-            nxt_ws_slot_1 = ws_slot_1;
-            nxt_q_half_1 = q_half_1;
+            nxt_doc_begin_1 = doc_begin;
+            nxt_doc_len_1 = doc_len;
+            nxt_packed_1 = packed;
+            nxt_kv_words_1 = kv_words;
+            nxt_ws_slot_1 = ws_slot;
+            nxt_q_half_1 = q_half;
             unsigned int _phase_scale_full_0 = 0;
             unsigned int _phase_scale_full_1 = 0;
             unsigned int _phase_o_full_0 = 0;
             unsigned int _phase_o_full_1 = 0;
             #pragma unroll 1
-            for (unsigned int tile_idx_1 = cluster_id; tile_idx_1 < total_tiles; tile_idx_1 += num_clusters) {
+            for (unsigned int tile_idx_1 = cluster_id; tile_idx_1 < total_tiles; tile_idx_1++) {
                 int doc_begin_0_1 = nxt_doc_begin_1;
                 int doc_len_1_1 = nxt_doc_len_1;
                 int ws_slot_2_1 = nxt_ws_slot_1;
@@ -2207,20 +2253,9 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                 int unit_row0_1 = c_1 * 512 + (nxt_q_half_1 >> 1) * 256;
                 int full_rows_1 = ((doc_len_1_1 - unit_row0_1 > 256) ? 1 : 0);
                 int two_stages_1 = ((nxt_q_half_1 == 0) ? full_rows_1 : 0);
-                unsigned int nxt_tile_1 = tile_idx_1 + num_clusters;
-                int rec_3_1 = nxt_tile_1 * 8;
-                int doc_begin_4_1 = unit_table[rec_3_1];
-                int doc_len_5_1 = unit_table[rec_3_1 + 1];
-                int packed_6_1 = unit_table[rec_3_1 + 2];
-                int kv_words_7_1 = unit_table[rec_3_1 + 3];
-                int ws_slot_8_1 = unit_table[rec_3_1 + 4];
-                int q_half_9_1 = unit_table[rec_3_1 + 5];
-                nxt_doc_begin_1 = doc_begin_4_1;
-                nxt_doc_len_1 = doc_len_5_1;
-                nxt_packed_1 = packed_6_1;
-                nxt_kv_words_1 = kv_words_7_1;
-                nxt_ws_slot_1 = ws_slot_8_1;
-                nxt_q_half_1 = q_half_9_1;
+                unsigned int tk_slot_1 = tile_idx_1 - cluster_id + 1 & 1;
+                unsigned int tk_parity_1 = tile_idx_1 - cluster_id >> 1 & 1;
+                unsigned int nxt_tile_1;
                 asm volatile(
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                     :: "r"((p_full_addr) & 0xFEFFFFFF) : "memory");
@@ -2229,21 +2264,13 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((p_full_addr + 8) & 0xFEFFFFFF) : "memory");
                 }
-#if __CUDA_ARCH__ == 1000
-                mbarrier_wait_hint(scale_full_addr, _phase_scale_full_0, 1000000);
-#else
                 mbarrier_wait(scale_full_addr, _phase_scale_full_0);
-#endif
                 _phase_scale_full_0 ^= 1;
                 asm volatile(
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                     :: "r"((scale_empty_addr) & 0xFEFFFFFF) : "memory");
                 if (two_stages_1 == 1) {
-#if __CUDA_ARCH__ == 1000
-                    mbarrier_wait_hint(scale_full_addr + 8, _phase_scale_full_1, 1000000);
-#else
                     mbarrier_wait(scale_full_addr + 8, _phase_scale_full_1);
-#endif
                     _phase_scale_full_1 ^= 1;
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
@@ -2251,11 +2278,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                 }
                 #pragma unroll 1
                 for (unsigned int n_iter_1 = 1; n_iter_1 < num_n_blocks_1; n_iter_1++) {
-#if __CUDA_ARCH__ == 1000
-                    mbarrier_wait_hint(scale_full_addr, _phase_scale_full_0, 1000000);
-#else
                     mbarrier_wait(scale_full_addr, _phase_scale_full_0);
-#endif
                     _phase_scale_full_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float _tmem_load_0[1];
@@ -2270,11 +2293,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((scale_empty_addr) & 0xFEFFFFFF) : "memory");
-#if __CUDA_ARCH__ == 1000
-                    mbarrier_wait_hint(o_full_addr, _phase_o_full_0, 1000000);
-#else
                     mbarrier_wait(o_full_addr, _phase_o_full_0);
-#endif
                     _phase_o_full_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     if (two_stages_1 == 0) {
@@ -2305,11 +2324,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((p_full_addr) & 0xFEFFFFFF) : "memory");
                     if (two_stages_1 == 1) {
-#if __CUDA_ARCH__ == 1000
-                        mbarrier_wait_hint(scale_full_addr + 8, _phase_scale_full_1, 1000000);
-#else
                         mbarrier_wait(scale_full_addr + 8, _phase_scale_full_1);
-#endif
                         _phase_scale_full_1 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         float _tmem_load_2[1];
@@ -2324,11 +2339,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                         asm volatile(
                             "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                             :: "r"((scale_empty_addr + 8) & 0xFEFFFFFF) : "memory");
-#if __CUDA_ARCH__ == 1000
-                        mbarrier_wait_hint(o_full_addr + 8, _phase_o_full_1, 1000000);
-#else
                         mbarrier_wait(o_full_addr + 8, _phase_o_full_1);
-#endif
                         _phase_o_full_1 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         if (skip_rescale1 == 0) {
@@ -2357,11 +2368,22 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                             :: "r"((p_full_addr + 8) & 0xFEFFFFFF) : "memory");
                     }
                 }
-#if __CUDA_ARCH__ == 1000
-                mbarrier_wait_hint(o_full_addr, _phase_o_full_0, 1000000);
-#else
+                mbarrier_wait(tk_full_addr + (tk_slot_1) * 8, tk_parity_1);
+                nxt_tile_1 = tickets[tk_slot_1];
+                int rec_3 = nxt_tile_1 * 8;
+                int doc_begin_4 = unit_table[rec_3];
+                int doc_len_5 = unit_table[rec_3 + 1];
+                int packed_6 = unit_table[rec_3 + 2];
+                int kv_words_7 = unit_table[rec_3 + 3];
+                int ws_slot_8 = unit_table[rec_3 + 4];
+                int q_half_9 = unit_table[rec_3 + 5];
+                nxt_doc_begin_1 = doc_begin_4;
+                nxt_doc_len_1 = doc_len_5;
+                nxt_packed_1 = packed_6;
+                nxt_kv_words_1 = kv_words_7;
+                nxt_ws_slot_1 = ws_slot_8;
+                nxt_q_half_1 = q_half_9;
                 mbarrier_wait(o_full_addr, _phase_o_full_0);
-#endif
                 _phase_o_full_0 ^= 1;
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
                 float final_sum = scales[warp % 4 * 32 + lane + 2 * BLOCK_M];
@@ -2491,11 +2513,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                     }
                 }
                 if (two_stages_1 == 1) {
-#if __CUDA_ARCH__ == 1000
-                    mbarrier_wait_hint(o_full_addr + 8, _phase_o_full_1, 1000000);
-#else
                     mbarrier_wait(o_full_addr + 8, _phase_o_full_1);
-#endif
                     _phase_o_full_1 ^= 1;
                     asm volatile("barrier.sync 2, 256;" ::: "memory");
                     float final_sum_0 = scales[warp % 4 * 32 + lane + BLOCK_M + 2 * BLOCK_M];
@@ -2625,12 +2643,18 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                         }
                     }
                 }
+                if (nxt_tile_1 >= total_tiles) {
+                    break;
+                }
             }
             if (warp == 8) {
                 if (elect_sync()) {
                     asm volatile("cp.async.bulk.wait_group.read 0;");
                 }
             }
+            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+            asm volatile("tcgen05.fence::before_thread_sync;");
+            asm volatile("barrier.sync 9, 384;" ::: "memory");
         }
     }
     // ---- Role: mma ----
@@ -2658,21 +2682,14 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                 int nxt_kv_words_2;
                 int nxt_ws_slot_2;
                 int nxt_q_half_2;
-                int rec_2 = cluster_id * 8;
-                int doc_begin_2 = unit_table[rec_2];
-                int doc_len_3 = unit_table[rec_2 + 1];
-                int packed_2 = unit_table[rec_2 + 2];
-                int kv_words_2 = unit_table[rec_2 + 3];
-                int ws_slot_3 = unit_table[rec_2 + 4];
-                int q_half_2 = unit_table[rec_2 + 5];
-                nxt_doc_begin_2 = doc_begin_2;
-                nxt_doc_len_2 = doc_len_3;
-                nxt_packed_2 = packed_2;
-                nxt_kv_words_2 = kv_words_2;
-                nxt_ws_slot_2 = ws_slot_3;
-                nxt_q_half_2 = q_half_2;
+                nxt_doc_begin_2 = doc_begin;
+                nxt_doc_len_2 = doc_len;
+                nxt_packed_2 = packed;
+                nxt_kv_words_2 = kv_words;
+                nxt_ws_slot_2 = ws_slot;
+                nxt_q_half_2 = q_half;
                 #pragma unroll 1
-                for (unsigned int tile_idx_2 = cluster_id; tile_idx_2 < total_tiles; tile_idx_2 += num_clusters) {
+                for (unsigned int tile_idx_2 = cluster_id; tile_idx_2 < total_tiles; tile_idx_2++) {
                     int doc_begin_0_2 = nxt_doc_begin_2;
                     int doc_len_1_2 = nxt_doc_len_2;
                     int ws_slot_2_2 = nxt_ws_slot_2;
@@ -2683,28 +2700,13 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                     int unit_row0_2 = c_2 * 512 + (nxt_q_half_2 >> 1) * 256;
                     int full_rows_2 = ((doc_len_1_2 - unit_row0_2 > 256) ? 1 : 0);
                     int two_stages_2 = ((nxt_q_half_2 == 0) ? full_rows_2 : 0);
-                    unsigned int nxt_tile_2 = tile_idx_2 + num_clusters;
-                    int rec_3_2 = nxt_tile_2 * 8;
-                    int doc_begin_4_2 = unit_table[rec_3_2];
-                    int doc_len_5_2 = unit_table[rec_3_2 + 1];
-                    int packed_6_2 = unit_table[rec_3_2 + 2];
-                    int kv_words_7_2 = unit_table[rec_3_2 + 3];
-                    int ws_slot_8_2 = unit_table[rec_3_2 + 4];
-                    int q_half_9_2 = unit_table[rec_3_2 + 5];
-                    nxt_doc_begin_2 = doc_begin_4_2;
-                    nxt_doc_len_2 = doc_len_5_2;
-                    nxt_packed_2 = packed_6_2;
-                    nxt_kv_words_2 = kv_words_7_2;
-                    nxt_ws_slot_2 = ws_slot_8_2;
-                    nxt_q_half_2 = q_half_9_2;
+                    unsigned int tk_slot_2 = tile_idx_2 - cluster_id + 1 & 1;
+                    unsigned int tk_parity_2 = tile_idx_2 - cluster_id >> 1 & 1;
+                    unsigned int nxt_tile_2;
                     mbarrier_wait_cluster_hint(q_full_addr, _phase_q_full_0, 10000000);
                     _phase_q_full_0 ^= 1;
                     mbarrier_wait(kv_full_addr + (k_stage) * 8, k_phase);
-#if __CUDA_ARCH__ == 1000
-                    mbarrier_wait_hint(scale_empty_addr, _phase_scale_empty_0, 1000000);
-#else
                     mbarrier_wait(scale_empty_addr, _phase_scale_empty_0);
-#endif
                     _phase_scale_empty_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_a_lo_0 = ((smem_q0_addr) >> 4) & 0x3FFF;
@@ -2765,11 +2767,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_scores), "r"(0));
                     elect_commit_cg2_multicast(s_full_addr, (uint16_t)(3));
                     if (two_stages_2 == 1) {
-#if __CUDA_ARCH__ == 1000
-                        mbarrier_wait_hint(scale_empty_addr + 8, _phase_scale_empty_1, 1000000);
-#else
                         mbarrier_wait(scale_empty_addr + 8, _phase_scale_empty_1);
-#endif
                         _phase_scale_empty_1 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int _mma_a_lo_1 = ((smem_q1_addr) >> 4) & 0x3FFF;
@@ -2840,11 +2838,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                     for (unsigned int n_iter_2 = 0; n_iter_2 < num_n_blocks_2 - 1; n_iter_2++) {
                         int first_pv_flag = first_pv;
                         mbarrier_wait(kv_full_addr + (k_stage) * 8, k_phase);
-#if __CUDA_ARCH__ == 1000
-                        mbarrier_wait_hint(scale_empty_addr, _phase_scale_empty_0, 1000000);
-#else
                         mbarrier_wait(scale_empty_addr, _phase_scale_empty_0);
-#endif
                         _phase_scale_empty_0 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int _mma_a_lo_2 = ((smem_q0_addr) >> 4) & 0x3FFF;
@@ -2905,11 +2899,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                     :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"(tmem_scores), "r"(0));
                         elect_commit_cg2_multicast(s_full_addr, (uint16_t)(3));
                         mbarrier_wait(kv_full_addr + (v_stage) * 8, v_phase);
-#if __CUDA_ARCH__ == 1000
-                        mbarrier_wait_hint(p_full_addr, _phase_p_full_0, 1000000);
-#else
                         mbarrier_wait(p_full_addr, _phase_p_full_0);
-#endif
                         _phase_p_full_0 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int _mma_b_lo_3 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (v_stage) * 1024;
@@ -2990,11 +2980,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
 #endif
                         elect_commit_cg2_multicast(o_full_addr, (uint16_t)(3));
                         if (two_stages_2 == 1) {
-#if __CUDA_ARCH__ == 1000
-                            mbarrier_wait_hint(scale_empty_addr + 8, _phase_scale_empty_1, 1000000);
-#else
                             mbarrier_wait(scale_empty_addr + 8, _phase_scale_empty_1);
-#endif
                             _phase_scale_empty_1 ^= 1;
                             asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1000
@@ -3070,11 +3056,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                         k_stage += 1;
                         if (k_stage == 5) { k_stage = 0; k_phase ^= 1; }
                         if (two_stages_2 == 1) {
-#if __CUDA_ARCH__ == 1000
-                            mbarrier_wait_hint(p_full_addr + 8, _phase_p_full_1, 1000000);
-#else
                             mbarrier_wait(p_full_addr + 8, _phase_p_full_1);
-#endif
                             _phase_p_full_1 ^= 1;
                             asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1000
@@ -3169,11 +3151,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                     elect_commit_cg2_multicast(q_empty_addr, (uint16_t)(3));
                     int first_pv_flag_1 = first_pv;
                     mbarrier_wait(kv_full_addr + (v_stage) * 8, v_phase);
-#if __CUDA_ARCH__ == 1000
-                    mbarrier_wait_hint(p_full_addr, _phase_p_full_0, 1000000);
-#else
                     mbarrier_wait(p_full_addr, _phase_p_full_0);
-#endif
                     _phase_p_full_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1000
@@ -3258,11 +3236,7 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
 #endif
                     elect_commit_cg2_multicast(o_full_addr, (uint16_t)(3));
                     if (two_stages_2 == 1) {
-#if __CUDA_ARCH__ == 1000
-                        mbarrier_wait_hint(p_full_addr + 8, _phase_p_full_1, 1000000);
-#else
                         mbarrier_wait(p_full_addr + 8, _phase_p_full_1);
-#endif
                         _phase_p_full_1 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1000
@@ -3352,6 +3326,24 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                     if (v_stage == 5) { v_stage = 0; v_phase ^= 1; }
                     v_stage += 1;
                     if (v_stage == 5) { v_stage = 0; v_phase ^= 1; }
+                    mbarrier_wait(tk_full_addr + (tk_slot_2) * 8, tk_parity_2);
+                    nxt_tile_2 = tickets[tk_slot_2];
+                    int rec_3_1 = nxt_tile_2 * 8;
+                    int doc_begin_4_1 = unit_table[rec_3_1];
+                    int doc_len_5_1 = unit_table[rec_3_1 + 1];
+                    int packed_6_1 = unit_table[rec_3_1 + 2];
+                    int kv_words_7_1 = unit_table[rec_3_1 + 3];
+                    int ws_slot_8_1 = unit_table[rec_3_1 + 4];
+                    int q_half_9_1 = unit_table[rec_3_1 + 5];
+                    nxt_doc_begin_2 = doc_begin_4_1;
+                    nxt_doc_len_2 = doc_len_5_1;
+                    nxt_packed_2 = packed_6_1;
+                    nxt_kv_words_2 = kv_words_7_1;
+                    nxt_ws_slot_2 = ws_slot_8_1;
+                    nxt_q_half_2 = q_half_9_1;
+                    if (nxt_tile_2 >= total_tiles) {
+                        break;
+                    }
                 }
             }
         }
@@ -3366,23 +3358,28 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
             int nxt_kv_words_3;
             int nxt_ws_slot_3;
             int nxt_q_half_3;
-            int rec_4 = cluster_id * 8;
-            int doc_begin_3 = unit_table[rec_4];
-            int doc_len_4 = unit_table[rec_4 + 1];
-            int packed_3 = unit_table[rec_4 + 2];
-            int kv_words_3 = unit_table[rec_4 + 3];
-            int ws_slot_4 = unit_table[rec_4 + 4];
-            int q_half_3 = unit_table[rec_4 + 5];
-            nxt_doc_begin_3 = doc_begin_3;
-            nxt_doc_len_3 = doc_len_4;
-            nxt_packed_3 = packed_3;
-            nxt_kv_words_3 = kv_words_3;
-            nxt_ws_slot_3 = ws_slot_4;
-            nxt_q_half_3 = q_half_3;
+            nxt_doc_begin_3 = doc_begin;
+            nxt_doc_len_3 = doc_len;
+            nxt_packed_3 = packed;
+            nxt_kv_words_3 = kv_words;
+            nxt_ws_slot_3 = ws_slot;
+            nxt_q_half_3 = q_half;
+            int ticket_idx = (total_tiles + num_clusters) * 8;
+            int drawn;
+            int ticket;
+            unsigned int tk_slot0 = 1;
+            unsigned int tk_parity0 = 1;
+            if (cta_rank == 0) {
+                mbarrier_wait_cluster(tk_empty_addr + (tk_slot0) * 8, tk_parity0);
+                if (lane == 0) {
+                    int _atomic_old_0 = atomicAdd(&unit_table[ticket_idx], 1);
+                    drawn = _atomic_old_0;
+                }
+            }
             unsigned int _phase_q_empty_0 = 1;
             unsigned int _phase_kv_empty = 1;
             #pragma unroll 1
-            for (unsigned int tile_idx_3 = cluster_id; tile_idx_3 < total_tiles; tile_idx_3 += num_clusters) {
+            for (unsigned int tile_idx_3 = cluster_id; tile_idx_3 < total_tiles; tile_idx_3++) {
                 int doc_begin_0_3 = nxt_doc_begin_3;
                 int doc_len_1_3 = nxt_doc_len_3;
                 int ws_slot_2_3 = nxt_ws_slot_3;
@@ -3393,20 +3390,6 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                 int unit_row0_3 = c_3 * 512 + (nxt_q_half_3 >> 1) * 256;
                 int full_rows_3 = ((doc_len_1_3 - unit_row0_3 > 256) ? 1 : 0);
                 int two_stages_3 = ((nxt_q_half_3 == 0) ? full_rows_3 : 0);
-                unsigned int nxt_tile_3 = tile_idx_3 + num_clusters;
-                int rec_3_3 = nxt_tile_3 * 8;
-                int doc_begin_4_3 = unit_table[rec_3_3];
-                int doc_len_5_3 = unit_table[rec_3_3 + 1];
-                int packed_6_3 = unit_table[rec_3_3 + 2];
-                int kv_words_7_3 = unit_table[rec_3_3 + 3];
-                int ws_slot_8_3 = unit_table[rec_3_3 + 4];
-                int q_half_9_3 = unit_table[rec_3_3 + 5];
-                nxt_doc_begin_3 = doc_begin_4_3;
-                nxt_doc_len_3 = doc_len_5_3;
-                nxt_packed_3 = packed_6_3;
-                nxt_kv_words_3 = kv_words_7_3;
-                nxt_ws_slot_3 = ws_slot_8_3;
-                nxt_q_half_3 = q_half_9_3;
                 int q_row0 = doc_begin_0_3 + unit_row0_3 + cta_rank * BLOCK_M;
                 int q_row1 = q_row0 + 256;
                 mbarrier_wait(q_empty_addr, _phase_q_empty_0);
@@ -3423,6 +3406,27 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                             :: "r"((q_full_addr) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
                         tma_4d_gmem2smem_cta2(smem_q0_addr, (&Q), 0, q_row0, head_3, 0, ((q_full_addr) & 0xFEFFFFFF));
+                    }
+                }
+                unsigned int tk_slot_3 = tile_idx_3 - cluster_id + 1 & 1;
+                unsigned int tk_parity_3 = tile_idx_3 - cluster_id >> 1 & 1;
+                int mailbox = (total_tiles + cluster_id) * 8 + 6;
+                if (cta_rank == 0) {
+                    if (lane == 0) {
+                        int grid_clusters = num_clusters;
+                        ticket = drawn + grid_clusters;
+                        unit_table[mailbox] = ticket;
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b32 remAddr32;\n\t"
+                            "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+                            "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [remAddr32];\n\t"
+                            "}"
+                            :: "r"(tk_go_addr + tk_slot_3 * 8), "r"(1) : "memory");
+                        int last_draw = total_tiles - 1;
+                        if (drawn == last_draw) {
+                            unit_table[ticket_idx] = 0;
+                        }
                     }
                 }
                 #pragma unroll 1
@@ -3448,6 +3452,46 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
                     load_stage += 1;
                     if (load_stage == 5) { load_stage = 0; _phase_kv_empty ^= 1; }
                 }
+                if (cta_rank == 1) {
+                    mbarrier_wait_cluster(tk_go_addr + (tk_slot_3) * 8, tk_parity_3);
+                    if (lane == 0) {
+                        int _atomic_old_1 = atomicAdd(&unit_table[mailbox], 0);
+                        ticket = _atomic_old_1;
+                    }
+                }
+                if (lane == 0) {
+                    tickets[tk_slot_3] = ticket;
+                    mbarrier_arrive(tk_full_addr + (tk_slot_3) * 8);
+                }
+                int _shfl_0 = __shfl_sync(0xFFFFFFFF, ticket, 0);
+                unsigned int nxt_tile_3 = _shfl_0;
+                int rec_3_2 = nxt_tile_3 * 8;
+                int doc_begin_4_2 = unit_table[rec_3_2];
+                int doc_len_5_2 = unit_table[rec_3_2 + 1];
+                int packed_6_2 = unit_table[rec_3_2 + 2];
+                int kv_words_7_2 = unit_table[rec_3_2 + 3];
+                int ws_slot_8_2 = unit_table[rec_3_2 + 4];
+                int q_half_9_2 = unit_table[rec_3_2 + 5];
+                nxt_doc_begin_3 = doc_begin_4_2;
+                nxt_doc_len_3 = doc_len_5_2;
+                nxt_packed_3 = packed_6_2;
+                nxt_kv_words_3 = kv_words_7_2;
+                nxt_ws_slot_3 = ws_slot_8_2;
+                nxt_q_half_3 = q_half_9_2;
+                if (nxt_tile_3 < total_tiles) {
+                    if (cta_rank == 0) {
+                        unsigned int tk_slot2 = tile_idx_3 - cluster_id + 2 & 1;
+                        unsigned int tk_parity2 = tile_idx_3 - cluster_id + 1 >> 1 & 1;
+                        mbarrier_wait_cluster(tk_empty_addr + (tk_slot2) * 8, 1 - tk_parity2);
+                        if (lane == 0) {
+                            int _atomic_old_2 = atomicAdd(&unit_table[ticket_idx], 1);
+                            drawn = _atomic_old_2;
+                        }
+                    }
+                }
+                if (nxt_tile_3 >= total_tiles) {
+                    break;
+                }
             }
         }
     }
@@ -3457,12 +3501,6 @@ kernel_cake_minimax_h3_varlen_attention_ee96b07d39fc362d3fe5(const __grid_consta
     }
 
     // Cleanup
-    asm volatile("barrier.cluster.arrive.release.aligned;");
-    asm volatile("barrier.cluster.wait.acquire.aligned;");
-
-    if (warp == 0) {
-        asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
-    }
 }
 
 } // extern "C"
