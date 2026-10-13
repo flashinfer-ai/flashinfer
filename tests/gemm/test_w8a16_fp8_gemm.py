@@ -128,7 +128,15 @@ def test_w8a16_fp8_gemm_rejects_bad_inputs():
 
 
 @pytest.mark.parametrize(
-    "algo", ["2sm256x128", "2sm256x192", "2sm256x256", "1sm128x128", "2sm256x128_splitk"]
+    "algo",
+    [
+        "2sm256x128",
+        "2sm256x192",
+        "2sm256x256",
+        "1sm128x128",
+        "2sm256x128_splitk",
+        "2sm256x128_streamk",
+    ],
 )
 @pytest.mark.parametrize("m,n,k", [(1024, 1024, 5120), (200, 1024, 5120), (4096, 128, 5120)])
 @pytest.mark.parametrize("bias", [False, True])

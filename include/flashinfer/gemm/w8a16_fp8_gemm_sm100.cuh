@@ -65,6 +65,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/packed_stride.hpp"
@@ -296,8 +297,20 @@ using W8A16Sm100Cfg2SM256x192 = W8A16Sm100Cfg<256, 192, 128, 2, true>;
 // many tiles for the persistent scheduler; W8A16Sm100SplitKReduceKernel then sums the
 // partials, applies the per-tensor scale and the bias and casts.  Scale and bias are
 // deferred to the reduce (alpha = 1 here) so the partials are plain accumulators.
-template <typename T, typename Cfg, bool kSplitK = false>
+// Version B13: stream-K.  With kStreamK the kernel runs under CUTLASS's SM100 stream-K
+// tile scheduler instead of the plain persistent one: the full waves stay data-parallel
+// (one cluster per output tile, whole K), and the tiles of the partial last wave(s) are
+// cut along K into equal iteration counts handed to every resident cluster, so no
+// cluster idles while a dozen others walk a whole K.  Peers of a tile reduce their fp32
+// partials through the scheduler workspace (deterministic order); only the final peer
+// runs the real epilogue (scale, bias, cast), so the output path is the plain one.  The
+// mainloop is untouched: kernel.hpp already consumes the per-unit k-range and calls the
+// scheduler's fixup before the epilogue.  Mutually exclusive with kSplitK.
+inline cutlass::gemm::kernel::detail::DecompositionMode W8A16Sm100StreamKModeEnv();
+
+template <typename T, typename Cfg, bool kSplitK = false, bool kStreamK = false>
 struct W8A16Sm100Gemm {
+  static_assert(!(kSplitK && kStreamK), "split-K and stream-K are different variants");
   using ElementW = cutlass::float_e4m3_t;
   using ElementAct = typename W8A16Sm100CutlassType<T>::type;
   using ElementD = std::conditional_t<kSplitK, float, ElementAct>;
@@ -340,8 +353,11 @@ struct W8A16Sm100Gemm {
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
       typename Cfg::MainloopSchedule>::CollectiveOp;
 
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>,
-                                                          CollectiveMainloop, CollectiveEpilogue>;
+  using TileSchedulerTag =
+      std::conditional_t<kStreamK, cutlass::gemm::StreamKScheduler, void>;
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,
+                                           CollectiveEpilogue, TileSchedulerTag>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
   using StrideA = typename GemmKernel::StrideA;
@@ -389,6 +405,15 @@ struct W8A16Sm100Gemm {
       (void)scale;
       (void)bias;
     }
+    if constexpr (kStreamK) {
+      // Heuristic: data-parallel for the full waves, stream-K for the tiles of the last
+      // (up to two) waves; collapses to plain split-K when the leftover tiles divide the
+      // clusters evenly, and to data-parallel when there is nothing to balance.
+      // FLASHINFER_W8A16_FP8_STREAMK_MODE pins a decomposition for benchmarking.
+      args.scheduler.decomposition_mode = W8A16Sm100StreamKModeEnv();
+      args.scheduler.reduction_mode =
+          cutlass::gemm::kernel::detail::ReductionMode::Deterministic;
+    }
     return args;
   }
 
@@ -396,8 +421,9 @@ struct W8A16Sm100Gemm {
     return kSplitK && splits > 1 ? static_cast<size_t>(splits) * M * N * sizeof(float) : 0;
   }
 
-  // CUTLASS workspace (persistent scheduler: usually 0) rounded to 256 B, then the
-  // fp32 partials for split-K.
+  // CUTLASS workspace (persistent scheduler: usually 0; stream-K: the peers' fp32
+  // partials plus per-tile barriers) rounded to 256 B, then the fp32 partials for
+  // split-K.
   static size_t WorkspaceBytes(int M, int N, int K, int device_id, int num_sms, int splits = 1) {
     auto args = MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, device_id,
                               num_sms, splits);
@@ -449,9 +475,10 @@ enum class W8A16Sm100Tile {
   k1SM128x128 = 2,
   k2SM256x256 = 3,
   k2SM256x192 = 4,
-  k2SM256x128SplitK = 5  // rung B12: 256x128 tile, batched K-slices + fp32 reduce
+  k2SM256x128SplitK = 5,  // version B12: 256x128 tile, batched K-slices + fp32 reduce
+  k2SM256x128StreamK = 6  // version B13: 256x128 tile under the stream-K scheduler
 };
-constexpr int kW8A16Sm100MaxTileCode = 5;
+constexpr int kW8A16Sm100MaxTileCode = 6;
 constexpr int kW8A16Sm100MaxSplits = 8;
 
 inline W8A16Sm100Tile W8A16Sm100TileFromCode(int code) {
@@ -460,7 +487,7 @@ inline W8A16Sm100Tile W8A16Sm100TileFromCode(int code) {
 }
 
 // FLASHINFER_W8A16_FP8_TILE_SM100 = "2sm256x128" | "1sm128x128" | "2sm256x256" |
-// "2sm256x192" | "2sm256x128_splitk" pins the tile; read once.
+// "2sm256x192" | "2sm256x128_splitk" | "2sm256x128_streamk" pins the tile; read once.
 inline W8A16Sm100Tile W8A16Sm100TileEnv() {
   static const W8A16Sm100Tile tile = [] {
     const char* s = std::getenv("FLASHINFER_W8A16_FP8_TILE_SM100");
@@ -470,9 +497,26 @@ inline W8A16Sm100Tile W8A16Sm100TileEnv() {
     if (std::strcmp(s, "2sm256x256") == 0) return W8A16Sm100Tile::k2SM256x256;
     if (std::strcmp(s, "2sm256x192") == 0) return W8A16Sm100Tile::k2SM256x192;
     if (std::strcmp(s, "2sm256x128_splitk") == 0) return W8A16Sm100Tile::k2SM256x128SplitK;
+    if (std::strcmp(s, "2sm256x128_streamk") == 0) return W8A16Sm100Tile::k2SM256x128StreamK;
     return W8A16Sm100Tile::kAuto;
   }();
   return tile;
+}
+
+// FLASHINFER_W8A16_FP8_STREAMK_MODE = "heuristic" (default) | "streamk" | "splitk" |
+// "dataparallel": the decomposition handed to the stream-K scheduler of the
+// 2sm256x128_streamk variant.  For benchmarking; read once.
+inline cutlass::gemm::kernel::detail::DecompositionMode W8A16Sm100StreamKModeEnv() {
+  using Mode = cutlass::gemm::kernel::detail::DecompositionMode;
+  static const Mode mode = [] {
+    const char* s = std::getenv("FLASHINFER_W8A16_FP8_STREAMK_MODE");
+    if (s == nullptr || *s == '\0') return Mode::Heuristic;
+    if (std::strcmp(s, "streamk") == 0) return Mode::StreamK;
+    if (std::strcmp(s, "splitk") == 0) return Mode::SplitK;
+    if (std::strcmp(s, "dataparallel") == 0) return Mode::DataParallel;
+    return Mode::Heuristic;
+  }();
+  return mode;
 }
 
 // Split count for the 256x128 2SM tile (rung B12).  Two cases split, both from the
@@ -565,6 +609,9 @@ size_t W8A16Fp8GemmSm100WorkspaceBytes(int M, int N, int K, int device_id, int n
     case W8A16Sm100Tile::k2SM256x128SplitK:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, true>::WorkspaceBytes(
           M, N, K, device_id, num_sms, std::max(2, W8A16Sm100SplitsFor(M, N, K, num_sms)));
+    case W8A16Sm100Tile::k2SM256x128StreamK:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, false, true>::WorkspaceBytes(
+          M, N, K, device_id, num_sms);
     case W8A16Sm100Tile::k1SM128x128:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg1SM128x128>::WorkspaceBytes(M, N, K, device_id,
                                                                         num_sms);
@@ -593,6 +640,10 @@ cudaError_t W8A16Fp8GemmSm100(const T* act, const __nv_fp8_e4m3* weight, const f
           act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
           stream, splits);
     }
+    case W8A16Sm100Tile::k2SM256x128StreamK:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, false, true>::Run(
+          act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
+          stream);
     case W8A16Sm100Tile::k1SM128x128:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg1SM128x128>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,
