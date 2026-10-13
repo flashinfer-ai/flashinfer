@@ -39,7 +39,9 @@ _FP4_LUT = (
 # The twenty scheduled model rows plus rows outside the old route table: KV
 # lengths never catalogued (2048, 8192, 65536, 1048576 for one query) and query
 # counts that are not 1, 16 or 128 (partial four-query blocks, 33 and 132
-# queries, and 2052/2053 queries on the unbounded metadata tier).
+# queries, and 2052/2053 queries on the unbounded metadata tier), plus one row
+# per two-launch route at the first KV length above its single-launch class's
+# policy bound (the ``:short`` classes serve every other row of this table).
 CASES = [
     (precision, queries, keys)
     for precision in ("fp4", "fp8")
@@ -69,6 +71,20 @@ CASES = [
     ("fp8", 2053, 2048),
     ("fp8", 132, 2048),
     ("fp8", 33, 8192),
+    ("fp8", 1, 1048832),
+    ("fp8", 16, 1048832),
+    ("fp8", 3, 1048832),
+    ("fp8", 128, 131328),
+    ("fp8", 33, 1048832),
+    ("fp8", 132, 8448),
+    ("fp8", 130, 8448),
+    ("fp8", 2052, 8448),
+    ("fp8", 2053, 8448),
+    ("fp4", 1, 131328),
+    ("fp4", 16, 1048832),
+    ("fp4", 33, 1048832),
+    ("fp4", 130, 65792),
+    ("fp4", 2052, 65792),
 ]
 
 
@@ -267,6 +283,14 @@ def test_dense_mqa_logits(precision, queries, keys):
         precision, q, kv, weights, starts, ends, q_scales=qs, kv_scales=ks
     )
     assert plan.route_name == _runtime.route_name(precision, queries, keys)
+    # One submission per stage, or one for a prepared sequence; a ``:short``
+    # route is a single logits launch that writes the schedule itself.
+    assert plan.launch_count == (
+        1 if plan.route.get("sequence") else len(plan.route["stages"])
+    )
+    if plan.route_name.endswith(":short"):
+        assert plan.launch_count == 1
+        assert [stage for stage, _p in plan.route["stages"]] == ["logits"]
     sms = plan.num_sms
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -309,24 +333,89 @@ def test_dense_mqa_logits(precision, queries, keys):
 @pytest.mark.parametrize(
     "precision,queries,keys,route",
     [
-        ("fp4", 1, 4096, "fp4:q1"),
-        ("fp4", 16, 1048576, "fp4:le16"),
-        ("fp4", 7, 2048, "fp4:le16"),
-        ("fp4", 17, 2048, "fp4:le128"),
-        ("fp4", 130, 65536, "fp4:le2048"),
-        ("fp4", 2049, 4096, "fp4:any"),
+        # FP4: fused single-query chain, then the scan class of the query count
+        # (smallest covering block ceiling, its own KV bound), then the pair.
+        ("fp4", 1, 4096, "fp4:q1:short"),
+        ("fp4", 1, 131072, "fp4:q1:short"),
+        ("fp4", 1, 131328, "fp4:q1"),
+        ("fp4", 7, 2048, "fp4:le32:short"),
+        ("fp4", 16, 1048576, "fp4:le32:short"),
+        ("fp4", 16, 1048832, "fp4:le16"),
+        ("fp4", 17, 2048, "fp4:le32:short"),
+        ("fp4", 128, 4096, "fp4:le32:short"),
+        ("fp4", 33, 1048832, "fp4:le128"),
+        ("fp4", 130, 65536, "fp4:le1024:short"),
+        ("fp4", 130, 65792, "fp4:le2048"),
+        ("fp4", 2049, 4096, "fp4:le1024:short"),
+        ("fp4", 2052, 65792, "fp4:any"),
+        ("fp4", 4100, 2048, "fp4:any"),  # 1025 query blocks: no scan class
+        # FP8: fused Q1 chain, plain Q1 pair, fused Q128 text, the scan class
+        # qualified by block kind (Q = 128 never takes a class), then the pair.
         ("fp8", 1, 4096, "fp8:q1:short"),
-        ("fp8", 1, 131072, "fp8:q1:short"),
-        ("fp8", 1, 131328, "fp8:q1"),
+        ("fp8", 1, 1048576, "fp8:q1:short"),
+        ("fp8", 1, 1048832, "fp8:q1"),
         ("fp8", 128, 4096, "fp8:q128:short"),
-        ("fp8", 128, 4352, "fp8:full:le128"),
-        ("fp8", 16, 2048, "fp8:full:le16"),
-        ("fp8", 3, 8192, "fp8:partial:le16"),
-        ("fp8", 130, 8192, "fp8:partial:le2048"),
+        ("fp8", 128, 131072, "fp8:q128:short"),
+        ("fp8", 128, 131328, "fp8:full:le128"),
+        ("fp8", 16, 2048, "fp8:full:le32:short"),
+        ("fp8", 16, 1048576, "fp8:full:le32:short"),
+        ("fp8", 16, 1048832, "fp8:full:le16"),
+        ("fp8", 3, 8192, "fp8:partial:le32:short"),
+        ("fp8", 3, 1048832, "fp8:partial:le16"),
+        ("fp8", 33, 8192, "fp8:partial:le32:short"),
+        ("fp8", 33, 1048832, "fp8:partial:le128"),
+        ("fp8", 124, 4096, "fp8:full:le32:short"),
+        ("fp8", 132, 2048, "fp8:full:le768:short"),
+        ("fp8", 132, 8192, "fp8:full:le768:short"),
+        ("fp8", 132, 8448, "fp8:full:le2048"),
+        ("fp8", 130, 8192, "fp8:partial:le768:short"),
+        ("fp8", 130, 8448, "fp8:partial:le2048"),
+        ("fp8", 2052, 2048, "fp8:full:le768:short"),
+        ("fp8", 2052, 8448, "fp8:full:any"),
+        ("fp8", 2053, 2048, "fp8:partial:le768:short"),
+        ("fp8", 2053, 8448, "fp8:partial:any"),
+        ("fp8", 3076, 2048, "fp8:full:any"),  # 769 query blocks: no scan class
     ],
 )
 def test_dense_mqa_route_selection(precision, queries, keys, route):
     assert _runtime.route_name(precision, queries, keys) == route
+
+
+def test_dense_single_launch_policy_is_published():
+    """Host-only: the v9 policy carries the single-launch classes the router
+    reads -- the FP8 scan ceilings with one KV bound each and the ``fp4`` block
+    (fused Q1 bound, scan ceilings, one KV bound each) -- as positive multiples
+    of the 256-token KV alignment, ceilings ascending; every ``:short`` 32-head
+    route is one ``logits`` stage of the catalog."""
+    catalog = _runtime._catalog()
+    policy = catalog["policy"]
+    tables = {"fp8": policy, "fp4": policy["fp4"]}
+    for precision, table in tables.items():
+        ceilings = [int(c) for c in table["fused_scan_ceilings"]]
+        assert ceilings == sorted(ceilings) and ceilings[0] >= 1, precision
+        for ceiling in ceilings:
+            bound = int(table[f"fused_scan{ceiling}_max_kv"])
+            assert bound >= 256 and bound % 256 == 0, (precision, ceiling)
+        q1_bound = int(table["fused_q1_max_kv"])
+        assert q1_bound >= 256 and q1_bound % 256 == 0, precision
+    assert int(policy["fused_q128_max_kv"]) % 256 == 0
+    short = {
+        route
+        for route, record in catalog["routes"].items()
+        if route.endswith(":short") and int(record["num_heads"]) == 32
+    }
+    expected = {"fp8:q1:short", "fp8:q128:short", "fp4:q1:short"}
+    for ceiling in tables["fp8"]["fused_scan_ceilings"]:
+        for kind in ("full", "partial"):
+            expected.add(f"fp8:{kind}:le{int(ceiling)}:short")
+    for ceiling in tables["fp4"]["fused_scan_ceilings"]:
+        expected.add(f"fp4:le{int(ceiling)}:short")
+    assert short == expected
+    for route in short:
+        record = catalog["routes"][route]
+        assert [stage for stage, _p in record["stages"]] == ["logits"], route
+        assert not record.get("sequence"), route
+        assert record["clean_logits"] == "fused" and record["kv_alignment"] == 256
 
 
 @pytest.mark.parametrize("sm_count", [132, 148, 152])
@@ -344,7 +433,7 @@ def test_dense_mqa_sm_count_definition(sm_count):
     )
     assert plan.route_name == "fp8:q1:short"
     assert plan.num_sms == sm_count
-    program = dict(plan.route["stages"])["logits"]
+    program = dict(plan.route["stages"])["logits"][arch]
     assert plan.program_names == [program]
     record = _runtime._catalog()["programs"][program]
     assert record["definitions"] == ["SM_COUNT"]
@@ -377,23 +466,39 @@ def test_dense_mqa_rejects_unsupported_shapes():
 
 
 def test_dense_route_table_is_catalog_driven():
-    """Host-only: the 32-head names are unchanged, other head counts carry the
-    ``h<H>`` infix with tiers named by their token ceiling, and availability
-    (including the per-head KV alignment) is the catalog's word."""
-    assert _runtime.route_name("fp8", 16, 4096) == "fp8:full:le16"
+    """Host-only: the 32-head names carry no head infix (the single-launch
+    classes by query-block kind and ceiling, the pairs by metadata tier), other
+    head counts carry the ``h<H>`` infix with tiers named by their token
+    ceiling, and availability (including the per-head KV alignment) is the
+    catalog's word."""
+    assert _runtime.route_name("fp8", 16, 4096) == "fp8:full:le32:short"
+    assert _runtime.route_name("fp8", 16, 1048832) == "fp8:full:le16"
     assert _runtime.route_name("fp8", 1, 4096) == "fp8:q1:short"
-    assert _runtime.route_name("fp8", 130, 8192) == "fp8:partial:le2048"
+    assert _runtime.route_name("fp8", 130, 8192) == "fp8:partial:le768:short"
+    assert _runtime.route_name("fp8", 130, 8448) == "fp8:partial:le2048"
     assert _runtime.dense_route_available(32, 16, 4096)
+    assert _runtime.dense_route_available(32, 16, 1048832)
     assert not _runtime.dense_route_available(32, 16, 4100)  # 32 heads: K % 256
-    record = _runtime.route_record("fp8", 16, 4096)
-    assert record["num_heads"] == 32 and record["block_q"] == 4
-    assert record["clean_logits"] == "fused" and record["kv_alignment"] == 256
+    for keys in (4096, 1048832):
+        record = _runtime.route_record("fp8", 16, keys)
+        assert record["num_heads"] == 32 and record["block_q"] == 4
+        assert record["clean_logits"] == "fused" and record["kv_alignment"] == 256
+    # A 32-head ``:short`` route is served everywhere (no per-arch admission).
+    for arch in sorted(_runtime._catalog()["arches"]):
+        served = _runtime.served_route("fp8", 16, 4096, arch=arch)
+        assert served == "fp8:full:le32:short"
+        assert _runtime.served_route("fp4", 7, 2048, arch=arch) == "fp4:le32:short"
+        assert _runtime.dense_route_available(32, 7, 2048, "fp4", arch=arch)
     if 64 in _runtime.heads():
         assert _runtime.block_q(64) == 2
         assert _runtime.route_name("fp8", 16, 4096, 64) == "fp8:h64:full:le64"
         assert _runtime.route_name("fp8", 3, 4100, 64) == "fp8:h64:partial:le8"
         assert _runtime.route_name("fp8", 1, 300, 64) == "fp8:h64:q1"
         assert _runtime.route_name("fp8", 1024, 5124, 64) == "fp8:h64:full:le1024"
+        assert _runtime.route_name("fp8", 37, 37, 64) == "fp8:h64:partial:short"
+        assert _runtime.route_name("fp8", 16, 16, 64) == "fp8:h64:full:short"
+        assert _runtime.route_name("fp8", 2, 2, 64) == "fp8:h64:full:le8"
+        assert _runtime.route_name("fp8", 3, 257, 64) == "fp8:h64:partial:le8"
         # W-dense contract: single-stage gridDim-strided programs, no metadata stage, no query bound.
         assert not _runtime.schedules_metadata(64) and _runtime.max_queries(64) is None
         # Availability of a 64-head point is decided per architecture (policy.dense_admission).
@@ -413,12 +518,20 @@ def test_dense_route_table_is_catalog_driven():
         assert [stage for stage, _p in record["stages"]] == ["logits"]
         # Only tiers admitted on at least one architecture have a record (and programs); a route withheld
         # everywhere is absent from the table. Every catalogued 64-head route is a single logits stage whose
-        # program is a catalogued program (program ids are the generated-unit names, not template names).
-        programs = set(_runtime._catalog()["programs"])
+        # program on each architecture is a catalogued program delivered for that architecture (program ids
+        # are the generated-unit names, not template names; the 64-head production text is chosen per
+        # architecture, so the union over the architectures may hold one program per architecture).
+        programs = _runtime._catalog()["programs"]
+        arches = sorted(_runtime._catalog()["arches"])
         for r in _runtime._catalog()["routes"]:
             if r.startswith("fp8:h64:"):
-                names = _runtime.program_names(r)
-                assert len(names) == 1 and set(names) <= programs, (r, names)
+                for a in arches:
+                    names = _runtime.program_names(r, arch=a)
+                    assert len(names) == 1 and names[0] in programs, (r, a, names)
+                    assert a in programs[names[0]]["arches"], (r, a, names)
+                union = _runtime.program_names(r)
+                assert 1 <= len(union) <= len(arches), (r, union)
+                assert set(union) <= set(programs), (r, union)
     else:
         assert not _runtime.dense_route_available(64, 16, 4096)
     assert (
@@ -580,8 +693,13 @@ def test_catalog_programs_are_delivered_and_distinct():
     generated = "csrc/experimental/deepgemm_dense_mqa/generated"
     for table in ("routes", "paged_routes"):
         for route, record in catalog.get(table, {}).items():
-            for _stage, program in record["stages"]:
-                assert program in programs, (table, route, program)
+            for _stage, by_arch in record["stages"]:
+                where = (table, route, by_arch)
+                assert sorted(by_arch) == sorted(catalog["arches"]), where
+                for arch, program in by_arch.items():
+                    where = (table, route, arch, program)
+                    assert program in programs, where
+                    assert arch in programs[program]["arches"], where
             assert not record.get("sequence") or record["sequence"] in programs, (
                 table,
                 route,
@@ -645,7 +763,7 @@ def test_h64_admission_matches_the_catalog_table():
         *(
             f"fp8:h64:{kind}:{tier}"
             for kind in ("full", "partial")
-            for tier in ("le8", "le64", "le1024", "any")
+            for tier in ("le8", "le64", "le1024", "any", "short")
         ),
     }
     verdicts, sample = {}, {}
@@ -669,6 +787,37 @@ def test_h64_admission_matches_the_catalog_table():
             ), (arch, queries, route)
             verdicts.setdefault(route, set()).add(route in admitted)
             sample.setdefault(route, queries)
+        # The one-split ``:short`` routes (K <= dense_short.max_kv, >= dense_short.min_q_blocks query blocks):
+        # served where admitted, otherwise by the tier route of the query count -- never the stock kernel, so
+        # dense_route_available follows the served route and the fallback is a route the arch admits.
+        short = catalog["policy"]["dense_short"]
+        assert short["fallback"] == "tier" and int(short["min_q_blocks"]) == 2
+        max_kv = int(short["max_kv"])
+        for queries in (3, 4, 8, 16, 37, 64, 128, 129, 255, 256):
+            route = _runtime.route_name("fp8", queries, max_kv, 64)
+            assert route.endswith(":short"), (queries, route)
+            served = _runtime.served_route("fp8", queries, max_kv, 64, arch=arch)
+            kind = route.split(":")[-2]
+            if route in admitted:
+                assert served == route
+            else:
+                assert served == f"fp8:h64:{kind}:{_runtime.metadata_tier(queries, 64)}"
+            assert _runtime.dense_route_available(64, queries, max_kv, arch=arch) == (
+                served in admitted
+            ), (arch, queries, served)
+            record = _runtime.route_record("fp8", queries, max_kv, 64, arch=arch)
+            assert record["stages"][0][0] == "logits"
+        for queries in (1, 2):
+            route = _runtime.route_name("fp8", queries, max_kv, 64)
+            assert not route.endswith(":short")
+        assert not _runtime.route_name("fp8", 3, max_kv + 1, 64).endswith(":short")
+        # 32 heads never take the 64-head one-split route: at this KV length Q = 37 is the 32-head
+        # in-kernel scan class (v9 ``fp8:partial:le32:short``); above that class's policy bound the
+        # metadata + logits pair serves it.
+        route32 = _runtime.route_name("fp8", 37, max_kv, 32)
+        assert route32 == "fp8:partial:le32:short", route32
+        above32 = int(catalog["policy"]["fused_scan32_max_kv"]) + 256
+        assert not _runtime.route_name("fp8", 37, above32, 32).endswith(":short")
     for route, outcomes in verdicts.items():
         if len(outcomes) == 1:
             assert (
@@ -684,23 +833,34 @@ def test_h64_admission_matches_the_catalog_table():
 
 def _route_point(route_name, record):
     """A legal ``(queries, keys)`` of one dense route: the KV length that selects the
-    route's KV range (``:short`` fused routes below their ceiling, the non-fused
-    ``fp8:q1`` above ``fused_q1_max_kv``, the 64-head routes any length) and the
+    route's KV range (``:short`` routes below their class's bound, a 32-head
+    two-launch route at the first KV length above the single-launch bound that
+    would otherwise own the query count, the 64-head routes any length) and the
     smallest query count the router maps to the route name."""
     policy = _runtime._catalog()["policy"]
     precision = route_name.split(":")[0]
     num_heads = int(record["num_heads"])
     if route_name.endswith(":short"):
-        keys = 512
-    elif route_name == "fp8:q1":
-        keys = int(policy["fused_q1_max_kv"]) + 256
+        # 32 heads: the single-launch routes below their KV bound; 64 heads: the one-split routes at K <= dense_short.max_kv
+        short_kv = int(policy["dense_short"]["max_kv"])
+        candidates = [512 if num_heads == _runtime.NUM_HEADS else short_kv]
+    elif num_heads == _runtime.NUM_HEADS:
+        # the two-launch pairs: 256 past each single-launch bound of the precision
+        table = policy if precision == "fp8" else policy["fp4"]
+        bounds = [int(table["fused_q1_max_kv"])]
+        if precision == "fp8":
+            bounds.append(int(policy["fused_q128_max_kv"]))
+        for ceiling in table["fused_scan_ceilings"]:
+            bounds.append(int(table[f"fused_scan{int(ceiling)}_max_kv"]))
+        candidates = [512] + sorted({bound + 256 for bound in bounds})
     else:
-        keys = 512 if num_heads == _runtime.NUM_HEADS else 300
-    for queries in range(1, 4200):
-        if _runtime.route_name(precision, queries, keys, num_heads) == route_name:
-            return queries, keys
+        candidates = [300]
+    for keys in candidates:
+        for queries in range(1, 4200):
+            if _runtime.route_name(precision, queries, keys, num_heads) == route_name:
+                return queries, keys
     raise AssertionError(
-        f"no query count in 1..4199 selects {route_name} at K = {keys}"
+        f"no query count in 1..4199 selects {route_name} at K in {candidates}"
     )
 
 
@@ -765,7 +925,12 @@ def test_dense_bindings_cover_every_program_argument():
         if sequence:
             selections = [(None, sequence)]
         else:
-            selections = [tuple(stage) for stage in record["stages"]]
+            # Every program a stage launches on any architecture binds the same way.
+            selections = [
+                (stage, program)
+                for stage, by_arch in record["stages"]
+                for program in sorted(set(by_arch.values()))
+            ]
         for stage, program in selections:
             missing = []
             for kind, key in catalog["programs"][program]["arg_plan"]:
