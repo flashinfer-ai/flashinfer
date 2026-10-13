@@ -196,6 +196,8 @@ using W8A16Sm90Cfg64x256 = W8A16Sm90Cfg<64, 256>;  // ping-pong: 2 tiles in flig
 
 inline cutlass::gemm::kernel::detail::DecompositionMode W8A16Sm90StreamKModeEnv();
 inline cutlass::gemm::kernel::detail::ReductionMode W8A16Sm90StreamKReductionEnv();
+inline int W8A16Sm90SwizzleEnv();
+inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm90RasterEnv();
 
 template <typename T, typename Cfg, bool kStreamK = false>
 struct W8A16Sm90Gemm {
@@ -269,6 +271,11 @@ struct W8A16Sm90Gemm {
     fusion.beta_ptr = nullptr;
     fusion.bias_ptr = reinterpret_cast<const ElementBias*>(bias);  // nullptr -> 0
     fusion.dBias = {cute::_1{}, cute::_0{}, 0};
+    // Tile walk order of the persistent scheduler (both the plain and the stream-K one):
+    // the raster direction and how many tile rows / columns are grouped so that the
+    // operand slab they share stays in L2.  CUTLASS's default is no grouping.
+    args.scheduler.max_swizzle_size = W8A16Sm90SwizzleEnv();
+    args.scheduler.raster_order = W8A16Sm90RasterEnv();
     if constexpr (kStreamK) {
       args.scheduler.decomposition_mode = W8A16Sm90StreamKModeEnv();
       args.scheduler.reduction_mode = W8A16Sm90StreamKReductionEnv();
@@ -366,6 +373,34 @@ inline cutlass::gemm::kernel::detail::ReductionMode W8A16Sm90StreamKReductionEnv
     return Mode::Deterministic;
   }();
   return mode;
+}
+
+// FLASHINFER_W8A16_FP8_SM90_SWIZZLE = 1 | 2 | 4 | 8 (default): tile-group size of the
+// persistent scheduler's L2 swizzle.  FLASHINFER_W8A16_FP8_SM90_RASTER = "heuristic"
+// (default) | "m" | "n": raster direction (M = along the weight tiles, N = along the
+// activation tiles).  CUTLASS's own default is no grouping (1), and that is where the
+// CUTLASS mainloop looked 12% slower than the hand kernel: ncu at locked clocks on
+// gen.qkv tp1 M=8192 (N=10240 K=5120), Tue 13 Oct 2026, 128x256 tile: swizzle 1 =
+// 1.261 ms at 56% of DRAM peak, swizzle 8 = 1.117 ms, the hand kernel 1.121 ms.  The
+// raster direction does not matter once the groups are 8 wide.  For benchmarking; read once.
+inline int W8A16Sm90SwizzleEnv() {
+  static const int v = [] {
+    const char* s = std::getenv("FLASHINFER_W8A16_FP8_SM90_SWIZZLE");
+    const int n = (s != nullptr && *s != '\0') ? std::atoi(s) : 8;
+    return (n == 1 || n == 2 || n == 4 || n == 8) ? n : 8;
+  }();
+  return v;
+}
+
+inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm90RasterEnv() {
+  using R = cutlass::gemm::kernel::detail::RasterOrderOptions;
+  static const R v = [] {
+    const char* s = std::getenv("FLASHINFER_W8A16_FP8_SM90_RASTER");
+    if (s != nullptr && std::strcmp(s, "m") == 0) return R::AlongM;
+    if (s != nullptr && std::strcmp(s, "n") == 0) return R::AlongN;
+    return R::Heuristic;
+  }();
+  return v;
 }
 
 // Version H1: the launcher's choice is still the hand kernel; the CUTLASS variants are
