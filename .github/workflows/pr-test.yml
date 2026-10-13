@@ -731,13 +731,13 @@ jobs:
           fi
 
           # Run the check. Passes --fail only when ENFORCE_SKIP_ALL is 'true'.
+          SKIP_ALL_EXIT=0
           REPORT=$(python3 scripts/pr_checks/check_skip_all.py \
             --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
             $SUMMARY_ARGS \
             $SHARD_ARGS \
             --junit-dir junit-h100 \
-            --github-actions $FAIL_FLAG 2>&1)
-          SKIP_ALL_EXIT=$?
+            --github-actions $FAIL_FLAG 2>&1) || SKIP_ALL_EXIT=$?
           echo "$REPORT"
 
           if echo "$REPORT" | grep -q "skip-all"; then
