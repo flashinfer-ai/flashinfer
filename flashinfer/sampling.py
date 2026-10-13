@@ -2187,7 +2187,8 @@ def top_p_renorm_probs(
         Probabilities, shape ``(batch_size, num_classes)``.
     top_p: Union[torch.Tensor, float]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-p threshold for
-        re-normalizing probabilities, should be in ``(0, 1)``.
+        re-normalizing probabilities, should be in ``(0, 1]``.
+        A threshold of one retains every nonnegative probability and renormalizes the row.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
         We mask out the probabilities less than `threshold` where the cumulative sum

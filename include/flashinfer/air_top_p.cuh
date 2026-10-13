@@ -286,6 +286,8 @@ __global__ void AirTopPRenormRadixKernel(Counter<T>* counters, HisT<IsDeterminis
   using HisT_ = HisT<IsDeterministic, T>;
   int const batchId = blockIdx.y;
   auto counter = counters + batchId;
+  // Full support needs no threshold search; the apply stages still renormalize the row.
+  if (counter->p == 1.0f) return;
   AccT currentSum;
   IdxT previousLen, currentLen;
   if (pass == 0) {
@@ -416,7 +418,7 @@ __global__ void AirTopPRenormInitKernel(Counter<T>* counters, int len, T const* 
     counter->previousLen = len;
     counter->p = top_p_arr ? top_p_arr[batchIdx] : top_p_val;
     counter->sum = 0;
-    counter->kthValueBits = 0;
+    counter->kthValueBits = counter->p == 1.0f ? twiddleIn(static_cast<T>(0), false) : 0;
     counter->finishedBlockCnt = 0;
     counter->filterCnt = 0;
   }
@@ -431,8 +433,8 @@ __global__ void AirTopPRenormInitKernel(Counter<T>* counters, int len, T const* 
 // ======================== Renorm apply kernel ========================
 
 template <typename T>
-__global__ void AirTopPRenormSumKernel(T const* probs, Counter<T>* counters,
-                                      float* partials, int partialStride, int vocabSize) {
+__global__ void AirTopPRenormSumKernel(T const* probs, Counter<T>* counters, float* partials,
+                                       int partialStride, int vocabSize) {
   int const batchId = blockIdx.y;
   int const logicalTid = blockIdx.x * blockDim.x + threadIdx.x;
   T const threshold = twiddleOut<T>(counters[batchId].kthValueBits, false);
@@ -447,7 +449,7 @@ __global__ void AirTopPRenormSumKernel(T const* probs, Counter<T>* counters,
 
 template <typename T>
 __global__ void AirTopPRenormNormKernel(float const* partials, int partialStride,
-                                       Counter<T>* counters) {
+                                        Counter<T>* counters) {
   int const batchId = blockIdx.x;
   float threadSum = partials[batchId * partialStride + threadIdx.x];
   typedef cub::BlockReduce<float, 1024> BlockReduce;
@@ -459,8 +461,8 @@ __global__ void AirTopPRenormNormKernel(float const* partials, int partialStride
 }
 
 template <typename T>
-__global__ void AirTopPRenormApplyKernel(T const* probs, T* renormedProbs,
-                                        Counter<T>* counters, int vocabSize) {
+__global__ void AirTopPRenormApplyKernel(T const* probs, T* renormedProbs, Counter<T>* counters,
+                                         int vocabSize) {
   int const batchId = blockIdx.y;
   T const threshold = twiddleOut<T>(counters[batchId].kthValueBits, false);
   float const norm = counters[batchId].sum;
@@ -547,10 +549,10 @@ cudaError_t AirTopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_a
   // Histogram storage is dead after the final radix pass and fits 1024 FP32 sums per row.
   float* partials = reinterpret_cast<float*>(histograms);
   constexpr int partialStride = sizeof(HisT_) * NUM_BUCKETS / sizeof(float);
-  AirTopPRenormSumKernel<DType><<<dim3(4, batch_size), 256, 0, stream>>>(
-      probs, counters, partials, partialStride, d);
-  AirTopPRenormNormKernel<DType><<<batch_size, 1024, 0, stream>>>(
-      partials, partialStride, counters);
+  AirTopPRenormSumKernel<DType>
+      <<<dim3(4, batch_size), 256, 0, stream>>>(probs, counters, partials, partialStride, d);
+  AirTopPRenormNormKernel<DType>
+      <<<batch_size, 1024, 0, stream>>>(partials, partialStride, counters);
   AirTopPRenormApplyKernel<DType><<<dim3(ceilDiv<uint32_t>(d, 1024), batch_size), 256, 0, stream>>>(
       probs, renormed_prob, counters, d);
 
