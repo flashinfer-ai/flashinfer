@@ -171,6 +171,9 @@ class _AllGatherDualNormDeviceKernel:
         fragment = cluster_rank * self.threads + tidx
         column = Int64(fragment) * VEC_BF16
         row_element = Int64(token) * self.hidden + column
+        # Every peer must have started before cluster_row_sum stores into its
+        # shared memory; the matching wait sits just before that first store.
+        cute.arch.cluster_arrive_relaxed()
 
         # Parameters and the residual stream do not depend on the publisher.
         alpha_values = load_f32x8(alpha, column)
@@ -207,6 +210,7 @@ class _AllGatherDualNormDeviceKernel:
         branch = packed_u32x4_to_bf16x8(branch_packed.load()).to(Float32)
         if cutlass.const_expr(constants.has_post_weight):
             branch = branch * post_gamma
+        cute.arch.cluster_wait()
         post_sum = cluster_row_sum(
             (branch * branch).reduce(
                 cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0

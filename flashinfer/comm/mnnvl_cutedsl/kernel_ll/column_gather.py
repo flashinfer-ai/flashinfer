@@ -57,6 +57,12 @@ def cluster_row_sum(
 
     Each warp scatters its sum straight into ``slots[cluster_rank, warp]`` of
     every peer CTA, so one cluster barrier replaces the CTA-level stage.
+
+    The caller must complete one cluster barrier before the first call: a
+    remote shared-memory store to a peer CTA that has not started executing
+    faults with "cluster target block not present". Kernels arrive (relaxed)
+    at entry and wait just before the first call so the barrier overlaps the
+    parameter loads and the mailbox poll.
     """
     for offset in (16, 8, 4, 2, 1):
         value = value + cute.arch.shuffle_sync_bfly(value, offset=offset)

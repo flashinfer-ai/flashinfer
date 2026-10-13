@@ -123,6 +123,9 @@ class _AllGatherNormQuantDeviceKernel:
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = cute.arch.lane_idx()
         fragment = cluster_rank * _THREADS + tidx
+        # Every peer must have started before cluster_row_sum stores into its
+        # shared memory; the matching wait sits just before that first store.
+        cute.arch.cluster_arrive_relaxed()
 
         gamma = load_bf16x8_as_f32(weight, Int64(fragment) * VEC_BF16) + Float32(
             self.constants.gain_center
@@ -148,6 +151,7 @@ class _AllGatherNormQuantDeviceKernel:
         smem = cutlass.utils.SmemAllocator()
         slots = smem.allocate_array(Float32, self.cluster_size * self.warps)
         x = packed_u32x4_to_bf16x8(packed.load()).to(Float32)
+        cute.arch.cluster_wait()
         sum_sq = cluster_row_sum(
             (x * x).reduce(
                 cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0

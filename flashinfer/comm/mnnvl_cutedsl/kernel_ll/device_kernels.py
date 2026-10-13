@@ -811,6 +811,11 @@ class _LamportResidualRMSNormDeviceKernel:
         rank_lane = tidx % self.rank_lanes
         group = tidx // self.rank_lanes
         base_fragment = cluster_rank * self.groups_per_cta + group
+        if cutlass.const_expr(self.write_norm_output):
+            # Every peer must have started before the RMS partial sums are
+            # stored into its shared memory; the matching wait sits just
+            # before that first remote store.
+            cute.arch.cluster_arrive_relaxed()
 
         prenorm_fragments = cute.make_rmem_tensor(
             cute.make_layout(
@@ -982,8 +987,6 @@ class _LamportResidualRMSNormDeviceKernel:
                 self.warps,
                 self.rank_lanes,
             )
-            # Peer CTAs must exist before accessing their distributed shared memory.
-            cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
             if tidx < self.cluster_size:
                 local_slot = cluster_sums + cluster_rank
