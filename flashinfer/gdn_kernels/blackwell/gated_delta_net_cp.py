@@ -1532,6 +1532,8 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         initial_state_inner_strides: tuple[int, ...] | None = None,
         output_state_inner_strides: tuple[int, ...] | None = None,
         store_initial_state: bool = False,
+        head_size: int = 128,
+        head_size_v: int | None = None,
     ):
         self.needs_initial_state = needs_initial_state
         self.store_final_state = store_final_state
@@ -1545,11 +1547,15 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         self.store_initial_state = store_initial_state
         self.acc_dtype = cutlass.Float32
         self.mma_dtype = cutlass.TFloat32
-        self.D = 128
-        if rows_per_cta not in (64, 128):
-            raise ValueError(f"rows_per_cta must be 64 or 128, got {rows_per_cta}")
+        self.DK = head_size
+        self.DV = head_size_v if head_size_v is not None else head_size
+        if rows_per_cta not in (64, 128) or self.DV % rows_per_cta != 0:
+            raise ValueError(
+                f"rows_per_cta must be 64 or 128 and divide DV={self.DV}, "
+                f"got {rows_per_cta}"
+            )
         self.rows_per_cta = rows_per_cta
-        self.row_ctas = self.D // rows_per_cta
+        self.row_ctas = self.DV // rows_per_cta
         # A second M stage hides the exposed UTC64 TMA load; UTC128 is unchanged by it.
         self.m_stage = 2 if rows_per_cta == 64 else 1
         self.n_stage = 1
@@ -1566,6 +1572,8 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         self.manual_cache_key(
             "rows_per_cta",
             "row_ctas",
+            "DK",
+            "DV",
             "needs_initial_state",
             "store_final_state",
             "initial_state_dtype",
@@ -1598,11 +1606,11 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         sTensor_stage = sTensor[None, None, handle.index]
         mTensor = tma_tensor[None, None, head_idx, chunk_idx]
         if cutlass.const_expr(is_transfer):
-            gTensor = cute.zipped_divide(mTensor, (self.D, self.D))[
+            gTensor = cute.zipped_divide(mTensor, (self.DK, self.DK))[
                 ((None, None), (0, 0))
             ]
         else:
-            gTensor = cute.zipped_divide(mTensor, (self.rows_per_cta, self.D))[
+            gTensor = cute.zipped_divide(mTensor, (self.rows_per_cta, self.DK))[
                 ((None, None), (row_cta_idx, 0))
             ]
         tTsT, tTgT = cpasync.tma_partition(
@@ -1617,14 +1625,14 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
 
     @cute.jit
     def make_tmem_tensor(self, tmem_ptr: cutlass.Int64, tiled_mma):
-        acc_shape = tiled_mma.partition_shape_C((self.rows_per_cta, self.D))
+        acc_shape = tiled_mma.partition_shape_C((self.rows_per_cta, self.DK))
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, 1))
         tCtAcc = cute.make_tensor(tmem_ptr + self.tmem_acc_offset, tCtAcc_fake.layout)
         return tCtAcc
 
     @cute.jit
     def make_tmem_operand(self, tmem_ptr: cutlass.Int64, tiled_mma):
-        opd_shape = tiled_mma.partition_shape_A((self.rows_per_cta, self.D))
+        opd_shape = tiled_mma.partition_shape_A((self.rows_per_cta, self.DK))
         tCtOpd_fake = tiled_mma.make_fragment_A(cute.append(opd_shape, 1))
         return cute.make_tensor(
             cute.recast_ptr(tmem_ptr + self.tmem_opd_offset, dtype=self.mma_dtype),
@@ -1642,7 +1650,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         stage: cutlass.Int32,
     ):
         tCtAcc_mn = utils.gemm.sm100.transform_partitioned_tensor_layout(tCtAcc)
-        cAcc = cute.make_identity_tensor((self.rows_per_cta, self.D))
+        cAcc = cute.make_identity_tensor((self.rows_per_cta, self.DK))
         if cutlass.const_expr(self.rows_per_cta == 128):
             atom_r2t = cute.make_copy_atom(
                 tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
@@ -1673,7 +1681,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
     ):
         tCtAcc_mn = utils.gemm.sm100.transform_partitioned_tensor_layout(tCtAcc)
         tCtOpd_mn = utils.gemm.sm100.transform_partitioned_tensor_layout(tCtOpd)
-        cAcc = cute.make_identity_tensor((self.rows_per_cta, self.D))
+        cAcc = cute.make_identity_tensor((self.rows_per_cta, self.DK))
         if cutlass.const_expr(self.rows_per_cta == 128):
             atom_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
@@ -1729,7 +1737,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         stage: cutlass.Int32,
     ):
         tCtAcc_mn = utils.gemm.sm100.transform_partitioned_tensor_layout(tCtAcc)
-        cAcc = cute.make_identity_tensor((self.rows_per_cta, self.D))
+        cAcc = cute.make_identity_tensor((self.rows_per_cta, self.DK))
         if cutlass.const_expr(self.rows_per_cta == 128):
             atom_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
@@ -1921,11 +1929,14 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             )
         )
         m_layout = sm100_utils.make_smem_layout_b(
-            tiled_mma, (self.rows_per_cta, self.D, self.D), self.acc_dtype, self.m_stage
+            tiled_mma,
+            (self.rows_per_cta, self.DK, self.DK),
+            self.acc_dtype,
+            self.m_stage,
         )
         n_layout = sm100_utils.make_smem_layout_a(
             tiled_mma,
-            (self.rows_per_cta, self.D, self.D),
+            (self.rows_per_cta, self.DK, self.DK),
             self.acc_dtype,
             self.n_stage,
             is_k_major=True,
@@ -1940,10 +1951,10 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         m_tma_layout = cute.slice_(m_semantic_layout, (None, None, 0))
         n_tma_layout = cute.slice_(n_semantic_layout, (None, None, 0))
         tma_m = cpasync.make_tiled_tma_atom(
-            tma_op, g_transfer_t, m_tma_layout, (self.D, self.D)
+            tma_op, g_transfer_t, m_tma_layout, (self.DK, self.DK)
         )
         tma_n = cpasync.make_tiled_tma_atom(
-            tma_op, g_local_state_t, n_tma_layout, (self.rows_per_cta, self.D)
+            tma_op, g_local_state_t, n_tma_layout, (self.rows_per_cta, self.DK)
         )
         tma_atom_m, tma_tensor_m = tma_m
         tma_atom_n, tma_tensor_n = tma_n
@@ -2082,18 +2093,18 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         pipeline.pipeline_init_wait(cluster_shape_mn=cute.make_layout((1, 1)))
 
         out_layout = cute.make_layout(
-            (self.D, self.D, num_heads, total_cp_chunks),
-            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
+            (self.DV, self.DK, num_heads, total_cp_chunks),
+            stride=(self.DK, 1, self.DV * self.DK, self.DV * self.DK * num_heads),
         )
         gFixedState = cute.make_tensor(g_fixed_state_t.iterator.align(128), out_layout)
         gFixedStateCta = cute.local_tile(
             gFixedState[None, None, head_idx, None],
-            (self.rows_per_cta, self.D, total_cp_chunks),
+            (self.rows_per_cta, self.DK, total_cp_chunks),
             (row_cta_idx, 0, 0),
         )
         state_layout = cute.make_layout(
-            (self.D, self.D, num_heads, num_seqs),
-            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
+            (self.DV, self.DK, num_heads, num_seqs),
+            stride=(self.DK, 1, self.DV * self.DK, self.DV * self.DK * num_heads),
         )
         state_idx = seq_idx
         if cutlass.const_expr(self.use_state_indices):
@@ -2101,7 +2112,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         if cutlass.const_expr(self.needs_initial_state):
             if cutlass.const_expr(self.use_state_indices):
                 initial_layout = cute.make_layout(
-                    (self.D, self.D, num_heads, g_initial_state_t.shape[0]),
+                    (self.DV, self.DK, num_heads, g_initial_state_t.shape[0]),
                     stride=(
                         g_initial_state_t.stride[2],
                         g_initial_state_t.stride[3],
@@ -2118,7 +2129,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
                 )
             gInitialState = cute.local_tile(
                 gInitialStateTensor[None, None, head_idx, state_idx],
-                (self.rows_per_cta, self.D),
+                (self.rows_per_cta, self.DK),
                 (row_cta_idx, 0),
             )
             gInitialStateWorkspaceTensor = cute.make_tensor(
@@ -2126,7 +2137,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             )
             gInitialStateWorkspace = cute.local_tile(
                 gInitialStateWorkspaceTensor[None, None, head_idx, seq_idx],
-                (self.rows_per_cta, self.D),
+                (self.rows_per_cta, self.DK),
                 (row_cta_idx, 0),
             )
         else:
@@ -2135,7 +2146,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         if cutlass.const_expr(self.store_final_state):
             if cutlass.const_expr(self.use_state_indices):
                 output_layout = cute.make_layout(
-                    (self.D, self.D, num_heads, g_output_state_t.shape[0]),
+                    (self.DV, self.DK, num_heads, g_output_state_t.shape[0]),
                     stride=(
                         g_output_state_t.stride[2],
                         g_output_state_t.stride[3],
@@ -2152,7 +2163,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
                 )
             gOutputState = cute.local_tile(
                 gOutputStateTensor[None, None, head_idx, state_idx],
-                (self.rows_per_cta, self.D),
+                (self.rows_per_cta, self.DK),
                 (row_cta_idx, 0),
             )
         else:

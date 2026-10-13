@@ -367,6 +367,8 @@ def _get_fixup_kernel(
     output_state_inner_strides,
     kernel_kind,
     cu_seqlens_dtype,
+    head_size,
+    head_size_v,
 ):
     if kernel_kind == "simt_row4":
         return CPDeltaRuleFixupSm100(
@@ -381,6 +383,8 @@ def _get_fixup_kernel(
             initial_state_inner_strides=initial_state_inner_strides,
             output_state_inner_strides=output_state_inner_strides,
             store_initial_state=needs_initial_state,
+            head_size=head_size,
+            head_size_v=head_size_v,
         )
     if kernel_kind == "simt_row8":
         return CPDeltaRuleFixupSm100(
@@ -395,6 +399,8 @@ def _get_fixup_kernel(
             initial_state_inner_strides=initial_state_inner_strides,
             output_state_inner_strides=output_state_inner_strides,
             store_initial_state=needs_initial_state,
+            head_size=head_size,
+            head_size_v=head_size_v,
         )
     if kernel_kind == "hmma":
         return CPDeltaRuleFixupHmmaSm100(
@@ -408,6 +414,8 @@ def _get_fixup_kernel(
             initial_state_inner_strides=initial_state_inner_strides,
             output_state_inner_strides=output_state_inner_strides,
             store_initial_state=needs_initial_state,
+            head_size=head_size,
+            head_size_v=head_size_v,
         )
     if kernel_kind in ("utcmma", "utcmma64", "utcmma128"):
         return CPDeltaRuleFixupUtcmmaSm100(
@@ -422,6 +430,8 @@ def _get_fixup_kernel(
             initial_state_inner_strides=initial_state_inner_strides,
             output_state_inner_strides=output_state_inner_strides,
             store_initial_state=needs_initial_state,
+            head_size=head_size,
+            head_size_v=head_size_v,
         )
     raise ValueError(f"Unsupported fixup kernel kind: {kernel_kind}")
 
@@ -447,19 +457,26 @@ def cp_delta_rule_fixup_dsl_sm100(
 
     device = local_transfer.device if _device is None else _device
     if not _skip_check:
-        if local_transfer.ndim != 4:
+        if local_transfer.ndim != 4 or local_state.ndim != 4:
             raise RuntimeError(
-                "local_transfer must have shape (num_chunks, num_heads, DimV, DimK), "
-                f"got {tuple(local_transfer.shape)}"
+                "local_transfer/local_state must have shapes "
+                "(num_chunks, num_heads, DimK, DimK)/(num_chunks, num_heads, DimV, DimK), "
+                f"got {tuple(local_transfer.shape)} and {tuple(local_state.shape)}"
             )
-        if local_state.shape != local_transfer.shape:
+        dk = local_transfer.shape[-1]
+        if (
+            local_transfer.shape[-2] != dk
+            or local_state.shape[:2] != local_transfer.shape[:2]
+            or local_state.shape[-1] != dk
+        ):
             raise RuntimeError(
-                "local_state shape must match local_transfer shape, "
+                "local_state/local_transfer shapes must be (C, H, DimV, DimK)/(C, H, DimK, DimK), "
                 f"got {tuple(local_state.shape)} and {tuple(local_transfer.shape)}"
             )
-        if local_transfer.shape[-2:] != (128, 128):
+        if tuple(local_state.shape[-2:]) not in ((128, 128), (64, 128)):
             raise RuntimeError(
-                f"CPDeltaRuleFixupSm100 only supports D=128, got {tuple(local_transfer.shape[-2:])}"
+                "CPDeltaRuleFixupSm100 only supports (DimV, DimK) in "
+                f"{{(128, 128), (64, 128)}}, got {tuple(local_state.shape[-2:])}"
             )
         if local_transfer.dtype != torch.float32 or local_state.dtype != torch.float32:
             raise RuntimeError(
@@ -472,7 +489,7 @@ def cp_delta_rule_fixup_dsl_sm100(
             ("output_state", output_state),
         ):
             if tensor is not None:
-                expected_tail = (local_transfer.shape[1], 128, 128)
+                expected_tail = tuple(local_state.shape[1:])
                 if tuple(tensor.shape[1:]) != expected_tail or (
                     not use_state_indices and tensor.shape[0] != cu_seqlens.shape[0] - 1
                 ):
@@ -507,7 +524,7 @@ def cp_delta_rule_fixup_dsl_sm100(
             ):
                 raise RuntimeError(f"{name} must be contiguous")
 
-    total_cp_chunks, num_heads, _, d = local_transfer.shape
+    total_cp_chunks, num_heads, dv, dk = local_state.shape
     if not _skip_check:
         if cp_chunk_len <= 0:
             raise RuntimeError(f"cp_chunk_len must be positive, got {cp_chunk_len}")
@@ -530,7 +547,7 @@ def cp_delta_rule_fixup_dsl_sm100(
     if initial_state is not None and initial_state_workspace is None:
         initial_state_workspace = _get_cp_workspace(
             "gdn_cp_sm100_initial_state",
-            (num_seqs, num_heads, d, d),
+            (num_seqs, num_heads, dv, dk),
             torch.float32,
             device,
         )
@@ -538,10 +555,10 @@ def cp_delta_rule_fixup_dsl_sm100(
         return fixed_state
 
     local_transfer_tma = local_transfer.as_strided(
-        (d, d, num_heads, total_cp_chunks), (1, d, d * d, num_heads * d * d)
+        (dk, dk, num_heads, total_cp_chunks), (1, dk, dk * dk, num_heads * dk * dk)
     )
     local_state_tma = local_state.as_strided(
-        (d, d, num_heads, total_cp_chunks), (d, 1, d * d, num_heads * d * d)
+        (dv, dk, num_heads, total_cp_chunks), (dk, 1, dv * dk, num_heads * dv * dk)
     )
     stream = (
         _stream
@@ -560,13 +577,14 @@ def cp_delta_rule_fixup_dsl_sm100(
     if _kernel_kind is None:
         num_parallel_states = num_seqs * num_heads
         num_sms = get_device_sm_count(device)
-        # SIMT4 sustains two CTAs/SM. UTC64 and UTC128 launch D/rows_per_cta
+        # SIMT4 sustains two CTAs/SM. UTC64 and UTC128 launch DV/rows_per_cta
         # CTAs per state, so UTC64 switches out when its two-CTA grid exceeds one wave.
-        simt_row4_one_wave_states = num_sms * 2 // (d // 4)
-        utcmma64_one_wave_states = num_sms // (d // 64)
+        # DV=64 has a single 64-row CTA per state, so UTC128 does not apply.
+        simt_row4_one_wave_states = num_sms * 2 // (dv // 4)
+        utcmma64_one_wave_states = num_sms // (dv // 64)
         if num_parallel_states <= simt_row4_one_wave_states:
             _kernel_kind = "simt_row4"
-        elif num_parallel_states <= utcmma64_one_wave_states:
+        elif dv == 64 or num_parallel_states <= utcmma64_one_wave_states:
             _kernel_kind = "utcmma64"
         else:
             _kernel_kind = "utcmma128"
@@ -589,6 +607,8 @@ def cp_delta_rule_fixup_dsl_sm100(
         ),
         _kernel_kind,
         _cu_seqlens_dtype(cu_seqlens.dtype),
+        dk,
+        dv,
     )
     compile_options = _blackwell_compile_options(device)
     compiled = get_cached_compile(kernel, compile_options)
@@ -599,7 +619,7 @@ def cp_delta_rule_fixup_dsl_sm100(
         initial_state_cute = None
         if needs_initial_state:
             initial_state_cute = from_dlpack(initial_state, assumed_align=16)
-            _mark_state_layout(initial_state_cute, use_state_indices, d)
+            _mark_state_layout(initial_state_cute, use_state_indices, dk)
         initial_state_workspace_cute = (
             from_dlpack(
                 initial_state_workspace.reshape(-1), assumed_align=16
@@ -610,7 +630,7 @@ def cp_delta_rule_fixup_dsl_sm100(
         output_state_cute = None
         if store_final_state:
             output_state_cute = from_dlpack(output_state, assumed_align=16)
-            _mark_state_layout(output_state_cute, use_state_indices, d)
+            _mark_state_layout(output_state_cute, use_state_indices, dk)
         kernel_args = (
             from_dlpack(local_transfer_tma, assumed_align=128).mark_layout_dynamic(
                 leading_dim=0

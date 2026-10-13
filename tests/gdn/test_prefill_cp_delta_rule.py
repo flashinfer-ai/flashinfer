@@ -76,7 +76,7 @@ from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 FIXUP_TF32_ATOL = 2e-3
 FIXUP_TF32_RTOL = 2e-3
-FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8", "hmma"]
+FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8", "hmma", "utcmma64", "utcmma128"]
 
 
 def _skip_if_cp_unsupported():
@@ -91,6 +91,13 @@ def _skip_if_cp_unsupported():
         return
     if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
         pytest.skip("CP GDN prefill requires SM90, SM100, or SM12x")
+
+
+def _skip_if_head_sizes_unsupported(head_size, head_size_v):
+    if (head_size, head_size_v) != (128, 128) and not is_sm100a_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("CP GDN prefill supports DK=DV=128 only outside SM100")
 
 
 def _seed_all(seed):
@@ -407,6 +414,7 @@ def test_cp_delta_rule_mn_precompute(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("kernel_kind", FIXUP_KERNEL_KINDS)
+@pytest.mark.parametrize("head_size_v", [128, 64])
 @pytest.mark.parametrize("use_initial_state", [False, True])
 @pytest.mark.parametrize("num_heads", [1, 3])
 @pytest.mark.parametrize(
@@ -417,13 +425,19 @@ def test_cp_delta_rule_fixup(
     cp_chunk_len,
     num_heads,
     use_initial_state,
+    head_size_v,
     kernel_kind,
     seed=int(os.environ.get("SEED", "0")),
 ):
     _skip_if_cp_unsupported()
-    _seed_all(seed)
-    device = torch.device("cuda")
     head_size = 128
+    _skip_if_head_sizes_unsupported(head_size, head_size_v)
+    device = torch.device("cuda")
+    if kernel_kind.startswith("utcmma") and not is_sm100a_supported(device):
+        pytest.skip("UTCMMA fixup is SM100-only")
+    if kernel_kind == "utcmma128" and head_size_v < 128:
+        pytest.skip("UTCMMA128 fixup needs DV >= 128")
+    _seed_all(seed)
     cu_seqlens = _make_cu_seqlens(seq_lens, device)
     total_seqlen = sum(seq_lens)
     total_cp_chunks = workspace_num_chunks_host(
@@ -445,7 +459,7 @@ def test_cp_delta_rule_fixup(
         torch.randn(
             total_cp_chunks,
             num_heads,
-            head_size,
+            head_size_v,
             head_size,
             dtype=torch.float32,
             device=device,
@@ -460,7 +474,7 @@ def test_cp_delta_rule_fixup(
             torch.randn(
                 len(seq_lens),
                 num_heads,
-                head_size,
+                head_size_v,
                 head_size,
                 dtype=torch.float32,
                 device=device,
