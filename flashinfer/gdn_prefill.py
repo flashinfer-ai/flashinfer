@@ -686,7 +686,8 @@ def chunk_gated_delta_rule(
         carry ``num_householder`` rows per token and ``cu_seqlens`` counts
         that expanded timeline, while ``q``, ``g`` and the output stay at
         real-token rows.  Only the flashinfer backend implements it, on SM90
-        and SM100.
+        and SM100, and not under context parallelism: ``use_cp="auto"`` stays
+        on the chunked kernels and ``use_cp=True`` raises.
     scale : float, optional
         Scale factor for the attention scores.  Defaults to
         ``1 / sqrt(head_size)`` when ``None``.
@@ -885,6 +886,13 @@ def chunk_gated_delta_rule(
             f"num_householder={num_householder} (Gated DeltaProduct) is only "
             f"implemented for the flashinfer GDN backend, got backend={backend!r}"
         )
+    # No CP kernel takes num_householder: they would index q, g and the output
+    # on the expanded timeline.  "auto" keeps GDP on the chunked kernels below.
+    if num_householder > 1 and use_cp is True:
+        raise NotImplementedError(
+            f"use_cp=True is not implemented for num_householder={num_householder} "
+            '(Gated DeltaProduct); pass use_cp=False or "auto"'
+        )
     num_q_heads = q.size(1)
     num_v_heads = v.size(1)
     head_size = q.size(2)
@@ -1020,7 +1028,10 @@ def chunk_gated_delta_rule(
         device_capability=_device_capability,
     )
     will_use_cp = use_cp is True or (
-        backend != "cake_gdn" and use_cp == "auto" and cp_heuristic_matches
+        backend != "cake_gdn"
+        and use_cp == "auto"
+        and num_householder == 1
+        and cp_heuristic_matches
     )
     use_gdn_cp_backend = bool(
         backend == "cake_gdn"

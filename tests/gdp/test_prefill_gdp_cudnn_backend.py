@@ -37,6 +37,7 @@ import torch
 import torch.nn.functional as F
 
 import flashinfer
+import flashinfer.gdn_prefill as gdn_prefill
 from flashinfer.cudnn import cudnn_chunk_gated_delta_product
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.gdp_prefill import chunk_gated_delta_product
@@ -295,6 +296,30 @@ def test_gdp_with_num_householder_one_matches_gdn(backend, use_initial_state):
     ref_out, ref_state = _serial(inputs)
     assert_rel_close("output vs serial", gdp_out, ref_out, SERIAL_TOLERANCE)
     assert_rel_close("state vs serial", gdp_state, ref_state, SERIAL_TOLERANCE)
+
+
+@pytest.mark.parametrize("backend", ["flashinfer"])
+def test_gdp_stays_off_context_parallelism(backend, monkeypatch):
+    """No CP kernel takes ``num_householder``.
+
+    Called directly, ``chunk_gated_delta_rule`` must keep GDP on the chunked
+    kernel under ``use_cp="auto"`` even when the CP heuristic matches, and
+    refuse ``use_cp=True``.
+    """
+    monkeypatch.setattr(
+        gdn_prefill, "should_use_cp_host", lambda *_args, **_kwargs: True
+    )
+    inputs = _make_inputs([512], 4, 4, 4, 2, seed=11)
+    args = (inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"], None)
+    kwargs = dict(
+        cu_seqlens=inputs["cu_seqlens"] * 2, output_final_state=True, num_householder=2
+    )
+    out, final_state = chunk_gated_delta_rule(*args, **kwargs, use_cp="auto")
+    ref_out, ref_state = _serial(inputs)
+    assert_rel_close("output", out, ref_out, SERIAL_TOLERANCE)
+    assert_rel_close("final_state", final_state, ref_state, SERIAL_TOLERANCE)
+    with pytest.raises(NotImplementedError, match="use_cp=True"):
+        chunk_gated_delta_rule(*args, **kwargs, use_cp=True)
 
 
 @pytest.mark.parametrize("backend", GDP_BACKENDS)
