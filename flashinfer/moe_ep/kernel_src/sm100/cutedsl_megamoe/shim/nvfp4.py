@@ -1308,6 +1308,8 @@ def get_symm_buffer_for_mega_moe(
         ),
     )
     cfg = with_knobs(cfg, knobs)
+    if defer_topk_reduce and not cfg.defer_topk_reduce:
+        raise ValueError("defer_topk_reduce=True cannot be disabled by knobs")
     # TODO(Sep 2026) Previously we explicitly overrode the knobs here with the user request,
     #   despite the autotuner supporting disabling ikr if it would be faster.
     #   ikr is taken as permission to violate batch invariance so selecting different knobs is fine

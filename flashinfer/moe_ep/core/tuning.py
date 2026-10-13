@@ -19,11 +19,11 @@ def tuning_live_tokens(tokens: int | None, capacity: int, group: Any = None) -> 
 def live_buckets(entries: list[dict[str, Any]], capacity: int) -> list[int]:
     return sorted(
         {
-            e["live_tokens"]
+            e.get("live_tokens", capacity)
             for e in entries
             if e["max_tokens"] == capacity
-            and type(e.get("live_tokens")) is int
-            and 0 <= e["live_tokens"] <= capacity
+            and type(e.get("live_tokens", capacity)) is int
+            and 0 <= e.get("live_tokens", capacity) <= capacity
         }
     )
 
@@ -43,7 +43,7 @@ def select_token_entries(
         return [
             e
             for e in entries
-            if e["max_tokens"] == capacity and e.get("live_tokens") == bucket
+            if e["max_tokens"] == capacity and e.get("live_tokens", capacity) == bucket
         ]
     # Old files had no live-token dimension. Full-capacity records have the
     # same meaning, so both retain the old capacity-rounding fallback.

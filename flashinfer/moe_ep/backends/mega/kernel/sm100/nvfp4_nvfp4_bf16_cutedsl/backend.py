@@ -187,7 +187,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             ).view(fp.max_tokens_per_rank, k.top_k)
             workspace._unfinalized_weights = (
                 torch.ones_like(workspace.topk_weights)
-                if k.apply_topk_in_fc1
+                if workspace._frontend.config.apply_topk_in_fc1
                 else workspace.topk_weights
             )
         return workspace
@@ -463,9 +463,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             # compute() re-attempts it (all ranks fail together, so lockstep holds).
             self._autotune_pending = False
         # Steady-state launch thunk: nvfp4_mega_moe re-validates, re-resolves
-        # the clamp, and rebuilds the 12-field inputs bundle on every call
-        # (~70us of loop-invariant host Python at 43 layers x 4 ranks — the
-        # measured arrival-skew generator; see vllm_e2e RUNS.md run 27/28).
+        # the clamp, and rebuilds the 12-field inputs bundle on every call.
         # Build once per (workspace, weights, compiled-session, STREAM) and
         # reuse. The stream is part of the key because the thunk's launch
         # kwargs bind it at build time — a graph capture runs on a capture
