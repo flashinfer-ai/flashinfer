@@ -664,6 +664,11 @@ class CuteDslFusedMoERunner(TunableRunner):
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        # local_expert_offset stays out of the persisted key: ranks tuned under
+        # set_autotune_process_group must share file entries, since a cache hit
+        # skips the group reduce. The offset only selects which expert slice is
+        # profiled; tactic validity follows the profiled shapes, so the timing
+        # skew it adds is averaged out by that reduce.
         return (
             self.quant_mode,
             int(self.activation_type),
@@ -673,7 +678,6 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.situ_beta,
             self.situ_linear_beta,
             self.num_experts,
-            self.local_expert_offset,
             self.use_fused_finalize,
             self.output_dtype,
             self.enable_pdl,
@@ -1136,11 +1140,15 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        # local_expert_offset stays out of the persisted key: ranks tuned under
+        # set_autotune_process_group must share file entries, since a cache hit
+        # skips the group reduce. The offset only selects which expert slice is
+        # profiled; tactic validity follows the profiled shapes, so the timing
+        # skew it adds is averaged out by that reduce.
         return (
             self.num_experts,
             self.top_k,
             self.num_local_experts,
-            self.local_expert_offset,
             self.use_fused_finalize,
             self.output_dtype,
             self.enable_pdl,
