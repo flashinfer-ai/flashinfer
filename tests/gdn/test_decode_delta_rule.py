@@ -4191,6 +4191,71 @@ def _packed_qkv_params(batch_size, seq_len, num_v_heads, device):
     return a, b, A_log, dt_bias
 
 
+def test_decode_pretranspose_accepts_scalar_aligned_views():
+    """Gate/parameter views with only element-size alignment must be accepted.
+
+    Regression test: the scalar-loaded operands (a, b, A_log, dt_bias) were
+    wrapped with from_dlpack(assumed_align=16), rejecting contiguous views
+    whose base pointer is not 16-byte aligned, e.g. the second half of a
+    packed [B, 2*HV] gate buffer when HV % 8 != 0.
+    """
+    _skip_if_not_sm90_or_later()
+    torch.manual_seed(0)
+    B, H, HV, D = 2, 2, 4, 128
+    dev = torch.device("cuda")
+    scale = 1.0 / math.sqrt(D)
+
+    q = torch.randn(B, 1, H, D, dtype=torch.bfloat16, device=dev)
+    k = torch.randn_like(q)
+    v = torch.randn(B, 1, HV, D, dtype=torch.bfloat16, device=dev)
+    pool = torch.randn(B + 1, HV, D, D, dtype=torch.float32, device=dev)
+    indices = torch.arange(1, B + 1, dtype=torch.int32, device=dev)
+    # Offset by one element: contiguous but only element-size aligned.
+    A_log = torch.randn(HV + 1, dtype=torch.float32, device=dev)[1:]
+    dt_bias = torch.randn(HV + 1, dtype=torch.float32, device=dev)[1:]
+    # Packed [B, 2*HV] gate buffer: the second half starts at HV * 2 = 8
+    # bytes into the allocation when HV % 8 != 0.
+    gates = torch.randn(B, 2 * HV, dtype=torch.bfloat16, device=dev)
+    b, a = gates.chunk(2, dim=-1)
+    assert A_log.data_ptr() % 16 == 4 and a.data_ptr() % 16 == 8
+
+    kw = dict(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        scale=scale,
+        use_qk_l2norm=True,
+        initial_state_indices=indices,
+        backend="flashinfer",
+    )
+    out_view = torch.empty(B, 1, HV, D, dtype=torch.bfloat16, device=dev)
+    pool_view = pool.clone()
+    gated_delta_rule_decode_pretranspose(
+        A_log=A_log,
+        a=a.unsqueeze(1),
+        dt_bias=dt_bias,
+        b=b.unsqueeze(1),
+        output=out_view,
+        initial_state=pool_view,
+        **kw,
+    )
+    out_clone = torch.empty_like(out_view)
+    pool_clone = pool.clone()
+    gated_delta_rule_decode_pretranspose(
+        A_log=A_log.clone(),
+        a=a.contiguous().unsqueeze(1),
+        dt_bias=dt_bias.clone(),
+        b=b.contiguous().unsqueeze(1),
+        output=out_clone,
+        initial_state=pool_clone,
+        **kw,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_view, out_clone, atol=0, rtol=0)
+    torch.testing.assert_close(pool_view, pool_clone, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])
 @pytest.mark.parametrize("batch_size", [2, 8, 64])
 def test_decode_pretranspose_packed_qkv(batch_size: int, state_dtype: str):
