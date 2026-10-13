@@ -17,6 +17,7 @@
 from collections.abc import Callable, Sequence
 import dataclasses
 from dataclasses import dataclass
+import enum
 import functools
 import hashlib
 import math
@@ -1914,6 +1915,16 @@ def _get_compiled_decode(
     kernel_key = _decode_compile_cache_key(compile_spec)
     source_files = _decode_kernel_source_files()
 
+    def build_and_load(kind: str, compile_fn: Callable[[], object]) -> object:
+        if kernel_key is None:
+            return compile_fn()
+        return build_and_load_cute_dsl_kernel(
+            "prims_ts_decode",
+            f"{kind}_{kernel_key}",
+            compile_fn,
+            extra_key_files=source_files,
+        )
+
     def compile_main():
         return cute.compile(
             main_tensor_adapter,
@@ -1978,32 +1989,59 @@ def _get_compiled_decode(
         )
 
     with torch.cuda.device(device_index):
-        compiled_main = build_and_load_cute_dsl_kernel(
-            "prims_ts_decode",
-            f"main_{kernel_key}",
-            compile_main,
-            extra_key_files=source_files,
-        )
+        compiled_main = build_and_load("main", compile_main)
         compiled_reducer = None
         if cfg.use_separate_reduction_kernel:
-            compiled_reducer = build_and_load_cute_dsl_kernel(
-                "prims_ts_decode",
-                f"reducer_{kernel_key}",
-                compile_reducer,
-                extra_key_files=source_files,
-            )
+            compiled_reducer = build_and_load("reducer", compile_reducer)
 
     return compiled_main, compiled_reducer
 
 
-def _decode_compile_cache_key(compile_spec: _DecodeCompileSpec) -> str:
-    """Stable on-disk name for one compiled decode topology.
+def _decode_compile_cache_key(compile_spec: _DecodeCompileSpec) -> Optional[str]:
+    """Stable on-disk name for one compiled decode topology, or None.
 
-    The device index only selects where the kernel runs; the compiled code
-    depends on the architecture, which the persistent cache keys separately.
+    The name is the only per-kernel key in the persistent cache (meta.json
+    guards arch, DSL stack and sources), so it digests every compile-spec
+    field except the device index: that only selects where the kernel runs.
+    A readable prefix helps when browsing ``cached_ops/``. Returns None, which
+    bypasses the disk cache, if a field has no process-stable encoding.
     """
-    spec = dataclasses.replace(compile_spec, device_index=0)
-    return hashlib.sha256(repr(spec).encode()).hexdigest()[:32]
+    fields = {
+        field.name: getattr(compile_spec, field.name)
+        for field in dataclasses.fields(compile_spec)
+        if field.name != "device_index"
+    }
+    try:
+        digest_input = repr(_stable_cache_key_value(tuple(fields.items())))
+    except TypeError:
+        return None
+    digest = hashlib.sha256(digest_input.encode()).hexdigest()[:20]
+    prefix = (
+        f"q{compile_spec.seq_len_q}_h{compile_spec.num_qo_heads}"
+        f"x{compile_spec.num_kv_heads}_d{compile_spec.head_dim}"
+        f"_{compile_spec.q_dtype_key}_{compile_spec.k_dtype_key}"
+    )
+    return f"{prefix}_{digest}"
+
+
+def _stable_cache_key_value(value: object) -> object:
+    """Map a compile-spec value onto builtins whose repr is process-stable."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, enum.Enum):
+        return f"{type(value).__qualname__}.{value.name}"
+    if isinstance(value, type):
+        return f"{value.__module__}.{value.__qualname__}"
+    if isinstance(value, (tuple, list)):
+        return tuple(_stable_cache_key_value(item) for item in value)
+    if dataclasses.is_dataclass(value):
+        return _stable_cache_key_value(
+            tuple(
+                (field.name, getattr(value, field.name))
+                for field in dataclasses.fields(value)
+            )
+        )
+    raise TypeError(f"no stable cache-key encoding for {type(value).__name__}")
 
 
 @functools.cache
