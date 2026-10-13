@@ -1161,12 +1161,14 @@ def _decode_fp8_output(
     output_m: int,
     n: int,
     is_swap_ab: bool,
+    pitch: int | None = None,
 ) -> torch.Tensor:
     """Decode plain per-tensor FP8 C storage into a logical float32 view."""
-    elem_count = output_m * n
+    pitch = output_m if pitch is None else pitch
+    elem_count = (n - 1) * pitch + output_m
     fp8_vals = c_storage[:elem_count].view(torch.float8_e4m3fn).float()
     if is_swap_ab:
-        return torch.as_strided(fp8_vals, (output_m, n), (1, output_m))
+        return torch.as_strided(fp8_vals, (output_m, n), (1, pitch))
     return fp8_vals.view(output_m, n)
 
 
@@ -1560,6 +1562,15 @@ def validate_schedule(
     return True
 
 
+_C_STRIDE_SENTINEL_F = 123.0
+_C_STRIDE_SENTINEL_U8 = 0xA5
+
+
+def _partition_view(storage, width, cols, pitch):
+    """Logical [width, cols] view of one partition inside a pitch-strided buffer."""
+    return torch.as_strided(storage, (width, cols), (1, pitch))
+
+
 def reference_check(
     *,
     num_experts,
@@ -1576,6 +1587,8 @@ def reference_check(
     return_output=False,
     repeat_launches=1,
     output_guard_elements=0,
+    c_row_stride=None,
+    c_partition_offset=0,
     early_exit_max_token_ctas=0,
     **cfg_overrides,
 ):
@@ -1966,6 +1979,32 @@ def reference_check(
 
     logical_output_m, logical_output_n = _logical_output_shape(cfg, M, N, is_gated)
     plain_output_dtype = _plain_output_torch_dtype(cfg)
+    c_pitch = int(c_row_stride) if c_row_stride else logical_output_m
+    if c_row_stride:
+        if not cfg.is_swap_ab:
+            raise ValueError("c_row_stride reference checks cover swapAB only")
+        if c_pitch < logical_output_m:
+            raise ValueError(
+                f"c_row_stride={c_pitch} is narrower than the output width "
+                f"{logical_output_m}"
+            )
+        if cfg.has_epilogue_quant or cfg.has_deepseek_fp8_c_scale:
+            raise ValueError(
+                "c_row_stride reference checks do not cover block-scaled output"
+            )
+    if c_partition_offset:
+        if not c_row_stride:
+            raise ValueError("c_partition_offset requires c_row_stride")
+        if c_partition_offset % 32:
+            raise ValueError(
+                f"c_partition_offset={c_partition_offset} must be a multiple of 32"
+            )
+        if c_partition_offset + logical_output_m > c_pitch:
+            raise ValueError(
+                f"partition at offset {c_partition_offset} with width "
+                f"{logical_output_m} does not fit inside pitch {c_pitch}"
+            )
+    c_storage_elems = logical_output_n * c_pitch
     if cfg.has_epilogue_quant:
         if output_guard_elements > 0:
             raise ValueError("output_guard_elements is not supported with FP4 C output")
@@ -1992,11 +2031,19 @@ def reference_check(
     elif cfg.uses_fp8_output:
         if output_guard_elements > 0:
             raise ValueError("output_guard_elements is not supported with FP8 C output")
-        c_storage = torch.zeros(
-            (logical_output_m * logical_output_n,),
+        c_storage = torch.full(
+            (c_storage_elems,),
+            _C_STRIDE_SENTINEL_U8 if c_row_stride else 0,
             dtype=torch.uint8,
             device=device,
         )
+        if c_row_stride:
+            _partition_view(
+                c_storage[c_partition_offset:],
+                logical_output_m,
+                logical_output_n,
+                c_pitch,
+            ).zero_()
         c_torch = None
         if cfg.has_deepseek_fp8_c_scale:
             sf_c_torch = torch.zeros(
@@ -2044,16 +2091,20 @@ def reference_check(
         output_guard_value = None
         c_guard = None
         if cfg.is_swap_ab:
-            c_storage = torch.zeros(
-                (logical_output_m * logical_output_n,),
+            c_storage = torch.full(
+                (c_storage_elems,),
+                _C_STRIDE_SENTINEL_F if c_row_stride else 0.0,
                 dtype=plain_output_dtype,
                 device=device,
             )
-            c_torch = torch.as_strided(
-                c_storage,
-                (logical_output_m, logical_output_n),
-                (1, logical_output_m),
+            c_torch = _partition_view(
+                c_storage[c_partition_offset:],
+                logical_output_m,
+                logical_output_n,
+                c_pitch,
             )
+            if c_row_stride:
+                c_torch.zero_()
         else:
             c_torch = torch.zeros(
                 (logical_output_m, logical_output_n),
@@ -2133,7 +2184,7 @@ def reference_check(
         )
         c_dp = make_ptr(
             c_dtype,
-            c_storage.data_ptr(),
+            c_storage[c_partition_offset:].data_ptr(),
             cutlass.AddressSpace.gmem,
             assumed_align=16,
         )
@@ -2279,6 +2330,7 @@ def reference_check(
     # Package the launch pointers so the shared compile/launch helpers can be
     # reused (same single ``cute.compile`` path as compile/benchmark).
     ref_io = {
+        "c_row_stride": c_row_stride,
         "a_dp": a_dp,
         "b_dp": b_dp,
         "sfa_dp": sfa_dp,
@@ -2363,10 +2415,11 @@ def reference_check(
         )
     elif cfg.uses_fp8_output:
         c_logical = _decode_fp8_output(
-            c_storage,
+            c_storage[c_partition_offset:],
             output_m=logical_output_m,
             n=logical_output_n,
             is_swap_ab=cfg.is_swap_ab,
+            pitch=c_pitch,
         )
     else:
         c_logical = c_torch
@@ -2376,6 +2429,21 @@ def reference_check(
         f"Output sample (first 8 elements): {c_logical[0, : min(8, logical_output_n)]}"
     )
     print(f"Output max: {c_logical.abs().max().item()}")
+    if c_row_stride:
+        touched = torch.zeros(c_storage_elems, dtype=torch.bool, device=device)
+        _partition_view(
+            touched[c_partition_offset:],
+            logical_output_m,
+            logical_output_n,
+            c_pitch,
+        ).fill_(True)
+        expect = _C_STRIDE_SENTINEL_U8 if cfg.uses_fp8_output else _C_STRIDE_SENTINEL_F
+        if (c_storage.reshape(-1)[~touched] != expect).any().item():
+            print("Strided output wrote outside its partition")
+            if return_output:
+                return False, c_logical.detach().clone()
+            return False
+
     if output_guard_elements > 0:
         guard_changed = (c_guard != output_guard_value).any().item()
         print(f"Output guard changed: {guard_changed}")
@@ -3405,9 +3473,22 @@ def _compile_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_clamp_limit_dp"],
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
+        _c_row_stride(io),
         io["cfg"],
         stream,
     )
+
+
+def _c_row_stride(io: dict) -> int:
+    """Row pitch of the C buffer in elements; defaults to this launch's width."""
+    v = io.get("c_row_stride")
+    if v:
+        return int(v)
+    m = int(io["shape"][0])
+    cfg = io["cfg"]
+    if cfg.is_swap_ab and cfg.has_gated_epilogue:
+        return m // 2
+    return m
 
 
 def _launch_arg_tuple(io: dict, stream) -> tuple:
@@ -3439,6 +3520,7 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_clamp_limit_dp"],
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
+        _c_row_stride(io),
         stream,
     )
 

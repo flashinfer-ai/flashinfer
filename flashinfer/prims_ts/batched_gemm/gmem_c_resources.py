@@ -96,6 +96,7 @@ class GmemCResource(MemoryResource):
     total_num_padded_tokens_tensor: Any = None
     problem_m: Any = None
     problem_n: Any = None
+    c_row_stride: Any = None
     gC: Any = None  # make_array_view of c_tensor
     gCBytes: Any = None
     gCInt16: Any = None
@@ -311,6 +312,12 @@ class GmemCResource(MemoryResource):
                 barrier_id=9,
                 thread_count=self.cfg.num_epilogue_warps * 32,
             )
+
+    def _c_pitch(self, output_m):
+        """Row pitch of C in elements; defaults to this launch's output width."""
+        if self.c_row_stride is not None:
+            return self.c_row_stride
+        return output_m
 
     def _use_swap_ab_quant_tma_store(self) -> bool:
         """Whether the swapAB quantized epilogue should stage C through TMA."""
@@ -2101,10 +2108,10 @@ class GmemCResource(MemoryResource):
         elif output_in_bounds:
             if cutlass.const_expr(self.cfg.use_tma_oob_opt):
                 if token_in_bounds:
-                    flat_idx0 = n_col * output_m + m_row0
+                    flat_idx0 = n_col * self._c_pitch(output_m) + m_row0
                     self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
             else:
-                flat_idx0 = n_col * output_m + m_row0
+                flat_idx0 = n_col * self._c_pitch(output_m) + m_row0
                 self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
 
         sf_packed = sf.to(cutlass.Float8E4M3FN).bitcast(cutlass.Int8)
@@ -2415,7 +2422,7 @@ class GmemCResource(MemoryResource):
                 ) + warpgroup_idx * Int32(self.cfg.num_bytes_c_tma_store_per_group)
                 self.sCInt16.subview(smem_offset0 >> Int32(1)).store(packed)
         elif output_in_bounds:
-            flat_idx0 = n_col * output_m + m_row0
+            flat_idx0 = n_col * self._c_pitch(output_m) + m_row0
             if cutlass.const_expr(self.cfg.uses_mxfp4_output_quant):
                 packed = _convert_f32x2_to_e2m1x2(scaled1, scaled0)
                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
@@ -2938,7 +2945,7 @@ class GmemCResource(MemoryResource):
                                     output_in_bounds,
                                 )
                             else:
-                                flat_idx0 = n_col * output_m + m_row0
+                                flat_idx0 = n_col * self._c_pitch(output_m) + m_row0
                                 flat_idx1 = flat_idx0 + Int32(1)
                                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
                                     if token_in_bounds & output_in_bounds:
@@ -3209,7 +3216,7 @@ class GmemCResource(MemoryResource):
 
                                 m_row = m_tile_base // Int32(2) + m_local_row
                                 n_col = n_tile_base + tmem_col_even
-                                flat_idx = n_col * output_m + m_row
+                                flat_idx = n_col * self._c_pitch(output_m) + m_row
                                 token_in_bounds = (
                                     n_subtile_offset + tmem_col_even
                                 ) < token_limit
@@ -3320,7 +3327,7 @@ class GmemCResource(MemoryResource):
                             warpgroup_idx,
                         )
                         m_row1 = m_row0 + Int32(1)
-                        flat_idx0 = n_col * output_m + m_row0
+                        flat_idx0 = n_col * self._c_pitch(output_m) + m_row0
                         output_pair_in_bounds = (m_row1 < output_m) & (
                             n_col < self.problem_n
                         )
@@ -3486,7 +3493,7 @@ class GmemCResource(MemoryResource):
                             elif row_sub == 3:
                                 val_f32 = val3_vals[pair_idx]
                             val_out = self._to_output_value(val_f32 * q_scale)
-                            flat_idx = n_col * output_m + m_row
+                            flat_idx = n_col * self._c_pitch(output_m) + m_row
                             output_in_bounds = (m_row < output_m) & (
                                 n_col < self.problem_n
                             )
@@ -3630,7 +3637,7 @@ class GmemCResource(MemoryResource):
                                 val_f32 = val_f32 * val_f32
                             val_f32 = self._maybe_apply_scale_c(val_f32, scale_c)
                             val_out = self._to_output_value(val_f32)
-                            flat_idx = n_col * output_m + m_row
+                            flat_idx = n_col * self._c_pitch(output_m) + m_row
                             token_in_bounds = (
                                 n_subtile_offset + tmem_col
                             ) < token_limit
