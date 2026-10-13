@@ -12,9 +12,11 @@ import torch
 from ..api_logging import flashinfer_api
 from ..cute_dsl.availability import is_cute_dsl_experimental_available
 from ..trace.templates.attn_scores import (
+    gather_key_sample_trace,
     quantize_write_index_k_nvfp4_trace,
     single_head_paged_mqa_logits_trace,
     single_head_paged_mqa_threshold_select_trace,
+    thresholds_from_sample_trace,
 )
 from ..utils import get_compute_capability, get_device_sm_count
 
@@ -295,6 +297,122 @@ def quantize_write_index_k_nvfp4(
             128,
             (key, slots, key_cache, key_scales),
             (),
+            module="single_head_scorer",
+            key_files=(single_head_scorer.__file__,),
+        )
+
+
+@flashinfer_api(trace=gather_key_sample_trace)
+def gather_key_sample(
+    key_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    offsets: torch.Tensor,
+    sample_ends: torch.Tensor,
+    *,
+    sample_keys: torch.Tensor,
+    samples_per_run: int,
+    pages_per_run: int,
+    key_scales: Optional[torch.Tensor] = None,
+    sample_scales: Optional[torch.Tensor] = None,
+) -> None:
+    """Copy a strided random sample of each request's paged keys into dense
+    sample rows, whose scores give thresholds for
+    :func:`single_head_paged_mqa_threshold_select`.
+
+    Viewed as 64-key pages (``sample_keys.view(-1, 64, d)``), the sample can be
+    scored by :func:`single_head_paged_mqa_logits`. It runs as one launch
+    without host synchronization, so it can be captured in a CUDA graph.
+
+    Parameters
+    ----------
+    key_cache : torch.Tensor
+        As in :func:`single_head_paged_mqa_logits`.
+    block_table : torch.Tensor
+        int32 ``[requests, blocks]``: each request's pages of 64 keys.
+    offsets : torch.Tensor
+        uint8 ``[capacity]``: sample slot ``s`` takes the key at ``offsets[s]``
+        (below ``64 * pages_per_run``) into run ``s // samples_per_run``.
+    sample_ends : torch.Tensor
+        int32 ``[requests]``: each request's number of samples. Later slots are
+        left as they are.
+    sample_keys : torch.Tensor
+        BF16 ``[requests, capacity, 128]`` or NVFP4 uint8 ``[..., 64]``, output,
+        ``capacity`` a multiple of 128.
+    samples_per_run : int
+        Samples per run of ``pages_per_run`` pages.
+    pages_per_run : int
+        Pages per run.
+    key_scales : torch.Tensor, optional
+        NVFP4 key scales, as in :func:`single_head_paged_mqa_logits`.
+    sample_scales : torch.Tensor, optional
+        ``[requests, capacity, 8]``, output: the sampled keys' NVFP4 scales.
+    """
+    from ..cute_dsl.launch import launch
+    from .kernels import single_head_scorer
+
+    requests, capacity, width = sample_keys.shape
+    if capacity % 128 or (key_scales is None) != (sample_scales is None):
+        raise ValueError("Sample rows hold whole 128-key tiles, with scales if NVFP4")
+    if (
+        width != key_cache.shape[2]
+        or sample_ends.shape[0] != requests
+        or offsets.shape[0] < capacity
+        or block_table.shape[0] < requests
+        or samples_per_run < 1
+    ):
+        raise ValueError("Mismatched sample rows, keys, sample ends, offsets or table")
+    args = (key_cache, key_scales, block_table, offsets, sample_ends, sample_keys)
+    if requests and capacity:
+        launch(
+            single_head_scorer.key_sample_kernel,
+            (requests, capacity // 128),
+            128,
+            (*args, sample_scales),
+            (samples_per_run, 64 * pages_per_run, width),
+            module="single_head_scorer",
+            key_files=(single_head_scorer.__file__,),
+        )
+
+
+@flashinfer_api(trace=thresholds_from_sample_trace)
+def thresholds_from_sample(
+    sample_scores: torch.Tensor,
+    sample_top: torch.Tensor,
+    *,
+    thresholds: torch.Tensor,
+    counters: torch.Tensor,
+) -> None:
+    """Set each query row's threshold for
+    :func:`single_head_paged_mqa_threshold_select` from a sample of its scores,
+    and zero its counters. It runs as one launch without host synchronization,
+    so it can be captured in a CUDA graph.
+
+    Parameters
+    ----------
+    sample_scores : torch.Tensor
+        float32 ``[rows, samples]``: each row's sampled scores.
+    sample_top : torch.Tensor
+        int32 ``[rows, rank]``: each row's Top positions among its samples.
+    thresholds : torch.Tensor
+        float32 ``[rows]``, output: the least of the row's sampled Top scores. A
+        -1 position or a NaN score counts as -inf, since dummy and capture passes
+        can feed NaN from uninitialized memory.
+    counters : torch.Tensor
+        int32 ``[rows, 2]``, output: zeroed.
+    """
+    from ..cute_dsl.launch import launch
+    from .kernels import single_head_scorer
+
+    rows, rank = sample_top.shape
+    if {sample_scores.shape[0], thresholds.shape[0], counters.shape[0]} != {rows}:
+        raise ValueError("Mismatched sample rows, thresholds or counters")
+    if rows:
+        launch(
+            single_head_scorer.thresholds_kernel,
+            ((rows + 3) // 4, 1),
+            128,
+            (sample_scores, sample_top, thresholds, counters),
+            (rank,),
             module="single_head_scorer",
             key_files=(single_head_scorer.__file__,),
         )
