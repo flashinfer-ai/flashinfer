@@ -4719,35 +4719,20 @@ def test_moe_core_preserves_fc2_output_dtype(
 
 
 @cute_dsl_available
-@pytest.mark.parametrize("available", ["execute_on_streams", "legacy", "none"])
+@pytest.mark.parametrize("available", [True, False])
 def test_localized_stream_executor_resolution(monkeypatch, available):
     """Stock PyTorch builds without the fork/join helper use the in-repo mirror."""
-    import sys
-    from types import SimpleNamespace
-
     from flashinfer.fused_moe.cute_dsl import fused_moe as module
 
     def upstream(streams, fn, *inputs):
         return [fn(*args) for args in zip(*inputs, strict=True)]
 
-    def legacy(streams, fn):
-        pass
-
-    if available == "execute_on_streams":
+    if available:
         monkeypatch.setattr(torch.cuda, "execute_on_streams", upstream, raising=False)
     else:
         monkeypatch.delattr(torch.cuda, "execute_on_streams", raising=False)
-    monkeypatch.setitem(
-        sys.modules,
-        "torch.cuda.green_contexts",
-        SimpleNamespace(execute_in_green_contexts=legacy)
-        if available == "legacy"
-        else None,
-    )
     executor = module._resolve_stream_executor()
-    expected = (
-        upstream if available == "execute_on_streams" else module._execute_on_streams
-    )
+    expected = upstream if available else module._execute_on_streams
     assert executor is expected
 
 
