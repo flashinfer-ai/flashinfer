@@ -33,9 +33,15 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
+)
 
-GDNCPArch = Literal["sm_100a", "sm_103a"]
+GDNCPArch = Literal["sm_100a", "sm_103a", "sm_107a"]
 
 # Filled mechanically by the Cake exporter from the complete production builds.
 MODULES: dict[str, dict[str, Any]] = {
@@ -67,7 +73,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_11cf3c609ca59a007e96": {
         "sources": [
@@ -107,7 +113,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_13ae1311f2f0ee1b7813": {
         "sources": [
@@ -139,7 +145,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_173b7a01d35b79f84731": {
         "sources": [
@@ -167,7 +173,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_182ccae8c184a6945d27": {
         "sources": [
@@ -199,7 +205,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_29539d13a8dd2cd0568f": {
         "sources": [
@@ -234,7 +240,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_29c857ce26576248b1c8": {
         "sources": [
@@ -274,7 +280,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_3c808f2c5dac8046844b": {
         "sources": [
@@ -339,7 +345,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_427bbbbbb5253da4a9c6": {
         "sources": [
@@ -378,7 +384,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_103a"],
+        "arches": ["sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_4913bea45166d7c45234": {
         "sources": [
@@ -411,7 +417,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_4e5f37aac06abc7b42a0": {
         "sources": [
@@ -443,7 +449,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_5b18710c217aae02ee0e": {
         "sources": [
@@ -475,7 +481,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_6856273b89c0049e09b9": {
         "sources": [
@@ -514,7 +520,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_6a6a9d040a98ccea86c9": {
         "sources": [
@@ -544,7 +550,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_6d92c5b1c26421eb420f": {
         "sources": [
@@ -576,7 +582,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_6e3ae3e850e9989ccdc2": {
         "sources": [
@@ -608,7 +614,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_72e10fdf3b60fe467d88": {
         "sources": [
@@ -647,7 +653,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_7c18fb3d6e06a4d25a64": {
         "sources": [
@@ -682,7 +688,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_8c895924c32f9c71dcf6": {
         "sources": [
@@ -714,7 +720,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_902c2149cbdfd8f74a79": {
         "sources": [
@@ -753,7 +759,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_902cedff35fc12c2a357": {
         "sources": [
@@ -785,7 +791,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_acaf46daf1b4b166f7f2": {
         "sources": [
@@ -824,7 +830,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_bb7a8a4735606de585d8": {
         "sources": [
@@ -852,7 +858,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_d4736ea62c7fb5df0e35": {
         "sources": [
@@ -884,7 +890,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_d5727d042939d5b90479": {
         "sources": [
@@ -923,7 +929,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_dd2c081134dd8b47073c": {
         "sources": [
@@ -988,7 +994,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_f3a9ede2eb4e48a3e107": {
         "sources": [
@@ -1020,7 +1026,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cooperative": False,
             "use_pdl": False,
         },
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
 }
 KERNELS: dict[str, Any] = {
@@ -1093,9 +1099,48 @@ KERNELS: dict[str, Any] = {
         "t_precompute_bf16": "cake_gdn_cp_0d2152b1fca65e744033",
         "t_precompute_gb300_hv48_min6": "cake_gdn_cp_6a6a9d040a98ccea86c9",
     },
+    "sm_107a": {
+        # fp32 SIMT fixup only: the TF32 UTCMMA fixups are not registered
+        # for sm_107a, so any plan naming them fails in ``program_for``.
+        "cp_prefill": "cake_gdn_cp_d5727d042939d5b90479",
+        "cp_prefill_bf16": "cake_gdn_cp_6856273b89c0049e09b9",
+        "cp_prefill_checkpoint": "cake_gdn_cp_d5727d042939d5b90479",
+        "cp_prefill_equal_head": "cake_gdn_cp_72e10fdf3b60fe467d88",
+        "cp_prefill_equal_head_checkpoint": "cake_gdn_cp_72e10fdf3b60fe467d88",
+        "cp_prefill_equal_head_h32": "cake_gdn_cp_427bbbbbb5253da4a9c6",
+        "cp_prefill_generic": "cake_gdn_cp_acaf46daf1b4b166f7f2",
+        "cp_prefill_generic_bf16": "cake_gdn_cp_902c2149cbdfd8f74a79",
+        "cp_prefill_generic_checkpoint": "cake_gdn_cp_acaf46daf1b4b166f7f2",
+        "mn_precompute": "cake_gdn_cp_29539d13a8dd2cd0568f",
+        "mn_precompute_bf16": "cake_gdn_cp_7c18fb3d6e06a4d25a64",
+        "normalized_final_state": "cake_gdn_cp_11cf3c609ca59a007e96",
+        "normalized_final_state_bf16": "cake_gdn_cp_29c857ce26576248b1c8",
+        "qk_norm": "cake_gdn_cp_bb7a8a4735606de585d8",
+        "qk_norm_bf16": "cake_gdn_cp_173b7a01d35b79f84731",
+        "state_fixup_simt_row4": "cake_gdn_cp_4913bea45166d7c45234",
+        "state_gather_bf16": "cake_gdn_cp_5b18710c217aae02ee0e",
+        "state_gather_bf16_int64": "cake_gdn_cp_f3a9ede2eb4e48a3e107",
+        "state_gather_fp16": "cake_gdn_cp_d4736ea62c7fb5df0e35",
+        "state_gather_fp16_int64": "cake_gdn_cp_902cedff35fc12c2a357",
+        "state_gather_fp32": "cake_gdn_cp_ef19bc051e3664f9ba15",
+        "state_gather_fp32_int64": "cake_gdn_cp_13ae1311f2f0ee1b7813",
+        "state_scatter_bf16": "cake_gdn_cp_6e3ae3e850e9989ccdc2",
+        "state_scatter_bf16_int64": "cake_gdn_cp_6d92c5b1c26421eb420f",
+        "state_scatter_fp16": "cake_gdn_cp_8c895924c32f9c71dcf6",
+        "state_scatter_fp16_int64": "cake_gdn_cp_4e5f37aac06abc7b42a0",
+        "state_scatter_fp32": "cake_gdn_cp_3df53d2d65fb731b7e09",
+        "state_scatter_fp32_int64": "cake_gdn_cp_182ccae8c184a6945d27",
+        "t_precompute": "cake_gdn_cp_6a6a9d040a98ccea86c9",
+        "t_precompute_bf16": "cake_gdn_cp_0d2152b1fca65e744033",
+        "t_precompute_gb300_hv48_min6": "cake_gdn_cp_6a6a9d040a98ccea86c9",
+    },
 }
 
-_ARCH_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
+_ARCH_FLAGS = {
+    "sm_100a": sm100a_nvcc_flags,
+    "sm_103a": sm103a_nvcc_flags,
+    "sm_107a": sm107a_nvcc_flags,
+}
 
 
 def _source_path(relative: str) -> Path:

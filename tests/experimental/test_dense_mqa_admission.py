@@ -3,8 +3,11 @@
 The engine (sglang ``supports_fp8_mqa_logits``) decides per request whether to take the Cake route or keep
 stock DeepGEMM by asking ``dense_route_available(H, Q, K, arch=device_arch)``; the producer publishes the
 64-head family per tier and per architecture (``policy.dense_admission``): an admitted tier is served on that
-arch, a withheld tier is not (its record may exist for another arch).  These tests pin that contract against
-the shipped catalog itself and against a synthetic catalog whose architectures disagree.  No device, no JIT.
+arch, a withheld tier is not (its record may exist for another arch).  The one-split ``:short`` routes
+(K <= ``policy.dense_short.max_kv``, two or more query blocks) are the exception: a withheld ``:short`` call
+is served by the tier route of its query count, never by the stock kernel.  These tests pin that contract
+against the shipped catalog itself and against a synthetic catalog whose architectures disagree.  No device,
+no JIT.
 """
 
 import copy
@@ -22,21 +25,25 @@ H64_ROUTES = frozenset(
         *(
             f"fp8:h64:{kind}:{tier}"
             for kind in ("full", "partial")
-            for tier in H64_TIERS
+            for tier in (*H64_TIERS, "short")
         ),
     }
 )
-# One or two query counts per 64-head route (K = 4137 is a legal 64-head KV length: any K >= 1).
-QUERIES_BY_ROUTE = {
-    "fp8:h64:q1": (1,),
-    "fp8:h64:full:le8": (2, 8),
-    "fp8:h64:partial:le8": (3, 7),
-    "fp8:h64:full:le64": (16, 64),
-    "fp8:h64:partial:le64": (37, 63),
-    "fp8:h64:full:le1024": (128, 1024),
-    "fp8:h64:partial:le1024": (129, 1023),
-    "fp8:h64:full:any": (4096, 16232),
-    "fp8:h64:partial:any": (1025, 16231),
+# One or two (queries, keys) points per 64-head route.  K = 4137 is a legal 64-head KV length (any K >= 1)
+# that the one-split gate never accepts; a ``:short`` route needs K <= policy.dense_short.max_kv (256) and
+# at least two query blocks (block_q = 2 for 64 heads).
+SHAPES_BY_ROUTE = {
+    "fp8:h64:q1": ((1, 4137),),
+    "fp8:h64:full:le8": ((2, 4137), (8, 4137)),
+    "fp8:h64:partial:le8": ((3, 4137), (7, 4137)),
+    "fp8:h64:full:le64": ((16, 4137), (64, 4137)),
+    "fp8:h64:partial:le64": ((37, 4137), (63, 4137)),
+    "fp8:h64:full:le1024": ((128, 4137), (1024, 4137)),
+    "fp8:h64:partial:le1024": ((129, 4137), (1023, 4137)),
+    "fp8:h64:full:any": ((4096, 4137), (16232, 4137)),
+    "fp8:h64:partial:any": ((1025, 4137), (16231, 4137)),
+    "fp8:h64:full:short": ((16, 16), (256, 256)),
+    "fp8:h64:partial:short": ((3, 256), (37, 37)),
 }
 # Synthetic per-arch admission: sm_100a admits nothing, sm_103a admits two tiers (the shape of the export's
 # ``policy.dense_admission``); one tier is therefore admitted on some architectures only.
@@ -128,31 +135,47 @@ def test_dense_admission_is_per_arch_disjoint_and_complete(catalog_variant):
         )
 
 
+def _served_route(route, queries, admitted):
+    """The route the runtime serves for a 64-head point whose logical route is ``route`` on an arch that
+    admits ``admitted``: the route itself, except a ``:short`` route the arch withholds (or the catalog does
+    not carry) is served by the tier route of the same query count -- never by the stock kernel
+    (``policy.dense_short.fallback == "tier"``)."""
+    if route.endswith(":short") and route not in admitted:
+        kind = route.split(":")[-2]
+        return f"fp8:h64:{kind}:{_runtime.metadata_tier(queries, 64)}"
+    return route
+
+
 @pytest.mark.parametrize("route", sorted(H64_ROUTES))
 def test_dense_route_available_follows_the_per_arch_admission(catalog_variant, route):
-    """On every arch, every query count of an admitted tier is available and every query count of a withheld
-    (or unexported) tier is not; the engine-facing wrapper agrees with the backend; without ``arch`` the call
-    answers only where the architectures agree and raises otherwise."""
+    """On every arch, every point of an admitted tier is available and every point of a withheld (or
+    unexported) tier is not -- a withheld one-split ``:short`` point follows the tier route it is served by;
+    the engine-facing wrapper agrees with the backend; without ``arch`` the call answers only where the
+    architectures agree and raises otherwise."""
     verdicts = {}
     for arch in _arches():
-        admitted = route in dense_mqa.dense_admission(arch)["admitted_routes"]
-        verdicts[arch] = admitted
-        for queries in QUERIES_BY_ROUTE[route]:
+        admitted = set(dense_mqa.dense_admission(arch)["admitted_routes"])
+        for queries, keys in SHAPES_BY_ROUTE[route]:
             if 64 in _runtime.heads():
-                assert _runtime.route_name("fp8", queries, 4137, 64) == route, queries
-            available = dense_mqa.dense_route_available(64, queries, 4137, arch=arch)
-            assert available == admitted, (arch, route, queries)
+                assert _runtime.route_name("fp8", queries, keys, 64) == route, (
+                    queries,
+                    keys,
+                )
+            available = dense_mqa.dense_route_available(64, queries, keys, arch=arch)
+            served = _served_route(route, queries, admitted)
+            assert available == (served in admitted), (arch, route, queries, keys)
             assert available == _runtime.dense_route_available(
-                64, queries, 4137, arch=arch
+                64, queries, keys, arch=arch
             )
-    queries = QUERIES_BY_ROUTE[route][0]
-    if len(set(verdicts.values())) == 1:
-        assert dense_mqa.dense_route_available(64, queries, 4137) == next(
-            iter(verdicts.values())
-        )
-    else:
-        with pytest.raises(ValueError, match="pass arch"):
-            dense_mqa.dense_route_available(64, queries, 4137)
+            verdicts.setdefault((queries, keys), {})[arch] = available
+    for (queries, keys), by_arch in verdicts.items():
+        if len(set(by_arch.values())) == 1:
+            assert dense_mqa.dense_route_available(64, queries, keys) == next(
+                iter(by_arch.values())
+            )
+        else:
+            with pytest.raises(ValueError, match="pass arch"):
+                dense_mqa.dense_route_available(64, queries, keys)
     with pytest.raises(ValueError, match="arch must be one of"):
         dense_mqa.dense_admission("sm_999x")
 

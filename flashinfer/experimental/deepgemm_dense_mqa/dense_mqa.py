@@ -17,6 +17,15 @@ Head counts: the catalog policy lists the exported head counts (``heads``);
 ``BLOCK_Q = 128 // num_heads`` queries share one 128-row MMA tile (4 for 32
 heads, 2 for 64 heads). The one-shot ``fp8_mqa_logits`` mirrors DeepGEMM's
 ``fp8_mqa_logits`` signature on top of :class:`DenseMqaPlan`.
+
+32-head routes come in two launch shapes: the metadata program followed by the
+logits program (the ``q1`` and ``<tier>`` routes), or ONE logits launch that
+computes the schedule in-kernel (the ``:short`` routes: the fused single-query
+chain ``q1:short``, the warp-scan classes ``q128:short`` / ``le32:short`` and
+the CTA-scan classes ``le768:short`` (FP8) / ``le1024:short`` (FP4)). A class
+is named by its query-BLOCK ceiling and served while the KV length is within
+the catalog policy's bound for that class (``fused_*_max_kv``); above the
+bound the two-launch route of the same query count serves the call.
 """
 
 from __future__ import annotations
@@ -26,7 +35,7 @@ import json
 from pathlib import Path
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-CATALOG_SCHEMA = "dense_mqa.v6"
+CATALOG_SCHEMA = "dense_mqa.v9"
 NUM_HEADS = 32  # default head count of the public helpers
 BLOCK_QH = 128  # query rows x heads per MMA tile
 BLOCK_Q = BLOCK_QH // NUM_HEADS
@@ -80,13 +89,30 @@ def _nvcc_flags(arch):
     return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
 
 
-def program_names(route=None):
-    """Names of the catalogued programs (optionally only those a route can launch)."""
+def stage_program(stage, arch):
+    """The program one route stage launches on ``arch``; ``stage`` is one ``[name, {arch: program}]`` entry
+    of a route record's ``stages`` (the catalog binds a stage's program per architecture)."""
+    name, by_arch = stage
+    try:
+        return by_arch[arch]
+    except KeyError:
+        raise RuntimeError(
+            f"route stage {name} has no program for {arch}; catalogued architectures: {sorted(by_arch)}"
+        ) from None
+
+
+def program_names(route=None, arch=None):
+    """Names of the catalogued programs: all of them, those a route launches on ``arch`` (stage order, then
+    the sequence), or -- without ``arch`` -- the sorted union over the architectures of what the route launches."""
     catalog = _catalog()
     if route is None:
         return sorted(catalog["programs"])
     record = catalog["routes"].get(route) or catalog["paged_routes"][route]
-    names = [program for _stage, program in record["stages"]]
+    if arch is None:
+        stages = record["stages"]
+        names = sorted({p for _stage, by_arch in stages for p in by_arch.values()})
+    else:
+        names = [stage_program(stage, arch) for stage in record["stages"]]
     if record.get("sequence"):
         names.append(record["sequence"])
     return names
@@ -164,14 +190,40 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     The 32-head names are the shipped ones (``K % 256 == 0``); other head counts
     carry an ``h<H>`` infix, their programs take any ``K >= 1`` (in-kernel KV
     tail) and their tiers are named by the token ceiling of the shared block
-    ceilings (``le8`` / ``le64`` / ``le1024`` / ``any`` for 64 heads). Whether the
-    catalog ships the route is a separate question (:func:`dense_route_available`).
+    ceilings (``le8`` / ``le64`` / ``le1024`` / ``any`` for 64 heads); a 64-head
+    call with ``K <= policy.dense_short.max_kv`` and at least
+    ``policy.dense_short.min_q_blocks`` query blocks names the one-split
+    ``:short`` route of its kind (:func:`h64_short_shape`). Whether the catalog
+    ships the route is a separate question (:func:`dense_route_available`), and
+    which route the device is served is :func:`served_route`.
+
+    32-head precedence (every bound is a catalog policy key). FP8: the fused
+    single-query chain ``fp8:q1:short`` (``K <= fused_q1_max_kv``), the plain
+    ``fp8:q1`` pair, the fused ``fp8:q128:short`` text (``Q = 128``,
+    ``K <= fused_q128_max_kv``), the in-kernel scan class of the query count
+    qualified by block kind (``fp8:{full,partial}:le{32,768}:short``;
+    ``Q = 128`` belongs to the Q128 rule only), then the metadata + indexer
+    pair. FP4: ``fp4:q1:short`` (``K <= fp4.fused_q1_max_kv``), the scan class
+    (``fp4:le{32,1024}:short``), then the pair. A scan class is the smallest
+    ``fused_scan_ceilings`` entry covering ``ceil(Q / 4)`` and is served only
+    while ``K <= fused_scan<ceiling>_max_kv`` of that class
+    (:func:`_fused_scan_class`).
     """
     policy = _catalog()["policy"]
     if precision not in ("fp4", "fp8"):
         raise ValueError("precision must be 'fp4' or 'fp8'")
     prefix = _route_prefix(precision, num_heads)
+    kind = "full" if queries % block_q(num_heads) == 0 else "partial"
     if precision == "fp4":
+        if num_heads == NUM_HEADS:
+            fp4 = policy["fp4"]
+            if queries == 1:
+                if keys <= int(fp4["fused_q1_max_kv"]):
+                    return f"{prefix}:q1:short"
+                return f"{prefix}:q1"
+            scan = _fused_scan_class(queries, keys, fp4)
+            if scan:
+                return f"{prefix}:le{scan}:short"
         return (
             f"{prefix}:q1"
             if queries == 1
@@ -181,14 +233,73 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
         if num_heads == NUM_HEADS and keys <= policy["fused_q1_max_kv"]:
             return f"{prefix}:q1:short"
         return f"{prefix}:q1"
-    if (
-        num_heads == NUM_HEADS
-        and queries == 128
-        and keys <= policy["fused_q128_max_kv"]
-    ):
-        return f"{prefix}:q128:short"
-    kind = "full" if queries % block_q(num_heads) == 0 else "partial"
+    if num_heads == NUM_HEADS:
+        if queries == 128 and keys <= policy["fused_q128_max_kv"]:
+            return f"{prefix}:q128:short"
+        # Q = 128 is owned by the fused-Q128 rule: above its bound it takes the
+        # two-launch pair, never the le32 class.
+        scan = 0 if queries == 128 else _fused_scan_class(queries, keys, policy)
+        if scan:
+            return f"{prefix}:{kind}:le{scan}:short"
+    if num_heads != NUM_HEADS and h64_short_shape(queries, keys, num_heads):
+        return f"{prefix}:{kind}:short"
     return f"{prefix}:{kind}:{metadata_tier(queries, num_heads)}"
+
+
+def _fused_scan_class(queries, keys, bounds):
+    """The in-kernel scan class that serves a 32-head call, or 0: the SMALLEST
+    query-block ceiling of ``bounds["fused_scan_ceilings"]`` covering ``ceil(Q / 4)``
+    when ``K <= bounds["fused_scan<ceiling>_max_kv"]``. The class is fixed by the
+    query count and only its own KV bound is consulted; above it the call takes
+    the two-launch route, never a larger class."""
+    blocks = (queries + BLOCK_Q - 1) // BLOCK_Q
+    for ceiling in bounds["fused_scan_ceilings"]:
+        ceiling = int(ceiling)
+        if blocks <= ceiling:
+            if keys <= int(bounds[f"fused_scan{ceiling}_max_kv"]):
+                return ceiling
+            return 0
+    return 0
+
+
+def h64_short_shape(queries, keys, num_heads=64):
+    """Shape-only one-split gate of the 64-head ``:short`` routes (``policy.dense_short``): ``K <= max_kv``
+    (every query block covers one 256-row KV split whatever the windows hold) and at least ``min_q_blocks``
+    query blocks (a one-block call does not gain from the one-split text). False when the catalog has no
+    ``dense_short`` policy."""
+    short = _catalog()["policy"].get("dense_short")
+    if short is None:
+        return False
+    blocks = (queries + block_q(num_heads) - 1) // block_q(num_heads)
+    return keys <= int(short["max_kv"]) and blocks >= int(short["min_q_blocks"])
+
+
+def _h64_tier_fallback(precision, queries, num_heads, route):
+    kind = route.split(":")[-2]
+    return f"{_route_prefix(precision, num_heads)}:{kind}:{metadata_tier(queries, num_heads)}"
+
+
+def served_route(precision, queries, keys, num_heads=NUM_HEADS, *, arch=None):
+    """The route the runtime serves for a problem on ``arch``: :func:`route_name`, except that a 64-head
+    ``:short`` route the catalog does not carry or ``arch`` withholds (``policy.dense_admission``) is served by
+    the tier route of the same query count -- the production program the tier table admits -- never by the
+    stock kernel (``policy.dense_short.fallback == "tier"``). ``arch=None`` is accepted only where the
+    architectures agree on the short route's admission (``ValueError`` otherwise, as :func:`_admitted`)."""
+    route = route_name(precision, queries, keys, num_heads)
+    if num_heads != NUM_HEADS and route.endswith(":short"):
+        if route not in _catalog()["routes"] or not _admitted(route, arch):
+            return _h64_tier_fallback(precision, queries, num_heads, route)
+    return route
+
+
+def _export_route(precision, queries, keys, num_heads=NUM_HEADS):
+    """The route the export resolves for a point (admission is routing policy, not a precondition of the
+    program): :func:`route_name`, or the tier route when a 64-head ``:short`` route has no catalog record."""
+    route = route_name(precision, queries, keys, num_heads)
+    short = num_heads != NUM_HEADS and route.endswith(":short")
+    if short and route not in _catalog()["routes"]:
+        return _h64_tier_fallback(precision, queries, num_heads, route)
+    return route
 
 
 def kv_alignment(num_heads=NUM_HEADS):
@@ -232,7 +343,7 @@ def dense_route_available(num_heads, queries, keys, precision="fp8", *, arch=Non
             return False
         if keys % kv_alignment(num_heads):
             return False
-        route = route_name(precision, queries, keys, num_heads)
+        route = served_route(precision, queries, keys, num_heads, arch=arch)
     except (ValueError, KeyError):
         return False
     if route not in _catalog()["routes"]:
@@ -242,8 +353,9 @@ def dense_route_available(num_heads, queries, keys, precision="fp8", *, arch=Non
 
 def h64_admission(arch):
     """``policy.dense_admission`` of one architecture: ``{"admitted_routes": [...], "withheld_routes": [...],
-    "reason": str | None}`` -- the 64-head tiers served on ``arch`` (every query count of those tiers), the
-    tiers the producer measured and did not admit there (the engine keeps its stock kernel; ``reason`` says
+    "reason": str | None}`` -- the 64-head routes served on ``arch`` (every query count of those tiers), the
+    routes the producer measured and did not admit there (a withheld TIER route keeps the engine's stock
+    kernel; a withheld ``:short`` route is served by its tier route, see :func:`served_route`; ``reason`` says
     why), two disjoint lists. Empty / ``None`` when the catalog has no 64-head family. Host-only."""
     record = _catalog()["policy"].get("dense_admission")
     arches = (
@@ -297,7 +409,8 @@ def route_record(precision, queries, keys, num_heads=NUM_HEADS, *, arch=None):
         raise ValueError(
             f"no exported dense MQA route for {(precision, num_heads, queries, keys)} on {arch or 'every arch'}"
         )
-    return _catalog()["routes"][route_name(precision, queries, keys, num_heads)]
+    served = served_route(precision, queries, keys, num_heads, arch=arch)
+    return _catalog()["routes"][served]
 
 
 def metadata_tier(queries, num_heads=NUM_HEADS):
@@ -478,8 +591,9 @@ class DenseMqaPlan:
     64-head routes are single-stage without a metadata buffer (``metadata`` must
     be None, ``plan.metadata`` is None, the program is gridDim-strided over the
     tiles from the ``sm_count`` launch grid) and store raw tiles only (cells
-    outside the windows are unspecified); the 32-head fused short-KV routes have
-    no metadata stage but still own the buffer their program writes in-kernel.
+    outside the windows are unspecified); the 32-head ``:short`` routes (fused
+    single-query chain, in-kernel warp / CTA scan) have no metadata stage but
+    still own the buffer their program writes in-kernel.
     FP4 output storage must include the final query tile.
     """
 
@@ -527,7 +641,7 @@ class DenseMqaPlan:
             # Export validation runs every catalogued row on every architecture; the per-arch admission
             # (policy.dense_admission) is routing policy for the engines, not a precondition of the program.
             try:
-                available = route_name(
+                available = _export_route(
                     precision, queries, keys, num_heads
                 ) in _catalog()["routes"] and (keys % kv_alignment(num_heads) == 0)
             except ValueError:
@@ -610,7 +724,13 @@ class DenseMqaPlan:
         self.arch = arch
         self.num_sms = num_sms
         self.num_heads = num_heads
-        self.route_name = route_name(precision, queries, keys, num_heads)
+        # The served route: a withheld 64-head :short route runs its tier program on this arch; export validation
+        # (enforce_admission=False) runs every catalogued route on every arch.
+        self.route_name = (
+            served_route(precision, queries, keys, num_heads, arch=arch)
+            if enforce_admission
+            else _export_route(precision, queries, keys, num_heads)
+        )
         self.route = _catalog()["routes"][self.route_name]
         self.config = dict(
             precision=precision,
@@ -643,8 +763,9 @@ class DenseMqaPlan:
                 f"FP4 output backing storage must include the final {bq}-row tile"
             )
         # The metadata buffer belongs to the head count's schedule, not to the route's stage list: the
-        # shipped 32-head fused routes (fp8:q1:short / fp8:q128:short) have no metadata stage yet WRITE
-        # their schedule into ScheduleMeta in-kernel, so every 32-head plan owns the buffer; the 64-head
+        # shipped 32-head ``:short`` routes (fp8:q1:short, fp8:q128:short, the le32 / le768 / le1024 scan
+        # classes, fp4:q1:short) have no metadata stage yet WRITE their schedule into ScheduleMeta
+        # in-kernel, so every 32-head plan owns the buffer; the 64-head
         # programs never touch it (ScheduleMeta bound to ks).
         if schedules_metadata(num_heads):
             words = metadata_words(queries, num_sms, num_heads)
@@ -679,11 +800,11 @@ class DenseMqaPlan:
         )
         self._submissions, self._programs = [], []
         sequence = self.route.get("sequence")
-        selections = (
-            [(None, sequence)]
-            if sequence
-            else [(stage, program) for stage, program in self.route["stages"]]
-        )
+        if sequence:
+            selections = [(None, sequence)]
+        else:
+            stages = self.route["stages"]
+            selections = [(stage[0], stage_program(stage, arch)) for stage in stages]
         self.program_names = [program for _stage, program in selections]
         for stage_name, program in selections:
             submit, loaded = _submission(

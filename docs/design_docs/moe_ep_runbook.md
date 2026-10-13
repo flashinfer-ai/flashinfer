@@ -240,7 +240,44 @@ device-side aborts):
 Hopper-only (`sm90_fp8_fp8_bf16_pull_cutedsl`) correctness targets run in their own pytest
 process (the SM90/SM100 kernel trees are mutually exclusive per process):
 `bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
-`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
+`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).  The BF16 pull-style
+twin (`sm90_bf16_bf16_bf16_pull_cutedsl`) shares both targets, and its token
+sweep has its own bench script,
+`benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_bf16_pull_mega.py`
+(same CLI minus the FP8-only axes; see that tree's `TUNING.md`).
+
+The SM120 MXFP4 x MXFP8 MegaMoE backend (`sm120_mxfp4_mxfp8_bf16_cake`: one
+Cake-generated parametric persistent kernel per deployment, JIT-compiled from
+`flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/`) has its own target,
+`bash tests/moe_ep/run_tests.sh mega_sm120_cake` (4 GPUs; `NPROC_CAKE_SM120=8`
+for a full host). It needs NCCL 2.30.7 with the Device API (`NCCL_HOME`), and on
+multi-GPU PCIe hosts a pinned `NCCL_TOPO_FILE`. Sixteen ranks over two hosts run
+the same modules under a two-node torchrun (`--nnodes 2 --nproc_per_node 8`,
+`NCCL_GIN_ENABLE=1`); cross-host pairs use GIN, the transport table may keep LSA
+inside each host. Each EP-rank pair moves dispatch payloads and expert results over
+GIN (default `transport_table="all_gin"`) or LSA (load/store over NVLink / PCIe peer
+mappings; the copier instances reserve one copier CTA per LSA destination of a rank).
+To pick the table per deployment offline, run
+`torchrun --nproc_per_node=<EP> -m flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8
+--hidden H --intermediate I --num-experts E --topk K --max-tokens <capacities>
+[--shared-expert]` once and configure `transport_table="tuned"`: the workspace looks
+the winner up in `FLASHINFER_MOE_EP_KNOB_CACHE` (keyed by GPU, geometry, variant,
+capacity and the gathered peer topology; all-GIN on a miss). Latency:
+`benchmarks/moe_ep/backends/mega/kernel/sm120/bench_moe_ep_sm120_w4a8_cake_mega.py`.
+Serving frameworks that know the largest per-rank token count of a call should pass it
+as the invocation's token bucket (`layer.stage_inputs(t, compile_tokens_per_rank=bucket)`
+then `layer.compute_staged(output=...)`, the same value on every rank): the call then skips
+the backend's per-call `[rows, expert histogram]` all-gather and its host read-back, and it
+can be captured into a CUDA graph -- one graph per bucket, after one eager call of the layer on
+that workspace; every rank replays the same bucket sequence in the same order (see "CUDA
+graphs" in the kernel package README).
+A rank that stalls or dies mid-call for longer than the kernel's 600 s wait deadline
+makes the call fail on every rank with `CUDA error: unspecified launch failure`
+(device `trap`) instead of hanging; restart the processes (see the wait-deadline
+paragraph in `flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/README.md`).
+On a single host, `all_gin` sends same-host pairs through NIC loopback; with RoCE ECN / DCQCN congestion control
+this can throttle large calls (a tail of 10-100 ms at EP4 / 8192 tokens per rank on our PCIe host, CNPs rising on
+the NICs).  Prefer an LSA table for same-host pairs there (`lsa_where_reachable`, `all_lsa`, or `"tuned"`).
 
 The native BF16 Hopper backend (`sm90_bf16_bf16_bf16_push_cake`: bf16 dispatch
 payload, Cake-generated WGMMA FC1/FC2 with fp32 accumulation, bf16 combine
@@ -583,7 +620,7 @@ vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 
 - `kernel_src/sm100/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
-  (a fork of the same kernel repo)
+  and BF16 (a fork of the same kernel repo)
 - `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 (raw CUDA,
   JIT-compiled; vendored from flashinfer PR #4069, see its VENDOR.md)
 - `kernel_src/sm120/swapab_cutedsl_megakernel/` — Blackwell-consumer
