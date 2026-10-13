@@ -6,18 +6,16 @@ set -x
 : ${CUDA_VISIBLE_DEVICES:=0}
 : ${SKIP_INSTALL:=0}
 
-# Source test environment setup (handles package overrides like TVM-FFI)
 source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/jit_test_logging.sh"
 
 if [ "$SKIP_INSTALL" = "0" ]; then
   install_flashinfer_editable
 fi
 
-# Create JUnit XML output directories for cross-lane coverage analysis
-mkdir -p junit-shard/tests/attention junit-shard/tests/utils junit-shard/tests/gemm \
-  junit-shard/tests/cli junit-shard/tests/moe junit-shard/tests/experimental \
-  junit-shard/tests
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Run each test file separately to isolate CUDA memory issues
-pytest -s --junitxml=junit-shard/tests/utils/test_sampling.py.xml tests/utils/test_sampling.py
-pytest -s --junitxml=junit-shard/tests/utils/test_topk.py.xml tests/utils/test_topk.py
+# Separate processes release CUDA memory between files.
+pytest -s tests/utils/test_sampling.py
+pytest -s tests/utils/test_topk.py
+pytest -s tests/attention/test_batch_prefill_kernels.py -k 'not nvfp4'

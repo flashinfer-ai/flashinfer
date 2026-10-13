@@ -2918,7 +2918,7 @@ def test_mla_decode_trtllm_gen_rejects_head_gap():
     args = _mla_decode_inputs(num_heads=96, page_size=64)
     with pytest.raises(
         ValueError,
-        match=r"64 < num_heads_q < 128.*backend='cute-dsl'",
+        match=r"64 < num_heads_q < 128; got num_heads_q=96\.",
     ):
         trtllm_batch_decode_with_kv_cache_mla(**args, backend="trtllm-gen")
 
@@ -2937,3 +2937,70 @@ def test_mla_decode_variable_q_auto_uses_cute_dsl_for_head_gap():
         max_q_len=8,
         public_backend="auto",
     )
+
+
+def test_functional_profile_preserves_caller_lse_and_resizes_scratch():
+    from flashinfer.mla._batch_mla._backends.cute_dsl_monolithic_backend import (
+        _BatchMLAPagedAttentionCuteDslMonolithicBackend,
+    )
+
+    skip_if_sm100a_unsupported()
+    torch.manual_seed(392)
+    query = torch.randn(2, 2, 128, 576, dtype=torch.bfloat16, device="cuda") * 0.5
+    kv = torch.randn(8, 32, 576, dtype=torch.bfloat16, device="cuda") * 0.5
+    tables = torch.tensor(
+        [[3, 0, 2, 1], [6, 4, 7, 5]], dtype=torch.int32, device="cuda"
+    )
+    lengths = torch.tensor([47, 91], dtype=torch.int32, device="cuda")
+    caller_lse = torch.full((4, 128), float("nan"), device="cuda")
+    runner = _BatchMLAPagedAttentionCuteDslMonolithicBackend.from_functional(
+        kv_cache=kv,
+        workspace_buffer=torch.zeros(128 * 1024**2, dtype=torch.uint8, device="cuda"),
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        max_seq_len=128,
+        softmax_scale=0.125,
+        output_scale=0.75,
+        out_dtype=torch.bfloat16,
+        enable_pdl=False,
+        is_var_seq=True,
+        uses_shared_paged_kv_idx=True,
+        lse=caller_lse,
+        return_lse=True,
+        return_lse_base="basee",
+        sinks=None,
+        cute_dsl_impl="monolithic",
+    )
+    # A bucket-sized profiling call must use private LSE scratch; the actual
+    # invocation must resize it and bind the caller's full-size LSE buffer.
+    for batch_size, profiling in [(1, True), (2, False)]:
+        q = query[:batch_size]
+        out = torch.empty(batch_size, 2, 128, 512, dtype=torch.bfloat16, device="cuda")
+        inputs = [q, tables[:batch_size], lengths[:batch_size], out]
+        result = (
+            runner.forward(inputs, tactic=-1) if profiling else runner.forward(inputs)
+        )
+        expected, expected_lse = torch_reference_mla(
+            q[..., :512],
+            q[..., 512:],
+            kv[..., :512].reshape(-1, 512),
+            kv[..., 512:].reshape(-1, 64),
+            tables[:batch_size],
+            lengths[:batch_size],
+            0.125,
+            0.75,
+            32,
+            apply_mtp_mask=True,
+            return_lse=True,
+        )
+        torch.testing.assert_close(
+            result[0].float(), expected.float(), rtol=0.01, atol=0.01
+        )
+        torch.testing.assert_close(
+            result[1].reshape_as(expected_lse), expected_lse, rtol=0.01, atol=0.01
+        )
+        if profiling:
+            assert torch.isnan(caller_lse).all()
+        else:
+            assert result[1].data_ptr() == caller_lse.data_ptr()

@@ -37,13 +37,14 @@ from tvm_ffi import cpp
 from . import env as jit_env
 from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 
-CakeGDNArch = Literal["sm_100a", "sm_103a"]
+CakeGDNArch = Literal["sm_100a", "sm_103a", "sm_107a"]
 
 _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
 _DEFINE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,
+    "sm_107a": 212,
 }
 
 
@@ -251,8 +252,16 @@ def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
         arch=arch,
         digest=compile_digest,
         compile_options=compile_options,
+        # The shared device header includes its helper definitions from the
+        # content-addressed ``csrc/cake_device_helpers/`` files relative to ``csrc``
+        # (root.parents[1], as the host-shim build below already passes it).
         include_paths=tuple(
-            dict.fromkeys((root / header["path"]).parent for header in headers)
+            dict.fromkeys(
+                [
+                    *((root / header["path"]).parent for header in headers),
+                    root.parents[1],
+                ]
+            )
         ),
         nvcc=nvcc,
     )
@@ -532,6 +541,196 @@ def select_cake_gdn_prefill_variant(
     )
 
 
+# BF16-state T=1 decode: every per-rank (H, HV) geometry is admitted at any
+# batch; the body and grid tile follow the state-head count B*HV in bands
+# (mirrors the Cake program rule ``select_bf16_t1_route``; calibrated against
+# the FlashInfer BF16 pool kernel on B200/B300).  ``vec8`` is the
+# latency-first instance of the vec8 body (``__launch_bounds__(128, 1)``, every
+# first-block load ahead of the reductions), ``vec8r56`` the same schedule under
+# a 56-register cap (``__launch_bounds__(128, 9)``; the sm_103a build spills
+# nothing and reads 1.4-4.3 % faster than ``vec8`` at TILE_V=16 while the
+# sm_100a build is 4-5 % slower, so it is routed per architecture through
+# ``CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES``), ``vec8occ`` the occupancy-first
+# instance (default launch bounds, eight CTAs per SM so the 1024-CTA grids at
+# 256 and 512 state heads run in one wave) and ``wide`` the MTP wide-tile body
+# at ``T_STEPS=1`` (one 128-row CTA per state head) for the bandwidth-bound
+# large pools.  The grid is ``V / TILE_V`` 128-thread CTAs per state head.
+CAKE_GDN_BF16_T1_BODIES = ("vec8", "vec8r56", "vec8occ", "wide")
+# (largest state-head count of the band or None for the open last band, body, TILE_V)
+CAKE_GDN_BF16_T1_ROUTE_BANDS = (
+    (8, "vec8", 32),
+    # 9-192 heads: TILE_V=16 (``vec8r56`` on sm_103a).  TILE_V=32 ties it at
+    # 192 heads in the calibration sweeps on both GPUs but its 768-CTA grid is
+    # launch-order sensitive on GB300 (the first of two back-to-back launches
+    # runs ~7 % slower; export rows b6 H16/HV32 and b24 H4/HV8 failed the
+    # directional gate every round).
+    (192, "vec8", 16),
+    (256, "vec8occ", 32),
+    (384, "vec8", 64),
+    (512, "vec8occ", 64),
+    (768, "vec8", 64),
+    (None, "wide", 128),
+)
+
+
+# Per-architecture body overrides of the band rule ({arch: {band upper bound: body}};
+# mirrors Cake's ``BF16_T1_ROUTE_ARCH_BODIES``): GB300 takes the 56-register
+# ``vec8r56`` instance in the 9-192 band, B200 keeps ``vec8``.
+CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES: dict[str, dict[int, str]] = {
+    "sm_103a": {192: "vec8r56"}
+}
+
+# Architectures whose calibration does not follow the shared bands carry a
+# complete band table of their own (mirrors Cake's ``BF16_T1_ROUTE_ARCH_BANDS``).
+# sm_107a (Rubin R200, 212 SMs): calibrated on R200 against the per-row fastest
+# of the ten admitted (body, TILE_V) instances over the 94 Qwen3.5 serving rows
+# plus 17 synthetic batches; the shared table costs 1.064x of the
+# per-row fastest there (1.268x at 1536 state heads), this table 1.001x.  The
+# ``vec8occ`` instance at TILE_V=16 leads below 192 heads (one wave of 128-row
+# CTAs; ``vec8``/``vec8r56`` 0.4-3.3 % behind), TILE_V=32 takes over at 193-256
+# (``vec8``) and 257-368 / 417-3072 heads (``vec8occ``), 369-416 heads return to
+# ``vec8occ`` at TILE_V=16, and the wide 128-row body only wins above 3072 heads
+# (the shared table hands over at 768).
+CAKE_GDN_BF16_T1_ROUTE_ARCH_BANDS: dict[
+    str, tuple[tuple[int | None, str, int], ...]
+] = {
+    "sm_107a": (
+        (192, "vec8occ", 16),
+        (256, "vec8", 32),
+        (368, "vec8occ", 32),
+        (416, "vec8occ", 16),
+        (768, "vec8", 32),
+        (3072, "vec8occ", 32),
+        (None, "wide", 128),
+    ),
+}
+
+
+def cake_gdn_bf16_t1_route(
+    batch_size: int, num_v_heads: int, arch: CakeGDNArch
+) -> tuple[str, int]:
+    """``(body, TILE_V)`` of the BF16-state T=1 decode route for ``batch_size * num_v_heads`` state heads on ``arch``."""
+
+    state_heads = int(batch_size) * int(num_v_heads)
+    bands = CAKE_GDN_BF16_T1_ROUTE_ARCH_BANDS.get(arch)
+    overrides = (
+        CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES.get(arch, {}) if bands is None else {}
+    )
+    if bands is None:
+        bands = CAKE_GDN_BF16_T1_ROUTE_BANDS
+    for max_state_heads, body, tile_v in bands:
+        if max_state_heads is None or state_heads <= max_state_heads:
+            return overrides.get(max_state_heads, body), tile_v
+    raise AssertionError("BF16 T=1 route band tables must end with an open band")
+
+
+# The full-warp tile-v16 BF16 verify body per architecture: Rubin (sm_107a) runs the
+# `tile16_vpre` schedule (every draft token's v values staged in shared memory ahead
+# of the serial recurrence, fully unrolled token loop; bitwise-identical output),
+# B200/B300 keep the shipped body.  Mirrors
+# loom.examples.weave.gdn_decode_pretranspose.select_bf16_verify_tile16_body.
+CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES: dict[str, str] = {"sm_107a": "tile16_vpre"}
+
+
+def cake_gdn_bf16_verify_tile16_schedule(arch: CakeGDNArch) -> str:
+    """Schedule attribute of the full-warp tile-v16 BF16 verify kernel on ``arch``."""
+    body = CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES.get(arch, "tile16")
+    return f"gdn_decode_pretranspose_t4_bf16state_{body}"
+
+
+# The wide (TILE_V_WIDE 32/64/128) BF16-state MTP body of the multi-token
+# verify / update / checkpoint rows, per architecture: sm_107a routes the
+# `wide128_vpre` schedule (the draft window's v values prefetched before the
+# barrier, token loop unrolled; bitwise-identical output), every other
+# architecture and every T=1 band row the shipped wide body.  Mirrors
+# `BF16_WIDE_ARCH_BODIES` / `select_bf16_wide_body` of the Cake exporter.
+CAKE_GDN_BF16_WIDE_ARCH_BODIES: dict[str, str] = {"sm_107a": "wide128_vpre"}
+# The promoted fp32-state MTP update body (B4 T4 with the intermediate-state cache,
+# `..._mtp_t4_splitv8`) is routed per architecture as well: Rubin (sm_107a) runs its
+# `_pro` twin (producer phase parallel over the draft tokens, every independent global
+# load issued before the first reduction; bitwise-identical output), B200 / B300 keep
+# the shipped body.  The verify body `..._mtp_t2_inline_tile8` is the same everywhere.
+# Mirrors the splitv8 entry of `FP32_MTP_ARCH_BODIES` / `select_fp32_mtp_body` in
+# loom.examples.weave.gdn_decode_pretranspose; keyed by architecture here because the
+# table applies to that one base (the resolver consults it for the splitv8 row only).
+CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[str, str] = {
+    "sm_107a": "gdn_decode_pretranspose_mtp_t4_splitv8_pro"
+}
+# The fp32-state T=1 pretranspose body (`..._splitv8`, route `indexed_fp32_t1_splitv8`)
+# is routed per architecture by the state-head count B*HV: Rubin (sm_107a) runs the
+# shipped `splitv8` body (TILE_V 16, eight CTAs per state head) below 256 state heads
+# and its `splitv8_tilev32` twin (TILE_V 32, four CTAs per state head; bitwise-identical
+# output, only the row -> CTA mapping changes) from 256 state heads on: 5-8.5 % faster
+# on R200 from 256 through 2048 state heads, 11-17 % slower at 32 and 128.  B200 / B300
+# keep `splitv8` at every count.  Mirrors `FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS` /
+# `FP32_T1_SPLITV8_ARCH_BANDS` / `select_fp32_t1_splitv8_route` in
+# loom.examples.weave.gdn_decode_pretranspose (the Cake tree cross-checks these copies).
+CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS = 256
+# (largest state-head count of the band or None for the open last band, body)
+CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
+    "sm_107a": (
+        (CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS - 1, "splitv8"),
+        (None, "splitv8_tilev32"),
+    ),
+}
+# CTAs per state head each fp32 T=1 body launches (the host grid is B * HV times this),
+# keyed by the record's schedule: the resolved record carries its own grid instead of a
+# fixed eight.
+CAKE_GDN_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
+    "gdn_decode_pretranspose_splitv8": 8,
+    "gdn_decode_pretranspose_splitv8_tilev32": 4,
+}
+
+
+def cake_gdn_fp32_t1_route(batch_size: int, num_v_heads: int, arch: CakeGDNArch) -> str:
+    """Body (``splitv8`` or ``splitv8_tilev32``) of the fp32-state T=1 pretranspose route for ``batch_size * num_v_heads`` state heads on ``arch``."""
+
+    bands = CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS.get(arch)
+    if bands is None:
+        return "splitv8"
+    state_heads = int(batch_size) * int(num_v_heads)
+    for max_state_heads, body in bands:
+        if max_state_heads is None or state_heads <= max_state_heads:
+            return body
+    raise AssertionError("fp32 T=1 route band tables must end with an open band")
+
+
+@functools.cache
+def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
+    """CTAs per state head the fp32-state T=1 pretranspose record ``variant_name`` launches (read from its schedule)."""
+
+    record = _kernel_record(variant_name)
+    schedule = record["source_schedule"].rsplit(":", 1)[-1]
+    ctas_per_state = CAKE_GDN_FP32_T1_CTAS_PER_STATE.get(schedule)
+    if ctas_per_state is None:
+        raise CakeGDNUnsupportedError(
+            f"{variant_name!r} ({schedule}) is not an fp32-state T=1 pretranspose record"
+        )
+    return ctas_per_state
+
+
+def cake_gdn_bf16_wide_schedule(arch: CakeGDNArch, seq_len: int) -> str:
+    if int(seq_len) <= 1:
+        return "gdn_decode_pretranspose_mtp_t4_bf16state_wide128"
+    body = CAKE_GDN_BF16_WIDE_ARCH_BODIES.get(arch, "wide128")
+    return f"gdn_decode_pretranspose_mtp_t4_bf16state_{body}"
+
+
+def cake_gdn_bf16_route_tile_v(route_id: str) -> int:
+    """The grid tile a BF16 decode route id carries (``.vec8_t<N>``, ``.vec8r56_t<N>``, ``.vec8occ_t<N>``, ``.wide<N>`` or ``.tile16_fullwarp``)."""
+
+    if route_id.endswith(".tile16_fullwarp"):
+        return 16
+    match = re.fullmatch(
+        r".*\.(?:vec8_t|vec8r56_t|vec8occ_t|wide)(16|32|64|128)", route_id
+    )
+    if match is None:
+        raise CakeGDNUnsupportedError(
+            f"BF16 decode route {route_id!r} carries no grid tile"
+        )
+    return int(match.group(1))
+
+
 @functools.lru_cache(maxsize=1024)
 def select_cake_gdn_decode_variant(
     *,
@@ -552,7 +751,7 @@ def select_cake_gdn_decode_variant(
     cache_intermediate_states: bool = False,
     cache_steps: int = 0,
 ) -> CakeGDNRoute:
-    """Resolve one frozen FP32 T=1/MTP or exact promoted BF16 serving row."""
+    """Resolve one frozen FP32 T=1/MTP row, one BF16 T=1 serving geometry or one exact promoted BF16 verify/update row."""
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
         raise CakeGDNUnsupportedError(f"unsupported architecture {arch}")
@@ -576,9 +775,58 @@ def select_cake_gdn_decode_variant(
     if batch_size <= 0:
         raise CakeGDNUnsupportedError("decode batch size must be positive")
     if state_dtype == "bfloat16":
+        if layout != "pretranspose":
+            raise CakeGDNUnsupportedError(
+                "BF16 decode requires the pretranspose state-pool layout"
+            )
+        if seq_len == 1:
+            # Single-token serving decode: every per-rank (H, HV) geometry at
+            # any batch (Qwen3.5-35B TP1/TP2/TP4, Qwen3.5-397B TP2/TP4/TP8);
+            # every T=1 body takes its strides at runtime.  The body and grid
+            # tile follow the state-head count; an unlisted (geometry, body,
+            # tile) fails closed in _variant_for.
+            if disable_state_update or cache_intermediate_states or cache_steps:
+                raise CakeGDNUnsupportedError(
+                    "BF16 T=1 decode updates the state and caches nothing"
+                )
+            body, tile_v = cake_gdn_bf16_t1_route(batch_size, num_v_heads, arch)
+            if body == "wide":
+                record = _variant_for(
+                    domain="decode",
+                    schedule_attr="gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+                    specializations={
+                        "CACHE_INTERMEDIATE_STATES": 0,
+                        "H": num_q_heads,
+                        "HV": num_v_heads,
+                        "INTERMEDIATE_BATCH_STRIDE": 128 * 128,
+                        "INTERMEDIATE_TOKEN_STRIDE": 128 * 128,
+                        "SCALE": scale,
+                        "STRIDED_INPUTS": 1,
+                        "TILE_V_WIDE": tile_v,
+                        "T_STEPS": 1,
+                        "UPDATE_STATE": 1,
+                    },
+                )
+                return CakeGDNRoute(
+                    f"flashinfer.gdn_decode.indexed_bf16_t1.wide{tile_v}",
+                    record["name"],
+                )
+            record = _variant_for(
+                domain="decode",
+                schedule_attr=f"gdn_decode_pretranspose_t1_bf16state_{body}",
+                specializations={
+                    "H": num_q_heads,
+                    "HV": num_v_heads,
+                    "SCALE": scale,
+                    "STRIDED_INPUTS": 1,
+                    "TILE_V": tile_v,
+                },
+            )
+            return CakeGDNRoute(
+                f"flashinfer.gdn_decode.indexed_bf16_t1.{body}_t{tile_v}",
+                record["name"],
+            )
         promoted = {
-            (4, 1, 16, 32, True, False, False, 0),
-            (4, 1, 4, 8, True, False, False, 0),
             (4, 2, 16, 32, False, True, True, 4),
             (8, 3, 16, 64, True, True, True, 3),
             (8, 4, 16, 64, True, True, True, 4),
@@ -627,21 +875,18 @@ def select_cake_gdn_decode_variant(
             cache_intermediate_states,
             cache_steps,
         )
-        if (
-            layout != "pretranspose"
-            or num_k_heads != num_q_heads
-            or key not in promoted
-        ):
+        if key not in promoted:
             raise CakeGDNUnsupportedError(
-                "BF16 decode is limited to the exact promoted indexed/verify rows"
+                "BF16 multi-token decode is limited to the exact promoted verify/update rows"
             )
         if num_q_heads == 8 and num_v_heads == 16 and batch_size <= 4:
             # Qwen3.5-35B-A3B TP=2 per-rank verify (speculative_num_draft_tokens=7
             # verifies T=7; T=8 is the adjacent window): B<=4 runs the full-warp
-            # tile-v16 kernel with T_STEPS specialized, B>=5 falls through to wide32.
+            # tile-v16 kernel with T_STEPS specialized (the `tile16_vpre` body on
+            # sm_107a), B>=5 falls through to wide32.
             record = _variant_for(
                 domain="decode",
-                schedule_attr="gdn_decode_pretranspose_t4_bf16state_tile16",
+                schedule_attr=cake_gdn_bf16_verify_tile16_schedule(arch),
                 specializations={
                     "H": num_q_heads,
                     "HV": num_v_heads,
@@ -657,28 +902,16 @@ def select_cake_gdn_decode_variant(
                 record["name"],
             )
         if num_q_heads == 4 and num_v_heads == 8:
-            if seq_len == 1:
-                schedule_attr = "gdn_decode_pretranspose_t1_bf16state_tile16"
-                specializations = {
-                    "H": num_q_heads,
-                    "HV": num_v_heads,
-                    "SCALE": scale,
-                    "STRIDED_INPUTS": int(strided_inputs),
-                }
-                route = "flashinfer.gdn_decode.indexed_bf16_t1.tile16_fullwarp"
-            else:
-                schedule_attr = "gdn_decode_pretranspose_t4_bf16state_tile16"
-                specializations = {
-                    "H": num_q_heads,
-                    "HV": num_v_heads,
-                    "INTERMEDIATE_BATCH_STRIDE": (
-                        cache_steps * num_v_heads * 128 * 128
-                    ),
-                    "INTERMEDIATE_TOKEN_STRIDE": num_v_heads * 128 * 128,
-                    "SCALE": scale,
-                    "STRIDED_INPUTS": 1,
-                }
-                route = "flashinfer.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp"
+            schedule_attr = cake_gdn_bf16_verify_tile16_schedule(arch)
+            specializations = {
+                "H": num_q_heads,
+                "HV": num_v_heads,
+                "INTERMEDIATE_BATCH_STRIDE": (cache_steps * num_v_heads * 128 * 128),
+                "INTERMEDIATE_TOKEN_STRIDE": num_v_heads * 128 * 128,
+                "SCALE": scale,
+                "STRIDED_INPUTS": 1,
+            }
+            route = "flashinfer.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp"
             record = _variant_for(
                 domain="decode",
                 schedule_attr=schedule_attr,
@@ -691,7 +924,7 @@ def select_cake_gdn_decode_variant(
         update_state = not cache_intermediate_states
         record = _variant_for(
             domain="decode",
-            schedule_attr="gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+            schedule_attr=cake_gdn_bf16_wide_schedule(arch, seq_len),
             specializations={
                 "CACHE_INTERMEDIATE_STATES": int(cache_intermediate_states),
                 "H": num_q_heads,
@@ -713,9 +946,7 @@ def select_cake_gdn_decode_variant(
                 "UPDATE_STATE": int(update_state),
             },
         )
-        if seq_len == 1:
-            route = "flashinfer.gdn_decode.indexed_bf16_t1"
-        elif disable_state_update:
+        if disable_state_update:
             route = f"flashinfer.gdn_decode.indexed_bf16_verify_t{seq_len}"
         elif cache_intermediate_states:
             route = f"flashinfer.gdn_decode.indexed_bf16_checkpoint_t{seq_len}"
@@ -760,7 +991,10 @@ def select_cake_gdn_decode_variant(
                 "FP32 MTP decode is limited to promoted B1/T2 verify and "
                 "B4/B16/B64 T4 update rows"
             )
-        schedule_attr, route = selected
+        base_attr, route = selected
+        schedule_attr = base_attr
+        if base_attr == "gdn_decode_pretranspose_mtp_t4_splitv8":
+            schedule_attr = CAKE_GDN_FP32_MTP_ARCH_BODIES.get(arch, base_attr)
         mtp_specializations: dict[str, int | float] = {
             "H": num_q_heads,
             "HV": num_v_heads,
@@ -769,7 +1003,7 @@ def select_cake_gdn_decode_variant(
             "SCALE": scale,
             "STRIDED_INPUTS": 1,
         }
-        if schedule_attr != "gdn_decode_pretranspose_mtp_t2_inline_tile8":
+        if base_attr != "gdn_decode_pretranspose_mtp_t2_inline_tile8":
             mtp_specializations.update(
                 {
                     "CACHE_INTERMEDIATE_STATES": 1,
@@ -788,8 +1022,14 @@ def select_cake_gdn_decode_variant(
             "FP32-state T=1 child contract requires state update and no cache"
         )
     if layout == "pretranspose":
-        schedule_attr = "gdn_decode_pretranspose_splitv8"
-        route = "flashinfer.gdn_decode.indexed_fp32_t1_splitv8"
+        # The body follows the state-head count per architecture (sm_107a runs the
+        # `splitv8_tilev32` twin from 256 state heads); the route id names a twin and
+        # the host reads the record's CTAs per state head for the grid.
+        body = cake_gdn_fp32_t1_route(batch_size, num_v_heads, arch)
+        schedule_attr = f"gdn_decode_pretranspose_{body}"
+        route = "flashinfer.gdn_decode.indexed_fp32_t1_splitv8" + body.removeprefix(
+            "splitv8"
+        )
     elif layout == "nontranspose":
         if batch_size < 32:
             schedule_attr = "gdn_decode_nontranspose_fp32_t1_small"
@@ -812,8 +1052,11 @@ def arch_for_compute_capability(major: int, minor: int) -> CakeGDNArch:
         return "sm_100a"
     if (major, minor) == (10, 3):
         return "sm_103a"
+    if (major, minor) == (10, 7):
+        return "sm_107a"
     raise CakeGDNUnsupportedError(
-        f"Cake GDN supports only SM100a/SM103a, got compute capability {major}.{minor}"
+        "Cake GDN supports only SM100a/SM103a/SM107a, "
+        f"got compute capability {major}.{minor}"
     )
 
 

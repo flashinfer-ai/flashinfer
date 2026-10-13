@@ -32,7 +32,7 @@ from pathlib import Path
 
 import torch
 
-from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.activations import (
+from flashinfer.fused_moe.backends.cudnn_frost.activations import (
     ACTIVATIONS,
 )
 
@@ -94,7 +94,7 @@ def benchmark(args):
     torch.manual_seed(41)
     e, h, i = args.experts, args.hidden, args.intermediate
     if args.artifact_root is not None:
-        from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
             fc2,
             runtime,
         )
@@ -114,7 +114,8 @@ def benchmark(args):
     eligible = {
         cls: runner
         for cls, runner in _BACKEND_RUNNERS.items()
-        if cls.supported(arch)
+        if not runner.backend_key.startswith("cudnn_frost_")
+        and cls.supported(arch)
         and runner.supports_quant(QuantConfig())
         and isinstance(activation, runner.supported_activation_classes)
     }
@@ -218,7 +219,7 @@ def benchmark(args):
         # Benchmark-only dispatcher ablation, never a change to an existing runner.
         layers["original"]._additional_candidates = lambda *args: []
         if args.probe_cudnn_frost:
-            from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16.moe import (
+            from flashinfer.fused_moe.backends.cudnn_frost.bf16.moe import (
                 CudnnFrostBf16MoeRunner,
             )
 
@@ -503,7 +504,7 @@ def catalog_configs(op, e, n, k, file):
     from cudnn.gemm.frost import tile_config
     from cudnn.gemm.frost.compiler import probe_chain
     from cudnn.gemm.frost.graph_analyzer import analyze
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export import (
+    from flashinfer.fused_moe.backends.cudnn_frost.export import (
         _build_graph,
     )
 
@@ -548,7 +549,7 @@ def catalog_configs(op, e, n, k, file):
 
 def export_task(opts):
     """A CPU compiler worker; no benchmark timing is collected in this phase."""
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export import (
+    from flashinfer.fused_moe.backends.cudnn_frost.export import (
         export_one,
     )
 
@@ -556,7 +557,7 @@ def export_task(opts):
     try:
         kernel = export_one(opts)
         if opts.warm_source_jit:
-            from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+            from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
                 runtime,
             )
 
@@ -774,7 +775,7 @@ def measure_stage(fn, out, ref, args):
 
 
 def sweep(args, file):
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+    from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
         fc2,
         moe,
         runtime,
@@ -1134,7 +1135,7 @@ def copy_selected(artifacts, selected_dir, identities, file):
 
     Packaged records keep their order; new records are appended by identity.
     """
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.runtime import (
+    from flashinfer.fused_moe.backends.cudnn_frost.runtime import (
         _safe_child,
     )
 
@@ -1259,7 +1260,7 @@ def build_shortlist(results, width):
 
 def validate_shortlist(args, entries, file):
     """Check every shortlisted pair as a complete routed MoE and graph replay."""
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+    from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
         fc2,
         moe,
         runtime,

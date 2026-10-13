@@ -31,7 +31,7 @@ from .kda_prefill import (
 )
 from .utils import get_compute_capability
 
-_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
+_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3), (10, 7)}
 _HEAD_DIM = 128
 _CHUNK_SIZE = 16
 

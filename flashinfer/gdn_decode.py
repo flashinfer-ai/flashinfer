@@ -338,16 +338,7 @@ def _run_cake_gdn_decode_pretranspose(
     batch_size, seq_len = int(q.shape[0]), int(q.shape[1])
     num_v_heads = int(v.shape[2])
     if state_pool.dtype == torch.bfloat16:
-        state_heads = batch_size * num_v_heads
-        tile_v = (
-            16
-            if route.route_id.endswith(".tile16_fullwarp")
-            else 128
-            if state_heads >= 1024
-            else 64
-            if state_heads >= 512
-            else 32
-        )
+        tile_v = _cake_gdn.cake_gdn_bf16_route_tile_v(route.route_id)
         entry(
             q,
             k,
@@ -380,7 +371,9 @@ def _run_cake_gdn_decode_pretranspose(
             output,
             initial_state_indices,
             write_indices,
-            batch_size * num_v_heads * 8,
+            batch_size
+            * num_v_heads
+            * _cake_gdn.cake_gdn_fp32_t1_ctas_per_state(route.variant_name),
             1,
             1,
         )
