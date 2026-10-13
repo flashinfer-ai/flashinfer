@@ -1112,6 +1112,10 @@ __global__ __launch_bounds__(kThreads, 1) void union_gqa_prefill_kernel(
   }
 }
 
+/**
+ * @brief Build TMA descriptors and launch at most one persistent CTA per SM.
+ * @return The CUDA setup or launch error, or cudaSuccess when there is no work.
+ */
 static cudaError_t launch_kernel(const UnionGQAPrefillParams& params) {
   using namespace cute;
 
@@ -1167,6 +1171,13 @@ static cudaError_t launch_kernel(const UnionGQAPrefillParams& params) {
 
 }  // namespace
 
+/**
+ * @brief Pack validated contiguous BF16 inputs into the Union-GQA launch parameters.
+ *
+ * Block indices and cumulative sequence lengths reside on the device as int32 arrays.
+ * The caller supplies SM100-compatible shapes, aligned pointers, and disjoint output.
+ * @return The CUDA setup or launch status without synchronizing the supplied stream.
+ */
 cudaError_t LaunchUnionGQAPrefill(void* q, void* k, void* v, int32_t* block_indices,
                                   int32_t* cu_seqlens_q, void* out, int s_q, int h_q, int h_kv,
                                   int topk_blocks, int num_seq, int max_seqlen_q,

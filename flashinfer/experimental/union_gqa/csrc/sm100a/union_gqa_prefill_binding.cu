@@ -27,6 +27,7 @@ namespace flashinfer::union_gqa {
 
 namespace {
 
+/** @brief Require compute capability 10.0 and report CUDA attribute-query failures. */
 void CheckSM100(int device_id) {
   int major = 0;
   int minor = 0;
@@ -40,6 +41,7 @@ void CheckSM100(int device_id) {
       << "union_gqa_prefill requires compute capability 10.0, got " << major << "." << minor;
 }
 
+/** @brief Require a tensor to share Q's device type and device index. */
 void CheckSameDevice(const TensorView& tensor, const TensorView& q, const char* name) {
   TVM_FFI_CHECK(tensor.device().device_type == q.device().device_type &&
                     tensor.device().device_id == q.device().device_id,
@@ -47,11 +49,13 @@ void CheckSameDevice(const TensorView& tensor, const TensorView& q, const char* 
       << name << " must be on cuda:" << q.device().device_id;
 }
 
+/** @brief Require the 16-byte base-pointer alignment used by TMA transfers. */
 void CheckTmaAlignment(const TensorView& tensor, const char* name) {
   TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0, ValueError)
       << name << " must be 16-byte aligned";
 }
 
+/** @brief Return the storage size in bytes for a contiguous tensor view. */
 uint64_t TensorBytes(const TensorView& tensor) {
   uint64_t elements = 1;
   for (int i = 0; i < tensor.ndim(); ++i) {
@@ -60,6 +64,7 @@ uint64_t TensorBytes(const TensorView& tensor) {
   return elements * tensor.dtype().bits * tensor.dtype().lanes / 8;
 }
 
+/** @brief Test whether two contiguous tensor views have overlapping storage ranges. */
 bool Overlaps(const TensorView& lhs, const TensorView& rhs) {
   const auto lhs_start = reinterpret_cast<uintptr_t>(lhs.data_ptr());
   const auto rhs_start = reinterpret_cast<uintptr_t>(rhs.data_ptr());
@@ -69,6 +74,13 @@ bool Overlaps(const TensorView& lhs, const TensorView& rhs) {
 
 }  // namespace
 
+/**
+ * @brief Validate Union-GQA tensor metadata and enqueue prefill on Q's current stream.
+ *
+ * Inputs must use contiguous storage, BF16 Q/K/V and output, int32 block indices and
+ * cumulative sequence lengths, a head dimension of 128, and 16 query heads per KV head.
+ * The output must not overlap any input. Tensor values are not inspected on the host.
+ */
 void Run(TensorView q, TensorView k, TensorView v, TensorView block_indices,
          TensorView cu_seqlens_q, TensorView out, double softmax_scale, int64_t max_seqlen_q) {
   CHECK_DIM(3, q);

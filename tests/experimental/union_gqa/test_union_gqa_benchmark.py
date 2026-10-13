@@ -39,6 +39,7 @@ def test_invalid_grid_fails_before_any_case(monkeypatch, capsys, arguments, mess
     monkeypatch.setattr(benchmark.torch.cuda, "get_device_capability", lambda: (10, 0))
 
     def unexpected_case(*args):
+        """Fail if grid validation allows an invalid case to reach execution."""
         pytest.fail("invalid grid reached GPU execution")
 
     monkeypatch.setattr(benchmark, "_run_case", unexpected_case)
@@ -59,6 +60,7 @@ def test_representable_ratio_with_float_roundoff_reaches_grid(monkeypatch):
     monkeypatch.setattr(benchmark.torch.cuda, "get_device_capability", lambda: (10, 0))
 
     def reached_case(*args):
+        """Signal that a representable sharing ratio passed grid validation."""
         raise RuntimeError("valid grid reached")
 
     monkeypatch.setattr(benchmark, "_run_case", reached_case)
