@@ -21,8 +21,10 @@ reduced with the wrong operator. The multi-GPU tests can only observe the
 consequences, and one of the consequences is a hang.
 """
 
+import ast
 import inspect
 import json
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -226,6 +228,45 @@ def test_survivor_count_is_a_constant_not_a_threshold() -> None:
     assert "return [TABLE_TACTIC] + kept" in src
 
 
+def _calls_in_source_order(fn) -> list[str]:
+    """The callee of every call in ``fn``, as written, in source order.
+
+    Parsed rather than searched: a comment or a docstring that names a call can
+    neither satisfy nor break an assertion about the code.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    calls = sorted(
+        (node for node in ast.walk(tree) if isinstance(node, ast.Call)),
+        key=lambda node: (node.lineno, node.col_offset),
+    )
+    return [ast.unparse(node.func) for node in calls]
+
+
+def test_the_barrier_precedes_the_first_collective_launch() -> None:
+    """No rank may launch until every rank is past the steps that can fail alone.
+
+    The first launch is the per-variant module-load warm-up, not the timed loop,
+    and it is as collective as the rest: it spins, with no timeout, until every
+    peer issues the same kernel. A rank that fails before issuing it -- an
+    allocation is the realistic case -- leaves its peers spinning there, where
+    no NCCL abort reaches them. Behind a barrier they wait in NCCL instead. The
+    reference all-reduce is no substitute: it orders the devices, not the hosts,
+    so launches issued after it are already queued behind it.
+    """
+    calls = _calls_in_source_order(tuning.PcieIpcAllReduceRunner.get_valid_tactics)
+    first_launch = calls.index("ws._launch")
+    barriers = [i for i, c in enumerate(calls[:first_launch]) if c == "dist.barrier"]
+    assert barriers, f"a collective launch is issued before any barrier: {calls}"
+    # And behind the allocations it guards: above them, a rank that fails to
+    # allocate would still leave its peers spinning in the launch.
+    allocations = [
+        i
+        for i, c in enumerate(calls[:first_launch])
+        if c in ("inp.clone", "self._output_for", "torch.zeros", "torch.cuda.Event")
+    ]
+    assert allocations and max(allocations) < barriers[-1], calls
+
+
 def test_timings_are_reduced_with_max(monkeypatch) -> None:
     """MAX, and reduced at all -- a rank-local ranking is the deadlock above."""
     seen = {}
@@ -241,6 +282,103 @@ def test_timings_are_reduced_with_max(monkeypatch) -> None:
     monkeypatch.setattr(tuning, "dist", _FakeDist)
     tuning.reduce_timings(torch.tensor([1.0, 2.0]), group=None)
     assert seen["op"] == _FakeDist.ReduceOp.MAX
+
+
+# The copy-engine plane; every other variant runs on the SM.
+_CE_VARIANTS = (
+    IpcVariant.COPY_ENGINE_RING,
+    IpcVariant.COPY_ENGINE_ISLAND,
+    IpcVariant.COPY_ENGINE_RING_MEMOP,
+)
+
+
+def _on_ce_plane(config) -> bool:
+    return config.variant in _CE_VARIANTS
+
+
+def _stranded(configs, order):
+    """Candidates no ranking round times behind a launch on their own plane.
+
+    Models the launches get_valid_tactics issues: one warm-up launch per
+    distinct variant, in list order, then the rounds back to back. The barrier
+    before round 0 is left out; it precedes only the seed, whose score the
+    ranking does not use. The minimum over rounds removes only an inflation that
+    some round escapes, so a candidate returned here keeps a plane switch in
+    its score.
+    """
+    warmed = []
+    for config in configs:
+        if all(config.variant != w.variant for w in warmed):
+            warmed.append(config)
+    previous = warmed[-1]
+    escaped = set()
+    for r in range(tuning.TUNE_RANK_ROUNDS):
+        for i in order(len(configs), r):
+            if _on_ce_plane(previous) == _on_ce_plane(configs[i]):
+                escaped.add(i)
+            previous = configs[i]
+    return [c for i, c in enumerate(configs) if i not in escaped]
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 121])
+def test_each_ranking_round_times_every_candidate_once(n: int) -> None:
+    """One sample per candidate per round, and the screening round in order.
+
+    The timing events and the verdict are indexed by candidate, so any
+    permutation is safe; a round that skipped or repeated an index would leave
+    an event unrecorded or a candidate unscreened.
+    """
+    for r in range(tuning.TUNE_RANK_ROUNDS):
+        assert sorted(tuning._round_order(n, r)) == list(range(n)), (n, r)
+    assert list(tuning._round_order(n, 0)) == list(range(n))
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
+@pytest.mark.parametrize("profile", [PROFILE_ROOTCPLX, PROFILE_SWITCHPAIR])
+@pytest.mark.parametrize("memop_supported", [False, True])
+@pytest.mark.parametrize("numel", [64 * 1024, 1024 * 6144, 8192 * 6144])
+def test_no_candidate_is_timed_behind_a_plane_switch_in_every_round(
+    world_size: int, profile: str, memop_supported: bool, numel: int
+) -> None:
+    """The ranking's minimum has to have a clean sample to find.
+
+    In one fixed order, every round timed the first copy-engine candidate
+    directly behind the last SM candidate, and on 8x L40S it scored 12-40%
+    above an identical copy timed behind another copy-engine launch, ranking
+    11th-19th where the copy ranked 3rd-6th.
+    """
+    tactics = tuning.candidate_tactics(
+        world_size, numel=numel, profile=profile, memop_supported=memop_supported
+    )
+    seed = get_pcie_ipc_launch_config(world_size, numel, 2)
+    configs = [seed] + [tuning.tactic_to_config(t) for t in tactics]
+
+    assert _stranded(configs, tuning._round_order) == []
+    # Not vacuous: one order for every round strands the first copy-engine
+    # candidate behind the last SM one.
+    first_ce = next(c for c in configs if _on_ce_plane(c))
+    assert first_ce in _stranded(configs, lambda n, r: range(n))
+
+
+def test_the_ranking_rounds_take_their_order_from_round_order() -> None:
+    """The order property above is only worth anything if the loop uses it."""
+    src = inspect.getsource(tuning.PcieIpcAllReduceRunner.get_valid_tactics)
+    loops = [
+        node
+        for node in ast.walk(ast.parse(textwrap.dedent(src)))
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Call)
+        and ast.unparse(node.iter.func) == "_round_order"
+    ]
+    assert len(loops) == 1, "the ranking rounds must iterate _round_order"
+    # Timed and recorded per candidate, not per position in the round.
+    assert ast.unparse(loops[0].target) == "i", ast.unparse(loops[0].target)
+    calls = {
+        ast.unparse(node.func)
+        for node in ast.walk(loops[0])
+        if isinstance(node, ast.Call)
+    }
+    assert {"ws._launch", "starts[r][i].record", "ends[r][i].record"} <= calls, calls
 
 
 def test_the_prefill_screen_keeps_every_measured_prefill_winner() -> None:
@@ -360,6 +498,9 @@ def test_resolve_falls_back_to_the_seed() -> None:
     assert resolve(seed, (0, 128, 128), 8, 32) is seed
     # Stale: a variant this world size does not dispatch.
     assert resolve(seed, (int(IpcVariant.FLAT_STAGED), 1, 128), 4, MAX_BLOCKS) is seed
+    # Stale: a copy-engine depth past the workspace's budget. That plane sizes
+    # nothing by max_blocks, but the launcher's blocks check is shared.
+    assert resolve(seed, (int(IpcVariant.COPY_ENGINE_RING), 2, 256), 8, 1) is seed
     # Usable.
     assert resolve(seed, (int(IpcVariant.STAGED_RING), 2, 256), 8, MAX_BLOCKS) == (
         IpcLaunchConfig(2, 256, IpcVariant.STAGED_RING)

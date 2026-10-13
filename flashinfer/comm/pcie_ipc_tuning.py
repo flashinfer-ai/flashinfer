@@ -401,13 +401,38 @@ TUNE_SURVIVORS = 48
 # The score is the minimum over the rounds, then MAX-reduced across ranks.
 # Minimum because what is estimated is how fast the configuration can go, and a
 # sample is only ever inflated -- by a neighbour, a clock excursion, a queued
-# launch -- never deflated. MAX because every rank has to truncate to the same
-# list: ranks returning different numbers of tactics deadlock in a kernel that
-# spins with no timeout. No number of rounds settles a choice between candidates
+# launch -- never deflated. It removes only an inflation that some round
+# escapes, which is why the rounds do not all run in one order; see
+# _round_order. MAX because every rank has to truncate to the same list: ranks
+# returning different numbers of tactics deadlock in a kernel that spins with
+# no timeout. No number of rounds settles a choice between candidates
 # that differ by less than the capture domain resolves; those remedies -- pinned
 # clocks, a larger repeat, a longer capture window for small shapes -- live
 # outside get_valid_tactics.
 TUNE_RANK_ROUNDS = 3
+
+
+def _round_order(n: int, round_index: int) -> range:
+    """Indices of ``n`` candidates in the order one ranking round times them.
+
+    Forward on even rounds, backward on odd ones. A launch is not timed in
+    isolation: it inherits cost from the launch before it, and a switch between
+    the SM and copy-engine planes is the expensive case. In one fixed order,
+    every round put the first copy-engine candidate directly behind the last SM
+    candidate, so every sample carried the switch and the minimum kept it: on
+    8x L40S at world size 8 that candidate scored 12-40% above an identical
+    copy timed behind another copy-engine launch at 1024 and 4096 rows of 6144,
+    and at most 7% with the direction alternating.
+
+    Alternating the direction gives each candidate both neighbours as
+    predecessors, and a backward round starts on the candidate the previous
+    round ended on, so the round boundary is no switch either. A rotation would
+    not help: it moves where a round starts and leaves every adjacency in place.
+
+    A pure function of the round index and the list length, so every rank
+    issues the same launches in the same order. Round 0 runs forward.
+    """
+    return range(n - 1, -1, -1) if round_index % 2 else range(n)
 
 
 def reduce_timings(times: "torch.Tensor", group) -> "torch.Tensor":
@@ -612,9 +637,9 @@ class PcieIpcAllReduceRunner(TunableRunner):
         Cardinality is the hazard. Every rank must issue exactly these launches
         in exactly this order; an early return between the first launch and the
         verdict reduction leaves peers spinning inside a kernel this rank never
-        issued, with no timeout. Hence: barrier first, every buffer allocated
-        before the loop, and a loop body that does not allocate, synchronise
-        with the host, or branch.
+        issued, with no timeout. Hence: a barrier before the first collective
+        launch, every persistent buffer allocated before it, and nothing between
+        it and the reductions that branches on anything rank-local.
         """
         inp = inputs[0]
         ws = self._ws
@@ -663,7 +688,10 @@ class PcieIpcAllReduceRunner(TunableRunner):
         # loads its module, which shows up as an order-of-magnitude outlier and
         # would demote whichever candidate happened to be that variant's first.
         # Per variant, not per candidate: block and thread counts do not pull in
-        # a new module.
+        # a new module. These are collective launches already, so the barrier
+        # goes in front of them: a rank that failed before this point leaves its
+        # peers waiting in NCCL, which can be aborted, rather than in a kernel.
+        dist.barrier(group=ws.group)
         seen_variants = set()
         for config in configs:
             if config.variant not in seen_variants:
@@ -672,7 +700,10 @@ class PcieIpcAllReduceRunner(TunableRunner):
 
         dist.barrier(group=ws.group)
         for r in range(TUNE_RANK_ROUNDS):
-            for i, config in enumerate(configs):
+            # Events and verdicts are indexed by candidate, not by position, so
+            # the direction a round runs in changes nothing downstream.
+            for i in _round_order(len(configs), r):
+                config = configs[i]
                 # A kernel that leaves part of the payload unwritten would
                 # otherwise show the previous candidate's correct result.
                 out.fill_(float("nan"))

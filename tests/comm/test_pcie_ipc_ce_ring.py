@@ -22,6 +22,10 @@ from tests.comm.test_pcie_ipc_all_reduce import (
     multi_process_parallel,
 )
 
+# The sharding runner pins a regular worker to one GPU, where every multi-GPU
+# case here would skip; a solo file runs with all visible GPUs.
+pytestmark = pytest.mark.solo
+
 _HIDDEN = 6144
 _BATCH = 64
 

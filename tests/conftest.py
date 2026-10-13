@@ -190,7 +190,9 @@ def pytest_configure(config):
         "long_running: front-load this test file at the start of the parallel CI queue",
     )
     config.addinivalue_line(
-        "markers", "solo: run this whole test file alone (memory-heavy)"
+        "markers",
+        "solo: run this whole test file alone (memory-heavy, or multi-GPU tests "
+        "that need every visible GPU)",
     )
     config.addinivalue_line(
         "markers",

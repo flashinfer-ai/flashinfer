@@ -24,6 +24,10 @@ from tests.comm.test_pcie_ipc_all_reduce import (
     multi_process_parallel,
 )
 
+# The sharding runner pins a regular worker to one GPU, where every multi-GPU
+# case here would skip; a solo file runs with all visible GPUs.
+pytestmark = pytest.mark.solo
+
 # At TP8 the large payload gives every shard two 512-KiB pieces. The smaller
 # shape also exercises the production clamp from a requested P2 to actual P1.
 _NUMELS = (128 * 1024, 4 * 1024 * 1024)

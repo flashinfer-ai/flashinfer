@@ -116,3 +116,34 @@ def test_the_copy_engine_region_stays_proportional_to_the_payload(
     # KiB, and a layout that made them scale with the payload would be wrong in
     # a way the ratio check above cannot see.
     assert ce_flag_bytes + ce_counter_bytes + binary_flag_bytes < 64 * 1024
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_the_flag_block_predicate_agrees_with_the_module(world_size: int) -> None:
+    """The gate above is a second copy of one the binding already owns.
+
+    ``_expected_binary_flag_bytes`` decides from the compute capability; the
+    allocation decides from ``pcie_ipc_memop_supported()``. Two predicates for
+    one fact is how the term went unmodelled in the first place -- it was absent
+    from the expectation entirely, which passed on every device that cannot run
+    the protocol and failed on every device that can. Restating it rather than
+    importing it is deliberate, so this asserts they still agree instead.
+
+    Also pinned: the term is a function of the world size alone. It is flags,
+    not staging, so it must not move with the payload.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU to load the module")
+    module = get_pcie_ipc_comm_module()
+    expected = 2 * (world_size - 1) * 128 if world_size in (4, 8) else 0
+    from_module = expected if module.memop_supported() and world_size in (4, 8) else 0
+    assert _expected_binary_flag_bytes(world_size) == from_module
+
+    deltas = {
+        module.workspace_size(world_size, n, 2, 128)
+        - _expected_total(world_size, n, 2, 128)
+        for n in (8 * 1024, 128 * 6144, 8192 * 6144)
+    }
+    assert deltas == {0}, (
+        f"the layout has a term the expectation does not model: {deltas}"
+    )
