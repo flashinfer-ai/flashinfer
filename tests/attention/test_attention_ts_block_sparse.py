@@ -1319,7 +1319,6 @@ def test_public_paged_wrapper_uses_only_live_run_metadata() -> None:
     reason="fatal device assertions require explicit isolated-test opt-in",
 )
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 def test_reusable_paged_invalid_seq_len_triggers_one_device_assert(
     tmp_path: Path,
 ) -> None:
@@ -1999,7 +1998,6 @@ def test_q8_b8_parallel_load_tasks_partition_resources() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("q_block_size", "dtype", "route_size"),
     (
@@ -2119,7 +2117,6 @@ def test_block_sparse_keeps_rescale_threshold_gpu_edges(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_q8_sparse_p_discards_dead_paired_instance() -> None:
     """The straight-line Q8 P helper must discard a dead paired instance."""
@@ -3562,7 +3559,6 @@ def _fail_if_planned(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("case", "message"),
     (
@@ -3597,7 +3593,6 @@ def test_paged_one_shot_rejects_invalid_live_metadata_before_plan(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "case",
     (
@@ -3733,7 +3728,6 @@ def _paged_one_shot_metadata_abi_cases() -> list[object]:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("field", "make_tensor", "error_type", "message"),
     _paged_one_shot_metadata_abi_cases(),
@@ -3756,7 +3750,6 @@ def test_paged_one_shot_rejects_invalid_metadata_abi_before_plan(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 def test_paged_one_shot_rejects_batch_mismatch_before_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3968,7 +3961,6 @@ def test_metadata_inspection_scan_positions_use_int64() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("indptr", "indices", "message"),
     (
@@ -4010,7 +4002,6 @@ def test_one_shot_rejects_noncanonical_bsr(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_one_shot_all_empty_bsr_returns_finite_zero() -> None:
     q = torch.randn((1, 64, 1, _HEAD_DIM), device="cuda", dtype=torch.float16)
@@ -4035,7 +4026,6 @@ def test_one_shot_all_empty_bsr_returns_finite_zero() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 def test_plan_owns_uniform_route_storage_for_skewed_rows() -> None:
     """Every row receives the declared maximum route capacity."""
 
@@ -4074,7 +4064,6 @@ def test_plan_owns_uniform_route_storage_for_skewed_rows() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("case", _CASES, ids=lambda case: case.name)
 @torch.no_grad()
 def test_public_block_sparse_correctness(
@@ -4188,7 +4177,6 @@ def test_public_block_sparse_correctness(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "case",
     _PROXY_ROUTE_CASES,
@@ -4316,7 +4304,6 @@ def test_public_proxy_bsr_and_bitmask_match_reference_for_tail(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("case", _GQA_CASES, ids=lambda case: case.name)
 @torch.no_grad()
 def test_public_block_sparse_gqa_correctness(
@@ -4438,7 +4425,6 @@ def test_public_block_sparse_gqa_correctness(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_one_block_sparse_plan_runs_distinct_layer_routes() -> None:
     """One capacity plan accepts distinct eager and captured route storage."""
@@ -4586,7 +4572,6 @@ def _make_lifecycle_problem() -> tuple[
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_failed_replan_preserves_runnable_plan() -> None:
     wrapper, q, k, v, block_indptr, block_indices = _make_lifecycle_problem()
@@ -4608,7 +4593,6 @@ def test_failed_replan_preserves_runnable_plan() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_run_uses_callers_current_stream() -> None:
     wrapper, q, k, v, block_indptr, block_indices = _make_lifecycle_problem()
@@ -4627,7 +4611,6 @@ def test_run_uses_callers_current_stream() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_cuda_graph_keeps_captured_plan_after_replan() -> None:
     wrapper, q, k, v, old_indptr, old_indices = _make_lifecycle_problem()
@@ -4656,7 +4639,6 @@ def test_cuda_graph_keeps_captured_plan_after_replan() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_runtime_routes_cuda_graph_replays_routes_and_token_mask() -> None:
     """A captured run observes in-place metadata updates without replanning."""
@@ -4771,7 +4753,6 @@ def test_runtime_routes_cuda_graph_replays_routes_and_token_mask() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_runtime_routes_repartition_rows_with_declared_capacity() -> None:
     """One plan accepts changing indptr rows inside a declared BSR envelope."""
@@ -4858,7 +4839,6 @@ def test_runtime_routes_repartition_rows_with_declared_capacity() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 @pytest.mark.parametrize(
     ("live_seq_len_kv", "physical_page_ids", "patterns"),
@@ -4970,7 +4950,6 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference(
         pytest.param(4, 2, 8, id="q4-gqa2"),
     ),
 )
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_public_paged_gqa_small_q_blocks_match_reference(
     q_block_size: int,
@@ -5143,7 +5122,6 @@ def test_public_paged_gqa_small_q_blocks_match_reference(
     ),
     ids=("q32-kv128-page64-fp16", "q64-kv256-page128-bf16"),
 )
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_public_paged_gqa_graph_reloads_routes_and_pages(
     kv_block_size: int,
@@ -5337,7 +5315,6 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_sparse_routes() -> (
     None
@@ -5855,7 +5832,6 @@ def test_dense_contiguous_run_rejects_routing_inputs(argument: str) -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("case", _DENSE_CONTIGUOUS_CASES, ids=lambda case: case.name)
 @torch.no_grad()
 def test_dense_contiguous_run_matches_reference(case: _Case) -> None:
