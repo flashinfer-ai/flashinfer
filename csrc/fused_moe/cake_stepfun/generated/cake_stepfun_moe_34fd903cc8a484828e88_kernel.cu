@@ -20,7 +20,7 @@
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 256
 #define TMEM_ACCUM_OFFSET 0
-#define NUM_K_PIPE_STAGES 8
+#define NUM_K_PIPE_STAGES 9
 #define NUM_MMA_PIPE_STAGES 2
 #define NUM_WORK_PIPE_STAGES 3
 #define NUM_THROTTLE_PIPE_STAGES 3
@@ -28,26 +28,26 @@
 #define SMEM_SMEM_A_OFF 1024
 #define SMEM_SMEM_A_STAGE_BYTES 16384
 #define SMEM_SMEM_A_STRIDE 16384
-#define SMEM_SMEM_B_OFF 132096
+#define SMEM_SMEM_B_OFF 148480
 #define SMEM_SMEM_B_STAGE_BYTES 8192
 #define SMEM_SMEM_B_STRIDE 8192
-#define SMEM_EPI_STAGING_OFF 197632
+#define SMEM_EPI_STAGING_OFF 222208
 #define SMEM_EPI_STAGING_STAGE_BYTES 4096
 #define SMEM_EPI_STAGING_STRIDE 4096
-#define SMEM_WORK_RESPONSE_OFF 201728
+#define SMEM_WORK_RESPONSE_OFF 226304
 #define SMEM_WORK_RESPONSE_STAGE_BYTES 16
 #define SMEM_WORK_RESPONSE_STRIDE 16
-#define SMEM_FAST_DRAIN_RESPONSE_OFF 201776
+#define SMEM_FAST_DRAIN_RESPONSE_OFF 226352
 #define SMEM_FAST_DRAIN_RESPONSE_STAGE_BYTES 64
 #define SMEM_FAST_DRAIN_RESPONSE_STRIDE 64
-#define SMEM_TOTAL 201856
+#define SMEM_TOTAL 226432
 #define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_0e4cef152811bbf71e93(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles)
+kernel_cake_stepfun_moe_34fd903cc8a484828e88(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -64,15 +64,15 @@ kernel_cake_stepfun_moe_0e4cef152811bbf71e93(const __grid_constant__ CUtensorMap
 
     const int mbar_base = smem;
     #define a_full_addr (mbar_base + 0)
-    #define b_full_addr (mbar_base + 64)
-    #define k_done_addr (mbar_base + 128)
-    #define mma_full_addr (mbar_base + 192)
-    #define mma_free_addr (mbar_base + 208)
-    #define work_full_addr (mbar_base + 224)
-    #define work_empty_addr (mbar_base + 248)
-    #define throttle_full_addr (mbar_base + 272)
-    #define throttle_empty_addr (mbar_base + 296)
-    #define drain_full_addr (mbar_base + 320)
+    #define b_full_addr (mbar_base + 72)
+    #define k_done_addr (mbar_base + 144)
+    #define mma_full_addr (mbar_base + 216)
+    #define mma_free_addr (mbar_base + 232)
+    #define work_full_addr (mbar_base + 248)
+    #define work_empty_addr (mbar_base + 272)
+    #define throttle_full_addr (mbar_base + 296)
+    #define throttle_empty_addr (mbar_base + 320)
+    #define drain_full_addr (mbar_base + 344)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -97,14 +97,14 @@ kernel_cake_stepfun_moe_0e4cef152811bbf71e93(const __grid_constant__ CUtensorMap
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if ((int)blockIdx.y >= num_non_exiting_ctas[0]) return;
 
-    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 41 barriers)
-    // Mbarriers at smem_raw[0..328)
+    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 44 barriers)
+    // Mbarriers at smem_raw[0..352)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'k_pipe' ---
-            // a_full: 8 barriers, init_count=2
+            // a_full: 9 barriers, init_count=2
             mbarrier_init(smem + 0, 2);
             mbarrier_init(smem + 8, 2);
             mbarrier_init(smem + 16, 2);
@@ -113,8 +113,8 @@ kernel_cake_stepfun_moe_0e4cef152811bbf71e93(const __grid_constant__ CUtensorMap
             mbarrier_init(smem + 40, 2);
             mbarrier_init(smem + 48, 2);
             mbarrier_init(smem + 56, 2);
-            // b_full: 8 barriers, init_count=2
             mbarrier_init(smem + 64, 2);
+            // b_full: 9 barriers, init_count=2
             mbarrier_init(smem + 72, 2);
             mbarrier_init(smem + 80, 2);
             mbarrier_init(smem + 88, 2);
@@ -122,43 +122,46 @@ kernel_cake_stepfun_moe_0e4cef152811bbf71e93(const __grid_constant__ CUtensorMap
             mbarrier_init(smem + 104, 2);
             mbarrier_init(smem + 112, 2);
             mbarrier_init(smem + 120, 2);
-            // k_done: 8 barriers, init_count=1
-            mbarrier_init(smem + 128, 1);
-            mbarrier_init(smem + 136, 1);
+            mbarrier_init(smem + 128, 2);
+            mbarrier_init(smem + 136, 2);
+            // k_done: 9 barriers, init_count=1
             mbarrier_init(smem + 144, 1);
             mbarrier_init(smem + 152, 1);
             mbarrier_init(smem + 160, 1);
             mbarrier_init(smem + 168, 1);
             mbarrier_init(smem + 176, 1);
             mbarrier_init(smem + 184, 1);
-            // --- pipeline 'mma_pipe' ---
-            // mma_full: 2 barriers, init_count=1
             mbarrier_init(smem + 192, 1);
             mbarrier_init(smem + 200, 1);
+            mbarrier_init(smem + 208, 1);
+            // --- pipeline 'mma_pipe' ---
+            // mma_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 216, 1);
+            mbarrier_init(smem + 224, 1);
             // mma_free: 2 barriers, init_count=256
-            mbarrier_init(smem + 208, 256);
-            mbarrier_init(smem + 216, 256);
+            mbarrier_init(smem + 232, 256);
+            mbarrier_init(smem + 240, 256);
             // --- pipeline 'work_pipe' ---
             // work_full: 3 barriers, init_count=1
-            mbarrier_init(smem + 224, 1);
-            mbarrier_init(smem + 232, 1);
-            mbarrier_init(smem + 240, 1);
+            mbarrier_init(smem + 248, 1);
+            mbarrier_init(smem + 256, 1);
+            mbarrier_init(smem + 264, 1);
             // work_empty: 3 barriers, init_count=960
-            mbarrier_init(smem + 248, 960);
-            mbarrier_init(smem + 256, 960);
-            mbarrier_init(smem + 264, 960);
+            mbarrier_init(smem + 272, 960);
+            mbarrier_init(smem + 280, 960);
+            mbarrier_init(smem + 288, 960);
             // --- pipeline 'throttle_pipe' ---
             // throttle_full: 3 barriers, init_count=32
-            mbarrier_init(smem + 272, 32);
-            mbarrier_init(smem + 280, 32);
-            mbarrier_init(smem + 288, 32);
-            // throttle_empty: 3 barriers, init_count=32
             mbarrier_init(smem + 296, 32);
             mbarrier_init(smem + 304, 32);
             mbarrier_init(smem + 312, 32);
+            // throttle_empty: 3 barriers, init_count=32
+            mbarrier_init(smem + 320, 32);
+            mbarrier_init(smem + 328, 32);
+            mbarrier_init(smem + 336, 32);
             // --- pipeline 'drain_pipe' ---
             // drain_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 320, 1);
+            mbarrier_init(smem + 344, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -169,9 +172,9 @@ kernel_cake_stepfun_moe_0e4cef152811bbf71e93(const __grid_constant__ CUtensorMap
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (256 columns, 256 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 328);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 352);
     if (warp == 0) {
-        int _tmem_hold = smem + 328;
+        int _tmem_hold = smem + 352;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
@@ -2726,7 +2729,7 @@ kernel_cake_stepfun_moe_0e4cef152811bbf71e93(const __grid_constant__ CUtensorMap
                         }
                     }
                     stage += 1;
-                    if (stage == 8) { stage = 0; _phase_k_done ^= 1; }
+                    if (stage == 9) { stage = 0; _phase_k_done ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
                 uint32_t _clc_valid_1 = 0;
@@ -2847,7 +2850,7 @@ kernel_cake_stepfun_moe_0e4cef152811bbf71e93(const __grid_constant__ CUtensorMap
                             :: "r"((a_full_addr + (stage_1) * 8) & 0xFEFFFFFF), "r"((uint32_t)(16384)) : "memory");
                     }
                     stage_1 += 1;
-                    if (stage_1 == 8) { stage_1 = 0; _phase_k_done_1 ^= 1; }
+                    if (stage_1 == 9) { stage_1 = 0; _phase_k_done_1 ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_2) * 8, _phase_work_full_2);
                 uint32_t _clc_valid_0 = 0;
@@ -2951,7 +2954,7 @@ kernel_cake_stepfun_moe_0e4cef152811bbf71e93(const __grid_constant__ CUtensorMap
                             elect_commit_cg2_multicast(mma_full_addr + (acc_stage_1) * 8, (uint16_t)(3));
                         }
                         stage_2 += 1;
-                        if (stage_2 == 8) { stage_2 = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
+                        if (stage_2 == 9) { stage_2 = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
                     }
                     acc_stage_1 += 1;
                     if (acc_stage_1 == 2) { acc_stage_1 = 0; _phase_mma_free ^= 1; }

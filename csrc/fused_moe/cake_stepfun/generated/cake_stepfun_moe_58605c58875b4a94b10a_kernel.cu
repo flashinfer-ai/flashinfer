@@ -52,7 +52,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_c53ed492dc2fd2732230(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles)
+kernel_cake_stepfun_moe_58605c58875b4a94b10a(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -141,7 +141,8 @@ kernel_cake_stepfun_moe_c53ed492dc2fd2732230(const __grid_constant__ CUtensorMap
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
 
-    __syncwarp();
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (256 columns, 256 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 312);
@@ -152,12 +153,12 @@ kernel_cake_stepfun_moe_c53ed492dc2fd2732230(const __grid_constant__ CUtensorMap
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
     }
 
-    __syncthreads();
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    // Partial post-allocation TMEM rendezvous (192 threads on named barrier 6)
+    if (warp == 0 || warp == 1 || warp == 2 || warp == 3 || warp == 4 || warp == 7) {
+        asm volatile("barrier.sync.aligned %0, %1;" :: "r"(6), "r"(192) : "memory");
+    }
 
-    const int taddr = tmem_addr_storage[0];
+    const int taddr = (warp == 0 || warp == 1 || warp == 2 || warp == 3 || warp == 4 || warp == 7) ? tmem_addr_storage[0] : 0;
 
     // Kernel post-init ops
     const int tmem_accum = taddr;
