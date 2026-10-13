@@ -118,7 +118,7 @@ Caveats:
   not cached.
 - The cache is per-devcontainer by design: sccache's local storage supports a
   single server at a time, so two containers must not share one cache directory.
-  
+
 ## cuDNN linear attention
 
 Use `nvidia-cudnn-frontend>=1.31.0`; KDA and GDN normalization use additive
