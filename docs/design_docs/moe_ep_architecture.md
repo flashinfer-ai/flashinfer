@@ -108,11 +108,15 @@ Fleet transports:
 |---|---|---|---|---|---|
 | `identity` (`IdentityConfig`) | passthrough | none | dispatch tensor unchanged | any | — |
 | `fused_moe` (`FusedMoeKernelConfig`) with `TrtllmBf16Config` | BF16 | BF16 | BF16 | SM100 family | inner `MoELayer` AutoTuner: per-runner tactic search + cross-backend winner per token bucket, up to `ExecutionConfig.tune_max_num_tokens` |
-| `fused_moe` with `TrtllmFp4Config` | NVFP4 (block-16, quantized post-dispatch in the bridge) | NVFP4 (block-16) | BF16 | SM100/SM103/SM107 | same `MoELayer` AutoTuner |
+| `fused_moe` with `TrtllmFp4Config` | NVFP4 (block-16) or MXFP8 (block-32), quantized post-dispatch in the bridge | NVFP4 or MXFP4, respectively | BF16 | SM100/SM103/SM107 | same `MoELayer` AutoTuner |
 | `fused_moe` with `CuteDslConfig` | NVFP4 (W4A4), MXFP8 (W4A8), or BF16 (W4A16); W4A8 may use pre-dispatch packed payloads with `mxfp8_dispatch=True` | NVFP4/MXFP4 | BF16 | SM100/SM103 (W4A4/W4A16 also SM107) | same `MoELayer` AutoTuner |
 
-`fused_moe` accepts exactly one backend candidate per `MoEConfig` (weight
-views are prepared for the first match only). The W4A8 split kernel requires
+`fused_moe` prepares weight views for each configured compute backend. For
+NVFP4×NVFP4 or MXFP4×MXFP8, `BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config()))`
+lets `MoELayer` compare eligible compute backends and cache its winner per
+token-count bucket. A singleton retains explicit backend selection. This
+comparison times local compute, not EP dispatch/combine; warm up each input
+shape before graph capture. The W4A8 split kernel requires
 hidden and intermediate sizes to be multiples of 128.
 
 ## How tuning works
@@ -692,3 +696,27 @@ Reconciliation goes through the bootstrap rendezvous store
 allreduce: an allreduce over the EP group would hang on exactly the rank being
 masked out. See `core/comm/fault_tolerance.py` and the runbook for the protocol
 and the recovery state machine.
+
+### Offline live-token tuning
+
+CuTeDSL MegaMoE tuning records both workspace capacity (`max_tokens`) and
+benchmark workload (`live_tokens`) in each JSON entry. Different workloads at
+the same capacity coexist; retuning the same pair replaces its winner. No
+profile tag is required. This applies to SM90, SM100, and SM107 tuners.
+
+Lookup first matches capacity exactly, then selects the smallest recorded live
+bucket at least as large as the workload, or the largest bucket if none is
+large enough. Legacy entries without `live_tokens` retain capacity-based
+fallback. Default callers without a live count select for full capacity.
+
+Before CUDA graph capture, enumerate `layer.live_token_buckets(capacity)`, create
+`layer.create_workspace(capacity, live_tokens=bucket)`, and warm each handle.
+Use the same cache and allocation order on all EP ranks. Select the handle using
+the EP-wide maximum padded token count; the handle retains its tactic and
+addresses through capture and replay. Equal tactics at the same capacity share
+buffers; distinct tactics require additional memory. Restart to reload tuning.
+Explicit knob dictionaries override offline tuning; SM107 requires `knobs="cache"`.
+
+For decode capacity 512 and prefill capacity 16384, record workloads separately
+under each capacity, for example `--max-tokens 512 --live-tokens 128` and
+`--max-tokens 16384 --live-tokens 2048`. Graph replay performs no JSON lookup.
