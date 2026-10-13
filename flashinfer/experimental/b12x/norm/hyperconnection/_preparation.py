@@ -41,6 +41,7 @@ def compile_hyperconnection(query_payload, config_payload, ordinal):
             device,
             has_eps=True,
             runtime_ints=1,
+            runtime_int64s=1,
             pointer_dtypes=(torch.bfloat16, weight_dtype, torch.bfloat16),
         )
     if role == "grouped_rmsnorm":
@@ -189,7 +190,10 @@ def _launcher(query, config, compiled):
         elif role in ("combine", "combine_norm"):
             runtime = lambda tensors: (tensors[0].shape[0], tensors[2].stride(0))
         elif role == "grouped_rmsnorm":
-            runtime = lambda tensors: (tensors[0].shape[0] * query.streams,)
+            runtime = lambda tensors: (
+                tensors[0].shape[0] * query.streams,
+                tensors[0].stride(0),
+            )
         elif role == "engram_mix":
             runtime = lambda tensors: (tensors[0].shape[0],)
         else:

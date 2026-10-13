@@ -235,7 +235,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate,
     default_config=_default_config,
-    candidate_contract_version=6,
+    candidate_contract_version=7,
     knobs=(
         Knob(name="reduction_block_h", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="pointwise_block", values=None, binding=ParameterBinding.COMPILE),

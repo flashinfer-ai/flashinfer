@@ -27,6 +27,12 @@ def _bound_plan_handle(binding):
 
 
 def run_grouped_rmsnorm(state, weight, *, eps, binding: Binding, zero_centered=True):
+    """Normalize each stream into caller-owned contiguous output.
+
+    Ordinary affine normalization (``zero_centered=False``) accepts disjoint
+    rows with unit column stride, including column slices of packed projections.
+    Zero-centered normalization requires contiguous input.
+    """
     if state.shape[0] != binding.tokens:
         raise ValueError("state rows differ from bound live rows")
     torch.ops.b12x.hyperconnection_grouped_rmsnorm(

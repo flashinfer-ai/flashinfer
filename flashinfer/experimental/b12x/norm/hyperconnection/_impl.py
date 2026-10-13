@@ -285,7 +285,13 @@ def run_grouped_rmsnorm_impl(
     caps = plan.caps
     tokens = plan._live_tokens(state.shape[0])
     width = caps.streams * caps.hidden_size
-    _validate_input(state, shape=(tokens, width), caps=caps, name="state")
+    _validate_input(
+        state,
+        shape=(tokens, width),
+        caps=caps,
+        name="state",
+        row_strided=not plan.query.zero_centered,
+    )
     if weight.dtype != getattr(torch, plan.query.weight_dtype):
         raise ValueError("affine weight dtype differs from preparation")
     if (

@@ -353,14 +353,27 @@ def test_prepared_add_retains_fp32_before_cancellation() -> None:
 
 @pytest.mark.parametrize("hidden", (128, 512, 1280))
 @pytest.mark.parametrize("weight_dtype", (torch.bfloat16, torch.float32))
-def test_ordinary_rmsnorm_uses_affine_weight_without_offset(hidden, weight_dtype):
+@pytest.mark.parametrize("streams,padding", ((1, 0), (1, 37), (4, 0), (4, 37)))
+def test_ordinary_rmsnorm_uses_affine_weight_without_offset(
+    hidden, weight_dtype, streams, padding
+):
     device, capacity = require_b12x(), 7
-    state = torch.randn((capacity, hidden), device=device, dtype=torch.bfloat16)
-    weight = torch.linspace(-0.5, 1.5, hidden, device=device).to(weight_dtype)
-    normalized = torch.empty_like(state)
+    width = streams * hidden
+    owner = torch.full(
+        (capacity, width + padding), 123, device=device, dtype=torch.bfloat16
+    )
+    offset = 3 if padding else 0
+    state = owner[:, offset : offset + width]
+    state.normal_()
+    weight = torch.linspace(-0.5, 1.5, width, device=device).to(weight_dtype)
+    normalized = torch.empty((capacity, width), device=device, dtype=torch.bfloat16)
     plan = hc.plan(
         hc.Caps(
-            device=device, max_tokens=capacity, hidden_size=hidden, streams=1, lowrank=1
+            device=device,
+            max_tokens=capacity,
+            hidden_size=hidden,
+            streams=streams,
+            lowrank=1,
         ),
         invocation=FrozenMapping(
             {
@@ -392,7 +405,9 @@ def test_ordinary_rmsnorm_uses_affine_weight_without_offset(hidden, weight_dtype
             )
         )
         bottleneck = torch.empty((capacity, 1), device=device, dtype=torch.bfloat16)
-        block_input = torch.empty_like(state)
+        block_input = torch.empty(
+            (capacity, hidden), device=device, dtype=torch.bfloat16
+        )
         session.freeze()
         for rows in (0, 1, capacity):
             binding = hc.bind(
@@ -414,15 +429,32 @@ def test_ordinary_rmsnorm_uses_affine_weight_without_offset(hidden, weight_dtype
             state.mul_(0.75)
             weight.neg_()
             normalized.fill_(float("nan"))
+            torch.cuda.synchronize(device)
+            before = torch.cuda.memory_stats(device)
             graph.replay()
-            values = state[:rows].float()
+            torch.cuda.synchronize(device)
+            after = torch.cuda.memory_stats(device)
+            for key in (
+                "allocation.all.allocated",
+                "allocation.all.freed",
+                "segment.all.allocated",
+                "segment.all.freed",
+            ):
+                assert before[key] == after[key]
+            values = state[:rows].float().reshape(rows, streams, hidden)
             expected = (
-                values
-                * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-20)
-                * weight.float()
-            ).bfloat16()
+                (
+                    values
+                    * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-20)
+                    * weight.float().reshape(streams, hidden)
+                )
+                .flatten(1)
+                .bfloat16()
+            )
             torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
             assert torch.isnan(normalized[rows:]).all()
+            assert (owner[:, :offset] == 123).all()
+            assert (owner[:, offset + width :] == 123).all()
             graph.reset()
 
 

@@ -87,9 +87,10 @@ class _GroupedRmsNorm:
         output: cute.Pointer,
         eps: Float32,
         rows: Int32,
+        state_row_stride: Int64,
         stream: cuda.CUstream,
     ) -> None:
-        self.kernel(state, weight, output, eps).launch(
+        self.kernel(state, weight, output, eps, state_row_stride).launch(
             grid=(rows, 1, 1),
             block=(_THREADS, 1, 1),
             stream=stream,
@@ -102,6 +103,7 @@ class _GroupedRmsNorm:
         weight: cute.Pointer,
         output: cute.Pointer,
         eps: Float32,
+        state_row_stride: Int64,
     ) -> None:
         row, _, _ = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
@@ -109,6 +111,7 @@ class _GroupedRmsNorm:
         thread_i = Int32(thread)
         base = row_i * Int64(self.hidden_size)
         weight_base = Int64(Int32(row) % Int32(self.streams)) * Int64(self.hidden_size)
+        source_base = (row_i // Int64(self.streams)) * state_row_stride + weight_base
 
         values = cute.make_rmem_tensor((self.items,), Float32)
         square_sum = Float32(0.0)
@@ -116,7 +119,7 @@ class _GroupedRmsNorm:
             column = thread_i + Int32(item * _THREADS)
             value = Float32(0.0)
             if column < Int32(self.hidden_size):
-                value = Float32(state[base + column.to(Int64)])
+                value = Float32(state[source_base + column.to(Int64)])
             values[item] = value
             square_sum += value * value
 
@@ -910,6 +913,7 @@ def grouped_rmsnorm(
         (state, weight, output),
         eps=eps,
         runtime_ints=(rows,),
+        runtime_int64s=(int(state.stride(0)),),
     )
 
 
