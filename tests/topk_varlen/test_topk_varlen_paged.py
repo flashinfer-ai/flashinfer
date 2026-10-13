@@ -343,3 +343,73 @@ def test_paged_on_non_current_device():
     ) | (l64 & (page_size - 1))
     expected = torch.where(loc >= 0, phys.to(torch.int32), loc)
     assert torch.equal(torch.sort(pg, dim=1).values, torch.sort(expected, dim=1).values)
+
+
+def test_paged_boundary_ties_tie_aware_check():
+    """Boundary ties under paged output (reviewer's case): 1024 equal scores,
+    K=512, an identity page table and page_size=1 make every 512-subset a correct
+    answer. The kernel's choice is valid, the trace checker accepts it and any
+    other tied set through the page map, and still rejects a slot outside the
+    request's pages or a selection below the K-th value; a non-identity table
+    exercises the inversion, and a table padded past a shorter request's pages
+    with a live page id inverts only the spanned pages."""
+    if not flashinfer.top_k_varlen.is_backend_supported("gvr_2", _cc()):
+        pytest.skip("gvr_2 not supported here")
+    from flashinfer.trace.templates.topk import _top_k_varlen_check as check
+
+    rows, n, k = 2, 1024, 512
+    lg = torch.ones((rows, n), dtype=torch.float32, device=_DEV)
+    lens = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    pt = torch.arange(n, dtype=torch.int32, device=_DEV).repeat(rows, 1).contiguous()
+    out, _ = flashinfer.top_k_varlen(
+        lg, lens, k, page_table=pt, page_size=1, backend="gvr_2"
+    )
+    torch.cuda.synchronize()
+    for r in range(rows):  # 512 distinct slots inside the row
+        v = out[r][out[r] >= 0]
+        assert v.numel() == k and v.unique().numel() == k and int(v.max()) < n
+    kw = dict(logits=lg, seq_lens=lens, top_k=k, page_table=pt, page_size=1)
+    lo = torch.arange(k, dtype=torch.int32, device=_DEV).repeat(rows, 1)
+    hi = (torch.arange(k, dtype=torch.int32, device=_DEV) + k).repeat(rows, 1)
+    assert check(
+        lo, out, **kw
+    )  # the kernel's tied set against a reference that chose 0..511
+    assert check(lo, hi, **kw)  # two different tied sets are both correct
+    bad = hi.clone()
+    bad[0, 0] = n + 5  # a slot outside the request's pages
+    assert not check(lo, bad, **kw)
+    lg2 = lg.clone()
+    lg2[:, k:] = 0.0  # now 0..511 are the only winners: 512..1023 is wrong
+    assert not check(
+        lo, hi, logits=lg2, seq_lens=lens, top_k=k, page_table=pt, page_size=1
+    )
+    # a non-identity page map with 64-column pages: the kernel's slots invert
+    # back to columns through the map and pass the value check
+    pt64 = _page_table(rows, n, 64, seed=5)
+    out64, _ = flashinfer.top_k_varlen(
+        lg, lens, k, page_table=pt64, page_size=64, backend="gvr_2"
+    )
+    torch.cuda.synchronize()
+    assert check(
+        out64, out64, logits=lg, seq_lens=lens, top_k=k, page_table=pt64, page_size=64
+    )
+    # a shorter request whose table is padded past its live pages with one of
+    # them (serving tables carry such padding): only the spanned pages invert
+    lens2 = torch.tensor([n, 640], dtype=torch.int32, device=_DEV)
+    pt_pad = pt64.clone()
+    pt_pad[1, 10:] = pt_pad[
+        1, 0
+    ]  # ceil(640 / 64) = 10 live pages, the rest repeat page 0
+    out_pad, _ = flashinfer.top_k_varlen(
+        lg, lens2, k, page_table=pt_pad, page_size=64, backend="gvr_2"
+    )
+    torch.cuda.synchronize()
+    assert check(
+        out_pad,
+        out_pad,
+        logits=lg,
+        seq_lens=lens2,
+        top_k=k,
+        page_table=pt_pad,
+        page_size=64,
+    )

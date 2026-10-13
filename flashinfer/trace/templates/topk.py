@@ -68,6 +68,8 @@ def _top_k_varlen_check(
     row_starts=None,
     absolute_indices=False,
     page_table=None,
+    page_size=None,
+    next_n=1,
     **_unused,
 ):
     """Tie-safe value check: every selected value must be >= the row's K-th largest.
@@ -80,10 +82,6 @@ def _top_k_varlen_check(
     via **_unused from the check call in the test.
     """
     act = actual_outputs if not isinstance(actual_outputs, list) else actual_outputs[0]
-    if page_table is not None:
-        # paged output holds physical slots, not columns: only set equality with
-        # the reference is meaningful (the reference applied the same table)
-        logits = None
     if logits is None or seq_lens is None or top_k is None:
         # Fallback to exact set equality when logits are unavailable.
         ref = (
@@ -104,10 +102,40 @@ def _top_k_varlen_check(
 
     logits_f32 = logits.to(torch.float32)
     N = logits_f32.shape[1]
+    if page_table is not None:
+        ps = 1 if page_size is None else int(page_size)
+        pt64 = page_table.to(torch.int64)
     for r in range(act.shape[0]):
         s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0
         n = max(min(s + int(seq_lens[r].item()), N) - s, 0)
         sel = act[r].long()  # window-local indices (absolute: shift back by s)
+        if page_table is not None:
+            # paged output holds physical KV slots: map every valid slot back to
+            # its logits column through the request's page map (one physical
+            # page per logical page, so the map inverts), then validate the
+            # columns exactly like the other frames -- ties at the K-th value
+            # may be broken differently from the reference and still be correct.
+            # Only the pages the row's length spans take part: later table
+            # entries are padding (and may repeat a live page id). A slot
+            # outside the spanned pages is a failure.
+            row_pt = pt64[r // next_n][: (n + ps - 1) // ps]
+            valid = sel >= 0
+            slots = sel[valid]
+            phys = slots // ps
+            if bool((phys > row_pt.max()).any()):
+                return False
+            inv = torch.full(
+                (int(row_pt.max().item()) + 1,),
+                -1,
+                dtype=torch.int64,
+                device=sel.device,
+            )
+            inv[row_pt] = torch.arange(row_pt.numel(), device=sel.device)
+            logical = inv[phys]
+            if bool((logical < 0).any()):
+                return False
+            sel = sel.clone()
+            sel[valid] = logical * ps + slots % ps
         if absolute_indices:
             sel = torch.where(sel >= 0, sel - s, sel)  # -1 pads stay -1
         if n < top_k:
