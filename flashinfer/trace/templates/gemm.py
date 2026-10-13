@@ -700,6 +700,7 @@ def _mm_bf16_fp4_cute_dsl_init(
         nvfp4_quantize,
         prepare_bf16_fp4_weights,
     )
+    from flashinfer.gemm.gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout  # noqa: PLC0415
     from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
 
     if not torch.cuda.is_available() or torch.device(device).type != "cuda":
@@ -707,7 +708,7 @@ def _mm_bf16_fp4_cute_dsl_init(
     major, minor = torch.cuda.get_device_capability(torch.device(device))
     if not mm_bf16_fp4.is_backend_supported("cute-dsl", major * 10 + minor):
         raise NotImplementedError(f"mm_bf16_fp4 is not supported on SM{major}{minor}")
-    if (major, minor) in ((10, 0), (10, 3)):
+    if _cute_dsl_uses_sm100_layout(major, minor):
         raise NotImplementedError(
             f"SM{major}{minor} prepares a different cute-dsl layout; use "
             "mm_bf16_fp4_cute_dsl_sm100_trace"
@@ -757,12 +758,13 @@ def _mm_bf16_fp4_cute_dsl_sm100_init(
         nvfp4_quantize,
         prepare_bf16_fp4_weights,
     )
+    from flashinfer.gemm.gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout  # noqa: PLC0415
     from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
 
     if not torch.cuda.is_available() or torch.device(device).type != "cuda":
         raise NotImplementedError("mm_bf16_fp4 init requires a CUDA device")
     major, minor = torch.cuda.get_device_capability(torch.device(device))
-    if (major, minor) not in ((10, 0), (10, 3)):
+    if not _cute_dsl_uses_sm100_layout(major, minor):
         raise NotImplementedError(
             f"this template describes the SM100/103 cute-dsl layout; got "
             f"SM{major}{minor}"
