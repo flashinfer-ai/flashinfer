@@ -851,7 +851,7 @@ _VARLEN_CACHE = {}
 # has returned (the once-init is synchronous inside it) the wrapper costs one
 # list-element load per launch.
 _GATE_LOCK = threading.Lock()
-_GATED = {}  # id(compiled fn) -> (compiled fn kept alive, gated wrapper)
+_GATED = {}  # id(compiled fn) -> (compiled fn kept alive, gated wrapper, first-call-done flag)
 
 
 def _gate_first_call(raw):
@@ -871,8 +871,20 @@ def _gate_first_call(raw):
                 _warm[0] = True  # only after a completed first call
             return out
 
-        _GATED[id(raw)] = (raw, gated)
+        _GATED[id(raw)] = (raw, gated, warm)
         return gated
+
+
+def _first_call_done(gated_fn) -> bool:
+    """TESTING: True once ``gated_fn`` (a ``_gate_first_call`` wrapper) has
+    completed its first call, i.e. the compiled object's once-init already ran
+    eagerly -- the state ``warmup_varlen`` / ``warmup_prefill`` promise for
+    every launcher they populate."""
+    with _GATE_LOCK:
+        for _raw, gated, warm in _GATED.values():
+            if gated is gated_fn:
+                return bool(warm[0])
+    raise KeyError("not a gated kernel object")
 
 
 # Programmatic dependent launch for the register families of the decode path: the
@@ -885,6 +897,21 @@ _DECODE_PDL = True
 # and written in one coalesced epilogue (the paged transform applied there)
 # instead of per-winner scattered stores with the transform inline
 _REGCLUS_STAGE_OUT = True
+
+
+def _reg_stage_out(num_rows: int, sms: int) -> bool:
+    """Register family: staged (coalesced) emit for one-wave launches only. A
+    compile dimension of the engine chosen by the row count, so
+    ``warmup_varlen`` keys its band representatives on it as well: a band
+    spanning the SM count holds two objects and both need an eager launch."""
+    return num_rows <= sms
+
+
+def _regclus_stage_out(num_rows: int, k: int, paged: bool) -> bool:
+    """Clustered register family: staged emit for paged output, except K > 1024
+    below 16 rows. Same role as ``_reg_stage_out`` (a compile dimension the
+    warmup band key mirrors)."""
+    return bool(_REGCLUS_STAGE_OUT) and paged and (k <= 1024 or num_rows >= 16)
 
 
 def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None):
@@ -945,7 +972,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         # us at 1 x 32K); those keep the scattered emit. Unpaged output stays
         # scattered: funnelling every rank's winners through rank 0 lost
         # 0.3-0.8 us at 16-64 rows there.
-        stage_rc = bool(_REGCLUS_STAGE_OUT) and paged and (k <= 1024 or num_rows >= 16)
+        stage_rc = _regclus_stage_out(num_rows, k, paged)
         fn = _gate_first_call(
             dev.get_compiled__regclus(
                 tuple(plan_free["tpl"]),
@@ -973,7 +1000,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         # staged coalesced emit only for one-wave launches (rows <= SMs): it trades
         # scattered stores for a barrier + copy, a 5-25% win when latency-bound and
         # a 3-4% loss when the grid is several waves deep (measured B200/B300)
-        stage_out = num_rows <= sms
+        stage_out = _reg_stage_out(num_rows, sms)
         fn = _gate_first_call(
             dev.get_compiled__reg(
                 tuple(plan_free["tpl"]),
@@ -2733,9 +2760,11 @@ def warmup_varlen(
     if not req_rows:
         return
     # BAND-AWARE enumeration: the engine compile key depends on the plan's
-    # constexpr tuple (+ r_const family axis), NOT on the exact row count, so
-    # warming ONE representative row per distinct engine key covers every row
-    # count up to the largest request. Representatives are the first row of
+    # constexpr tuple (+ r_const family axis) and, for the register families,
+    # on the staged-output mode (a row-count threshold: _reg_stage_out /
+    # _regclus_stage_out), NOT on the exact row count, so warming ONE
+    # representative row per distinct engine key covers every row count up to
+    # the largest request. Representatives are the first row of
     # each band, which keeps the warmup allocation bounded (~a few hundred
     # rows) even when CUDA-graph batch lists reach thousands of rows.
     n_env_c = max(1, int(max_seq_len) // int(compress_ratio))
@@ -2748,14 +2777,19 @@ def warmup_varlen(
     rows_list = []
     r = nn
     r_max = req_rows[-1]
+    sms = _sm_count()
     while r <= r_max:
         plan_free = route(
-            r, max(min(n_env_c, npad_c), int(top_k) + 1), npad_c, int(top_k), sms=_sm_count()
+            r, max(min(n_env_c, npad_c), int(top_k) + 1), npad_c, int(top_k), sms=sms
         )
         if plan_free["kernel"] == "reg_clus":
-            ekey = ("reg_clus", tuple(plan_free["tpl"]))
+            ekey = (
+                "reg_clus",
+                tuple(plan_free["tpl"]),
+                _regclus_stage_out(r, int(top_k), page_shift is not None),
+            )
         elif plan_free["kernel"] in ("reg", "regimg"):
-            ekey = ("reg", tuple(plan_free["tpl"]))
+            ekey = ("reg", tuple(plan_free["tpl"]), _reg_stage_out(r, sms))
         else:
             p = route_streaming(
                 r,

@@ -1084,6 +1084,78 @@ def test_gvr2_sequential_warmup_populates_exact_launchers():
 
 
 @requires_gvr2
+@pytest.mark.parametrize("page_size", [None, 64], ids=["unpaged", "paged64"])
+def test_gvr2_warmup_launches_both_staged_output_variants(page_size):
+    """The register family's staged-output emit is a compile dimension picked
+    by the row count (one wave, rows <= SMs, stages; deeper grids emit
+    directly), so one register band holds two kernel objects. warmup_varlen's
+    band key did not include it: for a band spanning the SM count (N = 2048,
+    K = 512 covers every row count) only the one-wave variant got an eager
+    launch, and the many-wave variant was compiled by the final launcher
+    population without ever being called, leaving its first-call gate cold
+    for the capture that follows. next_n = 3 gives this test compile keys no
+    other test warms, so the objects are cold beforehand."""
+    top_k, msl, nn = 512, 2048, 3
+    sms = _host._sm_count()
+    rows = nn * sms  # past the SM count: the many-wave (direct-emit) variant
+    npad = _round64(msl)
+    page_shift = None if page_size is None else page_size.bit_length() - 1
+    modes = [(False, None), (True, None)]  # (hint_free, page_shift)
+    if page_shift is not None:
+        modes.append((True, page_shift))
+
+    def launcher(r, hf, ps):
+        hits = [
+            lc
+            for key, lc in _host._VARLEN_CACHE.items()
+            if key[:5] == (r, npad, top_k, msl, nn) and key[6:8] == (hf, ps)
+        ]
+        assert len(hits) == 1, (
+            f"{len(hits)} launchers: rows={r} hint_free={hf} page_shift={ps}"
+        )
+        return hits[0]
+
+    _host.warmup_varlen(
+        top_k, msl, next_n=nn, num_rows_list=(rows,), page_size=page_size
+    )
+    torch.cuda.synchronize()
+    for hf, ps in modes:
+        many = launcher(rows, hf, ps)  # the requested geometry (many waves)
+        one = launcher(nn, hf, ps)  # the band's first-row representative (one wave)
+        assert many[0] == one[0] == "reg", (many[0], one[0])
+        assert many[1] is not one[1], "the two row counts must compile distinct objects"
+        assert _host._first_call_done(one[1]), (
+            f"one-wave variant cold: hint_free={hf} page_shift={ps}"
+        )
+        assert _host._first_call_done(many[1]), (
+            f"many-wave variant cold: hint_free={hf} page_shift={ps}"
+        )
+    # the capture the warmup is for, at the requested geometry (hint-free, and
+    # paged through an identity table so slots are columns)
+    gen = torch.Generator(device=_DEV).manual_seed(31)
+    logits = torch.randn(rows, npad, generator=gen, device=_DEV) - 2.0
+    batch = rows // nn
+    seq_lens = torch.full((batch,), msl, dtype=torch.int32, device=_DEV)
+    out = torch.empty(rows, top_k, dtype=torch.int32, device=_DEV)
+    kw = {}
+    if page_size is not None:
+        pt = torch.arange(npad // page_size, dtype=torch.int32, device=_DEV)
+        kw = dict(page_table=pt.repeat(batch, 1).contiguous(), page_size=page_size)
+    s = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, None, out_indices=out, next_n=nn, **kw)
+    torch.cuda.current_stream().wait_stream(s)
+    g.replay()
+    torch.cuda.synchronize()
+    _check_varlen_rows(
+        logits, out, _row_valid_lens([msl] * batch, rows, nn, 1, msl), top_k
+    )
+
+
+@requires_gvr2
 def test_gvr2_rejects_overlapping_rows():
     """stride(0) < shape[1] (an expand view) is not a row-major layout the
     kernel can address; the checker used to derive npad = 0 from it and
