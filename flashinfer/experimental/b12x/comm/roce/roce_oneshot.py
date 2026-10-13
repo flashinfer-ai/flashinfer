@@ -9,14 +9,18 @@ payload, and reduce in fixed rank order.  Larger messages (with ``pipe_bytes``
 set) take the pipelined two-shot path (``_twoshot_cute.py``): a reduce-scatter
 and an all-gather in chunks, so each rank sends ``2 (world - 1) / world`` of the
 message instead of ``world - 1`` copies, and staging, the wire and the
-reduction overlap.  Both paths produce the same bits.
+reduction overlap.  Both paths produce the same bits.  With ``max_varlen_bytes``
+set, ``all_gather_varlen`` streams contributions whose byte counts the device
+supplies at run time (``_varlen_cute.py``), so a captured graph can gather
+data of a length it learns only when it replays.
 
 Runtime constraints:
 
 * one all-reduce in flight per runtime (single channel, one stream);
 * one-shot all-reduce messages up to ``max_size`` bytes, two-shot ones up to
-  ``pipe_bytes`` (16-byte aligned tensors), and all-gather shards up to
-  ``max_gather_bytes``, all multiples of 16 bytes;
+  ``pipe_bytes`` (16-byte aligned tensors), all-gather shards up to
+  ``max_gather_bytes``, and variable-length contributions up to
+  ``max_varlen_bytes``, all multiples of 16 bytes;
 * every rank of the exchange group must construct the runtime collectively;
 * every peer payload is striped across all configured HCAs, with a completion
   flag per stripe so the GPU consumes the slot only after every HCA delivered.
@@ -36,7 +40,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from . import _allgather_cute, _twoshot_cute
+from . import _allgather_cute, _twoshot_cute, _varlen_cute
 from ._oneshot_cute import PACK_BYTES, get_launcher
 from ._proxy import Layout, Proxy, load as _load_proxy_library
 from ._routes import MAX_RAILS, local_endpoints, plan_routes
@@ -59,6 +63,9 @@ DEFAULT_BLOCKS = 8
 # on two ranks and 1 MiB on more, where one-shot's extra copies dominate.
 DEFAULT_PIPE_BLOCKS = 4
 DEFAULT_PIPE_CHUNK_BYTES = 128 * 1024
+# Variable-length all-gather defaults (see benchmarks/experimental/b12x/benchmark_roce_varlen.py).
+DEFAULT_VARLEN_BLOCKS = 4
+DEFAULT_VARLEN_CHUNK_BYTES = 256 * 1024
 
 
 def default_pipe_threshold(world_size: int) -> int:
@@ -229,6 +236,9 @@ class RoceOneshotAllReduce:
         pipe_blocks: int = DEFAULT_PIPE_BLOCKS,
         pipe_chunk_bytes: int = DEFAULT_PIPE_CHUNK_BYTES,
         region_allocator: Optional[Callable[[int], torch.Tensor]] = None,
+        max_varlen_bytes: int = 0,
+        varlen_blocks: int = DEFAULT_VARLEN_BLOCKS,
+        varlen_chunk_bytes: int = DEFAULT_VARLEN_CHUNK_BYTES,
     ) -> None:
         """Allocate the pinned region, build and connect the proxy, and start it.
 
@@ -237,6 +247,12 @@ class RoceOneshotAllReduce:
         ``default_pipe_threshold(world)``) up to ``pipe_bytes``, and any message
         above ``max_size``; smaller messages keep the one-shot path, whose
         latency is lower.
+
+        ``max_varlen_bytes`` (default 0: none) is the largest contribution of one
+        rank to ``all_gather_varlen``; the region then holds two receive rows of
+        that size per rank (the operation alternates them).  Contributions
+        stream in chunks of at least ``varlen_chunk_bytes`` through a grid of
+        ``varlen_blocks``.
 
         ``region_allocator(nbytes)``, when given, supplies the pinned region: a
         CPU ``uint8`` tensor of at least ``nbytes`` registered with CUDA at the
@@ -277,6 +293,12 @@ class RoceOneshotAllReduce:
             raise ValueError("pipe_bytes must be a non-negative multiple of 16")
         if int(pipe_chunk_bytes) < PACK_BYTES:
             raise ValueError("pipe_chunk_bytes must hold at least one pack")
+        if int(max_varlen_bytes) < 0 or int(max_varlen_bytes) % PACK_BYTES != 0:
+            raise ValueError("max_varlen_bytes must be a non-negative multiple of 16")
+        if int(varlen_blocks) < 1 or int(varlen_blocks) & (int(varlen_blocks) - 1) != 0:
+            raise ValueError("varlen_blocks must be a positive power of two")
+        if int(varlen_chunk_bytes) < PACK_BYTES:
+            raise ValueError("varlen_chunk_bytes must hold at least one pack")
         self.max_size = int(max_size)
         self.max_gather_bytes = int(max_gather_bytes)
         self.pipe_bytes = int(pipe_bytes)
@@ -304,9 +326,19 @@ class RoceOneshotAllReduce:
             max(self.max_size, self.max_gather_bytes), _SLOT_ALIGNMENT
         )
         self._layout = Layout(
-            self.world_size, slot_bytes, _align_up(self.pipe_bytes, _SLOT_ALIGNMENT)
+            self.world_size,
+            slot_bytes,
+            _align_up(self.pipe_bytes, _SLOT_ALIGNMENT),
+            _align_up(int(max_varlen_bytes), _SLOT_ALIGNMENT),
         )
         self._slot_bytes = slot_bytes
+        self.max_varlen_bytes = int(max_varlen_bytes)
+        self._varlen_blocks = int(varlen_blocks)
+        # Chunks large enough that a full contribution fits the proxy's chunk flags.
+        self._varlen_chunk_packs = max(
+            int(varlen_chunk_bytes) // PACK_BYTES,
+            -(-self._layout.varlen_bytes // PACK_BYTES // self._layout.varlen_max_chunks),
+        )
 
         with torch.cuda.device(self.device):
             # Pinned, zero-initialised: flags and the control record start at 0
@@ -334,9 +366,15 @@ class RoceOneshotAllReduce:
             # for every power-of-two grid size because their free-running
             # counters use the launch grid as their modulus.
             # The two-shot path appends a staged and a reduced counter per chunk
-            # and its own tail counter for its fixed grid.
+            # and its own tail counter for its fixed grid; the variable-length
+            # all-gather then a staged counter per chunk and a tail counter.
             self._counters = torch.zeros(
-                2 + 2 * self._counter_classes + 2 * self._layout.max_chunks + 1,
+                2
+                + 2 * self._counter_classes
+                + 2 * self._layout.max_chunks
+                + 1
+                + self._layout.varlen_max_chunks
+                + 1,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -352,10 +390,11 @@ class RoceOneshotAllReduce:
         self._send_base = host_ptr + self._layout.send_off
         self._ctrl_base = host_ptr + self._layout.ctrl_off
         # ctrl record (kernel-written): seq, nbytes, error seq, missing peer,
-        # nbytes per slot (the proxy uses these when it has to catch up), and
-        # the missing rail index for timeout diagnostics (reported as error_hca).
+        # nbytes per slot (the proxy uses these when it has to catch up), the
+        # missing rail index for timeout diagnostics (reported as error_hca), and
+        # the reason a kernel failed without a timeout (error_kind).
         self._ctrl_words = self._region[
-            self._layout.ctrl_off : self._layout.ctrl_off + 28
+            self._layout.ctrl_off : self._layout.ctrl_off + 32
         ].view(torch.int32)
         self._error_word = self._ctrl_words[2:3]
         # numpy view of the control words: reading it costs nanoseconds, so the
@@ -364,6 +403,9 @@ class RoceOneshotAllReduce:
         self._epoch_address = self._counters.data_ptr()
         self._poison_address = self._epoch_address + 4 * (1 + 2 * self._counter_classes)
         self._pipe_counter_address = self._poison_address + 4
+        self._varlen_counter_address = self._pipe_counter_address + 4 * (
+            2 * self._layout.max_chunks + 1
+        )
 
         error: Optional[str] = None
         try:
@@ -376,6 +418,7 @@ class RoceOneshotAllReduce:
                 region_bytes=self._layout.total_bytes,
                 slot_bytes=slot_bytes,
                 pipe_bytes=self._layout.pipe_bytes,
+                varlen_bytes=self._layout.varlen_bytes,
             )
             blob = self._proxy.local_blob()
             endpoints = local_endpoints(self.hca_names, self.gid_index)
@@ -406,6 +449,9 @@ class RoceOneshotAllReduce:
             "pipe_blocks": self._pipe_blocks,
             "pipe_chunk_packs": self._pipe_chunk_packs,
             "max_chunks": self._layout.max_chunks,
+            "varlen_bytes": self._layout.varlen_bytes,
+            "varlen_blocks": self._varlen_blocks,
+            "varlen_chunk_packs": self._varlen_chunk_packs,
         }
         statuses = _exchange((error, blob, config, endpoints), exchange_group)
         failures = [
@@ -583,6 +629,18 @@ class RoceOneshotAllReduce:
             self.device.index,
         )
 
+    def _varlen_launcher_key(self) -> tuple[object, ...]:
+        """Cache key of the variable-length all-gather launcher."""
+        return (
+            self.world_size,
+            self.rank,
+            self._threads,
+            self._layout.flag_stride,
+            self.rail_count,
+            self._layout.varlen_max_chunks,
+            self.device.index,
+        )
+
     def _gather_launcher_key(self) -> tuple[object, ...]:
         """Cache key of the all-gather launcher."""
         return (
@@ -623,6 +681,8 @@ class RoceOneshotAllReduce:
                 if self.pipe_bytes:
                     _twoshot_cute.get_launcher(*self._twoshot_launcher_key(dtype))
             _allgather_cute.get_launcher(*self._gather_launcher_key())
+            if self.max_varlen_bytes:
+                _varlen_cute.get_launcher(*self._varlen_launcher_key())
             self._aligned_scratch(0, self._region[:PACK_BYTES])
             if padded_gather:
                 self._gather_scratch(PACK_BYTES)
@@ -839,6 +899,13 @@ class RoceOneshotAllReduce:
         if failed_seq != 0:
             peer = int(self._ctrl_np[3])
             hca = int(self._ctrl_np[6])
+            if int(self._ctrl_np[7]) == _varlen_cute.ERROR_KIND_INVALID_COUNT:
+                raise RuntimeError(
+                    f"RoCE variable-length all-gather at sequence {failed_seq} received "
+                    f"an unusable byte count for rank {peer} (not a multiple of 16, or "
+                    "above the call's limit); every rank stopped before sending, and "
+                    "the runtime is poisoned"
+                )
             raise RuntimeError(
                 f"RoCE collective on rank {self.rank} timed out waiting for rank "
                 f"{peer}, HCA {hca}, at sequence {failed_seq}; the runtime is "
@@ -874,6 +941,7 @@ class RoceOneshotAllReduce:
             },
             "slot_bytes": self._slot_bytes,
             "pipe_bytes": layout.pipe_bytes,
+            "varlen_bytes": layout.varlen_bytes,
             "ctrl_offset": layout.ctrl_off,
             "hca_names": list(self.hca_names),
             "gid_index": self.gid_index,
@@ -1090,6 +1158,130 @@ class RoceOneshotAllReduce:
         if not torch.cuda.is_current_stream_capturing():
             self.check_health()
 
+    # -- variable-length all-gather ---------------------------------------------
+
+    def all_gather_varlen(
+        self,
+        source: torch.Tensor,
+        counts: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+        plan,
+    ) -> torch.Tensor:
+        """Run a published prepared variable-length all-gather; see ``_run_prepared_all_gather_varlen``."""
+        from b12x.preparation.types import require_prepared
+
+        prepared = require_prepared(plan, "comm.roce", self.device)
+        if prepared.runtime is not self:
+            raise ValueError("RoCE plan belongs to another runtime")
+        return self._run_prepared_all_gather_varlen(
+            source, counts, prepared=prepared, out=out, stream=stream
+        )
+
+    def _run_prepared_all_gather_varlen(
+        self,
+        source: torch.Tensor,
+        counts: torch.Tensor,
+        *,
+        prepared: object,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+    ) -> torch.Tensor:
+        """Gather the first ``counts[r]`` bytes of rank ``r``'s ``source`` into row ``r`` of ``out``.
+
+        ``source`` is this rank's contiguous, 16-byte-aligned contribution of any
+        dtype.  ``counts`` is a CUDA int64 ``[world_size]`` tensor of byte counts,
+        each a multiple of 16; every rank must pass the same values, which the
+        device reads when the kernel runs, so a captured graph gathers whatever
+        counts hold at replay.  ``out`` (default: ``[world_size,
+        max_varlen_bytes]`` uint8) is a contiguous CUDA tensor whose first
+        dimension is ``world_size``, viewed as one 16-byte-aligned row of bytes
+        per rank; bytes past a row's count are left as they were.  ``source``
+        may be this rank's row of ``out`` itself, which saves the local copy.
+
+        A count above the call's limit (``max_varlen_bytes``, ``source``'s and an
+        ``out`` row's bytes) or not a multiple of 16 stops every rank before any
+        data moves and poisons the runtime, which ``check_health`` reports.
+        Ranks must pass equally sized buffers so they share one limit.
+        """
+        if not self.max_varlen_bytes:
+            raise ValueError("this RoCE runtime has no variable-length all-gather area")
+        if (
+            not source.is_cuda
+            or source.device != self.device
+            or not source.is_contiguous()
+            or source.data_ptr() % PACK_BYTES
+        ):
+            raise ValueError(
+                "source must be a contiguous, 16-byte-aligned tensor on the runtime's device"
+            )
+        if (
+            counts.device != self.device
+            or counts.dtype != torch.int64
+            or counts.shape != (self.world_size,)
+            or not counts.is_contiguous()
+        ):
+            raise ValueError("counts must be a contiguous int64 [world_size] tensor on the runtime's device")
+        with self._lock:
+            self.check_health()
+            if out is None:
+                out = torch.empty(
+                    (self.world_size, self.max_varlen_bytes), dtype=torch.uint8, device=self.device
+                )
+            row_bytes = (
+                out.numel() * out.element_size() // self.world_size if out.dim() else 0
+            )
+            if (
+                out.device != self.device
+                or not out.is_contiguous()
+                or out.dim() == 0
+                or out.shape[0] != self.world_size
+                or out.data_ptr() % PACK_BYTES
+                or row_bytes % PACK_BYTES
+            ):
+                raise ValueError(
+                    "out must be a contiguous tensor on the runtime's device with one "
+                    "16-byte-aligned row per rank"
+                )
+            limit = min(
+                self.max_varlen_bytes, source.numel() * source.element_size(), row_bytes
+            )
+            context = (
+                torch.cuda.stream(stream) if stream is not None else _nullcontext()
+            )
+            with torch.cuda.device(self.device), context:
+                capturing = torch.cuda.is_current_stream_capturing()
+                launcher = getattr(prepared, "varlen_launcher", None)
+                if launcher is None:
+                    raise ValueError(
+                        "the RoCE plan was prepared without the variable-length all-gather"
+                    )
+                base = self._region.data_ptr()
+                self._order_stream(capturing)
+                launcher(
+                    source.data_ptr(),
+                    out.data_ptr(),
+                    counts.data_ptr(),
+                    limit // PACK_BYTES,
+                    row_bytes,
+                    int(source.data_ptr() != out.data_ptr() + self.rank * row_bytes),
+                    self._varlen_chunk_packs,
+                    base + self._layout.varlen_recv_off,
+                    base + self._layout.varlen_flag_off,
+                    self._layout.varlen_bytes,
+                    self._ctrl_base,
+                    self._epoch_address,
+                    self._varlen_counter_address,
+                    self._poison_address,
+                    self.spin_limit,
+                    self._varlen_blocks,
+                )
+                self._mark_stream(capturing)
+        if not capturing:
+            self.check_health()
+        return out
+
     @contextmanager
     def capture(self, stream: object = None, *, channel_id: Optional[str] = None):
         """Context manager for CUDA graph capture; the launchers must already be prepared.
@@ -1125,10 +1317,14 @@ class RoceOneshotAllReduce:
             "pipe_threshold": self.pipe_threshold,
             "pipe_blocks": self._pipe_blocks,
             "pipe_chunk_bytes": self._pipe_chunk_packs * PACK_BYTES,
+            "max_varlen_bytes": self.max_varlen_bytes,
+            "varlen_blocks": self._varlen_blocks,
+            "varlen_chunk_bytes": self._varlen_chunk_packs * PACK_BYTES,
             "epoch": int(self._counters[0].item()),
             "error_seq": int(self._error_word.item()),
             "error_peer": int(self._ctrl_words[3].item()),
             "error_hca": int(self._ctrl_words[6].item()),
+            "error_kind": int(self._ctrl_words[7].item()),
             "ctrl_seq": int(self._ctrl_words[0].item()),
             "spin_limit": self.spin_limit,
             "rails": self.rail_count,

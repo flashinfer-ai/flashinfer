@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from b12x.preparation import BackendConfig, FrozenMapping, make_fixed_contract
 
 
-SURFACES = ("AllReduce.all_reduce", "AllReduce.all_gather")
+SURFACES = ("AllReduce.all_reduce", "AllReduce.all_gather", "AllReduce.all_gather_varlen")
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -22,6 +22,8 @@ _LOCK = threading.Lock()
 _LIB: ctypes.CDLL | None = None
 
 BLOB_STRUCT_ERR = "roce proxy blob size mismatch"
+# Region layout and doorbell protocol of ``_roce_proxy.c``; native runtimes vendor the same file.
+ABI_VERSION = 7
 
 
 def _traffic_class() -> int:
@@ -105,7 +107,7 @@ def load() -> ctypes.CDLL:
         lib.roce_abi_version.restype = ctypes.c_int
         lib.roce_abi_version.argtypes = []
         lib.roce_layout.restype = ctypes.c_int
-        lib.roce_layout.argtypes = [ctypes.c_int, u64, u64, ctypes.POINTER(u64)]
+        lib.roce_layout.argtypes = [ctypes.c_int, u64, u64, u64, ctypes.POINTER(u64)]
         lib.roce_blob_bytes.restype = u64
         lib.roce_blob_bytes.argtypes = []
         lib.roce_create.restype = p
@@ -117,6 +119,7 @@ def load() -> ctypes.CDLL:
             ctypes.c_int,
             ctypes.c_int,
             p,
+            u64,
             u64,
             u64,
             u64,
@@ -147,7 +150,7 @@ def load() -> ctypes.CDLL:
         lib.roce_hca_stat.argtypes = [p, ctypes.c_int, ctypes.c_int]
         lib.roce_destroy.restype = None
         lib.roce_destroy.argtypes = [p]
-        if lib.roce_abi_version() != 6:
+        if lib.roce_abi_version() != ABI_VERSION:
             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
         _LIB = lib
         return lib
@@ -170,18 +173,32 @@ class Layout:
         "shard_cap",
         "max_chunks",
         "pipe_bytes",
+        "varlen_recv_off",
+        "varlen_flag_off",
+        "varlen_bytes",
+        "varlen_max_chunks",
     )
 
-    def __init__(self, world_size: int, slot_bytes: int, pipe_bytes: int = 0) -> None:
-        """Ask the proxy library for the layout of ``world_size`` one-shot slots and a two-shot area."""
-        out = (ctypes.c_uint64 * 13)()
+    def __init__(
+        self,
+        world_size: int,
+        slot_bytes: int,
+        pipe_bytes: int = 0,
+        varlen_bytes: int = 0,
+    ) -> None:
+        """Ask the proxy library for the layout of ``world_size`` one-shot slots, a two-shot
+        area and a variable-length all-gather area of ``varlen_bytes`` per rank and slot."""
+        out = (ctypes.c_uint64 * 17)()
         if (
-            load().roce_layout(int(world_size), int(slot_bytes), int(pipe_bytes), out)
+            load().roce_layout(
+                int(world_size), int(slot_bytes), int(pipe_bytes), int(varlen_bytes), out
+            )
             != 0
         ):
             raise ValueError(
                 f"unsupported RoCE geometry: world_size={world_size} slot_bytes={slot_bytes} "
-                f"pipe_bytes={pipe_bytes} (2..16 ranks, sizes multiples of 4096)"
+                f"pipe_bytes={pipe_bytes} varlen_bytes={varlen_bytes} (2..16 ranks, sizes "
+                "multiples of 4096, at most 4 GiB of variable-length capacity)"
             )
         (
             self.recv_off,
@@ -197,6 +214,10 @@ class Layout:
             self.shard_cap,
             self.max_chunks,
             self.pipe_bytes,
+            self.varlen_recv_off,
+            self.varlen_flag_off,
+            self.varlen_bytes,
+            self.varlen_max_chunks,
         ) = (int(v) for v in out)
 
 
@@ -214,6 +235,7 @@ class Proxy:
         region_bytes: int,
         slot_bytes: int,
         pipe_bytes: int = 0,
+        varlen_bytes: int = 0,
     ) -> None:
         """Create the proxy context: open the HCAs, register the pinned region, create the queue pairs."""
         self.traffic_class = _traffic_class()
@@ -231,6 +253,7 @@ class Proxy:
             int(region_bytes),
             int(slot_bytes),
             int(pipe_bytes),
+            int(varlen_bytes),
             err,
             len(err),
         )
@@ -322,4 +345,4 @@ class Proxy:
             self.close()
 
 
-__all__ = ["Layout", "Proxy", "load"]
+__all__ = ["ABI_VERSION", "Layout", "Proxy", "load"]

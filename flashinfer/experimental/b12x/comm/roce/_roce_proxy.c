@@ -40,6 +40,20 @@
 // sends its N + 1 all-gather only after our N + 1 reduce-scatter, which we post
 // after our N kernel finished reading.
 //
+// A variable-length all-gather (ctrl kind[slot] = 2) streams each rank's contribution, whose size
+// the kernel reads from device memory, through
+//
+//   varlen_recv[slot][src]  (2 * world * varlen_bytes)  src's contribution of the slot's op;
+//                                                       our own row is the posting source
+//   varlen_flag[slot][src][chunk][rail]                 seq after each chunk stripe
+//
+// The kernel stages chunk c of its contribution into its own row and publishes
+// ready_vl[c] = seq; the proxy posts the chunk to the same row of every peer.  Ops alternate
+// slots: a kernel finishes on its peers' rows alone, so our op N + 1 may stage (and overwrite
+// ready_vl) before this thread posted our op N.  Its rows and flags are the other slot's, a
+// ready word of N + 1 also releases chunk c of N, and no peer can begin op N + 2, which would
+// reuse N's slot, before receiving our N.
+//
 // This file is compiled by b12x.comm.roce._proxy at first use with the host
 // gcc and libibverbs; it must stay plain C with no CUDA dependency.
 
@@ -62,11 +76,12 @@
 #define ROCE_FLAG_STRIDE 128
 #define ROCE_PORT 1
 #define ROCE_SEND_DEPTH 512
-#define ROCE_ABI_VERSION 6
+#define ROCE_ABI_VERSION 7
 #define ROCE_MAX_CHUNKS 64
+#define ROCE_VARLEN_MAX_CHUNKS 512
 #define ROCE_CTRL_BYTES 4096
-// ctrl words (u32): the one-shot record, then per-slot op descriptors and the
-// two-shot chunk-ready words.
+// ctrl words (u32): the one-shot record, then per-slot op descriptors, the
+// two-shot chunk-ready words and the variable-length all-gather's.
 #define CTRL_SEQ 0
 #define CTRL_ERROR 2
 #define CTRL_SLOT_NBYTES 4
@@ -75,6 +90,10 @@
 #define CTRL_SLOT_CHUNKS 12
 #define CTRL_READY_RS 64
 #define CTRL_READY_AG 128
+#define CTRL_READY_VL 256
+#define KIND_ONESHOT 0
+#define KIND_TWOSHOT 1
+#define KIND_VARLEN 2
 // Model graphs leave sub-millisecond gaps between collectives.  Keep the
 // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
 // every collective on the graph's critical path.
@@ -123,6 +142,9 @@ typedef struct {
   size_t pipe_recv_off;
   size_t pipe_flag_off;
   size_t shard_cap;
+  size_t varlen_bytes;
+  size_t varlen_recv_off;
+  size_t varlen_flag_off;
   int started;
   uint64_t peer_addr[ROCE_MAX_PEERS];
   // Per peer and rail: the local HCA that carries it and the peer's rkey on the
@@ -146,11 +168,14 @@ static void set_err(roce_ctx_t* c, const char* what, int e) {
 
 int roce_abi_version(void) { return ROCE_ABI_VERSION; }
 
-int roce_layout(int world, uint64_t slot_bytes, uint64_t pipe_bytes, uint64_t* out) {
+int roce_layout(int world, uint64_t slot_bytes, uint64_t pipe_bytes, uint64_t varlen_bytes,
+                uint64_t* out) {
   // out = {recv_off, flag_off, send_off, ctrl_off, total_bytes, flag_stride, slots,
-  //        pipe_send_off, pipe_recv_off, pipe_flag_off, shard_cap, max_chunks, pipe_bytes}
+  //        pipe_send_off, pipe_recv_off, pipe_flag_off, shard_cap, max_chunks, pipe_bytes,
+  //        varlen_recv_off, varlen_flag_off, varlen_bytes, varlen_max_chunks}
   if (world < 2 || world > ROCE_MAX_PEERS || slot_bytes == 0 || (slot_bytes % 4096) != 0 ||
-      (pipe_bytes % 4096) != 0) {
+      (pipe_bytes % 4096) != 0 || (varlen_bytes % 4096) != 0 ||
+      varlen_bytes > ((uint64_t)1 << 32)) {
     return -1;
   }
   // Reject a layout whose arithmetic would wrap; the caller sizes slots from
@@ -176,7 +201,14 @@ int roce_layout(int world, uint64_t slot_bytes, uint64_t pipe_bytes, uint64_t* o
   uint64_t pipe_flag_bytes =
       pipe_bytes == 0 ? 0
                       : (uint64_t)2 * world * ROCE_MAX_CHUNKS * ROCE_MAX_RAILS * ROCE_FLAG_STRIDE;
-  total = pipe_flag_off + pipe_flag_bytes;
+  // The variable-length area follows; without one the region is unchanged.
+  uint64_t varlen_recv_off = pipe_flag_off + pipe_flag_bytes;
+  uint64_t varlen_flag_off = varlen_recv_off + (uint64_t)ROCE_SLOTS * world * varlen_bytes;
+  uint64_t varlen_flag_bytes =
+      varlen_bytes == 0 ? 0
+                        : (uint64_t)ROCE_SLOTS * world * ROCE_VARLEN_MAX_CHUNKS * ROCE_MAX_RAILS *
+                              ROCE_FLAG_STRIDE;
+  total = varlen_flag_off + varlen_flag_bytes;
   uint64_t recv_off = 0;
   uint64_t flag_off = recv_off + recv_bytes;
   out[0] = recv_off;
@@ -192,6 +224,10 @@ int roce_layout(int world, uint64_t slot_bytes, uint64_t pipe_bytes, uint64_t* o
   out[10] = shard_cap;
   out[11] = ROCE_MAX_CHUNKS;
   out[12] = pipe_bytes;
+  out[13] = varlen_recv_off;
+  out[14] = varlen_flag_off;
+  out[15] = varlen_bytes;
+  out[16] = ROCE_VARLEN_MAX_CHUNKS;
   return 0;
 }
 
@@ -291,9 +327,10 @@ static int open_hca(roce_ctx_t* c, int h, const char* name) {
 
 roce_ctx_t* roce_create(int world, int rank, const char* const* hca_names, int n_hca, int gid_index,
                         int traffic_class, void* region, uint64_t region_bytes, uint64_t slot_bytes,
-                        uint64_t pipe_bytes, char* err, uint64_t err_len) {
-  uint64_t layout[13];
-  if (roce_layout(world, slot_bytes, pipe_bytes, layout) != 0 || layout[4] > region_bytes ||
+                        uint64_t pipe_bytes, uint64_t varlen_bytes, char* err, uint64_t err_len) {
+  uint64_t layout[17];
+  if (roce_layout(world, slot_bytes, pipe_bytes, varlen_bytes, layout) != 0 ||
+      layout[4] > region_bytes ||
       rank < 0 || rank >= world || n_hca < 1 || n_hca > ROCE_MAX_HCAS || traffic_class < 0 ||
       traffic_class > 255) {
     snprintf(err, err_len, "invalid roce runtime geometry");
@@ -321,6 +358,9 @@ roce_ctx_t* roce_create(int world, int rank, const char* const* hca_names, int n
   c->pipe_flag_off = layout[9];
   c->shard_cap = layout[10];
   c->pipe_bytes = layout[12];
+  c->varlen_recv_off = layout[13];
+  c->varlen_flag_off = layout[14];
+  c->varlen_bytes = layout[15];
   for (int h = 0; h < n_hca; h++) {
     if (open_hca(c, h, hca_names[h]) != 0) {
       snprintf(err, err_len, "%s", c->err);
@@ -691,6 +731,78 @@ static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t ch
   return drain_all(c);
 }
 
+// Run variable-length all-gather op seq: post each chunk of our contribution, from our row of
+// the op's slot to the same row of every peer, once the kernel staged it.
+static int run_varlen_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t chunk_packs,
+                         uint32_t chunks) {
+  volatile uint32_t* ctrl = (volatile uint32_t*)(c->region + c->ctrl_off);
+  uint32_t total = nbytes / 16;
+  uint32_t expected = chunk_packs == 0 ? 0 : (total + chunk_packs - 1) / chunk_packs;
+  if (expected == 0) {
+    expected = 1;  // an empty contribution still sends one chunk of flags
+  }
+  if (c->varlen_bytes == 0 || nbytes % 16 != 0 || nbytes > c->varlen_bytes || chunk_packs == 0 ||
+      chunks != expected || chunks > ROCE_VARLEN_MAX_CHUNKS) {
+    snprintf(c->err, sizeof(c->err),
+             "invalid variable-length op %u: %u bytes in %u chunks of %u packs (capacity %zu)",
+             seq, nbytes, chunks, chunk_packs, c->varlen_bytes);
+    return -1;
+  }
+  uint32_t slot = seq & 1u;
+  uint64_t row_off =
+      c->varlen_recv_off + ((uint64_t)slot * c->world + (uint64_t)c->rank) * c->varlen_bytes;
+  uint32_t posted = 0;
+  uint64_t idle = 0;
+  while (posted < chunks) {
+    // A ready word of a later op releases this one's chunk too (see the header).
+    uint32_t ready = __atomic_load_n(&ctrl[CTRL_READY_VL + posted], __ATOMIC_ACQUIRE);
+    if ((int32_t)(ready - seq) >= 0) {
+      uint64_t lo = (uint64_t)posted * chunk_packs;
+      uint64_t hi = lo + chunk_packs;
+      if (lo > total) {
+        lo = total;
+      }
+      if (hi > total) {
+        hi = total;
+      }
+      for (int p = 0; p < c->world; p++) {
+        if (p == c->rank) {
+          continue;
+        }
+        uint64_t flag_off =
+            c->varlen_flag_off +
+            ((((uint64_t)slot * c->world + c->rank) * ROCE_VARLEN_MAX_CHUNKS + posted) *
+             (uint64_t)c->n_rail) *
+                ROCE_FLAG_STRIDE;
+        if (post_striped(c, p, c->region + row_off + lo * 16, row_off + lo * 16,
+                         (uint32_t)(hi - lo), flag_off, seq) != 0) {
+          return -1;
+        }
+      }
+      posted++;
+      idle = 0;
+      continue;
+    }
+    if (++idle % 64 == 0) {
+      if (drain_all(c) != 0) {
+        return -1;
+      }
+      if (ctrl[CTRL_ERROR] != 0) {
+        snprintf(c->err, sizeof(c->err),
+                 "variable-length op %u abandoned: kernel stopped at seq %u", seq,
+                 ctrl[CTRL_ERROR]);
+        return -1;
+      }
+      if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
+        snprintf(c->err, sizeof(c->err), "RoCE proxy stopped inside variable-length op %u", seq);
+        return -1;
+      }
+    }
+  }
+  c->ops_posted += 1;
+  return drain_all(c);
+}
+
 static void* proxy_main(void* arg) {
   roce_ctx_t* c = (roce_ctx_t*)arg;
   volatile uint32_t* ctrl = (volatile uint32_t*)(c->region + c->ctrl_off);
@@ -733,10 +845,20 @@ static void* proxy_main(void* arg) {
     for (uint32_t s = c->last_seq + 1; pending > 0; s++, pending--) {
       uint32_t slot = s & 1u;
       uint32_t nbytes = ctrl[CTRL_SLOT_NBYTES + slot];
-      int rc = ctrl[CTRL_SLOT_KIND + slot] == 0
-                   ? post_op(c, s, nbytes)
-                   : run_pipe_op(c, s, nbytes, ctrl[CTRL_SLOT_CHUNK_PACKS + slot],
-                                 ctrl[CTRL_SLOT_CHUNKS + slot]);
+      uint32_t kind = ctrl[CTRL_SLOT_KIND + slot];
+      int rc;
+      if (kind == KIND_ONESHOT) {
+        rc = post_op(c, s, nbytes);
+      } else if (kind == KIND_TWOSHOT) {
+        rc = run_pipe_op(c, s, nbytes, ctrl[CTRL_SLOT_CHUNK_PACKS + slot],
+                         ctrl[CTRL_SLOT_CHUNKS + slot]);
+      } else if (kind == KIND_VARLEN) {
+        rc = run_varlen_op(c, s, nbytes, ctrl[CTRL_SLOT_CHUNK_PACKS + slot],
+                           ctrl[CTRL_SLOT_CHUNKS + slot]);
+      } else {
+        snprintf(c->err, sizeof(c->err), "unknown op kind %u at seq %u", kind, s);
+        rc = -1;
+      }
       if (rc != 0) {
         atomic_store(&c->failed, 1);
         return NULL;

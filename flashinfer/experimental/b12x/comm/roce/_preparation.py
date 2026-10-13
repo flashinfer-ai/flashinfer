@@ -25,7 +25,7 @@ def _dtypes(query: RoceQuery) -> tuple[torch.dtype, ...]:
 @program_cache(scope="preparation")
 def compile_roce(payload, ordinal: int):
     """Resolve exactly the all-reduce/all-gather launchers in a declaration."""
-    from . import _allgather_cute, _twoshot_cute
+    from . import _allgather_cute, _twoshot_cute, _varlen_cute
     from ._oneshot_cute import get_launcher
     from .roce_oneshot import _DTYPE_NAMES
 
@@ -59,6 +59,17 @@ def compile_roce(payload, ordinal: int):
                     max_chunks,
                     ordinal,
                 )
+        varlen_chunks = int(setup.get("varlen_chunks", 0))
+        if varlen_chunks:
+            programs["varlen"] = _varlen_cute.get_launcher(
+                query.world_size,
+                query.rank,
+                int(setup["threads"]),
+                int(setup["flag_stride"]),
+                int(setup["hca_count"]),
+                varlen_chunks,
+                ordinal,
+            )
         return programs
 
 
@@ -68,12 +79,24 @@ class _PreparedRoce:
     reduce_launchers: dict[torch.dtype, object]
     gather_launcher: object
     twoshot_launchers: dict[torch.dtype, object]
+    varlen_launcher: object = None
 
     def all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor | None = None):
         return self.runtime._run_prepared_all_reduce(inp, prepared=self, out=out)
 
     def all_gather(self, inp: torch.Tensor, *, out: torch.Tensor | None = None):
         return self.runtime._run_prepared_all_gather(inp, prepared=self, dim=0, out=out)
+
+    def all_gather_varlen(
+        self,
+        source: torch.Tensor,
+        counts: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+    ):
+        return self.runtime._run_prepared_all_gather_varlen(
+            source, counts, prepared=self, out=out
+        )
 
 
 def prepared_call(
@@ -98,6 +121,19 @@ def prepared_gather_call(state: object, *, inp: torch.Tensor) -> PreparedCall:
     if not isinstance(state, _PreparedRoce):
         raise TypeError("RoCE preparation callback requires materialized runtime state")
     return PreparedCall(run=lambda: state.all_gather(inp))
+
+
+def prepared_varlen_call(
+    state: object,
+    *,
+    source: torch.Tensor,
+    counts: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> PreparedCall:
+    """Prime the actual variable-length all-gather launcher before publication."""
+    if not isinstance(state, _PreparedRoce):
+        raise TypeError("RoCE preparation callback requires materialized runtime state")
+    return PreparedCall(run=lambda: state.all_gather_varlen(source, counts, out=out))
 
 
 def plan(
@@ -147,6 +183,7 @@ def plan(
                 for key, value in programs.items()
                 if isinstance(key, tuple) and key[0] == "twoshot"
             },
+            programs.get("varlen"),
         )
 
     return Plan(
@@ -187,9 +224,19 @@ def query_from_runtime(
                 "hca_count": runtime.rail_count,
                 # Chunk-flag capacity of the two-shot path; 0 when the runtime has none.
                 "pipe_chunks": runtime._layout.max_chunks if runtime.pipe_bytes else 0,
+                # Chunk-flag capacity of the variable-length all-gather; 0 without one.
+                "varlen_chunks": runtime._layout.varlen_max_chunks
+                if runtime.max_varlen_bytes
+                else 0,
             }
         ),
     )
 
 
-__all__ = ["plan", "prepared_call", "prepared_gather_call", "query_from_runtime"]
+__all__ = [
+    "plan",
+    "prepared_call",
+    "prepared_gather_call",
+    "prepared_varlen_call",
+    "query_from_runtime",
+]

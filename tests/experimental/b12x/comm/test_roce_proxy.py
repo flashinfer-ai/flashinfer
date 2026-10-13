@@ -85,3 +85,29 @@ def test_layout_places_two_shot_area_after_control():
     assert Layout(3, 2 << 20, 4096 * 5).shard_cap == 8192
     with pytest.raises(ValueError):
         Layout(4, 2 << 20, 1000)
+
+
+def test_layout_places_variable_length_area_after_two_shot():
+    """Two receive rows per rank and slot, then per-slot chunk flags; without one, nothing changes."""
+    from b12x.comm.roce._proxy import ABI_VERSION, Layout, load
+
+    try:
+        lib = load()
+    except RuntimeError as exc:  # no C compiler or libibverbs headers
+        pytest.skip(str(exc))
+    assert lib.roce_abi_version() == ABI_VERSION == 7
+    piped = Layout(4, 2 << 20, 64 << 20)
+    assert piped.varlen_bytes == 0
+    assert piped.varlen_recv_off == piped.varlen_flag_off == piped.total_bytes
+    varlen = Layout(4, 2 << 20, 64 << 20, 8 << 20)
+    assert varlen.pipe_flag_off == piped.pipe_flag_off
+    assert varlen.varlen_recv_off == piped.total_bytes
+    assert varlen.varlen_flag_off == varlen.varlen_recv_off + 2 * 4 * (8 << 20)
+    flags = 2 * 4 * varlen.varlen_max_chunks * 2 * varlen.flag_stride
+    assert varlen.total_bytes == varlen.varlen_flag_off + flags
+    # Without a two-shot area the variable-length one follows the control record.
+    alone = Layout(2, 4096, 0, 4096)
+    assert alone.varlen_recv_off == alone.pipe_send_off == alone.ctrl_off + 4096
+    for bad in (1000, (1 << 32) + 4096):
+        with pytest.raises(ValueError):
+            Layout(4, 2 << 20, 0, bad)
