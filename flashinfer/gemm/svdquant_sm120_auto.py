@@ -1,6 +1,7 @@
 """Cross-backend SVDQuant tuning with lazy CUTLASS candidates and exact shapes."""
 
 from collections.abc import Callable
+from functools import cache
 from typing import Final
 
 import torch
@@ -14,22 +15,12 @@ from ..quantization.nvfp4_quantization_utils import (
 from ..utils import BackendSupportedError, device_support_pdl
 from . import gemm_svdquant as gemm
 from . import svdquant_sm120_cutlass as cutlass
+from .svdquant_sm120_inputs import _check_linear_gemm_inputs, _linear_gemm_inputs
 
 
 # Composite runners profile eagerly, like the existing fused/unfused comparison.
 # Every dimension is static: producer eligibility and workspace are shape-specific.
 _TUNING_CONFIG: Final = TuningConfig(use_cuda_graph=False, use_cold_l2_cache=True)
-
-
-def _linear_gemm_inputs(inputs: list[torch.Tensor]) -> list[torch.Tensor]:
-    x, weight, weight_sf, alpha, _, l2t, l1, _, bias, out = inputs
-    m, k = x.shape
-    xq = torch.empty((m, k // 2), dtype=torch.uint8, device=x.device)
-    sf = torch.empty(
-        gemm._swizzled_sf_size(m, k // 16), dtype=torch.uint8, device=x.device
-    )
-    down = torch.empty((m, l2t.shape[1]), dtype=torch.bfloat16, device=x.device)
-    return [xq, weight, sf, weight_sf, alpha, down, l1, bias, out]
 
 
 def _cutlass_compatible(inputs: list[torch.Tensor], linear: bool) -> bool:
@@ -81,20 +72,28 @@ class _CutlassAutoRunner(TunableRunner):
             self._runner_cache = factory(self.enable_pdl, inputs[0].device, rank)
         return self._runner_cache
 
-    def _native_inputs(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
-        values = _linear_gemm_inputs(inputs) if self.linear else inputs
-        a, b, _, _, _, down = values[:6]
+    def _native_inputs(
+        self, inputs: list[torch.Tensor], *, prepare: bool = False
+    ) -> list[torch.Tensor]:
+        a, b, _, _, _, down = inputs[:6]
+        k = a.shape[1] if self.linear else a.shape[1] * 2
         size = max(
             cutlass.DEFAULT_WORKSPACE_SIZE,
             cutlass._sm120_max_workspace_bytes(
-                a.device, a.shape[0], b.shape[0], a.shape[1] * 2, down.shape[1]
+                a.device, a.shape[0], b.shape[0], k, down.shape[1]
             ),
         )
         workspace = cutlass._get_cache_buf(
             "nvfp4_svdquant_gemm_workspace", size, a.device
         )
         if self.linear:
-            return inputs[:9] + [values[0], values[2], values[5], inputs[9], workspace]
+            # Native tactic queries read original operands and workspace only.
+            # Keep the ABI slots, allocating scratch only for an actual launch.
+            scratch = [None, None, None]
+            if prepare:
+                values = _linear_gemm_inputs(inputs)
+                scratch = [values[0], values[2], values[5]]
+            return inputs[:9] + scratch + [inputs[9], workspace]
         return [*inputs, workspace]
 
     def get_valid_tactics(
@@ -127,7 +126,7 @@ class _CutlassAutoRunner(TunableRunner):
         **kwargs,
     ) -> torch.Tensor:
         runner = self._runner(inputs)
-        values = self._native_inputs(inputs)
+        values = self._native_inputs(inputs, prepare=True)
         tactic = cutlass._svdquant_workspace_safe_tactic(runner, values, tactic)
         return runner(values, tactic=tactic, do_preparation=do_preparation)
 
@@ -172,22 +171,48 @@ class _CuteLinearRunner(TunableRunner):
         )
 
 
+@cache
+def _auto_runners(
+    enable_pdl: bool,
+    device: torch.device,
+    rank: int,
+    *,
+    cute: bool,
+    native: bool,
+    linear: bool = False,
+    fused: bool = False,
+) -> list[TunableRunner]:
+    """Reuse candidates per device/rank without caching inputs or chosen tactics."""
+    runners: list[TunableRunner] = []
+    if cute:
+        runners.extend(
+            [_CuteLinearRunner(enable_pdl), _CuteLinearRunner(enable_pdl, unfused=True)]
+            if linear
+            else [
+                gemm._sm120_nvfp4_svdquant_runner(enable_pdl),
+                gemm._sm120_nvfp4_svdquant_unfused_runner(enable_pdl),
+            ]
+        )
+    if native:
+        if fused:
+            runners.append(_CutlassAutoRunner(enable_pdl, linear=True, fused=True))
+        runners.append(_CutlassAutoRunner(enable_pdl, linear=linear))
+    return runners
+
+
 def mm_auto(
     inputs: list[torch.Tensor], enable_pdl: bool, backends: list[str]
 ) -> torch.Tensor:
     if inputs[0].shape[0] == 0:
         return inputs[-1]
-    runners: list[TunableRunner] = []
-    if "cute-dsl" in backends:
-        runners.extend(
-            [
-                gemm._sm120_nvfp4_svdquant_runner(enable_pdl),
-                gemm._sm120_nvfp4_svdquant_unfused_runner(enable_pdl),
-            ]
-        )
     native = "cutlass-sm120" in backends and _cutlass_compatible(inputs, False)
-    if native:
-        runners.append(_CutlassAutoRunner(enable_pdl))
+    runners = _auto_runners(
+        enable_pdl,
+        inputs[0].device,
+        inputs[5].shape[1],
+        cute="cute-dsl" in backends,
+        native=native,
+    )
     if not runners:
         raise BackendSupportedError(
             "No SVDQuant auto backend supports the input storage"
@@ -210,7 +235,7 @@ def linear_auto(inputs: list[torch.Tensor], enable_pdl: bool | None) -> torch.Te
     inputs[9] = torch.empty(
         (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
     )
-    gemm._check_mm_nvfp4_svdquant_problem(*_linear_gemm_inputs(inputs))
+    _check_linear_gemm_inputs(inputs)
     inputs[3] = alpha.reshape(-1)[:1]
     if x.shape[0] == 0:
         return inputs[9]
@@ -225,15 +250,16 @@ def linear_auto(inputs: list[torch.Tensor], enable_pdl: bool | None) -> torch.Te
         env_flag_enabled("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"),
     )
     native = policy == (None, False) and _cutlass_compatible(inputs, True)
-    runners: list[TunableRunner] = []
-    if cute:
-        runners.extend(
-            [_CuteLinearRunner(enable_pdl), _CuteLinearRunner(enable_pdl, unfused=True)]
-        )
-    if native:
-        if cutlass._sm120_fused_linear_supported(x.shape[0], x.shape[1], l2t.shape[1]):
-            runners.append(_CutlassAutoRunner(enable_pdl, linear=True, fused=True))
-        runners.append(_CutlassAutoRunner(enable_pdl, linear=True))
+    runners = _auto_runners(
+        enable_pdl,
+        x.device,
+        l2t.shape[1],
+        cute=cute,
+        native=native,
+        linear=True,
+        fused=native
+        and cutlass._sm120_fused_linear_supported(x.shape[0], x.shape[1], l2t.shape[1]),
+    )
     if not runners:
         raise BackendSupportedError(
             "No SVDQuant linear auto backend supports the quantization policy and input storage"
