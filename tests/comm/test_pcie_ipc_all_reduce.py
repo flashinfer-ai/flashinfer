@@ -29,8 +29,6 @@ import flashinfer.comm as comm
 from flashinfer.comm.pcie_ipc_policy import IpcLaunchConfig, IpcVariant
 from flashinfer.comm.pcie_ipc_topology import PCIE_IPC_PROFILES
 
-# The sharding runner pins a regular worker to one GPU, where every multi-GPU
-# case here would skip; a solo file runs with all visible GPUs.
 pytestmark = pytest.mark.solo
 
 # (world_size, hidden, batch, blocks, threads, variant)
@@ -1074,13 +1072,7 @@ def test_pcie_ipc_tune_gate_excludes_wrong_candidates(
 def _small_max_blocks_tune_worker(
     world_size: int, rank: int, port: int, tmpdir: str, max_blocks: int
 ) -> None:
-    """A workspace with fewer blocks than the copy-engine depths still tunes.
-
-    The launcher checks ``blocks <= max_blocks`` for every variant, and on the
-    copy-engine variants ``blocks`` is the ring's sub-chunk depth. A candidate
-    list that offered a deeper ring than the workspace allows failed that check
-    in the middle of the search, on every rank at once.
-    """
+    """A workspace with fewer blocks than the copy-engine depths still tunes."""
     ws = None
     group = None
     try:
@@ -1107,8 +1099,7 @@ def _small_max_blocks_tune_worker(
             ws.tune([_TUNE_HIDDEN], cache=_tune_cache_path(tmpdir), warmup=2, repeat=5)
         finally:
             ws._launch = original
-        # Not vacuous: the search still covers the copy-engine plane, at the
-        # depths the budget allows.
+        # Not vacuous: copy-engine candidates are still searched.
         copy_engine = (IpcVariant.COPY_ENGINE_RING, IpcVariant.COPY_ENGINE_ISLAND)
         assert any(c.variant in copy_engine for c in launched), set(launched)
         assert all(c.blocks <= max_blocks for c in launched), {

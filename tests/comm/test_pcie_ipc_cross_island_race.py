@@ -45,7 +45,6 @@ from tests.comm.test_pcie_ipc_all_reduce import (
     multi_process_parallel,
 )
 
-# Solo like the other multi-GPU files, so an opted-in run sees every visible GPU.
 pytestmark = [
     pytest.mark.solo,
     pytest.mark.skipif(

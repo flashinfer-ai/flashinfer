@@ -229,11 +229,7 @@ def test_survivor_count_is_a_constant_not_a_threshold() -> None:
 
 
 def _calls_in_source_order(fn) -> list[str]:
-    """The callee of every call in ``fn``, as written, in source order.
-
-    Parsed rather than searched: a comment or a docstring that names a call can
-    neither satisfy nor break an assertion about the code.
-    """
+    """The callee of every call in ``fn``, in source order."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
     calls = sorted(
         (node for node in ast.walk(tree) if isinstance(node, ast.Call)),
@@ -243,22 +239,15 @@ def _calls_in_source_order(fn) -> list[str]:
 
 
 def test_the_barrier_precedes_the_first_collective_launch() -> None:
-    """No rank may launch until every rank is past the steps that can fail alone.
+    """A barrier sits between the allocations and the first collective launch.
 
-    The first launch is the per-variant module-load warm-up, not the timed loop,
-    and it is as collective as the rest: it spins, with no timeout, until every
-    peer issues the same kernel. A rank that fails before issuing it -- an
-    allocation is the realistic case -- leaves its peers spinning there, where
-    no NCCL abort reaches them. Behind a barrier they wait in NCCL instead. The
-    reference all-reduce is no substitute: it orders the devices, not the hosts,
-    so launches issued after it are already queued behind it.
+    The warm-up spins with no timeout, so a rank that fails before it must leave
+    its peers in NCCL, not in the kernel.
     """
     calls = _calls_in_source_order(tuning.PcieIpcAllReduceRunner.get_valid_tactics)
     first_launch = calls.index("ws._launch")
     barriers = [i for i, c in enumerate(calls[:first_launch]) if c == "dist.barrier"]
     assert barriers, f"a collective launch is issued before any barrier: {calls}"
-    # And behind the allocations it guards: above them, a rank that fails to
-    # allocate would still leave its peers spinning in the launch.
     allocations = [
         i
         for i, c in enumerate(calls[:first_launch])
@@ -297,14 +286,9 @@ def _on_ce_plane(config) -> bool:
 
 
 def _stranded(configs, order):
-    """Candidates no ranking round times behind a launch on their own plane.
+    """Candidates that every ranking round times right after a plane switch.
 
-    Models the launches get_valid_tactics issues: one warm-up launch per
-    distinct variant, in list order, then the rounds back to back. The barrier
-    before round 0 is left out; it precedes only the seed, whose score the
-    ranking does not use. The minimum over rounds removes only an inflation that
-    some round escapes, so a candidate returned here keeps a plane switch in
-    its score.
+    Models get_valid_tactics: one warm-up launch per variant, then the rounds.
     """
     warmed = []
     for config in configs:
@@ -322,12 +306,7 @@ def _stranded(configs, order):
 
 @pytest.mark.parametrize("n", [1, 2, 3, 121])
 def test_each_ranking_round_times_every_candidate_once(n: int) -> None:
-    """One sample per candidate per round, and the screening round in order.
-
-    The timing events and the verdict are indexed by candidate, so any
-    permutation is safe; a round that skipped or repeated an index would leave
-    an event unrecorded or a candidate unscreened.
-    """
+    """Every round times each candidate once, and round 0 runs in list order."""
     for r in range(tuning.TUNE_RANK_ROUNDS):
         assert sorted(tuning._round_order(n, r)) == list(range(n)), (n, r)
     assert list(tuning._round_order(n, 0)) == list(range(n))
@@ -340,13 +319,7 @@ def test_each_ranking_round_times_every_candidate_once(n: int) -> None:
 def test_no_candidate_is_timed_behind_a_plane_switch_in_every_round(
     world_size: int, profile: str, memop_supported: bool, numel: int
 ) -> None:
-    """The ranking's minimum has to have a clean sample to find.
-
-    In one fixed order, every round timed the first copy-engine candidate
-    directly behind the last SM candidate, and on 8x L40S it scored 12-40%
-    above an identical copy timed behind another copy-engine launch, ranking
-    11th-19th where the copy ranked 3rd-6th.
-    """
+    """Every candidate gets at least one round free of a plane switch."""
     tactics = tuning.candidate_tactics(
         world_size, numel=numel, profile=profile, memop_supported=memop_supported
     )
@@ -354,8 +327,7 @@ def test_no_candidate_is_timed_behind_a_plane_switch_in_every_round(
     configs = [seed] + [tuning.tactic_to_config(t) for t in tactics]
 
     assert _stranded(configs, tuning._round_order) == []
-    # Not vacuous: one order for every round strands the first copy-engine
-    # candidate behind the last SM one.
+    # Not vacuous: a fixed order strands the first copy-engine candidate.
     first_ce = next(c for c in configs if _on_ce_plane(c))
     assert first_ce in _stranded(configs, lambda n, r: range(n))
 
@@ -371,7 +343,6 @@ def test_the_ranking_rounds_take_their_order_from_round_order() -> None:
         and ast.unparse(node.iter.func) == "_round_order"
     ]
     assert len(loops) == 1, "the ranking rounds must iterate _round_order"
-    # Timed and recorded per candidate, not per position in the round.
     assert ast.unparse(loops[0].target) == "i", ast.unparse(loops[0].target)
     calls = {
         ast.unparse(node.func)
@@ -498,8 +469,7 @@ def test_resolve_falls_back_to_the_seed() -> None:
     assert resolve(seed, (0, 128, 128), 8, 32) is seed
     # Stale: a variant this world size does not dispatch.
     assert resolve(seed, (int(IpcVariant.FLAT_STAGED), 1, 128), 4, MAX_BLOCKS) is seed
-    # Stale: a copy-engine depth past the workspace's budget. That plane sizes
-    # nothing by max_blocks, but the launcher's blocks check is shared.
+    # Stale: a copy-engine depth past the workspace's max_blocks.
     assert resolve(seed, (int(IpcVariant.COPY_ENGINE_RING), 2, 256), 8, 1) is seed
     # Usable.
     assert resolve(seed, (int(IpcVariant.STAGED_RING), 2, 256), 8, MAX_BLOCKS) == (

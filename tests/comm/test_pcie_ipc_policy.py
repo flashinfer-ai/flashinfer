@@ -282,15 +282,10 @@ def _ce_variants(world_size):
 
 @pytest.mark.parametrize("max_blocks", (1, 2, 3))
 def test_a_small_max_blocks_bounds_the_copy_engine_depth_too(max_blocks: int) -> None:
-    """The launcher checks ``blocks <= max_blocks`` before it looks at the variant.
+    """Copy-engine depths past ``max_blocks`` are neither admitted nor offered.
 
-    On the copy-engine variants ``blocks`` is a sub-chunk depth, not a grid,
-    and nothing on that plane is sized by ``max_blocks`` -- but the check is
-    shared, so a deeper ring fails it all the same.
-    ``test_a_small_max_blocks_is_never_exceeded`` cannot see this, because the
-    seed never picks a copy-engine variant. The tuner's candidates do, and a
-    workspace built with ``max_blocks`` below ``CE_MAX_PIECES`` failed
-    ``tune()`` on the deeper depths, on every rank at once.
+    The launcher checks ``blocks <= max_blocks`` for every variant, and the seed
+    never picks a copy-engine variant, so the test above cannot see this.
     """
     for world_size in (4, 8):
         for variant in _ce_variants(world_size):
@@ -299,8 +294,6 @@ def test_a_small_max_blocks_bounds_the_copy_engine_depth_too(max_blocks: int) ->
                 assert not _is_launchable(world_size, config, max_blocks), config
 
         offered = 0
-        # numel=None is "which configurations can exist"; the shapes are what
-        # get_valid_tactics asks with, which is what reaches the launcher.
         for numel in (None, *_NUMELS):
             for memop_supported in (False, True):
                 tactics = tuning.candidate_tactics(
@@ -315,8 +308,7 @@ def test_a_small_max_blocks_bounds_the_copy_engine_depth_too(max_blocks: int) ->
                     if config.variant in _CE_VARIANTS:
                         offered += 1
                         assert config.blocks <= max_blocks, (world_size, numel, config)
-        # Depth 1 fits every budget, so a sweep with no copy-engine candidate
-        # in it has stopped checking anything.
+        # Not vacuous: depth 1 fits every budget.
         assert offered, f"ws={world_size} max_blocks={max_blocks} checks nothing"
 
 
@@ -324,18 +316,12 @@ def test_a_small_max_blocks_bounds_the_copy_engine_depth_too(max_blocks: int) ->
 def test_a_copy_engine_depth_within_max_blocks_is_still_offered(
     max_blocks: int,
 ) -> None:
-    """The budget removes the depths the launcher refuses, and no others.
-
-    A depth the workspace can run but the tuner no longer offers is one the
-    search can never pick again, and nothing reports the loss -- the same
-    silent narrowing as a winner the grid cannot name.
-    """
+    """The budget removes only the depths the launcher refuses."""
     bound = min(CE_MAX_PIECES, max_blocks)
     ring = {b for b in tuning.TUNE_BLOCKS if b <= bound}
     for world_size in (4, 8):
         for variant in _ce_variants(world_size):
-            # The memop ring runs at depth 1 only; deeper, the launcher runs the
-            # plain ring in its place, so its admission there is not pinned.
+            # Memop runs at depth 1 only; deeper falls back to the plain ring.
             if variant is IpcVariant.COPY_ENGINE_RING_MEMOP:
                 continue
             for depth in range(1, bound + 1):
@@ -344,8 +330,7 @@ def test_a_copy_engine_depth_within_max_blocks_is_still_offered(
 
         expected = {
             IpcVariant.COPY_ENGINE_RING: ring,
-            # Offered at depth 1 only, whatever the budget -- a candidate-list
-            # rule, not an admission one.
+            # A candidate-list rule, whatever the budget.
             IpcVariant.COPY_ENGINE_RING_MEMOP: {1},
         }
         if world_size == 8:

@@ -401,11 +401,9 @@ TUNE_SURVIVORS = 48
 # The score is the minimum over the rounds, then MAX-reduced across ranks.
 # Minimum because what is estimated is how fast the configuration can go, and a
 # sample is only ever inflated -- by a neighbour, a clock excursion, a queued
-# launch -- never deflated. It removes only an inflation that some round
-# escapes, which is why the rounds do not all run in one order; see
-# _round_order. MAX because every rank has to truncate to the same list: ranks
-# returning different numbers of tactics deadlock in a kernel that spins with
-# no timeout. No number of rounds settles a choice between candidates
+# launch -- never deflated. MAX because every rank has to truncate to the same
+# list: ranks returning different numbers of tactics deadlock in a kernel that
+# spins with no timeout. No number of rounds settles a choice between candidates
 # that differ by less than the capture domain resolves; those remedies -- pinned
 # clocks, a larger repeat, a longer capture window for small shapes -- live
 # outside get_valid_tactics.
@@ -413,24 +411,11 @@ TUNE_RANK_ROUNDS = 3
 
 
 def _round_order(n: int, round_index: int) -> range:
-    """Indices of ``n`` candidates in the order one ranking round times them.
+    """Candidate indices for one ranking round; odd rounds run backward.
 
-    Forward on even rounds, backward on odd ones. A launch is not timed in
-    isolation: it inherits cost from the launch before it, and a switch between
-    the SM and copy-engine planes is the expensive case. In one fixed order,
-    every round put the first copy-engine candidate directly behind the last SM
-    candidate, so every sample carried the switch and the minimum kept it: on
-    8x L40S at world size 8 that candidate scored 12-40% above an identical
-    copy timed behind another copy-engine launch at 1024 and 4096 rows of 6144,
-    and at most 7% with the direction alternating.
-
-    Alternating the direction gives each candidate both neighbours as
-    predecessors, and a backward round starts on the candidate the previous
-    round ended on, so the round boundary is no switch either. A rotation would
-    not help: it moves where a round starts and leaves every adjacency in place.
-
-    A pure function of the round index and the list length, so every rank
-    issues the same launches in the same order. Round 0 runs forward.
+    In one fixed order the first copy-engine candidate always followed the last
+    SM candidate, so every sample carried that switch and the minimum kept it.
+    Depends only on its arguments, so every rank launches in the same order.
     """
     return range(n - 1, -1, -1) if round_index % 2 else range(n)
 
@@ -700,8 +685,6 @@ class PcieIpcAllReduceRunner(TunableRunner):
 
         dist.barrier(group=ws.group)
         for r in range(TUNE_RANK_ROUNDS):
-            # Events and verdicts are indexed by candidate, not by position, so
-            # the direction a round runs in changes nothing downstream.
             for i in _round_order(len(configs), r):
                 config = configs[i]
                 # A kernel that leaves part of the payload unwritten would
