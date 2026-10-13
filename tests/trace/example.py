@@ -121,6 +121,7 @@ rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
+silu_and_mul_mxfp8_experts_quantize_k8192.json
 silu_and_mul_nvfp4_quantize_k16384.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
@@ -464,6 +465,7 @@ from flashinfer.quantization.fp4_quantization import (
 from flashinfer.quantization.fp8_quantization import (
     mxfp8_grouped_quantize,
     mxfp8_quantize,
+    silu_and_mul_mxfp8_experts_quantize,
 )
 
 quant_M, quant_K = 128, 4096
@@ -564,6 +566,12 @@ with contextlib.suppress(Exception):
     grouped_a = torch.randn(2, 256, quant_K, dtype=torch.bfloat16, device=device)
     grouped_mask = torch.full((2,), 256, dtype=torch.int32, device=device)
     mxfp8_grouped_quantize(grouped_a, grouped_mask)
+
+# Fused SiLU + mul + masked MXFP8 (SM100+): [B, M, 2K] -> masked grouped GEMM layout.
+with contextlib.suppress(Exception):
+    experts_a = torch.randn(2, 256, 2 * quant_K, dtype=torch.bfloat16, device=device)
+    experts_mask = torch.full((2,), 256, dtype=torch.int32, device=device)
+    silu_and_mul_mxfp8_experts_quantize(experts_a, experts_mask)
 
 # ── Single-request attention (non-batched) ───────────────────────────────────
 sa_Hq, sa_Hk, sa_D, sa_KV = 32, 8, 128, 256

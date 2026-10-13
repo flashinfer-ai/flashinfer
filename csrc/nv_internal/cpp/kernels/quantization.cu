@@ -238,6 +238,56 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
       reinterpret_cast<uint32_t*>(SFOutput), layout);
 }
 
+template <typename T>
+void invokeSiluAndMulMxFP8Quantization(int numExperts, int m, int n, int padded_n, T const* input,
+                                       int32_t const* mask, bool use_silu_and_mul, uint8_t* output,
+                                       uint8_t* SFOutput, int multiProcessorCount, bool enable_pdl,
+                                       cudaStream_t stream) {
+  TLLM_CHECK_WITH_INFO(numExperts > 0, "numExperts must be > 0");
+  TLLM_CHECK_WITH_INFO(m > 0, "m must be > 0");
+  TLLM_CHECK_WITH_INFO(n > 0 && n % 32 == 0, "n must be a positive multiple of 32");
+  TLLM_CHECK_WITH_INFO(padded_n >= n && padded_n % 128 == 0,
+                       "padded_n must be a multiple of 128 and >= n");
+
+  // Each column thread converts CVT_FP16_TO_MXFP8_SM100_ELTS_PER_THREAD values. A block row covers
+  // a matrix row in the fewest passes of at most kMaxBlockThreads threads, with its warp-aligned
+  // width balanced across the passes so few lanes idle; narrow rows stack several rows per block
+  // along y.
+  constexpr int kMaxBlockThreads = 256;
+  int const numColThreads = padded_n / CVT_FP16_TO_MXFP8_SM100_ELTS_PER_THREAD;
+  int const numColPasses = (numColThreads + kMaxBlockThreads - 1) / kMaxBlockThreads;
+  int const blockX = PadUpFn((numColThreads + numColPasses - 1) / numColPasses, 32);
+  int const blockY = std::max(1, kMaxBlockThreads / blockX);
+  dim3 const block(blockX, blockY);
+
+  // The mask lives on the device, so size the grid for the full capacity m and let blocks past
+  // mask[e] exit early. Cap the total at the number of resident blocks, so a fully valid batch
+  // runs in a single wave. Experts vary fastest across the grid, so when few rows are valid the
+  // active (low row-block) blocks of all experts are consecutive in launch order and spread over
+  // all SMs.
+  int numBlocksPerSM = 0;
+  TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &numBlocksPerSM, cvt_fp16_to_mxfp8_expert<T>, blockX * blockY, 0));
+  int const numRowBlocks = (m + blockY - 1) / blockY;
+  int const maxBlocksPerExpert =
+      std::max(1, multiProcessorCount * std::max(1, numBlocksPerSM) / numExperts);
+  dim3 const grid(numExperts, std::min(numRowBlocks, maxBlocksPerExpert));
+
+  cudaLaunchConfig_t config;
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+  TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, cvt_fp16_to_mxfp8_expert<T>, m, n, padded_n, input,
+                                     mask, use_silu_and_mul, output,
+                                     reinterpret_cast<uint32_t*>(SFOutput)));
+}
+
 // Do per-token (row) quantization from fp16/bf16/fp32 to int8/fp8_e4m3.
 template <typename T, typename QuantT>
 void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows,
@@ -769,6 +819,11 @@ template void invokeSiluAndMulNVFP4Quantization<half>(void* output, void* output
                                                       bool use_silu_and_mul, int m_topk, int k,
                                                       int n_experts, NVFP4RecipeSpec const& recipe,
                                                       cudaStream_t stream);
+template void invokeSiluAndMulMxFP8Quantization<half>(int numExperts, int m, int n, int padded_n,
+                                                      half const* input, int32_t const* mask,
+                                                      bool use_silu_and_mul, uint8_t* output,
+                                                      uint8_t* SFOutput, int multiProcessorCount,
+                                                      bool enable_pdl, cudaStream_t stream);
 
 #ifdef ENABLE_BF16
 template void invokeFP4Quantization<__nv_bfloat16, 16>(
@@ -790,7 +845,10 @@ template void invokeSiluAndMulNVFP4Quantization<__nv_bfloat16>(
     void* output, void* output_scale, void* input, void* input_global_scale, void* mask,
     bool use_silu_and_mul, int m_topk, int k, int n_experts, NVFP4RecipeSpec const& recipe,
     cudaStream_t stream);
-
+template void invokeSiluAndMulMxFP8Quantization<__nv_bfloat16>(
+    int numExperts, int m, int n, int padded_n, __nv_bfloat16 const* input, int32_t const* mask,
+    bool use_silu_and_mul, uint8_t* output, uint8_t* SFOutput, int multiProcessorCount,
+    bool enable_pdl, cudaStream_t stream);
 #endif
 
 #ifdef ENABLE_FP8

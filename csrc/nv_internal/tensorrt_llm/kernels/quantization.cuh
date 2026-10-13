@@ -60,6 +60,15 @@ constexpr int CVT_FP16_TO_MXFP8_ELTS_PER_THREAD = 16;
 constexpr int CVT_FP16_TO_FP4_ELTS_PER_THREAD = 8;
 constexpr int CVT_FP16_TO_MXFP8_ELTS_PER_THREAD = 8;
 #endif
+// CVT_FP16_TO_MXFP8_ELTS_PER_THREAD of the SM100+ device pass, for host-side launch sizing: the
+// host pass has no __CUDA_ARCH__, so the value above is 8 there. MXFP8 kernels only run on SM100+,
+// where the device value depends only on the nvcc version.
+#if defined(__CUDACC_VER_MAJOR__) && defined(__CUDACC_VER_MINOR__) && \
+    ((__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9) || (__CUDACC_VER_MAJOR__ >= 13))
+constexpr int CVT_FP16_TO_MXFP8_SM100_ELTS_PER_THREAD = 16;
+#else
+constexpr int CVT_FP16_TO_MXFP8_SM100_ELTS_PER_THREAD = 8;
+#endif
 inline int runtimeBlocksPerSM(int blockThreads) {
   int device = -1;
   cudaGetDevice(&device);
@@ -718,6 +727,79 @@ cvt_fp16_to_fp4_expert(
                              DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(in_vec, SFScaleVal,
                                                                                sf_out);
   }
+#endif
+}
+
+// MXFP8 quantization of an expert-major, masked batch, optionally fused with SiLU-and-mul.
+//
+// in:    [numExperts, numRows, numCols], or [numExperts, numRows, 2 * numCols] when
+//        use_silu_and_mul is set; each row then holds the gate values followed by the up values
+//        and silu(gate) * up is quantized.
+// out:   [numExperts, numRows, numPaddedCols] e4m3; columns [numCols, numPaddedCols) are zero.
+// SFout: per expert, UE8M0 scales of the [numRows, numPaddedCols / 32] SF matrix in the 128x4
+//        swizzled layout, with rows padded to a multiple of 128.
+// mask:  [numExperts]; only the first min(mask[e], numRows) rows of expert e are read and written.
+//
+// blockIdx.x is the expert; blockIdx.y and threadIdx.y stride over its rows. blockDim.x is a
+// multiple of 32 and every lane runs every column iteration, so each warp maps to a single row and
+// the SF reduction in cvt_warp_fp16_to_mxfp8 always sees a full warp.
+template <class Type>
+__global__ void cvt_fp16_to_mxfp8_expert(int32_t numRows, int32_t numCols, int32_t numPaddedCols,
+                                         Type const* in, int32_t const* mask, bool use_silu_and_mul,
+                                         uint8_t* out, uint32_t* SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static constexpr int SF_VEC_SIZE = 32;
+  static constexpr int ELTS_PER_THREAD = CVT_FP16_TO_MXFP8_ELTS_PER_THREAD;
+  static_assert(ELTS_PER_THREAD == CVT_FP16_TO_MXFP8_SM100_ELTS_PER_THREAD,
+                "The launcher sizes blocks with CVT_FP16_TO_MXFP8_SM100_ELTS_PER_THREAD.");
+  static constexpr int NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;
+  using PackedVecT = PackedVec<Type, ELTS_PER_THREAD>;
+  using RawVecT = std::conditional_t<sizeof(PackedVecT) == 16, PackedU32x4, PackedU32x8>;
+  using MxFp8OutT = std::conditional_t<ELTS_PER_THREAD == 16, uint4, uint64_t>;
+
+  asm volatile("griddepcontrol.wait;");
+
+  int const expertIdx = blockIdx.x;
+  int const numValidRows = min(mask[expertIdx], numRows);
+  int const numColThreads = numCols / ELTS_PER_THREAD;
+  int const numInColThreads = use_silu_and_mul ? 2 * numColThreads : numColThreads;
+  int const numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
+  int const numColVecs = numPaddedCols / SF_VEC_SIZE;
+
+  for (int rowIdx = blockIdx.y * blockDim.y + threadIdx.y; rowIdx < numValidRows;
+       rowIdx += gridDim.y * blockDim.y) {
+    int64_t const rowOffset = static_cast<int64_t>(expertIdx) * numRows + rowIdx;
+    PackedVecT const* inRow = reinterpret_cast<PackedVecT const*>(in) + rowOffset * numInColThreads;
+    MxFp8OutT* outRow = reinterpret_cast<MxFp8OutT*>(out) + rowOffset * numPaddedColThreads;
+
+    for (int colBase = 0; colBase < numPaddedColThreads; colBase += blockDim.x) {
+      int const colIdx = colBase + threadIdx.x;
+      PackedVecT vec;
+      if (colIdx < numColThreads) {
+        loadPackedVec(vec, inRow + colIdx);
+        if (use_silu_and_mul) {
+          PackedVecT upVec;
+          loadPackedVec(upVec, inRow + numColThreads + colIdx);
+          silu_and_mul<Type, ELTS_PER_THREAD>(vec, upVec);
+        }
+      } else {
+        // Padded columns quantize to zero values with a zero scale.
+        reinterpret_cast<RawVecT&>(vec) = RawVecT{};
+      }
+      uint8_t* sfOut = nullptr;
+      if (colIdx < numPaddedColThreads) {
+        sfOut = cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(
+            expertIdx, rowIdx, colIdx, numRows, numColVecs, SFout,
+            QuantizationSFLayout::SWIZZLED_128x4);
+      }
+      MxFp8OutT const outVec =
+          cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, ELTS_PER_THREAD>(vec, sfOut);
+      if (colIdx < numPaddedColThreads) {
+        outRow[colIdx] = outVec;
+      }
+    }
+  }
+  asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
