@@ -85,9 +85,16 @@ def _tc_eligible(query):
 
 
 def _torch_eligible(query):
+    if query.source_dtype != "bfloat16" or query.weight_dtype != "bfloat16":
+        return False
+    if query.output_dtype == "bfloat16":
+        return query.bias_dtype in (None, "bfloat16")
+    import torch
+
     return (
-        query.source_dtype == query.weight_dtype == query.output_dtype == "bfloat16"
-        and query.bias_dtype in (None, "bfloat16")
+        query.output_dtype == "float32"
+        and query.bias_dtype is None
+        and hasattr(torch.ops.aten.mm, "dtype_out")
     )
 
 
@@ -146,7 +153,10 @@ def validate_config(query, config, device):
             8,
         ):
             raise ValueError("SIMT projection rows_per_tile must be 1, 2, 4 or 8")
-        if type(config.block_threads) is not int or config.block_threads not in (128, 256):
+        if type(config.block_threads) is not int or config.block_threads not in (
+            128,
+            256,
+        ):
             raise ValueError("SIMT projection block_threads must be 128 or 256")
         return
     if config.rows_per_tile != 8:
@@ -206,11 +216,9 @@ TUNING = TuningContract(
         Knob(
             name="rows_per_tile", values=(1, 2, 4, 8), binding=ParameterBinding.COMPILE
         ),
-        Knob(
-            name="block_threads", values=(128, 256), binding=ParameterBinding.COMPILE
-        ),
+        Knob(name="block_threads", values=(128, 256), binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=6,
+    candidate_contract_version=7,
     parameters=_parameters,
     materialize=lambda query, device, choice: GemvConfig(**dict(choice)),
 )

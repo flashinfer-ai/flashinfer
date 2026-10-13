@@ -86,7 +86,9 @@ def compile_gemv(query_payload, config_payload, ordinal):
 
 
 def _torch_projection(x, weight, out, bias):
-    if bias is None:
+    if out.dtype == torch.float32:
+        torch.mm(x, weight.T, out_dtype=torch.float32, out=out)
+    elif bias is None:
         torch.mm(x, weight.T, out=out)
     else:
         torch.addmm(bias, x, weight.T, out=out)

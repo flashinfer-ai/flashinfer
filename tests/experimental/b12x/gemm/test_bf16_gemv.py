@@ -76,16 +76,21 @@ def _op():
 
 
 @cuda_required
-@pytest.mark.parametrize("with_bias", [False, True])
-def test_prepared_torch_projection_reuses_dynamic_graphs(with_bias):
+@pytest.mark.parametrize(
+    "with_bias,output_dtype",
+    [(False, torch.bfloat16), (True, torch.bfloat16), (False, torch.float32)],
+)
+def test_prepared_torch_projection_reuses_dynamic_graphs(with_bias, output_dtype):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.preparation import require_prepared
 
+    if output_dtype == torch.float32 and not hasattr(torch.ops.aten.mm, "dtype_out"):
+        pytest.skip("explicit FP32 mm output requires the dtype_out overload")
     torch.manual_seed(41)
     source = torch.randn(65, 1024, device="cuda", dtype=torch.bfloat16) * 0.125
     weight = torch.randn(512, 1024, device="cuda", dtype=torch.bfloat16) * 0.125
     bias = torch.randn(512, device="cuda", dtype=torch.bfloat16) if with_bias else None
-    output = torch.empty(65, 512, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(65, 512, device="cuda", dtype=output_dtype)
     with PreparationSession(
         device=source.device, autotune=False, compile_workers=0
     ) as session:
@@ -113,11 +118,14 @@ def test_prepared_torch_projection_reuses_dynamic_graphs(with_bias):
                 graph.replay()
                 torch.cuda.synchronize()
                 assert torch.cuda.memory_allocated() == allocated
-                expected = source[:rows].float() @ weight.float().T
+                expected = (source[:rows].float().cpu() @ weight.float().cpu().T).to(
+                    source.device
+                )
                 if bias is not None:
                     expected += bias.float()
+                tolerance = 2e-5 if output_dtype == torch.float32 else 0.01
                 torch.testing.assert_close(
-                    output[:rows].float(), expected, rtol=0.01, atol=0.01
+                    output[:rows].float(), expected, rtol=tolerance, atol=tolerance
                 )
                 assert torch.isfinite(output[:rows]).all()
                 assert torch.count_nonzero(output[:rows])
