@@ -685,6 +685,48 @@ single_head_paged_mqa_logits_trace = TraceTemplate(
 )
 
 
+single_head_paged_mqa_threshold_select_trace = TraceTemplate(
+    op_type="single_head_paged_mqa_threshold_select",
+    description=(
+        "Keys of each query row's request scoring above the row's threshold, with "
+        "one query head over paged BF16 or NVFP4 keys, written as (key, score) "
+        "candidate and tie slots. SM100/SM103."
+    ),
+    axes={
+        "rows": Var(description="Query rows, 128 per tile."),
+        "tiles": Var(description="Query tiles, one request each."),
+        "requests": Var(description="Block-table rows."),
+        "pages": Var(description="Key cache pages."),
+        "blocks": Var(description="64-key blocks per request."),
+        "page_size": Const(description="Keys per page."),
+        "dim": Const(description="Elements per key: 128 BF16, or 64 NVFP4 bytes."),
+        "scales": Var(description="NVFP4's E4M3 scales per key, one per 16 values."),
+        "slots": Var(description="Tie slots, then candidate slots."),
+        "counters": Const(description="Candidate and tie counts."),
+        "pair": Const(description="Key index and score bits."),
+    },
+    inputs={
+        "query": Tensor(["rows", "dim"]),
+        "key_cache": Tensor(["pages", "page_size", "dim"]),
+        "row_ends": Tensor(["rows"]),
+        "tile_requests": Tensor(["tiles"]),
+        "block_table": Tensor(["requests", "blocks"]),
+        "thresholds": Tensor(["rows"]),
+        "counters": Tensor(["rows", "counters"]),
+        "candidates": Tensor(["rows", "slots", "pair"]),
+        "max_context": Scalar("int32"),
+        "top_k": Scalar("int32"),
+        "query_scales": Tensor(["rows", "scales"], optional=True),
+        "key_scales": Tensor(["pages", "page_size", "scales"], optional=True),
+    },
+    outputs={
+        "counters": Tensor(["rows", "counters"], dtype="int32"),
+        "candidates": Tensor(["rows", "slots", "pair"], dtype="int32"),
+    },
+    constraints=["rows == 128 * tiles"],
+    tags=["arch:sm100", "arch:sm103"],
+)
+
 quantize_write_index_k_nvfp4_trace = TraceTemplate(
     op_type="quantize_write_index_k_nvfp4",
     description=(

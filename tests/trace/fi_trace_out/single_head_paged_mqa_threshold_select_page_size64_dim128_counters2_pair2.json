@@ -1,0 +1,163 @@
+{
+  "name": "single_head_paged_mqa_threshold_select_page_size64_dim128_counters2_pair2",
+  "description": "Keys of each query row's request scoring above the row's threshold, with one query head over paged BF16 or NVFP4 keys, written as (key, score) candidate and tie slots. SM100/SM103.",
+  "op_type": "single_head_paged_mqa_threshold_select",
+  "tags": [
+    "fi_api:flashinfer.attn_scores.single_head.single_head_paged_mqa_threshold_select",
+    "arch:sm100",
+    "arch:sm103"
+  ],
+  "axes": {
+    "rows": {
+      "type": "var",
+      "description": "Query rows, 128 per tile."
+    },
+    "tiles": {
+      "type": "var",
+      "description": "Query tiles, one request each."
+    },
+    "requests": {
+      "type": "var",
+      "description": "Block-table rows."
+    },
+    "pages": {
+      "type": "var",
+      "description": "Key cache pages."
+    },
+    "blocks": {
+      "type": "var",
+      "description": "64-key blocks per request."
+    },
+    "page_size": {
+      "type": "const",
+      "value": 64,
+      "description": "Keys per page."
+    },
+    "dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Elements per key: 128 BF16, or 64 NVFP4 bytes."
+    },
+    "scales": {
+      "type": "var",
+      "description": "NVFP4's E4M3 scales per key, one per 16 values."
+    },
+    "slots": {
+      "type": "var",
+      "description": "Tie slots, then candidate slots."
+    },
+    "counters": {
+      "type": "const",
+      "value": 2,
+      "description": "Candidate and tie counts."
+    },
+    "pair": {
+      "type": "const",
+      "value": 2,
+      "description": "Key index and score bits."
+    }
+  },
+  "constraints": [
+    "rows == 128 * tiles"
+  ],
+  "inputs": {
+    "query": {
+      "shape": [
+        "rows",
+        "dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "key_cache": {
+      "shape": [
+        "pages",
+        "page_size",
+        "dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "row_ends": {
+      "shape": [
+        "rows"
+      ],
+      "dtype": "int32"
+    },
+    "tile_requests": {
+      "shape": [
+        "tiles"
+      ],
+      "dtype": "int32"
+    },
+    "block_table": {
+      "shape": [
+        "requests",
+        "blocks"
+      ],
+      "dtype": "int32"
+    },
+    "thresholds": {
+      "shape": [
+        "rows"
+      ],
+      "dtype": "float32"
+    },
+    "counters": {
+      "shape": [
+        "rows",
+        "counters"
+      ],
+      "dtype": "int32"
+    },
+    "candidates": {
+      "shape": [
+        "rows",
+        "slots",
+        "pair"
+      ],
+      "dtype": "int32"
+    },
+    "max_context": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "query_scales": {
+      "shape": [
+        "rows",
+        "scales"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    },
+    "key_scales": {
+      "shape": [
+        "pages",
+        "page_size",
+        "scales"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "counters": {
+      "shape": [
+        "rows",
+        "counters"
+      ],
+      "dtype": "int32"
+    },
+    "candidates": {
+      "shape": [
+        "rows",
+        "slots",
+        "pair"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

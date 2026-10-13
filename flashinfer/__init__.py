@@ -139,6 +139,9 @@ from .attn_scores import (
 from .attn_scores import (
     single_head_paged_mqa_logits as single_head_paged_mqa_logits,
 )
+from .attn_scores import (
+    single_head_paged_mqa_threshold_select as single_head_paged_mqa_threshold_select,
+)
 from .fused_moe import (
     cutlass_fused_moe,
     cudnn_frost_grouped_gemm1_swiglu,
