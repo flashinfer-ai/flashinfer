@@ -1767,7 +1767,7 @@ def fp8_paged_mqa_logits(
                          output_dtype explicitly in code that uses both.
         epi_dtype:       epilogue accumulation dtype (float32 or float16).
                          float16 halves the epilogue traffic but saturates at
-                         ``|logit|`` > 65504 -- long-sequence accumulations can
+                         |logit| > 65504 -- long-sequence accumulations can
                          overflow to inf where float32 would not.
         acc_dtype:       MMA accumulator dtype (float32 or float16)
         schedule_meta:   optional pre-computed [num_sms+1, 2] int32 CTA
@@ -2321,7 +2321,7 @@ def fp4_paged_mqa_logits(
                          in code that uses both.
         epi_dtype:       epilogue accumulation dtype (float32, float16, or
                          bfloat16).  float16 halves the epilogue traffic but
-                         saturates at ``|logit|`` > 65504 -- long-sequence
+                         saturates at |logit| > 65504 -- long-sequence
                          accumulations can overflow to inf where float32 would
                          not.  There is no acc_dtype knob: block-scaled FP4
                          MMA always accumulates in float32.
