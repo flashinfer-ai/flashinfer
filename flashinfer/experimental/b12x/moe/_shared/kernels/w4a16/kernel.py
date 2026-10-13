@@ -9760,13 +9760,17 @@ class W4A16TopKSumKernel:
             for route in cutlass.range_constexpr(self.topk):
                 row = token * Int32(self.topk) + Int32(route)
                 valid_route = Int32(1)
+                raw_expert = route_expert_ids_flat[row].to(Int32)
                 if cutlass.const_expr(self.use_expert_map):
-                    raw_expert = route_expert_ids_flat[row].to(Int32)
                     expert = Int32(-1)
                     if raw_expert >= Int32(0) and raw_expert < route_num_experts:
                         expert = expert_map_flat[raw_expert].to(Int32)
                     if expert < Int32(0) or expert >= weight_num_experts:
                         valid_route = Int32(0)
+                elif raw_expert < Int32(0):
+                    # Route packing drops negative (unrouted) ids, so FC2 never
+                    # writes their rows; summing them would add stale scratch.
+                    valid_route = Int32(0)
                 if valid_route != Int32(0):
                     route_value = fc2_flat[
                         Int64(row) * Int64(self.hidden_size) + Int64(col)
@@ -12422,9 +12426,11 @@ def _w4a16_topk_sum_launch_flat(
 ) -> None:
     full_rotation = bool(full_rotation)
     intermediate_hadamard = bool(intermediate_hadamard)
-    route_ids_dtype = (
-        torch.int32 if route_expert_ids is None else route_expert_ids.dtype
-    )
+    if route_expert_ids is None:
+        # Every top-k sum reads the route ids: negative (unrouted) routes have
+        # no FC2 row and must be skipped.
+        raise ValueError("W4A16 top-k sum requires route_expert_ids")
+    route_ids_dtype = route_expert_ids.dtype
     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
     broadcast_svh = (
         full_rotation and svh_table is not None and svh_table.numel() == hidden_size
@@ -12516,6 +12522,7 @@ def _w4a16_topk_sum_launch_op(
     hidden_size: int,
     element_dtype: str,
     stream_int: int,
+    route_expert_ids: torch.Tensor,
 ) -> None:
     _w4a16_topk_sum_launch_flat(
         fc2_out=fc2_out,
@@ -12525,6 +12532,7 @@ def _w4a16_topk_sum_launch_op(
         hidden_size=hidden_size,
         element_dtype=element_dtype,
         stream_int=stream_int,
+        route_expert_ids=route_expert_ids,
     )
 
 
@@ -12537,6 +12545,7 @@ def _w4a16_topk_sum_launch_fake(
     hidden_size: int,
     element_dtype: str,
     stream_int: int,
+    route_expert_ids: torch.Tensor,
 ) -> None:
     return None
 
@@ -14396,6 +14405,11 @@ def run_w4a16_moe(
     sum_uses_map = sum_expert_map is not None and (
         full_rotation or use_direct_topk_routes
     )
+    # The map-free top-k sum is planned with int32 route ids; it reads them only
+    # to skip negative (unrouted) routes.
+    sum_route_ids = (
+        topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+    )
     if topk_sum_launch is not None:
         expected_sum = (
             topk,
@@ -14437,7 +14451,9 @@ def run_w4a16_moe(
             intermediate_hadamard=intermediate_hadamard,
             num_experts=int(prepared.num_experts),
             topk_weights=topk_weights if full_rotation else None,
-            route_expert_ids=topk_ids,
+            route_expert_ids=(
+                topk_ids if full_rotation or sum_uses_map else sum_route_ids
+            ),
             expert_map=sum_expert_map if sum_uses_map else None,
             svh_table=svh_table if full_rotation else None,
             launcher=topk_sum_launch,
@@ -14451,6 +14467,7 @@ def run_w4a16_moe(
             hidden_size,
             element_dtype,
             int(stream),
+            sum_route_ids,
         )
     return output
 
