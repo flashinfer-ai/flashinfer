@@ -10,6 +10,7 @@ from ..cutile import is_cuda_tile_available
 from ..trace.templates.quantize import (
     mxfp8_grouped_quantize_trace,
     mxfp8_quantize_trace,
+    silu_and_mul_mxfp8_experts_quantize_trace,
 )
 from ..jit.cake_grouped_mxfp8_quantize import (
     BF16 as _CAKE_GROUPED_MXFP8_BF16,
@@ -167,10 +168,83 @@ def get_mxfp8_quantization_sm100_module():
     ) -> torch.Tensor:
         return input.new_empty([input.shape[0], input.shape[1]], dtype=torch.float32)
 
+    def _mxfp8_experts_output_shapes(input: torch.Tensor, use_silu_and_mul: bool):
+        b, m, in_k = input.shape
+        k = in_k // 2 if use_silu_and_mul else in_k
+        padded_k = _round_up(k, 128)
+        return (b, m, padded_k), (b, _round_up(m, 128), padded_k // 32)
+
+    def _mxfp8_experts_quantize(
+        input: torch.Tensor,
+        mask: torch.Tensor,
+        use_silu_and_mul: bool,
+        enable_pdl: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        val_shape, sf_shape = _mxfp8_experts_output_shapes(input, use_silu_and_mul)
+        out_val = torch.empty(val_shape, dtype=torch.float8_e4m3fn, device=input.device)
+        out_sf = torch.empty(sf_shape, dtype=torch.uint8, device=input.device)
+        module.silu_and_mul_mxfp8_experts_quantize(
+            input, mask, out_val, out_sf, use_silu_and_mul, enable_pdl
+        )
+        return out_val, out_sf
+
+    def _fake_mxfp8_experts_quantize(
+        input: torch.Tensor, use_silu_and_mul: bool
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        val_shape, sf_shape = _mxfp8_experts_output_shapes(input, use_silu_and_mul)
+        return (
+            input.new_empty(val_shape, dtype=torch.float8_e4m3fn),
+            input.new_empty(sf_shape, dtype=torch.uint8),
+        )
+
+    @register_custom_op(
+        "flashinfer::silu_and_mul_mxfp8_experts_quantize_sm100",
+        mutates_args=(),
+    )
+    def silu_and_mul_mxfp8_experts_quantize_sm100(
+        input: torch.Tensor,
+        mask: torch.Tensor,
+        enable_pdl: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the physical ``[B, M, padded_K]`` values and ``[B, padded_M, padded_K // 32]`` scales."""
+        return _mxfp8_experts_quantize(input, mask, True, enable_pdl)
+
+    @register_fake_op("flashinfer::silu_and_mul_mxfp8_experts_quantize_sm100")
+    def _fake_silu_and_mul_mxfp8_experts_quantize_sm100(
+        input: torch.Tensor,
+        mask: torch.Tensor,
+        enable_pdl: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return _fake_mxfp8_experts_quantize(input, True)
+
+    @register_custom_op(
+        "flashinfer::mxfp8_grouped_quant_sm100",
+        mutates_args=(),
+    )
+    def mxfp8_grouped_quant_sm100(
+        input: torch.Tensor,
+        mask: torch.Tensor,
+        enable_pdl: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the physical ``[B, M, padded_K]`` values and ``[B, padded_M, padded_K // 32]`` scales."""
+        return _mxfp8_experts_quantize(input, mask, False, enable_pdl)
+
+    @register_fake_op("flashinfer::mxfp8_grouped_quant_sm100")
+    def _fake_mxfp8_grouped_quant_sm100(
+        input: torch.Tensor,
+        mask: torch.Tensor,
+        enable_pdl: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return _fake_mxfp8_experts_quantize(input, False)
+
     # Register the module
     return SimpleNamespace(
         mxfp8_quantize_sm100=mxfp8_quantize_sm100,
         mxfp8_dequantize_host_sm100=mxfp8_dequantize_host_sm100,
+        silu_and_mul_mxfp8_experts_quantize_sm100=silu_and_mul_mxfp8_experts_quantize_sm100,
+        _fake_silu_and_mul_mxfp8_experts_quantize_sm100=_fake_silu_and_mul_mxfp8_experts_quantize_sm100,
+        mxfp8_grouped_quant_sm100=mxfp8_grouped_quant_sm100,
+        _fake_mxfp8_grouped_quant_sm100=_fake_mxfp8_grouped_quant_sm100,
     )
 
 
@@ -617,7 +691,7 @@ def _mxfp8_grouped_quantize_cake(
 def mxfp8_grouped_quantize(
     a: torch.Tensor,
     mask: torch.Tensor,
-    backend: Literal["cutile", "cake"] = "cutile",
+    backend: Literal["cuda", "cutile", "cake"] = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize grouped inputs to MXFP8 with UE8M0 block scales.
 
@@ -635,12 +709,16 @@ def mxfp8_grouped_quantize(
         CUDA-graph capture. Out-of-range values are undefined behavior. The
         kernel writes scale factors with bounds checking disabled, so
         ``mask[i] > M`` corrupts neighboring groups or writes out of bounds.
-    backend : {``"cutile"``, ``"cake"``}
-        Implementation backend. ``"cutile"`` remains the default and fallback
-        path. ``"cake"`` explicitly selects a generated, exact-architecture
-        Blackwell profile and raises a clear error when that profile is not
-        installed; runtime launch failures are never silently retried through a
-        different implementation.
+    backend : {``"cuda"``, ``"cutile"``, ``"cake"``}
+        Implementation backend. ``"cuda"`` (the default) runs a single CUDA
+        kernel that reads ``mask`` on the device and skips the rows past it;
+        it is the same kernel as :func:`silu_and_mul_mxfp8_experts_quantize`
+        with the SiLU-and-mul step disabled. ``"cutile"`` runs the cuTile
+        kernel and requires the ``cuda-tile`` package. ``"cake"`` explicitly
+        selects a generated, exact-architecture Blackwell profile and raises a
+        clear error when that profile is not installed. Runtime launch failures
+        are never silently retried through a different implementation. All
+        backends produce the same valid-row output bits and scale bytes.
 
     Returns
     -------
@@ -657,7 +735,7 @@ def mxfp8_grouped_quantize(
         The consumer must use the same ``mask`` and read only the valid rows.
     """
 
-    if backend not in ("cutile", "cake"):
+    if backend not in ("cuda", "cutile", "cake"):
         raise ValueError(f"Unsupported backend for mxfp8_grouped_quantize: {backend!r}")
     if a.dim() != 3:
         raise ValueError("a must be a 3D tensor with shape [B, M, K]")
@@ -678,6 +756,21 @@ def mxfp8_grouped_quantize(
     if major < 10:
         raise RuntimeError("mxfp8_grouped_quantize requires SM100 or newer")
 
+    if backend == "cuda":
+        b, m, k = a.shape
+        if k % 32 != 0:
+            raise ValueError(f"K must be divisible by 32, got {k}")
+        x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_grouped_quant_sm100(
+            a.contiguous(), mask.contiguous(), device_support_pdl(a.device)
+        )
+        padded_m = _round_up(m, 128)
+        scale_k = _round_up(k, 128) // 32
+        x_q = x_q.permute(1, 2, 0)
+        sf = sf.view(b, padded_m // 128, scale_k // 4, 32, 4, 4).permute(
+            3, 4, 1, 5, 2, 0
+        )
+        return x_q, sf
+
     if backend == "cutile":
         if not is_cuda_tile_available():
             raise RuntimeError(
@@ -695,6 +788,98 @@ def mxfp8_grouped_quantize(
     if k % 32 != 0:
         raise ValueError(f"K must be divisible by 32, got {k}")
     return _mxfp8_grouped_quantize_cake(a, mask, backend="cake")
+
+
+@flashinfer_api(trace=silu_and_mul_mxfp8_experts_quantize_trace)
+def silu_and_mul_mxfp8_experts_quantize(
+    a: torch.Tensor,
+    mask: torch.Tensor,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Fused SiLU + mul + MXFP8 quantization of an expert-major, masked batch.
+
+    Computes ``silu(a[..., :K]) * a[..., K:]`` for the valid rows of each
+    expert, rounds it to the input dtype, and quantizes it to MXFP8 (E4M3
+    values with one UE8M0 scale per 32 elements). This is the activation step
+    between the two :func:`flashinfer.gemm.grouped_gemm_nt_masked` GEMMs of a
+    batched MoE expert computation.
+
+    The outputs use the same layout as :func:`mxfp8_grouped_quantize`, so they
+    can be passed directly as the ``(A, SFA)`` operand of
+    :func:`flashinfer.gemm.grouped_gemm_nt_masked` with
+    ``ab_dtype="float8_e4m3fn"``, ``sf_dtype="float8_e8m0fnu"`` and
+    ``sf_vec_size=32``.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Contiguous input tensor of shape ``[B, M, 2 * K]`` with dtype
+        ``float16`` or ``bfloat16``. Each row holds the gate values followed
+        by the up values. ``K`` must be divisible by 32.
+    mask : torch.Tensor
+        Contiguous int32 CUDA tensor of shape ``[B]`` with the number of
+        valid rows of each expert. Only the first ``min(mask[i], M)`` rows of
+        expert ``i`` are read and written. The values are read on the device,
+        so the call does not synchronize with the host and can be captured in
+        a CUDA graph.
+    enable_pdl : bool, optional
+        Whether to enable Programmatic Dependent Launch. Auto-detected from
+        the device capability when ``None``.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(x_q, sf)`` where ``x_q`` has logical shape ``[M, padded_K, B]``
+        with dtype ``float8_e4m3fn`` and ``sf`` has logical shape
+        ``[32, 4, padded_M // 128, 4, padded_K // 128, B]`` with dtype
+        ``uint8``. ``padded_K`` rounds ``K`` up to a multiple of 128 (the
+        padded columns hold zero values and zero scales) and ``padded_M``
+        rounds ``M`` up to a multiple of 128. The physical layouts are grouped
+        by ``B`` and then permuted, matching :func:`mxfp8_grouped_quantize`.
+
+        Rows ``>= mask[i]`` of expert ``i`` (and their scale factors) are
+        unspecified; the consumer must use the same ``mask``.
+    """
+    if a.dim() != 3:
+        raise ValueError("a must be a 3D tensor with shape [B, M, 2 * K]")
+    if not a.is_cuda:
+        raise ValueError("a must be a CUDA tensor")
+    if a.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("a dtype must be torch.float16 or torch.bfloat16")
+    if not a.is_contiguous():
+        raise ValueError("a must be contiguous")
+    if a.size(2) % 64 != 0:
+        raise ValueError(
+            f"a last dim must be 2 * K with K divisible by 32, got {a.size(2)}"
+        )
+    if mask.dim() != 1 or mask.size(0) != a.size(0):
+        raise ValueError("mask must be a 1D tensor with one entry per expert")
+    if mask.dtype != torch.int32:
+        raise ValueError("mask dtype must be torch.int32")
+    if mask.device != a.device:
+        raise ValueError("mask must live on the same CUDA device as a")
+    if not mask.is_contiguous():
+        raise ValueError("mask must be contiguous")
+
+    major, _ = get_compute_capability(a.device)
+    if major < 10:
+        raise RuntimeError(
+            "silu_and_mul_mxfp8_experts_quantize requires SM100 or newer"
+        )
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(a.device)
+
+    b = a.size(0)
+    padded_m = _round_up(a.size(1), 128)
+    scale_k = _round_up(a.size(2) // 2, 128) // 32
+    x_q, sf = (
+        get_mxfp8_quantization_sm100_module().silu_and_mul_mxfp8_experts_quantize_sm100(
+            a, mask, enable_pdl
+        )
+    )
+    x_q = x_q.permute(1, 2, 0)
+    sf = sf.view(b, padded_m // 128, scale_k // 4, 32, 4, 4).permute(3, 4, 1, 5, 2, 0)
+    return x_q, sf
 
 
 @flashinfer_api

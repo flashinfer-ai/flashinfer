@@ -1094,6 +1094,92 @@ mxfp8_grouped_quantize_trace = TraceTemplate(
 )
 
 
+def _silu_and_mul_mxfp8_experts_quantize_init(
+    *,
+    B,
+    M,
+    K_doubled=4096,
+    padded_K=0,
+    rm=0,
+    rk=0,
+    m32=32,
+    m4=4,
+    k4=4,
+    device="cuda",
+    seed=0,
+):
+    """Build inputs for ``flashinfer.silu_and_mul_mxfp8_experts_quantize``.
+
+    Every expert uses the full ``M`` valid rows (``mask = M``) so the trace
+    exercises the dense path with no uninitialized output rows; callers may
+    shrink ``mask`` afterwards.
+    """
+    del padded_K, rm, rk, m32, m4, k4  # output-only / derived axes
+    torch.manual_seed(seed)
+    a = torch.randn(B, M, K_doubled, dtype=torch.bfloat16, device=device)
+    mask = torch.full((B,), M, dtype=torch.int32, device=device)
+    return {"a": a, "mask": mask}
+
+
+silu_and_mul_mxfp8_experts_quantize_trace = TraceTemplate(
+    op_type="activation_quantize",
+    name_prefix="silu_and_mul_mxfp8_experts_quantize",
+    description=(
+        "Fused SiLU+mul activation followed by masked MXFP8 quantization "
+        "(SM100+), used between the two masked grouped GEMMs of batched MoE "
+        "experts: [B, M, 2K] bf16/fp16 -> fp8_e4m3fn activations + UE8M0 "
+        "block scales in the masked grouped GEMM layout. K is padded up to a "
+        "multiple of 128."
+    ),
+    axes={
+        "B": Var(description="Number of experts."),
+        "M": Var(description="Row capacity per expert."),
+        "K_doubled": Const(
+            abbrev="k", description="2 * K, gate then up columns (K divisible by 32)."
+        ),
+        "padded_K": Var(description="K rounded up to a multiple of 128."),
+        "rm": Var(description="padded_M // 128 (row scale tiles)."),
+        "rk": Var(description="padded_K // 128 (column scale tiles)."),
+        "m32": Var(description="MXFP8 scale swizzle dim (32)."),
+        "m4": Var(description="MXFP8 scale swizzle dim (4)."),
+        "k4": Var(description="MXFP8 scale swizzle dim (4)."),
+    },
+    inputs={
+        "a": Tensor(
+            ["B", "M", "K_doubled"],
+            description="Gate values followed by up values, fp16/bf16.",
+        ),
+        "mask": Tensor(
+            ["B"],
+            dtype="int32",
+            description="Valid rows per expert (int32).",
+        ),
+    },
+    outputs={
+        "x_q": Tensor(
+            ["M", "padded_K", "B"],
+            dtype="float8_e4m3fn",
+            description="Quantized activations, permuted for the grouped GEMM.",
+        ),
+        "sf": Tensor(
+            ["m32", "m4", "rm", "k4", "rk", "B"],
+            dtype="uint8",
+            description="UE8M0 swizzled block scales (1 byte per 32-element block).",
+        ),
+    },
+    constraints=[
+        "padded_K == ((K_doubled // 2 + 127) // 128) * 128",
+        "rm == (M + 127) // 128",
+        "rk == padded_K // 128",
+        "m32 == 32",
+        "m4 == 4",
+        "k4 == 4",
+    ],
+    tags=["status:verified", "fused", "quantization:mxfp8", "moe"],
+    init=_silu_and_mul_mxfp8_experts_quantize_init,
+)
+
+
 class _Dsv41CacheFormat:
     """Static facts of one DeepSeek-V4.1 paged cache ABI (shared by pack / append traces)."""
 
