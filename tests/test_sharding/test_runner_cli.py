@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import select
 import shlex
 import subprocess
@@ -35,43 +34,43 @@ RUNNER = REPO_ROOT / "scripts" / "unit_test_runner.py"
 def _queue_test_unit(identifier: str) -> Unit:
     return Unit(
         id=identifier,
-        batches=(),
+        batches=(
+            Batch(
+                identifier, f"{identifier}.py", (f"{identifier}.py::test",), 1, 0, False
+            ),
+        ),
         estimated_ms=1,
         oversized=False,
     )
 
 
 def test_worker_unit_selection_prefers_local_queue_before_stealing() -> None:
-    work_by_worker = [queue.Queue() for _ in range(2)]
-    work_by_worker[0].put(_queue_test_unit("donor"))
-    work_by_worker[1].put(_queue_test_unit("local"))
-
-    local_queue, local_unit = runner._next_worker_unit(work_by_worker, 1)
-
-    assert local_queue is work_by_worker[1]
-    assert local_unit.id == "local"
-
-    donor_queue, donor_unit = runner._next_worker_unit(work_by_worker, 1)
-
-    assert donor_queue is work_by_worker[0]
-    assert donor_unit.id == "donor"
+    work_by_worker = [[_queue_test_unit("donor")], [_queue_test_unit("local")]]
+    assert runner._next_worker_unit(work_by_worker, 1).id == "local"
+    assert runner._next_worker_unit(work_by_worker, 1).id == "donor"
 
 
 def test_worker_unit_stealing_drains_queued_units_exactly_once() -> None:
-    work_by_worker = [queue.Queue() for _ in range(4)]
+    work_by_worker = [[] for _ in range(4)]
     expected = [f"unit-{index}" for index in range(40)]
     for index, identifier in enumerate(expected):
-        work_by_worker[index % 2].put(_queue_test_unit(identifier))
+        work_by_worker[index % 2].append(_queue_test_unit(identifier))
+    resources = runner._ResourceQueue(
+        devices=["4", "6", "4", "6"],
+        long_work_by_worker=[[] for _ in range(4)],
+        normal_work_by_worker=work_by_worker,
+        gpu_exclusive_sources=frozenset(f"unit-{i}.py" for i in range(0, 40, 5)),
+        host_memory_heavy_sources=frozenset(f"unit-{i}.py" for i in range(0, 40, 7)),
+    )
 
     def drain(worker_index: int) -> list[str]:
         completed = []
         while True:
-            try:
-                work, unit = runner._next_worker_unit(work_by_worker, worker_index)
-            except queue.Empty:
-                return completed
-            completed.append(unit.id)
-            work.task_done()
+            with resources.reserve(worker_index) as unit:
+                if unit is None:
+                    return completed
+                completed.append(unit.id)
+                time.sleep(0.001)
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         completed = [
@@ -81,7 +80,9 @@ def test_worker_unit_stealing_drains_queued_units_exactly_once() -> None:
         ]
 
     assert sorted(completed) == sorted(expected)
-    assert all(work.unfinished_tasks == 0 for work in work_by_worker)
+    assert not any(work_by_worker)
+    assert not resources.active
+    assert not resources.draining
 
 
 def test_compatibility_defaults_use_file_sized_units_with_failure_timeout(
@@ -1443,7 +1444,9 @@ from pathlib import Path
 import pytest
 
 MODE = {mode!r}
-if MODE != "shared":
+if MODE == "both":
+    pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.host_memory_heavy]
+elif MODE != "shared":
     pytestmark = getattr(pytest.mark, MODE)
 
 @pytest.fixture(scope="module", autouse=True)
@@ -1454,16 +1457,16 @@ def reserve_memory():
         host_lock = stack.enter_context((state / "runner.lock").open("a"))
         host_mode = fcntl.LOCK_EX if MODE == "solo" else fcntl.LOCK_SH
         fcntl.flock(host_lock, host_mode | fcntl.LOCK_NB)
-        if MODE == "host_memory_heavy":
+        if MODE in ("host_memory_heavy", "both"):
             heavy_lock = stack.enter_context((state / "host-heavy.lock").open("a"))
             fcntl.flock(heavy_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         with (state / (device + ".lock")).open("a") as gpu_lock:
-            gpu_mode = fcntl.LOCK_EX if MODE in ("solo", "gpu_exclusive") else fcntl.LOCK_SH
+            gpu_mode = fcntl.LOCK_EX if MODE in ("solo", "gpu_exclusive", "both") else fcntl.LOCK_SH
             fcntl.flock(gpu_lock, gpu_mode | fcntl.LOCK_NB)
             start = time.time()
             if MODE == "shared":
                 (state / "light-seen").touch()
-            if MODE == "host_memory_heavy":
+            if MODE in ("host_memory_heavy", "both"):
                 deadline = time.monotonic() + 10
                 while not (state / "light-seen").exists():
                     assert time.monotonic() < deadline, "host-heavy work blocked light work"
@@ -1479,7 +1482,11 @@ def test_case():
     time.sleep(0.1)
 """
     modes = (
-        ["host_memory_heavy"] * 2 + ["gpu_exclusive"] * 4 + ["shared"] * 8 + ["solo"]
+        ["host_memory_heavy"] * 3
+        + ["both"]
+        + ["gpu_exclusive"] * 4
+        + ["shared"] * 8
+        + ["solo"]
     )
     for index, mode in enumerate(modes):
         (suite / f"test_{index}.py").write_text(source.format(mode=mode))
@@ -1512,43 +1519,90 @@ def test_case():
 
 
 def test_resource_reservation_releases_after_failure() -> None:
-    gate = runner._ResourceGate()
-    with (
-        pytest.raises(RuntimeError),
-        gate.reserve("4", gpu_exclusive=True, host_memory_heavy=True),
-    ):
+    resources = runner._ResourceQueue(
+        devices=["4"],
+        long_work_by_worker=[[_queue_test_unit("heavy"), _queue_test_unit("next")]],
+        normal_work_by_worker=[[]],
+        gpu_exclusive_sources=frozenset({"heavy.py"}),
+        host_memory_heavy_sources=frozenset({"heavy.py", "next.py"}),
+    )
+    with pytest.raises(RuntimeError), resources.reserve(0) as unit:
+        assert unit.id == "heavy"
         raise RuntimeError("batch failed")
-    with gate.reserve("4", gpu_exclusive=False, host_memory_heavy=True):
-        assert gate.active["4"] == 1
-        assert not gate.exclusive
-    assert gate.active["4"] == 0
-    assert not gate.host_heavy_active
+    with resources.reserve(0) as unit:
+        assert unit.id == "next"
+    assert not resources.active
+
+
+def test_busy_host_file_stays_queued_while_light_work_runs() -> None:
+    resources = runner._ResourceQueue(
+        devices=["4", "6"],
+        long_work_by_worker=[
+            [_queue_test_unit("heavy-a")],
+            [_queue_test_unit("heavy-b")],
+        ],
+        normal_work_by_worker=[[], [_queue_test_unit("light")]],
+        host_memory_heavy_sources=frozenset({"heavy-a.py", "heavy-b.py"}),
+    )
+    with resources.reserve(0) as first:
+        with resources.reserve(1) as second:
+            assert first.id == "heavy-a"
+            assert second.id == "light"
+        assert resources.long_work_by_worker[1][0].id == "heavy-b"
+    with resources.reserve(1) as last:
+        assert last.id == "heavy-b"
 
 
 def test_gpu_wait_does_not_reserve_host_capacity() -> None:
-    gate = runner._ResourceGate()
-    host_started = threading.Event()
+    resources = runner._ResourceQueue(
+        devices=["4", "4", "6"],
+        long_work_by_worker=[[], [], []],
+        normal_work_by_worker=[
+            [_queue_test_unit("light")],
+            [_queue_test_unit("both")],
+            [],
+        ],
+        gpu_exclusive_sources=frozenset({"both.py"}),
+        host_memory_heavy_sources=frozenset({"both.py", "heavy.py"}),
+    )
+    with resources.reserve(0):
+        with resources.condition:
+            assert resources._take(1) is None
+            resources.long_work_by_worker[2].append(_queue_test_unit("heavy"))
+        with resources.reserve(2) as unit:
+            assert unit.id == "heavy"
+            with resources.condition:
+                resources.normal_work_by_worker[1].append(
+                    _queue_test_unit("next-light")
+                )
+            with resources.reserve(1) as light:
+                assert light.id == "next-light"
+    with resources.reserve(1) as unit:
+        assert unit.id == "both"
 
-    def host_job(device: str) -> None:
-        with gate.reserve(device, gpu_exclusive=True, host_memory_heavy=True):
-            if device == "6":
-                host_started.set()
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        with gate.reserve("4", gpu_exclusive=True, host_memory_heavy=False):
-            blocked = pool.submit(host_job, "4")
-            deadline = time.monotonic() + 2
-            while True:
-                with gate.condition:
-                    if gate.waiting_exclusive["4"]:
-                        break
-                assert time.monotonic() < deadline, "GPU waiter did not start"
-                time.sleep(0.01)
-            free = pool.submit(host_job, "6")
-            assert host_started.wait(2), "GPU waiter reserved the host slot"
-            assert not blocked.done()
-        blocked.result(timeout=2)
-        free.result(timeout=2)
+def test_exclusive_file_drains_one_gpu_and_can_be_stolen() -> None:
+    resources = runner._ResourceQueue(
+        devices=["4", "4", "6", "6"],
+        long_work_by_worker=[[], [], [], []],
+        normal_work_by_worker=[
+            [_queue_test_unit("active")],
+            [_queue_test_unit("exclusive"), _queue_test_unit("waiting")],
+            [_queue_test_unit("other")],
+            [],
+        ],
+        gpu_exclusive_sources=frozenset({"exclusive.py"}),
+    )
+    with resources.reserve(0), resources.reserve(2):
+        with resources.condition:
+            assert resources._take(1) is None
+            assert set(resources.draining) == {"4"}
+        with resources.reserve(3) as unit:
+            assert unit.id == "waiting"
+    # GPU 6 takes the exclusive file and clears GPU 4's drain request.
+    with resources.reserve(2) as unit:
+        assert unit.id == "exclusive"
+        assert not resources.draining
 
 
 def test_host_heavy_file_starts_before_larger_light_file(tmp_path: Path) -> None:

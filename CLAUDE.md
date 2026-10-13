@@ -145,13 +145,21 @@ and permits only one marked file at a time, while lighter files keep running.
 Reserve `pytest.mark.solo` for files that must run alone across the allocation.
 These markers cover setup, execution and process cleanup. Host and GPU capacity
 are acquired together, so a file waiting for a GPU cannot hold the host slot.
+Workers leave blocked files queued and take runnable work from their own queue
+or another worker's queue. An exclusive file can drain one GPU of shared work;
+other GPUs keep running. This prevents shared work from delaying it indefinitely.
 
-The H100 policy uses runs 38120808880 and 38310310922: files above 128 GiB host
-RSS are `host_memory_heavy`; files above 32 GiB GPU memory are `gpu_exclusive`.
+The H100 policy uses runs 38120808880, 38310310922 and 38334636543: files above
+128 GiB host RSS are `host_memory_heavy`; files above 32 GiB GPU memory are
+`gpu_exclusive`.
 The second run measured sliding-window GPU memory at 2 GiB, so it can share.
+Single-GPU attention-sink tests use both markers instead of `solo`: their
+89.2 GiB host peak stays isolated from other host-heavy files, and their GPU
+stays exclusive while other GPUs work.
 These markers are measured baselines, not enforced memory limits. Cold JIT
-compilation can move the host-memory peak between files; recheck both traces.
-`RESOURCE WAIT` records waits of at least one second before a unit starts.
+compilation can move the host-memory peak between files; recheck the traces.
+`RESOURCE WAIT` records worker idle time of at least one second when queued work
+cannot use that worker's GPU or the host-memory slot.
 
 GPU sharing can hide CPU and compilation waits; it does not imply a 2x speedup.
 Run the CPU-only coordinator checks with

@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -1006,28 +1005,24 @@ class _UnitTimer:
 
 
 def _next_worker_unit(
-    work_by_worker: list[queue.Queue[Unit]],
+    work_by_worker: list[list[Unit]],
     worker_index: int,
-) -> tuple[queue.Queue[Unit], Unit]:
-    preferred = work_by_worker[worker_index]
-    try:
-        return preferred, preferred.get_nowait()
-    except queue.Empty:
-        pass
+    can_run: Callable[[Unit], bool] = lambda unit: True,
+) -> Unit | None:
+    # The resource queue holds its condition while selecting and reserving work.
     donors = sorted(
         (
-            (work.qsize(), index, work)
+            (len(work), index, work)
             for index, work in enumerate(work_by_worker)
             if index != worker_index
         ),
         key=lambda item: (-item[0], item[1]),
     )
-    for _, _, work in donors:
-        try:
-            return work, work.get_nowait()
-        except queue.Empty:
-            continue
-    raise queue.Empty
+    for work in [work_by_worker[worker_index], *(work for _, _, work in donors)]:
+        for position, unit in enumerate(work):
+            if can_run(unit):
+                return work.pop(position)
+    return None
 
 
 @dataclass
@@ -1086,48 +1081,92 @@ class _ShardProgress:
 
 
 @dataclass
-class _ResourceGate:
-    """Acquire host and GPU capacity together; keep light work concurrent."""
+class _ResourceQueue:
+    """Take runnable work and reserve its host/GPU capacity atomically."""
 
+    devices: list[str | None]
+    long_work_by_worker: list[list[Unit]]
+    normal_work_by_worker: list[list[Unit]]
+    gpu_exclusive_sources: frozenset[str] = frozenset()
+    host_memory_heavy_sources: frozenset[str] = frozenset()
+    stop: threading.Event = field(default_factory=threading.Event)
     condition: threading.Condition = field(default_factory=threading.Condition)
-    active: Counter[str | None] = field(default_factory=Counter)
-    exclusive: set[str | None] = field(default_factory=set)
-    waiting_exclusive: Counter[str | None] = field(default_factory=Counter)
-    host_heavy_active: bool = False
+    active: dict[int, Unit] = field(default_factory=dict)
+    draining: dict[str | None, Unit] = field(default_factory=dict)
+
+    def _gpu_exclusive(self, unit: Unit) -> bool:
+        return any(b.source_file in self.gpu_exclusive_sources for b in unit.batches)
+
+    def _host_heavy(self, unit: Unit) -> bool:
+        return any(
+            b.source_file in self.host_memory_heavy_sources for b in unit.batches
+        )
+
+    def _take(self, worker: int) -> Unit | None:
+        device = self.devices[worker]
+        gpu_active = [
+            unit for index, unit in self.active.items() if self.devices[index] == device
+        ]
+        host_busy = any(self._host_heavy(unit) for unit in self.active.values())
+        self.draining = {
+            gpu: unit
+            for gpu, unit in self.draining.items()
+            if not (host_busy and self._host_heavy(unit))
+        }
+        if any(self._gpu_exclusive(unit) for unit in gpu_active):
+            return None
+
+        def can_run(unit: Unit) -> bool:
+            if host_busy and self._host_heavy(unit):
+                return False
+            if self._gpu_exclusive(unit):
+                if not gpu_active:
+                    return True
+                # Drain one GPU for this file; other GPUs can still take light work.
+                if unit not in self.draining.values():
+                    self.draining.setdefault(device, unit)
+                return False
+            return device not in self.draining
+
+        for queues in (self.long_work_by_worker, self.normal_work_by_worker):
+            unit = _next_worker_unit(queues, worker, can_run)
+            if unit is not None:
+                self.active[worker] = unit
+                self.draining = {
+                    gpu: waiting
+                    for gpu, waiting in self.draining.items()
+                    if waiting.id != unit.id
+                }
+                self.condition.notify_all()
+                return unit
+        return None
 
     @contextmanager
-    def reserve(
-        self, device: str | None, *, gpu_exclusive: bool, host_memory_heavy: bool
-    ) -> Iterator[None]:
+    def reserve(self, worker: int) -> Iterator[Unit | None]:
+        unit = None
+        waited = 0.0
         with self.condition:
-            self.waiting_exclusive[device] += int(gpu_exclusive)
-            try:
-                self.condition.wait_for(
-                    lambda: not (host_memory_heavy and self.host_heavy_active)
-                    and device not in self.exclusive
-                    and (
-                        self.active[device] == 0
-                        if gpu_exclusive
-                        else self.waiting_exclusive[device] == 0
-                    )
-                )
-                self.active[device] += 1
-                if gpu_exclusive:
-                    self.exclusive.add(device)
-                if host_memory_heavy:
-                    self.host_heavy_active = True
-            finally:
-                self.waiting_exclusive[device] -= int(gpu_exclusive)
+            while not self.stop.is_set():
+                unit = self._take(worker)
+                if unit is not None or not any(
+                    self.long_work_by_worker + self.normal_work_by_worker
+                ):
+                    break
+                started = time.monotonic()
+                self.condition.wait()
+                waited += time.monotonic() - started
         try:
-            yield
+            if waited >= 1:
+                write_console(
+                    f"RESOURCE WAIT worker={worker} device={self.devices[worker]} "
+                    f"elapsed={waited:.3f}s"
+                )
+            yield unit
         finally:
-            with self.condition:
-                self.active[device] -= 1
-                if gpu_exclusive:
-                    self.exclusive.remove(device)
-                if host_memory_heavy:
-                    self.host_heavy_active = False
-                self.condition.notify_all()
+            if unit is not None:
+                with self.condition:
+                    del self.active[worker]
+                    self.condition.notify_all()
 
 
 @dataclass
@@ -1146,9 +1185,7 @@ class _ShardExecutor:
     progress: _ShardProgress
     gpu_exclusive_sources: frozenset[str] = frozenset()
     host_memory_heavy_sources: frozenset[str] = frozenset()
-    resource_gate: _ResourceGate = field(default_factory=_ResourceGate)
-    long_work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
-    normal_work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
+    resource_queue: _ResourceQueue = field(init=False)
     solo_units: list[Unit] = field(default_factory=list)
     non_solo_units: list[Unit] = field(default_factory=list)
     all_non_solo_units: list[Unit] = field(default_factory=list)
@@ -1174,21 +1211,27 @@ class _ShardExecutor:
             key=lambda item: (-item.estimated_ms, item.id.encode("utf-8")),
         )
         self.non_solo_units = [unit for unit in pending if not self._unit_is_solo(unit)]
-        self.long_work_by_worker = []
-        self.normal_work_by_worker = []
+        self.resource_queue = _ResourceQueue(
+            devices=self.devices,
+            long_work_by_worker=[],
+            normal_work_by_worker=[],
+            gpu_exclusive_sources=self.gpu_exclusive_sources,
+            host_memory_heavy_sources=self.host_memory_heavy_sources,
+            stop=self.stop_workers,
+        )
         for worker_units in source_affine_unit_bins(
             self.non_solo_units, self.execution.workers
         ):
-            long_work: queue.Queue[Unit] = queue.Queue()
-            normal_work: queue.Queue[Unit] = queue.Queue()
+            long_work: list[Unit] = []
+            normal_work: list[Unit] = []
             for unit in sorted(
                 worker_units,
                 key=lambda item: (-item.estimated_ms, item.id.encode("utf-8")),
             ):
                 target = long_work if self._unit_is_long_running(unit) else normal_work
-                target.put(unit)
-            self.long_work_by_worker.append(long_work)
-            self.normal_work_by_worker.append(normal_work)
+                target.append(unit)
+            self.resource_queue.long_work_by_worker.append(long_work)
+            self.resource_queue.normal_work_by_worker.append(normal_work)
 
     def run(self) -> None:
         self.progress.start()
@@ -1206,7 +1249,9 @@ class _ShardExecutor:
                     try:
                         future.result()
                     except Exception as error:
-                        self.stop_workers.set()
+                        with self.resource_queue.condition:
+                            self.stop_workers.set()
+                            self.resource_queue.condition.notify_all()
                         self._record_infrastructure_error(
                             f"worker-{index}: {type(error).__name__}: {error}"
                         )
@@ -1230,55 +1275,22 @@ class _ShardExecutor:
         )
         try:
             while not self.stop_workers.is_set():
-                try:
-                    try:
-                        work, unit = _next_worker_unit(self.long_work_by_worker, index)
-                    except queue.Empty:
-                        work, unit = _next_worker_unit(
-                            self.normal_work_by_worker, index
-                        )
-                except queue.Empty:
-                    return
-                before = {
-                    batch.id
-                    for batch in unit.batches
-                    if batch_is_final(self.junit_dir, unit, batch)
-                }
-                pending_nodes = sum(
-                    len(batch.nodeids)
-                    for batch in unit.batches
-                    if batch.id not in before
-                )
-                try:
-                    gpu_exclusive = any(
-                        batch.source_file in self.gpu_exclusive_sources
+                with self.resource_queue.reserve(index) as unit:
+                    if unit is None:
+                        return
+                    before = {
+                        batch.id
                         for batch in unit.batches
-                    )
-                    host_memory_heavy = any(
-                        batch.source_file in self.host_memory_heavy_sources
+                        if batch_is_final(self.junit_dir, unit, batch)
+                    }
+                    pending_nodes = sum(
+                        len(batch.nodeids)
                         for batch in unit.batches
+                        if batch.id not in before
                     )
-                    wait_started = time.monotonic()
-                    with self.resource_gate.reserve(
-                        device,
-                        gpu_exclusive=gpu_exclusive,
-                        host_memory_heavy=host_memory_heavy,
-                    ):
-                        if self.stop_workers.is_set():
-                            return
-                        waited = time.monotonic() - wait_started
-                        if waited >= 1:
-                            write_console(
-                                f"RESOURCE WAIT worker={index} device={device} "
-                                f"source={unit.batches[0].source_file} "
-                                f"elapsed={waited:.3f}s gpu_exclusive={gpu_exclusive} "
-                                f"host_memory_heavy={host_memory_heavy}"
-                            )
-                        self._report_worker_task(index, unit, pending_nodes, solo=False)
-                        self._execute_unit(index, unit, solo=False)
-                        stats.update(self._new_unit_outcomes(unit, before))
-                finally:
-                    work.task_done()
+                    self._report_worker_task(index, unit, pending_nodes, solo=False)
+                    self._execute_unit(index, unit, solo=False)
+                    stats.update(self._new_unit_outcomes(unit, before))
         finally:
             self._report_worker_end(index, started, stats, solo=False)
 
