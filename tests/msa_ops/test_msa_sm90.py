@@ -482,6 +482,56 @@ def test_bf16_kv_cache_is_rejected_by_sparse_attention():
 
 
 @sm90_only
+@pytest.mark.parametrize(
+    "fill", ["nan", "nan_k_only", "nan_v_only", "garbage", "zeros"]
+)
+def test_prefill_ignores_page_bytes_past_seqused_k(fill):
+    """Page memory beyond seqused_k must not reach the result.
+
+    vLLM hands out pages whose tail is uninitialized. The kernel reads whole
+    128-token pages, so without a causal bound on the selected blocks -- and with
+    an additive mask, which cannot clear a NaN -- that tail leaks into the
+    softmax. NaN there poisons the whole row.
+    """
+    torch.manual_seed(0)
+    batch, qlen, hq, hkv, mkt = 1, 128, 8, 1, 8
+    npages = mkt * batch
+    kv = torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4
+    # sequence ends mid-page; everything after it is "uninitialized"
+    seqlen = mkt * BLK_KV - 50
+    last_pg, off = seqlen // BLK_KV, seqlen % BLK_KV
+    if fill == "nan":
+        kv[last_pg, :, off:, :] = float("nan")
+    elif fill == "nan_k_only":  # K tail NaN, V tail finite
+        kv[last_pg, :, off:, :HEAD_DIM] = float("nan")
+    elif fill == "nan_v_only":  # V tail NaN, K tail finite
+        kv[last_pg, :, off:, HEAD_DIM:] = float("nan")
+    elif fill == "garbage":
+        kv[last_pg, :, off:, :] = 1e4
+    else:
+        kv[last_pg, :, off:, :] = 0.0
+    kv = kv.to(torch.float8_e4m3fn)
+    k, v = kv[..., :HEAD_DIM], kv[..., HEAD_DIM:]
+    q = (torch.randn(qlen, hq, HEAD_DIM, device="cuda") / 4).to(torch.bfloat16)
+    idx = torch.randint(0, mkt, (hkv, qlen, TOPK), dtype=torch.int32, device="cuda")
+    cu_q = torch.tensor([0, qlen], dtype=torch.int32, device="cuda")
+    page_table = torch.arange(npages, dtype=torch.int32, device="cuda").view(batch, mkt)
+    seqused_k = torch.full((batch,), seqlen, dtype=torch.int32, device="cuda")
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+    )
+    assert torch.isfinite(out.float()).all(), f"{fill} tail leaked into the output"
+
+
+@sm90_only
 def test_sm90_is_advertised_as_supporting_packed_kv():
     """vLLM selects the FlashInfer MSA path off this flag; losing it silently serves Triton."""
     assert flashinfer.msa_ops.SUPPORTS_PACKED_KV is True
