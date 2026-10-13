@@ -29,6 +29,7 @@ dsv41_fp8_quantize_append_sparse_mla_cache_2d_nhd_ps8.json
 fused_add_rmsnorm_h5120.json
 fused_add_rmsnorm_quant_h7168.json
 fmha_v2_prefill_sm120_h4_d128.json
+fmha_v2_prefill_deepseek_h20_d256_dv256.json
 gdn_decode_qk4_v8_d128.json
 gdn_fused_decode_h5120_v48_d128.json
 gdn_mtp_qk4_v8_d128.json
@@ -196,6 +197,7 @@ from flashinfer.mla import BatchMLAPagedAttentionWrapper
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
+    fmha_v2_prefill_deepseek,
     fmha_v2_prefill_sm120,
 )
 from flashinfer.utils import is_sm100a_supported
@@ -2813,6 +2815,12 @@ if torch.cuda.get_device_capability() == (12, 0):
         scale_bmm2_d=_fmha_scale_bmm2_d,
         causal=True,
     )
+    from flashinfer.trace.templates.gemm import fmha_v2_prefill_deepseek_trace
+
+    _fmha_glm_inputs = fmha_v2_prefill_deepseek_trace.init(
+        batch_size=1, seq_len=129, num_heads=20, head_dim=256, head_dim_v=256
+    )
+    fmha_v2_prefill_deepseek(**_fmha_glm_inputs)
 
 # ── Minimax Sparse Attention (MSA) numeric ops (SM120/SM121) ─────────────────
 # M3 shapes: indexer 4 index heads / 1 index-kv-head; attention 64 qo / 4 kv,

@@ -5561,6 +5561,8 @@ def enumerate_qmma_flash_kernels(
         # Standard self-attention with separate Q/K/V tensors.
         ((64, 64), (64, 64), 1),
         ((128, 128), (64, 64), 1),
+        # GLM-4.7-Flash expanded MLA prefill uses Q/K=192+64 and V=256.
+        ((256, 256), (64, 64), 1),
         # MLA kernels.
         ((192, 128), (64, 64), 1),
         ((576, 512), (64, 64), 1),
@@ -5581,14 +5583,21 @@ def enumerate_qmma_flash_kernels(
         else:
             head_size = head_size_params
             head_size_v = 0
+        # Keep the new GLM prefill specialization confined to the SM120
+        # separate-Q/K/V entry point; other layouts retain their existing tiles.
+        if (head_size, head_size_v) == (256, 256) and (
+            sm != 120 or input_layout != InputLayout.SEPARATE_Q_K_V
+        ):
+            continue
         # skip if head_size is not in head_sizes
         if head_sizes is not None and head_size not in head_sizes:
             continue
-        # Separate Q/K/V supports standard 64/64 and 128/128 attention plus
+        # Separate Q/K/V supports equal-dimension attention through 256 plus
         # the existing MLA specializations with V dimension 128 or 512.
         if input_layout == InputLayout.SEPARATE_Q_K_V and head_size_v not in (
             64,
             128,
+            256,
             512,
         ):
             continue

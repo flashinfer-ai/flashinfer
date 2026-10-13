@@ -520,20 +520,73 @@ def test_fmha_v2_prefill_deepseek(
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
 
 
-@pytest.mark.parametrize(
-    "qkv_dtype,o_dtype",
-    [
-        (torch.bfloat16, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.float16),
-    ],
-)
-def test_fmha_v2_prefill_deepseek_cuda_graph(qkv_dtype, o_dtype):
+@pytest.mark.parametrize("num_heads", [5, 20])
+@pytest.mark.parametrize("seq_len", [63, 64, 65, 129])
+@pytest.mark.parametrize("o_dtype", [torch.bfloat16, torch.float16])
+def test_fmha_v2_prefill_sm120_glm_fp8(num_heads, seq_len, o_dtype):
     if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
 
-    batch_size, seq_len, num_heads = 1, 128, 4
-    head_dim_qk, head_dim_v = 192, 128
+    # GLM-4.7-Flash has 20 heads (5 per rank at TP=4), QK=192+64, and V=256.
+    # Exercise both full and partial 64-token tiles, including multiple KV tiles.
+    torch.manual_seed(42)
+    batch_size, head_dim = 2, 256
+    shape = (batch_size, seq_len, num_heads, head_dim)
+    q_bf16 = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    q, q_scale = to_float8(q_bf16)
+    k, k_scale = to_float8(torch.randn_like(q_bf16))
+    v, v_scale = to_float8(torch.randn_like(q_bf16))
+    q_scale, k_scale, v_scale = q_scale.item(), k_scale.item(), v_scale.item()
+    out = torch.full(shape, float("nan"), dtype=o_dtype, device="cuda")
+    lse = torch.empty(
+        batch_size, seq_len, num_heads, 2, dtype=torch.float32, device="cuda"
+    )
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    out, lse = fmha_v2_prefill_deepseek(
+        q,
+        k,
+        v,
+        out,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        seq_len=seq_len,
+        scale_softmax=1.0,
+        scale_bmm1=q_scale * k_scale * sm_scale,
+        scale_bmm2=v_scale,
+        return_lse=True,
+        lse=lse,
+    )
+    out_ref, lse_ref = attention_mla_ref_torch(
+        batch_size,
+        q.float() * q_scale,
+        k.float() * k_scale,
+        v.float() * v_scale,
+        causal=True,
+        sm_scale=sm_scale,
+    )
+    lse = lse[..., 0] + torch.log(lse[..., 1] / 256.0)
+    torch.testing.assert_close(out, out_ref.to(o_dtype), rtol=4e-2, atol=6e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "head_dim_qk,head_dim_v,num_heads,seq_len,qkv_dtype,o_dtype",
+    [
+        (192, 128, 4, 128, torch.bfloat16, torch.bfloat16),
+        (192, 128, 4, 128, torch.float8_e4m3fn, torch.bfloat16),
+        (192, 128, 4, 128, torch.float8_e4m3fn, torch.float16),
+        (256, 256, 20, 129, torch.float8_e4m3fn, torch.bfloat16),
+        (256, 256, 20, 129, torch.float8_e4m3fn, torch.float16),
+    ],
+)
+def test_fmha_v2_prefill_deepseek_cuda_graph(
+    head_dim_qk, head_dim_v, num_heads, seq_len, qkv_dtype, o_dtype
+):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+
+    batch_size = 1
     torch.manual_seed(42)
     q = torch.randn(
         batch_size,
@@ -571,6 +624,9 @@ def test_fmha_v2_prefill_deepseek_cuda_graph(qkv_dtype, o_dtype):
         dtype=o_dtype,
         device="cuda",
     )
+    lse = torch.empty(
+        batch_size, seq_len, num_heads, 2, dtype=torch.float32, device="cuda"
+    )
     kwargs = {
         "num_heads": num_heads,
         "head_dim": head_dim_qk,
@@ -592,6 +648,8 @@ def test_fmha_v2_prefill_deepseek_cuda_graph(qkv_dtype, o_dtype):
             if qkv_dtype == torch.float8_e4m3fn
             else None
         ),
+        "return_lse": True,
+        "lse": lse,
     }
 
     warmup_stream = torch.cuda.Stream()
@@ -602,15 +660,18 @@ def test_fmha_v2_prefill_deepseek_cuda_graph(qkv_dtype, o_dtype):
     torch.cuda.current_stream().wait_stream(warmup_stream)
     torch.cuda.synchronize()
     expected_out = out.clone()
+    expected_lse = lse.clone()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         fmha_v2_prefill_deepseek(q, k, v, out, **kwargs)
     out.fill_(float("nan"))
+    lse.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
 
     torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("causal", [False, True])

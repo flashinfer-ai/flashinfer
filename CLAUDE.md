@@ -219,6 +219,11 @@ follow effective compute precision; TMA descriptors and raw allocations must
 follow storage precision. The public plan accepts separate `k_data_type` and
 `v_data_type`, with `kv_data_type` retained as a common-KV compatibility alias.
 
+`fmha_v2_prefill_deepseek` also supports GLM-4.7-Flash expanded prefill on
+SM12x: contiguous FP8 E4M3 Q/K/V with head dimensions 256/256 and BF16/FP16
+output. Apply RoPE upstream; NoPE and RoPE share the FP8 dtype and scalar
+scale. GLM's fused QK scale is `q_scale * k_scale / 16`.
+
 ## Code Linting
 
 Run all pre-commit hooks:
