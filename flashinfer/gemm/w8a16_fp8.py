@@ -234,6 +234,8 @@ def w8a16_fp8_gemm(
         raise ValueError("weight_prepared=True is a Hopper-only layout")
     if weight_prepared and algo not in (None, "auto", "hand"):
         raise ValueError("weight_prepared=True is a layout of the hand-written Hopper kernel")
+    if weight_prepared:
+        algo = "hand"  # the prepared layout exists only in the hand kernel; skip the dispatcher
     if weight_scale.dtype != torch.float32:
         weight_scale = weight_scale.to(torch.float32)
     weight_scale = weight_scale.reshape(1)

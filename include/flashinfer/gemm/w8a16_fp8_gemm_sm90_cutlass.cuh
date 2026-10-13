@@ -403,17 +403,57 @@ inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm90RasterEnv() {
   return v;
 }
 
-// Version H1: the launcher's choice is still the hand kernel; the CUTLASS variants are
-// reachable through `algo` / the env var until the per-shape sweep says otherwise.
+// Version H2: the dispatcher over the hand kernel and the CUTLASS variants, fitted to the
+// locked-clock sweep of Tue 13 Oct 2026 (H100 SXM s4124-0125, every launch timed by ncu at
+// base clocks with the caches flushed, 24 Cosmos3 shapes x 6 M classes, each variant / the
+// bf16 cuBLAS GEMM measured next to it).  Geomean kernel / cuBLAS per M class:
+//
+//   M       hand   this rule   per-row oracle
+//   1024    1.34   1.19        1.18
+//   2048    1.20   1.12        1.10
+//   4096    1.09   1.08        1.06
+//   8192    1.05   1.05        1.03
+//   44160   1.03   1.03        1.00
+//   88320   0.99   0.99        0.94
+//
+// What the data says, in terms of the 128x256 CTA tile's wave count (units = weight tiles
+// x activation tiles, 132 SMs):
+//   * full waves (> 3): the hand kernel is at cuBLAS; the CUTLASS 128x256 mainloop with
+//     L2 swizzle 8 is 0-10% behind it across the table (equal on the one shape profiled
+//     under ncu --set full), so the hand kernel keeps those rows.  Exception: M <= 2048
+//     with a wide N (mlp.gate_up / gen.qkv at TP 1-2), where stream-K balances the tail
+//     and wins 2-7%.
+//   * a partial first wave (<= 1.5): with a long K (>= 4096) and N >= 5120, stream-K cuts
+//     the tiles along K and wins 25-30% over the hand kernel's split-K (attn.out, mlp.down,
+//     gen.qkv tp2 at M=1024); with a short K or a modest N the 64x256 ping-pong tile
+//     (two tiles in flight per SM, 2x the CTAs of 128x256) wins 10-25%; N below 1024 is
+//     the hand kernel's split-K territory on every row (CUTLASS's stream-K / split-K has a
+//     ~40 us floor on those).
+//   * 1.5-3 waves: ping-pong for N >= 5120 (and N >= 2560 at M >= 4096), stream-K for
+//     K >= 12800 or N >= 8192, otherwise the hand kernel.
+// Worst row of the rule against the hand kernel: gen.qkv tp8 M=2048 (+7%).  128x192 /
+// 128x160 / 128x128 never win a row that matters (the register-sourced mainloop converts
+// the weight once per activation tile, so narrower tiles convert more per flop); they stay
+// `algo`-only.
 inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int algo = 0) {
   const W8A16Sm90Algo forced = W8A16Sm90AlgoFromCode(algo);
   if (forced != W8A16Sm90Algo::kAuto) return forced;
   const W8A16Sm90Algo env = W8A16Sm90AlgoEnv();
   if (env != W8A16Sm90Algo::kAuto) return env;
-  (void)M;
-  (void)N;
-  (void)K;
-  (void)num_sms;
+  if (N <= 1024 || K % 16 != 0 || N % 8 != 0) return W8A16Sm90Algo::kHand;
+  const double units = static_cast<double>((N + 127) / 128) * ((M + 255) / 256);
+  const double waves = units / std::max(num_sms, 1);
+  if (waves <= 1.5) {
+    if (K >= 4096 && N >= 5120) return W8A16Sm90Algo::kCutlass128x256StreamK;
+    if ((K <= 3200 || N <= 2048) && !(N <= 1024 && M >= 4096)) return W8A16Sm90Algo::kCutlass64x256;
+    return W8A16Sm90Algo::kHand;
+  }
+  if (waves <= 3.0) {
+    if (K >= 12800 || N >= 8192) return W8A16Sm90Algo::kCutlass128x256StreamK;
+    if (N >= 5120 || (N >= 2560 && M >= 4096)) return W8A16Sm90Algo::kCutlass64x256;
+    return W8A16Sm90Algo::kHand;
+  }
+  if (M <= 2048 && K >= 4096) return W8A16Sm90Algo::kCutlass128x256StreamK;
   return W8A16Sm90Algo::kHand;
 }
 

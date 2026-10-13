@@ -126,6 +126,98 @@ benchmark (plus TP 1, so 144 rows); a separate JIT module picked by compute capa
 (`gen_w8a16_fp8_gemm_sm100_module`), the Hopper module is untouched.  No prepared weight
 layout on Blackwell.
 
+## Hopper, CUTLASS line (versions H1 / H2, Tue 13 Oct 2026)
+
+`include/flashinfer/gemm/w8a16_fp8_gemm_sm90_cutlass.cuh`: the same op on CUTLASS's sm90
+mixed-input mainloop (`sm90_mma_tma_gmma_rs_warpspecialized_mixed_input`: TMA to smem, each
+consumer warpgroup converts its 64 weight rows in registers, wgmma with A from registers),
+built next to the hand kernel so the two compete per shape through the Python op's `algo`
+argument (`W8A16_FP8_GEMM_ALGOS_SM90`: `hand`, `cutlass_128x256`, `cutlass_128x192`,
+`cutlass_128x160`, `cutlass_128x128`, `cutlass_64x256` (ping-pong), `cutlass_128x256_streamk`,
+`cutlass_128x192_streamk`; env `FLASHINFER_W8A16_FP8_ALGO_SM90`).  Same operand mapping,
+epilogue fusion and 4-wide converter specialisation as the Blackwell header (the ALU path
+for bf16, Hopper has no packed e4m3 -> bf16 cvt; native `cvt.rn.f16x2.e4m3x2` for fp16).
+
+Why: the hand kernel's tile height and scheduler are hand-written, so the wave-fill menu and
+stream-K that paid off on Blackwell (B13 / B14) would each be a week of kernel work there;
+on CUTLASS they are template arguments.
+
+### What the H100 said
+
+Measurement had to change twice.  The node (s4124-0125) throttles thermally under a sweep
+(the `SW Thermal Slowdown` counter climbs, cuBLAS itself swings up to 2.5x between
+processes at M >= 4096), and a fixed back-to-back variant order parks the middle variants
+in the hot state every pass.  The usable method was `sweepH1d`: every launch timed by
+`ncu --metrics gpu__time_duration.sum` (clocks locked to base, caches flushed before each
+kernel), one variant per process with the bf16 cuBLAS GEMM measured next to it, ratios
+per row.  Caveat: the flush between the hand kernel's split-K GEMM and its reduce kernel
+inflates those rows a little (the partials would normally be read from L2), which is why
+the N <= 1024 rows stay on the hand kernel even where the table calls them a tie.
+
+Geomean kernel / cuBLAS over the 24 shapes of each M class, locked clocks:
+
+| M | hand (v37) | c128x256 | c128x192 | c128x128 | c64x256 | c128x256 stream-K | c128x192 stream-K | best CUTLASS per row | oracle (all) |
+|---|---|---|---|---|---|---|---|---|---|
+| 1024 | 1.34 | 1.66 | 1.90 | 1.55 | 1.29 | 1.40 | 1.74 | 1.24 | 1.18 |
+| 2048 | 1.20 | 1.33 | 1.82 | 1.37 | 1.15 | 1.26 | 1.66 | 1.13 | 1.10 |
+| 4096 | 1.09 | 1.15 | 1.35 | 1.35 | 1.12 | 1.15 | 1.32 | 1.06 | 1.06 |
+| 8192 | 1.05 | 1.09 | 1.30 | 1.31 | 1.20 | 1.10 | 1.29 | 1.05 | 1.03 |
+| 44160 | 1.03 | 1.11 | 1.14 | 1.33 | 1.71 | 1.09 | 1.12 | 1.06 | 1.00 |
+| 88320 | 0.99 | 1.08 | 1.09 | 1.31 | 1.75 | 1.09 | 1.10 | 0.99 | 0.94 |
+
+Per-row winners: hand 53, 128x256 32, 64x256 27, 128x256 stream-K 18, 128x192 stream-K 8,
+128x192 3, 128x128 3.  (The 128x160 tile ran in the free-running sweeps only: a dud, one
+win in 144 rows, and under ncu it executes twice the instructions of the 256 tile.)
+
+* **Mainloop (H1 + swizzle).** CUTLASS's persistent scheduler defaults to no L2 tile
+  grouping; with it the 128x256 mainloop read 2.5x the DRAM bytes of the hand kernel and
+  ran 12% slower at full waves (ncu `--set full`, gen.qkv tp1 M=8192: 1.261 vs 1.121 ms,
+  tensor pipe 90.5% vs 91.7%, DRAM 56% vs 23% of peak).  `max_swizzle_size = 8`
+  (`FLASHINFER_W8A16_FP8_SM90_SWIZZLE`, raster order `FLASHINFER_W8A16_FP8_SM90_RASTER`
+  does not matter at 8) closes it on that shape: 1.117 ms.  Across the table it is still
+  0-10% behind the hand kernel at full waves, so the hand kernel keeps those rows.
+* **Tile heights are not free here.** 256 > 192 > 160 > 128 at full waves: the
+  register-sourced mainloop converts the weight tile once per activation tile, so a
+  narrower tile converts more per flop (on Blackwell the transform warps are off the MMA's
+  critical path, which is why the 160-row tile worked there).  The wave-fill menu does not
+  transfer; what does is stream-K (long K, partial first wave: 25-30% over the hand
+  kernel's split-K on attn.out / mlp.down / gen.qkv tp2 at M=1024) and the 64x256
+  ping-pong tile (short K or modest N: two tiles in flight per SM, 10-25%).
+* **Narrow N** (und.kv, N <= 1024): CUTLASS's stream-K and forced split-K have a ~40 us
+  floor on these shapes (37-51 us vs the hand kernel's 14-27 us at M=1024); the hand
+  kernel's batched split-K + tiny reduce stays.
+
+### Version H2: the dispatcher (`W8A16Sm90PickAlgo`)
+
+Waves of the 128x256 CTA tile (`ceil(N/128) x ceil(M/256)` units over the SM count):
+N <= 1024 -> hand.  <= 1.5 waves: K >= 4096 and N >= 5120 -> 128x256 stream-K; short K
+(<= 3200) or N <= 2048 (unless N <= 1024 at M >= 4096) -> 64x256; else hand.  1.5-3
+waves: K >= 12800 or N >= 8192 -> stream-K; N >= 5120 (or N >= 2560 at M >= 4096) ->
+64x256; else hand.  > 3 waves: M <= 2048 with K >= 4096 -> stream-K; else hand.  Explicit
+`algo` and the env variable override it; `weight_prepared=True` always runs the hand kernel.
+
+| M | hand (v37) / cuBLAS | H2 auto / cuBLAS | oracle / cuBLAS | picks |
+|---|---|---|---|---|
+| 1024 | 1.34 | 1.19 | 1.18 | stream-K 10, 64x256 8, hand 6 |
+| 2048 | 1.20 | 1.12 | 1.10 | 64x256 11, stream-K 7, hand 6 |
+| 4096 | 1.09 | 1.08 | 1.06 | hand 21, 64x256 3 |
+| 8192 | 1.05 | 1.05 | 1.03 | hand |
+| 44160 | 1.03 | 1.03 | 1.00 | hand |
+| 88320 | 0.99 | 0.99 | 0.94 | hand |
+
+Worst row against the hand kernel: gen.qkv tp8 M=2048 (+7%).  Free-running spot check
+(attn.out tp1 M=1024: auto 120 us, hand 164, cuBLAS 109; attn.out tp8: 21.6 / 26.6 /
+19.4) agrees with the locked-clock table.  Not pursued: the 0-10% full-wave gap of the
+CUTLASS mainloop (WARPGROUP wait is 33% of its PC samples vs 14% in the hand kernel, with
+fewer instructions executed overall; a cluster of 2 with activation multicast is the
+untried knob), and the narrow-N rows at M >= 8192 where 128x128 wins 8-30% over the hand
+kernel's split-K.
+
+Results: `/home/scratch.ishovkun_gpu/w8a16-results/hopper/` (`sweepH1b_*`, `sweepH1c_*`
+free-running per-variant; `sweepH1d_{rows,ncu}_*` the locked-clock sweep; `ncuH1_*`
+`--set full` reports of the hand kernel and the 256 / 192 / 160 / 128 tiles, and the nine
+swizzle / raster settings).
+
 ## Why not the Hopper design
 
 tcgen05.mma takes both operands from shared memory (or A from TMEM), so the fp8 -> bf16
