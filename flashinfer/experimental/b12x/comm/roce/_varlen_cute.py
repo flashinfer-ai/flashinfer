@@ -93,7 +93,9 @@ class _RoceVarlenLaunch:
     @cute.jit
     def _packs(self, counts_base: Int64, peer: Int32) -> Int32:
         """Packs ``peer`` contributes (the low word of its byte count; validity is checked once)."""
-        return Int32(ld_relaxed_gpu_u32(counts_base + Int64(8) * Int64(peer)) >> Uint32(4))
+        return Int32(
+            ld_relaxed_gpu_u32(counts_base + Int64(8) * Int64(peer)) >> Uint32(4)
+        )
 
     @cute.jit
     def _chunks(self, packs: Int32, chunk_packs: Int32) -> Int32:
@@ -211,7 +213,9 @@ class _RoceVarlenLaunch:
         stride = Int32(gdim) * Int32(self._threads)
         stage_counters = counter_base
         tail_counter = counter_base + Int64(4 * self._max_chunks)
-        own_row = recv_base + (slot * Int64(self._world_size) + Int64(self._rank)) * row_bytes
+        own_row = (
+            recv_base + (slot * Int64(self._world_size) + Int64(self._rank)) * row_bytes
+        )
         own_output = output_base + Int64(self._rank) * output_row_bytes
 
         poisoned = ld_relaxed_gpu_u32(poison_ptr)
@@ -221,7 +225,9 @@ class _RoceVarlenLaunch:
                 # 1. every rank reads the same counts, so every rank stops here alike
                 if Int32(tidx) == Int32(0):
                     st_relaxed_sys_u32(ctrl_base + Int64(12), Uint32(bad))
-                    st_relaxed_sys_u32(ctrl_base + Int64(28), Uint32(ERROR_KIND_INVALID_COUNT))
+                    st_relaxed_sys_u32(
+                        ctrl_base + Int64(28), Uint32(ERROR_KIND_INVALID_COUNT)
+                    )
                     st_relaxed_sys_u32(ctrl_base + Int64(8), seq)
                     st_release_gpu_u32(poison_ptr, seq)
             else:
@@ -232,13 +238,17 @@ class _RoceVarlenLaunch:
                     if Int32(tidx) == Int32(0):
                         nbytes = Uint32(own_packs) * Uint32(PACK_BYTES)
                         st_relaxed_sys_u32(ctrl_base + Int64(4), nbytes)
-                        st_relaxed_sys_u32(ctrl_base + Int64(16) + slot * Int64(4), nbytes)
+                        st_relaxed_sys_u32(
+                            ctrl_base + Int64(16) + slot * Int64(4), nbytes
+                        )
                         st_relaxed_sys_u32(
                             ctrl_base + Int64(4 * _CTRL_SLOT_KIND) + slot * Int64(4),
                             Uint32(_KIND_VARLEN),
                         )
                         st_relaxed_sys_u32(
-                            ctrl_base + Int64(4 * _CTRL_SLOT_CHUNK_PACKS) + slot * Int64(4),
+                            ctrl_base
+                            + Int64(4 * _CTRL_SLOT_CHUNK_PACKS)
+                            + slot * Int64(4),
                             Uint32(chunk_packs),
                         )
                         st_relaxed_sys_u32(
@@ -256,10 +266,16 @@ class _RoceVarlenLaunch:
                     while stage_index < hi:
                         offset = Int64(stage_index) * Int64(PACK_BYTES)
                         words = ld_global_v4_u32(source_base + offset)
-                        st_global_v4_u32(own_row + offset, words[0], words[1], words[2], words[3])
+                        st_global_v4_u32(
+                            own_row + offset, words[0], words[1], words[2], words[3]
+                        )
                         if copy_own != Int32(0):
                             st_global_v4_u32(
-                                own_output + offset, words[0], words[1], words[2], words[3]
+                                own_output + offset,
+                                words[0],
+                                words[1],
+                                words[2],
+                                words[3],
                             )
                         stage_index += stride
                     cute.arch.sync_threads()
@@ -277,7 +293,9 @@ class _RoceVarlenLaunch:
                     if cutlass.const_expr(peer != self._rank):
                         longest = cutlass.max(
                             longest,
-                            self._chunks(self._packs(counts_base, Int32(peer)), chunk_packs),
+                            self._chunks(
+                                self._packs(counts_base, Int32(peer)), chunk_packs
+                            ),
                         )
                 for chunk in cutlass.range(longest, unroll=1):
                     if ld_relaxed_gpu_u32(poison_ptr) == Uint32(0):
@@ -285,20 +303,31 @@ class _RoceVarlenLaunch:
                             peer = Int32(tidx) // Int32(self._hca_count)
                             hca = Int32(tidx) - peer * Int32(self._hca_count)
                             if peer != Int32(self._rank):
-                                if chunk < self._chunks(self._packs(counts_base, peer), chunk_packs):
+                                if chunk < self._chunks(
+                                    self._packs(counts_base, peer), chunk_packs
+                                ):
                                     flag_addr = flag_base + (
                                         (
-                                            (slot * Int64(self._world_size) + Int64(peer))
+                                            (
+                                                slot * Int64(self._world_size)
+                                                + Int64(peer)
+                                            )
                                             * Int64(self._max_chunks)
                                             + Int64(chunk)
                                         )
                                         * Int64(self._hca_count)
                                         + Int64(hca)
                                     ) * Int64(self._flag_stride)
-                                    timed_out = spin_until_eq_acquire_sys(flag_addr, seq, spin_limit)
+                                    timed_out = spin_until_eq_acquire_sys(
+                                        flag_addr, seq, spin_limit
+                                    )
                                     if timed_out != Uint32(0):
-                                        st_relaxed_sys_u32(ctrl_base + Int64(12), Uint32(peer))
-                                        st_relaxed_sys_u32(ctrl_base + Int64(24), Uint32(hca))
+                                        st_relaxed_sys_u32(
+                                            ctrl_base + Int64(12), Uint32(peer)
+                                        )
+                                        st_relaxed_sys_u32(
+                                            ctrl_base + Int64(24), Uint32(hca)
+                                        )
                                         st_relaxed_sys_u32(ctrl_base + Int64(8), seq)
                                         st_release_gpu_u32(poison_ptr, seq)
                     cute.arch.sync_threads()
@@ -308,16 +337,24 @@ class _RoceVarlenLaunch:
                                 packs = self._packs(counts_base, Int32(peer))
                                 lo = chunk * chunk_packs
                                 hi = cutlass.min(packs, lo + chunk_packs)
-                                row = recv_base + (
-                                    slot * Int64(self._world_size) + Int64(peer)
-                                ) * row_bytes
-                                output_row = output_base + Int64(peer) * output_row_bytes
+                                row = (
+                                    recv_base
+                                    + (slot * Int64(self._world_size) + Int64(peer))
+                                    * row_bytes
+                                )
+                                output_row = (
+                                    output_base + Int64(peer) * output_row_bytes
+                                )
                                 copy_index = lo + index
                                 while copy_index < hi:
                                     offset = Int64(copy_index) * Int64(PACK_BYTES)
                                     words = ld_relaxed_sys_v4_u32(row + offset)
                                     st_global_v4_u32(
-                                        output_row + offset, words[0], words[1], words[2], words[3]
+                                        output_row + offset,
+                                        words[0],
+                                        words[1],
+                                        words[2],
+                                        words[3],
                                     )
                                     copy_index += stride
 

@@ -337,7 +337,11 @@ class RoceOneshotAllReduce:
         # Chunks large enough that a full contribution fits the proxy's chunk flags.
         self._varlen_chunk_packs = max(
             int(varlen_chunk_bytes) // PACK_BYTES,
-            -(-self._layout.varlen_bytes // PACK_BYTES // self._layout.varlen_max_chunks),
+            -(
+                -self._layout.varlen_bytes
+                // PACK_BYTES
+                // self._layout.varlen_max_chunks
+            ),
         )
 
         with torch.cuda.device(self.device):
@@ -1222,12 +1226,16 @@ class RoceOneshotAllReduce:
             or counts.shape != (self.world_size,)
             or not counts.is_contiguous()
         ):
-            raise ValueError("counts must be a contiguous int64 [world_size] tensor on the runtime's device")
+            raise ValueError(
+                "counts must be a contiguous int64 [world_size] tensor on the runtime's device"
+            )
         with self._lock:
             self.check_health()
             if out is None:
                 out = torch.empty(
-                    (self.world_size, self.max_varlen_bytes), dtype=torch.uint8, device=self.device
+                    (self.world_size, self.max_varlen_bytes),
+                    dtype=torch.uint8,
+                    device=self.device,
                 )
             row_bytes = (
                 out.numel() * out.element_size() // self.world_size if out.dim() else 0

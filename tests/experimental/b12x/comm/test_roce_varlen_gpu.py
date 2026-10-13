@@ -96,7 +96,9 @@ def _prepare(spin_limit: int | None = None, **kwargs) -> _Prepared:
         )
         return PreparedCall(run=lambda: [call.run() for call in calls])
 
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
         session.prepare((plan.request(name="roce", prepare_call=prepare),))
     return _Prepared(rt, plan)
 
@@ -112,7 +114,9 @@ def runtime():
 def _contribution(rank: int, nbytes: int, trial: int, device) -> torch.Tensor:
     """Rank-specific bytes every rank can regenerate."""
     gen = torch.Generator(device=device).manual_seed(1009 * trial + rank)
-    return torch.randint(0, 256, (CAPACITY,), dtype=torch.uint8, device=device, generator=gen)
+    return torch.randint(
+        0, 256, (CAPACITY,), dtype=torch.uint8, device=device, generator=gen
+    )
 
 
 def _check(out: torch.Tensor, counts: list[int], trial: int) -> None:
@@ -121,7 +125,9 @@ def _check(out: torch.Tensor, counts: list[int], trial: int) -> None:
     for peer, count in enumerate(counts):
         expected = _contribution(peer, count, trial, device)[:count]
         assert torch.equal(rows[peer, :count], expected), f"row {peer} differs"
-        assert bool((rows[peer, count:] == SENTINEL).all()), f"row {peer} written past its count"
+        assert bool((rows[peer, count:] == SENTINEL).all()), (
+            f"row {peer} written past its count"
+        )
 
 
 def _counts_cases(world: int) -> list[list[int]]:
@@ -155,8 +161,12 @@ def test_source_may_be_this_ranks_output_row(runtime):
     device = runtime.runtime.device
     counts = [16 * (3000 + 7 * r) for r in range(world)]
     out = torch.full((world, CAPACITY), SENTINEL, dtype=torch.uint8, device=device)
-    out[rank, : counts[rank]] = _contribution(rank, counts[rank], 41, device)[: counts[rank]]
-    runtime.gather(out[rank], torch.tensor(counts, dtype=torch.int64, device=device), out=out)
+    out[rank, : counts[rank]] = _contribution(rank, counts[rank], 41, device)[
+        : counts[rank]
+    ]
+    runtime.gather(
+        out[rank], torch.tensor(counts, dtype=torch.int64, device=device), out=out
+    )
     torch.cuda.synchronize()
     _check(out, counts, 41)
 
@@ -200,8 +210,12 @@ def test_graph_replays_with_counts_changing_between_replays(runtime):
         torch.cuda.synchronize()
         rt.check_health()
         _check(out, counts, 100 + trial)
-        torch.testing.assert_close(small_out, expected_small, rtol=1e-2, atol=4e-2 * world)
-        torch.testing.assert_close(large_out, expected_large, rtol=1e-2, atol=4e-2 * world)
+        torch.testing.assert_close(
+            small_out, expected_small, rtol=1e-2, atol=4e-2 * world
+        )
+        torch.testing.assert_close(
+            large_out, expected_large, rtol=1e-2, atol=4e-2 * world
+        )
     dist.barrier()
 
 
@@ -218,7 +232,10 @@ def test_proxy_catches_up_after_the_next_gather_overwrote_ready_words(runtime):
     counts = [CHUNK * 5 + 16 * (r + 1) for r in range(world)]
     counts_tensor = torch.tensor(counts, dtype=torch.int64, device=device)
     sources = [_contribution(rank, counts[rank], 200 + i, device) for i in range(2)]
-    outs = [torch.full((world, CAPACITY), SENTINEL, dtype=torch.uint8, device=device) for _ in range(2)]
+    outs = [
+        torch.full((world, CAPACITY), SENTINEL, dtype=torch.uint8, device=device)
+        for _ in range(2)
+    ]
     torch.cuda.synchronize()
     dist.barrier()
     if rank == 1:
@@ -246,7 +263,9 @@ def test_unusable_count_stops_every_rank_before_sending():
     rt = prepared.runtime
     try:
         epoch_before = rt.stats()["epoch"]
-        counts = torch.tensor([16] * (world - 1) + [8], dtype=torch.int64, device=rt.device)
+        counts = torch.tensor(
+            [16] * (world - 1) + [8], dtype=torch.int64, device=rt.device
+        )
         source = torch.zeros(4096, dtype=torch.uint8, device=rt.device)
         # The kernel stops at once, so the launch's own health check may already report it.
         with pytest.raises(RuntimeError, match="unusable byte count for rank"):
@@ -266,7 +285,9 @@ def test_gather_fail_stop_when_a_peer_never_sends():
     prepared = _prepare(spin_limit=2_000_000)
     rt = prepared.runtime
     try:
-        counts = torch.full((dist.get_world_size(),), CHUNK, dtype=torch.int64, device=rt.device)
+        counts = torch.full(
+            (dist.get_world_size(),), CHUNK, dtype=torch.int64, device=rt.device
+        )
         source = torch.ones(CHUNK, dtype=torch.uint8, device=rt.device)
         dist.barrier()
         if rank == 1:
@@ -309,8 +330,12 @@ def test_external_region_describes_the_variable_length_area():
         assert description["region"]["nbytes"] == rt._layout.total_bytes
         counts = [16 * (500 + r) for r in range(world)]
         source = _contribution(rank, counts[rank], 300, rt.device)
-        out = torch.full((world, CAPACITY), SENTINEL, dtype=torch.uint8, device=rt.device)
-        prepared.gather(source, torch.tensor(counts, dtype=torch.int64, device=rt.device), out=out)
+        out = torch.full(
+            (world, CAPACITY), SENTINEL, dtype=torch.uint8, device=rt.device
+        )
+        prepared.gather(
+            source, torch.tensor(counts, dtype=torch.int64, device=rt.device), out=out
+        )
         torch.cuda.synchronize()
         _check(out, counts, 300)
     finally:

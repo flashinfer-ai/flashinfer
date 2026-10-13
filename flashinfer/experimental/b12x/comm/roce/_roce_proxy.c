@@ -204,10 +204,10 @@ int roce_layout(int world, uint64_t slot_bytes, uint64_t pipe_bytes, uint64_t va
   // The variable-length area follows; without one the region is unchanged.
   uint64_t varlen_recv_off = pipe_flag_off + pipe_flag_bytes;
   uint64_t varlen_flag_off = varlen_recv_off + (uint64_t)ROCE_SLOTS * world * varlen_bytes;
-  uint64_t varlen_flag_bytes =
-      varlen_bytes == 0 ? 0
-                        : (uint64_t)ROCE_SLOTS * world * ROCE_VARLEN_MAX_CHUNKS * ROCE_MAX_RAILS *
-                              ROCE_FLAG_STRIDE;
+  uint64_t varlen_flag_bytes = varlen_bytes == 0
+                                   ? 0
+                                   : (uint64_t)ROCE_SLOTS * world * ROCE_VARLEN_MAX_CHUNKS *
+                                         ROCE_MAX_RAILS * ROCE_FLAG_STRIDE;
   total = varlen_flag_off + varlen_flag_bytes;
   uint64_t recv_off = 0;
   uint64_t flag_off = recv_off + recv_bytes;
@@ -330,9 +330,8 @@ roce_ctx_t* roce_create(int world, int rank, const char* const* hca_names, int n
                         uint64_t pipe_bytes, uint64_t varlen_bytes, char* err, uint64_t err_len) {
   uint64_t layout[17];
   if (roce_layout(world, slot_bytes, pipe_bytes, varlen_bytes, layout) != 0 ||
-      layout[4] > region_bytes ||
-      rank < 0 || rank >= world || n_hca < 1 || n_hca > ROCE_MAX_HCAS || traffic_class < 0 ||
-      traffic_class > 255) {
+      layout[4] > region_bytes || rank < 0 || rank >= world || n_hca < 1 || n_hca > ROCE_MAX_HCAS ||
+      traffic_class < 0 || traffic_class > 255) {
     snprintf(err, err_len, "invalid roce runtime geometry");
     return NULL;
   }
@@ -744,8 +743,8 @@ static int run_varlen_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t 
   if (c->varlen_bytes == 0 || nbytes % 16 != 0 || nbytes > c->varlen_bytes || chunk_packs == 0 ||
       chunks != expected || chunks > ROCE_VARLEN_MAX_CHUNKS) {
     snprintf(c->err, sizeof(c->err),
-             "invalid variable-length op %u: %u bytes in %u chunks of %u packs (capacity %zu)",
-             seq, nbytes, chunks, chunk_packs, c->varlen_bytes);
+             "invalid variable-length op %u: %u bytes in %u chunks of %u packs (capacity %zu)", seq,
+             nbytes, chunks, chunk_packs, c->varlen_bytes);
     return -1;
   }
   uint32_t slot = seq & 1u;

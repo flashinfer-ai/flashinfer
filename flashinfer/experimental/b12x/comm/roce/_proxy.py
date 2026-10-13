@@ -191,7 +191,11 @@ class Layout:
         out = (ctypes.c_uint64 * 17)()
         if (
             load().roce_layout(
-                int(world_size), int(slot_bytes), int(pipe_bytes), int(varlen_bytes), out
+                int(world_size),
+                int(slot_bytes),
+                int(pipe_bytes),
+                int(varlen_bytes),
+                out,
             )
             != 0
         ):

@@ -78,6 +78,7 @@ for chunk_kib in (int(c) for c in args.chunk_kib.split(",")):
         session = PreparationSession(device=device, autotune=False, compile_workers=2)
         session.prepare((plan.request(name="roce", prepare_call=prepare),))
         chunk_bytes = runtime.stats()["varlen_chunk_bytes"]
+
         def contribution(peer):
             """Rank ``peer``'s bytes, which every rank regenerates to check its rows."""
             gen = torch.Generator(device=device).manual_seed(1000 + peer)
