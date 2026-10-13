@@ -263,7 +263,19 @@ def staged_qk_mma_k_tile(smem_k, tmem_s, iterations: int):
     smem_k.release()
 
 
-def staged_pv_mma_v_tile(smem_v, smem_p, tmem_o, iterations: int):
+def staged_qk_mma_k_tile_from_acquired_s(smem_k, tmem_s, iterations: int):
+    """Issue one QK tile into an S stage the caller has already acquired."""
+    smem_k.wait()
+    for k_subtile_idx in range(iterations):
+        desc_k_base = smem_k.k_desc(k_subtile_idx=k_subtile_idx)
+        tmem_s.qk_mma(desc_k_base=desc_k_base, k_subtile_idx=k_subtile_idx)
+    tmem_s.commit()
+    smem_k.release()
+
+
+def staged_pv_mma_v_tile(
+    smem_v, smem_p, tmem_o, iterations: int, *, is_tail: bool = False
+):
     """Consume one whole V stage plus one P stage and produce one O tile."""
     smem_p.wait()
     desc_p_base = smem_p.p_desc()
@@ -275,10 +287,30 @@ def staged_pv_mma_v_tile(smem_v, smem_p, tmem_o, iterations: int):
             desc_p_base=desc_p_base,
             desc_v_base=desc_v_base,
             v_subtile_idx=v_subtile_idx,
+            is_tail=is_tail,
         )
     tmem_o.commit()
     smem_v.release()
     smem_p.release()
+
+
+def staged_pv_mma_v_tile_parity_p(
+    smem_v, smem_p, tmem_o, iterations: int, *, is_tail: bool = False
+):
+    """Produce one O tile from the P stage selected by loop_offset; no P mbarrier."""
+    desc_p_base = smem_p.p_desc_final_tile() if is_tail else smem_p.p_desc_prior_tile()
+    smem_v.wait()
+    tmem_o.acquire()
+    for v_subtile_idx in range(iterations):
+        desc_v_base = smem_v.v_desc(v_subtile_idx=v_subtile_idx)
+        tmem_o.pv_mma(
+            desc_p_base=desc_p_base,
+            desc_v_base=desc_v_base,
+            v_subtile_idx=v_subtile_idx,
+            is_tail=is_tail,
+        )
+    tmem_o.commit()
+    smem_v.release()
 
 
 def staged_pv_mma_v_tile_per_n(
@@ -288,6 +320,7 @@ def staged_pv_mma_v_tile_per_n(
     *,
     iterations_pv_k: int,
     iterations_pv_n: int,
+    is_tail: bool = False,
 ):
     """Consume P/V and publish one O pipeline token per PV N-slice."""
     smem_p.wait()
@@ -302,6 +335,7 @@ def staged_pv_mma_v_tile_per_n(
                 desc_v_base=desc_v_base,
                 pv_n_idx=pv_n_idx,
                 pv_k_idx=pv_k_idx,
+                is_tail=is_tail,
             )
         tmem_o.commit()
     smem_v.release()

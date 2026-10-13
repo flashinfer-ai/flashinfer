@@ -49,7 +49,7 @@ from ...helpers.math import (
 )
 from ...helpers.ops import (
     float_to_u32_bits,
-    fp8_log2_quant_scale,
+    fp8_log2_p_scale,
     pack_float4_to_fp8_e4m3,
     softmax_sum_state_ptr,
     tcgen05_second_panel_addr,
@@ -156,8 +156,8 @@ class TmemPResource(MlaResource):
         ):
             log2_scale_pair = (self.scale_softmax_log2, self.scale_softmax_log2)
             neg_scaled_pair = (
-                neg_scaled_max[0] + fp8_log2_quant_scale(),
-                neg_scaled_max[0] + fp8_log2_quant_scale(),
+                neg_scaled_max[0] + fp8_log2_p_scale(cfg),
+                neg_scaled_max[0] + fp8_log2_p_scale(cfg),
             )
             has_finite_max = new_max_arr[0] != neg_max_f32()
             for packed_idx in cutlass.range_constexpr(packed_p_reg_count):
@@ -211,7 +211,7 @@ class TmemPResource(MlaResource):
                         p_val = cute.math.exp2(
                             s_arr[s_idx] * self.scale_softmax_log2
                             + neg_scaled_max[scale_idx]
-                            + fp8_log2_quant_scale(),
+                            + fp8_log2_p_scale(cfg),
                             fastmath=True,
                         )
                     p_vals[elem_idx] = p_val

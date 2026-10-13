@@ -457,6 +457,7 @@ def build_throughput_latency_mla_task_manager(
     cta_idx_head_dim_v=None,
     scale_softmax_log2=None,
     output_scale=None,
+    adjusted_skip_corr_threshold=None,
     o_tensor=None,
     lse_tensor=None,
     acc_o_tensor=None,
@@ -481,6 +482,8 @@ def build_throughput_latency_mla_task_manager(
         scale_softmax_log2,
         output_scale,
     )
+    if adjusted_skip_corr_threshold is None:
+        adjusted_skip_corr_threshold = Float32(0.0)
     _check_persistent_scheduler_modes(
         use_clc_dynamic_scheduler,
         use_static_persistent_scheduler,
@@ -506,6 +509,7 @@ def build_throughput_latency_mla_task_manager(
             cta_idx_head_dim_v=cta_idx_head_dim_v,
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
+            adjusted_skip_corr_threshold=adjusted_skip_corr_threshold,
             o_tensor=o_tensor,
             lse_tensor=lse_tensor,
             acc_o_tensor=acc_o_tensor,
@@ -691,6 +695,7 @@ def build_throughput_latency_mla_task_manager(
         pipeline_config=tmem_s_cfg,
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
+        adjusted_skip_corr_threshold=adjusted_skip_corr_threshold,
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
@@ -705,6 +710,7 @@ def build_throughput_latency_mla_task_manager(
         pipeline_config=tmem_s1_cfg,
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
+        adjusted_skip_corr_threshold=adjusted_skip_corr_threshold,
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
@@ -1032,6 +1038,7 @@ def _make_keeps_mma_ab_task_graph(
     cta_idx_head_dim_v=None,
     scale_softmax_log2=None,
     output_scale=None,
+    adjusted_skip_corr_threshold=None,
     o_tensor=None,
     lse_tensor=None,
     acc_o_tensor=None,
@@ -1053,6 +1060,8 @@ def _make_keeps_mma_ab_task_graph(
         scale_softmax_log2,
         output_scale,
     )
+    if adjusted_skip_corr_threshold is None:
+        adjusted_skip_corr_threshold = Float32(0.0)
     _check_persistent_scheduler_modes(
         use_clc_dynamic_scheduler,
         use_static_persistent_scheduler,
@@ -1197,6 +1206,7 @@ def _make_keeps_mma_ab_task_graph(
         pipeline_config=tmem_s_cfg,
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
+        adjusted_skip_corr_threshold=adjusted_skip_corr_threshold,
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
@@ -1449,6 +1459,7 @@ class ThroughputLatencyMlaDecodeTs:
         explicit_split_kv: int | None = None,
         explicit_persistent: bool | None = None,
         mask_type: MaskType | str = MaskType.CAUSAL,
+        enable_skip_correction: bool = False,
     ):
         """Initialize one selected physical tile profile over logical flat Q rows."""
         import cutlass as _cutlass
@@ -1471,6 +1482,7 @@ class ThroughputLatencyMlaDecodeTs:
         self.profile = profile
         self.persistent_wave_sm_count = persistent_wave_sm_count
         self.reduction_mode = reduction_mode
+        self.enable_skip_correction = enable_skip_correction
         self.logical_num_heads = logical_num_heads
         self.logical_seq_len_q = logical_seq_len_q
         self.tile_size_q = tile_size_q
@@ -1591,6 +1603,7 @@ class ThroughputLatencyMlaDecodeTs:
             explicit_split_kv=self.explicit_split_kv,
             explicit_persistent=self.explicit_persistent,
             mask_type=self.mask_type,
+            enable_skip_correction=self.enable_skip_correction,
         )
         return cfg
 
@@ -1665,6 +1678,7 @@ class ThroughputLatencyMlaDecodeTs:
         block_split_kvs: cute.Tensor,
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
+        skip_corr_threshold: cutlass.Float32,
         stream: object,
     ):
         """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q."""
@@ -1922,6 +1936,7 @@ class ThroughputLatencyMlaDecodeTs:
             cu_seqlens_q,
             softmax_scale_log2,
             output_scale,
+            skip_corr_threshold,
             tile_sched_params,
         ).launch(
             grid=grid,
@@ -2027,10 +2042,19 @@ class ThroughputLatencyMlaDecodeTs:
         cu_seqlens_q: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
+        skip_corr_threshold: cutlass.Float32,
         tile_sched_params: object,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
+        # The user threshold is pre-divided by the log2 softmax scale so
+        # the row-max freeze compares raw-score increases (same contract as the
+        # throughput-2CTA TmemS resource).
+        adjusted_skip_corr_threshold = (
+            skip_corr_threshold / softmax_scale_log2
+            if cutlass.const_expr(cfg.enable_skip_correction)
+            else Float32(0.0)
+        )
 
         # The grid is expressed in physical flat-Q tile coordinates. Decode it
         # once here; Q/O resources retain responsibility for logical-row
@@ -2130,6 +2154,7 @@ class ThroughputLatencyMlaDecodeTs:
             cta_idx_head_dim_v=cta_idx_head_dim_v,
             scale_softmax_log2=softmax_scale_log2,
             output_scale=output_scale,
+            adjusted_skip_corr_threshold=adjusted_skip_corr_threshold,
             o_tensor=o,
             lse_tensor=lse,
             acc_o_tensor=acc_o,

@@ -14,6 +14,8 @@
 
 """Math, dtype, and atomic helper functions for MLA decode TS examples."""
 
+import math
+import numbers
 from functools import partial
 
 import cutlass
@@ -29,6 +31,15 @@ NEG_FLT_MAX = -3.4028235e38
 # E4M3FN finite maximum used when clamping FP8 output conversion.
 FP8_E4M3_MAX = 448.0
 
+# tcgen05 K-major SMEM descriptor geometry.  A swizzle atom spans eight SMEM
+# rows, so the stride byte offset is ``8 x row bytes``.  For a swizzled K-major
+# operand PTX treats the leading byte offset as unused ("assumed 1"), which is
+# conventionally encoded as 16 bytes unless the descriptor must hop whole tiles.
+SWIZZLE_ATOM_ROWS = 8
+SWIZZLE_64B_ROW_BYTES = 64
+SWIZZLE_128B_ROW_BYTES = 128
+K_MAJOR_LEADING_BYTE_OFFSET_UNUSED = 16
+
 fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
 add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd="rn")
 mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
@@ -41,6 +52,48 @@ ffma2 = partial(cute.arch.fma_packed_f32x2, ftz=False, rnd="rn")
 def ceil_div(a, b):
     """Return integer ceil(a / b) for positive integer-like values."""
     return (a + b - 1) // b
+
+
+def max_skip_corr_threshold(qkv_dtype: str) -> float:
+    """Return the largest legal ``skip_corr_threshold`` (log2 units) per P dtype.
+
+    ``"e4m3"`` caps at 8: the P scale is 1.75 and ``1.75 * 2**8 == 448`` is the
+    E4M3 maximum.  ``"bf16"`` caps at 64 (``2**6``): P is unscaled, so this is
+    an engineering cap well inside the FP32 exponent range.
+    """
+
+    if qkv_dtype == "e4m3":
+        return 8.0
+    if qkv_dtype == "bf16":
+        return 64.0
+    raise ValueError(f"unsupported qkv_dtype={qkv_dtype!r}")
+
+
+def validate_skip_corr_threshold(
+    threshold: object, *, qkv_dtype: str, bmm1_scale: float
+) -> float:
+    """Validate a public ``skip_corr_threshold`` and return it as ``float``.
+
+    Zero disables skip correction.  A positive value selects the enabled kernel
+    specialization and requires a positive ``bmm1_scale`` because the kernel
+    divides the threshold by the log2 softmax scale.
+    """
+
+    bound = max_skip_corr_threshold(qkv_dtype)
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, numbers.Real)
+        or not math.isfinite(float(threshold))
+        or not 0.0 <= float(threshold) <= bound
+    ):
+        raise ValueError(
+            f"skip_corr_threshold must be a finite number in [0, {bound:g}] "
+            f"for {qkv_dtype} P"
+        )
+    value = float(threshold)
+    if value > 0.0 and not bmm1_scale > 0.0:
+        raise ValueError("positive skip_corr_threshold requires a positive bmm1_scale")
+    return value
 
 
 def qkv_dtype(cfg):
@@ -143,22 +196,46 @@ def qk_desc_stride_byte_offset(cfg) -> int:
     return qk_desc_stride_byte_offset_for_head_dim(cfg, cfg.mma_qk_tiler_k)
 
 
+def p_desc_params(cfg):
+    """Return ``(layout, leading_byte_offset, stride_byte_offset)`` for P in SMEM.
+
+    Dense decode stores P as a K-major SWIZZLE_64B tile (one 64-byte row per
+    M row): BF16 K32 or E4M3 K64.  The dynamic token sparse profile widens P
+    to one E4M3 K128 operand per V panel, i.e. a 128-byte SWIZZLE_128B row, and
+    its descriptor must hop one whole per-CTA P tile (rows x row bytes) along
+    the leading dimension.  ``is_dynamic_token_sparse`` and ``mma_pv_tiler``
+    are 2CTA-only config fields, so the sparse branch is guarded and the dense
+    branch reads no config attributes.
+    """
+    if getattr(cfg, "is_dynamic_token_sparse", False):
+        p_row_bytes = cfg.mma_pv_tiler[2] * cfg.qkv_dtype_bytes
+        if p_row_bytes == SWIZZLE_128B_ROW_BYTES:
+            p_rows_per_cta = cfg.mma_pv_tiler[0] // cfg.num_mma_ctas
+            return (
+                prims.Tcgen05SmemSwizzle.SWIZZLE_128B,
+                p_rows_per_cta * p_row_bytes,
+                SWIZZLE_ATOM_ROWS * p_row_bytes,
+            )
+    return (
+        prims.Tcgen05SmemSwizzle.SWIZZLE_64B,
+        K_MAJOR_LEADING_BYTE_OFFSET_UNUSED,
+        SWIZZLE_ATOM_ROWS * SWIZZLE_64B_ROW_BYTES,
+    )
+
+
 def p_desc_layout(cfg):
-    """Return the UMMA descriptor layout for P in SMEM."""
-    del cfg
-    return 4
+    """Return the UMMA descriptor layout (swizzle) for P in SMEM."""
+    return p_desc_params(cfg)[0]
 
 
 def p_desc_leading_byte_offset(cfg) -> int:
     """Return the descriptor leading byte offset for P in SMEM."""
-    del cfg
-    return 16
+    return p_desc_params(cfg)[1]
 
 
 def p_desc_stride_byte_offset(cfg) -> int:
     """Return the descriptor stride byte offset for P in SMEM."""
-    del cfg
-    return 512
+    return p_desc_params(cfg)[2]
 
 
 def neg_max_f32():

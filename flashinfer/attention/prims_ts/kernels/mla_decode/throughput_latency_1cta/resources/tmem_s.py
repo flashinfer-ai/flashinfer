@@ -115,6 +115,8 @@ class TmemSResource(MlaResource):
     )
     inst_id: cutlass.Constexpr[int] = 0
     scale_softmax_log2: Float32 = None
+    # threshold / scale_softmax_log2; zero disables the row-max freeze.
+    adjusted_skip_corr_threshold: Float32 = None
     p_ref: Optional[MemoryResource] = None
     global_ref: Optional[MemoryResource] = None
     cache_seqs: object = None
@@ -620,6 +622,7 @@ class TmemSResource(MlaResource):
                 ),
                 ftz=True,
             )
+            local_max = self._freeze_row_max(old_max_vals[0], local_max)
             new_max_vals[0] = local_max
             self.new_max_state[0] = local_max
         else:
@@ -713,8 +716,9 @@ class TmemSResource(MlaResource):
                 alignment=16 if num_scale_groups == 4 else 8,
             )
             for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                new_max_vals[scale_idx] = u32_to_float_for_atomic_max(
-                    reduced_max[scale_idx]
+                new_max_vals[scale_idx] = self._freeze_row_max(
+                    old_max_vals[scale_idx],
+                    u32_to_float_for_atomic_max(reduced_max[scale_idx]),
                 )
                 self.new_max_state[scale_idx] = new_max_vals[scale_idx]
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
@@ -724,6 +728,23 @@ class TmemSResource(MlaResource):
         for idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
             s_arr[idx] = s_vals[idx]
         return old_max_arr, sum_arr, new_max_arr, local_sum_arr, s_arr
+
+    @cute.jit
+    def _freeze_row_max(self, old_max, new_max):
+        """Apply threshold skip correction to one row-max update.
+
+        When the raw-score increase of this K tile fits the adjusted threshold
+        the previous row max is kept, so P grows by at most ``2**threshold``
+        and the running O accumulation needs no rescale for this tile.  The
+        first tile (``old_max == -inf``) always adopts the new max.
+        """
+        frozen = new_max
+        if cutlass.const_expr(self.cfg.enable_skip_correction):
+            if self.adjusted_skip_corr_threshold > Float32(0.0):
+                if old_max != neg_max_f32():
+                    if new_max - old_max <= self.adjusted_skip_corr_threshold:
+                        frozen = old_max
+        return frozen
 
     @consumer_work(
         work_attrs=WorkAttr.AUXILIARY,

@@ -98,6 +98,10 @@ class MlaConfig:
     # Causal is bottom-right aligned for speculative decode. Dense keeps only
     # the ordinary per-batch KV-tail predicate.
     mask_type: str = MaskType.CAUSAL.value
+    # Threshold skip correction: freeze the running row max while a
+    # K tile raises it by at most the runtime threshold (log2 units) and skip
+    # that tile's O rescale.  E4M3 P then uses the 1.75 scale instead of 448.
+    enable_skip_correction: bool = False
     head_dim_qk: int = 576
     head_dim_v: int = 512
     latent_dim: int = 512
@@ -1448,6 +1452,7 @@ def make_throughput_latency_mla_config(
     explicit_split_kv: int | None = None,
     explicit_persistent: bool | None = None,
     mask_type: MaskType | str = MaskType.CAUSAL,
+    enable_skip_correction: bool = False,
 ) -> MlaConfig:
     """Return throughput-latency 1CTA MLA traits for a concrete profile."""
 
@@ -1594,6 +1599,7 @@ def make_throughput_latency_mla_config(
         logical_num_heads_q=logical_num_heads_q,
         logical_seq_len_q=logical_seq_len_q,
         mask_type=mask_type,
+        enable_skip_correction=enable_skip_correction,
         head_dim_qk=head_dim_qk,
         head_dim_v=latent_dim,
         latent_dim=latent_dim,
