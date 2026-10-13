@@ -658,7 +658,6 @@ def _mnnvl_cutedsl_allreduce_fusion(
             residual_in,
             rms_gamma,
             input.shape[0],
-            # Protocol-internal norm_output names the primary BF16/FP8 result.
             norm_output=norm_target,
             residual_output=residual_out,
             norm_output_bf16=companion_out,
@@ -761,7 +760,6 @@ def _mnnvl_cutedsl_allreduce_fusion(
             residual_in,
             rms_gamma,
             m,
-            # Protocol-internal norm_output names the primary BF16/FP8 result.
             norm_output=norm_target,
             residual_output=residual_out,
             norm_output_bf16=companion_out,
