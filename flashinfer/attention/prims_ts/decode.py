@@ -15,10 +15,13 @@
 """Task-scheduled paged decode with a FlashInfer-style plan/run lifecycle."""
 
 from collections.abc import Callable, Sequence
+import dataclasses
 from dataclasses import dataclass
 import functools
+import hashlib
 import math
 import numbers
+import pathlib
 import struct
 from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
 
@@ -1908,8 +1911,13 @@ def _get_compiled_decode(
             ),
         )
 
-    with torch.cuda.device(device_index):
-        compiled_main = cute.compile(
+    from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
+    kernel_key = _decode_compile_cache_key(compile_spec)
+    source_files = _decode_kernel_source_files()
+
+    def compile_main():
+        return cute.compile(
             main_tensor_adapter,
             q_fake,
             k_fake,
@@ -1947,31 +1955,64 @@ def _get_compiled_decode(
             static_native_uniform_kv,
             options=_COMPILE_OPTIONS,
         )
+
+    def compile_reducer():
+        assert reduction_tensor_adapter is not None
+        return cute.compile(
+            reduction_tensor_adapter,
+            out_fake,
+            seq_lens_fake,
+            cu_seqlens_q_fake,
+            partial_o_fake,
+            partial_stats_fake,
+            attention_sinks_fake,
+            Float32(1.0),
+            Float32(1.0),
+            direct_q1_fake,
+            stream_fake,
+            cfg,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            max_kv_len,
+            static_full_split_prefix,
+            options=_COMPILE_OPTIONS,
+        )
+
+    with torch.cuda.device(device_index):
+        compiled_main = build_and_load_cute_dsl_kernel(
+            "prims_ts_decode",
+            f"main_{kernel_key}",
+            compile_main,
+            extra_key_files=source_files,
+        )
         compiled_reducer = None
         if cfg.use_separate_reduction_kernel:
-            assert reduction_tensor_adapter is not None
-            compiled_reducer = cute.compile(
-                reduction_tensor_adapter,
-                out_fake,
-                seq_lens_fake,
-                cu_seqlens_q_fake,
-                partial_o_fake,
-                partial_stats_fake,
-                attention_sinks_fake,
-                Float32(1.0),
-                Float32(1.0),
-                direct_q1_fake,
-                stream_fake,
-                cfg,
-                num_qo_heads,
-                num_kv_heads,
-                head_dim,
-                max_kv_len,
-                static_full_split_prefix,
-                options=_COMPILE_OPTIONS,
+            compiled_reducer = build_and_load_cute_dsl_kernel(
+                "prims_ts_decode",
+                f"reducer_{kernel_key}",
+                compile_reducer,
+                extra_key_files=source_files,
             )
 
     return compiled_main, compiled_reducer
+
+
+def _decode_compile_cache_key(compile_spec: _DecodeCompileSpec) -> str:
+    """Stable on-disk name for one compiled decode topology.
+
+    The device index only selects where the kernel runs; the compiled code
+    depends on the architecture, which the persistent cache keys separately.
+    """
+    spec = dataclasses.replace(compile_spec, device_index=0)
+    return hashlib.sha256(repr(spec).encode()).hexdigest()[:32]
+
+
+@functools.cache
+def _decode_kernel_source_files() -> tuple[str, ...]:
+    root = pathlib.Path(__file__).resolve().parent
+    files = [root / "decode.py", *(root / "kernels" / "fmha_decode").rglob("*.py")]
+    return tuple(sorted(str(path) for path in files))
 
 
 def get_prims_ts_batch_decode_workspace_size(
