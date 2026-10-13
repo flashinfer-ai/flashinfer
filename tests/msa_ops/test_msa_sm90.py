@@ -482,9 +482,7 @@ def test_bf16_kv_cache_is_rejected_by_sparse_attention():
 
 
 @sm90_only
-@pytest.mark.parametrize(
-    "fill", ["nan", "nan_k_only", "nan_v_only", "garbage", "zeros"]
-)
+@pytest.mark.parametrize("fill", ["nan", "nan_k_only", "nan_v_only", "garbage", "zeros"])
 def test_prefill_ignores_page_bytes_past_seqused_k(fill):
     """Page memory beyond seqused_k must not reach the result.
 
@@ -496,15 +494,15 @@ def test_prefill_ignores_page_bytes_past_seqused_k(fill):
     torch.manual_seed(0)
     batch, qlen, hq, hkv, mkt = 1, 128, 8, 1, 8
     npages = mkt * batch
-    kv = torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4
+    kv = (torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4)
     # sequence ends mid-page; everything after it is "uninitialized"
     seqlen = mkt * BLK_KV - 50
     last_pg, off = seqlen // BLK_KV, seqlen % BLK_KV
     if fill == "nan":
         kv[last_pg, :, off:, :] = float("nan")
-    elif fill == "nan_k_only":  # K tail NaN, V tail finite
+    elif fill == "nan_k_only":          # K tail NaN, V tail finite
         kv[last_pg, :, off:, :HEAD_DIM] = float("nan")
-    elif fill == "nan_v_only":  # V tail NaN, K tail finite
+    elif fill == "nan_v_only":          # V tail NaN, K tail finite
         kv[last_pg, :, off:, HEAD_DIM:] = float("nan")
     elif fill == "garbage":
         kv[last_pg, :, off:, :] = 1e4
@@ -518,17 +516,85 @@ def test_prefill_ignores_page_bytes_past_seqused_k(fill):
     page_table = torch.arange(npages, dtype=torch.int32, device="cuda").view(batch, mkt)
     seqused_k = torch.full((batch,), seqlen, dtype=torch.int32, device="cuda")
     out = msa_sparse_attention(
-        q,
-        k,
-        v,
-        idx,
-        cu_q,
-        page_table=page_table,
-        seqused_k=seqused_k,
-        causal=True,
-        softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+        q, k, v, idx, cu_q, page_table=page_table, seqused_k=seqused_k,
+        causal=True, softmax_scale=1.0 / math.sqrt(HEAD_DIM),
     )
     assert torch.isfinite(out.float()).all(), f"{fill} tail leaked into the output"
+
+
+@sm90_only
+@pytest.mark.parametrize("pattern", ["all_equal", "few_distinct", "tied_top16", "ties_with_pad"])
+def test_topk_select_returns_distinct_blocks_under_ties(pattern):
+    """Exact score ties must not yield duplicate block indices.
+
+    The final scatter folds the lane into its sort key so it is tie-safe, but the
+    cascade merge keeps (score, index) pairs with a plain >= on the score; a tile
+    reachable from two partial lists can therefore be emitted twice, leaving
+    fewer than topk distinct blocks.
+    """
+    torch.manual_seed(0)
+    num_qo_heads, max_k_tiles, total_q = 4, 64, 32
+    if pattern == "all_equal":
+        scores = torch.full((num_qo_heads, max_k_tiles, total_q), 1.0,
+                            dtype=torch.float32, device="cuda")
+    elif pattern == "few_distinct":                     # 4 values over 64 tiles
+        base = torch.tensor([3.0, 2.0, 1.0, 0.0], device="cuda")
+        scores = base.repeat(max_k_tiles // 4)[None, :, None].expand(
+            num_qo_heads, max_k_tiles, total_q).contiguous()
+    elif pattern == "tied_top16":                       # 16 tied winners, rest lower
+        scores = torch.zeros(num_qo_heads, max_k_tiles, total_q,
+                             dtype=torch.float32, device="cuda")
+        scores[:, :16, :] = 5.0
+    else:                                               # ties plus padding
+        scores = torch.full((num_qo_heads, max_k_tiles, total_q), 2.0,
+                            dtype=torch.float32, device="cuda")
+        scores[:, 8:, :] = float("-inf")                # only 8 valid tiles
+    out = msa_topk_select(scores, TOPK)
+    bad = []
+    for t in range(total_q):
+        for h in range(num_qo_heads):
+            sel = out[t, h].tolist()
+            real = [b for b in sel if b >= 0]
+            if len(real) != len(set(real)):
+                dup = {b for b in real if real.count(b) > 1}
+                bad.append((t, h, sorted(dup), len(set(real))))
+    assert not bad, (
+        f"{len(bad)} (token, head) slots have duplicate blocks; "
+        f"first: token={bad[0][0]} head={bad[0][1]} dups={bad[0][2]} "
+        f"distinct={bad[0][3]}"
+    )
+
+
+@sm90_only
+@pytest.mark.parametrize("hq,tiles,nq", [(1, 64, 1536), (1, 512, 8192)])
+def test_topk_select_20way_tie_reviewer_repro(hq, tiles, nq):
+    """Reviewer repro for #6140: a 20-way tie at the top score.
+
+    q = 22 everywhere; the first 20 blocks carry k = 22, giving an exact block
+    score of 128 * 22^2 = 61952, and every other block k = 11 -> 30976. Twenty
+    blocks tie for sixteen slots. Observed before the fix: duplicated indices and
+    fewer than sixteen distinct blocks, e.g. [0, 0, 16 x8, 17 x6]. The failure is
+    plan dependent, hence both shapes.
+    """
+    hi, lo = 128.0 * 22.0 * 22.0, 128.0 * 11.0 * 11.0
+    scores = torch.full((hq, tiles, nq), lo, dtype=torch.float32, device="cuda")
+    scores[:, :20, :] = hi
+    out = msa_topk_select(scores, TOPK)
+    assert out.shape == (nq, hq, TOPK)
+    sel = out.reshape(-1, TOPK)
+    # every slot must be a real block (20 candidates >= 16 slots) and distinct
+    assert int(sel.min()) >= 0, "padding emitted despite 20 valid candidates"
+    srt, _ = sel.sort(dim=-1)
+    dup_rows = (srt[:, 1:] == srt[:, :-1]).any(dim=-1)
+    if bool(dup_rows.any()):
+        i = int(dup_rows.nonzero()[0])
+        row = sel[i].tolist()
+        raise AssertionError(
+            f"{int(dup_rows.sum())}/{sel.shape[0]} rows duplicate a block; "
+            f"row {i} = {row} ({len(set(row))} distinct)"
+        )
+    # all winners must come from the tied top-20
+    assert int(sel.max()) < 20, f"selected a non-tied block: max={int(sel.max())}"
 
 
 @sm90_only
