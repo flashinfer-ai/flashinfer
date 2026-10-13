@@ -3754,6 +3754,22 @@ def _is_cudnn_override_shape_available() -> bool:
         return False
 
 
+# cuDNN frees a plan's runtime-compiled kernels together with the last Python
+# reference to its graph.  CUDA graph replay bypasses Python, so the lru_caches
+# on the build_cudnn_gemm_* helpers never see a captured graph being used and
+# may evict it (e.g. after 2048 other shapes) while a captured CUDA graph still
+# launches its kernels -> use-after-free (segfault in cuGraphLaunch, hangs).
+# Keep every cuDNN graph that is executed during stream capture alive for the
+# life of the process.  This only grows while capturing, so it is bounded by
+# the shapes that are captured (tens in practice), and it is a no-op otherwise.
+_CUDNN_GRAPHS_USED_BY_CUDA_GRAPHS: dict = {}
+
+
+def _retain_cudnn_graph_if_capturing(graph) -> None:
+    if torch.cuda.is_current_stream_capturing():
+        _CUDNN_GRAPHS_USED_BY_CUDA_GRAPHS.setdefault(id(graph), graph)
+
+
 def _get_cudnn_workspace_size(graph, plan_index: int) -> int:
     if plan_index < 0:
         return graph.get_workspace_size()
@@ -3966,6 +3982,9 @@ def clear_cudnn_graph_cache() -> None:
 
     This does **not** clear:
 
+        * cuDNN graphs that were executed during CUDA graph capture
+          (``_CUDNN_GRAPHS_USED_BY_CUDA_GRAPHS``) -- captured CUDA graphs
+          may still launch their kernels.
         * cuDNN handles (``_cudnn_handles``) -- those are cheap to
           re-set the stream on and expensive to recreate.
         * The autotuner's ``_find_nearest_profile`` LRU cache -- it is
@@ -4143,6 +4162,7 @@ def execute_cudnn_gemm_fp4_graph(
     workspace_buffer,
     tactic=-1,
 ):
+    _retain_cudnn_graph_if_capturing(graph)
     variant_pack = {
         UIDs.A_UID.value: a.view(get_native_fp4_dtype()),
         UIDs.B_UID.value: b.view(get_native_fp4_dtype()),
@@ -4326,6 +4346,7 @@ def execute_cudnn_gemm_fp4_graph_override_shape(
     tactic=-1,
 ):
     """Execute FP4 GEMM cuDNN graph with dynamic-shape overrides."""
+    _retain_cudnn_graph_if_capturing(graph)
 
     real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
     real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
@@ -4460,6 +4481,7 @@ def execute_cudnn_gemm_mxfp8_graph(
     workspace_buffer,
     tactic=-1,
 ):
+    _retain_cudnn_graph_if_capturing(graph)
     _check_mxfp8_gemm_strides(a, b, "cuDNN")
 
     variant_pack = {
@@ -4613,6 +4635,7 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
     tactic=-1,
 ):
     """Execute MXFP8 GEMM cuDNN graph with dynamic-shape overrides."""
+    _retain_cudnn_graph_if_capturing(graph)
     # Override-shape graphs require the runtime strides to match the profiled layout.
     if a.stride(-1) != 1:
         raise ValueError(
@@ -4800,6 +4823,7 @@ def execute_cudnn_gemm_fp8_graph(
     workspace,
     tactic=-1,
 ):
+    _retain_cudnn_graph_if_capturing(graph)
     variant_pack = {
         UIDs.A_UID.value: a,
         UIDs.B_UID.value: b,
@@ -4913,6 +4937,7 @@ def execute_cudnn_gemm_fp8_graph_override_shape(
     graph, a, b, a_scale, b_scale, c_final, workspace, tactic=-1
 ):
     """Execute FP8 per-tensor GEMM graph with dynamic-shape overrides."""
+    _retain_cudnn_graph_if_capturing(graph)
     # Override-shape graphs require the runtime strides to match the profiled layout.
     if a.stride(-1) != 1:
         raise ValueError(
@@ -5228,6 +5253,7 @@ def build_cudnn_gemm_bf16_graph(
 
 
 def execute_cudnn_gemm_bf16_graph(graph, a, b, bias, c_final, workspace, tactic=-1):
+    _retain_cudnn_graph_if_capturing(graph)
     if bias is not None:
         variant_pack = {
             UIDs.A_UID.value: a,
@@ -5367,6 +5393,7 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
     ``override_shapes`` / ``override_strides`` so a single compiled plan
     handles any M dimension without rebuilding.
     """
+    _retain_cudnn_graph_if_capturing(graph)
     a_shape, a_stride = _get_bf16_3d_shape_stride(a)
     b_shape, b_stride = _get_bf16_3d_shape_stride(b)
     c_shape, c_stride = _get_bf16_3d_shape_stride(c_final)
