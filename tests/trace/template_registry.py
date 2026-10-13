@@ -48,6 +48,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.comm.pcie_ipc_ar",
     "flashinfer.comm.pcie_ipc_collectives.all_gather",
     "flashinfer.comm.pcie_ipc_collectives.reduce_scatter",
+    "flashinfer.comm.rdma_moe_alltoall",
     "flashinfer.comm.tp_moe_finalize_rmsnorm",
     "flashinfer.comm.ulysses",
     "flashinfer.concat_ops",

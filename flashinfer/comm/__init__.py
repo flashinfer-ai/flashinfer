@@ -19,6 +19,10 @@ from .cake_fp4_allreduce import (
 )
 from .dlpack_utils import pack_strided_memory
 from .mapping import Mapping
+from .rdma_moe_alltoall import (
+    RdmaMoeAlltoAll as RdmaMoeAlltoAll,
+    RdmaMoeAlltoAllConfig as RdmaMoeAlltoAllConfig,
+)
 from .trtllm_ar import AllReduceFusionOp as AllReduceFusionOp
 from .trtllm_ar import AllReduceFusionPattern as AllReduceFusionPattern
 from .trtllm_ar import AllReduceStrategyConfig as AllReduceStrategyConfig
