@@ -56,10 +56,12 @@ class TraceAudit:
 
     @property
     def covered(self) -> bool:
+        """Return whether the definition has both a check and a reference."""
         return self.has_check and self.has_reference
 
     @property
     def gap_description(self) -> str:
+        """List missing coverage components, or return 'none' when covered."""
         missing: list[str] = []
         if not self.has_check:
             missing.append("check")
@@ -322,6 +324,7 @@ def _selftest() -> int:
 
 
 def main() -> int:
+    """Run the trace coverage audit or self-test and return the CLI exit status."""
     ap = argparse.ArgumentParser(
         description="Audit GDN/KDA trace definitions for numerical reference coverage."
     )

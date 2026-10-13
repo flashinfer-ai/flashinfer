@@ -743,6 +743,7 @@ def _detect_gpu_name() -> str:
 
 
 def _runtime_version_line() -> str:
+    """Format runtime and dependency versions as space-separated name=value pairs."""
     versions = [
         ("python", sys.version.split()[0]),
         ("flashinfer", _package_version("flashinfer-python")),

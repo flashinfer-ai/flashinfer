@@ -74,22 +74,27 @@ class FileResult:
 
     @property
     def executed_anywhere(self) -> bool:
+        """Return whether any lane recorded a passed or failed test node."""
         return any(lr.passed + lr.failed > 0 for lr in self.lanes.values())
 
     @property
     def collected_anywhere(self) -> bool:
+        """Return whether any lane recorded test nodes, including unknown outcomes."""
         return any(lr.total > 0 for lr in self.lanes.values())
 
     @property
     def total_skipped(self) -> int:
+        """Return the number of skipped test nodes summed across all lanes."""
         return sum(lr.skipped for lr in self.lanes.values())
 
     @property
     def total_passed(self) -> int:
+        """Return the number of passed test nodes summed across all lanes."""
         return sum(lr.passed for lr in self.lanes.values())
 
     @property
     def total_failed(self) -> int:
+        """Return the number of failed test nodes summed across all lanes."""
         return sum(lr.failed for lr in self.lanes.values())
 
 
@@ -106,6 +111,7 @@ class LaneResult:
 
     @property
     def total(self) -> int:
+        """Return this lane's test node count, including unknown outcomes."""
         return self.passed + self.failed + self.skipped + self.unknown
 
 
@@ -616,9 +622,7 @@ def _selftest() -> int:
                 name="pytest_nodeid",
                 value=f"tests/gdn/test_foo.py::test_something[{i}]",
             )
-            ET.SubElement(
-                tc, "skipped", message="ReplaySSM requires SM100/SM103"
-            )
+            ET.SubElement(tc, "skipped", message="ReplaySSM requires SM100/SM103")
         tree = ET.ElementTree(root_el)
         tree.write(xml_path, xml_declaration=True)
 
@@ -679,6 +683,7 @@ def _selftest() -> int:
 
 
 def main() -> int:
+    """Run the skip-all audit or self-test and return the CLI exit status."""
     ap = argparse.ArgumentParser(
         description="Detect changed test files where all nodes were skipped."
     )
