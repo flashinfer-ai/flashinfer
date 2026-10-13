@@ -46,6 +46,21 @@ _SM107_NATIVE_VARIANTS: frozenset[str] = frozenset(
     }
 )
 
+# Variants that store the two output rows a thread group owns as one 32-bit
+# BF16x2 word.  They need a 4-byte-aligned output base; otherwise the band's
+# scalar-publish body of the same schedule runs (same output bits).
+_PAIR_PUBLISH_FALLBACK: dict[str, str] = {
+    "cpasync_tile128_register_pipeline_pair_publish": (
+        "cpasync_tile128_register_pipeline"
+    ),
+}
+
+
+def _output_pair_store_aligned(output_view: torch.Tensor) -> bool:
+    """Whether the contiguous output view can take 32-bit BF16x2 pair stores."""
+
+    return int(output_view.data_ptr()) % 4 == 0
+
 
 def _target_for_device(device: torch.device) -> CakeKDAPackedT1Target:
     """Select the legacy exact target or the SM100-family target."""
@@ -180,6 +195,10 @@ def run_packed_kda_decode(
         state_aligned=state_aligned,
         aux_vec4_aligned=aux_vec4_aligned,
     )
+    if optimized_variant in _PAIR_PUBLISH_FALLBACK and not _output_pair_store_aligned(
+        output_view
+    ):
+        optimized_variant = _PAIR_PUBLISH_FALLBACK[optimized_variant]
     if optimized_variant is None:
         legacy_variant = _legacy_variant_for_batch(batch)
         module = get_flash_kda_packed_t1_module(legacy_variant, target)

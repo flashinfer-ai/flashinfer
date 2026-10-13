@@ -585,12 +585,16 @@ def test_public_packed_kda_decode_forwards_canonical_output_cpu(monkeypatch):
 
 
 class _FakeCudaTensor:
-    def __init__(self, shape, *, device="cuda:0"):
+    def __init__(self, shape, *, device="cuda:0", data_ptr=0):
         self.shape = tuple(shape)
         self.device = device
         self.is_cuda = True
         self.view_result = None
         self.allocated_shapes = []
+        self._data_ptr = data_ptr
+
+    def data_ptr(self):
+        return self._data_ptr
 
     @property
     def ndim(self):
@@ -600,7 +604,9 @@ class _FakeCudaTensor:
         return True
 
     def view(self, *shape):
-        self.view_result = _FakeCudaTensor(shape, device=self.device)
+        self.view_result = _FakeCudaTensor(
+            shape, device=self.device, data_ptr=self._data_ptr
+        )
         return self.view_result
 
     def new_empty(self, shape):
@@ -706,6 +712,7 @@ def test_kernel_facade_selects_optimized_variant_and_caller_stream_cpu(monkeypat
         ((10, 3), "cpasync_tile64_register_pipeline_early_publish_bulk1", "sm100f"),
         ((10, 7), "register_tile16", "sm100f"),
         ((10, 7), "cpasync_tile128_register_pipeline", "sm100f"),
+        ((10, 7), "cpasync_tile128_register_pipeline_pair_publish", "sm100f"),
         ((10, 7), "cpasync_tile64_ilp4", "sm100f"),
         ((10, 3), "cpasync_tile64_register_pipeline_early_publish", "sm100f"),
         ((10, 0), "cpasync_tile64_register_pipeline_early_publish", "sm100f"),
@@ -735,8 +742,9 @@ def test_kernel_facade_native_sm107_target_is_variant_keyed_cpu(
         (48, "cpasync_tile64_register_pipeline_early_publish", "sm107a"),
         (56, "cpasync_tile64_register_pipeline_early_publish_bulk1", "sm107a"),
         (63, "cpasync_tile64_register_pipeline_early_publish_bulk1", "sm107a"),
-        (64, "cpasync_tile128_register_pipeline", "sm100f"),
-        (128, "cpasync_tile128_register_pipeline", "sm100f"),
+        (64, "cpasync_tile128_register_pipeline_pair_publish", "sm100f"),
+        (72, "cpasync_tile128_register_pipeline_pair_publish", "sm100f"),
+        (128, "cpasync_tile128_register_pipeline_pair_publish", "sm100f"),
     ],
 )
 def test_kernel_facade_compiles_sm107_tile64_band_natively_cpu(
@@ -809,3 +817,51 @@ def test_kernel_facade_selects_exact_physical_target_cpu(
             packed_module._target_for_device(torch.device("cpu"))
     else:
         assert packed_module._target_for_device(torch.device("cpu")) == expected
+
+
+@pytest.mark.parametrize(
+    ("output_ptr", "expected_variant"),
+    [
+        (0, "cpasync_tile128_register_pipeline_pair_publish"),
+        (4, "cpasync_tile128_register_pipeline_pair_publish"),
+        (2, "cpasync_tile128_register_pipeline"),
+    ],
+)
+def test_kernel_facade_pair_publish_requires_aligned_output_cpu(
+    monkeypatch, output_ptr, expected_variant
+):
+    """The pair-store body runs only on a 4-byte-aligned output base.
+
+    A 2-byte-aligned caller output (legal for a BF16 tensor) falls back to the
+    scalar-publish body of the same band, which produces the same bits.
+    """
+
+    packed_module = importlib.import_module(
+        "flashinfer.kda_kernels.cake_packed_kda_decode"
+    )
+    fake_torch = SimpleNamespace(
+        Tensor=_FakeCudaTensor,
+        cuda=SimpleNamespace(
+            current_stream=lambda device: SimpleNamespace(cuda_stream=0x1234)
+        ),
+    )
+    monkeypatch.setattr(packed_module, "torch", fake_torch)
+    monkeypatch.setattr(packed_module, "get_compute_capability", lambda device: (10, 7))
+    monkeypatch.setattr(packed_module, "is_cuda_version_at_least", lambda version: True)
+    monkeypatch.setattr(
+        packed_module,
+        "_optimized_alignment_flags",
+        lambda *args: (True, True),
+    )
+    module_calls = []
+
+    def get_module(selected_variant, selected_target):
+        module_calls.append((selected_variant, selected_target))
+        return SimpleNamespace(run=lambda *args: None)
+
+    monkeypatch.setattr(packed_module, "get_cake_kda_packed_t1_module", get_module)
+    mixed_qkv = _FakeCudaTensor((64, _MIXED_WIDTH))
+    inputs = [mixed_qkv, *(_FakeCudaTensor((1,)) for _ in range(6))]
+    output = _FakeCudaTensor((64, 1, _HEADS, _HEAD_DIM), data_ptr=output_ptr)
+    packed_module.run_packed_kda_decode(*inputs, output=output)
+    assert module_calls == [(expected_variant, "sm100f")]

@@ -63,8 +63,9 @@ def test_aligned_selector_matches_qualified_batch_bands(
         (49, "cpasync_tile64_register_pipeline_early_publish_bulk1"),
         (56, "cpasync_tile64_register_pipeline_early_publish_bulk1"),
         (63, "cpasync_tile64_register_pipeline_early_publish_bulk1"),
-        (64, "cpasync_tile128_register_pipeline"),
-        (65535, "cpasync_tile128_register_pipeline"),
+        (64, "cpasync_tile128_register_pipeline_pair_publish"),
+        (72, "cpasync_tile128_register_pipeline_pair_publish"),
+        (65535, "cpasync_tile128_register_pipeline_pair_publish"),
     ],
 )
 def test_aligned_selector_rebands_on_compute_capability_10_7(batch, expected):
@@ -210,6 +211,13 @@ def test_jit_specs_bind_frozen_source_and_physical_launch_metadata(
         "#define CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 "
         f"{int(metadata.requires_aux_vec4)}"
     ) in binding
+    assert (
+        f"#define CAKE_KDA_PACKED_T1_PAIR_PUBLISH {int(metadata.pair_publish)}"
+        in binding
+    )
+    assert metadata.pair_publish == (
+        variant == "cpasync_tile128_register_pipeline_pair_publish"
+    )
     assert '#include "cake_kda_packed_t1_binding.cuh"' in binding
     cake_kda_packed_t1.gen_cake_kda_packed_t1_module.cache_clear()
 
@@ -223,6 +231,8 @@ def test_binding_preserves_stream_stride_index_and_alignment_contracts():
     assert "state.stride(0) % 8 == 0" in binding
     assert "state.data_ptr()) % 16 == 0" in binding
     assert "CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4" in binding
+    assert "CAKE_KDA_PACKED_T1_PAIR_PUBLISH != 0" in binding
+    assert "out.data_ptr()) % 4 == 0" in binding
     assert "mixed_qkv.stride(0)" in binding
     assert "raw_gate.stride(0)" in binding
     assert "raw_beta.stride(0)" in binding

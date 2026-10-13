@@ -40,6 +40,7 @@ CakeKDAPackedT1Variant = Literal[
     "cpasync_tile128_v_private_prefetch",
     "cpasync_tile128_paired_row_pipeline",
     "cpasync_tile128_register_pipeline",
+    "cpasync_tile128_register_pipeline_pair_publish",
 ]
 CakeKDAPackedT1Target = Literal["sm100a", "sm100f", "sm107a"]
 
@@ -57,6 +58,7 @@ CAKE_KDA_PACKED_T1_VARIANTS: tuple[CakeKDAPackedT1Variant, ...] = (
     "cpasync_tile128_v_private_prefetch",
     "cpasync_tile128_paired_row_pipeline",
     "cpasync_tile128_register_pipeline",
+    "cpasync_tile128_register_pipeline_pair_publish",
 )
 
 _CAKE_KDA_PACKED_T1_TARGETS: tuple[CakeKDAPackedT1Target, ...] = (
@@ -75,6 +77,10 @@ class CakeKDAPackedT1VariantMetadata(NamedTuple):
     smem_bytes: int
     requires_aux_vec4: bool
     extra_cuda_flags: tuple[str, ...] = ("--maxrregcount=128",)
+    # The variant publishes the two output rows a thread group owns as one
+    # 32-bit BF16x2 store (same bytes as two scalar stores); the binding then
+    # requires a 4-byte-aligned output base.
+    pair_publish: bool = False
 
 
 CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
@@ -195,6 +201,18 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
         smem_bytes=20480,
         requires_aux_vec4=True,
     ),
+    "cpasync_tile128_register_pipeline_pair_publish": CakeKDAPackedT1VariantMetadata(
+        body="cake_kda_packed_t1_cpasync_tile128_register_pipeline_pair_publish.cu",
+        symbol=(
+            "kernel_flashinfer_packed_kda_t1_cpasync_tile128_register_pipeline_"
+            "pair_publish"
+        ),
+        value_tiles=1,
+        threads=128,
+        smem_bytes=20480,
+        requires_aux_vec4=True,
+        pair_publish=True,
+    ),
 }
 
 
@@ -233,13 +251,19 @@ _CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM100: tuple[
 # cp.async.bulk sibling carries B49-B63.  That edge is the last measured row
 # where the ring body is not slower (B48; the bulk body is 1.8-2.2 % faster at
 # B56 on both seeds, native cubin, same output bits); B57-B63 follow B56.
+# From B64 the tile-128 register pipeline runs its pair-publish build: the same
+# schedule with the two output rows a thread group owns stored as one 32-bit
+# BF16x2 word instead of two 16-bit stores (same output bits; 2.6-3.2 % faster
+# at B64 and B72 on R200 on both measured seeds, family cubin).  It needs a
+# 4-byte-aligned output base; the facade falls back to the scalar-publish body
+# otherwise.  No SM100 band selects it.
 _CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM107: tuple[
     tuple[Optional[int], CakeKDAPackedT1Variant], ...
 ] = (
     (17, "register_tile16"),
     (48, "cpasync_tile64_register_pipeline_early_publish"),
     (63, "cpasync_tile64_register_pipeline_early_publish_bulk1"),
-    (None, "cpasync_tile128_register_pipeline"),
+    (None, "cpasync_tile128_register_pipeline_pair_publish"),
 )
 CAKE_KDA_PACKED_T1_ALIGNED_BANDS: dict[
     tuple[int, ...], tuple[tuple[Optional[int], CakeKDAPackedT1Variant], ...]
@@ -312,6 +336,7 @@ def _get_binding_cu(metadata: CakeKDAPackedT1VariantMetadata) -> str:
 #define CAKE_KDA_PACKED_T1_THREADS {metadata.threads}
 #define CAKE_KDA_PACKED_T1_SMEM_BYTES {metadata.smem_bytes}
 #define CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 {int(metadata.requires_aux_vec4)}
+#define CAKE_KDA_PACKED_T1_PAIR_PUBLISH {int(metadata.pair_publish)}
 
 #include "cake_kda_packed_t1_binding.cuh"
 """
