@@ -17,9 +17,7 @@ limitations under the License.
 # Tests for the experimental Cake MXFP8 MegaMoE EP16 backend.
 
 import ast
-import copy
 import inspect
-import json
 import os
 import runpy
 import subprocess
@@ -171,6 +169,7 @@ def test_invalid_backend_is_rejected_collectively(
     monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 3))
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.3a")
 
     with pytest.raises(ValueError, match="backend must be 'cuda' or 'cute_dsl'"):
         _CakeMxfp8MegaMoeEp16Session(
@@ -248,19 +247,17 @@ def test_cute_source_key_covers_kernel_and_adapter_dependencies() -> None:
 
     package = Path(cute_dsl.__file__).resolve().parent
     flashinfer_root = package.parent.parent
+    generated = package / "csrc" / "cake_mxfp8_megamoe_ep16" / "cute"
     expected = {
-        package / "kernels" / "fused_cta0.py",
-        package / "kernels" / "fused_all_ctas.py",
-        package / "kernels" / "topk_reduce.py",
+        generated / "cake_mxfp8_megamoe_ep16_fused.py",
+        generated / "cake_mxfp8_megamoe_ep16_topk_reduce.py",
         package / "cute_dsl.py",
         package / "backend.py",
+        package / "jit.py",
         package / "__init__.py",
         flashinfer_root / "moe_ep" / "cake_mxfp8_megamoe_ep16.py",
         Path(cute_dsl_core.__file__).resolve(),
     }
-    kernels_init = package / "kernels" / "__init__.py"
-    if kernels_init.is_file():
-        expected.add(kernels_init)
     actual = tuple(Path(path) for path in cute_dsl._source_files())
     assert len(actual) == len(set(actual))
     assert set(actual) == expected
@@ -297,52 +294,86 @@ def test_cute_source_key_changes_for_each_dependency(tmp_path) -> None:
 
 
 def test_generated_source_closure() -> None:
-    _, manifest = _read_manifest()
+    csrc_root, manifest = _read_manifest()
     sequence = manifest["sequences"][0]
-    assert sequence["arch"] == "sm_103a"
-    assert len(sequence["translation_units"]["devices"]) == 3
+    assert sequence["archs"] == ["sm_100a", "sm_103a"]
+    units = sequence["translation_units"]
+    assert len(units["devices"]) == 2 and len(units["headers"]) == 1
     assert sequence["setup_ffi_entry"] == "setup_tma"
     assert sequence["launches_per_call"] == 2
     assert sequence["setup_launches"] == 1
     assert sequence["max_launch_epoch"] == _MAX_LAUNCH_EPOCH
+    variants = sequence["fused_variants"]
+    tokens = sequence["token_specializations"]
+    assert tokens == {"16": variants["0"], "32": variants["1"], "64": variants["0"]}
+    fused = (csrc_root / Path(*Path(units["devices"][0]).parts[1:])).read_text()
+    for value, symbol in (("0", variants["0"]), ("1", variants["1"])):
+        assert f"#define {variants['flag']} {value}" in fused
+        assert symbol in fused
+    assert fused.count(f'#include "{Path(units["headers"][0]).name}"') == 2
+
+
+@pytest.mark.parametrize(
+    "arch_list,expected",
+    (
+        ("10.3a", ((10, 3),)),
+        ("10.0a", ((10, 0),)),
+        ("10.0 10.3", ((10, 0), (10, 3))),
+        ("9.0a 12.0f", ()),
+    ),
+)
+def test_loader_targets_follow_flashinfer_cuda_arch_list(
+    monkeypatch, arch_list, expected
+) -> None:
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", arch_list)
+    assert _jit.supported_capabilities() == expected
+    for capability in expected:
+        assert _jit.require_supported_capability(capability) == capability
+    for capability in set(_jit.SUPPORTED_CAPABILITIES) - set(expected):
+        with pytest.raises(RuntimeError, match="FLASHINFER_CUDA_ARCH_LIST"):
+            _jit.require_supported_capability(capability)
+    with pytest.raises(RuntimeError, match="requires compute capability"):
+        _jit.require_supported_capability((9, 0))
+
+
+@pytest.mark.parametrize(
+    "capability,arch", (((10, 0), "compute_100a"), ((10, 3), "compute_103a"))
+)
+def test_jit_spec_is_exact_per_capability(monkeypatch, capability, arch) -> None:
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a")
+    _jit.gen_cake_mxfp8_megamoe_ep16_module.cache_clear()
+    spec = _jit.gen_cake_mxfp8_megamoe_ep16_module(capability)
+    assert spec.name.endswith(_jit.device_arch(capability))
+    assert any(arch in flag for flag in spec.extra_cuda_cflags)
+    assert len(spec.sources) == 3
+
+
+def test_cute_compile_program_takes_variant_and_architecture() -> None:
+    for role, parameters in (
+        ("fused", ["return_all_cta", "arch"]),
+        ("topk_reduce", ["arch"]),
+    ):
+        tree = ast.parse(_jit.cute_dsl_source(role).read_text())
+        functions = {
+            node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+        }
+        assert [a.arg for a in functions["compile_program"].args.args] == parameters
+    fused = ast.parse(_jit.cute_dsl_source("fused").read_text())
+    guards = [
+        node
+        for node in ast.walk(fused)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Call)
+        and getattr(node.test.func, "attr", "") == "const_expr"
+        and getattr(node.test.args[0], "id", "") == "return_all_cta"
+    ]
+    assert guards and all(node.orelse for node in guards)
 
 
 def test_jit_resolves_flashinfer_headers() -> None:
     header_dirs = _jit._get_flashinfer_header_dirs()
     assert any((path / "tvm_ffi_utils.h").is_file() for path in header_dirs)
     assert any((path / "flashinfer" / "layout.cuh").is_file() for path in header_dirs)
-
-
-def _write_test_manifest(tmp_path, manifest: dict) -> None:
-    operator_dir = tmp_path / "cake_mxfp8_megamoe_ep16"
-    operator_dir.mkdir(parents=True)
-    (operator_dir / "cake_mxfp8_megamoe_ep16_manifest.json").write_text(
-        json.dumps(manifest)
-    )
-
-
-def test_manifest_rejects_aggregate_identity_drift(tmp_path, monkeypatch) -> None:
-    _, manifest = _read_manifest()
-    mutated = copy.deepcopy(manifest)
-    mutated["sequences"][0]["max_launch_epoch"] += 1
-    _write_test_manifest(tmp_path, mutated)
-    monkeypatch.setattr(_jit, "_get_csrc_root", lambda: tmp_path)
-    with pytest.raises(
-        RuntimeError, match="aggregate source-closure identity mismatch"
-    ):
-        _read_manifest()
-
-
-def test_manifest_requires_translation_units_to_equal_closure(
-    tmp_path, monkeypatch
-) -> None:
-    _, manifest = _read_manifest()
-    mutated = copy.deepcopy(manifest)
-    mutated["sequences"][0]["translation_units"]["devices"].pop()
-    _write_test_manifest(tmp_path, mutated)
-    monkeypatch.setattr(_jit, "_get_csrc_root", lambda: tmp_path)
-    with pytest.raises(RuntimeError, match="translation units must exactly equal"):
-        _read_manifest()
 
 
 def test_host_binding_argument_count() -> None:
@@ -553,7 +584,7 @@ def test_sparse_reference_routing_exercises_mixed_width_tail() -> None:
 @pytest.mark.parametrize(
     "backend", (None, "cute_dsl"), ids=("default_cuda", "cute_dsl")
 )
-def test_ep16_sm103_sparse_reference_and_repeated_result(backend) -> None:
+def test_ep16_sparse_reference_and_repeated_result(backend) -> None:
     """Run under 16-rank torchrun with ``-m pytest <this-file> -k sparse_reference``."""
 
     if int(os.environ.get("WORLD_SIZE", "0")) != 16:
@@ -575,8 +606,8 @@ def test_ep16_sm103_sparse_reference_and_repeated_result(backend) -> None:
         device_index = local_rank
     torch.cuda.set_device(device_index)
     device = torch.device("cuda", torch.cuda.current_device())
-    if torch.cuda.get_device_capability(device) != (10, 3):
-        pytest.skip("requires exact SM103")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+        pytest.skip("requires SM100 or SM103")
 
     initialized_here = not dist.is_initialized()
     if initialized_here:

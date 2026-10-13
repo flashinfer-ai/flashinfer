@@ -39,6 +39,7 @@ from .cake_grouped_fp8_gemm import gen_cake_grouped_fp8_gemm_module
 from .cake_grouped_fp8_fused_silu_quant import (
     gen_cake_grouped_fp8_fused_silu_quant_module,
 )
+from .cake_batch_deepgemm_fp8 import gen_cake_batch_deepgemm_fp8_module
 
 __all__ = [
     "gen_gemm_module",
@@ -62,4 +63,5 @@ __all__ = [
     "gen_blackwell_bf16_bmm_module",
     "gen_cake_grouped_fp8_gemm_module",
     "gen_cake_grouped_fp8_fused_silu_quant_module",
+    "gen_cake_batch_deepgemm_fp8_module",
 ]

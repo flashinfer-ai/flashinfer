@@ -24,6 +24,7 @@ tests of the FA sparse-MLA backward: per-document causal random top-k with
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Optional
 
 import torch
@@ -130,6 +131,42 @@ class Inputs:
         )
 
 
+def globalize_gather_indices_loop(
+    gather_kv_indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    *,
+    causal: bool = True,
+) -> torch.Tensor:
+    """Plain-Python reference of the varlen index rule (host tensors; loop-sized problems).
+
+    Row ``t`` of document ``d`` (``cu_seqlens_q[d] <= t < cu_seqlens_q[d + 1]``) is the query at key
+    position ``(seqlen_k[d] - seqlen_q[d]) + (t - cu_seqlens_q[d])`` of its document: the query segment
+    is the tail of its key prefix.  Slot ``idx`` is valid when ``0 <= idx < seqlen_k[d]`` and, with
+    ``causal``, ``idx <= that position``; valid slots become ``idx + cu_seqlens_k[d]``, the others ``-1``.
+    A zero-length query segment contributes no rows.
+    """
+    local = gather_kv_indices.cpu().tolist()
+    cu_q = [int(v) for v in cu_seqlens_q.cpu().tolist()]
+    cu_k = [int(v) for v in cu_seqlens_k.cpu().tolist()]
+    rows = []
+    for d in range(len(cu_q) - 1):
+        seqlen_q, seqlen_k = cu_q[d + 1] - cu_q[d], cu_k[d + 1] - cu_k[d]
+        for i in range(seqlen_q):
+            position = (seqlen_k - seqlen_q) + i
+            rows.append(
+                [
+                    idx + cu_k[d]
+                    if 0 <= idx < seqlen_k and (not causal or idx <= position)
+                    else -1
+                    for idx in local[cu_q[d] + i]
+                ]
+            )
+    return torch.tensor(rows, dtype=torch.int32).reshape(
+        len(rows), int(gather_kv_indices.shape[1])
+    )
+
+
 def make_inputs(
     seq_q,
     seq_k,
@@ -209,6 +246,7 @@ def reference_fp64(
     softmax_scale: float = DEFAULT_SCALE,
     own_key: Optional[torch.Tensor] = None,
     chunk_rows: int = 256,
+    consume: Optional[Callable[[int, int, dict], None]] = None,
 ) -> dict:
     """Chunked FP64 reference from the BF16 inputs.
 
@@ -222,20 +260,33 @@ def reference_fp64(
     rounded to BF16 at the MMA inputs, BF16 outputs); with ``own_key`` also the mean softmax mass on the
     query's own key (``self_weight``).  Slots that are ``-1``, ``>= S`` or
     ``>= topk_length[t]`` are invalid.
+
+    With ``consume`` the per-query results are streamed instead of kept: after
+    every ``chunk_rows`` query rows ``consume(r0, r1, chunk)`` receives the
+    slice ``chunk`` (``out``, ``lse``, ``out_emu`` and, with ``dout``,
+    ``dq_latent``, ``dq_rope``, ``dq_latent_emu``, ``dq_rope_emu``; FP64, rows
+    ``r0:r1``) and the returned dict holds only the key-side results.  The
+    numbers are those of the unstreamed call; only the retained memory differs
+    (a 131072-query problem keeps 136 GiB of FP64 per-query results otherwise).
     """
     device = q_latent.device
     total_q, total_k = int(q_latent.shape[0]), int(kv_latent.shape[0])
     kf, vf = k_rope.double(), kv_latent.double()
-    out = torch.empty(total_q, NUM_HEADS, D_LATENT, dtype=torch.float64, device=device)
-    out_emu = torch.empty_like(out)
-    lse = torch.empty(total_q, NUM_HEADS, dtype=torch.float64, device=device)
     want_grad = dout is not None
-    dql = torch.empty_like(out) if want_grad else None
-    dqr = (
-        torch.empty(total_q, NUM_HEADS, D_ROPE, dtype=torch.float64, device=device)
-        if want_grad
-        else None
-    )
+    stream = consume is not None
+    out = out_emu = lse = dql = dqr = dql_emu = dqr_emu = None
+    if not stream:
+        out = torch.empty(
+            total_q, NUM_HEADS, D_LATENT, dtype=torch.float64, device=device
+        )
+        out_emu = torch.empty_like(out)
+        lse = torch.empty(total_q, NUM_HEADS, dtype=torch.float64, device=device)
+        dql = torch.empty_like(out) if want_grad else None
+        dqr = (
+            torch.empty(total_q, NUM_HEADS, D_ROPE, dtype=torch.float64, device=device)
+            if want_grad
+            else None
+        )
     dkvl = (
         torch.zeros(total_k, D_LATENT, dtype=torch.float64, device=device)
         if want_grad
@@ -248,8 +299,9 @@ def reference_fp64(
     )
     # BF16-P/dS numerics floor of the backward: P and dS rounded to BF16 where a kernel feeds them to
     # its MMAs, FP32-exact accumulation, BF16 outputs (dQ directly, dKV/dKr after the FP32 sum).
-    dql_emu = torch.empty_like(dql) if want_grad else None
-    dqr_emu = torch.empty_like(dqr) if want_grad else None
+    if not stream:
+        dql_emu = torch.empty_like(dql) if want_grad else None
+        dqr_emu = torch.empty_like(dqr) if want_grad else None
     dkvl_emu = torch.zeros_like(dkvl) if want_grad else None
     dkr_emu = torch.zeros_like(dkr) if want_grad else None
     self_w = torch.zeros((), dtype=torch.float64, device=device)
@@ -268,18 +320,23 @@ def reference_fp64(
         l = torch.logsumexp(s, dim=-1)
         p = torch.exp(s - l[..., None]).nan_to_num(0.0)
         o = torch.einsum("thw,twd->thd", p, vg)
-        out[r0:r1], lse[r0:r1] = o, l
+        if not stream:
+            out[r0:r1], lse[r0:r1] = o, l
         m = s.amax(dim=-1, keepdim=True)
         m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
         p_rel = torch.exp(s - m).nan_to_num(0.0)
         num = torch.einsum("thw,twd->thd", p_rel.to(torch.bfloat16).double(), vg)
-        out_emu[r0:r1] = (
+        o_emu = (
             (num / p_rel.sum(-1, keepdim=True))
             .nan_to_num(0.0)
             .to(torch.bfloat16)
             .double()
         )
-        del p_rel, num
+        if stream:
+            chunk = dict(out=o, lse=l, out_emu=o_emu)
+        else:
+            out_emu[r0:r1] = o_emu
+        del p_rel, num, o_emu
         if own_key is not None:
             is_own = (ix == own_key[r0:r1, None]) & valid
             self_w += (p * is_own[:, None, :]).sum()
@@ -287,8 +344,13 @@ def reference_fp64(
             g = dout[r0:r1].double()
             dp = torch.einsum("thd,twd->thw", g, vg)
             ds = p * (dp - (g * o).sum(-1, keepdim=True)) * softmax_scale
-            dqr[r0:r1] = torch.einsum("thw,twd->thd", ds, kg)
-            dql[r0:r1] = torch.einsum("thw,twd->thd", ds, vg)
+            dqr_c = torch.einsum("thw,twd->thd", ds, kg)
+            dql_c = torch.einsum("thw,twd->thd", ds, vg)
+            if stream:
+                chunk.update(dq_rope=dqr_c, dq_latent=dql_c)
+            else:
+                dqr[r0:r1], dql[r0:r1] = dqr_c, dql_c
+            del dqr_c, dql_c
             dkr.index_add_(0, ix[valid], torch.einsum("thw,thd->twd", ds, qr)[valid])
             dvl = torch.einsum("thw,thd->twd", ds, ql) + torch.einsum(
                 "thw,thd->twd", p, g
@@ -296,12 +358,17 @@ def reference_fp64(
             dkvl.index_add_(0, ix[valid], dvl[valid])
             p_b = p.to(torch.bfloat16).double()
             ds_b = ds.to(torch.bfloat16).double()
-            dqr_emu[r0:r1] = (
+            dqr_emu_c = (
                 torch.einsum("thw,twd->thd", ds_b, kg).to(torch.bfloat16).double()
             )
-            dql_emu[r0:r1] = (
+            dql_emu_c = (
                 torch.einsum("thw,twd->thd", ds_b, vg).to(torch.bfloat16).double()
             )
+            if stream:
+                chunk.update(dq_rope_emu=dqr_emu_c, dq_latent_emu=dql_emu_c)
+            else:
+                dqr_emu[r0:r1], dql_emu[r0:r1] = dqr_emu_c, dql_emu_c
+            del dqr_emu_c, dql_emu_c
             dkr_emu.index_add_(
                 0, ix[valid], torch.einsum("thw,thd->twd", ds_b, qr)[valid]
             )
@@ -314,15 +381,21 @@ def reference_fp64(
                 )[valid],
             )
             del p_b, ds_b
-    result = dict(out=out, lse=lse, out_emu=out_emu)
+        if stream:
+            consume(r0, r1, chunk)
+            del chunk
+    result = {} if stream else dict(out=out, lse=lse, out_emu=out_emu)
     if want_grad:
+        if not stream:
+            result.update(
+                dq_latent=dql,
+                dq_rope=dqr,
+                dq_latent_emu=dql_emu,
+                dq_rope_emu=dqr_emu,
+            )
         result.update(
-            dq_latent=dql,
-            dq_rope=dqr,
             dkv_latent=dkvl,
             dk_rope=dkr,
-            dq_latent_emu=dql_emu,
-            dq_rope_emu=dqr_emu,
             dkv_latent_emu=dkvl_emu.to(torch.bfloat16).double(),
             dk_rope_emu=dkr_emu.to(torch.bfloat16).double(),
         )

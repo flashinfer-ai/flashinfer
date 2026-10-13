@@ -2,22 +2,28 @@
 
 The active generic kernel is the `1667b47a` upstream export; see
 [VENDOR.md](VENDOR.md) for the full pin and [SKILL.md](SKILL.md) for refreshes.
-The export also includes GenPhase, but the FlashInfer backend/benchmark does not
-yet select it. SiTU and compressed-combine variants remain separate integration
-work. Historical `92dd334` knob profiles are candidate settings for this newer
+Select GenPhase with `kernel_variant="genphase"` on a backend config or
+`--kernel-variant genphase` in the offline tuner. The generic inference kernel
+also supports `combine_dtype="nvfp4"` and `combine_dtype="mxfp8"`.
+Historical `92dd334` knob profiles are candidate settings for this newer
 kernel, not new measurements; tuning caches from that drop are invalidated.
 
 Qualify correctness first using the [Rubin runbook](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
-All three formats (NVFP4, MXFP8 E4M3, MXFP8 E5M2) require native SM107 and
+NVFP4, MXFP8 E4M3/E5M2, and MXFP4/MXFP8 require native SM107 and
 a compatible CuTe DSL build. Export `CUTE_DSL_ARCH=sm_107a` before Python
 starts. Record the compiler stack and absolute latency with each result.
 
 Single-GPU and EP4 correctness passed at FlashInfer `5bd5aeef`: 50 single-GPU
 cases and 16 EP4 cases per rank.
 
+Use `--dtype mxfp4_mxfp8 --arch sm107` for mixed-format offline tuning, or
+`--quant-kind mxfp4_mxfp8` in the benchmark below. The mixed format shares
+MXFP8 activation staging and uses packed E2M1 weights with block-32 E8M0
+scales. Its tuning cache entries are separate from the MXFP8-weight entries.
+
 ## What the benchmark measures
 
-`benchmarks/bench_moe_ep_sm107_block_scaled_mega.py` reports:
+`benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py` reports:
 
 - `--mode kernel`: a launch over already staged inputs, including the
   required output/reset operations and dispatch, both GEMMs, and combine.
@@ -139,8 +145,9 @@ Use `compute` / eager with per-iteration L2 flushing, 20 warmups / 50 samples,
 three independent process repetitions, and rank-zero median for the historical
 comparison. Kernel/forward characterization uses eager/graph without flushing;
 EP2/8 are scaling experiments, not matches to the historical EP4 table.
-DeepGEMM is excluded from this campaign. Quantized NVFP4/MXFP8 combine paths
-exist in vendored source but their FlashInfer integration is deferred.
+DeepGEMM is excluded from this campaign. The benchmark CLI exposes BF16 combine
+and in-kernel reduction. Select GenPhase and quantized combine through the
+backend API or offline tuner.
 
 Example primary-series invocation (repeat for each geometry, variant and token
 count above, starting a fresh process for each point):
@@ -151,7 +158,7 @@ export CUTE_DSL_ARCH=sm_107a
 mkdir -p "$FI_RESULTS"
 for fi_variant in bf16 ikr; do
   for fi_repeat in 1 2 3; do
-    torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
+    torchrun --standalone --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py \
       --hidden 7168 --intermediate 2048 --num-experts 256 --topk 8 \
       --quant-kind nvfp4 --routing gaussian --input-profile blackwell \
       --tokens 8 --capacity 64 --variant "$fi_variant" --knobs heuristic \
@@ -213,8 +220,18 @@ MAX across ranks before taking the median. Only a candidate passing the
 numerical checks can enter the cache. Runtime failures stop the job;
 relaunch in fresh workers instead of continuing on a failed CUDA context.
 
+Select SiTU with `--activation situ --situ-beta <value>
+--situ-linear-beta <value>`. Both beta parameters must be positive and finite;
+SiTU cannot be combined with `--gate-up-clamp`.
+For NVFP4, `--input-norm-const`, `--fc1-alpha`, `--fc2-alpha`, and
+`--fc1-norm-const` set positive, finite scalars for the generated tuning inputs.
+Each expert uses the same CLI value. These values are passed to the numerical
+reference and every candidate. The layer API also accepts distinct values per
+local expert; see the [normalization contract](../../../../../docs/design_docs/moe_ep_sm107_qualification.md#nvfp4-normalization).
+
 The cache distinguishes the SM107 implementation revision, geometry,
-quantization, early/late routing weights, and nondeterminism permission.
+quantization, kernel variant, combine format, activation and beta parameters,
+gate/up clamp, early/late routing weights, and nondeterminism permission.
 Legacy entries from the original PR are ignored. In-kernel reduction is
 excluded by default; `--allow-nondeterministic` opts it into tuning.
 Engine-side cache lookup requires `in_kernel_fc2_reduce=True` to permit
@@ -222,3 +239,37 @@ such an entry, and early routing weights are mandatory for that mode.
 Record accuracy and replay variability for any selected nondeterministic
 configuration. Retune after changing the kernel, compiler, device
 partition, topology, or relevant runtime configuration.
+
+## GenPhase selection
+
+Set `kernel_variant="genphase"`, `cluster_shape_mn=(4, 1)`, and
+`fc2_use_bulk=True` on a Rubin backend config. GenPhase accepts at most 1024
+tokens per rank and uses BF16 combine. It supports separate reduction with
+either routing-weight position; in-kernel reduction requires early weights.
+Mixed clusters and token-back tuning do not apply to this composition.
+Tile K must be 256 for NVFP4 activations or 128 for MXFP8 activations so that
+each gathered row occupies one 128-byte swizzle atom.
+
+Use `--kernel-variant genphase` with the offline tuner. Its candidates and
+cache entries are separate from the generic inference kernel. A cache miss
+uses the fixed GenPhase cluster and bulk-store settings.
+
+## Quantized combine selection
+
+Set `combine_dtype="nvfp4"` or `combine_dtype="mxfp8"` on a Rubin backend
+config, or pass `--combine-dtype nvfp4` or `--combine-dtype mxfp8` to the SM107
+offline tuner. This compresses each
+expert's FC2 return payload before top-k reduction. It does not change weight
+or activation precision, and the final output remains BF16.
+
+NVFP4 combine uses packed E2M1 values with a BF16 amax per 16 elements.
+MXFP8 combine uses E4M3 values with an E8M0 scale per 32 elements. Both
+require `kernel_variant="inference"` and `in_kernel_fc2_reduce=False`. Each format has
+separate workspace and tuning-cache entries. Numerical checks include the
+return quantization before applying late routing weights and reducing experts.
+
+The peer-facing bulk store does not support FP4 payloads. With
+`token_back_mode="epi_warps"`, use `fc2_use_bulk=False`. Bulk stores are legal
+when `standalone_warps` or `reuse_dispatch_warps` returns the data from a local
+buffer. The NVFP4 combine cache fallback keeps epilogue warps and disables bulk
+stores. MXFP8 combine supports the peer-facing bulk store.

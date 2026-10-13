@@ -14,25 +14,32 @@ from ..api_logging import experimental_auto_backends_allowed
 @dataclass(frozen=True)
 class AutoCandidateSpec:
     support_module: str
+    experimental: bool = True
 
 
 _AUTO_CANDIDATES = {
     "cudnn_frost_bf16": AutoCandidateSpec(
-        "flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16.support",
+        "flashinfer.fused_moe.backends.cudnn_frost.bf16.support",
+        experimental=False,
     ),
     "cudnn_frost_mxfp8": AutoCandidateSpec(
-        "flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8.support",
+        "flashinfer.fused_moe.backends.cudnn_frost.mxfp8.support",
+        experimental=False,
     ),
     "cudnn_frost_nvfp4": AutoCandidateSpec(
-        "flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4.support",
+        "flashinfer.fused_moe.backends.cudnn_frost.nvfp4.support",
+        experimental=False,
     ),
     "cudnn_frost_mxfp8_mxfp4": AutoCandidateSpec(
-        "flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8_mxfp4.support",
+        "flashinfer.fused_moe.backends.cudnn_frost.mxfp8_mxfp4.support",
+        experimental=False,
     ),
 }
 
 
-def additional_candidates(config, device, arch, act, weights, *, tuning, cache):
+def additional_candidates(
+    config, device, arch, act, weights, *, tuning, cache, exclude=()
+):
     """Return eligible runners, preserving layer-owned resources across captures.
 
     The support-module contract is ``is_eligible(config, act, arch)`` followed by
@@ -41,10 +48,12 @@ def additional_candidates(config, device, arch, act, weights, *, tuning, cache):
     a registration or its gate excludes its cached runner without destroying
     resources still referenced by captured graphs.
     """
-    if not experimental_auto_backends_allowed():
-        return []
     candidates = []
     for key, spec in _AUTO_CANDIDATES.items():
+        if key in exclude or (
+            spec.experimental and not experimental_auto_backends_allowed()
+        ):
+            continue
         if not tuning and key not in cache:
             continue
         support = import_module(spec.support_module)
@@ -63,3 +72,9 @@ def additional_candidates(config, device, arch, act, weights, *, tuning, cache):
         if runner.accepts(act, weights):
             candidates.append(runner)
     return candidates
+
+
+def is_experimental_candidate(key):
+    """Whether an additional candidate still requires experimental opt-in."""
+    spec = _AUTO_CANDIDATES.get(key)
+    return spec is not None and spec.experimental

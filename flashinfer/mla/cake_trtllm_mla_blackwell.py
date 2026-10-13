@@ -14,1224 +14,852 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+# Generated Blackwell MLA decode backend (``backend="cake"`` of
+# ``trtllm_batch_decode_with_kv_cache_mla``): dispatcher + JIT loader.
+#
+# ``MODULES`` / ``FAMILIES`` / ``ROUTES`` are written by the Cake generated-program
+# exporter.  One generated device source per physical schedule serves every listed
+# architecture; one compiled family binding per (domain, architecture) selects the
+# kernel and launches it.  Route selection uses dtype, shapes, strides and cached
+# device facts; the request KV lengths are read once per input identity only for
+# the host-known geometries whose production route keys on them
+# (``exact_route_candidate``).  Per-row metadata (row -> request, causal KV
+# length, page rows, work order) is computed on the device with tensor ops.
+
 from __future__ import annotations
 
 import functools
-import hashlib
-import json
 import math
-import os
-import re
-import shutil
-import subprocess
 import threading
 from collections import OrderedDict
-from collections.abc import Mapping
-from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Literal, Optional, Union
+from pathlib import Path
+from typing import Any, Literal, Optional, Union
 
 import torch
-from filelock import FileLock
-from tvm_ffi import cpp
 
 from ..jit import env as jit_env
-from ..jit.core import logger
-from ..jit.cpp_ext import is_cuda_version_at_least
-from ..utils import get_compute_capability, get_device_sm_count, log2e
+from ..jit.core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from ..utils import log2e
 
-# --- Source-built domain loader (formerly flashinfer/jit/cake_trtllm_mla_blackwell.py) ---
-
-_TARGETS = {
-    "sm_100a_148": ("sm_100a", 148),
-    "sm_100a_152": ("sm_100a", 152),
-    "sm_103a_148": ("sm_103a", 148),
-    "sm_103a_152": ("sm_103a", 152),
+MODULES: dict[str, dict[str, Any]] = {
+    "cake_trtllm_mla_blackwell_03b4acdad2f17d77e6a8": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_03b4acdad2f17d77e6a8_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a"],
+    },
+    "cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_5a25f65a14bfec7b2b1e": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_5a25f65a14bfec7b2b1e_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_6a2644cd7c80243f7cc3": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_6a2644cd7c80243f7cc3_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_6ba043a3192bee6bfe95": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_6ba043a3192bee6bfe95_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_71fdced8e63ff5ad0ba4": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_71fdced8e63ff5ad0ba4_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_74250d91903d28576cba": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_74250d91903d28576cba_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a"],
+    },
+    "cake_trtllm_mla_blackwell_79e49e216298d59fce33": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_79e49e216298d59fce33_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_88179fe5ff3ecd4952de": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_88179fe5ff3ecd4952de_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_c343762a5d3d9f326db2": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_c343762a5d3d9f326db2_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a"],
+    },
+    "cake_trtllm_mla_blackwell_d1a68c90cbc4aa0fcd6e": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_d1a68c90cbc4aa0fcd6e_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_d396fd37061fb32d5197": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_d396fd37061fb32d5197_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_d6056fe83ccbe21f79b3": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_d6056fe83ccbe21f79b3_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_d7731e89cd4b1ecceeb0": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_d7731e89cd4b1ecceeb0_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a"],
+    },
+    "cake_trtllm_mla_blackwell_db015a53334184a3005e": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_db015a53334184a3005e_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_f2fc000e792120064e14": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_f2fc000e792120064e14_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_103a"],
+    },
 }
-_TARGET_ORDER = tuple(_TARGETS)
-_ARCH_CAPABILITIES = {"sm_100a": (10, 0), "sm_103a": (10, 3)}
-_SOURCE_CATALOG_RELATIVE_PATH = Path("generated") / "cake_source_catalog.json"
-_DOMAIN_DEVICE_COUNTS = {
-    "mla_bf16_vquarter": 1,
-    "mla_bf16_vhalf": 1,
-    "mla_bf16_unsplit": 1,
-    "mla_bf16_clc": 8,
-    "mla_bf16_tail": 1,
-    "mla_fp8_tail": 1,
-    "mla_fp8_p32_qk_l2": 1,
-    "mla_fp8_page64_pdl": 2,
-    "mla_bf16_native_split8_pdl": 2,
+FAMILIES: dict[str, dict[str, Any]] = {
+    "cake_trtllm_mla_blackwell_family_3542f15da2f1ae0fc00c": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_103a/cake_trtllm_mla_blackwell_family_3542f15da2f1ae0fc00c_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_6a2644cd7c80243f7cc3"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "q_rows"],
+            ["buffer", "kv_pages"],
+            ["buffer", "output"],
+            ["buffer", "seq_lens"],
+            ["buffer", "page_table"],
+            ["buffer", "sinks"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "total_work_items"],
+            ["parameter", "value_split_count"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "enable_sink"],
+            ["parameter", "grid_x"],
+            ["parameter", "grid_z"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_vhalf",
+    },
+    "cake_trtllm_mla_blackwell_family_35a4a08ccde422e44143": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_103a/cake_trtllm_mla_blackwell_family_35a4a08ccde422e44143_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_f2fc000e792120064e14"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "q_rows"],
+            ["buffer", "kv_pages"],
+            ["buffer", "output"],
+            ["buffer", "seq_lens"],
+            ["buffer", "page_table"],
+            ["buffer", "sinks"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "total_work_items"],
+            ["parameter", "value_split_count"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "enable_sink"],
+            ["parameter", "grid_x"],
+            ["parameter", "grid_z"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_clc_exact007790",
+    },
+    "cake_trtllm_mla_blackwell_family_3fa9fe12db6254809466": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_103a/cake_trtllm_mla_blackwell_family_3fa9fe12db6254809466_binding.cu",
+        "dependencies": [
+            "cake_trtllm_mla_blackwell_db015a53334184a3005e",
+            "cake_trtllm_mla_blackwell_d1a68c90cbc4aa0fcd6e",
+        ],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "q_rows"],
+            ["buffer", "kv_half_pages"],
+            ["buffer", "output"],
+            ["buffer", "seq_lens"],
+            ["buffer", "page_table"],
+            ["buffer", "sinks"],
+            ["workspace", "partial_output"],
+            ["workspace", "partial_lse"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "partial_bmm2_scale"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "num_split"],
+            ["parameter", "total_work_items"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "enable_sink"],
+            ["parameter", "grid_x"],
+            ["parameter", "num_rows"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_native_split8_pdl",
+    },
+    "cake_trtllm_mla_blackwell_family_58aaa55b459e12fb35b8": {
+        "arch": "sm_100a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_58aaa55b459e12fb35b8_binding.cu",
+        "dependencies": [
+            "cake_trtllm_mla_blackwell_db015a53334184a3005e",
+            "cake_trtllm_mla_blackwell_d1a68c90cbc4aa0fcd6e",
+        ],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "q_rows"],
+            ["buffer", "kv_half_pages"],
+            ["buffer", "output"],
+            ["buffer", "seq_lens"],
+            ["buffer", "page_table"],
+            ["buffer", "sinks"],
+            ["workspace", "partial_output"],
+            ["workspace", "partial_lse"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "partial_bmm2_scale"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "num_split"],
+            ["parameter", "total_work_items"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "enable_sink"],
+            ["parameter", "grid_x"],
+            ["parameter", "num_rows"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_native_split8_pdl",
+    },
+    "cake_trtllm_mla_blackwell_family_5a587bd20f8138cb26c9": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_103a/cake_trtllm_mla_blackwell_family_5a587bd20f8138cb26c9_binding.cu",
+        "dependencies": [
+            "cake_trtllm_mla_blackwell_88179fe5ff3ecd4952de",
+            "cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29",
+        ],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "query"],
+            ["buffer", "kv"],
+            ["buffer", "output"],
+            ["buffer", "lse"],
+            ["buffer", "seq_lens"],
+            ["buffer", "work_batch_indices"],
+            ["buffer", "page_table"],
+            ["workspace", "partial_output"],
+            ["workspace", "partial_stats"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "num_split"],
+            ["parameter", "num_queries"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "num_reduce_ctas"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_fp8_page64_pdl",
+    },
+    "cake_trtllm_mla_blackwell_family_5b3d4b45f82fac17edbd": {
+        "arch": "sm_100a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_5b3d4b45f82fac17edbd_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_5a25f65a14bfec7b2b1e"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "q_rows"],
+            ["buffer", "kv_pages"],
+            ["buffer", "output"],
+            ["buffer", "seq_lens"],
+            ["buffer", "page_table"],
+            ["buffer", "sinks"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "total_work_items"],
+            ["parameter", "value_split_count"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "enable_sink"],
+            ["parameter", "grid_x"],
+            ["parameter", "grid_z"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_vquarter",
+    },
+    "cake_trtllm_mla_blackwell_family_69765950411de111b0b4": {
+        "arch": "sm_100a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_69765950411de111b0b4_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_6ba043a3192bee6bfe95"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "query"],
+            ["buffer", "kv"],
+            ["buffer", "fp8_lut"],
+            ["buffer", "page_table"],
+            ["buffer", "sparse_indices"],
+            ["buffer", "row_batches"],
+            ["buffer", "row_seq_lens"],
+            ["buffer", "output"],
+            ["buffer", "lse"],
+            ["buffer", "sinks"],
+            ["parameter", "num_heads"],
+            ["parameter", "qk_dim"],
+            ["parameter", "value_dim"],
+            ["parameter", "kv_stride"],
+            ["parameter", "page_size"],
+            ["parameter", "page_table_width"],
+            ["parameter", "sparse_width"],
+            ["parameter", "use_sparse"],
+            ["parameter", "softmax_scale"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "enable_sink"],
+            ["parameter", "write_lse"],
+            ["parameter", "num_rows"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_tail",
+    },
+    "cake_trtllm_mla_blackwell_family_6e7d2a25e57e51cfa70f": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_103a/cake_trtllm_mla_blackwell_family_6e7d2a25e57e51cfa70f_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_6ba043a3192bee6bfe95"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "query"],
+            ["buffer", "kv"],
+            ["buffer", "fp8_lut"],
+            ["buffer", "page_table"],
+            ["buffer", "sparse_indices"],
+            ["buffer", "row_batches"],
+            ["buffer", "row_seq_lens"],
+            ["buffer", "output"],
+            ["buffer", "lse"],
+            ["buffer", "sinks"],
+            ["parameter", "num_heads"],
+            ["parameter", "qk_dim"],
+            ["parameter", "value_dim"],
+            ["parameter", "kv_stride"],
+            ["parameter", "page_size"],
+            ["parameter", "page_table_width"],
+            ["parameter", "sparse_width"],
+            ["parameter", "use_sparse"],
+            ["parameter", "softmax_scale"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "enable_sink"],
+            ["parameter", "write_lse"],
+            ["parameter", "num_rows"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_tail",
+    },
+    "cake_trtllm_mla_blackwell_family_73c2aeebeee855cabb5c": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_103a/cake_trtllm_mla_blackwell_family_73c2aeebeee855cabb5c_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_5a25f65a14bfec7b2b1e"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "q_rows"],
+            ["buffer", "kv_pages"],
+            ["buffer", "output"],
+            ["buffer", "seq_lens"],
+            ["buffer", "page_table"],
+            ["buffer", "sinks"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "total_work_items"],
+            ["parameter", "value_split_count"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "enable_sink"],
+            ["parameter", "grid_x"],
+            ["parameter", "grid_z"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_vquarter",
+    },
+    "cake_trtllm_mla_blackwell_family_964aa840394fcd0656c0": {
+        "arch": "sm_100a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_964aa840394fcd0656c0_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_6a2644cd7c80243f7cc3"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "q_rows"],
+            ["buffer", "kv_pages"],
+            ["buffer", "output"],
+            ["buffer", "seq_lens"],
+            ["buffer", "page_table"],
+            ["buffer", "sinks"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "total_work_items"],
+            ["parameter", "value_split_count"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "enable_sink"],
+            ["parameter", "grid_x"],
+            ["parameter", "grid_z"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_vhalf",
+    },
+    "cake_trtllm_mla_blackwell_family_9eb0e53aa4b05afa531b": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_103a/cake_trtllm_mla_blackwell_family_9eb0e53aa4b05afa531b_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_d396fd37061fb32d5197"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "q_rows"],
+            ["buffer", "kv_pages"],
+            ["buffer", "output"],
+            ["buffer", "seq_lens"],
+            ["buffer", "page_table"],
+            ["buffer", "sinks"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "total_work_items"],
+            ["parameter", "value_split_count"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "enable_sink"],
+            ["parameter", "grid_x"],
+            ["parameter", "grid_z"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_clc_exact007826",
+    },
+    "cake_trtllm_mla_blackwell_family_a77fd5c07db49c791e35": {
+        "arch": "sm_100a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_a77fd5c07db49c791e35_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_c343762a5d3d9f326db2"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "q_rows"],
+            ["buffer", "kv_pages"],
+            ["buffer", "output"],
+            ["buffer", "seq_lens"],
+            ["buffer", "page_table"],
+            ["buffer", "sinks"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "total_work_items"],
+            ["parameter", "value_split_count"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "enable_sink"],
+            ["parameter", "grid_x"],
+            ["parameter", "grid_z"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_clc_exact007826",
+    },
+    "cake_trtllm_mla_blackwell_family_c325c9f98ac456facec0": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_103a/cake_trtllm_mla_blackwell_family_c325c9f98ac456facec0_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_d6056fe83ccbe21f79b3"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "query"],
+            ["buffer", "kv"],
+            ["buffer", "fp8_lut"],
+            ["buffer", "page_table"],
+            ["buffer", "sparse_indices"],
+            ["buffer", "row_batches"],
+            ["buffer", "row_seq_lens"],
+            ["buffer", "output"],
+            ["buffer", "lse"],
+            ["buffer", "sinks"],
+            ["parameter", "num_heads"],
+            ["parameter", "qk_dim"],
+            ["parameter", "value_dim"],
+            ["parameter", "kv_stride"],
+            ["parameter", "page_size"],
+            ["parameter", "page_table_width"],
+            ["parameter", "sparse_width"],
+            ["parameter", "use_sparse"],
+            ["parameter", "softmax_scale"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "enable_sink"],
+            ["parameter", "write_lse"],
+            ["parameter", "num_rows"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_fp8_tail",
+    },
+    "cake_trtllm_mla_blackwell_family_c461bee2a4bb9454ff11": {
+        "arch": "sm_100a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_c461bee2a4bb9454ff11_binding.cu",
+        "dependencies": [
+            "cake_trtllm_mla_blackwell_03b4acdad2f17d77e6a8",
+            "cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29",
+        ],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "query"],
+            ["buffer", "kv"],
+            ["buffer", "output"],
+            ["buffer", "lse"],
+            ["buffer", "seq_lens"],
+            ["buffer", "work_batch_indices"],
+            ["buffer", "page_table"],
+            ["workspace", "partial_output"],
+            ["workspace", "partial_stats"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "num_split"],
+            ["parameter", "num_queries"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "num_reduce_ctas"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_fp8_page64_pdl",
+    },
+    "cake_trtllm_mla_blackwell_family_cf9531ca88d55eb2813d": {
+        "arch": "sm_100a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_cf9531ca88d55eb2813d_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_79e49e216298d59fce33"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "query"],
+            ["buffer", "kv"],
+            ["buffer", "page_table"],
+            ["buffer", "seq_lens"],
+            ["buffer", "output"],
+            ["buffer", "completion"],
+            ["workspace", "partial_output"],
+            ["workspace", "partial_stats"],
+            ["parameter", "batch"],
+            ["parameter", "q_len"],
+            ["parameter", "page_table_stride"],
+            ["parameter", "max_num_ctas_q"],
+            ["parameter", "max_num_ctas_kv"],
+            ["parameter", "bmm1_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_fp8_p32_qk_l2",
+    },
+    "cake_trtllm_mla_blackwell_family_df126547928223b70b63": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_103a/cake_trtllm_mla_blackwell_family_df126547928223b70b63_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_79e49e216298d59fce33"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "query"],
+            ["buffer", "kv"],
+            ["buffer", "page_table"],
+            ["buffer", "seq_lens"],
+            ["buffer", "output"],
+            ["buffer", "completion"],
+            ["workspace", "partial_output"],
+            ["workspace", "partial_stats"],
+            ["parameter", "batch"],
+            ["parameter", "q_len"],
+            ["parameter", "page_table_stride"],
+            ["parameter", "max_num_ctas_q"],
+            ["parameter", "max_num_ctas_kv"],
+            ["parameter", "bmm1_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_fp8_p32_qk_l2",
+    },
+    "cake_trtllm_mla_blackwell_family_df17a573e48e469242d2": {
+        "arch": "sm_100a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_df17a573e48e469242d2_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_74250d91903d28576cba"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "q_rows"],
+            ["buffer", "kv_pages"],
+            ["buffer", "output"],
+            ["buffer", "seq_lens"],
+            ["buffer", "page_table"],
+            ["buffer", "sinks"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "total_work_items"],
+            ["parameter", "value_split_count"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "enable_sink"],
+            ["parameter", "grid_x"],
+            ["parameter", "grid_z"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_clc",
+    },
+    "cake_trtllm_mla_blackwell_family_e958fd69e74d907885f3": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_103a/cake_trtllm_mla_blackwell_family_e958fd69e74d907885f3_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_71fdced8e63ff5ad0ba4"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "q_rows"],
+            ["buffer", "kv_pages"],
+            ["buffer", "output"],
+            ["buffer", "seq_lens"],
+            ["buffer", "page_table"],
+            ["buffer", "sinks"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "total_work_items"],
+            ["parameter", "value_split_count"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "enable_sink"],
+            ["parameter", "grid_x"],
+            ["parameter", "grid_z"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_clc",
+    },
+    "cake_trtllm_mla_blackwell_family_f0c36de00f7e55ccf2c2": {
+        "arch": "sm_100a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_f0c36de00f7e55ccf2c2_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_d7731e89cd4b1ecceeb0"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "q_rows"],
+            ["buffer", "kv_pages"],
+            ["buffer", "output"],
+            ["buffer", "seq_lens"],
+            ["buffer", "page_table"],
+            ["buffer", "sinks"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "total_work_items"],
+            ["parameter", "value_split_count"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "enable_sink"],
+            ["parameter", "grid_x"],
+            ["parameter", "grid_z"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_bf16_clc_exact007790",
+    },
+    "cake_trtllm_mla_blackwell_family_f662abe7edbd911e086f": {
+        "arch": "sm_100a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_f662abe7edbd911e086f_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_d6056fe83ccbe21f79b3"],
+        "compile_flags": ["-std=c++17"],
+        "ffi_entry": "run",
+        "route_entry": "route_of",
+        "arg_plan": [
+            ["buffer", "query"],
+            ["buffer", "kv"],
+            ["buffer", "fp8_lut"],
+            ["buffer", "page_table"],
+            ["buffer", "sparse_indices"],
+            ["buffer", "row_batches"],
+            ["buffer", "row_seq_lens"],
+            ["buffer", "output"],
+            ["buffer", "lse"],
+            ["buffer", "sinks"],
+            ["parameter", "num_heads"],
+            ["parameter", "qk_dim"],
+            ["parameter", "value_dim"],
+            ["parameter", "kv_stride"],
+            ["parameter", "page_size"],
+            ["parameter", "page_table_width"],
+            ["parameter", "sparse_width"],
+            ["parameter", "use_sparse"],
+            ["parameter", "softmax_scale"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "enable_sink"],
+            ["parameter", "write_lse"],
+            ["parameter", "num_rows"],
+            ["stream", "cuda_stream_ptr"],
+        ],
+        "domain": "mla_fp8_tail",
+    },
 }
-_DOMAIN_ORDER = tuple(_DOMAIN_DEVICE_COUNTS)
-_EXPORTED_COMPILE_FLAGS = ["--use_fast_math"]
-_HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_C_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+ROUTES: dict[str, str] = {
+    "mla_bf16_clc__sm_100a": "cake_trtllm_mla_blackwell_family_df17a573e48e469242d2",
+    "mla_bf16_clc__sm_103a": "cake_trtllm_mla_blackwell_family_e958fd69e74d907885f3",
+    "mla_bf16_clc_exact007790__sm_100a": "cake_trtllm_mla_blackwell_family_f0c36de00f7e55ccf2c2",
+    "mla_bf16_clc_exact007790__sm_103a": "cake_trtllm_mla_blackwell_family_35a4a08ccde422e44143",
+    "mla_bf16_clc_exact007826__sm_100a": "cake_trtllm_mla_blackwell_family_a77fd5c07db49c791e35",
+    "mla_bf16_clc_exact007826__sm_103a": "cake_trtllm_mla_blackwell_family_9eb0e53aa4b05afa531b",
+    "mla_bf16_native_split8_pdl__sm_100a": "cake_trtllm_mla_blackwell_family_58aaa55b459e12fb35b8",
+    "mla_bf16_native_split8_pdl__sm_103a": "cake_trtllm_mla_blackwell_family_3fa9fe12db6254809466",
+    "mla_bf16_tail__sm_100a": "cake_trtllm_mla_blackwell_family_69765950411de111b0b4",
+    "mla_bf16_tail__sm_103a": "cake_trtllm_mla_blackwell_family_6e7d2a25e57e51cfa70f",
+    "mla_bf16_vhalf__sm_100a": "cake_trtllm_mla_blackwell_family_964aa840394fcd0656c0",
+    "mla_bf16_vhalf__sm_103a": "cake_trtllm_mla_blackwell_family_3542f15da2f1ae0fc00c",
+    "mla_bf16_vquarter__sm_100a": "cake_trtllm_mla_blackwell_family_5b3d4b45f82fac17edbd",
+    "mla_bf16_vquarter__sm_103a": "cake_trtllm_mla_blackwell_family_73c2aeebeee855cabb5c",
+    "mla_fp8_p32_qk_l2__sm_100a": "cake_trtllm_mla_blackwell_family_cf9531ca88d55eb2813d",
+    "mla_fp8_p32_qk_l2__sm_103a": "cake_trtllm_mla_blackwell_family_df126547928223b70b63",
+    "mla_fp8_page64_pdl__sm_100a": "cake_trtllm_mla_blackwell_family_c461bee2a4bb9454ff11",
+    "mla_fp8_page64_pdl__sm_103a": "cake_trtllm_mla_blackwell_family_5a587bd20f8138cb26c9",
+    "mla_fp8_tail__sm_100a": "cake_trtllm_mla_blackwell_family_f662abe7edbd911e086f",
+    "mla_fp8_tail__sm_103a": "cake_trtllm_mla_blackwell_family_c325c9f98ac456facec0",
+}
+
+_ARCH_NVCC_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
+_ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+PACKAGE_DIR = "cake_trtllm_mla_blackwell"
 
 
-def _source_dir() -> Path:
-    """Locate the generated MLA source package in installs and checkouts."""
+# --- JIT loader -------------------------------------------------------------------
 
-    packaged = jit_env.FLASHINFER_CSRC_DIR / "cake_trtllm_mla_blackwell"
+
+def _csrc_dir() -> Path:
+    packaged = jit_env.FLASHINFER_CSRC_DIR / PACKAGE_DIR
     if packaged.is_dir():
         return packaged
-    return Path(__file__).resolve().parents[2] / "csrc" / "cake_trtllm_mla_blackwell"
+    return Path(__file__).resolve().parents[2] / "csrc" / PACKAGE_DIR
 
 
-def _source_record(
-    value: object,
-    *,
-    domain: str,
-    kind: str,
-    target: str | None = None,
-    index: int | None = None,
-) -> Mapping[str, object]:
-    location_parts = [domain]
-    if target is not None:
-        location_parts.append(target)
-    location_parts.append(kind if index is None else f"{kind}[{index}]")
-    location = "/".join(location_parts)
-    expected_keys = {"path", "sha256"}
-    if kind == "device_source":
-        expected_keys.update({"module_ident", "compile_flags"})
-    if not isinstance(value, dict) or set(value) != expected_keys:
-        raise RuntimeError(
-            f"TRT-LLM MLA Blackwell catalog {location} schema is invalid"
+def _source_path(relative: str) -> Path:
+    # Registry paths are relative to the package directory.
+    path = _csrc_dir() / Path(relative).relative_to(PACKAGE_DIR)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"generated TRT-LLM MLA Blackwell source is missing: {path}"
         )
-
-    relative = value["path"]
-    sha256 = value["sha256"]
-    suffix = ".cpp" if kind == "host_source" else ".cu"
-    if not isinstance(relative, str):
-        raise RuntimeError(f"TRT-LLM MLA Blackwell catalog {location} path is invalid")
-    path = PurePosixPath(relative)
-    if (
-        not relative
-        or "\\" in relative
-        or path.is_absolute()
-        or ".." in path.parts
-        or path.as_posix() != relative
-        or path.suffix != suffix
-    ):
-        raise RuntimeError(
-            f"TRT-LLM MLA Blackwell catalog {location} path is noncanonical: {relative!r}"
-        )
-    if not isinstance(sha256, str) or _HEX_SHA256.fullmatch(sha256) is None:
-        raise RuntimeError(
-            f"TRT-LLM MLA Blackwell catalog {location} sha256 is invalid"
-        )
-
-    if kind == "device_source":
-        module_ident = value["module_ident"]
-        compile_flags = value["compile_flags"]
-        if (
-            not isinstance(module_ident, str)
-            or _C_IDENTIFIER.fullmatch(module_ident) is None
-        ):
-            raise RuntimeError(
-                f"TRT-LLM MLA Blackwell catalog {location} module identity is invalid"
-            )
-        if compile_flags != _EXPORTED_COMPILE_FLAGS:
-            raise RuntimeError(
-                f"TRT-LLM MLA Blackwell catalog {location} compile flags differ from "
-                f"the exported contract: {compile_flags!r}"
-            )
-    return value
+    return path
 
 
 @functools.cache
-def _source_catalog() -> Mapping[str, object]:
-    """Load and validate the exact physical-target generated-source catalog."""
-
-    catalog_path = _source_dir() / _SOURCE_CATALOG_RELATIVE_PATH
-    if not catalog_path.is_file():
-        raise RuntimeError(
-            f"TRT-LLM MLA Blackwell generated-source catalog is missing: {catalog_path}"
-        )
+def gen_cake_trtllm_mla_blackwell_family(name: str) -> JitSpec:
+    """JIT spec of one compiled family: its binding plus every device kernel it links."""
     try:
-        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise RuntimeError(
-            f"TRT-LLM MLA Blackwell generated-source catalog is unreadable: {catalog_path}"
-        ) from error
-    if not isinstance(catalog, dict) or set(catalog) != {
-        "schema_version",
-        "target_order",
-        "targets",
-        "domain_order",
-        "domains",
-    }:
-        raise RuntimeError(
-            "TRT-LLM MLA Blackwell generated-source catalog schema is invalid"
-        )
-    target_order = catalog["target_order"]
-    canonical_targets = [
-        target
-        for target in _TARGET_ORDER
-        if isinstance(target_order, list) and target in target_order
-    ]
-    expected_targets = {
-        target: {"arch": arch, "multi_processor_count": multi_processor_count}
-        for target, (arch, multi_processor_count) in _TARGETS.items()
-        if target in canonical_targets
-    }
-    if (
-        isinstance(catalog["schema_version"], bool)
-        or catalog["schema_version"] != 4
-        or not canonical_targets
-        or target_order != canonical_targets
-        or not isinstance(catalog["targets"], dict)
-        or list(catalog["targets"]) != target_order
-        or catalog["targets"] != expected_targets
-        or catalog["domain_order"] != list(_DOMAIN_ORDER)
-    ):
-        raise RuntimeError(
-            "TRT-LLM MLA Blackwell generated-source catalog identity is invalid"
-        )
-
-    domains = catalog["domains"]
-    if not isinstance(domains, dict) or tuple(domains) != _DOMAIN_ORDER:
-        raise RuntimeError(
-            "TRT-LLM MLA Blackwell generated-source catalog domain topology is invalid"
-        )
-    source_paths: set[str] = set()
-    # Every physical target carries its own generated host source and device
-    # identities: the schedules are traced per target, so module identities and
-    # host dispatch code are independent between targets.
-    module_idents_by_target: dict[str, set[str]] = {
-        target: set() for target in target_order
-    }
-    device_source_count = {target: 0 for target in target_order}
-    for domain, expected_device_count in _DOMAIN_DEVICE_COUNTS.items():
-        profile = domains[domain]
-        if not isinstance(profile, dict) or set(profile) != {
-            "host_sources",
-            "device_sources",
-        }:
-            raise RuntimeError(
-                f"TRT-LLM MLA Blackwell catalog domain {domain!r} schema is invalid"
-            )
-        hosts_by_target = profile["host_sources"]
-        devices_by_target = profile["device_sources"]
-        if (
-            not isinstance(hosts_by_target, dict)
-            or list(hosts_by_target) != target_order
-            or not isinstance(devices_by_target, dict)
-            or list(devices_by_target) != target_order
-        ):
-            raise RuntimeError(
-                f"TRT-LLM MLA catalog domain {domain!r} target inventory is invalid"
-            )
-        for target in target_order:
-            host = _source_record(
-                hosts_by_target[target],
-                domain=domain,
-                target=target,
-                kind="host_source",
-            )
-            host_path = str(host["path"])
-            if (
-                host_path != f"host/{target}/cake_{domain}.cpp"
-                or host_path in source_paths
-            ):
-                raise RuntimeError("TRT-LLM MLA catalog host source paths are invalid")
-            source_paths.add(host_path)
-            devices = devices_by_target[target]
-            if not isinstance(devices, list) or len(devices) != expected_device_count:
-                raise RuntimeError(
-                    f"TRT-LLM MLA catalog domain {domain!r}/{target} must contain "
-                    f"exactly {expected_device_count} device sources"
-                )
-            records = [
-                _source_record(
-                    device,
-                    domain=domain,
-                    target=target,
-                    kind="device_source",
-                    index=index,
-                )
-                for index, device in enumerate(devices)
-            ]
-            idents = tuple(str(record["module_ident"]) for record in records)
-            module_idents = module_idents_by_target[target]
-            if len(set(idents)) != len(idents) or any(
-                ident in module_idents for ident in idents
-            ):
-                raise RuntimeError(
-                    "TRT-LLM MLA catalog contains duplicate device module identities"
-                )
-            module_idents.update(idents)
-            paths = [str(record["path"]) for record in records]
-            expected_paths = [f"device/{target}/cake_{ident}.cu" for ident in idents]
-            if paths != expected_paths or any(path in source_paths for path in paths):
-                raise RuntimeError(
-                    "TRT-LLM MLA catalog device source paths are invalid"
-                )
-            source_paths.update(paths)
-            device_source_count[target] += len(records)
-    if device_source_count != {target: 18 for target in target_order} or any(
-        len(module_idents_by_target[target]) != 18 for target in target_order
-    ):
-        raise RuntimeError(
-            "TRT-LLM MLA generated-source catalog must contain exactly 18 "
-            "device sources for each supported target"
-        )
-    return catalog
-
-
-def _domain_profile(domain: str, target: str) -> Mapping[str, object]:
-    if domain not in _DOMAIN_DEVICE_COUNTS:
+        family = FAMILIES[name]
+    except KeyError as exc:
         raise ValueError(
-            f"unknown TRT-LLM MLA domain {domain!r}; expected one of "
-            f"{list(_DOMAIN_ORDER)!r}"
-        )
-    if target not in _TARGETS:
-        raise ValueError(
-            f"unsupported TRT-LLM MLA target {target!r}; expected one of "
-            f"{list(_TARGET_ORDER)!r}"
-        )
-    catalog = _source_catalog()
-    targets = catalog["targets"]
-    assert isinstance(targets, dict)
-    if target not in targets:
-        raise ValueError(
-            f"TRT-LLM MLA target {target!r} is absent from the generated-source "
-            f"catalog; available targets: {catalog['target_order']!r}"
-        )
-    domains = catalog["domains"]
-    assert isinstance(domains, dict)
-    profile = domains[domain]
-    assert isinstance(profile, dict)
-    return profile
-
-
-def _target_key(device: torch.device | int | str | None = None) -> str:
-    capability = torch.cuda.get_device_capability(device)
-    multi_processor_count = torch.cuda.get_device_properties(
-        device
-    ).multi_processor_count
-    for target, (arch, expected_multi_processor_count) in _TARGETS.items():
-        if (
-            capability == _ARCH_CAPABILITIES[arch]
-            and multi_processor_count == expected_multi_processor_count
-        ):
-            return target
-    raise ValueError(
-        "TRT-LLM MLA requires one of the exact targets "
-        f"{list(_TARGET_ORDER)!r}, got compute capability "
-        f"{capability[0]}.{capability[1]} with {multi_processor_count} SMs"
+            f"TRT-LLM MLA Blackwell has no generated family {name!r}"
+        ) from exc
+    arch = family["arch"]
+    sources = [_source_path(family["binding"])]
+    flags: list[str] = [*_ARCH_NVCC_FLAGS[arch], *family["compile_flags"]]
+    for dependency in family["dependencies"]:
+        module = MODULES[dependency]
+        sources.append(_source_path(module["device"]))
+        for flag in module["compile_flags"]:
+            if flag not in flags:
+                flags.append(flag)
+    csrc_dir = _csrc_dir()
+    return gen_jit_spec(
+        name=f"cake_trtllm_mla_blackwell_{name}",
+        sources=sources,
+        extra_cuda_cflags=flags,
+        # The generated contract owns the fast-math decision.
+        use_fast_math=False,
+        extra_include_paths=[csrc_dir, csrc_dir.parent],
+        extra_ldflags=["-lcuda"],
     )
 
 
-def _sealed_source_bytes(
-    source_dir: Path,
-    record: Mapping[str, object],
-) -> tuple[Path, bytes]:
-    relative = record["path"]
-    expected_sha256 = record["sha256"]
-    assert isinstance(relative, str)
-    assert isinstance(expected_sha256, str)
-    generated_root = (source_dir / "generated").resolve()
-    path = (generated_root / relative).resolve()
-    if generated_root not in path.parents:
-        raise RuntimeError(
-            f"TRT-LLM MLA Blackwell generated source path escapes its package: {path}"
-        )
-    if not path.is_file():
-        raise RuntimeError(f"TRT-LLM MLA Blackwell generated source is missing: {path}")
-    payload = path.read_bytes()
-    actual_sha256 = hashlib.sha256(payload).hexdigest()
-    if actual_sha256 != expected_sha256:
-        raise RuntimeError(
-            "TRT-LLM MLA Blackwell generated source identity drift: "
-            f"{path} has sha256={actual_sha256}, expected {expected_sha256}"
-        )
-    return path, payload
+@functools.cache
+def get_cake_trtllm_mla_blackwell_family(name: str):
+    return gen_cake_trtllm_mla_blackwell_family(name).build_and_load()
 
 
-def _nvcc() -> Path:
-    candidate = shutil.which("nvcc")
-    if candidate is None:
-        cuda_root = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-        if cuda_root:
-            path = Path(cuda_root) / "bin" / "nvcc"
-            if path.is_file():
-                candidate = str(path)
-    if candidate is None:
-        raise RuntimeError(
-            "nvcc is required to build the TRT-LLM MLA Blackwell backend"
-        )
-    return Path(candidate).resolve()
-
-
-def _digest_field(digest, value: bytes) -> None:
-    digest.update(len(value).to_bytes(8, "big"))
-    digest.update(value)
+def route_key(domain: str, arch: str) -> str:
+    return f"{domain}__{arch}"
 
 
 @functools.cache
-def _load_domain_module(domain: str, target: str):
-    """Compile and load one catalog-bound domain for an exact physical target."""
-
-    profile = _domain_profile(domain, target)
-    arch, multi_processor_count = _TARGETS[target]
-    source_dir = _source_dir()
-    hosts_by_target = profile["host_sources"]
-    devices_by_target = profile["device_sources"]
-    assert isinstance(hosts_by_target, dict)
-    assert isinstance(devices_by_target, dict)
-    host = hosts_by_target[target]
-    devices = devices_by_target[target]
-    assert isinstance(host, dict)
-    assert isinstance(devices, list)
-    _, host_payload = _sealed_source_bytes(source_dir, host)
-    nvcc = _nvcc()
-
-    digest = hashlib.sha256()
-    for value in (
-        domain.encode(),
-        target.encode(),
-        arch.encode(),
-        str(multi_processor_count).encode(),
-        str(nvcc).encode(),
-        host_payload,
-    ):
-        _digest_field(digest, value)
-    resolved_devices: list[tuple[str, Path, tuple[str, ...]]] = []
-    for device in devices:
-        assert isinstance(device, dict)
-        module_ident = device["module_ident"]
-        compile_flags = device["compile_flags"]
-        assert isinstance(module_ident, str)
-        assert isinstance(compile_flags, list)
-        device_path, device_payload = _sealed_source_bytes(source_dir, device)
-        flags = tuple(compile_flags)
-        for value in (
-            module_ident.encode(),
-            device_payload,
-            "\0".join(flags).encode(),
-        ):
-            _digest_field(digest, value)
-        resolved_devices.append((module_ident, device_path, flags))
-
-    module_name = f"trtllm_mla_{domain}_{target}_{digest.hexdigest()[:16]}"
-    build_dir = jit_env.FLASHINFER_JIT_DIR / module_name
-    build_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = build_dir / f"{module_name}.lock"
-    with FileLock(lock_path, thread_local=False):
-        cubins: dict[str, bytes] = {}
-        for module_ident, device_path, compile_flags in resolved_devices:
-            cubin_path = build_dir / f"{module_ident}.cubin"
-            if not cubin_path.is_file():
-                temporary = build_dir / f"{module_ident}.{os.getpid()}.tmp.cubin"
-                command = [
-                    str(nvcc),
-                    "-cubin",
-                    f"-arch={arch}",
-                    "--std=c++17",
-                    "-O3",
-                    "-I",
-                    str(nvcc.parent.parent / "include"),
-                    *compile_flags,
-                    str(device_path),
-                    "-o",
-                    str(temporary),
-                ]
-                process = subprocess.run(command, text=True, capture_output=True)
-                if process.returncode != 0:
-                    temporary.unlink(missing_ok=True)
-                    raise RuntimeError(
-                        f"TRT-LLM MLA Blackwell nvcc failed for {domain}/"
-                        f"{module_ident} ({target}, {arch}):\n{process.stderr}"
-                    )
-                os.replace(temporary, cubin_path)
-            cubins[module_ident] = cubin_path.read_bytes()
-
-        module = cpp.load_inline(
-            module_name,
-            cpp_sources=host_payload.decode("utf-8"),
-            embed_cubin=cubins,
-            extra_include_paths=[str(nvcc.parent.parent / "include")],
-            extra_cflags=["-O3"],
-            extra_ldflags=["-lcuda"],
-            build_directory=str(build_dir),
-        )
-    logger.info("Loaded TRT-LLM MLA domain %s for target %s (%s)", domain, target, arch)
-    return module
-
-
-def get_domain_module(domain: str, device: torch.device | int | str | None = None):
-    """Return the cached source-built module for one exact public domain."""
-
-    if domain not in _DOMAIN_DEVICE_COUNTS:
+def family_for(domain: str, arch: str) -> str:
+    try:
+        return ROUTES[route_key(domain, arch)]
+    except KeyError as exc:
         raise ValueError(
-            f"unknown TRT-LLM MLA domain {domain!r}; expected one of "
-            f"{list(_DOMAIN_ORDER)!r}"
+            f"TRT-LLM MLA Blackwell has no generated family for domain {domain!r} on {arch}"
+        ) from exc
+
+
+# --- Device facts (cached once per device index) ------------------------------------
+
+
+@functools.cache
+def _device_facts(index: int) -> tuple[str, int]:
+    capability = tuple(torch.cuda.get_device_capability(index))
+    arch = _ARCH_BY_CAPABILITY.get(capability)
+    if arch is None:
+        raise RuntimeError(
+            "TRT-LLM MLA Blackwell requires compute capability 10.0 or 10.3, "
+            f"got {capability[0]}.{capability[1]}"
         )
-    return _load_domain_module(domain, _target_key(device))
+    return arch, int(torch.cuda.get_device_properties(index).multi_processor_count)
 
 
-# --- Semantic dispatcher ---
-
+# --- Semantic dispatcher ----------------------------------------------------------
 
 _ALIGNED_HEADS = 128
 _ALIGNED_QK_DIM = 576
 _ALIGNED_VALUE_DIM = 512
+_ALIGNED_DIMS = (128, 512, 64)
 _CLUSTER_SIZE = 2
+_KV_TILE = 128
 _MAX_GENERIC_TOKENS = 4096
-_WORKSPACE_CACHE_CAPACITY = 8
-_HOST_METADATA_CACHE_CAPACITY = 16
+_MAX_SPLITS = 256
+_NATIVE_SPLIT = 8
+_P32_KV_CTAS = 2
+_P32_HEAD_GROUPS = 32
+# Split-KV partials, KV-length reads and the row plans of recent request identities.
+_WORKSPACE_CACHE_CAPACITY = 32
 
-_VHALF_ROUTE = "bf16_q128_runtime_vhalf_underfill_sink_one_launch_v1"
-_VQUARTER_ROUTE = "bf16_q128_runtime_vquarter_underfill_sink_one_launch_v1"
-_UNSPLIT_ROUTE = "bf16_b64_q16_kv1024_unsplit_v1"
-_CLC_ROUTE = "bf16_clc_packed_affine_full_tile_mask_bmm2_one_v1"
-_GENERIC_BF16_ROUTE = "bf16_full_abi_runtime_tail_one_launch_v1"
-_GENERIC_FP8_ROUTE = "fp8_full_abi_runtime_tail_one_launch_v1"
-_FP8_P32_QK_L2_ROUTE = "fp8_p32_q2_kv1024_qk_l2_resident_v1"
-_FP8_PAGE64_ROUTE = "fp8_page64_native_pdl_sequence_unified_v_leader_consumer_v1"
-_NATIVE_BF16_ROUTE = "v32_15stage_page_native_sink_pdl_runtime_v4_full_tmem_scrub"
-
-ROUTE_TO_DOMAIN = {
-    _VQUARTER_ROUTE: "mla_bf16_vquarter",
-    _VHALF_ROUTE: "mla_bf16_vhalf",
-    _UNSPLIT_ROUTE: "mla_bf16_unsplit",
-    _CLC_ROUTE: "mla_bf16_clc",
-    _GENERIC_BF16_ROUTE: "mla_bf16_tail",
-    _GENERIC_FP8_ROUTE: "mla_fp8_tail",
-    _FP8_P32_QK_L2_ROUTE: "mla_fp8_p32_qk_l2",
-    _FP8_PAGE64_ROUTE: "mla_fp8_page64_pdl",
-    _NATIVE_BF16_ROUTE: "mla_bf16_native_split8_pdl",
+DOMAIN_BF16_NATIVE_SPLIT8 = "mla_bf16_native_split8_pdl"
+DOMAIN_BF16_VQUARTER = "mla_bf16_vquarter"
+DOMAIN_BF16_VHALF = "mla_bf16_vhalf"
+DOMAIN_BF16_CLC = "mla_bf16_clc"
+DOMAIN_BF16_CLC_EXACT007790 = "mla_bf16_clc_exact007790"
+DOMAIN_BF16_CLC_EXACT007826 = "mla_bf16_clc_exact007826"
+_CLC_DOMAINS = (
+    DOMAIN_BF16_CLC,
+    DOMAIN_BF16_CLC_EXACT007790,
+    DOMAIN_BF16_CLC_EXACT007826,
+)
+_ALIGNED_BF16_DOMAINS = (
+    DOMAIN_BF16_NATIVE_SPLIT8,
+    DOMAIN_BF16_VQUARTER,
+    DOMAIN_BF16_VHALF,
+    *_CLC_DOMAINS,
+)
+DOMAIN_BF16_TAIL = "mla_bf16_tail"
+DOMAIN_FP8_P32 = "mla_fp8_p32_qk_l2"
+DOMAIN_FP8_TAIL = "mla_fp8_tail"
+DOMAIN_FP8_PAGE64 = "mla_fp8_page64_pdl"
+# Exact-geometry CLC programs: (batch, q_len, max KV length, page-table width) each bakes in.
+EXACT_CLC_GEOMETRY = {
+    DOMAIN_BF16_CLC_EXACT007790: (64, 2, 8192, 256),
+    DOMAIN_BF16_CLC_EXACT007826: (512, 16, 1024, 32),
 }
 
 _WORKSPACE_CACHE: "OrderedDict[tuple[Any, ...], dict[str, Any]]" = OrderedDict()
 _WORKSPACE_CACHE_LOCK = threading.Lock()
-_HOST_METADATA_CACHE: "OrderedDict[tuple[Any, ...], tuple[torch.Tensor, tuple[int, ...]]]" = OrderedDict()
-_HOST_METADATA_CACHE_LOCK = threading.Lock()
-
-
-@dataclass(frozen=True)
-class _BlackwellDispatchMetadata:
-    """Host-visible values which determine the exported semantic domain."""
-
-    dtype: torch.dtype
-    batch_size: int
-    q_len: int
-    total_q: int
-    q_lens: tuple[int, ...]
-    kv_lens: tuple[int, ...]
-    num_heads: int
-    qk_dim: int
-    value_dim: int
-    page_size: int
-    max_seq_len: int
-    topk: int
-    table_ndim: int
-    num_sms: int
-    ragged_query: bool = False
-    uses_shared_paged_kv_idx: bool = True
-    enable_sink: bool = False
-    skip_softmax: bool = False
-    return_lse: bool = False
-    provide_lse: bool = False
-    device_scale: bool = False
-    bmm2_scale: float = 1.0
-
-    @property
-    def variant(self) -> str:
-        return "topk" if self.topk > 0 else "dense"
-
-
-def _workspace_get_or_create(
-    key: tuple[Any, ...], builder: Callable[[], dict[str, Any]]
-) -> dict[str, Any]:
-    with _WORKSPACE_CACHE_LOCK:
-        state = _WORKSPACE_CACHE.get(key)
-        if state is not None:
-            _WORKSPACE_CACHE.move_to_end(key)
-            return state
-    state = builder()
-    with _WORKSPACE_CACHE_LOCK:
-        existing = _WORKSPACE_CACHE.get(key)
-        if existing is not None:
-            _WORKSPACE_CACHE.move_to_end(key)
-            return existing
-        _WORKSPACE_CACHE[key] = state
-        while len(_WORKSPACE_CACHE) > _WORKSPACE_CACHE_CAPACITY:
-            _WORKSPACE_CACHE.popitem(last=False)
-    return state
-
-
-def _tensor_ptr(value: Any) -> int:
-    return 0 if value is None else int(value.data_ptr())
-
-
-def _tensor_version(value: Any) -> int:
-    return -1 if value is None else int(getattr(value, "_version", 0))
-
-
-def _host_int_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
-    key = (
-        _tensor_ptr(tensor),
-        _tensor_version(tensor),
-        tuple(tensor.shape),
-        tensor.dtype,
-        tensor.device,
-    )
-    with _HOST_METADATA_CACHE_LOCK:
-        entry = _HOST_METADATA_CACHE.get(key)
-        if entry is not None and entry[0] is tensor:
-            _HOST_METADATA_CACHE.move_to_end(key)
-            return entry[1]
-    values = tuple(int(value) for value in tensor.tolist())
-    with _HOST_METADATA_CACHE_LOCK:
-        existing = _HOST_METADATA_CACHE.get(key)
-        if existing is not None and existing[0] is tensor:
-            _HOST_METADATA_CACHE.move_to_end(key)
-            return existing[1]
-        _HOST_METADATA_CACHE[key] = (tensor, values)
-        while len(_HOST_METADATA_CACHE) > _HOST_METADATA_CACHE_CAPACITY:
-            _HOST_METADATA_CACHE.popitem(last=False)
-    return values
-
-
-def _state_key(inputs: dict[str, Any], family: str) -> tuple[Any, ...]:
-    tensors = (
-        inputs.get("Q"),
-        inputs.get("KV_cache"),
-        inputs.get("page_table"),
-        inputs.get("q_indptr"),
-        inputs.get("seq_lens"),
-        inputs.get("O"),
-        inputs.get("LSE"),
-        inputs.get("sinks"),
-    )
-    return (
-        family,
-        *((_tensor_ptr(value), _tensor_version(value)) for value in tensors),
-        tuple(inputs["Q"].shape),
-        tuple(inputs["KV_cache"].shape),
-        str(inputs["dtype"]),
-        int(inputs["page_size"]),
-        int(inputs["q_len"]),
-        int(inputs["total_q"]),
-        tuple(inputs["q_lens"]),
-        tuple(inputs["kv_lens"]),
-        int(inputs["topk"]),
-        int(inputs["stream"]),
-    )
-
-
-def _e4m3_decode_table() -> list[float]:
-    values = []
-    for bits in range(256):
-        sign = -1.0 if bits & 0x80 else 1.0
-        exponent = (bits >> 3) & 0xF
-        mantissa = bits & 0x7
-        if exponent == 0:
-            magnitude = mantissa * (2.0**-9)
-        elif exponent == 0xF and mantissa == 0x7:
-            magnitude = 0.0
-        else:
-            magnitude = (1.0 + mantissa / 8.0) * (2.0 ** (exponent - 7))
-        values.append(sign * magnitude)
-    return values
-
-
-def _runtime_rows(inputs: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
-    device = inputs["Q"].device
-    row_batches, causal_lens = [], []
-    for batch, (q_len, kv_len) in enumerate(
-        zip(inputs["q_lens"], inputs["kv_lens"], strict=True)
-    ):
-        for query in range(q_len):
-            row_batches.append(batch)
-            causal_lens.append(kv_len - q_len + query + 1)
-    row_batches = torch.tensor(row_batches, dtype=torch.int32, device=device)
-    row_seq_lens = torch.tensor(causal_lens, dtype=torch.int32, device=device)
-    return row_batches, row_seq_lens
-
-
-def _base_state(inputs: dict[str, Any], family: str) -> dict[str, Any]:
-    key = _state_key(inputs, family)
-
-    def build() -> dict[str, Any]:
-        row_batches, row_seq_lens = _runtime_rows(inputs)
-        device = inputs["Q"].device
-        row_batch_long = row_batches.to(torch.int64)
-        use_sparse = int(inputs["topk"]) > 0
-        sparse_width = int(inputs["topk"]) if use_sparse else 0
-        source_table = inputs["page_table"]
-        if source_table.ndim == 3:
-            source_table = source_table[:, 0]
-        source_table = source_table.to(dtype=torch.int32).contiguous()
-        row_table = source_table.index_select(0, row_batch_long)
-        if use_sparse:
-            sparse_indices = inputs["page_table"].reshape(
-                int(inputs["total_q"]), sparse_width
-            )
-            sparse_indices = sparse_indices.to(dtype=torch.int32).contiguous()
-            row_seq_lens = torch.full_like(row_seq_lens, sparse_width)
-        else:
-            sparse_indices = row_batches
-        sinks = inputs["sinks"]
-        if sinks is None:
-            sinks = torch.zeros(
-                int(inputs["num_heads"]), dtype=torch.float32, device=device
-            )
-        lse = inputs["LSE"]
-        if lse is None:
-            lse = torch.empty(
-                (int(inputs["total_q"]), int(inputs["num_heads"])),
-                dtype=torch.float32,
-                device=device,
-            )
-        fp8_lut = (
-            torch.tensor(_e4m3_decode_table(), dtype=torch.float32, device=device)
-            if inputs["dtype"] == torch.float8_e4m3fn
-            else torch.zeros(1, dtype=torch.float32, device=device)
-        )
-        return {
-            "num_rows": int(inputs["total_q"]),
-            "row_batches": row_batches,
-            "row_seq_lens": row_seq_lens,
-            "source_page_table": source_table,
-            "row_page_table": row_table,
-            "sparse_indices": sparse_indices,
-            "sparse_width": sparse_width,
-            "use_sparse": use_sparse,
-            "sinks": sinks,
-            "lse": lse,
-            "fp8_lut": fp8_lut,
-        }
-
-    return _workspace_get_or_create(key, build)
-
-
-def _longest_first_work_order(tile_counts: list[int]) -> list[int]:
-    """Work ids in descending KV-tile order; ties keep row order."""
-    return sorted(
-        range(len(tile_counts)), key=lambda row: (-int(tile_counts[row]), row)
-    )
-
-
-def _append_work_order_rows(
-    table: torch.Tensor, inputs: dict[str, Any]
-) -> torch.Tensor:
-    """Append the longest-first work permutation after the num_rows page-table rows.
-
-    The persistent CLC kernels consume raw work ids in launch order and read
-    ``page_table[num_rows * max_pages_per_seq + raw_id]`` to find the row each id
-    processes, so long rows start first and the dynamic scheduler balances the
-    tail.  Padding entries hold -1; rows below num_rows are unchanged, so every
-    other aligned domain sees the same page table as before.
-    """
-    tile_counts = [
-        (kv_len - q_len + query + 128) // 128
-        for q_len, kv_len in zip(inputs["q_lens"], inputs["kv_lens"], strict=True)
-        for query in range(int(q_len))
-    ]
-    num_rows, width = int(table.shape[0]), int(table.shape[1])
-    if num_rows != len(tile_counts):
-        raise ValueError("aligned page table rows do not match the query rows")
-    order = _longest_first_work_order(tile_counts)
-    tail_rows = (num_rows + width - 1) // width
-    tail = torch.full((tail_rows * width,), -1, dtype=torch.int32, device=table.device)
-    tail[:num_rows] = torch.tensor(order, dtype=torch.int32, device=table.device)
-    return torch.cat(
-        (table.to(dtype=torch.int32), tail.view(tail_rows, width)), dim=0
-    ).contiguous()
-
-
-def _aligned_state(inputs: dict[str, Any]) -> dict[str, Any]:
-    state = _base_state(inputs, "aligned_bf16")
-    if "kv_half_pages" not in state:
-        table = state["row_page_table"]
-        if int(inputs["page_size"]) == 64:
-            table = torch.stack((table * 2, table * 2 + 1), dim=-1)
-            table = table.reshape(state["num_rows"], -1).contiguous()
-        table = _append_work_order_rows(table, inputs)
-        state.update(
-            {
-                "row_page_table": table,
-                "kv_half_pages": inputs["KV_cache"].reshape(-1, 32, _ALIGNED_QK_DIM),
-                "q_rows": inputs["Q"].reshape(-1, _ALIGNED_QK_DIM),
-                "o_rows": inputs["O"].reshape(-1, _ALIGNED_VALUE_DIM),
-                "num_sms": int(inputs["num_sms"]),
-            }
-        )
-    return state
-
-
-def _is_aligned(meta: _BlackwellDispatchMetadata) -> bool:
-    return (
-        meta.num_heads == _ALIGNED_HEADS
-        and meta.qk_dim == _ALIGNED_QK_DIM
-        and meta.value_dim == _ALIGNED_VALUE_DIM
-        and meta.topk == 0
-        and meta.uses_shared_paged_kv_idx
-        and not meta.return_lse
-        and not meta.provide_lse
-    )
-
-
-def _can_clc(meta: _BlackwellDispatchMetadata) -> bool:
-    q_lens = meta.q_lens
-    return (
-        meta.dtype == torch.bfloat16
-        and _is_aligned(meta)
-        and meta.page_size == 32
-        and meta.variant == "dense"
-        and not meta.enable_sink
-        and not meta.skip_softmax
-        and meta.bmm2_scale == 1.0
-        and bool(q_lens)
-        and min(q_lens) > 0
-        and len(set(q_lens)) == 1
-    )
-
-
-def _use_unsplit(meta: _BlackwellDispatchMetadata) -> bool:
-    return (
-        _can_clc(meta)
-        and meta.q_lens == (16,) * 64
-        and len(meta.kv_lens) == 64
-        and max(meta.kv_lens) == 1024
-        and meta.kv_lens[-1] == 1024
-    )
-
-
-def _use_native_bf16(meta: _BlackwellDispatchMetadata) -> bool:
-    if (
-        meta.dtype != torch.bfloat16
-        or not _is_aligned(meta)
-        or meta.variant != "dense"
-        or meta.ragged_query
-        or meta.skip_softmax
-    ):
-        return False
-    return (
-        meta.page_size == 32
-        and not meta.enable_sink
-        and meta.q_lens == (4,)
-        and meta.kv_lens == (1024,)
-    ) or (
-        meta.page_size == 64
-        and meta.enable_sink
-        and meta.q_lens == (1,)
-        and meta.kv_lens == (1024,)
-    )
-
-
-def _can_fp8_p32(meta: _BlackwellDispatchMetadata) -> bool:
-    q_lens = meta.q_lens
-    if not q_lens or len(q_lens) != len(meta.kv_lens) or len(set(q_lens)) != 1:
-        return False
-    q_len = q_lens[0]
-    causal = [
-        kv_len - q_len + query + 1
-        for kv_len, query_len in zip(meta.kv_lens, q_lens, strict=True)
-        for query in range(query_len)
-    ]
-    return (
-        meta.dtype == torch.float8_e4m3fn
-        and _is_aligned(meta)
-        and q_len == 2
-        and meta.kv_lens == (1024,)
-        and not meta.ragged_query
-        and meta.page_size == 32
-        and meta.variant == "dense"
-        and meta.table_ndim == 2
-        and not meta.device_scale
-        and not meta.enable_sink
-        and not meta.skip_softmax
-        and all(length > 256 for length in causal)
-    )
-
-
-def _can_page64(meta: _BlackwellDispatchMetadata) -> bool:
-    if meta.ragged_query and len(set(meta.q_lens)) != 1:
-        return False
-    return (
-        meta.dtype == torch.float8_e4m3fn
-        and _is_aligned(meta)
-        and meta.page_size == 64
-        and meta.variant == "dense"
-        and not meta.enable_sink
-        and not meta.skip_softmax
-    )
-
-
-def _select_route(meta: _BlackwellDispatchMetadata) -> str:
-    if meta.dtype == torch.bfloat16 and _is_aligned(meta):
-        resident = max(1, meta.num_sms // _CLUSTER_SIZE)
-        if _use_native_bf16(meta):
-            return _NATIVE_BF16_ROUTE
-        if _use_unsplit(meta):
-            return _UNSPLIT_ROUTE
-        if meta.enable_sink or meta.total_q * 4 <= resident:
-            return _VQUARTER_ROUTE
-        if meta.total_q * 2 <= resident:
-            return _VHALF_ROUTE
-        if _can_clc(meta):
-            return _CLC_ROUTE
-        raise ValueError(
-            "TRT-LLM MLA Blackwell has no qualified aligned BF16 domain for this configuration"
-        )
-    if _can_fp8_p32(meta):
-        return _FP8_P32_QK_L2_ROUTE
-    if _can_page64(meta):
-        return _FP8_PAGE64_ROUTE
-    if max(meta.kv_lens) > _MAX_GENERIC_TOKENS:
-        raise ValueError(
-            "TRT-LLM MLA Blackwell generic tail supports max_seq_len <= "
-            f"{_MAX_GENERIC_TOKENS}"
-        )
-    return _GENERIC_BF16_ROUTE if meta.dtype == torch.bfloat16 else _GENERIC_FP8_ROUTE
-
-
-def _clc_source_selector_eligibility(
-    inputs: dict[str, Any], q_lens: tuple[int, ...], kv_lens: tuple[int, ...]
-) -> int:
-    """Resolve page-table eligibility bits 1/2 and all-KV-uniform bit 4."""
-    source_page_table = inputs.get("page_table")
-    q4_source_eligible = (
-        source_page_table is not None
-        and int(source_page_table.ndim) == 2
-        and int(source_page_table.shape[1]) == 32
-        and int(source_page_table.data_ptr()) % 16 == 0
-    )
-    register_profile_source_eligible = (
-        source_page_table is not None
-        and int(source_page_table.ndim) == 2
-        and int(source_page_table.shape[0]) == len(q_lens)
-    )
-    return (
-        int(q4_source_eligible)
-        + 2 * int(register_profile_source_eligible)
-        + 4
-        * int(
-            len(kv_lens) == len(q_lens)
-            and all(length == kv_lens[0] for length in kv_lens)
-        )
-    )
-
-
-def _aligned_launch(inputs: dict[str, Any], route: str):
-    state = _aligned_state(inputs)
-    resident = max(1, state["num_sms"] // _CLUSTER_SIZE)
-    if route == _VQUARTER_ROUTE:
-        split = 4
-        work = state["num_rows"] * 4
-        grid_x = min(work, resident) * 2
-        grid_z = 1
-    elif route == _VHALF_ROUTE:
-        split = 2
-        work = state["num_rows"] * 2
-        grid_x = min(work, resident) * 2
-        grid_z = 1
-    elif route == _UNSPLIT_ROUTE:
-        split = 1
-        work = state["num_rows"]
-        grid_x = min(work, resident) * 2
-        grid_z = 1
-    else:
-        split = int(inputs["q_len"])
-        work = state["num_rows"]
-        grid_x = 2 * split
-        grid_z = int(inputs["batch_size"])
-    tensors = (
-        state["q_rows"],
-        state["kv_half_pages"],
-        state["o_rows"],
-        state["row_seq_lens"],
-        state["row_page_table"],
-        state["sinks"],
-    )
-    scalars: tuple[Any, ...] = (
-        float(inputs["bmm1_scale"]) * log2e,
-        float(inputs["bmm2_scale"]),
-        work,
-        split,
-        int(state["row_page_table"].shape[1]),
-        int(inputs["sinks"] is not None),
-        grid_x,
-        grid_z,
-    )
-    if route == _CLC_ROUTE:
-        kv_lens = tuple(int(value) for value in inputs["kv_lens"])
-        q_lens = tuple(int(value) for value in inputs["q_lens"])
-        scalars += (
-            max(kv_lens),
-            kv_lens[-1],
-            _clc_source_selector_eligibility(inputs, q_lens, kv_lens),
-        )
-    return tensors, scalars
-
-
-def _native_launch(inputs: dict[str, Any]):
-    state = _aligned_state(inputs)
-    num_split = 8
-    total_work_items = state["num_rows"] * num_split
-    grid_x = min(total_work_items, state["num_sms"] // _CLUSTER_SIZE) * _CLUSTER_SIZE
-    if "native_partial_output" not in state:
-        state["native_partial_output"] = torch.empty(
-            (state["num_rows"], _ALIGNED_HEADS, num_split, _ALIGNED_VALUE_DIM),
-            dtype=torch.bfloat16,
-            device=inputs["Q"].device,
-        )
-        state["native_partial_lse"] = torch.empty(
-            (state["num_rows"], _ALIGNED_HEADS, num_split),
-            dtype=torch.float32,
-            device=inputs["Q"].device,
-        )
-    tensors = (
-        state["q_rows"],
-        state["kv_half_pages"],
-        state["o_rows"],
-        state["row_seq_lens"],
-        state["row_page_table"],
-        state["sinks"],
-        state["native_partial_output"],
-        state["native_partial_lse"],
-    )
-    scalars = (
-        float(inputs["bmm1_scale"]) * log2e,
-        1.0,
-        float(inputs["bmm2_scale"]),
-        num_split,
-        total_work_items,
-        int(state["row_page_table"].shape[1]),
-        int(inputs["sinks"] is not None),
-        grid_x,
-        state["num_rows"],
-    )
-    return tensors, scalars
-
-
-def _generic_launch(inputs: dict[str, Any]):
-    state = _base_state(inputs, "generic")
-    num_heads = int(inputs["num_heads"])
-    qk_dim = int(inputs["Q"].shape[-1])
-    value_dim = int(inputs["O"].shape[-1])
-    kv_stride = int(inputs["KV_cache"].shape[-1])
-    query = inputs["Q"].reshape(-1, qk_dim)
-    kv = inputs["KV_cache"].reshape(-1, kv_stride)
-    if inputs["dtype"] == torch.float8_e4m3fn:
-        query = query.view(torch.uint8)
-        kv = kv.view(torch.uint8)
-    tensors = (
-        query,
-        kv,
-        state["fp8_lut"],
-        state["source_page_table"],
-        state["sparse_indices"],
-        state["row_batches"],
-        state["row_seq_lens"],
-        inputs["O"].reshape(-1, value_dim),
-        state["lse"].reshape(-1),
-        state["sinks"],
-    )
-    scalars = (
-        num_heads,
-        qk_dim,
-        value_dim,
-        kv_stride,
-        int(inputs["page_size"]),
-        int(state["source_page_table"].shape[1]),
-        state["sparse_width"],
-        int(state["use_sparse"]),
-        float(inputs["bmm1_scale"]),
-        float(inputs["bmm2_scale"]),
-        int(inputs["sinks"] is not None),
-        int(inputs["return_lse"] or inputs["provide_lse"]),
-        state["num_rows"],
-    )
-    return tensors, scalars
-
-
-def _p32_launch(inputs: dict[str, Any]):
-    reduction_groups = int(inputs["batch_size"]) * 32 * int(inputs["q_len"])
-    key = _state_key(inputs, "fp8_p32")
-    state = _workspace_get_or_create(
-        key,
-        lambda: {
-            "completion": torch.zeros(
-                reduction_groups,
-                dtype=torch.uint32,
-                device=inputs["Q"].device,
-            )
-        },
-    )
-    if "partial_output" not in state:
-        state["partial_output"] = torch.empty(
-            (reduction_groups, 2, 16, 128),
-            dtype=torch.bfloat16,
-            device=inputs["Q"].device,
-        )
-        state["partial_stats"] = torch.empty(
-            (reduction_groups, 2, 16, 2),
-            dtype=torch.float32,
-            device=inputs["Q"].device,
-        )
-    tensors = (
-        inputs["Q"].reshape(-1, 576).view(torch.uint8),
-        inputs["KV_cache"].reshape(-1, 32, 576).view(torch.uint8),
-        inputs["page_table"].reshape(-1),
-        inputs["seq_lens"],
-        inputs["O"].reshape(-1),
-        state["completion"],
-        state["partial_output"],
-        state["partial_stats"],
-    )
-    scalars = (
-        int(inputs["batch_size"]),
-        int(inputs["q_len"]),
-        int(inputs["page_table"].shape[-1]),
-        int(inputs["q_len"]),
-        2,
-        float(inputs["bmm1_scale"]) * log2e,
-        float(inputs["bmm2_scale"]),
-    )
-    return tensors, scalars
-
-
-def _pick_num_split(work_items: int, tiles: list[int], num_sms: int) -> int:
-    tiles = [int(value) for value in tiles if int(value) > 0]
-    if not tiles:
-        return 1
-    min_tiles, max_tiles = min(tiles), max(tiles)
-    source_cap = max(1, (max_tiles + 1) // 2)
-    if min_tiles <= 2:
-        return 1
-    target = min(source_cap, max(1, num_sms // max(1, work_items * 2)))
-    split = max(1, min(target, min_tiles))
-    blocks = (min_tiles + split - 1) // split
-    split = (min_tiles + blocks - 1) // blocks
-    while split > 1:
-        if all((split - 1) * ((count + split - 1) // split) < count for count in tiles):
-            break
-        split -= 1
-    return split
-
-
-def _page64_launch(inputs: dict[str, Any]):
-    state = _base_state(inputs, "fp8_page64")
-    q_lens = inputs["q_lens"]
-    kv_lens = inputs["kv_lens"]
-    work_items = sum(q_lens)
-    causal_lengths = [
-        kv_lens[batch] - q_len + query
-        for batch, q_len in enumerate(q_lens)
-        for query in range(q_len)
-    ]
-    tiles = [(length + 127) // 128 for length in causal_lengths]
-    num_split = _pick_num_split(work_items, tiles, int(inputs["num_sms"]))
-    if num_split <= 1:
-        raise ValueError(
-            "TRT-LLM MLA Blackwell page-64 PDL domain requires split-K reduction"
-        )
-    reduce_ctas = min(
-        64,
-        max(1, (int(inputs["num_sms"]) * 2) // max(1, work_items * 2)),
-    )
-    if "partial_output" not in state:
-        state["partial_output"] = torch.empty(
-            (work_items, num_split, _ALIGNED_HEADS, _ALIGNED_VALUE_DIM),
-            dtype=torch.bfloat16,
-            device=inputs["Q"].device,
-        )
-        state["partial_stats"] = torch.empty(
-            (work_items, num_split, _ALIGNED_HEADS, 2),
-            dtype=torch.float32,
-            device=inputs["Q"].device,
-        )
-    tensors = (
-        inputs["Q"].reshape(-1, 576).view(torch.uint8),
-        inputs["KV_cache"].reshape(-1, 576).view(torch.uint8),
-        inputs["O"].reshape(-1, 512),
-        state["lse"].reshape(-1, 128),
-        torch.tensor(causal_lengths, dtype=torch.int32, device=inputs["Q"].device),
-        state["row_batches"],
-        inputs["page_table"].reshape(-1),
-        state["partial_output"],
-        state["partial_stats"],
-    )
-    scalars = (
-        float(inputs["bmm1_scale"]) * log2e,
-        float(inputs["bmm2_scale"]),
-        num_split,
-        work_items,
-        int(inputs["page_table"].shape[-1]),
-        reduce_ctas,
-    )
-    return tensors, scalars
-
-
-def _prepare(inputs: dict[str, Any], route: str):
-    if route == _NATIVE_BF16_ROUTE:
-        tensors, scalars = _native_launch(inputs)
-    elif route in {_VQUARTER_ROUTE, _VHALF_ROUTE, _UNSPLIT_ROUTE, _CLC_ROUTE}:
-        tensors, scalars = _aligned_launch(inputs, route)
-    elif route in {_GENERIC_BF16_ROUTE, _GENERIC_FP8_ROUTE}:
-        tensors, scalars = _generic_launch(inputs)
-    elif route == _FP8_P32_QK_L2_ROUTE:
-        tensors, scalars = _p32_launch(inputs)
-    elif route == _FP8_PAGE64_ROUTE:
-        tensors, scalars = _page64_launch(inputs)
-    else:
-        raise ValueError(
-            f"route is outside the TRT-LLM MLA Blackwell export inventory: {route!r}"
-        )
-    return ROUTE_TO_DOMAIN[route], tensors, scalars
-
-
-def _check_tensor(
-    tensor: torch.Tensor,
-    *,
-    name: str,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> None:
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if tensor.device != device:
-        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
-    if tensor.dtype != dtype:
-        raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
-    if not tensor.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
-
-
-def _normalize_sinks(
-    sinks: Optional[Union[list[torch.Tensor], tuple[torch.Tensor, ...], torch.Tensor]],
-    *,
-    num_heads: int,
-    device: torch.device,
-) -> Optional[torch.Tensor]:
-    if sinks is None:
-        return None
-    if isinstance(sinks, (list, tuple)):
-        if len(sinks) != 1:
-            raise ValueError("TRT-LLM MLA Blackwell expects one sink tensor")
-        sink = sinks[0]
-    else:
-        sink = sinks
-    _check_tensor(sink, name="sinks", dtype=torch.float32, device=device)
-    if tuple(sink.shape) != (num_heads,):
-        raise ValueError(f"sinks must have shape ({num_heads},)")
-    return sink
-
-
-def _normalize_scale(value: float | torch.Tensor, name: str) -> float:
-    if isinstance(value, torch.Tensor):
-        raise TypeError(f"TRT-LLM MLA Blackwell requires scalar {name}")
-    if not isinstance(value, (int, float)):
-        raise TypeError(f"{name} must be a scalar float")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite")
-    return result
-
 
 # (qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, num_heads) tuples with generated programs.
 DENSE_DIMENSION_TUPLES = frozenset(
@@ -1275,6 +903,430 @@ def supports_dimension_tuple(
     return key in DENSE_DIMENSION_TUPLES
 
 
+def _pick_num_split(work_items: int, tile_counts: list[int], num_sms: int) -> int:
+    """Split-KV count of the aligned BF16 producer for the given per-row KV tiles."""
+    live = [count for count in tile_counts if count > 0]
+    if not live:
+        return 1
+    min_tiles = min(live)
+    if min_tiles <= 2 or work_items >= max(1, num_sms // _CLUSTER_SIZE):
+        return 1
+    target = max(1, (num_sms // _CLUSTER_SIZE) // max(1, work_items))
+    split = min(target, min_tiles, 16, _MAX_SPLITS)
+    while split > 1:
+        if all((split - 1) * ((count + split - 1) // split) < count for count in live):
+            break
+        split -= 1
+    return split
+
+
+def exact_route_candidate(
+    *,
+    dtype: torch.dtype,
+    num_heads: int,
+    page_size: int,
+    topk: int,
+    ragged_query: bool,
+    enable_sink: bool,
+    skip_softmax: bool,
+    batch_size: int,
+    q_len: int,
+    table_width: int,
+) -> bool:
+    """Whether the request KV lengths decide the domain.
+
+    Only these host-known geometries can select the native split-KV sequence,
+    an exact-geometry CLC program or the FP8 P32 producer; ``seq_lens`` is read
+    to the host once per input identity for them and never otherwise.
+    """
+    if topk != 0 or ragged_query or skip_softmax or num_heads != _ALIGNED_HEADS:
+        return False
+    if dtype == torch.bfloat16:
+        if batch_size == 1 and (
+            (q_len == 4 and page_size == 32 and not enable_sink)
+            or (q_len == 1 and page_size == 64 and enable_sink)
+        ):
+            return True
+        return page_size == 32 and any(
+            (batch_size, q_len, table_width) == (batch, length, width)
+            for batch, length, _max_kv, width in EXACT_CLC_GEOMETRY.values()
+        )
+    return (
+        dtype == torch.float8_e4m3fn
+        and batch_size == 1
+        and q_len == 2
+        and page_size == 32
+    )
+
+
+def select_domain(
+    *,
+    dtype: torch.dtype,
+    num_heads: int,
+    qk_dim: int,
+    value_dim: int,
+    qk_nope_head_dim: int,
+    page_size: int,
+    topk: int,
+    uses_shared_paged_kv_idx: bool,
+    ragged_query: bool,
+    enable_sink: bool,
+    skip_softmax: bool,
+    wants_lse: bool,
+    bmm2_scale: float,
+    total_q: int,
+    max_seq_len: int,
+    batch_size: int,
+    q_len: int,
+    table_width: int,
+    kv_lens: Optional[tuple[int, ...]],
+    num_sms: int,
+) -> str:
+    """Pick the generated domain in the production dispatcher's order.
+
+    ``kv_lens`` is required when ``exact_route_candidate`` holds for the geometry
+    (the host read it once for this input identity); ``None`` otherwise, or under
+    stream capture, where the runtime-shape domains serve the request.
+    """
+    aligned = (
+        num_heads == _ALIGNED_HEADS
+        and qk_dim == _ALIGNED_QK_DIM
+        and value_dim == _ALIGNED_VALUE_DIM
+        and topk == 0
+        and uses_shared_paged_kv_idx
+        and not wants_lse
+    )
+    dims_match = (qk_nope_head_dim, value_dim, qk_dim - value_dim) == _ALIGNED_DIMS
+    if dtype == torch.bfloat16 and aligned:
+        if kv_lens is not None and dims_match and not ragged_query and not skip_softmax:
+            native = (
+                batch_size == 1
+                and kv_lens == (1024,)
+                and (
+                    (page_size == 32 and not enable_sink and q_len == 4)
+                    or (page_size == 64 and enable_sink and q_len == 1)
+                )
+            )
+            if native:
+                rows = [
+                    kv - q_len + query + 1 for kv in kv_lens for query in range(q_len)
+                ]
+                tiles = [(length + _KV_TILE - 1) // _KV_TILE for length in rows]
+                if _pick_num_split(total_q, tiles, num_sms) == _NATIVE_SPLIT:
+                    return DOMAIN_BF16_NATIVE_SPLIT8
+        resident = max(1, num_sms // _CLUSTER_SIZE)
+        if enable_sink or total_q * 4 <= resident:
+            return DOMAIN_BF16_VQUARTER
+        if total_q * 2 <= resident:
+            return DOMAIN_BF16_VHALF
+        if (
+            page_size == 32
+            and not ragged_query
+            and not skip_softmax
+            and bmm2_scale == 1.0
+        ):
+            if kv_lens is not None:
+                max_kv = max(kv_lens)
+                for domain, (
+                    batch,
+                    length,
+                    max_kv_len,
+                    width,
+                ) in EXACT_CLC_GEOMETRY.items():
+                    if (batch_size, q_len, table_width) == (batch, length, width) and (
+                        max_kv == max_kv_len and kv_lens[-1] == max_kv
+                    ):
+                        return domain
+            return DOMAIN_BF16_CLC
+        raise ValueError(
+            "TRT-LLM MLA Blackwell has no qualified aligned BF16 domain for this configuration"
+        )
+    if (
+        dtype == torch.float8_e4m3fn
+        and aligned
+        and kv_lens is not None
+        and dims_match
+        and not ragged_query
+        and page_size == 32
+        and not enable_sink
+        and not skip_softmax
+        and q_len == 2
+        and kv_lens == (1024,)
+        and all(
+            kv - q_len + query + 1 > 256 for kv in kv_lens for query in range(q_len)
+        )
+    ):
+        return DOMAIN_FP8_P32
+    if (
+        dtype == torch.float8_e4m3fn
+        and aligned
+        and page_size == 64
+        and not ragged_query
+        and not enable_sink
+        and not skip_softmax
+    ):
+        return DOMAIN_FP8_PAGE64
+    if max_seq_len > _MAX_GENERIC_TOKENS:
+        raise ValueError(
+            "TRT-LLM MLA Blackwell generic tail supports max_seq_len <= "
+            f"{_MAX_GENERIC_TOKENS}"
+        )
+    return DOMAIN_BF16_TAIL if dtype == torch.bfloat16 else DOMAIN_FP8_TAIL
+
+
+def plan_num_split(work_items: int, max_seq_len: int, num_sms: int) -> int:
+    """Split-K factor of the FP8 page-64 producer from host-known sizes."""
+    max_tiles = max(1, (max_seq_len + _KV_TILE - 1) // _KV_TILE)
+    cap = max(1, (max_tiles + 1) // 2)
+    target = max(1, num_sms // max(1, work_items * _CLUSTER_SIZE))
+    return max(2, min(cap, target, max_tiles))
+
+
+def _workspace_peek(key: tuple[Any, ...]) -> Optional[dict[str, Any]]:
+    with _WORKSPACE_CACHE_LOCK:
+        state = _WORKSPACE_CACHE.get(key)
+        if state is not None:
+            _WORKSPACE_CACHE.move_to_end(key)
+        return state
+
+
+def _workspace(key: tuple[Any, ...], build) -> dict[str, Any]:
+    with _WORKSPACE_CACHE_LOCK:
+        state = _WORKSPACE_CACHE.get(key)
+        if state is not None:
+            _WORKSPACE_CACHE.move_to_end(key)
+            return state
+    state = build()
+    with _WORKSPACE_CACHE_LOCK:
+        existing = _WORKSPACE_CACHE.get(key)
+        if existing is not None:
+            _WORKSPACE_CACHE.move_to_end(key)
+            return existing
+        _WORKSPACE_CACHE[key] = state
+        while len(_WORKSPACE_CACHE) > _WORKSPACE_CACHE_CAPACITY:
+            _WORKSPACE_CACHE.popitem(last=False)
+    return state
+
+
+@functools.cache
+def _e4m3_decode_table_values() -> tuple[float, ...]:
+    values = []
+    for bits in range(256):
+        sign = -1.0 if bits & 0x80 else 1.0
+        exponent = (bits >> 3) & 0xF
+        mantissa = bits & 0x7
+        if exponent == 0:
+            magnitude = mantissa * (2.0**-9)
+        elif exponent == 0xF and mantissa == 0x7:
+            magnitude = 0.0
+        else:
+            magnitude = (1.0 + mantissa / 8.0) * (2.0 ** (exponent - 7))
+        values.append(sign * magnitude)
+    return tuple(values)
+
+
+def _fp8_lut(device: torch.device) -> torch.Tensor:
+    return _workspace(
+        ("fp8_lut", device),
+        lambda: {
+            "lut": torch.tensor(
+                _e4m3_decode_table_values(), dtype=torch.float32, device=device
+            )
+        },
+    )["lut"]
+
+
+def row_metadata(
+    seq_lens: torch.Tensor,
+    cum_seq_lens_q: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    q_len: int,
+    total_q: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per query row: its request index and its causal KV length, on the device."""
+    device = seq_lens.device
+    if cum_seq_lens_q is None:
+        row_batches = torch.arange(batch_size, dtype=torch.int32, device=device)
+        row_batches = row_batches.repeat_interleave(q_len)
+        offsets = torch.arange(1 - q_len, 1, dtype=torch.int32, device=device).repeat(
+            batch_size
+        )
+        row_seq_lens = seq_lens.repeat_interleave(q_len) + offsets
+        return row_batches, row_seq_lens
+    cum = cum_seq_lens_q.to(torch.int64)
+    q_lens = cum[1:] - cum[:-1]
+    row_batches = torch.arange(batch_size, dtype=torch.int64, device=device)
+    row_batches = row_batches.repeat_interleave(q_lens, output_size=total_q)
+    row_pos = (
+        torch.arange(total_q, dtype=torch.int64, device=device) - cum[:-1][row_batches]
+    )
+    row_seq_lens = (
+        seq_lens.to(torch.int64)[row_batches] - q_lens[row_batches] + row_pos + 1
+    )
+    return row_batches.to(torch.int32), row_seq_lens.to(torch.int32)
+
+
+def longest_first_order(row_seq_lens: torch.Tensor) -> torch.Tensor:
+    """Work ids in descending KV-tile order (ties keep row order), on the device."""
+    tiles = (row_seq_lens.to(torch.int64) + (_KV_TILE - 1)) // _KV_TILE
+    return torch.argsort(tiles, descending=True, stable=True).to(torch.int32)
+
+
+def _aligned_page_table(
+    table: torch.Tensor,
+    row_batches: torch.Tensor,
+    row_seq_lens: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    """Row page table (page-32 halves) followed by the longest-first work permutation.
+
+    The persistent CLC kernel reads ``page_table[num_rows * width + raw_id]`` for the row
+    that raw work id ``raw_id`` processes; the other aligned kernels read only the first
+    ``num_rows`` rows.  Padding entries hold -1.
+    """
+    if table.ndim == 3:
+        table = table[:, 0]
+    rows = table.to(torch.int32).index_select(0, row_batches.to(torch.int64))
+    if page_size == 64:
+        rows = torch.stack((rows * 2, rows * 2 + 1), dim=-1).reshape(rows.shape[0], -1)
+    num_rows, width = int(rows.shape[0]), int(rows.shape[1])
+    tail_rows = (num_rows + width - 1) // width
+    tail = torch.full((tail_rows * width,), -1, dtype=torch.int32, device=table.device)
+    tail[:num_rows] = longest_first_order(row_seq_lens)
+    return torch.cat((rows, tail.view(tail_rows, width)), dim=0).contiguous()
+
+
+def _tensor_identity(tensor: Optional[torch.Tensor]) -> Optional[tuple[Any, ...]]:
+    if tensor is None:
+        return None
+    return (
+        tensor.data_ptr(),
+        tensor._version,
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+    )
+
+
+def _host_kv_lens(seq_lens: torch.Tensor) -> Optional[tuple[int, ...]]:
+    """The request KV lengths, read once per ``seq_lens`` identity.
+
+    Under stream capture an identity read before capture is reused; one not seen
+    before cannot be read and returns ``None`` (the runtime-shape domains serve it).
+    """
+    key = ("kv_lens", seq_lens.device, _tensor_identity(seq_lens))
+    state = _workspace_peek(key)
+    if state is not None:
+        return state["kv_lens"]
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    return _workspace(
+        key, lambda: {"kv_lens": tuple(int(v) for v in seq_lens.tolist())}
+    )["kv_lens"]
+
+
+def _row_plan(
+    domain: str,
+    *,
+    seq_lens: torch.Tensor,
+    cum_seq_lens_q: Optional[torch.Tensor],
+    block_tables: torch.Tensor,
+    batch_size: int,
+    q_len: int,
+    total_q: int,
+    page_size: int,
+    topk: int,
+) -> dict[str, torch.Tensor]:
+    """The per-row metadata a domain's kernels read, built once per input identity.
+
+    As in the production path, the rows are derived when a request's tensors
+    (storage address, in-place version counter, shape and strides) first appear
+    and reused while they are unchanged, so a warm call launches only the
+    attention kernels.  Values rewritten through torch in-place ops bump the
+    version counter and rebuild the plan; writes that bypass torch must pass
+    fresh tensors.  Under stream capture a plan built before capture is reused;
+    a new identity's metadata is recomputed inside the graph and not cached.
+    """
+
+    def build() -> dict[str, torch.Tensor]:
+        row_batches, row_seq_lens = row_metadata(
+            seq_lens,
+            cum_seq_lens_q,
+            batch_size=batch_size,
+            q_len=q_len,
+            total_q=total_q,
+        )
+        state = {"row_batches": row_batches, "row_seq_lens": row_seq_lens}
+        if domain in _ALIGNED_BF16_DOMAINS:
+            state["table"] = _aligned_page_table(
+                block_tables, row_batches, row_seq_lens, page_size
+            )
+        elif domain == DOMAIN_FP8_PAGE64:
+            state["last_kv"] = row_seq_lens - 1
+        elif topk > 0:
+            state["row_seq_lens"] = torch.full_like(row_seq_lens, topk)
+        return state
+
+    key = (
+        "plan",
+        domain,
+        seq_lens.device,
+        _tensor_identity(seq_lens),
+        _tensor_identity(cum_seq_lens_q),
+        _tensor_identity(block_tables),
+        batch_size,
+        q_len,
+        total_q,
+        page_size,
+        topk,
+    )
+    cached = _workspace_peek(key)
+    if cached is not None:
+        return cached
+    if torch.cuda.is_current_stream_capturing():
+        return build()
+    return _workspace(key, build)
+
+
+def _check_tensor(
+    tensor: torch.Tensor, *, name: str, dtype: torch.dtype, device: torch.device
+) -> None:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    if tensor.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+
+
+def _normalize_scale(value: float | torch.Tensor, name: str) -> float:
+    if isinstance(value, torch.Tensor):
+        raise TypeError(f"TRT-LLM MLA Blackwell requires scalar {name}")
+    if not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a scalar float")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _normalize_sinks(
+    sinks, *, num_heads: int, device: torch.device
+) -> Optional[torch.Tensor]:
+    if sinks is None:
+        return None
+    if isinstance(sinks, (list, tuple)):
+        if len(sinks) != 1:
+            raise ValueError("TRT-LLM MLA Blackwell expects one sink tensor")
+        sinks = sinks[0]
+    _check_tensor(sinks, name="sinks", dtype=torch.float32, device=device)
+    if tuple(sinks.shape) != (num_heads,):
+        raise ValueError(f"sinks must have shape ({num_heads},)")
+    return sinks
+
+
 def trtllm_mla_blackwell_decode(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1302,26 +1354,15 @@ def trtllm_mla_blackwell_decode(
     enable_dcp: bool,
     backend: Literal["cake"] = "cake",
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    """Dispatch the qualified SM100a/SM103a MLA semantic envelope."""
-
+    """Dispatch the generated SM100a/SM103a MLA decode programs."""
     if backend != "cake":
         raise ValueError(f"backend must be 'cake', got {backend!r}")
-    if not isinstance(query, torch.Tensor):
-        raise TypeError("query must be a torch.Tensor")
-    if not query.is_cuda:
+    if not isinstance(query, torch.Tensor) or not query.is_cuda:
         raise ValueError("query must be a CUDA tensor")
     device = query.device
-    capability = get_compute_capability(device)
-    if capability not in {(10, 0), (10, 3)}:
-        major, minor = capability
-        raise RuntimeError(
-            "TRT-LLM MLA Blackwell requires compute capability 10.0 or 10.3, "
-            f"got {major}.{minor}"
-        )
-    if not is_cuda_version_at_least("12.9"):
-        raise RuntimeError(
-            "TRT-LLM MLA Blackwell on SM100a/SM103a requires CUDA 12.9 or newer"
-        )
+    arch, num_sms = _device_facts(
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
     if enable_dcp:
         raise ValueError("TRT-LLM MLA Blackwell does not support DCP")
     if multi_ctas_kv_counter_buffer is not None:
@@ -1332,7 +1373,6 @@ def trtllm_mla_blackwell_decode(
         raise ValueError("TRT-LLM MLA Blackwell does not accept sparse_mla_top_k_lens")
     if seq_lens is None:
         raise ValueError("seq_lens is required for TRT-LLM MLA Blackwell")
-
     if query.dtype not in {torch.bfloat16, torch.float8_e4m3fn}:
         raise TypeError("TRT-LLM MLA Blackwell query must use BF16 or FP8 E4M3")
     _check_tensor(query, name="query", dtype=query.dtype, device=device)
@@ -1341,10 +1381,10 @@ def trtllm_mla_blackwell_decode(
         raise ValueError(
             "query must be a fixed [B, Q, H, D] or compact [T, H, D] tensor"
         )
-    if kv_cache.ndim not in {3, 4}:
-        raise ValueError("kv_cache must be a 3D or 4D paged tensor")
-    if kv_cache.ndim == 4 and kv_cache.shape[1] != 1:
-        raise ValueError("4D kv_cache must have a singleton head axis")
+    if kv_cache.ndim not in {3, 4} or (kv_cache.ndim == 4 and kv_cache.shape[1] != 1):
+        raise ValueError(
+            "kv_cache must be a 3D or 4D paged tensor with a singleton head axis"
+        )
     page_size = int(kv_cache.shape[-2])
     if page_size not in {32, 64}:
         raise ValueError("TRT-LLM MLA Blackwell requires page size 32 or 64")
@@ -1356,10 +1396,7 @@ def trtllm_mla_blackwell_decode(
         raise ValueError("compact query and cum_seq_lens_q must be provided together")
     if ragged_query:
         _check_tensor(
-            cum_seq_lens_q,
-            name="cum_seq_lens_q",
-            dtype=torch.int32,
-            device=device,
+            cum_seq_lens_q, name="cum_seq_lens_q", dtype=torch.int32, device=device
         )
         if cum_seq_lens_q.ndim != 1 or cum_seq_lens_q.numel() < 2:
             raise ValueError("cum_seq_lens_q must have shape [batch_size + 1]")
@@ -1378,40 +1415,17 @@ def trtllm_mla_blackwell_decode(
         raise ValueError(
             "TRT-LLM MLA Blackwell requires nonempty batch and query dimensions"
         )
-
+    if max_seq_len <= 0:
+        raise ValueError("max_seq_len must be positive")
     _check_tensor(seq_lens, name="seq_lens", dtype=torch.int32, device=device)
     if tuple(seq_lens.shape) != (batch_size,):
         raise ValueError(f"seq_lens must have shape ({batch_size},)")
-    if ragged_query:
-        q_indptr_host = _host_int_tuple(cum_seq_lens_q)
-        if q_indptr_host[0] != 0 or q_indptr_host[-1] != total_q:
-            raise ValueError("cum_seq_lens_q must start at 0 and end at total_q")
-        q_lens = tuple(
-            right - left
-            for left, right in zip(q_indptr_host[:-1], q_indptr_host[1:], strict=True)
-        )
-        if any(q <= 0 for q in q_lens) or max(q_lens) > q_len:
-            raise ValueError("cum_seq_lens_q contains an invalid query length")
-    else:
-        q_lens = (q_len,) * batch_size
-    kv_lens = _host_int_tuple(seq_lens)
-    if len(q_lens) != len(kv_lens) or any(
-        q <= 0 or kv <= 0 or q > kv for q, kv in zip(q_lens, kv_lens, strict=True)
-    ):
-        raise ValueError("every TRT-LLM MLA Blackwell row requires 0 < q_len <= kv_len")
-    if max_seq_len <= 0 or max(kv_lens) > max_seq_len:
-        raise ValueError("max_seq_len must cover every runtime KV length")
     _check_tensor(block_tables, name="block_tables", dtype=torch.int32, device=device)
-    if sparse_mla_top_k > 0:
-        expected_table_shape = (
-            (total_q, sparse_mla_top_k)
-            if ragged_query
-            else (batch_size, q_len, sparse_mla_top_k)
-        )
-        if tuple(block_tables.shape) != expected_table_shape:
-            raise ValueError(
-                f"sparse block_tables must have shape {expected_table_shape}"
-            )
+    topk = int(sparse_mla_top_k)
+    if topk > 0:
+        expected = (total_q, topk) if ragged_query else (batch_size, q_len, topk)
+        if tuple(block_tables.shape) != expected:
+            raise ValueError(f"sparse block_tables must have shape {expected}")
     else:
         expected_ndim = 2 if uses_shared_paged_kv_idx else 3
         if block_tables.ndim != expected_ndim or block_tables.shape[0] != batch_size:
@@ -1423,16 +1437,16 @@ def trtllm_mla_blackwell_decode(
     qk_dim = int(query.shape[-1])
     value_dim = int(kv_lora_rank)
     if not supports_dimension_tuple(
-        qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, num_heads, sparse_mla_top_k
+        qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, num_heads, topk
     ):
         raise ValueError("unsupported TRT-LLM MLA Blackwell dimension tuple")
     if qk_dim != kv_lora_rank + qk_rope_head_dim:
         raise ValueError("query width must equal kv_lora_rank + qk_rope_head_dim")
-
     sink = _normalize_sinks(sinks, num_heads=num_heads, device=device)
-    bmm1_scale_value = _normalize_scale(bmm1_scale, "bmm1_scale")
-    bmm2_scale_value = _normalize_scale(bmm2_scale, "bmm2_scale")
-    if skip_softmax_threshold_scale_factor is not None:
+    bmm1 = _normalize_scale(bmm1_scale, "bmm1_scale")
+    bmm2 = _normalize_scale(bmm2_scale, "bmm2_scale")
+    skip_softmax = skip_softmax_threshold_scale_factor is not None
+    if skip_softmax:
         threshold = float(skip_softmax_threshold_scale_factor)
         if not math.isfinite(threshold) or threshold <= 0:
             raise ValueError("skip_softmax_threshold_scale_factor must be positive")
@@ -1445,72 +1459,265 @@ def trtllm_mla_blackwell_decode(
             raise ValueError(f"out must have shape {expected_out_shape}")
     if lse is not None:
         _check_tensor(lse, name="lse", dtype=torch.float32, device=device)
-        valid_lse_shapes = {(total_q, num_heads), (*query.shape[:-1],)}
-        if tuple(lse.shape) not in valid_lse_shapes:
+        if tuple(lse.shape) not in {(total_q, num_heads), tuple(query.shape[:-1])}:
             raise ValueError("lse shape must match flattened or physical query rows")
     if return_lse and lse is None:
         lse = torch.empty((total_q, num_heads), dtype=torch.float32, device=device)
 
-    num_sms = get_device_sm_count(device)
-    metadata = _BlackwellDispatchMetadata(
+    table_width = int(block_tables.shape[-1])
+    candidate = exact_route_candidate(
         dtype=query.dtype,
+        num_heads=num_heads,
+        page_size=page_size,
+        topk=topk,
+        ragged_query=ragged_query,
+        enable_sink=sink is not None,
+        skip_softmax=skip_softmax,
         batch_size=batch_size,
         q_len=q_len,
-        total_q=total_q,
-        q_lens=q_lens,
-        kv_lens=kv_lens,
+        table_width=table_width,
+    )
+    domain = select_domain(
+        dtype=query.dtype,
         num_heads=num_heads,
         qk_dim=qk_dim,
         value_dim=value_dim,
+        qk_nope_head_dim=int(qk_nope_head_dim),
         page_size=page_size,
-        max_seq_len=int(max_seq_len),
-        topk=int(sparse_mla_top_k),
-        table_ndim=int(block_tables.ndim),
-        num_sms=num_sms,
+        topk=topk,
+        uses_shared_paged_kv_idx=bool(uses_shared_paged_kv_idx),
         ragged_query=ragged_query,
-        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         enable_sink=sink is not None,
-        skip_softmax=skip_softmax_threshold_scale_factor is not None,
-        return_lse=return_lse,
-        provide_lse=lse is not None and not return_lse,
-        device_scale=False,
-        bmm2_scale=bmm2_scale_value,
+        skip_softmax=skip_softmax,
+        wants_lse=lse is not None,
+        bmm2_scale=bmm2,
+        total_q=total_q,
+        max_seq_len=int(max_seq_len),
+        batch_size=batch_size,
+        q_len=q_len,
+        table_width=table_width,
+        kv_lens=_host_kv_lens(seq_lens) if candidate else None,
+        num_sms=num_sms,
     )
-    route = _select_route(metadata)
+    plan = _row_plan(
+        domain,
+        seq_lens=seq_lens,
+        cum_seq_lens_q=cum_seq_lens_q,
+        block_tables=block_tables,
+        batch_size=batch_size,
+        q_len=q_len,
+        total_q=total_q,
+        page_size=page_size,
+        topk=topk,
+    )
+    row_batches, row_seq_lens = plan["row_batches"], plan["row_seq_lens"]
     stream = int(torch.cuda.current_stream(device).cuda_stream)
-    inputs = {
-        "Q": query,
-        "KV_cache": kv_cache,
-        "page_table": block_tables,
-        "q_indptr": cum_seq_lens_q,
-        "seq_lens": seq_lens,
-        "O": out,
-        "LSE": lse,
-        "sinks": sink,
-        "dtype": query.dtype,
-        "batch_size": batch_size,
-        "q_len": q_len,
-        "total_q": total_q,
-        "q_lens": q_lens,
-        "kv_lens": kv_lens,
-        "num_heads": num_heads,
-        "page_size": page_size,
-        "max_seq_len": int(max_seq_len),
-        "topk": int(sparse_mla_top_k),
-        "bmm1_scale": bmm1_scale_value,
-        "bmm2_scale": bmm2_scale_value,
-        "return_lse": return_lse,
-        "provide_lse": lse is not None and not return_lse,
-        "num_sms": num_sms,
-        "stream": stream,
-    }
-    domain, tensors, scalars = _prepare(inputs, route)
-    with torch.cuda.device(device):
-        get_domain_module(domain, device).run(*tensors, *scalars, stream)
+    run = get_cake_trtllm_mla_blackwell_family(family_for(domain, arch)).run
+    softmax_scale_log2 = bmm1 * log2e
+
+    if domain == DOMAIN_BF16_NATIVE_SPLIT8:
+        table = plan["table"]
+        resident = max(1, num_sms // _CLUSTER_SIZE)
+        work = total_q * _NATIVE_SPLIT
+        grid_x = min(work, resident) * _CLUSTER_SIZE
+        state = _workspace(
+            ("native_split8", device, total_q),
+            lambda: {
+                "partial_output": torch.empty(
+                    (total_q, _ALIGNED_HEADS, _NATIVE_SPLIT, _ALIGNED_VALUE_DIM),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                "partial_lse": torch.empty(
+                    (total_q, _ALIGNED_HEADS, _NATIVE_SPLIT),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            },
+        )
+        run(
+            query.reshape(-1, _ALIGNED_QK_DIM),
+            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
+            out.reshape(-1, _ALIGNED_VALUE_DIM),
+            row_seq_lens,
+            table,
+            sink if sink is not None else _fp8_lut(device)[:num_heads],
+            state["partial_output"],
+            state["partial_lse"],
+            softmax_scale_log2,
+            1.0,
+            bmm2,
+            _NATIVE_SPLIT,
+            work,
+            int(table.shape[1]),
+            int(sink is not None),
+            grid_x,
+            total_q,
+            stream,
+        )
+    elif domain in _ALIGNED_BF16_DOMAINS:
+        table = plan["table"]
+        resident = max(1, num_sms // _CLUSTER_SIZE)
+        if domain in _CLC_DOMAINS:
+            split, work, grid_x, grid_z = q_len, total_q, 2 * q_len, batch_size
+        else:
+            split = 4 if domain == DOMAIN_BF16_VQUARTER else 2
+            work = total_q * split
+            grid_x, grid_z = min(work, resident) * 2, 1
+        sinks_arg = sink if sink is not None else _fp8_lut(device)[:num_heads]
+        run(
+            query.reshape(-1, _ALIGNED_QK_DIM),
+            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
+            out.reshape(-1, _ALIGNED_VALUE_DIM),
+            row_seq_lens,
+            table,
+            sinks_arg,
+            softmax_scale_log2,
+            bmm2,
+            work,
+            split,
+            int(table.shape[1]),
+            int(sink is not None),
+            grid_x,
+            grid_z,
+            stream,
+        )
+    elif domain == DOMAIN_FP8_P32:
+        reduction_groups = batch_size * _P32_HEAD_GROUPS * q_len
+        state = _workspace(
+            ("fp8_p32", device, batch_size, q_len),
+            lambda: {
+                # The producer's same-kernel reduction leaves every counter at zero.
+                "completion": torch.zeros(
+                    reduction_groups, dtype=torch.uint32, device=device
+                ),
+                "partial_output": torch.empty(
+                    (reduction_groups, _P32_KV_CTAS, 16, 128),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                "partial_stats": torch.empty(
+                    (reduction_groups, _P32_KV_CTAS, 16, 2),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            },
+        )
+        run(
+            query.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
+            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM).view(torch.uint8),
+            block_tables.reshape(-1),
+            seq_lens,
+            out.reshape(-1),
+            state["completion"],
+            state["partial_output"],
+            state["partial_stats"],
+            batch_size,
+            q_len,
+            table_width,
+            q_len,
+            _P32_KV_CTAS,
+            softmax_scale_log2,
+            bmm2,
+            stream,
+        )
+    elif domain == DOMAIN_FP8_PAGE64:
+        work_items = total_q
+        num_split = plan_num_split(work_items, int(max_seq_len), num_sms)
+        reduce_ctas = min(64, max(1, (num_sms * 2) // max(1, work_items * 2)))
+        state = _workspace(
+            ("fp8_page64", device, work_items, num_split),
+            lambda: {
+                "partial_output": torch.empty(
+                    (work_items, num_split, _ALIGNED_HEADS, _ALIGNED_VALUE_DIM),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                "partial_stats": torch.empty(
+                    (work_items, num_split, _ALIGNED_HEADS, 2),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "lse": torch.empty(
+                    (work_items, _ALIGNED_HEADS), dtype=torch.float32, device=device
+                ),
+            },
+        )
+        run(
+            query.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
+            kv_cache.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
+            out.reshape(-1, _ALIGNED_VALUE_DIM),
+            state["lse"],
+            plan["last_kv"],
+            row_batches,
+            block_tables.reshape(-1),
+            state["partial_output"],
+            state["partial_stats"],
+            softmax_scale_log2,
+            bmm2,
+            num_split,
+            work_items,
+            int(block_tables.shape[-1]),
+            reduce_ctas,
+            stream,
+        )
+    else:
+        kv_stride = int(kv_cache.shape[-1])
+        q_rows = query.reshape(-1, qk_dim)
+        kv_rows = kv_cache.reshape(-1, kv_stride)
+        if query.dtype == torch.float8_e4m3fn:
+            q_rows = q_rows.view(torch.uint8)
+            kv_rows = kv_rows.view(torch.uint8)
+        source_table = (
+            block_tables[:, 0] if block_tables.ndim == 3 and topk == 0 else block_tables
+        )
+        if topk > 0:
+            sparse_indices = block_tables.reshape(total_q, topk)
+            source_table = sparse_indices
+        else:
+            sparse_indices = row_batches
+        lse_rows = lse.reshape(-1) if lse is not None else _fp8_lut(device)[:1]
+        run(
+            q_rows,
+            kv_rows,
+            _fp8_lut(device),
+            source_table,
+            sparse_indices,
+            row_batches,
+            row_seq_lens,
+            out.reshape(-1, value_dim),
+            lse_rows,
+            sink if sink is not None else _fp8_lut(device)[:num_heads],
+            num_heads,
+            qk_dim,
+            value_dim,
+            kv_stride,
+            page_size,
+            int(source_table.shape[-1]),
+            topk,
+            int(topk > 0),
+            bmm1,
+            bmm2,
+            int(sink is not None),
+            int(lse is not None),
+            total_q,
+            stream,
+        )
     if return_lse:
         assert lse is not None
         return out, lse
     return out
 
 
-__all__ = ["ROUTE_TO_DOMAIN", "trtllm_mla_blackwell_decode"]
+__all__ = [
+    "FAMILIES",
+    "MODULES",
+    "ROUTES",
+    "exact_route_candidate",
+    "gen_cake_trtllm_mla_blackwell_family",
+    "plan_num_split",
+    "row_metadata",
+    "select_domain",
+    "supports_dimension_tuple",
+    "trtllm_mla_blackwell_decode",
+]

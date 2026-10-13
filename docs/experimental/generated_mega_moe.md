@@ -1,36 +1,44 @@
-# Prepared MegaMoE on SM103a
+# Prepared MegaMoE on SM100a and SM103a
 
-The generated catalogs require a GPU with compute capability 10.3 and 152
-physical SMs. They contain a fixed set of shapes; an unsupported shape has no
-fallback. Input preparation and JIT compilation occur before repeated `run()`.
+The generated catalog requires a GPU with compute capability 10.0 (148
+physical SMs) or 10.3 (152 physical SMs); the route is selected from the
+device, there is no SM-count override. It contains a fixed set of model
+shapes (384 experts, top-6, hidden 5120, intermediate 2304; routed FP4 at 1,
+16, 128, 512, 1024 and 4096 tokens, routed FP8 at 16 tokens); an unsupported
+shape has no fallback. Input preparation and JIT compilation occur before
+repeated `run()`.
 
-`flashinfer.source_mega_moe.prepare_mega_moe` executes dispatch, two projections,
-clamped SwiGLU, one shared FP8 expert, and combine in one submission. Routed
-weights may use packed FP4 E2M1 or FP8 E4M3. It accepts packed activations and
-scale words, int64 expert indices and float32 route weights, and explicit packed
-weight tensors. `MegaMoEPlan` documents the tensor extents. Its workspace is
-zero-initialized once. Subsequent calls rely on device cleanup. Use
-`update_inputs()` between serialized calls to copy new activation/routing inputs
-into the same workspace; do not reset its counters on the host.
+The catalog (`mega_moe_v3.v3`) lists one program per schedule, compiled for
+both architectures from one source: the pipeline kernels read the SM count
+from the compile line (`-DNUM_CTAS=<physical SMs>`, supplied by the loader
+from the route), the grouped kernels carry no SM count at all. Two FP4
+pipeline schedules (16 and 128 tokens) select different producer
+instructions per architecture and stay as per-architecture pairs. Every
+route names its SM count and launch grid per architecture; the bindings are
+thin `tvm_ffi_utils.h` launchers.
 
-`flashinfer.mega_moe_v3.prepare_pipeline` accepts logical gate/up weight halves
-and float power-of-two scales. Preparation packs scales and interleaves the
-weights. A route whose catalog entry declares `self_cleaning` launches exactly
-one kernel per `run()`: the kernel zeroes its per-launch workspace words before
+`flashinfer.mega_moe_v3.prepare_pipeline` executes dispatch, two projections,
+clamped SwiGLU and combine in one submission. Routed weights may use packed
+FP4 E2M1 or FP8 E4M3. It accepts logical gate/up weight halves and float
+power-of-two scales. Its FP4 model routes cover 1, 16, 128, 512, 1024
+and 4096 tokens (FP8 routed weights at 16 tokens); the 1024- and 4096-token
+routes use the 32- and 128-row source tile heights. Preparation packs scales and interleaves the
+weights. Every exported pipeline route is `self_cleaning`: it launches exactly
+one kernel per `run()`, the kernel zeroes its per-launch workspace words before
 it exits and its grid gates are phase-toggling words, so the plan zeroes the
 counter workspace once when it is bound, never inside `run()` (a captured
-`run()` contains only the kernel node), and `plan.reset()` is rejected. Every
-other route keeps its required counter resets inside `run()`.
-`plan.self_cleaning` reports which contract applies; the declaration is per
-exported architecture. The separately exported `prepare_grouped_l2` accepts
-E4M3 activation values, packed E2M1 weights and natural row-major packed scale
-words; every `run()` repacks both scale tensors before the clustered GEMM. Do
-not time the GEMM alone.
+`run()` contains only the kernel node), and `plan.reset()` is rejected.
+`plan.self_cleaning` reports the contract; the grouped fused route keeps its
+L1 arrival reset inside `run()`. The separately exported `prepare_grouped_l2`
+accepts E4M3 activation values, packed E2M1 weights and natural row-major
+packed scale words; it repacks both scale tensors into the group-folded layout
+at preparation, `run()` launches only the clustered GEMM, and
+`plan.update_scales()` repacks again after the caller changed the scale words
+in place.
 
 FP4 packs the earlier K element into the low nibble. The scale granularity is
 32 values. A UE8M0 byte contains the biased exponent of a power-of-two scale;
-four consecutive bytes make an int32 scale word. Source weight scales additionally
-use a 128-row permutation and group-folded order. The example input helper
+four consecutive bytes make an int32 scale word. The example input helper
 shows these layouts using synthetic values without an external quantizer.
 
 L1 projection rounds to BF16 before gate/up clamping. Gate values have an upper
@@ -46,25 +54,14 @@ capture is unsupported.
 From the repository root:
 
 ```bash
-python examples/experimental/mega_moe.py --family source --precision fp4
-python examples/experimental/mega_moe.py --family v3 --precision fp8
-python examples/experimental/mega_moe.py --family grouped-l2
 pytest -q tests/experimental/test_generated_mega_moe.py
-python examples/experimental/bench_mega_moe.py --family v3 --precision fp4
 ```
 
 The public tests use independent PyTorch math on the exact packed inputs,
 check valid dispatch metadata and reusable counters, poison outputs between
-launches, and exercise direct and graph replay. They include both routed
-precisions on the two smoke routes and the catalog's grouped L2 route, and they
-check that a captured `run()` has the declared topology (one kernel node for a
-self-cleaning route, counter resets plus kernel otherwise). The FP4 single-token
-model route's workspace lifecycle is covered when the device has about 48 GiB of
-free memory for the 384-expert inputs. These examples do not enumerate every
-model shape or claim model-wide performance.
-
-The benchmark requires `cupti-python >= 13`, flushes L2, and sums all kernel
-activities belonging to the complete `plan.run()` call. Missing CUPTI is an
-error; no CUDA-event fallback is permitted. The reported median excludes JIT
-and input preparation. It does not establish comparative speedup or an export
-regression gate.
+launches, and exercise direct and graph replay. They cover both routed
+precisions on the 16-token model route, the FP4 single-token route's workspace
+lifecycle, the FP4 1024- and 4096-token routes, and the catalog's grouped L2
+route, and they check that a captured `run()` is one kernel node. The 384-expert inputs need about 48 GiB of free device memory;
+the tests skip below that. They do not enumerate every model shape or claim
+model-wide performance.

@@ -15,9 +15,7 @@
  */
 
 // clang-format off
-// Generated from a recurrent-KDA Loom schedule.
-// Raw generated body SHA256: 116612419179c171252cbdfa11b2e531a2c2a12ddf5b8eecb2874ecd2dea396f
-// Normalized generated SHA256: 116612419179c171252cbdfa11b2e531a2c2a12ddf5b8eecb2874ecd2dea396f
+// Frozen Cake recurrent-KDA export; do not edit by hand.
 // BEGIN FROZEN GENERATED BODY
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;

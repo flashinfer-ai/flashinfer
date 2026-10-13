@@ -53,9 +53,11 @@ from .fmha_resources import (
     SmemQResource,
     TmemOResource,
     TmemPResource,
+    SmemPResource,
     TmemSPResource,
     TmemStatsResource,
     TmemStatsDoneResource,
+    TmemPPrefixReadyResource,
 )
 
 
@@ -811,6 +813,10 @@ def create_mma_task(
     tmem_vec_done_1: TmemStatsDoneResource | None,
     work_queue: WorkQueue | None,
     task_class: type[Task] = Task,
+    tmem_p_prefix_ready_0: TmemPPrefixReadyResource | None = None,
+    tmem_p_prefix_ready_1: TmemPPrefixReadyResource | None = None,
+    smem_p0: SmemPResource | None = None,
+    smem_p1: SmemPResource | None = None,
     **task_kwargs: Any,
 ) -> Task:
     """Create the one-warp MMA compute task."""
@@ -822,7 +828,26 @@ def create_mma_task(
     if split_kv and smem_v is None:
         raise ValueError("split K/V staging requires a separate V buffer")
     kv_resources = (smem_k_or_kv, smem_v) if split_kv else (smem_k_or_kv,)
-    src = _src_resources(*qkv_resources, smem_q, *kv_resources, work_queue=work_queue)
+    pv_half_overlap = smem_q.cfg.pv_half_overlap
+    if pv_half_overlap and (
+        tmem_p_prefix_ready_0 is None or tmem_p_prefix_ready_1 is None
+    ):
+        raise ValueError("pv_half_overlap requires both P-prefix barriers")
+    p_prefix_resources = (
+        (tmem_p_prefix_ready_0, tmem_p_prefix_ready_1) if pv_half_overlap else ()
+    )
+    p_in_smem = smem_q.cfg.p_in_smem
+    if p_in_smem and (smem_p0 is None or smem_p1 is None):
+        raise ValueError("p_in_smem requires both SMEM P resources")
+    smem_p_resources = (smem_p0, smem_p1) if p_in_smem else ()
+    src = _src_resources(
+        *qkv_resources,
+        smem_q,
+        *kv_resources,
+        *p_prefix_resources,
+        *smem_p_resources,
+        work_queue=work_queue,
+    )
     num_head_dim_stages_k = smem_k_or_kv.cfg.num_head_dim_stages_k
     num_head_dim_stages_v = smem_k_or_kv.cfg.num_head_dim_stages_v
 
@@ -1256,8 +1281,36 @@ def create_mma_task(
         vd0: TmemStatsDoneResource,
         vd1: TmemStatsDoneResource,
         wq: WorkQueue | None = None,
+        pr0: TmemPPrefixReadyResource | None = None,
+        pr1: TmemPPrefixReadyResource | None = None,
+        pb0: SmemPResource | None = None,
+        pb1: SmemPResource | None = None,
     ) -> None:
         """Interleave paired QK/PV while retaining each K slice for both Qs."""
+
+        def pv(
+            sp: TmemSPResource,
+            pr: TmemPPrefixReadyResource | None,
+            pb: SmemPResource | None,
+            *,
+            group: int,
+            **kw: Any,
+        ) -> None:
+            """PV for query group ``group``. P-ready comes from the SMEM P tile with
+            P in SMEM, from the P-prefix barrier with the half overlap, else from the SP acquire."""
+            if p_in_smem:
+                pb.wait()
+                to.pv_mma(inst_idx=group, **kw)
+                pb.release()
+                return
+            if pv_half_overlap:
+                pr.wait()
+                to.pv_mma(k_half=0, **kw)
+                pr.release()
+            sp.acquire()
+            sp.p_read()
+            to.pv_mma(k_half=1 if pv_half_overlap else None, **kw)
+
         sq.init_descriptor_state()
         sk.init_descriptor_state()
         sv.init_descriptor_state()
@@ -1333,60 +1386,147 @@ def create_mma_task(
             else:
                 desc_v_base = sv.v_desc()
             # Acquire O first (off critical path), then acquire SP0 and run PV→O0.
-            to.acquire()
-            sp0.acquire()
-            sp0.p_read()
-            to.pv_mma(desc_v_base=desc_v_base, section=FmhaStage.Head)
-            to.commit()
-
-            # QK0 -> PV1 -> QK1 -> PV0: retain each K slice and the previous V
-            # until both peer query tiles have consumed the corresponding data.
-            with domain_loop(loop_start, loop_end, loop_step):
-                k_descriptors = qk_mma_stages(sk, sp0, desc_q0_base, FmhaStage.Loop)
-                sp0.commit()
+            if not p_in_smem:
                 to.acquire()
-                sp1.acquire()
-                sp1.p_read()
-                to.pv_mma(desc_v_base=desc_v_base, section=FmhaStage.Loop)
-                to.commit()
-                # Release V_prev after PV1 UMMA consumed SMEM data.
-                sv.release()
-                qk_mma_stages(
-                    sk, sp1, desc_q1_base, FmhaStage.Loop, descriptors=k_descriptors
+                pv(
+                    sp0,
+                    pr0,
+                    pb0,
+                    group=0,
+                    desc_v_base=desc_v_base,
+                    section=FmhaStage.Head,
                 )
-                sp1.commit()
-                # Release Ki+1, then wait Vi+1.
+                to.commit()
+
+            def wait_next_v() -> Any:
+                """Release Ki+1, then wait Vi+1 and build its descriptor."""
                 for _ in range(num_head_dim_stages_k):
                     sk.release()
                 # TODO: sv.wait() (Vi+1) could move earlier in this iteration
                 # to overlap with QK0/PV1/QK1.
                 sv.wait()
                 if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
-                    desc_v_base = sv.v_desc_paged(
+                    return sv.v_desc_paged(
                         section=FmhaStage.Loop,
                         tile_offset=1,
                         seqlen_k=v_seqlen_k,
                         kv_tile_start=v_kv_tile_start,
                     )
-                else:
-                    desc_v_base = sv.v_desc()
-                # PV0: P0 * Vi+1 → O0.
-                to.acquire()
-                sp0.acquire()
-                sp0.p_read()
-                to.pv_mma(desc_v_base=desc_v_base, section=FmhaStage.Loop, inst_idx=1)
-                to.commit()
+                return sv.v_desc()
 
-            sq.release()
-            sq.release()
-            sp0.commit()
-            to.acquire()
-            sp1.acquire()
-            sp1.p_read()
-            to.pv_mma(desc_v_base=desc_v_base, section=FmhaStage.Tail, is_tail=True)
-            to.commit()
-            sv.release()
-            sp1.commit()
+            if p_in_smem:
+                # With P in SMEM, softmax releases the S stage right after loading
+                # S, so QK(i+1) overlaps exp2(i). The MMA issues QK0(i+1), PV0(i),
+                # QK1(i+1), PV1(i). Each QK acquires its SP slot here and each PV
+                # waits on its group's P tile instead. The tail drains no SP slot.
+                with domain_loop(loop_start, loop_end, loop_step):
+                    sp0.acquire()
+                    k_descriptors = qk_mma_stages(sk, sp0, desc_q0_base, FmhaStage.Loop)
+                    sp0.commit()
+                    to.acquire()
+                    pv(
+                        sp0,
+                        pr0,
+                        pb0,
+                        group=0,
+                        desc_v_base=desc_v_base,
+                        section=FmhaStage.Loop,
+                    )
+                    to.commit()
+                    sp1.acquire()
+                    qk_mma_stages(
+                        sk, sp1, desc_q1_base, FmhaStage.Loop, descriptors=k_descriptors
+                    )
+                    sp1.commit()
+                    to.acquire()
+                    pv(
+                        sp1,
+                        pr1,
+                        pb1,
+                        group=1,
+                        desc_v_base=desc_v_base,
+                        section=FmhaStage.Loop,
+                    )
+                    to.commit()
+                    sv.release()
+                    desc_v_base = wait_next_v()
+                sq.release()
+                sq.release()
+                to.acquire()
+                pv(
+                    sp0,
+                    pr0,
+                    pb0,
+                    group=0,
+                    desc_v_base=desc_v_base,
+                    section=FmhaStage.Tail,
+                    is_tail=True,
+                )
+                to.commit()
+                to.acquire()
+                pv(
+                    sp1,
+                    pr1,
+                    pb1,
+                    group=1,
+                    desc_v_base=desc_v_base,
+                    section=FmhaStage.Tail,
+                    is_tail=True,
+                )
+                to.commit()
+                sv.release()
+            else:
+                # QK0 -> PV1 -> QK1 -> PV0: retain each K slice and the previous V
+                # until both peer query tiles have consumed the corresponding data.
+                with domain_loop(loop_start, loop_end, loop_step):
+                    k_descriptors = qk_mma_stages(sk, sp0, desc_q0_base, FmhaStage.Loop)
+                    sp0.commit()
+                    to.acquire()
+                    pv(
+                        sp1,
+                        pr1,
+                        pb1,
+                        group=1,
+                        desc_v_base=desc_v_base,
+                        section=FmhaStage.Loop,
+                    )
+                    to.commit()
+                    # Release V_prev after PV1 UMMA consumed SMEM data.
+                    sv.release()
+                    qk_mma_stages(
+                        sk, sp1, desc_q1_base, FmhaStage.Loop, descriptors=k_descriptors
+                    )
+                    sp1.commit()
+                    desc_v_base = wait_next_v()
+                    # PV0: P0 * Vi+1 → O0.
+                    to.acquire()
+                    pv(
+                        sp0,
+                        pr0,
+                        pb0,
+                        group=0,
+                        desc_v_base=desc_v_base,
+                        section=FmhaStage.Loop,
+                        inst_idx=1,
+                    )
+                    to.commit()
+
+                sq.release()
+                sq.release()
+                sp0.commit()
+                to.acquire()
+                pv(
+                    sp1,
+                    pr1,
+                    pb1,
+                    group=1,
+                    desc_v_base=desc_v_base,
+                    section=FmhaStage.Tail,
+                    is_tail=True,
+                )
+                to.commit()
+                sv.release()
+                sp1.commit()
 
     @schedule
     def mma_schedule(
@@ -1419,8 +1559,90 @@ def create_mma_task(
         """Split K/V captured schedule."""
         mma_schedule_body(gqkv, sq, sk, sv, sp0, sp1, to, vd0, vd1, wq)
 
+    # Overlap variants carry the two P-prefix barriers.
+    @schedule
+    def mma_schedule_pr(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        skv: SmemKVResource,
+        sp0: TmemSPResource,
+        sp1: TmemSPResource,
+        to: TmemOResource,
+        vd0: TmemStatsDoneResource,
+        vd1: TmemStatsDoneResource,
+        pr0: TmemPPrefixReadyResource,
+        pr1: TmemPPrefixReadyResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Shared-buffer captured schedule with P-prefix overlap."""
+        mma_schedule_body(gqkv, sq, skv, skv, sp0, sp1, to, vd0, vd1, wq, pr0, pr1)
+
+    @schedule
+    def mma_split_schedule_pr(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        sk: SmemKVResource,
+        sv: SmemKVResource,
+        sp0: TmemSPResource,
+        sp1: TmemSPResource,
+        to: TmemOResource,
+        vd0: TmemStatsDoneResource,
+        vd1: TmemStatsDoneResource,
+        pr0: TmemPPrefixReadyResource,
+        pr1: TmemPPrefixReadyResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Split K/V captured schedule with P-prefix overlap."""
+        mma_schedule_body(gqkv, sq, sk, sv, sp0, sp1, to, vd0, vd1, wq, pr0, pr1)
+
+    # P-in-SMEM variants carry the two SMEM P tiles.
+    @schedule
+    def mma_split_schedule_pb(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        sk: SmemKVResource,
+        sv: SmemKVResource,
+        sp0: TmemSPResource,
+        sp1: TmemSPResource,
+        to: TmemOResource,
+        vd0: TmemStatsDoneResource,
+        vd1: TmemStatsDoneResource,
+        pb0: SmemPResource,
+        pb1: SmemPResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Split K/V captured schedule with P staged in SMEM."""
+        mma_schedule_body(
+            gqkv, sq, sk, sv, sp0, sp1, to, vd0, vd1, wq, None, None, pb0, pb1
+        )
+
+    @schedule
+    def mma_schedule_pb(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        skv: SmemKVResource,
+        sp0: TmemSPResource,
+        sp1: TmemSPResource,
+        to: TmemOResource,
+        vd0: TmemStatsDoneResource,
+        vd1: TmemStatsDoneResource,
+        pb0: SmemPResource,
+        pb1: SmemPResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Shared-buffer captured schedule with P staged in SMEM."""
+        mma_schedule_body(
+            gqkv, sq, skv, skv, sp0, sp1, to, vd0, vd1, wq, None, None, pb0, pb1
+        )
+
+    if p_in_smem:
+        selected_mma_schedule = mma_split_schedule_pb if split_kv else mma_schedule_pb
+    elif pv_half_overlap:
+        selected_mma_schedule = mma_split_schedule_pr if split_kv else mma_schedule_pr
+    else:
+        selected_mma_schedule = mma_split_schedule if split_kv else mma_schedule
     captured_schedule = _schedule_with_work_queue(
-        mma_split_schedule if split_kv else mma_schedule,
+        selected_mma_schedule,
         gmem_qkv,
         smem_q,
         *kv_resources,
@@ -1429,6 +1651,8 @@ def create_mma_task(
         tmem_o,
         tmem_vec_done_0,
         tmem_vec_done_1,
+        *p_prefix_resources,
+        *smem_p_resources,
         work_queue=work_queue,
     )
     return task_class(
@@ -1452,6 +1676,8 @@ def create_softmax_task(
     s0s1_seq: S0S1SequenceResource | None,
     work_queue: WorkQueue | None,
     task_class: type[Task] = Task,
+    tmem_p_prefix_ready: TmemPPrefixReadyResource | None = None,
+    smem_p: SmemPResource | None = None,
     **task_kwargs: Any,
 ) -> Task:
     """Create a four-warp Softmax task.
@@ -1535,6 +1761,12 @@ def create_softmax_task(
                             )
                         else:
                             old_row_max, row_max = sp.compute_row_max(row_max=row_max)
+                        if tmem_sp.cfg.corr_skip_threshold_log2 > 0:
+                            row_max = sp.freeze_row_max(
+                                old_row_max=old_row_max,
+                                row_max=row_max,
+                                scale_softmax_log2=scale_softmax_log2,
+                            )
                         # Stats(i): S(i) -> row max/sum for correction.
                         vec.store_vec(
                             old_row_max=old_row_max,
@@ -1948,13 +2180,24 @@ def create_softmax_task(
     dst = [tmem_vec]
     if s0s1_seq is not None and index == 0:
         dst.append(s0s1_seq)
+    pv_half_overlap = tmem_sp.cfg.pv_half_overlap
+    if pv_half_overlap:
+        if tmem_p_prefix_ready is None:
+            raise ValueError("pv_half_overlap requires the P-prefix barrier")
+        dst.append(tmem_p_prefix_ready)
+    p_in_smem = tmem_sp.cfg.p_in_smem
+    if p_in_smem:
+        if smem_p is None:
+            raise ValueError("p_in_smem requires the group's SMEM P resource")
+        dst.append(smem_p)
 
-    @schedule
-    def softmax_schedule(
+    def softmax_schedule_body(
         sp: TmemSPResource,
         vec: TmemStatsResource,
         seq: S0S1SequenceResource,
         wq: WorkQueue | None = None,
+        pr: TmemPPrefixReadyResource | None = None,
+        pb: SmemPResource | None = None,
     ) -> None:
         """Captured schedule for one softmax warp group."""
         if tmem_sp.enable_early_tile_sum:
@@ -1964,6 +2207,30 @@ def create_softmax_task(
         else:
             p_chunk = sp.init_softmax_state()
         scale_softmax_log2 = sp.load_scale_softmax_log2()
+
+        def exp2_p(sp: TmemSPResource, *, row_max: Any, scale_softmax_log2: Any) -> Any:
+            """Softmax and P store. With P in SMEM the store goes to the SMEM P tile,
+            with the half overlap the leading half is published behind ``pr``, else P goes
+            to the TMEM S/P stage."""
+            if p_in_smem:
+                # The S stage is released already, so exp2 and the P store are
+                # auxiliary work on the loaded S and the SMEM P tile.
+                p_chunk = sp.exp2_p_smem(
+                    row_max=row_max, scale_softmax_log2=scale_softmax_log2
+                )
+                pb.acquire()
+                sp.store_p()
+                pb.commit()
+                return p_chunk
+            if not pv_half_overlap:
+                return sp.exp2_p(row_max=row_max, scale_softmax_log2=scale_softmax_log2)
+            pr.acquire()
+            p_lo = sp.exp2_p_lo(row_max=row_max, scale_softmax_log2=scale_softmax_log2)
+            pr.commit()
+            return sp.exp2_p_hi(
+                row_max=row_max, scale_softmax_log2=scale_softmax_log2, p_lo=p_lo
+            )
+
         vec.init_store_state()
         with _work_tile_schedule_loop(wq, skip_if=skip_work_tile_if):
             # Recompute per-tile SP/Vec TMEM state.
@@ -2012,12 +2279,21 @@ def create_softmax_task(
                     )
                 else:
                     old_row_max, row_max = sp.compute_row_max(row_max=row_max)
+                if tmem_sp.cfg.corr_skip_threshold_log2 > 0:
+                    row_max = sp.freeze_row_max(
+                        old_row_max=old_row_max,
+                        row_max=row_max,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
                     row_sum=row_sum,
                 )
                 vec.commit()
+                if p_in_smem:
+                    # S is in registers. Free the stage so QK(i+1) overlaps exp2.
+                    sp.release()
                 if s0s1_seq is None:
                     pass
                 elif index == 0:
@@ -2028,23 +2304,28 @@ def create_softmax_task(
                     seq.wait()
                 # FP8 returns the pacing token before P work. Its SP release
                 # still follows every P store's completion.
-                if tmem_sp.cfg.uses_d128_fp8_softmax_cadence:
+                early_token = tmem_sp.cfg.uses_d128_fp8_softmax_cadence or (
+                    p_in_smem and tmem_sp.cfg.fp8_psmem_early_token
+                )
+                if early_token:
                     if index == 0:
                         seq.commit()
                     else:
                         seq.release()
                 # Apply softmax and write P.
-                p_chunk = sp.exp2_p(
+                p_chunk = exp2_p(
+                    sp,
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
-                if s0s1_seq is None or tmem_sp.cfg.uses_d128_fp8_softmax_cadence:
+                if s0s1_seq is None or early_token:
                     pass
                 elif index == 0:
                     seq.commit()
                 else:
                     seq.release()
-                sp.release()
+                if not p_in_smem:
+                    sp.release()
                 # Reduction.
                 row_sum = sp.softmax_aux_reduce(
                     old_row_max=old_row_max,
@@ -2122,15 +2403,27 @@ def create_softmax_task(
                     row_sum=row_sum,
                 )
                 vec.commit()
+                if p_in_smem:
+                    sp.release()
                 if s0s1_seq is not None:
                     seq.acquire()
-                p_chunk = sp.masked_exp2_p(
-                    row_max=row_max,
-                    scale_softmax_log2=scale_softmax_log2,
-                )
+                if p_in_smem:
+                    p_chunk = sp.masked_exp2_p_smem(
+                        row_max=row_max,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
+                    pb.acquire()
+                    sp.store_p()
+                    pb.commit()
+                else:
+                    p_chunk = sp.masked_exp2_p(
+                        row_max=row_max,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
                 if s0s1_seq is not None:
                     seq.commit()
-                sp.release()
+                if not p_in_smem:
+                    sp.release()
                 row_sum = sp.softmax_aux_reduce(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -2151,11 +2444,16 @@ def create_softmax_task(
                     if s0s1_seq is not None:
                         seq.acquire()
                     sp.invalid_exp2_p(row_max=row_max)
+                    if p_in_smem:
+                        # MMA skips this PV but still waits on the P tile.
+                        pb.acquire()
+                        pb.commit()
                     if s0s1_seq is not None:
                         seq.commit()
                     sp.release()
-                sp.wait()
-                sp.release()
+                if not p_in_smem:
+                    sp.wait()
+                    sp.release()
                 old_row_max = sp.softmax_aux_identity(row_max=row_max)
                 vec.acquire()
                 vec.store_vec(
@@ -2178,15 +2476,27 @@ def create_softmax_task(
                     row_sum=row_sum,
                 )
                 vec.commit()
+                if p_in_smem:
+                    sp.release()
                 if s0s1_seq is not None:
                     seq.wait()
-                p_chunk = sp.masked_exp2_p(
-                    row_max=row_max,
-                    scale_softmax_log2=scale_softmax_log2,
-                )
+                if p_in_smem:
+                    p_chunk = sp.masked_exp2_p_smem(
+                        row_max=row_max,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
+                    pb.acquire()
+                    sp.store_p()
+                    pb.commit()
+                else:
+                    p_chunk = sp.masked_exp2_p(
+                        row_max=row_max,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
                 if s0s1_seq is not None:
                     seq.release()
-                sp.release()
+                if not p_in_smem:
+                    sp.release()
                 row_sum = sp.softmax_aux_reduce(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -2194,8 +2504,9 @@ def create_softmax_task(
                     p_chunk=p_chunk,
                     scale_softmax_log2=scale_softmax_log2,
                 )
-                sp.wait()
-                sp.release()
+                if not p_in_smem:
+                    sp.wait()
+                    sp.release()
                 old_row_max = sp.softmax_aux_identity(row_max=row_max)
                 vec.acquire()
                 vec.store_vec(
@@ -2218,13 +2529,16 @@ def create_softmax_task(
                     row_sum=row_sum,
                 )
                 vec.commit()
+                if p_in_smem:
+                    sp.release()
                 if s0s1_seq is None:
                     pass
                 elif index == 0:
                     seq.acquire()
                 else:
                     seq.wait()
-                p_chunk = sp.exp2_p(
+                p_chunk = exp2_p(
+                    sp,
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
@@ -2234,7 +2548,8 @@ def create_softmax_task(
                     seq.commit()
                 else:
                     seq.release()
-                sp.release()
+                if not p_in_smem:
+                    sp.release()
                 row_sum = sp.softmax_aux_reduce(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -2244,8 +2559,9 @@ def create_softmax_task(
                 )
                 vec.acquire()
                 # Cleanup: drain the final SP slot and publish identity stats.
-                sp.wait()
-                sp.release()
+                if not p_in_smem:
+                    sp.wait()
+                    sp.release()
                 old_row_max = sp.softmax_aux_identity(row_max=row_max)
                 vec.store_vec(
                     old_row_max=old_row_max,
@@ -2256,8 +2572,9 @@ def create_softmax_task(
                 vec.commit()
             else:
                 # Non-causal tail: no more tiles, just publish the final stats.
-                sp.wait()
-                sp.release()
+                if not p_in_smem:
+                    sp.wait()
+                    sp.release()
                 old_row_max = sp.softmax_aux_identity(row_max=row_max)
                 vec.store_vec(
                     old_row_max=old_row_max,
@@ -2267,9 +2584,57 @@ def create_softmax_task(
                 )
                 vec.commit()
 
-    captured_schedule = _schedule_with_work_queue(
-        softmax_schedule, tmem_sp, tmem_vec, s0s1_seq, work_queue=work_queue
-    )
+    @schedule
+    def softmax_schedule(
+        sp: TmemSPResource,
+        vec: TmemStatsResource,
+        seq: S0S1SequenceResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        softmax_schedule_body(sp, vec, seq, wq)
+
+    @schedule
+    def softmax_schedule_pr(
+        sp: TmemSPResource,
+        vec: TmemStatsResource,
+        seq: S0S1SequenceResource,
+        pr: TmemPPrefixReadyResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        softmax_schedule_body(sp, vec, seq, wq, pr)
+
+    @schedule
+    def softmax_schedule_pb(
+        sp: TmemSPResource,
+        vec: TmemStatsResource,
+        seq: S0S1SequenceResource,
+        pb: SmemPResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        softmax_schedule_body(sp, vec, seq, wq, None, pb)
+
+    if p_in_smem:
+        captured_schedule = _schedule_with_work_queue(
+            softmax_schedule_pb,
+            tmem_sp,
+            tmem_vec,
+            s0s1_seq,
+            smem_p,
+            work_queue=work_queue,
+        )
+    elif pv_half_overlap:
+        captured_schedule = _schedule_with_work_queue(
+            softmax_schedule_pr,
+            tmem_sp,
+            tmem_vec,
+            s0s1_seq,
+            tmem_p_prefix_ready,
+            work_queue=work_queue,
+        )
+    else:
+        captured_schedule = _schedule_with_work_queue(
+            softmax_schedule, tmem_sp, tmem_vec, s0s1_seq, work_queue=work_queue
+        )
     return task_class(
         src_resources=src,
         dst_resources=dst,
@@ -2423,6 +2788,9 @@ def create_correction_task(
     def _create_paired_task() -> Task:
         if tmem_vec1 is None or smem_o_1 is None or tmem_vec_done_1 is None:
             raise ValueError("paired correction scheduling requires peer-1 resources")
+        release_stats_after_read = tmem_vec0.cfg.p_in_smem
+        if release_stats_after_read and not tmem_vec0.cfg.stats_via_smem:
+            raise ValueError("early stats release requires SMEM-staged stats")
 
         src = _src_resources(
             tmem_vec0,
@@ -2469,14 +2837,19 @@ def create_correction_task(
                 v0.wait()
                 v0.release()
                 v1.wait()
+                if release_stats_after_read:
+                    v1.release()
                 # The correction loop consumes vec/O pairs in alternating order so
-                # each half can unblock the other half's next producer.
+                # each half can unblock the other half's next producer. With P in
+                # SMEM each stats slot is released right after read_vec instead.
                 with domain_loop(loop_start, loop_end, loop_step):
                     # Part 1: consume TmemStats0 + O0, release TmemStats1.
                     v0.wait()
                     vec_old_max, vec_new_max, _, vec_scale = v0.read_vec(
                         scale_softmax_log2=scale_softmax_log2_v0,
                     )
+                    if release_stats_after_read:
+                        v0.release()
                     to.wait()
                     to.correct(
                         vec_old_max=vec_old_max,
@@ -2484,13 +2857,16 @@ def create_correction_task(
                         vec_scale=vec_scale,
                         inst_idx=0,
                     )
-                    v1.release()
+                    if not release_stats_after_read:
+                        v1.release()
                     to.release()
                     # Part 2: consume TmemStats1 + O1, release TmemStats0.
                     v1.wait()
                     vec_old_max, vec_new_max, _, vec_scale = v1.read_vec(
                         scale_softmax_log2=scale_softmax_log2_v1,
                     )
+                    if release_stats_after_read:
+                        v1.release()
                     to.wait()
                     to.correct(
                         vec_old_max=vec_old_max,
@@ -2498,10 +2874,12 @@ def create_correction_task(
                         vec_scale=vec_scale,
                         inst_idx=1,
                     )
-                    v0.release()
+                    if not release_stats_after_read:
+                        v0.release()
                     to.release()
                 # Tail: read the final stats, then write corrected O0/O1 to smem.
-                v1.release()
+                if not release_stats_after_read:
+                    v1.release()
                 v0.wait()
                 _, _, vec_row_sum, vec_scale = v0.read_vec(
                     scale_softmax_log2=scale_softmax_log2_v0,

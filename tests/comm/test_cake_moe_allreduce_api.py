@@ -8,6 +8,7 @@ import torch
 
 import flashinfer.comm as comm
 from flashinfer.comm import trtllm_ar
+from flashinfer.jit import cake_trtllm_moe_allreduce_union as union
 
 
 _PUBLIC_PARAMETER_NAMES = (
@@ -94,14 +95,16 @@ def test_default_backend_keeps_trtllm_dispatch(
     assert calls[0]["moe_reduction_token_input"] is args["moe_reduction_token_input"]
 
 
-def test_cake_backend_dispatches_exact_18_argument_ffi_contract(
+def test_cake_backend_dispatches_to_the_union(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = []
-    module = SimpleNamespace(run_reduction=lambda *args: calls.append(args))
+    union_parameters = set(
+        inspect.signature(union.run_cake_moe_allreduce_union).parameters
+    )
     monkeypatch.setattr(trtllm_ar, "_validate_cake_moe_allreduce", lambda **kwargs: 3)
     monkeypatch.setattr(
-        trtllm_ar, "get_cake_moe_allreduce_module", lambda device_index: module
+        union, "run_cake_moe_allreduce_union", lambda **kwargs: calls.append(kwargs)
     )
     monkeypatch.setattr(
         trtllm_ar,
@@ -114,23 +117,33 @@ def test_cake_backend_dispatches_exact_18_argument_ffi_contract(
 
     assert len(calls) == 1
     call = calls[0]
-    assert len(call) == 18
-    assert call[:4] == (2, 0, 1, 4)
-    assert call[4] is args["workspace_ptrs"]
-    assert call[5] is False
-    assert call[6] is args["residual_in"]
-    assert call[7] is args["rms_gamma"]
-    assert call[8:11] == (1e-6, 1.0, 2)
-    assert call[11] is args["moe_reduction_scale_input"]
-    assert call[12] is args["moe_reduction_active_experts_token_input"]
-    assert call[13] is args["moe_reduction_token_input"]
-    assert call[14] is None
-    assert call[15] is args["residual_out"]
-    assert call[16] is args["norm_out"]
-    assert call[17] is None
+    assert call["backend"] == "cake"
+    assert (
+        call["world_size"],
+        call["world_rank"],
+        call["token_num"],
+        call["hidden_dim"],
+    ) == (2, 0, 1, 4)
+    assert call["workspace_ptrs"] is args["workspace_ptrs"]
+    assert call["launch_with_pdl"] is False
+    assert call["residual_in"] is args["residual_in"]
+    assert call["rms_gamma"] is args["rms_gamma"]
+    assert (call["rms_eps"], call["scale_factor"]) == (1e-6, 1.0)
+    assert call["moe_reduction_device_num_experts"] == 2
+    assert call["moe_reduction_scale_input"] is args["moe_reduction_scale_input"]
+    assert (
+        call["moe_reduction_active_experts_token_input"]
+        is args["moe_reduction_active_experts_token_input"]
+    )
+    assert call["moe_reduction_token_input"] is args["moe_reduction_token_input"]
+    assert call["moe_allreduce_out"] is None
+    assert call["residual_out"] is args["residual_out"]
+    assert call["norm_out"] is args["norm_out"]
+    assert call["weight_bias"] is None
+    assert set(call) == union_parameters
 
 
-def test_cake_validator_accepts_tokens_above_legacy_cap(
+def test_cake_validator_has_no_token_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     token_num = 2049
@@ -184,9 +197,9 @@ def test_lamport_byte_limit_rejects_before_backend_load(
     args = _reduction_args()
     args["moe_reduction_token_input"] = SimpleNamespace(numel=lambda: overflow_numel)
     monkeypatch.setattr(
-        trtllm_ar,
-        "get_cake_moe_allreduce_module",
-        lambda _: pytest.fail("oversize payload must fail before Cake module load"),
+        union,
+        "run_cake_moe_allreduce_union",
+        lambda **_: pytest.fail("oversize payload must fail before the union runs"),
     )
 
     with pytest.raises(
@@ -208,9 +221,9 @@ def test_invalid_backend_fails_before_module_load(
         lambda: pytest.fail("invalid backend must fail before module load"),
     )
     monkeypatch.setattr(
-        trtllm_ar,
-        "get_cake_moe_allreduce_module",
-        lambda _device_index: pytest.fail("invalid backend must not load Cake"),
+        union,
+        "run_cake_moe_allreduce_union",
+        lambda **_: pytest.fail("invalid backend must not reach the union"),
     )
 
     with pytest.raises(ValueError, match="unsupported MoE all-reduce backend"):

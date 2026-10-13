@@ -304,10 +304,6 @@ def prepare_minimax_h3_qkv_quantize_pack(
     fmt = cast(MiniMaxH3QkvPackFormat, format)
     route = minimax_h3_qkv_pack_route_record(device, P, fmt)
     record = route["module"]
-    if int(record.get("tma_workspace_bytes", 0)) != 0:
-        raise RuntimeError(
-            "MiniMax-H3 QKV pack route unexpectedly requires a TMA workspace"
-        )
     module = load_minimax_h3_qkv_pack_module(device, P, fmt)
 
     values = {

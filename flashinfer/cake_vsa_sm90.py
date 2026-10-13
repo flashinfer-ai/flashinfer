@@ -112,6 +112,14 @@ META_WORDS = META_OWN_OFF + NUM_CONSUMER_WGS * OWN_WORDS  # 144
 
 # Small-selection route (port of the Cake kernel module ``vsa_sm90_small``).
 SMALL_KMAX_VARIANTS = (1, 3, 4, 6)
+# Split-KV variants that ship.  :func:`split_kmax` ranks variants by
+# ``chain_blocks(kmax) + SPLIT_MERGE_COST * (max_nsplit - 1)``: KMAX 3 has the
+# same two-block chain as KMAX 4 and never fewer slices, so KMAX 4 always wins
+# the tie-or-better; KMAX 1 (one-block chain, one slice per block) only wins
+# when KMAX 3/4/6 all exceed the one-wave item budget while KMAX 1 fits it,
+# a band of ragged masks with ``2 * tiles`` within two of the SM count and one
+# selection of 13..31 blocks.  Those masks run the persistent kernel instead.
+SPLIT_KMAX_VARIANTS = (4, 6)
 SMALL_OCCUPANCY = {
     1: 4,
     2: 1,
@@ -189,10 +197,11 @@ def split_kmax(counts: list[int], *, sms: Optional[int] = None) -> int:
     Variants whose item count fits one wave (when ``sms`` is given) and whose
     plan fits the parameter bank are ranked by ``chain_blocks(kmax) * SPLIT_BLOCK_COST
     + (max_nsplit - 1) * SPLIT_MERGE_COST``; the cheapest wins (largest kmax on
-    ties).  Raises when no variant fits.  Mirrors ``vsa_sm90_small.split_kmax``.
+    ties).  Raises when no variant fits.  Mirrors ``vsa_sm90_small.split_kmax``
+    over the shipped :data:`SPLIT_KMAX_VARIANTS`.
     """
     best = None
-    for kmax in SMALL_KMAX_VARIANTS:
+    for kmax in SPLIT_KMAX_VARIANTS:
         nsplits = [max(1, -(-c // kmax)) for c in counts]
         items = sum(nsplits)
         if (
@@ -473,6 +482,10 @@ def plan_small(
     if kmax not in SMALL_KMAX_VARIANTS and not cluster:
         raise ValueError(
             f"kmax={kmax} is not a compiled small-kernel variant {SMALL_KMAX_VARIANTS}"
+        )
+    if split and kmax not in SPLIT_KMAX_VARIANTS:
+        raise ValueError(
+            f"kmax={kmax} is not a compiled split-KV variant {SPLIT_KMAX_VARIANTS}"
         )
     if not split and not cluster and kmax < capacity:
         raise ValueError(f"kmax={kmax} cannot hold {capacity} blocks per tile")

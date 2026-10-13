@@ -33,6 +33,22 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     group.addoption("--flashinfer-node-file", metavar="PATH")
     group.addoption("--flashinfer-result-json", metavar="PATH")
     group.addoption("--flashinfer-telemetry-json", metavar="PATH")
+    # Accept --full so that PYTEST_ADDOPTS="--full" (injected by nightly
+    # builds via task_test_nightly_build.sh) does not cause an unrecognized-
+    # argument error in collection or execution subprocesses where
+    # tests/conftest.py may not be on the conftest discovery path.
+    # When conftest discovery also loads tests/test_helpers/parametrize.py,
+    # --full is already registered — silently skip the duplicate.
+    import argparse
+    import contextlib
+
+    with contextlib.suppress(argparse.ArgumentError):
+        group.addoption(
+            "--full",
+            action="store_true",
+            default=False,
+            help="run full parameter matrices instead of regular subsets",
+        )
 
 
 def pytest_configure(config: pytest.Config) -> None:
