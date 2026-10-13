@@ -18,6 +18,7 @@ from typing import Final, Literal
 
 import pytest
 import torch
+from packaging.version import Version
 
 from flashinfer import svdquant_linear
 from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig
@@ -48,6 +49,369 @@ from flashinfer.testing.svdq_model_shapes import (
 )
 
 # Backend dispatch, rank handling and linear runner selection.
+
+
+@pytest.fixture
+def auto_backend_case(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
+    """Run real public dispatch and tuning with CPU kernels and deterministic timings."""
+    import flashinfer.cute_dsl
+    import flashinfer.utils
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setattr(flashinfer.utils, "get_compute_capability", lambda _: (12, 0))
+    monkeypatch.setattr(gemm_svdquant, "get_compute_capability", lambda _: (12, 0))
+    monkeypatch.setattr(gemm_svdquant, "get_cuda_version", lambda: Version("12.9"))
+    monkeypatch.setattr(flashinfer.cute_dsl, "is_cute_dsl_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    profiles: list[tuple[str, int]] = []
+    builds: list[str] = []
+
+    class Runner(TunableRunner):
+        def __init__(self, label: str, output_index: int) -> None:
+            self.label = label
+            self.output_index = output_index
+
+        def get_cache_key_extras(self, inputs):
+            return (self.label,)
+
+        def get_valid_tactics(self, inputs, profile):
+            return [0]
+
+        def validate_tactic(self, inputs, tactic):
+            return tactic in (-1, 0)
+
+        def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+            value = 2 if self.label.startswith("cutlass") else 1
+            inputs[self.output_index].fill_(value)
+            return inputs[self.output_index]
+
+    def native(label: str, output_index: int):
+        builds.append(label)
+        return Runner(label, output_index)
+
+    monkeypatch.setattr(
+        gemm_svdquant, "_sm120_nvfp4_svdquant_runner", lambda _: Runner("cute", 8)
+    )
+    monkeypatch.setattr(
+        gemm_svdquant,
+        "_sm120_nvfp4_svdquant_unfused_runner",
+        lambda _: Runner("cute-unfused", 8),
+    )
+    monkeypatch.setattr(
+        backend, "_nvfp4_svdquant_gemm_runner", lambda *args: native("cutlass", 8)
+    )
+    monkeypatch.setattr(
+        backend, "_sm120_cutlass_linear_runner", lambda *args: native("cutlass", 12)
+    )
+    monkeypatch.setattr(
+        backend, "_sm120_fused_linear_runner", lambda *args: native("cutlass-fused", 12)
+    )
+    monkeypatch.setattr(backend, "_sm120_max_workspace_bytes", lambda *args: 16)
+    monkeypatch.setattr(backend, "DEFAULT_WORKSPACE_SIZE", 16)
+    monkeypatch.setattr(
+        backend,
+        "_get_cache_buf",
+        lambda _, size, device: torch.empty(size, dtype=torch.uint8),
+    )
+
+    def quantize(x, scale, global_scale, **kwargs):
+        m, k = x.shape
+        return (
+            torch.zeros((m, k // 2), dtype=torch.uint8),
+            torch.zeros(gemm_svdquant._swizzled_sf_size(m, k // 16), dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(gemm_svdquant, "nvfp4_quantize_smooth", quantize)
+
+    def profile(runner, inputs, tactic, tuning_config, **kwargs):
+        result = runner(inputs, tactic=tactic)
+        value = int(result[0, 0])
+        profiles.append((type(runner).__name__, len(inputs)))
+        return 1.0 if value == 2 else 10.0
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", profile)
+    m, n, k, rank = getattr(request, "param", (64, 128, 256, 32))
+    x = torch.ones((m, k), dtype=torch.bfloat16)
+    weight = torch.zeros((n, k // 2), dtype=torch.uint8)
+    sf = torch.zeros(gemm_svdquant._swizzled_sf_size(n, k // 16), dtype=torch.uint8)
+    scale = torch.ones(1)
+    l2 = torch.ones((k, rank), dtype=torch.bfloat16)
+    l1 = torch.ones((n, rank), dtype=torch.bfloat16)
+    operands = [x, weight, sf, scale, x[0], l2, l1, scale, None]
+
+    def call(operation: str, enable_pdl: bool = False):
+        x, weight, sf, scale, pqs, l2, l1, global_scale, bias = operands
+        if operation == "gemm":
+            xq, x_sf = quantize(x, pqs, global_scale)
+            return gemm_svdquant.mm_nvfp4_svdquant(
+                xq,
+                weight,
+                x_sf,
+                sf,
+                scale,
+                torch.mm(x, l2),
+                l1,
+                bias=bias,
+                backend="auto",
+                enable_pdl=enable_pdl,
+            )
+        return gemm_svdquant.svdquant_linear(
+            *operands,
+            backend="auto",
+            enable_pdl=enable_pdl,
+        )
+
+    return tuner, call, profiles, builds, operands
+
+
+@pytest.mark.parametrize("operation", ["gemm", "linear"])
+@pytest.mark.parametrize("source", ["memory", "file"])
+def test_auto_tunes_cutlass_and_replays_winner(
+    auto_backend_case, operation, source, tmp_path
+):
+    from flashinfer import autotune
+
+    tuner, call, profiles, builds, _ = auto_backend_case
+    with autotune(True):
+        result = call(operation)
+    assert torch.all(result == 2), "auto never offered the faster CUTLASS backend"
+    assert profiles and builds
+    assert tuner.profiling_cache
+    if source == "file":
+        path = str(tmp_path / "auto.json")
+        tuner.save_configs(path)
+        tuner.clear_cache()
+        assert tuner.load_configs(path)
+    count = len(profiles)
+    replay = call(operation)
+    assert torch.all(replay == 2)
+    assert len(profiles) == count
+    if operation == "linear":
+        assert all(size == 10 for _, size in profiles), "tune the full linear chain"
+
+
+@pytest.mark.parametrize("operation", ["gemm", "linear"])
+def test_auto_untuned_keeps_cute_without_cutlass_build(auto_backend_case, operation):
+    _, call, profiles, builds, _ = auto_backend_case
+    assert torch.all(call(operation) == 1)
+    assert not profiles
+    assert not builds
+
+
+@pytest.mark.parametrize("operation", ["gemm", "linear"])
+def test_auto_can_choose_cute_over_cutlass(auto_backend_case, operation, monkeypatch):
+    from flashinfer import autotune
+
+    tuner, call, profiles, builds, _ = auto_backend_case
+    profile = tuner._profile_single_kernel
+    monkeypatch.setattr(
+        tuner,
+        "_profile_single_kernel",
+        lambda *args, **kwargs: -profile(*args, **kwargs),
+    )
+    with autotune(True):
+        assert torch.all(call(operation) == 1)
+    assert builds and profiles
+    assert torch.all(call(operation) == 1)
+
+
+@pytest.mark.parametrize("operation", ["gemm", "linear"])
+def test_auto_uses_cutlass_without_cute_dsl(auto_backend_case, operation, monkeypatch):
+    import flashinfer.cute_dsl
+
+    _, call, profiles, builds, _ = auto_backend_case
+    monkeypatch.setattr(flashinfer.cute_dsl, "is_cute_dsl_available", lambda: False)
+    assert torch.all(call(operation) == 2)
+    assert builds and not profiles
+
+
+@pytest.mark.parametrize("operation", ["gemm", "linear"])
+def test_auto_drops_cached_cutlass_for_unaligned_lora(auto_backend_case, operation):
+    from flashinfer import autotune
+
+    _, call, profiles, builds, operands = auto_backend_case
+    with autotune(True):
+        assert torch.all(call(operation) == 2)
+    aligned = operands[6]
+    operands[6] = torch.ones(aligned.numel() + 1, dtype=aligned.dtype)[1:].reshape(
+        aligned.shape
+    )
+    assert operands[6].data_ptr() % 16 != 0
+    profiles.clear()
+    builds.clear()
+    assert torch.all(call(operation) == 1)
+    assert not builds and not profiles
+
+
+@pytest.mark.parametrize("operation", ["gemm", "linear"])
+@pytest.mark.parametrize("change", ["pdl", "abi"])
+def test_auto_does_not_reuse_winner_across_pdl_or_abi(
+    auto_backend_case, operation, change, monkeypatch
+):
+    from flashinfer import autotune
+
+    _, call, _, _, _ = auto_backend_case
+    with autotune(True):
+        assert torch.all(call(operation) == 2)
+    if change == "abi":
+        monkeypatch.setattr(
+            backend, "_SM120_TACTIC_ABI_VERSION", backend._SM120_TACTIC_ABI_VERSION + 1
+        )
+        monkeypatch.setattr(
+            backend,
+            "_sm120_linear_op_name",
+            lambda *args, **kwargs: "future_linear_abi",
+        )
+    assert torch.all(call(operation, enable_pdl=change == "pdl") == 1)
+
+
+@pytest.mark.parametrize(
+    "flag", ["FLASHINFER_NVFP4_4OVER6", "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"]
+)
+def test_auto_linear_quantization_policy_excludes_cached_native(
+    auto_backend_case, monkeypatch, flag
+):
+    from flashinfer import autotune
+
+    _, call, profiles, builds, _ = auto_backend_case
+    with autotune(True):
+        assert torch.all(call("linear") == 2)
+    monkeypatch.setenv(flag, "1")
+    profiles.clear()
+    builds.clear()
+    assert torch.all(call("linear") == 1)
+    assert not profiles and not builds
+
+
+@pytest.mark.parametrize(
+    "auto_backend_case", [(64, 128, 3072, 32), (64, 128, 3072, 64)], indirect=True
+)
+def test_auto_linear_measures_both_native_prefixes(auto_backend_case):
+    from flashinfer import autotune
+
+    _, call, profiles, builds, _ = auto_backend_case
+    with autotune(True):
+        assert torch.all(call("linear") == 2)
+    assert {"cutlass", "cutlass-fused"} <= set(builds)
+    assert all(size == 10 for _, size in profiles)
+
+
+@pytest.mark.parametrize("index", [1, 2, 3, 5, 6, 8])
+def test_auto_linear_validates_before_tuning(auto_backend_case, index):
+    _, call, profiles, builds, operands = auto_backend_case
+    operands[index] = torch.zeros((1, 32) if index == 5 else (1,), dtype=torch.int64)
+    with pytest.raises(ValueError):
+        call("linear")
+    assert not profiles and not builds
+
+
+@pytest.mark.parametrize("operation", ["gemm", "linear"])
+def test_auto_keeps_cute_when_native_build_is_unavailable(
+    auto_backend_case, operation, monkeypatch
+):
+    from flashinfer import autotune
+
+    _, call, profiles, _, _ = auto_backend_case
+
+    def unavailable(*args):
+        raise RuntimeError("native compiler unavailable")
+
+    monkeypatch.setattr(backend, "_nvfp4_svdquant_gemm_runner", unavailable)
+    monkeypatch.setattr(backend, "_sm120_cutlass_linear_runner", unavailable)
+    monkeypatch.setattr(backend, "_sm120_fused_linear_runner", unavailable)
+    with autotune(True):
+        assert torch.all(call(operation) == 1)
+    assert profiles
+
+
+@pytest.mark.parametrize("operation", ["gemm", "linear"])
+@pytest.mark.parametrize("capability", [(10, 0), (12, 1)])
+def test_auto_keeps_other_architectures_on_existing_backends(
+    auto_backend_case, operation, capability, monkeypatch
+):
+    import flashinfer.utils
+    from flashinfer import autotune
+
+    _, call, _, builds, _ = auto_backend_case
+    monkeypatch.setattr(
+        flashinfer.utils, "get_compute_capability", lambda _: capability
+    )
+    monkeypatch.setattr(gemm_svdquant, "get_compute_capability", lambda _: capability)
+    monkeypatch.setattr(
+        gemm_svdquant,
+        "_nvfp4_svdquant_gemm_runner",
+        gemm_svdquant._sm120_nvfp4_svdquant_runner,
+    )
+    monkeypatch.setattr(
+        gemm_svdquant,
+        "_get_cache_buf",
+        lambda *args: torch.empty(16, dtype=torch.uint8),
+    )
+    with autotune(True):
+        assert torch.all(call(operation) == 1)
+    assert not builds
+
+
+@pytest.mark.parametrize("operation", ["gemm", "linear"])
+def test_auto_empty_batch_skips_tuning_and_native_build(auto_backend_case, operation):
+    from flashinfer import autotune
+
+    _, call, profiles, builds, operands = auto_backend_case
+    operands[0] = operands[0][:0]
+    with autotune(True):
+        result = call(operation)
+    assert result.shape == (0, operands[1].shape[0])
+    assert not profiles and not builds
+
+
+def test_auto_linear_prefix_and_pooled_alpha_match_composition(
+    auto_backend_case, monkeypatch
+):
+    _, call, _, _, operands = auto_backend_case
+    operands[3] = torch.tensor([0.5, 999.0])
+    operands[8] = torch.ones(operands[1].shape[0], dtype=torch.bfloat16)
+
+    class CpuLoraRunner(TunableRunner):
+        def get_valid_tactics(self, inputs, profile):
+            return [0]
+
+        def forward(self, inputs, tactic=-1, **kwargs):
+            _, _, _, _, alpha, down, l1, bias, out = inputs
+            assert alpha.shape == (1,)
+            out.copy_((down.float() @ l1.float().T) * alpha + bias)
+            return out
+
+    monkeypatch.setattr(
+        gemm_svdquant, "_sm120_nvfp4_svdquant_runner", lambda _: CpuLoraRunner()
+    )
+    expected = (
+        torch.mm(operands[0], operands[5]).float() @ operands[6].float().T
+    ) * 0.5 + operands[8]
+    torch.testing.assert_close(call("linear"), expected.bfloat16(), rtol=0, atol=0)
+
+
+def test_auto_native_adapter_rechecks_actual_workspace(workspace_case, monkeypatch):
+    from flashinfer.gemm.svdquant_sm120_auto import _CutlassAutoRunner
+
+    case = workspace_case
+    linear = len(case.inputs) == 14
+    fused = type(case.runner).__name__ == "Sm120FusedLinearRunner"
+    adapter = _CutlassAutoRunner(False, linear=linear, fused=fused)
+    for name in (
+        "_nvfp4_svdquant_gemm_runner",
+        "_sm120_cutlass_linear_runner",
+        "_sm120_fused_linear_runner",
+    ):
+        monkeypatch.setattr(backend, name, lambda *args: case.runner)
+    monkeypatch.setattr(backend, "_sm120_max_workspace_bytes", lambda *args: 64)
+    monkeypatch.setattr(backend, "_get_cache_buf", lambda *args: case.inputs[-1])
+    values = case.inputs[:9] + ([case.inputs[12]] if linear else [])
+    assert adapter.validate_tactic(values, case.large_tactic)
+    case.inputs[-1] = case.inputs[-1][:16]
+    assert not adapter.validate_tactic(values, case.large_tactic)
+    adapter(values, tactic=case.large_tactic)
+    assert case.launches == [0]
 
 
 def test_backend_for_capability_routing():

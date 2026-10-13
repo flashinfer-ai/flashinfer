@@ -2,8 +2,8 @@
 
 The fused linear path combines CUDA smooth quantization and LoRA-down
 projection with a CUTLASS GEMM that applies the LoRA-up correction and bias.
-Select it explicitly with ``backend="cutlass-sm120"``; ``"auto"`` keeps the
-upstream backend selection.
+Select it explicitly with ``backend="cutlass-sm120"``, or let ``"auto"`` compare
+it with CuTe DSL while autotuning. Untuned auto calls prefer CuTe DSL when available.
 """
 
 import functools

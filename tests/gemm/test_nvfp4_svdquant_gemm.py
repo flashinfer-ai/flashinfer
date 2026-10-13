@@ -4795,7 +4795,11 @@ def test_sm120_splitk_initializes_workspace_once_and_replays_fresh_inputs(
 
 
 def _check_linear_graph_replay(
-    rank: int, shape: tuple[int, int, int], use_bias: bool, enable_pdl: bool
+    rank: int,
+    shape: tuple[int, int, int],
+    use_bias: bool,
+    enable_pdl: bool,
+    backend_name: str = "cutlass-sm120",
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires SM120")
@@ -4828,7 +4832,7 @@ def _check_linear_graph_replay(
             global_sf,
             bias=bias,
             enable_pdl=enable_pdl,
-            backend="cutlass-sm120",
+            backend=backend_name,
         )
 
     def reference() -> torch.Tensor:
@@ -4873,10 +4877,15 @@ def _check_linear_graph_replay(
     "shape", [(129, 256, 256), (537, 5376, 7168), (64, 3072, 3072)]
 )
 @pytest.mark.parametrize("use_bias,enable_pdl", [(False, False), (True, True)])
+@pytest.mark.parametrize("backend_name", ["cutlass-sm120", "auto"])
 def test_linear_rank_autotune_and_graph_replay(
-    rank: int, shape: tuple[int, int, int], use_bias: bool, enable_pdl: bool
+    rank: int,
+    shape: tuple[int, int, int],
+    use_bias: bool,
+    enable_pdl: bool,
+    backend_name: str,
 ) -> None:
-    _check_linear_graph_replay(rank, shape, use_bias, enable_pdl)
+    _check_linear_graph_replay(rank, shape, use_bias, enable_pdl, backend_name)
 
 
 @pytest.mark.parametrize(
