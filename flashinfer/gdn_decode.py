@@ -371,7 +371,9 @@ def _run_cake_gdn_decode_pretranspose(
             output,
             initial_state_indices,
             write_indices,
-            batch_size * num_v_heads * 8,
+            batch_size
+            * num_v_heads
+            * _cake_gdn.cake_gdn_fp32_t1_ctas_per_state(route.variant_name),
             1,
             1,
         )

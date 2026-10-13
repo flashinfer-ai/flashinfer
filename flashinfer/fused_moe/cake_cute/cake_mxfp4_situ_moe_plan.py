@@ -74,7 +74,7 @@ SIBLING_MODULE = "flashinfer.fused_moe.cake"
 # whose decision selects another path, although
 # every launch of such a row has a generated form (see the manifest's ``carried_rows`` /
 # ``carried_rows_mixed_backend`` / ``uncarried_rows``).
-EXECUTABLE_PATHS = ('plain', 'dense', 'split_two_stage', 'hybrid')
+EXECUTABLE_PATHS = ('plain', 'dense', 'split_two_stage', 'hybrid', 'mixed192')
 
 
 SWAP_ATOMIC_FINALIZE_MAX_TOKENS = 16        # mxfp4.py:63-65
@@ -257,6 +257,12 @@ SWAP_WIDE192_DENSE_FIRST_MIN_TOKENS = 16384  # mxfp4.py:315-317
 SWAP_MIXED_GEMM2_MGROUP = 2                 # mxfp4.py:321
 
 
+MIXED192_SWAP_GEMM2_CHUNK_MAJOR = 4
+
+
+MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS = 32768
+
+
 B300_SITU_DENSE_TACTIC = (128, ((128, 256), (1, 1), False), ((128, 256), (1, 1), False))   # :353
 
 
@@ -328,6 +334,9 @@ DENSE_GEMM2_RASTER_M_MAX_SHARD = 512        # mxfp4.py:558-560
 
 
 DENSE_GEMM2_RASTER_M_MIN_TOKENS = 16384     # mxfp4.py:561-563
+
+
+MIXED192_WIDE_RASTER_M_MIN_TOKENS = 8192
 
 
 DENSE_DUAL_ALT_PDL = False                  # mxfp4.py:573
@@ -572,6 +581,7 @@ class GemmForm:
     pdl_trigger_after_wait: bool  # GEMM1 triggers dependents right after its common wait (:1411-1413)
     two_cta: bool = False
     row_tma: bool = False
+    sched_chunk_major: int = 0        # Cake lever: chunk-major finalize raster (``gemm2_swapab.form_config``, ``_cm``; B >= 2 = blocked ``_cm<B>``)
     row_group_list: bool = False   # GEMM1 SiTU over ``tile_idx_to_row_group`` (hybrid / mixed192 chains)
     sf_blocked: bool = False       # GEMM1 output scales in the tcgen05 atom layout (deployed with the list)
 
@@ -635,7 +645,7 @@ SWAPAB_SITU_FORMS = ((8, 8), (16, 4), (32, 4), (64, 4), (128, 4))   # gemm2_swap
 SWAPAB_NARROW_FORMS = (8, 16, 32)                                   # gemm2_swapab.NARROW_FORMS
 
 
-SWAPAB_SITU_ROWGROUP_FORMS = ((64, 4), (192, 4))                     # gemm2_swapab.SITU_ROWGROUP_FORMS (r11b: hybrid n64 / mixed192 n192 2-CTA)
+SWAPAB_SITU_ROWGROUP_FORMS = ((64, 4), (192, 4))                     # gemm2_swapab.SITU_ROWGROUP_FORMS (hybrid n64 / mixed192 n192 2-CTA)
 
 
 SWAPAB_WIDE_CTA1_FORMS = (64, 128)                                  # gemm2_swapab.WIDE_CTA1_FORMS (row TMA)
@@ -648,20 +658,44 @@ GEMM2_DENSE_TRACED_N = (128, 192, 256)                              # gemm2_dens
 
 
 GEMM1_DENSE_FORMS = {
-    "gemm1_dense_situ_m128_n256": (128, 256, False, False, False, False),
-    "gemm1_dense_situ_m128_n256_rowgroup": (128, 256, False, False, True, False),
-    "gemm1_dense_situ_m128_n128_rowgroup": (128, 128, False, False, True, False),
-    "gemm1_dense_situ_m128_n256_zero_fill": (128, 256, True, False, False, False),
-    "gemm1_dense_situ_m256_n256_2cta_zero_fill_secondary": (256, 256, True, True, False, False),
-    "gemm1_dense_situ_m128_n256_rowgroup_early": (128, 256, False, False, True, True),
-    "gemm1_dense_situ_m128_n128_rowgroup_early": (128, 128, False, False, True, True),
+    "gemm1_dense_situ_m128_n256": (128, 256, False, False, False, False, True),
+    "gemm1_dense_situ_m128_n256_rowgroup": (128, 256, False, False, True, False, True),
+    "gemm1_dense_situ_m128_n128_rowgroup": (128, 128, False, False, True, False, True),
+    "gemm1_dense_situ_m128_n256_zero_fill": (128, 256, True, False, False, False, True),
+    "gemm1_dense_situ_m256_n256_2cta_zero_fill_secondary": (256, 256, True, True, False, False, True),
+    "gemm1_dense_situ_m128_n256_rowgroup_early": (128, 256, False, False, True, True, True),
+    "gemm1_dense_situ_m128_n128_rowgroup_early": (128, 128, False, False, True, True, True),
+    # The mixed192 chain's dense GEMM1 pair over the compacted wide lists with the output zero fill
+    # (mxfp4.py:1552-1676; base (128, 256) / (1, 1) primary, alternate (256, 256) / (2, 1) secondary).
+    "gemm1_dense_situ_m128_n256_rowgroup_zero_fill": (128, 256, True, False, True, False, True),
+    "gemm1_dense_situ_m256_n256_2cta_rowgroup_zero_fill_secondary": (256, 256, True, True, True, False, True),
+    # Lever L13: the plain 2-CTA row-group alternate for SWAP_WIDE192_ZERO_FILL = "route".
+    "gemm1_dense_situ_m256_n256_2cta_rowgroup": (256, 256, False, False, True, False, True),
+    # Lever c10 (``MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS``): the mixed192 zero-fill pair without the
+    # weight-stream hint (``_nol2``, same bodies; ``SWAP_WIDE192_ZERO_FILL = "dense"``, the default placement -- the
+    # one the lever was measured on). The L13 ``"route"`` placement's plain row-group pair keeps the hint: not measured,
+    # not traced here (``gemm1_dense.form_kwargs_for_symbol`` would accept it; the e2e registry / export gates do not).
+    "gemm1_dense_situ_m128_n256_rowgroup_zero_fill_nol2": (128, 256, True, False, True, False, False),
+    "gemm1_dense_situ_m256_n256_2cta_rowgroup_zero_fill_secondary_nol2": (256, 256, True, True, True, False, False),
 }
 
 
 DENSE_EARLY_SUFFIX = "_early"                                       # gemm1_dense.EARLY_SUFFIX / gemm2_dense.EARLY_SUFFIX
 
 
+DENSE_NOL2_SUFFIX = "_nol2"                                         # gemm1_dense.NOL2_SUFFIX (lever c10, appended last)
+
+
 GEMM2_DENSE_CLUSTER12_N = (256, 192)                                # gemm2_dense.CLUSTER12_FORMS ((128, N) / cluster (1, 2))
+
+
+GEMM2_DENSE_ROW_GROUP_CLUSTER_FORMS = ((256, 1, 2), (256, 2, 1))
+
+
+GEMM2_DENSE_RASTER_AUTO_FORMS = ((192, 1, 2), (256, 2, 1))                 # (n_tile, cta_group, cluster_n)
+
+
+GEMM2_DENSE_ROW_GROUP_RASTER_AUTO_FORMS = ((256, 1, 2), (256, 2, 1))
 
 
 SWAPAB_PARTIAL_FORMS = ((8, 4, 2), (16, 4, 2), (32, 4, 2))         # gemm2_swapab.PARTIAL_FORMS ((n_tile, kbps, m_group))
@@ -722,7 +756,7 @@ def swapab_situ_form(n_tile: int, kbps: int, *, row_group_list: bool = False, sf
         hw += " " + ", ".join(flags)
     nol2 = swapab_l2_suffix(n_tile, weight_l2_hint)
     if row_group_list or sf_blocked or two_cta:
-        # Round 11 (r11b): the deployed pairings of the list forms -- the hybrid 64-row sub-tile form over 128-row
+        # The deployed pairings of the list forms -- the hybrid 64-row sub-tile form over 128-row
         # sort groups (``swapab_gemm1_situ(tile_idx_to_row_group=swap_row_groups, group_rows=128, sf_blocked=True)``,
         # mxfp4.py:1346-1351) and the mixed192 192-row cta_group::2 window form (:1350-1357 / :1403-1408, ``row_unit``
         # 64) -- both write the blocked output scales the dense finalize GEMM2 tiles of the chain read
@@ -748,10 +782,20 @@ def swapab_situ_form(n_tile: int, kbps: int, *, row_group_list: bool = False, sf
                   + swapab_pdl_suffix(n_tile, dep_prefetch) + nol2, GEMM2_SWAPAB_MODULE, BOTH)
 
 
+def swapab_cm_suffix(chunk_major: int) -> str:
+    """Form suffix of the chunk-major lever: ``_cm`` (plain), ``_cm<B>`` (blocked sweep of B chunks), none when off."""
+    block = int(chunk_major)
+    return "" if block <= 0 else ("_cm" if block == 1 else f"_cm{block}")
+
+
 def swapab_gemm2_form(n_tile: int, kbps: int, m_group: int, *, finalize: bool, row_group_list: bool = False,
                       sf_blocked: bool = False, two_cta: bool = False, dep_prefetch: bool | None = None,
-                      weight_l2_hint: int | None = TMA_L2_EVICT_FIRST) -> Launch:
+                      weight_l2_hint: int | None = TMA_L2_EVICT_FIRST, chunk_major: int = 0) -> Launch:
     """GEMM2 swap-AB launch (hand-written ``swapab_gemm2``, swapab_moe.py:836-1000).
+
+    ``chunk_major`` (Cake lever ``MIXED192_SWAP_GEMM2_CHUNK_MAJOR``) selects the chunk-major scheduler raster of the
+    192-row 2-CTA finalize (``gemm2_swapab_finalize_n192_2cta_cm``; an int ``B >= 2`` the blocked sweep ``_cm<B>``),
+    recorded as a deviation from the hand-written m-fastest raster; it is traced for that form only.
 
     ``dep_prefetch`` (the plan's ``pdl and dep_prefetch``, mxfp4.py:1982) selects ``late_dep_wait``; the form symbol
     carries ``swapab_pdl_suffix`` (``_nodp`` on the split chain's narrow partial GEMM2). ``weight_l2_hint`` (:1979 /
@@ -788,7 +832,17 @@ def swapab_gemm2_form(n_tile: int, kbps: int, m_group: int, *, finalize: bool, r
             return Launch(step, hw, None, GEMM2_SWAPAB_MODULE, BOTH,
                           missing=f"gemm2_swapab two_cta form only traced as n192 kbps 4 m_group 1 with the row-group "
                                   f"list and blocked scales (mixed192 deployment); got n{n_tile} k{kbps} m{m_group}")
+        if chunk_major:
+            return Launch(step, hw, "gemm2_swapab_finalize_n192_2cta" + nodp + swapab_cm_suffix(chunk_major),
+                          GEMM2_SWAPAB_MODULE, BOTH,
+                          deviations=("scheduler raster chunk-major (weight chunk outer, window inner"
+                                      + (f", blocked {int(chunk_major)} chunks per window" if int(chunk_major) > 1 else "")
+                                      + "; Cake lever MIXED192_SWAP_GEMM2_CHUNK_MAJOR) vs the hand-written m-fastest "
+                                      "raster (swapab_moe.py:789 / :1418): same reduce-adds, different arrival order",))
         return Launch(step, hw, "gemm2_swapab_finalize_n192_2cta" + nodp, GEMM2_SWAPAB_MODULE, BOTH)
+    if chunk_major:
+        return Launch(step, hw, None, GEMM2_SWAPAB_MODULE, BOTH,
+                      missing="gemm2_swapab chunk-major raster (_cm) is traced for the 192-row 2-CTA finalize only")
     if row_group_list or sf_blocked:
         return Launch(step, hw, None, GEMM2_SWAPAB_MODULE, BOTH,
                       missing="gemm2_swapab single-CTA finalize with tile_idx_to_row_group / sf_blocked "
@@ -805,9 +859,10 @@ def swapab_gemm2_form(n_tile: int, kbps: int, m_group: int, *, finalize: bool, r
 
 
 def gemm1_dense_form_symbol(tile_m: int, n_tile: int, *, zero_fill: bool, zero_fill_secondary: bool,
-                            row_group_list: bool, pdl_trigger_early: bool = False) -> str:
+                            row_group_list: bool, pdl_trigger_early: bool = False, weight_l2_hint: bool = True) -> str:
     """``kimi_k3_mxfp4_situ_gemm1_dense.form_symbol``:
-    ``gemm1_dense_situ_m<M>_n<N>[_2cta][_rowgroup][_zero_fill[_secondary]][_early]``."""
+    ``gemm1_dense_situ_m<M>_n<N>[_2cta][_rowgroup][_zero_fill[_secondary]][_early][_nol2]`` (``_nol2`` = the weight
+    loads without the EVICT_FIRST hint, ``weight_l2_hint=False``; always the last suffix)."""
     sym = f"gemm1_dense_situ_m{tile_m}_n{n_tile}" + ("_2cta" if tile_m == 256 else "")
     if row_group_list:
         sym += "_rowgroup"
@@ -815,29 +870,48 @@ def gemm1_dense_form_symbol(tile_m: int, n_tile: int, *, zero_fill: bool, zero_f
         sym += "_zero_fill" + ("_secondary" if zero_fill_secondary else "")
     if pdl_trigger_early:
         sym += DENSE_EARLY_SUFFIX
+    if not weight_l2_hint:
+        sym += DENSE_NOL2_SUFFIX
     return sym
+
+
+def mixed192_dense_weight_l2_hint(num_tokens: int, *, zero_fill_in_dense: bool = True) -> bool:
+    """Weight-stream L2 policy of the mixed192 chain's dense GEMM1 pair at ``num_tokens`` (Cake lever
+    ``MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS``): ``True`` = the hand-written EVICT_FIRST hint
+    (``DENSE_WEIGHT_L2_HINT``), ``False`` = the ``_nol2`` forms. The one rule behind ``decide`` and
+    ``mixed192_launch_config``; the hybrid chain's dense launch and the split chain's wide launches keep the hint, and
+    so does the L13 ``"route"`` zero-fill placement (``zero_fill_in_dense=False``: its plain row-group pair was not
+    measured with the hint off)."""
+    if not zero_fill_in_dense:
+        return True
+    return int(num_tokens) < int(MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS)
 
 
 def gemm1_dense_form(mma_tiler: tuple[int, int], cluster: tuple[int, int], *, cluster_split_k: bool = False,
                      zero_fill: bool = False, zero_fill_secondary: bool = False, row_group_list: bool = False,
-                     pdl_trigger_early: bool = False) -> Launch:
+                     pdl_trigger_early: bool = False, weight_l2_hint: bool = True) -> Launch:
     """Dense gather GEMM1 SiTU launch (hand-written ``blockscaled_contiguous_gather_grouped_gemm_act_fusion``).
 
     Traced forms = ``GEMM1_DENSE_FORMS``: the (128, 256) / (1, 1) plain, row-group and zero-fill forms,
-    the (128, 128) / (1, 1) row-group form (``SWAP_SPLIT_GEMM1_N_POLICY`` at T <= 512) and the 2-CTA (256, 256) /
-    (2, 1) ``zero_fill_secondary`` alternate. Flag combinations without a traced form (row-group list together with
-    zero fill, the 2-CTA tile with a row-group list or without the secondary fill, ...) are refused by name.
+    the (128, 128) / (1, 1) row-group form (``SWAP_SPLIT_GEMM1_N_POLICY`` at T <= 512), the 2-CTA (256, 256) /
+    (2, 1) ``zero_fill_secondary`` alternate, and the mixed192 pair (row-group list together with the zero fill:
+    (128, 256) primary, 2-CTA secondary). Flag combinations without a traced form (the 2-CTA tile without the
+    secondary fill, a row-group zero-fill form with the early trigger, ...) are refused by name.
     ``cluster_split_k`` (form (c)) is recorded as a deviation on the traced form it decorates. ``pdl_trigger_early``
     (the split chain's wide launches, ``pdl and SWAP_SPLIT_EARLY_TRIGGER``) selects the ``_early`` placement form
     (``launch_dependents`` at kernel entry right before the common wait, no footer trigger; K:1775-1777 / :5482).
+    ``weight_l2_hint=False`` (Cake lever ``MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS``, the mixed192 pair from that
+    token count) selects the ``_nol2`` form -- the weight / weight-scale loads without the hand-written EVICT_FIRST
+    hint (``DENSE_WEIGHT_L2_HINT``) -- and records the deviation; traced for the mixed192 pairs only.
     """
     hw = f"dense gather GEMM1 mma_tiler {mma_tiler} cluster {cluster}"
     flags = [name for flag, name in ((zero_fill, "zero_fill_output"), (zero_fill_secondary, "zero_fill_secondary"),
                                      (row_group_list, "tile_idx_to_row_group"), (cluster_split_k, "cluster_split_k"),
-                                     (pdl_trigger_early, "pdl_trigger_early")) if flag]
+                                     (pdl_trigger_early, "pdl_trigger_early"),
+                                     (not weight_l2_hint, "weight_l2_hint=None")) if flag]
     if flags:
         hw += " " + ", ".join(flags)
-    deviations = ()
+    deviations: tuple[str, ...] = ()
     missing = []
     tile_m, n = mma_tiler
     expected_cluster = (2, 1) if tile_m == 256 else (1, 1)
@@ -846,7 +920,8 @@ def gemm1_dense_form(mma_tiler: tuple[int, int], cluster: tuple[int, int], *, cl
                        "(128, 128) / (1, 1), (256, 256) / (2, 1))")
     else:
         sym = gemm1_dense_form_symbol(tile_m, n, zero_fill=zero_fill, zero_fill_secondary=zero_fill_secondary,
-                                      row_group_list=row_group_list, pdl_trigger_early=pdl_trigger_early)
+                                      row_group_list=row_group_list, pdl_trigger_early=pdl_trigger_early,
+                                      weight_l2_hint=weight_l2_hint)
         if sym not in GEMM1_DENSE_FORMS:
             letters = []
             if zero_fill and tile_m == 128:
@@ -857,12 +932,18 @@ def gemm1_dense_form(mma_tiler: tuple[int, int], cluster: tuple[int, int], *, cl
                 letters.append("row-group list")
             if pdl_trigger_early:
                 letters.append("pdl_trigger_early")
+            if not weight_l2_hint:
+                letters.append("weight_l2_hint=None")
             missing.append(f"gemm1_dense form {sym} ({', '.join(letters)} together) not traced; traced forms: "
                            f"{tuple(GEMM1_DENSE_FORMS)}")
     if cluster_split_k:
         # Same class as the swap-AB GEMM1 cluster split-K recorded by the plain chain:
         # a device-side split decided per launch inside the (1, 1, 2) cluster launch; recorded, not a refusal.
-        deviations = ("cluster_split_k (form (c), (1, 1, 2) cluster; device-side split when 2 * valid_tiles <= grid.z)",)
+        deviations += ("cluster_split_k (form (c), (1, 1, 2) cluster; device-side split when "
+                       "2 * valid_tiles <= grid.z)",)
+    if not weight_l2_hint:
+        deviations += ("dense weight-stream L2 hint off (Cake lever MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS; the "
+                       "hand-written chain keeps MXFP4_DENSE_L2HINT=first)",)
     if missing:
         return Launch("gemm1_dense", hw, None, GEMM1_DENSE_MODULE, BOTH, missing="; ".join(missing), deviations=deviations)
     return Launch("gemm1_dense", hw, sym, GEMM1_DENSE_MODULE, BOTH, deviations=deviations)
@@ -893,9 +974,9 @@ def gemm2_dense_form(mma_tiler: tuple[int, int], cluster: tuple[int, int], *, ra
         if cta_group != 1 or n not in GEMM2_DENSE_CLUSTER12_N:
             missing.append(f"gemm2_dense {mma_tiler} cluster (1, 2) (traced for (128, N), N in "
                            f"{GEMM2_DENSE_CLUSTER12_N} only)")
-        elif row_group_list:
-            missing.append(f"gemm2_dense (128, {n}) cluster (1, 2) with the tile_idx_to_row_group list (only the "
-                           "plain _c12 forms are traced / registered)")
+        elif row_group_list and (n, 1, 2) not in GEMM2_DENSE_ROW_GROUP_CLUSTER_FORMS:
+            missing.append(f"gemm2_dense (128, {n}) cluster (1, 2) with the tile_idx_to_row_group list (registered "
+                           f"row-group cluster forms: {GEMM2_DENSE_ROW_GROUP_CLUSTER_FORMS})")
         elif hidden_size is None:
             raise ValueError("gemm2_dense_form(cluster=(1, 2)) needs hidden_size to resolve the weight-tile count")
         elif -(-hidden_size // n) % 2:
@@ -907,18 +988,32 @@ def gemm2_dense_form(mma_tiler: tuple[int, int], cluster: tuple[int, int], *, ra
                            f"ceil({-(-hidden_size // n)} / 2), SMs // 2), 1, 1) vs hand-written (1, 2, Z) (recorded)",)
     elif cta_group == 2 and (mma_tiler, cluster) != ((256, 256), (2, 1)):
         missing.append(f"gemm2_dense 2-CTA form {mma_tiler} / {cluster} (only (256, 256) / (2, 1) traced)")
+    elif cta_group == 2 and row_group_list and (n, 2, 1) not in GEMM2_DENSE_ROW_GROUP_CLUSTER_FORMS:
+        # The 2-CTA row-group symbol is reported only when the module registers it (the mixed192 alternate finalize).
+        missing.append(f"gemm2_dense 2-CTA form {mma_tiler} / {cluster} with the tile_idx_to_row_group list (registered "
+                       f"row-group cluster forms: {GEMM2_DENSE_ROW_GROUP_CLUSTER_FORMS})")
     elif cta_group == 1 and (cluster != (1, 1) or n not in GEMM2_DENSE_TRACED_N):
         missing.append(f"gemm2_dense form {mma_tiler} / {cluster} (traced: n in {GEMM2_DENSE_TRACED_N}, cluster (1, 1))")
-    if raster_along_m == "auto" or raster_along_m is True or swizzle != 1:
-        missing.append(f"gemm2_dense raster_along_m={raster_along_m!r} swizzle={swizzle} (device-side scheduler mode "
-                       "vote / M-fastest raster not traced)")
+    raster_auto = raster_along_m == "auto"
+    if raster_along_m is True or swizzle != 1:
+        missing.append(f"gemm2_dense raster_along_m={raster_along_m!r} swizzle={swizzle} (only the raster_along_m='auto' "
+                       "scheduler vote with swizzle 1 is traced, as the _rauto forms)")
+    elif raster_auto and ((n, cta_group, 2 if cluster == (1, 2) else 1) not in (
+            GEMM2_DENSE_ROW_GROUP_RASTER_AUTO_FORMS if row_group_list else GEMM2_DENSE_RASTER_AUTO_FORMS)
+                          or pdl_trigger_early):
+        missing.append(f"gemm2_dense raster_along_m='auto' for {mma_tiler} / {cluster}"
+                       + (" with the tile_idx_to_row_group list" if row_group_list else "")
+                       + (" with pdl_trigger_early" if pdl_trigger_early else "")
+                       + f" (registered _rauto forms: {GEMM2_DENSE_RASTER_AUTO_FORMS}, with the list: "
+                       f"{GEMM2_DENSE_ROW_GROUP_RASTER_AUTO_FORMS}; footer trigger)")
     if c_stages != 1:
         missing.append(f"gemm2_dense c_stages {c_stages} (form_config allows 1)")
     if missing:
         return Launch("gemm2_dense_finalize", hw, None, GEMM2_DENSE_MODULE, BOTH, missing="; ".join(missing),
                       deviations=deviations)
     sym = (f"gemm2_dense_finalize_n{n}" + ("_2cta" if cta_group == 2 else "") + ("_c12" if cluster == (1, 2) else "")
-           + ("_rg" if row_group_list else "") + (DENSE_EARLY_SUFFIX if pdl_trigger_early else ""))
+           + ("_rg" if row_group_list else "") + ("_rauto" if raster_auto else "")
+           + (DENSE_EARLY_SUFFIX if pdl_trigger_early else ""))
     if pdl_trigger_early and not row_group_list:
         missing.append(f"gemm2_dense {sym}: pdl_trigger_early is traced on the split chain's _rg form only")
         return Launch("gemm2_dense_finalize", hw, None, GEMM2_DENSE_MODULE, BOTH, missing="; ".join(missing),
@@ -1256,12 +1351,20 @@ class CakeSwapAbPolicy:
                     and gemm1_tactic[0][0] == 128 and tuple(gemm1_tactic[1]) == (1, 1)
                     and not self.dense_fill_in_gemm1(num_tokens))
 
-    def gemm2_raster(self, num_tokens: int, gemm2_tile_n: int) -> tuple:
-        """:2407-2430 (``MXFP4_GEMM2_RASTER_M=auto``, swizzle 4)."""
+    def gemm2_raster(self, num_tokens: int, gemm2_tile_n: int, *, wide_list: bool = False) -> tuple:
+        """:2407-2430 (``MXFP4_GEMM2_RASTER_M=auto``, swizzle 4).
+
+        ``wide_list`` = the mixed192 split finalize pair over the compacted wide lists: the hand-written chain
+        rasters it N-fastest below ``DENSE_GEMM2_RASTER_M_MIN_TOKENS``; the Cake lever
+        ``MIXED192_WIDE_RASTER_M_MIN_TOKENS`` is its own bound (equal by default) and selects the traced
+        ``swizzle_size`` 1 layout (the ``_rg_rauto`` forms; the swizzled cluster layout is not traced).
+        """
         if DENSE_GEMM2_RASTER_M == "auto":
-            if not (self.intermediate_shard <= DENSE_GEMM2_RASTER_M_MAX_SHARD
-                    and num_tokens >= DENSE_GEMM2_RASTER_M_MIN_TOKENS):
+            min_tokens = MIXED192_WIDE_RASTER_M_MIN_TOKENS if wide_list else DENSE_GEMM2_RASTER_M_MIN_TOKENS
+            if not (self.intermediate_shard <= DENSE_GEMM2_RASTER_M_MAX_SHARD and num_tokens >= min_tokens):
                 return False, 1
+            if wide_list:
+                return "auto", 1
             mode = "auto"
         elif DENSE_GEMM2_RASTER_M == "1":
             mode = True
@@ -1513,12 +1616,16 @@ class CakeSwapAbPolicy:
             if mixed192 and g1_tactic[0][0] != group:
                 g1_tactic = ((group, 256), (1, 1), False)
             zero_in_dense = zero_fill == "dense"
+            # Cake lever c10 (``MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS``): the mixed192 pair drops the EVICT_FIRST
+            # weight-stream hint from that token count (the ``_nol2`` forms); the hybrid chain's dense launch keeps it.
+            dense_hint = mixed192_dense_weight_l2_hint(T, zero_fill_in_dense=zero_in_dense) if mixed192 else True
+            g1_split = bool(mixed192 and self.dense_gemm1_cluster_split(g1_tactic, T))
             dense_g1.append(gemm1_dense_form(g1_tactic[0], g1_tactic[1], row_group_list=True, zero_fill=zero_in_dense,
-                                             cluster_split_k=(mixed192 and self.dense_gemm1_cluster_split(g1_tactic, T))))
+                                             cluster_split_k=g1_split, weight_l2_hint=dense_hint))
             if mixed192_dual is not None:                                                    # :1678-1727
                 alt = mixed192_dual[1]
                 dense_g1.append(gemm1_dense_form(alt[0], alt[1], row_group_list=True, zero_fill=zero_in_dense,
-                                                 zero_fill_secondary=zero_in_dense))
+                                                 zero_fill_secondary=zero_in_dense, weight_l2_hint=dense_hint))
         # ---- GEMM2 --------------------------------------------------------------------------------------------
         mixed192_gemm2 = self.swap_mixed192_gemm2(T) if mixed192 else None
         mixed192_dense_gemm2 = mixed192 and mixed192_gemm2 == "dense"
@@ -1563,9 +1670,10 @@ class CakeSwapAbPolicy:
             if split_k > 1 and (not fused_finalize or g2_two_cta or k_tiles2 % split_k):
                 split_k = 1                                                                  # swapab_moe.py:880-887
             g2_lists = bool(mixed or mixed192)
+            g2_cm = int(MIXED192_SWAP_GEMM2_CHUNK_MAJOR) if (mixed192 and g2_two_cta) else 0   # Cake lever (no hw line)
             g2 = swapab_gemm2_form(tile, kb2, mg2, finalize=fused_finalize, row_group_list=g2_lists,
                                    sf_blocked=g2_lists and not (mixed and SWAP_MIXED_SF_PLAIN), two_cta=g2_two_cta,
-                                   dep_prefetch=pdl and dep_prefetch, weight_l2_hint=hint)
+                                   dep_prefetch=pdl and dep_prefetch, weight_l2_hint=hint, chunk_major=g2_cm)
             g2_dev = tuple(g2.deviations)
             if split_k > 1:
                 g2_dev += ("split_k=2 device-side (swapab_moe.py:880-887)",)
@@ -1573,17 +1681,17 @@ class CakeSwapAbPolicy:
                                   "side" if (win_side and mixed192_gemm2 != "dense") else "main", g2_dev))
             gemm2 = GemmForm(n_tile=tile, kbps=kb2, m_group=mg2, k_tiles=k_tiles2, use_pdl=pdl, weight_l2_hint=hint,
                              hw_split_k=split_k, hw_cluster_split_k=False, late_dep_wait=pdl and dep_prefetch,
-                             pdl_trigger_after_wait=False, two_cta=g2_two_cta, row_tma=False)
+                             pdl_trigger_after_wait=False, two_cta=g2_two_cta, row_tma=False, sched_chunk_major=g2_cm)
         g2_wide: list[Launch] = []
         if mixed192 and not mixed192_dense_gemm2:                                            # :1803-1850
             g2_tactic = self.tactic(T)[2]
             if g2_tactic[0][0] != group:
                 g2_tactic = ((group, 192), (1, 2), False)
-            raster = self.gemm2_raster(T, g2_tactic[0][1])
+            raster = self.gemm2_raster(T, g2_tactic[0][1], wide_list=True)
             g2_wide.append(gemm2_dense_form(g2_tactic[0], g2_tactic[1], hidden_size=self.hidden_size, raster_along_m=raster[0], swizzle=raster[1],
                                             c_stages=DENSE_GEMM2_C_STAGES, row_group_list=True))
             if mixed192_dual is not None:                                                    # :1851-1862, :1820-1861
-                raster_b = self.gemm2_raster(T, self.tactic(T)[2][0][1])
+                raster_b = self.gemm2_raster(T, self.tactic(T)[2][0][1], wide_list=not mixed192_alt_gemm2)
                 g2_wide.append(gemm2_dense_form(mixed192_dual[2][0], mixed192_dual[2][1], hidden_size=self.hidden_size, raster_along_m=raster_b[0],
                                                 swizzle=raster_b[1], c_stages=DENSE_GEMM2_C_STAGES,
                                                 row_group_list=not mixed192_alt_gemm2))
@@ -1971,12 +2079,21 @@ def gemm1_dense_launch_bindings(b: dict[str, Any], *, weights: dict[str, Any], x
     split layout the groups are the ``SWAP_SPLIT_WIDE_TILE``-row wide slots from row 0, so the lists are the
     routing kernel's ``swap_wide_expert`` / ``swap_wide_limit`` (hand-written mxfp4.py:1478-1482); the 128-row sort
     groups of the hybrid / mixed192 forms use ``out_tile_idx_to_*``.
+
+    mixed192 dual pair (``dual`` + ``row_group_list``, mxfp4.py:1552-1676): the base launch rasters
+    ``swap_wide_list`` / ``swap_wide_count`` over the 128-row groups (``out_tile_idx_to_*``) and fills the other
+    padding's tiles ``swap_alt_wide_count``; the ``secondary`` (2-CTA) launch rasters ``swap_alt_wide_list`` /
+    ``swap_alt_wide_count`` over the 256-row groups (``out_alt_tile_idx_to_*``) with
+    ``zero_fill_other_tiles = swap_wide_count``.
     """
     import torch
 
     if secondary and not dual:
         raise ValueError("the zero_fill_secondary launch is the alternate of a dual-tile pair (dual=True)")
-    if row_group_list:
+    if row_group_list and secondary:
+        tile_expert, tile_limit = b["out_alt_tile_idx_to_expert_idx"], b["out_alt_tile_idx_to_mn_limit"]
+        row_group, valid = b["swap_alt_wide_list"], b["swap_alt_wide_count"]
+    elif row_group_list:
         if split_layout:
             tile_expert, tile_limit = b["swap_wide_expert"], b["swap_wide_limit"]
         else:
@@ -1993,9 +2110,9 @@ def gemm1_dense_launch_bindings(b: dict[str, Any], *, weights: dict[str, Any], x
         zf_words = output.view(torch.uint32).reshape(-1)
         zf_num = num_tokens * hidden // 2
         if secondary:
-            zf_other = b["out_base_active_num_non_exiting_tiles"]
+            zf_other = b["swap_wide_count"] if row_group_list else b["out_base_active_num_non_exiting_tiles"]
         elif dual:
-            zf_other = b["out_alt_num_non_exiting_tiles"]
+            zf_other = b["swap_alt_wide_count"] if row_group_list else b["out_alt_num_non_exiting_tiles"]
         else:
             zf_other = b["out_num_non_exiting_tiles"]
     else:
@@ -2012,14 +2129,24 @@ def gemm1_dense_launch_bindings(b: dict[str, Any], *, weights: dict[str, Any], x
 
 
 def gemm2_launch_bindings(b: dict[str, Any], *, weights: dict[str, Any], route_weights, hidden: int, shard: int,
-                          top_k: int, tiles: int, k_tiles: int, output, dbg, unused: dict[str, Any]) -> dict[str, Any]:
-    """Named bindings of the swap-AB finalize GEMM2 launch (:1957-1990); SiTU operands are the module's placeholders."""
+                          top_k: int, tiles: int, k_tiles: int, output, dbg, unused: dict[str, Any],
+                          row_group_list: bool = False) -> dict[str, Any]:
+    """Named bindings of the swap-AB finalize GEMM2 launch (:1957-1990); SiTU operands are the module's placeholders.
+
+    ``row_group_list`` (the mixed192 chain's 192-row 2-CTA window form, hand-written :1949-1961): the work list is
+    the K6 window list ``swap_row_groups`` with its count ``swap_row_group_count`` (``tile_idx_to_row_group`` /
+    ``num_non_exiting_tiles``), ``group_capacity`` the list capacity; the expert / row-bound tables stay the 128-row
+    sort groups' ``out_tile_idx_to_*`` and the activation scales are read blocked (``sf_blocked``, the SiTU
+    ``_rowgroup`` GEMM1 wrote them so). ``tiles`` is the sort-group capacity either way."""
     import torch
 
+    common = _gemm_common_bindings(b, route_weights=route_weights, tiles=tiles, top_k=top_k, dbg=dbg, unused=unused)
+    if row_group_list:
+        common.update(tile_idx_to_row_group=b["swap_row_groups"], num_non_exiting_tiles=b["swap_row_group_count"],
+                      group_capacity=int(b["swap_row_groups"].numel()))
     return dict(
         A=weights["w2"], SFA=weights["w2_sf"], B=b["gemm1_out"].view(torch.uint8), SFB=b["gemm1_out_scale"],
-        alpha=b["w2_alpha"],
-        **_gemm_common_bindings(b, route_weights=route_weights, tiles=tiles, top_k=top_k, dbg=dbg, unused=unused),
+        alpha=b["w2_alpha"], **common,
         num_m_tiles=hidden // 128, k_tiles=k_tiles, k_cols=shard, sf_cols=shard // 32, out_cols=hidden,
         out=output, **_gemm_module()._unused_situ_operands(output.device))
 
@@ -2054,12 +2181,18 @@ def gemm2_dense_launch_bindings(b: dict[str, Any], *, w2, w2_sf, route_weights, 
     layout). ``dual``: the launch belongs to a dual-tile pair -- the base launch's valid count is
     ``out_base_active_num_non_exiting_tiles`` (fused_moe.py:654-658), the ``secondary`` (2-CTA (256, 256) alternate)
     launch reads ``out_alt_tile_idx_to_*`` / ``out_alt_num_non_exiting_tiles`` over 256-row groups with ``tiles`` =
-    the 256-row capacity (fused_moe.py:684-717)."""
+    the 256-row capacity (fused_moe.py:684-717). ``secondary`` + ``row_group`` (the mixed192 split finalize over the
+    alternate wide list, ``_prepare_dense_gemm2_alt(wide=True)``, mxfp4.py:1821-1869): ``swap_alt_wide_list`` /
+    ``swap_alt_wide_count`` over the 256-row groups (``out_alt_tile_idx_to_*``), ``tiles`` = the 256-row capacity;
+    the base member (``row_group``, not ``secondary``) rasters ``swap_wide_list`` / ``swap_wide_count``."""
     import torch
 
-    if secondary and (not dual or row_group):
-        raise ValueError("the alternate GEMM2 launch is the 2-CTA member of a dual-tile pair (dual=True, no row-group list)")
-    if row_group:
+    if secondary and not dual:
+        raise ValueError("the alternate GEMM2 launch is the 2-CTA member of a dual-tile pair (dual=True)")
+    if row_group and secondary:
+        tile_expert, tile_limit = b["out_alt_tile_idx_to_expert_idx"], b["out_alt_tile_idx_to_mn_limit"]
+        valid, group_list = b["swap_alt_wide_count"], b["swap_alt_wide_list"]
+    elif row_group:
         tile_expert, tile_limit = ((b["swap_wide_expert"], b["swap_wide_limit"]) if split_layout
                                    else (b["out_tile_idx_to_expert_idx"], b["out_tile_idx_to_mn_limit"]))
         valid, group_list = b["swap_wide_count"], b["swap_wide_list"]
@@ -2147,27 +2280,36 @@ def dense_launch_config(policy: CakeSwapAbPolicy, decision: PlanDecision) -> dic
     if names != (forms[1], forms[2]):
         raise AssertionError(f"K6 configuration {names} does not reproduce the plan's forms")
     gemm1 = GEMM1_DENSE_FORMS[forms[3]]
-    if gemm1[2] != sel.fill_in_gemm1 or gemm1[3] or gemm1[4] or gemm1[5]:
-        raise AssertionError(f"base GEMM1 form {forms[3]} does not match the selection (zero_fill={sel.fill_in_gemm1})")
+    if gemm1[2] != sel.fill_in_gemm1 or gemm1[3] or gemm1[4] or gemm1[5] or not gemm1[6]:
+        raise AssertionError(f"base GEMM1 form {forms[3]} does not match the selection (zero_fill={sel.fill_in_gemm1}, "
+                             "no list / early trigger, weight-stream hint on)")
     n2, cluster_n = sel.gemm2[0][1], sel.gemm2[1][1]
-    g2_form = f"gemm2_dense_finalize_n{n2}" + ("_c12" if cluster_n == 2 else "")
+    # :2407-2430 raster vote (``MXFP4_GEMM2_RASTER_M=auto``): the plan names the ``_rauto`` form from
+    # ``DENSE_GEMM2_RASTER_M_MIN_TOKENS`` on shards up to ``DENSE_GEMM2_RASTER_M_MAX_SHARD`` (the TP shard above
+    # 16384 tokens when the mixed192 layouts are disabled); the ep8 shard never qualifies.
+    raster = policy.gemm2_raster(decision.num_tokens, n2)
+    g2_form = (f"gemm2_dense_finalize_n{n2}" + ("_c12" if cluster_n == 2 else "")
+               + ("_rauto" if raster[0] == "auto" else ""))
     g2_at = 5 if dual else 4
     if forms[g2_at] != g2_form or sel.gemm2[1][0] != 1:
         raise AssertionError(f"GEMM2 form {forms[g2_at]} != {g2_form}")
-    cfg = {"sort": sort_cfg, "gemm1": gemm1, "gemm2": (n2, cluster_n), "clear": decision.clear_output,
-           "pdl": decision.pdl, "alt_tile": None, "gemm1_alt": None, "gemm2_alt": None, "pdl_alt": None}
+    cfg = {"sort": sort_cfg, "gemm1": gemm1, "gemm2": (n2, cluster_n), "gemm2_raster": raster,
+           "clear": decision.clear_output, "pdl": decision.pdl, "alt_tile": None, "gemm1_alt": None,
+           "gemm2_alt": None, "gemm2_alt_raster": None, "pdl_alt": None}
     if dual:
         alt_tile, (g1_alt_tiler, g1_alt_cluster, _), (g2_alt_tiler, g2_alt_cluster, _) = sel.dual
         if alt_tile != 256 or (g1_alt_tiler, g1_alt_cluster) != ((256, 256), (2, 1)) or \
                 (g2_alt_tiler, g2_alt_cluster) != ((256, 256), (2, 1)):
             raise AssertionError(f"dual tactic {sel.dual} is not the B300 SiTU dual tactic (256-row 2-CTA pair)")
         gemm1_alt = GEMM1_DENSE_FORMS[forms[4]]
-        if gemm1_alt != (256, 256, True, True, False, False) or not sel.fill_in_gemm1:
+        if gemm1_alt != (256, 256, True, True, False, False, True) or not sel.fill_in_gemm1:
             raise AssertionError(f"alternate GEMM1 form {forms[4]} is not the 2-CTA zero_fill_secondary form "
                                  f"(fill_in_gemm1={sel.fill_in_gemm1})")
-        if forms[6] != "gemm2_dense_finalize_n256_2cta":
-            raise AssertionError(f"alternate GEMM2 form {forms[6]} != gemm2_dense_finalize_n256_2cta")
-        cfg.update(alt_tile=alt_tile, gemm1_alt=gemm1_alt, gemm2_alt=(256, 2, 1),
+        raster_alt = policy.gemm2_raster(decision.num_tokens, 256)
+        alt_form = "gemm2_dense_finalize_n256_2cta" + ("_rauto" if raster_alt[0] == "auto" else "")
+        if forms[6] != alt_form:
+            raise AssertionError(f"alternate GEMM2 form {forms[6]} != {alt_form}")
+        cfg.update(alt_tile=alt_tile, gemm1_alt=gemm1_alt, gemm2_alt=(256, 2, 1), gemm2_alt_raster=raster_alt,
                    pdl_alt=bool(decision.pdl or DENSE_DUAL_ALT_PDL))
     return cfg
 
@@ -2205,7 +2347,7 @@ def split_launch_config(policy: CakeSwapAbPolicy, decision: PlanDecision) -> dic
     g1_sym = gemm1_dense_form_symbol(SWAP_SPLIT_WIDE_TILE, gemm1_n, zero_fill=False, zero_fill_secondary=False,
                                      row_group_list=True, pdl_trigger_early=early)
     if forms["gemm1_dense"] != g1_sym or \
-            GEMM1_DENSE_FORMS[g1_sym] != (SWAP_SPLIT_WIDE_TILE, gemm1_n, False, False, True, early):
+            GEMM1_DENSE_FORMS[g1_sym] != (SWAP_SPLIT_WIDE_TILE, gemm1_n, False, False, True, early, True):
         raise AssertionError(f"wide GEMM1 form {forms['gemm1_dense']} != {g1_sym}")
     gemm2_tactic = policy.tactic(T)[2]
     n2 = gemm2_tactic[0][1]
@@ -2284,7 +2426,8 @@ def hybrid_launch_config(policy: CakeSwapAbPolicy, decision: PlanDecision) -> di
     g1_tactic = policy.tactic(T)[1]
     dense_sym = gemm1_dense_form_symbol(g1_tactic[0][0], g1_tactic[0][1], zero_fill=False, zero_fill_secondary=False,
                                         row_group_list=True)
-    if forms["gemm1_dense"] != dense_sym or GEMM1_DENSE_FORMS[dense_sym] != (group, g1_tactic[0][1], False, False, True, False) \
+    expected_g1 = (group, g1_tactic[0][1], False, False, True, False, True)      # footer trigger, hand-written hint
+    if forms["gemm1_dense"] != dense_sym or GEMM1_DENSE_FORMS[dense_sym] != expected_g1 \
             or tuple(g1_tactic[1]) != (1, 1):
         raise AssertionError(f"wide GEMM1 form {forms['gemm1_dense']} != {dense_sym} (tactic {g1_tactic})")
     g2_tactic = policy.tactic(T)[2]
@@ -2300,6 +2443,125 @@ def hybrid_launch_config(policy: CakeSwapAbPolicy, decision: PlanDecision) -> di
             # The hybrid dense launches trigger in the footer (mxfp4.py:1594 / :1659 pass ``enable_pdl`` only).
             "gemm1": g1, "gemm1_dense": GEMM1_DENSE_FORMS[dense_sym], "gemm2_dense": (n2, cluster_n, False),
             "clear": decision.clear_output, "pdl": decision.pdl}
+
+
+MIXED192_CHAIN_STEPS_SPLIT = ("route_preprocess", "moe_sort_init", "moe_sort_coop", "gemm1_swapab_situ", "gemm1_dense",
+                              "gemm1_dense", "gemm2_swapab_finalize", "gemm2_dense_finalize", "gemm2_dense_finalize")
+
+
+MIXED192_CHAIN_STEPS_DENSE = ("route_preprocess", "moe_sort_init", "moe_sort_coop", "gemm1_dense", "gemm1_dense",
+                              "gemm1_swapab_situ", "gemm2_dense_finalize", "gemm2_dense_finalize")
+
+
+def mixed192_launch_config(policy: CakeSwapAbPolicy, decision: PlanDecision) -> dict[str, Any]:
+    """Host-only resolution of the mixed192 chain's module configurations from the decision's launch plan
+    (hand-written ``Mxfp4MoESwapAbPlan`` with ``_swap_mixed192`` on the MoE-TP shard, T >= SWAP_WIDE192_MIN_TOKENS:
+    decision :2454-2495, streams / dense-first :1062-1072, zero fill in the dense GEMM1s :1185-1190, run
+    :1997-2061 / :2169-2170).
+
+    Nothing is inferred from names: the K6 configuration (tier, dual 256-row padding, mixed lists, bounded state,
+    PDL) is rebuilt from the decision inputs and must reproduce the plan's form names; the swap-AB GEMM1 (and, below
+    16384 tokens, the swap-AB finalize GEMM2) is ``decision.gemm1`` / ``decision.gemm2`` (the 192-row 2-CTA window
+    forms over the K6 window list, blocked scales); the dense GEMM1 pair comes from the pinned table by symbol
+    (row-group list + zero fill, primary / secondary rule, the weight-stream hint by ``mixed192_dense_weight_l2_hint``
+    -- the Cake lever's ``_nol2`` forms from ``MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS``); the dense finalize
+    pair is the C4 tactic ``(128, N)`` /
+    cluster (1, 2) and the 2-CTA ``(256, 256)`` / (2, 1) alternate, over the wide lists (``_rg``) below 16384 tokens
+    and over every group with the ``raster_along_m="auto"`` scheduler vote (``_rauto``) from 16384. Every kernel
+    launches with the plan's PDL attribute (``decision.pdl``).
+    """
+    if decision.path != "mixed192":
+        raise ValueError(f"not a mixed192 decision (path {decision.path!r})")
+    if not decision.supported:
+        raise NotImplementedError(decision.reason)
+    T, group, tile = decision.num_tokens, decision.group_rows, decision.tile
+    dense_gemm2 = policy.swap_mixed192_gemm2(T) == "dense"                                   # :2486-2495
+    dense_first = T >= SWAP_WIDE192_DENSE_FIRST_MIN_TOKENS                                   # :1065-1068
+    expected = MIXED192_CHAIN_STEPS_DENSE if dense_gemm2 else MIXED192_CHAIN_STEPS_SPLIT
+    steps = tuple(l.step for l in decision.launch_plan)
+    if steps != expected or dense_first != dense_gemm2:
+        raise NotImplementedError(f"mixed192 launch sequence {steps} (dense_first={dense_first}) is not the executable "
+                                  f"chain {expected}")
+    side_steps = {l.step for l in decision.launch_plan if l.stream == "side"}
+    if side_steps != ({"gemm1_swapab_situ"} if dense_gemm2 else {"gemm1_swapab_situ", "gemm2_swapab_finalize"}):
+        raise AssertionError(f"mixed192 side-stream launches {side_steps} (SWAP_WIDE192_MIXED_STREAMS='win', :1062-1072)")
+    if (group, tile) != (SWAP_HYBRID_GROUP_ROWS, SWAP_WIDE192_TILE) or decision.fused_routing or decision.two_stage \
+            or decision.token_index or decision.dep_prefetch:
+        raise AssertionError("mixed192 chain: 128-row sort groups, 192-row windows, generic routing, no token index, "
+                             "no dependent-side prefetch (:1148-1152)")
+    # Zero-fill placement (hand-written ``SWAP_WIDE192_ZF`` :1185-1190; Cake lever L13): ``"dense"`` fills the
+    # finalize output inside the dense GEMM1 pair (``_zero_fill`` / ``_zero_fill_secondary`` forms, no K1 clear);
+    # ``"route"`` clears it in the route-preprocess kernel (``decision.clear_output``) and the pair is the plain
+    # row-group forms. Every output element is written exactly once before the finalize reduce-adds either way.
+    route_fill = bool(decision.clear_output)
+    by_step: dict[str, list[str]] = {}
+    for l in decision.launch_plan:
+        by_step.setdefault(l.step, []).append(l.form)
+    if by_step["route_preprocess"] != ["kimi_k3_mxfp4_situ_route_preprocess"]:
+        raise AssertionError(f"route preprocess form {by_step['route_preprocess']}")
+    dual = policy.swap_mixed192_dual(T)
+    if dual is None or dual[0] != 2 * group:
+        raise AssertionError(f"mixed192 dual-tile tactic {dual!r} (hand-written 256-row alternate, :2473-2484)")
+    alt_tile, alt_g1, alt_g2 = dual
+    ms = _moe_sort_module()
+    tier = moe_sort_expert_tier(policy.layout.num_experts)
+    # ``narrow_count_base`` bound: the hand-written kernel writes ``mPtrMixedNarrowCountBase`` (0 under the 256-row
+    # padding, RoutingKernel.cuh:326-328) and ``moe_sort_launch_bindings`` binds ``swap_row_group_count_base``.
+    sort_cfg = ms.MoeSortConfig(tier=tier, dual=True, mixed=True, narrow_count_base=True, pdl=decision.pdl,
+                                bounded=moe_sort_bounded_state(T, policy.top_k, tier, policy.sm_count))
+    names = (ms.init_form_name(sort_cfg), ms.coop_form_name(sort_cfg))
+    if names != (by_step["moe_sort_init"][0], by_step["moe_sort_coop"][0]):
+        raise AssertionError(f"K6 configuration {names} does not reproduce the plan's forms")
+    g1 = decision.gemm1
+    if g1 is None or not (g1.row_group_list and g1.sf_blocked and g1.two_cta) or g1.n_tile != tile \
+            or g1.kbps != gemm1_k_blocks_per_stage(tile) or g1.hw_cluster_split_k or g1.pdl_trigger_after_wait:
+        raise AssertionError("mixed192 swap-AB GEMM1 is the 192-row 2-CTA SiTU form over the window list with blocked "
+                             "scales, no cluster split-K, no dependent-side prefetch (:1419-1453)")
+    g1_sym = f"gemm1_swapab_situ_n{tile}_2cta_rowgroup" + swapab_l2_suffix(tile, g1.weight_l2_hint)
+    if by_step["gemm1_swapab_situ"] != [g1_sym]:
+        raise AssertionError(f"swap-AB GEMM1 form {by_step['gemm1_swapab_situ']} != [{g1_sym}]")
+    g1_tactic = policy.tactic(T)[1]
+    if g1_tactic[0][0] != group:
+        g1_tactic = ((group, 256), (1, 1), False)
+    # The same rule ``decide`` applied (Cake lever c10): the ``_nol2`` zero-fill pair from the lever's token count.
+    dense_hint = mixed192_dense_weight_l2_hint(T, zero_fill_in_dense=not route_fill)
+    base_sym = gemm1_dense_form_symbol(g1_tactic[0][0], g1_tactic[0][1], zero_fill=not route_fill,
+                                       zero_fill_secondary=False, row_group_list=True, weight_l2_hint=dense_hint)
+    alt_sym = gemm1_dense_form_symbol(alt_g1[0][0], alt_g1[0][1], zero_fill=not route_fill,
+                                      zero_fill_secondary=not route_fill, row_group_list=True,
+                                      weight_l2_hint=dense_hint)
+    if by_step["gemm1_dense"] != [base_sym, alt_sym] or tuple(g1_tactic[1]) != (1, 1) or tuple(alt_g1[1]) != (2, 1):
+        raise AssertionError(f"dense GEMM1 forms {by_step['gemm1_dense']} != [{base_sym}, {alt_sym}] "
+                             f"(tactics {g1_tactic} / {alt_g1})")
+    g2_tactic = policy.tactic(T)[2]
+    if g2_tactic[0][0] != group:
+        g2_tactic = ((group, 192), (1, 2), False)
+    n2, cluster_n = g2_tactic[0][1], g2_tactic[1][1]
+    alt_n2, alt_cg, alt_cn = alt_g2[0][1], 2 if alt_g2[0][0] == 2 * group else 1, alt_g2[1][1]
+    if g2_tactic[1][0] != 1 or (alt_cg, alt_cn) != (2, 1):
+        raise AssertionError(f"mixed192 dense GEMM2 tactics {g2_tactic} / {alt_g2}: cluster (1, N) base + 2-CTA (2, 1) alternate")
+    # :1803-1850 (wide lists; the Cake ``MIXED192_WIDE_RASTER_M_MIN_TOKENS`` lever may add the vote) vs :1686-1736.
+    raster = policy.gemm2_raster(T, n2, wide_list=not dense_gemm2)
+    raster_alt = policy.gemm2_raster(T, policy.tactic(T)[2][0][1], wide_list=not dense_gemm2)
+    rauto, rauto_alt = ("_rauto" if raster[0] == "auto" else ""), ("_rauto" if raster_alt[0] == "auto" else "")
+    want = [f"gemm2_dense_finalize_n{n2}" + ("_c12" if cluster_n == 2 else "") + ("" if dense_gemm2 else "_rg") + rauto,
+            f"gemm2_dense_finalize_n{alt_n2}_2cta" + ("" if dense_gemm2 else "_rg") + rauto_alt]
+    if by_step["gemm2_dense_finalize"] != want:
+        raise AssertionError(f"dense GEMM2 forms {by_step['gemm2_dense_finalize']} != {want}")
+    cfg = {"sort": sort_cfg, "gemm1": g1, "alt_tile": alt_tile, "dense_gemm2": dense_gemm2, "dense_first": dense_first,
+           "gemm1_dense": GEMM1_DENSE_FORMS[base_sym], "gemm1_alt": GEMM1_DENSE_FORMS[alt_sym],
+           "gemm2": (n2, cluster_n, raster[0], raster[1]), "gemm2_alt": (alt_n2, alt_cg, raster_alt[0], raster_alt[1]),
+           "pdl": decision.pdl, "swap_gemm2": None, "clear": route_fill}
+    if not dense_gemm2:
+        g2 = decision.gemm2
+        if g2 is None or not g2.two_cta or g2.n_tile != tile or g2.m_group != 1 or g2.hw_split_k != 1 \
+                or g2.late_dep_wait or by_step["gemm2_swapab_finalize"] != [f"gemm2_swapab_finalize_n{tile}_2cta"
+                                                                            + swapab_l2_suffix(tile, g2.weight_l2_hint)
+                                                                            + swapab_cm_suffix(g2.sched_chunk_major)]:
+            raise AssertionError("mixed192 swap-AB GEMM2 is the 192-row 2-CTA finalize form over the window list, "
+                                 "m_group 1, no split-K, no late dependent wait (:1931-1990)")
+        cfg["swap_gemm2"] = g2
+    return cfg
 
 
 @dataclass(frozen=True)
@@ -2498,9 +2760,9 @@ class CakeDensePlan:
         self._dbg = torch.zeros(64 * sms, dtype=torch.int32, device=self.device)
         g1_weights = {"w1": dense_w["w1"], "w1_sf": dense_w["w1_sf"]}
         # W1 dense gather GEMM1 (fused_moe.py:481-541): persistent grid over (row tiles x N tiles) up to the SMs.
-        tile_m, n1, zero_fill, secondary, row_group, early = cfg["gemm1"]
+        tile_m, n1, zero_fill, secondary, row_group, early, l2_hint = cfg["gemm1"]
         self._gemm1 = g1d.build_module(self.backend, tile_m, n1, zero_fill, secondary, row_group, use_pdl=cfg["pdl"],
-                                       pdl_trigger_early=early)
+                                       pdl_trigger_early=early, weight_l2_hint=l2_hint)
         self._gemm1_grid = (min((decision.rows // tile_m) * (2 * I // n1), sms), 1, 1)
         self._gemm1_args = gemm1_dense_launch_bindings(
             b, weights=g1_weights, x=x, x_sf=x_sf, hidden=H, shard=I, top_k=K,
@@ -2513,10 +2775,11 @@ class CakeDensePlan:
         self._gemm1_alt = self._gemm1_alt_grid = self._gemm1_alt_args = None
         self._gemm2_alt = self._gemm2_alt_grid = self._gemm2_alt_args = None
         if dual:
-            alt_m, alt_n1, alt_zf, alt_sec, alt_rg, alt_early = cfg["gemm1_alt"]
+            alt_m, alt_n1, alt_zf, alt_sec, alt_rg, alt_early, alt_l2 = cfg["gemm1_alt"]
             alt_cap = decision.rows // alt_tile
-            self._gemm1_alt = g1d.build_module(self.backend, alt_m, alt_n1, alt_zf, alt_sec, alt_rg, use_pdl=cfg["pdl_alt"],
-                                               pdl_trigger_early=alt_early)
+            self._gemm1_alt = g1d.build_module(self.backend, alt_m, alt_n1, alt_zf, alt_sec, alt_rg,
+                                               use_pdl=cfg["pdl_alt"], pdl_trigger_early=alt_early,
+                                               weight_l2_hint=alt_l2)
             self._gemm1_alt_grid = (2 * min(alt_cap * (2 * I // alt_n1), self._gemm1_alt.max_active_clusters()), 1, 1)
             self._gemm1_alt_args = gemm1_dense_launch_bindings(
                 b, weights=g1_weights, x=x, x_sf=x_sf, hidden=H, shard=I, top_k=K,
@@ -2525,7 +2788,9 @@ class CakeDensePlan:
                 linear_beta_stride=1, unused=self._unused, dual=True)
         # W11 dense finalize GEMM2 (fused_moe.py:697-736): one CTA (cluster) per raster unit up to the SMs.
         n2, cluster_n = cfg["gemm2"]
-        self._gemm2 = g2d.build_module(self.backend, n2, use_pdl=cfg["pdl"], cta_group=1, cluster_n=cluster_n)
+        raster_m, swizzle = cfg["gemm2_raster"]
+        self._gemm2 = g2d.build_module(self.backend, n2, use_pdl=cfg["pdl"], cta_group=1, cluster_n=cluster_n,
+                                       raster_along_m=raster_m, swizzle=swizzle)
         n2_tiles = -(-H // n2)
         self._gemm2_grid = (cluster_n * min(decision.tiles * (-(-n2_tiles // cluster_n)), sms // cluster_n), 1, 1)
         self._gemm2_args = gemm2_dense_launch_bindings(
@@ -2537,8 +2802,9 @@ class CakeDensePlan:
             # ``out_alt_*`` 256-row groups; one CTA pair per raster unit up to SMs // 2 (``gemm2_dense.grid_for``).
             alt_n2, alt_cg, alt_cn = cfg["gemm2_alt"]
             alt_cap = decision.rows // alt_tile
+            alt_raster_m, alt_swizzle = cfg["gemm2_alt_raster"]
             self._gemm2_alt = g2d.build_module(self.backend, alt_n2, use_pdl=cfg["pdl_alt"], cta_group=alt_cg,
-                                               cluster_n=alt_cn)
+                                               cluster_n=alt_cn, raster_along_m=alt_raster_m, swizzle=alt_swizzle)
             pair = alt_cg * alt_cn
             self._gemm2_alt_grid = (pair * min(alt_cap * (-(-H // alt_n2)), sms // pair), 1, 1)
             self._gemm2_alt_args = gemm2_dense_launch_bindings(
@@ -2643,9 +2909,9 @@ class CakeSplitPlan:
             group_rows=decision.group_rows, unused=self._unused, split_layout=True)
         # Wide GEMM1: W1 row-group form over ``swap_wide_list`` (:1473-1503); grid one CTA per list slot x N tile.
         dense_w = dense_weight_operands(weights, local_experts=L, hidden=H, shard=I)
-        tile_m, n1, zf, zfs, rg, early = cfg["gemm1_dense"]
+        tile_m, n1, zf, zfs, rg, early, l2_hint = cfg["gemm1_dense"]
         self._gemm1_dense = g1d.build_module(self.backend, tile_m, n1, zf, zfs, rg, use_pdl=cfg["pdl"],
-                                             pdl_trigger_early=early)
+                                             pdl_trigger_early=early, weight_l2_hint=l2_hint)
         self._gemm1_dense_grid = (min(wide_slots * (2 * I // n1), sms), 1, 1)
         self._gemm1_dense_args = gemm1_dense_launch_bindings(
             b, weights={"w1": dense_w["w1"], "w1_sf": dense_w["w1_sf"]}, x=x, x_sf=x_sf, hidden=H, shard=I, top_k=K,
@@ -2792,9 +3058,9 @@ class CakeHybridPlan:
         # ``swap_wide_count`` indexing the 128-row sort groups' expert / limit tables; grid one CTA per (list slot,
         # N tile) up to the SMs (the list capacity is the group capacity).
         dense_w = dense_weight_operands(weights, local_experts=L, hidden=H, shard=I)
-        tile_m, n1, zf, zfs, rg, early = cfg["gemm1_dense"]
+        tile_m, n1, zf, zfs, rg, early, l2_hint = cfg["gemm1_dense"]
         self._gemm1_dense = g1d.build_module(self.backend, tile_m, n1, zf, zfs, rg, use_pdl=cfg["pdl"],
-                                             pdl_trigger_early=early)
+                                             pdl_trigger_early=early, weight_l2_hint=l2_hint)
         self._gemm1_dense_grid = (min(tiles * (2 * I // n1), sms), 1, 1)
         self._gemm1_dense_args = gemm1_dense_launch_bindings(
             b, weights={"w1": dense_w["w1"], "w1_sf": dense_w["w1_sf"]}, x=x, x_sf=x_sf, hidden=H, shard=I, top_k=K,
@@ -2843,6 +3109,221 @@ class CakeHybridPlan:
             self._gemm1.launch(grid=self._gemm1_grid, **self._gemm1_args)
             self._gemm1_dense.launch(grid=self._gemm1_dense_grid, **self._gemm1_dense_args)
             self._gemm2.launch(grid=self._gemm2_grid, **self._gemm2_args)
+        return self.output
+
+
+class CakeMixed192Plan:
+    """The executable mixed192 chain of one planned problem (hand-written ``Mxfp4MoESwapAbPlan`` with
+    ``_swap_mixed192``, MoE-TP shard T >= 8192, mxfp4.py:1997-2061 / :2169-2170): K1 route preprocess (conversion
+    only; the dense GEMM1s zero-fill the output), the K6 ``moe_sort`` pair with the dual 128 / 256-row paddings and
+    the mixed lists (wide base / wide alternate groups, 192-row windows at 64-row offsets), the swap-AB SiTU GEMM1
+    192-row 2-CTA ``_rowgroup`` form over the windows on the plan's side stream, the dense gather GEMM1 base (M128,
+    primary zero-fill rule) and alternate (M256 2-CTA, secondary rule) forms over the wide lists on the caller's
+    stream, then either (T < 16384, ``split``) the swap-AB finalize GEMM2 over the windows (side) + the dense
+    finalize pair over the wide lists (main), or (T >= 16384, ``dense``, dense GEMM1s first) the dense finalize pair
+    over every base / alternate group with the device-side raster vote (main) after the side stream's swap GEMM1.
+    Fork / fill / swap-GEMM1 / join events reproduce the hand-written ``win`` stream layout (:1073-1086), so the
+    chain is CUDA-graph capturable from the caller's stream. Same buffer / operand conventions as
+    :class:`CakeDensePlan`; the two zero-fill launches share one plan-owned pair of counters."""
+
+    def __init__(self, *, wrapper: CakeMxfp4MoEWrapper, decision: PlanDecision, buffers: dict[str, Any],
+                 workspace, x, x_sf, topk_ids, topk_weights, weights: dict[str, Any], beta, linear_beta, output):
+        import torch
+
+        self._wrapper = wrapper
+        self.backend = wrapper.backend
+        self.decision = decision
+        self.workspace = workspace
+        self.output = output
+        self.device = output.device
+        self.n_tile = decision.tile
+        self.finalize = True
+        self.group_rows = decision.group_rows
+        self._buffers = b = buffers
+        self._inputs = (x, x_sf, topk_ids, topk_weights)
+        self._weights = weights
+        T = x.shape[0]
+        pol = wrapper.policy
+        H, I, K, L = pol.hidden_size, pol.intermediate_shard, pol.top_k, pol.num_local_experts
+        E, offset = pol.layout.num_experts, pol.layout.local_expert_offset
+        self.sm_count = sms = _runner_sm_count(wrapper, self.device)
+        cfg = mixed192_launch_config(pol, decision)
+        self.dense_gemm2, self.dense_first = cfg["dense_gemm2"], cfg["dense_first"]
+        self.mode, weights_src, w_strides, self.route_weights, self.route_ids = _route_operands(b, topk_ids, topk_weights)
+        self.expanded_idx_to_permuted_idx = b["out_expanded_idx_to_permuted_idx"]
+        rt, ms, gm = _routing_module(), _moe_sort_module(), _gemm_module()
+        g1d, g2d = _gemm1_dense_module(), _gemm2_dense_module()
+        tiles, rows = decision.tiles, decision.rows
+        alt_tile = cfg["alt_tile"]
+        alt_cap = rows // alt_tile
+        pdl = cfg["pdl"]
+        # K1: conversion (:1261-1266; zero fill "dense" -> clear_output False) or conversion + output clear when the
+        # zero fill is placed on the route-preprocess kernel (``SWAP_WIDE192_ZERO_FILL = "route"``, lever L13).
+        pre_cfg = rt.PreprocessConfig(mode=self.mode, threads=ROUTE_PREPROCESS_THREADS, clear=cfg["clear"])
+        self._pre = rt.build_preprocess_module(pre_cfg, self.backend)
+        self._pre_grid = (rt.preprocess_grid(pre_cfg, T, K, H), 1, 1)
+        self._pre_args = preprocess_launch_bindings(b, topk_ids=topk_ids, weights_src=weights_src, w_strides=w_strides,
+                                                    output=output, num_tokens=T, top_k=K, hidden=H)
+        # K6: dual padding + mixed lists (:1267-1315; the window list, the wide base / alternate lists).
+        sort_cfg = cfg["sort"]
+        self._sort_init = ms.build_init_module(sort_cfg)
+        self._sort_coop = ms.build_coop_module(sort_cfg)
+        self._sort_init_grid = (ms.init_grid(sort_cfg, E), 1, 1)
+        self._sort_coop_grid = (ms.coop_grid(sms), 1, 1)
+        self._unused = unused_launch_operands(self.device, group_capacity=tiles)
+        self._sort_init_args, self._sort_coop_args = moe_sort_launch_bindings(
+            b, topk_ids=self.route_ids, num_tokens=T, top_k=K, num_experts=E, local_experts=L, local_offset=offset,
+            tile=decision.group_rows, alt_tile=alt_tile, permille=DENSE_DUAL_TILE_THRESHOLD_PERMILLE, mixed=True,
+            narrow_tile=decision.tile, unused=self._unused)
+        self._dbg = torch.zeros(64 * sms, dtype=torch.int32, device=self.device)
+        # Swap-AB SiTU GEMM1 over the 192-row windows (:1419-1453): one 2-CTA cluster per (weight M chunk, list slot)
+        # up to the co-resident cluster capacity (hand-written ``max_active_clusters``; ``finalize_grid`` rule).
+        g1 = cfg["gemm1"]
+        self._gemm1 = build_gemm1_module(self.backend, g1)
+        list_capacity = int(b["swap_row_groups"].numel())
+        g1_cfg = gm.form_config(g1.n_tile, g1.kbps, situ=True, row_group_list=True, sf_blocked=True, two_cta=True)
+        g1_items = gm.m_chunks_of(2 * I // 128, g1_cfg["M_GROUP"] * g1_cfg["CTA_V"]) * list_capacity
+        self._gemm1_grid = (g1_cfg["CTA_V"] * min(g1_items, self._gemm1.max_active_clusters()), 1, 1)
+        self._gemm1_args = gemm1_launch_bindings(
+            b, weights=weights, x=x, x_sf=x_sf, route_weights=self.route_weights, hidden=H, shard=I, top_k=K,
+            num_tokens=T, tiles=tiles, k_tiles=g1.k_tiles, beta=beta, linear_beta=linear_beta, dbg=self._dbg,
+            unused=self._unused, row_group_list=True)
+        # Dense GEMM1 pair over the wide lists (:1552-1676): the base M128 form rasters ``swap_wide_list`` (primary
+        # rule, other = ``swap_alt_wide_count``), the 2-CTA alternate rasters ``swap_alt_wide_list`` (secondary rule,
+        # other = ``swap_wide_count``). With the zero fill in the pair (``zf``) both share the plan's counters; with
+        # the route placement (``cfg["clear"]``) the forms are plain and the zero-fill operands are the dummies.
+        dense_w = dense_weight_operands(weights, local_experts=L, hidden=H, shard=I)
+        g1_weights = {"w1": dense_w["w1"], "w1_sf": dense_w["w1_sf"]}
+        self._zero_fill_counters = torch.zeros(2, dtype=torch.int32, device=self.device)
+        tile_m, n1, zf, zfs, rg, early, l2_hint = cfg["gemm1_dense"]
+        self._gemm1_dense = g1d.build_module(self.backend, tile_m, n1, zf, zfs, rg, use_pdl=pdl,
+                                             pdl_trigger_early=early, weight_l2_hint=l2_hint)
+        self._gemm1_dense_grid = (min(list_capacity * (2 * I // n1), sms), 1, 1)
+        self._gemm1_dense_args = gemm1_dense_launch_bindings(
+            b, weights=g1_weights, x=x, x_sf=x_sf, hidden=H, shard=I, top_k=K, num_tokens=T, rows=rows, tile_m=tile_m,
+            n_tile=n1, row_group_list=True, zero_fill=zf, secondary=False, output=output, beta=beta,
+            linear_beta=linear_beta, beta_stride=1, linear_beta_stride=1, unused=self._unused, dual=True)
+        if zf:
+            self._gemm1_dense_args["zero_fill_counters"] = self._zero_fill_counters
+        alt_m, alt_n1, alt_zf, alt_sec, alt_rg, alt_early, alt_l2 = cfg["gemm1_alt"]
+        self._gemm1_alt = g1d.build_module(self.backend, alt_m, alt_n1, alt_zf, alt_sec, alt_rg, use_pdl=pdl,
+                                           pdl_trigger_early=alt_early, weight_l2_hint=alt_l2)
+        alt_list_capacity = int(b["swap_alt_wide_list"].numel())
+        self._gemm1_alt_grid = (2 * min(alt_list_capacity * (2 * I // alt_n1), self._gemm1_alt.max_active_clusters()), 1, 1)
+        self._gemm1_alt_args = gemm1_dense_launch_bindings(
+            b, weights=g1_weights, x=x, x_sf=x_sf, hidden=H, shard=I, top_k=K, num_tokens=T, rows=rows, tile_m=alt_m,
+            n_tile=alt_n1, row_group_list=True, zero_fill=alt_zf, secondary=True, output=output, beta=beta,
+            linear_beta=linear_beta, beta_stride=1, linear_beta_stride=1, unused=self._unused, dual=True)
+        if alt_zf:
+            self._gemm1_alt_args["zero_fill_counters"] = self._zero_fill_counters
+        # GEMM2 stage.
+        n2, cluster_n, raster, swizzle = cfg["gemm2"]
+        alt_n2, alt_cg, raster_alt, swizzle_alt = cfg["gemm2_alt"]
+        self._swap_gemm2 = self._swap_gemm2_grid = self._swap_gemm2_args = None
+        if not self.dense_gemm2:
+            # Swap-AB finalize GEMM2 over the windows (:1931-1990, mixed192 list block :1949-1961); grid as GEMM1.
+            g2 = cfg["swap_gemm2"]
+            self._swap_gemm2 = build_gemm2_module(self.backend, g2)
+            g2_cfg = gm.form_config(g2.n_tile, g2.kbps, m_group=g2.m_group)
+            g2_items = gm.m_chunks_of(H // 128, g2_cfg["M_GROUP"] * g2_cfg["CTA_V"]) * list_capacity
+            self._swap_gemm2_grid = (g2_cfg["CTA_V"] * min(g2_items, self._swap_gemm2.max_active_clusters()), 1, 1)
+            self._swap_gemm2_args = gemm2_launch_bindings(
+                b, weights=weights, route_weights=self.route_weights, hidden=H, shard=I, top_k=K, tiles=tiles,
+                k_tiles=g2.k_tiles, output=output, dbg=self._dbg, unused=self._unused, row_group_list=True)
+            # Dense finalize pair over the compacted wide lists (:1748-1785 base, :1821-1869 alternate ``wide=True``).
+            self._gemm2 = g2d.build_module(self.backend, n2, use_pdl=pdl, cta_group=1, cluster_n=cluster_n, row_group=True,
+                                           raster_along_m=raster, swizzle=swizzle)
+            self._gemm2_alt = g2d.build_module(self.backend, alt_n2, use_pdl=pdl, cta_group=alt_cg, cluster_n=1,
+                                               row_group=True, raster_along_m=raster_alt, swizzle=swizzle_alt)
+            g2_rg, g2_slots, g2_alt_slots = True, list_capacity, alt_list_capacity
+        else:
+            # Dense finalize pair over every base / alternate group with the raster vote (:1686-1742); the base
+            # launch keys off ``out_base_active_num_non_exiting_tiles`` (zero under the 256-row padding).
+            self._gemm2 = g2d.build_module(self.backend, n2, use_pdl=pdl, cta_group=1, cluster_n=cluster_n,
+                                           raster_along_m=raster, swizzle=swizzle)
+            self._gemm2_alt = g2d.build_module(self.backend, alt_n2, use_pdl=pdl, cta_group=alt_cg, cluster_n=1,
+                                               raster_along_m=raster_alt, swizzle=swizzle_alt)
+            g2_rg, g2_slots, g2_alt_slots = False, tiles, alt_cap
+        n2_tiles = -(-H // n2)
+        self._gemm2_grid = (cluster_n * min(g2_slots * (-(-n2_tiles // cluster_n)), sms // cluster_n), 1, 1)
+        self._gemm2_args = gemm2_dense_launch_bindings(
+            b, w2=dense_w["w2"], w2_sf=dense_w["w2_sf"], route_weights=self.route_weights, hidden=H, shard=I, top_k=K,
+            tiles=g2_slots, rows=rows, n_tile=n2, output=output, dbg=self._dbg, unused=self._unused, row_group=g2_rg,
+            dual=True)
+        self._gemm2_alt_grid = (alt_cg * min(g2_alt_slots * (-(-H // alt_n2)), sms // alt_cg), 1, 1)
+        self._gemm2_alt_args = gemm2_dense_launch_bindings(
+            b, w2=dense_w["w2"], w2_sf=dense_w["w2_sf"], route_weights=self.route_weights, hidden=H, shard=I, top_k=K,
+            tiles=g2_alt_slots, rows=rows, n_tile=alt_n2, output=output, dbg=self._dbg, unused=self._unused,
+            row_group=g2_rg, dual=True, secondary=True)
+        self._dense_weights = dense_w
+        self._beta, self._linear_beta = beta, linear_beta
+        # Side stream + events (hand-written ``win`` layout, :1073-1086 / :2003-2061).
+        self._side = torch.cuda.Stream(device=self.device)
+        self._fork, self._fill, self._swap_g1, self._join = (torch.cuda.Event() for _ in range(4))
+        forms = [l.form for l in decision.launch_plan]
+        window_g1 = [("gemm1_swapab_situ", self.backend, self._gemm1_grid)]
+        dense_g1 = [("gemm1_dense", self.backend, self._gemm1_dense_grid), ("gemm1_dense", self.backend, self._gemm1_alt_grid)]
+        order = [("route_preprocess", self.backend, self._pre_grid), ("moe_sort_init", "cuda_cpp", self._sort_init_grid),
+                 ("moe_sort_coop", "cuda_cpp", self._sort_coop_grid)]
+        order += (dense_g1 + window_g1) if self.dense_first else (window_g1 + dense_g1)
+        if not self.dense_gemm2:
+            order.append(("gemm2_swapab_finalize", self.backend, self._swap_gemm2_grid))
+        order += [("gemm2_dense_finalize", self.backend, self._gemm2_grid),
+                  ("gemm2_dense_finalize", self.backend, self._gemm2_alt_grid)]
+        if [step for step, _b, _g in order] != [l.step for l in decision.launch_plan]:
+            raise AssertionError("mixed192 enqueue order does not reproduce the decision's launch plan")
+        self.launches = tuple(ExecutedLaunch(step, form, backend, grid)
+                              for (step, backend, grid), form in zip(order, forms))
+        # Warmup run = the hand-written planning postcondition (valid output after ``plan``, :1214 / :1216-1218).
+        with torch.cuda.device(self.device):
+            self.run()
+            torch.cuda.synchronize()
+
+    @property
+    def executed_chain(self) -> dict[str, Any]:
+        return executed_chain_record("mixed192", self.decision, self.launches, self.sm_count)
+
+    def launch_sequence(self) -> tuple[tuple[str, tuple[int, int, int]], ...]:
+        return tuple((l.step, l.grid) for l in self.launches)
+
+    def run(self):
+        """Enqueue the chain across the caller's current stream (main) and the plan's side stream in the hand-written
+        order (:1997-2061): preprocess, K6 pair, fork; T < 16384: side swap GEMM1 | main dense GEMM1 base, alternate;
+        fill event main -> side; side swap GEMM2 | main dense finalize base, alternate; T >= 16384: main dense GEMM1
+        base, alternate | side swap GEMM1 -> event -> main dense finalize base, alternate; join (:2169-2170)."""
+        import torch
+
+        with torch.cuda.device(self.device):
+            main = torch.cuda.current_stream(self.device)
+            self._pre.launch(grid=self._pre_grid, **self._pre_args)
+            self._sort_init.launch(grid=self._sort_init_grid, **self._sort_init_args)
+            self._sort_coop.launch(grid=self._sort_coop_grid, **self._sort_coop_args)
+            self._fork.record(main)
+            self._side.wait_event(self._fork)
+            if not self.dense_first:
+                with torch.cuda.stream(self._side):
+                    self._gemm1.launch(grid=self._gemm1_grid, **self._gemm1_args)
+                self._gemm1_dense.launch(grid=self._gemm1_dense_grid, **self._gemm1_dense_args)
+                self._gemm1_alt.launch(grid=self._gemm1_alt_grid, **self._gemm1_alt_args)
+            else:
+                self._gemm1_dense.launch(grid=self._gemm1_dense_grid, **self._gemm1_dense_args)
+                self._gemm1_alt.launch(grid=self._gemm1_alt_grid, **self._gemm1_alt_args)
+                with torch.cuda.stream(self._side):
+                    self._gemm1.launch(grid=self._gemm1_grid, **self._gemm1_args)
+            if not self.dense_gemm2:
+                # The window finalize reduce-adds into the output the dense GEMM1s zero-filled (:2050-2052).
+                self._fill.record(main)
+                self._side.wait_event(self._fill)
+                with torch.cuda.stream(self._side):
+                    self._swap_gemm2.launch(grid=self._swap_gemm2_grid, **self._swap_gemm2_args)
+            else:
+                # The dense finalize over every group reads the window rows the side stream's GEMM1 wrote (:2033-2034).
+                self._swap_g1.record(self._side)
+                main.wait_event(self._swap_g1)
+            self._gemm2.launch(grid=self._gemm2_grid, **self._gemm2_args)
+            self._gemm2_alt.launch(grid=self._gemm2_alt_grid, **self._gemm2_alt_args)
+            self._join.record(self._side)
+            main.wait_event(self._join)
         return self.output
 
 
@@ -2909,7 +3390,7 @@ class CakeMxfp4MoEWrapper:
         return self.policy.get_workspace_size(num_tokens)
 
     def plan(self, x, x_sf, topk_ids, topk_weights, w1, w1_sf, w2, w2_sf, *, beta, linear_beta, workspace,
-             output) -> CakeSwapAbPlan | CakeDensePlan | CakeSplitPlan | CakeHybridPlan:
+             output) -> CakeSwapAbPlan | CakeDensePlan | CakeSplitPlan | CakeHybridPlan | CakeMixed192Plan:
         """Bind buffers, compile the forms, run one warmup (:2851-3088).
 
         ``w1`` / ``w1_sf`` / ``w2`` / ``w2_sf`` are the :func:`prepare_cake_mxfp4_weights` operands (tile-major
@@ -2987,6 +3468,8 @@ class CakeMxfp4MoEWrapper:
             # Round-10 behaviour kept until the split chain is verified: the plain chain with the split's narrow
             # tile; the plan's ``executed_chain`` labels the row "plain" (decided_path "split_two_stage").
             return CakeSwapAbPlan(**kwargs)
+        if decision.path == "mixed192":
+            return CakeMixed192Plan(**kwargs)
         if decision.path not in EXECUTABLE_PATHS:
             raise NotImplementedError(f"T={T}: the {decision.path} chain is traced but the Cake-tree runner does not "
                                       f"enqueue it (launches {decision.launches})")
@@ -3310,6 +3793,41 @@ class _GemmModule:
     m_chunks_of = staticmethod(m_chunks_of)
     _unused_situ_operands = staticmethod(_unused_situ_operands)
 
+    @staticmethod
+    def form_config(n_tile: int, kbps: int = 4, *, situ: bool = False, m_group: int | None = None,
+                    row_group_list: bool | None = None, sf_blocked: bool | None = None,
+                    two_cta: bool | None = None) -> dict[str, object]:
+        """The trace-time constants of a swap-AB form the plan sizes its grids with (``M_GROUP`` / ``CTA_V`` of the
+        mixed192 chain's 2-CTA GEMM1 list form and finalize GEMM2), read from the generated modules' ``route.form``
+        records instead of re-tracing: every shipped form matching the given constructor arguments must agree on
+        them (the modules differ only in griddepcontrol placement / weight L2 policy / scheduler raster)."""
+        form: dict[str, object] = {"kind": "gemm1_swapab" if situ else "gemm2_swapab", "n_tile": int(n_tile),
+                                   "kbps": int(kbps)}
+        if m_group is not None:
+            form["m_group"] = int(m_group)
+        if row_group_list is not None:
+            form["row_group_list"] = bool(row_group_list)
+        if sf_blocked is not None:
+            form["sf_blocked"] = bool(sf_blocked)
+        if two_cta is not None:
+            form["cta_v"] = 2 if two_cta else 1
+        records = [dict(item["route"]["form"]) for item in _kernels().modules()
+                   if all(dict(item["route"].get("form", {})).get(key) == value for key, value in form.items())]
+        if not records:
+            raise KeyError(f"no generated swap-AB form matches {form}")
+        keys = sorted(set.intersection(*(set(record) for record in records)) - {"kind", "gate", "registry",
+                                                                                 "backends", "plan_selected"})
+        config: dict[str, object] = {}
+        for key in keys:
+            values = {repr(record[key]) for record in records}
+            if len(values) == 1:
+                config[key.upper()] = records[0][key]
+        for required in ("M_GROUP", "CTA_V"):
+            if required not in config:
+                raise KeyError(f"the generated swap-AB forms matching {form} disagree on {required}: "
+                               f"{[record.get(required.lower()) for record in records]}")
+        return config
+
 
 class _MoeSortModule:
     """The K6 ``moe_sort`` helpers the plan reads through ``_moe_sort_module()`` (extracted above); the kernels
@@ -3340,17 +3858,20 @@ def _k6_stage(name: str, pdl: bool) -> str:
 
 class _Gemm1DenseModule:
     """The dense gather GEMM1 builder the plan reaches through ``_gemm1_dense_module()``; the module is selected
-    by the form's trace-time fields and the launch attribute the chain asks for (the dense chain launches with the
-    wrapper's ``enable_pdl``; both attributes are rendered)."""
+    by the form's trace-time fields -- ``weight_l2_hint`` included: the mixed192 rows from the plan's
+    ``MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS`` tokens launch the pair without the EVICT_FIRST weight-stream
+    hint (``_nol2`` modules), every other row the hint-on module -- and the launch attribute the chain asks for (the
+    dense chain launches with the wrapper's ``enable_pdl``; both attributes are rendered)."""
 
     @staticmethod
     def build_module(backend: str, tile_m: int, n_tile: int, zero_fill: bool, zero_fill_secondary: bool,
-                     row_group_list: bool, *, use_pdl: bool, pdl_trigger_early: bool = False) -> "PackageLaunch":
+                     row_group_list: bool, *, use_pdl: bool, pdl_trigger_early: bool = False,
+                     weight_l2_hint: bool = True) -> "PackageLaunch":
         _check_backend(backend)
         kernel = _kernels().find_kernel(kind="gemm1_dense", tile_m=int(tile_m), n_tile=int(n_tile),
                                         zero_fill=bool(zero_fill), zero_fill_secondary=bool(zero_fill_secondary),
                                         row_group_list=bool(row_group_list), pdl_trigger_early=bool(pdl_trigger_early),
-                                        use_pdl=bool(use_pdl))
+                                        weight_l2_hint=bool(weight_l2_hint), use_pdl=bool(use_pdl))
         return _package_launch(kernel, use_pdl=use_pdl)
 
 
@@ -3389,11 +3910,20 @@ class _Gemm2DenseModule:
 
     @staticmethod
     def build_module(backend: str, n_tile: int, *, use_pdl: bool, cta_group: int = 1, cluster_n: int = 1,
-                     row_group: bool = False, pdl_trigger_early: bool = False) -> "PackageLaunch":
+                     row_group: bool = False, pdl_trigger_early: bool = False, raster_along_m: object = False,
+                     swizzle: int = 1) -> "PackageLaunch":
+        """``raster_along_m`` / ``swizzle`` as the Cake module's ``form_config``: ``False`` (static N-fastest raster)
+        or ``"auto"`` (the ``_rauto`` scheduler-vote forms of the mixed192 long-prefill chain); only ``swizzle`` 1
+        is traced (the swizzled cluster raster layout is not a shipped form)."""
         _check_backend(backend)
+        if raster_along_m not in (False, "auto"):
+            raise ValueError(f"raster_along_m={raster_along_m!r}: the generated forms use False or 'auto'")
+        if int(swizzle) != 1:
+            raise ValueError(f"swizzle={swizzle}: only swizzle_size 1 is a generated form")
         kernel = _kernels().find_kernel(kind="gemm2_dense", n_tile=int(n_tile), cta_group=int(cta_group),
                                         cluster_n=int(cluster_n), row_group=bool(row_group),
-                                        pdl_trigger_early=bool(pdl_trigger_early), use_pdl=bool(use_pdl))
+                                        pdl_trigger_early=bool(pdl_trigger_early), raster_along_m=raster_along_m,
+                                        use_pdl=bool(use_pdl))
         return _package_launch(kernel, use_pdl=use_pdl)
 
 
@@ -3476,6 +4006,26 @@ class PackageLaunch:
         self.stage: str = kernel.stage
         self._bound = None
 
+    def max_active_clusters(self, device_index: int | None = None) -> int:
+        """Co-resident cluster capacity of this cluster-launched module: the bound the plan sizes its persistent
+        2-CTA swap-AB grids with (Cake ``KernelModule.max_active_clusters`` = ``cuOccupancyMaxActiveClusters`` of the
+        kernel's launch configuration). The exported packages own no driver function (JIT ``.so`` / DSL program), so
+        the query is the hand-written wrapper's own: ``flashinfer.cute_dsl.utils.get_max_active_clusters`` (CUTLASS
+        ``HardwareInfo``) for the module's cluster size -- the GPC-topology bound these one-CTA-per-SM kernels hit,
+        which does not depend on the kernel body (Cake's CuTe DSL backend queries an empty probe the same way)."""
+        import math
+
+        from ...cute_dsl.utils import get_max_active_clusters
+
+        cluster = tuple(int(dim) for dim in self.kernel.cluster)
+        size = math.prod(cluster)
+        if len(cluster) != 3 or size < 2:
+            raise ValueError(f"max_active_clusters is defined only for cluster-launched modules (cluster {cluster})")
+        if device_index is not None and int(device_index) != int(torch.cuda.current_device()):
+            with torch.cuda.device(int(device_index)):
+                return int(get_max_active_clusters(size))
+        return int(get_max_active_clusters(size))
+
     def launch(self, grid, **bindings) -> None:
         if self._bound is None:
             device = next(value.device for value in bindings.values() if hasattr(value, "device"))
@@ -3526,10 +4076,12 @@ def build_gemm1_module(backend: str, form: GemmForm) -> PackageLaunch:
 
 def build_gemm2_module(backend: str, form: GemmForm) -> PackageLaunch:
     """The swap-AB finalize GEMM2 module of ``form`` (``n_tile`` / ``kbps`` / ``m_group``, the placement
-    ``late_dep_wait`` and the weight-stream L2 policy ``weight_l2_hint``)."""
+    ``late_dep_wait``, the weight-stream L2 policy ``weight_l2_hint`` and the finalize scheduler raster
+    ``sched_chunk_major`` -- the mixed192 rows launch the blocked chunk-major ``_cm<B>`` n192 2-CTA form)."""
     _check_backend(backend)
     kernel = _kernels().select_gemm2(form.n_tile, form.kbps, form.m_group, late_dep_wait=form.late_dep_wait,
-                                     weight_l2_hint=form.weight_l2_hint is not None)
+                                     weight_l2_hint=form.weight_l2_hint is not None,
+                                     sched_chunk_major=int(form.sched_chunk_major))
     return _package_launch(kernel, use_pdl=form.use_pdl, pdl_placement=_pdl_placement(form))
 
 
@@ -3537,6 +4089,8 @@ def build_gemm2_partial_module(backend: str, form: GemmForm) -> PackageLaunch:
     """The swap-AB *partial* GEMM2 module of ``form`` (the deferred epilogue of the two-stage chains, ``out =
     partial_rows``; ``n_tile`` / ``kbps`` / ``m_group`` match on the partial form table)."""
     _check_backend(backend)
+    if form.sched_chunk_major:
+        raise ValueError("the partial GEMM2 forms are traced with the row-group-major raster (sched_chunk_major=0)")
     kernel = _kernels().find_kernel(kind="gemm2_swapab_partial", n_tile=int(form.n_tile), kbps=int(form.kbps),
                                     m_group=int(form.m_group), late_dep_wait=bool(form.late_dep_wait),
                                     weight_l2_hint=form.weight_l2_hint is not None)
