@@ -22,9 +22,17 @@ loader tables.  The multi-GPU tests (two, four or eight devices of one
 supported architecture) check both layouts against an fp32 step-by-step
 reference including a tail row count, CUDA-graph capture and replay with fresh
 inputs and eager calls in between, two sessions in flight on one group, the
-refusals that protect a captured graph, the NCCL path, and the two launch paths
-against each other (bitwise-equal outputs; the default folded path two launches
-per call, the explicit barrier path three).
+refusals that protect a captured graph, the NCCL path (the per-operator path:
+cuBLAS projection, ``rmsnorm``, RoPE) against a reference that mirrors its own
+rounding points (the ranks agree on the tolerance verdict before raising), and
+the two launch paths against each other (the default folded path two launches
+per call, the explicit barrier path three).  Every comparison of a device
+output with a host reference is ``_check``: finite, then ``assert_close`` at
+``atol = 0.05``, ``rtol = 1e-2``.  Four comparisons are bitwise
+(``torch.equal``): the replayed outputs of the two captured calls against each
+other (part 2), the kept slot views of the NCCL path (part 4), the folded
+against the barrier launch path (part 5) and, host-only, the ``v`` of the two
+references.
 """
 
 from __future__ import annotations
@@ -45,6 +53,9 @@ from flashinfer.jit import cake_qkv_norm_rope_exchange_overlap as loader
 HEAD_DIM = 128
 EPS = 1e-6
 WORKER_TIMEOUT_SECONDS = 1800
+# Head count of the negative case (part 6 of the multi-GPU test): 27 is not divisible by any supported world size
+# (2, 4, 8), so every world size refuses it.
+INDIVISIBLE_HEADS = 27
 
 
 # --------------------------------------------------------------------------- host-only
@@ -346,6 +357,45 @@ def _reference_local(x, w_qkv, q_scale, k_scale, cos_sin):
     return q.view(shape), k.view(shape), v.view(shape)
 
 
+def _reference_per_operator(x, w_qkv, q_scale, k_scale, cos_sin):
+    """The rounding points of the per-operator path (``functional.linear`` -> ``rmsnorm`` -> RoPE) in fp32 host math:
+
+    1. the projection accumulates in fp32 and is stored in BF16 (cuBLAS with BF16 operands); ``v`` is that value;
+    2. ``rmsnorm`` reads the BF16 projection, forms ``rsqrt(mean(x * x) + eps)`` in fp32, multiplies ``x * rrms``
+       first and the fp32 weight second, and stores BF16 once;
+    3. RoPE (``is_neox=False``) reads the BF16 normed values and the fp32 cos / sin table, rotates each interleaved
+       pair in fp32 (``x0 * cos - x1 * sin``, ``x1 * cos + x0 * sin``) and stores BF16.
+
+    Not reproduced: the fp32 accumulation order of the projection and of the sum of squares, the approximate
+    ``rsqrt`` and the fused multiply-adds of the kernels.  They move a value across a BF16 rounding boundary only
+    occasionally (about 2e-4 of the stored projection values between two fp32 accumulation orders on the host at
+    hidden 1024 to 8192); at a near-zero RoPE output such a flip of an O(1) normed input is an absolute difference
+    of a few BF16 spacings of the pair norm (0.03125 at most recorded for the per-operator path against this
+    reference), inside the tolerance of ``_check``."""
+
+    batch, s_local, hidden = x.shape
+    rows = batch * s_local
+    heads = hidden // HEAD_DIM
+    acc = x.reshape(rows, hidden).float() @ w_qkv.float().t()
+    qkv = acc.to(torch.bfloat16).view(rows, 3, heads, HEAD_DIM)
+    cos = cos_sin[:, : HEAD_DIM // 2][:, None, :]
+    sin = cos_sin[:, HEAD_DIM // 2 :][:, None, :]
+
+    def norm_rope(part, scale):
+        normed = part.float()
+        rrms = torch.rsqrt(normed.pow(2).mean(dim=-1, keepdim=True) + EPS)
+        normed = (normed * rrms * scale.float()).to(torch.bfloat16).float()
+        rotated = torch.empty_like(normed)
+        rotated[..., 0::2] = normed[..., 0::2] * cos - normed[..., 1::2] * sin
+        rotated[..., 1::2] = normed[..., 1::2] * cos + normed[..., 0::2] * sin
+        return rotated.to(torch.bfloat16)
+
+    shape = (batch, s_local, heads, HEAD_DIM)
+    q = norm_rope(qkv[:, 0], q_scale).view(shape)
+    k = norm_rope(qkv[:, 1], k_scale).view(shape)
+    return q, k, qkv[:, 2].reshape(shape)
+
+
 def _redistribute(local, group, world_size, rank):
     """``[B, S_local, H, D] -> [B, S_global, H_local, D]``: this rank's head band of every rank's tokens."""
 
@@ -357,14 +407,30 @@ def _redistribute(local, group, world_size, rank):
     )
 
 
-def _expected(x, w_qkv, q_scale, k_scale, cos_sin, group, world_size, rank):
-    q, k, v = _reference_local(x, w_qkv, q_scale, k_scale, cos_sin)
+def _expected(x, w_qkv, q_scale, k_scale, cos_sin, group, world_size, rank, ref=None):
+    q, k, v = (ref or _reference_local)(x, w_qkv, q_scale, k_scale, cos_sin)
     return tuple(_redistribute(t, group, world_size, rank) for t in (q, k, v))
 
 
 def _check(actual, expected):
-    assert torch.isfinite(actual).all()
-    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+    """A device output against its host fp32 reference: finite, and ``assert_close`` at ``atol = 0.05``,
+    ``rtol = 1e-2``.  The absolute tolerance covers BF16 rounding flips between the device and the host: both round
+    the normed values to BF16 at the same points but not always to the same side (fp32 accumulation order,
+    approximate ``rsqrt``, fused multiply-adds), and at a near-zero RoPE output -- two terms of magnitude up to ~4
+    cancelling -- one such flip of a stored input is an absolute difference of a few BF16 spacings of the pair norm.
+    Recorded on two-, four- and eight-GPU runs of three architectures: the largest difference of any element is
+    0.03125, both for the fused path and for the per-operator path against its mirrored reference (the largest
+    element outside ``0.01 + 0.01 * |expected|`` was 0.0137, fused path); the tolerance is set above these maxima,
+    not derived as a bound.  ``v`` (the BF16 projection, no cancellation; at most 0.015625 recorded) shares the
+    tolerance for uniformity.  What the tolerance rejects: an element with |diff| > 0.05 + 0.01 * |expected| -- a
+    wrong scale, pairing, table row, slot or transport moves whole O(1) values on many elements.  What it admits:
+    any per-element error inside that bound (0.06 at unit scale), a uniform relative error of the q / k outputs
+    below ~2.2 %, a RoPE angle error below ~0.012 rad.  The bitwise comparisons (replayed first against second
+    captured call, kept slot views, folded against barrier launch path) cover the replay, the transport and the
+    launch paths exactly."""
+
+    assert torch.isfinite(actual).all(), "non-finite elements in the output"
+    torch.testing.assert_close(actual.float(), expected.float(), atol=0.05, rtol=1e-2)
 
 
 def _check_outputs(session, outputs, expected):
@@ -374,6 +440,26 @@ def _check_outputs(session, outputs, expected):
     else:
         for index, want in enumerate(expected):
             _check(outputs[..., index * HEAD_DIM : (index + 1) * HEAD_DIM], want)
+
+
+def _check_per_operator_outputs(outputs, expected, group, device, rank, label):
+    """``(q, k, v)`` of the per-operator path (``bshd`` layout) against the redistributed per-operator reference,
+    with ``_check``.  The ranks agree on the tolerance verdict (the ``AssertionError`` of ``_check``) before any of
+    them raises (a rank that raised alone would leave its peers blocked in the next collective); the message names
+    the rank and the failing tensors."""
+
+    failures = {}
+    for name, actual, want in zip(("q", "k", "v"), outputs, expected, strict=True):
+        try:
+            _check(actual, want)
+        except AssertionError as error:
+            failures[name] = " ".join(str(error).split())
+    failed = torch.tensor([int(bool(failures))], dtype=torch.int32, device=device)
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
+    assert int(failed.item()) == 0, (
+        f"{label}: the per-operator path fails its reference on at least one rank; "
+        f"rank {rank}: {failures or 'every tensor passed on this rank'}"
+    )
 
 
 def _operands(device, *, batch, s_local, hidden, seed):
@@ -514,9 +600,18 @@ def _run_worker(rank, world_size, port):
             with torch.cuda.graph(graph, stream=capture_stream):
                 first = session(x, w_qkv, q_scale, k_scale, cos_sin)
                 second = session(x, w_qkv, q_scale, k_scale, cos_sin)
-            eager_x = torch.randn_like(x)
+            # Fresh inputs from a seeded generator, so that a miss of the fused-path check below is
+            # reproducible (the inputs of every other part are seeded too).
+            fresh = torch.Generator(device=device).manual_seed(201 + rank)
+            eager_x = torch.randn(
+                x.shape, dtype=torch.float32, device=device, generator=fresh
+            ).to(torch.bfloat16)
             for _replay in range(3):
-                x.copy_(torch.randn_like(x))
+                x.copy_(
+                    torch.randn(
+                        x.shape, dtype=torch.float32, device=device, generator=fresh
+                    ).to(torch.bfloat16)
+                )
                 dist.barrier(group=group)
                 graph.replay()
                 torch.cuda.synchronize(device)
@@ -525,6 +620,15 @@ def _run_worker(rank, world_size, port):
                 )
                 _check_outputs(session, first, replay_expected)
                 _check_outputs(session, second, replay_expected)
+                # Both captured calls read the same ``x`` through consecutive receive
+                # slots and alternating fold phases; the kernel is deterministic, so
+                # their replayed outputs must be bitwise identical.
+                for one, other in zip(first, second, strict=True):
+                    assert torch.equal(one, other), (
+                        "replayed outputs of the two captured calls differ: both "
+                        "read the same inputs through consecutive slots and "
+                        "alternating fold phases, so they must be bitwise identical"
+                    )
                 eager_expected = _expected(
                     eager_x, w_qkv, q_scale, k_scale, cos_sin, group, world_size, rank
                 )
@@ -591,7 +695,8 @@ def _run_worker(rank, world_size, port):
             a.close()
             b.close()
 
-        # 4. NCCL path: same math through the per-operator path; not capturable.
+        # 4. NCCL path: the per-operator path (cuBLAS projection, ``rmsnorm``, RoPE) against the reference that
+        #    mirrors its rounding points; not capturable.
         nccl = QkvNormRopeExchangeOverlap(
             group,
             hidden=hidden,
@@ -603,8 +708,21 @@ def _run_worker(rank, world_size, port):
         )
         try:
             assert nccl.backend == "nccl" and not nccl.graph_capturable
+            per_operator = _expected(
+                x,
+                w_qkv,
+                q_scale,
+                k_scale,
+                cos_sin,
+                group,
+                world_size,
+                rank,
+                ref=_reference_per_operator,
+            )
             first = nccl(x, w_qkv, q_scale, k_scale, cos_sin)
-            _check_outputs(nccl, first, expected)
+            _check_per_operator_outputs(
+                first, per_operator, group, device, rank, "part 4, first call"
+            )
             # A call's outputs stay valid for num_slots - 1 further calls on this path too:
             # the next call lands in another receive slot and leaves the first views intact.
             kept = tuple(t.clone() for t in first)
@@ -612,7 +730,14 @@ def _run_worker(rank, world_size, port):
             torch.cuda.synchronize(device)
             for before, view in zip(kept, first, strict=True):
                 assert torch.equal(before, view)
-            _check_outputs(nccl, nccl(x, w_qkv, q_scale, k_scale, cos_sin), expected)
+            _check_per_operator_outputs(
+                nccl(x, w_qkv, q_scale, k_scale, cos_sin),
+                per_operator,
+                group,
+                device,
+                rank,
+                "part 4, third call",
+            )
             refusal = torch.cuda.CUDAGraph()
             with (
                 pytest.raises(RuntimeError, match="not CUDA-graph capturable"),
@@ -677,11 +802,12 @@ def _run_worker(rank, world_size, port):
             barrier_path.close()
 
         # 6. Heads not divisible by the world size raise on every rank before any collective.
+        assert INDIVISIBLE_HEADS % world_size
         with pytest.raises(ValueError, match="divisible by world_size"):
             QkvNormRopeExchangeOverlap(
                 group,
-                hidden=3584,
-                num_heads=28,
+                hidden=INDIVISIBLE_HEADS * HEAD_DIM,
+                num_heads=INDIVISIBLE_HEADS,
                 layout="bshd",
                 max_tokens=128,
                 backend="nvlink",
@@ -740,7 +866,7 @@ def test_qkv_norm_rope_exchange_overlap_multi_gpu(world_size):
 
 
 def test_math_reference_is_self_consistent():
-    """The fp32 reference used by the multi-GPU tests: unit scales and zero angles leave a normalised head."""
+    """The fp32 references used by the multi-GPU tests: unit scales and zero angles leave a normalised head."""
 
     x = torch.randn(1, 4, 256, dtype=torch.bfloat16)
     w = torch.eye(256, dtype=torch.bfloat16).repeat(3, 1)
@@ -748,8 +874,34 @@ def test_math_reference_is_self_consistent():
     cos_sin = torch.cat(
         [torch.ones(4, HEAD_DIM // 2), torch.zeros(4, HEAD_DIM // 2)], dim=-1
     )
-    q, _k, v = _reference_local(x, w, ones, ones, cos_sin)
-    assert torch.allclose(v.float(), x.view(1, 4, 2, HEAD_DIM).float())
-    rms = q.float().pow(2).mean(dim=-1).sqrt()
-    assert torch.allclose(rms, torch.ones_like(rms), atol=2e-2)
-    assert math.isfinite(float(q.float().abs().max()))
+    for reference in (_reference_local, _reference_per_operator):
+        q, _k, v = reference(x, w, ones, ones, cos_sin)
+        assert torch.allclose(v.float(), x.view(1, 4, 2, HEAD_DIM).float())
+        rms = q.float().pow(2).mean(dim=-1).sqrt()
+        assert torch.allclose(rms, torch.ones_like(rms), atol=2e-2)
+        assert math.isfinite(float(q.float().abs().max()))
+
+
+def test_per_operator_reference_mirrors_its_rounding_points():
+    """``_reference_per_operator`` differs from ``_reference_local`` only by the rounding points it mirrors: the same
+    stored ``v``; q / k not bit-identical and within 0.1 of each other (two BF16 rounding chains -- the benchmark
+    guard's tolerance; the recorded differences reach 0.0625 at larger shapes, which is why the per-operator path is
+    compared with the reference of its own chain).  ``_check`` admits a difference inside its tolerance and rejects
+    one just beyond it."""
+
+    x, w_qkv, q_scale, k_scale, cos_sin = _operands(
+        torch.device("cpu"), batch=1, s_local=256, hidden=512, seed=41
+    )
+    fused = _reference_local(x, w_qkv, q_scale, k_scale, cos_sin)
+    per_operator = _reference_per_operator(x, w_qkv, q_scale, k_scale, cos_sin)
+    assert torch.equal(fused[2], per_operator[2])
+    for index in range(2):
+        assert not torch.equal(per_operator[index], fused[index])
+        torch.testing.assert_close(
+            per_operator[index].float(), fused[index].float(), atol=0.1, rtol=1e-2
+        )
+    q = per_operator[0]
+    _check(q, q)
+    _check(q.float() + 0.049, q)
+    with pytest.raises(AssertionError, match="Greatest absolute difference"):
+        _check(q.float() + 0.0625, q)
