@@ -4,6 +4,7 @@
 """Single-head paged MQA logits, for sparse attention whose indexer scores keys
 with one query head and no head weights."""
 
+import math
 from typing import Optional
 
 import torch
@@ -13,6 +14,7 @@ from ..cute_dsl.availability import is_cute_dsl_experimental_available
 from ..trace.templates.attn_scores import (
     quantize_write_index_k_nvfp4_trace,
     single_head_paged_mqa_logits_trace,
+    single_head_paged_mqa_threshold_select_trace,
 )
 from ..utils import get_compute_capability, get_device_sm_count
 
@@ -80,13 +82,13 @@ def single_head_paged_mqa_logits(
     workers = max(2 * get_device_sm_count(query.device) // batch, runs, 1)
     keys = (query, query_scales, key_cache, key_scales)
     tables = (context_lengths, requests, block_table)
-    _score(rows, keys, (*tables, scores, max_context, workers))
+    _score("decode", rows, keys, (*tables, None, None, scores, max_context, workers, 0))
 
 
-def _score(rows: int, keys: tuple, args: tuple) -> None:
-    """Check the key format, then run the scorer for `rows` query rows per job.
-    `keys` is (query, query_scales, key_cache, key_scales), and `args` holds
-    the kernel's other arguments."""
+def _score(mode: str, rows: int, keys: tuple, args: tuple) -> None:
+    """Check the key format, then run the scorer in `mode` for `rows` query rows
+    per job. `keys` is (query, query_scales, key_cache, key_scales), and `args`
+    holds the kernel's other arguments."""
     from ..cute_dsl.launch import argument_kind, compiled
     from .kernels import single_head_scorer
 
@@ -113,15 +115,86 @@ def _score(rows: int, keys: tuple, args: tuple) -> None:
         raise ValueError("Queries, lengths, tables and outputs must be contiguous")
     args = (*keys, *args)
     function = compiled(
-        single_head_scorer.scorers(rows, nvfp4),
+        single_head_scorer.scorers(mode, rows, nvfp4),
         "single_head_scorer",
-        f"scorer_{rows}_{'nvfp4' if nvfp4 else 'bf16'}",
+        f"{mode}_{rows}_{'nvfp4' if nvfp4 else 'bf16'}",
         (),
         query.device,
         tuple(map(argument_kind, args)),
         (single_head_scorer.__file__,),
     )
     function(*args)
+
+
+@flashinfer_api(trace=single_head_paged_mqa_threshold_select_trace)
+def single_head_paged_mqa_threshold_select(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    row_ends: torch.Tensor,
+    tile_requests: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    thresholds: torch.Tensor,
+    counters: torch.Tensor,
+    candidates: torch.Tensor,
+    max_context: int,
+    top_k: int,
+    query_scales: Optional[torch.Tensor] = None,
+    key_scales: Optional[torch.Tensor] = None,
+) -> None:
+    """Select the keys that score above each query row's threshold, in one pass
+    over the row's paged keys and without writing its scores.
+
+    Keys, queries and pages are as in :func:`single_head_paged_mqa_logits`.
+    Query tile ``t`` (rows ``128t`` to ``128t + 127``) scores the keys of request
+    ``tile_requests[t]`` below ``max_context``, which sizes the grid. Row ``r``
+    sees keys below ``row_ends[r]``.
+
+    Row ``r``'s threshold is ``thresholds[r]`` (float32 ``[rows]``). A key that
+    scores above it is a candidate, and one that scores neither above nor below
+    it (equal, or NaN) is a tie. ``counters[r]`` (int32 ``[rows, 2]``, zeroed by
+    the caller) counts the row's candidates and ties, and each is stored as a
+    ``(key index, score bits)`` pair in ``candidates[r]`` (int32
+    ``[rows, top_k + capacity, 2]``): the ``n``-th candidate at ``top_k + n`` if
+    ``n < capacity``, the ``n``-th tie at ``top_k - 1 - n`` if ``n < top_k``.
+    Slot order is unspecified. Scores are stored less the row's threshold where
+    that is exact (scores at most twice it), which keeps their order.
+
+    A row fits when its candidates fit ``capacity`` and, with at most ``top_k``
+    ties, reach ``min(row_ends[r], top_k)``, as its counters tell. Its exact
+    Top-``top_k`` keys are then among its written slots, and a threshold at or a
+    little below its ``top_k``-th largest score makes it fit. It runs as one
+    launch without host synchronization, so it can be captured in a CUDA graph
+    (run it once before capture to compile it).
+    """
+    if not is_cute_dsl_experimental_available():
+        raise RuntimeError("Threshold select needs CuTe DSL 4.7 or newer")
+    from .kernels.single_head_scorer import SELECT_TILES_PER_CTA
+
+    tiles, width = tile_requests.shape[0], block_table.shape[1]
+    key_tiles = (max_context + 127) // 128
+    if min(tiles, key_cache.shape[0], width, key_tiles) <= 0:
+        raise ValueError("queries, keys, the block table and context must be nonempty")
+    per_row = {t.shape[0] for t in (query, row_ends, thresholds, counters, candidates)}
+    if per_row != {tiles * 128} or counters.shape[1:] + candidates.shape[2:] != (2, 2):
+        raise ValueError("Mismatched query rows (128 per tile) and per-row outputs")
+    if max_context > 64 * width:
+        raise ValueError("The block table must cover the context capacity")
+    if not 0 <= top_k < candidates.shape[1]:
+        raise ValueError(
+            "candidates must hold the top_k tie slots and at least one more"
+        )
+    # CTAs per query tile: the fewest that give every SM the same number of CTAs
+    # and keep each CTA's run within SELECT_TILES_PER_CTA. tiles * workers is a
+    # multiple of the SM count exactly when workers is a multiple of unit.
+    sms = get_device_sm_count(query.device)
+    unit = sms // math.gcd(tiles, sms)
+    runs = -(-key_tiles // SELECT_TILES_PER_CTA)
+    workers = unit * -(-runs // unit)
+    keys = (query, query_scales, key_cache, key_scales)
+    tables = (row_ends, tile_requests, block_table)
+    outputs = (thresholds, counters, candidates)
+    _score("select", 128, keys, (*tables, *outputs, key_tiles * 128, workers, top_k))
 
 
 @flashinfer_api(trace=quantize_write_index_k_nvfp4_trace)

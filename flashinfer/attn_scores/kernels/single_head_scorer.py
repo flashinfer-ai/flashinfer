@@ -2,7 +2,8 @@
 # Copyright (c) 2026 by FlashInfer team.
 
 """The single-head paged scorer: FP32 dot products of query rows with their
-request's paged BF16 or NVFP4 keys, on SM100 tensor cores (tcgen05)."""
+request's paged BF16 or NVFP4 keys, on SM100 tensor cores (tcgen05), stored as
+scores or selected against per-row thresholds."""
 
 from functools import cache
 from typing import Optional
@@ -26,9 +27,10 @@ from ...cute_dsl.fp4_common import (
     fp8_e4m3_to_f32,
 )
 
-# The most key tiles a CTA runs over, staging their page indices (8 B a tile),
-# so a run covers 32K keys.
+# The most key tiles a CTA runs over, since it stages their page indices (8 bytes
+# a tile): 256 in decode, so a run covers 32K keys, and 128 in select.
 TILES_PER_CTA = 256
+SELECT_TILES_PER_CTA = 128
 # NVFP4 values (E2M1, two to a byte) come with one E4M3 scale per 16.
 SCALE_TYPE = cutlass.Float8E4M3FN
 SCALE_VECTOR = 16
@@ -53,22 +55,29 @@ class PagedScorer:
     """Scores of query rows against their request's paged keys, BF16 or NVFP4
     (``nvfp4``: E2M1 values with E4M3 scales).
 
-    A job is ``rows`` (1 to 8) consecutive query rows that share block-table row
-    ``tile_requests[j]`` and see keys ``< row_ends[j]``. Each job gets
-    ``workers`` CTAs (the jobs are the grid's fastest-varying index), each
-    owning one equal run of the job's 128-key tiles.
+    A job is ``rows`` consecutive query rows that share block-table row
+    ``tile_requests[j]``. In "decode", a job is 1 to 8 rows that all see keys
+    below ``row_ends[j]``. In "select", it is a 128-row query tile whose row r
+    sees keys below ``row_ends[r]``. Each job gets ``workers`` CTAs (jobs vary
+    fastest in the grid), and each CTA owns an equal run of the job's 128-key
+    tiles below its longest row end.
 
     A CTA streams its run through its key stages: a tile's two 64-key pages are
     TMA-loaded into a stage once the MMA of the stage's previous tile is done.
     Warps are specialized: warp 5 loads the keys, warp 4 issues each tile's MMA
     into one of two accumulators, and warps 0-3 store the scores. The keys are
     on the TMEM lanes (M = 128 keys, N = 8 query columns, ``rows`` of them real),
-    so a warp stores 32 consecutive scores per row. With NVFP4, warps 0-3 also
-    copy each tile's key scales by cp.async into its stage, counted in on the
-    stage's full barrier.
+    so a warp stores 32 consecutive scores per row. With NVFP4, threads 0-127
+    also copy each tile's key scales by cp.async into its stage, counted in on
+    the stage's full barrier.
+
+    "select" puts the queries on the TMEM lanes (M = 128 rows, N = 128 keys)
+    over 512 threads, each comparing its row's 32 scores of a tile (warpgroup g
+    owns keys 32 g .. 32 g + 31) to the row's threshold.
     """
 
-    def __init__(self, rows: int, nvfp4: bool):
+    def __init__(self, mode: str, rows: int, nvfp4: bool):
+        self.decode = mode == "decode"
         self.rows = rows  # query rows per job
         self.values = cutlass.Float4E2M1FN if nvfp4 else cutlass.BFloat16
         self.scaled = nvfp4
@@ -77,6 +86,11 @@ class PagedScorer:
         # NVFP4's scale blocks in the 32 TMEM columns tcgen05.alloc takes at least.
         self.tile, self.threads = (128, 8, 128), 192
         self.accumulators, self.tmem_columns = 2, 32
+        self.max_tiles = TILES_PER_CTA
+        if not self.decode:  # one accumulator in 256 columns, N = 128 keys
+            self.tile, self.threads = (128, 128, 128), 512
+            self.accumulators, self.tmem_columns = 1, 256
+            self.max_tiles = SELECT_TILES_PER_CTA
         self.stages = 0  # key stages, set at compile time
 
     @cute.jit
@@ -90,9 +104,12 @@ class PagedScorer:
         row_ends: cute.Tensor,
         tile_requests: cute.Tensor,
         block_table: cute.Tensor,
+        thresholds: Optional[cute.Tensor],
+        counters: Optional[cute.Tensor],
         output: cute.Tensor,
         key_rows: cutlass.Int32,
         workers: cutlass.Int32,
+        ties: cutlass.Int32,
     ):
         jobs, pages = query.shape[0] // self.rows, key_cache.shape[0]
         packing = key_cache.element_type.width // self.values.width  # NVFP4: 2
@@ -127,7 +144,7 @@ class PagedScorer:
                 tcgen05.CtaGroup.ONE,
                 self.tile[:2],
             )
-        # The keys are the MMA's A operand, the query B.
+        # Decode's keys are the MMA's A operand, the query B; select swaps them.
         make_key = (
             sm100_utils.make_smem_layout_a,
             blockscaled_utils.make_smem_layout_sfa,
@@ -136,6 +153,8 @@ class PagedScorer:
             sm100_utils.make_smem_layout_b,
             blockscaled_utils.make_smem_layout_sfb,
         )
+        if cutlass.const_expr(not self.decode):
+            make_key, make_query = make_query, make_key
 
         def operand(make: tuple, stages: int) -> tuple:
             """An operand's shared-memory layout, NVFP4's scale layout, and bytes."""
@@ -147,13 +166,16 @@ class PagedScorer:
             return layout, scales, size
 
         # Shared memory: the query, the barriers and TMEM address (padded to
-        # 128 B), the page indices, then as many key stages as fit in half an
-        # SM's 228 KB (a CTA's 227 KB plus the 1 KB reserved per CTA).
+        # 128 B), the page indices, select's 32 staged scores per thread, then as
+        # many key stages as fit in half an SM's 228 KB (a CTA's 227 KB plus the
+        # 1 KB reserved per CTA), or in all of it if two CTAs do not fit.
         capacity = utils.get_smem_capacity_in_bytes("sm_100") + 1024
         layout_query, scales_query, fixed = operand(make_query, 1)
-        fixed += 8 * 2 * (1 + self.accumulators) + 4 + 127 + 8 * TILES_PER_CTA
+        fixed += 8 * 2 * (1 + self.accumulators) + 4 + 127 + 8 * self.max_tiles
+        fixed += 0 if self.decode else 4 * 32 * self.threads
         stage = 16 + operand(make_key, 1)[2]
-        self.stages = (capacity // 2 - 1024 - fixed) // stage
+        ctas = min(2, capacity // (fixed + stage + 1024))
+        self.stages = (capacity // ctas - 1024 - fixed) // stage
         layout_key, scales_key, _ = operand(make_key, self.stages)
         shared_bytes = fixed + self.stages * stage
         # A key tile as TMA writes it, then the stages: the key operand's swizzled
@@ -180,7 +202,10 @@ class PagedScorer:
             layout_key_page,
             (64, 128),
         )
-        tma_query, tensor_query = cute.nvgpu.make_tiled_tma_atom_B(
+        make_tma_query = cute.nvgpu.make_tiled_tma_atom_B
+        if cutlass.const_expr(not self.decode):
+            make_tma_query = cute.nvgpu.make_tiled_tma_atom_A
+        tma_query, tensor_query = make_tma_query(
             cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
             matrix_query,
             cute.slice_(layout_query, (None, None, None, 0)),
@@ -198,6 +223,8 @@ class PagedScorer:
             row_ends,
             tile_requests,
             block_table,
+            thresholds,
+            counters,
             output,
             layout_key,
             layout_query,
@@ -206,11 +233,12 @@ class PagedScorer:
             key_pages,
             key_rows,
             workers,
+            ties,
         ).launch(
             grid=(jobs, workers, 1),
             block=(self.threads, 1, 1),
             smem=shared_bytes,
-            min_blocks_per_mp=2,
+            min_blocks_per_mp=ctas,
             stream=stream,
         )
 
@@ -227,6 +255,8 @@ class PagedScorer:
         row_ends: cute.Tensor,
         tile_requests: cute.Tensor,
         block_table: cute.Tensor,
+        thresholds: Optional[cute.Tensor],
+        counters: Optional[cute.Tensor],
         output: cute.Tensor,
         layout_key: cute.ComposedLayout,
         layout_query: cute.ComposedLayout,
@@ -235,6 +265,7 @@ class PagedScorer:
         key_pages: cute.Layout,
         key_rows: cutlass.Int32,
         workers: cutlass.Int32,
+        ties: cutlass.Int32,
     ):
         thread, _, _ = cute.arch.thread_idx()
         job, worker, _ = cute.arch.block_idx()
@@ -260,13 +291,27 @@ class PagedScorer:
         tmem_pool = tmem.reserve(self.tmem_columns)
         tmem.relinquish_alloc_permit()
         base = tmem_pool.base_ptr
-        local_thread = thread % 128  # the TMEM lane: a key
+        local_thread = thread % 128  # the TMEM lane: a key or a query row
+        key_group = thread // 128  # select: 32 key columns of every tile
         # Flat views with 64-bit offsets: cache and output offsets can pass 2**31.
         flat_int64 = cute.make_layout(cutlass.Int64(2**31 - 1))
         pages = cute.make_tensor(block_table.iterator, flat_int64)
-        # The job's request and last key; its rows share one length.
+        # The job's request and last key; decode rows share one length.
         request = cute.make_tensor(tile_requests.iterator, flat_int64)[job]
-        job_end = cutlass.min(row_ends[job], key_rows)
+        job_end = cutlass.Int32(0)
+        if cutlass.const_expr(self.decode):
+            job_end = row_ends[job]
+        else:  # a select tile's longest row
+            for row_group in cutlass.range(self.rows // 32, unroll_full=True):
+                row = job * self.rows + row_group * 32 + thread % 32
+                job_end = cutlass.max(job_end, row_ends[row])
+            job_end = cute.arch.warp_redux_sync(job_end, "max")
+        job_end = cutlass.min(job_end, key_rows)
+        my_row = job * self.rows + local_thread
+        my_end, my_threshold = job_end, cutlass.Float32(0)
+        if cutlass.const_expr(not self.decode):
+            my_end = cutlass.min(row_ends[my_row], key_rows)
+            my_threshold = thresholds[my_row]
         # This CTA's run of key tiles.
         job_tiles = (job_end + 127) // 128
         run = (job_tiles + workers - 1) // workers
@@ -289,8 +334,13 @@ class PagedScorer:
             shared_query_scales = shared.allocate_tensor(SCALE_TYPE, scales_query, 128)
         # Each 64-key half-tile's page.
         tile_pages = shared.allocate_tensor(
-            cutlass.Int32, cute.make_layout(2 * TILES_PER_CTA), 16
+            cutlass.Int32, cute.make_layout(2 * self.max_tiles), 16
         )
+        staged = None
+        if cutlass.const_expr(not self.decode):
+            staged = shared.allocate_tensor(
+                cutlass.Float32, cute.make_layout(32 * self.threads), 16
+            )
         accumulator = tmem_pool.allocate_tensor(
             tiled_mma.make_fragment_C(
                 cute.append(
@@ -299,9 +349,14 @@ class PagedScorer:
             ).layout,
             cutlass.Float32,
         )
+        # Decode's keys are the MMA's A operand, select's queries.
+        make_key_sf = blockscaled_utils.make_tmem_layout_sfa
+        make_query_sf = blockscaled_utils.make_tmem_layout_sfb
+        if cutlass.const_expr(not self.decode):
+            make_key_sf, make_query_sf = make_query_sf, make_key_sf
         if cutlass.const_expr(self.scaled):  # the pool asserts they fit
             scale_key = tmem_pool.allocate_tensor(
-                blockscaled_utils.make_tmem_layout_sfa(
+                make_key_sf(
                     tiled_mma,
                     self.tile,
                     SCALE_VECTOR,
@@ -310,7 +365,7 @@ class PagedScorer:
                 SCALE_TYPE,
             )
             scale_query = tmem_pool.allocate_tensor(
-                blockscaled_utils.make_tmem_layout_sfb(
+                make_query_sf(
                     tiled_mma,
                     self.tile,
                     SCALE_VECTOR,
@@ -318,8 +373,12 @@ class PagedScorer:
                 ),
                 SCALE_TYPE,
             )
-        fragment_key = tiled_mma.make_fragment_A(shared_key)
-        fragment_query = tiled_mma.make_fragment_B(shared_query)
+        if cutlass.const_expr(self.decode):
+            fragment_key = tiled_mma.make_fragment_A(shared_key)
+            fragment_query = tiled_mma.make_fragment_B(shared_query)
+        else:
+            fragment_query = tiled_mma.make_fragment_A(shared_query)
+            fragment_key = tiled_mma.make_fragment_B(shared_key)
         # The run's page indices: 0 past the job's end, whose entries go unread.
         request_row = request.to(cutlass.Int64) * block_table.shape[1]
         for slot in cutlass.range(thread, 2 * tile_count, self.threads):
@@ -345,6 +404,14 @@ class PagedScorer:
                 )
             cute.arch.fence_view_async_shared()
         cute.arch.barrier()
+        # Select: this row's candidate and tie counters, and the address of its
+        # first (key index, score) pair; the candidates follow `ties` tie slots.
+        if cutlass.const_expr(not self.decode):
+            capacity = output.shape[1] - ties
+            row_counters = counters.iterator + my_row * 2
+            row_pairs = cutlass.Int64(output.iterator.toint()) + 8 * (
+                my_row.to(cutlass.Int64) * output.shape[1]
+            )
         producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
         # A key stage is full once its TMA bytes and NVFP4's scale copies land.
@@ -369,7 +436,9 @@ class PagedScorer:
             barrier_storage=storage.acc_barriers.data_ptr(),
             num_stages=self.accumulators,
             producer_group=producer_group,
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
+            consumer_group=pipeline.CooperativeGroup(  # decode: warps 0-3
+                pipeline.Agent.Thread, 128 if self.decode else self.threads
+            ),
         ).make_participants()
         mma_thread = tiled_mma.get_slice(0)
         global_key = cute.local_tile(tensor_key, (64, 128), (None, None, None))
@@ -380,29 +449,32 @@ class PagedScorer:
             cute.make_tensor(shared_key.iterator, key_pages),
             cute.group_modes(global_key, 0, 2),
         )
-        query_tile = cute.local_tile(tensor_query, (8, 128), (None, None, None))
+        query_box = 8 if self.decode else 128  # the MMA's query N or M
+        query_tile = cute.local_tile(tensor_query, (query_box, 128), (None,) * 3)
+        partition = mma_thread.partition_B if self.decode else mma_thread.partition_A
         load_query_dst, load_query_src = cpasync.tma_partition(
             tma_query,
             0,
             cute.make_layout(1),
             cute.group_modes(shared_query, 0, 3),
-            cute.group_modes(mma_thread.partition_B(query_tile), 0, 3),
+            cute.group_modes(partition(query_tile), 0, 3),
         )
         load_query_dst = cute.filter_zeros(load_query_dst)
         load_query_src = cute.filter_zeros(load_query_src)
-        # Each thread reads the 8 query columns of its key from TMEM, where an
-        # address is lane << 16 | column.
+        # Each thread reads its lane's scores from TMEM, where an address is
+        # lane << 16 | column: decode, the 8 query columns of its key; select,
+        # its row's 32 scores of its warpgroup's key group.
+        columns = 8 if self.decode else 32
         atom = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition(8), tcgen05.Pack.NONE),
+            tcgen05.Ld32x32bOp(tcgen05.Repetition(columns), tcgen05.Pack.NONE),
             cutlass.Float32,
         )
-        resident_layout = cute.make_layout((128, 8), stride=(65536, 1))
-        tiled_copy = tcgen05.make_tmem_copy(
-            atom, cute.make_tensor(base, resident_layout)
-        )
+        resident_layout = cute.make_layout((128, columns), stride=(65536, 1))
+        resident = cute.make_tensor(base + key_group * columns, resident_layout)
+        tiled_copy = tcgen05.make_tmem_copy(atom, resident)
         thread_copy = tiled_copy.get_slice(local_thread)
         registers = cute.make_fragment_like(
-            thread_copy.partition_D(cute.make_identity_tensor((128, 8))),
+            thread_copy.partition_D(cute.make_identity_tensor((128, columns))),
             cutlass.Float32,
         )
         copies = scale_loads = None
@@ -412,9 +484,12 @@ class PagedScorer:
                 partition_scales(shared_key_scales, scale_key),
             )
             scale_loads = (key_scales, shared_key_scales, tile_pages, key_pipeline)
-        # The keys are the MMA's A operand, the query B.
+        # Decode's keys are the MMA's A operand, select's queries.
         mma: tuple = (tiled_mma, accumulator, fragment_key, fragment_query)
         mma += (scale_key, scale_query, copies)
+        if cutlass.const_expr(not self.decode):
+            mma = (tiled_mma, accumulator, fragment_query, fragment_key)
+            mma += (scale_query, scale_key, copies)
         key_loads = (tma_key, load_key_src, load_key_dst, tile_pages)
         # Tile t + stages - 1 loads into the stage of tile t - 1, whose MMA is done.
         ahead = self.stages - 1
@@ -422,10 +497,61 @@ class PagedScorer:
             pipeline.PipelineUserType.Producer, self.stages
         )
 
-        # Warp 5 loads the query once, then the keys; warp 4 issues tile t's MMA
-        # into one accumulator while warps 0-3 store tile t - 1's scores from
-        # the other.
-        if warp == 5:
+        # Select runs its tiles in lockstep. Step s reads tile s - 1's scores,
+        # issues tile s's MMA (warp 0 also loads the query and keys), and then
+        # selects from tile s - 1's scores. In decode, warp 5 loads the query once
+        # and then the keys, and warp 4 issues tile t's MMA into one accumulator
+        # while warps 0-3 store tile t - 1's scores from the other.
+        if cutlass.const_expr(not self.decode):
+            source = thread_copy.partition_S(resident)
+            selection = (row_counters, row_pairs, ties, capacity, staged)
+            if warp == 0:
+                query_empty = query_producer.acquire_and_advance()
+                cute.copy(
+                    tma_query,
+                    load_query_src[None, 0, 0, job],
+                    load_query_dst[None, 0],
+                    tma_bar_ptr=query_empty.barrier,
+                )
+            for step in cutlass.range(-ahead, tile_count + 1):
+                if step > 0:
+                    acc_full = acc_consumer.wait_and_advance()
+                    cute.copy(tiled_copy, source, registers)
+                    cute.arch.fence_view_async_tmem_load()
+                    acc_full.release()
+                if step + ahead >= 0 and step + ahead < tile_count:
+                    if warp == 0:
+                        key_empty = key_producer.acquire_and_advance()
+                        self.load_keys(key_empty, key_loads, step + ahead)
+                    if cutlass.const_expr(self.scaled):
+                        if thread < 128:
+                            tile = step + ahead
+                            self.load_scales(scale_loads, tile, scale_stage, thread)
+                            scale_stage.advance()
+                if warp == 0 and step >= 0 and step < tile_count:
+                    if step == 0:
+                        query_consumer.wait_and_advance()
+                    self.mma(
+                        mma,
+                        acc_producer.acquire_and_advance(),
+                        key_consumer.wait_and_advance(),
+                        step == 0,
+                    )
+                if step > 0:
+                    tile = first_tile + step - 1
+                    key_base = tile * 128 + key_group * 32
+                    limit = cutlass.min(cutlass.max(my_end - key_base, 0), 32)
+                    # Keys at or past my_end are neither; only tiles that
+                    # straddle a row end (of any row in this warp) check it.
+                    if cute.arch.vote_all_sync(tile * 128 + 128 <= my_end):
+                        self.select_keys(
+                            registers, my_threshold, 32, key_base, selection, thread
+                        )
+                    else:
+                        self.select_keys(
+                            registers, my_threshold, limit, key_base, selection, thread
+                        )
+        elif warp == 5:
             query_empty = query_producer.acquire_and_advance()
             cute.copy(
                 tma_query,
@@ -435,7 +561,7 @@ class PagedScorer:
             )
             for tile in cutlass.range(tile_count):
                 self.load_keys(key_producer.acquire_and_advance(), key_loads, tile)
-        if warp == 4:
+        elif warp == 4:
             query_consumer.wait_and_advance()
             for tile in cutlass.range(tile_count):
                 self.mma(
@@ -444,7 +570,7 @@ class PagedScorer:
                     key_consumer.wait_and_advance(),
                     tile == 0,
                 )
-        if warp < 4:
+        elif warp < 4:
             if cutlass.const_expr(self.scaled):
                 for slot in cutlass.range(cutlass.min(ahead, tile_count)):
                     self.load_scales(scale_loads, slot, scale_stage, thread)
@@ -480,7 +606,8 @@ class PagedScorer:
 
     @cute.jit
     def load_keys(self, key_empty, loads: tuple, tile: cutlass.Int32):
-        """Warp 5: TMA the run's tile `tile` into the stage `key_empty`."""
+        """Decode's warp 5, select's warp 0: TMA the run's tile `tile` into the
+        stage `key_empty`."""
         tma_key, sources, destinations, tile_pages = loads
         for half in cutlass.range(2, unroll_full=True):
             cute.copy(
@@ -492,9 +619,9 @@ class PagedScorer:
 
     @cute.jit
     def mma(self, operands: tuple, acc_empty, key_full, first):
-        """Warp 4: NVFP4's scales to TMEM (the query's if `first`), then the MMA
-        of stage `key_full` into accumulator `acc_empty`; the stage is released
-        and the accumulator committed."""
+        """Decode's warp 4, select's warp 0: NVFP4's scales to TMEM (the query's
+        if `first`), then the MMA of stage `key_full` into accumulator
+        `acc_empty`; the stage is released and the accumulator committed."""
         tiled_mma, accumulator, fragment_a, fragment_b, scale_a, scale_b, copies = (
             operands
         )
@@ -509,6 +636,7 @@ class PagedScorer:
                 copy_ksf, ksf_src[None, None, None, None, key_full.index], ksf_dst
             )
         partial = accumulator[None, None, None, acc_empty.index]
+        stage_a, stage_b = (key_full.index, 0) if self.decode else (0, key_full.index)
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
         # MMAs per tile: NVFP4 2, BF16 8.
         for depth in cutlass.range(cute.size(fragment_a, mode=[2]), unroll_full=True):
@@ -518,8 +646,8 @@ class PagedScorer:
             cute.gemm(
                 tiled_mma,
                 partial,
-                fragment_a[None, None, depth, key_full.index],
-                fragment_b[None, None, depth, 0],
+                fragment_a[None, None, depth, stage_a],
+                fragment_b[None, None, depth, stage_b],
                 partial,
             )
             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
@@ -551,6 +679,110 @@ class PagedScorer:
                 cute.make_tensor(place + half * 128, cute.make_layout(1)),
             )
         cute.arch.cp_async_mbarrier_arrive_noinc(keys.producer_get_barrier(stage))
+
+    @cute.jit
+    def select_keys(
+        self,
+        registers: cute.Tensor,
+        threshold: cutlass.Float32,
+        limit: cutlass.Int32,
+        key_base: cutlass.Int32,
+        selection: tuple,
+        thread: cutlass.Int32,
+    ):
+        """A thread's 32 scores of its row, the first `limit` live, as candidates
+        (above the threshold) and ties (neither above nor below): one atomic add
+        per class reserves slots, and each written slot gets one 8-byte (key,
+        score) pair; past the row's slots they are counted, not written. The
+        scores are staged in the thread's 128 shared-memory bytes so the
+        candidate loop runs once per set mask bit."""
+        row_counters, row_pairs, ties, capacity, staged = selection
+        mask = cutlass.Uint32(0)
+        tie_seen = cutlass.Boolean(False)
+        for j in cutlass.range_constexpr(32):
+            if j < limit:
+                mask |= cutlass.Uint32(threshold < registers[j]) << j
+                tie_seen |= self.is_tie(registers[j], threshold)
+        # Score j at word j ^ (4 * (thread % 8)): the 8 threads of a quarter
+        # warp store their 16-byte chunks to distinct banks.
+        swizzle = (thread % 8) * 4
+        mine = thread * 32
+        atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=128
+        )
+        for chunk in cutlass.range_constexpr(8):
+            cute.copy(
+                atom,
+                cute.make_tensor(registers.iterator + chunk * 4, cute.make_layout(4)),
+                cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Float32,
+                        (staged.iterator + mine + (chunk * 4 ^ swizzle)).toint(),
+                        cute.AddressSpace.smem,
+                        assumed_align=16,
+                    ),
+                    cute.make_layout(4),
+                ),
+            )
+        if tie_seen:
+            tied = cutlass.Int32(0)
+            for j in cutlass.range_constexpr(32):
+                if j < limit:
+                    tied += cutlass.Int32(self.is_tie(registers[j], threshold))
+            slot = cute.arch.atomic_add(
+                (row_counters + 1).llvm_ptr, tied, sem="relaxed", scope="gpu"
+            )
+            address = row_pairs + 8 * (ties - 1 - slot).to(cutlass.Int64)
+            for j in cutlass.range_constexpr(32):
+                if j < limit:
+                    if self.is_tie(registers[j], threshold):
+                        if slot < ties:
+                            self.store_pair(
+                                address, key_base + j, registers[j], threshold
+                            )
+                        slot += 1
+                        address -= 8
+        above = cute.arch.popc(mask)
+        slot = cute.arch.atomic_add(
+            row_counters.llvm_ptr, above, sem="relaxed", scope="gpu"
+        )
+        address = row_pairs + 8 * (ties + slot).to(cutlass.Int64)
+        for _ in cutlass.range(cutlass.min(above, cutlass.max(capacity - slot, 0))):
+            j = cutlass.Int32(cute.arch.bfind(mask))
+            mask ^= cutlass.Uint32(1) << j
+            self.store_pair(
+                address, key_base + j, staged[mine + (j ^ swizzle)], threshold
+            )
+            address += 8
+
+    @cute.jit
+    def is_tie(
+        self, score: cutlass.Float32, threshold: cutlass.Float32
+    ) -> cutlass.Boolean:
+        """Neither above nor below the threshold: equal, or NaN."""
+        return not (threshold < score) and not (score < threshold)
+
+    @cute.jit
+    def store_pair(
+        self,
+        address: cutlass.Int64,
+        key: cutlass.Int32,
+        score: cutlass.Float32,
+        lower_bound: cutlass.Float32,
+    ):
+        # The score's distance above the lower bound where exact, up to twice it
+        # (Sterbenz lemma); larger scores stay, above every shifted one, so the
+        # order holds. A negative lower bound never passes the check.
+        if score <= lower_bound + lower_bound:
+            score -= lower_bound
+        pair = cute.make_tensor(
+            cute.make_ptr(
+                cutlass.Int64, address, cute.AddressSpace.gmem, assumed_align=8
+            ),
+            cute.make_layout(1),
+        )
+        bits = score.bitcast(cutlass.Uint32).to(cutlass.Int64)
+        pair[0] = (bits << 32) | key.to(cutlass.Uint32).to(cutlass.Int64)
 
 
 @cute.kernel
@@ -595,5 +827,5 @@ def index_k_write_kernel(
             key_scales[page, row, part // 2] = scale.to(cutlass.Uint8)
 
 
-# One scorer per query rows per request and key format, so each compiles once.
+# One scorer per mode, query rows per job and key format, so each compiles once.
 scorers = cache(PagedScorer)
