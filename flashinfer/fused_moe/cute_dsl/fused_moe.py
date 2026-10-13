@@ -244,7 +244,13 @@ def _resolve_stream_executor() -> Callable[[list, Callable[[int], None]], None]:
     """Prefer PyTorch's fork/join helper; fall back to the in-repo mirror."""
     executor = getattr(torch.cuda, "execute_on_streams", None)
     if executor is not None:
-        return executor
+
+        def execute_with_indices(streams, fn):
+            # Upstream maps explicit input sequences to callbacks; it does not
+            # supply the domain index implicitly like the legacy helpers.
+            executor(streams, fn, range(len(streams)))
+
+        return execute_with_indices
     try:
         # Name used by earlier revisions of the PyTorch proposal.
         from torch.cuda.green_contexts import execute_in_green_contexts

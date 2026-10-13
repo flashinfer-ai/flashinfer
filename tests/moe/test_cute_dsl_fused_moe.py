@@ -4732,8 +4732,15 @@ def test_localized_stream_executor_resolution(monkeypatch, available):
 
     from flashinfer.fused_moe.cute_dsl import fused_moe as module
 
-    def upstream(streams, fn):
-        pass
+    streams = [object(), object()]
+    seen = []
+
+    def upstream(actual_streams, fn, *inputs):
+        assert actual_streams is streams
+        assert len(inputs) == 1
+        assert list(inputs[0]) == [0, 1]
+        for args in zip(*inputs, strict=True):
+            fn(*args)
 
     def legacy(streams, fn):
         pass
@@ -4749,12 +4756,22 @@ def test_localized_stream_executor_resolution(monkeypatch, available):
         if available == "legacy"
         else None,
     )
-    expected = {
-        "execute_on_streams": upstream,
-        "legacy": legacy,
-        "none": module._execute_on_streams,
-    }[available]
-    assert module._resolve_stream_executor() is expected
+    executor = module._resolve_stream_executor()
+    if available == "execute_on_streams":
+        executor(streams, seen.append)
+        assert seen == [0, 1]
+
+        def fail(index):
+            seen.append(index)
+            raise RuntimeError("callback failed")
+
+        seen.clear()
+        with pytest.raises(RuntimeError, match="callback failed"):
+            executor(streams, fail)
+        assert seen == [0]
+    else:
+        expected = legacy if available == "legacy" else module._execute_on_streams
+        assert executor is expected
 
 
 @cute_dsl_available
