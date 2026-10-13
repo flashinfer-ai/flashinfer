@@ -303,7 +303,8 @@ def _blockscaled_dequant(x_bshd, qk_mode):
 @pytest.mark.parametrize("qk_mode", ["mxfp8", "nvfp4"])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_blockscaled_quantize_and_prefill(qk_mode, causal, out_dtype):
+@pytest.mark.parametrize("p_exp_mode", ["exp2", "expcast"])
+def test_blockscaled_quantize_and_prefill(qk_mode, causal, out_dtype, p_exp_mode):
     """End-to-end block-scaled path: fused quantizer -> SF -> FMHA kernel."""
     from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
     from flashinfer.attention.cute_dsl.fmha_blockscaled import (
@@ -331,6 +332,7 @@ def test_blockscaled_quantize_and_prefill(qk_mode, causal, out_dtype):
         v_store,
         o,
         qk_mode=qk_mode,
+        p_exp_mode=p_exp_mode,
         is_causal=causal,
         sm_scale=sm,
         scale_q=q_scale,
@@ -350,3 +352,156 @@ def test_blockscaled_quantize_and_prefill(qk_mode, causal, out_dtype):
     atol = 0.25 if out_dtype == torch.float8_e4m3fn else 0.1
     rtol = 0.1 if out_dtype == torch.float8_e4m3fn else 1e-2
     torch.testing.assert_close(o.float(), o_ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("qk_mode", ["mxfp8", "nvfp4"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("feature", ["plain", "window", "skip_softmax"])
+def test_blockscaled_expcast_online_softmax(qk_mode, causal, feature, monkeypatch):
+    """Exercise rescaling across KV tiles, GQA, residual masks, and base-2 LSE."""
+    from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
+    from flashinfer.attention.cute_dsl.fmha_blockscaled import (
+        cute_dsl_fmha_blockscaled_prefill,
+    )
+
+    # Opt-in variants must never load the existing exp2 artifacts.
+    def reject_artifact_load(*args, **kwargs):
+        raise AssertionError("expcast attempted to load an exp2 artifact")
+
+    monkeypatch.setattr(
+        "flashinfer.attention.cute_dsl.fmha_blockscaled.get_cute_dsl_fmha_blockscaled_kernel",
+        reject_artifact_load,
+    )
+    torch.manual_seed(7)
+    b, sq, sk, hq, hk, d = 2, 257, 513, 8, 4, 128
+    q = torch.randn(b, sq, hq, d, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(b, sk, hk, d, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn(b, sk, hk, d, device=DEVICE, dtype=torch.bfloat16)
+    # Vary the tile maxima enough to exercise online accumulator correction.
+    k[:, :128] *= 2
+    qs, ks, qsf, ksf, qscale, kscale = quantize_blockscaled_qk(q, k, qk_mode)
+    vs = v.to(torch.float8_e4m3fn)
+    out = torch.empty(b, sq, hq, d, device=DEVICE, dtype=torch.bfloat16)
+    lse = torch.empty(b, sq, hq, device=DEVICE, dtype=torch.float32)
+    window_left = 63 if feature == "window" else -1
+    cute_dsl_fmha_blockscaled_prefill(
+        qs,
+        ks,
+        qsf,
+        ksf,
+        vs,
+        out,
+        qk_mode=qk_mode,
+        p_exp_mode="expcast",
+        is_causal=causal,
+        scale_q=qscale,
+        scale_k=kscale,
+        scale_v=1.5,
+        scale_o=0.5,
+        window_left=window_left,
+        lse=lse,
+        skip_softmax_threshold_scale_factor=1e-5 if feature == "skip_softmax" else None,
+    )
+    qr = _blockscaled_dequant(q, qk_mode)
+    kr = _blockscaled_dequant(k, qk_mode).repeat_interleave(hq // hk, dim=2)
+    vr = vs.float().repeat_interleave(hq // hk, dim=2)
+    scores = torch.einsum("bqhd,bkhd->bhqk", qr, kr) / math.sqrt(d)
+    rows = torch.arange(sq, device=DEVICE)[:, None] + sk - sq
+    cols = torch.arange(sk, device=DEVICE)[None, :]
+    if causal:
+        scores.masked_fill_(cols > rows, -torch.inf)
+    if window_left >= 0:
+        scores.masked_fill_(cols < rows - window_left, -torch.inf)
+    reference = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), vr) * 3.0
+    lse_reference = scores.logsumexp(-1).transpose(1, 2) / math.log(2)
+    torch.testing.assert_close(out.float(), reference, atol=0.2, rtol=0.05)
+    torch.testing.assert_close(lse, lse_reference, atol=0.2, rtol=0.01)
+
+
+@pytest.mark.parametrize("qk_mode", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("feature", ["plain", "causal", "skip_all"])
+def test_blockscaled_expcast_persistent_matches_nonpersistent(
+    qk_mode, feature, monkeypatch
+):
+    """The original P pipeline must survive skipping and persistent tile reuse."""
+    from flashinfer.cute_dsl.attention.fmha.compile import (
+        compile_cute_dsl_fmha_blockscaled_kernel,
+    )
+    from flashinfer.cute_dsl.attention.fmha.fmha_blockscaled import (
+        BlackwellFusedMultiHeadBlockScaledAttentionForward as Attention,
+    )
+    from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
+    from flashinfer.attention.cute_dsl.fmha_blockscaled import (
+        cute_dsl_fmha_blockscaled_prefill,
+    )
+
+    torch.manual_seed(29)
+    hq, hk, d = 64, 8, 128
+    # More work tiles than SMs forces persistent CTAs to reuse their P slots.
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    sq = (sm_count // hq + 1) * 256
+    q = torch.randn(1, sq, hq, d, device=DEVICE, dtype=torch.bfloat16)
+    # Keep every causal query nonempty while retaining a residual KV tile.
+    k = torch.randn(1, sq + 257, hk, d, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn_like(k).to(torch.float8_e4m3fn)
+    qs, ks, qsf, ksf, qscale, kscale = quantize_blockscaled_qk(q, k, qk_mode)
+    original_init = Attention.__init__
+    expected = None
+    try:
+        for is_persistent in [False, True]:
+
+            def configure(self, *args, **kwargs):
+                kwargs.update(
+                    is_persistent=is_persistent,
+                    rescale_threshold=2**-8,
+                )
+                original_init(self, *args, **kwargs)
+
+            monkeypatch.setattr(Attention, "__init__", configure)
+            compile_cute_dsl_fmha_blockscaled_kernel.cache_clear()
+            out = torch.empty_like(q)
+            lse = torch.empty(q.shape[:-1], device=DEVICE, dtype=torch.float32)
+            cute_dsl_fmha_blockscaled_prefill(
+                qs,
+                ks,
+                qsf,
+                ksf,
+                v,
+                out,
+                qk_mode=qk_mode,
+                p_exp_mode="expcast",
+                is_causal=feature == "causal",
+                scale_q=qscale,
+                scale_k=kscale,
+                lse=lse,
+                # Force later KV tiles to skip. The P readiness slot must
+                # still advance even though PV does not read those P bytes.
+                skip_softmax_threshold_scale_factor=1e9
+                if feature == "skip_all"
+                else None,
+            )
+            assert torch.isfinite(out).all()
+            if expected is None:
+                expected = (out, lse)
+            else:
+                torch.testing.assert_close(out, expected[0], rtol=0, atol=0)
+                torch.testing.assert_close(lse, expected[1], rtol=0, atol=0)
+    finally:
+        compile_cute_dsl_fmha_blockscaled_kernel.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "mode,v_dtype", [("unknown", torch.float8_e4m3fn), ("expcast", torch.bfloat16)]
+)
+def test_blockscaled_expcast_rejects_invalid_mode_or_pv(mode, v_dtype):
+    from flashinfer.attention.cute_dsl.fmha_blockscaled import (
+        cute_dsl_fmha_blockscaled_prefill,
+    )
+
+    q = torch.empty(1, 128, 1, 128, device=DEVICE, dtype=torch.float8_e4m3fn)
+    v = torch.empty_like(q, dtype=v_dtype)
+    sf = torch.empty(0, device=DEVICE)
+    with pytest.raises(ValueError, match="p_exp_mode|E4M3 PV"):
+        cute_dsl_fmha_blockscaled_prefill(
+            q, q, sf, sf, v, v, qk_mode="mxfp8", p_exp_mode=mode
+        )
