@@ -696,16 +696,19 @@ def _get_prefill_kernel(
     enable_checkpoints,
     cu_seqlens_dtype,
     checkpoint_cu_starts_dtype,
+    head_size,
+    head_size_v,
 ):
+    dk, dv = head_size, head_size_v
     return CPDeltaRulePrefillTcgen05Sm100(
         io_dtype=kernel_dtype,
         acc_dtype=cutlass.Float32,
         state_dtype=state_dtype,
         checkpoint_dtype=checkpoint_dtype,
-        mma_tiler_qk=(64, 64, 128),
-        mma_tiler_qs=(128, 64, 128),
-        mma_tiler_qkv=(128, 64, 64),
-        mma_tiler_kv=(128, 128, 64),
+        mma_tiler_qk=(64, 64, dk),
+        mma_tiler_qs=(dv, 64, dk),
+        mma_tiler_qkv=(dv, 64, 64),
+        mma_tiler_kv=(dv, dk, 64),
         max_active_clusters=num_sm,
         num_sm=num_sm,
         is_GQA=is_gqa,
@@ -749,11 +752,11 @@ def cp_delta_rule_prefill_dsl_sm100(
     if not _skip_check:
         if q.ndim != 3:
             raise RuntimeError(
-                f"q must have shape (total_seqlen, num_q_heads, D), got {tuple(q.shape)}"
+                f"q must have shape (total_seqlen, num_q_heads, DimK), got {tuple(q.shape)}"
             )
         if k.ndim != 3 or v.ndim != 3 or o.ndim != 3:
             raise RuntimeError(
-                "k, v, and o must have shape (total_seqlen, num_heads, D), "
+                "k, v, and o must have shape (total_seqlen, num_heads, DimK/DimV), "
                 f"got k={tuple(k.shape)}, v={tuple(v.shape)}, o={tuple(o.shape)}"
             )
         if (
@@ -762,12 +765,8 @@ def cp_delta_rule_prefill_dsl_sm100(
             or o.shape[0] != q.shape[0]
         ):
             raise RuntimeError("q, k, v, and o must have the same total_seqlen")
-        if (
-            k.shape[2] != q.shape[2]
-            or v.shape[2] != q.shape[2]
-            or o.shape[2] != q.shape[2]
-        ):
-            raise RuntimeError("q, k, v, and o must have the same D")
+        if k.shape[2] != q.shape[2] or o.shape[2] != v.shape[2]:
+            raise RuntimeError("q/k must share DimK and v/o must share DimV")
         if total_seqlen != q.shape[0]:
             raise RuntimeError(
                 f"total_seqlen must match q.shape[0], got {total_seqlen} and {q.shape[0]}"
@@ -782,16 +781,19 @@ def cp_delta_rule_prefill_dsl_sm100(
     num_seqs = cu_seqlens.shape[0] - 1
     if max_seqlen is None:
         raise RuntimeError("max_seqlen must be provided")
-    _, num_q_heads, d = q.shape
+    _, num_q_heads, dk = q.shape
     num_k_heads = k.shape[1]
-    num_v_heads = v.shape[1]
+    _, num_v_heads, dv = v.shape
     num_sab_heads = max(num_q_heads, num_v_heads)
     enable_checkpoints = checkpoint_every_n_tokens > 0
     total_t_blocks = workspace_num_chunks_host(cu_seqlens, 64, total_seqlen)
     total_cp_chunks = workspace_num_chunks_host(cu_seqlens, cp_chunk_len, total_seqlen)
     if not _skip_check:
-        if d != 128:
-            raise RuntimeError(f"CPDeltaRulePrefillSm100 only supports D=128, got {d}")
+        if (dk, dv) not in ((128, 128), (128, 64)):
+            raise RuntimeError(
+                "CPDeltaRulePrefillSm100 only supports (DimK, DimV) in "
+                f"{{(128, 128), (128, 64)}}, got {(dk, dv)}"
+            )
         if q.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
                 f"CPDeltaRulePrefillSm100 only supports fp16/bf16 inputs, got {q.dtype}"
@@ -807,16 +809,16 @@ def cp_delta_rule_prefill_dsl_sm100(
             raise RuntimeError(
                 f"alpha must have dtype torch.float32, got {alpha.dtype}"
             )
-        if o.shape != (total_seqlen, num_sab_heads, d):
+        if o.shape != (total_seqlen, num_sab_heads, dv):
             raise RuntimeError(
-                f"o must have shape {(total_seqlen, num_sab_heads, d)}, got {tuple(o.shape)}"
+                f"o must have shape {(total_seqlen, num_sab_heads, dv)}, got {tuple(o.shape)}"
             )
         if t.shape != (total_t_blocks, num_sab_heads, 64, 64):
             raise RuntimeError(
                 f"t must have shape {(total_t_blocks, num_sab_heads, 64, 64)}, got {tuple(t.shape)}"
             )
-        expected_workspace_shape = (total_cp_chunks, num_sab_heads, d, d)
-        expected_state_shape = (num_seqs, num_sab_heads, d, d)
+        expected_workspace_shape = (total_cp_chunks, num_sab_heads, dv, dk)
+        expected_state_shape = (num_seqs, num_sab_heads, dv, dk)
         if fixed_state.shape != expected_workspace_shape:
             raise RuntimeError(
                 f"fixed_state must have shape {expected_workspace_shape}, got {tuple(fixed_state.shape)}"
@@ -843,10 +845,10 @@ def cp_delta_rule_prefill_dsl_sm100(
                     "state_checkpoints and checkpoint_cu_starts are required when "
                     "checkpointing is enabled"
                 )
-            if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, d, d):
+            if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, dv, dk):
                 raise RuntimeError(
                     "state_checkpoints must have shape "
-                    f"[*, {num_sab_heads}, {d}, {d}], got {tuple(state_checkpoints.shape)}"
+                    f"[*, {num_sab_heads}, {dv}, {dk}], got {tuple(state_checkpoints.shape)}"
                 )
             if checkpoint_cu_starts.shape != (num_seqs + 1,):
                 raise RuntimeError(
@@ -864,7 +866,7 @@ def cp_delta_rule_prefill_dsl_sm100(
                 "checkpointing is disabled"
             )
         if not _FullyFusedDeltaRuleSm120.can_implement(
-            num_q_heads, num_k_heads, num_v_heads, d, q.element_size()
+            num_q_heads, num_k_heads, num_v_heads, dk, q.element_size()
         ):
             raise RuntimeError(
                 "q/v heads must be positive multiples of k heads, "
@@ -883,9 +885,9 @@ def cp_delta_rule_prefill_dsl_sm100(
         ):
             if tensor is not None and not tensor.is_contiguous():
                 raise RuntimeError(f"{name} must be contiguous")
-        if state is not None and state.stride()[1:] != (d * d, d, 1):
+        if state is not None and state.stride()[1:] != (dv * dk, dk, 1):
             raise RuntimeError("state must be contiguous in its inner [H, V, K] modes")
-        if initial_state is not None and initial_state.stride()[1:] != (d * d, d, 1):
+        if initial_state is not None and initial_state.stride()[1:] != (dv * dk, dk, 1):
             raise RuntimeError(
                 "initial_state must be contiguous in its inner [H, V, K] modes"
             )
@@ -938,6 +940,8 @@ def cp_delta_rule_prefill_dsl_sm100(
         enable_checkpoints,
         _cu_seqlens_dtype(cu_seqlens.dtype),
         (_cu_seqlens_dtype(checkpoint_cu_starts.dtype) if enable_checkpoints else None),
+        dk,
+        dv,
     )
     compile_options = _blackwell_compile_options(device)
     workspace_size = (
@@ -958,16 +962,16 @@ def cp_delta_rule_prefill_dsl_sm100(
         initial_state_cute = None
         if needs_initial_state:
             initial_state_cute = from_dlpack(initial_state, assumed_align=16)
-            _mark_state_layout(initial_state_cute, False, d)
+            _mark_state_layout(initial_state_cute, False, dk)
         state_cute = None
         if store_final_state:
             state_cute = from_dlpack(state, assumed_align=16)
-            _mark_state_layout(state_cute, False, d)
+            _mark_state_layout(state_cute, False, dk)
         state_checkpoints_cute = None
         checkpoint_cu_starts_cute = None
         if enable_checkpoints:
             state_checkpoints_cute = from_dlpack(state_checkpoints, assumed_align=16)
-            _mark_state_layout(state_checkpoints_cute, False, d)
+            _mark_state_layout(state_checkpoints_cute, False, dk)
             checkpoint_cu_starts_cute = from_dlpack(
                 checkpoint_cu_starts, assumed_align=8
             ).mark_layout_dynamic()
@@ -1070,11 +1074,11 @@ def cp_delta_rule_dsl_sm100(
         )
     if q.ndim != 3:
         raise RuntimeError(
-            f"q must have shape (total_seqlen, num_q_heads, D), got {tuple(q.shape)}"
+            f"q must have shape (total_seqlen, num_q_heads, DimK), got {tuple(q.shape)}"
         )
     if k.ndim != 3 or v.ndim != 3 or o.ndim != 3:
         raise RuntimeError(
-            "k, v, and o must have shape (total_seqlen, num_heads, D), "
+            "k, v, and o must have shape (total_seqlen, num_heads, DimK/DimV), "
             f"got k={tuple(k.shape)}, v={tuple(v.shape)}, o={tuple(o.shape)}"
         )
     if (
@@ -1083,7 +1087,7 @@ def cp_delta_rule_dsl_sm100(
         or o.shape[0] != total_seqlen
     ):
         raise RuntimeError("q, k, v, and o must have the same total_seqlen")
-    if k.shape[2] != q.shape[2] or v.shape[2] != q.shape[2] or o.shape[2] != q.shape[2]:
+    if k.shape[2] != q.shape[2] or o.shape[2] != v.shape[2]:
         raise RuntimeError("q, k, v, and o must have the same D")
     if alpha.shape != beta.shape or alpha.shape[0] != total_seqlen:
         raise RuntimeError(
@@ -1096,9 +1100,9 @@ def cp_delta_rule_dsl_sm100(
     if not cu_seqlens.is_contiguous():
         raise RuntimeError("cu_seqlens must be contiguous")
 
-    _, num_q_heads, d = q.shape
+    _, num_q_heads, dk = q.shape
     num_k_heads = k.shape[1]
-    num_v_heads = v.shape[1]
+    _, num_v_heads, dv = v.shape
     num_sab_heads = max(num_q_heads, num_v_heads)
     enable_checkpoints = checkpoint_every_n_tokens > 0
     if o.shape[1] != num_sab_heads or alpha.shape[1] != num_sab_heads:
@@ -1106,13 +1110,13 @@ def cp_delta_rule_dsl_sm100(
             f"o/alpha/beta heads must equal max(q heads, v heads)={num_sab_heads}"
         )
     if not _FullyFusedDeltaRuleSm120.can_implement(
-        num_q_heads, num_k_heads, num_v_heads, d, q.element_size()
+        num_q_heads, num_k_heads, num_v_heads, dk, q.element_size()
     ):
         raise RuntimeError(
             "CPDeltaRuleSm100 only supports GQA/GVA head counts, "
             f"got q={num_q_heads}, k={num_k_heads}, v={num_v_heads}"
         )
-    expected_state_shape = (num_seqs, num_sab_heads, d, d)
+    expected_state_shape = (num_seqs, num_sab_heads, dv, dk)
     use_state_indices = state_indices is not None
     if state is not None and (
         (not use_state_indices and state.shape != expected_state_shape)
@@ -1152,10 +1156,10 @@ def cp_delta_rule_dsl_sm100(
                 "state_checkpoints and checkpoint_cu_starts are required when "
                 "checkpointing is enabled"
             )
-        if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, d, d):
+        if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, dv, dk):
             raise RuntimeError(
                 "state_checkpoints must have shape "
-                f"[*, {num_sab_heads}, {d}, {d}], got {tuple(state_checkpoints.shape)}"
+                f"[*, {num_sab_heads}, {dv}, {dk}], got {tuple(state_checkpoints.shape)}"
             )
         if checkpoint_cu_starts.shape != (num_seqs + 1,):
             raise RuntimeError(
@@ -1172,8 +1176,11 @@ def cp_delta_rule_dsl_sm100(
             "state_checkpoints and checkpoint_cu_starts must be None when "
             "checkpointing is disabled"
         )
-    if d != 128:
-        raise RuntimeError(f"CPDeltaRuleSm100 only supports D=128, got {d}")
+    if (dk, dv) not in ((128, 128), (128, 64)):
+        raise RuntimeError(
+            "CPDeltaRuleSm100 only supports (DimK, DimV) in "
+            f"{{(128, 128), (128, 64)}}, got {(dk, dv)}"
+        )
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError(
             f"CPDeltaRuleSm100 only supports fp16/bf16 inputs, got {q.dtype}"
@@ -1230,7 +1237,7 @@ def cp_delta_rule_dsl_sm100(
         if initial_state is not None:
             initial_state_workspace = _get_cp_workspace(
                 "gdn_cp_sm100_initial_state",
-                (num_seqs, num_sab_heads, d, d),
+                (num_seqs, num_sab_heads, dv, dk),
                 torch.float32,
                 device,
             )

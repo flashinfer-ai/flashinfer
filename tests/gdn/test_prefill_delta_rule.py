@@ -62,6 +62,17 @@ def _skip_if_cp_unsupported():
         pytest.skip("CP GDN prefill requires SM90, SM100, or SM12x")
 
 
+def _skip_if_cp_head_sizes_unsupported(head_size, head_size_v):
+    """CP supports DK=DV=128 everywhere, plus DK=128/DV=64 on SM100."""
+    if (head_size, head_size_v) == (128, 128):
+        return
+    if (head_size, head_size_v) == (128, 64) and is_sm100a_supported(
+        torch.device("cuda")
+    ):
+        return
+    pytest.skip("CP supports DK=DV=128, plus DK=128/DV=64 on SM100")
+
+
 def _skip_if_not_sm100():
     """Skip test if not SM100 (Blackwell) with CUDA 13+."""
     device = torch.device("cuda")
@@ -306,8 +317,8 @@ def test_prefill_kernel_basic(
         and (head_size, head_size_v) != (128, 128)
     ):
         pytest.skip("the SM12x kernel only implements DK == DV == 128")
-    if use_cp and (head_size, head_size_v) != (128, 128):
-        pytest.skip("CP path only supports square DK=DV=128")
+    if use_cp:
+        _skip_if_cp_head_sizes_unsupported(head_size, head_size_v)
 
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_prefill_kernel(
@@ -981,8 +992,8 @@ def test_checkpoint_correctness(
         or is_sm12x_supported(torch.device("cuda"))
     ):
         pytest.skip("CP state checkpointing requires SM90, SM100, or SM120")
-    if head_size_v != head_size and use_cp:
-        pytest.skip("CP requires DV == DK")
+    if use_cp:
+        _skip_if_cp_head_sizes_unsupported(head_size, head_size_v)
     if (
         not is_sm90a_supported(torch.device("cuda"))
         and not is_sm100a_supported(torch.device("cuda"))
@@ -1324,8 +1335,8 @@ def test_prefill_kernel_state_dtype(
     use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
-    if head_size_v != head_size and use_cp:
-        pytest.skip("CP requires DV == DK")
+    if use_cp:
+        _skip_if_cp_head_sizes_unsupported(head_size, head_size_v)
     if (
         not is_sm90a_supported(torch.device("cuda"))
         and not is_sm100a_supported(torch.device("cuda"))

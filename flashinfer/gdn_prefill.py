@@ -605,9 +605,12 @@ def _cp_delta_rule_rejection_reason(
         return "CP delta rule is currently implemented only for SM90, SM100, and SM120"
     if q.shape[-1] != 128:
         return f"CP delta rule only supports head_size=128, got {q.shape[-1]}"
-    if v.shape[-1] != q.shape[-1]:
+    # Only the SM100 CuTe DSL CP backend implements head_size_v=64 < head_size.
+    dv64_supported = arch_major == 10 and not use_gdn_cp_backend
+    if v.shape[-1] != q.shape[-1] and not (dv64_supported and v.shape[-1] == 64):
         return (
-            "CP delta rule requires head_size_v == head_size_k, got "
+            "CP delta rule requires head_size_v == head_size_k"
+            f"{' or head_size_v == 64' if dv64_supported else ''}, got "
             f"{v.shape[-1]} != {q.shape[-1]}"
         )
     if q.dtype not in (torch.float16, torch.bfloat16):
@@ -745,7 +748,9 @@ def chunk_gated_delta_rule(
         Whether to use context parallelism when low-parallelism heuristics
         match. SM100/SM103 uses the generated GDN CP-only four-stage
         implementation for structurally supported shapes. Other legal
-        configurations retain the CuTe-DSL implementation.
+        configurations retain the CuTe-DSL implementation. CP requires
+        ``head_size == 128`` and ``head_size_v == 128``; the SM100/SM103
+        CuTe-DSL route also accepts ``head_size_v == 64``.
         ``"auto"`` enables conservative routing, ``True`` requires CP support,
         and ``False`` disables CP. Default: ``"auto"``.
     state_indices : torch.Tensor, optional
@@ -1082,7 +1087,7 @@ def chunk_gated_delta_rule(
         else:
             if output_final_state and output_state is None:
                 output_state = torch.empty(
-                    (num_seqs, num_sab_heads, head_size, head_size),
+                    (num_seqs, num_sab_heads, head_size_v, head_size),
                     dtype=torch.float32,
                     device=device,
                 )
