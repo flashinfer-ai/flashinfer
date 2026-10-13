@@ -43,7 +43,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(896, LAUNCH_MIN_BLOCKS) void
-kernel_cake_deepgemm_mega_gate_882c44206a6ea3c085b4(const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap W, float* __restrict__ bias, float* __restrict__ image_bias, uint8_t* __restrict__ image_mask, uint8_t* __restrict__ mask, int* __restrict__ physical_map, int* __restrict__ logical_count, long long* __restrict__ topk_idx, long long* __restrict__ unmapped_idx, float* __restrict__ topk_weights, float* __restrict__ scratch, unsigned long long* __restrict__ score_barriers, uint8_t* __restrict__ fixed_mask, uint8_t* __restrict__ random_mask, int num_tokens, int num_shared, int map_width, unsigned int ep_rank, float routed_scale, long long unmapped_stride, int num_workers, int route_flags, int num_split_k)
+kernel_cake_deepgemm_mega_gate_000e384816b058464abf(const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap W, float* __restrict__ bias, float* __restrict__ image_bias, uint8_t* __restrict__ image_mask, uint8_t* __restrict__ mask, int* __restrict__ physical_map, int* __restrict__ logical_count, long long* __restrict__ topk_idx, long long* __restrict__ unmapped_idx, float* __restrict__ topk_weights, float* __restrict__ scratch, unsigned long long* __restrict__ score_barriers, uint8_t* __restrict__ fixed_mask, uint8_t* __restrict__ random_mask, int num_tokens, int num_shared, int map_width, unsigned int ep_rank, float routed_scale, long long unmapped_stride, int num_workers, int route_flags, int num_split_k)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -71,14 +71,14 @@ kernel_cake_deepgemm_mega_gate_882c44206a6ea3c085b4(const __grid_constant__ CUte
     const int cta_rank = 0;
 
     // Kernel setup ops
-    __nv_bfloat16* sx = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int sx_addr = smem + 1024;
-    __nv_bfloat16* sw = reinterpret_cast<__nv_bfloat16*>(smem_raw + 87040);
-    const int sw_addr = smem + 87040;
-    float* metadata = reinterpret_cast<float*>(smem_raw + 201728);
-    const int metadata_addr = smem + 201728;
-    int* cached_counts = reinterpret_cast<int*>(smem_raw + 203264);
-    const int cached_counts_addr = smem + 203264;
+    __nv_bfloat16* sx = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SX_OFF);
+    const int sx_addr = smem + SMEM_SX_OFF;
+    __nv_bfloat16* sw = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SW_OFF);
+    const int sw_addr = smem + SMEM_SW_OFF;
+    float* metadata = reinterpret_cast<float*>(smem_raw + SMEM_METADATA_OFF);
+    const int metadata_addr = smem + SMEM_METADATA_OFF;
+    int* cached_counts = reinterpret_cast<int*>(smem_raw + SMEM_CACHED_COUNTS_OFF);
+    const int cached_counts_addr = smem + SMEM_CACHED_COUNTS_OFF;
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&X))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory"); }
 
