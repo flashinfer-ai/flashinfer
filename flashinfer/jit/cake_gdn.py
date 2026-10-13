@@ -629,7 +629,7 @@ def cake_gdn_bf16_t1_route(
 # of the serial recurrence, fully unrolled token loop; bitwise-identical output),
 # B200/B300 keep the shipped body.  Mirrors
 # loom.examples.weave.gdn_decode_pretranspose.select_bf16_verify_tile16_body.
-CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES: dict[str, str] = {"sm_107a": "tile16_vpre"}
+CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES: dict[str, str] = {"sm_107a": "tile16_vpre_es_pro"}
 
 
 def cake_gdn_bf16_verify_tile16_schedule(arch: CakeGDNArch) -> str:

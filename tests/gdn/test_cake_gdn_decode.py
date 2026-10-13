@@ -648,9 +648,9 @@ def test_decode_resolver_routes_the_bf16_verify_tile16_body_per_architecture(
     # full-warp tile-v16 verify kernel; B200 / B300 keep the shipped body.  The
     # route id (grid tile) is the same on every architecture.
     assert cake_gdn.CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES == {
-        "sm_107a": "tile16_vpre"
+        "sm_107a": "tile16_vpre_es_pro"
     }
-    body = "tile16_vpre" if arch == "sm_107a" else "tile16"
+    body = "tile16_vpre_es_pro" if arch == "sm_107a" else "tile16"
     rows = [
         *(
             dict(
