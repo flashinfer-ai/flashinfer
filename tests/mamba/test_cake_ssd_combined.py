@@ -5757,15 +5757,23 @@ def test_cake_ssd_combined_chunk_parallel_is_bitwise_the_exact_scan(
     three_phase = results["three_phase"]
     mode = "varlen" if varlen else "batched"
     # forced exact scan: the fused program where its preprocess grid is 0
-    # (batched, cu_seqlens form), the two-kernel program in the triple form
-    # (exactpre, or the retained start program for one-chunk items).
-    family = (
-        importlib.import_module("flashinfer.mamba.cake_ssd_combined").two_kernel_family(
+    # (batched, cu_seqlens form, and the triple form whose caller cumsum is
+    # trusted -- ``_case`` precomputes it -- inside the fused window); the
+    # two-kernel program otherwise (exactpre, or the retained start program
+    # for one-chunk items).
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    if form == "triple" and not module.fused_selected(
+        nheads=8,
+        num_sequences=len(lengths),
+        nchunks=-(-max(lengths) // 128),
+        mode_varlen=True,
+        total_tokens=sum(lengths),
+    ):
+        family = module.two_kernel_family(
             mode_varlen=True, num_sequences=len(lengths), seqlen=sum(lengths)
         )
-        if form == "triple"
-        else "exactfused"
-    )
+    else:
+        family = "exactfused"
     assert exact.program == f"{family}_{_state_key(state_dtype)}_{mode}"
     assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
     assert three_phase.program == f"chunkpar3_{_state_key(state_dtype)}_{mode}"
