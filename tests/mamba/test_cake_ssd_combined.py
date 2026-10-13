@@ -672,6 +672,7 @@ def test_cake_ssd_combined_updates_caller_buffers():
         pytest.skip("Cake SSDCombined requires SM100 or SM103")
 
     constructor, tensors, arguments = _case(varlen=True)
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     expected_cumsum = arguments["seq_chunk_cumsum"]
     actual_cumsum = torch.full_like(expected_cumsum, -1)
@@ -679,7 +680,26 @@ def test_cake_ssd_combined_updates_caller_buffers():
     # the kernels and returned as-is.
     out = torch.empty((1, 256, 8, 64), dtype=torch.bfloat16, device="cuda")
     runner = SSDCombined(**constructor, backend="cake")
+    cake = runner._cake_runner
+    # ``_case``'s triple form carries the caller's trusted table
+    # (``update_seq_chunk_cumsum=False``): no kernel publishes metadata, so
+    # the call runs the fused single-launch program (CAKE-956 round 6 F1b);
+    # 2 sequences x 8 heads over 256 tokens sit inside the fused window.
     allocated = runner.run(*tensors, **arguments)
+    program_trusted = cake.last_program_name
+    assert program_trusted == "exactfused_bf16_varlen"
+    _assert_cake_accuracy(allocated, expected, constructor, tensors, arguments)
+    # Without a caller table the preprocess derives it into the runner's own
+    # vector: the two-kernel program (one chunk per item here -> the retained
+    # start ``exact`` program, ``two_kernel_family``).
+    derived = runner.run(
+        *tensors, **{**arguments, "seq_chunk_cumsum": None, "num_seqs": 2}
+    )
+    program_derived = cake.last_program_name
+    assert program_derived == (
+        module.two_kernel_family(mode_varlen=True, num_sequences=2, seqlen=256)
+        + "_bf16_varlen"
+    )
     actual = runner.run(
         *tensors,
         **{
@@ -690,16 +710,19 @@ def test_cake_ssd_combined_updates_caller_buffers():
         },
     )
 
+    # Publishing into the caller's buffer is the derived form: the same
+    # two-kernel program, and the kernel-written table is the host's.
+    assert cake.last_program_name == program_derived
     torch.testing.assert_close(actual_cumsum, expected_cumsum, rtol=0, atol=0)
     assert actual[0] is out
     # Caller-owned output storage and a kernel-written cumsum must not change
-    # the arithmetic: bit-identical to the allocating run.
-    torch.testing.assert_close(actual[0], allocated[0], rtol=0, atol=0)
-    torch.testing.assert_close(actual[1], allocated[1], rtol=0, atol=0)
+    # the arithmetic: bit-identical to the derived run of the same program.
+    torch.testing.assert_close(actual[0], derived[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], derived[1], rtol=0, atol=0)
     _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
     preserved_cumsum = actual_cumsum.clone()
-    runner.run(
+    trusted_again = runner.run(
         *tensors,
         **{
             **arguments,
@@ -707,7 +730,12 @@ def test_cake_ssd_combined_updates_caller_buffers():
             "update_seq_chunk_cumsum": False,
         },
     )
+    # A trusted caller table is never written, selects the single-launch
+    # program again and reproduces the allocating run bit for bit.
+    assert cake.last_program_name == program_trusted
     torch.testing.assert_close(actual_cumsum, preserved_cumsum, rtol=0, atol=0)
+    torch.testing.assert_close(trusted_again[0], allocated[0], rtol=0, atol=0)
+    torch.testing.assert_close(trusted_again[1], allocated[1], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("state_dtype", (torch.bfloat16, torch.float16))
@@ -1399,7 +1427,10 @@ def _assert_two_forms_p6(monkeypatch, *, lengths, state_dtype, initial_states, p
     round-5 scan, the baseline reading), and judge each form's output and
     final states against the fp64 recurrence under clause GOAL6-A-20261012
     (``_assert_p6_clause``).  ``programs`` = (cu_seqlens program, triple
-    program) the forms must keep running."""
+    program) the forms must keep running.  The triple form here derives the
+    table on the device (no caller ``seq_chunk_cumsum``): with a trusted
+    caller table it runs the fused program of the cu_seqlens form (F1b) and
+    the two forms are bitwise, not a P6 reading."""
 
     candidates = {"cu_seqlens": {}, "triple": {}}
     baseline = {}
@@ -1417,8 +1448,15 @@ def _assert_two_forms_p6(monkeypatch, *, lengths, state_dtype, initial_states, p
             seed=seed,
         )
         runner = SSDCombined(**constructor, backend="cake")
+        derived_arguments = {
+            **arguments,
+            "seq_chunk_cumsum": None,
+            "num_seqs": len(lengths),
+        }
         monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
-        out_triple, final_triple = (value.clone() for value in runner.run(*tensors, **arguments))
+        out_triple, final_triple = (
+            value.clone() for value in runner.run(*tensors, **derived_arguments)
+        )
         assert runner._cake_runner.last_program_name == programs[1]
         out_cu, final_cu = (
             value.clone()
@@ -1426,7 +1464,9 @@ def _assert_two_forms_p6(monkeypatch, *, lengths, state_dtype, initial_states, p
         )
         assert runner._cake_runner.last_program_name == programs[0]
         monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "three_phase")
-        out_base, final_base = (value.clone() for value in runner.run(*tensors, **arguments))
+        out_base, final_base = (
+            value.clone() for value in runner.run(*tensors, **derived_arguments)
+        )
         assert runner._cake_runner.last_program_name.startswith("chunkpar3_")
         y, states = _fp64_reference(constructor, tensors, {**arguments, "num_seqs": len(lengths)})
         for label, cu, triple, base, oracle in (
@@ -1477,7 +1517,15 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     reading as the round-5 baseline, ``_P6_SEEDS`` seeds) and the two forms
     are compared at the state dtype tolerance as a sanity check only (the
     tolerance never replaces the P6 reading).  The host contract -- ``run`` /
-    ``prepare`` signatures and both metadata forms -- is unchanged."""
+    ``prepare`` signatures and both metadata forms -- is unchanged.
+
+    The triple form judged here derives ``seq_chunk_cumsum`` on the device
+    (no caller table).  With the caller's trusted table instead
+    (``_case``'s default, ``update_seq_chunk_cumsum=False``) nothing is
+    published, so the triple runs the fused program of the cu_seqlens form
+    wherever the fused window admits it (CAKE-956 round 6 F1b) and the two
+    forms are then bitwise again; outside the window it runs the two-kernel
+    program of the derived triple (last block)."""
 
     _skip_unless_cake_arch()
     constructor, tensors, arguments = _case(
@@ -1486,11 +1534,16 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
         state_dtype=state_dtype,
         initial_states=initial_states,
     )
+    derived_arguments = {
+        **arguments,
+        "seq_chunk_cumsum": None,
+        "num_seqs": len(lengths),
+    }
     runner = SSDCombined(**constructor, backend="cake")
     cake = runner._cake_runner
     cake.seq_idx_status(reset=True)
     out_triple, final_triple = (
-        value.clone() for value in runner.run(*tensors, **arguments)
+        value.clone() for value in runner.run(*tensors, **derived_arguments)
     )
     assert cake.seq_idx_status() == 0
     program_triple = cake.last_program_name
@@ -1508,6 +1561,7 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     # fused program's) from two chunks per item, the retained start ``exact``
     # program for one-chunk items (CAKE-956 round 6 c9).
     same_arithmetic = True
+    fused = False
     if program_triple.startswith("chunkpar_"):
         assert program_cu == program_triple, (
             f"cu_seqlens form ran {program_cu}, the triple {program_triple}"
@@ -1565,6 +1619,24 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
         f"seq_idx riding along ran {cake.last_program_name}, the cu_seqlens form {program_cu}"
     )
     assert torch.equal(out_ride, out) and torch.equal(final_ride, final)
+    # The triple with the caller's trusted table: the fused program of the
+    # cu_seqlens form inside the fused window (one launch, the caller's
+    # tables read in-kernel) and bitwise that form; the derived triple's
+    # two-kernel program outside it, bitwise the derived call.
+    out_trusted, final_trusted = runner.run(*tensors, **arguments)
+    assert cake.seq_idx_status(reset=True) == 0
+    program_trusted = cake.last_program_name
+    if fused and not program_triple.startswith("chunkpar_"):
+        assert program_trusted == program_cu, (
+            f"trusted-table triple ran {program_trusted}, cu_seqlens {program_cu}"
+        )
+        assert torch.equal(out_trusted, out) and torch.equal(final_trusted, final)
+    else:
+        assert program_trusted == program_triple, (
+            f"trusted-table triple ran {program_trusted}, derived {program_triple}"
+        )
+        assert torch.equal(out_trusted, out_triple)
+        assert torch.equal(final_trusted, final_triple)
     # The public functional entry takes the same form (it infers the state
     # dtype from initial_states, BF16 without them).
     if initial_states or state_dtype == torch.bfloat16:
@@ -3660,8 +3732,10 @@ def test_source_varlen_cumsum_binding_without_gpu(monkeypatch, case):
     same vector to both stages and ``write_seq_chunk_cumsum`` says whether
     the preprocess fills it; ``num_seqs`` supplies the count when there are
     no initial states.  The seq_idx triple form runs the two-kernel program
-    (round 6: the fused program is selected only where its preprocess grid
-    is 0)."""
+    where the preprocess publishes the table (runner-owned, or the caller's
+    buffer with ``update_seq_chunk_cumsum=True``) and the fused single-launch
+    program where the caller's table is trusted (round 6: the fused program
+    is selected only where its preprocess grid is 0; F1b)."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     calls = []
@@ -3702,10 +3776,17 @@ def test_source_varlen_cumsum_binding_without_gpu(monkeypatch, case):
     assert tuple(out.shape) == (1, seqlen, 1, 64)
     assert tuple(final.shape) == (num_seqs, 1, 64, 128)
     ((name, launch),) = calls
-    # seq_idx triple form: the two-kernel program (the fused program is
-    # selected only where its preprocess grid is 0 -- batched / cu_seqlens).
-    assert name == "exactpre_bf16_varlen"
+    # seq_idx triple form: the fused program only where its preprocess grid
+    # is 0 (a trusted caller table), the two-kernel program where the
+    # preprocess publishes the table.
+    if case == "precomputed":
+        assert name == "exactfused_bf16_varlen"
+        assert launch["preprocess_grid"] == (0, 1, 1)
+    else:
+        assert name == "exactpre_bf16_varlen"
+        assert launch["preprocess_grid"][0] >= 1
     preprocess, main = launch["preprocess"], launch["main"]
+    assert main["metadata_from_cu_seqlens"] == 0
     assert preprocess["seq_chunk_cumsum"] is main["seq_chunk_cumsum"]
     assert preprocess["num_sequences"] == main["sequence_count"] == num_seqs
     assert preprocess["seq_idx_i32"] is main["seq_idx_i32"] is kwargs["seq_idx"]
@@ -6244,14 +6325,18 @@ def test_source_saturated_batched_call_keeps_the_two_kernel_program(monkeypatch)
     assert launch["main"]["metadata_from_cu_seqlens"] == 0
 
 
-def test_source_varlen_triple_form_keeps_the_two_kernel_program(monkeypatch):
-    """A short packed-varlen call in the seq_idx triple form runs the
-    two-kernel program even inside the fused shape window: its preprocess
-    would run anyway (it publishes ``seq_chunk_cumsum``, or the HBM delta /
-    cumsum of the two-kernel program), and the fused main kernel costs more
-    than the two-kernel main kernel (round-6 pre-acceptance gate, 15 rows).
-    A caller vector does not change the program; the same call in the
-    cu_seqlens form takes the fused program (next test)."""
+def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch):
+    """A short packed-varlen call in the seq_idx triple form inside the fused
+    shape window runs the two-kernel program while its preprocess publishes
+    ``seq_chunk_cumsum`` (runner-owned, or the caller's buffer with
+    ``update_seq_chunk_cumsum=True``): the preprocess would run anyway and
+    the fused main kernel costs more than the two-kernel main kernel
+    (round-6 pre-acceptance gate, 15 rows).  With a caller table the
+    preprocess does not rewrite (``update_seq_chunk_cumsum=False``) nothing
+    is published, so the fused program is one launch reading the caller's
+    tables (CAKE-956 round 6 F1b; ``_WorkspaceKey.caller_cumsum``).  Outside
+    the window the trusted table still runs the two-kernel program.  The
+    same call in the cu_seqlens form takes the fused program (next test)."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     calls = []
@@ -6269,26 +6354,98 @@ def test_source_varlen_triple_form_keeps_the_two_kernel_program(monkeypatch):
         "num_seqs": num_seqs,
     }
 
+    def key(caller_cumsum):
+        # (device, batch, seqlen, nchunks, num_segments, num_sequences, state
+        # dtype, from_cu_seqlens, caller_cumsum, family override)
+        return module._WorkspaceKey(
+            None,
+            1,
+            seqlen,
+            3,
+            3,
+            num_seqs,
+            torch.bfloat16,
+            False,
+            caller_cumsum,
+            "auto",
+        )
+
     # inside the fused shape window (2 items, 3 packed chunks) ...
     assert module.fused_selected(
         nheads=1, num_sequences=num_seqs, nchunks=3, mode_varlen=True, total_tokens=seqlen
     )
     runner.run(x, dt, A, B, C, **triple)
     name, launch = calls[-1]
-    # ... but the triple form runs the two-kernel program, preprocess included
-    assert name == "exactpre_bf16_varlen"
+    # ... the triple form deriving the table runs the two-kernel program,
+    # preprocess included
+    assert name == runner.last_program_name == "exactpre_bf16_varlen"
     assert module._PROGRAMS[name].family == "exactpre"
     assert launch["preprocess"]["write_seq_chunk_cumsum"] == 1
     assert launch["preprocess_grid"][0] >= 1
     assert launch["main"]["metadata_from_cu_seqlens"] == 0
+    assert key(False) in runner._workspaces
 
+    # ... a trusted caller table makes the fused program one launch: the
+    # preprocess grid is 0 and the main kernel reads the caller's tables
     vector = torch.tensor([0, 1, 3], dtype=torch.int32)
     runner.run(x, dt, A, B, C, **triple, seq_chunk_cumsum=vector)
     name, launch = calls[-1]
-    assert name == "exactpre_bf16_varlen"
+    assert name == runner.last_program_name == "exactfused_bf16_varlen"
+    assert module._PROGRAMS[name].family == "exactfused"
+    assert launch["preprocess_grid"] == (0, 1, 1)
+    assert launch["preprocess"]["write_seq_chunk_cumsum"] == 0
+    assert launch["main"]["metadata_from_cu_seqlens"] == 0
+    assert launch["main"]["seq_chunk_cumsum"] is vector
+    assert launch["main"]["chunk_indices"] is triple["chunk_indices"]
+    assert launch["main"]["chunk_offsets"] is triple["chunk_offsets"]
+    assert key(True) in runner._workspaces
+    assert runner._workspaces.get(key(True)).workspace["program"] == name
+
+    # ... while a caller buffer the preprocess must fill is the derived form
+    # again (its own workspace key, the two-kernel program)
+    buffer = torch.empty_like(vector)
+    runner.run(
+        x, dt, A, B, C, **triple, seq_chunk_cumsum=buffer, update_seq_chunk_cumsum=True
+    )
+    name, launch = calls[-1]
+    assert name == runner.last_program_name == "exactpre_bf16_varlen"
+    assert launch["preprocess"]["write_seq_chunk_cumsum"] == 1
+    assert launch["preprocess"]["seq_chunk_cumsum"] is buffer
+    assert launch["preprocess_grid"][0] >= 1
+    assert runner._workspaces.get(key(False)).workspace["program"] == name
+    assert len(runner._workspaces) == 2
+
+    # Outside the fused window (257 one-token sequences > 256 items) the
+    # trusted table keeps the two-kernel program: one chunk per item, so the
+    # retained start ``exact`` program (``two_kernel_family``).
+    count = 257
+    ids = torch.arange(count, dtype=torch.int32)
+    wide = {
+        "seq_idx": ids.reshape(1, count),
+        "chunk_indices": ids // 128,
+        "chunk_offsets": ids % 128,
+    }
+    assert not module.fused_selected(
+        nheads=1, num_sequences=count, nchunks=3, mode_varlen=True, total_tokens=count
+    )
+    assert (
+        module.two_kernel_family(mode_varlen=True, num_sequences=count, seqlen=count)
+        == "exact"
+    )
+    runner.run(
+        torch.empty((1, count, 1, 64), dtype=torch.bfloat16),
+        torch.empty((1, count, 1), dtype=torch.float32),
+        A,
+        torch.empty((1, count, 1, 128), dtype=torch.bfloat16),
+        torch.empty((1, count, 1, 128), dtype=torch.bfloat16),
+        **wide,
+        seq_chunk_cumsum=torch.arange(count + 1, dtype=torch.int32),
+    )
+    name, launch = calls[-1]
+    assert name == runner.last_program_name == "exact_bf16_varlen"
+    assert module._PROGRAMS[name].family == "exact"
     assert launch["preprocess"]["write_seq_chunk_cumsum"] == 0
     assert launch["preprocess_grid"][0] >= 1
-    assert launch["main"]["seq_chunk_cumsum"] is vector
 
 
 def test_source_fused_cu_seqlens_form_derives_the_metadata_in_kernel(monkeypatch):

@@ -126,8 +126,9 @@ class _Program:
 # (``exactfused_*``, CAKE-956 round 6 item 2: delta / cumsum computed in-CTA,
 # one launch), the two-kernel exact scan (``exactpre_*``: the start pre+scan
 # form with the round-6 single-rounding state update, which the fused route
-# keeps for saturated / long-item calls and for the seq_idx triple form, see
-# :func:`fused_selected`), the START two-kernel exact scan (``exact_*``: the
+# keeps for saturated / long-item calls and for the seq_idx triple form whose
+# preprocess publishes ``seq_chunk_cumsum``, see :func:`fused_selected`), the
+# START two-kernel exact scan (``exact_*``: the
 # round-5 programs retained byte for byte -- the export never refreshes
 # ``_SCAN_MODULES`` -- which :func:`two_kernel_family` keeps for one-chunk
 # items, CAKE-956 round 6 c9), the look-back chunk-parallel program
@@ -784,7 +785,14 @@ class CakeSSDCombinedCaptureError(RuntimeError):
 class _WorkspaceKey(NamedTuple):
     """Identity of a per-call-shape workspace.  The family override is part
     of it because it selects the program and therefore the values the
-    workspace binds; the device index because the buffers live on it."""
+    workspace binds; the device index because the buffers live on it.
+    ``from_cu_seqlens`` and ``caller_cumsum`` are the two packed-varlen
+    metadata facts the exact-scan route reads (``_materialize_workspace``):
+    the ``cu_seqlens`` form, and the ``seq_idx`` triple form with a caller
+    ``seq_chunk_cumsum`` the preprocess does not rewrite
+    (``update_seq_chunk_cumsum=False``), where the fused program is one
+    launch; both are derived from the call's arguments alone, so ``prepare``
+    and ``run`` of the same call resolve the same key."""
 
     device_index: Optional[int]
     batch: int
@@ -794,12 +802,13 @@ class _WorkspaceKey(NamedTuple):
     num_sequences: int
     state_dtype: torch.dtype
     from_cu_seqlens: bool
+    caller_cumsum: bool
     chunk_parallel_mode: str
 
 
 # ``_WorkspaceKey`` without the family override: what ``prepare`` freezes the
 # override for.
-_ShapeKey = Tuple[Optional[int], int, int, int, int, int, torch.dtype, bool]
+_ShapeKey = Tuple[Optional[int], int, int, int, int, int, torch.dtype, bool, bool]
 
 
 @dataclass(frozen=True)
@@ -1125,9 +1134,10 @@ def fused_selected(
     ``nchunks`` is the chunk count per sequence (batched); ``total_tokens`` the
     packed token count (varlen; the per-sequence lengths live on the device
     and are not read).  The runner applies the window only where the fused
-    program's preprocess grid is 0 -- batched calls and the ``cu_seqlens``
-    form; the ``seq_idx`` triple form always runs the two-kernel program
-    (``_materialize_workspace``)."""
+    program's preprocess grid is 0 -- batched calls, the ``cu_seqlens`` form
+    and the ``seq_idx`` triple form with a caller ``seq_chunk_cumsum`` the
+    preprocess does not rewrite; the triple form deriving the table runs the
+    two-kernel program (``_materialize_workspace``)."""
 
     items = int(num_sequences) * int(nheads)
     if not mode_varlen:
@@ -1538,8 +1548,12 @@ class CakeSSDCombined:
     ``seq_chunk_cumsum`` from the packed-varlen metadata unless the caller
     supplies a precomputed vector) followed by the scan.  The fused
     exact-scan program is selected only where its preprocess stage is skipped
-    (grid 0): batched calls and the ``cu_seqlens`` form, where the call is
-    one kernel; the ``seq_idx`` triple form runs the two-kernel program.  A
+    (grid 0): batched calls, the ``cu_seqlens`` form and the ``seq_idx``
+    triple form with a caller ``seq_chunk_cumsum`` the preprocess does not
+    rewrite (``update_seq_chunk_cumsum=False``; the kernel reads the caller's
+    tables), where the call is one kernel; the triple form without one (the
+    preprocess publishes the table, runner-owned or into the caller's buffer
+    with ``update_seq_chunk_cumsum=True``) runs the two-kernel program.  A
     caller buffer for the ``cu_seqlens``-derived vector brings the fused
     program's preprocess back to publish it (two launches).
 
@@ -1886,15 +1900,18 @@ class CakeSSDCombined:
         )
         chunk_parallel = family != "exact"
         # The fused program is a single launch only where its preprocess
-        # grid is 0: batched calls and the cu_seqlens form (the kernel
-        # derives the segment tables in-CTA).  In the seq_idx triple form the
-        # preprocess still runs to publish ``seq_chunk_cumsum``, and the fused
-        # main kernel then costs more than the two-kernel main kernel, so the
-        # triple form keeps the two-kernel program (round-6 FI mirror of the
-        # Cake ``fused_route`` window plus this grid-0 condition).
+        # grid is 0: batched calls, the cu_seqlens form (the kernel derives
+        # the segment tables in-CTA) and the seq_idx triple form with a
+        # caller ``seq_chunk_cumsum`` the preprocess does not rewrite (the
+        # kernel reads the caller's tables, ``key.caller_cumsum``).  In the
+        # triple form without one the preprocess still runs to publish
+        # ``seq_chunk_cumsum``, and the fused main kernel then costs more
+        # than the two-kernel main kernel, so that form keeps the two-kernel
+        # program (round-6 FI mirror of the Cake ``fused_route`` window plus
+        # this grid-0 condition).
         fused = (
             not chunk_parallel
-            and (not self.has_varlen or key.from_cu_seqlens)
+            and (not self.has_varlen or key.from_cu_seqlens or key.caller_cumsum)
             and fused_selected(
                 nheads=self.nheads,
                 num_sequences=num_sequences,
@@ -2194,9 +2211,17 @@ class CakeSSDCombined:
         (the same tensor every call, overwritten by each launch) instead of
         fresh storage.  The prepared shape's workspace is pinned: never
         evicted for the lifetime of the runner.  A caller-owned
-        ``seq_chunk_cumsum`` given here is validated as :meth:`run` does with
-        ``update_seq_chunk_cumsum=True``; the checkpoint outputs are per-call
-        options of :meth:`run`.  The kernel handles of the host shim resolve
+        ``seq_chunk_cumsum`` given here is read as :meth:`run` reads it by
+        default: in the ``seq_idx`` triple form the trusted table of the call
+        (``update_seq_chunk_cumsum=False``, the fused program where its
+        shape window admits it), in the ``cu_seqlens`` form the buffer the
+        preprocess publishes the derived table into (that form's only
+        reading, ``update_seq_chunk_cumsum=True``).  A later :meth:`run` of
+        the triple form that asks the preprocess to rewrite the table
+        (``update_seq_chunk_cumsum=True``) is another call shape -- its
+        workspace key differs -- and is prepared by running it eagerly once.
+        The checkpoint outputs are per-call options of :meth:`run`.  The
+        kernel handles of the host shim resolve
         on the program's first launch, so run the shape eagerly once before
         capturing it.  A static ``out`` is not required here; a captured
         :meth:`run` without one allocates its output from the graph pool,
@@ -2208,6 +2233,10 @@ class CakeSSDCombined:
                 "Cake SSDCombined prepare() allocates and may build programs: call "
                 "it eagerly, outside CUDA-graph capture"
             )
+        # The cu_seqlens form only publishes into a caller buffer; the triple
+        # form's caller table is trusted (run's default), which keeps
+        # prepare's workspace key the key of that run.
+        publishes_into_buffer = cu_seqlens is not None and seq_chunk_cumsum is not None
         plan = self._plan(
             x=x,
             dt=dt,
@@ -2224,7 +2253,7 @@ class CakeSSDCombined:
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
             seq_chunk_cumsum=seq_chunk_cumsum,
-            update_seq_chunk_cumsum=seq_chunk_cumsum is not None,
+            update_seq_chunk_cumsum=publishes_into_buffer,
             checkpoint_token_indices=None,
             checkpoint_state_slots=None,
             checkpoint_states=None,
@@ -2373,6 +2402,16 @@ class CakeSSDCombined:
                 )
         if initial_states is not None and initial_states.dtype != self.state_dtype:
             raise ValueError("initial_states dtype must match state_dtype")
+        # seq_idx triple form with a caller ``seq_chunk_cumsum`` the
+        # preprocess does not rewrite: the kernels read the caller's tables
+        # and nothing is published, so the fused program is one launch there
+        # (part of the workspace key: it selects the program).
+        caller_cumsum = (
+            mode_varlen
+            and not from_cu_seqlens
+            and seq_chunk_cumsum is not None
+            and not update_seq_chunk_cumsum
+        )
 
         nchunks = -(-seqlen // _CHUNK_SIZE)
         if not mode_varlen:
@@ -2541,6 +2580,7 @@ class CakeSSDCombined:
             num_sequences,
             self.state_dtype,
             from_cu_seqlens,
+            caller_cumsum,
         )
         if preparing:
             mode = _chunk_parallel_mode()

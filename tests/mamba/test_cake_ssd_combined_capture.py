@@ -82,6 +82,38 @@ def _module():
 # GPU: prepared capture, bitwise replays and the refusals.
 
 
+def _triple_arguments(lengths):
+    """The packed-varlen ``seq_idx`` / ``chunk_indices`` / ``chunk_offsets``
+    triple of ``lengths`` (chunk-128 logical segments) with the caller's
+    ``seq_chunk_cumsum`` (exclusive prefix sum of per-sequence logical chunk
+    counts) on the current device."""
+
+    total = sum(lengths)
+    seq_idx = torch.empty((1, total), dtype=torch.int32, device="cuda")
+    chunk_indices, chunk_offsets, cumsum, start = [], [], [0], 0
+    for sequence, length in enumerate(lengths):
+        seq_idx[0, start : start + length] = sequence
+        end = start + length
+        cumsum.append(cumsum[-1] + ((-(-end // 128) - start // 128) if length else 0))
+        start = end
+    for chunk in range(-(-total // 128)):
+        values = seq_idx[0, chunk * 128 : (chunk + 1) * 128]
+        previous = torch.cat((values[:1] - 1, values[:-1]))
+        for offset in (values != previous).nonzero(as_tuple=True)[0].tolist():
+            chunk_indices.append(chunk)
+            chunk_offsets.append(offset)
+
+    def as_i32(values):
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    return dict(
+        seq_idx=seq_idx,
+        chunk_indices=as_i32(chunk_indices),
+        chunk_offsets=as_i32(chunk_offsets),
+        seq_chunk_cumsum=as_i32(cumsum),
+    )
+
+
 def _inputs(
     *,
     varlen=False,
@@ -91,11 +123,13 @@ def _inputs(
     nheads=8,
     ngroups=8,
     seed=7,
+    form="cu_seqlens",
 ):
     """One Cake SSDCombined call on the current device -- bf16 x/B/C/z/D,
     f32 dt/A/dt_bias, softplus with a finite clamp, bf16 initial states --
-    batched or packed varlen on the ``cu_seqlens`` form.  Returns the
-    constructor kwargs, the positional tensors and the keyword arguments."""
+    batched or packed varlen on the ``cu_seqlens`` form (``form``: or the
+    seq_idx triple with the caller's trusted ``seq_chunk_cumsum``).  Returns
+    the constructor kwargs, the positional tensors and the keyword arguments."""
 
     torch.manual_seed(seed)
     if varlen:
@@ -135,7 +169,9 @@ def _inputs(
         dt_limit=(0.001, 0.1),
         initial_states=initial_states,
     )
-    if varlen:
+    if varlen and form == "triple_cumsum":
+        arguments.update(_triple_arguments(lengths))
+    elif varlen:
         cu = [0]
         for length in lengths:
             cu.append(cu[-1] + int(length))
@@ -186,13 +222,18 @@ def _replay_matches(graph, out, final, expected_out, expected_final, repeats=3):
 
 
 @requires_blackwell
-@pytest.mark.parametrize("form", ("batched", "cu_seqlens", "chunk_parallel"))
+@pytest.mark.parametrize(
+    "form", ("batched", "cu_seqlens", "triple_cumsum", "chunk_parallel")
+)
 def test_prepared_run_replays_bitwise_from_a_cuda_graph(monkeypatch, form):
     """``prepare`` then capture ``run`` with static inputs and ``out``: the
     captured call allocates nothing, never reads the environment, returns
     the prepared static final-states buffer, pins its workspace, and three
     replays reproduce the eager run bit for bit -- for the exact family in
-    batched bf16-state form, for a packed-varlen ``cu_seqlens`` shape and
+    batched bf16-state form, for a packed-varlen ``cu_seqlens`` shape, for
+    the seq_idx triple with the caller's trusted ``seq_chunk_cumsum`` (the
+    fused single-launch program, CAKE-956 round 6 F1b: ``prepare`` and the
+    captured ``run`` resolve the same program from the same arguments) and
     for the chunk-parallel program forced through the override.
 
     Chunk-parallel caveat: that program needs every CTA of its grid (one
@@ -205,7 +246,9 @@ def test_prepared_run_replays_bitwise_from_a_cuda_graph(monkeypatch, form):
         monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "always")
         constructor, tensors, arguments = _inputs(batch=2, seqlen=1024)
     else:
-        constructor, tensors, arguments = _inputs(varlen=form == "cu_seqlens")
+        constructor, tensors, arguments = _inputs(
+            varlen=form in ("cu_seqlens", "triple_cumsum"), form=form
+        )
     runner = SSDCombined(**constructor, backend="cake")
     cake = runner._cake_runner
     out = torch.empty(tensors[0].shape, dtype=torch.bfloat16, device="cuda")
@@ -215,8 +258,13 @@ def test_prepared_run_replays_bitwise_from_a_cuda_graph(monkeypatch, form):
     assert isinstance(prepared, PreparedSSDCombined)
     assert not cake.is_captured(prepared)
     family = "chunkpar" if form == "chunk_parallel" else "exactfused"
-    mode = "varlen" if form == "cu_seqlens" else "batched"
+    mode = "varlen" if form in ("cu_seqlens", "triple_cumsum") else "batched"
     assert prepared.program_name == f"{family}_bf16_{mode}"
+    if family == "exactfused":
+        # The fused program is prepared only as a single launch.
+        assert prepared.preprocess_grid == (0, 1, 1)
+    assert prepared.workspace_key.caller_cumsum == (form == "triple_cumsum")
+    assert prepared.workspace_key.from_cu_seqlens == (form == "cu_seqlens")
     assert cake.last_program_name is None  # prepare launched nothing
     # The override was read once by prepare; the prepared shape must never
     # consult it again (an invalid value would make a read raise).
@@ -495,10 +543,10 @@ def _cpu_inputs(seqlen, nheads=8, ngroups=8):
     return x, dt, A, B, torch.empty_like(B)
 
 
-def _cpu_runner(module, monkeypatch, calls, loads=None):
-    """A real batched bf16 runner (8 heads, 8 groups) on CPU tensors: the
-    device queries answer for a 148-SM sm_103a device, the launcher records
-    its calls and the program loader builds nothing."""
+def _cpu_runner(module, monkeypatch, calls, loads=None, *, has_varlen=False):
+    """A real bf16 runner (8 heads, 8 groups; batched unless ``has_varlen``)
+    on CPU tensors: the device queries answer for a 148-SM sm_103a device,
+    the launcher records its calls and the program loader builds nothing."""
 
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
@@ -533,10 +581,114 @@ def _cpu_runner(module, monkeypatch, calls, loads=None):
         has_d=False,
         d_has_hdim=False,
         has_initial_states=False,
-        has_varlen=False,
+        has_varlen=has_varlen,
         has_z=False,
         seq_idx_dtype=torch.int32,
     )
+
+
+def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_gpu(
+    monkeypatch,
+):
+    """The seq_idx triple form with a caller ``seq_chunk_cumsum`` the
+    preprocess does not rewrite is one workspace key (``caller_cumsum``) for
+    ``prepare`` and ``run``: ``prepare`` reads the table as trusted (the
+    ``run`` default), freezes the fused single-launch program for the shape
+    and the following ``run`` is a pure launch of that program; a ``run``
+    that asks the preprocess to rewrite the table is another shape with the
+    two-kernel program; the ``cu_seqlens`` form with a caller buffer is still
+    prepared as the publishing call (its only reading).  CAKE-956 round 6
+    F1b."""
+
+    module = _module()
+    calls, loads = [], []
+    runner = _cpu_runner(module, monkeypatch, calls, loads, has_varlen=True)
+    seqlen, num_seqs = 300, 2  # 2 sequences x 8 heads, 3 packed chunks
+    x, dt, A, B, C = _cpu_inputs(seqlen)
+    out = torch.empty_like(x)
+    triple = {
+        "seq_idx": torch.zeros((1, seqlen), dtype=torch.int32),
+        "chunk_indices": torch.tensor([0, 1, 2], dtype=torch.int32),
+        "chunk_offsets": torch.tensor([0, 0, 0], dtype=torch.int32),
+        "num_seqs": num_seqs,
+    }
+    table = torch.tensor([0, 1, 3], dtype=torch.int32)
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
+
+    prepared = runner.prepare(
+        x=x, dt=dt, A=A, B=B, C=C, **triple, seq_chunk_cumsum=table, out=out
+    )
+
+    assert calls == [] and runner.last_program_name is None
+    assert prepared.program_name == "exactfused_bf16_varlen"
+    assert prepared.preprocess_grid == (0, 1, 1)
+    assert prepared.workspace_key == module._WorkspaceKey(
+        None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, True, "never"
+    )
+    assert loads == [("exactfused_bf16_varlen", "sm_103a")]
+    assert runner._workspaces.get(prepared.workspace_key).prepared
+
+    # The run of the same call: the frozen program, a pure launch, the
+    # caller's tables bound to the single main kernel.
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "invalid-after-prepare")
+    out_run, _final = runner.run(
+        x, dt, A, B, C, **triple, seq_chunk_cumsum=table, out=out
+    )
+    name, launch = calls[-1]
+    assert out_run is out
+    assert name == runner.last_program_name == prepared.program_name
+    assert runner._allocations_in_last_run == 0
+    assert loads == [("exactfused_bf16_varlen", "sm_103a")]  # no new load
+    assert launch["preprocess_grid"] == (0, 1, 1)
+    assert launch["preprocess"]["write_seq_chunk_cumsum"] == 0
+    assert launch["main"]["metadata_from_cu_seqlens"] == 0
+    assert launch["main"]["seq_chunk_cumsum"] is table
+    assert launch["main"]["chunk_indices"] is triple["chunk_indices"]
+    assert len(runner._workspaces) == 1
+
+    # Asking the preprocess to rewrite the table is another call shape: the
+    # two-kernel program under its own key (unprepared, so it reads the
+    # environment).
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
+    runner.run(
+        x, dt, A, B, C, **triple, seq_chunk_cumsum=table, update_seq_chunk_cumsum=True
+    )
+    name, launch = calls[-1]
+    assert name == runner.last_program_name == "exactpre_bf16_varlen"
+    assert launch["preprocess"]["write_seq_chunk_cumsum"] == 1
+    assert launch["preprocess_grid"][0] >= 1
+    assert module._WorkspaceKey(
+        None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, False, "never"
+    ) in runner._workspaces
+    assert len(runner._workspaces) == 2
+
+    # cu_seqlens form with a caller buffer: prepared as the publishing call
+    # (the fused program with its preprocess, two launches), never as a
+    # trusted table.
+    cu_seqlens = torch.tensor([0, 150, seqlen], dtype=torch.int32)
+    buffer = torch.empty(num_seqs + 1, dtype=torch.int32)
+    prepared_cu = runner.prepare(
+        x=x, dt=dt, A=A, B=B, C=C, cu_seqlens=cu_seqlens, seq_chunk_cumsum=buffer
+    )
+    assert prepared_cu.program_name == "exactfused_bf16_varlen"
+    assert prepared_cu.preprocess_grid[0] >= 1
+    assert prepared_cu.workspace_key.from_cu_seqlens
+    assert not prepared_cu.workspace_key.caller_cumsum
+    runner.run(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        cu_seqlens=cu_seqlens,
+        seq_chunk_cumsum=buffer,
+        update_seq_chunk_cumsum=True,
+    )
+    name, launch = calls[-1]
+    assert name == prepared_cu.program_name
+    assert launch["preprocess_grid"] == prepared_cu.preprocess_grid
+    assert launch["preprocess"]["seq_chunk_cumsum"] is buffer
+    assert runner._allocations_in_last_run == 0
 
 
 def test_prepare_resolves_the_shape_without_launching_without_gpu(monkeypatch):
@@ -561,7 +713,7 @@ def test_prepare_resolves_the_shape_without_launching_without_gpu(monkeypatch):
     assert prepared == module.PreparedSSDCombined(
         program_name="chunkpar_bf16_batched",
         workspace_key=module._WorkspaceKey(
-            None, 1, 256, 2, 2, 1, torch.bfloat16, False, "always"
+            None, 1, 256, 2, 2, 1, torch.bfloat16, False, False, "always"
         ),
         grid=(16, 1, 1),
         preprocess_grid=(2, 1, 1),
