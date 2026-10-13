@@ -64,10 +64,13 @@ _QK_DIM = NOPE_DIM + ROPE_DIM
 BACKENDS = ("auto", "specialized", "cake")
 _FUSED_BACKENDS = ("specialized", "cake")
 # Head counts at which "auto" prefers the specialized kernel. GB300 / B200
-# kernel-level A/B (cold L2, 18 serving shapes): the unrolled 12-head variant is
-# 0-3 % faster than the Cake program at every token count, while for every other
-# head count the Cake programs are 1.03-1.4x faster (more bytes in flight per
-# warp). 12 = Kimi-K3's 96 heads over TP8.
+# kernel-level A/B (cold L2, 18 serving shapes): the unrolled 12-head variant
+# and the Cake program are within +-1 % of each other at every token count
+# (the Cake 4 + 2 head-group plan below closed the earlier 0-3 % gap; both sit
+# on the streaming-copy floor), while for every other head count the Cake
+# programs are 1.03-1.4x faster (more bytes in flight per warp). The
+# specialized kernel stays auto's pick at 12 heads (Kimi-K3's 96 heads over
+# TP8): it is marginally ahead on GB300 at the smallest chunk sizes.
 _SPECIALIZED_AUTO_HEADS = frozenset({12})
 
 # Host plan of the generated Cake programs (a replica of the Cake production
@@ -78,7 +81,8 @@ _THREADS_PER_CTA = 32 * _WARPS_PER_CTA
 # Below this token count prefer two pairs per warp (more CTAs in the one-wave
 # regime) whenever the head-pair count is even.
 _SMALL_T_TOKENS = 2048
-# Most head pairs (4 KB of input) a warp keeps in flight within the register budget.
+# Most head pairs (4 KB of input) a warp keeps in flight within the register
+# budget; every warp of a token but the last takes this many.
 _MAX_HEAD_GROUP = 4
 
 # Dispatch surface of the fused kernels (package data; see the file's note).
@@ -121,23 +125,26 @@ def _load_allowlist() -> Optional[dict]:
 
 
 def _plan_head_group(num_tokens: int, num_heads: int) -> int:
-    """Head pairs per warp: the fewest warps per token that keep at most four
-    pairs (4 KB of loads in flight) per warp, with the pairs spread evenly over
-    those warps; two for one-wave shapes.
+    """Head pairs per warp: four (4 KB of loads in flight, the register budget's
+    maximum) for every warp of the token except the last, which takes the
+    remainder; two for one-wave shapes.
 
     Exact replica of the Cake production launcher's rule, which selects the
     generated program: ``T <= 2048`` with an even pair count takes two pairs per
     warp (more, smaller CTAs for a one-wave launch); otherwise ``ceil(P / 4)``
-    warps share the token's ``P = ceil(H / 2)`` pairs and each warp takes
-    ``ceil(P / warps)`` of them (one pair for H <= 2, three for H in {5, 6}, for
-    H in {9, 10}: 3 + 2 rather than 4 + 1, for H in {17, 18}: 3 + 3 + 3, and
-    for H in {11, 12}: 3 + 3 rather than 4 + 2; four for H = 24 .. 128).
+    warps share the token's ``P = ceil(H / 2)`` pairs, the first warps taking
+    four and the last the remainder (one pair for H <= 2, two for H in {3, 4},
+    three for H in {5, 6}, 4 + 1 for H in {9, 10}, 4 + 2 for H in {11, 12},
+    4 + 4 + 1 for H in {17, 18}; four per warp for H = 24 .. 128). The 4 + 2 split
+    replaced the earlier balanced 3 + 3 split for 12 local heads after the
+    B200 / GB300 A/B of the two programs (Cake CAKE-1089 round 11): 4 + 2 is
+    faster on every one of the 18 Kimi-K3 serving shapes on B200 (+0.5 % to
+    +1.5 %) and equal within noise on GB300.
     """
     head_pairs = (int(num_heads) + 1) // 2
     if int(num_tokens) <= _SMALL_T_TOKENS and head_pairs % 2 == 0:
         return 2
-    warps_per_token = (head_pairs + _MAX_HEAD_GROUP - 1) // _MAX_HEAD_GROUP
-    return (head_pairs + warps_per_token - 1) // warps_per_token
+    return min(head_pairs, _MAX_HEAD_GROUP)
 
 
 def _plan_grid(num_tokens: int, num_heads: int, head_group: int) -> Tuple[int, int]:
@@ -529,9 +536,10 @@ def concat_mla_kv_quant_fp8(
       tensors; ``k_pe`` may be a row-strided column slice of a wider row-major
       workspace (unit last stride, row stride a multiple of 16 elements).
     - ``"auto"`` (default): ``"specialized"`` for 12 local heads (96 heads over
-      TP8, where it measured 0-3 % faster on GB300/B200 at every token count),
-      ``"cake"`` for every other head count (1.03-1.4x faster there); if the
-      preferred backend cannot serve the call the other one is tried.
+      TP8, where the two backends measure within +-1 % of each other on
+      GB300/B200 at every token count), ``"cake"`` for every other head count
+      (1.03-1.4x faster there); if the preferred backend cannot serve the call
+      the other one is tried.
 
     Every call no fused backend serves takes the composable torch path.
     ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` forces the composable path
