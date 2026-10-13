@@ -1328,7 +1328,8 @@ def test_attention_ts_encoded_pages_trace_rejects_incompatible_storage(
         )
 
 
-def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
+@pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
+def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state(output_dtype):
     """An omitted out override must retain the wrapper plan's output dtype."""
     from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
     from flashinfer.fi_trace import fi_trace
@@ -1353,7 +1354,7 @@ def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
         storage_page_size=page_size,
         use_packed_q=False,
         seq_len_q=1,
-        output_dtype=torch.float16,
+        output_dtype=output_dtype,
         mask_type="dense",
         window_left=-1,
         max_kv_len=page_size,
@@ -1370,10 +1371,12 @@ def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
     )
 
     assert definition["name"] == (
-        "prims_ts_decode_wrapper_tuple_fp16_output_dense_maxq1_maxk32_"
+        f"prims_ts_decode_wrapper_tuple_{'fp16' if output_dtype == torch.float16 else 'bf16'}_output_dense_maxq1_maxk32_"
         "wl-1_pf0_um0_h8_kv2_d128_ps32"
     )
-    assert definition["outputs"]["output"]["dtype"] == "float16"
+    assert definition["outputs"]["output"]["dtype"] == str(output_dtype).removeprefix(
+        "torch."
+    )
 
 
 def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
