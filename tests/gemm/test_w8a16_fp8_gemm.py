@@ -136,6 +136,7 @@ def test_w8a16_fp8_gemm_rejects_bad_inputs():
         "1sm128x128",
         "2sm256x128_splitk",
         "2sm256x128_streamk",
+        "2sm256x160",
     ],
 )
 @pytest.mark.parametrize("m,n,k", [(1024, 1024, 5120), (200, 1024, 5120), (4096, 128, 5120)])

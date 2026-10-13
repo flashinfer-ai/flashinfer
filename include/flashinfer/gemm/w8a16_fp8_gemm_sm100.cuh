@@ -290,6 +290,14 @@ using W8A16Sm100Cfg2SM256x256 = W8A16Sm100Cfg<256, 256, 64, 2, true, true>;
 // Rung B8: 192-row activation tile with A still in TMEM (2 x 192 acc + 2 x 64 A = 512 cols):
 // 2/3 the transform work per flop of 256x128 on the skeleton whose no-convert ceiling is 99%.
 using W8A16Sm100Cfg2SM256x192 = W8A16Sm100Cfg<256, 192, 128, 2, true>;
+// Version B14: 160-row activation tile (2 x 160 acc + 2 x 64 A = 448 TMEM cols).  Not a
+// faster tile per se: a second tile *height* so the dispatcher can pick the one whose
+// tile count lands closest to a whole number of waves.  N=5120 at M=1024: 20 x 8 =
+// 160 tiles of 128 rows = 2.16 waves (last wave 16% full) vs 20 x 7 = 140 tiles of 160
+// rows = 1.89 waves (89% full); the extra rows of the last M-tile are masked by the
+// TMA / epilogue predication, and the transform work per k-tile (the weight tile) is
+// the same, so the taller tile costs only its extra MMA.
+using W8A16Sm100Cfg2SM256x160 = W8A16Sm100Cfg<256, 160, 128, 2, true>;
 
 // Rung B12: split-K.  With kSplitK the kernel runs as a *batch* of `splits` GEMMs over
 // K-slices in one launch (batch stride = the slice length along K for A and B, one
@@ -476,9 +484,10 @@ enum class W8A16Sm100Tile {
   k2SM256x256 = 3,
   k2SM256x192 = 4,
   k2SM256x128SplitK = 5,  // version B12: 256x128 tile, batched K-slices + fp32 reduce
-  k2SM256x128StreamK = 6  // version B13: 256x128 tile under the stream-K scheduler
+  k2SM256x128StreamK = 6,  // version B13: 256x128 tile under the stream-K scheduler
+  k2SM256x160 = 7          // version B14: 160-row tile for wave quantisation
 };
-constexpr int kW8A16Sm100MaxTileCode = 6;
+constexpr int kW8A16Sm100MaxTileCode = 7;
 constexpr int kW8A16Sm100MaxSplits = 8;
 
 inline W8A16Sm100Tile W8A16Sm100TileFromCode(int code) {
@@ -498,6 +507,7 @@ inline W8A16Sm100Tile W8A16Sm100TileEnv() {
     if (std::strcmp(s, "2sm256x192") == 0) return W8A16Sm100Tile::k2SM256x192;
     if (std::strcmp(s, "2sm256x128_splitk") == 0) return W8A16Sm100Tile::k2SM256x128SplitK;
     if (std::strcmp(s, "2sm256x128_streamk") == 0) return W8A16Sm100Tile::k2SM256x128StreamK;
+    if (std::strcmp(s, "2sm256x160") == 0) return W8A16Sm100Tile::k2SM256x160;
     return W8A16Sm100Tile::kAuto;
   }();
   return tile;
@@ -624,6 +634,16 @@ inline W8A16Sm100Tile W8A16Sm100PickTile(int M, int N, int K, int num_sms, int a
   // gave 1.040).  The 1SM 128x128 tile never wins once the per-M classes are measured
   // in isolation (its apparent wins were thermal noise of the full-table sweep), so it
   // is `algo`-only as well.
+  //
+  // Version B14: the 160-row tile joins the menu as a third tile *height*, so the model
+  // can land the tile count near a whole number of waves (the taller tile's extra rows
+  // in the last M-tile are masked for free).  Its factor (0.96) was fitted on the
+  // back-to-back M=1024 / 2048 sweeps of Tue 13 Oct 2026 together with the B13 all-M
+  // 128/192 data: geomean model pick / oracle 1.010; any value in 0.94-1.00 scores the
+  // same, 1.02 for the 192-row tile keeps the large-M picks of B11.  On the N=5120
+  // M=1024 rows (160 tiles of 128 rows = 2.16 waves vs 140 tiles of 160 rows = 1.89
+  // waves) the 160-row tile is 11-16% faster; it also takes several M=2048 rows with
+  // N <= 4096.
   (void)K;
   const long long clusters = num_sms > 1 ? num_sms / 2 : 1;
   const long long w_tiles = (N + 255) / 256;
@@ -632,8 +652,10 @@ inline W8A16Sm100Tile W8A16Sm100PickTile(int M, int N, int K, int num_sms, int a
     return static_cast<double>((units + clusters - 1) / clusters) * tile_a / eff;
   };
   const double c128 = cost(128, 1.00);
+  const double c160 = cost(160, 0.96);
   const double c192 = cost(192, 1.02);
-  if (c192 <= c128) return W8A16Sm100Tile::k2SM256x192;
+  if (c192 <= c128 && c192 <= c160) return W8A16Sm100Tile::k2SM256x192;
+  if (c160 < c128) return W8A16Sm100Tile::k2SM256x160;
   return W8A16Sm100Tile::k2SM256x128;
 }
 
@@ -655,6 +677,9 @@ size_t W8A16Fp8GemmSm100WorkspaceBytes(int M, int N, int K, int device_id, int n
                                                                         num_sms);
     case W8A16Sm100Tile::k2SM256x192:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x192>::WorkspaceBytes(M, N, K, device_id,
+                                                                        num_sms);
+    case W8A16Sm100Tile::k2SM256x160:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x160>::WorkspaceBytes(M, N, K, device_id,
                                                                         num_sms);
     default:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128>::WorkspaceBytes(M, N, K, device_id,
@@ -689,6 +714,10 @@ cudaError_t W8A16Fp8GemmSm100(const T* act, const __nv_fp8_e4m3* weight, const f
                                                              num_sms, stream);
     case W8A16Sm100Tile::k2SM256x192:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x192>::Run(act, weight, scale, bias, out, M, N, K,
+                                                             workspace, workspace_bytes, device_id,
+                                                             num_sms, stream);
+    case W8A16Sm100Tile::k2SM256x160:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x160>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,
                                                              num_sms, stream);
     default:
