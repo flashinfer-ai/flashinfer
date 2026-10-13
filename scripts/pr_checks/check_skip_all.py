@@ -65,9 +65,11 @@ from pathlib import Path, PurePosixPath
 # Data model
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class FileResult:
     """Aggregated test results for one source file across all lanes."""
+
     path: str
     lanes: dict[str, LaneResult] = field(default_factory=dict)
 
@@ -95,6 +97,7 @@ class FileResult:
 @dataclass
 class LaneResult:
     """Results for one source file on one lane."""
+
     lane: str
     planned: int = 0
     passed: int = 0
@@ -110,6 +113,7 @@ class LaneResult:
 @dataclass
 class SkipAllFinding:
     """A changed test file that was skip-all on every lane."""
+
     path: str
     result: FileResult
     skip_reasons: list[str] = field(default_factory=list)
@@ -118,6 +122,7 @@ class SkipAllFinding:
 # ---------------------------------------------------------------------------
 # Skip reason extraction from JUnit XML
 # ---------------------------------------------------------------------------
+
 
 def _extract_skip_reasons_from_xml(xml_path: Path, source_file: str) -> list[str]:
     """Extract distinct skip-reason messages for *source_file* from a JUnit XML.
@@ -205,32 +210,45 @@ def _changed_test_files(base_sha: str, head_sha: str) -> list[str]:
     """Return repo-relative paths of changed/added test files in the PR."""
     try:
         output = subprocess.check_output(
-            ["git", "diff", "--name-only", "--diff-filter=ACMR",
-             f"{base_sha}...{head_sha}"],
-            text=True, stderr=subprocess.PIPE,
+            [
+                "git",
+                "diff",
+                "--name-only",
+                "--diff-filter=ACMR",
+                f"{base_sha}...{head_sha}",
+            ],
+            text=True,
+            stderr=subprocess.PIPE,
         )
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
             f"git diff failed: {exc.stderr.strip() if exc.stderr else exc}"
         ) from exc
-    return sorted(set(
-        line.strip() for line in output.splitlines()
-        if line.strip() and _TEST_FILE_RE.match(line.strip())
-    ))
+    return sorted(
+        set(
+            line.strip()
+            for line in output.splitlines()
+            if line.strip() and _TEST_FILE_RE.match(line.strip())
+        )
+    )
 
 
 def _changed_test_files_from_list(path: str) -> list[str]:
     """Read changed file paths from a newline-separated file."""
     with open(path, encoding="utf-8") as fh:
-        return sorted(set(
-            line.strip() for line in fh
-            if line.strip() and _TEST_FILE_RE.match(line.strip())
-        ))
+        return sorted(
+            set(
+                line.strip()
+                for line in fh
+                if line.strip() and _TEST_FILE_RE.match(line.strip())
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
 # Summary parsing
 # ---------------------------------------------------------------------------
+
 
 def _load_summary(path: str, lane_name: str | None = None) -> tuple[str, list[dict]]:
     """Load a run-summary.json and return (lane_name, sources).
@@ -249,7 +267,10 @@ def _load_summary(path: str, lane_name: str | None = None) -> tuple[str, list[di
             lane_name = "unknown"
             for part in parts:
                 lower = part.lower()
-                if any(gpu in lower for gpu in ("h100", "a10g", "t4", "sm90", "sm86", "sm75")):
+                if any(
+                    gpu in lower
+                    for gpu in ("h100", "a10g", "t4", "sm90", "sm86", "sm75")
+                ):
                     lane_name = part
                     break
     sources = data.get("sources", [])
@@ -297,7 +318,10 @@ def _aggregate_from_junit_xml(
                     continue
 
                 # Determine outcome.
-                if testcase.find("./failure") is not None or testcase.find("./error") is not None:
+                if (
+                    testcase.find("./failure") is not None
+                    or testcase.find("./error") is not None
+                ):
                     outcome = "failed"
                 elif testcase.find("./skipped") is not None:
                     outcome = "skipped"
@@ -351,6 +375,7 @@ def _aggregate_results(
 # Analysis
 # ---------------------------------------------------------------------------
 
+
 def find_skip_all_files(
     changed_files: list[str],
     summary_paths: list[str],
@@ -375,9 +400,13 @@ def find_skip_all_files(
             reasons: list[str] = []
             if junit_dirs:
                 reasons = _collect_skip_reasons(path, junit_dirs)
-            findings.append(SkipAllFinding(
-                path=path, result=fr, skip_reasons=reasons,
-            ))
+            findings.append(
+                SkipAllFinding(
+                    path=path,
+                    result=fr,
+                    skip_reasons=reasons,
+                )
+            )
 
     return findings, results
 
@@ -385,6 +414,7 @@ def find_skip_all_files(
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+
 
 def format_report(
     findings: list[SkipAllFinding],
@@ -418,7 +448,9 @@ def format_report(
             status = "❌ failures"
         else:
             status = "✅ ok"
-        lines.append(f"| `{path}` | {passed} | {failed} | {skipped} | {executed} | {status} |")
+        lines.append(
+            f"| `{path}` | {passed} | {failed} | {skipped} | {executed} | {status} |"
+        )
 
     lines.append("")
 
@@ -453,7 +485,8 @@ def format_report(
 
     # Files not collected on any lane.
     uncollected = [
-        path for path in changed_files
+        path
+        for path in changed_files
         if not results.get(path, FileResult(path=path)).collected_anywhere
         and path in results
     ]
@@ -481,8 +514,7 @@ def emit_annotations(
     for finding in findings:
         fr = finding.result
         lanes_desc = ", ".join(
-            f"{name}: {lr.skipped} skipped"
-            for name, lr in sorted(fr.lanes.items())
+            f"{name}: {lr.skipped} skipped" for name, lr in sorted(fr.lanes.items())
         )
         reasons_desc = ""
         if finding.skip_reasons:
@@ -494,7 +526,8 @@ def emit_annotations(
         print(f"::warning file={finding.path},line=1::{msg}")
 
     uncollected = [
-        path for path in changed_files
+        path
+        for path in changed_files
         if not results.get(path, FileResult(path=path)).collected_anywhere
         and path in results
     ]
@@ -508,6 +541,7 @@ def emit_annotations(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def _selftest() -> int:
     """Minimal self-test with synthetic data."""
@@ -564,29 +598,40 @@ def _selftest() -> int:
             json.dump(summary, fh)
 
         # Create a JUnit XML with skip reasons for the GDN file.
-        junit_dir = os.path.join(td, "junit", "shards", "shard-0000",
-                                 "units", "u0", "batches")
+        junit_dir = os.path.join(
+            td, "junit", "shards", "shard-0000", "units", "u0", "batches"
+        )
         os.makedirs(junit_dir)
         xml_path = os.path.join(junit_dir, "b0.xml")
         root_el = ET.Element("testsuites")
-        suite_el = ET.SubElement(root_el, "testsuite",
-                                 name="tests/gdn/test_foo.py",
-                                 tests="10", skipped="10")
+        suite_el = ET.SubElement(
+            root_el, "testsuite", name="tests/gdn/test_foo.py", tests="10", skipped="10"
+        )
         for i in range(10):
-            tc = ET.SubElement(suite_el, "testcase",
-                               classname="tests.gdn.test_foo",
-                               name=f"test_something[{i}]", time="0")
+            tc = ET.SubElement(
+                suite_el,
+                "testcase",
+                classname="tests.gdn.test_foo",
+                name=f"test_something[{i}]",
+                time="0",
+            )
             props = ET.SubElement(tc, "properties")
-            ET.SubElement(props, "property", name="pytest_nodeid",
-                          value=f"tests/gdn/test_foo.py::test_something[{i}]")
-            skip_el = ET.SubElement(tc, "skipped",
-                                    message="ReplaySSM requires SM100/SM103")
+            ET.SubElement(
+                props,
+                "property",
+                name="pytest_nodeid",
+                value=f"tests/gdn/test_foo.py::test_something[{i}]",
+            )
+            skip_el = ET.SubElement(
+                tc, "skipped", message="ReplaySSM requires SM100/SM103"
+            )
         tree = ET.ElementTree(root_el)
         tree.write(xml_path, xml_declaration=True)
 
         changed = ["tests/gdn/test_foo.py", "tests/attention/test_ok.py"]
         findings, results = find_skip_all_files(
-            changed, [summary_path],
+            changed,
+            [summary_path],
             junit_dirs=[Path(td) / "junit"],
         )
 
@@ -602,8 +647,10 @@ def _selftest() -> int:
                 print("FAIL: skip_reasons is empty", file=sys.stderr)
                 failures += 1
             elif "ReplaySSM requires SM100/SM103" not in findings[0].skip_reasons:
-                print(f"FAIL: unexpected reasons: {findings[0].skip_reasons}",
-                      file=sys.stderr)
+                print(
+                    f"FAIL: unexpected reasons: {findings[0].skip_reasons}",
+                    file=sys.stderr,
+                )
                 failures += 1
 
         fr_ok = results["tests/attention/test_ok.py"]
@@ -619,11 +666,15 @@ def _selftest() -> int:
 
         # Test with a file not in any summary (uncollected).
         findings3, results3 = find_skip_all_files(
-            ["tests/new/test_brand_new.py"], [summary_path], junit_dirs=None,
+            ["tests/new/test_brand_new.py"],
+            [summary_path],
+            junit_dirs=None,
         )
         if findings3:
-            print("FAIL: uncollected file should not be a skip-all finding",
-                  file=sys.stderr)
+            print(
+                "FAIL: uncollected file should not be a skip-all finding",
+                file=sys.stderr,
+            )
             failures += 1
         if results3["tests/new/test_brand_new.py"].collected_anywhere:
             print("FAIL: brand new file should not be collected", file=sys.stderr)
@@ -644,26 +695,35 @@ def main() -> int:
         help="File listing changed paths (alternative to --base-sha/--head-sha)",
     )
     ap.add_argument(
-        "--summary", action="append", default=[],
+        "--summary",
+        action="append",
+        default=[],
         help="Path to run-summary.json (repeatable, one per lane)",
     )
     ap.add_argument(
-        "--junit-dir", action="append", default=[],
+        "--junit-dir",
+        action="append",
+        default=[],
         help="Path to JUnit output directory for skip reason extraction "
-             "(repeatable, one per lane)",
+        "(repeatable, one per lane)",
     )
     ap.add_argument(
-        "--junit-xml-lane", action="append", default=[], nargs=2,
+        "--junit-xml-lane",
+        action="append",
+        default=[],
+        nargs=2,
         metavar=("LANE_NAME", "DIR"),
         help="Lane name and JUnit XML directory for lanes without run-summary.json "
-             "(repeatable, e.g. --junit-xml-lane A10G junit-shards/a10g)",
+        "(repeatable, e.g. --junit-xml-lane A10G junit-shards/a10g)",
     )
     ap.add_argument(
-        "--github-actions", action="store_true",
+        "--github-actions",
+        action="store_true",
         help="Emit GitHub Actions annotations",
     )
     ap.add_argument(
-        "--fail", action="store_true",
+        "--fail",
+        action="store_true",
         help="Exit 1 if any changed test file is skip-all on every lane",
     )
     ap.add_argument("--selftest", action="store_true")
@@ -688,10 +748,13 @@ def main() -> int:
     junit_dirs = [Path(d) for d in args.junit_dir] if args.junit_dir else None
     junit_xml_dirs = (
         [(name, Path(d)) for name, d in args.junit_xml_lane]
-        if args.junit_xml_lane else None
+        if args.junit_xml_lane
+        else None
     )
     findings, results = find_skip_all_files(
-        changed, args.summary, junit_dirs=junit_dirs,
+        changed,
+        args.summary,
+        junit_dirs=junit_dirs,
         junit_xml_dirs=junit_xml_dirs,
     )
 

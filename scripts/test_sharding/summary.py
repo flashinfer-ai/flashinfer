@@ -716,11 +716,24 @@ def _detect_gpu_name() -> str:
     """Return a short GPU name like 'H100' or 'A10G', or 'unknown'."""
     try:
         import torch
+
         if torch.cuda.is_available():
             full = torch.cuda.get_device_name(0)
             # Normalize common names: "NVIDIA H100 80GB HBM3" → "H100"
-            for short in ("H100", "H200", "A100", "A10G", "A10", "T4",
-                          "L4", "L40", "V100", "B100", "B200", "GB200"):
+            for short in (
+                "H100",
+                "H200",
+                "A100",
+                "A10G",
+                "A10",
+                "T4",
+                "L4",
+                "L40",
+                "V100",
+                "B100",
+                "B200",
+                "GB200",
+            ):
                 if short in full:
                     return short
             return full

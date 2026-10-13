@@ -41,14 +41,16 @@ from pathlib import Path
 # Data model
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class TraceAudit:
     """Audit result for one trace definition file."""
+
     name: str
     path: str
     op_type: str
-    status: str          # e.g. "verified", "experimental", or ""
-    api_tag: str         # fi_api:... tag
+    status: str  # e.g. "verified", "experimental", or ""
+    api_tag: str  # fi_api:... tag
     has_check: bool
     has_reference: bool
 
@@ -69,6 +71,7 @@ class TraceAudit:
 # ---------------------------------------------------------------------------
 # Scanning
 # ---------------------------------------------------------------------------
+
 
 def scan_trace_definitions(
     trace_dir: Path,
@@ -93,10 +96,7 @@ def scan_trace_definitions(
         name = data.get("name", path.stem)
 
         # Filter to GDN/KDA definitions.
-        matches = (
-            op_type in op_types
-            or any(ot in path.stem for ot in op_types)
-        )
+        matches = op_type in op_types or any(ot in path.stem for ot in op_types)
         if not matches:
             continue
 
@@ -107,15 +107,17 @@ def scan_trace_definitions(
         has_check = bool(data.get("check"))
         has_reference = bool(data.get("reference"))
 
-        audits.append(TraceAudit(
-            name=name,
-            path=str(path),
-            op_type=op_type,
-            status=status_tags[0] if status_tags else "",
-            api_tag=api_tags[0] if api_tags else "",
-            has_check=has_check,
-            has_reference=has_reference,
-        ))
+        audits.append(
+            TraceAudit(
+                name=name,
+                path=str(path),
+                op_type=op_type,
+                status=status_tags[0] if status_tags else "",
+                api_tag=api_tags[0] if api_tags else "",
+                has_check=has_check,
+                has_reference=has_reference,
+            )
+        )
 
     return audits
 
@@ -123,6 +125,7 @@ def scan_trace_definitions(
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+
 
 def format_report(audits: list[TraceAudit]) -> list[str]:
     """Format a Markdown report."""
@@ -160,8 +163,10 @@ def format_report(audits: list[TraceAudit]) -> list[str]:
         )
         lines.append("")
         for a in gaps:
-            lines.append(f"- **`{a.name}`** ({a.op_type}, {a.status or 'no status'}): "
-                         f"missing {a.gap_description}")
+            lines.append(
+                f"- **`{a.name}`** ({a.op_type}, {a.status or 'no status'}): "
+                f"missing {a.gap_description}"
+            )
             if a.api_tag:
                 lines.append(f"  - API: `{a.api_tag}`")
         lines.append("")
@@ -197,6 +202,7 @@ def emit_annotations(audits: list[TraceAudit]) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def _selftest() -> int:
     """Minimal self-test with synthetic data."""
     import tempfile
@@ -208,53 +214,78 @@ def _selftest() -> int:
 
         # Complete definition.
         with open(trace_dir / "gdn_full.json", "w") as f:
-            json.dump({
-                "name": "gdn_full",
-                "op_type": "gdn",
-                "tags": ["fi_api:flashinfer.gdn.full", "status:verified"],
-                "check": "def check(): pass",
-                "reference": "def ref(): pass",
-                "axes": {}, "inputs": {}, "outputs": {},
-            }, f)
+            json.dump(
+                {
+                    "name": "gdn_full",
+                    "op_type": "gdn",
+                    "tags": ["fi_api:flashinfer.gdn.full", "status:verified"],
+                    "check": "def check(): pass",
+                    "reference": "def ref(): pass",
+                    "axes": {},
+                    "inputs": {},
+                    "outputs": {},
+                },
+                f,
+            )
 
         # Missing check.
         with open(trace_dir / "gdn_no_check.json", "w") as f:
-            json.dump({
-                "name": "gdn_no_check",
-                "op_type": "gdn",
-                "tags": ["fi_api:flashinfer.gdn.no_check", "status:verified"],
-                "reference": "def ref(): pass",
-                "axes": {}, "inputs": {}, "outputs": {},
-            }, f)
+            json.dump(
+                {
+                    "name": "gdn_no_check",
+                    "op_type": "gdn",
+                    "tags": ["fi_api:flashinfer.gdn.no_check", "status:verified"],
+                    "reference": "def ref(): pass",
+                    "axes": {},
+                    "inputs": {},
+                    "outputs": {},
+                },
+                f,
+            )
 
         # Missing reference.
         with open(trace_dir / "kda_no_ref.json", "w") as f:
-            json.dump({
-                "name": "kda_no_ref",
-                "op_type": "kda",
-                "tags": ["fi_api:flashinfer.kda.no_ref", "status:verified"],
-                "check": "def check(): pass",
-                "axes": {}, "inputs": {}, "outputs": {},
-            }, f)
+            json.dump(
+                {
+                    "name": "kda_no_ref",
+                    "op_type": "kda",
+                    "tags": ["fi_api:flashinfer.kda.no_ref", "status:verified"],
+                    "check": "def check(): pass",
+                    "axes": {},
+                    "inputs": {},
+                    "outputs": {},
+                },
+                f,
+            )
 
         # Experimental (missing both — should warn, not error).
         with open(trace_dir / "kda_exp.json", "w") as f:
-            json.dump({
-                "name": "kda_exp",
-                "op_type": "kda",
-                "tags": ["fi_api:flashinfer.kda.exp", "status:experimental"],
-                "axes": {}, "inputs": {}, "outputs": {},
-            }, f)
+            json.dump(
+                {
+                    "name": "kda_exp",
+                    "op_type": "kda",
+                    "tags": ["fi_api:flashinfer.kda.exp", "status:experimental"],
+                    "axes": {},
+                    "inputs": {},
+                    "outputs": {},
+                },
+                f,
+            )
 
         # Non-GDN/KDA (should be excluded).
         with open(trace_dir / "attention_foo.json", "w") as f:
-            json.dump({
-                "name": "attention_foo",
-                "op_type": "attention",
-                "tags": [],
-                "check": "def check(): pass",
-                "axes": {}, "inputs": {}, "outputs": {},
-            }, f)
+            json.dump(
+                {
+                    "name": "attention_foo",
+                    "op_type": "attention",
+                    "tags": [],
+                    "check": "def check(): pass",
+                    "axes": {},
+                    "inputs": {},
+                    "outputs": {},
+                },
+                f,
+            )
 
         audits = scan_trace_definitions(trace_dir)
         if len(audits) != 4:
@@ -263,7 +294,9 @@ def _selftest() -> int:
 
         covered = [a for a in audits if a.covered]
         if len(covered) != 1 or covered[0].name != "gdn_full":
-            print(f"FAIL: expected 1 covered (gdn_full), got {covered}", file=sys.stderr)
+            print(
+                f"FAIL: expected 1 covered (gdn_full), got {covered}", file=sys.stderr
+            )
             failures += 1
 
         gaps = [a for a in audits if not a.covered]
@@ -273,8 +306,10 @@ def _selftest() -> int:
 
         verified_gaps = [a for a in gaps if a.status == "verified"]
         if len(verified_gaps) != 2:
-            print(f"FAIL: expected 2 verified gaps, got {len(verified_gaps)}",
-                  file=sys.stderr)
+            print(
+                f"FAIL: expected 2 verified gaps, got {len(verified_gaps)}",
+                file=sys.stderr,
+            )
             failures += 1
 
         # Verify report generation doesn't crash.
@@ -297,11 +332,13 @@ def main() -> int:
         help="Path to trace definition directory (default: tests/trace/fi_trace_out)",
     )
     ap.add_argument(
-        "--github-actions", action="store_true",
+        "--github-actions",
+        action="store_true",
         help="Emit GitHub Actions annotations",
     )
     ap.add_argument(
-        "--fail", action="store_true",
+        "--fail",
+        action="store_true",
         help="Exit 1 if any verified definition is missing coverage",
     )
     ap.add_argument("--selftest", action="store_true")
