@@ -145,6 +145,7 @@ class TransportSession:
         stream.synchronize()
 
     def close(self) -> None:
+        """Collective teardown; synchronizes the whole device (not for a serving path)."""
         import torch.distributed as dist
 
         if self.closed:

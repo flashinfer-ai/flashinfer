@@ -677,6 +677,8 @@ class _CakeWorkspace:
         self.destroyed = True
         torch.cuda.synchronize(self.device)
         self.layers.clear()
+        for inst in self.instances.values():
+            self.module.module_unload_function(inst.function)
         self.session.close()
         self.storage.clear()
         self.instances.clear()
@@ -962,6 +964,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             gin_world_barrier_count=int(gin["world_barrier_count"]),
             gin_strong_signals_required=bool(gin["strong_signals_required"]),
         )
+        loaded_functions: list[int] = []
         try:
             table, report = self._choose_table(module, session, kernel, group)
             copiers = table.count(TRANSPORT_LSA) != 0
@@ -991,8 +994,11 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
                 device,
                 variant,
                 device_cubin,
+                loaded_functions,
             )
         except BaseException:
+            for function in loaded_functions:
+                module.module_unload_function(function)
             session.close()
             raise
         torch.cuda.current_stream(device).synchronize()
@@ -1015,6 +1021,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
         device: torch.device,
         variant: str,
         device_cubin: Any,
+        loaded_functions: list[int],
     ) -> _CakeWorkspace:
         import torch.distributed as dist
 
@@ -1122,6 +1129,8 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
                     str(spec["symbol"]),
                 )
             )
+            # Unloaded by the caller if the build fails, else by destroy().
+            loaded_functions.append(function)
             if int(module.function_local_bytes(function)) > LOCAL_BYTES_LIMIT:
                 raise RuntimeError(
                     f"{KERNEL_NAME}: {inst_name}{suffix} uses local memory"
