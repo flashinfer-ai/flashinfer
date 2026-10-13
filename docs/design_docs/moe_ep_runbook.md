@@ -240,7 +240,92 @@ device-side aborts):
 Hopper-only (`sm90_fp8_fp8_bf16_pull_cutedsl`) correctness targets run in their own pytest
 process (the SM90/SM100 kernel trees are mutually exclusive per process):
 `bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
-`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
+`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).  The BF16 pull-style
+twin (`sm90_bf16_bf16_bf16_pull_cutedsl`) shares both targets, and its token
+sweep has its own bench script,
+`benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_bf16_pull_mega.py`
+(same CLI minus the FP8-only axes; see that tree's `TUNING.md`).
+
+The SM120 MXFP4 x MXFP8 MegaMoE backend (`sm120_mxfp4_mxfp8_bf16_cake`: one
+Cake-generated parametric persistent kernel per deployment, JIT-compiled from
+`flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/`) has its own target,
+`bash tests/moe_ep/run_tests.sh mega_sm120_cake` (4 GPUs; `NPROC_CAKE_SM120=8`
+for a full host). It needs NCCL 2.30.7 with the Device API (`NCCL_HOME`), and on
+multi-GPU PCIe hosts a pinned `NCCL_TOPO_FILE`. Sixteen ranks over two hosts run
+the same modules under a two-node torchrun (`--nnodes 2 --nproc_per_node 8`,
+`NCCL_GIN_ENABLE=1`); cross-host pairs use GIN, the transport table may keep LSA
+inside each host. Each EP-rank pair moves dispatch payloads and expert results over
+GIN (default `transport_table="all_gin"`) or LSA (load/store over NVLink / PCIe peer
+mappings; the copier instances reserve one copier CTA per LSA destination of a rank).
+To pick the table per deployment offline, run
+`torchrun --nproc_per_node=<EP> -m flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8
+--hidden H --intermediate I --num-experts E --topk K --max-tokens <capacities>
+[--shared-expert]` once and configure `transport_table="tuned"`: the workspace looks
+the winner up in `FLASHINFER_MOE_EP_KNOB_CACHE` (keyed by GPU, geometry, variant,
+capacity and the gathered peer topology; all-GIN on a miss). Latency:
+`benchmarks/moe_ep/backends/mega/kernel/sm120/bench_moe_ep_sm120_w4a8_cake_mega.py`.
+Serving frameworks that know the largest per-rank token count of a call should pass it
+as the invocation's token bucket (`layer.stage_inputs(t, compile_tokens_per_rank=bucket)`
+then `layer.compute_staged(output=...)`, the same value on every rank): the call then skips
+the backend's per-call `[rows, expert histogram]` all-gather and its host read-back, and it
+can be captured into a CUDA graph -- one graph per bucket, after one eager call of the layer on
+that workspace; every rank replays the same bucket sequence in the same order (see "CUDA
+graphs" in the kernel package README).
+A rank that stalls or dies mid-call for longer than the kernel's 600 s wait deadline
+makes the call fail on every rank with `CUDA error: unspecified launch failure`
+(device `trap`) instead of hanging; restart the processes (see the wait-deadline
+paragraph in `flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/README.md`).
+On a single host, `all_gin` sends same-host pairs through NIC loopback; with RoCE ECN / DCQCN congestion control
+this can throttle large calls (a tail of 10-100 ms at EP4 / 8192 tokens per rank on our PCIe host, CNPs rising on
+the NICs).  Prefer an LSA table for same-host pairs there (`lsa_where_reachable`, `all_lsa`, or `"tuned"`).
+
+The native BF16 Hopper backend (`sm90_bf16_bf16_bf16_push_cake`: bf16 dispatch
+payload, Cake-generated WGMMA FC1/FC2 with fp32 accumulation, bf16 combine
+wire — no FP8 anywhere) has its own target,
+`bash tests/moe_ep/run_tests.sh sm90_bf16_push_cake` (2 GPUs; set
+`NPROC_SM90_BF16_PUSH_CAKE` for larger worlds). It compares every output
+elementwise (atol = rtol = 1e-2) against the independent bf16 torch reference
+in `tests/moe_ep/_sm90_bf16_reference.py` over uniform / all-remote / hot /
+masked / duplicate / empty-rank routing, uneven token counts, repeated calls
+and CUDA-graph replay. Supported geometry: `hidden % 256 == 0`,
+`intermediate % 128 == 0`, `top_k in {1, 2, 4, 6, 8}`, experts divisible by
+the world size; anything else raises `MoEEpConfigError` at init. The expert
+GEMMs ship as generated sources sealed by
+`kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_manifest.json`;
+the target runs the CPU frozen-sources guard
+(`tests/moe_ep/test_sm90_bf16_push_cake_frozen_sources.py`) first, and a
+hand-edited generated file fails the JIT loader closed (sha256 mismatch).
+On the receiving rank the combine tail (wait for every source, fp32 top-k
+reduce, ack) runs as one fused kernel without a per-round combine-inbox fill;
+`FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL=0` selects the vendored three-kernel
+tail (bit-identical output) for A/B checks, and peers may mix the two. Small
+dedup rounds (`T <= 128`, `T * top_k <= 1024`) dispatch through one cooperative
+kernel (count + reserve + store_publish); `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH=0`
+selects the vendored dispatch kernels, which larger rounds and non-dedup pipes
+always use. The dispatch wire format is the vendored one in every combination.
+
+The combine wire (expert rank -> token owner) is selected by
+`combine_wire` on the config (`None` reads
+`FLASHINFER_SM90_CAKE_BF16_COMBINE_WIRE`, default `prereduced`) and must be
+the same on every EP rank (checked with an allgather at init; a mixed pipe
+raises on every rank). `prereduced`: the expert rank pre-reduces all routes
+of a token that landed on it in fp32 (`fmaf` in ascending route order), rounds
+once to bf16 and sends ONE row per (token, source rank) into the owner's
+top-k inbox (slot = the group's smallest route index); the owner sums the
+<= ep_size rows in ascending source-rank order in fp32 and rounds once.
+`prereduced_hilo`: as `prereduced`, but a source rank holding >= 2 routes of a
+token sends its fp32 partial as two bf16 rows (hi, and the residual `p - hi`
+in the slot of its second-smallest route index) so no group partial is rounded
+to bf16; single-route groups are `bf16(w * y)` exactly as the per-route wire.
+`per_route`: one `bf16(fp32(y_k) * w_k)` row per route, summed over k by the
+owner (the original wire, kept for A/B comparison; the only wire that also
+runs the vendored three-kernel tail). Both wires are deterministic (fixed
+reduction order, no floating-point atomics; repeated calls and CUDA-graph
+replay are bitwise identical) but not bitwise identical to each other: the
+pre-reduced wire rounds each element twice instead of top_k + 1 times. The
+section tests run every routing pattern under both wires, including the
+pre-reduce-specific cases (all K routes of a token on one remote rank, all on
+the local rank) and the wire-mismatch rejection.
 
 ### SM107 (Rubin) mega tests
 
@@ -267,7 +352,7 @@ topk 6, 384 experts EP4, hidden 7168, intermediate 3072 post-SwiGLU, tokens
 per rank 512..32768) through the FI `MoEEpLayer` mega path, on 4×H100:
 
 ```bash
-torchrun --nproc_per_node=4 benchmarks/bench_moe_ep_sm90_mega.py
+torchrun --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py
 ```
 
 Rank 0 prints one `BENCH_CSV` row per (scale_mode, layout, tokens) point;
@@ -281,6 +366,20 @@ M256 N32), `--mma-tiler M,N`, `--tokens`, `--kind`. See the module docstring
 for the full timing/mapping notes. Measured results, comparison caveats,
 and the reproduce recipe live in
 [`kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md).
+
+The native BF16 backend is benchmarked against the same-precision split
+baseline (NCCL-EP + CUTLASS BF16 fused MoE through the same `MoEEpLayer`)
+with
+
+```bash
+python -m torch.distributed.run --nproc_per_node=8 \
+  benchmarks/bench_moe_ep_sm90_bf16_mega.py --geometry A --arms cand,b1
+```
+
+(`--geometry {A,B,C}` = DeepSeek-V3 7168/2048/256/top-8, DSV4-Pro
+7168/3072/384/top-6, DSV4-Flash 4096/2048/256/top-6; eager and CUDA-graph
+series per token count; `--check` compares both arms against the bf16 torch
+reference first). See the module docstring for the columns.
 
 ---
 
@@ -521,7 +620,7 @@ vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 
 - `kernel_src/sm100/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
-  (a fork of the same kernel repo)
+  and BF16 (a fork of the same kernel repo)
 - `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 (raw CUDA,
   JIT-compiled; vendored from flashinfer PR #4069, see its VENDOR.md)
 - `kernel_src/sm120/swapab_cutedsl_megakernel/` — Blackwell-consumer
@@ -697,7 +796,9 @@ outright and points at the API below.
 
 Capture with `create_graph_state()`, which holds one long-lived handle across
 forwards (the allocating half outside the capture, `Handle.update()` recorded
-inside it):
+inside it). `MoEEpCommunication` backends (e.g. `nvlink_one_sided`) are
+long-lived already; their graph state carries no handle and only pins the
+bound buffers, and the same capture recipe applies:
 
 ```python
 state = layer.create_graph_state(t)          # outside any capture, ALL ranks
@@ -758,7 +859,7 @@ Rules, in rough order of how easily they are violated:
   long as the state and every graph captured from it.
 - **`enable_timing` is off-limits under capture.** It synchronizes the device
   to read its CUDA events, which capture forbids. Time `g.replay()` instead
-  (`benchmarks/bench_moe_ep.py --cuda-graph` does exactly this).
+  (`benchmarks/moe_ep/bench_moe_ep.py --cuda-graph` does exactly this).
 - **All EP ranks must run the same sequence of eager calls and replays.**
   Ordinary collective discipline, but nixl_ep makes it sharper: its Buffer
   toggles a *host-side* double-buffer index (`buffer_idx ^= 1`) on every

@@ -51,8 +51,19 @@ class Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     situ_beta: float | None = None
     situ_linear_beta: float | None = None
     activation_clamp: float | None = None
+    # False exposes per-route outputs through MoEEpMegaLayer.forward_unfinalized().
+    do_finalize: bool = True
 
     def __post_init__(self) -> None:
+        if not self.do_finalize:
+            if self.enable_in_kernel_fc2_reduce:
+                raise ValueError(
+                    "do_finalize=False requires enable_in_kernel_fc2_reduce=False."
+                )
+            if self.knobs == "auto":
+                raise ValueError(
+                    "do_finalize=False requires fixed/offline-tuned knobs."
+                )
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         if self.activation not in ("swiglu", "situ"):

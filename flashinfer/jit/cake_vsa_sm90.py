@@ -13,13 +13,14 @@
 # limitations under the License.
 
 
-"""JIT loader for the generated Cake SM90 (Hopper) variable block-sparse attention kernel.
+"""JIT loader for the generated Cake SM90 (Hopper) variable block-sparse attention kernels.
 
 One source-only manifest lives under ``csrc/cake_vsa_sm90``
-(``cake_vsa_sm90_manifest.json``, schema ``cake.library_export.v5``): a single
-``sm_90a`` module rendered from the Cake kernel ``vsa_sm90_bf16_fwd`` (BF16 HND,
-head_dim 128, 64-token blocks) plus its tvm-ffi binding.  The Python planner that
-produces the kernel's tile metadata lives in :mod:`flashinfer.cake_vsa_sm90`.
+(``cake_vsa_sm90_manifest.json``, schema ``cake.library_export.v5``): one
+``sm_90a`` device translation unit plus its tvm-ffi launcher per stage (BF16
+HND, head_dim 128, 64-token blocks), sharing one device preamble header and
+one launcher-helper header.  The Python planner that produces the kernels'
+tile metadata lives in :mod:`flashinfer.cake_vsa_sm90`.
 """
 
 from __future__ import annotations
@@ -36,19 +37,19 @@ from .core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags
 _GENERATED_ROOT = "csrc/cake_vsa_sm90"
 _MANIFEST_NAME = "cake_vsa_sm90_manifest.json"
 _ARCH = "sm_90a"
-# Persistent pair/split route plus the small-selection route (one CTA per query
-# block, plan in the kernel-parameter constant bank) in four KMAX variants, each
-# also as a split-KV variant (selections sliced across CTAs, last-CTA merge),
-# and the cluster variants (slices of a query block as one thread-block
-# cluster, merge through distributed shared memory).
+# Persistent pair/split route (static and queue-scheduled tile lists) plus the
+# small-selection route (one CTA per query block, plan in the kernel-parameter
+# constant bank) in four KMAX variants, its split-KV variants for KMAX 4 and 6
+# (selections sliced across CTAs, last-CTA merge; the planner never selects a
+# KMAX 1 or 3 split), and the cluster variants (slices of a query block as one
+# thread-block cluster, merge through distributed shared memory).
 STAGES = (
     "attention",
+    "attention_queue",
     "small_k1",
     "small_k3",
     "small_k4",
     "small_k6",
-    "small_k1s",
-    "small_k3s",
     "small_k4s",
     "small_k6s",
     "small_k2c4",
@@ -150,7 +151,13 @@ def gen_cake_vsa_sm90_module(stage: str = "attention") -> JitSpec:
         sources=[_source_path(units["device"]), _source_path(units["binding"])],
         extra_cuda_cflags=[*sm90a_nvcc_flags, *record["compile_flags"]],
         extra_ldflags=["-lcuda"],
-        extra_include_paths=[_get_csrc_dir().parent, _get_include_dir()],
+        # The family directory holds the shared device preamble and launcher
+        # helper headers that every translation unit includes by name.
+        extra_include_paths=[
+            _get_csrc_dir(),
+            _get_csrc_dir().parent,
+            _get_include_dir(),
+        ],
     )
     logger.info("Generated Cake SM90 VSA JIT spec: %s", spec.name)
     return spec

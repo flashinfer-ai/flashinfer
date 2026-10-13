@@ -15,12 +15,28 @@ limitations under the License.
 """
 
 import math
+from pathlib import Path
 
 import pytest
 import torch
 
 from flashinfer import sm110_gqa_decode
-from flashinfer.experimental.sm110_gqa_decode.jit import _read_manifest
+from flashinfer.experimental.sm110_gqa_decode import backend, jit, prepared
+
+_PACKAGE = Path(jit.__file__).resolve().parent
+_REQUIRES_CUDA = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires a CUDA device"
+)
+_REQUIRES_SM110 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (11, 0),
+    reason="requires an exact SM110 GPU",
+)
+_SHAPES = [
+    (1, 64, [1], 95601),
+    (4, 256, [64, 127, 191, 256], 95602),
+    (1, 1024, [1024], 95603),
+    (1, 4096, [3968], 95604),
+]
 
 
 def _reference(
@@ -42,83 +58,10 @@ def _reference(
     return torch.einsum("bhgk,bhkd->bhgd", probabilities, v).reshape_as(q).half()
 
 
-def _has_sm110() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (11, 0)
-
-
-def test_public_entry_point_is_experimental() -> None:
-    assert sm110_gqa_decode.is_experimental
-
-
-def test_generated_source_closure() -> None:
-    _, manifest = _read_manifest()
-    assert manifest["architecture"] == "sm_110a"
-    assert manifest["contract"]["gqa_group_size"] == 4
-    assert {route["ffi_entry"] for route in manifest["routes"]} == {
-        "run_short",
-        "run_long",
-    }
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
-@pytest.mark.parametrize(
-    ("capacity", "lengths"),
-    [
-        (64, [1, 0]),
-        (64, [1, 65]),
-        (65, [1, -1]),
-        (65, [1, 66]),
-    ],
-    ids=(
-        "short-non-positive",
-        "short-oversized",
-        "long-non-positive",
-        "long-oversized",
-    ),
-)
-def test_sm110_gqa_decode_rejects_invalid_sequence_lengths(
-    capacity: int,
-    lengths: list[int],
-) -> None:
-    batch = len(lengths)
-    q = torch.empty((batch, 32, 128), dtype=torch.float16, device="cuda")
-    kv = torch.empty((batch, 2, 8, capacity, 128), dtype=torch.float16, device="cuda")
-    sequence_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
-
-    with pytest.raises(
-        ValueError,
-        match=(
-            rf"sequence_lengths values must be within the inclusive range "
-            rf"\[1, {capacity}\]"
-        ),
-    ):
-        sm110_gqa_decode(q, kv, sequence_lengths)
-
-
-@pytest.mark.skipif(not _has_sm110(), reason="requires an exact SM110 GPU")
-@pytest.mark.parametrize(
-    ("batch", "capacity", "lengths", "seed"),
-    [
-        (1, 64, [1], 95601),
-        (4, 256, [64, 127, 191, 256], 95602),
-        (1, 1024, [1024], 95603),
-        (1, 4096, [3968], 95604),
-    ],
-)
-def test_sm110_gqa_decode_matches_reference(
-    batch: int,
-    capacity: int,
-    lengths: list[int],
-    seed: int,
-) -> None:
+def _inputs(batch, capacity, lengths, seed=0):
     generator = torch.Generator(device="cuda").manual_seed(seed)
     q = torch.randn(
-        batch,
-        32,
-        128,
-        dtype=torch.float16,
-        device="cuda",
-        generator=generator,
+        batch, 32, 128, dtype=torch.float16, device="cuda", generator=generator
     )
     kv = torch.randn(
         batch,
@@ -130,7 +73,154 @@ def test_sm110_gqa_decode_matches_reference(
         device="cuda",
         generator=generator,
     )
-    sequence_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    return q, kv, lengths
+
+
+class _RecordingModule:
+    """Stands in for the compiled module so the host path runs on any GPU."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, entry):
+        if not entry.startswith("run"):
+            raise AttributeError(entry)
+
+        def launch(*arguments):
+            self.calls.append((entry, arguments))
+
+        return launch
+
+
+def test_public_entry_point_is_experimental() -> None:
+    assert sm110_gqa_decode.is_experimental
+
+
+def test_registry_names_delivered_sources() -> None:
+    assert set(jit.ROUTES) == {
+        "short",
+        "long",
+        "n32_b4_direct",
+        "n32_disjoint_s10",
+        "n64_kvlast_s10",
+    }
+    for route, record in jit.ROUTES.items():
+        module = jit.MODULES[record["module"]]
+        assert record["num_splits"] in (1, 10), route
+        assert record["ffi_entry"].isidentifier(), route
+        assert record["kernel_symbol"].startswith("kernel_sm110_gqa_decode_"), route
+        for source in module["sources"]:
+            assert (_PACKAGE / source).is_file(), f"{route}: missing {source}"
+    assert set(jit.PREPARED_ROUTES.values()) <= set(jit.ROUTES)
+    assert {"manifest.json", "RESULTS.md"}.isdisjoint(
+        p.name for p in _PACKAGE.rglob("*")
+    )
+
+
+@_REQUIRES_CUDA
+@pytest.mark.parametrize(("batch", "capacity", "lengths", "seed"), _SHAPES)
+def test_decode_host_path_launches_without_device_synchronization(
+    monkeypatch, batch, capacity, lengths, seed
+) -> None:
+    """The convenience API enqueues one launch and never reads device values."""
+
+    module = _RecordingModule()
+    monkeypatch.setattr(backend, "load_sm110_gqa_decode_module", lambda **_: module)
+    q, kv, sequence_lengths = _inputs(batch, capacity, lengths, seed)
+    out = torch.empty_like(q)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        result = sm110_gqa_decode(q, kv, sequence_lengths, out=out, q_scale=1.5)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert result is out
+    (entry, arguments), *rest = module.calls
+    assert not rest
+    assert entry == jit.ROUTES["short" if capacity <= 64 else "long"]["ffi_entry"]
+    grouped_q, k, v, o, lengths_arg, scale, grid_x, grid_y, grid_z = arguments
+    assert tuple(grouped_q.shape) == (batch, 4, 8, 128)
+    assert grouped_q.data_ptr() == q.data_ptr()
+    assert k.data_ptr() == kv[:, 0].data_ptr() and v.data_ptr() == kv[:, 1].data_ptr()
+    assert o is out and lengths_arg is sequence_lengths
+    assert scale == pytest.approx(1.5 / math.sqrt(128) / math.log(2.0))
+    assert (grid_x, grid_y, grid_z) == (batch * 8, 1, 1)
+
+
+@_REQUIRES_CUDA
+@pytest.mark.parametrize(
+    ("batch", "capacity", "num_splits", "route", "workspace_bytes"),
+    [
+        (1, 64, None, "short", 0),
+        (4, 256, None, "n32_b4_direct", 0),
+        (4, 256, 1, "long", 0),
+        (1, 1024, None, "n64_kvlast_s10", 4 * (32 * 10 * 128 + 2 * 32 * 10) + 4 * 8),
+        (1, 1024, 10, "n64_kvlast_s10", 4 * (32 * 10 * 128 + 2 * 32 * 10) + 4 * 8),
+        (1, 4096, None, "n32_disjoint_s10", 4 * (32 * 10 * 128 + 2 * 32 * 10) + 4 * 8),
+        (2, 65, None, "long", 0),
+    ],
+)
+def test_prepared_host_path_selects_routes_without_device_synchronization(
+    monkeypatch, batch, capacity, num_splits, route, workspace_bytes
+) -> None:
+    launches = []
+    monkeypatch.setattr(prepared, "_check_exact_sm110a", lambda device: None)
+    monkeypatch.setattr(
+        prepared,
+        "_launcher",
+        lambda selected: lambda *arguments: launches.append((selected, arguments)),
+    )
+    q, kv, lengths = _inputs(batch, capacity, [capacity] * batch, 95700)
+    inputs = {"Q": q, "KV": kv, "O": torch.empty_like(q), "sequence_lengths": lengths}
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        state = prepared.prepare_for_launch(inputs, num_splits=num_splits)
+        result = prepared.launch_prepared(state)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert result is inputs["O"]
+    assert state["route"] == route
+    assert state["num_splits"] == jit.ROUTES[route]["num_splits"]
+    assert state["workspace_bytes"] == workspace_bytes
+    assert state["launch_names"] == [jit.ROUTES[route]["kernel_symbol"]]
+    ((selected, arguments),) = launches
+    assert selected == route
+    assert arguments[-3:] == (batch * 8 * state["num_splits"], 1, 1)
+    assert len(arguments) == (13 if state["num_splits"] > 1 else 9)
+
+
+@_REQUIRES_CUDA
+@pytest.mark.parametrize(
+    ("num_splits", "message"),
+    [
+        (True, "num_splits must be None or an integer"),
+        (3, "num_splits must be None or an integer"),
+        (10, "shape does not select an exported split tile"),
+    ],
+)
+def test_prepared_rejects_unsupported_b4_splits(monkeypatch, num_splits, message):
+    """The base API's split validation and its messages are unchanged."""
+
+    monkeypatch.setattr(prepared, "_check_exact_sm110a", lambda device: None)
+    q, kv, lengths = _inputs(4, 256, [64, 127, 191, 256], 95902)
+    inputs = {"Q": q, "KV": kv, "O": torch.empty_like(q), "sequence_lengths": lengths}
+    with pytest.raises(ValueError, match=message):
+        prepared.prepare_for_launch(inputs, num_splits=num_splits)
+
+
+@_REQUIRES_SM110
+@pytest.mark.parametrize(("batch", "capacity", "lengths", "seed"), _SHAPES)
+def test_sm110_gqa_decode_matches_reference(
+    batch: int,
+    capacity: int,
+    lengths: list[int],
+    seed: int,
+) -> None:
+    q, kv, sequence_lengths = _inputs(batch, capacity, lengths, seed)
     expected = _reference(q, kv, sequence_lengths, q_scale=1.0)
     q_before = q.clone()
     kv_before = kv.clone()

@@ -267,26 +267,29 @@ void moe_output_memset_inplace_bf16(int64_t input_ptr, int64_t num_tokens, int64
 void moe_activation_fp16(int64_t input_ptr, int64_t output_ptr, int64_t tile_idx_to_mn_limit_ptr,
                          int64_t num_non_exiting_tiles_ptr, int32_t activation_type,
                          int32_t max_num_permuted_tokens, int32_t interm_size, int32_t tile_size,
-                         bool enable_pdl) {
+                         bool enable_pdl, int64_t cuda_stream_ptr) {
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moeActivation<half>(reinterpret_cast<half const*>(input_ptr), reinterpret_cast<half*>(output_ptr),
                       reinterpret_cast<int32_t const*>(tile_idx_to_mn_limit_ptr),
                       reinterpret_cast<int32_t const*>(num_non_exiting_tiles_ptr),
                       static_cast<MoeActivationType>(activation_type), max_num_permuted_tokens,
-                      interm_size, tile_size, enable_pdl, get_current_stream());
+                      interm_size, tile_size, enable_pdl, stream);
 }
 
 #ifdef ENABLE_BF16
 void moe_activation_bf16(int64_t input_ptr, int64_t output_ptr, int64_t tile_idx_to_mn_limit_ptr,
                          int64_t num_non_exiting_tiles_ptr, int32_t activation_type,
                          int32_t max_num_permuted_tokens, int32_t interm_size, int32_t tile_size,
-                         bool enable_pdl) {
+                         bool enable_pdl, int64_t cuda_stream_ptr) {
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moeActivation<__nv_bfloat16>(reinterpret_cast<__nv_bfloat16 const*>(input_ptr),
                                reinterpret_cast<__nv_bfloat16*>(output_ptr),
                                reinterpret_cast<int32_t const*>(tile_idx_to_mn_limit_ptr),
                                reinterpret_cast<int32_t const*>(num_non_exiting_tiles_ptr),
                                static_cast<MoeActivationType>(activation_type),
-                               max_num_permuted_tokens, interm_size, tile_size, enable_pdl,
-                               get_current_stream());
+                               max_num_permuted_tokens, interm_size, tile_size, enable_pdl, stream);
 }
 #endif
 
@@ -361,16 +364,9 @@ void moe_sort(
     int64_t tile_idx_to_expert_idx_ptr, int64_t tile_idx_to_mn_limit_ptr,
     int64_t expanded_idx_to_permuted_idx_ptr, int64_t permuted_idx_to_expanded_idx_ptr,
     int64_t total_num_padded_tokens_ptr, int64_t num_non_exiting_tiles_ptr,
-    // Optional: expert counts buffer for large token counts (>1024)
+    // Optional: expert counts buffer for the cooperative and multi-kernel routing paths
     // Should be size 2 * num_experts, int32
     int64_t expert_counts_ptr,
-    // Optional dual-tile routing (0 / nullptr = off): pad each routing to
-    // tile_tokens_dim or tile_tokens_dim_alt at run time (see
-    // DataBase::mPaddingLog2Alt) and write the alternate tile list and the
-    // two active counts into these buffers.
-    int32_t tile_tokens_dim_alt, int32_t dual_tile_threshold_permille,
-    int64_t alt_tile_idx_to_expert_idx_ptr, int64_t alt_tile_idx_to_mn_limit_ptr,
-    int64_t alt_num_non_exiting_tiles_ptr, int64_t base_active_num_non_exiting_tiles_ptr,
     // Optional: explicit CUDA stream pointer for CUDA graph compatibility
     // If 0, uses TVM FFI's current stream
     int64_t cuda_stream_ptr) {
@@ -402,8 +398,8 @@ void moe_sort(
   // Not using packed format since we have explicit TopK IDs
   routingData.mPtrTopKPacked = nullptr;
 
-  // Expert counts buffer: required when num_tokens > 1024
-  // The kernel will set this to nullptr internally for small token counts
+  // Expert counts buffer: required by the cooperative and multi-kernel routing paths;
+  // 0 (nullptr) when the caller's token count takes neither path.
   routingData.mPtrExpertCounts = reinterpret_cast<int32_t*>(expert_counts_ptr);
 
   // Metadata
@@ -412,26 +408,6 @@ void moe_sort(
   routingData.mTopK = top_k;
   routingData.mPaddingLog2 = computeLog2(tile_tokens_dim);
   routingData.mTileTokensDim = tile_tokens_dim;
-  if (tile_tokens_dim_alt > 0) {
-    TVM_FFI_ICHECK(tile_tokens_dim_alt > tile_tokens_dim &&
-                   tile_tokens_dim_alt % tile_tokens_dim == 0 &&
-                   (tile_tokens_dim_alt & (tile_tokens_dim_alt - 1)) == 0 &&
-                   (tile_tokens_dim & (tile_tokens_dim - 1)) == 0)
-        << "dual-tile routing needs power-of-two tiles with tile_tokens_dim_alt a multiple "
-           "of tile_tokens_dim";
-    TVM_FFI_ICHECK(alt_tile_idx_to_expert_idx_ptr != 0 && alt_tile_idx_to_mn_limit_ptr != 0 &&
-                   alt_num_non_exiting_tiles_ptr != 0 && base_active_num_non_exiting_tiles_ptr != 0)
-        << "dual-tile routing needs the alternate list and both active-count buffers";
-    routingData.mPaddingLog2Alt = computeLog2(tile_tokens_dim_alt);
-    routingData.mDualTileThresholdPermille = dual_tile_threshold_permille;
-    routingData.mPtrCtaIdxXyToBatchIdxAlt =
-        reinterpret_cast<int32_t*>(alt_tile_idx_to_expert_idx_ptr);
-    routingData.mPtrCtaIdxXyToMnLimitAlt = reinterpret_cast<int32_t*>(alt_tile_idx_to_mn_limit_ptr);
-    routingData.mPtrNumNonExitingCtasAlt =
-        reinterpret_cast<int32_t*>(alt_num_non_exiting_tiles_ptr);
-    routingData.mPtrNumNonExitingCtasBaseActive =
-        reinterpret_cast<int32_t*>(base_active_num_non_exiting_tiles_ptr);
-  }
   routingData.mLocalExpertsStartIdx = local_expert_offset;
   routingData.mLocalExpertsStrideLog2 = 0;
   routingData.mNumLocalExperts = num_local_experts;

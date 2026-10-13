@@ -260,9 +260,7 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
   TLLM_CHECK_WITH_INFO(status == cudaSuccess, "Cake fused routing launch failed: %s",
                        cudaGetErrorString(status));
   sync_check_cuda_error(stream);
-  return;
-#endif
-
+#else
   // Check if we can use the optimized deepseek_v3_topk_kernel
   bool const is_single_group = (n_group == 1) && (num_experts <= NumKimiK2Experts);
 
@@ -310,6 +308,7 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                          "original pytorch implementation.",
                          n_group, num_experts, topk_group);
   }
+#endif
 }
 
 #define INSTANTIATE_NOAUX_TC(InputT, BiasT, OutputT, IdxT)                              \
@@ -356,6 +355,12 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
       << "scores and bias must be CUDA tensors";
   TVM_FFI_ICHECK(scores.device().device_id == bias.device().device_id)
       << "scores and bias must be on the same device";
+  // Both kernels address scores as a dense [num_tokens, num_experts] row-major matrix and write
+  // dense [num_tokens, topk] outputs; strided views are rejected instead of silently misread.
+  CHECK_CONTIGUOUS(scores);
+  CHECK_CONTIGUOUS(bias);
+  CHECK_CONTIGUOUS(topk_values);
+  CHECK_CONTIGUOUS(topk_indices);
   TVM_FFI_ICHECK(bias.dim() == 1 && bias.numel() == num_experts)
       << "bias must be 1D with length == number of experts (%ld)";
   TVM_FFI_ICHECK(num_experts % n_group == 0) << "num_experts should be divisible by n_group";
@@ -397,6 +402,7 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
     TVM_FFI_ICHECK(replay.sizes()[1] == topk) << "routing_replay_out dim1 must equal topk";
     TVM_FFI_ICHECK(encode_dlpack_dtype(replay.dtype()) == int16_code_val)
         << "routing_replay_out must be int16 dtype";
+    CHECK_CONTIGUOUS(replay);
     replay_ptr = reinterpret_cast<int16_t*>(replay.data_ptr());
   }
 

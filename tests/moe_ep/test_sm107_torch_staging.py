@@ -77,14 +77,14 @@ def test_sampled_oracle_matches_full_raw_scale_oracle(kind):
     torch.testing.assert_close(expected, full[indices], rtol=0.01, atol=0.001)
 
 
-@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
 def test_prequantized_metadata_rejects_wrong_encoding_and_oversized_scales(kind):
     fp = FleetParams(num_experts=4, max_tokens_per_rank=10, token_hidden_size=128)
     dtype = (
         torch.float4_e2m1fn_x2
         if kind == "nvfp4"
         else torch.float8_e4m3fn
-        if kind == "mxfp8_e4m3"
+        if kind in ("mxfp8_e4m3", "mxfp4_mxfp8")
         else torch.float8_e5m2
     )
     sf_dtype = torch.float8_e4m3fn if kind == "nvfp4" else torch.float8_e8m0fnu
@@ -181,6 +181,8 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     )
     ws.topk_idx = torch.zeros(4, 2, device="cuda", dtype=torch.int32)
     ws.topk_weights = torch.ones(4, 2, device="cuda")
+    for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+        setattr(ws, name, torch.ones(4, device="cuda") if kind == "nvfp4" else None)
     ws.output_activation = torch.empty(4, 128, device="cuda", dtype=torch.bfloat16)
     ws.shared_workspace = torch.zeros(4096, device="cuda", dtype=torch.uint8)
     ws.local_workspace = torch.zeros_like(ws.shared_workspace)

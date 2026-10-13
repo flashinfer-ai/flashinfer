@@ -427,7 +427,8 @@ def alphamoe_nvfp4_aligned_moe(
     ----------
     hidden_states : torch.Tensor
         Packed E2M1 activations ``[M, K / 2]``. The innermost stride must be 1;
-        row-strided views are supported.
+        row-strided views require a positive row stride of at least ``K / 2``
+        that is divisible by 16, and a 16-byte-aligned data pointer.
     hidden_states_scale : torch.Tensor
         Linear E4M3 scales ``[M, K / 16]``.
     gemm1_weights : torch.Tensor
@@ -925,6 +926,72 @@ def alphamoe_nvfp4_routed_moe(
     weighted route sum is written directly (the prior contents of ``out`` are
     ignored, so no zero fill is needed); the result equals the seeded path on a
     zero output bit for bit.
+
+    Parameters
+    ----------
+    hidden_states : torch.Tensor
+        Packed E2M1 activations ``[M, K / 2]``. The innermost stride must be 1;
+        row-strided views are supported.
+    hidden_states_scale : torch.Tensor
+        Linear E4M3 scales ``[M, K / 16]``.
+    gemm1_weights : torch.Tensor
+        Packed gate/up weights ``[E, N, K / 2]`` with ``N`` divisible by 256.
+    gemm1_weights_scale : torch.Tensor
+        Linear E4M3 scales ``[E, N, K / 16]``.
+    gemm2_weights : torch.Tensor
+        Packed down weights ``[E, K, N / 4]``.
+    gemm2_weights_scale : torch.Tensor
+        Linear E4M3 scales ``[E, K, N / 32]``.
+    output1_scale_gate_scalar : torch.Tensor
+        Contiguous FP32 per-expert gate dequantization scales ``[E]``.
+    output1_scale_scalar : torch.Tensor
+        Contiguous FP32 per-expert up-projection scales ``[E]``.
+    output2_scale_scalar : torch.Tensor
+        Contiguous FP32 per-expert down-projection scales ``[E]``.
+    sorted_token_ids : torch.Tensor
+        Caller-owned contiguous int32 storage for aligned-plan entries. It must
+        hold at least ``expert_ids.numel() * block_m`` entries.
+    expert_ids : torch.Tensor
+        Caller-owned contiguous int32 storage for expert ids in the aligned plan.
+    num_tokens_post_padded : torch.Tensor
+        Caller-owned one-element int32 tensor receiving the valid plan extent.
+    topk_weights : torch.Tensor
+        FP32 route weights ``[M, top_k]``.
+    out : torch.Tensor
+        Contiguous BF16 output ``[M, K]``. It is updated in place and returned.
+    topk_ids : torch.Tensor
+        Contiguous int32 routed expert ids ``[M, top_k]`` used to build the plan.
+    cumsum_buffer : torch.Tensor
+        Caller-owned contiguous int32 routing workspace with at least ``E + 2`` entries.
+    top_k : int
+        Routes per token.
+    block_m : int
+        Routing-plan block size, at least 8 and divisible by 8.
+    routed_scaling_factor : float
+        Finite scalar applied to each routed contribution.
+    w1_scale_prepared, w2_scale_prepared : Optional[torch.Tensor]
+        Immutable prepared scale panels from :func:`prepare_nvfp4_w1_scales` and
+        :func:`prepare_nvfp4_w2_scales`.
+    w1_data_prepared : Optional[torch.Tensor]
+        Immutable W1 panels from :func:`prepare_nvfp4_w1_data` for eligible routes.
+    w1_gate_up_data_prepared, w1_gate_up_scale_prepared : Optional[torch.Tensor]
+        Immutable adjacent gate/up panels from :func:`prepare_nvfp4_w1_gate_up_data`
+        and :func:`prepare_nvfp4_w1_gate_up_scales` for the M512 route.
+    w1_scale_prepared_interleaved : Optional[torch.Tensor]
+        Immutable interleaved W1 scales from :func:`prepare_nvfp4_w1_scales_interleaved`.
+    w2_data_prepared : Optional[torch.Tensor]
+        Immutable W2 panels from :func:`prepare_nvfp4_w2_data` for eligible routes.
+    w2_data_prepared_k256, w2_scale_prepared_k256 : Optional[torch.Tensor]
+        Immutable K256 W2 data and scale panels from
+        :func:`prepare_nvfp4_w2_data_k256` and :func:`prepare_nvfp4_w2_scales_k256`.
+    accumulate : bool
+        If ``True``, add routed contributions to the existing ``out`` values;
+        otherwise overwrite ``out`` with the routed sum.
+
+    Returns
+    -------
+    torch.Tensor
+        The same ``out`` tensor after routed accumulation.
     """
     _check_alphamoe_nvfp4_supported(
         hidden_states,

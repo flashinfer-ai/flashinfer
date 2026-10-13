@@ -73,11 +73,17 @@ def sampled_reference(
             l2[0].permute(0, 2, 1),
             l2[1],
             quant_kind=cfg.quant_kind,
+            combine_dtype=cfg.combine_dtype,
             local_expert_offset=cfg.rank * cfg.experts_per_rank,
             gate_up_clamp=cfg.gate_up_clamp,
             apply_topk_at_fc1=cfg.apply_topk_at_fc1,
             weight_scales_are_swizzled=True,
             return_fp32=True,
+            situ_beta=cfg.situ_beta,
+            situ_linear_beta=cfg.situ_linear_beta,
+            fc1_alpha=getattr(symm_buffer, "fc1_alpha", None),
+            fc2_alpha=getattr(symm_buffer, "fc2_alpha", None),
+            fc1_norm_const=getattr(symm_buffer, "fc1_norm_const", None),
         )
         if cfg.world_size > 1:
             dist.reduce(

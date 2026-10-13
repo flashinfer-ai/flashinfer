@@ -11,8 +11,8 @@ Kernel weight layout (see the drop's ``generate_inputs`` contract):
   stride-1; flat SF plane of
   ``round_up(hidden, 128) * round_up(intermediate/16, 4)``.
 
-Quantization uses norm_const=1.0, so the kernel's optional per-expert
-fc1_alpha / fc2_alpha / fc1_norm_const scalars stay omitted (identically 1).
+BF16 preprocessing uses norm_const=1.0. Prequantized block scales are preserved;
+any global normalization is corrected by the caller's per-expert alpha tensors.
 """
 
 from __future__ import annotations
@@ -55,16 +55,20 @@ def preprocess_mega_weights(
     intermediate_size: int,
     hidden_size: int,
 ) -> TransformedMegaWeights:
-    """Canonical bf16 ``w13``/``w2`` -> SM107 nvfp4 kernel layout.
-
-    Pre-quantized packs are not supported yet (the kernel-layout + swizzled-SF
-    import path can be added when a producer exists).
-    """
+    """Canonical BF16 or packed NVFP4 weights -> SM107 kernel layout."""
     if isinstance(weights, PrequantizedMoEWeights):
-        raise MoEEpConfigError(
-            "pre-quantized weights are not supported by the "
-            "sm107_nvfp4_nvfp4_bf16_cutedsl backend yet; pass canonical "
-            "bf16/fp32 weights."
+        from ......kernel_src.sm107.next_cutedsl_megamoe import (
+            preprocess_prequantized_block_scaled_weights,
+        )
+
+        return preprocess_prequantized_block_scaled_weights(
+            weights.w13,
+            weights.w2,
+            weights.w13_scale,
+            weights.w2_scale,
+            quant_kind="nvfp4",
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
         )
 
     from ......kernel_src.sm107.next_cutedsl_megamoe import (

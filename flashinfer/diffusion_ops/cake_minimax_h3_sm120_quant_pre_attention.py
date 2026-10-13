@@ -549,7 +549,9 @@ def minimax_h3_fp8_pre_attention(
     x_norm_weight : torch.Tensor
         BF16 ``[5376]`` pre-norm weight.
     adaln_scale, adaln_shift : torch.Tensor
-        BF16 ``[rows, 5376]`` AdaLN modulation tables; ``adaln_index`` (int32 ``[M]``) selects a row per token.
+        BF16 ``[rows, 5376]`` AdaLN modulation tables.
+    adaln_index : torch.Tensor
+        Int32 ``[M]`` indices selecting one AdaLN modulation row per token.
     qkv_weight_q, qkv_weight_scale : torch.Tensor
         ``float8_e4m3fn [21504, 5376]`` and FP32 ``[21504]`` from :func:`quantize_minimax_h3_qkv_weight_fp8`.
         Output column ``h * 384 + kind * 128 + d`` is channel ``d`` of head ``h`` for ``kind`` 0 = Q, 1 = K, 2 = V.
@@ -566,6 +568,10 @@ def minimax_h3_fp8_pre_attention(
         (row-major) with the caller's per-tensor ``*_global_scale`` (FlashInfer ``fp4_quantize`` semantics).
     q, k, v, q_sf, k_sf, v_sf : Optional[torch.Tensor]
         Optional pre-allocated outputs; allocated when omitted.
+    q_descale, k_descale, v_descale : Optional[Scalar]
+        Per-tensor E4M3 dequantization scales required when ``out_mode == "e4m3"``.
+    q_global_scale, k_global_scale, v_global_scale : Optional[Scalar]
+        NVFP4 global scales required when ``out_mode == "nvfp4"``.
     act_q, act_scale : Optional[torch.Tensor]
         Optional stage-1 workspaces (``float8_e4m3fn [M, 5376]``, FP32 ``[M]``); allocated when omitted.
 
@@ -698,14 +704,46 @@ def minimax_h3_nvfp4_pre_attention(
 
     Parameters
     ----------
-    qkv_weight_q, qkv_weight_sf, qkv_weight_global_scale
+    x : torch.Tensor
+        BF16 ``[M, 5376]`` hidden states.
+    x_norm_weight : torch.Tensor
+        BF16 ``[5376]`` pre-norm weight.
+    adaln_scale, adaln_shift : torch.Tensor
+        BF16 ``[rows, 5376]`` AdaLN modulation tables.
+    adaln_index : torch.Tensor
+        Int32 ``[M]`` indices selecting one AdaLN modulation row per token.
+    qkv_weight_q, qkv_weight_sf : torch.Tensor
         Outputs of :func:`quantize_minimax_h3_qkv_weight_nvfp4`.
+    qkv_weight_global_scale : Scalar
+        NVFP4 weight global scale as a float or single-element tensor.
     act_global_scale : torch.Tensor
         FP32 ``[1]`` CUDA tensor ``448 * 6 / amax`` of the calibrated normalized activation
         (:func:`nvfp4_global_scale_from_amax`); read on the device, no host synchronization.
+    q_norm_weight, k_norm_weight : torch.Tensor
+        BF16 ``[128]`` per-head RMSNorm weights.
+    rope_cos_sin : torch.Tensor
+        BF16 ``[M, 96]`` tensor storing ``[cos(48), sin(48)]`` per token.
+    eps : float
+        RMSNorm epsilon for both the pre-norm and the Q/K norms.
+    out_mode : str
+        Output format: ``"bf16"``, ``"e4m3"``, or ``"nvfp4"``. Shapes and quantization
+        conventions match :func:`minimax_h3_fp8_pre_attention`.
     alpha : Optional[float]
         ``1 / (act_global_scale * qkv_weight_global_scale)``.  Pass it explicitly to avoid the host
         synchronization needed to read the global scales; derived from them when omitted.
+    q, k, v : Optional[torch.Tensor]
+        Optional pre-allocated outputs; allocated when omitted.
+    q_sf, k_sf, v_sf : Optional[torch.Tensor]
+        Optional pre-allocated NVFP4 scale outputs; used only when
+        ``out_mode == "nvfp4"`` and ignored for other output modes. Allocated
+        when omitted in NVFP4 mode.
+    q_descale, k_descale, v_descale : Optional[Scalar]
+        Per-tensor E4M3 dequantization scales required when ``out_mode == "e4m3"``.
+    q_global_scale, k_global_scale, v_global_scale : Optional[Scalar]
+        NVFP4 global scales required when ``out_mode == "nvfp4"``.
+    act_q, act_sf : Optional[torch.Tensor]
+        Optional stage-1 workspaces (packed E2M1 ``uint8 [M, 2688]`` and UE4M3 scales
+        ``uint8 [M, 336]``); allocated when omitted.
 
     Returns
     -------

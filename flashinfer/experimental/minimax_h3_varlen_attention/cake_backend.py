@@ -79,12 +79,40 @@ Two program families share this package:
   one the plan needs with that program's parameter set
   (:func:`nvfp4_attention_stage`).
 
+The BF16 route also carries several programs per architecture (round 13 of
+the Cake kernel): three retraces of one Weave body with identical outputs --
+``attention`` (the static persistent schedule), ``attention_dyn`` (the dynamic
+whole-unit ticket scheduler: the first wave stays static, then the leader
+CTA's load warp draws the cluster's next unit from a per-plan ticket counter
+one unit ahead of its use; units are handed out in the LPT slot order, so
+only a unit's cluster changes) and, on ``BF16_SREAD_ARCHES`` (sm_100a) only,
+``attention_sread`` (the stage-0 cross-stage read wait issued before every P
+store, no per-block guard on the publish tail).
+:func:`build_bf16_segment_plan` decides from the plan numbers alone
+(``plan.dyn_sched``: at least ``BF16_DYN_SCHED_MIN_WAVES`` waves and
+``BF16_DYN_SCHED_MIN_CLUSTER_BLOCKS`` stage-weighted K/V blocks in every
+cluster's static share, then at least ``BF16_DYN_SCHED_MIN_UNITS_PER_CLUSTER``
+units per cluster or a static cluster imbalance above the cheapest unit;
+``plan.sread_unified`` is its complement) and
+:func:`prepare_minimax_h3_varlen_attention` binds that one program
+(``runner.attention_stage``, ``route_metadata["attention_variant"]``).  Every
+BF16 ``unit_table`` carries one more zero record after the ``num_clusters``
+prefetch padding: word 0 is the ticket counter, which the kernel resets at
+the end of every launch, so a cached plan needs no host memset.  The
+``attention_dyn`` program also uses word 6 of padding record ``c`` as
+cluster ``c``'s ticket mailbox and leaves the terminal ticket there, so
+the padding of a launched plan is launch state, not zeros.  Launches of
+one plan are stream-ordered (the plan cache keys the stream); never launch
+one cached plan concurrently from two streams.
+
 See ``README.md`` in this package and flashinfer-ai/flashinfer#4532.
 """
 
 from __future__ import annotations
 
+import functools
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence, Union
 
@@ -92,6 +120,7 @@ import torch
 import tvm_ffi
 
 from .cake_jit import (
+    BF16_SREAD_ARCHES,
     MODULES,
     STAGES,
     load_cake_minimax_h3_varlen_attention_module,
@@ -110,13 +139,63 @@ BF16_MAX_SEGMENT_CLUSTERS = 1 << 16
 # Fixed per-unit overhead (Q staging, pipeline fill, epilogue) in K/V-block
 # units for the longest-processing-time-first slot assignment.
 BF16_UNIT_OVERHEAD_BLOCKS = 2
+# Most recently used BF16 segment plans (device tables and the partial
+# workspace), keyed by ``(cu_seqlens, device index, num_heads, kv_splits,
+# q_split, stream)``.  The diffusion engine issues hundreds of calls per sample with
+# one segment layout; a hit re-launches with the cached tables (no Python
+# planning, no host-to-device copies, no allocation, no synchronization).
+# Bounded: the oldest plan is evicted once the limit is reached, so varying
+# segment layouts cannot grow device memory without bound.
+BF16_PLAN_CACHE_CAPACITY = 256
+# Cost of a single-stage unit (at most 256 valid Q rows: the kernel skips its
+# second Q stage) relative to a two-stage unit, as a fraction NUM / DEN: half
+# the MMA work, but the stage-0 softmax latency is no longer hidden behind
+# the other stage's MMAs.
+BF16_SINGLE_STAGE_COST_NUM = 3
+BF16_SINGLE_STAGE_COST_DEN = 5
+# Tail-round Q-split (mirrors the Cake production planner's ``Q_SPLIT_PLAN`` /
+# ``choose_q_splits``): a two-stage unit of the partial tail round, where
+# ``G - U mod G`` clusters would idle for a whole unit time, is emitted as two
+# 256-row single-stage records (record word 5, ``q_half`` 1 / 2) when the
+# simulated makespan improves by at least ``BF16_Q_SPLIT_MIN_GAIN``.  The bar
+# is lower than the K/V split's because a half costs nothing beyond its own
+# modelled single-stage inefficiency (no combine launch, no workspace).  The
+# registered attention program decodes the word on both architectures (it is
+# the Cake ``kernel_for_arch`` retrace traced with ``Q_SPLIT_DECODE``); plans
+# built with ``q_split=False`` are the plain enumeration (word 5 is 0).
+BF16_Q_SPLIT_PLAN = True
+BF16_Q_SPLIT_MIN_GAIN = 0.005
 # K/V-split planner (mirrors the Cake production planner ``choose_kv_splits``):
 # a unit is split into at most ``MAX_KV_SPLITS`` near-equal K/V block ranges;
 # the cost model is in K/V-block units (combine launch + per-slot traffic) and
 # a split is only taken below ``KV_SPLIT_MAX_WAVES`` waves when it beats the
 # unsplit makespan by more than ``KV_SPLIT_MIN_GAIN``.
-UNIT_WORDS = 4
+# Eight int32 per unit record: segment token begin, segment length,
+# ``head << 16 | cluster_in_segment``, ``kv_block_begin << 16 | kv_blocks``,
+# partial slot and three reserved words; the table carries ``num_clusters``
+# zero records of padding (every kernel role prefetches the record of its
+# next unit).
+UNIT_WORDS = 8
 COMBINE_WORDS = 4
+# Per-plan BF16 program dispatch (mirrors the Cake production planner's
+# ``dyn_sched_for_records`` / ``sread_unified_for_plan``, round 13): a plan
+# binds the dynamic whole-unit ticket scheduler (``attention_dyn``) when it
+# has at least ``BF16_DYN_SCHED_MIN_WAVES`` waves and every cluster's static
+# share is at least ``BF16_DYN_SCHED_MIN_CLUSTER_BLOCKS`` stage-weighted K/V
+# blocks (a two-stage unit counts its blocks twice) and then either the
+# fullest cluster runs at least ``BF16_DYN_SCHED_MIN_UNITS_PER_CLUSTER`` units
+# or the static LPT order is provably not makespan-optimal (its cluster
+# imbalance ``W_max - W_min`` exceeds the cheapest unit's weight).  The ticket
+# chain costs a fixed ~2.5 us at a cluster's first unit, so one-wave plans and
+# plans of many small units keep the static schedule.  Every other plan
+# records ``sread_unified`` and binds ``attention_sread`` on
+# ``BF16_SREAD_ARCHES`` (``cake_jit``).
+BF16_DYN_SCHED_MIN_WAVES = 2
+BF16_DYN_SCHED_MIN_CLUSTER_BLOCKS = 8192
+BF16_DYN_SCHED_MIN_UNITS_PER_CLUSTER = 64
+# Rows of one CTA's Q stage: a unit with at most this many valid rows from its
+# first row runs a single stage (the kernel's record decode, ``two_stages``).
+CTA_Q_ROWS = CLUSTER_Q_ROWS // 2
 PARTIAL_ROWS = CLUSTER_Q_ROWS  # FP16 rows per partial slot (one cluster's Q rows)
 MAX_KV_SPLITS = 8
 MAX_KV_BLOCKS = 1 << 16
@@ -176,12 +255,10 @@ PV_MMA_DTYPE = {
 # argument plans); ``grid`` is expanded to ``grid_x/y/z``.
 BF16_ATTENTION_KWARGS = (
     "Q",
-    "Q_raw",
     "K",
     "V",
     "O",
-    "seg_begin",
-    "seg_len",
+    "O_raw",
     "unit_table",
     "partial_O",
     "partial_ML",
@@ -317,15 +394,26 @@ class BF16SegmentPlan:
     """Host segment plan of the BF16 kernel (non-empty segments only).
 
     A *unit* is one head x one cluster tile (512 consecutive Q rows of one
-    segment); ``total_tiles = num_heads * total_clusters`` units run on a
-    persistent grid of ``num_clusters`` 2-CTA clusters (``2 * num_clusters``
-    CTAs).  ``unit_table`` holds ``UNIT_WORDS`` int32 per persistent-grid slot --
-    the segment index, ``head << 16 | cluster_in_segment``,
-    ``kv_block_begin << 16 | kv_blocks`` and the partial slot (-1 for an
-    unsplit unit) -- in slot order: unit ``u`` of the table runs on cluster
-    ``u % num_clusters`` as its ``u // num_clusters``-th unit (see
-    :func:`assign_unit_slots`).  ``total_tiles`` counts scheduled units
-    (split ranges included); ``combine_table`` holds ``COMBINE_WORDS`` int32
+    segment); the ``num_heads * total_clusters`` units run on a persistent
+    grid of ``num_clusters`` 2-CTA clusters (``2 * num_clusters`` CTAs).
+    ``unit_table`` holds ``UNIT_WORDS`` int32 per persistent-grid slot -- the
+    segment's token begin and length, ``head << 16 | cluster_in_segment``,
+    ``kv_block_begin << 16 | kv_blocks``, the partial slot (-1 for an unsplit
+    unit), ``q_half`` (0 for a whole 512-row unit, 1 / 2 for the first / second
+    256-row half of a tail-round Q-split unit, run as a single-stage unit) and
+    two reserved words -- in slot order: unit ``u`` of the table runs on
+    cluster ``u % num_clusters`` as its ``u // num_clusters``-th unit (see
+    :func:`assign_unit_slots`), followed by ``num_clusters`` zero records (the
+    kernel's one-unit-ahead record prefetch; the ``attention_dyn`` program uses
+    word 6 of padding record ``c`` as cluster ``c``'s ticket mailbox and leaves
+    the terminal ticket there) and one more zero record whose word 0 is the
+    dynamic scheduler's ticket counter (reset by the kernel at the end of
+    every launch).  ``dyn_sched`` / ``sread_unified`` record which
+    attention program the plan binds (``BF16_DYN_SCHED_MIN_WAVES`` and
+    below; ``sread_unified`` applies on ``BF16_SREAD_ARCHES`` only, see
+    :func:`bf16_attention_stage`).  ``total_tiles`` counts scheduled
+    units (K/V ranges and Q-split halves included; ``num_q_split_units`` counts
+    the halved units); ``combine_table`` holds ``COMBINE_WORDS`` int32
     per split (segment, head, cluster) unit and ``partial_O`` / ``partial_ML``
     are that plan's FP16 / FP32 partial workspace.
     """
@@ -345,14 +433,30 @@ class BF16SegmentPlan:
     num_partial_slots: int
     num_combine_units: int
     max_kv_splits: int
+    num_q_split_units: int
+    dyn_sched: bool
+    sread_unified: bool
+
+
+@functools.cache
+def _device_facts(index: int) -> tuple[int, tuple[int, int]]:
+    """``(multi_processor_count, compute capability)`` of CUDA device ``index``, read once."""
+    props = torch.cuda.get_device_properties(index)
+    return int(props.multi_processor_count), (int(props.major), int(props.minor))
+
+
+def _device_index(device: torch.device) -> int:
+    if device.type != "cuda":
+        raise ValueError(f"expected a CUDA device, got {device}")
+    return device.index if device.index is not None else torch.cuda.current_device()
 
 
 def bf16_grid_clusters(device: torch.device) -> int:
     """Persistent-grid capacity of ``device`` in 2-CTA clusters (``num_SMs / 2``)."""
-    return max(1, torch.cuda.get_device_properties(device).multi_processor_count // 2)
+    return max(1, _device_facts(_device_index(device))[0] // 2)
 
 
-def assign_unit_slots(unit_costs: Sequence[int], num_clusters: int) -> list[int]:
+def assign_unit_slots(unit_costs: Sequence[float], num_clusters: int) -> list[int]:
     """Longest-processing-time-first placement of units into persistent-grid slots.
 
     Slot ``k * num_clusters + i`` is the ``k``-th unit of cluster ``i``.  The
@@ -487,6 +591,134 @@ def _partial_workspace(
     )
 
 
+def bf16_unit_cost(blocks: int, single_stage: bool) -> int:
+    """LPT cost of a unit's K/V range in block units (single-stage units are discounted)."""
+    if single_stage:
+        blocks = (
+            blocks * BF16_SINGLE_STAGE_COST_NUM + BF16_SINGLE_STAGE_COST_DEN - 1
+        ) // BF16_SINGLE_STAGE_COST_DEN
+    return blocks + BF16_UNIT_OVERHEAD_BLOCKS
+
+
+def bf16_choose_q_splits(
+    costs: Sequence[int], half_costs: Sequence[Optional[int]], num_clusters: int
+) -> list[bool]:
+    """Which units of the partial tail round to run as two 256-row single-stage halves.
+
+    ``costs[u]`` is the LPT cost of unit ``u`` and ``half_costs[u]`` the cost
+    of one of its halves (``bf16_unit_cost(blocks, True)``), or ``None`` for a
+    unit that must stay whole: a single-stage unit (nothing to halve) or a
+    K/V-split range (the halves must stay clear of the combine path).  The
+    statically strided grid runs ``U mod G`` units in its tail round while
+    ``G - U mod G`` clusters idle for a whole unit time; each idle cluster can
+    take one half.  The ``n`` most expensive halvable tail-round units are
+    halved for ``n`` in ``1..idle`` (the makespan is a maximum, so the
+    expensive units bound it; the halves are cheaper than every unit, so they
+    and the unhalved tail units stay in the tail round) and the ``n`` with the
+    smallest simulated makespan (:func:`lpt_makespan`, smallest ``n`` on ties)
+    is taken when it beats the unhalved makespan by at least
+    ``BF16_Q_SPLIT_MIN_GAIN``.  Returns the per-unit flag (all ``False``
+    without a tail round, without a halvable candidate or without a paying
+    ``n``).  At most ``G / 2`` makespan simulations.  Mirrors the Cake
+    production planner's ``choose_q_splits``.
+    """
+    U = len(costs)
+    flags = [False] * U
+    if U == 0:
+        return flags
+    G = max(1, int(num_clusters))
+    tail = U % G
+    if tail == 0:
+        return flags
+    idle = G - tail
+    if U < G:
+        tail_units = list(range(U))
+    else:
+        tail_units = assign_unit_slots(costs, G)[(U // G) * G :]
+    candidates = sorted(
+        (u for u in tail_units if half_costs[u] is not None), key=lambda u: -costs[u]
+    )
+    if not candidates:
+        return flags
+    base = lpt_makespan(costs, G)
+    best, best_n = base, 0
+    for n in range(1, min(len(candidates), idle) + 1):
+        halved = set(candidates[:n])
+        sim: list[int] = []
+        for u in range(U):
+            half = half_costs[u]
+            if half is not None and u in halved:
+                sim.extend((half, half))
+            else:
+                sim.append(costs[u])
+        span = lpt_makespan(sim, G)
+        if span < best:
+            best, best_n = span, n
+    if best > base * (1.0 - BF16_Q_SPLIT_MIN_GAIN):
+        return flags
+    for u in candidates[:best_n]:
+        flags[u] = True
+    return flags
+
+
+def bf16_unit_weights(table: Sequence[int]) -> list[int]:
+    """Per-slot stage-weighted K/V blocks of a unit table (a two-stage unit counts its blocks twice).
+
+    Mirrors the Cake planner's ``unit_weights``: ``two_stages`` is the kernel's record decode
+    (``q_half == 0`` and more than ``CTA_Q_ROWS`` valid rows from the unit's first row).
+    """
+    weights: list[int] = []
+    for slot in range(len(table) // UNIT_WORDS):
+        words = table[slot * UNIT_WORDS : (slot + 1) * UNIT_WORDS]
+        seg_len, c, kv_blocks, q_half = (
+            words[1],
+            words[2] & 0xFFFF,
+            words[3] & 0xFFFF,
+            words[5],
+        )
+        unit_row0 = c * CLUSTER_Q_ROWS + (q_half >> 1) * CTA_Q_ROWS
+        two_stages = q_half == 0 and seg_len - unit_row0 > CTA_Q_ROWS
+        weights.append(kv_blocks * (2 if two_stages else 1))
+    return weights
+
+
+def bf16_cluster_work(table: Sequence[int], num_clusters: int) -> list[int]:
+    """Per-cluster work of the static slot order (slot ``k * G + i`` is unit ``k`` of cluster ``i``)."""
+    G = max(1, int(num_clusters))
+    work = [0] * G
+    for slot, weight in enumerate(bf16_unit_weights(table)):
+        work[slot % G] += weight
+    return work
+
+
+def bf16_dyn_sched(table: Sequence[int], total_tiles: int, num_clusters: int) -> bool:
+    """Whether a plan binds the dynamic whole-unit ticket scheduler (mirrors ``dyn_sched_for_records``).
+
+    ``table`` holds the ``total_tiles`` scheduled unit records (no padding records).
+    """
+    total_tiles, num_clusters = int(total_tiles), int(num_clusters)
+    if num_clusters <= 0 or total_tiles < BF16_DYN_SCHED_MIN_WAVES * num_clusters:
+        return False
+    weights = bf16_unit_weights(table)
+    work = [0] * num_clusters
+    for slot, weight in enumerate(weights):
+        work[slot % num_clusters] += weight
+    if min(work) < BF16_DYN_SCHED_MIN_CLUSTER_BLOCKS:
+        return False
+    if -(-total_tiles // num_clusters) >= BF16_DYN_SCHED_MIN_UNITS_PER_CLUSTER:
+        return True
+    return max(work) - min(work) > min(weights)
+
+
+def bf16_attention_stage(plan: "BF16SegmentPlan", arch: str) -> str:
+    """The attention program ``plan`` binds on ``arch``: ``attention_dyn``, ``attention_sread`` or ``attention``."""
+    if plan.dyn_sched:
+        return "attention_dyn"
+    if plan.sread_unified and arch in BF16_SREAD_ARCHES:
+        return "attention_sread"
+    return "attention"
+
+
 def build_bf16_segment_plan(
     cu_seqlens: Union[torch.Tensor, Sequence[int]],
     device: torch.device,
@@ -495,13 +727,20 @@ def build_bf16_segment_plan(
     num_clusters: Optional[int] = None,
     cu_seqlens_host: Optional[Sequence[int]] = None,
     kv_splits: Optional[int] = None,
+    q_split: Optional[bool] = None,
 ) -> BF16SegmentPlan:
     """Build the BF16 segment plan (tables and partial workspace on ``device``).
 
     ``num_clusters`` is the persistent-grid capacity in 2-CTA clusters; it
     defaults to ``bf16_grid_clusters(device)`` (``device`` must then be a CUDA
     device).  ``kv_splits`` forces one K/V split factor on every unit
-    (``None``: :func:`choose_kv_splits`).  The plan reproduces the Cake
+    (``None``: :func:`choose_kv_splits`).  ``q_split`` (``None``:
+    ``BF16_Q_SPLIT_PLAN``) enables the tail-round Q-split: unsplit two-stage
+    units of the partial tail round are emitted as two 256-row single-stage
+    records (``q_half`` 1 / 2 in record word 5) when
+    :func:`bf16_choose_q_splits` finds a paying makespan gain; the plan's
+    ``num_q_split_units`` counts the halved units.  Off, the records are
+    those of the plain plan (word 5 is 0).  The plan reproduces the Cake
     production planner's ``build_segment_plan`` table for table.
     """
     bounds = normalize_cu_seqlens(cu_seqlens, cu_seqlens_host=cu_seqlens_host)
@@ -529,8 +768,11 @@ def build_bf16_segment_plan(
         for _ in range(num_heads * clusters[seg])
     ]
     split_of = choose_kv_splits(unit_blocks, int(num_clusters), force=kv_splits)
-    units: list[tuple[int, int, int, int, int, int]] = []
+    # (segment, head, cluster_in_segment, kv_block_begin, kv_blocks, partial_slot, q_half)
+    units: list[tuple[int, int, int, int, int, int, int]] = []
     costs: list[int] = []
+    # LPT cost of one 256-row half of the unit; None for units that stay whole.
+    half_costs: list[Optional[int]] = []
     combine: list[int] = []
     partial_slots = 0
     unit_index = 0
@@ -539,22 +781,64 @@ def build_bf16_segment_plan(
             for c in range(seg_clusters):
                 chunks = split_chunks(blocks[seg], split_of[unit_index])
                 unit_index += 1
+                # Units with at most half a cluster tile of valid rows run one Q stage.
+                single_stage = lens[seg] - c * CLUSTER_Q_ROWS <= CLUSTER_Q_ROWS // 2
                 if len(chunks) == 1:
-                    units.append((seg, head, c, 0, blocks[seg], -1))
-                    costs.append(blocks[seg] + BF16_UNIT_OVERHEAD_BLOCKS)
+                    units.append((seg, head, c, 0, blocks[seg], -1, 0))
+                    costs.append(bf16_unit_cost(blocks[seg], single_stage))
+                    # A two-stage unit may run as two 256-row single-stage halves.
+                    half_costs.append(
+                        None if single_stage else bf16_unit_cost(blocks[seg], True)
+                    )
                     continue
                 combine.extend((seg, (head << 16) | c, partial_slots, len(chunks)))
                 for begin, count in chunks:
-                    units.append((seg, head, c, begin, count, partial_slots))
-                    costs.append(count + BF16_UNIT_OVERHEAD_BLOCKS)
+                    units.append((seg, head, c, begin, count, partial_slots, 0))
+                    costs.append(bf16_unit_cost(count, single_stage))
+                    half_costs.append(None)  # K/V ranges stay clear of the combine path
                     partial_slots += 1
+    if q_split is None:
+        q_split = bool(BF16_Q_SPLIT_PLAN)
+    num_q_split_units = 0
+    if q_split:
+        halve = bf16_choose_q_splits(costs, half_costs, int(num_clusters))
+        if any(halve):
+            split_units: list[tuple[int, int, int, int, int, int, int]] = []
+            split_costs: list[int] = []
+            for u, (unit, cost) in enumerate(zip(units, costs, strict=True)):
+                if not halve[u]:
+                    split_units.append(unit)
+                    split_costs.append(cost)
+                    continue
+                half_cost = half_costs[u]
+                assert half_cost is not None
+                # Consecutive in enumeration order: the stable LPT sort keeps
+                # the two halves on neighbouring slots (one head's K/V in L2).
+                for q_half in (1, 2):
+                    split_units.append((*unit[:6], q_half))
+                    split_costs.append(half_cost)
+                num_q_split_units += 1
+            units, costs = split_units, split_costs
     total_tiles = len(units)
     num_clusters = min(int(num_clusters), max(total_tiles, 1))
     table: list[int] = []
-    for unit in assign_unit_slots(costs, num_clusters):
-        seg, head, c, begin, count, slot = units[unit]
-        table.extend((seg, (head << 16) | c, (begin << 16) | count, slot))
+    for unit_index in assign_unit_slots(costs, num_clusters):
+        seg, head, c, begin, count, slot, q_half = units[unit_index]
+        table.extend(
+            (
+                begins[seg],
+                lens[seg],
+                (head << 16) | c,
+                (begin << 16) | count,
+                slot,
+                q_half,
+                0,
+                0,
+            )
+        )
     partial_O, partial_ML = _partial_workspace(partial_slots, device)
+    # Per-plan program dispatch from the scheduled records (see ``bf16_dyn_sched``).
+    dyn_sched = bf16_dyn_sched(table, total_tiles, num_clusters)
     return BF16SegmentPlan(
         cu_seqlens=bounds,
         num_heads=num_heads,
@@ -564,8 +848,16 @@ def build_bf16_segment_plan(
         num_clusters=num_clusters,
         seg_begin=_table(begins, device),
         seg_len=_table(lens, device),
+        # ``num_clusters`` zero records of padding (every kernel role prefetches
+        # the record of its next unit, ``tile_idx + num_clusters``; the
+        # ``attention_dyn`` program keeps cluster ``c``'s ticket mailbox in word 6
+        # of padding record ``c``) and one more zero record whose word 0 is the
+        # dynamic scheduler's ticket counter (reset by the kernel at the end of
+        # every launch).
         unit_table=torch.tensor(
-            table or [0] * UNIT_WORDS, dtype=torch.int32, device=device
+            (table or [0] * UNIT_WORDS) + [0] * (UNIT_WORDS * (num_clusters + 1)),
+            dtype=torch.int32,
+            device=device,
         ),
         combine_table=torch.tensor(
             combine or [0] * COMBINE_WORDS, dtype=torch.int32, device=device
@@ -575,7 +867,65 @@ def build_bf16_segment_plan(
         num_partial_slots=partial_slots,
         num_combine_units=len(combine) // COMBINE_WORDS,
         max_kv_splits=max(split_of, default=1),
+        num_q_split_units=num_q_split_units,
+        dyn_sched=dyn_sched,
+        # Recorded arch-independently; the launcher applies ``BF16_SREAD_ARCHES``.
+        sread_unified=not dyn_sched,
     )
+
+
+_BF16_PLANS: "OrderedDict[tuple, BF16SegmentPlan]" = OrderedDict()
+
+
+def cached_bf16_segment_plan(
+    cu_seqlens: Sequence[int],
+    device: torch.device,
+    num_heads: int,
+    *,
+    kv_splits: Optional[int] = None,
+    q_split: Optional[bool] = None,
+) -> BF16SegmentPlan:
+    """The BF16 segment plan of ``(cu_seqlens, device, num_heads, kv_splits,
+    q_split)`` on the current stream, built once.
+
+    ``cu_seqlens`` is the validated host tuple (:func:`normalize_cu_seqlens`);
+    ``q_split`` (``None``: ``BF16_Q_SPLIT_PLAN``) is the tail-round Q-split
+    option of :func:`build_bf16_segment_plan` and part of the key.
+    Plans live in a most-recently-used cache of ``BF16_PLAN_CACHE_CAPACITY``
+    entries; a hit returns the same tables and partial workspace, so repeated
+    calls with one segment layout cost no planning, uploads or allocations.
+    The key includes the current CUDA stream: launches of one plan are
+    stream-ordered on their stream (a K/V-split plan's partial workspace is
+    rewritten by every launch) and concurrent streams never share a plan.
+    The dynamic scheduler's ticket counter (word 0 of the plan's last
+    ``unit_table`` record) is rewritten by every launch as well and left at
+    zero by the kernel, so a cached plan needs no host reset.
+    """
+    index = _device_index(device)
+    q_split = bool(BF16_Q_SPLIT_PLAN) if q_split is None else bool(q_split)
+    key = (
+        tuple(int(v) for v in cu_seqlens),
+        index,
+        int(num_heads),
+        None if kv_splits is None else int(kv_splits),
+        q_split,
+        torch.cuda.current_stream(index).cuda_stream,
+    )
+    plan = _BF16_PLANS.get(key)
+    if plan is None:
+        while len(_BF16_PLANS) >= BF16_PLAN_CACHE_CAPACITY:
+            _BF16_PLANS.popitem(last=False)
+        plan = build_bf16_segment_plan(
+            key[0],
+            torch.device("cuda", index),
+            num_heads,
+            kv_splits=kv_splits,
+            q_split=q_split,
+        )
+        _BF16_PLANS[key] = plan
+    else:
+        _BF16_PLANS.move_to_end(key)
+    return plan
 
 
 def combine_kwargs(
@@ -782,10 +1132,18 @@ def build_tile_tables(
     if num_clusters is None:
         num_clusters = bf16_grid_clusters(device)
     segments = sorted(range(plan.num_segments), key=lambda s: -plan.seg_len[s])
-    cl = {
-        name: getattr(plan, name).tolist()
-        for name in ("cl_seg_begin", "cl_seg_len", "cl_kv_base", "cl_q_block")
+    cl: dict[str, list[int]] = {
+        "cl_seg_begin": [],
+        "cl_seg_len": [],
+        "cl_kv_base": [],
+        "cl_q_block": [],
     }
+    for s in range(plan.num_segments):
+        for c in range(plan.cluster_off[s + 1] - plan.cluster_off[s]):
+            cl["cl_seg_begin"].append(plan.seg_begin[s])
+            cl["cl_seg_len"].append(plan.seg_len[s])
+            cl["cl_kv_base"].append(plan.seg_tile_base[s])
+            cl["cl_q_block"].append(CLUSTER_Q_BLOCKS * c)
     seg_blocks = [(length + BLOCK_N - 1) // BLOCK_N for length in plan.seg_len]
     unit_blocks = [
         seg_blocks[s]
@@ -949,7 +1307,7 @@ def amax_kwargs(
 
 
 def _arch_for(device: torch.device) -> str:
-    capability = torch.cuda.get_device_capability(device)
+    capability = _device_facts(_device_index(device))[1]
     arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
     if arch is None:
         raise ValueError(
@@ -961,14 +1319,14 @@ def _arch_for(device: torch.device) -> str:
 
 def generated_program_available(device: torch.device, variant: str = "bf16") -> bool:
     """True when this checkout registers ``variant`` for ``device``."""
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
+    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(_device_facts(_device_index(device))[1])
     return arch is not None and route_available(variant, arch)
 
 
 def _bind_stage(
-    module_name: str, kwargs: dict[str, Any]
+    module_name: str, arch: str, kwargs: dict[str, Any]
 ) -> tuple[Callable[..., Any], tuple]:
-    """Order ``kwargs`` by the generated argument plan of ``module_name``."""
+    """Order ``kwargs`` by the generated argument plan of ``module_name`` built for ``arch``."""
     record = MODULES[module_name]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
     arguments = []
@@ -982,18 +1340,23 @@ def _bind_stage(
                 f"generated module {module_name!r} expects argument {name!r} "
                 f"({kind}); host binding provides {sorted(kwargs)}"
             )
-    module = load_cake_minimax_h3_varlen_attention_module(module_name)
+    module = load_cake_minimax_h3_varlen_attention_module(module_name, arch)
     return getattr(module, record["ffi_entry"]), tuple(arguments)
 
 
 def _persistent_grid(
     device: torch.device, total_tiles: int, *, at_least_one: bool
 ) -> tuple[int, int, int]:
-    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    num_sms = _device_facts(_device_index(device))[0]
     pairs = min(num_sms // 2, total_tiles)
     if at_least_one:
         pairs = max(1, pairs)
     return (2 * pairs, 1, 1)
+
+
+# Element multiple that keeps a BF16 stride 16-byte aligned (TMA global
+# strides and the BF16 kernel's 16-byte ragged-tail copies).
+THD_STRIDE_ALIGN = 16 // 2
 
 
 def _check_thd(
@@ -1002,7 +1365,19 @@ def _check_thd(
     total_tokens: int,
     num_heads: int,
     device: torch.device,
+    *,
+    contiguous: bool,
 ) -> None:
+    """Validate one ``[T, H, 128]`` BF16 operand.
+
+    ``contiguous=False`` accepts any view with unit innermost stride, a head
+    stride that is a 16-byte multiple of at least 128 elements, a token
+    stride that is a 16-byte multiple of at least ``H * head_stride`` and a
+    16-byte-aligned base: contiguous tensors, the column slices of a fused
+    ``[T, 3 * H * 128]`` QKV projection (strides ``(3 * H * 128, 128, 1)``)
+    and the slices of a ``[T, H, 3, 128]`` pack (strides ``(H * 384, 384,
+    1)``).  ``contiguous=True`` additionally requires a contiguous tensor.
+    """
     if not tensor.is_cuda or tensor.device != device:
         raise ValueError(f"{name} must live on {device}")
     if tensor.dtype != torch.bfloat16:
@@ -1012,8 +1387,27 @@ def _check_thd(
             f"{name} must be [T, H, {HEAD_DIM}] = {(total_tokens, num_heads, HEAD_DIM)}, "
             f"got {tuple(tensor.shape)}"
         )
-    if not tensor.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
+    row_stride, head_stride, elem_stride = (int(s) for s in tensor.stride())
+    if elem_stride != 1:
+        raise ValueError(
+            f"{name} must have a unit innermost stride, got stride(2)={elem_stride}"
+        )
+    if head_stride < HEAD_DIM or head_stride % THD_STRIDE_ALIGN:
+        raise ValueError(
+            f"{name} head stride must be a 16-byte multiple of at least {HEAD_DIM} "
+            f"elements, got {head_stride}"
+        )
+    if row_stride < num_heads * head_stride or row_stride % THD_STRIDE_ALIGN:
+        raise ValueError(
+            f"{name} token stride must be a 16-byte multiple of at least "
+            f"H * head_stride = {num_heads * head_stride} elements, got {row_stride}"
+        )
+    if tensor.data_ptr() % 16:
+        raise ValueError(f"{name} base address must be 16-byte aligned")
+    if contiguous and not tensor.is_contiguous():
+        raise ValueError(
+            f"{name} must be contiguous, got strides {tuple(tensor.stride())}"
+        )
 
 
 def validate_minimax_h3_varlen_inputs(
@@ -1021,10 +1415,16 @@ def validate_minimax_h3_varlen_inputs(
     key: torch.Tensor,
     value: torch.Tensor,
     out: Optional[torch.Tensor],
+    *,
+    strided_qkv: bool,
 ) -> tuple[int, int, torch.device]:
     """Shape / dtype / device validation shared by both families.
 
-    Returns ``(total_tokens, num_heads, device)``.
+    ``strided_qkv=True`` (the BF16 route) accepts strided ``[T, H, 128]``
+    views for ``query`` / ``key`` / ``value`` (see ``_check_thd``; the three
+    may differ in strides); ``False`` (the NVFP4 routes, whose quantizers
+    read contiguous THD) requires contiguous tensors.  ``out`` is always
+    contiguous.  Returns ``(total_tokens, num_heads, device)``.
     """
     if query.ndim != 3:
         raise ValueError(f"query must be THD [T, H, {HEAD_DIM}]")
@@ -1033,9 +1433,11 @@ def validate_minimax_h3_varlen_inputs(
         raise ValueError("query must have at least one head")
     device = query.device
     for name, tensor in (("query", query), ("key", key), ("value", value)):
-        _check_thd(name, tensor, total_tokens, num_heads, device)
+        _check_thd(
+            name, tensor, total_tokens, num_heads, device, contiguous=not strided_qkv
+        )
     if out is not None:
-        _check_thd("out", out, total_tokens, num_heads, device)
+        _check_thd("out", out, total_tokens, num_heads, device, contiguous=True)
     return total_tokens, num_heads, device
 
 
@@ -1059,6 +1461,7 @@ class MiniMaxH3VarlenAttentionRunner:
     arch: str
     plan: BF16SegmentPlan
     main_kwargs: dict
+    attention_stage: str
     out: torch.Tensor
     _entry: Optional[Callable[..., Any]]
     _arguments: tuple
@@ -1093,6 +1496,11 @@ class MiniMaxH3VarlenAttentionRunner:
             persistent_clusters=self.plan.num_clusters,
             kv_split_units=self.plan.num_combine_units,
             max_kv_splits=self.plan.max_kv_splits,
+            q_split_units=self.plan.num_q_split_units,
+            attention_variant=self.attention_stage,
+            dyn_sched=bool(self.plan.dyn_sched),
+            sread_unified=bool(self.plan.sread_unified)
+            and self.arch in BF16_SREAD_ARCHES,
         )
 
 
@@ -1212,13 +1620,20 @@ def prepare_minimax_h3_varlen_attention(
 ) -> MiniMaxH3VarlenAttentionRunner:
     """Validate, plan and bind one BF16 packed-varlen attention problem.
 
-    Every allocation happens here (only the optional output and the small
-    int32 plan tables); the returned runner launches with none.
+    ``query`` / ``key`` / ``value`` may be strided ``[T, H, 128]`` views (unit
+    innermost stride, 16-byte-aligned head and token strides and base; for
+    example the column slices of a fused QKV projection or the slices of a
+    ``[T, H, 3, 128]`` pack): the kernel reads them in place, no copies are
+    made.  ``out`` is contiguous.  The segment plan comes from the
+    most-recently-used plan cache (:func:`cached_bf16_segment_plan`): the
+    first preparation of a ``(cu_seqlens, num_heads, device, stream)`` builds
+    and uploads the tables, later ones reuse them, so the only allocation
+    here is the optional output; the returned runner launches with none.
     """
     if backend != "cake":
         raise ValueError("MiniMax-H3 varlen attention supports backend='cake'")
     total_tokens, num_heads, device = validate_minimax_h3_varlen_inputs(
-        query, key, value, out
+        query, key, value, out, strided_qkv=True
     )
     if isinstance(cu_seqlens, torch.Tensor) and (
         not cu_seqlens.is_cuda or cu_seqlens.device != device
@@ -1235,16 +1650,14 @@ def prepare_minimax_h3_varlen_attention(
         out = torch.empty(
             (total_tokens, num_heads, HEAD_DIM), dtype=torch.bfloat16, device=device
         )
-    plan = build_bf16_segment_plan(bounds, device, num_heads)
+    plan = cached_bf16_segment_plan(bounds, device, num_heads)
     total_tiles = int(plan.total_tiles)
     main_kwargs = dict(
         Q=query,
-        Q_raw=query,
         K=key,
         V=value,
         O=out,
-        seg_begin=plan.seg_begin,
-        seg_len=plan.seg_len,
+        O_raw=out,
         unit_table=plan.unit_table,
         partial_O=plan.partial_O,
         partial_ML=plan.partial_ML,
@@ -1254,15 +1667,22 @@ def prepare_minimax_h3_varlen_attention(
         grid=(2 * int(plan.num_clusters), 1, 1),
     )
     assert tuple(main_kwargs) == BF16_ATTENTION_KWARGS
+    attention_stage = bf16_attention_stage(plan, arch)
     entry: Optional[Callable[..., Any]] = None
     arguments: tuple = ()
     combine_entry: Optional[Callable[..., Any]] = None
     combine_arguments: tuple = ()
     if total_tiles > 0:
-        entry, arguments = _bind_stage(route["modules"]["attention"], main_kwargs)
+        # Per-plan program dispatch: the plan's ``dyn_sched`` / ``sread_unified``
+        # flags and the arch filter select one of the route's BF16 attention
+        # programs (``bf16_attention_stage``).
+        entry, arguments = _bind_stage(
+            route["modules"][attention_stage], arch, main_kwargs
+        )
         if plan.num_combine_units > 0:
             combine_entry, combine_arguments = _bind_stage(
                 route["modules"]["combine"],
+                arch,
                 combine_kwargs(
                     plan.partial_O,
                     plan.partial_ML,
@@ -1279,6 +1699,7 @@ def prepare_minimax_h3_varlen_attention(
         arch,
         plan,
         main_kwargs,
+        attention_stage,
         out,
         entry,
         arguments,
@@ -1312,7 +1733,7 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
         raise ValueError(f"pv_mode must be one of {PV_MODES}, got {pv_mode!r}")
     variant = NVFP4_VARIANT[pv_mode]
     total_tokens, num_heads, device = validate_minimax_h3_varlen_inputs(
-        query, key, value, out
+        query, key, value, out, strided_qkv=False
     )
     if isinstance(cu_seqlens, torch.Tensor) and (
         not cu_seqlens.is_cuda or cu_seqlens.device != device
@@ -1467,7 +1888,9 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
         if skipped:
             stages.append((stage, None, ()))
             continue
-        entry, arguments = _bind_stage(route["modules"][stage], stage_kwargs[stage])
+        entry, arguments = _bind_stage(
+            route["modules"][stage], arch, stage_kwargs[stage]
+        )
         stages.append((stage, entry, arguments))
     return MiniMaxH3VarlenNVFP4AttentionRunner(
         variant,
@@ -1499,6 +1922,21 @@ def minimax_h3_varlen_attention(
     cu_seqlens_host: Optional[Sequence[int]] = None,
     backend: str = "cake",
 ) -> torch.Tensor:
+    """BF16 packed-varlen attention in one call: plan, bind and launch.
+
+    The segment plan is resolved from ``cu_seqlens`` through the
+    most-recently-used plan cache (:func:`cached_bf16_segment_plan`): the
+    first call for a segment layout builds and uploads the tables, every
+    later call with the same ``cu_seqlens`` / ``num_heads`` on the same
+    device and stream re-launches with them (no planning, no host-to-device
+    copies, no allocation when ``out`` is given).  Without ``cu_seqlens_host``
+    the int32 CUDA tensor is read back to the host first (one stream
+    synchronization); pass ``cu_seqlens_host`` (the same offsets as a
+    Python sequence) to call without any device synchronization.  For CUDA
+    Graph capture prepare once with
+    :func:`prepare_minimax_h3_varlen_attention` (or warm this entry up with
+    the exact ``cu_seqlens`` on the capture stream) and replay the runner.
+    """
     runner = prepare_minimax_h3_varlen_attention(
         query,
         key,
@@ -1524,6 +1962,16 @@ def minimax_h3_varlen_nvfp4_attention(
     cu_seqlens_host: Optional[Sequence[int]] = None,
     backend: str = "cake",
 ) -> torch.Tensor:
+    """NVFP4 packed-varlen attention in one call: plan, quantize, attend.
+
+    Every call plans from ``cu_seqlens`` and allocates the packed operand
+    workspace.  Without ``cu_seqlens_host`` the int32 CUDA tensor is read
+    back to the host first (one stream synchronization); pass
+    ``cu_seqlens_host`` to plan without any device synchronization.  For
+    repeated launches of one problem or CUDA Graph capture prepare once
+    with :func:`prepare_minimax_h3_varlen_nvfp4_attention` (optionally
+    with a caller-owned ``workspace``) and call the runner.
+    """
     runner = prepare_minimax_h3_varlen_nvfp4_attention(
         query,
         key,

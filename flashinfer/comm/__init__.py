@@ -39,6 +39,30 @@ from .pcie_ipc_ar import (
 )
 from .pcie_ipc_ar import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
 from .pcie_ipc_ar import get_pcie_ipc_comm_module as get_pcie_ipc_comm_module
+from .pcie_ipc_collectives.all_gather import (
+    PcieIpcAllGatherWorkspace as PcieIpcAllGatherWorkspace,
+)
+from .pcie_ipc_collectives.all_gather_policy import (
+    PcieIpcAllGatherLaunchConfig as PcieIpcAllGatherLaunchConfig,
+)
+from .pcie_ipc_collectives.all_gather_policy import (
+    PcieIpcAllGatherVariant as PcieIpcAllGatherVariant,
+)
+from .pcie_ipc_collectives.all_gather_policy import (
+    get_pcie_ipc_all_gather_launch_config as get_pcie_ipc_all_gather_launch_config,
+)
+from .pcie_ipc_collectives.reduce_scatter import (
+    PcieIpcReduceScatterWorkspace as PcieIpcReduceScatterWorkspace,
+)
+from .pcie_ipc_collectives.reduce_scatter_policy import (
+    PcieIpcReduceScatterLaunchConfig as PcieIpcReduceScatterLaunchConfig,
+)
+from .pcie_ipc_collectives.reduce_scatter_policy import (
+    PcieIpcReduceScatterVariant as PcieIpcReduceScatterVariant,
+)
+from .pcie_ipc_collectives.reduce_scatter_policy import (
+    get_pcie_ipc_reduce_scatter_launch_config as get_pcie_ipc_reduce_scatter_launch_config,
+)
 from .pcie_ipc_policy import IpcLaunchConfig as PcieIpcLaunchConfig
 from .pcie_ipc_policy import IpcVariant as PcieIpcVariant
 from .pcie_ipc_tuning import PCIE_IPC_CUSTOM_OP as PCIE_IPC_CUSTOM_OP
@@ -74,6 +98,9 @@ from .ulysses_topology import (
     probe_ulysses_rank_topology as probe_ulysses_rank_topology,
 )
 from .ulysses_topology import resolve_ulysses_backend as resolve_ulysses_backend
+from .qkv_norm_rope_exchange_overlap import (
+    QkvNormRopeExchangeOverlap as QkvNormRopeExchangeOverlap,
+)
 
 # Unified AllReduce Fusion API
 from .allreduce import AllReduceFusionWorkspace as AllReduceFusionWorkspace

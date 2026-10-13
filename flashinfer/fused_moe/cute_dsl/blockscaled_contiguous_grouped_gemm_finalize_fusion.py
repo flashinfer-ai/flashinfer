@@ -42,10 +42,11 @@ Key features:
 
 import functools
 import warnings
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
+
 import cuda.bindings.driver as cuda
 import torch
 
@@ -207,7 +208,7 @@ def _get_compiled_finalize_kernel(
     sf_vec_size: int,
     tile_size: int,
     cluster_shape_mn: Tuple[int, int],
-    raster_along_m: Union[bool, str],
+    raster_along_m: bool,
     a_dtype: type,
     b_dtype: type,
     sf_dtype: type,
@@ -222,13 +223,6 @@ def _get_compiled_finalize_kernel(
     enable_pdl: bool = True,
     use_a_per_token_scale: bool = False,
     use_fused_finalize: bool = True,
-    enable_narrow_a: bool = False,
-    weight_l2_hint: Optional[int] = None,
-    swizzle_size: int = 1,
-    # Optional compacted work list (Blackwell only); its presence is part of
-    # the compiled kernel, the pointer value is a runtime parameter.
-    row_group_ptr=None,
-    pdl_trigger_early: bool = False,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -261,23 +255,15 @@ def _get_compiled_finalize_kernel(
         sf_dtype,
         out_dtype,
         final_scale_dtype,
+        # The persistent grid size is a compile-time constant.
+        max_active_clusters,
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
-        enable_narrow_a,
-        weight_l2_hint,
-        swizzle_size,
-        row_group_ptr is not None,
-        pdl_trigger_early,
     )
 
     if cache_key not in _finalize_kernel_cache:
         if is_rubin:
-            if row_group_ptr is not None or pdl_trigger_early:
-                raise NotImplementedError(
-                    "tile_idx_to_row_group and pdl_trigger_early are not "
-                    "supported by the Rubin (SM107) finalize grouped GEMM kernel."
-                )
             if use_a_per_token_scale:
                 raise NotImplementedError(
                     "use_a_per_token_scale (per-token activation scale) is "
@@ -310,8 +296,7 @@ def _get_compiled_finalize_kernel(
                 mma_inst_shape=mma_inst_shape,
                 mma_tiler=mma_tiler,
                 cluster_shape_mn=cluster_shape_mn,
-                # The SM107 kernel has no device-side raster choice.
-                raster_along_m=raster_along_m is True,
+                raster_along_m=raster_along_m,
                 topK=topk,
                 enable_pdl=enable_pdl,
             )
@@ -325,10 +310,6 @@ def _get_compiled_finalize_kernel(
                 enable_pdl=enable_pdl,
                 use_a_per_token_scale=use_a_per_token_scale,
                 use_fused_finalize=use_fused_finalize,
-                enable_narrow_a=enable_narrow_a,
-                weight_l2_hint=weight_l2_hint,
-                swizzle_size=swizzle_size,
-                pdl_trigger_early=pdl_trigger_early,
             )
             wrapper_fn = gemm_bw.wrapper
 
@@ -341,8 +322,8 @@ def _get_compiled_finalize_kernel(
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,
         #  permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
-        #  token_final_scales_ptr, [a_per_token_scale_ptr,
-        #  tile_idx_to_row_group_ptr], m, n, k, l, num_tokens, top_k,
+        #  token_final_scales_ptr, [a_per_token_scale_ptr],
+        #  m, n, k, l, num_tokens, top_k,
         #  tile_size, scaling_vector_size, max_active_clusters, stream)
         compiled_gemm = cute.compile(
             wrapper_fn,
@@ -357,7 +338,7 @@ def _get_compiled_finalize_kernel(
             permuted_idx_ptr,
             num_tiles_ptr,
             token_scales_ptr,
-            *([] if is_rubin else [a_per_token_scale_ptr, row_group_ptr]),
+            *([] if is_rubin else [a_per_token_scale_ptr]),
             permuted_m,
             n,
             k,
@@ -368,6 +349,8 @@ def _get_compiled_finalize_kernel(
             scaling_vector_size=sf_vec_size,
             max_active_clusters=max_active_clusters,
             stream=stream,
+            # Rubin strides must be runtime Int64s, not Python constexprs.
+            **({"c_stride_row": cutlass.Int64(0)} if is_rubin else {}),
         )
 
         _finalize_kernel_cache[cache_key] = compiled_gemm
@@ -396,21 +379,14 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     sf_vec_size: int = 16,
     mma_tiler_mn: Tuple[int, int] = (256, 128),
     cluster_shape_mn: Tuple[int, int] = (2, 1),
-    raster_along_m: Union[bool, str] = False,
-    # Persistent scheduler swizzle: with raster_along_m, tiles advance along M in
-    # groups of swizzle_size N tiles (must divide the N tile count).
-    swizzle_size: int = 1,
+    raster_along_m: bool = False,
     sm_count: Optional[int] = None,
+    domain_id: int = -1,
     # Rubin-specific parameters (optional; when set, use SM107 kernel)
     mma_tiler: Optional[Tuple[int, int, int]] = None,
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
-    _prepared_launches: Optional[Dict[str, Any]] = None,
-    _enable_narrow_a: bool = False,
-    weight_l2_hint: Optional[int] = None,
-    tile_idx_to_row_group: Optional[torch.Tensor] = None,
-    pdl_trigger_early: bool = False,
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
@@ -432,7 +408,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         token_final_scales: Router scaling factors, shape (seq_len, topk), float32/bf16/fp16
         out: Optional output tensor. Shape is ``(seq_len, n)`` in fused mode
              and ``(seq_len * topk, n)`` in deterministic mode. In fused mode,
-             a provided buffer must already be zero-initialized.
+             a provided buffer must already be zero-initialized. Caller-provided
+             buffers must be contiguous and on the same device as A.
         a_per_token_scale: Optional per-row operand-A scale, shape (permuted_m,).
              Used when GEMM1 output is quantized by a standalone per-token
              W4A4 quantizer instead of the fused GEMM1 epilogue.
@@ -443,16 +420,11 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         sf_vec_size: Scale factor vector size. Use 16 for W4A4 or 32 for W4A8.
         mma_tiler_mn: MMA tile shape (M, N). Default: (256, 128)
         cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Default: (2, 1)
-        raster_along_m: True rasters tiles along M, False along N, "auto" lets the
-            kernel pick per launch from the routing (Blackwell finalize kernel). Default: False
+        raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
-        tile_idx_to_row_group: Optional int32 work list, shape (num_tiles,):
-            scheduler slot ``i`` processes the ``tile_size``-row group
-            ``tile_idx_to_row_group[i]`` of the permuted rows (its expert and
-            limit are read at that group index) and ``num_non_exiting_tiles``
-            counts list entries. Blackwell only.
-        pdl_trigger_early: Signal programmatic dependents right after the
-            dependency wait instead of at kernel end (Blackwell only).
+        domain_id: Locality-domain index (0 or 1), or -1 for ordinary output.
+             Rubin localized execution writes this shard's hidden columns into
+             a caller-provided output with twice the shard's output width.
         use_fused_finalize: Use atomic fused finalize; otherwise write expanded
              rows for deterministic reduction. Default: True.
 
@@ -614,6 +586,23 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
 
     output_rows = seq_len if use_fused_finalize else seq_len * topk
 
+    # Both domains write disjoint column ranges of one full-width output.
+    localized_half_gemm = domain_id >= 0
+    if localized_half_gemm:
+        if not is_rubin:
+            raise ValueError(
+                "locality-domain hidden-shard (domain_id >= 0) is Rubin (SM107) only"
+            )
+        if domain_id >= 2:
+            raise ValueError(f"domain_id must be 0 or 1, got {domain_id}")
+        if out is None:
+            raise ValueError(
+                "locality-domain hidden-shard requires a caller-provided full-width out. Both "
+                "dies write disjoint column halves of one shared buffer, which the "
+                "caller must also have zeroed before the fused atomic finalize."
+            )
+    expected_n = n * 2 if localized_half_gemm else n
+
     # Atomic fused finalize requires zero-initialized output.
     if out is None:
         allocator = torch.zeros if use_fused_finalize else torch.empty
@@ -624,23 +613,39 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         )
     else:
         expected_out_dtype = cutlass_to_torch_dtype(out_dtype_cutlass)
-        if out.shape != (output_rows, n):
+        if out.shape != (output_rows, expected_n):
             raise ValueError(
-                f"out must have shape ({output_rows}, {n}), got {tuple(out.shape)}"
+                f"out must have shape ({output_rows}, {expected_n}), got {tuple(out.shape)}"
             )
         if out.dtype != expected_out_dtype:
             raise TypeError(
                 f"out must have dtype {expected_out_dtype}, got {out.dtype}"
             )
+        if out.device != a.device:
+            raise ValueError(f"out must be on {a.device}, got {out.device}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
 
     # Get SM count
+    total_sm = get_num_sm(a.device)
     if sm_count is None:
-        sm_count = get_num_sm(a.device)
+        sm_count = total_sm
 
     # Compute max active clusters (cached to avoid expensive HardwareInfo queries)
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
+    # Scale full-device occupancy to the green context's SM allocation.
+    if sm_count < total_sm:
+        max_active_clusters = max(1, max_active_clusters * sm_count // total_sm)
+
+    # Each domain writes its own columns with the full output row stride.
+    if localized_half_gemm:
+        c_stride_row_val = cutlass.Int64(n * 2)
+        c_data_ptr = out.data_ptr() + domain_id * n * out.element_size()
+    else:
+        c_stride_row_val = cutlass.Int64(0)
+        c_data_ptr = out.data_ptr()
 
     tile_size = mma_tiler[0] if is_rubin else mma_tiler_mn[0]
 
@@ -657,8 +662,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     b_sf_ptr = make_ptr(
         sf_dtype_cutlass, b_scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
     )
+    # c_data_ptr carries this die's column offset in locality-domain mode (== out.data_ptr()
+    # otherwise).
     c_ptr = make_ptr(
-        out_dtype_cutlass, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        out_dtype_cutlass, c_data_ptr, cute.AddressSpace.gmem, assumed_align=32
     )
 
     alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
@@ -674,26 +681,6 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     permuted_idx_ptr = make_ptr(
         cutlass.Int32, permuted_idx_to_expanded_idx.data_ptr(), cute.AddressSpace.gmem
     )
-    row_group_ptr = None
-    if tile_idx_to_row_group is not None:
-        if is_rubin:
-            raise NotImplementedError(
-                "tile_idx_to_row_group is not supported by the Rubin (SM107) "
-                "finalize grouped GEMM kernel."
-            )
-        if (
-            tile_idx_to_row_group.dtype != torch.int32
-            or tile_idx_to_row_group.device != a.device
-            or not tile_idx_to_row_group.is_contiguous()
-            or tile_idx_to_row_group.shape[0] < permuted_m // tile_size
-        ):
-            raise ValueError(
-                "tile_idx_to_row_group must be contiguous int32 on the input "
-                "device with at least permuted_m // tile_size entries"
-            )
-        row_group_ptr = make_ptr(
-            cutlass.Int32, tile_idx_to_row_group.data_ptr(), cute.AddressSpace.gmem
-        )
 
     # Token final scales - create pointer
     token_scales_ptr = make_ptr(
@@ -740,7 +727,6 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         tile_size=tile_size,
         cluster_shape_mn=cluster_shape_mn,
         raster_along_m=raster_along_m,
-        swizzle_size=swizzle_size,
         a_dtype=a_dtype_cutlass,
         b_dtype=b_dtype_cutlass,
         sf_dtype=sf_dtype_cutlass,
@@ -751,11 +737,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         mma_inst_shape=mma_inst_shape if is_rubin else None,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
-        weight_l2_hint=weight_l2_hint,
         use_a_per_token_scale=use_a_per_token_scale,
-        enable_narrow_a=_enable_narrow_a,
-        row_group_ptr=row_group_ptr,
-        pdl_trigger_early=pdl_trigger_early,
     )
 
     # Execute kernel with runtime parameters.
@@ -764,9 +746,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     # so on Rubin the extra pointer must be omitted here too.
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr, tile_idx_ptr,
     #  mn_limit_ptr, permuted_idx_ptr, num_tiles_ptr, token_scales_ptr,
-    #  [a_per_token_scale_ptr, tile_idx_to_row_group_ptr], m, n, k, l,
-    #  num_tokens, top_k, stream)
-    launch_args = (
+    #  [a_per_token_scale_ptr], m, n, k, l, num_tokens, top_k, stream)
+    compiled_gemm(
         a_ptr,
         b_ptr,
         a_sf_ptr,
@@ -778,17 +759,17 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         permuted_idx_ptr,
         num_tiles_ptr,
         token_scales_ptr,
-        *([] if is_rubin else [a_per_token_scale_ptr, row_group_ptr]),
+        *([] if is_rubin else [a_per_token_scale_ptr]),
         permuted_m,
         n,
         k,
         num_experts,
         seq_len,
         topk,
+        stream=stream,
+        # Match the runtime stride traced by the Rubin wrapper.
+        **({"c_stride_row": c_stride_row_val} if is_rubin else {}),
     )
-    if _prepared_launches is not None:
-        _prepared_launches["finalize"] = (compiled_gemm, launch_args)
-    compiled_gemm(*launch_args, stream=stream)
 
     return out
 

@@ -22,6 +22,8 @@ SUITES = {
     "host": [
         "tests/moe_ep/test_sm107_block_scaled_config.py",
         "tests/moe_ep/test_sm107_block_scaled_contracts.py",
+        "tests/moe_ep/test_sm107_runtime_options.py",
+        "tests/moe_ep/test_sm107_combine.py",
         "tests/moe_ep/test_sm107_block_scaled_weights.py",
         "tests/moe_ep/test_sm107_torch_staging.py",
         "tests/moe_ep/test_sm107_tuning.py",
@@ -31,6 +33,8 @@ SUITES = {
     "single": [
         "tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py",
         "tests/moe_ep/test_sm107_kernel_boundaries.py",
+        "tests/moe_ep/test_sm107_genphase_kernel.py",
+        "tests/moe_ep/test_sm107_combine_kernel.py",
     ],
     "multi": ["tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py"],
 }

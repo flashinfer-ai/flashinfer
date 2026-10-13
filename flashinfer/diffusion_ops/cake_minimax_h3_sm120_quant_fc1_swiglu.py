@@ -203,6 +203,18 @@ def prepare_minimax_h3_fc1_weight_fp8(
     ``float32`` ``[28672]`` in the prepacked row order.  The layout is specific to the SM120
     operator; it is not interchangeable with the SM100/SM103 ``prepare_minimax_h3_fc1_weight_*``
     outputs.
+
+    Parameters
+    ----------
+    fc1_weight : torch.Tensor
+        BF16 CUDA tensor with shape ``[28672, 5376]`` in gate-rows-then-up-rows order.
+    chunk_rows : int
+        Number of weight rows quantized per temporary FP32 chunk.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        The prepacked E4M3 weight and its FP32 per-row scales.
     """
     _check_fc1_weight(fc1_weight)
     weight_q = torch.empty(

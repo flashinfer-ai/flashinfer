@@ -4,8 +4,8 @@
 
 The JSON format and file location are shared with SM100. An ``sm107:`` device
 prefix keeps the architectures' entries separate. Implementation revision,
-quantization, EP size, geometry, combine format, nondeterminism permission,
-and routing-weight policy must match.
+quantization, EP size, geometry, combine format, activation and beta parameters,
+gate/up clamp, nondeterminism permission, and routing-weight policy must match.
 
 Populate entries with ``python -m flashinfer.moe_ep.tune``. Set
 ``FLASHINFER_MOE_EP_KNOB_CACHE`` to a path, or ``0``/``off`` to disable it;
@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _CACHE_VERSION = 1
 _KEY_FIELDS = (
     "backend_revision",
+    "kernel_variant",
     "allow_nondeterministic",
     "apply_topk_at_fc1",
     "device",
@@ -38,6 +39,10 @@ _KEY_FIELDS = (
     "num_experts",
     "topk",
     "combine_dtype",
+    "activation",
+    "situ_beta",
+    "situ_linear_beta",
+    "gate_up_clamp",
 )
 
 
@@ -105,7 +110,7 @@ def _knobs_from_json(knobs: Dict[str, Any]) -> Dict[str, Any]:
     return {k: tuple(v) if isinstance(v, list) else v for k, v in knobs.items()}
 
 
-def lookup_knobs(
+def _matching_entries(
     *,
     dtype: str,
     world_size: int,
@@ -115,18 +120,28 @@ def lookup_knobs(
     topk: int,
     max_tokens: int,
     combine_dtype: str = "bf16",
+    kernel_variant: str = "inference",
     device: Optional[str] = None,
     allow_nondeterministic: bool = False,
     apply_topk_at_fc1: bool = True,
-) -> Optional[Dict[str, Any]]:
+    activation: str = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    gate_up_clamp: Optional[float] = None,
+) -> List[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss."""
     path = _cache_path()
     if path is None:
-        return None
+        return []
     key = dict(
-        backend_revision="sm107-block-scaled-1667b47a-v3",
+        backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
+        kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        gate_up_clamp=gate_up_clamp,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -146,6 +161,56 @@ def lookup_knobs(
             allow_nondeterministic or not e["knobs"].get("reduce_topk_in_kernel", False)
         )
     ]
+    return matches
+
+
+def live_token_buckets(**kwargs: Any) -> List[int]:
+    from flashinfer.moe_ep.core.tuning import live_buckets
+
+    return live_buckets(_matching_entries(**kwargs), kwargs["max_tokens"])
+
+
+def lookup_knobs(
+    *,
+    dtype: str,
+    world_size: int,
+    hidden: int,
+    intermediate: int,
+    num_experts: int,
+    topk: int,
+    max_tokens: int,
+    live_tokens: Optional[int] = None,
+    combine_dtype: str = "bf16",
+    kernel_variant: str = "inference",
+    device: Optional[str] = None,
+    allow_nondeterministic: bool = False,
+    apply_topk_at_fc1: bool = True,
+    activation: str = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    gate_up_clamp: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    from flashinfer.moe_ep.core.tuning import select_token_entries
+
+    matches = _matching_entries(
+        dtype=dtype,
+        world_size=world_size,
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_experts,
+        topk=topk,
+        max_tokens=max_tokens,
+        combine_dtype=combine_dtype,
+        kernel_variant=kernel_variant,
+        device=device,
+        allow_nondeterministic=allow_nondeterministic,
+        apply_topk_at_fc1=apply_topk_at_fc1,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        gate_up_clamp=gate_up_clamp,
+    )
+    matches = select_token_entries(matches, max_tokens, live_tokens)
     if not matches:
         return None
     at_or_above = [e for e in matches if e["max_tokens"] >= max_tokens]
@@ -166,14 +231,22 @@ def record_knobs(
     num_experts: int,
     topk: int,
     max_tokens: int,
+    live_tokens: Optional[int] = None,
     combine_dtype: str = "bf16",
+    kernel_variant: str = "inference",
     device: Optional[str] = None,
     p50_us: Optional[float] = None,
     source: str = "autotune",
     allow_nondeterministic: bool = False,
     apply_topk_at_fc1: bool = True,
+    activation: str = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    gate_up_clamp: Optional[float] = None,
 ) -> Optional[str]:
     """Upsert one tuned entry (exact key incl. ``max_tokens``); atomic write.
+
+    ``live_tokens`` distinguishes workloads at the same workspace capacity.
 
     Best-effort: returns the cache path written, or ``None`` when the cache is
     disabled or the write failed.
@@ -182,13 +255,22 @@ def record_knobs(
         raise ValueError(
             "recording in-kernel reduction requires allow_nondeterministic=True"
         )
+    if live_tokens is None:
+        live_tokens = max_tokens
+    if type(live_tokens) is not int or not 0 <= live_tokens <= max_tokens:
+        raise ValueError("live_tokens must be between zero and max_tokens")
     path = _cache_path()
     if path is None:
         return None
     entry = dict(
-        backend_revision="sm107-block-scaled-1667b47a-v3",
+        backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
+        kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        gate_up_clamp=gate_up_clamp,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -198,6 +280,7 @@ def record_knobs(
         topk=topk,
         combine_dtype=combine_dtype,
         max_tokens=max_tokens,
+        live_tokens=live_tokens,
         knobs=_knobs_to_json(knobs),
         p50_us=p50_us,
         source=source,
@@ -211,6 +294,7 @@ def record_knobs(
             if not (
                 all(e.get(f) == entry[f] for f in _KEY_FIELDS)
                 and e.get("max_tokens") == max_tokens
+                and e.get("live_tokens", e["max_tokens"]) == live_tokens
             )
         ]
         entries.append(entry)
@@ -235,8 +319,14 @@ def record_knobs(
     return path
 
 
-def default_knobs(max_tokens: int, *, quant_kind: str = "nvfp4") -> Dict[str, Any]:
-    """Built-in SM107 heuristic: the upstream Rubin perf-report selected-best profile.
+def default_knobs(
+    max_tokens: int,
+    *,
+    quant_kind: str = "nvfp4",
+    kernel_variant: str = "inference",
+    combine_dtype: str = "bf16",
+) -> Dict[str, Any]:
+    """Built-in SM107 configurations for cache misses.
 
     Two token profiles (see TUNING.md): <2048 tokens/rank keeps the 128-wide
     N tile, >=2048 the 256-wide.  Both use mixed CGA (4x1 preferred, 2x1
@@ -244,11 +334,23 @@ def default_knobs(max_tokens: int, *, quant_kind: str = "nvfp4") -> Dict[str, An
     work IDs, FC2 bulk TMA stage 2, epi-warp token back, and separate top-k
     reduction.  Tile K is the kind's 2x-mode depth (2 x instruction K).
 
+    GenPhase uses uniform (4, 1) clusters and its required FC2 bulk path.
+    NVFP4 combine disables the peer-facing bulk store, which cannot send FP4.
     Returns a fresh dict each call.
     """
+    if kernel_variant == "genphase":
+        if combine_dtype != "bf16":
+            raise ValueError("GenPhase requires BF16 combine.")
+        return {
+            "cluster_shape_mn": (4, 1),
+            "fc2_use_bulk": True,
+            "reduce_topk_in_kernel": False,
+        }
+    if kernel_variant != "inference":
+        raise ValueError(f"unsupported kernel_variant {kernel_variant!r}")
     tile_k = 256 if quant_kind == "nvfp4" else 128
     tile_n = 128 if max_tokens < 2048 else 256
-    return {
+    knobs = {
         "mma_tiler_mnk": (256, tile_n, tile_k),
         "cluster_shape_mn": (4, 1),
         "fallback_cluster_shape_mn": (2, 1),
@@ -262,6 +364,12 @@ def default_knobs(max_tokens: int, *, quant_kind: str = "nvfp4") -> Dict[str, An
         "reduce_topk_in_kernel": False,
     }
 
+    if combine_dtype == "nvfp4":
+        # The peer-facing bulk store cannot send packed FP4 data.
+        knobs["fc2_use_bulk"] = False
+        knobs["fc2_tma_stages"] = None
+    return knobs
+
 
 def resolve_knobs(
     *,
@@ -272,9 +380,15 @@ def resolve_knobs(
     num_experts: int,
     topk: int,
     max_tokens: int,
+    live_tokens: Optional[int] = None,
     combine_dtype: str = "bf16",
+    kernel_variant: str = "inference",
     allow_nondeterministic: bool = False,
     apply_topk_at_fc1: bool = True,
+    activation: str = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    gate_up_clamp: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else the built-in heuristic.
 
@@ -288,13 +402,24 @@ def resolve_knobs(
         num_experts=num_experts,
         topk=topk,
         max_tokens=max_tokens,
+        live_tokens=live_tokens,
         combine_dtype=combine_dtype,
+        kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        gate_up_clamp=gate_up_clamp,
     )
     if cached is not None:
         return cached, "cache"
-    return default_knobs(max_tokens, quant_kind=dtype), "heuristic"
+    return default_knobs(
+        max_tokens,
+        quant_kind=dtype,
+        kernel_variant=kernel_variant,
+        combine_dtype=combine_dtype,
+    ), "heuristic"
 
 
 __all__ = [

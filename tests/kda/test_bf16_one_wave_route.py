@@ -4,12 +4,19 @@ Licensed under the Apache License, Version 2.0.
 https://www.apache.org/licenses/LICENSE-2.0
 """
 
-"""BF16 prefill routing: one-wave grids take the M64 value split on SM100a/SM103a."""
+"""BF16 prefill routing: one-wave grids take the M64 value split on SM100a/SM103a.
+
+The prepared export serves FP32 state pools, whose split body carries FP32
+chunk state (CAKE-736 round 9), so bounded logit-beta grids keep the split at
+every length; the BF16-pool split body (not exported here) keeps its BF16
+carrier and is routed to the direct N32 body beyond one 64-token chunk.
+"""
 
 import pytest
 import torch
 
 from flashinfer import prepare_bf16_kda_prefill
+from flashinfer.cake_kda_tf32_runtime import select_bf16_schedule_route
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -77,8 +84,15 @@ def _prepare(lengths, heads, *, active_beta):
             True,
             "fused_active_beta_checkpoint_dvsplit_m64",
         ),
-        # Logit beta, FP32 state, 24 tasks: the FP32-state M64 split.
+        # Logit beta, FP32 state, 24 tasks, 1025 tokens: the FP32-state M64
+        # split.  Its round-7 body re-derived the chunk state from a BF16 copy
+        # and drifted 0.026 at 1024 tokens under trained deep-layer statistics
+        # (CAKE-736 round 8 routed it to the direct N32 body); the round-9 body
+        # accumulates the decay correction onto the FP32 state (delta decay),
+        # so the split is back.
         ((33, 1025), 12, False, "fused_m64_independent_dvsplit_fp32_state"),
+        # Logit beta, FP32 state, single-chunk residuals: the split stays.
+        ((17, 64, 33, 64, 9, 64), 6, False, "fused_m64_independent_dvsplit_fp32_state"),
         # Mixed lengths with six heads (36 tasks), active beta.
         (
             (1300, 547, 2048, 963, 271, 3063),
@@ -104,3 +118,15 @@ def test_multi_wave_grid_keeps_direct_tile():
     schedule = _prepare((128,) * 8, 12, active_beta=True)
     assert "m64" not in schedule
     assert schedule.startswith("fused_")
+
+
+def test_select_bf16_schedule_route_rejects_unknown_gpu_arch():
+    """The metadata adapter takes ``gpu_arch`` directly (no device probe); an
+    unmapped architecture string fails with a clear error instead of a KeyError."""
+    kwargs = dict(
+        sm_count=148, fixed_layout=False, sequence_lengths=(1025, 33), num_heads=12
+    )
+    for gpu_arch in ("sm_100a", "sm_103a"):
+        assert isinstance(select_bf16_schedule_route(gpu_arch=gpu_arch, **kwargs), str)
+    with pytest.raises(ValueError, match="gpu_arch must be one of"):
+        select_bf16_schedule_route(gpu_arch="sm_90a", **kwargs)
