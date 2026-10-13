@@ -520,9 +520,7 @@ _INVENTORY_ROWS = (
     _INVENTORY_ROWS,
     ids=[row[0] for row in _INVENTORY_ROWS],
 )
-def test_main_block_n_routes_the_inventory_rows_like_the_exporter(
-    label, shape, widths
-):
+def test_main_block_n_routes_the_inventory_rows_like_the_exporter(label, shape, widths):
     """The delivered loader resolves every inventory row to the width the
     exporter built its route with; on the inventory the delivered-class table
     never changes the outcome of the frozen rule."""
@@ -1409,9 +1407,7 @@ def test_launch_is_one_host_sequence_call_with_the_workspace_tables(monkeypatch)
     # 288 N256 tiles: two waves, and halving the width saves no idle slot
     # (2 * 2 = ceil(576 / 148)), so the call runs the N256 main; the width
     # travels to the sequence right after grid_z.
-    grid = backend.loader.main_grid(
-        1025, 2048, world_size=4, sm_count=148, block_n=256
-    )
+    grid = backend.loader.main_grid(1025, 2048, world_size=4, sm_count=148, block_n=256)
     assert sequence.calls == [
         (
             "run",
