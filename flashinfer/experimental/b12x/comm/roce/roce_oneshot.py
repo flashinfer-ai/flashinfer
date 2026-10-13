@@ -30,7 +30,7 @@ import os
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -228,6 +228,7 @@ class RoceOneshotAllReduce:
         pipe_threshold: Optional[int] = None,
         pipe_blocks: int = DEFAULT_PIPE_BLOCKS,
         pipe_chunk_bytes: int = DEFAULT_PIPE_CHUNK_BYTES,
+        region_allocator: Optional[Callable[[int], torch.Tensor]] = None,
     ) -> None:
         """Allocate the pinned region, build and connect the proxy, and start it.
 
@@ -236,6 +237,12 @@ class RoceOneshotAllReduce:
         ``default_pipe_threshold(world)``) up to ``pipe_bytes``, and any message
         above ``max_size``; smaller messages keep the one-shot path, whose
         latency is lower.
+
+        ``region_allocator(nbytes)``, when given, supplies the pinned region: a
+        CPU ``uint8`` tensor of at least ``nbytes`` registered with CUDA at the
+        same device address (for example a runtime package's mapped host
+        storage, which a native runtime restores at that address and drives
+        from ``native_description``).  The runtime zeroes it.
         """
         self.device = _normalize_device(device)
         self.rank = dist.get_rank(group=exchange_group)
@@ -304,9 +311,25 @@ class RoceOneshotAllReduce:
         with torch.cuda.device(self.device):
             # Pinned, zero-initialised: flags and the control record start at 0
             # and the first sequence number is 1.
-            self._region = torch.zeros(
-                self._layout.total_bytes, dtype=torch.uint8, pin_memory=True
-            )
+            if region_allocator is None:
+                self._region = torch.zeros(
+                    self._layout.total_bytes, dtype=torch.uint8, pin_memory=True
+                )
+            else:
+                region = region_allocator(self._layout.total_bytes)
+                if (
+                    region.device.type != "cpu"
+                    or region.dtype != torch.uint8
+                    or region.numel() < self._layout.total_bytes
+                    or not region.is_contiguous()
+                    or region.data_ptr() % _SLOT_ALIGNMENT
+                ):
+                    raise ValueError(
+                        "region_allocator must return a contiguous, page-aligned CPU "
+                        f"uint8 tensor of at least {self._layout.total_bytes} bytes"
+                    )
+                self._region = region[: self._layout.total_bytes]
+                self._region.zero_()
             # Epoch and poison are global. Stage and tail arrivals are separate
             # for every power-of-two grid size because their free-running
             # counters use the launch grid as their modulus.
@@ -822,6 +845,42 @@ class RoceOneshotAllReduce:
                 f"poisoned (its epoch stopped at {failed_seq - 1}, later launches "
                 "do nothing) and rank data is no longer trustworthy"
             )
+
+    def native_description(self) -> dict[str, Any]:
+        """What a native runtime needs to rebuild this rank's transport over the same memory.
+
+        The region and the device counters must be restored at their recorded
+        addresses and zeroed, so every rank starts again at sequence 1 with
+        empty flags.  ``hca_names``, ``gid_index`` and the per-peer ``routes``
+        (local HCA index, peer HCA index per rail) are the ones this setup
+        verified; a restoring host must expose the same devices.  The proxy
+        ABI pins the region layout and the doorbell protocol.  The kernel's
+        error word is ``ctrl_offset + 8`` in the region.
+        """
+        if self._proxy is None:
+            raise RuntimeError("RoCE runtime is closed")
+        layout = self._layout
+        return {
+            "proxy_abi": _load_proxy_library().roce_abi_version(),
+            "world_size": self.world_size,
+            "rank": self.rank,
+            "region": {
+                "address": self._region.data_ptr(),
+                "nbytes": layout.total_bytes,
+            },
+            "counters": {
+                "address": self._counters.data_ptr(),
+                "nbytes": self._counters.numel() * self._counters.element_size(),
+            },
+            "slot_bytes": self._slot_bytes,
+            "pipe_bytes": layout.pipe_bytes,
+            "ctrl_offset": layout.ctrl_off,
+            "hca_names": list(self.hca_names),
+            "gid_index": self.gid_index,
+            "traffic_class": self._proxy.traffic_class,
+            "rails": self.rail_count,
+            "routes": [[list(link) for link in links] for links in self.routes],
+        }
 
     @property
     def poisoned(self) -> bool:

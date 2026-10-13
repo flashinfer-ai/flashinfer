@@ -282,3 +282,45 @@ def test_twoshot_fail_stop_on_timeout(runtime):
     assert not torch.equal(out, x * dist.get_world_size())
     rt.close()  # teardown during failure must not hang
     dist.barrier()
+
+
+def test_external_region_and_native_description():
+    """A caller-supplied region carries the transport; the description names it and the counters."""
+    world, rank = dist.get_world_size(), dist.get_rank()
+    supplied = []
+
+    def allocate(nbytes):
+        # Fill with garbage: the runtime must zero the region itself.
+        region = torch.full((nbytes + 8192,), 0xA5, dtype=torch.uint8, pin_memory=True)
+        supplied.append(region)
+        return region
+
+    prepared = _prepare(region_allocator=allocate)
+    rt = prepared.runtime
+    try:
+        description = rt.native_description()
+        assert description["region"]["address"] == supplied[0].data_ptr()
+        assert (
+            description["region"]["nbytes"]
+            == rt._layout.total_bytes
+            <= supplied[0].numel()
+        )
+        assert description["counters"]["address"] == rt._counters.data_ptr()
+        assert (description["world_size"], description["rank"]) == (world, rank)
+        assert (
+            description["pipe_bytes"] == PIPE_BYTES
+            and description["rails"] == rt.rail_count
+        )
+        assert len(description["routes"]) == world and description["routes"][rank] == []
+        torch.manual_seed(5 + rank)
+        x = torch.randn(1 << 20, dtype=torch.bfloat16, device=rt.device)
+        expected = x.clone()
+        dist.all_reduce(expected)
+        rtol, atol = _tolerance(torch.bfloat16, world)
+        torch.testing.assert_close(prepared.twoshot(x), expected, rtol=rtol, atol=atol)
+        torch.testing.assert_close(
+            prepared.oneshot(x[:4096]), expected[:4096], rtol=rtol, atol=atol
+        )
+    finally:
+        rt.close()
+        dist.barrier()
