@@ -61,7 +61,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_blackwell_msa_ac0063009af12ef9de35(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages)
+kernel_cake_blackwell_msa_2a38253c76cec86dc2cd(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -618,6 +618,11 @@ kernel_cake_blackwell_msa_ac0063009af12ef9de35(const __grid_constant__ CUtensorM
                 smem_row_sum[state_idx] = row_sum;
                 smem_row_max[state_idx] = row_max;
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                if (stage == 0) {
+                    mbarrier_wait(p_full_addr, 1);
+                } else {
+                    mbarrier_wait(p_full_addr + 8, 1);
+                }
                 if (stage == 0) {
                     mbarrier_arrive(corr_sig_addr);
                 } else {

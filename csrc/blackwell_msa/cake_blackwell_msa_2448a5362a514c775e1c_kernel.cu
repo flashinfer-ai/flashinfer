@@ -110,7 +110,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_prefill, __half* __restrict__ Q_prefill_raw, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap K_prefill_pair, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, const __grid_constant__ CUtensorMap V_prefill_pair, const __grid_constant__ CUtensorMap KV, __half* __restrict__ O, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ qo_indptr, int* __restrict__ kv_indptr, int* __restrict__ kv_len_arr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int* __restrict__ task_q_tile, int* __restrict__ task_split, int* __restrict__ task_kv_tile_begin, int* __restrict__ task_kv_tile_end, int* __restrict__ task_qo_begin, int* __restrict__ task_qo_end, int* __restrict__ task_page_begin, int* __restrict__ task_page_end, int* __restrict__ status, int num_requests, int num_q_heads, int num_kv_heads, int max_kv_tiles, int max_splits, int max_task_claims, float softmax_scale_log2, float k_global_scale, float v_global_scale, int attention_mode, int is_causal, int derive_q_offset, int record_tasks, int msa_max_pages, int msa_split_policy)
+kernel_cake_blackwell_msa_2448a5362a514c775e1c(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_prefill, __nv_bfloat16* __restrict__ Q_prefill_raw, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap K_prefill_pair, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, const __grid_constant__ CUtensorMap V_prefill_pair, const __grid_constant__ CUtensorMap KV, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ qo_indptr, int* __restrict__ kv_indptr, int* __restrict__ kv_len_arr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int* __restrict__ task_q_tile, int* __restrict__ task_split, int* __restrict__ task_kv_tile_begin, int* __restrict__ task_kv_tile_end, int* __restrict__ task_qo_begin, int* __restrict__ task_qo_end, int* __restrict__ task_page_begin, int* __restrict__ task_page_end, int* __restrict__ status, int num_requests, int num_q_heads, int num_kv_heads, int max_kv_tiles, int max_splits, int max_task_claims, float softmax_scale_log2, float k_global_scale, float v_global_scale, int attention_mode, int is_causal, int derive_q_offset, int record_tasks, int msa_max_pages, int msa_split_policy)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -166,35 +166,35 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
     const int smem_exch0_u32_addr = smem + SMEM_SMEM_EXCH0_U32_OFF;
     unsigned int* smem_exch1_u32 = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_EXCH1_U32_OFF);
     const int smem_exch1_u32_addr = smem + SMEM_SMEM_EXCH1_U32_OFF;
-    __half* smem_qt = reinterpret_cast<__half*>(smem_raw + SMEM_SMEM_QT_OFF);
+    __nv_bfloat16* smem_qt = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_QT_OFF);
     const int smem_qt_addr = smem + SMEM_SMEM_QT_OFF;
-    __half* smem_kv = reinterpret_cast<__half*>(smem_raw + SMEM_SMEM_KV_OFF);
+    __nv_bfloat16* smem_kv = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_KV_OFF);
     const int smem_kv_addr = smem + SMEM_SMEM_KV_OFF;
-    __half* smem_v = reinterpret_cast<__half*>(smem_raw + SMEM_SMEM_V_OFF);
+    __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_V_OFF);
     const int smem_v_addr = smem + SMEM_SMEM_V_OFF;
     uint8_t* smem_kv_fp8 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_KV_FP8_OFF);
     const int smem_kv_fp8_addr = smem + SMEM_SMEM_KV_FP8_OFF;
     uint8_t* smem_kv_nvfp4_scale = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_KV_NVFP4_SCALE_OFF);
     const int smem_kv_nvfp4_scale_addr = smem + SMEM_SMEM_KV_NVFP4_SCALE_OFF;
-    __half* smem_p0 = reinterpret_cast<__half*>(smem_raw + SMEM_SMEM_P0_OFF);
+    __nv_bfloat16* smem_p0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_P0_OFF);
     const int smem_p0_addr = smem + SMEM_SMEM_P0_OFF;
-    __half* smem_p1 = reinterpret_cast<__half*>(smem_raw + SMEM_SMEM_P1_OFF);
+    __nv_bfloat16* smem_p1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_P1_OFF);
     const int smem_p1_addr = smem + SMEM_SMEM_P1_OFF;
     int* smem_page_indices = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_PAGE_INDICES_OFF);
     const int smem_page_indices_addr = smem + SMEM_SMEM_PAGE_INDICES_OFF;
     float* prefill_scale = reinterpret_cast<float*>(smem_raw + SMEM_PREFILL_SCALE_OFF);
     const int prefill_scale_addr = smem + SMEM_PREFILL_SCALE_OFF;
-    __half* prefill_q0 = reinterpret_cast<__half*>(smem_raw + SMEM_PREFILL_Q0_OFF);
+    __nv_bfloat16* prefill_q0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_PREFILL_Q0_OFF);
     const int prefill_q0_addr = smem + SMEM_PREFILL_Q0_OFF;
     float* prefill_partial_tile = reinterpret_cast<float*>(smem_raw + SMEM_PREFILL_PARTIAL_TILE_OFF);
     const int prefill_partial_tile_addr = smem + SMEM_PREFILL_PARTIAL_TILE_OFF;
     float* prefill_split_weights = reinterpret_cast<float*>(smem_raw + SMEM_PREFILL_SPLIT_WEIGHTS_OFF);
     const int prefill_split_weights_addr = smem + SMEM_PREFILL_SPLIT_WEIGHTS_OFF;
-    __half* prefill_q1 = reinterpret_cast<__half*>(smem_raw + SMEM_PREFILL_Q1_OFF);
+    __nv_bfloat16* prefill_q1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_PREFILL_Q1_OFF);
     const int prefill_q1_addr = smem + SMEM_PREFILL_Q1_OFF;
-    __half* prefill_kv = reinterpret_cast<__half*>(smem_raw + SMEM_PREFILL_KV_OFF);
+    __nv_bfloat16* prefill_kv = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_PREFILL_KV_OFF);
     const int prefill_kv_addr = smem + SMEM_PREFILL_KV_OFF;
-    __half* prefill_v = reinterpret_cast<__half*>(smem_raw + SMEM_PREFILL_V_OFF);
+    __nv_bfloat16* prefill_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_PREFILL_V_OFF);
     const int prefill_v_addr = smem + SMEM_PREFILL_V_OFF;
     int* task_offsets = reinterpret_cast<int*>(smem_raw + SMEM_TASK_OFFSETS_OFF);
     const int task_offsets_addr = smem + SMEM_TASK_OFFSETS_OFF;
@@ -536,7 +536,6 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                     }
                     tmem_st_x16_f32(my_tmem_stats, acc_scale);
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     if (is_wg1 != 0) {
                         mbarrier_arrive(corr_sig_addr + 8);
                     } else {
@@ -573,8 +572,8 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                     unsigned int p_packed[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 8; _lp++) {
-                        __half2 _h2 = __float22half2_rn(make_float2(exp_vals[_lp*2 + 0], exp_vals[_lp*2+1 + 0]));
-                        p_packed[_lp] = *(uint32_t*)&_h2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(exp_vals[_lp*2 + 0], exp_vals[_lp*2+1 + 0]));
+                        p_packed[_lp] = *(uint32_t*)&_bf2;
                     }
                     int k_panel = warp_in_wg / 2;
                     int warp_in_panel = warp_in_wg % 2;
@@ -600,11 +599,6 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                 }
                 mbarrier_wait(decode_tail_ack_addr, _phase_decode_tail_ack_0);
                 _phase_decode_tail_ack_0 ^= 1;
-                if (is_wg1 != 0) {
-                    asm volatile("barrier.sync 12, 128;" ::: "memory");
-                } else {
-                    asm volatile("barrier.sync 11, 128;" ::: "memory");
-                }
                 int head_pair_base_1 = lane % 4 * 2;
                 if (lane < 4) {
                     my_exch_ptr[warp_in_wg * 16 + head_pair_base_1] = row_sum_pair[0];
@@ -625,11 +619,6 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                         my_corr_ptr[head_idx] = total_sum;
                         my_exch_ptr[head_idx] = row_max_pair[head_slot_1];
                     }
-                }
-                if (is_wg1 != 0) {
-                    asm volatile("barrier.sync 12, 128;" ::: "memory");
-                } else {
-                    asm volatile("barrier.sync 11, 128;" ::: "memory");
                 }
                 if (is_wg1 != 0) {
                     mbarrier_arrive(corr_sig_addr + 8);
@@ -776,7 +765,7 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                                 }
                                 *(reinterpret_cast<float*>(msa_lse + q_row) + (0)) = natural_lse;
                             }
-                            *(reinterpret_cast<__half*>(O + out_idx) + (0)) = __float2half_rn(merged * inv_sum_h);
+                            *(reinterpret_cast<__nv_bfloat16*>(O + out_idx) + (0)) = __float2bfloat16_rn(merged * inv_sum_h);
                         } else {
                             int logical_output_1 = request * num_kv_heads + kv_head;
                             int partial_slot = logical_output_1 * 1 + split;
@@ -878,7 +867,7 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                                 }
                                 int q_row_2 = qo_begin * num_q_heads + kv_head * group_size_1 + h_3;
                                 int out_idx_1 = q_row_2 * 128 + d_idx;
-                                *(reinterpret_cast<__half*>(O + out_idx_1) + (0)) = __float2half_rn(reduce_o * prefill_scale[scale_warp_base + h_3]);
+                                *(reinterpret_cast<__nv_bfloat16*>(O + out_idx_1) + (0)) = __float2bfloat16_rn(reduce_o * prefill_scale[scale_warp_base + h_3]);
                             }
                         }
                         asm volatile("barrier.sync 13, 128;" ::: "memory");
@@ -947,42 +936,42 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                     uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
                     uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134479888, 0);
+                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134481040, 0);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134481040, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134481040, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134481040, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 1018U);
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 122U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134481040, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134481040, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134481040, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134481040, 1);
                     }
                 }
                 elect_commit(s_full_addr);
@@ -1013,42 +1002,42 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                         uint64_t _mma_ss_a_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_1);
                         uint64_t _mma_ss_b_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_1);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134479888, 0);
+                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134481040, 0);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134481040, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134481040, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134481040, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_1, 1018U);
                         incr_smem_desc_lo(_mma_ss_b_desc_1, 122U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134481040, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134481040, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134481040, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134481040, 1);
                         }
                     }
                     elect_commit(s_full_addr + 8);
@@ -1063,42 +1052,42 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                         uint64_t _mma_ss_a_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_2);
                         uint64_t _mma_ss_b_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_2);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134512656, ((first_pv0) ? 0 : 1));
+                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134513808, ((first_pv0) ? 0 : 1));
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_2, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134513808, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_2, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134513808, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_2, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134513808, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_2, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_2, 122U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134513808, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_2, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134513808, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_2, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134513808, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_2, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134513808, 1);
                         }
                     }
                     elect_commit(kv_empty_addr + (v0_stage) * 8);
@@ -1108,42 +1097,42 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                         uint64_t _mma_ss_a_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_3);
                         uint64_t _mma_ss_b_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_1);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134479888, 0);
+                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134481040, 0);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134481040, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134481040, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134481040, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_3, 1018U);
                         incr_smem_desc_lo(_mma_ss_b_desc_3, 122U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134481040, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134481040, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134481040, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134479888, 1);
+                            tcgen05_mma_f16(tmem_tmem_s0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134481040, 1);
                         }
                     }
                     elect_commit(s_full_addr);
@@ -1158,42 +1147,42 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                         uint64_t _mma_ss_a_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_4);
                         uint64_t _mma_ss_b_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_4);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134512656, ((first_pv1) ? 0 : 1));
+                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134513808, ((first_pv1) ? 0 : 1));
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134513808, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134513808, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134513808, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 122U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134513808, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134513808, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134513808, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134512656, 1);
+                            tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134513808, 1);
                         }
                     }
                     elect_commit(kv_empty_addr + (v1_stage) * 8);
@@ -1217,42 +1206,42 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                     uint64_t _mma_ss_a_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_5);
                     uint64_t _mma_ss_b_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134479888, 0);
+                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134481040, 0);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_5, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134481040, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_5, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134481040, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_5, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134481040, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_5, 1018U);
                     incr_smem_desc_lo(_mma_ss_b_desc_5, 122U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134481040, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_5, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134481040, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_5, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134481040, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_5, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134479888, 1);
+                        tcgen05_mma_f16(tmem_tmem_s1, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134481040, 1);
                     }
                 }
                 elect_commit(s_full_addr + 8);
@@ -1267,42 +1256,42 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                     uint64_t _mma_ss_a_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_6);
                     uint64_t _mma_ss_b_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_6);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134512656, ((first_pv0) ? 0 : 1));
+                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134513808, ((first_pv0) ? 0 : 1));
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_6, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_6, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134513808, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_6, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_6, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134513808, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_6, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_6, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134513808, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_6, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_6, 122U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134513808, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_6, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_6, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134513808, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_6, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_6, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134513808, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_6, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_6, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134513808, 1);
                     }
                 }
                 elect_commit(kv_empty_addr + (v0_last_stage) * 8);
@@ -1316,42 +1305,42 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                     uint64_t _mma_ss_a_desc_7 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_7);
                     uint64_t _mma_ss_b_desc_7 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_7);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134512656, ((first_pv1) ? 0 : 1));
+                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134513808, ((first_pv1) ? 0 : 1));
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_7, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_7, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134513808, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_7, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_7, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134513808, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_7, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_7, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134513808, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_7, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_7, 122U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134513808, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_7, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_7, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134513808, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_7, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_7, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134513808, 1);
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_7, 128U);
                     incr_smem_desc_lo(_mma_ss_b_desc_7, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134512656, 1);
+                        tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134513808, 1);
                     }
                 }
                 elect_commit(kv_empty_addr + (v1_last_stage) * 8);
@@ -1458,7 +1447,6 @@ kernel_cake_blackwell_msa_da9415d0747e3357b8c2(const __grid_constant__ CUtensorM
                             smem_page_indices[block_ordinal] = valid_cols_1;
                             smem_page_indices[16 + block_ordinal] = token_base;
                             smem_page_indices[32 + block_ordinal] = page_head;
-                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             int transfer = task_iter_3 * 16 * 2 + pair_3 * 4 + inst;
                             int stage = transfer % 6;
                             int full_phase = transfer / 6 % 2;

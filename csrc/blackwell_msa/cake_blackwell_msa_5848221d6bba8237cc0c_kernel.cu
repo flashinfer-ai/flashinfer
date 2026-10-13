@@ -110,7 +110,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_blackwell_msa_20dfea8fa77cc958668b(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_prefill, __nv_bfloat16* __restrict__ Q_prefill_raw, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap K_prefill_pair, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, const __grid_constant__ CUtensorMap V_prefill_pair, const __grid_constant__ CUtensorMap KV, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ qo_indptr, int* __restrict__ kv_indptr, int* __restrict__ kv_len_arr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int* __restrict__ task_q_tile, int* __restrict__ task_split, int* __restrict__ task_kv_tile_begin, int* __restrict__ task_kv_tile_end, int* __restrict__ task_qo_begin, int* __restrict__ task_qo_end, int* __restrict__ task_page_begin, int* __restrict__ task_page_end, int* __restrict__ status, int num_requests, int num_q_heads, int num_kv_heads, int max_kv_tiles, int max_splits, int max_task_claims, float softmax_scale_log2, float k_global_scale, float v_global_scale, int attention_mode, int is_causal, int derive_q_offset, int record_tasks, int msa_max_pages, int msa_split_policy)
+kernel_cake_blackwell_msa_5848221d6bba8237cc0c(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_prefill, __nv_bfloat16* __restrict__ Q_prefill_raw, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap K_prefill_pair, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, const __grid_constant__ CUtensorMap V_prefill_pair, const __grid_constant__ CUtensorMap KV, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ qo_indptr, int* __restrict__ kv_indptr, int* __restrict__ kv_len_arr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int* __restrict__ task_q_tile, int* __restrict__ task_split, int* __restrict__ task_kv_tile_begin, int* __restrict__ task_kv_tile_end, int* __restrict__ task_qo_begin, int* __restrict__ task_qo_end, int* __restrict__ task_page_begin, int* __restrict__ task_page_end, int* __restrict__ status, int num_requests, int num_q_heads, int num_kv_heads, int max_kv_tiles, int max_splits, int max_task_claims, float softmax_scale_log2, float k_global_scale, float v_global_scale, int attention_mode, int is_causal, int derive_q_offset, int record_tasks, int msa_max_pages, int msa_split_policy)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -536,7 +536,6 @@ kernel_cake_blackwell_msa_20dfea8fa77cc958668b(const __grid_constant__ CUtensorM
                     }
                     tmem_st_x16_f32(my_tmem_stats, acc_scale);
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     if (is_wg1 != 0) {
                         mbarrier_arrive(corr_sig_addr + 8);
                     } else {
@@ -600,11 +599,6 @@ kernel_cake_blackwell_msa_20dfea8fa77cc958668b(const __grid_constant__ CUtensorM
                 }
                 mbarrier_wait(decode_tail_ack_addr, _phase_decode_tail_ack_0);
                 _phase_decode_tail_ack_0 ^= 1;
-                if (is_wg1 != 0) {
-                    asm volatile("barrier.sync 12, 128;" ::: "memory");
-                } else {
-                    asm volatile("barrier.sync 11, 128;" ::: "memory");
-                }
                 int head_pair_base_1 = lane % 4 * 2;
                 if (lane < 4) {
                     my_exch_ptr[warp_in_wg * 16 + head_pair_base_1] = row_sum_pair[0];
@@ -625,11 +619,6 @@ kernel_cake_blackwell_msa_20dfea8fa77cc958668b(const __grid_constant__ CUtensorM
                         my_corr_ptr[head_idx] = total_sum;
                         my_exch_ptr[head_idx] = row_max_pair[head_slot_1];
                     }
-                }
-                if (is_wg1 != 0) {
-                    asm volatile("barrier.sync 12, 128;" ::: "memory");
-                } else {
-                    asm volatile("barrier.sync 11, 128;" ::: "memory");
                 }
                 if (is_wg1 != 0) {
                     mbarrier_arrive(corr_sig_addr + 8);
@@ -1463,7 +1452,6 @@ kernel_cake_blackwell_msa_20dfea8fa77cc958668b(const __grid_constant__ CUtensorM
                             smem_page_indices[block_ordinal] = valid_cols_1;
                             smem_page_indices[16 + block_ordinal] = token_base;
                             smem_page_indices[32 + block_ordinal] = page_head;
-                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             int transfer = task_iter_3 * 16 * 2 + pair_3 * 4 + inst;
                             int stage = transfer % 6;
                             int full_phase = transfer / 6 % 2;
