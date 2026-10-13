@@ -146,10 +146,10 @@ __device__ static inline float sanitize_lse(float l) {
 //   [src_rank][flattened batch/head entry][*]
 //
 // The grid is persistent and cooperatively launched:
-//   1. block 0 selects the graph-safe device epoch; grid sync;
+//   1. each block snapshots the graph-safe device epoch; block sync;
 //   2. blocks publish complete destination payloads and release-store flags;
 //   3. block 0 acquire-waits for every source flag; unconditional grid sync;
-//   4. blocks are reassigned to output rows and perform the LSE merge.
+//   4. block 0 advances the epoch; blocks perform the LSE merge.
 // Input strides are in elements. Workspace rows retain the original flattened
 // leading-dimension layout, independently of the source tensor's physical layout.
 struct InputGeometry {
@@ -198,15 +198,13 @@ __global__ void FusedKernel(const T* __restrict__ partial_o, const float* __rest
   auto* state = reinterpret_cast<uint32_t*>(workspace);
   auto* ready = reinterpret_cast<uint32_t*>(workspace + kMetadataBytes);
 
-  // Keep epoch selection on device so CUDA graph replay advances the slot.
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    const uint32_t epoch = state[0];
-    state[1] = epoch;
-    state[0] = epoch + 1;
-  }
-  grid.sync();
+  // Snapshot the epoch per block. Its update is deferred until every
+  // block reaches the receive barrier, avoiding an initial grid sync.
+  __shared__ uint32_t block_epoch;
+  if (threadIdx.x == 0) block_epoch = state[0];
+  __syncthreads();
 
-  const uint32_t epoch = state[1];
+  const uint32_t epoch = block_epoch;
   const uint32_t signal_value = epoch + 1;
   const uint32_t slot = epoch % kNumSlots;
   const int num_entries = num_tokens * local_heads;
@@ -278,6 +276,11 @@ __global__ void FusedKernel(const T* __restrict__ partial_o, const float* __rest
     }
   }
   grid.sync();
+
+  // All blocks have captured this call's epoch. A workspace is bound
+  // to one ordered stream, so the next call observes this increment
+  // only after every block in this call has finished its merge.
+  if (blockIdx.x == 0 && threadIdx.x == 0) state[0] = epoch + 1;
 
   const T* recv_out =
       reinterpret_cast<const T*>(workspace + out_region_local_offset + slot * slot_out_bytes);
