@@ -1044,7 +1044,10 @@ def _cutlass_post_reference(backend_key):
             w2_ref = _dequant_cutlass_nvfp4_experts(
                 view["fc2_expert_weights"], view["fc2_weight_block_scale"], x.device
             )
-        elif backend_key == "cutlass_fp8_per_tensor":
+        elif backend_key in (
+            "cutlass_fp8_per_tensor",
+            "cudnn_grouped_gemm_fp8_per_tensor",
+        ):
             # Canonical TRTLLM pack: static multipliers live in the view and the
             # pack carries no scale; GEMM1 output is requantized with the
             # static intermediate multiplier before GEMM2.
@@ -1055,27 +1058,6 @@ def _cutlass_post_reference(backend_key):
             )
             w1_ref = (
                 view["fc1_expert_weights"].float() * view["fc1_dequant"][:, None, None]
-            )
-            w2_ref = (
-                view["fc2_expert_weights"].float() * view["fc2_dequant"][:, None, None]
-            )
-        elif backend_key == "cudnn_grouped_gemm_fp8_per_tensor":
-            # Canonical TRTLLM pack: static multipliers live in the view and the
-            # pack carries no scale; GEMM1 output is requantized with the
-            # static intermediate multiplier before GEMM2.
-            assert view["_activation_scale"] is None
-            x_ref = view["_activation_q"].float() / view["hidden_states_scale_global"]
-            intermediate_hook = fp8_per_tensor_requant_hook(
-                view["intermediate_scale_global"]
-            )
-            w1_ref = (
-                view["fc1_expert_weights"].float() * view["fc1_dequant"][:, None, None]
-            )
-            # The cuDNN view stores fc1 rows as [gate, up]; the reference
-            # wants [up, gate].
-            w1_ref = torch.cat(
-                (w1_ref[:, intermediate_size:], w1_ref[:, :intermediate_size]),
-                dim=1,
             )
             w2_ref = (
                 view["fc2_expert_weights"].float() * view["fc2_dequant"][:, None, None]
@@ -1157,9 +1139,6 @@ def _cutlass_post_reference(backend_key):
                 .to(x.device)
             )
             w1_ref = _dequant_cudnn_nvfp4_experts(view, "fc1", x.device)
-            w1_ref = torch.cat(
-                (w1_ref[:, intermediate_size:], w1_ref[:, :intermediate_size]), dim=1
-            )
             w2_ref = _dequant_cudnn_nvfp4_experts(view, "fc2", x.device)
         elif backend_key == "cutlass_w4a8":
             from flashinfer.fused_moe.prepare import _quantize_int4_grouped
@@ -2355,9 +2334,8 @@ _CURATED = [
         )
     ],
     # cuDNN grouped-GEMM runners: the unfinalized triple through the host
-    # recombination and the finalized output (the moe_utils kernel where the
-    # runner uses it, torch ops elsewhere). The imbalanced routes leave experts
-    # empty.
+    # recombination and the finalized output (the moe_unpermute kernel). The
+    # imbalanced routes leave experts empty.
     *[
         Cfg(
             16,

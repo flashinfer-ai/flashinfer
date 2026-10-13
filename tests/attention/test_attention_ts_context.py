@@ -37,6 +37,7 @@ from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
 from cutlass.experimental.task_scheduling.enums import TileSchedulerType
 
 import flashinfer.attention.prims_ts.context as context_module
+from flashinfer.attention.prims_ts.kernels import tcgen05_compat
 from flashinfer.attention.prims_ts import (
     BatchPrefillPagedTSWrapper,
     BatchPrefillTSWrapper,
@@ -2442,7 +2443,7 @@ def test_attention_ts_context_uses_ldtm_stat_default_is_off():
 def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
     """Context attention enables LDTM.STAT on B300 (SM103) and Rubin (SM107)."""
     expected = (
-        context_module._dsl_supports_ldtm_stat()
+        tcgen05_compat.dsl_supports_ldtm_stat()
         and torch.cuda.get_device_capability() in ((10, 3), (10, 7))
     )
     if torch.cuda.get_device_capability() == (10, 7):
