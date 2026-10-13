@@ -1148,9 +1148,9 @@ class BatchPODWithPagedKVCacheWrapper:
         Fused single-shot attention that runs batched paged prefill (``q_p`` against
         ``paged_kv_cache_p``) and batched paged decode (``q_d`` against
         ``paged_kv_cache_d``) in the same kernel launch, sharing scheduling and
-        execution resources. The prefill/decode shape and most policy parameters
-        are taken from the cached values supplied to :meth:`plan`; ``causal_p``
-        and the decode scale parameters are supplied to this method.
+        execution resources. Shape and shared attention settings come from
+        :meth:`plan`; prefill masking, ``use_fp16_qk_reduction``, and decode
+        scale parameters are supplied to this method.
 
         Parameters
         ----------

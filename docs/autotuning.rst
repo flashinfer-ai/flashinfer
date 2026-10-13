@@ -207,9 +207,10 @@ The benchmark harness supports config caching via the ``--autotune_cache`` flag.
 Cache File Format
 ^^^^^^^^^^^^^^^^^
 
-The cache file is a plain JSON dictionary. Each non-metadata key is a string representation
-of ``(custom_op, runner_class_name, optimization_profile)`` and each value is
-``[runner_class_name, tactic]``. The reserved ``_metadata`` key contains environment metadata:
+The cache file is a plain JSON dictionary. Each tuning-entry key is a string representation
+of ``(custom_op, runner_class_name, optimization_profile)``; its value starts with
+``[runner_class_name, tactic]`` and may include a measurement policy. The reserved
+``_metadata``, ``_records``, and ``_generation`` keys contain cache bookkeeping:
 
 .. code-block:: json
 

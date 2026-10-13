@@ -842,7 +842,7 @@ def bench_gpu_time_with_cuda_event(
         launch overhead. For microbenchmarking where launch latency matters,
         consider using ``bench_gpu_time_with_cudagraph`` instead.
 
-    .. deprecated:: 0.6.12
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device`` parameters
         are deprecated. Use ``cold_l2_cache`` instead.
     """
@@ -1013,7 +1013,7 @@ def bench_gpu_time_with_cupti(
         If CUPTI is not available, a warning is issued and the function
         automatically falls back to CUDA event or CUDA graph timing.
 
-    .. deprecated:: 0.6.12
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device`` parameters
         are deprecated. Use ``cold_l2_cache`` instead.
     """
@@ -1408,7 +1408,7 @@ def bench_gpu_time_with_cudagraph(
     See Also:
         - ``calculate_rotation_count``: Computes required buffer copies for cold-L2.
 
-    .. deprecated:: 0.6.12
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device`` parameters
         are deprecated. Use ``cold_l2_cache`` instead.
     """
@@ -1643,7 +1643,7 @@ def bench_gpu_time(
         - ``bench_gpu_time_with_cudagraph``: Direct CUDA graph timing.
         - ``bench_gpu_time_with_cupti``: Direct CUPTI timing.
 
-    .. deprecated:: 0.6.12
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device``
         parameters are deprecated. Use ``cold_l2_cache`` instead.
     """

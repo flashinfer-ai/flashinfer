@@ -575,7 +575,7 @@ class MultiLevelCascadeAttentionWrapper:
 
 class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
     r"""Wrapper class for decode attention with a shared-prefix paged KV cache for a batch
-    of requests. The shared-prefix KV cache is stored in a standalone tensor, and the unique
+    of requests. The shared-prefix keys and values are stored in separate tensors, and the unique
     KV cache of each request is stored in a paged KV cache data structure.
 
     Check :ref:`our tutorial<kv-layout>` for page table layout.

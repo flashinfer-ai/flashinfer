@@ -26,11 +26,13 @@ We can also generalize the value on index :math:`i` to index set :math:`I`:
 The :math:`softmax` function is restricted to the index set :math:`I`. Note that :math:`\mathbf{v}(\{1,2,\cdots, n\})` is the self-attention output of the entire sequence.
 The *attention state* of the index set :math:`I` can be defined as a tuple :math:`(s(I), \mathbf{v}(I))`, then we can define a binary **merge** operator :math:`\oplus` of two attention states (in practice, we subtract the maximum from :math:`s` for numerical stability and omit it here for simplicity):
 
+The index sets :math:`I` and :math:`J` in the following equation are disjoint.
+
 .. math::
 
   \begin{bmatrix}\mathbf{v}(I\cup J)\\s(I\cup J)\end{bmatrix}=\begin{bmatrix}\mathbf{v}(I)\\s(I)\end{bmatrix}\oplus\begin{bmatrix}\mathbf{v}(J)\\s(J)\end{bmatrix}=\begin{bmatrix} \frac{\mathbf{v}(I)\exp(s(I)) + \mathbf{v}(J)\exp(s(J))}{\exp(s(I)) + \exp(s(J))} \\  \log(\exp(s(I)) + \exp(s(J))) \end{bmatrix}
 
-the **merge** operator can be generalized to any number of attention state inputs:
+the **merge** operator can be generalized to any number of attention state inputs over pairwise-disjoint index sets:
 
 .. math::
     \begin{bmatrix}\mathbf{v}(\bigcup_{i=1}^{n}I_i) \\ s(\bigcup_{i=1}^{n}I_i) \end{bmatrix} = \bigoplus_{i=1}^{n}\begin{bmatrix}\mathbf{v}(I_i) \\ s(I_i)\end{bmatrix} = \begin{bmatrix} \sum_{i=1}^{n} \textrm{softmax}(s(I_i))\mathbf{v}(I_i) \\ \log(\sum_{i=1}^{n} \exp (s(I_i))) \end{bmatrix}
