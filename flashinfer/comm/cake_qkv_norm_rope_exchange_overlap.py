@@ -17,23 +17,25 @@ Cake backend of :class:`flashinfer.comm.QkvNormRopeExchangeOverlap`: the fused
 QKV projection + per-head RMSNorm + RoPE producer that stores every head band
 straight into the destination rank's symmetric receive slot (SM90 WGMMA, SM100
 / SM103 tcgen05), the one-CTA readiness wait kernel and the two-phase NVLink
-barrier -- as a separate kernel, or folded into the producer as one extra warp
-that runs the rendezvous and releases the stores -- driven from Python one
-launcher call per stage.
+barrier -- as a separate kernel, or folded into the producer as a rendezvous
+warp (one extra warp per CTA on SM100 / SM103, the otherwise idle TMA warp on
+SM90) that runs the rendezvous and releases the stores -- driven from Python
+one launcher call per stage.
 
 Launch path (``fold_barrier``; the keyword, else ``FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER``
 = ``0`` / ``1`` / ``auto``, else the architecture default
-``loader.FOLD_BARRIER_DEFAULT_BY_ARCH``: folded on SM100 / SM103, the separate
-barrier kernel on SM90, which delivers no folded producer -- so ``True`` fails
-closed there).  Both paths compute and store identical bits.  Per call (current
-stream = producer stream):
+``loader.FOLD_BARRIER_DEFAULT_BY_ARCH``: folded on SM90, SM100 and SM103; the
+folded producers are delivered on every architecture, and ``True`` fails closed
+only on a route table without them).  Both paths compute and store identical
+bits.  Per call (current stream = producer stream):
 
 1. wait for the slot's previous exchange (``exchange_done[slot]``; eager only),
 2. folded (two launches): record the fork event, then the producer build of
    this call's rendezvous phase (``producer_fold<phase>``, persistent grid
-   ``min(num_tiles, sm_count - 2)`` plus one rendezvous warp per CTA; CTA 0's
-   warp runs the cross-rank barrier and publishes ``ready_target`` into this
-   rank's arrive flag, every CTA acquires it once before its first store);
+   ``min(num_tiles, sm_count - 2)``; the rendezvous warp -- one extra warp per
+   CTA on SM100 / SM103, the idle TMA warp on SM90 -- of CTA 0 runs the
+   cross-rank barrier and publishes ``ready_target`` into this rank's arrive
+   flag, every CTA acquires it once before its first store);
    separate barrier (three launches): the barrier kernel of the phase, the
    fork event, then the plain producer.  Either producer publishes
    ``ready_target`` into every destination's readiness pad per chunk,
@@ -119,8 +121,9 @@ def resolve_fold_barrier(
 ) -> tuple[bool, str]:
     """Resolve the launch path on ``arch``: the explicit ``requested`` value, else :data:`FOLD_BARRIER_ENV`,
     else the architecture default.  Returns ``(fold_barrier, source)`` with ``source`` in ``"keyword"``,
-    ``"env"``, ``"default"``.  ``True`` fails closed where no folded producer is delivered (SM90): the
-    message names the architecture default and the opt-out, since the barrier path is always delivered."""
+    ``"env"``, ``"default"``.  ``True`` fails closed where the route table delivers no folded producer (no
+    delivered architecture; the check guards the table): the message names the architecture default and the
+    opt-out, since the barrier path is always delivered."""
 
     if requested is not None and not isinstance(requested, bool):
         raise ValueError(f"fold_barrier must be a bool or None, got {requested!r}")
@@ -135,8 +138,9 @@ def resolve_fold_barrier(
     if fold and not loader.fold_producers_delivered(arch):
         raise ValueError(
             f"fold_barrier=True ({source}): no producer program with the folded rendezvous is delivered for "
-            f"{arch}; its default launch path is fold_barrier={loader.default_fold_barrier(arch)} (the separate "
-            "barrier kernel) -- pass fold_barrier=False or leave it unset"
+            f"{arch} (its route table carries no fold key; the architecture default is "
+            f"fold_barrier={loader.default_fold_barrier(arch)}) -- pass fold_barrier=False to select the "
+            "separate barrier kernel, which is delivered on every architecture"
         )
     return fold, source
 

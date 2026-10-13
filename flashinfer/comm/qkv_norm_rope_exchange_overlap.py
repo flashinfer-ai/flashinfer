@@ -302,9 +302,9 @@ class QkvNormRopeExchangeOverlap:
         rendezvous -- two launches per call (producer, wait kernel); ``False``: the separate barrier kernel
         before the producer -- three launches.  ``None`` (default) reads the environment variable
         ``FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER`` (``0`` / ``1`` / ``auto``) and otherwise takes the
-        architecture default: ``True`` on SM100 / SM103, ``False`` on SM90, where no folded producer is
-        delivered (so ``True`` raises there).  Both paths store identical bits.  Must be uniform across the
-        ranks of the group; not accepted with ``backend="nccl"``.
+        architecture default: ``True`` on SM90, SM100 and SM103 (the folded producers are delivered on every
+        architecture).  Both paths store identical bits.  Must be uniform across the ranks of the group; not
+        accepted with ``backend="nccl"``.
     """
 
     def __init__(
