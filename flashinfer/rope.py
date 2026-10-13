@@ -1432,7 +1432,7 @@ def rope_quantize_fp8(
         Whether to enable PDL (Programmatic Dependent Launch). Default: ``False``.
     backend : str
         Implementation backend. ``"cuda"`` (default) uses the fused CUDA kernel;
-        ``"cutile"`` uses the cuda.tile Python kernel and requires SM89 or newer.
+        ``"cutile"`` uses the cuda.tile Python kernel and requires SM90 or newer.
 
     Returns
     -------
@@ -1465,9 +1465,9 @@ def rope_quantize_fp8(
         if cos_sin_cache.dtype != torch.float32:
             raise ValueError("cos_sin_cache should be float32")
         capability = get_compute_capability(q_rope.device)
-        if capability < (8, 9):
+        if capability < (9, 0):
             raise NotImplementedError(
-                "backend='cutile' rope_quantize_fp8 requires SM89 or newer "
+                "backend='cutile' rope_quantize_fp8 requires SM90 or newer "
                 f"for FP8 output; got SM{capability[0]}{capability[1]}."
             )
         from .quantization.kernels.cutile.rope_quantize_fp8_cutile import (
