@@ -23,6 +23,7 @@ import torch
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.cake_kda_packed_t1 import (
     CakeKDAPackedT1Target,
+    CakeKDAPackedT1Variant,
     get_cake_kda_packed_t1_module,
     select_cake_kda_packed_t1_variant,
 )
@@ -49,7 +50,7 @@ _SM107_NATIVE_VARIANTS: frozenset[str] = frozenset(
 # Variants that store the two output rows a thread group owns as one 32-bit
 # BF16x2 word.  They need a 4-byte-aligned output base; otherwise the band's
 # scalar-publish body of the same schedule runs (same output bits).
-_PAIR_PUBLISH_FALLBACK: dict[str, str] = {
+_PAIR_PUBLISH_FALLBACK: dict[CakeKDAPackedT1Variant, CakeKDAPackedT1Variant] = {
     "cpasync_tile128_register_pipeline_pair_publish": (
         "cpasync_tile128_register_pipeline"
     ),
