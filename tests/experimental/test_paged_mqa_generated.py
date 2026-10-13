@@ -6,7 +6,8 @@ schedule is derived in-kernel); ``get_paged_mqa_logits_metadata`` is a
 no-launch DeepGEMM-signature placeholder.
 
 The tests skip while the installed catalog carries no paged route for the
-shape (``paged_route_available``); the host-only helpers are tested always.
+shape (``paged_route_available``); the host-only helpers are tested always and
+their device-dependent checks run only on a catalogued architecture.
 Correctness is validated on EVERY shipped shape through
 ``PagedMqaPlan(enforce_admission=False)`` (the export protocol's view: the
 catalog's admission rules are routing policy, not a validity bound); where the
@@ -82,6 +83,19 @@ def _skip_unless_route(heads, page, next_n):
         pytest.skip(
             f"catalog has no paged route for H={heads}, page {page}, next_n {next_n}"
         )
+
+
+def _catalogued_device_arch():
+    """The catalog architecture of the current CUDA device, or ``None`` without a CUDA device or on a
+    device whose architecture ships no programs: the device-dependent half of a host test then ends."""
+    if not torch.cuda.is_available():
+        return None
+    from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa
+
+    try:
+        return dense_mqa.device_arch(torch.device("cuda"))
+    except RuntimeError:
+        return None
 
 
 def _admitted(q, ctx_2d, max_len, heads, page, next_n):
@@ -484,7 +498,7 @@ def test_paged_host_helpers_and_rejections():
     with pytest.raises(ValueError):
         _runtime.paged_next_n_atoms(3)
     assert not _runtime.paged_route_available(64, 64, 3)
-    if not torch.cuda.is_available():
+    if _catalogued_device_arch() is None:
         return
     device = torch.device("cuda")
     ctx_1d = torch.full((4,), 100, device=device, dtype=torch.int32)
@@ -988,12 +1002,12 @@ def test_paged_admission_rules_are_applied_per_arch(monkeypatch):
     with pytest.raises(ValueError, match="requires batch and max_context_len"):
         _runtime.paged_route_available(heads, page, 2, arch="sm_100a")
     monkeypatch.undo()
-    if not torch.cuda.is_available():
+    arch = _catalogued_device_arch()
+    if arch is None:
         return
     # Live refusal under the shipped rules of this device's architecture (and the export bypass). The plan
     # resolves the route from the call's batch (the dynamic-scheduler route up to its max_batch, the static
     # route above it), so every probe is judged on the route the plan would select.
-    arch = dense_mqa.device_arch(torch.device("cuda"))
     probes = ((17, 1024), (17, 32769), (65, 8448), (129, 8448), (4096, 131072))
     route_for = lambda b, c: _runtime.paged_route_name(
         heads, page, 2, batch=b, max_context_len=c, arch=arch
