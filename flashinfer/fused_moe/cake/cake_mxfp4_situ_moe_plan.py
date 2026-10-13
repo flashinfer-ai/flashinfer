@@ -263,6 +263,73 @@ MIXED192_SWAP_GEMM2_CHUNK_MAJOR = 4
 MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS = 32768
 
 
+MIXED192_GEMM2_PATH_OVERRIDE: str | None = None
+
+
+MIXED192_GEMM2_PATHS = ("dense", "split")
+
+
+MIXED192_SPLIT_WIDE_GEMM2_N_OVERRIDE: int | None = None
+
+
+MIXED192_SPLIT_WIDE_GEMM2_N_CHOICES = (192, 256)
+
+
+MIXED192_GEMM2_GATE_MIN_TOKENS = 16384
+
+
+MIXED192_GATE_MIN_WINDOWS = 1               # G-rule: the split path needs at least this many 192-row windows
+
+
+MIXED192_GATE_EVERY_GROUP_VOTE = 1          # ... and the every-group raster vote N-fastest (1; 0 = M-fastest; -1 = any)
+
+
+MIXED192_GATE_WIDE_LIST_VOTE = 0            # ... and the wide-list raster vote M-fastest (0; 1 = N-fastest; -1 = any)
+
+
+MIXED192_GATE_DISTINCT_THRESHOLD = 32       # the replayed vote's long-tail bound (gemm2_dense: ``distinct > 32``)
+
+
+MIXED192_GATE_VOTE_VALUES = (-1, 0, 1)
+
+
+MIXED192_GATE_WIDE_GEMM2_N = 256
+
+
+MIXED192_GATE_WIDE_GEMM2_N_CHOICES = (192, 256)
+
+
+MIXED192_GATE_WORDS = 8
+
+
+MIXED192_GATE_WORD_STRIDE = 64                # int32 elements per slot = WORKSPACE_ALIGN bytes (gemm2_gate.GATE_WORD_STRIDE)
+
+
+MIXED192_GATE_SLOT_WORDS = MIXED192_GATE_WORDS * MIXED192_GATE_WORD_STRIDE
+
+
+MIXED192_GATE_WORD_PATH = 0
+
+
+MIXED192_GATE_WORD_NARROW = 1               # window finalize (``swap_row_group_count`` on the split path, else 0)
+
+
+MIXED192_GATE_WORD_WIDE = 2                 # wide-list pair base member (``swap_wide_count`` on the split path, else 0)
+
+
+MIXED192_GATE_WORD_ALT_WIDE = 3             # wide-list pair alternate (``swap_alt_wide_count`` on the split path, else 0)
+
+
+MIXED192_GATE_WORD_BASE_ACTIVE = 4          # every-group pair base (``out_base_active_num_non_exiting_tiles`` on dense)
+
+
+MIXED192_GATE_WORD_ALT_ACTIVE = 5           # every-group pair alternate (``out_alt_num_non_exiting_tiles`` on dense)
+
+
+MIXED192_GATE_DEVIATION = ("item count device-gated by gemm2_gate (0 on the unselected finalize path; no hand-written "
+                           "counterpart)")
+
+
 B300_SITU_DENSE_TACTIC = (128, ((128, 256), (1, 1), False), ((128, 256), (1, 1), False))   # :353
 
 
@@ -633,6 +700,9 @@ MOE_SORT_MODULE = "cake.examples.cake.kimi_k3_mxfp4_situ_moe_sort"
 FINALIZE_MODULE = "cake.examples.cake.kimi_k3_mxfp4_situ_finalize"
 
 
+GATE_MODULE = "cake.examples.cake.kimi_k3_mxfp4_situ_gemm2_gate"
+
+
 BOTH = ("cuda_cpp", "cutedsl")
 
 
@@ -689,13 +759,13 @@ DENSE_NOL2_SUFFIX = "_nol2"                                         # gemm1_dens
 GEMM2_DENSE_CLUSTER12_N = (256, 192)                                # gemm2_dense.CLUSTER12_FORMS ((128, N) / cluster (1, 2))
 
 
-GEMM2_DENSE_ROW_GROUP_CLUSTER_FORMS = ((256, 1, 2), (256, 2, 1))
+GEMM2_DENSE_ROW_GROUP_CLUSTER_FORMS = ((256, 1, 2), (256, 2, 1), (192, 1, 2))
 
 
 GEMM2_DENSE_RASTER_AUTO_FORMS = ((192, 1, 2), (256, 2, 1))                 # (n_tile, cta_group, cluster_n)
 
 
-GEMM2_DENSE_ROW_GROUP_RASTER_AUTO_FORMS = ((256, 1, 2), (256, 2, 1))
+GEMM2_DENSE_ROW_GROUP_RASTER_AUTO_FORMS = GEMM2_DENSE_ROW_GROUP_CLUSTER_FORMS
 
 
 SWAPAB_PARTIAL_FORMS = ((8, 4, 2), (16, 4, 2), (32, 4, 2))         # gemm2_swapab.PARTIAL_FORMS ((n_tile, kbps, m_group))
@@ -1296,12 +1366,47 @@ class CakeSwapAbPolicy:
         return dual
 
     def swap_mixed192_gemm2(self, num_tokens: int) -> str:
-        """:2486-2496 (``MXFP4_SWAP192_MIXED_GEMM2=auto``): ``dense`` on the MoE-TP shard from 16384 tokens."""
+        """:2486-2496 (``MXFP4_SWAP192_MIXED_GEMM2=auto``): ``dense`` on the MoE-TP shard from 16384 tokens -- or, from
+        ``MIXED192_GEMM2_GATE_MIN_TOKENS`` (Cake lever L45 design A), ``gate``: the static chain that launches the K6b
+        gate kernel and both finalize paths, the path decided on the device.
+
+        ``MIXED192_GEMM2_PATH_OVERRIDE`` (Cake stage-0 instrument, default off) forces the path at every mixed192
+        token count and bypasses the gate; the token-count rule below is the hand-written one."""
+        if MIXED192_GEMM2_PATH_OVERRIDE is not None:
+            if MIXED192_GEMM2_PATH_OVERRIDE not in MIXED192_GEMM2_PATHS:
+                raise ValueError(f"MIXED192_GEMM2_PATH_OVERRIDE={MIXED192_GEMM2_PATH_OVERRIDE!r}: the forced mixed192 "
+                                 f"GEMM2 path is one of {MIXED192_GEMM2_PATHS}")
+            return MIXED192_GEMM2_PATH_OVERRIDE
         if SWAP_WIDE192_MIXED_GEMM2 != "auto":
             return SWAP_WIDE192_MIXED_GEMM2
         if self.layout.mode == "moe_tensor_parallel" and num_tokens >= SWAP_WIDE192_DENSE_GEMM2_MIN_TOKENS:
+            if num_tokens >= MIXED192_GEMM2_GATE_MIN_TOKENS:
+                return "gate"
             return "dense"
         return "split"
+
+    def mixed192_gemm2_base_tactic(self, num_tokens: int, group_rows: int, *, wide_list: bool,
+                                   gated: bool = False) -> tuple:
+        """The mixed192 chain's base dense finalize tactic ``((M, N), cluster, _)``: the dense tactic table's GEMM2
+        entry when it is on the chain's sort group, else the C4 ``(group, 192)`` / cluster (1, 2) tactic (the table's
+        entry is the 256-row dual tactic; mxfp4.py:1748-1785 / :1803-1850). ``wide_list`` = the split path's pair over
+        the compacted wide lists, where the stage-0 instrument ``MIXED192_SPLIT_WIDE_GEMM2_N_OVERRIDE`` may force the
+        N tile (192 / 256); the dense path over every group never takes the override. ``gated`` (the device-gated
+        chain's wide pair): the tile is ``MIXED192_GATE_WIDE_GEMM2_N`` (cluster (1, 2)) at every token count."""
+        tactic = self.tactic(num_tokens)[2]
+        if tactic[0][0] != group_rows:
+            tactic = ((group_rows, 192), (1, 2), False)
+        if wide_list and gated:
+            if MIXED192_GATE_WIDE_GEMM2_N not in MIXED192_GATE_WIDE_GEMM2_N_CHOICES:
+                raise ValueError(f"MIXED192_GATE_WIDE_GEMM2_N={MIXED192_GATE_WIDE_GEMM2_N!r}: the gated wide-list "
+                                 f"finalize N tile is one of {MIXED192_GATE_WIDE_GEMM2_N_CHOICES}")
+            return ((group_rows, MIXED192_GATE_WIDE_GEMM2_N), (1, 2), False)
+        if wide_list and MIXED192_SPLIT_WIDE_GEMM2_N_OVERRIDE is not None:
+            if MIXED192_SPLIT_WIDE_GEMM2_N_OVERRIDE not in MIXED192_SPLIT_WIDE_GEMM2_N_CHOICES:
+                raise ValueError(f"MIXED192_SPLIT_WIDE_GEMM2_N_OVERRIDE={MIXED192_SPLIT_WIDE_GEMM2_N_OVERRIDE!r}: the forced "
+                                 f"wide-list finalize N tile is one of {MIXED192_SPLIT_WIDE_GEMM2_N_CHOICES}")
+            tactic = ((group_rows, MIXED192_SPLIT_WIDE_GEMM2_N_OVERRIDE), (1, 2), False)
+        return tactic
 
     # -- dense path (:2353-2440, :451-497) -------------------------------------------------------------------
     def tactic(self, num_tokens: int) -> tuple:
@@ -1432,6 +1537,8 @@ class CakeSwapAbPolicy:
                       ("out_base_active_num_non_exiting_tiles", (1,), "int32"),
                       ("swap_alt_wide_list", (alt_tiles,), "int32"), ("swap_alt_wide_count", (1,), "int32"),
                       ("swap_row_group_count_base", (1,), "int32")]
+            if self.swap_mixed192_gemm2(num_tokens) == "gate":                               # Cake lever L45 design A
+                specs.append(("swap_gate_words", (MIXED192_GATE_SLOT_WORDS,), "int32"))
         specs += [
             ("out_expert_counts", (SORT_SCRATCH_WORDS,), "int32"),                          # :2714
             ("out_expanded_idx_to_permuted_idx", (num_tokens, K), "int32"),                 # :2715-2720
@@ -1628,14 +1735,27 @@ class CakeSwapAbPolicy:
                                                  zero_fill_secondary=zero_in_dense, weight_l2_hint=dense_hint))
         # ---- GEMM2 --------------------------------------------------------------------------------------------
         mixed192_gemm2 = self.swap_mixed192_gemm2(T) if mixed192 else None
-        mixed192_dense_gemm2 = mixed192 and mixed192_gemm2 == "dense"
+        mixed192_gated = bool(mixed192 and mixed192_gemm2 == "gate")
+        # The every-group finalize pair is built on the dense path and under the gate; the window finalize + the pair
+        # over the wide lists on the split path and under the gate (Cake lever L45 design A: both paths' kernels are
+        # enqueued every time, each keyed off the item count the gate kernel writes).
+        mixed192_dense_gemm2 = bool(mixed192 and mixed192_gemm2 in ("dense", "gate"))
+        mixed192_split_gemm2 = bool(mixed192 and mixed192_gemm2 in ("split", "gate"))
         mixed192_alt_gemm2 = mixed192 and mixed192_gemm2 == "alt" and mixed192_dual is not None
+        gate_plan: list[Launch] = []
+        if mixed192_gated:
+            rule = mixed192_gate_rule()
+            gate_plan.append(Launch("gemm2_gate",
+                                    f"(no hand-written counterpart) gemm2_gate: device-side GEMM2 path gate after moe_sort; "
+                                    f"split iff narrow_count >= {rule['min_windows']} and every-group vote == "
+                                    f"{rule['every_group_vote']} and wide-list vote == {rule['wide_list_vote']} (long tail: "
+                                    f"distinct > {rule['distinct_threshold']}); wide finalize N {MIXED192_GATE_WIDE_GEMM2_N} "
+                                    f"enable_pdl={pdl}", "gemm2_gate", GATE_MODULE, BOTH))
         gemm2 = None
         g2_main: list[Launch] = []
         if hybrid or mixed192_dense_gemm2:                                                   # :1738-1795
-            g2_tactic = self.tactic(T)[2]
-            if mixed192_dense_gemm2 and g2_tactic[0][0] != group:
-                g2_tactic = ((group, 192), (1, 2), False)
+            g2_tactic = (self.mixed192_gemm2_base_tactic(T, group, wide_list=False) if mixed192_dense_gemm2
+                         else self.tactic(T)[2])
             raster = self.gemm2_raster(T, g2_tactic[0][1]) if mixed192_dense_gemm2 else (False, 1)
             g2_main.append(gemm2_dense_form(g2_tactic[0], g2_tactic[1], hidden_size=self.hidden_size, raster_along_m=raster[0], swizzle=raster[1],
                                             c_stages=DENSE_GEMM2_C_STAGES if mixed192_dense_gemm2 else 1))
@@ -1643,7 +1763,8 @@ class CakeSwapAbPolicy:
                 raster_b = self.gemm2_raster(T, self.tactic(T)[2][0][1])
                 g2_main.append(gemm2_dense_form(mixed192_dual[2][0], mixed192_dual[2][1], hidden_size=self.hidden_size, raster_along_m=raster_b[0],
                                                 swizzle=raster_b[1], c_stages=DENSE_GEMM2_C_STAGES))
-        else:                                                                                # _prepare_swap_gemm2 :1897-1990
+        g2_swap: list[Launch] = []
+        if not (hybrid or mixed192_dense_gemm2) or mixed192_gated:                           # _prepare_swap_gemm2 :1897-1990
             kb2 = None
             if T <= SWAP_GEMM2_SHORT_STAGE_MAX_TOKENS and shard > SWAP_TWO_STAGE_MAX_SHARD:
                 kb2 = 4
@@ -1677,16 +1798,14 @@ class CakeSwapAbPolicy:
             g2_dev = tuple(g2.deviations)
             if split_k > 1:
                 g2_dev += ("split_k=2 device-side (swapab_moe.py:880-887)",)
-            g2_main.append(Launch(g2.step, g2.hw + f" enable_pdl={pdl}", g2.form, g2.module, g2.backends, g2.missing,
+            g2_swap.append(Launch(g2.step, g2.hw + f" enable_pdl={pdl}", g2.form, g2.module, g2.backends, g2.missing,
                                   "side" if (win_side and mixed192_gemm2 != "dense") else "main", g2_dev))
             gemm2 = GemmForm(n_tile=tile, kbps=kb2, m_group=mg2, k_tiles=k_tiles2, use_pdl=pdl, weight_l2_hint=hint,
                              hw_split_k=split_k, hw_cluster_split_k=False, late_dep_wait=pdl and dep_prefetch,
                              pdl_trigger_after_wait=False, two_cta=g2_two_cta, row_tma=False, sched_chunk_major=g2_cm)
         g2_wide: list[Launch] = []
-        if mixed192 and not mixed192_dense_gemm2:                                            # :1803-1850
-            g2_tactic = self.tactic(T)[2]
-            if g2_tactic[0][0] != group:
-                g2_tactic = ((group, 192), (1, 2), False)
+        if mixed192_split_gemm2:                                                             # :1803-1850
+            g2_tactic = self.mixed192_gemm2_base_tactic(T, group, wide_list=True, gated=mixed192_gated)
             raster = self.gemm2_raster(T, g2_tactic[0][1], wide_list=True)
             g2_wide.append(gemm2_dense_form(g2_tactic[0], g2_tactic[1], hidden_size=self.hidden_size, raster_along_m=raster[0], swizzle=raster[1],
                                             c_stages=DENSE_GEMM2_C_STAGES, row_group_list=True))
@@ -1695,6 +1814,9 @@ class CakeSwapAbPolicy:
                 g2_wide.append(gemm2_dense_form(mixed192_dual[2][0], mixed192_dual[2][1], hidden_size=self.hidden_size, raster_along_m=raster_b[0],
                                                 swizzle=raster_b[1], c_stages=DENSE_GEMM2_C_STAGES,
                                                 row_group_list=not mixed192_alt_gemm2))
+        if mixed192_gated:
+            # Every finalize launch of the gated chain keys off a gate word (recorded on the launch, not a form change).
+            g2_main, g2_swap, g2_wide = ([_gated_launch(l) for l in ls] for ls in (g2_main, g2_swap, g2_wide))
         # ---- finalize rows (two-stage) --------------------------------------------------------------------------
         fin: list[Launch] = []
         if two_stage:                                                                        # :1866-1882
@@ -1707,11 +1829,13 @@ class CakeSwapAbPolicy:
             dense_first = T >= SWAP_WIDE192_DENSE_FIRST_MIN_TOKENS
             window = [l for l in plan if l.step == "dispatch_mixed192"] + [g1]
             plan = [l for l in plan if l.step != "dispatch_mixed192"]
+            plan += gate_plan                                                                # K6b right after the K6 pair
             plan += (dense_g1 + window) if dense_first else (window + dense_g1)
-            plan += g2_main + g2_wide
+            # Finalize stage: window finalize (side), the wide-list pair, then the every-group pair (gated: all three).
+            plan += g2_swap + g2_wide + g2_main
         else:
             plan += wide_plan if split else []
-            plan += [g1] + dense_g1 + g2_main + g2_wide
+            plan += [g1] + dense_g1 + g2_main + g2_swap + g2_wide
         plan += fin
         if wide192:
             path = "mixed192" if mixed192 else "wide192"
@@ -2130,20 +2254,24 @@ def gemm1_dense_launch_bindings(b: dict[str, Any], *, weights: dict[str, Any], x
 
 def gemm2_launch_bindings(b: dict[str, Any], *, weights: dict[str, Any], route_weights, hidden: int, shard: int,
                           top_k: int, tiles: int, k_tiles: int, output, dbg, unused: dict[str, Any],
-                          row_group_list: bool = False) -> dict[str, Any]:
+                          row_group_list: bool = False, valid_count=None) -> dict[str, Any]:
     """Named bindings of the swap-AB finalize GEMM2 launch (:1957-1990); SiTU operands are the module's placeholders.
 
     ``row_group_list`` (the mixed192 chain's 192-row 2-CTA window form, hand-written :1949-1961): the work list is
     the K6 window list ``swap_row_groups`` with its count ``swap_row_group_count`` (``tile_idx_to_row_group`` /
     ``num_non_exiting_tiles``), ``group_capacity`` the list capacity; the expert / row-bound tables stay the 128-row
     sort groups' ``out_tile_idx_to_*`` and the activation scales are read blocked (``sf_blocked``, the SiTU
-    ``_rowgroup`` GEMM1 wrote them so). ``tiles`` is the sort-group capacity either way."""
+    ``_rowgroup`` GEMM1 wrote them so). ``tiles`` is the sort-group capacity either way. ``valid_count`` (the
+    device-gated mixed192 chain): the one-word item count the launch keys off instead of K6's own word -- the gate
+    kernel's ``narrow_count`` word (``swap_gate_words``), 0 when the device selected the dense path."""
     import torch
 
     common = _gemm_common_bindings(b, route_weights=route_weights, tiles=tiles, top_k=top_k, dbg=dbg, unused=unused)
     if row_group_list:
         common.update(tile_idx_to_row_group=b["swap_row_groups"], num_non_exiting_tiles=b["swap_row_group_count"],
                       group_capacity=int(b["swap_row_groups"].numel()))
+    if valid_count is not None:
+        common["num_non_exiting_tiles"] = valid_count
     return dict(
         A=weights["w2"], SFA=weights["w2_sf"], B=b["gemm1_out"].view(torch.uint8), SFB=b["gemm1_out_scale"],
         alpha=b["w2_alpha"], **common,
@@ -2169,7 +2297,7 @@ def preprocess_launch_bindings(b: dict[str, Any], *, topk_ids, weights_src, w_st
 def gemm2_dense_launch_bindings(b: dict[str, Any], *, w2, w2_sf, route_weights, hidden: int, shard: int, top_k: int,
                                 tiles: int, rows: int, n_tile: int, output, dbg, unused: dict[str, Any],
                                 row_group: bool = False, split_layout: bool = False, dual: bool = False,
-                                secondary: bool = False) -> dict[str, Any]:
+                                secondary: bool = False, valid_count=None) -> dict[str, Any]:
     """Named bindings of the dense finalize GEMM2 launch (hand-written
     ``blockscaled_contiguous_grouped_gemm_finalize_fusion``, fused_moe.py:697-736): ``A`` = the W1 activation
     (``gemm1_out``, ``(R, I)`` E4M3) with its blocked scales viewed as ``(R/128, I/128, 4, 128)`` atoms (W1
@@ -2184,7 +2312,9 @@ def gemm2_dense_launch_bindings(b: dict[str, Any], *, w2, w2_sf, route_weights, 
     the 256-row capacity (fused_moe.py:684-717). ``secondary`` + ``row_group`` (the mixed192 split finalize over the
     alternate wide list, ``_prepare_dense_gemm2_alt(wide=True)``, mxfp4.py:1821-1869): ``swap_alt_wide_list`` /
     ``swap_alt_wide_count`` over the 256-row groups (``out_alt_tile_idx_to_*``), ``tiles`` = the 256-row capacity;
-    the base member (``row_group``, not ``secondary``) rasters ``swap_wide_list`` / ``swap_wide_count``."""
+    the base member (``row_group``, not ``secondary``) rasters ``swap_wide_list`` / ``swap_wide_count``.
+    ``valid_count`` (the device-gated mixed192 chain): the one-word item count the launch keys off instead of K6's
+    word -- the gate kernel's word for this launch (``swap_gate_words``), 0 when the device selected the other path."""
     import torch
 
     if secondary and not dual:
@@ -2203,6 +2333,8 @@ def gemm2_dense_launch_bindings(b: dict[str, Any], *, w2, w2_sf, route_weights, 
         tile_expert, tile_limit = b["out_tile_idx_to_expert_idx"], b["out_tile_idx_to_mn_limit"]
         valid = b["out_base_active_num_non_exiting_tiles"] if dual else b["out_num_non_exiting_tiles"]
         group_list = unused["tile_idx_to_row_group"]
+    if valid_count is not None:
+        valid = valid_count
     return dict(
         A=b["gemm1_out"].view(torch.uint8), SFA=b["gemm1_out_scale"].reshape(rows // 128, shard // 128, 4, 128),
         B=w2, SFB=w2_sf, tile_idx_to_expert_idx=tile_expert,
@@ -2211,6 +2343,28 @@ def gemm2_dense_launch_bindings(b: dict[str, Any], *, w2, w2_sf, route_weights, 
         token_final_scales=route_weights.reshape(-1), tile_idx_to_row_group=group_list,
         num_m_tiles=tiles, num_n_tiles=-(-hidden // n_tile), k_tiles=shard // 128, out_cols=hidden, top_k=top_k,
         dbg=dbg, out=output)
+
+
+def gemm2_gate_launch_bindings(b: dict[str, Any], *, rule: dict[str, int]) -> dict[str, Any]:
+    """Named bindings of the K6b ``gemm2_gate`` launch (no hand-written counterpart): the K6 tables and words the
+    device-gated mixed192 chain's finalize launches key off -- the 128-row / 256-row expert tables, the base /
+    alternate active counts, the wide lists with their counts, the window count -- the ``swap_gate_words`` output and
+    the G-rule operands (``mixed192_gate_rule``). Same operand order as the module's kernel signature."""
+    return dict(
+        tile_expert=b["out_tile_idx_to_expert_idx"], alt_expert=b["out_alt_tile_idx_to_expert_idx"],
+        base_active=b["out_base_active_num_non_exiting_tiles"], alt_active=b["out_alt_num_non_exiting_tiles"],
+        wide_list=b["swap_wide_list"], wide_count=b["swap_wide_count"], alt_wide_list=b["swap_alt_wide_list"],
+        alt_wide_count=b["swap_alt_wide_count"], narrow_count=b["swap_row_group_count"], gate=b["swap_gate_words"],
+        min_windows=int(rule["min_windows"]), every_group_vote=int(rule["every_group_vote"]),
+        wide_list_vote=int(rule["wide_list_vote"]), distinct_threshold=int(rule["distinct_threshold"]))
+
+
+def mixed192_gate_word(b: dict[str, Any], index: int):
+    """The one-word view of gate word ``index`` (slot head ``swap_gate_words[MIXED192_GATE_WORD_STRIDE * index]``,
+    256-byte aligned) a gated finalize launch binds as its item count."""
+    if not 0 <= int(index) < MIXED192_GATE_WORDS:
+        raise ValueError(f"gate word {index} is outside 0..{MIXED192_GATE_WORDS - 1}")
+    return b["swap_gate_words"].narrow(0, int(index) * MIXED192_GATE_WORD_STRIDE, 1)
 
 
 def finalize_rows_launch_bindings(b: dict[str, Any], *, route_weights, output, num_tokens: int, hidden: int,
@@ -2445,12 +2599,57 @@ def hybrid_launch_config(policy: CakeSwapAbPolicy, decision: PlanDecision) -> di
             "clear": decision.clear_output, "pdl": decision.pdl}
 
 
-MIXED192_CHAIN_STEPS_SPLIT = ("route_preprocess", "moe_sort_init", "moe_sort_coop", "gemm1_swapab_situ", "gemm1_dense",
-                              "gemm1_dense", "gemm2_swapab_finalize", "gemm2_dense_finalize", "gemm2_dense_finalize")
+MIXED192_CHAIN_GEMM2_PATHS = ("dense", "split", "gate")
 
 
-MIXED192_CHAIN_STEPS_DENSE = ("route_preprocess", "moe_sort_init", "moe_sort_coop", "gemm1_dense", "gemm1_dense",
-                              "gemm1_swapab_situ", "gemm2_dense_finalize", "gemm2_dense_finalize")
+def mixed192_chain_steps(*, gemm2: str, dense_first: bool) -> tuple[str, ...]:
+    """The mixed192 launch sequence: K1, the K6 pair (+ the K6b gate kernel when ``gemm2 == "gate"``), the GEMM1 stage
+    (window GEMM1 on the side stream first, or the dense pair first from ``SWAP_WIDE192_DENSE_FIRST_MIN_TOKENS``), then
+    the finalize stage: ``split`` = window finalize + the ``_rg`` dense pair over the wide lists, ``dense`` = the dense
+    finalize pair over every group, ``gate`` = both (five finalize launches, each keyed off a gate word)."""
+    if gemm2 not in MIXED192_CHAIN_GEMM2_PATHS:
+        raise ValueError(f"gemm2={gemm2!r}: the mixed192 finalize stage is one of {MIXED192_CHAIN_GEMM2_PATHS}")
+    gemm1 = (("gemm1_dense", "gemm1_dense", "gemm1_swapab_situ") if dense_first
+             else ("gemm1_swapab_situ", "gemm1_dense", "gemm1_dense"))
+    gate = ("gemm2_gate",) if gemm2 == "gate" else ()
+    finalize = {"dense": ("gemm2_dense_finalize", "gemm2_dense_finalize"),
+                "split": ("gemm2_swapab_finalize", "gemm2_dense_finalize", "gemm2_dense_finalize"),
+                "gate": ("gemm2_swapab_finalize",) + ("gemm2_dense_finalize",) * 4}[gemm2]
+    return ("route_preprocess", "moe_sort_init", "moe_sort_coop") + gate + gemm1 + finalize
+
+
+MIXED192_CHAIN_STEPS_SPLIT = mixed192_chain_steps(gemm2="split", dense_first=False)
+
+
+MIXED192_CHAIN_STEPS_DENSE = mixed192_chain_steps(gemm2="dense", dense_first=True)
+
+
+MIXED192_CHAIN_STEPS_GATED = mixed192_chain_steps(gemm2="gate", dense_first=True)
+
+
+def mixed192_gate_rule() -> dict[str, int]:
+    """The G-rule parameters the gate kernel is launched with (``gemm2_gate`` scalar operands), from the plan
+    constants: ``split`` iff ``narrow_count >= min_windows`` and the every-group vote equals ``every_group_vote``
+    and the wide-list vote equals ``wide_list_vote`` (``-1`` = that vote is not required; votes: 1 = N-fastest,
+    0 = M-fastest), the replayed vote's long tail being ``distinct > distinct_threshold``."""
+    rule = dict(min_windows=int(MIXED192_GATE_MIN_WINDOWS), every_group_vote=int(MIXED192_GATE_EVERY_GROUP_VOTE),
+                wide_list_vote=int(MIXED192_GATE_WIDE_LIST_VOTE),
+                distinct_threshold=int(MIXED192_GATE_DISTINCT_THRESHOLD))
+    if rule["min_windows"] < 0:
+        raise ValueError("MIXED192_GATE_MIN_WINDOWS must be non-negative")
+    for key in ("every_group_vote", "wide_list_vote"):
+        if rule[key] not in MIXED192_GATE_VOTE_VALUES:
+            raise ValueError(f"MIXED192_GATE_{key.upper()} must be one of {MIXED192_GATE_VOTE_VALUES} (1 = N-fastest, "
+                             f"0 = M-fastest, -1 = not required)")
+    if not 0 < rule["distinct_threshold"] < 64:
+        raise ValueError("MIXED192_GATE_DISTINCT_THRESHOLD must be in 1..63 (64 samples)")
+    return rule
+
+
+def _gated_launch(launch: Launch) -> Launch:
+    """``launch`` with the device-gated item count recorded as a deviation (the form is unchanged)."""
+    return Launch(launch.step, launch.hw, launch.form, launch.module, launch.backends, launch.missing, launch.stream,
+                  launch.deviations + (MIXED192_GATE_DEVIATION,))
 
 
 def mixed192_launch_config(policy: CakeSwapAbPolicy, decision: PlanDecision) -> dict[str, Any]:
@@ -2460,28 +2659,36 @@ def mixed192_launch_config(policy: CakeSwapAbPolicy, decision: PlanDecision) -> 
     :1997-2061 / :2169-2170).
 
     Nothing is inferred from names: the K6 configuration (tier, dual 256-row padding, mixed lists, bounded state,
-    PDL) is rebuilt from the decision inputs and must reproduce the plan's form names; the swap-AB GEMM1 (and, below
-    16384 tokens, the swap-AB finalize GEMM2) is ``decision.gemm1`` / ``decision.gemm2`` (the 192-row 2-CTA window
-    forms over the K6 window list, blocked scales); the dense GEMM1 pair comes from the pinned table by symbol
-    (row-group list + zero fill, primary / secondary rule, the weight-stream hint by ``mixed192_dense_weight_l2_hint``
-    -- the Cake lever's ``_nol2`` forms from ``MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS``); the dense finalize
-    pair is the C4 tactic ``(128, N)`` /
-    cluster (1, 2) and the 2-CTA ``(256, 256)`` / (2, 1) alternate, over the wide lists (``_rg``) below 16384 tokens
-    and over every group with the ``raster_along_m="auto"`` scheduler vote (``_rauto``) from 16384. Every kernel
-    launches with the plan's PDL attribute (``decision.pdl``).
+    PDL) is rebuilt from the decision inputs and must reproduce the plan's form names; the swap-AB GEMM1 (and, on the
+    split and the gated chains, the swap-AB finalize GEMM2) is ``decision.gemm1`` / ``decision.gemm2`` (the 192-row
+    2-CTA window forms over the K6 window list, blocked scales); the dense GEMM1 pair comes from the pinned table by
+    symbol (row-group list + zero fill, primary / secondary rule, the weight-stream hint by
+    ``mixed192_dense_weight_l2_hint`` -- the Cake lever's ``_nol2`` forms from
+    ``MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS`` tokens); the dense finalize pairs are the C4 tactic ``(128, N)`` /
+    cluster (1, 2) and the 2-CTA ``(256, 256)`` / (2, 1) alternate: over the wide lists (``_rg``) on the split chain
+    (below 16384 tokens), over every group with the ``raster_along_m="auto"`` scheduler vote (``_rauto``) on the dense
+    chain, BOTH pairs (the wide pair at ``MIXED192_GATE_WIDE_GEMM2_N``) on the device-gated chain
+    (``gemm2_path == "gate"``, from ``MIXED192_GEMM2_GATE_MIN_TOKENS``) -- or the path the stage-0 instrument
+    ``MIXED192_GEMM2_PATH_OVERRIDE`` forces (``swap_mixed192_gemm2``), under the token count's own GEMM1 enqueue order
+    (``mixed192_chain_steps``). The gated chain adds the K6b ``gemm2_gate`` configuration (``gate``) and the G-rule
+    operands (``gate_rule``). Every kernel launches with the plan's PDL attribute (``decision.pdl``).
     """
     if decision.path != "mixed192":
         raise ValueError(f"not a mixed192 decision (path {decision.path!r})")
     if not decision.supported:
         raise NotImplementedError(decision.reason)
     T, group, tile = decision.num_tokens, decision.group_rows, decision.tile
-    dense_gemm2 = policy.swap_mixed192_gemm2(T) == "dense"                                   # :2486-2495
+    gemm2_path = policy.swap_mixed192_gemm2(T)                                               # :2486-2495 (+ the gate)
+    if gemm2_path not in MIXED192_CHAIN_GEMM2_PATHS:
+        raise AssertionError(f"mixed192 GEMM2 path {gemm2_path!r} is not an executable finalize stage")
+    gated = gemm2_path == "gate"
+    dense_gemm2 = gemm2_path == "dense"
     dense_first = T >= SWAP_WIDE192_DENSE_FIRST_MIN_TOKENS                                   # :1065-1068
-    expected = MIXED192_CHAIN_STEPS_DENSE if dense_gemm2 else MIXED192_CHAIN_STEPS_SPLIT
+    expected = mixed192_chain_steps(gemm2=gemm2_path, dense_first=dense_first)
     steps = tuple(l.step for l in decision.launch_plan)
-    if steps != expected or dense_first != dense_gemm2:
-        raise NotImplementedError(f"mixed192 launch sequence {steps} (dense_first={dense_first}) is not the executable "
-                                  f"chain {expected}")
+    if steps != expected:
+        raise NotImplementedError(f"mixed192 launch sequence {steps} (gemm2={gemm2_path}, dense_first="
+                                  f"{dense_first}) is not the executable chain {expected}")
     side_steps = {l.step for l in decision.launch_plan if l.stream == "side"}
     if side_steps != ({"gemm1_swapab_situ"} if dense_gemm2 else {"gemm1_swapab_situ", "gemm2_swapab_finalize"}):
         raise AssertionError(f"mixed192 side-stream launches {side_steps} (SWAP_WIDE192_MIXED_STREAMS='win', :1062-1072)")
@@ -2499,6 +2706,8 @@ def mixed192_launch_config(policy: CakeSwapAbPolicy, decision: PlanDecision) -> 
         by_step.setdefault(l.step, []).append(l.form)
     if by_step["route_preprocess"] != ["kimi_k3_mxfp4_situ_route_preprocess"]:
         raise AssertionError(f"route preprocess form {by_step['route_preprocess']}")
+    if by_step.get("gemm2_gate", []) != (["gemm2_gate"] if gated else []):
+        raise AssertionError(f"gate launches {by_step.get('gemm2_gate', [])} (gated={gated})")
     dual = policy.swap_mixed192_dual(T)
     if dual is None or dual[0] != 2 * group:
         raise AssertionError(f"mixed192 dual-tile tactic {dual!r} (hand-written 256-row alternate, :2473-2484)")
@@ -2533,25 +2742,38 @@ def mixed192_launch_config(policy: CakeSwapAbPolicy, decision: PlanDecision) -> 
     if by_step["gemm1_dense"] != [base_sym, alt_sym] or tuple(g1_tactic[1]) != (1, 1) or tuple(alt_g1[1]) != (2, 1):
         raise AssertionError(f"dense GEMM1 forms {by_step['gemm1_dense']} != [{base_sym}, {alt_sym}] "
                              f"(tactics {g1_tactic} / {alt_g1})")
-    g2_tactic = policy.tactic(T)[2]
-    if g2_tactic[0][0] != group:
-        g2_tactic = ((group, 192), (1, 2), False)
-    n2, cluster_n = g2_tactic[0][1], g2_tactic[1][1]
     alt_n2, alt_cg, alt_cn = alt_g2[0][1], 2 if alt_g2[0][0] == 2 * group else 1, alt_g2[1][1]
-    if g2_tactic[1][0] != 1 or (alt_cg, alt_cn) != (2, 1):
-        raise AssertionError(f"mixed192 dense GEMM2 tactics {g2_tactic} / {alt_g2}: cluster (1, N) base + 2-CTA (2, 1) alternate")
-    # :1803-1850 (wide lists; the Cake ``MIXED192_WIDE_RASTER_M_MIN_TOKENS`` lever may add the vote) vs :1686-1736.
-    raster = policy.gemm2_raster(T, n2, wide_list=not dense_gemm2)
-    raster_alt = policy.gemm2_raster(T, policy.tactic(T)[2][0][1], wide_list=not dense_gemm2)
-    rauto, rauto_alt = ("_rauto" if raster[0] == "auto" else ""), ("_rauto" if raster_alt[0] == "auto" else "")
-    want = [f"gemm2_dense_finalize_n{n2}" + ("_c12" if cluster_n == 2 else "") + ("" if dense_gemm2 else "_rg") + rauto,
-            f"gemm2_dense_finalize_n{alt_n2}_2cta" + ("" if dense_gemm2 else "_rg") + rauto_alt]
+    if (alt_cg, alt_cn) != (2, 1):
+        raise AssertionError(f"mixed192 dense GEMM2 alternate tactic {alt_g2}: the 2-CTA (2, 1) alternate")
+
+    def pair(wide_list: bool) -> tuple[tuple[int, int, Any, int], tuple[int, int, Any, int], list[str]]:
+        """``(base, alternate, forms)`` of one dense finalize pair: over the wide lists (``_rg``) or every group.
+        :1803-1850 (wide lists; the Cake ``MIXED192_WIDE_RASTER_M_MIN_TOKENS`` lever may add the vote) vs :1686-1736."""
+        tactic = policy.mixed192_gemm2_base_tactic(T, group, wide_list=wide_list, gated=gated and wide_list)
+        n2, cluster_n = tactic[0][1], tactic[1][1]
+        if tactic[1][0] != 1:
+            raise AssertionError(f"mixed192 dense GEMM2 base tactic {tactic}: cluster (1, N)")
+        raster = policy.gemm2_raster(T, n2, wide_list=wide_list)
+        raster_alt = policy.gemm2_raster(T, policy.tactic(T)[2][0][1], wide_list=wide_list)
+        rauto, rauto_alt = ("_rauto" if raster[0] == "auto" else ""), ("_rauto" if raster_alt[0] == "auto" else "")
+        rg = "_rg" if wide_list else ""
+        forms = [f"gemm2_dense_finalize_n{n2}" + ("_c12" if cluster_n == 2 else "") + rg + rauto,
+                 f"gemm2_dense_finalize_n{alt_n2}_2cta" + rg + rauto_alt]
+        return (n2, cluster_n, raster[0], raster[1]), (alt_n2, alt_cg, raster_alt[0], raster_alt[1]), forms
+
+    every = pair(False) if gemm2_path in ("dense", "gate") else None
+    wide = pair(True) if gemm2_path in ("split", "gate") else None
+    want = (wide[2] if wide is not None else []) + (every[2] if every is not None else [])  # enqueue order
     if by_step["gemm2_dense_finalize"] != want:
         raise AssertionError(f"dense GEMM2 forms {by_step['gemm2_dense_finalize']} != {want}")
-    cfg = {"sort": sort_cfg, "gemm1": g1, "alt_tile": alt_tile, "dense_gemm2": dense_gemm2, "dense_first": dense_first,
+    main_pair = every if every is not None else wide
+    cfg = {"sort": sort_cfg, "gemm1": g1, "alt_tile": alt_tile, "gemm2_path": gemm2_path, "dense_gemm2": dense_gemm2,
+           "gated": gated, "dense_first": dense_first,
            "gemm1_dense": GEMM1_DENSE_FORMS[base_sym], "gemm1_alt": GEMM1_DENSE_FORMS[alt_sym],
-           "gemm2": (n2, cluster_n, raster[0], raster[1]), "gemm2_alt": (alt_n2, alt_cg, raster_alt[0], raster_alt[1]),
-           "pdl": decision.pdl, "swap_gemm2": None, "clear": route_fill}
+           "gemm2": main_pair[0], "gemm2_alt": main_pair[1],
+           "gemm2_wide": wide[0] if gated else None, "gemm2_wide_alt": wide[1] if gated else None,
+           "pdl": decision.pdl, "swap_gemm2": None, "clear": route_fill, "gate": None, "gate_rule": None,
+           "gate_wide_n": None}
     if not dense_gemm2:
         g2 = decision.gemm2
         if g2 is None or not g2.two_cta or g2.n_tile != tile or g2.m_group != 1 or g2.hw_split_k != 1 \
@@ -2561,6 +2783,12 @@ def mixed192_launch_config(policy: CakeSwapAbPolicy, decision: PlanDecision) -> 
             raise AssertionError("mixed192 swap-AB GEMM2 is the 192-row 2-CTA finalize form over the window list, "
                                  "m_group 1, no split-K, no late dependent wait (:1931-1990)")
         cfg["swap_gemm2"] = g2
+    if gated:
+        if not dense_first:
+            raise AssertionError("the device-gated chain runs the dense-first GEMM1 order (T >= 16384)")
+        cfg["gate"] = _gemm2_gate_module().GateConfig(pdl=decision.pdl)
+        cfg["gate_rule"] = mixed192_gate_rule()
+        cfg["gate_wide_n"] = int(MIXED192_GATE_WIDE_GEMM2_N)
     return cfg
 
 
@@ -3120,8 +3348,18 @@ class CakeMixed192Plan:
     192-row 2-CTA ``_rowgroup`` form over the windows on the plan's side stream, the dense gather GEMM1 base (M128,
     primary zero-fill rule) and alternate (M256 2-CTA, secondary rule) forms over the wide lists on the caller's
     stream, then either (T < 16384, ``split``) the swap-AB finalize GEMM2 over the windows (side) + the dense
-    finalize pair over the wide lists (main), or (T >= 16384, ``dense``, dense GEMM1s first) the dense finalize pair
-    over every base / alternate group with the device-side raster vote (main) after the side stream's swap GEMM1.
+    finalize pair over the wide lists (main), or (``dense``, dense GEMM1s first) the dense finalize pair
+    over every base / alternate group with the device-side raster vote (main) after the side stream's swap GEMM1,
+    or (from ``MIXED192_GEMM2_GATE_MIN_TOKENS``, ``gate``: Cake lever L45 design A, no hand-written counterpart) the
+    STATIC device-gated chain: the one-warp ``gemm2_gate`` kernel right after the K6 pair reads the finished sort
+    tables, replays both finalize rasters' scheduler vote and writes the item count every finalize launch keys off
+    (K6's word on the path it selects, 0 on the other), then the dense-first GEMM1 stage and ALL five finalize
+    launches -- the window finalize (side), the ``_rg_rauto`` pair over the wide lists and the ``_rauto`` pair over
+    every group (main) -- so the unselected path's kernels exit on zero items without touching the output and the host
+    enqueues the same kernels on every run (CUDA-graph replayable, no host decision from the routing; the device's
+    choice is read back into ``executed_chain["gate"]`` after a run, never decided here). Numerics: the gate moves no
+    arithmetic; on either path every expert contribution is packed and reduce-added exactly once (two bf16 roundings
+    per contribution), only which kernel adds a window row's contribution, and in which order, differs.
     Fork / fill / swap-GEMM1 / join events reproduce the hand-written ``win`` stream layout (:1073-1086), so the
     chain is CUDA-graph capturable from the caller's stream. Same buffer / operand conventions as
     :class:`CakeDensePlan`; the two zero-fill launches share one plan-owned pair of counters."""
@@ -3149,6 +3387,8 @@ class CakeMixed192Plan:
         self.sm_count = sms = _runner_sm_count(wrapper, self.device)
         cfg = mixed192_launch_config(pol, decision)
         self.dense_gemm2, self.dense_first = cfg["dense_gemm2"], cfg["dense_first"]
+        self.gemm2_path, self.gated = cfg["gemm2_path"], cfg["gated"]
+        self._gate_rule, self._gate_wide_n = cfg["gate_rule"], cfg["gate_wide_n"]
         self.mode, weights_src, w_strides, self.route_weights, self.route_ids = _route_operands(b, topk_ids, topk_weights)
         self.expanded_idx_to_permuted_idx = b["out_expanded_idx_to_permuted_idx"]
         rt, ms, gm = _routing_module(), _moe_sort_module(), _gemm_module()
@@ -3175,6 +3415,13 @@ class CakeMixed192Plan:
             b, topk_ids=self.route_ids, num_tokens=T, top_k=K, num_experts=E, local_experts=L, local_offset=offset,
             tile=decision.group_rows, alt_tile=alt_tile, permille=DENSE_DUAL_TILE_THRESHOLD_PERMILLE, mixed=True,
             narrow_tile=decision.tile, unused=self._unused)
+        # K6b (gated chain): the one-CTA gate kernel right after the K6 pair; its words are the finalize item counts.
+        self._gate = self._gate_grid = self._gate_args = None
+        if self.gated:
+            gt = _gemm2_gate_module()
+            self._gate = gt.build_gate_module(cfg["gate"], self.backend)
+            self._gate_grid = (gt.gate_grid(), 1, 1)
+            self._gate_args = gemm2_gate_launch_bindings(b, rule=cfg["gate_rule"])
         self._dbg = torch.zeros(64 * sms, dtype=torch.int32, device=self.device)
         # Swap-AB SiTU GEMM1 over the 192-row windows (:1419-1453): one 2-CTA cluster per (weight M chunk, list slot)
         # up to the co-resident cluster capacity (hand-written ``max_active_clusters``; ``finalize_grid`` rule).
@@ -3216,11 +3463,19 @@ class CakeMixed192Plan:
             linear_beta=linear_beta, beta_stride=1, linear_beta_stride=1, unused=self._unused, dual=True)
         if alt_zf:
             self._gemm1_alt_args["zero_fill_counters"] = self._zero_fill_counters
-        # GEMM2 stage.
+        # GEMM2 stage: ``dense`` = the ``_rauto`` pair over every group; ``split`` = window finalize (side) + the ``_rg``
+        # pair over the wide lists; ``gate`` = all five, each keyed off its gate word (``swap_gate_words``).
         n2, cluster_n, raster, swizzle = cfg["gemm2"]
         alt_n2, alt_cg, raster_alt, swizzle_alt = cfg["gemm2_alt"]
+        gw = (lambda index: mixed192_gate_word(b, index)) if self.gated else (lambda index: None)
+        common2 = dict(w2=dense_w["w2"], w2_sf=dense_w["w2_sf"], route_weights=self.route_weights, hidden=H, shard=I,
+                       top_k=K, rows=rows, output=output, dbg=self._dbg, unused=self._unused, dual=True)
         self._swap_gemm2 = self._swap_gemm2_grid = self._swap_gemm2_args = None
-        if not self.dense_gemm2:
+        self._gemm2_wide = self._gemm2_wide_grid = self._gemm2_wide_args = None
+        self._gemm2_wide_alt = self._gemm2_wide_alt_grid = self._gemm2_wide_alt_args = None
+        self._gemm2 = self._gemm2_grid = self._gemm2_args = None
+        self._gemm2_alt = self._gemm2_alt_grid = self._gemm2_alt_args = None
+        if cfg["swap_gemm2"] is not None:
             # Swap-AB finalize GEMM2 over the windows (:1931-1990, mixed192 list block :1949-1961); grid as GEMM1.
             g2 = cfg["swap_gemm2"]
             self._swap_gemm2 = build_gemm2_module(self.backend, g2)
@@ -3229,32 +3484,41 @@ class CakeMixed192Plan:
             self._swap_gemm2_grid = (g2_cfg["CTA_V"] * min(g2_items, self._swap_gemm2.max_active_clusters()), 1, 1)
             self._swap_gemm2_args = gemm2_launch_bindings(
                 b, weights=weights, route_weights=self.route_weights, hidden=H, shard=I, top_k=K, tiles=tiles,
-                k_tiles=g2.k_tiles, output=output, dbg=self._dbg, unused=self._unused, row_group_list=True)
-            # Dense finalize pair over the compacted wide lists (:1748-1785 base, :1821-1869 alternate ``wide=True``).
-            self._gemm2 = g2d.build_module(self.backend, n2, use_pdl=pdl, cta_group=1, cluster_n=cluster_n, row_group=True,
-                                           raster_along_m=raster, swizzle=swizzle)
-            self._gemm2_alt = g2d.build_module(self.backend, alt_n2, use_pdl=pdl, cta_group=alt_cg, cluster_n=1,
-                                               row_group=True, raster_along_m=raster_alt, swizzle=swizzle_alt)
-            g2_rg, g2_slots, g2_alt_slots = True, list_capacity, alt_list_capacity
-        else:
+                k_tiles=g2.k_tiles, output=output, dbg=self._dbg, unused=self._unused, row_group_list=True,
+                valid_count=gw(MIXED192_GATE_WORD_NARROW))
+        if self.gemm2_path in ("split", "gate"):
+            # Dense finalize pair over the compacted wide lists (:1748-1785 base, :1821-1869 alternate ``wide=True``);
+            # on the gated chain the pair of ``MIXED192_GATE_WIDE_GEMM2_N`` keyed off the gate's wide / alt-wide words.
+            wn, wcn, wraster, wswizzle = cfg["gemm2_wide"] if self.gated else cfg["gemm2"]
+            wan, wacg, waraster, waswizzle = cfg["gemm2_wide_alt"] if self.gated else cfg["gemm2_alt"]
+            self._gemm2_wide = g2d.build_module(self.backend, wn, use_pdl=pdl, cta_group=1, cluster_n=wcn, row_group=True,
+                                                raster_along_m=wraster, swizzle=wswizzle)
+            self._gemm2_wide_alt = g2d.build_module(self.backend, wan, use_pdl=pdl, cta_group=wacg, cluster_n=1,
+                                                    row_group=True, raster_along_m=waraster, swizzle=waswizzle)
+            wn_tiles = -(-H // wn)
+            self._gemm2_wide_grid = (wcn * min(list_capacity * (-(-wn_tiles // wcn)), sms // wcn), 1, 1)
+            self._gemm2_wide_args = gemm2_dense_launch_bindings(
+                b, tiles=list_capacity, n_tile=wn, row_group=True, valid_count=gw(MIXED192_GATE_WORD_WIDE), **common2)
+            self._gemm2_wide_alt_grid = (wacg * min(alt_list_capacity * (-(-H // wan)), sms // wacg), 1, 1)
+            self._gemm2_wide_alt_args = gemm2_dense_launch_bindings(
+                b, tiles=alt_list_capacity, n_tile=wan, row_group=True, secondary=True,
+                valid_count=gw(MIXED192_GATE_WORD_ALT_WIDE), **common2)
+        if self.gemm2_path in ("dense", "gate"):
             # Dense finalize pair over every base / alternate group with the raster vote (:1686-1742); the base
-            # launch keys off ``out_base_active_num_non_exiting_tiles`` (zero under the 256-row padding).
+            # launch keys off ``out_base_active_num_non_exiting_tiles`` (zero under the 256-row padding) -- on the gated
+            # chain off the gate's base-active / alt-active words (zero when the device selected the split path).
             self._gemm2 = g2d.build_module(self.backend, n2, use_pdl=pdl, cta_group=1, cluster_n=cluster_n,
                                            raster_along_m=raster, swizzle=swizzle)
             self._gemm2_alt = g2d.build_module(self.backend, alt_n2, use_pdl=pdl, cta_group=alt_cg, cluster_n=1,
                                                raster_along_m=raster_alt, swizzle=swizzle_alt)
-            g2_rg, g2_slots, g2_alt_slots = False, tiles, alt_cap
-        n2_tiles = -(-H // n2)
-        self._gemm2_grid = (cluster_n * min(g2_slots * (-(-n2_tiles // cluster_n)), sms // cluster_n), 1, 1)
-        self._gemm2_args = gemm2_dense_launch_bindings(
-            b, w2=dense_w["w2"], w2_sf=dense_w["w2_sf"], route_weights=self.route_weights, hidden=H, shard=I, top_k=K,
-            tiles=g2_slots, rows=rows, n_tile=n2, output=output, dbg=self._dbg, unused=self._unused, row_group=g2_rg,
-            dual=True)
-        self._gemm2_alt_grid = (alt_cg * min(g2_alt_slots * (-(-H // alt_n2)), sms // alt_cg), 1, 1)
-        self._gemm2_alt_args = gemm2_dense_launch_bindings(
-            b, w2=dense_w["w2"], w2_sf=dense_w["w2_sf"], route_weights=self.route_weights, hidden=H, shard=I, top_k=K,
-            tiles=g2_alt_slots, rows=rows, n_tile=alt_n2, output=output, dbg=self._dbg, unused=self._unused,
-            row_group=g2_rg, dual=True, secondary=True)
+            n2_tiles = -(-H // n2)
+            self._gemm2_grid = (cluster_n * min(tiles * (-(-n2_tiles // cluster_n)), sms // cluster_n), 1, 1)
+            self._gemm2_args = gemm2_dense_launch_bindings(
+                b, tiles=tiles, n_tile=n2, row_group=False, valid_count=gw(MIXED192_GATE_WORD_BASE_ACTIVE), **common2)
+            self._gemm2_alt_grid = (alt_cg * min(alt_cap * (-(-H // alt_n2)), sms // alt_cg), 1, 1)
+            self._gemm2_alt_args = gemm2_dense_launch_bindings(
+                b, tiles=alt_cap, n_tile=alt_n2, row_group=False, secondary=True,
+                valid_count=gw(MIXED192_GATE_WORD_ALT_ACTIVE), **common2)
         self._dense_weights = dense_w
         self._beta, self._linear_beta = beta, linear_beta
         # Side stream + events (hand-written ``win`` layout, :1073-1086 / :2003-2061).
@@ -3265,11 +3529,17 @@ class CakeMixed192Plan:
         dense_g1 = [("gemm1_dense", self.backend, self._gemm1_dense_grid), ("gemm1_dense", self.backend, self._gemm1_alt_grid)]
         order = [("route_preprocess", self.backend, self._pre_grid), ("moe_sort_init", "cuda_cpp", self._sort_init_grid),
                  ("moe_sort_coop", "cuda_cpp", self._sort_coop_grid)]
+        if self.gated:
+            order.append(("gemm2_gate", self.backend, self._gate_grid))
         order += (dense_g1 + window_g1) if self.dense_first else (window_g1 + dense_g1)
-        if not self.dense_gemm2:
+        if self._swap_gemm2 is not None:
             order.append(("gemm2_swapab_finalize", self.backend, self._swap_gemm2_grid))
-        order += [("gemm2_dense_finalize", self.backend, self._gemm2_grid),
-                  ("gemm2_dense_finalize", self.backend, self._gemm2_alt_grid)]
+        if self._gemm2_wide is not None:
+            order += [("gemm2_dense_finalize", self.backend, self._gemm2_wide_grid),
+                      ("gemm2_dense_finalize", self.backend, self._gemm2_wide_alt_grid)]
+        if self._gemm2 is not None:
+            order += [("gemm2_dense_finalize", self.backend, self._gemm2_grid),
+                      ("gemm2_dense_finalize", self.backend, self._gemm2_alt_grid)]
         if [step for step, _b, _g in order] != [l.step for l in decision.launch_plan]:
             raise AssertionError("mixed192 enqueue order does not reproduce the decision's launch plan")
         self.launches = tuple(ExecutedLaunch(step, form, backend, grid)
@@ -3281,16 +3551,38 @@ class CakeMixed192Plan:
 
     @property
     def executed_chain(self) -> dict[str, Any]:
-        return executed_chain_record("mixed192", self.decision, self.launches, self.sm_count)
+        record = executed_chain_record("mixed192", self.decision, self.launches, self.sm_count)
+        if self.gated:
+            record["gate"] = self.gate_record()
+        return record
+
+    def gate_record(self) -> dict[str, Any]:
+        """The device-gated chain's G-rule operands and -- after a completed run, outside CUDA-graph capture -- the
+        words the gate kernel wrote (``gemm2_gate.GATE_WORDS`` order) and the path the DEVICE selected. Diagnostics of
+        what ran: the host never decides the path from them (the chain is static)."""
+        import torch
+
+        record: dict[str, Any] = {"rule": dict(self._gate_rule), "wide_gemm2_n": self._gate_wide_n,
+                                  "words": None, "device_path": None}
+        if not self.gated:
+            raise ValueError("gate_record is defined for the device-gated mixed192 chain")
+        if not torch.cuda.is_current_stream_capturing():
+            words = [int(v) for v in self._buffers["swap_gate_words"][::MIXED192_GATE_WORD_STRIDE].tolist()]
+            record["words"] = words
+            record["device_path"] = "split" if words[MIXED192_GATE_WORD_PATH] else "dense"
+        return record
 
     def launch_sequence(self) -> tuple[tuple[str, tuple[int, int, int]], ...]:
         return tuple((l.step, l.grid) for l in self.launches)
 
     def run(self):
         """Enqueue the chain across the caller's current stream (main) and the plan's side stream in the hand-written
-        order (:1997-2061): preprocess, K6 pair, fork; T < 16384: side swap GEMM1 | main dense GEMM1 base, alternate;
-        fill event main -> side; side swap GEMM2 | main dense finalize base, alternate; T >= 16384: main dense GEMM1
-        base, alternate | side swap GEMM1 -> event -> main dense finalize base, alternate; join (:2169-2170)."""
+        order (:1997-2061): preprocess, K6 pair (+ the K6b gate on the gated chain), fork; T < 16384: side swap GEMM1 |
+        main dense GEMM1 base, alternate; fill event main -> side; side swap GEMM2 | main dense finalize base,
+        alternate; T >= 16384 dense: main dense GEMM1 base, alternate | side swap GEMM1 -> event -> main dense finalize
+        base, alternate; gated: main dense GEMM1 base, alternate | side swap GEMM1 -> swap-GEMM1 event; fill event
+        main -> side; side window finalize | main wide pair, wait swap-GEMM1 event, every-group pair; join
+        (:2169-2170). The gated enqueue is identical on every run: the device's path choice lives in the gate words."""
         import torch
 
         with torch.cuda.device(self.device):
@@ -3298,6 +3590,8 @@ class CakeMixed192Plan:
             self._pre.launch(grid=self._pre_grid, **self._pre_args)
             self._sort_init.launch(grid=self._sort_init_grid, **self._sort_init_args)
             self._sort_coop.launch(grid=self._sort_coop_grid, **self._sort_coop_args)
+            if self.gated:
+                self._gate.launch(grid=self._gate_grid, **self._gate_args)
             self._fork.record(main)
             self._side.wait_event(self._fork)
             if not self.dense_first:
@@ -3310,18 +3604,33 @@ class CakeMixed192Plan:
                 self._gemm1_alt.launch(grid=self._gemm1_alt_grid, **self._gemm1_alt_args)
                 with torch.cuda.stream(self._side):
                     self._gemm1.launch(grid=self._gemm1_grid, **self._gemm1_args)
-            if not self.dense_gemm2:
+            if self.gated:
+                # The every-group pair reads the window rows the side stream's GEMM1 wrote (:2033-2034) ...
+                self._swap_g1.record(self._side)
+                # ... and the window finalize reduce-adds into the output the dense GEMM1s zero-filled (:2050-2052).
+                self._fill.record(main)
+                self._side.wait_event(self._fill)
+                with torch.cuda.stream(self._side):
+                    self._swap_gemm2.launch(grid=self._swap_gemm2_grid, **self._swap_gemm2_args)
+                self._gemm2_wide.launch(grid=self._gemm2_wide_grid, **self._gemm2_wide_args)
+                self._gemm2_wide_alt.launch(grid=self._gemm2_wide_alt_grid, **self._gemm2_wide_alt_args)
+                main.wait_event(self._swap_g1)
+                self._gemm2.launch(grid=self._gemm2_grid, **self._gemm2_args)
+                self._gemm2_alt.launch(grid=self._gemm2_alt_grid, **self._gemm2_alt_args)
+            elif not self.dense_gemm2:
                 # The window finalize reduce-adds into the output the dense GEMM1s zero-filled (:2050-2052).
                 self._fill.record(main)
                 self._side.wait_event(self._fill)
                 with torch.cuda.stream(self._side):
                     self._swap_gemm2.launch(grid=self._swap_gemm2_grid, **self._swap_gemm2_args)
+                self._gemm2_wide.launch(grid=self._gemm2_wide_grid, **self._gemm2_wide_args)
+                self._gemm2_wide_alt.launch(grid=self._gemm2_wide_alt_grid, **self._gemm2_wide_alt_args)
             else:
                 # The dense finalize over every group reads the window rows the side stream's GEMM1 wrote (:2033-2034).
                 self._swap_g1.record(self._side)
                 main.wait_event(self._swap_g1)
-            self._gemm2.launch(grid=self._gemm2_grid, **self._gemm2_args)
-            self._gemm2_alt.launch(grid=self._gemm2_alt_grid, **self._gemm2_alt_args)
+                self._gemm2.launch(grid=self._gemm2_grid, **self._gemm2_args)
+                self._gemm2_alt.launch(grid=self._gemm2_alt_grid, **self._gemm2_alt_args)
             self._join.record(self._side)
             main.wait_event(self._join)
         return self.output
@@ -3764,6 +4073,49 @@ class DispatchConfig:
     all_lists: bool = True
 
 
+@dataclass(frozen=True)
+class GateConfig:
+    """Build-time shape of the gate kernel: the PDL attribute (griddepcontrol emission) only."""
+
+    pdl: bool = True
+
+    @property
+    def threads(self) -> int:
+        return THREADS
+
+
+GATE_WORDS = ("path", "narrow_count", "wide_count", "alt_wide_count", "base_active", "alt_active",
+              "every_group_vote", "wide_list_vote")
+
+
+GATE_WORD = {name: index for index, name in enumerate(GATE_WORDS)}
+
+
+NUM_GATE_WORDS = len(GATE_WORDS)
+
+
+GATE_WORD_STRIDE = 64
+
+
+GATE_SLOT_WORDS = NUM_GATE_WORDS * GATE_WORD_STRIDE
+
+
+PATH_DENSE = 0
+
+
+PATH_SPLIT = 1
+
+
+def gate_grid() -> int:
+    """One CTA: the gate reads a handful of words and 128 samples."""
+    return 1
+
+
+def gate_form_name(cfg: GateConfig) -> str:
+    """IR export name of the gate configuration (the PDL attribute is a launch attribute, not part of the name)."""
+    return "gemm2_gate"
+
+
 # ----------------------------------------------------------------------------------------------------------
 # Package binding: the Cake-module accessors and kernel builders the plan below reaches for, served by the
 # generated modules of this package (``cake_mxfp4_situ_moe_kernels``) instead of the producer's compilers.
@@ -3927,6 +4279,29 @@ class _Gemm2DenseModule:
         return _package_launch(kernel, use_pdl=use_pdl)
 
 
+class _Gemm2GateModule:
+    """The one-warp GEMM2 path gate (K6b) the device-gated mixed192 chain reaches through ``_gemm2_gate_module()``
+    (extracted above: the configuration, the word table, the form name, the launch grid); the kernel is the generated
+    module whose ``route.form`` carries the configuration's PDL attribute (a trace-time constant, as for the K6 pair)."""
+
+    GateConfig = GateConfig
+    GATE_WORDS = GATE_WORDS
+    GATE_WORD = GATE_WORD
+    NUM_GATE_WORDS = NUM_GATE_WORDS
+    GATE_WORD_STRIDE = GATE_WORD_STRIDE
+    GATE_SLOT_WORDS = GATE_SLOT_WORDS
+    PATH_DENSE = PATH_DENSE
+    PATH_SPLIT = PATH_SPLIT
+    gate_grid = staticmethod(gate_grid)
+    gate_form_name = staticmethod(gate_form_name)
+
+    @staticmethod
+    def build_gate_module(cfg, backend: str) -> "PackageLaunch":
+        _check_backend(backend)
+        kernel = _kernels().find_kernel(kind="gemm2_gate", pdl=bool(cfg.pdl), use_pdl=bool(cfg.pdl))
+        return _package_launch(kernel, use_pdl=cfg.pdl)
+
+
 def _routing_module():
     return _RoutingModule
 
@@ -3945,6 +4320,10 @@ def _gemm1_dense_module():
 
 def _gemm2_dense_module():
     return _Gemm2DenseModule
+
+
+def _gemm2_gate_module():
+    return _Gemm2GateModule
 
 
 def _finalize_module():
@@ -4123,5 +4502,6 @@ def kernel_stages(plan) -> tuple[str, ...]:
     chain: routing, swap-AB GEMM1, swap-AB GEMM2 finalize; the dense chain: route preprocess, the K6 pair, dense
     GEMM1, dense finalize GEMM2; the split two-stage chain: split routing, wide row-group GEMM1 / GEMM2, narrow
     swap-AB GEMM1 / partial GEMM2, finalize rows; the hybrid chain: route preprocess, the K6 pair, dispatch, swap-AB
-    row-group GEMM1, dense row-group GEMM1, dense finalize GEMM2)."""
+    row-group GEMM1, dense row-group GEMM1, dense finalize GEMM2; the device-gated mixed192 chain: route preprocess,
+    the K6 pair, the gate, the GEMM1 stage, then every finalize launch of both paths)."""
     return tuple(value.stage for value in vars(plan).values() if isinstance(value, PackageLaunch))

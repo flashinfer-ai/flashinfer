@@ -44,6 +44,7 @@ owns dispatch, expert compute, and combine; output is always BF16
 | `sm90_bf16_bf16_bf16_pull_cutedsl` | BF16 | BF16 | BF16 | SM90 exactly | same `knobs` surface as the FP8 pull backend, shared knob cache |
 | `sm90_fp8_fp8_bf16_push_cuda` (`sm90_push_fp8`) | FP8 (E4M3) | FP8 (E4M3) | BF16 | SM90 | — (static dimensions/protocol choices only) |
 | `sm90_bf16_bf16_bf16_push_cake` | BF16 | BF16 | BF16 | SM90 | — (`capacity_factor`, `dedup_dispatch`, optional `clamp_limit`, `combine_wire` = `prereduced` (default: one pre-reduced bf16 row per (token, source rank), deterministic rank-ordered fp32 sum) or `per_route`; native BF16 end to end: bf16 dispatch payload, Cake-generated WGMMA FC1/FC2 with fp32 accumulation, bf16 combine wire) |
+| `sm120_mxfp4_mxfp8_bf16_cake` | MXFP8 (E4M3, block-32 UE8M0) | MXFP4 (E2M1, block-32 UE8M0); optional FP8 E4M3 shared expert | BF16 | SM120 | `transport_table` per EP-rank pair (`all_gin` default; `lsa_where_reachable` / `all_lsa` / explicit tuple: LSA copier CTAs over NVLink / PCIe P2P); `"tuned"` → offline winner from `torchrun --nproc_per_node=<EP> -m flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8` in `FLASHINFER_MOE_EP_KNOB_CACHE`; `"auto"` → setup probe. Compile-time `swiglu_limit`, `codec_overflow_blocks`; one Cake-generated parametric persistent kernel (dispatch, FC1 + SwiGLU, FP8 requant, FC2, return, weighted combine) JIT-compiled per (EP, E, H, I, top-k, capacity), DeepSeek-V4-Flash EP4/EP8 instances in AOT; graph token buckets via `stage_inputs(compile_tokens_per_rank=...)` |
 
 The SM90 pull-style CuTeDSL tree is process-exclusive with the SM100 CuTeDSL
 tree (module names collide). Weight inputs are canonical BF16 `MoEWeightPack`
@@ -471,7 +472,7 @@ See the [runbook's mega-kernel walkthrough](./moe_ep_runbook.md#adding-a-new-meg
 
 See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environment) for the container setup and per-target requirements.
 
-`tests/moe_ep/run_tests.sh [unit|oracle|oracle_sm90|oracle_sm107|qualify_sm107|multirank|sm90_push|sm90_bf16_push_cake|split_path_correctness_{bf16,nvfp4,ht}|mega|mega_sm90|mega_sm107|smoke|ft|all]`:
+`tests/moe_ep/run_tests.sh [unit|oracle|oracle_sm90|oracle_sm107|qualify_sm107|multirank|sm90_push|sm90_bf16_push_cake|split_path_correctness_{bf16,nvfp4,ht}|mega|mega_sm90|mega_sm107|mega_sm120_cake|smoke|ft|all]`:
 
 - **unit** — host-only pytest (mocks + single-GPU; no multirank)
 - **oracle** — single-GPU torch-oracle correctness for every SM100 compute path (see **Torch oracles** below)
@@ -483,12 +484,13 @@ See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environ
 - **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity **and multi-rank torch oracles**, plus single-rank preprocess/kernel-vs-reference checks (`MEGA_NO_DIST=1`) (Blackwell, sm_100+)
 - **mega_sm90** — 4-GPU (Hopper) sm90_fp8_fp8_bf16_pull_cutedsl (FP8) + sm90_bf16_bf16_bf16_pull_cutedsl (BF16) mega parity + multi-rank torch oracles; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
 - **mega_sm107** — Rubin MoEEpLayer vs multirank torch oracle for all three formats, with idle ranks and pooled-layer graph replay; `NPROC_MULTIRANK=2`, `4`, or `8` (default 4), own torchrun process
+- **mega_sm120_cake** — 4-GPU (SM120) sm120_mxfp4_mxfp8_bf16_cake backend vs a multirank torch oracle (V4-Flash, DeepSeek-V3, Qwen3 geometries, unclamped SwiGLU, odd local expert counts), EPLB physical experts == logical (bitwise), transport-table bit-identity; `NPROC_CAKE_SM120=8` (one host) or a two-node torchrun for 16 ranks; own torchrun processes
 - **sm90_push** — 2-GPU (Hopper) sm90_fp8_fp8_bf16_push_cuda kernel + backend; own torchrun process
 - **sm90_bf16_push_cake** — 2-GPU (Hopper) sm90_bf16_bf16_bf16_push_cake backend vs an independent bf16 torch reference (single-process `-k ep1` cases, then torchrun EP≥2 routing patterns incl. the pre-reduce cases, uneven tokens, graph replay, combine-wire mismatch; every case under both combine wires); own torchrun process
 - **smoke** — NCCL-EP smoke script (and NIXL-EP when built)
 - **ft** — 4-GPU fault-tolerance (stalled-rank pytest half + dead-rank smoke half)
 
-`all` runs the eight Blackwell-relevant sections (everything above except the Hopper-only targets — `oracle_sm90`, `mega_sm90`, `sm90_push`, `sm90_bf16_push_cake` — and the Rubin-only `*_sm107` targets).
+`all` runs the eight Blackwell-relevant sections (everything above except the Hopper-only targets — `oracle_sm90`, `mega_sm90`, `sm90_push`, `sm90_bf16_push_cake` — the Rubin-only `*_sm107` targets and the SM120-only `mega_sm120_cake`).
 
 Multirank/smoke/correctness need the NCCL-EP build (see **Build / availability** — `docker/install/build_flashinfer_ep_pytorch.sh`); mega additionally needs Blackwell, deep_gemm, triton.
 
@@ -696,3 +698,27 @@ Reconciliation goes through the bootstrap rendezvous store
 allreduce: an allreduce over the EP group would hang on exactly the rank being
 masked out. See `core/comm/fault_tolerance.py` and the runbook for the protocol
 and the recovery state machine.
+
+### Offline live-token tuning
+
+CuTeDSL MegaMoE tuning records both workspace capacity (`max_tokens`) and
+benchmark workload (`live_tokens`) in each JSON entry. Different workloads at
+the same capacity coexist; retuning the same pair replaces its winner. No
+profile tag is required. This applies to SM90, SM100, and SM107 tuners.
+
+Lookup first matches capacity exactly, then selects the smallest recorded live
+bucket at least as large as the workload, or the largest bucket if none is
+large enough. Legacy entries without `live_tokens` retain capacity-based
+fallback. Default callers without a live count select for full capacity.
+
+Before CUDA graph capture, enumerate `layer.live_token_buckets(capacity)`, create
+`layer.create_workspace(capacity, live_tokens=bucket)`, and warm each handle.
+Use the same cache and allocation order on all EP ranks. Select the handle using
+the EP-wide maximum padded token count; the handle retains its tactic and
+addresses through capture and replay. Equal tactics at the same capacity share
+buffers; distinct tactics require additional memory. Restart to reload tuning.
+Explicit knob dictionaries override offline tuning; SM107 requires `knobs="cache"`.
+
+For decode capacity 512 and prefill capacity 16384, record workloads separately
+under each capacity, for example `--max-tokens 512 --live-tokens 128` and
+`--max-tokens 16384 --live-tokens 2048`. Graph replay performs no JSON lookup.

@@ -71,23 +71,6 @@ import cutlass.experimental.primitives as nvvm
 from cutlass._mlir.dialects import llvm
 
 
-@cute.jit
-def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=False):
-    """N-direction super-block rasterization of the (m, n) cgrp-tile coord, for
-    L2 reuse. ``identity=True`` compiles out the general mapping when the caller
-    knows that ``swizzle_w == 1``.
-    """
-    if cutlass.const_expr(identity):
-        return raw_m, raw_n
-    t = raw_n * nt_m + raw_m
-    blk = nt_m * swizzle_w
-    sb = t // blk
-    off = t - sb * blk
-    base_n = sb * swizzle_w
-    cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
-    log_m = off // cur_S
-    log_n = base_n + off - log_m * cur_S
-    return log_m, log_n
 
 
 def epi_subtile_spans(cols, epi_n=32):
@@ -187,19 +170,6 @@ def fence_tensormap_acquire(desc_ptr) -> None:
     )
 
 
-@cute.jit
-def moe_group_at(visit_idx, num_groups, num_experts):
-    """Visitation index -> routed group index.
-
-    ``num_groups == num_experts`` (or a non-multiple) walks groups in order. Batched MoE
-    (``num_groups == B * num_experts``) walks expert-major -- the B groups sharing expert
-    ``g % E`` become consecutive, so the expert weight is fetched once instead of B times.
-    """
-    per_expert = num_groups // cutlass.max(num_experts, cutlass.Int32(1))
-    group = visit_idx
-    if per_expert > 1 and per_expert * num_experts == num_groups:
-        group = (visit_idx % per_expert) * num_experts + (visit_idx // per_expert)
-    return group
 
 
 @cute.jit
@@ -229,30 +199,6 @@ def tcgen05_dealloc(tmem_ptr, num_cols, *, is_exclusive=False, group=None):
         nvvm.tcgen05_dealloc(tmem_ptr, num_cols, group=group)
 
 
-def tcgen05_mma(mma_kind, cta_group, d, a, b, idesc, scale_d, *, collector_op=None, b_collector_op=None):
-    if b_collector_op is None:
-        nvvm.tcgen05_mma(
-            mma_kind,
-            cta_group,
-            d,
-            a,
-            b,
-            idesc,
-            scale_d,
-            collector_op=collector_op,
-        )
-    else:
-        nvvm.tcgen05_mma(
-            mma_kind,
-            cta_group,
-            d,
-            a,
-            b,
-            idesc,
-            scale_d,
-            collector_op=collector_op,
-            b_collector_op=b_collector_op,
-        )
 
 
 def tcgen05_mma_block_scale(mma_kind, cta_group, d, a, b, idesc, *, enable_input_d, scale_a, scale_b, scale_vec_size, collector_op=None, b_collector_op=None):
@@ -2273,7 +2219,7 @@ def _host(
                     1,
                     256,
                     cute.assume(256 * rest_k, 8),
-                    cute.assume(256 * rest_k * rest_n, 8),
+                    cute.assume(_sfb_op.stride[2] // 2, 8),
                 ),
             ),
         )

@@ -100,10 +100,9 @@ def _build_graph(
         )
 
     def apply_gemm_scale(tensor, name):
-        if dtype != "nvfp4":
+        if dtype == "bf16":
             return tensor
-        # NVFP4 global descales belong before the nonlinear activation. Each
-        # group supplies the product of its activation and weight descales.
+        # Apply per-group GEMM multipliers before the nonlinear activation.
         alpha = graph.tensor(
             name=name,
             dim=[groups, 1, 1],
@@ -583,7 +582,7 @@ def _export_compiled(args, compiled, config, arch):
     expected_aux = (
         {"scale", "gate_scale", "linear_scale"} if activation == "situ" else {"scale"}
     )
-    if dtype == "nvfp4":
+    if dtype != "bf16":
         expected_aux |= {"gate_alpha"}
         if is_gated(activation):
             expected_aux |= {"up_alpha"}
@@ -592,7 +591,7 @@ def _export_compiled(args, compiled, config, arch):
     if op != "grouped_gemm2" and set(aux_names) != expected_aux:
         raise RuntimeError(f"Unexpected FC1 auxiliary tensors: {aux_names}")
     if op == "grouped_gemm2":
-        if set(aux_names) != ({"alpha"} if dtype == "nvfp4" else set()):
+        if set(aux_names) != ({"alpha"} if dtype != "bf16" else set()):
             raise RuntimeError(f"Unexpected FC2 auxiliary tensors: {aux_names}")
     token_dtype, weight_dtype = {
         "bf16": ("bfloat16", "bfloat16"),
@@ -604,7 +603,7 @@ def _export_compiled(args, compiled, config, arch):
         "id": artifact_id,
         "op": prefix,
         "arch": arch,
-        "abi": f"cudnn_frost_{prefix}{'_quantized' if quantize_output else ''}{'_swap_ab' if swap_ab else ''}_v2",
+        "abi": f"cudnn_frost_{prefix}{'_quantized' if quantize_output else ''}{'_swap_ab' if swap_ab else ''}",
         "source": source,
         "workspace_bytes": int(compiled.workspace_bytes),
         "launch": {"tail": launch_tail},
@@ -641,12 +640,12 @@ def _export_compiled(args, compiled, config, arch):
             ),
             **(
                 {
-                    "elements_per_byte": 2,
+                    **({"elements_per_byte": 2} if dtype == "nvfp4" else {}),
                     "global_scale_dtype": "float32",
                     "global_scale_layout": "per_group",
                     "global_scale_position": "gemm_output_before_activation",
                 }
-                if dtype == "nvfp4"
+                if dtype != "bf16"
                 else {}
             ),
         },

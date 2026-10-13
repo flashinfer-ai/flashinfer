@@ -1,5 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
-"""Cheap BF16 auto-admission; source and shortlist checks live in the runner."""
+"""Cheap BF16 input geometry checks for ordinary MoELayer candidates."""
 
 import torch
 
@@ -42,10 +42,3 @@ def large_bf16_moe(config, act, arch):
 
 
 is_eligible = large_bf16_moe
-
-
-def create_runner(config, device):
-    """Load the implementation only after cheap automatic-admission checks."""
-    from .moe import automatic_candidate
-
-    return automatic_candidate(config, device)

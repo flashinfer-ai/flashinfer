@@ -150,17 +150,18 @@ def _plan_grid(num_tokens: int, num_heads: int, head_group: int) -> Tuple[int, i
     return grid, warps_per_token
 
 
-# Cake modules, keyed by (exact target, head group).
-_modules: Dict[Tuple[str, int], Any] = {}
+# Loaded JIT modules. The Cake backend builds one module per (exact target,
+# head group); the specialized backend one module holding both head-count
+# variants. Keyed by backend name so a future backend adds an entry, not a
+# global.
+_cake_modules: Dict[Tuple[str, int], Any] = {}
+_backend_modules: Dict[str, Any] = {}
 _module_errors: Dict[Any, str] = {}
 _module_lock = threading.Lock()
-# The specialized kernel's single module (both head-count variants in one build).
-_specialized_module: Any = None
-_SPECIALIZED_MODULE_KEY = "specialized"
 _stats: Dict[str, Any] = {
     "calls": 0,
     # Every fused dispatch, whichever backend served it.
-    "specialized_dispatches": 0,
+    "fused_dispatches": 0,
     "backend_dispatches": {"specialized": 0, "cake": 0},
     "fallback_dispatches": 0,
     "fallback_reasons": {},
@@ -179,13 +180,13 @@ def _bump_fallback(reason: str) -> None:
 def _get_module(target: str, head_group: int):
     """Build/load the Cake (target, head group) JIT module once; never inside a CUDA-graph capture."""
     key = (target, int(head_group))
-    module = _modules.get(key)
+    module = _cake_modules.get(key)
     if module is not None:
         return module
     with _module_lock:
-        if key not in _modules and key not in _module_errors:
+        if key not in _cake_modules and key not in _module_errors:
             try:
-                _modules[key] = load_concat_mla_kv_quant_fp8_build(
+                _cake_modules[key] = load_concat_mla_kv_quant_fp8_build(
                     target, int(head_group)
                 )
                 _stats["module_loaded"] = True
@@ -200,38 +201,36 @@ def _get_module(target: str, head_group: int):
                     int(head_group),
                     error,
                 )
-    return _modules.get(key)
+    return _cake_modules.get(key)
 
 
 def _get_specialized_module():
     """Build/load the specialized kernel's JIT module once; never inside a CUDA-graph capture."""
-    global _specialized_module
-    if _specialized_module is not None:
-        return _specialized_module
+    key = "specialized"
+    module = _backend_modules.get(key)
+    if module is not None:
+        return module
     with _module_lock:
-        if (
-            _specialized_module is None
-            and _SPECIALIZED_MODULE_KEY not in _module_errors
-        ):
+        if key not in _backend_modules and key not in _module_errors:
             try:
-                _specialized_module = gen_mla_kv_pack_fp8_module().build_and_load()
+                _backend_modules[key] = gen_mla_kv_pack_fp8_module().build_and_load()
                 _stats["module_loaded"] = True
             except Exception as exc:  # noqa: BLE001 - guard must never break the stock path
                 error = f"{type(exc).__name__}: {exc}"[:500]
-                _module_errors[_SPECIALIZED_MODULE_KEY] = error
+                _module_errors[key] = error
                 _stats["module_error"] = error
                 logger.warning(
                     "flashinfer.concat_mla_kv_quant_fp8: JIT build of the specialized "
                     "kernel failed, trying the other backends: %s",
                     error,
                 )
-    return _specialized_module
+    return _backend_modules.get(key)
 
 
 def _concat_mla_kv_quant_fp8_stats() -> dict:
     """Diagnostics: dispatch counters, JIT state and the compile footprint.
 
-    ``specialized_dispatches`` counts every fused dispatch; ``backend_dispatches``
+    ``fused_dispatches`` counts every fused dispatch; ``backend_dispatches``
     splits it by backend. The Cake backend is one generated program per head
     group (1, 2, 3 or 4 head pairs per warp, planned from ``(num_tokens,
     num_heads)`` on the host); the specialized backend is one module holding
@@ -250,15 +249,18 @@ def _concat_mla_kv_quant_fp8_stats() -> dict:
         "allowlist": allowlist,
         "backends": BACKENDS,
         "auto_specialized_heads": tuple(sorted(_SPECIALIZED_AUTO_HEADS)),
-        "compiled_variants": len(_modules) + (1 if _specialized_module else 0),
-        "specialized_module_loaded": _specialized_module is not None,
+        "compiled_variants": len(_cake_modules) + len(_backend_modules),
+        "backend_modules_loaded": {
+            "specialized": "specialized" in _backend_modules,
+            "cake": len(_cake_modules),
+        },
         "distinct_kernels_for_allowlist": len(ROUTES),
         "distinct_kernels": "cake: one generated program per head group "
         + ", ".join(sorted(ROUTES))
         + " (head group planned from num_tokens and num_heads); specialized: "
         "num_heads==12 (unrolled) + runtime-heads variant (T and H are runtime "
         "arguments on both)",
-        "precompiled": bool(_modules) or _specialized_module is not None,
+        "precompiled": bool(_cake_modules) or bool(_backend_modules),
     }
 
 
@@ -390,7 +392,7 @@ def _cake_supported(
         return "exact_target"
     if (
         torch.cuda.is_current_stream_capturing()
-        and _modules.get((target, _plan_head_group(num_tokens, num_heads))) is None
+        and _cake_modules.get((target, _plan_head_group(num_tokens, num_heads))) is None
     ):
         # Never compile/load inside a capture; the stock path is capture-safe.
         return "capturing_before_jit"
@@ -410,7 +412,10 @@ def _specialized_backend_supported(
     reason = _device_supported(kv_nope)
     if reason is not None:
         return reason
-    if torch.cuda.is_current_stream_capturing() and _specialized_module is None:
+    if (
+        torch.cuda.is_current_stream_capturing()
+        and "specialized" not in _backend_modules
+    ):
         return "capturing_before_jit"
     return None
 
@@ -430,7 +435,7 @@ def _backend_order(backend: str, num_heads: int) -> Tuple[str, ...]:
     return ("cake", "specialized")
 
 
-def _specialized_supported(
+def _fused_supported(
     kv_nope: torch.Tensor,
     k_pe: torch.Tensor,
     key: torch.Tensor,
@@ -619,7 +624,7 @@ def concat_mla_kv_quant_fp8(
             _bump_fallback(reason)
             return _fallback(kv_nope, k_pe, key, value, nope_dim)
         return key, value  # num_tokens == 0
-    _stats["specialized_dispatches"] += 1
+    _stats["fused_dispatches"] += 1
     _stats["backend_dispatches"][served] += 1
     if not _marker_logged:
         _marker_logged = True

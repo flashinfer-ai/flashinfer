@@ -307,7 +307,9 @@ def test_decision_served_rows_outside_the_executable_chain(layout, T, path, laun
 def test_long_prefill_rows_are_served_by_the_mixed192_chain(T):
     """The MoE-TP rows of 8192 tokens and above run the two-stream ``mixed192`` chain: every launch traced, the
     dense GEMM1 pair zero-fills the output (no K1 clear), the 192-row 2-CTA window forms on the side stream, the
-    dense finalize pair over the wide lists below 16384 tokens and over every group with the raster vote from 16384."""
+    dense finalize pair over the wide lists below 16384 tokens; from 16384 the static device-gated finalize stage:
+    the one-warp ``gemm2_gate`` kernel after ``moe_sort`` plus the window finalize, the wide-list pair and the
+    every-group raster-vote pair, each keyed off a gate word (the unselected path's kernels exit on zero items)."""
     decision = _runner(TP8).decide(T)
     assert decision.supported and decision.path == "mixed192" and decision.reason == ""
     assert (
@@ -319,17 +321,31 @@ def test_long_prefill_rows_are_served_by_the_mixed192_chain(T):
         and decision.tile == 192
     )
     forms = [launch.form for launch in decision.launch_plan]
+    gated = T >= plan.MIXED192_GEMM2_GATE_MIN_TOKENS
     assert "gemm1_swapab_situ_n192_2cta_rowgroup" in forms
-    assert ("gemm2_swapab_finalize_n192_2cta_cm4" in forms) == (T < 16384)
-    assert ("gemm2_dense_finalize_n256_c12_rg_rauto" in forms) == (T < 16384)
-    assert ("gemm2_dense_finalize_n192_c12_rauto" in forms) == (T >= 16384)
+    assert ("gemm2_gate" in forms) == gated
+    assert "gemm2_swapab_finalize_n192_2cta_cm4" in forms
+    assert "gemm2_dense_finalize_n256_c12_rg_rauto" in forms
+    assert ("gemm2_dense_finalize_n192_c12_rauto" in forms) == gated
+    assert ("gemm2_dense_finalize_n256_2cta_rauto" in forms) == gated
     assert {
         launch.step for launch in decision.launch_plan if launch.stream == "side"
-    } == (
-        {"gemm1_swapab_situ", "gemm2_swapab_finalize"}
-        if T < 16384
-        else {"gemm1_swapab_situ"}
-    )
+    } == {"gemm1_swapab_situ", "gemm2_swapab_finalize"}
+    if gated:
+        assert decision.launches == plan.MIXED192_CHAIN_STEPS_GATED
+        rule = plan.mixed192_gate_rule()
+        gate = kernels.find_form(
+            kind="gemm2_gate", pdl=decision.pdl, use_pdl=decision.pdl
+        )
+        assert gate["route"]["stage"] == "gemm2_gate" and rule["min_windows"] >= 0
+        assert set(rule) == {
+            "min_windows",
+            "every_group_vote",
+            "wide_list_vote",
+            "distinct_threshold",
+        }
+    else:
+        assert decision.launches == plan.MIXED192_CHAIN_STEPS_SPLIT
     # The dense GEMM1 pair loads its weights without the EVICT_FIRST weight-stream hint from the plan's
     # MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS tokens (the ``_nol2`` modules; the hint-on pair below): the
     # launch config resolves the 7-tuple and the package carries both variants.
@@ -340,6 +356,12 @@ def test_long_prefill_rows_are_served_by_the_mixed192_chain(T):
         "gemm1_dense_situ_m256_n256_2cta_rowgroup_zero_fill_secondary" + nol2,
     ]
     cfg = plan.mixed192_launch_config(_runner(TP8).policy, decision)
+    assert cfg["gated"] is gated and (cfg["gate"] is not None) is gated
+    if gated:
+        assert (
+            cfg["gemm2_wide"][0] == plan.MIXED192_GATE_WIDE_GEMM2_N
+            and cfg["gemm2"][0] == 192
+        )
     for args in (cfg["gemm1_dense"], cfg["gemm1_alt"]):
         tile_m, n1, zero_fill, secondary, row_group, early, l2_hint = args
         assert l2_hint is hint_on and zero_fill and row_group and not early

@@ -57,7 +57,7 @@ TVM-FFI functions to the MoE adapter. Later processes reuse the writable
 FlashInfer JIT cache. Cache identities include target architecture, the complete
 CuTe DSL compiler stack and source contents; persisted tactic identities also
 include the compiler stack. Upgrading CuTe DSL therefore recompiles kernels
-and invalidates old cuDNN Frost tactic choices. Compilation and native plan setup
+and invalidates old cuDNN Frost tactic choices. Compilation and native executor setup
 must finish before CUDA Graph capture.
 
 The sources use `cutlass.experimental.primitives` and the experimental tensor
@@ -69,10 +69,11 @@ target-architecture compile-option support, TVM-FFI support, and conflicting
 `CUTE_DSL_ARCH` overrides. Probe results are cached per architecture and source
 set; no kernel is compiled or launched by the probe.
 
-Missing capabilities skip cuDNN Frost in automatic MoE selection and raise an
-actionable `NotImplementedError` for explicit cuDNN Frost use. Source integrity errors
-and later compiler/runtime failures remain errors; static capability checks do
-not guarantee compiler correctness. The release qualification covers public CuTe DSL 4.8.0 and the development DSL
+Missing capabilities and invalid artifacts reject the candidate during
+`check_support()`. MoELayer skips rejected candidates and reports the reasons
+if none remain. Errors during kernel preparation and execution propagate.
+Static capability checks do not guarantee compiler correctness.
+The release qualification covers public CuTe DSL 4.8.0 and the development DSL
 build, with the selected external assembler. Python API capability checks remain
 in place in addition to the documented dependency baseline.
 This backend does not change the repository-wide dependency floor.
@@ -100,8 +101,8 @@ SM107 MoELayer admission requires CUDA 13.4 or newer for both external PTXAS
 and the bundled assembler, without a patch-level minimum. Use the latest
 assembler patch release for SM107 tensor-map updates.
 Setting `CUDA_HOME` alone does not select the external assembler.
-Older or unidentified assemblers are rejected,
-including on cached runners. Explicit use reports the requirement; automatic
+Older or unidentified assemblers are rejected when building or refreshing a
+MoE runner. Explicit use reports the requirement; automatic
 selection retains the other candidates. SM120 BF16 sources do not patch tensor
 maps and retain capability-based admission without this SM107 assembler minimum.
 
@@ -117,8 +118,10 @@ out  = silu(gate) * up * scale
 `first_token_offset` contains `G+1` nondecreasing int32 boundaries starting at
 zero. Group `g` spans `[first_token_offset[g], first_token_offset[g+1])` and uses
 expert `g % E`; `G` is a positive multiple of `E`. The final boundary may be
-smaller than buffer capacity `S`; rows beyond it are not processed. Artifact ABI
-`v2` requires this explicit final boundary and rejects the old `v1` manifests.
+smaller than buffer capacity `S`; rows beyond it are not processed. The grouped
+GEMM ABI requires this explicit final boundary. Host adapters and generated
+sources ship together; ABI names identify the operation and operand orientation,
+with launch arguments and numerical contracts checked during artifact discovery.
 Routing, permutation, GEMM2, and final scatter are outside this API.
 
 An independent FC2 grouped-GEMM PoC and a full `CudnnFrostBf16MoeRunner` are also
@@ -211,25 +214,30 @@ precomputed top-k ids/weights
 
 The runner consumes a `cudnn_frost_mxfp8` or canonical `cutlass_mxfp8` weight view, including its
 packed per-expert weight scales. Activation scales may use linear or swizzled
-F8_128x4 layout. Gated weights retain the canonical **[up, gate]** data layout;
-their scale buffers are split into the frozen kernels' contiguous expert layout
-during preparation. Per-expert FC1/FC2 input scales must be one. Bias, shared
-experts, expert parallelism, non-default activation parameters and logits-based
-routing are unsupported.
+F8_128x4 layout. Gated weights retain the canonical **[up, gate]** data layout.
+FC1 weight scales accept both canonical `[E, 2 * I, C]` and packed
+`[2, E, I, C]` storage, where `C` is the stored scale width; non-gated storage
+uses one branch. Tensor Core descriptors and FMA kernels read the supplied
+expert and branch strides directly, without rearranging or copying scales.
+Per-expert `fc1_input_scale` and `fc2_input_scale` are runtime
+FP32 multipliers. FC1 applies its multiplier to the GEMM accumulators before
+activation, including both gate and up branches; FC2 applies its multiplier
+before BF16 output conversion. Bias, shared experts, expert parallelism,
+non-default activation parameters and logits-based routing are unsupported.
 
 Automatic admission requires SM107a, MXFP8 operands, BF16 finalized output,
 precomputed routing and legal artifacts for both stages. No experimental auto
 opt-in is required. Existing
 `(activation,E,H,I,top_k,tokens)` measurements retain their two FC1/activation
 and two FC2 configurations and fused variants. Intermediate token counts use
-the next measured profile; native plans use the exact input shape.
+the next measured profile; native executors use the actual input shape at launch.
 
 MXFP8, NVFP4 and MXFP8 × MXFP4 shapes without a table entry (including token
 counts beyond its largest profile) use a bounded heuristic pool. H/I must be
 positive multiples of 128, at most 2^20; `1 <= top_k <= E <= 1024`;
 `1 <= T <= min(2^20, tune_max_num_tokens)`; expanded rows must satisfy the
-native int32 bound. Each stage must also match its artifact's dimension and
-activation contracts. Missing legal stages exclude Frost from auto selection.
+native int32 bound. Candidate selection checks each stage's artifact dimension
+and activation contracts; missing legal stages are reported during packing.
 BF16 retains its existing measured geometry policy until its shape-specific
 artifact contracts are generalized and validated.
 
@@ -264,29 +272,56 @@ graph resource retention used by the other FMA paths.
 
 Prepare and autotune outside CUDA Graph capture. Activation data, activation
 scales, expert ids and routing weights may change between graph replays.
-Prepared weights and weight scales must remain static. For ordinary tensors,
-changing weight scales and repacking refreshes the copied scale buffers, and
-existing graphs must be captured again. Inference tensors have no version
-counter: replace the tensor object when changing prepared weights or scales.
+Weight data and block-scale contents may also change in place between calls or
+graph replays. Keep their pointers, shapes and layouts stable for a captured
+graph, and order updates before execution on its stream. Replacing a tensor or
+changing its shape or layout requires packing again and recapturing the graph.
+This applies to inference tensors as well: block scales are read directly and
+do not use tensor version counters. MXFP8 and MXFP8 × MXFP4
+per-expert global multipliers are read directly from runtime tensors; their
+contents may change in place between calls or graph replays without repacking
+or recapturing.
 Keep the layer alive for its graphs and use one instance per stream/thread.
-Preparation lookup caches retain at most 32 exact-shape plans, four packed
-FC1 scale views, and 32 scale-validation records per runner. Scale keys weakly
-reference their source tensors; unused records disappear when their sources
-die. Active packed inputs and captured PyTorch graphs own the resources they
+Preparation lookup caches retain at most 32 bucket launch states and 128 fixed
+native executors per runner. Active packed inputs
+and captured PyTorch graphs own the resources they
 use independently of lookup eviction. Graph reset/destruction synchronizes its
 replay streams before releasing these resources. Replaying through raw CUDA
 graph handles bypasses that PyTorch lifetime tracking and is unsupported.
-A shape or scale version evicted from lookup must be prepared again outside
+A bucket evicted from lookup must be prepared again outside
 capture before capturing a new call. MoELayer keeps at most 128 winner entries;
 `reset_winner()` clears them as before.
 
-Admission and packing share a 128-entry selection cache per dtype keyed by artifact
-roots and cache version, architecture, exact geometry, and activation. It holds
-only kernel metadata; tensor layouts, alignment, and semantics are checked on
-each call. Quantized selectors also key by SM count and compiler/policy identity.
-Each dtype's `runtime.clear_artifact_cache()` invalidates this metadata when
-refreshing artifacts. Measure ordinary warm calls separately from CUDA Graph
-replay, which bypasses Python admission and packing.
+The four runners use a shared `FrostEngine` that captures the artifact catalog,
+shortlist, architecture, SM count, activation, compiler identity, and FMA
+configuration when built. Bounded selection caches use this fixed configuration
+and the token bucket and geometry. They hold only kernel metadata.
+Runners follow the standard `accepts / pack_inputs / forward` flow.
+`accepts` checks available weight views and cheap input geometry constraints;
+`pack_inputs` validates the current tensor contracts and prepares kernels.
+Invalid packs raise during packing; no validation result is cached across calls.
+Packed inputs own their immutable launch state. MoELayer caches winners by token
+bucket, routing mode and eligible candidate positions for every backend. All token counts
+in a bucket share a kernel candidate pool selected at its maximum legal token count.
+Native executors are cached by fixed geometry and tactic, independently of token
+count and bucket capacity. Each launch reads the actual token count and computes
+its workspace offsets, problem arguments, strides, and grids in native code.
+Bucket states hold capacity workspaces and their executor owners. FMA prepares
+all supported token specializations together when its executor is first built,
+then selects the appropriate functions in native code. Warm packing performs one
+bucket-state lookup; tuning configuration and input hooks are created lazily.
+
+Calls use the initialized configuration without checking global artifact versions
+or inspecting the compiler executable on warm paths. After changing configuration,
+call `layer.refresh_backends()` outside CUDA Graph capture or reconstruct the
+layer; a direct runner supports `runner.refresh()`. Refresh clears preparation
+lookups without releasing resources owned by older packs or graphs. Each dtype's
+`runtime.clear_artifact_cache()` clears shared discovery caches for future builds
+and explicit refreshes. Existing engines keep their captured configuration even
+when preparing a new token bucket.
+New compilation checks the actual assembler before and after compiling.
+Measure ordinary warm calls separately from CUDA Graph replay, which bypasses
+Python admission and packing.
 
 The `artifacts/mxfp8/` pool retains 169 selected BF16-output configurations in
 39 source templates, with 400 measured two-by-two profiles. It also includes
@@ -496,7 +531,7 @@ The FMA sources in `nvfp4/fma_fc*.py` follow the tiny-MoE algorithm from
 specializes their shapes and uses the same source verification, external PTXAS,
 and persistent compilation path as the frozen Tensor Core kernels. Conversion
 helpers and the native adapter participate in source/tactic identities. Compiled
-functions remain owned by the native plan and retained during CUDA Graph replay.
+functions remain owned by the native executor and retained during CUDA Graph replay.
 
 The runner consumes a `cudnn_frost_nvfp4` or canonical `cutlass_nvfp4` weight view. Activation
 scales may use linear or F8_128x4 layout. FC1 dequantization multiplies the
@@ -563,6 +598,8 @@ match the existing Tensor Core paths.
 The runner accepts a `cudnn_frost_mxfp8_mxfp4` weight view prepared by
 `CudnnFrostMxfp8Mxfp4Config.prepare_weights(...)`, or reuses an existing
 canonical `cutlass_mxfp8_mxfp4` view. Input scales may be linear or F8_128x4.
+Like MXFP8, FC1/FC2 support runtime per-expert global multipliers, with FC1
+scaling applied before activation and FC2 scaling before BF16 conversion.
 A Frost-only layer uses `BackendOptions((CudnnFrostMxfp8Mxfp4Config(),))`.
 Automatic candidates are added during tuning when a compatible view exists.
 The quantization configuration uses
@@ -598,7 +635,7 @@ accumulators before storing BF16. Gated activations fuse two grouped GEMMs;
 non-gated activations use one. FC2 sources are shared across activations.
 The standalone `cudnn_frost_grouped_gemm1_swiglu` API remains SwiGLU-specific.
 
-The native plan carries the generated argument order, including SiTU's scalar
+The native executor carries the generated argument order, including SiTU's scalar
 inputs, for both normal and swap-AB layouts. Activation-specific source hashes
 and artifact IDs isolate persisted tactics. Automatic selection still compares
 against eligible existing backends; it does not assume that every new activation
@@ -617,15 +654,15 @@ precomputed top-k ids/weights
   -> vectorized FP32 weighted reduction -> BF16 output
 ```
 
-`bf16/moe.py` owns support validation, compound tactics, native plans and workspace.
+`bf16/moe.py` owns support validation, compound tactics, native executors and workspace.
 `csrc/moe_bf16.cu` owns routing/finalize and calls the two native exported functions
 directly, without a Python callback between stages. Both the small embedding
 module and the GEMM kernels are compiled on first use through FlashInfer's JIT
 infrastructure. Workspace counters
 are reset on the current stream on every call and every graph replay. FC2
-reuses the grouped-input buffer after FC1 finishes consuming it. Exact-shape
-host plans share power-of-two-sized workspace allocations on the layer's
-stream; varying the token count does not allocate a large buffer per shape.
+reuses the grouped-input buffer after FC1 finishes consuming it. Bucket states
+share power-of-two-sized workspace allocations on the layer's stream; varying
+the token count within a bucket reuses both the state and its native executors.
 
 Frost participates in automatic selection during autotuning:
 
@@ -652,22 +689,15 @@ Automatic admission is deliberately narrow:
 - no bias, per-expert activation overrides, quantization scales, expert
   parallelism, shared experts, or in-kernel routing from logits.
 
-The dispatcher first admits cuDNN Frost during `autotune()`, compares its best
-compound tactic against the original backend pool, and reuses the winner in
-inference. Cold non-autotuned calls keep the original behavior. Unsupported
-calls keep the original candidates and a separate winner-cache entry. cuDNN Frost's
-exact-shape plans are never reused across rounded token-count buckets.
-
-Automatic candidates are registered lazily through
-`fused_moe/auto_candidates.py`; the layer does not contain cuDNN Frost-specific shape
-checks, runner fields, or cache branches. Each dtype's `support.py` owns admission
-and the deferred runner factory. Winner keys include the eligible automatic candidate
-set and exact input shape, so incompatible weight views cannot reuse a cuDNN Frost
-winner. All four Frost registrations are stable: the experimental environment
-variable does not affect their admission, cached runners, or cached winners.
-Experimental registrations still apply their own opt-in gate and warning.
-Explicit Frost runners also validate each pack and use exact-shape winner keys;
-they are not duplicated by automatic registration.
+The four Frost configs belong to the ordinary default backend list and use
+the same registration and dispatch path as explicitly configured backends.
+Custom `BackendOptions` determines the complete candidate pool; no extra runner
+is appended during autotuning. Shared weight-view eligibility skips candidates
+whose weights are unavailable. Each dtype's `support.py` supplies cheap input
+geometry constraints without compiler probing or kernel preparation per call.
+Winner keys include eligible runner positions, so changing views or input
+eligibility cannot reuse another pool's winner. Frost is stable and does not
+require the experimental environment variable.
 
 ### Rubin artifacts and swap AB
 
@@ -724,8 +754,8 @@ instantiation changes the concrete source AST. The deployed process needs no
 cuDNN installation to instantiate a template.
 
 Both stages independently support normal and swap-AB artifacts. Swapped kernels
-use explicit `cudnn_frost_grouped_gemm1_swiglu_swap_ab_v2` and
-`cudnn_frost_grouped_gemm2_swap_ab_v2` ABIs, with matching `tactic.swap_ab` metadata.
+use explicit `cudnn_frost_grouped_gemm1_swiglu_swap_ab` and
+`cudnn_frost_grouped_gemm2_swap_ab` ABIs, with matching `tactic.swap_ab` metadata.
 The adapter exchanges operand order, M/N problem dimensions and output strides;
 the external [up, gate]/down weight layout and grouped workspace layout stay the
 same. Normal-ABI records without `swap_ab` remain valid. Contradictory ABI
@@ -981,7 +1011,7 @@ across activations. FC2's N is the **hidden size**, whereas FC1's N is the
 intermediate size. FC2 does not apply an activation; its configurations are
 selected independently from FC1.
 
-The FC2 records use `op=grouped_gemm2` and ABI `cudnn_frost_grouped_gemm2_v2`;
+The FC2 records use `op=grouped_gemm2` and ABI `cudnn_frost_grouped_gemm2`;
 the manifest lists their Python source paths and digests. FC1 discovery ignores
 these records, retaining its separate candidate pool.
 
@@ -1023,7 +1053,7 @@ The old mixed cuDNN Frost/CUTLASS MoE runner, native GEMM1 plan adapter/interfac
 associated tests and full-MoE benchmark have been deleted. The CUTLASS CUDA
 sources and runner behavior are unaffected. Their workspace
 planning, tactic pools and cache keys are not modified for cuDNN Frost. Other backend
-runners do not import or inspect the cuDNN Frost manifest during execution. Core dispatch registers explicit configs and additional automatic candidates;
+runners do not import or inspect the cuDNN Frost manifest during execution. Core dispatch uses one configured candidate pool;
 backend-specific implementation and shape admission stay in this directory.
 
 The standalone FC1 API, offline exporter, FC2 prepared launcher and packaged
