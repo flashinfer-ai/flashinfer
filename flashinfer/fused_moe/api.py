@@ -191,8 +191,11 @@ class QuantConfig:
         Only NVFP4 activations accept an explicit value (``__post_init__``
         raises otherwise). A runner that has not threaded the setting into
         its quantizer rejects an explicit value instead of dropping it; see
-        ``MoERunner.supports_nvfp4_4over6``. A pinned recipe also pins the
-        GEMM2-input scale of the weight pack: build it with
+        ``MoERunner.supports_nvfp4_4over6``. The runners that have opted in
+        (CuteDSL, TRT-LLM FP4) honor a pinned recipe only with
+        ``per_token_scale=True``, where they requantize the GEMM2 input
+        themselves. For CuteDSL a pinned recipe also pins the GEMM2-input
+        scale of the weight pack: build it with
         ``CuteDslConfig.prepare_weights(..., nvfp4_4over6=<the same value>)``
         or the call raises ``ValueError``. An unset field is not emitted by
         ``__repr__``, so the ``eval(repr(cfg))`` round-trip still holds.

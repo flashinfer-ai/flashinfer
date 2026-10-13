@@ -20,8 +20,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import pytest
+import contextlib
+import os
 from typing import Dict
+
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -34,6 +37,7 @@ from flashinfer import (
 from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_routed_moe,
 )
+from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import (
     block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
@@ -59,22 +63,26 @@ cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 
 # The 4-over-6 x per-token-scaling matrix is the coverage here (only file exercising
 # it); shape fan-out kept to boundary corners.
-@pytest.mark.parametrize("num_tokens", [1, 1024])
-@pytest.mark.parametrize("hidden_size", [1024, 4096])
-@pytest.mark.parametrize("intermediate_size", [2048])
-@pytest.mark.parametrize("num_experts", [32])
-@pytest.mark.parametrize("top_k", [4])
-@pytest.mark.parametrize("use_4over6", [False, True])
-@pytest.mark.parametrize("weights_use_4over6", [False, True])
-@pytest.mark.parametrize(
-    "activation_type",
-    [
-        pytest.param(ActivationType.Swiglu, id="Swiglu"),
-        pytest.param(ActivationType.Relu2, id="Relu2"),
-    ],
-)
-@pytest.mark.parametrize("zero_rows", [False, True])
-def test_routed_fused_moe(
+@contextlib.contextmanager
+def _env(name: str, value: str):
+    saved = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = saved
+
+
+def _skip_unless_sm10x(device: torch.device) -> None:
+    if get_compute_capability(device)[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+
+def _per_token_routed_case(
+    *,
     num_tokens: int,
     hidden_size: int,
     intermediate_size: int,
@@ -84,11 +92,15 @@ def test_routed_fused_moe(
     weights_use_4over6: bool,
     activation_type: ActivationType,
     zero_rows: bool,
+    device: torch.device,
 ):
-    device = torch.device("cuda:0")
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10]:
-        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    """Build per-token NVFP4 inputs for the routed flat APIs and the reference.
+
+    Returns ``(kwargs, reference)``; ``kwargs`` is the keyword form of the
+    ``trtllm_fp4_block_scale_routed_moe`` call. The activation is quantized
+    under the ambient 4over6 environment; the weights under
+    ``weights_use_4over6``.
+    """
     enable_pdl = device_support_pdl(device)
 
     is_gated = activation_type.is_gated
@@ -325,47 +337,83 @@ def test_routed_fused_moe(
         torch.bfloat16
     ).view(torch.int16)
 
-    # ======== Launch MoE ========
-    from functools import partial
+    kwargs = dict(
+        topk_ids=packed_tensor,
+        routing_bias=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=w13_shuffled,
+        gemm1_weights_scale=w13_scale_shuffled,
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=w2_shuffled,
+        gemm2_weights_scale=w2_scale_shuffled,
+        gemm2_bias=None,
+        output1_scale_scalar=output1_scale_scalar,
+        output1_scale_gate_scalar=output1_scale_gate_scalar,
+        output2_scale_scalar=output2_scale_scalar,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.TopK.value,
+        do_finalize=True,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type.value,
+        per_token_scale=per_token_scale_inv,
+    )
+    return kwargs, reference
 
-    fn = partial(
-        trtllm_fp4_block_scale_routed_moe,
-        packed_tensor,
-        None,  # routing_bias
-        hidden_states,
-        hidden_states_scale,
-        w13_shuffled,
-        w13_scale_shuffled,
-        None,  # w13_bias
-        None,  # gemm1_alpha
-        None,  # gemm1_beta
-        None,  # gemm1_clamp_limit
-        w2_shuffled,
-        w2_scale_shuffled,
-        None,  # w2_bias
-        output1_scale_scalar,
-        output1_scale_gate_scalar,
-        output2_scale_scalar,
-        num_experts,
-        top_k,
-        None,  # n_group
-        None,  # topk_group
-        intermediate_size,
-        0,  # local_expert_offset
-        num_experts,
-        None,  # routed_scaling_factor
-        RoutingMethodType.TopK.value,
-        True,  # do_finalize
-        enable_pdl,
-        activation_type.value,  # act_type
-        per_token_scale_inv,
-        None,
+
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+@pytest.mark.parametrize("hidden_size", [1024, 4096])
+@pytest.mark.parametrize("intermediate_size", [2048])
+@pytest.mark.parametrize("num_experts", [32])
+@pytest.mark.parametrize("top_k", [4])
+@pytest.mark.parametrize("use_4over6", [False, True])
+@pytest.mark.parametrize("weights_use_4over6", [False, True])
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu, id="Swiglu"),
+        pytest.param(ActivationType.Relu2, id="Relu2"),
+    ],
+)
+@pytest.mark.parametrize("zero_rows", [False, True])
+def test_routed_fused_moe(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    top_k: int,
+    use_4over6: bool,
+    weights_use_4over6: bool,
+    activation_type: ActivationType,
+    zero_rows: bool,
+):
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    kwargs, reference = _per_token_routed_case(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        use_4over6=use_4over6,
+        weights_use_4over6=weights_use_4over6,
+        activation_type=activation_type,
+        zero_rows=zero_rows,
+        device=device,
     )
 
-    from flashinfer.autotuner import autotune
-
     with autotune(False):
-        result = fn()[0]
+        result = trtllm_fp4_block_scale_routed_moe(**kwargs)[0]
 
     torch.cuda.synchronize()
 
@@ -375,3 +423,59 @@ def test_routed_fused_moe(
         assert torch.all(result == 0)
         return
     check_accuracy(reference, result, atol=0.1, rtol=0.85, percent=0.9)
+
+
+# The autouse fixture keys on the ``use_4over6`` parameter: it pins every
+# FLASHINFER_NVFP4_4OVER6* variable, so the environment legs below differ only
+# in the on/off switch and ``NVFP44Over6Config()`` names the same recipe.
+@pytest.mark.parametrize("use_4over6", [True])
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        pytest.param(NVFP44Over6Config(), id="e4m3_max448"),
+        pytest.param(NVFP44Over6Config(e4m3_max=256), id="e4m3_max256"),
+    ],
+)
+def test_pinned_recipe_matches_env(recipe: NVFP44Over6Config, use_4over6: bool):
+    """``nvfp4_4over6=`` must select exactly the kernel the environment selects.
+
+    Per-token GEMM2-input requantization is the only place the fused MoE reads
+    the recipe, so this is where an explicit recipe must be bit-identical to
+    the environment it replaces, and ``None`` must ignore an environment that
+    turns 4over6 on. The default recipe exercises the candidate search; the
+    ``e4m3_max=256`` recipe also moves the per-token global scale
+    (``globalScaleInv``) from ``1/(448*6)`` to ``1/(256*6)``.
+    """
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    kwargs, _reference = _per_token_routed_case(
+        num_tokens=64,
+        hidden_size=1024,
+        intermediate_size=2048,
+        num_experts=32,
+        top_k=4,
+        use_4over6=True,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+
+    def run(**recipe):
+        with autotune(False):
+            out = trtllm_fp4_block_scale_routed_moe(**kwargs, **recipe)[0]
+        torch.cuda.synchronize()
+        return out.clone()
+
+    e4m3_use_256 = "1" if recipe.e4m3_max == 256 else "0"
+    with _env("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", e4m3_use_256):
+        env_on = run()
+        none_under_env_on = run(nvfp4_4over6=None)
+    with moe_utils.nvfp4_4over6_env(False):
+        env_off = run()
+        pinned_under_env_off = run(nvfp4_4over6=recipe)
+
+    # The recipe must change the output, or the equalities below are vacuous.
+    assert not torch.equal(env_on, env_off)
+    assert torch.equal(pinned_under_env_off, env_on)
+    assert torch.equal(none_under_env_on, env_off)

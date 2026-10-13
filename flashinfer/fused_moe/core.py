@@ -109,6 +109,13 @@ from ..utils import (
     register_fake_op,
 )
 from .da_moe import DA_MAX_EXPERTS, DABody, DAGraphTopology, DAPlan
+from ..quantization.nvfp4_quantization_utils import (
+    _UNSET,
+    NVFP4_4OVER6_CODE_FROM_ENV,
+    NVFP44Over6Config,
+    nvfp4_4over6_code,
+    resolve_nvfp4_4over6,
+)
 from .utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
@@ -3520,6 +3527,8 @@ def _build_trtllm_moe_namespace(module):
         # register_custom_op is ever re-enabled.
         hidden_states_scale_layout: Optional[int] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        # 4over6 recipe (nvfp4_4over6_code()); the default reads the env.
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -3629,6 +3638,7 @@ def _build_trtllm_moe_namespace(module):
             use_per_token_scaling=per_token_scale is not None,
             num_experts=num_experts,
             num_fused_shared_experts=n_fused_shared,
+            nvfp4_4over6_code=nvfp4_4over6_code,
         )
         moe_inputs = MoeRunnerInputs(
             output=output,
@@ -3736,6 +3746,7 @@ def _build_trtllm_moe_namespace(module):
                 valid_intermediate_size,
                 workspace_buffer,
                 False,  # query_workspace_size
+                nvfp4_4over6_code,
             )
             # FP4 always borrows the caller's topk_weights buffer (the launcher has
             # no allocate branch), so it is always the source for expert_weights.
@@ -3846,9 +3857,12 @@ def _build_trtllm_moe_namespace(module):
         valid_hidden_size: Optional[int] = None,
         valid_intermediate_size: Optional[int] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        hidden_states_scale_layout: Optional[int] = None,
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ):
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out, valid_intermediate_size
+        _ = hidden_states_scale_layout, nvfp4_4over6_code
         # Derive the padded hidden size exactly as the eager op does (NVFP4
         # activations arrive uint8-packed, two values per byte); GEMM2 then computes
         # roundUp(valid_hidden_size, 128) columns while finalize hands back only the
@@ -6457,6 +6471,31 @@ def trtllm_fp8_block_scale_routed_moe(
         return result
 
 
+def _trtllm_fp4_nvfp4_4over6_code(
+    nvfp4_4over6: Optional[NVFP44Over6Config],
+    per_token_scale: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+) -> int:
+    """Wire code for the flat FP4 MoE APIs' ``nvfp4_4over6=``.
+
+    A pinned recipe is only honored on the per-token NVFP4 path
+    (``per_token_scale`` with uint8 ``hidden_states``), the one path whose
+    GEMM2-input requantization has a 4over6 variant.
+    """
+    if nvfp4_4over6 is _UNSET:
+        return NVFP4_4OVER6_CODE_FROM_ENV
+    resolved = resolve_nvfp4_4over6(nvfp4_4over6)
+    if resolved is not None and (
+        per_token_scale is None or hidden_states.dtype != torch.uint8
+    ):
+        raise ValueError(
+            "nvfp4_4over6 requires per_token_scale with NVFP4 (uint8) "
+            "hidden_states; no other path has a 4over6 requantization. Pass "
+            "None to turn 4over6 off, or omit it to read the environment."
+        )
+    return nvfp4_4over6_code(resolved)
+
+
 @flashinfer_api(trace=trtllm_fp4_block_scale_moe_trace_dispatch)
 def trtllm_fp4_block_scale_moe(
     routing_logits: torch.Tensor,
@@ -6497,6 +6536,7 @@ def trtllm_fp4_block_scale_moe(
     valid_intermediate_size: Optional[int] = None,
     hidden_states_scale_layout: Optional[SfLayout] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
@@ -6677,6 +6717,18 @@ def trtllm_fp4_block_scale_moe(
         ``gemm1_lora_delta``. Autotuning profiles from the same buffer;
         scratch that does not fit (a larger token count) is allocated per call.
         Default ``None`` (allocate per call).
+
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 4over6 recipe for the per-token requantization of the GEMM2
+        input (the GEMM1 input is quantized by the caller).
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off, environment ignored.
+        - :class:`NVFP44Over6Config`: that recipe. Requires ``per_token_scale``;
+          no other path has a 4over6 requantization, so a pinned recipe
+          raises :class:`ValueError`.
+
     Returns
     -------
     List[torch.Tensor]
@@ -6687,6 +6739,10 @@ def trtllm_fp4_block_scale_moe(
         the ``routing_logits`` dtype — including the ``do_finalize=False``
         path and fp32 ``DeepSeekV3`` logits.
     """
+    # Reject an unhonorable pinned recipe before any device work.
+    nvfp4_4over6_code_value = _trtllm_fp4_nvfp4_4over6_code(
+        nvfp4_4over6, per_token_scale, hidden_states
+    )
     _nfse = _validate_fused_shared_experts(
         num_fused_shared_experts,
         local_expert_offset,
@@ -6742,6 +6798,7 @@ def trtllm_fp4_block_scale_moe(
         valid_intermediate_size,
         hidden_states_scale_layout,
         workspace_buffer=workspace_buffer,
+        nvfp4_4over6_code=nvfp4_4over6_code_value,
     )
 
 
@@ -6784,6 +6841,7 @@ def trtllm_fp4_block_scale_routed_moe(
     num_fused_shared_experts: Optional[int] = None,
     hidden_states_scale_layout: Optional[SfLayout] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation with pre-computed routing.
 
@@ -6959,12 +7017,28 @@ def trtllm_fp4_block_scale_routed_moe(
         ``gemm1_lora_delta``. Autotuning profiles from the same buffer;
         scratch that does not fit (a larger token count) is allocated per call.
         Default ``None`` (allocate per call).
+
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 4over6 recipe for the per-token requantization of the GEMM2
+        input (the GEMM1 input is quantized by the caller).
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off, environment ignored.
+        - :class:`NVFP44Over6Config`: that recipe. Requires ``per_token_scale``;
+          no other path has a 4over6 requantization, so a pinned recipe
+          raises :class:`ValueError`.
+
     Returns
     -------
     torch.Tensor or List[torch.Tensor]
         Return shape depends on ``do_finalize`` and ``gemm1_lora_delta``;
         see :func:`trtllm_bf16_routed_moe` for the table.
     """
+    # Reject an unhonorable pinned recipe before any device work.
+    nvfp4_4over6_code_value = _trtllm_fp4_nvfp4_4over6_code(
+        nvfp4_4over6, per_token_scale, hidden_states
+    )
     topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
 
     _nfse = _validate_fused_shared_experts(
@@ -7040,6 +7114,7 @@ def trtllm_fp4_block_scale_routed_moe(
         valid_intermediate_size,
         hidden_states_scale_layout,
         workspace_buffer=workspace_buffer,
+        nvfp4_4over6_code=nvfp4_4over6_code_value,
     )
 
 
@@ -7796,8 +7871,12 @@ def _trtllm_fused_moe_workspace_size_impl(
             num_experts, top_k, *experts, method, *launch, output, tactic,
             *ordinary, *valid,
         )  # fmt: skip
-    # Every entry point ends with (workspace_buffer, query_workspace_size).
-    result = fn(*args, None, True)
+    # Every entry point ends with (workspace_buffer, query_workspace_size); the FP4
+    # entry additionally takes the 4over6 recipe code.
+    tail = (
+        (NVFP4_4OVER6_CODE_FROM_ENV,) if fn is moe_op.trtllm_fp4_block_scale_moe else ()
+    )
+    result = fn(*args, None, True, *tail)
     return int(_torch_view_of_ffi_tensor(result[0]).item())
 
 
