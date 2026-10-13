@@ -5827,7 +5827,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     TensorView output, Array<int64_t> config_index, bool norm_topk_prob,
     Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
     Array<Tensor> da_body_workspace, bool is_da_body_preparation,
-    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size) {
+    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
+    int64_t nvfp4_4over6_code) {
   auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
                                         ? batchedGemm::gemm::BiasType::Mn
                                         : batchedGemm::gemm::BiasType::None;
@@ -5941,6 +5942,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     args->intermediate_size = intermediate_size;
     args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args->do_finalize = do_finalize;
+    args->nvfp4_4over6_code = nvfp4_4over6_code;
     args->output = output.data_ptr();
     args->output_scale = nullptr;
     set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);

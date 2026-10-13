@@ -404,6 +404,11 @@ struct MoERunnerArgs {
 
   // finalize
   bool do_finalize{true};
+
+  // 4over6 recipe for the per-token GEMM2-input requantization, as the code
+  // decoded by resolveNVFP4Recipe() (nvfp4Recipe.h). The default
+  // (kNVFP44Over6FromEnv) reads FLASHINFER_NVFP4_4OVER6* on every launch.
+  int64_t nvfp4_4over6_code{-1};
 };
 
 struct MoEWorkspace {

@@ -30,7 +30,9 @@ Two sections:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import os
 from types import SimpleNamespace
 from typing import Callable, ClassVar
 
@@ -58,6 +60,8 @@ from flashinfer.fused_moe import (
     BackendOptions,
     CuteDslConfig,
     CuteDslRunner,
+    CutlassNvfp4Runner,
+    PrimsTsRunner,
     CutlassBf16Config,
     CutlassBf16Runner,
     CutlassFp8BlockConfig,
@@ -1540,6 +1544,45 @@ class TestMoERunnerSupport:
         )
         assert runner.check_support() is None
 
+    def test_trtllm_fp4_pinned_4over6_requires_per_token_scale(self, monkeypatch):
+        """TRT-LLM sibling of the CuteDSL guard above.
+
+        The per-token kernel is the only TRT-LLM path that requantizes the
+        GEMM2 input, so a pinned recipe without per_token_scale must be refused
+        rather than dropped. ``None`` passes: the standard path never reads the
+        environment either.
+        """
+        import flashinfer.utils as utils
+
+        monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 0))
+        runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
+        runner.device = torch.device("cuda")
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=NVFP44Over6Config(),
+            )
+        )
+        with pytest.raises(NotImplementedError, match="per_token_scale=True"):
+            runner.check_support()
+
+        for quant in (
+            QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=None,
+            ),
+            QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                per_token_scale=True,
+                nvfp4_4over6=NVFP44Over6Config(),
+            ),
+        ):
+            runner.config = self._nvfp4_swiglu(quant=quant)
+            assert runner.check_support() is None
+
     def test_cute_dsl_w4a8_requires_fused_finalize(self):
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(
@@ -2051,9 +2094,16 @@ class TestRunner4Over6Support:
         assert runner.check_support() is None
 
     @pytest.mark.parametrize("setting", [None, NVFP44Over6Config()], ids=repr)
-    def test_trtllm_fp4_runner_rejects_explicit_recipe(self, setting):
-        """The real env-only backend, not just the synthetic one."""
-        runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
+    @pytest.mark.parametrize("runner_cls", [CutlassNvfp4Runner, PrimsTsRunner])
+    def test_non_opted_in_runner_rejects_explicit_recipe(self, runner_cls, setting):
+        """The real not-opted-in backends, not just the synthetic one.
+
+        CUTLASS's GEMM2-input quantizer still reads the environment (#5719);
+        Prims-TS has no GEMM2-input requantization step at all (its FC1
+        epilogue emits NVFP4 on every tactic). Both must refuse an explicit
+        value rather than drop it.
+        """
+        runner = runner_cls.__new__(runner_cls)
         runner.config = self._config(setting)
         runner.device = torch.device("cuda")
         with pytest.raises(NotImplementedError, match="nvfp4_4over6"):
@@ -3678,6 +3728,117 @@ class TestTrtllmRoutedPackingContract:
         )
 
 
+_DEFAULT_4OVER6_RECIPE = NVFP44Over6Config()
+
+
+@contextlib.contextmanager
+def _nvfp4_4over6_env(on: bool, recipe: NVFP44Over6Config = _DEFAULT_4OVER6_RECIPE):
+    """Pin every FLASHINFER_NVFP4_4OVER6* variable to ``recipe``.
+
+    The two legs of a config-equals-env check then differ only in the on/off
+    switch, and ``recipe`` names exactly what the "on" leg reads from the
+    environment.
+    """
+    values = {
+        "FLASHINFER_NVFP4_4OVER6": "1" if on else "0",
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE": str(recipe.err_mode.name),
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1"
+        if recipe.err_use_fast_math
+        else "0",
+        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1" if recipe.e4m3_max == 256 else "0",
+    }
+    saved = {name: os.environ.get(name) for name in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _per_token_recipe_outputs(runner_cls, device, recipe=_DEFAULT_4OVER6_RECIPE):
+    """Run ``runner_cls`` on one per-token NVFP4 problem under each recipe source.
+
+    Returns ``(env_on, env_off, pinned_under_env_off, none_under_env_on)``:
+    the unset default with ``recipe`` on and off in the environment, then
+    ``recipe`` pinned with the environment off and ``None`` with it on.
+    Inputs and weights are built once, so the legs differ only in the GEMM2
+    input requantization that reads the recipe.
+    """
+    num_tokens, hidden_size, intermediate_size = 64, 1024, 512
+    num_experts, top_k = 8, 2
+    with _nvfp4_4over6_env(True):
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            use_per_token_activation=True,
+            use_nontrivial_alphas=False,
+        )
+        prepared_weights = TrtllmFp4Config.prepare_weights(
+            tensors["w1_weight_bf16"],
+            tensors["w2_weight_bf16"],
+            num_local_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=SwiGLU(),
+            device=device,
+        )
+    act_pack = MoEActivationPack(
+        hidden_states_q=tensors["x"],
+        hidden_states_scale=tensors["x_sf"].squeeze(-1),
+        topk_ids=tensors["token_selected_experts"],
+        topk_weights=tensors["token_final_scales"].to(torch.bfloat16),
+        per_token_scale=tensors["x_per_token_scale"],
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+    )
+
+    def run(nvfp4_4over6):
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                per_token_scale=True,
+                nvfp4_4over6=nvfp4_4over6,
+            ),
+            experts=ExpertConfig(
+                intermediate_size=intermediate_size,
+                local_num_experts=num_experts,
+            ),
+            activation=SwiGLU(),
+        )
+        runner = _build_direct_runner(runner_cls, config, device)
+        weight_pack = MoEWeightPack()
+        weight_pack.prepare_for(runner.backend_key, prepared_weights)
+        out = runner.forward(runner.pack_inputs(act_pack, weight_pack), tactic=-1)
+        torch.cuda.synchronize()
+        return out.clone()
+
+    with _nvfp4_4over6_env(True, recipe):
+        env_on = run(_UNSET)
+        none_under_env_on = run(None)
+    with _nvfp4_4over6_env(False):
+        env_off = run(_UNSET)
+        pinned_under_env_off = run(recipe)
+    return env_on, env_off, pinned_under_env_off, none_under_env_on
+
+
+def _assert_recipe_matches_env(
+    env_on, env_off, pinned_under_env_off, none_under_env_on
+):
+    # The recipe must change the output, or the equalities below are vacuous.
+    assert not torch.equal(env_on, env_off)
+    assert torch.equal(pinned_under_env_off, env_on)
+    assert torch.equal(none_under_env_on, env_off)
+
+
 @sm100_required
 class TestTrtllmFp4UnpackedContract:
     @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
@@ -3845,6 +4006,26 @@ class TestTrtllmFp4UnpackedContract:
         torch.cuda.synchronize()
 
         torch.testing.assert_close(captured, eager)
+
+    @pytest.mark.parametrize(
+        "recipe",
+        [
+            pytest.param(NVFP44Over6Config(), id="e4m3_max448"),
+            pytest.param(NVFP44Over6Config(e4m3_max=256), id="e4m3_max256"),
+        ],
+    )
+    def test_pinned_recipe_matches_env(self, recipe):
+        """QuantConfig.nvfp4_4over6 reaches MoERunnerArgs.nvfp4_4over6_code.
+
+        A pinned recipe must select, bit for bit, the per-token GEMM2-input
+        requantization the environment selects, and ``None`` must ignore an
+        environment that turns 4over6 on. ``e4m3_max=256`` also moves the
+        per-token global scale, not just the candidate search.
+        """
+        device = torch.device("cuda", torch.cuda.current_device())
+        _assert_recipe_matches_env(
+            *_per_token_recipe_outputs(TrtllmFp4RoutedRunner, device, recipe)
+        )
 
 
 @sm100_required
