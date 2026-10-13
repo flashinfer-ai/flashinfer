@@ -4657,7 +4657,10 @@ def test_moe_core_preserves_fc2_output_dtype(
         assert list(inputs[0]) == list(range(len(streams)))
         return [fn(*args) for args in zip(*inputs, strict=True)]
 
-    monkeypatch.setattr(module, "_resolve_stream_executor", lambda: execute)
+    if localized:
+        monkeypatch.setattr(torch.cuda, "execute_on_streams", execute, raising=False)
+    else:
+        monkeypatch.delattr(torch.cuda, "execute_on_streams", raising=False)
     calls = []
 
     def finalize(**kwargs):
@@ -4719,90 +4722,6 @@ def test_moe_core_preserves_fc2_output_dtype(
 
 
 @cute_dsl_available
-@pytest.mark.parametrize("available", [True, False])
-def test_localized_stream_executor_resolution(monkeypatch, available):
-    """Stock PyTorch builds without the fork/join helper use the in-repo mirror."""
-    from flashinfer.fused_moe.cute_dsl import fused_moe as module
-
-    def upstream(streams, fn, *inputs):
-        return [fn(*args) for args in zip(*inputs, strict=True)]
-
-    if available:
-        monkeypatch.setattr(torch.cuda, "execute_on_streams", upstream, raising=False)
-    else:
-        monkeypatch.delattr(torch.cuda, "execute_on_streams", raising=False)
-    executor = module._resolve_stream_executor()
-    expected = upstream if available else module._execute_on_streams
-    assert executor is expected
-
-
-@cute_dsl_available
-@pytest.mark.parametrize("fail", [False, True])
-def test_localized_stream_fallback_inputs_and_join(monkeypatch, fail):
-    from contextlib import nullcontext
-    from unittest.mock import Mock, call
-
-    from flashinfer.fused_moe.cute_dsl import fused_moe as module
-
-    caller = Mock()
-    streams = [Mock(), Mock()]
-    start, first_done, second_done = Mock(), Mock(), Mock()
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: caller)
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
-    monkeypatch.setattr(
-        torch.cuda, "Event", Mock(side_effect=[start, first_done, second_done])
-    )
-    seen = []
-
-    def work(index, value):
-        seen.append((index, value))
-        if fail:
-            raise RuntimeError("callback failed")
-        return index + value
-
-    if fail:
-        with pytest.raises(RuntimeError, match="callback failed"):
-            module._execute_on_streams(streams, work, [0, 1], [10, 20])
-        assert seen == [(0, 10)]
-        second_done.record.assert_not_called()
-        streams[1].wait_event.assert_not_called()
-        expected_done = [first_done]
-    else:
-        assert module._execute_on_streams(streams, work, [0, 1], [10, 20]) == [10, 21]
-        assert seen == [(0, 10), (1, 20)]
-        second_done.record.assert_called_once_with(streams[1])
-        streams[1].wait_event.assert_called_once_with(start)
-        expected_done = [first_done, second_done]
-    start.record.assert_called_once_with(caller)
-    streams[0].wait_event.assert_called_once_with(start)
-    first_done.record.assert_called_once_with(streams[0])
-    assert caller.wait_event.call_args_list == [call(done) for done in expected_done]
-
-
-@cute_dsl_available
-@pytest.mark.parametrize(
-    "streams, inputs, message",
-    [
-        ([], ([0],), "at least one CUDA stream"),
-        ([object()], (), "at least one input sequence"),
-        ([object()], ([0], []), "one item per stream"),
-    ],
-)
-def test_localized_stream_fallback_invalid_inputs(
-    monkeypatch, streams, inputs, message
-):
-    from unittest.mock import Mock
-
-    from flashinfer.fused_moe.cute_dsl import fused_moe as module
-
-    current_stream = Mock()
-    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
-    with pytest.raises(ValueError, match=message):
-        module._execute_on_streams(streams, lambda *args: None, *inputs)
-    current_stream.assert_not_called()
-
-
-@cute_dsl_available
 @pytest.mark.parametrize("failed_domain", [0, 1])
 @pytest.mark.parametrize("failed_gemm", ["fc1", "fc2"])
 @pytest.mark.parametrize("use_memset_stream", [False, True])
@@ -4849,7 +4768,7 @@ def test_localized_streams_are_joined_on_failure(
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: main_stream)
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(torch.cuda, "Event", lambda: done)
-    monkeypatch.setattr(module, "_resolve_stream_executor", lambda: execute)
+    monkeypatch.setattr(torch.cuda, "execute_on_streams", execute, raising=False)
     with pytest.raises(ValueError) as exc:
         module._moe_core_impl(
             x=torch.empty((1, 64), dtype=torch.uint8),

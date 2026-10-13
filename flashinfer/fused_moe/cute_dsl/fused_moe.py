@@ -50,7 +50,7 @@ Example (Wrapper API with CUDA Graph):
     >>> g.replay()
 """
 
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Dict, Optional, Tuple
 
 import warnings
 import weakref
@@ -206,55 +206,6 @@ def _moe_hidden_size(w2_weight: torch.Tensor, localized_weights: Optional[list])
             f"localized FC2 shards must have equal positive widths, got {widths}"
         )
     return sum(widths)
-
-
-_T = TypeVar("_T")
-
-
-def _execute_on_streams(
-    streams: Sequence[torch.cuda.Stream],
-    fn: Callable[..., _T],
-    *inputs: Sequence[Any],
-) -> list[_T]:
-    """Map corresponding input items to ``fn`` on each stream and return results.
-
-    Mirrors ``torch.cuda.execute_on_streams``
-    for PyTorch builds without it. Each stream first waits for work already
-    queued on the caller stream; the caller stream then waits for every
-    callback's queued work, including work queued before a callback raised.
-    The host is never synchronized. Ordinary and green-context streams on the
-    caller's device are both supported.
-    """
-    if not streams:
-        raise ValueError("Need at least one CUDA stream to execute on")
-    if not inputs:
-        raise ValueError("Need at least one input sequence")
-    if any(len(values) != len(streams) for values in inputs):
-        raise ValueError("Each input sequence must have one item per stream")
-    results = []
-    caller_stream = torch.cuda.current_stream()
-    start = torch.cuda.Event()
-    start.record(caller_stream)
-    done_events = []
-    try:
-        for stream, args in zip(streams, zip(*inputs, strict=True), strict=True):
-            with torch.cuda.stream(stream):
-                stream.wait_event(start)
-                try:
-                    results.append(fn(*args))
-                finally:
-                    done = torch.cuda.Event()
-                    done.record(stream)
-                    done_events.append(done)
-    finally:
-        for done in done_events:
-            caller_stream.wait_event(done)
-    return results
-
-
-def _resolve_stream_executor() -> Callable[..., list[Any]]:
-    """Prefer PyTorch's fork/join helper; fall back to the in-repo mirror."""
-    return getattr(torch.cuda, "execute_on_streams", _execute_on_streams)
 
 
 def _get_cuda_graph_resources() -> Dict[str, Any]:
@@ -526,7 +477,6 @@ def _moe_core_impl(
                 "locality-domain localization requires use_fused_finalize=True; the "
                 "deterministic path's moe_unpermute reduction is not split-aware."
             )
-        execute_on_streams = _resolve_stream_executor()
         # The generic async-memset path cannot be composed with the localized
         # fork/join. The localized path orders its optional memset stream
         # explicitly below.
@@ -712,7 +662,7 @@ def _moe_core_impl(
                 localized_memset_done.record(localized_memset_stream)
 
         try:
-            execute_on_streams(
+            torch.cuda.execute_on_streams(
                 localized_streams, _fc1_die, range(len(localized_streams))
             )
         except BaseException:
@@ -843,7 +793,7 @@ def _moe_core_impl(
             )
 
         try:
-            execute_on_streams(
+            torch.cuda.execute_on_streams(
                 localized_streams, _fc2_die, range(len(localized_streams))
             )
         except BaseException:
@@ -1678,8 +1628,8 @@ def cute_dsl_fused_moe(
         One long-lived green-context CUDA stream for each locality domain
         (for example ``GreenContext.Stream()``). Work is forked from and
         joined to the caller's current stream with
-        ``torch.cuda.execute_on_streams`` when PyTorch provides it, otherwise
-        with an equivalent in-repo helper.
+        ``torch.cuda.execute_on_streams``. Localized execution requires a
+        PyTorch build providing this API.
     localized_sm_count : Optional[int]
         Number of SMs available to each locality-domain stream, used to size
         the persistent kernel grid.
