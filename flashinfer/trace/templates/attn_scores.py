@@ -759,3 +759,62 @@ quantize_write_index_k_nvfp4_trace = TraceTemplate(
     },
     tags=["arch:sm100", "arch:sm103"],
 )
+
+
+gather_key_sample_trace = TraceTemplate(
+    op_type="gather_key_sample",
+    description=(
+        "A strided random sample of each request's paged BF16 or NVFP4 keys, "
+        "copied into dense sample rows."
+    ),
+    axes={
+        "pages": Var(description="Key cache pages."),
+        "page_size": Const(description="Keys per page."),
+        "dim": Const(description="Elements per key: 128 BF16, or 64 NVFP4 bytes."),
+        "scales": Var(description="NVFP4's E4M3 scales per key, one per 16 values."),
+        "requests": Var(description="Block-table rows, one sample row each."),
+        "blocks": Var(description="64-key blocks per request."),
+        "capacity": Var(description="Sample slots per request, in 128-key tiles."),
+    },
+    inputs={
+        "key_cache": Tensor(["pages", "page_size", "dim"]),
+        "block_table": Tensor(["requests", "blocks"]),
+        "offsets": Tensor(["capacity"]),
+        "sample_ends": Tensor(["requests"]),
+        "sample_keys": Tensor(["requests", "capacity", "dim"]),
+        "samples_per_run": Scalar("int32"),
+        "pages_per_run": Scalar("int32"),
+        "key_scales": Tensor(["pages", "page_size", "scales"], optional=True),
+        "sample_scales": Tensor(["requests", "capacity", "scales"], optional=True),
+    },
+    outputs={
+        "sample_keys": Tensor(["requests", "capacity", "dim"], dtype_from="key_cache")
+    },
+    tags=["arch:sm100", "arch:sm103"],
+)
+
+
+thresholds_from_sample_trace = TraceTemplate(
+    op_type="thresholds_from_sample",
+    description=(
+        "Each query row's threshold as the least of its sampled Top scores, with "
+        "its threshold-select counters zeroed."
+    ),
+    axes={
+        "rows": Var(description="Query rows."),
+        "samples": Var(description="Sampled scores per row."),
+        "rank": Var(description="Top positions per row."),
+        "counters": Const(description="Candidate and tie counts."),
+    },
+    inputs={
+        "sample_scores": Tensor(["rows", "samples"]),
+        "sample_top": Tensor(["rows", "rank"]),
+        "thresholds": Tensor(["rows"]),
+        "counters": Tensor(["rows", "counters"]),
+    },
+    outputs={
+        "thresholds": Tensor(["rows"], dtype="float32"),
+        "counters": Tensor(["rows", "counters"], dtype="int32"),
+    },
+    tags=["arch:sm100", "arch:sm103"],
+)

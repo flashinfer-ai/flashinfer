@@ -12,9 +12,11 @@ import torch
 from ..api_logging import flashinfer_api
 from ..cute_dsl.availability import is_cute_dsl_experimental_available
 from ..trace.templates.attn_scores import (
+    gather_key_sample_trace,
     quantize_write_index_k_nvfp4_trace,
     single_head_paged_mqa_logits_trace,
     single_head_paged_mqa_threshold_select_trace,
+    thresholds_from_sample_trace,
 )
 from ..utils import get_compute_capability, get_device_sm_count
 
@@ -250,6 +252,90 @@ def quantize_write_index_k_nvfp4(
             128,
             (key, slots, key_cache, key_scales),
             (),
+            module="single_head_scorer",
+            key_files=(single_head_scorer.__file__,),
+        )
+
+
+@flashinfer_api(trace=gather_key_sample_trace)
+def gather_key_sample(
+    key_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    offsets: torch.Tensor,
+    sample_ends: torch.Tensor,
+    *,
+    sample_keys: torch.Tensor,
+    samples_per_run: int,
+    pages_per_run: int,
+    key_scales: Optional[torch.Tensor] = None,
+    sample_scales: Optional[torch.Tensor] = None,
+) -> None:
+    """Copy a strided random sample of each request's paged keys into dense
+    sample rows, whose scores give thresholds for
+    :func:`single_head_paged_mqa_threshold_select`.
+
+    Keys and pages are as in :func:`single_head_paged_mqa_logits`, and request
+    ``r``'s keys fall in runs of ``pages_per_run`` pages. Sample slot ``s`` of
+    ``sample_keys[r]`` (``[requests, capacity, 128]`` BF16 or ``[..., 64]``
+    NVFP4 bytes, ``capacity`` a multiple of 128) gets the key at offset
+    ``offsets[s]`` (uint8, below ``64 * pages_per_run``) into run
+    ``s // samples_per_run`` for ``s < sample_ends[r]``, and NVFP4 keys their
+    scales in ``sample_scales[r, s]`` (``[requests, capacity, 8]``). Later
+    slots are left as they are. Viewed as 64-key pages, the sample can be scored
+    by :func:`single_head_paged_mqa_logits`. It runs as one launch without host
+    synchronization, so it can be captured in a CUDA graph."""
+    from ..cute_dsl.launch import launch
+    from .kernels import single_head_scorer
+
+    requests, capacity, width = sample_keys.shape
+    if capacity % 128 or (key_scales is None) != (sample_scales is None):
+        raise ValueError("Sample rows hold whole 128-key tiles, with scales if NVFP4")
+    if width != key_cache.shape[2] or sample_ends.shape[0] != requests:
+        raise ValueError("Mismatched sample rows, keys or sample ends")
+    args = (key_cache, key_scales, block_table, offsets, sample_ends, sample_keys)
+    if requests and capacity:
+        launch(
+            single_head_scorer.key_sample_kernel,
+            (requests, capacity // 128),
+            128,
+            (*args, sample_scales),
+            (samples_per_run, 64 * pages_per_run, width),
+            module="single_head_scorer",
+            key_files=(single_head_scorer.__file__,),
+        )
+
+
+@flashinfer_api(trace=thresholds_from_sample_trace)
+def thresholds_from_sample(
+    sample_scores: torch.Tensor,
+    sample_top: torch.Tensor,
+    *,
+    thresholds: torch.Tensor,
+    counters: torch.Tensor,
+) -> None:
+    """Set each query row's threshold for
+    :func:`single_head_paged_mqa_threshold_select` from a sample of its scores,
+    and zero its counters.
+
+    Row ``r``'s threshold, ``thresholds[r]`` (float32 ``[rows]``), is the least
+    of its sampled scores ``sample_scores[r]`` (float32 ``[rows, samples]``) at
+    its Top positions ``sample_top[r]`` (int32 ``[rows, rank]``). A -1 position
+    or a NaN score counts as -inf, since dummy and capture passes can feed NaN
+    from uninitialized memory. ``counters`` is int32 ``[rows, 2]``. It runs as
+    one launch without host synchronization; it can be captured in a CUDA graph."""
+    from ..cute_dsl.launch import launch
+    from .kernels import single_head_scorer
+
+    rows, rank = sample_top.shape
+    if {sample_scores.shape[0], thresholds.shape[0], counters.shape[0]} != {rows}:
+        raise ValueError("Mismatched sample rows, thresholds or counters")
+    if rows:
+        launch(
+            single_head_scorer.thresholds_kernel,
+            ((rows + 3) // 4, 1),
+            128,
+            (sample_scores, sample_top, thresholds, counters),
+            (rank,),
             module="single_head_scorer",
             key_files=(single_head_scorer.__file__,),
         )
