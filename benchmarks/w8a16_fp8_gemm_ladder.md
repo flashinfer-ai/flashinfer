@@ -139,45 +139,59 @@ builder's A (M' = N), the activation `[M, K]` is B (N' = M), D `[M', N']` column
 `out[M, N]` row-major; the per-tensor scale is the epilogue alpha (device pointer), the bias
 a per-row broadcast in the fused epilogue.
 
-## Final state (rung B12)
+## Final state (version B13)
 
 Geometric mean of per-row time ratios over the 24 rows of each M class, B200
-(umb-b200-261, 148 SMs), free-running clocks, CUDA 13.6, torch 2.12, Mon 12 Oct 2026.
-Every variant is measured back to back on the same tensors (`bench --algo auto
-2sm256x128 2sm256x192 1sm128x128 2sm256x128_splitk`), one M class per process, two
-passes, per-row minimum.  (A single pass over the whole 144-row table is 5% median /
-20% p90 noisy between repeats on this box: the large-M rows heat the part and the
-small rows that follow swing; one M class per pass brings that to 2% / 11%.)
+(umb-b200-261 / umb-b200-250, 148 SMs), free-running clocks, CUDA 13.6, torch 2.12,
+Mon 12 / Tue 13 Oct 2026.  Every variant is measured back to back on the same tensors
+(`bench --algo auto 2sm256x128 2sm256x192 1sm128x128 2sm256x128_splitk
+2sm256x128_streamk`), one M class per process, two passes, per-row minimum.  (A single
+pass over the whole 144-row table is 5% median / 20% p90 noisy between repeats on
+this box: the large-M rows heat the part and the small rows that follow swing; one M
+class per pass brings that to 2% / 11%.)  The M=1024 / 2048 rows are the version B13
+remeasure (`sweepB13b`), the rest the version B12 table (the B13 rule does not fire
+above M=1024 on these shapes); the stream-K column is from the B13 sweep.
 
-| M | auto / cuBLAS | oracle / cuBLAS | 256x128 | 256x192 | 1SM 128x128 | 256x128 split-K | auto / oracle |
-|---|---|---|---|---|---|---|---|
-| 1024 | 1.10 | 1.09 | 1.17 | 1.34 | 1.25 | 1.23 | 1.01 |
-| 2048 | 1.04 | 1.03 | 1.10 | 1.15 | 1.20 | 1.29 | 1.01 |
-| 4096 | 0.99 | 0.98 | 1.01 | 1.08 | 1.12 | 1.26 | 1.01 |
-| 8192 | 0.99 | 0.98 | 1.01 | 1.03 | 1.11 | 1.32 | 1.01 |
-| 44160 | 1.02 | 0.99 | 1.03 | 1.02 | 1.10 | 1.34 | 1.03 |
-| 88320 | 1.05 | 1.03 | 1.06 | 1.05 | 1.15 | 1.40 | 1.02 |
+| M | auto / cuBLAS | oracle / cuBLAS | 256x128 | 256x192 | 1SM 128x128 | 256x128 split-K | 256x128 stream-K | auto / oracle |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 1.10 | 1.09 | 1.18 | 1.36 | 1.25 | 1.24 | 1.43 | 1.01 |
+| 2048 | 1.04 | 1.03 | 1.11 | 1.15 | 1.20 | 1.29 | 1.26 | 1.01 |
+| 4096 | 0.99 | 0.98 | 1.01 | 1.08 | 1.12 | 1.26 | 1.08 | 1.01 |
+| 8192 | 0.99 | 0.98 | 1.01 | 1.03 | 1.11 | 1.32 | 1.05 | 1.01 |
+| 44160 | 1.02 | 0.99 | 1.03 | 1.02 | 1.10 | 1.34 | 1.08 | 1.03 |
+| 88320 | 1.05 | 1.03 | 1.06 | 1.05 | 1.15 | 1.40 | 1.10 | 1.02 |
 
-Overall auto / cuBLAS 1.029, oracle (best variant per row) / cuBLAS 1.015, auto / oracle
-1.014; 68 of 144 rows have a variant at or under cuBLAS.  Who wins per row: the 256x128
-tile 71, 256x192 53, split-K 16 (all at M <= 8192, mostly the narrow und.kv rows and
-M=1024), the 1SM tile 4 (within noise of the 2SM tiles).  Rows still > 10% behind
-cuBLAS: a few M=1024 rows with K <= 5120 (attn.out, gen.qkv, mlp.down at TP 2-8: one
-partial wave and too short a K to split profitably) and the widest power-bound rows
-(mlp.gate_up N=25600 at M >= 44160, 1.25-1.30x, clocks at ~1.2 GHz).
+Overall auto / cuBLAS 1.028, oracle (best variant per row) / cuBLAS 1.014, auto / oracle
+1.013; 68 of 144 rows have a variant at or under cuBLAS.  Who wins per row: the 256x128
+tile ~70, 256x192 ~52, split-K ~15 (the narrow und.kv rows and M=1024), stream-K 5 (the
+M=1024 N=5120 rows with K >= 6400), the 1SM tile 4 (within noise of the 2SM tiles).
+Rows still > 10% behind cuBLAS: the M=1024 rows with N=5120 and K <= 5120 (attn.out,
+gen.qkv, mlp.down at TP 2-8, 1.18-1.29x: 160 tiles on 74 clusters is 2.16 waves, and
+with 8-40 k-tiles per tile neither split-K nor stream-K can cut the tail cheaper than
+it costs; see "Why the losers lost") and the widest power-bound rows (mlp.gate_up
+N=25600 at M >= 44160, 1.25-1.30x, clocks at ~1.2 GHz).
 
 ### Knobs and the `algo` argument
 
 `flashinfer.gemm.w8a16_fp8_gemm(..., algo=)` (Blackwell) pins a variant per call:
-`"2sm256x128"`, `"2sm256x192"`, `"2sm256x256"`, `"1sm128x128"`, `"2sm256x128_splitk"`;
-`None` / `"auto"` is the launcher's model.  The codes are the `W8A16Sm100Tile` enum
-values.  `FLASHINFER_W8A16_FP8_TILE_SM100` still pins a tile process-wide (same names).
-The benchmark takes `--algo a b ...` and emits one `kernel:<algo>` column per variant,
-measured back to back; that is what the tables above come from.
+`"2sm256x128"`, `"2sm256x192"`, `"2sm256x256"`, `"1sm128x128"`, `"2sm256x128_splitk"`,
+`"2sm256x128_streamk"`; `None` / `"auto"` is the launcher's model.  The codes are the
+`W8A16Sm100Tile` enum values.  `FLASHINFER_W8A16_FP8_TILE_SM100` still pins a tile
+process-wide (same names).  `FLASHINFER_W8A16_FP8_STREAMK_MODE` (`heuristic` |
+`streamk` | `splitk` | `dataparallel`) and `FLASHINFER_W8A16_FP8_STREAMK_REDUCTION`
+(`deterministic` | `nondeterministic`) pin the stream-K scheduler's decomposition and
+peer-reduction order for A/B runs.  The benchmark takes `--algo a b ...` and emits one
+`kernel:<algo>` column per variant, measured back to back; that is what the tables
+above come from.
 
-### The dispatcher after rungs B11 / B12 (`W8A16Sm100PickTile`)
+### The dispatcher after versions B11 / B12 / B13 (`W8A16Sm100PickTile`)
 
-1. Split-K (rung B12, 256x128 tile, `W8A16Sm100SplitK`): (a) fewer cluster tiles than
+0. Stream-K (version B13, 256x128 tile, `W8A16Sm100UseStreamK`): more than half the
+   clusters busy, two or three waves with the last one at most a third full, and >= 64
+   k-tiles per tile.  On the Cosmos3 table that is the three M=1024 N=5120 rows with
+   K >= 8192 (attn.out tp1, mlp.down tp1 / tp2), 7-8% faster than split-K there and now
+   at or under cuBLAS on two of them.
+1. Split-K (version B12, 256x128 tile, `W8A16Sm100SplitK`): (a) fewer cluster tiles than
    half the resident clusters: the largest split that still fits in one wave; (b) K >=
    100 k-tiles and a partial last wave: the smallest split with >= 50 k-tiles per slice
    that cuts waves x k-tiles-per-slice by >= 15%.  Short-K problems never split (the fp32
@@ -192,6 +206,20 @@ slice length for A and B, one fp32 M x N partial per slice for D, alpha = 1), th
 `W8A16Sm100SplitKReduceKernel` sums the slices, applies the per-tensor scale and the
 bias and casts; the fp32 epilogue uses a 128x16 epilogue tile to stay inside the
 227 KB smem budget next to the 6/4 mainloop stages.
+
+Stream-K runs the same kernel under CUTLASS's `PersistentTileSchedulerSm100StreamK`
+(a fourth template flag on `W8A16Sm100Gemm`; the forked kernel body already consumed
+the per-unit k-range and called the scheduler's fixup).  The full waves stay
+data-parallel; the tiles of the last wave(s) are cut along K into equal iteration
+counts for every resident cluster, the peers of a tile add their fp32 partials through
+the scheduler workspace, and only the final peer runs the scale / bias / cast epilogue,
+so no reduce kernel.  What it costs (Tue 13 Oct 2026, M=1024, N=5120, torch profiler):
+the per-launch workspace memset is 1.5 us; the kernel itself is 28.7 us against 21.2 us
+for the plain tile at K=2048, because every K fragment pays a fresh pipeline prologue
+and a 128 KB accumulator round trip through global memory, roughly 8-10 k-tiles' worth
+of mainloop.  Deterministic vs nondeterministic peer order makes no difference (within
+1%).  Hence the rule: only tiles >= 64 k-tiles deep, and only when the tail is most of
+the grid (at four or more waves, M=2048, it loses 5-11%).
 
 ### Rung B10 state, for the record
 
@@ -278,7 +306,8 @@ oracle).
 | B10 | d24ed43a9 | native `cvt.rn.bf16x2.e4m3x2` / `cvt.rn.f16x2.e4m3x2` converter (one F2FP per pair; ALU path kept behind `W8A16_FORCE_ALU_CONVERT` and for nvcc < 13.2) | WIN: 1.24 / 1.06 / 1.03 / 1.02 / 1.03 / 1.04 x cuBLAS, 0.928x B9 time |
 
 | B11 | (this commit) | `algo` argument on the Python op (codes 1-5, FFI `int64 algo`), `bench --algo a b ...` back-to-back columns, dispatcher refit: 256x192 eff 1.22 -> 1.02, 256x256 dropped from auto | WIN: auto / oracle 1.040 -> 1.014 |
-| B12 | (this commit) | batched split-K for the 256x128 tile (fp32 partials + reduce kernel, 128x16 fp32 epilogue tile), split rule for under-filled grids and long-K partial waves | WIN: M=1024 1.24 -> 1.10 x cuBLAS, M=2048 1.06 -> 1.04, und.kv rows 1.3-1.8x -> ~1.0x |
+| B12 | fec33517e | batched split-K for the 256x128 tile (fp32 partials + reduce kernel, 128x16 fp32 epilogue tile), split rule for under-filled grids and long-K partial waves | WIN: M=1024 1.24 -> 1.10 x cuBLAS, M=2048 1.06 -> 1.04, und.kv rows 1.3-1.8x -> ~1.0x |
+| B13 | cf6fb8984 + (this commit) | 256x128 tile under CUTLASS's SM100 stream-K scheduler (`2sm256x128_streamk`), dispatcher rule for a mostly-empty tail wave over >= 64-k-tile tiles | SMALL WIN: 3 rows (M=1024 N=5120 K >= 8192) 7-8% faster, two now under cuBLAS; M=1024 geomean 1.114 -> 1.103; everywhere else stream-K loses (1.43x at M=1024 overall when forced: per-fragment prologue + 128 KB accumulator round trip) |
 
 ### Why B10 works (PerfSim, gb100 model, Mon 12 Oct 2026)
 
@@ -309,12 +338,22 @@ same conclusion came independently out of the Kernel Factory campaign on this ke
   warps per sub-partition cannot hide it.
 - **B4 on narrow problems**: a 256x256 cluster tile leaves 32 clusters on 148 SMs for
   N=1024, M=2048; the dispatcher (B7/B9) keeps the 128-row tile there.
+- **B13 stream-K on short K**: the idea (split only the tail wave's tiles along K across
+  the idle clusters) is right, and the arithmetic says 160 tiles x 40 k-tiles over 74
+  clusters should drop from 3 waves to 2.16.  But each fragment re-fills the TMA /
+  transform pipeline and dumps and re-reads a 128 KB fp32 accumulator, which costs
+  about as much as 8-10 k-tiles of mainloop; with 8-40 k-tiles per tile that is more
+  than the 0.84 wave saved.  It pays from ~64 k-tiles per tile upwards, which is where
+  the rule draws the line.  The und.kv rows (8-32 tiles) stay with batched split-K,
+  whose slices need no handshake (11.9 us vs 34 us for stream-K at N=128).
 
 ## Results directory
 
 `/home/scratch.ishovkun_gpu/w8a16-results/blackwell/`: `rungB<N>_*_b200_full.csv`,
 `rungB<N>_ncu_*.txt`, `rungB5_sass.txt` / `rungB6_sass.txt` (cuobjdump of the module),
 `sweepB12d_b200_r<M>_<i>.csv` (the per-M back-to-back variant sweeps behind the B12
-table; `sweepB11i_*`, `sweepB12*_*` are the noisier whole-table sweeps).  Plots:
+table; `sweepB11i_*`, `sweepB12*_*` are the noisier whole-table sweeps),
+`sweepB13_b200_r<M>_<i>.csv` (all M, stream-K forced as a column) and
+`sweepB13b_b200_r{1024,2048}_<i>.csv` (the B13 dispatcher remeasure).  Plots:
 `plots/w8a16_b200_plots.py` in the main checkout renders the ladder figures from these
 CSVs.

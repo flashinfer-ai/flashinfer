@@ -307,6 +307,7 @@ using W8A16Sm100Cfg2SM256x192 = W8A16Sm100Cfg<256, 192, 128, 2, true>;
 // mainloop is untouched: kernel.hpp already consumes the per-unit k-range and calls the
 // scheduler's fixup before the epilogue.  Mutually exclusive with kSplitK.
 inline cutlass::gemm::kernel::detail::DecompositionMode W8A16Sm100StreamKModeEnv();
+inline cutlass::gemm::kernel::detail::ReductionMode W8A16Sm100StreamKReductionEnv();
 
 template <typename T, typename Cfg, bool kSplitK = false, bool kStreamK = false>
 struct W8A16Sm100Gemm {
@@ -411,8 +412,7 @@ struct W8A16Sm100Gemm {
       // clusters evenly, and to data-parallel when there is nothing to balance.
       // FLASHINFER_W8A16_FP8_STREAMK_MODE pins a decomposition for benchmarking.
       args.scheduler.decomposition_mode = W8A16Sm100StreamKModeEnv();
-      args.scheduler.reduction_mode =
-          cutlass::gemm::kernel::detail::ReductionMode::Deterministic;
+      args.scheduler.reduction_mode = W8A16Sm100StreamKReductionEnv();
     }
     return args;
   }
@@ -519,6 +519,19 @@ inline cutlass::gemm::kernel::detail::DecompositionMode W8A16Sm100StreamKModeEnv
   return mode;
 }
 
+// FLASHINFER_W8A16_FP8_STREAMK_REDUCTION = "deterministic" (default) | "nondeterministic":
+// whether the peers of a stream-K tile add their partials in K order (each waits for the
+// previous one) or in arrival order (atomic adds).  For benchmarking; read once.
+inline cutlass::gemm::kernel::detail::ReductionMode W8A16Sm100StreamKReductionEnv() {
+  using Mode = cutlass::gemm::kernel::detail::ReductionMode;
+  static const Mode mode = [] {
+    const char* s = std::getenv("FLASHINFER_W8A16_FP8_STREAMK_REDUCTION");
+    if (s != nullptr && std::strcmp(s, "nondeterministic") == 0) return Mode::Nondeterministic;
+    return Mode::Deterministic;
+  }();
+  return mode;
+}
+
 // Split count for the 256x128 2SM tile (rung B12).  Two cases split, both from the
 // back-to-back per-M sweeps of Mon 12 Oct 2026:
 //   1. an under-filled grid, fewer cluster tiles than half the resident clusters:
@@ -570,6 +583,26 @@ inline int W8A16Sm100SplitsFor(int M, int N, int K, int num_sms) {
   return 0;
 }
 
+// Version B13: stream-K pays only where the tail wave is most of the grid and the tiles
+// are long.  Every K fragment pays a pipeline prologue and a 128 KB fp32 accumulator
+// round trip through global memory, about as much as 8-10 k-tiles of mainloop, so a
+// tile has to be >= 64 k-tiles deep before cutting it is cheaper than idling (measured
+// Tue 13 Oct 2026: N=5120 at M=1024, 160 tiles = 2.16 waves: K=2048 1.53x slower,
+// K=5120 1.04x, K=8192 0.93x, K=12800 0.87x, K=25600 0.82x against the plain tile).
+// With four or more waves the saved fraction of a wave is too small (M=2048 rows lose
+// 5-11%), and under-filled grids (<= half the clusters busy) belong to split-K, whose
+// batched slices skip the per-fragment handshake.  So: more than half the clusters
+// busy, at most three waves with the last one at most a third full, >= 64 k-tiles.
+inline bool W8A16Sm100UseStreamK(int M, int N, int K, int num_sms) {
+  if (K % 128 != 0 || K / 128 < 64) return false;
+  const long long clusters = num_sms > 1 ? num_sms / 2 : 1;
+  const long long units = static_cast<long long>((N + 255) / 256) * ((M + 127) / 128);
+  if (units * 2 <= clusters) return false;
+  const long long waves = (units + clusters - 1) / clusters;
+  const long long tail = units - (waves - 1) * clusters;  // tiles in the last wave
+  return waves >= 2 && waves <= 3 && tail * 3 <= clusters;
+}
+
 // `algo` is the caller's tile code (0 = auto); an explicit code wins over the env
 // override, which wins over the cost model.
 inline W8A16Sm100Tile W8A16Sm100PickTile(int M, int N, int K, int num_sms, int algo = 0) {
@@ -577,7 +610,9 @@ inline W8A16Sm100Tile W8A16Sm100PickTile(int M, int N, int K, int num_sms, int a
   if (forced != W8A16Sm100Tile::kAuto) return forced;
   const W8A16Sm100Tile env = W8A16Sm100TileEnv();
   if (env != W8A16Sm100Tile::kAuto) return env;
-  // Rung B12: under-filled grids and long-K partial waves split K instead of choosing
+  // Version B13: a mostly-empty last wave over deep tiles is balanced by stream-K.
+  if (W8A16Sm100UseStreamK(M, N, K, num_sms)) return W8A16Sm100Tile::k2SM256x128StreamK;
+  // Version B12: under-filled grids and long-K partial waves split K instead of choosing
   // between tiles; see W8A16Sm100SplitK.
   if (W8A16Sm100SplitK(M, N, K, num_sms) > 1) return W8A16Sm100Tile::k2SM256x128SplitK;
 
