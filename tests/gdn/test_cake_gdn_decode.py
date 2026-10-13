@@ -750,22 +750,27 @@ def test_decode_resolver_routes_the_fp32_mtp_bodies_per_architecture(arch) -> No
 
 
 def test_fp32_t1_route_rule_follows_the_state_head_count() -> None:
-    # One threshold, one table (sm_107a only): the shipped `splitv8` body below 256
-    # state heads, its `splitv8_tilev32` twin from 256 on; B200 / B300 keep `splitv8`.
+    # Two thresholds, one table (sm_107a only): the shipped `splitv8` body up to 64 state
+    # heads, the register-direct `splitv8_reg` body below 256, the `splitv8_tilev32` twin
+    # from 256 on; B200 / B300 keep `splitv8`.
     assert cake_gdn.CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS == 256
+    assert cake_gdn.CAKE_GDN_FP32_T1_SPLITV8_REG_MIN_STATE_HEADS == 64
     assert set(cake_gdn.CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS) == {"sm_107a"}
     assert cake_gdn.CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS["sm_107a"] == (
-        (255, "splitv8"),
+        (64, "splitv8"),
+        (255, "splitv8_reg"),
         (None, "splitv8_tilev32"),
     )
     assert cake_gdn.CAKE_GDN_FP32_T1_CTAS_PER_STATE == {
         "gdn_decode_pretranspose_splitv8": 8,
         "gdn_decode_pretranspose_splitv8_tilev32": 4,
+        "gdn_decode_pretranspose_splitv8_reg": 8,
     }
     rule = cake_gdn.cake_gdn_fp32_t1_route
     for arch in ("sm_100a", "sm_103a"):
         for batch_size, num_v_heads in (
             (1, 32),
+            (2, 32),
             (7, 32),
             (8, 32),
             (16, 16),
@@ -773,14 +778,18 @@ def test_fp32_t1_route_rule_follows_the_state_head_count() -> None:
             (512, 32),
         ):
             assert rule(batch_size, num_v_heads, arch) == "splitv8"
-    # the public bench_pretranspose_b* rows (HV=32): b1 / b4 keep splitv8, b8 .. b64 take tilev32
+    # the public bench_pretranspose_b* rows (HV=32): b1 and the 64-head edge keep splitv8,
+    # 64 < heads < 256 (b4 .. b7) take splitv8_reg, b8 .. b512 splitv8_tilev32
     assert rule(1, 32, "sm_107a") == "splitv8"
-    assert rule(4, 32, "sm_107a") == "splitv8"
-    assert rule(7, 32, "sm_107a") == "splitv8"
-    assert rule(15, 16, "sm_107a") == "splitv8"
+    assert rule(2, 32, "sm_107a") == "splitv8"
+    assert rule(4, 32, "sm_107a") == "splitv8_reg"
+    assert rule(6, 32, "sm_107a") == "splitv8_reg"
+    assert rule(7, 32, "sm_107a") == "splitv8_reg"
+    assert rule(15, 16, "sm_107a") == "splitv8_reg"
     assert rule(8, 32, "sm_107a") == "splitv8_tilev32"
     assert rule(16, 16, "sm_107a") == "splitv8_tilev32"
     assert rule(16, 32, "sm_107a") == "splitv8_tilev32"
+    assert rule(32, 32, "sm_107a") == "splitv8_tilev32"
     assert rule(64, 32, "sm_107a") == "splitv8_tilev32"
     assert rule(512, 32, "sm_107a") == "splitv8_tilev32"
 
@@ -793,16 +802,19 @@ def test_decode_resolver_routes_the_fp32_t1_pretranspose_body_per_state_head_ban
     # Rubin (sm_107a) from 256 state heads: same kernel contract, bitwise-identical
     # output, four CTAs per state head instead of eight.  The route id names the twin
     # and the host takes the grid from the resolved record, not from a fixed eight.
-    for batch_size in (1, 4, 7, 8, 16, 64):
+    for batch_size in (1, 2, 4, 7, 8, 16, 32, 64):
         route = _decode(arch=arch, layout="pretranspose", batch_size=batch_size)
         body = cake_gdn.cake_gdn_fp32_t1_route(batch_size, 32, arch)
+        heads = batch_size * 32
+        if arch != "sm_107a" or heads <= 64:
+            expected = "splitv8"
+        elif heads < 256:
+            expected = "splitv8_reg"
+        else:
+            expected = "splitv8_tilev32"
+        assert body == expected, (arch, batch_size, body)
         tilev32 = body == "splitv8_tilev32"
-        assert tilev32 == (arch == "sm_107a" and batch_size * 32 >= 256), (
-            arch,
-            batch_size,
-            body,
-        )
-        suffix = "_tilev32" if tilev32 else ""
+        suffix = body.removeprefix("splitv8")
         assert (
             route.route_id == f"flashinfer.gdn_decode.indexed_fp32_t1_splitv8{suffix}"
         ), (arch, batch_size, route.route_id)

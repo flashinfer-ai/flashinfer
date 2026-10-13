@@ -8922,6 +8922,84 @@
       },
       "threads": 128,
       "tma_abi": "pointer"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_cake_gdn_76dbd9616fc3d0d426f4",
+      "defines": {
+        "H": "16",
+        "HV": "32",
+        "SCALE": "1.0"
+      },
+      "domain": "decode",
+      "dynamic_smem_bytes": 0,
+      "host_binding": {
+        "entry": "run_decode_gdn_decode_pretranspose_splitv8_reg_17e98bf1653e",
+        "module_ident": "cake_gdn_76dbd9616fc3d0d426f4_50b8350219",
+        "path": "host/cake_gdn_76dbd9616fc3d0d426f4_17e98bf1653e.cc"
+      },
+      "name": "decode_gdn_decode_pretranspose_splitv8_reg_17e98bf1653e",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_76dbd9616fc3d0d426f4_96be6ea3c235.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_splitv8_reg",
+      "source_symbol": "cake_gdn_76dbd9616fc3d0d426f4",
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 1.0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_cake_gdn_76dbd9616fc3d0d426f4",
+      "defines": {
+        "H": "16",
+        "HV": "32",
+        "SCALE": "0.08838834764831845"
+      },
+      "domain": "decode",
+      "dynamic_smem_bytes": 0,
+      "host_binding": {
+        "entry": "run_decode_gdn_decode_pretranspose_splitv8_reg_6a998fe39ebf",
+        "module_ident": "cake_gdn_76dbd9616fc3d0d426f4_7da5dee8cb",
+        "path": "host/cake_gdn_76dbd9616fc3d0d426f4_6a998fe39ebf.cc"
+      },
+      "name": "decode_gdn_decode_pretranspose_splitv8_reg_6a998fe39ebf",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_76dbd9616fc3d0d426f4_96be6ea3c235.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_splitv8_reg",
+      "source_symbol": "cake_gdn_76dbd9616fc3d0d426f4",
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 0.08838834764831845
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
     }
   ]
 }

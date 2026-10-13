@@ -674,10 +674,16 @@ CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[tuple[str, str], str] = {
 # `FP32_T1_SPLITV8_ARCH_BANDS` / `select_fp32_t1_splitv8_route` in
 # loom.examples.weave.gdn_decode_pretranspose (the Cake tree cross-checks these copies).
 CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS = 256
+# Rubin register-direct body `splitv8_reg` (eight CTAs per state head, state rows loaded
+# straight into registers) in the band 64 < state heads < 256; `splitv8` up to 64 heads,
+# the `splitv8_tilev32` twin from 256 on.  Bitwise-identical output, only the state load
+# path changes.  Mirrors `FP32_T1_SPLITV8_REG_MIN_STATE_HEADS`.
+CAKE_GDN_FP32_T1_SPLITV8_REG_MIN_STATE_HEADS = 64
 # (largest state-head count of the band or None for the open last band, body)
 CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_107a": (
-        (CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS - 1, "splitv8"),
+        (CAKE_GDN_FP32_T1_SPLITV8_REG_MIN_STATE_HEADS, "splitv8"),
+        (CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS - 1, "splitv8_reg"),
         (None, "splitv8_tilev32"),
     ),
 }
@@ -687,6 +693,7 @@ CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS: dict[str, tuple[tuple[int | None, str], ...
 CAKE_GDN_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
     "gdn_decode_pretranspose_splitv8": 8,
     "gdn_decode_pretranspose_splitv8_tilev32": 4,
+    "gdn_decode_pretranspose_splitv8_reg": 8,
 }
 
 
