@@ -1413,6 +1413,57 @@ class TestB12xFunctional:
             f"dual-use: diff={diff:.3e} noise={noise:.3e}"
         )
 
+    def test_input_global_scale_does_not_grow_weight_cache(self):
+        """Repeated functional calls with input_global_scale reuse one entry.
+
+        The functional path folds input_global_scale into a fresh w1_alpha on
+        every call. The weight cache must not key on or hold that per-call
+        tensor, else each call adds an entry that is never evicted.
+        """
+        import gc
+
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        num_tokens, hidden_size, intermediate_size = 8, 256, 512
+        num_experts, top_k = 8, 1
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        input_gs = torch.full((num_experts,), 0.5, device="cuda", dtype=torch.float32)
+
+        def run():
+            return b12x_fused_moe(
+                x=tensors["x_bf16"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                input_global_scale=input_gs,
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                num_experts=num_experts,
+                top_k=top_k,
+            )
+
+        first = run()
+        gc.collect()
+        keys = set(moe_dispatch._WEIGHT_CACHE)
+        for _ in range(8):
+            out = run()
+        gc.collect()
+        added = set(moe_dispatch._WEIGHT_CACHE) - keys
+        assert not added, f"{len(added)} weight cache entries added over 8 calls"
+        torch.testing.assert_close(out, first)
+
     @pytest.mark.parametrize(
         "activation", ["silu", "gelu_tanh", "swigluoai_uninterleave"]
     )
