@@ -29,7 +29,3 @@ Weight preparation
 
     transform_nvfp4_weights_for_mega_moe
     transform_mxfp4_weights_for_mega_moe
-
-See the :download:`implementation and validation guide <../megamoe_sm90.md>`
-for input layouts, collective-call requirements, numerical
-validation and benchmark protocols.
