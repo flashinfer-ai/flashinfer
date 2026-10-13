@@ -94,10 +94,11 @@ def _skip_if_cp_unsupported():
 
 
 def _skip_if_head_sizes_unsupported(head_size, head_size_v):
-    if (head_size, head_size_v) != (128, 128) and not is_sm100a_supported(
-        torch.device("cuda")
+    device = torch.device("cuda")
+    if (head_size, head_size_v) != (128, 128) and not (
+        is_sm90a_supported(device) or is_sm100a_supported(device)
     ):
-        pytest.skip("CP GDN prefill supports DK=DV=128 only outside SM100")
+        pytest.skip("CP GDN prefill supports DK=DV=128 only outside SM90/SM100")
 
 
 def _seed_all(seed):
