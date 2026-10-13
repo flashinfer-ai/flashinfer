@@ -147,7 +147,7 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         io_dtype   : input/output dtype (Float16)
         acc_dtype  : accumulator dtype  (Float32)
         b_t        : fixed chunk size / block tile (64)
-        DK         : key/query hidden dim     (128)
+        DK         : key/query hidden dim     (64 or 128)
         DV         : value hidden dim         (64 or 128, DV <= DK)
 
     DK and DV are carried by the MMA tilers: ``DK = mma_tiler_qk[2]`` and
@@ -371,10 +371,10 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             )
         DK = mma_tiler_qk[2]
         DV = mma_tiler_qkv[0]
-        if DK != 128 or DV not in (64, 128):
+        if DK not in (64, 128) or DV not in (64, 128) or DV > DK:
             raise testing.CantImplementError(
                 f"(head_size_k, head_size_v)={(DK, DV)} not supported; "
-                "only DK=128 with DV in {64, 128} is supported"
+                "DK and DV must be 64 or 128 with DV <= DK"
             )
         if mma_tiler_qk != (64, 64, DK):
             raise testing.CantImplementError(

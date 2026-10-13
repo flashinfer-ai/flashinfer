@@ -86,13 +86,15 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
+        head_size: int = 128,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.inverse_dtype = cutlass.Float16
         self.BLK = 64
-        self.D = 128
+        # DK only sets the K tile width and the K @ K^T reduction depth.
+        self.D = head_size
         self.manual_cache_key(
             "dtype", "acc_dtype", "cu_seqlens_dtype", "inverse_dtype", "BLK", "D"
         )

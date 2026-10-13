@@ -65,8 +65,10 @@ def _cu_seqlens_dtype(dtype):
 
 
 @functools.cache
-def _get_t_precompute_kernel(kernel_dtype, cu_seqlens_dtype):
-    return CPDeltaRuleTPrecomputeSm100(kernel_dtype, cu_seqlens_dtype=cu_seqlens_dtype)
+def _get_t_precompute_kernel(kernel_dtype, cu_seqlens_dtype, head_size):
+    return CPDeltaRuleTPrecomputeSm100(
+        kernel_dtype, cu_seqlens_dtype=cu_seqlens_dtype, head_size=head_size
+    )
 
 
 def cp_delta_rule_t_precompute_dsl_sm100(
@@ -113,9 +115,9 @@ def cp_delta_rule_t_precompute_dsl_sm100(
                 "beta heads must be a positive multiple of k heads, "
                 f"got beta heads={num_sab_heads} and k heads={num_k_heads}"
             )
-        if d != 128:
+        if d not in (64, 128):
             raise RuntimeError(
-                f"CPDeltaRuleTPrecomputeSm100 only supports D=128, got {d}"
+                f"CPDeltaRuleTPrecomputeSm100 only supports D in {{64, 128}}, got {d}"
             )
         if k.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
@@ -147,7 +149,9 @@ def cp_delta_rule_t_precompute_dsl_sm100(
         else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     )
 
-    kernel = _get_t_precompute_kernel(kernel_dtype, _cu_seqlens_dtype(cu_seqlens.dtype))
+    kernel = _get_t_precompute_kernel(
+        kernel_dtype, _cu_seqlens_dtype(cu_seqlens.dtype), d
+    )
     compile_options = _blackwell_compile_options(device)
     compiled = get_cached_compile(kernel, compile_options)
     if compiled is None:
@@ -257,10 +261,10 @@ def cp_delta_rule_mn_precompute_dsl_sm100(
         )
     total_cp_chunks = workspace_num_chunks_host(cu_seqlens, cp_chunk_len, total_seqlen)
     if not _skip_check:
-        if (dk, dv) not in ((128, 128), (128, 64)):
+        if (dk, dv) not in ((128, 128), (128, 64), (64, 64)):
             raise RuntimeError(
                 "CPDeltaRuleMNPrecomputeSm100 only supports (DimK, DimV) in "
-                f"{{(128, 128), (128, 64)}}, got {(dk, dv)}"
+                f"{{(128, 128), (128, 64), (64, 64)}}, got {(dk, dv)}"
             )
         if k.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
@@ -481,10 +485,10 @@ def cp_delta_rule_fixup_dsl_sm100(
                 "local_state/local_transfer shapes must be (C, H, DimV, DimK)/(C, H, DimK, DimK), "
                 f"got {tuple(local_state.shape)} and {tuple(local_transfer.shape)}"
             )
-        if tuple(local_state.shape[-2:]) not in ((128, 128), (64, 128)):
+        if tuple(local_state.shape[-2:]) not in ((128, 128), (64, 128), (64, 64)):
             raise RuntimeError(
                 "CPDeltaRuleFixupSm100 only supports (DimV, DimK) in "
-                f"{{(128, 128), (64, 128)}}, got {tuple(local_state.shape[-2:])}"
+                f"{{(128, 128), (64, 128), (64, 64)}}, got {tuple(local_state.shape[-2:])}"
             )
         if local_transfer.dtype != torch.float32 or local_state.dtype != torch.float32:
             raise RuntimeError(
@@ -789,10 +793,10 @@ def cp_delta_rule_prefill_dsl_sm100(
     total_t_blocks = workspace_num_chunks_host(cu_seqlens, 64, total_seqlen)
     total_cp_chunks = workspace_num_chunks_host(cu_seqlens, cp_chunk_len, total_seqlen)
     if not _skip_check:
-        if (dk, dv) not in ((128, 128), (128, 64)):
+        if (dk, dv) not in ((128, 128), (128, 64), (64, 64)):
             raise RuntimeError(
                 "CPDeltaRulePrefillSm100 only supports (DimK, DimV) in "
-                f"{{(128, 128), (128, 64)}}, got {(dk, dv)}"
+                f"{{(128, 128), (128, 64), (64, 64)}}, got {(dk, dv)}"
             )
         if q.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
@@ -1176,10 +1180,10 @@ def cp_delta_rule_dsl_sm100(
             "state_checkpoints and checkpoint_cu_starts must be None when "
             "checkpointing is disabled"
         )
-    if (dk, dv) not in ((128, 128), (128, 64)):
+    if (dk, dv) not in ((128, 128), (128, 64), (64, 64)):
         raise RuntimeError(
             "CPDeltaRuleSm100 only supports (DimK, DimV) in "
-            f"{{(128, 128), (128, 64)}}, got {(dk, dv)}"
+            f"{{(128, 128), (128, 64), (64, 64)}}, got {(dk, dv)}"
         )
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError(

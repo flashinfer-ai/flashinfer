@@ -603,15 +603,19 @@ def _cp_delta_rule_rejection_reason(
             return "CP delta rule SM120 DSL kernel is unavailable"
     else:
         return "CP delta rule is currently implemented only for SM90, SM100, and SM120"
-    if q.shape[-1] != 128:
-        return f"CP delta rule only supports head_size=128, got {q.shape[-1]}"
-    # Only the SM100 CuTe DSL CP backend implements head_size_v=64 < head_size.
-    dv64_supported = arch_major == 10 and not use_gdn_cp_backend
-    if v.shape[-1] != q.shape[-1] and not (dv64_supported and v.shape[-1] == 64):
+    # Only the SM100 CuTe DSL CP backend implements head size 64 (DK=DV=64, or
+    # DV=64 with DK=128); every other CP route requires DK=DV=128.
+    head_sizes = (q.shape[-1], v.shape[-1])
+    if arch_major == 10 and not use_gdn_cp_backend:
+        if head_sizes not in ((128, 128), (128, 64), (64, 64)):
+            return (
+                "CP delta rule supports (head_size, head_size_v) in "
+                f"{{(128, 128), (128, 64), (64, 64)}}, got {head_sizes}"
+            )
+    elif head_sizes != (128, 128):
         return (
-            "CP delta rule requires head_size_v == head_size_k"
-            f"{' or head_size_v == 64' if dv64_supported else ''}, got "
-            f"{v.shape[-1]} != {q.shape[-1]}"
+            "CP delta rule only supports head_size == head_size_v == 128, "
+            f"got {head_sizes}"
         )
     if q.dtype not in (torch.float16, torch.bfloat16):
         return f"CP delta rule only supports fp16/bf16 inputs, got {q.dtype}"
@@ -749,8 +753,9 @@ def chunk_gated_delta_rule(
         match. SM100/SM103 uses the generated GDN CP-only four-stage
         implementation for structurally supported shapes. Other legal
         configurations retain the CuTe-DSL implementation. CP requires
-        ``head_size == 128`` and ``head_size_v == 128``; the SM100/SM103
-        CuTe-DSL route also accepts ``head_size_v == 64``.
+        ``head_size == head_size_v == 128``; the SM100/SM103 CuTe-DSL route
+        also accepts ``(head_size, head_size_v)`` of ``(128, 64)`` and
+        ``(64, 64)``.
         ``"auto"`` enables conservative routing, ``True`` requires CP support,
         and ``False`` disables CP. Default: ``"auto"``.
     state_indices : torch.Tensor, optional

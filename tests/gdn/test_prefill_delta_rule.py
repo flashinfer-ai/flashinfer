@@ -63,14 +63,16 @@ def _skip_if_cp_unsupported():
 
 
 def _skip_if_cp_head_sizes_unsupported(head_size, head_size_v):
-    """CP supports DK=DV=128 everywhere, plus DK=128/DV=64 on SM100."""
+    """CP supports DK=DV=128 everywhere, plus (128, 64) and (64, 64) on SM100."""
     if (head_size, head_size_v) == (128, 128):
         return
-    if (head_size, head_size_v) == (128, 64) and is_sm100a_supported(
+    if (head_size, head_size_v) in ((128, 64), (64, 64)) and is_sm100a_supported(
         torch.device("cuda")
     ):
         return
-    pytest.skip("CP supports DK=DV=128, plus DK=128/DV=64 on SM100")
+    pytest.skip(
+        "CP supports DK=DV=128, plus (DK, DV) in {(128, 64), (64, 64)} on SM100"
+    )
 
 
 def _skip_if_not_sm100():
