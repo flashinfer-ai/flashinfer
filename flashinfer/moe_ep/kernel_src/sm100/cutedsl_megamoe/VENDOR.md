@@ -29,6 +29,11 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Pending local diffs vs upstream
 
+- `src/src/inputs_process.py` carries the routing-output cast and optional
+  offline NVFP4 scale multiplier from source revision
+  `381675f3fa078867cebf8d64a0e034829f356424`. This is a narrow backport onto
+  the existing snapshot, not a full file sync. Replace it with the next
+  staging-helper import.
 - `src/src/inputs_process.py` is synced **ahead** of the recorded drop, to
   upstream commit `50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab`
   (`src/inputs_process.py` in the internal repo), taken 2026-08-10: the kernel team's fix for the fused activation-quant
