@@ -657,9 +657,12 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     assert name == runner.last_program_name == "exactpre_bf16_varlen"
     assert launch["preprocess"]["write_seq_chunk_cumsum"] == 1
     assert launch["preprocess_grid"][0] >= 1
-    assert module._WorkspaceKey(
-        None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, False, "never"
-    ) in runner._workspaces
+    assert (
+        module._WorkspaceKey(
+            None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, False, "never"
+        )
+        in runner._workspaces
+    )
     assert len(runner._workspaces) == 2
 
     # cu_seqlens form with a caller buffer: prepared as the publishing call

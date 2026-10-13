@@ -457,7 +457,11 @@ _FAMILY_HOST = {
     "exactfused": (_EXACTFUSED_HOST_TEMPLATE, _MAIN_ARGS, _EXACTFUSED_SMEM_BYTES),
     "chunkpar": (_CHUNKPAR_HOST_TEMPLATE, _MAIN_ARGS_CHUNKPAR, _CHUNKPAR_SMEM_BYTES),
     "exactpre": (_EXACTPRE_HOST_TEMPLATE, _MAIN_ARGS, _EXACTPRE_SMEM_BYTES),
-    "chunkpar3": (_CHUNKPAR3_HOST_TEMPLATE, _MAIN_ARGS_CHUNKPAR3, _CHUNKPAR3_SMEM_BYTES),
+    "chunkpar3": (
+        _CHUNKPAR3_HOST_TEMPLATE,
+        _MAIN_ARGS_CHUNKPAR3,
+        _CHUNKPAR3_SMEM_BYTES,
+    ),
 }
 
 
@@ -735,6 +739,8 @@ def _chunk_parallel_vcount(capability: tuple[int, int]) -> int:
         key, _CHUNK_PARALLEL_VCOUNT_BY_ARCH[_CHUNK_PARALLEL_VCOUNT_DEFAULT]
     )
     return max(1, min(int(vcount), _CHUNK_PARALLEL_SEGMENT_CAP))
+
+
 # ``auto`` applies the rule; ``always`` forces the look-back family,
 # ``three_phase`` the three-phase family, ``never`` the exact scan.  Read on
 # every unprepared eager call; ``CakeSSDCombined.prepare`` reads it once and
@@ -2070,7 +2076,9 @@ class CakeSSDCombined:
         agg_elems = int(vcount) * _CHUNK_PARALLEL_AGG_ELEMS_PER_RANGE
         agg_work = self._agg_works.get(device.index)
         if agg_work is None or agg_work.shape[0] < agg_elems:
-            self._allocating(f"the chunk-parallel aggregate workspace for {vcount} ranges")
+            self._allocating(
+                f"the chunk-parallel aggregate workspace for {vcount} ranges"
+            )
             agg_work = torch.empty(agg_elems, dtype=torch.float32, device=device)
             self._agg_works[device.index] = agg_work
         return {
@@ -2881,7 +2889,9 @@ class CakeSSDCombined:
             # status word.  The two-kernel and chunk-parallel programs read
             # the tables their preprocess published.
             "cu_seqlens": cu_seqlens_arg,
-            "metadata_from_cu_seqlens": int(program.family == "exactfused" and from_cu_seqlens),
+            "metadata_from_cu_seqlens": int(
+                program.family == "exactfused" and from_cu_seqlens
+            ),
             "preprocess_status": preprocess_status,
         }
         if program.family in ("chunkpar", "chunkpar3"):
