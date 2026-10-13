@@ -78,9 +78,14 @@ for chunk_kib in (int(c) for c in args.chunk_kib.split(",")):
         session = PreparationSession(device=device, autotune=False, compile_workers=2)
         session.prepare((plan.request(name="roce", prepare_call=prepare),))
         chunk_bytes = runtime.stats()["varlen_chunk_bytes"]
-        source = torch.randint(0, 256, (capacity,), dtype=torch.uint8, device=device)
-        sources = [None] * world
-        dist.all_gather_object(sources, source.cpu())
+        def contribution(peer):
+            """Rank ``peer``'s bytes, which every rank regenerates to check its rows."""
+            gen = torch.Generator(device=device).manual_seed(1000 + peer)
+            return torch.randint(
+                0, 256, (capacity,), dtype=torch.uint8, device=device, generator=gen
+            )
+
+        source = contribution(rank)
         out = torch.empty((world, capacity), dtype=torch.uint8, device=device)
         stream = torch.cuda.Stream()
         for nbytes in sizes:
@@ -92,7 +97,7 @@ for chunk_kib in (int(c) for c in args.chunk_kib.split(",")):
             op()
             torch.cuda.synchronize()
             for peer in range(world):
-                if not torch.equal(out[peer, :nbytes].cpu(), sources[peer][:nbytes]):
+                if not torch.equal(out[peer, :nbytes], contribution(peer)[:nbytes]):
                     raise SystemExit(f"rank {rank}: row {peer} wrong at {nbytes} bytes")
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
