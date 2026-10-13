@@ -49,6 +49,40 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 from ._init_helpers import make_paged_kv_indices
 
 
+mla_swa_decode_trace = TraceTemplate(
+    op_type="mla_swa",
+    name_prefix="mla_swa_decode",
+    description="BF16 Page64 causal latent MLA sliding-window decode on SM90.",
+    axes={
+        "batch_size": Var(),
+        "q_len_per_req": Const(abbrev="sq"),
+        "num_heads": Const(abbrev="h"),
+        "head_dim_qk": Const(abbrev="d"),
+        "head_dim_v": Const(abbrev="dv", value=1024),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+        "table_width": Var(),
+        "workspace_bytes": Var(),
+    },
+    inputs={
+        "query": Tensor(["batch_size", "q_len_per_req", "num_heads", "head_dim_qk"]),
+        "kv_cache": Tensor(["num_pages", "page_size", "head_dim_qk"]),
+        "workspace_buffer": Tensor(["workspace_bytes"]),
+        "block_tables": Tensor(["batch_size", "table_width"]),
+        "seq_lens": Tensor(["batch_size"]),
+        "window_left": Scalar("int32"),
+        "sm_scale": Scalar("float32"),
+        "backend": Scalar("string", optional=True),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "q_len_per_req", "num_heads", "head_dim_v"],
+            dtype_from="query",
+        )
+    },
+)
+
+
 def _attention_check(
     reference_outputs,
     actual_outputs,

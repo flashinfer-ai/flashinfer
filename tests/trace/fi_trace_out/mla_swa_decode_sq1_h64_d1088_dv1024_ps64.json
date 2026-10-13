@@ -1,0 +1,105 @@
+{
+  "name": "mla_swa_decode_sq1_h64_d1088_dv1024_ps64",
+  "description": "BF16 Page64 causal latent MLA sliding-window decode on SM90.",
+  "op_type": "mla_swa",
+  "tags": [
+    "fi_api:flashinfer.mla._swa.batch_decode_with_kv_cache_mla_swa"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "q_len_per_req": {
+      "type": "const",
+      "value": 1
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 64
+    },
+    "head_dim_qk": {
+      "type": "const",
+      "value": 1088
+    },
+    "head_dim_v": {
+      "type": "const",
+      "value": 1024
+    },
+    "num_pages": {
+      "type": "var"
+    },
+    "page_size": {
+      "type": "const",
+      "value": 64
+    },
+    "table_width": {
+      "type": "var"
+    },
+    "workspace_bytes": {
+      "type": "var"
+    }
+  },
+  "inputs": {
+    "query": {
+      "shape": [
+        "batch_size",
+        "q_len_per_req",
+        "num_heads",
+        "head_dim_qk"
+      ],
+      "dtype": "bfloat16"
+    },
+    "kv_cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "head_dim_qk"
+      ],
+      "dtype": "bfloat16"
+    },
+    "workspace_buffer": {
+      "shape": [
+        "workspace_bytes"
+      ],
+      "dtype": "uint8"
+    },
+    "block_tables": {
+      "shape": [
+        "batch_size",
+        "table_width"
+      ],
+      "dtype": "int32"
+    },
+    "seq_lens": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32"
+    },
+    "window_left": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "sm_scale": {
+      "shape": null,
+      "dtype": "float32"
+    },
+    "backend": {
+      "shape": null,
+      "dtype": "string",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "q_len_per_req",
+        "num_heads",
+        "head_dim_v"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

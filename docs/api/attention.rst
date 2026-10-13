@@ -80,6 +80,12 @@ recapture.
 
 .. currentmodule:: flashinfer
 
+Sliding-window MLA (SM90)
+------------------------
+
+.. autofunction:: flashinfer.mla.batch_decode_with_kv_cache_mla_swa
+.. autofunction:: flashinfer.mla.get_mla_swa_workspace_size_bytes
+
 .. autosummary::
     :toctree: ../generated
 

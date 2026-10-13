@@ -213,6 +213,25 @@ from tests.trace.example_moe_layer import generate as generate_moe_layer_traces
 generate_moe_layer_traces(SAVE_DIR)
 
 device = "cuda"
+
+# Metadata-only SM90 MLA+SWA example, also usable without SM90 hardware.
+from flashinfer.mla import (
+    batch_decode_with_kv_cache_mla_swa,
+    get_mla_swa_workspace_size_bytes,
+)
+
+batch_decode_with_kv_cache_mla_swa.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty((1, 1, 64, 1088), device="meta", dtype=torch.bfloat16),
+    kv_cache=torch.empty((9, 64, 1088), device="meta", dtype=torch.bfloat16),
+    workspace_buffer=torch.empty(
+        get_mla_swa_workspace_size_bytes(1, 1), device="meta", dtype=torch.uint8
+    ),
+    block_tables=torch.empty((1, 9), device="meta", dtype=torch.int32),
+    seq_lens=torch.empty((1,), device="meta", dtype=torch.int32),
+    window_left=512,
+    sm_scale=0.0625,
+)
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
 
 # PCIe traces need only world_size and tensor metadata, not an IPC allocation
