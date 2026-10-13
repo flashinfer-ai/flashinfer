@@ -686,6 +686,7 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
         cu_seqlens=cu_seqlens,
         seq_chunk_cumsum=buffer,
         update_seq_chunk_cumsum=True,
+        out=out,
     )
     name, launch = calls[-1]
     assert name == prepared_cu.program_name

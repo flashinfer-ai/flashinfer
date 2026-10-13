@@ -5064,7 +5064,7 @@ def test_source_chunk_parallel_main_arguments_extend_the_exact_order():
     expected.append("vcount")
     assert tuple(expected) == module._MAIN_ARGS_CHUNKPAR
     assert len(common) == 41 and len(module._MAIN_ARGS) == 44
-    assert module._MAIN_ARGS_START == tuple(common)
+    assert tuple(common) == module._MAIN_ARGS_START
     assert len(module._MAIN_ARGS_CHUNKPAR) == 47
     assert set(module._MAIN_ARGS_CHUNKPAR) - set(common) == set(
         _CHUNK_PARALLEL_WORKSPACE_ARGS
@@ -5898,7 +5898,7 @@ def test_cake_ssd_combined_chunk_parallel_checkpoints_are_bitwise_the_exact_scan
     # up to its checkpoint token (batched: a per-row token index; packed
     # varlen: an absolute token index on the token axis).
     checkpoints = []
-    for sequence, (token, slot) in enumerate(zip(tokens, slots)):
+    for sequence, (token, slot) in enumerate(zip(tokens, slots, strict=True)):
         if slot < 0:
             continue
         start = 0 if form == "batched" else sum(lengths[:sequence])
@@ -6379,8 +6379,8 @@ def test_source_retained_start_programs_are_the_round5_files():
         path = source_dir / "generated" / relpath
         assert path.is_file(), relpath
         assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, relpath
-    assert module._HOST_TEMPLATE == Path(
-        "generated/host/mamba_ssd_combined_sequence.cpp"
+    assert (
+        Path("generated/host/mamba_ssd_combined_sequence.cpp") == module._HOST_TEMPLATE
     )
     assert {f"device/{ident}.cu" for ident in module._SCAN_MODULES.values()} == {
         relpath for relpath in retained if relpath.startswith("device/")

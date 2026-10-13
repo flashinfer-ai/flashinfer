@@ -1177,7 +1177,8 @@ def two_kernel_family(*, mode_varlen: bool, num_sequences: int, seqlen: int) -> 
     if not mode_varlen:
         chunks = -(-int(seqlen) // _CHUNK_SIZE)
     else:
-        chunks = -(-(-(-int(seqlen) // max(int(num_sequences), 1))) // _CHUNK_SIZE)
+        mean_tokens = -(-int(seqlen) // max(int(num_sequences), 1))
+        chunks = -(-mean_tokens // _CHUNK_SIZE)
     return "exactpre" if chunks >= _TWO_KERNEL_ROUTE_MIN_CHUNKS else "exact"
 
 
