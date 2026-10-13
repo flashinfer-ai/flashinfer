@@ -248,9 +248,10 @@ def test_unusable_count_stops_every_rank_before_sending():
         epoch_before = rt.stats()["epoch"]
         counts = torch.tensor([16] * (world - 1) + [8], dtype=torch.int64, device=rt.device)
         source = torch.zeros(4096, dtype=torch.uint8, device=rt.device)
-        prepared.gather(source, counts)
-        torch.cuda.synchronize()
+        # The kernel stops at once, so the launch's own health check may already report it.
         with pytest.raises(RuntimeError, match="unusable byte count for rank"):
+            prepared.gather(source, counts)
+            torch.cuda.synchronize()
             rt.check_health()
         assert rt.poisoned and rt.stats()["epoch"] == epoch_before
         assert rt.stats()["error_peer"] == world - 1
@@ -270,17 +271,19 @@ def test_gather_fail_stop_when_a_peer_never_sends():
         dist.barrier()
         if rank == 1:
             rt._proxy.stop()
-        prepared.gather(source, counts)
-        torch.cuda.synchronize()
         if rank != 1:
             with pytest.raises(RuntimeError, match="poisoned|timed out"):
+                prepared.gather(source, counts)
+                torch.cuda.synchronize()
                 rt.check_health()
         else:
             # Rank 1 received everything; its poisoned peers never send again.
-            rt.check_health()
             prepared.gather(source, counts)
             torch.cuda.synchronize()
+            rt.check_health()
             with pytest.raises(RuntimeError, match="poisoned|timed out"):
+                prepared.gather(source, counts)
+                torch.cuda.synchronize()
                 rt.check_health()
         assert rt.poisoned
     finally:
