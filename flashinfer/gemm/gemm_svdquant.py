@@ -45,6 +45,7 @@ from ..utils import (
     _get_cache_buf,
     backend_requirement,
     device_support_pdl,
+    get_compute_capability,
     get_device_sm_count,
     supported_compute_capability,
 )
@@ -692,16 +693,8 @@ def _heuristic_func_nvfp4_svdquant(
     # implementation tuning configuration.
     # The generated Cake implementation is explicit-only; preserve the
     # existing automatic backend selection and autotuning denominator.
-    #
-    # cutlass-sm120 is dropped rather than ordered. It is a second SM120
-    # implementation that has never been measured against cute-dsl, so letting
-    # "auto" reach it would be picking a winner by declaration order. Ask for it
-    # by name until the comparison exists.
-    return [
-        backend
-        for backend in suitable_backends
-        if backend not in ("cake", "cutlass-sm120")
-    ]
+    # SM120 CUTLASS joins the measured candidate set; CuTe remains the fallback.
+    return [backend for backend in suitable_backends if backend != "cake"]
 
 
 def _check_mm_nvfp4_svdquant_problem(
@@ -855,9 +848,10 @@ def mm_nvfp4_svdquant(
         ``"cute-dsl"`` selects the fused SM120/SM121 implementation;
         ``"cute-dsl-unfused"`` selects its compositional reference path;
         ``"cutlass-sm120"`` explicitly selects the SM120 CUTLASS implementation;
-        ``"auto"`` (default) selects by compute capability. On SM120/SM121,
-        fused and unfused are compared only while autotuning is enabled;
-        otherwise the fused-first runner is selected.
+        ``"auto"`` (default) selects by compute capability. On SM120 it tunes
+        across CuTe DSL fused/unfused and CUTLASS implementations; SM121 compares
+        the two CuTe DSL implementations. Outside tuning, cached winners are
+        reused, with CuTe fused as the default when available.
     enable_pdl: Optional[bool]
         Whether to launch with Programmatic Dependent Launch. For ``"cake"``, ``None``
         preserves the selected generated route; other backends use the device default.
@@ -894,6 +888,14 @@ def mm_nvfp4_svdquant(
 
     tune_sm120_implementations = False
     if backend == "auto":
+        if "cutlass-sm120" in mm_nvfp4_svdquant.suitable_auto_backends:
+            from .svdquant_sm120_auto import mm_auto
+
+            return mm_auto(
+                [a, b, a_sf, b_sf, alpha_scalar, d, l1, bias, out],
+                enable_pdl,
+                mm_nvfp4_svdquant.suitable_auto_backends,
+            )
         backend = mm_nvfp4_svdquant.suitable_auto_backends[0]
         tune_sm120_implementations = backend == "cute-dsl"
 
@@ -1122,12 +1124,40 @@ def svdquant_linear(
         architecture-based automatic selection.
         ``"cutlass-sm120"`` supports ranks 32 and 64, with fused or separate
         quantization and LoRA-down selected by complete-linear autotuning.
+        On SM120, ``"auto"`` also compares complete CuTe DSL and CUTLASS chains
+        for these ranks. Without a cached winner, CuTe DSL remains the default
+        when available. CuTe-specific quantization policies exclude native
+        preprocessing from the candidate set.
 
     Returns
     -------
     out: torch.Tensor
         Output tensor, shape ``(m, n)`` bf16.
     """
+    if (
+        backend == "auto"
+        and get_compute_capability(x.device) == (12, 0)
+        and l2t_smoothed.ndim == 2
+        and l2t_smoothed.shape[1] in (32, 64)
+    ):
+        from .svdquant_sm120_auto import linear_auto
+
+        return linear_auto(
+            [
+                x,
+                weight_fp4,
+                weight_sf,
+                alpha,
+                pre_quant_scale,
+                l2t_smoothed,
+                l1_scaled,
+                global_scale,
+                bias,
+                None,
+            ],
+            enable_pdl,
+        )
+
     if backend == "cutlass-sm120":
         from .svdquant_sm120_cutlass import svdquant_linear as _sm120_cutlass_linear
 
