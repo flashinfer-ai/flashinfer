@@ -22,6 +22,24 @@
 // waits for every stripe flag before consuming the receive slot.  Nothing on the receive path
 // involves the host.
 //
+// Messages too large for one-shot latency to matter take the pipelined two-shot
+// path instead (ctrl kind[slot] = 1).  The region then also holds
+//
+//   pipe_send          (pipe_bytes)                 staged input; our reduced shard
+//   pipe_recv[src][2]  (world * 2 * shard_cap)       peers' reduce-scatter and
+//                                                   all-gather chunks
+//   pipe_flag[2][src][chunk][rail]                   seq after each chunk stripe
+//
+// Shard j covers packs [j * P / world, (j + 1) * P / world) of a P-pack message and
+// is split into chunks of chunk_packs.  The kernel publishes ready_rs[c] = seq
+// once every block staged chunk c of every peer's shard and ready_ag[c] = seq once
+// chunk c of its own shard is reduced; the proxy posts each chunk as its word
+// turns, so staging, the wire and the reduction overlap.  The two-shot buffers
+// need one copy only: a rank leaves op N after every peer's all-gather of N
+// arrived, which every peer sent after reducing all of our N chunks, and a peer
+// sends its N + 1 all-gather only after our N + 1 reduce-scatter, which we post
+// after our N kernel finished reading.
+//
 // This file is compiled by b12x.comm.roce._proxy at first use with the host
 // gcc and libibverbs; it must stay plain C with no CUDA dependency.
 
@@ -43,8 +61,20 @@
 #define ROCE_SLOTS 2
 #define ROCE_FLAG_STRIDE 128
 #define ROCE_PORT 1
-#define ROCE_SEND_DEPTH 256
-#define ROCE_ABI_VERSION 5
+#define ROCE_SEND_DEPTH 512
+#define ROCE_ABI_VERSION 6
+#define ROCE_MAX_CHUNKS 64
+#define ROCE_CTRL_BYTES 4096
+// ctrl words (u32): the one-shot record, then per-slot op descriptors and the
+// two-shot chunk-ready words.
+#define CTRL_SEQ 0
+#define CTRL_ERROR 2
+#define CTRL_SLOT_NBYTES 4
+#define CTRL_SLOT_KIND 8
+#define CTRL_SLOT_CHUNK_PACKS 10
+#define CTRL_SLOT_CHUNKS 12
+#define CTRL_READY_RS 64
+#define CTRL_READY_AG 128
 // Model graphs leave sub-millisecond gaps between collectives.  Keep the
 // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
 // every collective on the graph's critical path.
@@ -88,6 +118,11 @@ typedef struct {
   size_t flag_off;
   size_t send_off;
   size_t ctrl_off;
+  size_t pipe_bytes;
+  size_t pipe_send_off;
+  size_t pipe_recv_off;
+  size_t pipe_flag_off;
+  size_t shard_cap;
   int started;
   uint64_t peer_addr[ROCE_MAX_PEERS];
   // Per peer and rail: the local HCA that carries it and the peer's rkey on the
@@ -111,24 +146,37 @@ static void set_err(roce_ctx_t* c, const char* what, int e) {
 
 int roce_abi_version(void) { return ROCE_ABI_VERSION; }
 
-int roce_layout(int world, uint64_t slot_bytes, uint64_t* out) {
-  // out = {recv_off, flag_off, send_off, ctrl_off, total_bytes, flag_stride, slots}
-  if (world < 2 || world > ROCE_MAX_PEERS || slot_bytes == 0 || (slot_bytes % 4096) != 0) {
+int roce_layout(int world, uint64_t slot_bytes, uint64_t pipe_bytes, uint64_t* out) {
+  // out = {recv_off, flag_off, send_off, ctrl_off, total_bytes, flag_stride, slots,
+  //        pipe_send_off, pipe_recv_off, pipe_flag_off, shard_cap, max_chunks, pipe_bytes}
+  if (world < 2 || world > ROCE_MAX_PEERS || slot_bytes == 0 || (slot_bytes % 4096) != 0 ||
+      (pipe_bytes % 4096) != 0) {
     return -1;
   }
   // Reject a layout whose arithmetic would wrap; the caller sizes slots from
   // configuration, so a wrapped region must fail here rather than at the NIC.
-  uint64_t recv_bytes, flag_bytes, send_bytes, send_off, ctrl_off, total;
-  if (slot_bytes > ((uint64_t)1 << 40) ||
+  uint64_t recv_bytes, flag_bytes, send_bytes, send_off, ctrl_off, pipe_send_off, pipe_recv_off,
+      pipe_flag_off, pipe_recv_bytes, total;
+  if (slot_bytes > ((uint64_t)1 << 40) || pipe_bytes > ((uint64_t)1 << 32) ||
       __builtin_mul_overflow((uint64_t)world * ROCE_SLOTS, slot_bytes, &recv_bytes) ||
       __builtin_mul_overflow((uint64_t)world * ROCE_SLOTS * ROCE_MAX_RAILS,
                              (uint64_t)ROCE_FLAG_STRIDE, &flag_bytes) ||
       __builtin_mul_overflow((uint64_t)ROCE_SLOTS, slot_bytes, &send_bytes) ||
       __builtin_add_overflow(recv_bytes, flag_bytes, &send_off) ||
       __builtin_add_overflow(send_off, send_bytes, &ctrl_off) ||
-      __builtin_add_overflow(ctrl_off, (uint64_t)ROCE_FLAG_STRIDE, &total)) {
+      __builtin_add_overflow(ctrl_off, (uint64_t)ROCE_CTRL_BYTES, &pipe_send_off)) {
     return -1;
   }
+  // A shard holds at most ceil(packs / world) packs.
+  uint64_t shard_cap = (pipe_bytes / 16 + (uint64_t)world - 1) / (uint64_t)world * 16;
+  shard_cap = (shard_cap + 4095) / 4096 * 4096;
+  pipe_recv_off = pipe_send_off + pipe_bytes;
+  pipe_recv_bytes = (uint64_t)world * 2 * shard_cap;
+  pipe_flag_off = pipe_recv_off + pipe_recv_bytes;
+  uint64_t pipe_flag_bytes =
+      pipe_bytes == 0 ? 0
+                      : (uint64_t)2 * world * ROCE_MAX_CHUNKS * ROCE_MAX_RAILS * ROCE_FLAG_STRIDE;
+  total = pipe_flag_off + pipe_flag_bytes;
   uint64_t recv_off = 0;
   uint64_t flag_off = recv_off + recv_bytes;
   out[0] = recv_off;
@@ -138,6 +186,12 @@ int roce_layout(int world, uint64_t slot_bytes, uint64_t* out) {
   out[4] = total;
   out[5] = ROCE_FLAG_STRIDE;
   out[6] = ROCE_SLOTS;
+  out[7] = pipe_send_off;
+  out[8] = pipe_recv_off;
+  out[9] = pipe_flag_off;
+  out[10] = shard_cap;
+  out[11] = ROCE_MAX_CHUNKS;
+  out[12] = pipe_bytes;
   return 0;
 }
 
@@ -237,10 +291,10 @@ static int open_hca(roce_ctx_t* c, int h, const char* name) {
 
 roce_ctx_t* roce_create(int world, int rank, const char* const* hca_names, int n_hca, int gid_index,
                         int traffic_class, void* region, uint64_t region_bytes, uint64_t slot_bytes,
-                        char* err, uint64_t err_len) {
-  uint64_t layout[7];
-  if (roce_layout(world, slot_bytes, layout) != 0 || layout[4] > region_bytes || rank < 0 ||
-      rank >= world || n_hca < 1 || n_hca > ROCE_MAX_HCAS || traffic_class < 0 ||
+                        uint64_t pipe_bytes, char* err, uint64_t err_len) {
+  uint64_t layout[13];
+  if (roce_layout(world, slot_bytes, pipe_bytes, layout) != 0 || layout[4] > region_bytes ||
+      rank < 0 || rank >= world || n_hca < 1 || n_hca > ROCE_MAX_HCAS || traffic_class < 0 ||
       traffic_class > 255) {
     snprintf(err, err_len, "invalid roce runtime geometry");
     return NULL;
@@ -262,6 +316,11 @@ roce_ctx_t* roce_create(int world, int rank, const char* const* hca_names, int n
   c->flag_off = layout[1];
   c->send_off = layout[2];
   c->ctrl_off = layout[3];
+  c->pipe_send_off = layout[7];
+  c->pipe_recv_off = layout[8];
+  c->pipe_flag_off = layout[9];
+  c->shard_cap = layout[10];
+  c->pipe_bytes = layout[12];
   for (int h = 0; h < n_hca; h++) {
     if (open_hca(c, h, hca_names[h]) != 0) {
       snprintf(err, err_len, "%s", c->err);
@@ -412,106 +471,224 @@ static int drain_cq(roce_ctx_t* c, int h) {
   return 0;
 }
 
-// Post op seq to every peer: one payload stripe plus its flag write per rail, each on
-// the HCA routed to that peer for the rail.
-static int post_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes) {
-  if (nbytes == 0 || nbytes % 16 != 0) {
-    snprintf(c->err, sizeof(c->err),
-             "RoCE payload size must be a positive multiple of 16 bytes, got %u", nbytes);
-    return -1;
-  }
-  uint32_t slot = seq & 1u;
-  uint8_t* send = c->region + c->send_off + (size_t)slot * c->slot_bytes;
-  uint32_t seq_copy = seq;
-  uint32_t total_packs = nbytes / 16;
-  for (int p = 0; p < c->world; p++) {
-    if (p == c->rank) {
-      continue;
+// Wait until HCA h can take one more stripe to peer p.  Two work requests per
+// stripe; keep the queue at most a quarter full so a provider that needs extra
+// entries can never fail a post.
+static int reserve(roce_ctx_t* c, int h, int p) {
+  roce_hca_t* hca = &c->hca[h];
+  while (hca->outstanding[p] >= ROCE_SEND_DEPTH / 4) {
+    if (drain_cq(c, h) != 0) {
+      return -1;
     }
-    uint32_t pack_offset = 0;
-    for (int k = 0; k < c->n_rail; k++) {
-      int h = c->rail_hca[p][k];
-      roce_hca_t* hca = &c->hca[h];
-      // Two work requests per stripe; keep the queue at most a quarter
-      // full so a provider that needs extra entries can never fail a post.
-      while (hca->outstanding[p] >= ROCE_SEND_DEPTH / 4) {
-        if (drain_cq(c, h) != 0) {
-          return -1;
-        }
-        // A peer that stopped acknowledging keeps the QP retrying for
-        // a long time; honour a stop request instead of blocking
-        // roce_stop (and so teardown) behind it.
-        if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
-          snprintf(c->err, sizeof(c->err),
-                   "RoCE proxy stopped with %u writes outstanding to rank %d", hca->outstanding[p],
-                   p);
-          return -1;
-        }
-      }
-      uint32_t stripe_packs = total_packs / (uint32_t)c->n_rail;
-      if ((uint32_t)k < total_packs % (uint32_t)c->n_rail) {
-        stripe_packs += 1;
-      }
-      uint32_t stripe_bytes = stripe_packs * 16;
-      uint64_t byte_offset = (uint64_t)pack_offset * 16;
-      uint64_t remote = c->peer_addr[p];
-      struct ibv_sge flag_sge = {
-          .addr = (uint64_t)(uintptr_t)&seq_copy,
-          .length = 4,
-          .lkey = 0,
-      };
-      struct ibv_send_wr flag_wr;
-      memset(&flag_wr, 0, sizeof(flag_wr));
-      flag_wr.wr_id = (uint64_t)p;
-      flag_wr.sg_list = &flag_sge;
-      flag_wr.num_sge = 1;
-      flag_wr.opcode = IBV_WR_RDMA_WRITE;
-      flag_wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
-      flag_wr.wr.rdma.remote_addr =
-          remote + c->flag_off +
-          (((uint64_t)c->rank * ROCE_SLOTS + slot) * (uint64_t)c->n_rail + (uint64_t)k) *
-              ROCE_FLAG_STRIDE;
-      flag_wr.wr.rdma.rkey = c->peer_rkey[k][p];
+    // A peer that stopped acknowledging keeps the QP retrying for
+    // a long time; honour a stop request instead of blocking
+    // roce_stop (and so teardown) behind it.
+    if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
+      snprintf(c->err, sizeof(c->err), "RoCE proxy stopped with %u writes outstanding to rank %d",
+               hca->outstanding[p], p);
+      return -1;
+    }
+  }
+  return 0;
+}
 
-      struct ibv_send_wr data_wr;
-      struct ibv_sge data_sge;
-      struct ibv_send_wr* first_wr = &flag_wr;
-      if (stripe_bytes != 0) {
-        data_sge = (struct ibv_sge){
-            .addr = (uint64_t)(uintptr_t)(send + byte_offset),
-            .length = stripe_bytes,
-            .lkey = hca->mr->lkey,
-        };
-        memset(&data_wr, 0, sizeof(data_wr));
-        data_wr.wr_id = (uint64_t)p;
-        data_wr.next = &flag_wr;
-        data_wr.sg_list = &data_sge;
-        data_wr.num_sge = 1;
-        data_wr.opcode = IBV_WR_RDMA_WRITE;
-        data_wr.wr.rdma.remote_addr = remote + c->recv_off +
-                                      ((uint64_t)c->rank * ROCE_SLOTS + slot) * c->slot_bytes +
-                                      byte_offset;
-        data_wr.wr.rdma.rkey = c->peer_rkey[k][p];
-        first_wr = &data_wr;
-      }
-      struct ibv_send_wr* bad = NULL;
-      int rc = ibv_post_send(hca->qp[p], first_wr, &bad);
-      if (rc != 0) {
-        set_err(c, "ibv_post_send", rc);
-        return -1;
-      }
-      hca->outstanding[p] += 1;
-      hca->bytes_posted += stripe_bytes;
-      pack_offset += stripe_packs;
+// Write `packs` 16-byte packs from local `send` to peer p at region offset
+// `remote_off`, striped across every rail, each stripe followed on its QP by a
+// 4-byte seq write to `flag_off + rail * ROCE_FLAG_STRIDE`.  An empty payload
+// still writes every flag, so receivers wait the same way for every chunk.
+static int post_striped(roce_ctx_t* c, int p, const uint8_t* send, uint64_t remote_off,
+                        uint32_t packs, uint64_t flag_off, uint32_t seq) {
+  uint32_t seq_copy = seq;
+  uint32_t pack_offset = 0;
+  uint64_t remote = c->peer_addr[p];
+  for (int k = 0; k < c->n_rail; k++) {
+    int h = c->rail_hca[p][k];
+    roce_hca_t* hca = &c->hca[h];
+    if (reserve(c, h, p) != 0) {
+      return -1;
     }
+    uint32_t stripe_packs = packs / (uint32_t)c->n_rail;
+    if ((uint32_t)k < packs % (uint32_t)c->n_rail) {
+      stripe_packs += 1;
+    }
+    uint32_t stripe_bytes = stripe_packs * 16;
+    uint64_t byte_offset = (uint64_t)pack_offset * 16;
+    struct ibv_sge flag_sge = {
+        .addr = (uint64_t)(uintptr_t)&seq_copy,
+        .length = 4,
+        .lkey = 0,
+    };
+    struct ibv_send_wr flag_wr;
+    memset(&flag_wr, 0, sizeof(flag_wr));
+    flag_wr.wr_id = (uint64_t)p;
+    flag_wr.sg_list = &flag_sge;
+    flag_wr.num_sge = 1;
+    flag_wr.opcode = IBV_WR_RDMA_WRITE;
+    flag_wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+    flag_wr.wr.rdma.remote_addr = remote + flag_off + (uint64_t)k * ROCE_FLAG_STRIDE;
+    flag_wr.wr.rdma.rkey = c->peer_rkey[k][p];
+
+    struct ibv_send_wr data_wr;
+    struct ibv_sge data_sge;
+    struct ibv_send_wr* first_wr = &flag_wr;
+    if (stripe_bytes != 0) {
+      data_sge = (struct ibv_sge){
+          .addr = (uint64_t)(uintptr_t)(send + byte_offset),
+          .length = stripe_bytes,
+          .lkey = hca->mr->lkey,
+      };
+      memset(&data_wr, 0, sizeof(data_wr));
+      data_wr.wr_id = (uint64_t)p;
+      data_wr.next = &flag_wr;
+      data_wr.sg_list = &data_sge;
+      data_wr.num_sge = 1;
+      data_wr.opcode = IBV_WR_RDMA_WRITE;
+      data_wr.wr.rdma.remote_addr = remote + remote_off + byte_offset;
+      data_wr.wr.rdma.rkey = c->peer_rkey[k][p];
+      first_wr = &data_wr;
+    }
+    struct ibv_send_wr* bad = NULL;
+    int rc = ibv_post_send(hca->qp[p], first_wr, &bad);
+    if (rc != 0) {
+      set_err(c, "ibv_post_send", rc);
+      return -1;
+    }
+    hca->outstanding[p] += 1;
+    hca->bytes_posted += stripe_bytes;
+    pack_offset += stripe_packs;
   }
-  c->ops_posted += 1;
+  return 0;
+}
+
+static int drain_all(roce_ctx_t* c) {
   for (int h = 0; h < c->n_hca; h++) {
     if (drain_cq(c, h) != 0) {
       return -1;
     }
   }
   return 0;
+}
+
+// Post one-shot op seq to every peer: the whole payload, one stripe plus its flag
+// write per rail, each on the HCA routed to that peer for the rail.
+static int post_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes) {
+  if (nbytes == 0 || nbytes % 16 != 0 || nbytes > c->slot_bytes) {
+    snprintf(c->err, sizeof(c->err),
+             "RoCE payload size must be a positive multiple of 16 bytes within the slot, got %u",
+             nbytes);
+    return -1;
+  }
+  uint32_t slot = seq & 1u;
+  const uint8_t* send = c->region + c->send_off + (size_t)slot * c->slot_bytes;
+  for (int p = 0; p < c->world; p++) {
+    if (p == c->rank) {
+      continue;
+    }
+    uint64_t remote_off = c->recv_off + ((uint64_t)c->rank * ROCE_SLOTS + slot) * c->slot_bytes;
+    uint64_t flag_off = c->flag_off + ((uint64_t)c->rank * ROCE_SLOTS + slot) *
+                                          (uint64_t)c->n_rail * ROCE_FLAG_STRIDE;
+    if (post_striped(c, p, send, remote_off, nbytes / 16, flag_off, seq) != 0) {
+      return -1;
+    }
+  }
+  c->ops_posted += 1;
+  return drain_all(c);
+}
+
+// First pack of shard j of a total-pack message (the kernel uses the same split).
+static inline uint32_t shard_start(const roce_ctx_t* c, uint32_t total, int j) {
+  return (uint32_t)(((uint64_t)j * total) / (uint64_t)c->world);
+}
+
+// Post chunk `chunk` of two-shot phase `phase` (0 reduce-scatter: peer p's shard
+// of our staged input; 1 all-gather: our reduced shard) to every peer.
+static int post_pipe_chunk(roce_ctx_t* c, uint32_t seq, int phase, uint32_t chunk, uint32_t total,
+                           uint32_t chunk_packs) {
+  const uint8_t* send = c->region + c->pipe_send_off;
+  for (int p = 0; p < c->world; p++) {
+    if (p == c->rank) {
+      continue;
+    }
+    int shard = phase == 0 ? p : c->rank;
+    uint32_t first = shard_start(c, total, shard);
+    uint32_t end = shard_start(c, total, shard + 1);
+    uint64_t lo = (uint64_t)first + (uint64_t)chunk * chunk_packs;
+    uint64_t hi = lo + chunk_packs;
+    if (lo > end) {
+      lo = end;
+    }
+    if (hi > end) {
+      hi = end;
+    }
+    uint64_t remote_off = c->pipe_recv_off +
+                          ((uint64_t)c->rank * 2 + (uint64_t)phase) * c->shard_cap +
+                          (lo - first) * 16;
+    uint64_t flag_off =
+        c->pipe_flag_off +
+        ((((uint64_t)phase * c->world + c->rank) * ROCE_MAX_CHUNKS + chunk) * (uint64_t)c->n_rail) *
+            ROCE_FLAG_STRIDE;
+    if (post_striped(c, p, send + lo * 16, remote_off, (uint32_t)(hi - lo), flag_off, seq) != 0) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+// Run two-shot op seq: post each reduce-scatter chunk once the kernel staged it
+// and each all-gather chunk once the kernel reduced it.
+static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t chunk_packs,
+                       uint32_t chunks) {
+  volatile uint32_t* ctrl = (volatile uint32_t*)(c->region + c->ctrl_off);
+  uint32_t total = nbytes / 16;
+  uint32_t widest = (total + (uint32_t)c->world - 1) / (uint32_t)c->world;
+  if (nbytes == 0 || nbytes % 16 != 0 || nbytes > c->pipe_bytes || chunks == 0 ||
+      chunks > ROCE_MAX_CHUNKS || chunk_packs == 0 || (uint64_t)chunks * chunk_packs < widest) {
+    snprintf(c->err, sizeof(c->err),
+             "invalid two-shot op %u: %u bytes in %u chunks of %u packs (capacity %zu)", seq,
+             nbytes, chunks, chunk_packs, c->pipe_bytes);
+    return -1;
+  }
+  uint32_t rs = 0;
+  uint32_t ag = 0;
+  uint64_t idle = 0;
+  while (rs < chunks || ag < chunks) {
+    int posted = 0;
+    if (rs < chunks && __atomic_load_n(&ctrl[CTRL_READY_RS + rs], __ATOMIC_ACQUIRE) == seq) {
+      if (post_pipe_chunk(c, seq, 0, rs, total, chunk_packs) != 0) {
+        return -1;
+      }
+      rs++;
+      posted = 1;
+    }
+    if (ag < chunks && __atomic_load_n(&ctrl[CTRL_READY_AG + ag], __ATOMIC_ACQUIRE) == seq) {
+      if (post_pipe_chunk(c, seq, 1, ag, total, chunk_packs) != 0) {
+        return -1;
+      }
+      ag++;
+      posted = 1;
+    }
+    if (posted) {
+      idle = 0;
+      continue;
+    }
+    if (++idle % 64 == 0) {
+      if (drain_all(c) != 0) {
+        return -1;
+      }
+      // A kernel whose peer wait timed out publishes no further chunks.
+      if (ctrl[CTRL_ERROR] != 0) {
+        snprintf(c->err, sizeof(c->err), "two-shot op %u abandoned: kernel timed out at seq %u",
+                 seq, ctrl[CTRL_ERROR]);
+        return -1;
+      }
+      if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
+        snprintf(c->err, sizeof(c->err), "RoCE proxy stopped inside two-shot op %u", seq);
+        return -1;
+      }
+    }
+  }
+  c->ops_posted += 1;
+  return drain_all(c);
 }
 
 static void* proxy_main(void* arg) {
@@ -525,15 +702,13 @@ static void* proxy_main(void* arg) {
   uint64_t idle = 0;
   const struct timespec nap = {0, 20000};
   while (atomic_load_explicit(&c->running, memory_order_relaxed)) {
-    uint32_t seq = __atomic_load_n(&ctrl[0], __ATOMIC_ACQUIRE);
+    uint32_t seq = __atomic_load_n(&ctrl[CTRL_SEQ], __ATOMIC_ACQUIRE);
     if (seq == c->last_seq) {
       idle++;
       if (idle % 64 == 0) {
-        for (int h = 0; h < c->n_hca; h++) {
-          if (drain_cq(c, h) != 0) {
-            atomic_store(&c->failed, 1);
-            return NULL;
-          }
+        if (drain_all(c) != 0) {
+          atomic_store(&c->failed, 1);
+          return NULL;
         }
       }
       if (idle >= ROCE_IDLE_SPINS) {
@@ -546,8 +721,8 @@ static void* proxy_main(void* arg) {
     // completes on the peers' payloads alone, so op N+1 can ring before
     // this thread has seen op N (it slept, or the scheduler moved it).
     // Peers cannot get further than one op ahead of us, so at most
-    // ROCE_SLOTS doorbells are pending and every send slot is intact:
-    // post each missed sequence in order using its per-slot byte count.
+    // ROCE_SLOTS doorbells are pending and every slot descriptor is intact:
+    // post each missed sequence in order using its per-slot record.
     uint32_t pending = seq - c->last_seq;
     if (pending > ROCE_SLOTS) {
       snprintf(c->err, sizeof(c->err), "doorbell skipped %u ops (last %u, now %u)", pending,
@@ -556,8 +731,13 @@ static void* proxy_main(void* arg) {
       return NULL;
     }
     for (uint32_t s = c->last_seq + 1; pending > 0; s++, pending--) {
-      uint32_t nbytes = ctrl[4 + (s & 1u)];
-      if (post_op(c, s, nbytes) != 0) {
+      uint32_t slot = s & 1u;
+      uint32_t nbytes = ctrl[CTRL_SLOT_NBYTES + slot];
+      int rc = ctrl[CTRL_SLOT_KIND + slot] == 0
+                   ? post_op(c, s, nbytes)
+                   : run_pipe_op(c, s, nbytes, ctrl[CTRL_SLOT_CHUNK_PACKS + slot],
+                                 ctrl[CTRL_SLOT_CHUNKS + slot]);
+      if (rc != 0) {
         atomic_store(&c->failed, 1);
         return NULL;
       }

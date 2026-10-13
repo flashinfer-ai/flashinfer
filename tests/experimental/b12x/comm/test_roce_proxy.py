@@ -61,3 +61,27 @@ def test_route_table_matches_native_peer_rail_pair_order():
             proxy.connect([b"aaaa", b"bbbb", b"cccc"], [[], [(0, 1)], [(1, 0), (3, 2)]])
     finally:
         proxy._ctx = None
+
+
+def test_layout_places_two_shot_area_after_control():
+    """The two-shot area follows the control record; without one the region is unchanged."""
+    from b12x.comm.roce._proxy import Layout, load
+
+    try:
+        load()
+    except RuntimeError as exc:  # no C compiler or libibverbs headers
+        pytest.skip(str(exc))
+    plain = Layout(4, 2 << 20)
+    assert plain.pipe_bytes == 0 and plain.total_bytes == plain.pipe_send_off
+    piped = Layout(4, 2 << 20, 64 << 20)
+    assert piped.ctrl_off == plain.ctrl_off
+    assert piped.pipe_send_off >= piped.ctrl_off + 4096
+    assert piped.pipe_recv_off == piped.pipe_send_off + (64 << 20)
+    assert piped.shard_cap == 16 << 20
+    assert piped.pipe_flag_off == piped.pipe_recv_off + 4 * 2 * piped.shard_cap
+    flags = 2 * 4 * piped.max_chunks * 2 * piped.flag_stride
+    assert piped.total_bytes == piped.pipe_flag_off + flags
+    # Uneven shards round up to whole pages.
+    assert Layout(3, 2 << 20, 4096 * 5).shard_cap == 8192
+    with pytest.raises(ValueError):
+        Layout(4, 2 << 20, 1000)

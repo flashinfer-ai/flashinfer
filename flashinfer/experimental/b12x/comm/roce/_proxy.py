@@ -105,7 +105,7 @@ def load() -> ctypes.CDLL:
         lib.roce_abi_version.restype = ctypes.c_int
         lib.roce_abi_version.argtypes = []
         lib.roce_layout.restype = ctypes.c_int
-        lib.roce_layout.argtypes = [ctypes.c_int, u64, ctypes.POINTER(u64)]
+        lib.roce_layout.argtypes = [ctypes.c_int, u64, u64, ctypes.POINTER(u64)]
         lib.roce_blob_bytes.restype = u64
         lib.roce_blob_bytes.argtypes = []
         lib.roce_create.restype = p
@@ -117,6 +117,7 @@ def load() -> ctypes.CDLL:
             ctypes.c_int,
             ctypes.c_int,
             p,
+            u64,
             u64,
             u64,
             ctypes.c_char_p,
@@ -146,14 +147,14 @@ def load() -> ctypes.CDLL:
         lib.roce_hca_stat.argtypes = [p, ctypes.c_int, ctypes.c_int]
         lib.roce_destroy.restype = None
         lib.roce_destroy.argtypes = [p]
-        if lib.roce_abi_version() != 5:
+        if lib.roce_abi_version() != 6:
             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
         _LIB = lib
         return lib
 
 
 class Layout:
-    """Byte offsets of the pinned region shared by the kernel and the proxy."""
+    """Byte offsets of the pinned region shared by the kernels and the proxy."""
 
     __slots__ = (
         "recv_off",
@@ -163,15 +164,24 @@ class Layout:
         "total_bytes",
         "flag_stride",
         "slots",
+        "pipe_send_off",
+        "pipe_recv_off",
+        "pipe_flag_off",
+        "shard_cap",
+        "max_chunks",
+        "pipe_bytes",
     )
 
-    def __init__(self, world_size: int, slot_bytes: int) -> None:
-        """Create the proxy context: open the HCAs, register the pinned region, create the queue pairs."""
-        out = (ctypes.c_uint64 * 7)()
-        if load().roce_layout(int(world_size), int(slot_bytes), out) != 0:
+    def __init__(self, world_size: int, slot_bytes: int, pipe_bytes: int = 0) -> None:
+        """Ask the proxy library for the layout of ``world_size`` one-shot slots and a two-shot area."""
+        out = (ctypes.c_uint64 * 13)()
+        if (
+            load().roce_layout(int(world_size), int(slot_bytes), int(pipe_bytes), out)
+            != 0
+        ):
             raise ValueError(
                 f"unsupported RoCE geometry: world_size={world_size} slot_bytes={slot_bytes} "
-                "(2..16 ranks, slot_bytes a positive multiple of 4096)"
+                f"pipe_bytes={pipe_bytes} (2..16 ranks, sizes multiples of 4096)"
             )
         (
             self.recv_off,
@@ -181,6 +191,12 @@ class Layout:
             self.total_bytes,
             self.flag_stride,
             self.slots,
+            self.pipe_send_off,
+            self.pipe_recv_off,
+            self.pipe_flag_off,
+            self.shard_cap,
+            self.max_chunks,
+            self.pipe_bytes,
         ) = (int(v) for v in out)
 
 
@@ -197,6 +213,7 @@ class Proxy:
         region_ptr: int,
         region_bytes: int,
         slot_bytes: int,
+        pipe_bytes: int = 0,
     ) -> None:
         """Create the proxy context: open the HCAs, register the pinned region, create the queue pairs."""
         self.traffic_class = _traffic_class()
@@ -213,6 +230,7 @@ class Proxy:
             ctypes.c_void_p(int(region_ptr)),
             int(region_bytes),
             int(slot_bytes),
+            int(pipe_bytes),
             err,
             len(err),
         )

@@ -25,7 +25,7 @@ def _dtypes(query: RoceQuery) -> tuple[torch.dtype, ...]:
 @program_cache(scope="preparation")
 def compile_roce(payload, ordinal: int):
     """Resolve exactly the all-reduce/all-gather launchers in a declaration."""
-    from . import _allgather_cute
+    from . import _allgather_cute, _twoshot_cute
     from ._oneshot_cute import get_launcher
     from .roce_oneshot import _DTYPE_NAMES
 
@@ -46,6 +46,19 @@ def compile_roce(payload, ordinal: int):
             for dtype in _dtypes(query)
         }
         programs["gather"] = _allgather_cute.get_launcher(*common)
+        max_chunks = int(setup.get("pipe_chunks", 0))
+        if max_chunks:
+            for dtype in _dtypes(query):
+                programs[("twoshot", dtype)] = _twoshot_cute.get_launcher(
+                    _DTYPE_NAMES[dtype],
+                    query.world_size,
+                    query.rank,
+                    int(setup["threads"]),
+                    int(setup["flag_stride"]),
+                    int(setup["hca_count"]),
+                    max_chunks,
+                    ordinal,
+                )
         return programs
 
 
@@ -54,6 +67,7 @@ class _PreparedRoce:
     runtime: object
     reduce_launchers: dict[torch.dtype, object]
     gather_launcher: object
+    twoshot_launchers: dict[torch.dtype, object]
 
     def all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor | None = None):
         return self.runtime._run_prepared_all_reduce(inp, prepared=self, out=out)
@@ -122,8 +136,17 @@ def plan(
         runtime._prepare_resources(_dtypes(query), padded_gather=True)
         return _PreparedRoce(
             runtime,
-            {key: value for key, value in programs.items() if key != "gather"},
+            {
+                key: value
+                for key, value in programs.items()
+                if isinstance(key, torch.dtype)
+            },
             gather,
+            {
+                key[1]: value
+                for key, value in programs.items()
+                if isinstance(key, tuple) and key[0] == "twoshot"
+            },
         )
 
     return Plan(
@@ -162,6 +185,8 @@ def query_from_runtime(
                 "slots": runtime._layout.slots,
                 "flag_stride": runtime._layout.flag_stride,
                 "hca_count": runtime.rail_count,
+                # Chunk-flag capacity of the two-shot path; 0 when the runtime has none.
+                "pipe_chunks": runtime._layout.max_chunks if runtime.pipe_bytes else 0,
             }
         ),
     )

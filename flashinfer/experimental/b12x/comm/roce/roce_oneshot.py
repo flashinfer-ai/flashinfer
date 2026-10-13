@@ -1,16 +1,22 @@
-"""RoCEnante: one-shot RoCE all-reduce and all-gather runtime for multi-node tensor parallelism.
+"""RoCEnante: RoCE all-reduce and all-gather runtime for multi-node tensor parallelism.
 
 Designed for DGX Spark clusters, whose integrated GPU can read pinned host
 memory in place and whose ConnectX-7 can RDMA-write into the same memory.
 Each rank owns one pinned region (see ``_roce_proxy.c``); every all-reduce is
-one kernel launch that stages the input, rings the proxy thread, waits for
-every peer's RDMA-written payload, and reduces in fixed rank order.
+one kernel launch.  Messages below ``pipe_threshold`` take the one-shot path:
+stage the input, ring the proxy thread, wait for every peer's RDMA-written
+payload, and reduce in fixed rank order.  Larger messages (with ``pipe_bytes``
+set) take the pipelined two-shot path (``_twoshot_cute.py``): a reduce-scatter
+and an all-gather in chunks, so each rank sends ``2 (world - 1) / world`` of the
+message instead of ``world - 1`` copies, and staging, the wire and the
+reduction overlap.  Both paths produce the same bits.
 
 Runtime constraints:
 
 * one all-reduce in flight per runtime (single channel, one stream);
-* all-reduce messages up to ``max_size`` bytes and all-gather shards up to
-  ``max_gather_bytes``, both multiples of 16 bytes;
+* one-shot all-reduce messages up to ``max_size`` bytes, two-shot ones up to
+  ``pipe_bytes`` (16-byte aligned tensors), and all-gather shards up to
+  ``max_gather_bytes``, all multiples of 16 bytes;
 * every rank of the exchange group must construct the runtime collectively;
 * every peer payload is striped across all configured HCAs, with a completion
   flag per stripe so the GPU consumes the slot only after every HCA delivered.
@@ -30,7 +36,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from . import _allgather_cute
+from . import _allgather_cute, _twoshot_cute
 from ._oneshot_cute import PACK_BYTES, get_launcher
 from ._proxy import Layout, Proxy, load as _load_proxy_library
 from ._routes import MAX_RAILS, local_endpoints, plan_routes
@@ -46,6 +52,20 @@ DEFAULT_MAX_SIZE = 2 * 1024 * 1024
 DEFAULT_MAX_GATHER_BYTES = 16 * 1024 * 1024
 DEFAULT_THREADS = 512
 DEFAULT_BLOCKS = 8
+# Two-shot (pipelined reduce-scatter + all-gather) defaults, measured on DGX
+# Sparks behind one 200 GbE switch: 4 blocks and 128 KiB shard chunks reach
+# about 96% of the wire from 16 MiB up at 2, 3 and 4 ranks (more blocks or
+# larger chunks lose up to 10%).  Two-shot overtakes one-shot at about 2 MiB
+# on two ranks and 1 MiB on more, where one-shot's extra copies dominate.
+DEFAULT_PIPE_BLOCKS = 4
+DEFAULT_PIPE_CHUNK_BYTES = 128 * 1024
+
+
+def default_pipe_threshold(world_size: int) -> int:
+    """Smallest all-reduce that takes the two-shot path by default."""
+    return (2 if world_size == 2 else 1) << 20
+
+
 DEFAULT_GID_INDEX = 3
 # Devices one rank may open (a switchless DGX Spark ring uses all four functions of
 # its two cabled ports); each peer is reached over at most MAX_RAILS of them.
@@ -204,8 +224,19 @@ class RoceOneshotAllReduce:
         gid_index: Optional[int] = None,
         threads: int = DEFAULT_THREADS,
         blocks: int = DEFAULT_BLOCKS,
+        pipe_bytes: int = 0,
+        pipe_threshold: Optional[int] = None,
+        pipe_blocks: int = DEFAULT_PIPE_BLOCKS,
+        pipe_chunk_bytes: int = DEFAULT_PIPE_CHUNK_BYTES,
     ) -> None:
-        """Allocate the pinned region, build and connect the proxy, and start it."""
+        """Allocate the pinned region, build and connect the proxy, and start it.
+
+        ``pipe_bytes`` (default 0: none) sizes the pipelined two-shot path, which
+        serves all-reduces of at least ``pipe_threshold`` bytes (default
+        ``default_pipe_threshold(world)``) up to ``pipe_bytes``, and any message
+        above ``max_size``; smaller messages keep the one-shot path, whose
+        latency is lower.
+        """
         self.device = _normalize_device(device)
         self.rank = dist.get_rank(group=exchange_group)
         self.world_size = dist.get_world_size(group=exchange_group)
@@ -233,8 +264,22 @@ class RoceOneshotAllReduce:
             # free-running 32-bit counter, which survives the counter wrap only
             # for a power-of-two block count.
             raise ValueError("blocks must be a positive power of two")
+        if int(pipe_blocks) < 1 or int(pipe_blocks) & (int(pipe_blocks) - 1) != 0:
+            raise ValueError("pipe_blocks must be a positive power of two")
+        if int(pipe_bytes) < 0 or int(pipe_bytes) % PACK_BYTES != 0:
+            raise ValueError("pipe_bytes must be a non-negative multiple of 16")
+        if int(pipe_chunk_bytes) < PACK_BYTES:
+            raise ValueError("pipe_chunk_bytes must hold at least one pack")
         self.max_size = int(max_size)
         self.max_gather_bytes = int(max_gather_bytes)
+        self.pipe_bytes = int(pipe_bytes)
+        self.pipe_threshold = (
+            default_pipe_threshold(self.world_size)
+            if pipe_threshold is None
+            else int(pipe_threshold)
+        )
+        self._pipe_blocks = int(pipe_blocks)
+        self._pipe_chunk_packs = int(pipe_chunk_bytes) // PACK_BYTES
         self._threads = int(threads)
         self._blocks = int(blocks)
         self._counter_classes = self._blocks.bit_length()
@@ -251,7 +296,9 @@ class RoceOneshotAllReduce:
         slot_bytes = _align_up(
             max(self.max_size, self.max_gather_bytes), _SLOT_ALIGNMENT
         )
-        self._layout = Layout(self.world_size, slot_bytes)
+        self._layout = Layout(
+            self.world_size, slot_bytes, _align_up(self.pipe_bytes, _SLOT_ALIGNMENT)
+        )
         self._slot_bytes = slot_bytes
 
         with torch.cuda.device(self.device):
@@ -263,8 +310,10 @@ class RoceOneshotAllReduce:
             # Epoch and poison are global. Stage and tail arrivals are separate
             # for every power-of-two grid size because their free-running
             # counters use the launch grid as their modulus.
+            # The two-shot path appends a staged and a reduced counter per chunk
+            # and its own tail counter for its fixed grid.
             self._counters = torch.zeros(
-                2 + 2 * self._counter_classes,
+                2 + 2 * self._counter_classes + 2 * self._layout.max_chunks + 1,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -291,6 +340,7 @@ class RoceOneshotAllReduce:
         self._ctrl_np = self._ctrl_words.numpy()
         self._epoch_address = self._counters.data_ptr()
         self._poison_address = self._epoch_address + 4 * (1 + 2 * self._counter_classes)
+        self._pipe_counter_address = self._poison_address + 4
 
         error: Optional[str] = None
         try:
@@ -302,6 +352,7 @@ class RoceOneshotAllReduce:
                 region_ptr=host_ptr,
                 region_bytes=self._layout.total_bytes,
                 slot_bytes=slot_bytes,
+                pipe_bytes=self._layout.pipe_bytes,
             )
             blob = self._proxy.local_blob()
             endpoints = local_endpoints(self.hca_names, self.gid_index)
@@ -327,6 +378,11 @@ class RoceOneshotAllReduce:
             "spin_limit": self.spin_limit,
             "threads": self._threads,
             "blocks": self._blocks,
+            "pipe_bytes": self.pipe_bytes,
+            "pipe_threshold": self.pipe_threshold,
+            "pipe_blocks": self._pipe_blocks,
+            "pipe_chunk_packs": self._pipe_chunk_packs,
+            "max_chunks": self._layout.max_chunks,
         }
         statuses = _exchange((error, blob, config, endpoints), exchange_group)
         failures = [
@@ -447,7 +503,24 @@ class RoceOneshotAllReduce:
         if inp.device != self.device or not inp.is_contiguous():
             return False
         nbytes = inp.numel() * inp.element_size()
-        return 0 < nbytes <= self.max_size and nbytes % PACK_BYTES == 0
+        return (
+            0 < nbytes <= max(self.max_size, self.pipe_bytes)
+            and nbytes % PACK_BYTES == 0
+        )
+
+    def _uses_pipe(self, nbytes: int) -> bool:
+        """True when an all-reduce of ``nbytes`` takes the two-shot path (rank-uniform)."""
+        return (
+            0 < self.pipe_bytes
+            and (nbytes > self.max_size or nbytes >= self.pipe_threshold)
+            and nbytes <= self.pipe_bytes
+        )
+
+    def _pipe_geometry(self, nbytes: int) -> tuple[int, int]:
+        """(chunk_packs, chunks) splitting each shard of an ``nbytes`` message."""
+        shard = -(-(nbytes // PACK_BYTES) // self.world_size)
+        chunk_packs = max(self._pipe_chunk_packs, -(-shard // self._layout.max_chunks))
+        return chunk_packs, -(-shard // chunk_packs)
 
     # -- channels / streams (single channel runtime) ---------------------------
 
@@ -471,6 +544,19 @@ class RoceOneshotAllReduce:
             self._layout.slots,
             self._layout.flag_stride,
             self.rail_count,
+            self.device.index,
+        )
+
+    def _twoshot_launcher_key(self, dtype: torch.dtype) -> tuple[object, ...]:
+        """Cache key of the two-shot all-reduce launcher for ``dtype``."""
+        return (
+            _DTYPE_NAMES[dtype],
+            self.world_size,
+            self.rank,
+            self._threads,
+            self._layout.flag_stride,
+            self.rail_count,
+            self._layout.max_chunks,
             self.device.index,
         )
 
@@ -511,6 +597,8 @@ class RoceOneshotAllReduce:
         with torch.cuda.device(self.device):
             for dtype in dtypes:
                 get_launcher(*self._launcher_key(dtype))
+                if self.pipe_bytes:
+                    _twoshot_cute.get_launcher(*self._twoshot_launcher_key(dtype))
             _allgather_cute.get_launcher(*self._gather_launcher_key())
             self._aligned_scratch(0, self._region[:PACK_BYTES])
             if padded_gather:
@@ -583,43 +671,84 @@ class RoceOneshotAllReduce:
                     ) from exc
                 if out is None:
                     out = torch.empty_like(inp)
-                src = inp
-                if inp.data_ptr() % PACK_BYTES != 0:
-                    src = self._aligned_scratch(0, inp)
-                    src.copy_(inp)
-                dst = (
-                    out
-                    if out.data_ptr() % PACK_BYTES == 0
-                    else self._aligned_scratch(1, out)
-                )
-                grid_blocks = _grid_blocks(
-                    nbytes // PACK_BYTES, self._threads, self._blocks
-                )
-                stage_counter, tail_counter = self._counter_addresses(grid_blocks)
-                self._order_stream(capturing)
-                launcher(
-                    src.data_ptr(),
-                    dst.data_ptr(),
-                    nbytes // PACK_BYTES,
-                    nbytes,
-                    self._recv_base,
-                    self._flag_base,
-                    self._send_base,
-                    self._ctrl_base,
-                    self._slot_bytes,
-                    self._epoch_address,
-                    stage_counter,
-                    tail_counter,
-                    self._poison_address,
-                    self.spin_limit,
-                    grid_blocks,
-                )
-                if dst is not out:
-                    out.copy_(dst)
+                if self._uses_pipe(nbytes):
+                    self._launch_twoshot(inp, out, nbytes, prepared, capturing)
+                else:
+                    src = inp
+                    if inp.data_ptr() % PACK_BYTES != 0:
+                        src = self._aligned_scratch(0, inp)
+                        src.copy_(inp)
+                    dst = (
+                        out
+                        if out.data_ptr() % PACK_BYTES == 0
+                        else self._aligned_scratch(1, out)
+                    )
+                    grid_blocks = _grid_blocks(
+                        nbytes // PACK_BYTES, self._threads, self._blocks
+                    )
+                    stage_counter, tail_counter = self._counter_addresses(grid_blocks)
+                    self._order_stream(capturing)
+                    launcher(
+                        src.data_ptr(),
+                        dst.data_ptr(),
+                        nbytes // PACK_BYTES,
+                        nbytes,
+                        self._recv_base,
+                        self._flag_base,
+                        self._send_base,
+                        self._ctrl_base,
+                        self._slot_bytes,
+                        self._epoch_address,
+                        stage_counter,
+                        tail_counter,
+                        self._poison_address,
+                        self.spin_limit,
+                        grid_blocks,
+                    )
+                    if dst is not out:
+                        out.copy_(dst)
                 self._mark_stream(capturing)
         if not capturing:
             self.check_health()
         return out
+
+    def _launch_twoshot(
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        nbytes: int,
+        prepared: object,
+        capturing: bool,
+    ) -> None:
+        """Launch the pipelined two-shot all-reduce of ``inp`` into ``out``."""
+        try:
+            launcher = prepared.twoshot_launchers[inp.dtype]
+        except KeyError as exc:
+            raise ValueError("RoCE two-shot dtype differs from preparation") from exc
+        if inp.data_ptr() % PACK_BYTES or out.data_ptr() % PACK_BYTES:
+            # The alignment scratch is sized for one-shot messages only.
+            raise ValueError("RoCE two-shot all-reduce needs 16-byte aligned tensors")
+        chunk_packs, chunks = self._pipe_geometry(nbytes)
+        base = self._region.data_ptr()
+        self._order_stream(capturing)
+        launcher(
+            inp.data_ptr(),
+            out.data_ptr(),
+            nbytes // PACK_BYTES,
+            nbytes,
+            chunk_packs,
+            chunks,
+            base + self._layout.pipe_send_off,
+            base + self._layout.pipe_recv_off,
+            base + self._layout.pipe_flag_off,
+            self._layout.shard_cap,
+            self._ctrl_base,
+            self._epoch_address,
+            self._pipe_counter_address,
+            self._poison_address,
+            self.spin_limit,
+            self._pipe_blocks,
+        )
 
     def _aligned_scratch(self, which: int, like: torch.Tensor) -> torch.Tensor:
         """16-byte-aligned device scratch shaped like ``like`` (input 0, output 1).
@@ -933,6 +1062,10 @@ class RoceOneshotAllReduce:
             "max_size": self.max_size,
             "max_gather_bytes": self.max_gather_bytes,
             "slot_bytes": self._slot_bytes,
+            "pipe_bytes": self.pipe_bytes,
+            "pipe_threshold": self.pipe_threshold,
+            "pipe_blocks": self._pipe_blocks,
+            "pipe_chunk_bytes": self._pipe_chunk_packs * PACK_BYTES,
             "epoch": int(self._counters[0].item()),
             "error_seq": int(self._error_word.item()),
             "error_peer": int(self._ctrl_words[3].item()),

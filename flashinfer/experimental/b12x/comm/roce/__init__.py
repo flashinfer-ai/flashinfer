@@ -1,4 +1,4 @@
-"""``b12x.comm.roce`` (RoCEnante): one-shot all-reduce and all-gather over RoCE for multi-node TP.
+"""``b12x.comm.roce`` (RoCEnante): one-shot and pipelined two-shot all-reduce and all-gather over RoCE for multi-node TP.
 
 Target: clusters of DGX Spark nodes joined by their ConnectX-7 200 GbE ports,
 one GPU per node.  The GB10's unified memory lets the NIC RDMA-write straight

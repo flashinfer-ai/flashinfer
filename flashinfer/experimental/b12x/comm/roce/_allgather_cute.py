@@ -188,6 +188,10 @@ class _RoceAllGatherLaunch:
                     st_relaxed_sys_u32(
                         ctrl_base + Int64(16) + slot * Int64(4), Uint32(nbytes)
                     )
+                    # kind[slot] = 0: a one-shot payload (a two-shot op may have used the slot).
+                    st_relaxed_sys_u32(
+                        ctrl_base + Int64(32) + slot * Int64(4), Uint32(0)
+                    )
                     fence_sc_sys()
                     st_relaxed_sys_u32(ctrl_base, seq)
 
@@ -333,7 +337,7 @@ def get_launcher(
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.roce.allgather", 4, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.roce.allgather", 5, cache_key),
     )
 
     def run(
