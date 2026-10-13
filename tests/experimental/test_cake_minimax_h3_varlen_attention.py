@@ -35,8 +35,12 @@ from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
     SUPPORTED_COMPUTE_CAPABILITIES,
     TileTables,
     assign_unit_slots,
+    bf16_attention_stage,
     bf16_choose_q_splits,
+    bf16_cluster_work,
+    bf16_dyn_sched,
     bf16_unit_cost,
+    bf16_unit_weights,
     build_bf16_segment_plan,
     lpt_makespan,
     choose_kv_splits,
@@ -116,10 +120,11 @@ def test_assign_unit_slots_lpt():
 def _decode_unit_table(plan):
     """``(segment, head, cluster, kv_begin, kv_blocks, slot)`` per scheduled unit."""
     table = plan.unit_table.tolist()
-    # ``num_clusters`` zero records of padding follow the scheduled units.
-    assert len(table) == UNIT_WORDS * (plan.total_tiles + plan.num_clusters)
+    # ``num_clusters`` zero records of padding follow the scheduled units, then
+    # the zero record whose word 0 is the dynamic scheduler's ticket counter.
+    assert len(table) == UNIT_WORDS * (plan.total_tiles + plan.num_clusters + 1)
     assert table[UNIT_WORDS * plan.total_tiles :] == [0] * (
-        UNIT_WORDS * plan.num_clusters
+        UNIT_WORDS * (plan.num_clusters + 1)
     )
     begins = plan.seg_begin.tolist()
     lens = plan.seg_len.tolist()
@@ -314,10 +319,10 @@ HALF_UNIT_ROWS = CLUSTER_Q_ROWS // 2
 
 
 def _bf16_records(plan):
-    """The ``total_tiles`` eight-word unit records of a plan; the ``num_clusters`` padding records are zero."""
+    """The ``total_tiles`` eight-word unit records of a plan; the ``num_clusters + 1`` padding records (prefetch padding and the ticket counter) are zero until an ``attention_dyn`` launch leaves the terminal tickets in word 6 of the padding records."""
     words = plan.unit_table.tolist()
     total = int(plan.total_tiles)
-    assert len(words) == UNIT_WORDS * (total + int(plan.num_clusters))
+    assert len(words) == UNIT_WORDS * (total + int(plan.num_clusters) + 1)
     assert all(word == 0 for word in words[UNIT_WORDS * total :])
     return [
         tuple(words[i : i + UNIT_WORDS])
@@ -1018,6 +1023,150 @@ def test_bf16_q_split_plan_output_is_bitwise_the_plain_plans(
     )
     cake_backend._BF16_PLANS.clear()
     monkeypatch.undo()
+
+
+# --- per-plan BF16 program dispatch (round 13: `attention` / `attention_dyn` / `attention_sread`) -------------------
+# 152 SMs: the predicate rows below are stated for this grid (B200: 74 clusters)
+GB300_GRID_CLUSTERS = 76
+DISPATCH_ROWS = {
+    # label: (cu_seqlens, heads, dyn_sched on 76 clusters)
+    # one wave (70 units on 70 clusters): nothing to balance
+    "tail_5s_p8_m4763": ([0, 4763], 7, False),
+    # 4.4 waves of 24-block units: below the per-cluster work floor
+    "short_units_3072x56": ([0, 3072], 56, False),
+    # 56 units per cluster, imbalance == cheapest unit: static is optimal
+    "center_5s_p1_m38592": ([0, 38592], 56, False),
+    # 71 units per cluster
+    "center_6s_p1_m48768": ([0, 48768], 56, True),
+    # 40 units per cluster, imbalance 860 > cheapest unit 430
+    "center_15s_p2_m54976": ([0, 54976], 28, True),
+}
+
+
+def _scheduled_records(plan):
+    return plan.unit_table.tolist()[: UNIT_WORDS * int(plan.total_tiles)]
+
+
+@pytest.mark.parametrize("label", sorted(DISPATCH_ROWS))
+def test_bf16_dyn_sched_predicate(label):
+    cu, heads, expected = DISPATCH_ROWS[label]
+    plan = build_bf16_segment_plan(
+        cu, torch.device("cpu"), heads, num_clusters=GB300_GRID_CLUSTERS
+    )
+    assert (
+        bf16_dyn_sched(_scheduled_records(plan), plan.total_tiles, plan.num_clusters)
+        is expected
+    )
+    assert plan.dyn_sched is expected and plan.sread_unified is (not expected)
+    assert bf16_attention_stage(plan, "sm_100a") == (
+        "attention_dyn" if expected else "attention_sread"
+    )
+    assert bf16_attention_stage(plan, "sm_103a") == (
+        "attention_dyn" if expected else "attention"
+    )
+
+
+def test_bf16_dyn_sched_predicate_numbers():
+    # center_5s_p1 on 76 clusters: 55 whole two-stage units (weight 2 x 302 blocks) and one single-stage
+    # 192-row tail unit (weight 302) per cluster; the imbalance equals the cheapest unit, so the static
+    # LPT order is makespan-optimal and 56 units per cluster are below the unit-count rule.
+    plan = build_bf16_segment_plan(
+        [0, 38592], torch.device("cpu"), 56, num_clusters=GB300_GRID_CLUSTERS
+    )
+    records = _scheduled_records(plan)
+    work = bf16_cluster_work(records, plan.num_clusters)
+    assert plan.total_tiles == 4256 and len(work) == 76
+    assert sum(work) == 2553712 and min(work) == 33522 and max(work) == 33824
+    assert max(work) - min(work) == min(bf16_unit_weights(records)) == 302
+    assert plan.dyn_sched is False
+    # center_15s_p2: 40 units per cluster only, but the LPT order leaves a whole two-stage unit (860)
+    # between the fullest and the lightest cluster while the cheapest unit is a single-stage tail (430).
+    plan = build_bf16_segment_plan(
+        [0, 54976], torch.device("cpu"), 28, num_clusters=GB300_GRID_CLUSTERS
+    )
+    records = _scheduled_records(plan)
+    work = bf16_cluster_work(records, plan.num_clusters)
+    assert -(-plan.total_tiles // plan.num_clusters) == 40
+    assert max(work) - min(work) == 860 > min(bf16_unit_weights(records)) == 430
+    assert plan.dyn_sched is True
+
+
+def test_bf16_unit_table_carries_the_ticket_counter_record():
+    plan = build_bf16_segment_plan(
+        [0, 4763], torch.device("cpu"), 7, num_clusters=GB300_GRID_CLUSTERS
+    )
+    words = plan.unit_table.tolist()
+    assert len(words) == UNIT_WORDS * (plan.total_tiles + plan.num_clusters + 1)
+    assert words[UNIT_WORDS * plan.total_tiles :] == [0] * (
+        UNIT_WORDS * (plan.num_clusters + 1)
+    )
+
+
+@pytest.mark.parametrize(
+    "label,cu,heads,dyn",
+    [
+        ("center_6s_p1_m48768", [0, 48768], 56, True),
+        ("tail_5s_p8_m4763", [0, 4763], 7, False),
+    ],
+)
+def test_bf16_dispatched_program_is_bitwise_the_static_program(
+    monkeypatch, label, cu, heads, dyn
+):
+    """The per-plan dispatch changes which program runs, never the arithmetic: on the same scheduled unit
+    records the dispatched program's output is bitwise the static ``attention`` program's.  The
+    ``attention_dyn`` program owns the padding of ``unit_table`` as launch state: it resets the ticket
+    counter and leaves every cluster's terminal ticket in word 6 of that cluster's padding record;
+    the static programs never write the table."""
+    _require_program("bf16")
+    cake_backend._BF16_PLANS.clear()
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=11)
+    dispatched = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, cu_seqlens_host=cu
+    )
+    sread_arch = dispatched.arch in cake_backend.BF16_SREAD_ARCHES
+    expected = (
+        "attention_dyn" if dyn else ("attention_sread" if sread_arch else "attention")
+    )
+    assert dispatched.plan.dyn_sched is dyn and dispatched.attention_stage == expected
+    assert dispatched.route_metadata["attention_variant"] == expected
+    assert dispatched.route_metadata["dyn_sched"] is dyn
+    assert dispatched.route_metadata["sread_unified"] is ((not dyn) and sread_arch)
+    total = int(dispatched.plan.total_tiles)
+    clusters = int(dispatched.plan.num_clusters)
+    scheduled = UNIT_WORDS * total
+    table_before = dispatched.plan.unit_table.clone()
+    assert table_before.numel() == scheduled + UNIT_WORDS * (clusters + 1)
+    assert not table_before[scheduled:].any()
+    out_dispatched = dispatched().clone()
+    torch.cuda.synchronize()
+    table_after = dispatched.plan.unit_table
+    assert torch.equal(table_after[:scheduled], table_before[:scheduled])
+    padding = table_after[scheduled:].view(clusters + 1, UNIT_WORDS).tolist()
+    # the ticket counter is reset by the last draw
+    assert padding[clusters] == [0] * UNIT_WORDS
+    for record in padding[:clusters]:
+        assert record[:6] == [0] * 6 and record[7] == 0
+    mailboxes = [record[6] for record in padding[:clusters]]
+    if dyn:
+        # Every cluster leaves on a terminal ticket (>= total_tiles) and publishes it to its mailbox.
+        assert all(ticket >= total for ticket in mailboxes)
+    else:
+        assert mailboxes == [0] * clusters
+    # Force the static program: no plan passes the wave floor and the sread arch filter is empty.
+    monkeypatch.setattr(cake_backend, "BF16_DYN_SCHED_MIN_WAVES", 1 << 30)
+    monkeypatch.setattr(cake_backend, "BF16_SREAD_ARCHES", ())
+    cake_backend._BF16_PLANS.clear()
+    static = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, cu_seqlens_host=cu
+    )
+    assert static.attention_stage == "attention" and static.plan.dyn_sched is False
+    assert torch.equal(static.plan.unit_table, table_before)
+    out_static = static().clone()
+    torch.cuda.synchronize()
+    # the static program never writes the table
+    assert torch.equal(static.plan.unit_table, table_before)
+    assert torch.equal(out_dispatched, out_static)
+    cake_backend._BF16_PLANS.clear()
 
 
 ENGINE_VIEW_ROWS = [
