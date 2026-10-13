@@ -132,7 +132,7 @@ def _entry_needs_ikr(entry: Dict[str, Any]) -> bool:
     return bool(isinstance(knobs, dict) and knobs.get("in_kernel_fc2_reduce"))
 
 
-def lookup_knobs(
+def _matching_entries(
     *,
     dtype: str,
     world_size: int,
@@ -144,15 +144,16 @@ def lookup_knobs(
     combine_dtype: str = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
     apply_topk_in_fc1: bool = False,
+    defer_topk_reduce: bool = False,
     device: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
+) -> List[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss.
 
     ``enable_in_kernel_fc2_reduce`` indicates whether the user has opted in to in_kernel_fc2_reduce.
     """
     path = _cache_path()
     if path is None:
-        return None
+        return []
     key = dict(
         device=device if device is not None else _current_device_name(),
         dtype=dtype,
@@ -168,10 +169,54 @@ def lookup_knobs(
         for e in _load_entries(path)
         if all(e.get(f) == key[f] for f in _KEY_FIELDS)
         and e.get("apply_topk_in_fc1") == apply_topk_in_fc1
+        and e.get("defer_topk_reduce", False) == defer_topk_reduce
+        and e.get("profile") in (None, "live_tokens")
         and isinstance(e.get("knobs"), dict)
         and isinstance(e.get("max_tokens"), int)
         and (enable_in_kernel_fc2_reduce or not _entry_needs_ikr(e))
     ]
+    return matches
+
+
+def live_token_buckets(**kwargs: Any) -> List[int]:
+    from flashinfer.moe_ep.core.tuning import live_buckets
+
+    return live_buckets(_matching_entries(**kwargs), kwargs["max_tokens"])
+
+
+def lookup_knobs(
+    *,
+    dtype: str,
+    world_size: int,
+    hidden: int,
+    intermediate: int,
+    num_experts: int,
+    topk: int,
+    max_tokens: int,
+    live_tokens: Optional[int] = None,
+    combine_dtype: str = "bf16",
+    enable_in_kernel_fc2_reduce: bool = False,
+    apply_topk_in_fc1: bool = False,
+    defer_topk_reduce: bool = False,
+    device: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    from flashinfer.moe_ep.core.tuning import select_token_entries
+
+    matches = _matching_entries(
+        dtype=dtype,
+        world_size=world_size,
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_experts,
+        topk=topk,
+        max_tokens=max_tokens,
+        combine_dtype=combine_dtype,
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        apply_topk_in_fc1=apply_topk_in_fc1,
+        defer_topk_reduce=defer_topk_reduce,
+        device=device,
+    )
+    matches = select_token_entries(matches, max_tokens, live_tokens)
     if not matches:
         return None
     # Key of `(tokens, ~ikr)` causes the IKR config to be selected by min()
@@ -199,8 +244,10 @@ def record_knobs(
     num_experts: int,
     topk: int,
     max_tokens: int,
+    live_tokens: Optional[int] = None,
     combine_dtype: str = "bf16",
     apply_topk_in_fc1: bool = False,
+    defer_topk_reduce: bool = False,
     device: Optional[str] = None,
     p50_us: Optional[float] = None,
     source: str = "autotune",
@@ -209,14 +256,20 @@ def record_knobs(
 
     Deterministic and ikr-tuned winners for the same geometry are separate
     entries (see :func:`_entry_needs_ikr`); FC1 and post-FC2 routing-weight
-    placement also have separate winners. A ``--allow-nondeterministic``
-    sweep does not evict the deterministic winner a reproducible session needs,
-    or vice versa.
+    placement and reduced/deferred output also have separate winners. A
+    ``--allow-nondeterministic`` sweep does not evict the deterministic winner
+    a reproducible session needs, or vice versa.
+
+    ``live_tokens`` distinguishes workloads at the same workspace capacity.
 
     Returns the cache path written, or ``None`` when the cache is disabled or
     the write failed (recording is best-effort — a read-only home directory
     must not break tuning).
     """
+    if live_tokens is None:
+        live_tokens = max_tokens
+    if type(live_tokens) is not int or not 0 <= live_tokens <= max_tokens:
+        raise ValueError("live_tokens must be between zero and max_tokens")
     path = _cache_path()
     if path is None:
         return None
@@ -230,7 +283,9 @@ def record_knobs(
         topk=topk,
         combine_dtype=combine_dtype,
         max_tokens=max_tokens,
+        live_tokens=live_tokens,
         apply_topk_in_fc1=apply_topk_in_fc1,
+        defer_topk_reduce=defer_topk_reduce,
         knobs=_knobs_to_json(knobs),
         p50_us=p50_us,
         source=source,
@@ -244,7 +299,10 @@ def record_knobs(
             if not (
                 all(e.get(f) == entry[f] for f in _KEY_FIELDS)
                 and e.get("max_tokens") == max_tokens
+                and e.get("live_tokens", e["max_tokens"]) == live_tokens
                 and e.get("apply_topk_in_fc1") == apply_topk_in_fc1
+                and e.get("defer_topk_reduce", False) == defer_topk_reduce
+                and e.get("profile") in (None, "live_tokens")
                 and _entry_needs_ikr(e) == _entry_needs_ikr(entry)
             )
         ]
@@ -280,9 +338,11 @@ def resolve_knobs(
     num_experts: int,
     topk: int,
     max_tokens: int,
+    live_tokens: Optional[int] = None,
     combine_dtype: str = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
     apply_topk_in_fc1: bool = False,
+    defer_topk_reduce: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else built-in heuristic.
 
@@ -306,9 +366,11 @@ def resolve_knobs(
         num_experts=num_experts,
         topk=topk,
         max_tokens=max_tokens,
+        live_tokens=live_tokens,
         combine_dtype=combine_dtype,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         apply_topk_in_fc1=apply_topk_in_fc1,
+        defer_topk_reduce=defer_topk_reduce,
     )
     if cached is not None:
         return cached, "cache"

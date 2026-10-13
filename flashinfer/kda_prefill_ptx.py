@@ -25,7 +25,7 @@ from .kda_prefill import (
     _get_stream_workspace,
     _storage_ranges_overlap,
 )
-from .utils import get_compute_capability
+from .utils import get_compute_capability, get_device_properties
 
 
 def _validate_tensor(name, tensor, shape, dtype, device, alignment=16):
@@ -81,7 +81,7 @@ def _run_ptx_kda(
     B, T, H, D = q.shape
     if B != 1 or T < 32 or H not in (64, 96) or D != 128:
         raise ValueError("PTX KDA requires B=1, T>=32, H in {64, 96}, D=128")
-    if torch.cuda.get_device_properties(q.device).multi_processor_count < H:
+    if get_device_properties(q.device).multi_processor_count < H:
         raise ValueError("PTX KDA requires H <= the device SM count")
     if B * T >= 2**21:
         raise ValueError("PTX KDA requires fewer than 2**21 total tokens")
@@ -180,7 +180,7 @@ def _launch_ptx_kda(
     workspace = prefill_workspace if explicit else _get_stream_workspace(q.device)
     out = torch.empty_like(v) if output is None else output
     _check_output_does_not_overlap_inputs(
-        out, q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state
+        output, q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state
     )
     for name, tensor in (
         ("A_log", A_log),
@@ -197,6 +197,13 @@ def _launch_ptx_kda(
     cu_version = (
         None if cu_seqlens is None or cu_seqlens.is_inference() else cu_seqlens._version
     )
+    # Packed offsets are read back from the device only when this cu_seqlens
+    # tensor (same storage, retained by the workspace entry) may have changed:
+    # a version bump, or an inference tensor, which has no version counter.
+    # Every PyTorch in-place write bumps the counter; a writer that bypasses
+    # PyTorch (a raw data_ptr write) must call
+    # torch.autograd.graph.increment_version(cu_seqlens) before the next call.
+    cu_key = (_tensor_signature(cu_seqlens), cu_version)
     signature = (
         tuple(map(_tensor_signature, tensors)),
         cu_version,
@@ -220,11 +227,16 @@ def _launch_ptx_kda(
                 )
         else:
             B, T, H, D = q.shape
-            offsets = (
-                list(range(0, B * T + 1, T))
-                if cu_seqlens is None
-                else cu_seqlens.tolist()
-            )
+            if cu_seqlens is None:
+                offsets = list(range(0, B * T + 1, T))
+            elif (
+                entry is not None
+                and cu_version is not None
+                and entry["cu_key"] == cu_key
+            ):
+                offsets = entry["offsets"]
+            else:
+                offsets = cu_seqlens.tolist()
             if (
                 offsets[0] != 0
                 or offsets[-1] != B * T
@@ -280,6 +292,7 @@ def _launch_ptx_kda(
                     final_state=state,
                     cu_seqlens=cu_seqlens,
                     lower_bound=lower_bound,
+                    offsets=offsets,
                 )
                 entry = {
                     "plan_key": plan_key,
@@ -290,6 +303,8 @@ def _launch_ptx_kda(
                 workspace.__dict__["_ptx_kda"] = entry
             entry["signature"] = signature
             entry["tensors"] = tensors
+            entry["cu_key"] = cu_key
+            entry["offsets"] = offsets
         state = entry["state"]
         entry["plan"].launch()
         if capturing:

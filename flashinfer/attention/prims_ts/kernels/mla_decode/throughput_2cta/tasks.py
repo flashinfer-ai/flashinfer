@@ -52,8 +52,7 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 from cutlass.experimental.task_scheduling.resources import StageInfo
 from cutlass.experimental.task_scheduling.task import Task
 
-from ......cute_dsl.utils import task_context_kwargs
-
+from ...task_compat import task_context_kwargs
 from .resources import (
     MlaWorkQueue,
     WorkThrottleBarrierResource,

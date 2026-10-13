@@ -56,29 +56,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_Q_SMEM_OFF 1024
-#define SMEM_Q_SMEM_STAGE_BYTES 8192
-#define SMEM_Q_SMEM_STRIDE 8192
-#define SMEM_K_SMEM_OFF 9216
-#define SMEM_K_SMEM_STAGE_BYTES 8192
-#define SMEM_K_SMEM_STRIDE 8192
-#define SMEM_V_TMA_SMEM_OFF 17408
-#define SMEM_V_TMA_SMEM_STAGE_BYTES 8192
-#define SMEM_V_TMA_SMEM_STRIDE 8192
-#define SMEM_V_SMEM_OFF 17408
-#define SMEM_V_SMEM_STAGE_BYTES 8192
-#define SMEM_V_SMEM_STRIDE 8192
-#define SMEM_O_SMEM_OFF 1024
-#define SMEM_O_SMEM_STAGE_BYTES 16384
-#define SMEM_O_SMEM_STRIDE 16384
-#define SMEM_TOTAL 25600
-#define THREADS 128
-#define HAS_BLOCK_NUMS 0
-#define BLOCK_SIZES_MODE 2
-#define FULL_K64_TILES 0
-#define UNIFORM_NONEMPTY 0
-#define CONTIGUOUS_BLOCK_INDICES 1
 
 #include <cuda_awbarrier_primitives.h>
 #include <math_constants.h>

@@ -30,6 +30,7 @@ class KDAForwardLaunch:
         cu_seqlens=None,
         allow_approximate_split=False,
         use_expected_norm=False,
+        offsets=None,
     ):
         self.out = out
         self.final_state = final_state
@@ -49,6 +50,7 @@ class KDAForwardLaunch:
             cu_seqlens=cu_seqlens,
             allow_approximate_split=allow_approximate_split,
             use_expected_norm=use_expected_norm,
+            offsets=offsets,
         )
 
     @property
@@ -85,7 +87,9 @@ def prepare_kda_forward(
     cu_seqlens=None,
     allow_approximate_split=False,
     use_expected_norm=False,
+    offsets=None,
 ):
+    """Plan one launch; ``offsets`` are the host-known packed boundaries."""
     if dt_bias.ndim == 1:
         dt_bias = dt_bias.view(q.shape[2], q.shape[3])
     if out is None:
@@ -106,6 +110,7 @@ def prepare_kda_forward(
         cu_seqlens=cu_seqlens,
         allow_approximate_split=allow_approximate_split,
         use_expected_norm=use_expected_norm,
+        offsets=offsets,
     )
 
 

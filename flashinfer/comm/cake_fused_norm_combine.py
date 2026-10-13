@@ -42,7 +42,9 @@ Usage protocol::
     cake_fused_norm_combine_destroy_workspace(workspace)
 
 Requirements: eight ranks on one node with CUDA IPC peer access, SM100 (B200)
-or SM103 (B300) devices, hidden size 2560, two tracks, contiguous BF16 tensors
+or SM103 (B300) devices that are build targets of this process
+(``FLASHINFER_CUDA_ARCH_LIST`` when set, else the visible devices), hidden
+size 2560, two tracks, contiguous BF16 tensors
 (``x``/``residual``/``norm_out``/``residual_out`` are ``[T, 2, 2560]``,
 ``weight`` is ``[2, 2560]``, ``collective_out`` is ``[T, 2560]``) and
 ``T <= max_tokens``.  A workspace carries one ordered launch sequence; every
@@ -58,13 +60,14 @@ import torch
 import torch.distributed as dist
 
 from ..jit.cake_fused_norm_combine import (
-    ARCH_BY_CAPABILITY,
     HIDDEN_DIM,
     LARGE_MIN_TOKENS,
+    SUPPORTED_CAPABILITIES,
     TRACKS,
     WIDE_MIN_TOKENS,
     WORKSPACE_TABLE_ENTRIES,
     WORLD_SIZE,
+    device_facts,
     route_applies,
     run_cake_fused_norm_combine,
     select_variant,
@@ -332,7 +335,7 @@ def cake_fused_norm_combine(
         )
     if not route_applies(
         world_size=workspace.world_size,
-        device_capability=tuple(torch.cuda.get_device_capability(device)),
+        device_capability=device_facts(device.index).capability,
         hidden_dim=workspace.hidden,
     ):
         raise ValueError(
@@ -354,12 +357,12 @@ def cake_fused_norm_combine(
 
 
 __all__ = [
-    "ARCH_BY_CAPABILITY",
     "CONTROL_WORDS",
     "HIDDEN_DIM",
     "LAMPORT_SENTINEL_U16",
     "LAMPORT_SLOTS",
     "LARGE_MIN_TOKENS",
+    "SUPPORTED_CAPABILITIES",
     "TRACKS",
     "WIDE_MIN_TOKENS",
     "WORLD_SIZE",

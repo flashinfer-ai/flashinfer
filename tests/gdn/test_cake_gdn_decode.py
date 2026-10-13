@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import re
 from pathlib import Path
 
 import pytest
@@ -59,21 +61,37 @@ def _decode(**overrides):
     return cake_gdn.select_cake_gdn_decode_variant(**params)
 
 
-def test_manifest_is_consistent_and_source_only() -> None:
-    # Check the manifest's own bookkeeping instead of pinning row counts:
-    # every promoted row lands here, so literal counts break on each export.
+def test_manifest_lists_loadable_source_only_variants() -> None:
+    # The manifest is the only registry: every variant names one kernel source
+    # (shared with the other specializations of the same body), the -D defines
+    # that specialize it, and one host shim.  Nothing is pinned by checksum.
     manifest = cake_gdn._manifest()
-    assert manifest["contract_row_count"] == len(manifest["contract_rows"]) > 0
-    assert manifest["architecture_row_count"] == manifest["contract_row_count"] * len(
-        manifest["architectures"]
-    )
-    assert manifest["architecture_row_count"] == (
-        manifest["admitted_architecture_rows"]
-        + manifest["fail_closed_architecture_rows"]
-    )
-    assert manifest["variant_count"] == len(manifest["variants"]) > 0
+    root = cake_gdn._source_dir()
+    variants = manifest["variants"]
+    assert len(variants) > 0
+    assert len({record["name"] for record in variants}) == len(variants)
     assert manifest["source_only"] is True
     assert manifest["binary_artifacts"] is False
+    assert "sha256" not in json.dumps(manifest)
+    architectures = set(manifest["architectures"])
+    for header in manifest["cuda_headers"]:
+        assert (root / header["path"]).is_file()
+    for record in variants:
+        # One body per architecture: a kernel whose lowering differs on one
+        # architecture (the sm_107a F64-free q scale) carries that architecture
+        # in its own output; the outputs partition the record's architectures.
+        served: list[str] = []
+        for output in record["outputs"]:
+            assert output["architectures"]
+            assert set(output["architectures"]) <= architectures
+            assert (root / output["path"]).is_file()
+            served.extend(output["architectures"])
+        assert sorted(served) == sorted(record["architectures"])
+        assert (root / record["host_binding"]["path"]).is_file()
+        for key, value in record["defines"].items():
+            assert key.isidentifier()
+            assert isinstance(value, str) and value
+        assert set(record["defines"]) <= set(record["specializations"])
 
 
 def test_prefill_resolver_selects_dvsplit_full_and_single_chunk() -> None:
@@ -321,10 +339,6 @@ def test_decode_resolver_fails_closed_for_unpromoted_fp32_mtp_rows() -> None:
 def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
     rows = (
         (
-            dict(batch_size=4, seq_len=1, num_v_heads=32, strided_inputs=True),
-            "indexed_bf16_t1.wide32",
-        ),
-        (
             dict(
                 batch_size=4,
                 seq_len=2,
@@ -404,8 +418,13 @@ def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
     tp4_rows = (
         (
             dict(batch_size=4, seq_len=1),
-            "indexed_bf16_t1.tile16_fullwarp",
-            "t1_bf16state_tile16",
+            "indexed_bf16_t1.vec8_t16",
+            "t1_bf16state_vec8",
+        ),
+        (
+            dict(batch_size=4, seq_len=1, arch="sm_103a"),
+            "indexed_bf16_t1.vec8r56_t16",
+            "t1_bf16state_vec8r56",
         ),
         *(
             (
@@ -436,23 +455,551 @@ def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
         assert variant_fragment in route.variant_name
 
 
-def test_decode_resolver_fails_closed_for_unpromoted_bf16_shape() -> None:
+_QWEN35_BF16_T1_GEOMETRIES = (
+    # (H, HV): Qwen3.5-35B-A3B TP1/TP2/TP4, Qwen3.5-397B-A17B TP2/TP4/TP8
+    (16, 32),
+    (8, 16),
+    (4, 8),
+    (8, 32),
+    (4, 16),
+    (2, 8),
+)
+_SGLANG_GRAPH_BATCHES = (
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8,
+    12,
+    16,
+    24,
+    32,
+    48,
+    64,
+    96,
+    128,
+    192,
+    256,
+    384,
+    512,
+    1000,
+)
+
+
+def test_bf16_t1_route_rule_follows_the_state_head_count() -> None:
+    bands = cake_gdn.CAKE_GDN_BF16_T1_ROUTE_BANDS
+    bounds = [band[0] for band in bands]
+    assert bounds[-1] is None and None not in bounds[:-1]
+    assert bounds[:-1] == sorted(bounds[:-1])
+    for _, body, tile_v in bands:
+        assert body in cake_gdn.CAKE_GDN_BF16_T1_BODIES and tile_v in (16, 32, 64, 128)
+    rule = cake_gdn.cake_gdn_bf16_t1_route
+    assert set(cake_gdn.CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES) == {"sm_103a"}
+    assert set(cake_gdn.CAKE_GDN_BF16_T1_ROUTE_ARCH_BANDS) == {"sm_107a"}
+    for arch, arch_bands, overrides in (
+        ("sm_100a", bands, {}),
+        ("sm_103a", bands, cake_gdn.CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES["sm_103a"]),
+        ("sm_107a", cake_gdn.CAKE_GDN_BF16_T1_ROUTE_ARCH_BANDS["sm_107a"], {}),
+    ):
+        arch_bounds = [band[0] for band in arch_bands]
+        assert arch_bounds[-1] is None and None not in arch_bounds[:-1]
+        assert arch_bounds[:-1] == sorted(arch_bounds[:-1])
+        previous = 0
+        for max_state_heads, body, tile_v in arch_bands[:-1]:
+            expected = (overrides.get(max_state_heads, body), tile_v)
+            assert expected[0] in cake_gdn.CAKE_GDN_BF16_T1_BODIES
+            assert tile_v in (16, 32, 64, 128)
+            assert rule(1, previous + 1, arch) == expected
+            assert rule(1, max_state_heads, arch) == expected
+            previous = max_state_heads
+        assert rule(1, previous + 1, arch) == arch_bands[-1][1:]
+        assert rule(512, 32, arch) == ("wide", 128)
+    # sm_107a (Rubin R200) carries a complete table of its own: TILE_V=16 of the
+    # occupancy-first body below 192 heads and again at 369-416, TILE_V=32 in
+    # between and up to 3072 heads, the wide body only above that.
+    assert rule(1, 32, "sm_107a") == ("vec8occ", 16)
+    assert rule(6, 32, "sm_107a") == ("vec8occ", 16)
+    assert rule(8, 32, "sm_107a") == ("vec8", 32)
+    assert rule(9, 32, "sm_107a") == ("vec8occ", 32)
+    assert rule(23, 16, "sm_107a") == ("vec8occ", 32)
+    assert rule(24, 16, "sm_107a") == ("vec8occ", 16)
+    assert rule(13, 32, "sm_107a") == ("vec8occ", 16)
+    assert rule(14, 32, "sm_107a") == ("vec8", 32)
+    assert rule(24, 32, "sm_107a") == ("vec8", 32)
+    assert rule(32, 32, "sm_107a") == ("vec8occ", 32)
+    assert rule(96, 32, "sm_107a") == ("vec8occ", 32)
+    assert rule(128, 32, "sm_107a") == ("wide", 128)
+    assert rule(1, 8, "sm_103a") == ("vec8", 32)
+    assert rule(1, 32, "sm_100a") == ("vec8", 16)
+    assert rule(1, 32, "sm_103a") == ("vec8r56", 16)
+    assert rule(4, 32, "sm_100a") == ("vec8", 16)
+    assert rule(4, 32, "sm_103a") == ("vec8r56", 16)
+    assert rule(16, 32, "sm_103a") == ("vec8occ", 64)
+    assert rule(24, 32, "sm_103a") == ("vec8", 64)
+    assert rule(32, 32, "sm_103a") == ("wide", 128)
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_t1.vec8_t16"
+        )
+        == 16
+    )
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_t1.vec8r56_t16"
+        )
+        == 16
+    )
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_t1.vec8occ_t64"
+        )
+        == 64
+    )
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_t1.wide128"
+        )
+        == 128
+    )
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp"
+        )
+        == 16
+    )
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_verify_t4.wide64"
+        )
+        == 64
+    )
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32"
+        )
+        == 32
+    )
+    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="carries no grid tile"):
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_fp32_t1_splitv8"
+        )
+
+
+@pytest.mark.parametrize("heads", _QWEN35_BF16_T1_GEOMETRIES)
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+def test_decode_resolver_admits_every_qwen35_bf16_t1_geometry_at_any_batch(
+    arch, heads
+) -> None:
+    num_q_heads, num_v_heads = heads
+    for batch_size in _SGLANG_GRAPH_BATCHES:
+        for strided_inputs in (True, False):
+            route = _decode(
+                arch=arch,
+                state_dtype="bfloat16",
+                layout="pretranspose",
+                batch_size=batch_size,
+                num_k_heads=num_q_heads,
+                num_q_heads=num_q_heads,
+                num_v_heads=num_v_heads,
+                seq_len=1,
+                strided_inputs=strided_inputs,
+            )
+            body, tile_v = cake_gdn.cake_gdn_bf16_t1_route(
+                batch_size, num_v_heads, arch
+            )
+            if body == "wide":
+                assert (
+                    route.route_id
+                    == f"flashinfer.gdn_decode.indexed_bf16_t1.wide{tile_v}"
+                )
+                assert "mtp_t4_bf16state_wide128" in route.variant_name
+            else:
+                assert (
+                    route.route_id
+                    == f"flashinfer.gdn_decode.indexed_bf16_t1.{body}_t{tile_v}"
+                )
+                assert f"t1_bf16state_{body}_" in route.variant_name
+            assert cake_gdn.cake_gdn_bf16_route_tile_v(route.route_id) == tile_v
+            record = cake_gdn._kernel_record(route.variant_name)
+            # The loader fails closed on a record that does not list the
+            # architecture, so every routed instance must carry it.
+            assert arch in record["architectures"]
+            assert record["specializations"]["H"] == num_q_heads
+            assert record["specializations"]["HV"] == num_v_heads
+            assert record["specializations"]["STRIDED_INPUTS"] == 1
+            assert (
+                record["specializations"].get(
+                    "TILE_V_WIDE", record["specializations"].get("TILE_V")
+                )
+                == tile_v
+            )
+            assert record["specializations"].get("T_STEPS", 1) == 1
+            assert record["specializations"].get("UPDATE_STATE", 1) == 1
+            assert arch in record["architectures"]
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+def test_decode_resolver_routes_the_bf16_verify_tile16_body_per_architecture(
+    arch,
+) -> None:
+    # Rubin (sm_107a) runs the v-prefetch / unrolled `tile16_vpre` schedule of the
+    # full-warp tile-v16 verify kernel; B200 / B300 keep the shipped body.  The
+    # route id (grid tile) is the same on every architecture.
+    assert cake_gdn.CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES == {
+        "sm_107a": "tile16_vpre"
+    }
+    body = "tile16_vpre" if arch == "sm_107a" else "tile16"
+    rows = [
+        *(
+            dict(
+                batch_size=batch_size,
+                seq_len=seq_len,
+                num_k_heads=8,
+                num_q_heads=8,
+                num_v_heads=16,
+                cache_steps=seq_len,
+            )
+            for batch_size, seq_len in ((1, 7), (2, 7), (3, 7), (4, 7), (1, 8))
+        ),
+        *(
+            dict(
+                batch_size=batch_size,
+                seq_len=4,
+                num_k_heads=4,
+                num_q_heads=4,
+                num_v_heads=8,
+                cache_steps=4,
+            )
+            for batch_size in range(1, 9)
+        ),
+    ]
+    for overrides in rows:
+        route = _decode(
+            arch=arch,
+            state_dtype="bfloat16",
+            layout="pretranspose",
+            strided_inputs=True,
+            disable_state_update=True,
+            cache_intermediate_states=True,
+            **overrides,
+        )
+        assert route.route_id.endswith(".tile16_fullwarp")
+        assert re.search(
+            rf"_t4_bf16state_{body}_[0-9a-f]{{12}}$", route.variant_name
+        ), (
+            arch,
+            overrides,
+            route.variant_name,
+        )
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_decode_resolver_routes_the_fp32_mtp_bodies_per_architecture(arch) -> None:
+    # The promoted fp32-state MTP update row (B4 T4, cache) runs the `_pro` twin of
+    # `mtp_t4_splitv8` on Rubin (sm_107a): same kernel contract, bitwise-identical
+    # output, only the schedule of the producer phase differs.  The verify row
+    # (B1 T2, `mtp_t2_inline_tile8`) keeps one body everywhere; route ids never change.
+    assert cake_gdn.CAKE_GDN_FP32_MTP_ARCH_BODIES == {
+        "sm_107a": "gdn_decode_pretranspose_mtp_t4_splitv8_pro"
+    }
+    suffix = "_pro" if arch == "sm_107a" else ""
+    rows = [
+        (
+            dict(batch_size=1, seq_len=2, disable_state_update=True, cache_steps=2),
+            "flashinfer.gdn_decode.indexed_fp32_mtp_t2.inline_tile8_verify_cache",
+            "_mtp_t2_inline_tile8",
+            "",
+        ),
+        (
+            dict(batch_size=4, seq_len=4, disable_state_update=False, cache_steps=4),
+            "flashinfer.gdn_decode.indexed_fp32_mtp_t4.splitv8_update_cache",
+            "_mtp_t4_splitv8",
+            suffix,
+        ),
+    ]
+    for overrides, route_id, body, body_suffix in rows:
+        route = _decode(
+            arch=arch,
+            state_dtype="float32",
+            layout="pretranspose",
+            strided_inputs=True,
+            cache_intermediate_states=True,
+            num_k_heads=16,
+            num_q_heads=16,
+            num_v_heads=32,
+            **overrides,
+        )
+        assert route.route_id == route_id, (arch, overrides, route.route_id)
+        assert re.search(rf"{body}{body_suffix}_[0-9a-f]{{12}}$", route.variant_name), (
+            arch,
+            overrides,
+            route.variant_name,
+        )
+
+
+def test_fp32_t1_route_rule_follows_the_state_head_count() -> None:
+    # One threshold, one table (sm_107a only): the shipped `splitv8` body below 256
+    # state heads, its `splitv8_tilev32` twin from 256 on; B200 / B300 keep `splitv8`.
+    assert cake_gdn.CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS == 256
+    assert set(cake_gdn.CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS) == {"sm_107a"}
+    assert cake_gdn.CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS["sm_107a"] == (
+        (255, "splitv8"),
+        (None, "splitv8_tilev32"),
+    )
+    assert cake_gdn.CAKE_GDN_FP32_T1_CTAS_PER_STATE == {
+        "gdn_decode_pretranspose_splitv8": 8,
+        "gdn_decode_pretranspose_splitv8_tilev32": 4,
+    }
+    rule = cake_gdn.cake_gdn_fp32_t1_route
+    for arch in ("sm_100a", "sm_103a"):
+        for batch_size, num_v_heads in (
+            (1, 32),
+            (7, 32),
+            (8, 32),
+            (16, 16),
+            (64, 32),
+            (512, 32),
+        ):
+            assert rule(batch_size, num_v_heads, arch) == "splitv8"
+    # the public bench_pretranspose_b* rows (HV=32): b1 / b4 keep splitv8, b8 .. b64 take tilev32
+    assert rule(1, 32, "sm_107a") == "splitv8"
+    assert rule(4, 32, "sm_107a") == "splitv8"
+    assert rule(7, 32, "sm_107a") == "splitv8"
+    assert rule(15, 16, "sm_107a") == "splitv8"
+    assert rule(8, 32, "sm_107a") == "splitv8_tilev32"
+    assert rule(16, 16, "sm_107a") == "splitv8_tilev32"
+    assert rule(16, 32, "sm_107a") == "splitv8_tilev32"
+    assert rule(64, 32, "sm_107a") == "splitv8_tilev32"
+    assert rule(512, 32, "sm_107a") == "splitv8_tilev32"
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_decode_resolver_routes_the_fp32_t1_pretranspose_body_per_state_head_band(
+    arch,
+) -> None:
+    # The indexed fp32-state T=1 row (H=16 / HV=32) runs the `splitv8_tilev32` twin on
+    # Rubin (sm_107a) from 256 state heads: same kernel contract, bitwise-identical
+    # output, four CTAs per state head instead of eight.  The route id names the twin
+    # and the host takes the grid from the resolved record, not from a fixed eight.
+    for batch_size in (1, 4, 7, 8, 16, 64):
+        route = _decode(arch=arch, layout="pretranspose", batch_size=batch_size)
+        body = cake_gdn.cake_gdn_fp32_t1_route(batch_size, 32, arch)
+        tilev32 = body == "splitv8_tilev32"
+        assert tilev32 == (arch == "sm_107a" and batch_size * 32 >= 256), (
+            arch,
+            batch_size,
+            body,
+        )
+        suffix = "_tilev32" if tilev32 else ""
+        assert (
+            route.route_id == f"flashinfer.gdn_decode.indexed_fp32_t1_splitv8{suffix}"
+        ), (arch, batch_size, route.route_id)
+        assert re.search(
+            rf"pretranspose_splitv8{suffix}_[0-9a-f]{{12}}$", route.variant_name
+        ), (arch, batch_size, route.variant_name)
+        record = cake_gdn._kernel_record(route.variant_name)
+        # The loader fails closed on a record that does not list the architecture,
+        # so every routed body must carry it (the twin is exported for sm_107a only).
+        assert arch in record["architectures"]
+        assert record["specializations"]["H"] == 16
+        assert record["specializations"]["HV"] == 32
+        assert cake_gdn.cake_gdn_fp32_t1_ctas_per_state(route.variant_name) == (
+            4 if tilev32 else 8
+        )
+    nontranspose = _decode(arch=arch, layout="nontranspose")
     with pytest.raises(
-        cake_gdn.CakeGDNUnsupportedError,
-        match="exact promoted indexed/verify rows",
+        cake_gdn.CakeGDNUnsupportedError, match="not an fp32-state T=1 pretranspose"
+    ):
+        cake_gdn.cake_gdn_fp32_t1_ctas_per_state(nontranspose.variant_name)
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_decode_resolver_routes_the_bf16_wide_body_per_architecture(arch) -> None:
+    # The multi-token rows outside the tile16 verify kernel run the wide
+    # (TILE_V_WIDE 32/64) MTP body; Rubin (sm_107a) takes its v-prefetch /
+    # unrolled `wide128_vpre` schedule, B200 / B300 keep the shipped body.  The
+    # route id (flavour + grid tile) is the same on every architecture, and the
+    # T=1 band rows keep the shipped wide body everywhere.
+    assert cake_gdn.CAKE_GDN_BF16_WIDE_ARCH_BODIES == {"sm_107a": "wide128_vpre"}
+    body = "wide128_vpre" if arch == "sm_107a" else "wide128"
+    rows = [
+        # (overrides, expected route id)
+        (
+            dict(
+                batch_size=5,
+                seq_len=7,
+                num_k_heads=8,
+                num_q_heads=8,
+                num_v_heads=16,
+                cache_steps=7,
+                strided_inputs=True,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+        ),
+        (
+            dict(
+                batch_size=1,
+                seq_len=7,
+                num_k_heads=16,
+                num_q_heads=16,
+                num_v_heads=32,
+                cache_steps=7,
+                strided_inputs=True,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+        ),
+        (
+            dict(
+                batch_size=8,
+                seq_len=4,
+                num_k_heads=16,
+                num_q_heads=16,
+                num_v_heads=32,
+                cache_steps=4,
+                strided_inputs=True,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_verify_t4.wide32",
+        ),
+        (
+            dict(
+                batch_size=4,
+                seq_len=2,
+                num_k_heads=16,
+                num_q_heads=16,
+                num_v_heads=32,
+                cache_steps=4,
+                strided_inputs=False,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_verify_t2.wide32",
+        ),
+        (
+            dict(
+                batch_size=8,
+                seq_len=3,
+                num_k_heads=16,
+                num_q_heads=16,
+                num_v_heads=64,
+                cache_steps=3,
+                strided_inputs=True,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_verify_t3.wide64",
+        ),
+        (
+            dict(
+                batch_size=8,
+                seq_len=2,
+                num_k_heads=16,
+                num_q_heads=16,
+                num_v_heads=64,
+                cache_steps=0,
+                strided_inputs=True,
+                disable_state_update=False,
+                cache_intermediate_states=False,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_update_t2.wide64",
+        ),
+        (
+            dict(
+                batch_size=8,
+                seq_len=4,
+                num_k_heads=16,
+                num_q_heads=16,
+                num_v_heads=64,
+                cache_steps=5,
+                strided_inputs=True,
+                disable_state_update=False,
+                cache_intermediate_states=True,
+            ),
+            "flashinfer.gdn_decode.indexed_bf16_checkpoint_t4.wide64",
+        ),
+    ]
+    for overrides, route_id in rows:
+        route = _decode(
+            arch=arch, state_dtype="bfloat16", layout="pretranspose", **overrides
+        )
+        assert route.route_id == route_id, (arch, overrides, route.route_id)
+        assert re.search(
+            rf"_mtp_t4_bf16state_{body}_[0-9a-f]{{12}}$", route.variant_name
+        ), (
+            arch,
+            overrides,
+            route.variant_name,
+        )
+    # T=1 rows that the band table sends to the wide body keep the shipped body on every arch.
+    t1 = _decode(
+        arch=arch,
+        state_dtype="bfloat16",
+        layout="pretranspose",
+        batch_size=256,
+        seq_len=1,
+        num_k_heads=16,
+        num_q_heads=16,
+        num_v_heads=32,
+        strided_inputs=True,
+    )
+    if t1.route_id.startswith("flashinfer.gdn_decode.indexed_bf16_t1.wide"):
+        assert re.search(r"_mtp_t4_bf16state_wide128_[0-9a-f]{12}$", t1.variant_name), (
+            arch,
+            t1.variant_name,
+        )
+
+
+def test_decode_resolver_fails_closed_for_unlisted_bf16_t1_geometry_and_controls() -> (
+    None
+):
+    with pytest.raises(
+        cake_gdn.CakeGDNUnsupportedError, match="no exact frozen Cake GDN variant"
     ):
         _decode(
             state_dtype="bfloat16",
             layout="pretranspose",
-            batch_size=5,
-            num_v_heads=32,
+            batch_size=4,
+            num_k_heads=16,
+            num_q_heads=16,
+            num_v_heads=64,
             seq_len=1,
             strided_inputs=True,
         )
+    with pytest.raises(
+        cake_gdn.CakeGDNUnsupportedError, match="updates the state and caches nothing"
+    ):
+        _decode(
+            state_dtype="bfloat16",
+            layout="pretranspose",
+            batch_size=4,
+            num_v_heads=32,
+            seq_len=1,
+            strided_inputs=True,
+            disable_state_update=True,
+        )
+    with pytest.raises(
+        cake_gdn.CakeGDNUnsupportedError, match="pretranspose state-pool layout"
+    ):
+        _decode(
+            state_dtype="bfloat16",
+            layout="nontranspose",
+            batch_size=4,
+            num_v_heads=32,
+            seq_len=1,
+        )
 
+
+def test_decode_resolver_fails_closed_for_unpromoted_bf16_shape() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
-        match="exact promoted indexed/verify rows",
+        match="exact promoted verify/update rows",
     ):
         _decode(
             state_dtype="bfloat16",
@@ -486,9 +1033,10 @@ def test_decode_resolver_fails_closed_outside_child_contract() -> None:
 def test_architecture_mapping_is_exact() -> None:
     assert cake_gdn.arch_for_compute_capability(10, 0) == "sm_100a"
     assert cake_gdn.arch_for_compute_capability(10, 3) == "sm_103a"
+    assert cake_gdn.arch_for_compute_capability(10, 7) == "sm_107a"
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
-        match="supports only SM100a/SM103a",
+        match="supports only SM100a/SM103a/SM107a",
     ):
         cake_gdn.arch_for_compute_capability(12, 0)
 
@@ -573,7 +1121,7 @@ def test_prefill_resolver_keeps_sglang_tp4_checkpoint_family_fail_closed() -> No
             seq_lens=(849, 835, 862, 897, 853),
         )
 
-    for arch, num_seqs in (("sm_100a", 10), ("sm_103a", 11)):
+    for arch, num_seqs in (("sm_100a", 10), ("sm_103a", 11), ("sm_107a", 14)):
         with pytest.raises(
             cake_gdn.CakeGDNUnsupportedError,
             match="indexed DV-split contract",
@@ -595,6 +1143,197 @@ def test_prefill_resolver_keeps_sglang_tp4_checkpoint_family_fail_closed() -> No
                 gates_present=True,
                 seq_lens=(64,) * num_seqs,
             )
+
+
+# Qwen3-Next / Qwen3.5 per-rank linear-attention head splits of the vLLM
+# prefill contract (BF16 I/O, packed FP32 initial+final state) as frozen
+# (HEAD_GROUP_LOG2, IS_GQA, NUM_O_HEADS_LOG2) triples: H/HV = 16/32, 8/16,
+# 4/8, 2/4 (Qwen3-Next-80B and Qwen3.5-35B-A3B at TP1/TP2/TP4/TP8) and
+# 16/64, 8/32, 4/16, 2/8 (Qwen3.5-397B-A17B at TP1/TP2/TP4/TP8).
+_QWEN_TP_FP32_STATE_GEOMETRIES = frozenset(
+    {
+        (1, 0, 2),
+        (1, 0, 3),
+        (1, 0, 4),
+        (1, 0, 5),
+        (2, 0, 3),
+        (2, 0, 4),
+        (2, 0, 5),
+        (2, 0, 6),
+    }
+)
+
+
+def _prefill_heads(geometry):
+    """``(num_q_heads, num_k_heads, num_v_heads)`` of one power-of-two geometry triple."""
+
+    head_group_log2, is_gqa, num_o_heads_log2 = geometry
+    num_o_heads = 1 << num_o_heads_log2
+    min_heads = num_o_heads >> head_group_log2
+    if is_gqa:
+        return num_o_heads, min_heads, min_heads
+    return min_heads, min_heads, num_o_heads
+
+
+def _prefill_geometry_of(route):
+    specs = cake_gdn._kernel_record(route.variant_name)["specializations"]
+    return (specs["HEAD_GROUP_LOG2"], specs["IS_GQA"], specs["NUM_O_HEADS_LOG2"])
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+def test_prefill_fp32_state_contract_covers_every_qwen_tp_geometry(arch) -> None:
+    contract = {
+        "arch": arch,
+        "io_dtype": "bfloat16",
+        "state_dtype": "float32",
+        "use_initial_state": True,
+        "store_final_state": True,
+    }
+    for dvsplit in (True, False):
+        geometries = cake_gdn.cake_gdn_prefill_geometries(**contract, dvsplit=dvsplit)
+        missing = _QWEN_TP_FP32_STATE_GEOMETRIES - geometries
+        assert not missing, (dvsplit, sorted(missing))
+    for geometry in sorted(_QWEN_TP_FP32_STATE_GEOMETRIES):
+        num_q_heads, num_k_heads, num_v_heads = _prefill_heads(geometry)
+        # One sequence keeps 2 * num_o_heads <= 128 tiles on the DV-split
+        # schedule; 64 sequences exceed every arch's active-cluster count.
+        for num_seqs, suffix in ((1, ".dvsplit"), (64, ".full_dv")):
+            route = cake_gdn.select_cake_gdn_prefill_variant(
+                arch=arch,
+                io_dtype="bfloat16",
+                state_dtype="float32",
+                num_seqs=num_seqs,
+                total_seq_len=256 * num_seqs,
+                max_seq_len=256,
+                num_q_heads=num_q_heads,
+                num_k_heads=num_k_heads,
+                num_v_heads=num_v_heads,
+                use_initial_state=True,
+                store_final_state=True,
+                checkpoint_every_n_tokens=0,
+                use_state_indices=False,
+                gates_present=True,
+            )
+            assert route.route_id == f"flashinfer.gdn_prefill.noncp{suffix}"
+            assert _prefill_geometry_of(route) == geometry
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+def test_prefill_geometries_mirror_the_resolver(arch) -> None:
+    # The helper tabulates nothing: every power-of-two triple it lists for a
+    # contract resolves, on that schedule, to a record carrying that triple.
+    for io_dtype, state_dtype in (
+        ("bfloat16", "float32"),
+        ("bfloat16", "bfloat16"),
+        ("float16", "float32"),
+    ):
+        for use_initial_state, store_final_state in (
+            (True, True),
+            (False, True),
+            (False, False),
+        ):
+            for dvsplit in (True, False):
+                geometries = cake_gdn.cake_gdn_prefill_geometries(
+                    arch=arch,
+                    io_dtype=io_dtype,
+                    state_dtype=state_dtype,
+                    use_initial_state=use_initial_state,
+                    store_final_state=store_final_state,
+                    dvsplit=dvsplit,
+                )
+                for geometry in sorted(geometries):
+                    if -1 in geometry:
+                        continue
+                    num_q_heads, num_k_heads, num_v_heads = _prefill_heads(geometry)
+                    # 256 sequences of 128 tokens exceed every arch's cluster
+                    # count at any head count (and are not single-chunk).
+                    num_seqs = 1 if dvsplit else 256
+                    route = cake_gdn.select_cake_gdn_prefill_variant(
+                        arch=arch,
+                        io_dtype=io_dtype,
+                        state_dtype=state_dtype,
+                        num_seqs=num_seqs,
+                        total_seq_len=128 * num_seqs,
+                        max_seq_len=128,
+                        num_q_heads=num_q_heads,
+                        num_k_heads=num_k_heads,
+                        num_v_heads=num_v_heads,
+                        use_initial_state=use_initial_state,
+                        store_final_state=store_final_state,
+                        checkpoint_every_n_tokens=0,
+                        use_state_indices=False,
+                        # FP16-I/O gated calls take the gatepipe4/fullgrid_vhold twins.
+                        gates_present=False,
+                    )
+                    assert route.route_id.endswith(
+                        ".dvsplit" if dvsplit else ".full_dv"
+                    ), route.route_id
+                    assert _prefill_geometry_of(route) == geometry, route
+
+
+def test_variant_resolution_fails_closed_for_an_unlisted_architecture(
+    monkeypatch,
+) -> None:
+    schedule_attr = "flashinfer_blackwell_gdn_prefill_initial"
+    specializations = {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 4,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0,
+    }
+    record = {
+        "name": "prefill_two_architecture_record",
+        "domain": "prefill",
+        "source_schedule": f"flashinfer.cake_gdn.generated.prefill:{schedule_attr}",
+        "tma_abi": "grid_constant",
+        "architectures": ["sm_100a", "sm_103a"],
+        "outputs": [{"architectures": ["sm_100a", "sm_103a"], "path": "cuda/x.cu"}],
+        "specializations": specializations,
+    }
+    monkeypatch.setattr(cake_gdn, "_manifest", lambda: {"variants": [record]})
+
+    def resolve(arch):
+        return cake_gdn._variant_for(
+            arch=arch,
+            domain="prefill",
+            schedule_attr=schedule_attr,
+            specializations=specializations,
+        )
+
+    assert resolve("sm_100a") is record
+    assert resolve("sm_103a") is record
+    # An architecture the row was never exported for fails closed at
+    # resolution (CakeGDNUnsupportedError), not as the loader's ValueError;
+    # the message names the architecture, the schedule and the key.
+    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="sm_107a") as info:
+        resolve("sm_107a")
+    assert not isinstance(info.value, ValueError)
+    assert schedule_attr in str(info.value)
+    assert repr(specializations) in str(info.value)
+
+    contract = {
+        "io_dtype": "bfloat16",
+        "state_dtype": "float32",
+        "use_initial_state": True,
+        "store_final_state": True,
+        "dvsplit": False,
+    }
+    assert cake_gdn.cake_gdn_prefill_geometries(arch="sm_103a", **contract) == {
+        (1, 0, 4)
+    }
+    assert cake_gdn.cake_gdn_prefill_geometries(arch="sm_107a", **contract) == set()
+
+    # Listing the architecture without a body for it fails closed the same way.
+    record["outputs"] = [{"architectures": ["sm_100a"], "path": "cuda/x.cu"}]
+    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="sm_103a"):
+        resolve("sm_103a")
+    assert resolve("sm_100a") is record
+    assert cake_gdn.cake_gdn_prefill_geometries(arch="sm_103a", **contract) == set()
 
 
 def test_nvcc_identity_captures_resolved_path_and_exact_version_output(

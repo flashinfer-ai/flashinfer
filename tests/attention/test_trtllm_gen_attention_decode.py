@@ -687,8 +687,6 @@ def _test_trtllm_batch_decode(
 
     # NVFP4 KV cache constraints
     if kv_dtype == "nvfp4":
-        if compute_capability == (10, 7):
-            pytest.skip("KV Cache NVFP4 is not supported on SM107")
         if backend != "trtllm-gen":
             pytest.skip("NVFP4 KV cache only supported by trtllm-gen backend")
         if q_dtype != "fp8":
@@ -1124,7 +1122,7 @@ def _test_trtllm_batch_decode(
             q_len_per_req=q_len_per_req,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
-        # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
+        # v_scale is fused into the kernel; bmm1 scale is formed in a different order.
         if v_scale == o_scale == 1.0:
             assert (output_wrapper == output).all()
         else:
@@ -1154,6 +1152,22 @@ def _test_trtllm_batch_decode(
                     atol=1e-1,
                     max_mismatched_elements=5,
                 )
+        # A caller-provided out= buffer must hold the v-scaled result.
+        out_buf = torch.empty_like(output_wrapper)
+        output_wrapper_out = wrapper_trtllm_gen.run(
+            q_input,
+            kv_cache,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale / o_scale,
+            enable_pdl=enable_pdl,
+            sinks=(sink if enable_sink else None),
+            q_len_per_req=q_len_per_req,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            out=out_buf,
+        )
+        assert output_wrapper_out.data_ptr() == out_buf.data_ptr()
+        assert (out_buf.float() == output_wrapper.float()).all()
 
 
 @pytest.mark.parametrize("q_len_per_req", [1, 2])

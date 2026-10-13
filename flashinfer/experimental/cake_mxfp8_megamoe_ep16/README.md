@@ -1,7 +1,8 @@
 # MXFP8 MegaMoE EP16
 
 This directory contains experimental JIT-only CUDA and CuTe-DSL backends for a
-fixed MXFP8 MegaMoE configuration on exact SM103a devices.
+fixed MXFP8 MegaMoE configuration on SM100 and SM103 devices (compute
+capability 10.0 or 10.3).
 
 The public entry points are
 `flashinfer.moe_ep.CakeMxfp8MegaMoeEp16` and
@@ -29,9 +30,28 @@ backend selection or fallback.
 
 CuTe-DSL requires the appropriate FlashInfer CUDA extra (`cu12` or `cu13`) and
 its CUTLASS DSL dependency. The CuTe modules are loaded lazily only when this
-backend is selected. They are compiled for `sm_103a` through FlashInfer's CuTe
-JIT cache; if `CUTE_DSL_ARCH` is set, it must also select `sm_103a`. Initial
-compilation belongs to session setup, not the forward path.
+backend is selected. They are compiled for the device's exact architecture
+through FlashInfer's CuTe JIT cache; if `CUTE_DSL_ARCH` is set, it must name
+that architecture. Initial compilation belongs to session setup, not the
+forward path.
+
+## Generated sources
+
+`csrc/cake_mxfp8_megamoe_ep16/` holds one architecture-neutral source closure:
+
+- `cake_mxfp8_megamoe_ep16_fused_kernel.cu` with the fused kernel body in
+  `cake_mxfp8_megamoe_ep16_fused_body.cuh`. The body is included once per
+  return protocol (`CAKE_MEGAMOE_RETURN_ALL_CTA` 0: CTA-0 coordinator for 16
+  and 64 tokens per rank; 1: all-CTA protocol for 32), so both kernel symbols
+  come from one text. The host binding selects the symbol by token count.
+- the ordered route reducer and the tvm-ffi binding;
+- `cute/`: the CuTe-DSL fused kernel (`compile_program(return_all_cta, arch)`)
+  and reducer (`compile_program(arch)`).
+
+The JIT loader builds one module per admitted architecture that is also a
+FlashInfer build target (`FLASHINFER_CUDA_ARCH_LIST` or the visible devices):
+`sm_100a` and `sm_103a`. The manifest lists the sources and launch facts; it
+does not re-verify digests at import time.
 
 ## Supported contract
 
@@ -42,7 +62,13 @@ compilation belongs to session setup, not the forward path.
 - BF16 activations and outputs with MXFP8 expert weights
 - immutable routing prepared with the session, with at most 64 routes assigned
   to any expert across all ranks
-- exact compute capability 10.3 and NVSHMEM symmetric memory
+- compute capability 10.0 or 10.3 and NVSHMEM symmetric memory
+
+End-to-end EP16 correctness and performance were measured on 16 GB300 GPUs
+(SM103). The SM100 target is admitted from the same source: the device text
+has no architecture-dependent code and uses only instructions shared by both
+targets; it is compile-proven on B200, and the 16-rank test has not been run
+there.
 
 CUDA session construction materializes eight fixed-address TMA descriptors with
 one setup kernel. CuTe-DSL prepares tensor-map dimensions and strides on the

@@ -1,57 +1,800 @@
-"""Prepared grouped packed FP4 E2M1 GEMM with BF16/FP32 output on SM100a/SM103a."""
+"""Prepared grouped packed FP4 E2M1 GEMM with BF16/FP32 output on SM100a/SM103a.
+
+``MODULES`` (one record per generated program, shared by every architecture)
+and ``ROUTES`` (schedule tier and output mode -> program) are written by the
+generated-program export; do not edit them by hand. Tiers: ``general_s1`` /
+``general_s2`` (N128, one or two store stages), ``n256``, ``swapped`` (BM240),
+``small`` (BM128 x BN16, runtime tile geometry) and ``small_2x8x3`` (the same
+schedule with the 2 x 8 x 3 tile geometry compiled in).
+"""
 
 from __future__ import annotations
-import functools
-import json
-from pathlib import Path
 
+import functools
+from typing import Any
+
+MODULES: dict[str, dict[str, Any]] = {
+    "cake_deepgemm_kgroup_gemm_0742ea5c6ecc95a608b9": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_0742ea5c6ecc95a608b9_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_0742ea5c6ecc95a608b9_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_0f18ee590e94e1f764dd": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_0f18ee590e94e1f764dd_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_0f18ee590e94e1f764dd_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_26c5ac585619a31d6037": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_26c5ac585619a31d6037_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_26c5ac585619a31d6037_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_4af7ea7eac0d5742e076": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_4af7ea7eac0d5742e076_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_4af7ea7eac0d5742e076_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_5aca7ac0c071c1894ca5": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_5aca7ac0c071c1894ca5_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_5aca7ac0c071c1894ca5_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_5c35d5418b2ca3c43c18": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_5c35d5418b2ca3c43c18_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_5c35d5418b2ca3c43c18_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_72e983a00369bcf1e7c9": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_72e983a00369bcf1e7c9_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_72e983a00369bcf1e7c9_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_731a5a2ebd3e006d7154": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_731a5a2ebd3e006d7154_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_731a5a2ebd3e006d7154_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_81e492072a5f28bf5037": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_81e492072a5f28bf5037_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_81e492072a5f28bf5037_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_8a4b0a083bd7c973917b": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_8a4b0a083bd7c973917b_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_8a4b0a083bd7c973917b_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a"],
+    },
+    "cake_deepgemm_kgroup_gemm_8c7c168642ff93b4bded": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_8c7c168642ff93b4bded_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_8c7c168642ff93b4bded_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_a2a735d32f4d0116c2ec": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_a2a735d32f4d0116c2ec_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_a2a735d32f4d0116c2ec_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_a6fc1f535d0e01ddac6a": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_a6fc1f535d0e01ddac6a_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_a6fc1f535d0e01ddac6a_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_bac08f1a9f3d96b9b6cd": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_bac08f1a9f3d96b9b6cd_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_bac08f1a9f3d96b9b6cd_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_cc5b14b295a81421d291": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_cc5b14b295a81421d291_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_cc5b14b295a81421d291_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_dba5ed7a5804ae4d1c7b": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_dba5ed7a5804ae4d1c7b_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_dba5ed7a5804ae4d1c7b_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_e790c4cfc1c3a686dd42": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_e790c4cfc1c3a686dd42_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_e790c4cfc1c3a686dd42_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_ef57d87e2e86c40f0b6d": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_ef57d87e2e86c40f0b6d_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_ef57d87e2e86c40f0b6d_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_kgroup_gemm_fb4cdee6c050c1b2c52d": {
+        "sources": [
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_fb4cdee6c050c1b2c52d_kernel.cu",
+            "csrc/experimental/deepgemm_kgroup_gemm/generated/cake_deepgemm_kgroup_gemm_fb4cdee6c050c1b2c52d_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "grouped_layout"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "num_groups"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+}
+ROUTES: dict[str, dict[str, str]] = {
+    "sm_100a": {
+        "general_s1:bf16": "cake_deepgemm_kgroup_gemm_a2a735d32f4d0116c2ec",
+        "general_s1:fp32": "cake_deepgemm_kgroup_gemm_0742ea5c6ecc95a608b9",
+        "general_s1:fp32_acc": "cake_deepgemm_kgroup_gemm_0f18ee590e94e1f764dd",
+        "general_s2:bf16": "cake_deepgemm_kgroup_gemm_fb4cdee6c050c1b2c52d",
+        "general_s2:fp32": "cake_deepgemm_kgroup_gemm_ef57d87e2e86c40f0b6d",
+        "general_s2:fp32_acc": "cake_deepgemm_kgroup_gemm_cc5b14b295a81421d291",
+        "n256:bf16": "cake_deepgemm_kgroup_gemm_5aca7ac0c071c1894ca5",
+        "n256:fp32": "cake_deepgemm_kgroup_gemm_8a4b0a083bd7c973917b",
+        "n256:fp32_acc": "cake_deepgemm_kgroup_gemm_81e492072a5f28bf5037",
+        "small:bf16": "cake_deepgemm_kgroup_gemm_8c7c168642ff93b4bded",
+        "small:fp32": "cake_deepgemm_kgroup_gemm_dba5ed7a5804ae4d1c7b",
+        "small:fp32_acc": "cake_deepgemm_kgroup_gemm_e790c4cfc1c3a686dd42",
+        "small_2x8x3:bf16": "cake_deepgemm_kgroup_gemm_bac08f1a9f3d96b9b6cd",
+        "small_2x8x3:fp32": "cake_deepgemm_kgroup_gemm_4af7ea7eac0d5742e076",
+        "small_2x8x3:fp32_acc": "cake_deepgemm_kgroup_gemm_731a5a2ebd3e006d7154",
+        "swapped:fp32": "cake_deepgemm_kgroup_gemm_72e983a00369bcf1e7c9",
+    },
+    "sm_103a": {
+        "general_s1:bf16": "cake_deepgemm_kgroup_gemm_a2a735d32f4d0116c2ec",
+        "general_s1:fp32": "cake_deepgemm_kgroup_gemm_0742ea5c6ecc95a608b9",
+        "general_s1:fp32_acc": "cake_deepgemm_kgroup_gemm_0f18ee590e94e1f764dd",
+        "general_s2:bf16": "cake_deepgemm_kgroup_gemm_fb4cdee6c050c1b2c52d",
+        "general_s2:fp32": "cake_deepgemm_kgroup_gemm_ef57d87e2e86c40f0b6d",
+        "general_s2:fp32_acc": "cake_deepgemm_kgroup_gemm_cc5b14b295a81421d291",
+        "n256:bf16": "cake_deepgemm_kgroup_gemm_5aca7ac0c071c1894ca5",
+        "n256:fp32": "cake_deepgemm_kgroup_gemm_5c35d5418b2ca3c43c18",
+        "n256:fp32_acc": "cake_deepgemm_kgroup_gemm_81e492072a5f28bf5037",
+        "small:bf16": "cake_deepgemm_kgroup_gemm_8c7c168642ff93b4bded",
+        "small:fp32": "cake_deepgemm_kgroup_gemm_dba5ed7a5804ae4d1c7b",
+        "small:fp32_acc": "cake_deepgemm_kgroup_gemm_e790c4cfc1c3a686dd42",
+        "small_2x8x3:bf16": "cake_deepgemm_kgroup_gemm_bac08f1a9f3d96b9b6cd",
+        "small_2x8x3:fp32": "cake_deepgemm_kgroup_gemm_4af7ea7eac0d5742e076",
+        "small_2x8x3:fp32_acc": "cake_deepgemm_kgroup_gemm_731a5a2ebd3e006d7154",
+        "swapped:bf16": "cake_deepgemm_kgroup_gemm_26c5ac585619a31d6037",
+        "swapped:fp32": "cake_deepgemm_kgroup_gemm_72e983a00369bcf1e7c9",
+        "swapped:fp32_acc": "cake_deepgemm_kgroup_gemm_a6fc1f535d0e01ddac6a",
+    },
+}
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+# Measured L2 geometry of the BM240 swapped schedule: every output mode on
+# 152 SMs, FP32 non-accumulating on 148 SMs.
+_SWAPPED_GEOMETRIES = frozenset({(5120, 2304)})
+_TILE_M = {"general": 128, "n256": 128, "swapped": 240, "small": 128}
+_TILE_N = {"general": 128, "n256": 256, "swapped": 128, "small": 16}
+# BN16 pays off once a group streams at least this many 256-wide k-blocks
+# (2 k-blocks tie with N128 at 256x128, 9 k-blocks run 1.4x faster).
+_SMALL_MIN_K_BLOCKS = 4
+_SWIZZLE_M_BLOCKS = 8  # BM128 x BN16 (small) swizzle width for every SM count
+# (grid_m, grid_n, num_groups) BN16 tile geometries served by an exact-geometry
+# program (tile count and scheduler divisors compiled in; the group layout stays
+# a runtime value): the 256x128 three-group rows.
+_SMALL_EXACT_GEOMETRIES = frozenset({(2, 8, 3)})
+
+
+def fast_division(divisor: int) -> tuple[int, int]:
+    """``(multiplier, shift)`` with ``(x * multiplier) >> shift == x // divisor`` for ``0 <= x < 2**31``."""
+    if divisor < 1 or divisor >= 1 << 30:
+        raise ValueError(f"fast_division needs 1 <= divisor < 2**30, got {divisor}")
+    shift = 31 + (divisor - 1).bit_length()
+    return -(-(1 << shift) // divisor), shift
+
+
+def swizzle_m_blocks(sm_count: int, tile_n: int) -> int:
+    """M tiles per swizzle group (8 or 16): the strict minimum of the per-wave A+B footprint, 8 on a tie."""
+    return min(
+        (8, 16),
+        key=lambda blocks: blocks * 128 + ((sm_count + blocks - 1) // blocks) * tile_n,
+    )
+
+
+def division_values(tier: str, grid_m: int, grid_n: int, sm_count: int) -> list[int]:
+    """Host-precomputed tile-scheduler divisors of one tier: six int32 slots appended
+    to the group metadata buffer, (multiplier, shift) for tiles per group, tiles
+    per swizzle group and the tail swizzle group's tile count.
+
+    ``n256`` swizzles M in groups of ``swizzle_m_blocks(sm_count, 256)`` tiles (16
+    on 148 and 152 SMs), ``small`` in groups of 8; ``swapped`` swizzles N in groups
+    of 16 tiles and reads only the swizzle and tail slots; ``general`` and the
+    exact-geometry ``small_<grid_m>x<grid_n>x<groups>`` programs read no
+    divisors. Multipliers above 2**31 are stored as their int32 bit pattern (the
+    kernel reads the slots as u32).
+    """
+    if tier in ("n256", "small"):
+        swizzle = (
+            swizzle_m_blocks(sm_count, 256) if tier == "n256" else _SWIZZLE_M_BLOCKS
+        )
+        divisors = (grid_m * grid_n, grid_n * swizzle, grid_m % swizzle or swizzle)
+    elif tier == "swapped":
+        divisors = (1, grid_m * 16, grid_n % 16 or 16)
+    else:
+        return []
+    values: list[int] = []
+    for divisor in divisors:
+        multiplier, shift = fast_division(divisor)
+        values += [
+            multiplier - (1 << 32) if multiplier >= 1 << 31 else multiplier,
+            shift,
+        ]
+    return values
 
 
 @functools.cache
-def _catalog():
-    return json.loads(Path(__file__).with_name("kgroup_catalog.json").read_text())
-
-
-def device_arch(device):
-    """Exact generated-program architecture for ``device`` (raises when none is catalogued)."""
+def device_facts(device_index: int) -> tuple[str, int]:
+    """``(arch, sm_count)`` of one CUDA device, queried once per process."""
     import torch
 
-    device = torch.device(device)
-    catalogued = sorted(_catalog()["arches"])
-    if device.type != "cuda":
-        raise RuntimeError("Grouped FP4 GEMM requires a CUDA device")
-    capability = tuple(torch.cuda.get_device_capability(device))
+    capability = tuple(torch.cuda.get_device_capability(device_index))
     arch = _ARCHES.get(capability)
-    if arch is None or arch not in catalogued:
+    if arch is None:
         raise RuntimeError(
-            f"Grouped FP4 GEMM has no exported programs for compute capability "
-            f"{capability}; catalogued architectures: {catalogued}"
+            f"Grouped FP4 GEMM has generated programs for {sorted(_ARCHES.values())}, "
+            f"not compute capability {capability}"
         )
-    return arch
+    return arch, torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def supported_num_sms(arch):
-    """SM counts with catalogued routes for ``arch``."""
-    routes = _catalog()["arches"][arch]["routes"].values()
-    return sorted({route["config"]["num_sms"] for route in routes})
+def output_mode(output_dtype: str, accumulate: bool) -> str:
+    return f"{output_dtype}_acc" if accumulate else output_dtype
 
 
-def _nvcc_flags(arch):
+def schedule_tier(
+    m: int,
+    n: int,
+    num_groups: int,
+    sm_count: int,
+    mode: str,
+    max_k_blocks: int,
+    swapped: bool = True,
+) -> str:
+    """Physical schedule for one problem.
+
+    Only the tile counts and the largest group's k-block count enter the
+    decision; every schedule reads the group layout itself at runtime.
+    ``swapped=False`` decides as if the BM240 schedule did not exist.
+    """
+    if (
+        swapped
+        and sm_count in (148, 152)
+        and (m, n) in _SWAPPED_GEOMETRIES
+        and (sm_count == 152 or mode == "fp32")
+    ):
+        return "swapped"
+    physical_m = (m + 255) // 256 * 256
+    general_tiles = (physical_m // 128) * (n // 128) * num_groups
+    if n % 256 == 0 and (physical_m // 128) * (n // 256) * num_groups >= sm_count:
+        return "n256"
+    if general_tiles * 8 <= sm_count and max_k_blocks >= _SMALL_MIN_K_BLOCKS:
+        return "small"
+    return "general"
+
+
+def route_candidates(
+    m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment=256
+) -> list[str]:
+    """Routes for one problem, preferred first.
+
+    The first entry is the schedule the decision chain picks for this SM
+    count; the following entries are the schedules it would pick if the
+    earlier ones did not exist (BM240 -> N256 / BN16 / N128, exact BN16
+    geometry -> runtime BN16, then both N128 store-stage variants). The N128
+    programs serve any problem, so the list always ends in a route every
+    architecture carries.
+    """
+    mode = output_mode(output_dtype, accumulate)
+    padded_ks = [(k + k_alignment - 1) // k_alignment * k_alignment for k in group_ks]
+    max_k_blocks = max((k + 255) // 256 for k in padded_ks)
+    physical_m = (m + 255) // 256 * 256
+    tiers: list[str] = []
+    tier = schedule_tier(m, n, len(group_ks), sm_count, mode, max_k_blocks)
+    if tier == "swapped":
+        tiers.append("swapped")
+        tier = schedule_tier(
+            m, n, len(group_ks), sm_count, mode, max_k_blocks, swapped=False
+        )
+    if tier == "n256":
+        tiers.append("n256")
+    elif tier == "small":
+        grid_m, grid_n, _grid = launch_geometry(
+            tier, physical_m, n, len(group_ks), sm_count
+        )
+        if (grid_m, grid_n, len(group_ks)) in _SMALL_EXACT_GEOMETRIES:
+            tiers.append(f"small_{grid_m}x{grid_n}x{len(group_ks)}")
+        tiers.append("small")
+    k_blocks = sum(padded_ks) // len(group_ks) // 256
+    threshold = {"bf16": 16, "fp32_acc": 24, "fp32": 32}[mode]
+    tiers += (
+        ["general_s1", "general_s2"]
+        if k_blocks >= threshold
+        else ["general_s2", "general_s1"]
+    )
+    return [f"{tier}:{mode}" for tier in tiers]
+
+
+def route_key(
+    m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment=256
+) -> str:
+    """The preferred route of one problem (``route_candidates(...)[0]``)."""
+    return route_candidates(
+        m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment
+    )[0]
+
+
+def route_table(arch: str) -> dict[str, str]:
+    """Route -> program of one architecture.
+
+    ``ROUTES`` is keyed by architecture when the architectures name different
+    programs for a route, and is one flat table otherwise.
+    """
+    flat: dict[str, str] = {}
+    for key, value in ROUTES.items():
+        if isinstance(value, dict):
+            if key == arch:
+                return dict(value)
+        else:
+            flat[key] = value
+    return flat
+
+
+def select_route(
+    arch, m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment=256
+) -> tuple[str, str]:
+    """``(route, program)`` for one device: the first candidate route whose
+    program the export measured on ``arch``.
+
+    The route table lists, per architecture, the schedules the export reached
+    on the catalog devices (148 SMs on SM100a, 152 SMs on SM103a). A device
+    whose SM count reaches a schedule the export never measured on its
+    architecture (the BM240 schedule in BF16 / FP32-accumulate on a 152-SM
+    SM100a part such as GB200) takes the next schedule of the decision chain
+    instead of failing the lookup.
+    """
+    table = route_table(arch)
+    candidates = route_candidates(
+        m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment
+    )
+    for route in candidates:
+        program = table.get(route)
+        if program is not None:
+            return route, program
+    raise RuntimeError(f"no generated program on {arch} for any of {candidates}")
+
+
+def launch_geometry(tier: str, physical_m: int, n: int, num_groups: int, sm_count: int):
+    """``(grid_m, grid_n, grid)``: tile counts and the persistent two-CTA cluster grid."""
+    base = tier.split("_")[0]
+    grid_m = (physical_m + _TILE_M[base] - 1) // _TILE_M[base]
+    grid_n = n // _TILE_N[base]
+    tiles = num_groups * grid_m * grid_n
+    if base == "small":
+        return grid_m, grid_n, (sm_count // 2 * 2, 1, 1)
+    return grid_m, grid_n, (min(sm_count // 2 * 2, (tiles + 1) // 2 * 2), 1, 1)
+
+
+def grouped_layout_values(group_ks, k_alignment: int) -> list[int]:
+    """Kernel group metadata: logical K ends over 256-aligned groups.
+
+    A coarser ``k_alignment`` pads every group to a multiple of it; the padding
+    holds encoded zero with valid scales, so the padded end is reported and the
+    products are unchanged.
+    """
+    ends, cursor = [], 0
+    for logical_k in group_ks:
+        padded_k = (logical_k + k_alignment - 1) // k_alignment * k_alignment
+        ends.append(cursor + (logical_k if k_alignment == 256 else padded_k))
+        cursor += padded_k
+    return ends
+
+
+def _nvcc_flags(arch: str):
     from flashinfer.jit.core import sm100a_nvcc_flags, sm103a_nvcc_flags
 
     return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
 
 
 @functools.cache
-def load_program(arch, name):
+def program_spec(arch: str, name: str):
+    """JIT build specification of one generated program for ``arch``."""
     from flashinfer.jit import env
     from flashinfer.jit.core import gen_jit_spec
 
-    record = _catalog()["arches"][arch]["programs"][name]
-    spec = gen_jit_spec(
-        name=name,
+    record = MODULES[name]
+    return gen_jit_spec(
+        name=f"{name}_{arch}",
         sources=[
             env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
         ],
@@ -64,33 +807,19 @@ def load_program(arch, name):
         extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
         use_fast_math=False,
     )
-    module = spec.build_and_load()
-    return module, {**record, "library_path": str(spec.get_library_path())}
 
 
-def route_key(options):
-    return json.dumps(
-        [
-            options["M"],
-            options["N"],
-            list(options["group_ks"]),
-            options["num_sms"],
-            options.get("k_alignment", 256),
-            bool(options.get("use_psum_layout", True)),
-            options.get("output_dtype", "bf16"),
-            bool(options.get("accumulate", False)),
-            options.get("num_stages", 7),
-        ],
-        separators=(",", ":"),
-    )
+@functools.cache
+def load_program(arch: str, name: str):
+    return program_spec(arch, name).build_and_load()
 
 
 class GroupedFP4Plan:
     """Prepared independent K-group products, with optional in-place FP32 addition.
 
     Each group owns out[group]. Padding contains encoded zero and valid scales.
-    run() uses the current stream; one output/descriptor workspace has one owner.
-    For all-empty groups, overwrite clears the output and accumulation preserves it.
+    run() uses the current stream; one output has one owner. For all-empty
+    groups, overwrite clears the output and accumulation preserves it.
     """
 
     def __init__(
@@ -108,23 +837,22 @@ class GroupedFP4Plan:
         accumulate=False,
         num_stages=7,
         out=None,
-        grouped_layout=None,
-        descriptor_workspace=None,
     ):
         import torch
 
-        arch = device_arch(a.device)
         group_ks = tuple(int(k) for k in group_ks)
         if m < 1 or not group_ks or any(k < 0 for k in group_ks):
             raise ValueError(
                 "m must be positive and group_ks a nonempty list of nonnegative K sizes"
             )
         if k_alignment < 256 or k_alignment % 256:
-            raise ValueError("k_alignment must be a positive multiple of256")
+            raise ValueError("k_alignment must be a positive multiple of 256")
         if output_dtype not in ("bf16", "fp32") or (
             accumulate and output_dtype != "fp32"
         ):
             raise ValueError("Output must be bf16/fp32; accumulation requires fp32")
+        if num_stages != 7:
+            raise ValueError("The generated schedules use seven load stages")
         if (
             a.ndim != 2
             or b.ndim != 2
@@ -132,9 +860,11 @@ class GroupedFP4Plan:
             or b.dtype not in (torch.int8, torch.uint8)
         ):
             raise ValueError("A and B must contain packed E2M1 int8/uint8 bytes")
+        if a.device.type != "cuda":
+            raise RuntimeError("Grouped FP4 GEMM requires a CUDA device")
         n = b.shape[0]
         if n < 1 or n % 128:
-            raise ValueError("N must be positive and divisible by128")
+            raise ValueError("N must be positive and divisible by 128")
         physical_m = (m + 255) // 256 * 256
         padded_ks = [
             (k + k_alignment - 1) // k_alignment * k_alignment for k in group_ks
@@ -145,7 +875,7 @@ class GroupedFP4Plan:
             total_k // 2,
         ):
             raise ValueError(
-                "A/B must use independently padded concatenated groups and physical M aligned to256"
+                "A/B must use independently padded concatenated groups and physical M aligned to 256"
             )
         for tensor, shape in (
             (a_scales, ((total_k + 127) // 128, physical_m)),
@@ -169,45 +899,46 @@ class GroupedFP4Plan:
             )
         if out.dtype != dtype or tuple(out.shape) != (len(group_ks), physical_m, n):
             raise ValueError("out must match output_dtype and [groups, physical_M, N]")
-        expected_layout = []
-        cursor = 0
-        for logical_k, padded_k in zip(group_ks, padded_ks, strict=False):
-            expected_layout.append(cursor + logical_k if use_psum_layout else padded_k)
-            cursor += padded_k
-        if grouped_layout is None:
-            grouped_layout = torch.tensor(
-                expected_layout, dtype=torch.int32, device=a.device
-            )
-        elif grouped_layout.dtype != torch.int32 or tuple(grouped_layout.shape) != (
-            len(group_ks),
-        ):
-            raise ValueError("grouped_layout must contain one int32 per group")
-        tensors = (a, b, a_scales, b_scales, out, grouped_layout)
+        tensors = (a, b, a_scales, b_scales, out)
         if any(t.device != a.device or not t.is_contiguous() for t in tensors):
             raise ValueError(
-                "Operands, scales, layout and output must be contiguous on one CUDA device"
+                "Operands, scales and output must be contiguous on one CUDA device"
             )
-        # Preparation validates optional caller metadata once, outside replay/timing.
-        if grouped_layout.cpu().tolist() != expected_layout:
-            raise ValueError(
-                "grouped_layout does not encode the declared logical/padded groups"
-            )
-        sms = torch.cuda.get_device_properties(a.device).multi_processor_count
+        arch, sm_count = device_facts(
+            a.device.index
+            if a.device.index is not None
+            else torch.cuda.current_device()
+        )
+        self.route, self.program = select_route(
+            arch, m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment
+        )
+        self.storage, self.output = out, out[:, :m]
+        self.empty, self.accumulate = total_k == 0, bool(accumulate)
         self.options = dict(
             M=m,
             N=n,
             group_ks=group_ks,
-            num_sms=sms,
             k_alignment=k_alignment,
-            use_psum_layout=use_psum_layout,
+            use_psum_layout=bool(use_psum_layout),
             output_dtype=output_dtype,
-            accumulate=accumulate,
+            accumulate=bool(accumulate),
             num_stages=num_stages,
         )
-        self.storage, self.output = out, out[:, :m]
-        self.empty, self.accumulate = total_k == 0, bool(accumulate)
-        self.descriptor_workspace = descriptor_workspace
-        self.bindings = dict(
+        if self.empty:
+            self._retained = tensors
+            return
+        tier = self.route.split(":")[0]
+        grid_m, grid_n, grid = launch_geometry(
+            tier, physical_m, n, len(group_ks), sm_count
+        )
+        self.grid = grid
+        grouped_layout = torch.tensor(
+            grouped_layout_values(group_ks, k_alignment)
+            + division_values(tier, grid_m, grid_n, sm_count),
+            dtype=torch.int32,
+            device=a.device,
+        )
+        bindings = dict(
             A=a.view(torch.uint8),
             B=b.view(torch.uint8),
             SFA=a_scales.view(torch.uint32),
@@ -217,47 +948,25 @@ class GroupedFP4Plan:
             M=physical_m,
             N=n,
             K=total_k,
+            grid_m=grid_m,
+            grid_n=grid_n,
             num_groups=len(group_ks),
         )
-        if self.empty:
-            self._retained = tensors
-            return
-        try:
-            route = _catalog()["arches"][arch]["routes"][route_key(self.options)]
-        except KeyError as error:
-            raise NotImplementedError(
-                f"No exported grouped FP4 schedule for {self.options}"
-            ) from error
-        cfg = route["config"]
-        for key in ("grid_m", "grid_n"):
-            self.bindings[key] = cfg[key]
-        self.bindings.update(
-            zip(("grid_x", "grid_y", "grid_z"), cfg["grid"], strict=False)
-        )
-        module, record = load_program(arch, route["program"])
-        workspace_bytes = record["tma_workspace_bytes"]
-        if workspace_bytes:
-            if descriptor_workspace is None:
-                descriptor_workspace = torch.empty(
-                    workspace_bytes, dtype=torch.uint8, device=a.device
+        grid_by_axis = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
+        record = MODULES[self.program]
+        args = []
+        for kind, name in record["arg_plan"]:
+            if kind == "grid":
+                args.append(grid_by_axis[name])
+            elif name in bindings:
+                args.append(bindings[name])
+            else:
+                raise RuntimeError(
+                    f"generated program {self.program} binds {name!r}, which this plan does not declare"
                 )
-            if (
-                descriptor_workspace.dtype != torch.uint8
-                or descriptor_workspace.device != a.device
-                or not descriptor_workspace.is_contiguous()
-                or descriptor_workspace.numel() < workspace_bytes
-                or descriptor_workspace.data_ptr() % 128
-            ):
-                raise ValueError(
-                    "Descriptor workspace must be aligned contiguous CUDA uint8 storage"
-                )
-        args = tuple(
-            descriptor_workspace if kind == "workspace" else self.bindings[name]
-            for kind, name in record["arg_plan"]
-        )
-        self._submission = module[record["ffi_entry"]], args
-        self._retained = (module, record, tensors, descriptor_workspace, self.bindings)
-        self.descriptor_workspace = descriptor_workspace
+        module = load_program(arch, self.program)
+        self._submission = getattr(module, record["ffi_entry"]), tuple(args)
+        self._retained = (module, tensors, grouped_layout)
 
     def run(self):
         import tvm_ffi

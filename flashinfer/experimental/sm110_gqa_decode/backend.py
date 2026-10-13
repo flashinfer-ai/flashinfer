@@ -23,13 +23,13 @@ from collections.abc import Sequence
 
 import torch
 
-from .jit import load_sm110_gqa_decode_module
+from .jit import ROUTES, SHORT_CAPACITY_MAX, load_sm110_gqa_decode_module
 
 _NUM_Q_HEADS = 32
 _NUM_KV_HEADS = 8
 _HEAD_DIM = 128
 _HEADS_PER_GROUP = _NUM_Q_HEADS // _NUM_KV_HEADS
-_SHORT_CAPACITY_MAX = 64
+_SOFTMAX_SCALE_LOG2 = 1.0 / math.sqrt(_HEAD_DIM) / math.log(2.0)
 
 
 def _require_tensor(
@@ -62,7 +62,13 @@ def sm110_gqa_decode(
     out: torch.Tensor | None = None,
     q_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Run the fixed Hq32/Hkv8/D128 FP16 decode specialization."""
+    """Run the fixed Hq32/Hkv8/D128 FP16 decode specialization.
+
+    ``sequence_lengths`` is consumed on the device: every value must be in
+    ``[1, capacity]`` when the kernel runs. This precondition is the caller's
+    responsibility, as for the prepared API; the host never reads the lengths
+    back, so the call enqueues without a device synchronization.
+    """
 
     if q.ndim != 3:
         raise ValueError("q must have shape [batch, 32, 128]")
@@ -94,12 +100,6 @@ def sm110_gqa_decode(
         dtype=torch.int32,
         device=q.device,
     )
-    min_length, max_length = torch.aminmax(sequence_lengths)
-    if min_length.item() < 1 or max_length.item() > capacity:
-        raise ValueError(
-            "sequence_lengths values must be within the inclusive range "
-            f"[1, {capacity}]"
-        )
 
     if out is None:
         out = torch.empty_like(q)
@@ -114,25 +114,23 @@ def sm110_gqa_decode(
         if out.data_ptr() == q.data_ptr():
             raise ValueError("out must not alias q")
 
-    module = load_sm110_gqa_decode_module(device=q.device)
+    route = ROUTES["short" if capacity <= SHORT_CAPACITY_MAX else "long"]
+    module = load_sm110_gqa_decode_module(device=q.device, module=route["module"])
+    launch = getattr(module, route["ffi_entry"])
     q_grouped = q.view(
         batch,
         _NUM_KV_HEADS,
         _HEADS_PER_GROUP,
         _HEAD_DIM,
     ).transpose(1, 2)
-    k = kv[:, 0]
-    v = kv[:, 1]
-    softmax_scale_log2 = float(q_scale) / math.sqrt(_HEAD_DIM) / math.log(2.0)
-    launch = module.run_short if capacity <= _SHORT_CAPACITY_MAX else module.run_long
     with torch.cuda.device(q.device):
         launch(
             q_grouped,
-            k,
-            v,
+            kv[:, 0],
+            kv[:, 1],
             out,
             sequence_lengths,
-            softmax_scale_log2,
+            float(q_scale) * _SOFTMAX_SCALE_LOG2,
             batch * _NUM_KV_HEADS,
             1,
             1,

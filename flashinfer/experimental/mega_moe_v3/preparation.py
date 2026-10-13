@@ -1,5 +1,7 @@
 """Selected packed-input and workspace preparation; no compiler or oracle dependency."""
 
+import math
+
 BLOCK_M = 128
 BLOCK_N = 128
 BLOCK_K = 256
@@ -7,6 +9,29 @@ CTA_GROUP = 2
 GRAN_OUT = 32
 ALIGN_M = 256
 DISP_NUM_EXPERTS_MAX = 384
+
+
+def _source_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
+    """Expert tile height of the source schedule for a single-rank model row.
+
+    Mirrors the generator's heuristic: 16 rows up to ten expected tokens per
+    expert, 32 rows up to 24, then the smallest wide candidate whose tile
+    count covers the expected load plus one standard deviation.
+    """
+    expected = num_tokens * top_k / num_experts
+    if expected <= 10:
+        return 16
+    if expected <= 24:
+        return 32
+    covered = expected + math.sqrt(expected)
+    num_blocks = math.ceil(covered / 240)
+    if num_blocks == 1 and covered > 192 and num_experts < 14:
+        num_blocks = 2
+    return next(
+        candidate
+        for candidate in (64, 128, 192, 240)
+        if num_blocks * candidate >= covered
+    )
 
 
 def _mega_dispatch_reference(
@@ -125,7 +150,8 @@ def prepare_pipeline_bindings(inputs, num_sms):
         and (not capture_l1)
         and ((E, TK, H, I) == (384, 6, 5120, 2304))
     )
-    source_blocks = E + (T * TK + 15) // 16
+    source_block_m = _source_block_m(T, E, TK)
+    source_blocks = E + (T * TK + source_block_m - 1) // source_block_m
     N1, K1, N2, K2 = (2 * I, H, H, I)
     grid_n1, K1_tiles = (N1 // BLOCK_N, K1 // BLOCK_K)
     grid_n2, K2_tiles = (N2 // BLOCK_N, K2 // BLOCK_K)
@@ -173,7 +199,7 @@ def prepare_pipeline_bindings(inputs, num_sms):
         )
         and (
             weight_fmt == "fp4"
-            and T in (16, 128, 512)
+            and T in (16, 128, 512, 1024, 4096)
             or (weight_fmt == "fp8" and T == 16)
         )
     )

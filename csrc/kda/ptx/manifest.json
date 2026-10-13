@@ -6,17 +6,10 @@
   "target": "sm_103a",
   "ptx_version": "9.2",
   "sha256": {
-    "fixed_h64.cc": "e1d1c383dee6af94e64f906ba25da5567eb4e95d736dc39fa0fe7a0f7e1c7db0",
-    "fixed_h64.json": "ef4001cc34948257afe37573cfa69d263192f668e47948d12e12889d5dac15c4",
     "fixed_h64.ptx": "d2f53ca43e4df55efb83957efedbfe010029eb91ef16968467e49fcaf025bb6f",
-    "fixed_h96.cc": "84c6d30c7f3910ebf4c3e05eda64a2cab26cc3129dd930b67f8615af50e0280e",
-    "fixed_h96.json": "5a2425524eef4f11bdd2b872b6d6505378dcb7463edf724e8e34c2b8e0e660ea",
     "fixed_h96.ptx": "3f089e6801e0162121969ca53bb2128d5ca20aeea793d2ee7db88ee137407010",
-    "varlen_mixed_h64.cc": "2bb80e76f995bafa6b3b7978bad31f7f39c639e1dc75e696553f94e59e988f6b",
-    "varlen_mixed_h64.json": "8bf57253be91a3da23f4b80fc69e3952ca7baa2b6c741c6ade76ef37191bc2e2",
     "varlen_mixed_h64.ptx": "46e000e9808298bd731d0d74d4e18f75249d0d6506075a54e81afe43e3073f83",
-    "varlen_uniform_h64.cc": "8fa877160a1c634cbb98414d27a9f196c25a79d8c7d1abc17464720185dd3e0f",
-    "varlen_uniform_h64.json": "0a4816f42deec62dcd31fd6642434ea4a88a974b47bcec704004053b2b2313f4",
     "varlen_uniform_h64.ptx": "4f6d8dd1e4c3bb9f92271bfb9b37e5081639ab38b8dbabcd27919d6f1f8fda5a"
-  }
+  },
+  "host_shim": "shim.cc and programs.json are FlashInfer-authored, derived from the imported per-program shims"
 }

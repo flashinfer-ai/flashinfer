@@ -9,8 +9,8 @@ eight-warp groups with an in-CTA merge, frozen for FP16 page128 KV only,
 selected with `kernel="register_mma_split"`; `kernel="register_mma_auto"`
 picks it for FP16 page128 KV and `register_mma` elsewhere), `tmem` (the
 tcgen05/TMEM-accumulator D512 tree schedule with Q and K/V fetched once per
-thread-block cluster by TMA multicast, every D512 cache mode, one frozen trace
-per GQA ratio 2/4/8/16, selected with `kernel="tmem"`) and `pair` (the same
+thread-block cluster by TMA multicast, every D512 cache mode, GQA ratios
+2/4/8/16, selected with `kernel="tmem"`) and `pair` (the same
 schedule as two `cta_group::2` CTA pairs in a `(4, 1, 1)` cluster that issue
 one MMA stream for the two 128-row Q tiles of a KV head; E4M3 KV with an even
 Q-tile count per head, GQA ratios 2/4/8/16, selected with `kernel="pair"`;
@@ -26,9 +26,7 @@ API. Backend implementation and JIT sources remain under
 removed without deprecation.
 
 Native compilation and correctness checks have run with CUDA 13.4 on physical
-SM110 hardware. See [RESULTS.md](RESULTS.md) for execution-validation status,
-sanitizer outcomes and performance results. The interface supports two
-attention families:
+SM110 hardware. The interface supports two attention families:
 
 | Family | Q | KV | Other metadata |
 | --- | --- | --- | --- |
@@ -69,10 +67,10 @@ output = plan.run()
 dequantize FP8 storage; decode currently requires both to be 1. Output is
 FP16 and may not alias any input. D128 accepts a runtime `partition_tokens`
 argument that is a positive multiple of 64; omitting it selects the frozen
-manifest's default. The manifest also identifies whether split results use a
-separate merge kernel or a fused last-CTA merge. This is a frozen physical
-choice, not a change to attention semantics.
-If the frozen producer caches merge statistics, preparation selects a
+default recorded in `jit.FROZEN`. The frozen decode producer merges its
+partitions in the last CTA; that is a frozen physical choice, not a change to
+attention semantics.
+Because the frozen producer caches merge statistics, preparation selects a
 separate specialization with that cache disabled for exactly one partition.
 Multiple partitions use the cache-enabled specialization, including its
 generic device loop when there are more than four partitions. The selected
@@ -116,19 +114,20 @@ preparation_stream.wait_stream(execution_stream)
 Neither API substitutes a kernel for another GPU architecture.
 
 The module requires CUDA 13.0 or newer and physical capability 11.0; the tested
-toolchain is CUDA 13.4. The frozen source manifest under `csrc/sm110_xqa/`
-specifies compiler flags and route geometry for seventeen base routes (six
-`tcgen05` routes, the four `register_mma` D512 tree routes `tree_*_mma`, the
+toolchain is CUDA 13.4. `jit.py` is the physical record of the delivered
+sources, written by the Cake export that generates them: `MODULES` lists the
+generated programs (the four `register_mma` D512 tree routes `tree_*_mma`, the
 `register_mma_split` FP16 page128 tree route `tree_fp16_paged_mma_split`, the
-four `tmem` D512 tree routes `tree_*_tmem` and the two `pair` E4M3 tree routes
-`tree_fp8_*_pair`),
-plus the single-partition specialization when required. Its `validation_status` field
-is an immutable source-generation record captured at freeze. Subsequent
-execution validation is documented separately in [RESULTS.md](RESULTS.md).
-The frozen D512 route declares a 128- or 256-column output tile and four or
-eight cooperating copy warps. Grid geometry comes from that manifest; native
-bindings use the traced thread block, shared memory and tensor-memory layout
-of the same physical candidate.
+`tmem` D512 tree routes `tree_*_tmem` in their two cluster forms and the two
+`pair` E4M3 tree routes `tree_fp8_*_pair`), each with its kernel and binding
+translation units, compiler flags, launch geometry and the argument plan of
+its `run` entry; `FROZEN` lists the routes kept from the earlier frozen tree
+(the four `tcgen05` D512 tree routes and the D128 decode producer with its
+single-partition specialization) with their compiler flags, content hash and
+launch facts; `ROUTES` maps `<route>__<cluster form>` to the serving program.
+The `tcgen05` D512 route runs a 64-row Q tile per CTA over a 256-column output
+tile; native bindings use the traced thread block, shared memory and
+tensor-memory layout of the same physical candidate.
 The `register_mma` tree routes launch one 32-row Q tile per CTA over all 512
 output columns with eight QK warps and eight PV warps (512 threads, grid
 `(1, Hkv * ceil(Q * ratio / 32), B)`), the same tensor layouts, mask contract,
@@ -148,13 +147,15 @@ per cluster by TMA multicast (a `(2, 1, 1)` Q-multicast form serves heads with
 an odd number of Q tiles). The binding encodes the Q and KV tensor maps on the
 host from the caller's tensors and launches with the cluster attribute; the
 same tensor layouts, mask contract, dequantization scales and tolerances apply.
-Each `tmem` route ships one frozen trace per GQA ratio (2, 4, 8 and 16: the
-128-row Q tile is ratio heads x 128 / ratio tokens) and cluster form; the
-binding selects the kernel from the ratio and the Q-tile parity and encodes Q
-with the ratio's box. The `pair` tree routes (`tree_fp8_{contiguous,paged}_pair`)
-run the same tcgen05/TMEM schedule as two `cta_group::2` CTA pairs in a
-`(4, 1, 1)` cluster per two Q tiles of a KV head (grid
-`(4, Hkv * ceil(Q * ratio / 128) / 2, B)`, one kernel per GQA ratio): the pair
+Each `tmem` program is one kernel template instantiated for the GQA ratios 2,
+4, 8 and 16 (the 128-row Q tile is ratio heads x 128 / ratio tokens), one
+program per cache mode and cluster form; the host selects the program from the
+Q-tile parity and the binding dispatches on the `head_group_size` argument and
+encodes Q with the ratio's box. The `pair` tree routes
+(`tree_fp8_{contiguous,paged}_pair`) run the same tcgen05/TMEM schedule as two
+`cta_group::2` CTA pairs in a `(4, 1, 1)` cluster per two Q tiles of a KV head
+(grid `(4, Hkv * ceil(Q * ratio / 128) / 2, B)`, one template instantiation
+per GQA ratio): the pair
 leader issues one M256 MMA stream for both Q tiles, each CTA holds one token
 half of every K chunk and one column half of every V chunk, and the raw E4M3 V
 rows are multicast to the pair. They serve E4M3 KV whose heads have an even
@@ -163,12 +164,11 @@ counts. The families are selected explicitly; `register_mma_auto` chooses
 between the two register families and `auto` selects `pair` for E4M3 KV with
 an even Q-tile count per head and `tmem` otherwise. D128 decode has only the
 `tcgen05` family.
-Each route also records whether it stages raw FP8 bytes asynchronously before
-widening to FP16. This physical option applies only to E4M3 cache routes; FP16
-routes always record it as disabled. Raw prefetch is enabled only when that
-FP8 staging path is active. The manifest also records the complete-prefix
-mask fast path and the half-warp fused decode merge selection. These physical
-choices do not change the public tensor API or dequantization scales.
+The generated binding of every D512 program binds the KV cache as bytes (the
+E4M3 routes widen them in the kernel), the draft mask as unsigned 32-bit words
+and the pointer arguments the kernels never dereference (packed-query offsets
+for uniform queries, attention sinks, semaphores, scratch) as null device
+addresses; no placeholder tensors are allocated.
 
 Validation commands from a FlashInfer checkout:
 
@@ -183,11 +183,9 @@ partition/repeated-counter checks, caller-provided workspace initialization,
 two cross-stream graph-replay cases, output-alias rejection and misaligned
 stats-cache workspace rejection (54 cases in
 total). Runtime cases cover one, two, three, four and more than four partitions
-and verify the selected specialization. Run it against each candidate manifest before freezing the physical
-choice. Numerical checks use an FP32
-oracle and `atol=rtol=1e-2`, including quantized cache cases. Seven performance
-rows are specified in `benchmarks/sm110_xqa_shapes.json`. Consult
-[RESULTS.md](RESULTS.md) for the measured results and validation status.
+and verify the selected specialization. Numerical checks use an FP32
+oracle and `atol=rtol=1e-2`, including quantized cache cases. The eighteen
+performance rows are specified in `benchmarks/sm110_xqa_shapes.json`.
 Performance inputs use seed-0 uniform [-1,1] values for D512 and seed-0 normal
 (0,1) values for D128, as recorded separately in that ledger.
 

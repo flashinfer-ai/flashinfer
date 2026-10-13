@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
 from typing import Optional, Tuple
 
@@ -139,6 +140,12 @@ def _prepare_sm120_sparse_metadata(
 
 
 _sm120_compile_cache = get_jit_cache("bsa_fwd_sm120")
+
+
+@functools.cache
+def _device_capability(device_index: int) -> tuple[int, int]:
+    major, minor = torch.cuda.get_device_capability(device_index)
+    return int(major), int(minor)
 
 
 @flashinfer_api
@@ -365,7 +372,7 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
     softmax_scale: Optional[float] = None,
     *,
     out: torch.Tensor,
-    tma_descriptor_workspace: torch.Tensor,
+    tma_descriptor_workspace: Optional[torch.Tensor] = None,
     uniform_block_count: bool = False,
     contiguous_block_indices: bool = False,
     backend: str = "cake",
@@ -374,7 +381,7 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
 
     All CUDA storage is caller-owned. ``out`` is contiguous BF16 BHSD.
     Tensor-map descriptors are passed by value as grid-constant kernel
-    parameters; ``tma_descriptor_workspace`` is accepted but unused.
+    parameters; ``tma_descriptor_workspace`` is accepted and ignored.
     Q/K use contiguous INT8 BHSD, V uses contiguous FP8 E4M3 HDS, and the
     operation supports MHA, head dimension 128, non-causal forward without LSE.
     """
@@ -415,7 +422,7 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
         if tensor.device != device or not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous on {device}")
 
-    capability = tuple(int(value) for value in torch.cuda.get_device_capability(device))
+    capability = _device_capability(device.index)
     if capability != (12, 0):
         raise RuntimeError(
             f"SM120 Sage attention requires compute capability 12.0, got {capability}"
@@ -509,43 +516,36 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
 
     full_k64_tiles = int(block_sizes_mode == 0 and seqlen_k % _BLOCK_SIZE == 0)
     uniform_nonempty = int(uniform_block_count and block_sparse_num > 0)
-    module, record = load_cake_sage_block_sparse_attention_module(
+    module = load_cake_sage_block_sparse_attention_module(
         has_block_nums,
         block_sizes_mode,
         full_k64_tiles,
         uniform_nonempty,
         int(contiguous_block_indices),
     )
-    bindings = {
-        "Q_map": q_int8,
-        "K_map": k_int8,
-        "V_map": v_fp8.view(torch.uint8),
-        "O_map": out,
-        "q_scale": q_scale,
-        "k_scale": k_scale,
-        "v_scale": v_scale,
-        "q2k_block_index": q2k_block_index,
-        "q2k_block_nums": q2k_nums_arg,
-        "block_sizes": block_sizes_arg,
-        "seqlen_q": seqlen_q,
-        "seqlen_k": seqlen_k,
-        "num_heads": heads,
-        "q2k_capacity": q2k_capacity,
-        "num_k_blocks": k_blocks,
-        "block_sparse_num": block_sparse_num,
-        "softmax_scale": float(softmax_scale),
-        "grid_x": q_blocks,
-        "grid_y": heads,
-        "grid_z": batch,
-    }
-    try:
-        args = [bindings[name] for _kind, name in record["arg_plan"]]
-    except KeyError as exc:
-        raise RuntimeError(
-            f"generated argument plan names an unknown binding: {exc}"
-        ) from exc
     with tvm_ffi.use_torch_stream():
-        getattr(module, str(record["ffi_entry"]))(*args)
+        module.run(
+            q_int8,
+            k_int8,
+            v_fp8.view(torch.uint8),
+            out,
+            q_scale,
+            k_scale,
+            v_scale,
+            q2k_block_index,
+            q2k_nums_arg,
+            block_sizes_arg,
+            seqlen_q,
+            seqlen_k,
+            heads,
+            q2k_capacity,
+            k_blocks,
+            block_sparse_num,
+            float(softmax_scale),
+            q_blocks,
+            heads,
+            batch,
+        )
     return out
 
 
@@ -578,16 +578,15 @@ def bsa_attn_sm120_blk64_sage_fwd(
 
     ``"cake"`` (default)
         tvm-ffi generated kernel. All CUDA storage is caller-owned: ``out``
-        and ``tma_descriptor_workspace`` are required keyword arguments.
-        Tensor-map descriptors are passed by value as grid-constant kernel
-        parameters; ``tma_descriptor_workspace`` is accepted but unused.
+        is a required keyword argument. Tensor-map descriptors are passed by
+        value as grid-constant kernel parameters; ``tma_descriptor_workspace``
+        is accepted and ignored.
         ``uniform_block_count`` and ``contiguous_block_indices`` tuning flags
         are only honoured by this backend.
 
     ``"cute_dsl"``
         CuTe-DSL port of upstream Block-Sparse-Attention. Uses BHSD tensor
-        layout throughout, allocates ``out`` internally when not provided,
-        and does not require ``tma_descriptor_workspace``. Supports SM120
+        layout throughout and allocates ``out`` internally when not provided. Supports SM120
         only (exact compute capability 12.0), MHA only, head dimension 128,
         non-causal forward without LSE. ``uniform_block_count`` and
         ``contiguous_block_indices`` are silently ignored by this backend.
@@ -630,11 +629,9 @@ def bsa_attn_sm120_blk64_sage_fwd(
         Required for ``backend="cake"``. For ``backend="cute_dsl"``,
         allocated internally when not provided.
     tma_descriptor_workspace : torch.Tensor, optional
-        Accepted for compatibility and unused. An empty tensor is sufficient;
-        this operation neither reads nor writes its storage. Tensor-map
-        descriptors are passed by value in the kernel launch, so workspace
-        contents, lifetime, and reuse across streams do not affect attention.
-        Required for ``backend="cake"``; ignored for ``backend="cute_dsl"``.
+        Accepted for compatibility and ignored by both backends. Tensor-map
+        descriptors are passed by value in the kernel launch, so no caller
+        storage is read or written.
     uniform_block_count : bool
         Whether every query block uses ``block_sparse_num`` selected blocks.
         Only honoured by ``backend="cake"``, where it is a caller-provided
@@ -679,8 +676,6 @@ def bsa_attn_sm120_blk64_sage_fwd(
     if backend == "cake":
         if out is None:
             raise ValueError("backend='cake' requires a caller-owned out tensor")
-        if tma_descriptor_workspace is None:
-            raise ValueError("backend='cake' requires tma_descriptor_workspace")
         return _bsa_attn_sm120_blk64_sage_fwd_cake(
             q_int8,
             k_int8,
@@ -694,7 +689,6 @@ def bsa_attn_sm120_blk64_sage_fwd(
             q2k_block_nums,
             softmax_scale,
             out=out,
-            tma_descriptor_workspace=tma_descriptor_workspace,
             uniform_block_count=uniform_block_count,
             contiguous_block_indices=contiguous_block_indices,
         )
