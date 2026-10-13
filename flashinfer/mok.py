@@ -13,8 +13,9 @@ MOK_PRECISIONS = ("bf16", "mxfp8")
 # 20 / 24 on this package's backward programs. Hottest rank at 5.6x / 7.4x the
 # mean routed load: -1.0 / -1.7 % and -1.2 / -1.3 %. Hottest rank at 3.0x (one
 # rank's experts at twice the routing probability): +0.4 / +0.7 % (full step),
-# +0.5 / +0.8 % (checkpoint step) and +0.6 / +1.6 % with ragged source rows, so
-# the fixed split is faster there. IMBALANCE_THRESHOLD therefore sits between
+# +0.5 / +0.8 % (checkpoint step) and -0.1 ... +1.6 % with ragged source rows
+# (8 cells, 7 slower) - no gain, within or just above the ~0.8 % spread of
+# identical arms, so the fixed split is kept. IMBALANCE_THRESHOLD sits between
 # the measured 3.0x and 5.6x; the crossover in between is not measured, and
 # with 4 ranks the ratio reaches 4 only when one rank carries every routed row.
 # Balanced steps never switch, so the fixed split stays in force for them.
@@ -119,8 +120,8 @@ def create_mok_bf16_workspace(
     24 / 28, no row elsewhere, so the fixed split stays in force there), ``None``
     keeps the fixed split and a pair sets it. ``precision`` only selects that row.
     The default ``imbalance_threshold`` (:data:`IMBALANCE_THRESHOLD`, 4) lies
-    between the measured 3x load ratio, where the fixed split is faster, and
-    5.6x, where the imbalance split gains 1-2 %. Balanced steps never switch.
+    between the measured 3x load ratio, where the imbalance split shows no
+    gain, and 5.6x, where it gains 1-2 %. Balanced steps never switch.
     ``CAKE_MOK_COMM_SPLIT_LOG=1`` prints each split change.
     """
     from .experimental.cake_mok_bf16.workspace import MoKConfig

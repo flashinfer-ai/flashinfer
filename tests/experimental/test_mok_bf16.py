@@ -463,9 +463,15 @@ def test_select_comm_split_decision_table():
     assert select_comm_split((), base, hot, 1.5) == base  # no observation yet
     assert select_comm_split([200, 100, 100, 100], base, None, 1.5) == base
     # The shipped threshold: 3x keeps the fixed split, 5.6x switches.
-    assert select_comm_split([300, 100, 100, 100, 100, 100, 0, 0], base, hot, 4.0) == base  # 3.0
-    assert select_comm_split([560, 100, 100, 40, 0, 0, 0, 0], base, hot, 4.0) == hot  # 5.6
-    assert select_comm_split([100, 0, 0, 0], base, hot, 4.0) == hot  # exactly 4 with 4 ranks
+    assert (
+        select_comm_split([300, 100, 100, 100, 100, 100, 0, 0], base, hot, 4.0) == base
+    )  # 3.0
+    assert (
+        select_comm_split([560, 100, 100, 40, 0, 0, 0, 0], base, hot, 4.0) == hot
+    )  # 5.6
+    assert (
+        select_comm_split([100, 0, 0, 0], base, hot, 4.0) == hot
+    )  # exactly 4 with 4 ranks
     loads = torch.tensor([300, 100, 100, 100], dtype=torch.int32)
     assert select_comm_split(loads, base, hot, 1.5) == hot
     assert select_comm_split(loads, base, [24, 28], 1.5) == (24, 28)

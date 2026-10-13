@@ -30,7 +30,7 @@ class MoKConfig:
     # on every rank. ``None`` keeps the fixed split; see
     # ``MoKFunctional._comm_split``. The threshold default follows
     # ``flashinfer.mok.IMBALANCE_THRESHOLD``: on B200 BF16 the imbalance split
-    # pays from about 5.6x the mean load, while at 3x the fixed split is faster.
+    # pays from about 5.6x the mean load and shows no gain at 3x.
     imbalance_comm_sms: tuple[int, int] | None = None
     imbalance_threshold: float = 4.0
     minibatch_size: int = 4096

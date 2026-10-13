@@ -170,8 +170,9 @@ to recreate the workspace.
   time against the fixed 20 / 24 on this package's backward programs: hottest
   rank at 5.6x / 7.4x the mean routed load -1.0 / -1.7 % and -1.2 / -1.3 %;
   hottest rank at 3.0x (one rank's experts at twice the routing probability)
-  +0.4 / +0.7 % (full step), +0.5 / +0.8 % (checkpoint step) and +0.6 / +1.6 %
-  with ragged source rows, where the fixed split is therefore kept. The
+  +0.4 / +0.7 % (full step), +0.5 / +0.8 % (checkpoint step) and -0.1 ... +1.6 %
+  with ragged source rows (8 cells, 7 slower): no gain, within or just above the
+  ~0.8 % spread of identical arms, so the fixed split is kept there. The
   threshold sits between the measured 3.0x and 5.6x (the crossover in between is
   not measured; with 4 ranks the ratio reaches 4 only when one rank carries
   every routed row). No row elsewhere.
