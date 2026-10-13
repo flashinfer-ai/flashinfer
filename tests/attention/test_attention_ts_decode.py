@@ -294,26 +294,23 @@ def test_q_token_kv_block_sparse_cpu_route_offsets_must_be_safe_before_upload(
 
 _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() != (10, 0)
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     or not is_sm100a_supported(torch.device("cuda")),
-    reason=(
-        "PrimTS FMHA decode is signoff-qualified on SM100; "
-        "SM103/B300 and GB300 qualification is pending"
-    ),
+    reason="PrimTS FMHA decode requires an SM100a, SM103a or SM107a GPU",
 )
 
 _REQUIRES_PAGE4_PRIMTS_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     or not is_sm100a_supported(torch.device("cuda")),
-    reason="PrimTS page-4 decode requires an SM100a or SM103a GPU",
+    reason="PrimTS page-4 decode requires an SM100a, SM103a or SM107a GPU",
 )
 
 _REQUIRES_BLACKWELL_PRIMTS_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     or not is_sm100a_supported(torch.device("cuda")),
-    reason="PrimTS grouped decode requires an SM100a or SM103a GPU",
+    reason="PrimTS grouped decode requires an SM100a, SM103a or SM107a GPU",
 )
 
 _Q_TOKEN_KV_BLOCK_SPARSE_TP_HEAD_GEOMETRIES = (

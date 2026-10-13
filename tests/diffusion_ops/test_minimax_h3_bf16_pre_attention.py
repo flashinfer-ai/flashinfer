@@ -248,25 +248,27 @@ def test_jit_source_resolution_supports_package_and_source_tree(monkeypatch, tmp
 
 def test_frozen_source_contains_index_and_tmem_safety_guards():
     source = _SOURCE.read_text(encoding="utf-8")
-    # The int64 AdaLN index is range-reduced against the runtime row count
-    # (out-of-range -> -1 sentinel row / row offset in shared memory), and the
-    # sentinel is re-checked before any table address is formed; neither bound
-    # is a literal.
+    # The int64 AdaLN index is range-checked against the runtime row count
+    # before any table address is formed (out-of-range -> zero activation
+    # row); neither bound is a literal.
     assert re.search(
         r"table_index >= 0(LL)? && table_index < \(?\s*\(?long long\)?\s*\)?\(?adaln_rows\)?",
         source,
     )
-    assert re.search(r"\b(table_row|table_base)(_\d+)? >= 0\b", source)
+    # TMEM ownership protocol of the GEMM (same surface as the fc1 / out_proj stages).
     assert "tcgen05.fence::after_thread_sync;" in source
     assert "tcgen05.wait::ld.sync.aligned;" in source
-    assert "tcgen05.fence::before_thread_sync;" in source
 
 
-def test_frozen_source_uses_launch_parameter_tensor_map():
+def test_frozen_source_uses_launch_parameter_tensor_maps():
     source = _SOURCE.read_text(encoding="utf-8")
+    assert "__grid_constant__ CUtensorMap activation" in source
     assert "__grid_constant__ CUtensorMap qkv_weight" in source
     assert "cuMemAlloc" not in source
     assert "qkv_weight tensor-map cache" not in source
+    # Two launches: the plain norm/AdaLN kernel and the cluster-launched GEMM.
+    assert "cudaLaunchKernelEx" in source
+    assert "TensorView workspace" in source
 
 
 @pytest.mark.parametrize("p", [1, 2, 4, 8])
@@ -421,7 +423,11 @@ def _reference(case):
     )
     adaln = torch.where(valid_index[:, None], adaln, torch.zeros_like(adaln))
     qkv = F.linear(adaln, case["qkv_weight"]).to(torch.bfloat16)
-    grouped = qkv.view(case["x"].shape[0], NUM_HEADS, QKV_KINDS, HEAD_DIM)
+    # Engine-resident weight rows are [qkv_kind, head, head_dim]: the projection
+    # columns are [q_all | k_all | v_all].
+    grouped = qkv.view(case["x"].shape[0], QKV_KINDS, NUM_HEADS, HEAD_DIM).transpose(
+        1, 2
+    )
     q = F.rms_norm(
         grouped[:, :, 0, :], (HEAD_DIM,), case["q_norm_weight"], eps=qk_eps
     ).to(torch.bfloat16)
@@ -630,3 +636,30 @@ def test_blackwell_cuda_graph_capture():
 @pytest.mark.parametrize("m,p,profile", FULL_CORRECTNESS_SHAPES)
 def test_blackwell_full_correctness(m, p, profile):
     _run_correctness_shape(m, p, profile)
+
+
+@requires_blackwell
+def test_blackwell_explicit_workspace_matches_and_is_overwritten():
+    case = _make_cuda_case(129, 8, "production_segments")
+    expected = _reference(case)
+    workspace = torch.full(
+        (129, HIDDEN), float("nan"), dtype=torch.bfloat16, device=_CUDA_DEVICE
+    )
+    actual = minimax_h3_bf16_pre_attention(**case, workspace=workspace)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+    assert torch.isfinite(workspace.float()).all()
+
+
+def test_workspace_contract_rejects_wrong_shape_and_dtype():
+    case = _make_meta_case(m=129, p=8)
+    with pytest.raises(ValueError, match="workspace shape"):
+        minimax_h3_bf16_pre_attention(
+            **case,
+            workspace=torch.empty((128, HIDDEN), dtype=torch.bfloat16, device="meta"),
+        )
+    with pytest.raises(ValueError, match="workspace dtype"):
+        minimax_h3_bf16_pre_attention(
+            **case,
+            workspace=torch.empty((129, HIDDEN), dtype=torch.float16, device="meta"),
+        )

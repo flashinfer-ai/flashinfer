@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
+
+if TYPE_CHECKING:
+    from .jit.cake_dcp import DcpSpecTarget
 
 from .utils import (
     _check_workspace_buffer_alignment,
@@ -142,6 +145,35 @@ def _split_workspace_views(
         partial_o_bytes : partial_o_bytes + partial_lse_bytes
     ].view(torch.float32)
     return partial_o, partial_lse, split_completion
+
+
+def _static_split_instance(num_split: int) -> str:
+    """Registry instance of the static split-KV programs: ``split1`` (one launch, FP8 only),
+    ``split2`` (straight-line two-way merge) or ``splitn`` (``NUM_SPLIT`` >= 3 on the compile line)."""
+
+    if num_split == 1:
+        return "split1"
+    return "split2" if num_split == 2 else "splitn"
+
+
+def _static_constants(
+    q_len: int,
+    cp_world: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    num_split: Optional[int] = None,
+) -> dict[str, int]:
+    """Compile-line constants of one static DCP program (``NUM_SPLIT`` only for the split-KV families)."""
+
+    constants = {
+        "Q_LEN": int(q_len),
+        "CP_WORLD": int(cp_world),
+        "NUM_Q_HEADS": int(num_q_heads),
+        "NUM_KV_HEADS": int(num_kv_heads),
+    }
+    if num_split is not None:
+        constants["NUM_SPLIT"] = int(num_split)
+    return constants
 
 
 def _select_num_split(
@@ -648,7 +680,7 @@ def _is_cuda_version_at_least(version: str) -> bool:
     return is_cuda_version_at_least(version)
 
 
-def _select_target(device: torch.device) -> str:
+def _select_target(device: torch.device) -> DcpSpecTarget:
     capability = get_compute_capability(device)
     if capability not in ((10, 0), (10, 3), (10, 7)):
         raise RuntimeError(
@@ -665,7 +697,7 @@ def _select_target(device: torch.device) -> str:
             "DCP speculative FMHA on compute capability 10.0 requires CUDA "
             "12.8 or newer"
         )
-    target = "sm103a" if capability == (10, 3) else "sm100f"
+    target: DcpSpecTarget = "sm103a" if capability == (10, 3) else "sm100f"
     if _is_cuda_version_at_least("12.9"):
         return target
     raise RuntimeError(
@@ -943,10 +975,7 @@ def run_dcp_spec_decode(
             # static specialization below serves the row exactly as before.
 
     if profile.startswith("fp8_p64"):
-        from .jit.cake_dcp import (
-            load_dcp_spec_fp8_d256_module,
-            load_dcp_spec_fp8_module,
-        )
+        from .jit.cake_dcp import load_dcp_spec_static_module
 
         local_blocks = max(1, (max_local_seq_len + _BLOCK_N - 1) // _BLOCK_N)
         num_split = _select_fp8_num_split(
@@ -958,28 +987,25 @@ def run_dcp_spec_decode(
         )
         head_dim = query.shape[-1]
         if head_dim == _D256_HEAD_DIM:
-            module = load_dcp_spec_fp8_d256_module(
+            module = load_dcp_spec_static_module(
+                "fp8_d256",
+                "split1" if num_split == 1 else "splitn",
                 target,
-                batch_size,
-                q_len_per_req,
-                num_qo_heads,
-                num_kv_heads,
-                cp_world,
-                num_split,
+                _static_constants(
+                    q_len_per_req, cp_world, num_qo_heads, num_kv_heads, num_split
+                ),
             )
         else:
             retain_kv_l2 = int(
                 cp_world > 1 and local_blocks <= _FP8_RETAIN_KV_L2_MAX_BLOCKS
             )
-            module = load_dcp_spec_fp8_module(
+            module = load_dcp_spec_static_module(
+                "fp8_d128",
+                f"{_static_split_instance(num_split)}_retain{retain_kv_l2}",
                 target,
-                batch_size,
-                q_len_per_req,
-                num_qo_heads,
-                num_kv_heads,
-                cp_world,
-                num_split,
-                retain_kv_l2,
+                _static_constants(
+                    q_len_per_req, cp_world, num_qo_heads, num_kv_heads, num_split
+                ),
             )
         if num_split == 1:
             partial_o = out
@@ -1033,19 +1059,15 @@ def run_dcp_spec_decode(
         sm_count=sm_count,
         local_blocks=local_blocks,
     )
-    from .jit.cake_dcp import load_dcp_spec_module
+    from .jit.cake_dcp import load_dcp_spec_static_module
 
     if num_split == 1:
         retain_kv_l2 = int(local_blocks <= _RETAIN_KV_L2_MAX_BLOCKS)
-        module = load_dcp_spec_module(
-            "v1",
+        module = load_dcp_spec_static_module(
+            "bf16_v1",
+            f"retain{retain_kv_l2}",
             target,
-            batch_size,
-            q_len_per_req,
-            num_qo_heads,
-            num_kv_heads,
-            cp_world,
-            retain_kv_l2,
+            _static_constants(q_len_per_req, cp_world, num_qo_heads, num_kv_heads),
         )
         grid = min(sm_count, logical_tiles)
         module.run(
@@ -1081,15 +1103,13 @@ def run_dcp_spec_decode(
         num_split=num_split,
     )
 
-    module = load_dcp_spec_module(
-        "v4",
+    module = load_dcp_spec_static_module(
+        "bf16_v4",
+        _static_split_instance(num_split),
         target,
-        batch_size,
-        q_len_per_req,
-        num_qo_heads,
-        num_kv_heads,
-        cp_world,
-        num_split,
+        _static_constants(
+            q_len_per_req, cp_world, num_qo_heads, num_kv_heads, num_split
+        ),
     )
     grid = min(sm_count, logical_tiles * num_split)
     module.run(

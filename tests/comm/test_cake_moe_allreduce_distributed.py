@@ -26,10 +26,11 @@ _DTYPE_NAME = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
 def _reduction_rows(
     arch: str | None, world_size: int, dtype: torch.dtype
 ) -> list[tuple[int, int]]:
-    """(token_num, num_experts) rows: the original rows plus every reviewed union shape.
+    """(token_num, num_experts) rows: the original rows plus both ends of every union token-range rule.
 
-    T=512 with 8 experts is reviewed nowhere, so it reaches the class program
-    (``generic`` or ``wide_mlp``) of every (world size, dtype, PDL) class.
+    T=512 with 8 experts lies outside every rule, so it reaches the class
+    program (``generic`` or ``wide_mlp``) of every (world size, dtype, PDL)
+    class; the range ends reach every specialization a rule names.
     """
     rows = {
         (1, ACTIVE_EXPERTS),
@@ -38,9 +39,11 @@ def _reduction_rows(
         (2048, ACTIVE_EXPERTS),
     }
     if arch is not None:
-        for key in union._REVIEWED_SPECIALIZATIONS:
+        for key, ranges in union._SPECIALIZATION_RULES.items():
             if key[:3] == (arch, world_size, _DTYPE_NAME[dtype]):
-                rows.add((key[4], key[5]))
+                for token_lo, token_hi, _specialization in ranges:
+                    rows.add((token_lo, key[4]))
+                    rows.add((token_hi, key[4]))
     return sorted(rows)
 
 

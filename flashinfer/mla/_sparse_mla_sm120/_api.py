@@ -977,7 +977,7 @@ class _SparseMLAPagedAttentionRunner:
         self._extra_kv_fp4 = extra_kv_fp4
         # backend="cake": the DSv4 NVFP4 route (kv_cache_format="nvfp4") or the DeepSeek-V4.1
         # mixed-cache route (kv_cache_format="fp8" + ue8m0_g32 + extra_kv_fp4), whose numerics
-        # route is fixed here: "default" and "bf16" select the BF16 route, "fp8" the FP8 route.
+        # route is fixed here: "default" and "bf16" select the BF16 route (the only one exported).
         self._cake_compute_precision: Optional[str] = None
         if backend == "cake" and kv_cache_format == "fp8":
             if self._kv_scale_format != "ue8m0_g32" or not extra_kv_fp4 or d_v != 512:

@@ -109,6 +109,19 @@ def _choose_chunk_len(
     )
 
 
+def _bounded_chunks(
+    chunk_len: int, *, max_seqlen: int, total_tokens: int, num_seqs: int
+) -> int:
+    """Safe upper bound of the chunk CTAs per head (the pinned source's rule)."""
+
+    remaining_tokens = max(0, total_tokens - max_seqlen)
+    remaining_seqs = max(0, num_seqs - 1)
+    longest = _ceil_div(max_seqlen, chunk_len)
+    compact_bound = min(remaining_seqs, remaining_tokens)
+    compact_bound += (remaining_tokens - compact_bound) // chunk_len
+    return longest + compact_bound
+
+
 def _choose_long_chunk_len(
     *,
     max_seqlen: int,
@@ -119,15 +132,13 @@ def _choose_long_chunk_len(
 ) -> int:
     """Resolve the shared long-path chunk search for an explicit CTA target."""
 
-    remaining_tokens = max(0, total_tokens - max_seqlen)
-    remaining_seqs = max(0, num_seqs - 1)
-
     def bounded_chunks(chunk_len: int) -> int:
-        # This is the same safe upper bound used by the pinned source.
-        longest = _ceil_div(max_seqlen, chunk_len)
-        compact_bound = min(remaining_seqs, remaining_tokens)
-        compact_bound += (remaining_tokens - compact_bound) // chunk_len
-        return longest + compact_bound
+        return _bounded_chunks(
+            chunk_len,
+            max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
+            num_seqs=num_seqs,
+        )
 
     lo = 1
     hi = max(1, _ceil_div(max_seqlen, chunk_len_granularity))
@@ -182,6 +193,33 @@ def _default_physical_chunk_len(
                 return _round_up(_ceil_div(total_tokens, 2), 2 * _BLOCK)
             target_chunks = max(1, 2 * num_sms // num_heads)
             granularity = 2 * _BLOCK
+    elif num_sms == 212:
+        # One CTA per SM and a chunk-major launch: when the rounded-up target
+        # leaves more chunk CTAs than SMs, the overflow CTAs are tail blocks
+        # that start only after the first tail CTAs finish, so the critical
+        # path becomes max(chunk, 2 * tail).  Use the one-wave floor target
+        # when that second wave is longer than a full chunk.
+        chunk_len = _choose_long_chunk_len(
+            max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
+            num_seqs=num_seqs,
+            target_chunks=target_chunks,
+            chunk_len_granularity=granularity,
+        )
+        longest = _ceil_div(max_seqlen, chunk_len)
+        tail = max_seqlen - (longest - 1) * chunk_len
+        overflow = (
+            num_heads
+            * _bounded_chunks(
+                chunk_len,
+                max_seqlen=max_seqlen,
+                total_tokens=total_tokens,
+                num_seqs=num_seqs,
+            )
+            > num_sms
+        )
+        if overflow and 2 * tail > chunk_len:
+            target_chunks = max(1, num_sms // num_heads)
     return _choose_long_chunk_len(
         max_seqlen=max_seqlen,
         total_tokens=total_tokens,
@@ -287,8 +325,10 @@ def _arch_for(device: torch.device) -> GDNCPArch:
         return "sm_100a"
     if capability == (10, 3):
         return "sm_103a"
+    if capability == (10, 7):
+        return "sm_107a"
     raise ValueError(
-        "GDN CP-prefill requires exact compute capability 10.0 or 10.3, "
+        "GDN CP-prefill requires exact compute capability 10.0, 10.3 or 10.7, "
         f"got {capability[0]}.{capability[1]}"
     )
 
@@ -528,9 +568,11 @@ def _build_plan(
         max_cp_chunks_per_seq=_ceil_div(max_seqlen, cp_chunk_len),
         t_kernel=t_kernel,
         mn_kernel=f"mn_precompute{dtype_suffix}",
+        # sm_107a runs the fp32 SIMT fixup only (no TF32 UTCMMA recurrence);
+        # sm_100a/sm_103a keep the parallelism-based choice unchanged.
         fixup_kernel=(
             "state_fixup_simt_row4"
-            if total_tokens <= (num_seqs - 1) * max_seqlen
+            if arch == "sm_107a" or total_tokens <= (num_seqs - 1) * max_seqlen
             else _choose_fixup_kind(num_seqs * num_sab_heads, num_sms)
         ),
         prefill_kernel=prefill_kernel,

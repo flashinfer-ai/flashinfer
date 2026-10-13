@@ -13,8 +13,9 @@ from typing import ClassVar, Optional, Union, cast
 import torch
 from packaging.version import InvalidVersion, Version
 
+from ....autotuner import TunableRunner
 from ....utils import get_compute_capability
-from .._contracts import _are_adjacent_last_dim_views
+from .._contracts import _are_adjacent_last_dim_views, _resolve_structural_mla_input
 from .._planning import _MLAPlanArguments, _audit_plan_from_wrapper_arguments
 from ._capabilities import (
     MLAPlanCapabilities,
@@ -23,7 +24,9 @@ from ._capabilities import (
 )
 
 
-_CUTILE_SUPPORTED_COMPUTE_CAPABILITIES = frozenset({(10, 0), (10, 3), (12, 0), (12, 1)})
+_CUTILE_SUPPORTED_COMPUTE_CAPABILITIES = frozenset(
+    {(10, 0), (10, 3), (10, 7), (12, 0), (12, 1)}
+)
 
 
 def _tensor_byte_span(tensor: torch.Tensor) -> tuple[int, int]:
@@ -78,9 +81,9 @@ def _get_compute_capability(device: torch.device):
     return get_compute_capability(device)
 
 
-@functools.lru_cache(maxsize=1)
-def get_cutile_mla_decode():
-    """Resolve executable preparation only after the cuTile plan is validated."""
+@functools.lru_cache(maxsize=32)
+def get_cutile_mla_decode(device: torch.device):
+    """Resolve preparation with compiler availability cached for the planned device."""
 
     try:
         installed_version = Version(importlib.metadata.version("cuda-tile"))
@@ -97,9 +100,11 @@ def get_cutile_mla_decode():
     from ._cutile_prepared import prepare_cutile_mla_decode
 
     try:
-        available = is_cuda_tile_available()
+        available = is_cuda_tile_available(device)
     except ModuleNotFoundError as exc:
-        if not exc.name.startswith("cuda.tile"):
+        if exc.name not in ("cuda", "cuda.tile") and not (exc.name or "").startswith(
+            "cuda.tile."
+        ):
             raise
         available = False
     if not available:
@@ -213,7 +218,7 @@ def _validate_runtime_metadata(
         raise ValueError(f"{name} must be contiguous.")
 
 
-class _BatchMLAPagedAttentionCutileBackend:
+class _BatchMLAPagedAttentionCutileBackend(TunableRunner):
     _plan_capabilities: ClassVar[MLAPlanCapabilities] = MLAPlanCapabilities(
         backend_name="cutile",
         lse_modes=frozenset({"none"}),
@@ -332,7 +337,7 @@ class _BatchMLAPagedAttentionCutileBackend:
         if (major, minor) not in _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES:
             raise _BackendPlanUnsupportedError(
                 "cutile backend supports only the validated Blackwell targets "
-                f"SM100, SM103, SM120, and SM121, got SM{major}{minor}."
+                f"SM100, SM103, SM107, SM120, and SM121, got SM{major}{minor}."
             )
 
         batch_size = cum_seq_lens_q.numel() - 1
@@ -368,16 +373,25 @@ class _BatchMLAPagedAttentionCutileBackend:
         # identity, which lets callers mutate values in place before graph replay.
         planned_kv_len = kv_len.to(device=self.device, non_blocking=True)
         planned_page_table = page_table.to(device=self.device, non_blocking=True)
-        decode_mla_kv_paged_cutile = get_cutile_mla_decode()(
-            device=self.device,
-            batch=batch_size,
-            heads=num_heads,
-            page=page_size,
-            table_width=page_table.shape[1],
-            dtype=q_data_type,
-            sm_scale=resolved_sm_scale,
-            dim=head_dim_ckv,
-        )
+        try:
+            decode_mla_kv_paged_cutile = get_cutile_mla_decode(self.device)(
+                device=self.device,
+                batch=batch_size,
+                heads=num_heads,
+                page=page_size,
+                table_width=page_table.shape[1],
+                dtype=q_data_type,
+                sm_scale=resolved_sm_scale,
+                dim=head_dim_ckv,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name not in ("cuda", "cuda.tile") and not (
+                exc.name or ""
+            ).startswith("cuda.tile."):
+                raise
+            raise _BackendPlanUnsupportedError(
+                "cutile requires the cuda-tile Python package and compilation API."
+            ) from exc
 
         # -----------------------------------------------------------------------
         # Publish only fully validated plan state
@@ -558,6 +572,91 @@ class _BatchMLAPagedAttentionCutileBackend:
             outputs=out,
         )
         return cast(torch.Tensor, out)
+
+    # Autotuning support for the current wrapper plan.
+
+    def __hash__(self):
+        return hash(type(self))
+
+    def configure_tuning(self, *, cache_key: tuple, run_options: dict) -> None:
+        """Bind immutable options; request tensors stay in forward's inputs."""
+        if any(isinstance(value, torch.Tensor) for value in run_options.values()):
+            raise TypeError("Planned tuning options must not contain tensors.")
+        self._planned_tuning_key = cache_key
+        self._planned_run_options = dict(run_options)
+
+    def get_valid_tactics(self, inputs, profile):
+        # Other split-input candidates accept strided independent tensors. Such
+        # layouts are valid MLA inputs, but cannot use cuTile's prepared ABI.
+        widths = (self._head_dim_ckv, self._head_dim_kpe)
+        compact = True
+        for value, name, dtype, dtype_name, leaf_names in (
+            (inputs[0], "query", self._q_data_type, "q_data_type", ("q_nope", "q_pe")),
+            (
+                inputs[1],
+                "KV cache",
+                self._kv_data_type,
+                "kv_data_type",
+                ("ckv_cache", "kpe_cache"),
+            ),
+        ):
+            left, right = _resolve_structural_mla_input(
+                value,
+                desired="split",
+                widths=widths,
+                name=name,
+                expected_dtype=dtype,
+                planned_dtype_name=dtype_name,
+                split_leaf_names=leaf_names,
+            )
+            if not (
+                (left.is_contiguous() and right.is_contiguous())
+                or _are_adjacent_last_dim_views(left, right)
+            ):
+                compact = False
+        out = inputs[2]
+        if out is not None:
+            _validate_launch_tensor(
+                out,
+                name="out",
+                device=self.device,
+                dtype=self._output_dtype,
+                shape=(self._batch_size, self._num_heads, self._head_dim_ckv),
+            )
+            compact = compact and out.is_contiguous()
+        return [-1] if compact else []
+
+    def get_cache_key_extras(self, inputs):
+        return ("planned", self._planned_tuning_key)
+
+    def forward(
+        self,
+        inputs,
+        tactic: int = -1,
+        do_preparation: bool = False,
+        run_options=None,
+        **kwargs,
+    ):
+        if tactic != -1:
+            raise ValueError(f"Unsupported cuTile MLA tactic: {tactic!r}.")
+        query, kv_cache, out, lse, sinks = inputs[:5]
+        widths = (self._head_dim_ckv, self._head_dim_kpe)
+        return self.run_from_wrapper(
+            query=_resolve_structural_mla_input(
+                query, desired="split", widths=widths, name="query"
+            ),
+            kv_cache=_resolve_structural_mla_input(
+                kv_cache, desired="split", widths=widths, name="KV cache"
+            ),
+            out=out,
+            lse=lse,
+            sinks=sinks,
+            profiler_buffer=None,
+            kv_len=None,
+            page_table=None,
+            ckv_scale_arr=None,
+            **(self._planned_run_options if run_options is None else run_options),
+        )
 
 
 __all__ = [

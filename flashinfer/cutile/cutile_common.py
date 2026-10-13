@@ -87,7 +87,7 @@ def _tileiras_supports_arch(tileiras_path: str, sm_arch: str) -> bool:
         return True  # assume supported if we can't check
 
 
-def is_cuda_tile_available() -> bool:
+def is_cuda_tile_available(device=None) -> bool:
     """Return True iff cuTile kernels can actually JIT-compile in this env.
 
     A working cuTile setup requires *both*:
@@ -102,8 +102,8 @@ def is_cuda_tile_available() -> bool:
        b. As ``tileiras`` on ``PATH``.
        c. As ``${CUDA_HOME:-/usr/local/cuda}/bin/tileiras`` (system CTK 13.1+).
 
-    Also verifies that the installed tileiras binary supports the current GPU's
-    SM architecture (e.g. ``sm_90`` for Hopper).  Some cuda-tile wheel builds
+    Also verifies that the installed tileiras binary supports the requested GPU's
+    SM architecture (the current GPU when ``device`` is omitted). Some cuda-tile wheel builds
     (e.g. the cu13 toolchain shipped with ``9.9.99.dev*``) do not include SM90
     support even though the Python API lists it as a valid target; calling
     ``compile_cubin`` with ``--gpu-name sm_90`` would crash mid-autotune with a
@@ -128,13 +128,13 @@ def is_cuda_tile_available() -> bool:
     if tileiras_path is None:
         return False
 
-    # Check that the installed tileiras supports the current GPU's SM arch.
+    # Check that the installed tileiras supports the requested GPU's SM arch.
     # Some toolchain builds omit certain architectures (e.g. cu13 drops sm_90).
     try:
         import torch
 
         if torch.cuda.is_available():
-            major, minor = torch.cuda.get_device_capability()
+            major, minor = torch.cuda.get_device_capability(device)
             sm_arch = f"sm_{major}{minor}"
             if not _tileiras_supports_arch(tileiras_path, sm_arch):
                 return False

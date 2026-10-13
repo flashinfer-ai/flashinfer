@@ -75,6 +75,7 @@ _CAKE_SPARSE_MLA_SM120_DSV41_MIXED_LAZY_EXPORTS = frozenset(
         "cake_sparse_mla_sm120_dsv41_mixed_num_chunks",
         "cake_sparse_mla_sm120_dsv41_mixed_plan_head_tiles",
         "cake_sparse_mla_sm120_dsv41_mixed_plan_splits",
+        "cake_sparse_mla_sm120_dsv41_mixed_plan_variant",
         "cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes",
         "cake_sparse_mla_sm120_dsv41_mixed_supported_heads",
     }
@@ -83,6 +84,7 @@ _CAKE_SPARSE_MLA_SM120_DSV41_MIXED_LAZY_EXPORTS = frozenset(
 _CAKE_DSV4_LAZY_EXPORTS = frozenset(
     {
         "cake_dsv4_workspace_layout",
+        "cake_dsv4_workspace_requirement",
         "cake_dsv4_workspace_reset",
         "get_cake_dsv4_workspace_bytes",
         "resolve_cake_dsv4_sparse_metadata",

@@ -450,7 +450,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     They are sized as follows:
     [buffer_size, flag_size, lamport_buffer_size * 3]
     where:
-    - buffer_size: tp_size * max_token_num * hidden_dim * sizeof(half)
+    - buffer_size: tp_size * max_token_num * hidden_dim * sizeof(elem)
     - flag_size: tp_size * BarrierFlagCount * sizeof(int)
     - lamport_buffer_size: tp_size * max_token_num * tp_size * hidden_dim * sizeof(half)
       where sizeof(elem) = 2 (fp16/bf16) or 4 (fp32 when use_fp32_lamport=True)
@@ -468,7 +468,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     if use_symm_dev_mem and not create_metadata:
         raise ValueError("use_symm_dev_mem is only supported when create_metadata=True")
 
-    buffer_size = tp_size * max_token_num * hidden_dim * 2
+    # The two-shot kernel writes 2 * token_num * hidden_dim elements of the input
+    # dtype into each rank's buffer, so size it by the element size (fp32 is 4 bytes).
+    buffer_size = tp_size * max_token_num * hidden_dim * (4 if use_fp32_lamport else 2)
     flag_size = tp_size * BarrierFlagCount * 4
     # lamport_comm_size = tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2
     # enable larger workspace for cases > OneShotMaxToken
