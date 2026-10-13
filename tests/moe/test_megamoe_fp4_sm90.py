@@ -1,4 +1,4 @@
-"""Eight-rank SM90 checks with an independent dense W4A8 reference.
+"""Four/eight-rank SM90 checks with an independent dense W4A8 reference.
 
 Run with plain Python (workers are spawned here):
     python tests/moe/test_megamoe_fp4_sm90.py --tokens 1 32 96 384
@@ -81,18 +81,20 @@ def _worker(rank, args):
         transform_mxfp4_weights_for_mega_moe,
     )
 
+    ep = getattr(args, "ep", 8)
     torch.cuda.set_device(rank)
     torch.backends.cuda.matmul.allow_tf32 = False
     dist.init_process_group(
         "nccl",
         rank=rank,
-        world_size=8,
+        world_size=ep,
         timeout=datetime.timedelta(minutes=10),
         device_id=torch.device("cuda", rank),
     )
     group = dist.group.WORLD
-    h, ih, experts, topk = args.hidden, args.intermediate, 256, 6
-    epr = experts // 8
+    h, ih = args.hidden, args.intermediate
+    experts, topk = getattr(args, "experts", 256), getattr(args, "topk", 6)
+    epr = experts // ep
     generator = torch.Generator(device="cuda").manual_seed(7919 + rank)
     buffer = MegaMoESymmBuffer(
         group, experts, args.capacity, topk, h, ih, fast_math=args.fast_math
@@ -140,11 +142,17 @@ def _worker(rank, args):
             run = nvfp4_mega_moe if fmt == "nvfp4" else mxfp4_mega_moe
             if fmt == "nvfp4":
                 kwargs["kernel_family"] = family
+                kwargs["force_push_dispatch"] = getattr(
+                    args, "force_push_dispatch", None
+                )
+                kwargs["force_no_clean_barrier"] = getattr(
+                    args, "force_no_clean_barrier", None
+                )
             if getattr(args, "check_no_swap", False):
                 from flashinfer.megamoe import select_mxfp4_fused_plan
 
                 plan = select_mxfp4_fused_plan(
-                    buffer.num_sms, 8, experts, topk, h, ih, args.capacity, m
+                    buffer.num_sms, ep, experts, topk, h, ih, args.capacity, m
                 )
                 assert not plan.swap_ab, "regression must exercise the SS L2 path"
             direct_repeats = getattr(args, "repeats", 2)
@@ -210,14 +218,16 @@ def _run(args):
         raise ValueError("repeats must be positive")
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29648")
-    torch.multiprocessing.spawn(_worker, args=(args,), nprocs=8)
+    torch.multiprocessing.spawn(_worker, args=(args,), nprocs=getattr(args, "ep", 8))
 
 
-def test_megamoe_fp4_sm90():
-    if torch.cuda.device_count() < 8 or torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("requires 8 Hopper GPUs")
+@pytest.mark.parametrize("ep", [4, 8])
+def test_megamoe_fp4_sm90(ep):
+    if torch.cuda.device_count() < ep or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip(f"requires {ep} Hopper GPUs")
     _run(
         argparse.Namespace(
+            ep=ep,
             hidden=512,
             intermediate=256,
             capacity=384,
@@ -249,8 +259,55 @@ def test_mxfp4_no_swap_decoded_b_reuse():
     )
 
 
+@pytest.mark.parametrize(
+    "hidden,intermediate,experts,topk",
+    [(4096, 2048, 256, 6), (6144, 2048, 384, 8), (7168, 3072, 384, 6)],
+)
+def test_nvfp4_ep4_production_shape(hidden, intermediate, experts, topk):
+    if torch.cuda.device_count() < 4 or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("requires 4 Hopper GPUs")
+    _run(
+        argparse.Namespace(
+            ep=4,
+            hidden=hidden,
+            intermediate=intermediate,
+            experts=experts,
+            topk=topk,
+            capacity=384,
+            tokens=[1, 96, 384],
+            formats=["nvfp4"],
+            fast_math=True,
+            routing="random",
+            cuda_graph=True,
+        )
+    )
+
+
+@pytest.mark.parametrize("no_clean", [False, True])
+def test_nvfp4_ep4_counter_dispatch(no_clean):
+    if torch.cuda.device_count() < 4 or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("requires 4 Hopper GPUs")
+    _run(
+        argparse.Namespace(
+            ep=4,
+            hidden=1024,
+            intermediate=256,
+            capacity=384,
+            tokens=[1, 24],
+            formats=["nvfp4"],
+            fast_math=True,
+            routing="random",
+            cuda_graph=True,
+            repeats=3,
+            force_push_dispatch=True,
+            force_no_clean_barrier=no_clean,
+        )
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--ep", type=int, choices=[4, 8], default=8)
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 24, 32, 96, 384])
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--intermediate", type=int, default=256)

@@ -13,6 +13,7 @@
 
 namespace flashinfer::megamoe::config {
 
+constexpr uint32_t kNumRanks = {{ num_ranks }};
 constexpr uint32_t kNumMaxTokensPerRank   = {{ num_max_tokens_per_rank }};
 constexpr uint32_t kNumExperts            = {{ num_experts }};
 constexpr uint32_t kNumTopk               = {{ num_topk }};
@@ -43,6 +44,6 @@ constexpr auto kKernel = &sm90_nvfp4_mega_moe_fused_impl<
     kSwapAB, kRSSwapAB, kSingleActiveDispatchWarp, kUseMode2RowDecoder,
     kUseInterleavedScheduler, kPushDispatch, kNoCleanBarrier,
     /* kStridedPoolDebug */ false, /* kPushProxyFence */ false,
-    /* kPushGenericRows */ false, /* kPhaseStamps */ false>;
+    /* kPushGenericRows */ false, /* kPhaseStamps */ false{% if num_ranks != 8 %}, kNumRanks{% endif %}>;
 
 }  // namespace flashinfer::megamoe::config

@@ -367,10 +367,10 @@ template <uint32_t kNumMaxTokensPerRank, uint32_t kNumExperts, uint32_t kNumTopk
           // Push rows with 16 B generic stores instead of TMA bulk copies (diagnostic).
           bool kPushGenericRows = false,
           // Phase stamps (globaltimer) compiled in; host env FI_MEGAMOE_NVFP4_PHASE_STAMPS_PTR.
-          bool kPhaseStamps = false>
+          bool kPhaseStamps = false, uint32_t kNumRanks = 8>
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void sm90_nvfp4_mega_moe_fused_impl(
     void* y, int* cumulative_local_expert_recv_stats, unsigned long long* phase_stamps,
-    const uint32_t num_tokens, const __grid_constant__ layout::SymBuffer<8> sym_buffer,
+    const uint32_t num_tokens, const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
@@ -384,7 +384,7 @@ CUTLASS_GLOBAL __launch_bounds__(384, 1) void sm90_nvfp4_mega_moe_fused_impl(
   constexpr uint32_t kNumNonEpilogueThreads = 64;
   constexpr uint32_t kNumEpilogueThreads = 256;
   constexpr uint32_t kNumSMs = MEGAMOE_NUM_SMS;
-  constexpr uint32_t kNumRanks = 8;
+  static_assert(kNumRanks > 0 && kNumRanks <= 32, "Invalid EP width");
   static_assert(kNumExperts % kNumRanks == 0, "Experts must divide evenly across ranks");
   constexpr uint32_t L1_SHAPE_N = kIntermediateHidden * 2;
   constexpr uint32_t L1_SHAPE_K = kHidden;

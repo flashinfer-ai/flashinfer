@@ -68,9 +68,10 @@ def get_megamoe_sm90_nvfp4_uri(
     intermediate_hidden: int,
     activation_clamp: float,
     fast_math: bool,
+    num_ranks: int = 8,
 ) -> str:
     return (
-        f"megamoe_sm90_nvfp4_sm{num_sms}_e{num_experts}_k{num_topk}"
+        f"megamoe_sm90_nvfp4_r{num_ranks}_sm{num_sms}_e{num_experts}_k{num_topk}"
         f"_h{hidden}_i{intermediate_hidden}_cap{num_max_tokens_per_rank}"
         f"_bm{plan.block_m}_bn{plan.block_n}_epw{plan.num_experts_per_wave}"
         f"_st{plan.num_stages}"
@@ -96,6 +97,7 @@ def gen_megamoe_sm90_nvfp4_module(
     intermediate_hidden: int,
     activation_clamp: float,
     fast_math: bool,
+    num_ranks: int = 8,
 ) -> JitSpec:
     uri = get_megamoe_sm90_nvfp4_uri(
         plan,
@@ -107,6 +109,7 @@ def gen_megamoe_sm90_nvfp4_module(
         intermediate_hidden,
         activation_clamp,
         fast_math,
+        num_ranks=num_ranks,
     )
     # Fused compiler fast-math follows the source policy.
     return _gen_fp4_module(
@@ -115,6 +118,7 @@ def gen_megamoe_sm90_nvfp4_module(
         ("megamoe_sm90_nvfp4_fused.cu",),
         dict(
             num_sms=num_sms,
+            num_ranks=num_ranks,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
             num_experts=num_experts,
             num_topk=num_topk,
@@ -321,7 +325,8 @@ def gen_megamoe_sm90_mxfp4_module(
         intermediate_hidden,
         activation_clamp,
         fast_math,
-    ).replace("nvfp4", f"mxfp4_r{num_ranks}")
+        num_ranks=num_ranks,
+    ).replace("nvfp4", "mxfp4")
     return _gen_fp4_module(
         uri,
         "megamoe_sm90_mxfp4_config",

@@ -6,8 +6,8 @@ perform token dispatch, two expert GEMMs, clamped SwiGLU and top-k reduction.
 
 | Weights | Family | Launches | EP ranks |
 | --- | --- | ---: | --- |
-| NVFP4 | fused | 1 | 8 |
-| NVFP4 | split | 2: L1, then L2 | 8 |
+| NVFP4 | fused | 1 | 4 or 8 |
+| NVFP4 | split | 2: L1, then L2 | 4 or 8 |
 | MXFP4 | fused | 1 | Powers of two from 1 to 32 |
 
 ## Usage
@@ -26,7 +26,10 @@ megamoe.nvfp4_mega_moe(y, nv_w1, nv_w2, buf, kernel_family="auto")
 megamoe.mxfp4_mega_moe(y, mx_w1, mx_w2, buf)
 ```
 
-NVFP4 auto selection uses fused through 256 tokens per rank, then split.
+NVFP4 supports 256 or 384 total experts. The process group selects EP4 or EP8;
+no separate execution API is needed. EP4 uses the generic fused schedule;
+EP8 retains its measured tuning policies. Auto selection uses fused through
+256 tokens per rank, then split.
 Input scales are FP32 per 128 channels; routing uses INT64 expert indices
 (`-1` masks a route) and FP32 weights. Hidden width is a multiple of 256 and
 intermediate width a multiple of 128. Raw weight scales use UINT8 E4M3 per
@@ -136,13 +139,45 @@ both launches. Packing, compilation and cache clearing are outside timing.
 </details>
 
 
+<details>
+<summary>NVFP4 EP4: 9 workloads (capacity 384)</summary>
+
+| Model | Family | M / rank | H20 (us) | H200 (us) |
+| --- | --- | ---: | ---: | ---: |
+| Flash | fused | 1 | 95.344 | 80.928 |
+| Flash | fused | 96 | 842.656 | 399.984 |
+| Flash | split | 384 | 1,051.264 | 512.256 |
+| MiMo | fused | 1 | 163.888 | 131.968 |
+| MiMo | fused | 96 | 1,758.592 | 831.920 |
+| MiMo | split | 384 | 2,232.464 | 1,068.272 |
+| Pro | fused | 1 | 202.512 | 175.536 |
+| Pro | fused | 96 | 3,007.920 | 1,401.072 |
+| Pro | split | 384 | 3,766.832 | 1,752.096 |
+
+</details>
+
+H200 EP8 regression against the original NVFP4 kernels covers 12 points
+(Flash/MiMo/Pro, M=1/32/96/384, capacity 384): latency changes range from
+-1.07% to +0.64%. Flash M96 is 227.808 us before and
+227.440 us after. EP4 results use the generic schedule without EP4-specific tuning.
+
 ## Validation
 
 ```bash
-pytest tests/moe/test_megamoe_fp4_weights.py tests/moe/test_megamoe_fp4_sm90.py
+pytest tests/moe/test_megamoe_fp4_ep.py tests/moe/test_megamoe_fp4_weights.py tests/moe/test_megamoe_fp4_sm90.py
 ```
 
-CPU weight-layout tests and eight-rank H20/H200 numerical, receive-count,
-workspace-reuse and CUDA graph checks pass. The bundled
-`benchmarks/bench_megamoe_fp4_sm90.py` defaults to warm-cache repeated calls,
-which use a different cache protocol from the table above.
+CPU plan/cache and weight-layout checks pass. EP4 numerical, receive-count,
+workspace-reuse and CUDA graph checks pass on H20 and H200, including Flash,
+MiMo and Pro shapes and both push-dispatch barrier modes. H200 EP8 regression
+outputs match the original NVFP4 fused/split kernels bitwise.
+
+Reproduce EP4 latency with the table's cache and timing protocol:
+
+```bash
+python benchmarks/bench_megamoe_fp4_sm90.py --ep 4 --formats nvfp4 \
+  --shapes flash mimo pro --tokens 1 96 384 --cold-l2 --repeats 1 --rounds 50
+```
+
+The benchmark defaults to warm-cache repeated calls; pass `--cold-l2` and
+`--repeats 1` for one cold-L2 invocation per sample.

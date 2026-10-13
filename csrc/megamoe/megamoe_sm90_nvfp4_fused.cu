@@ -3,7 +3,7 @@
  *
  * One persistent kernel fuses the cross-rank token dispatch, both FFN GEMMs
  * (NVFP4 weights x FP8 activations), SwiGLU and the combine reduction over an
- * 8-rank NVLink symmetric buffer. Everything that shapes shared memory or the
+ * rank-parameterized NVLink symmetric buffer. Everything that shapes shared memory or the
  * task schedule is a template parameter, so this file is compiled once per
  * (shape, plan) pair against the generated config header.
  */
@@ -38,7 +38,7 @@ void sm90_nvfp4_mega_moe_fused_launch(void* y, int* cumulative_local_expert_recv
   constexpr int kSwizzleActs = 128;
   constexpr int kBStoragePerKBlock = 80;
   constexpr int kL1ScaleGranK = 128;
-  constexpr int kNumExpertsPerRank = cfg::kNumExperts / 8;
+  constexpr int kNumExpertsPerRank = cfg::kNumExperts / cfg::kNumRanks;
 
   const DLDataType fp8{kDLFloat8_e4m3fn, 8, 1};
   const DLDataType f32{kDLFloat, 32, 1};
@@ -67,7 +67,8 @@ void sm90_nvfp4_mega_moe_fused_launch(void* y, int* cumulative_local_expert_recv
                                               kNumExpertsPerRank * cfg::kHidden, kBStoragePerKBlock,
                                               cfg::kBlockN, static_cast<int>(l2_weights_stride), 0);
 
-  const layout::SymBuffer<8> sym_buffer(sym_buffer_ptrs, static_cast<uint32_t>(rank_idx));
+  const layout::SymBuffer<cfg::kNumRanks> sym_buffer(sym_buffer_ptrs,
+                                                     static_cast<uint32_t>(rank_idx));
 
   auto* kernel = reinterpret_cast<void*>(cfg::kKernel);
   TVM_FFI_ICHECK_EQ(
@@ -81,7 +82,7 @@ void sm90_nvfp4_mega_moe_fused_launch(void* y, int* cumulative_local_expert_recv
                   &cumulative_local_expert_recv_stats,
                   &phase_stamps,
                   const_cast<uint32_t*>(&tokens),
-                  const_cast<layout::SymBuffer<8>*>(&sym_buffer),
+                  const_cast<layout::SymBuffer<cfg::kNumRanks>*>(&sym_buffer),
                   const_cast<CUtensorMap*>(&tm_l1_acts),
                   const_cast<CUtensorMap*>(&tm_l1_acts_sf),
                   const_cast<CUtensorMap*>(&tm_l1_weights),
@@ -126,9 +127,9 @@ using detail::offset_ptr;
  *  [10] num_padded_sf_pool_tokens
  */
 Array<int64_t> megamoe_sm90_nvfp4_symm_buffer_layout() {
-  return detail::symm_buffer_layout(8, cfg::kNumExperts, cfg::kNumMaxTokensPerRank, cfg::kNumTopk,
-                                    cfg::kHidden, cfg::kIntermediateHidden, cfg::kNumMaxPoolTokens,
-                                    cfg::kNumPaddedSFPoolTokens);
+  return detail::symm_buffer_layout(cfg::kNumRanks, cfg::kNumExperts, cfg::kNumMaxTokensPerRank,
+                                    cfg::kNumTopk, cfg::kHidden, cfg::kIntermediateHidden,
+                                    cfg::kNumMaxPoolTokens, cfg::kNumPaddedSFPoolTokens);
 }
 
 /*! \brief Plan constants this module was compiled for (for assertions in Python). */
@@ -146,7 +147,9 @@ void megamoe_sm90_nvfp4_fused(TensorView y, TensorView symm_buffer, Array<int64_
                               Optional<TensorView> cumulative_local_expert_recv_stats,
                               Optional<TensorView> l1_global_scales,
                               Optional<TensorView> l2_global_scales) {
-  TVM_FFI_ICHECK_EQ(symm_buffer_ptrs.size(), 8) << "MegaMoE is an 8-rank kernel";
+  TVM_FFI_ICHECK_EQ(symm_buffer_ptrs.size(), cfg::kNumRanks);
+  TVM_FFI_ICHECK_GE(rank_idx, 0);
+  TVM_FFI_ICHECK_LT(rank_idx, cfg::kNumRanks);
   TVM_FFI_ICHECK_GE(num_tokens, 1);
   TVM_FFI_ICHECK_LE(num_tokens, cfg::kNumMaxTokensPerRank);
 

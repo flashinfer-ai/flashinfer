@@ -18,7 +18,6 @@ INTERLEAVED_SCHEDULER_SMEM_BYTES = 96
 
 H20_NUM_SMS = 78
 H200_NUM_SMS = 132
-NUM_RANKS = 8
 
 # Token-pool block-size candidates (the pool is padded so that any of these
 # BLOCK_M values can address it).
@@ -253,21 +252,20 @@ def select_fused_plan(
 ) -> FusedPlan:
     if num_sms not in (H20_NUM_SMS, H200_NUM_SMS):
         raise ValueError(f"MegaMoE supports SM90 H20/H200 only, got num_sms={num_sms}")
-    if num_ranks != NUM_RANKS:
-        raise ValueError(
-            f"MegaMoE is an {NUM_RANKS}-rank kernel, got num_ranks={num_ranks}"
-        )
+    if num_ranks not in (4, 8):
+        raise ValueError("NVFP4 MegaMoE requires 4 or 8 ranks")
     num_experts_per_rank = num_experts // num_ranks
     if num_experts_per_rank * num_ranks != num_experts:
         raise ValueError("num_experts must be divisible by num_ranks")
-    if num_experts_per_rank not in (32, 48):
+    supported_experts_per_rank = (32, 48) if num_ranks == 8 else (64, 96)
+    if num_experts_per_rank not in supported_experts_per_rank:
         raise ValueError(f"unsupported experts per rank: {num_experts_per_rank}")
     if not 0 < num_tokens <= num_max_tokens_per_rank:
         raise ValueError("num_tokens must be in (0, num_max_tokens_per_rank]")
 
     # (block_m, block_n, experts per wave, stages, swap_ab, mode2, single warp)
     tuning: Optional[Tuple[int, int, int, int, bool, bool, bool]] = None
-    if num_sms == H20_NUM_SMS:
+    if num_ranks == 8 and num_sms == H20_NUM_SMS:
         for h, lo, hi, bm, epw, stages, swap, mode2, single in _H20_FUSED_BUCKETS:
             if h == hidden and lo <= num_tokens <= hi:
                 tuning = (bm, 256, epw, stages, swap, mode2, single)
@@ -306,12 +304,19 @@ def select_fused_plan(
     if is_pro and block_m == 8 and stages == 4:
         stages = 3
 
-    arm = _select_arm(num_sms, hidden, num_experts, num_topk, num_tokens)
+    # Deployment arm and counter ranges were measured at EP8.
+    arm = (
+        _select_arm(num_sms, hidden, num_experts, num_topk, num_tokens)
+        if num_ranks == 8
+        else "devm-dynamic"
+    )
     use_interleaved = arm != "static-ss"
     rs_swap_ab = arm == "dynamic-rs" and swap_ab
 
-    push, no_clean = _select_counter_policy(
-        num_sms, hidden, num_experts, num_topk, num_tokens
+    push, no_clean = (
+        _select_counter_policy(num_sms, hidden, num_experts, num_topk, num_tokens)
+        if num_ranks == 8
+        else (False, False)
     )
     if force_push_dispatch is not None:
         push = force_push_dispatch

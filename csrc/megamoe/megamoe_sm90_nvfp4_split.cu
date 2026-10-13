@@ -79,12 +79,13 @@ void sm90_nvfp4_mega_moe_split_launch(void* y, int* stats, int num_tokens,
                                               kEPR * cfg::kHidden, cfg::kWeightStoragePerKBlock,
                                               cfg::kBlockN, static_cast<int>(l2_weights_stride), 0);
 
-  const layout::SymBuffer<8> sym_buffer(sym_buffer_ptrs, static_cast<uint32_t>(rank_idx));
+  const layout::SymBuffer<cfg::kNumRanks> sym_buffer(sym_buffer_ptrs,
+                                                     static_cast<uint32_t>(rank_idx));
   const uint32_t tokens = static_cast<uint32_t>(num_tokens);
 
   void* l1_args[] = {&stats,
                      const_cast<uint32_t*>(&tokens),
-                     const_cast<layout::SymBuffer<8>*>(&sym_buffer),
+                     const_cast<layout::SymBuffer<cfg::kNumRanks>*>(&sym_buffer),
                      const_cast<CUtensorMap*>(&tm_l1_acts),
                      const_cast<CUtensorMap*>(&tm_l1_acts_sf),
                      const_cast<CUtensorMap*>(&tm_l1_weights),
@@ -96,7 +97,7 @@ void sm90_nvfp4_mega_moe_split_launch(void* y, int* stats, int num_tokens,
   void* l2_args[] = {&y,
                      &stats,
                      const_cast<uint32_t*>(&tokens),
-                     const_cast<layout::SymBuffer<8>*>(&sym_buffer),
+                     const_cast<layout::SymBuffer<cfg::kNumRanks>*>(&sym_buffer),
                      const_cast<CUtensorMap*>(&tm_l2_acts),
                      const_cast<CUtensorMap*>(&tm_l2_acts_sf),
                      const_cast<CUtensorMap*>(&tm_l2_weights),

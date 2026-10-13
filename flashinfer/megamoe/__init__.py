@@ -3,7 +3,7 @@
 The fused paths perform cross-rank token dispatch, two W4A8 GEMMs, clamped
 SwiGLU and top-k reduction in one persistent kernel. NVFP4 split uses separate
 L1 and L2 launches. All paths use FP8 activations and NVLink symmetric memory.
-NVFP4 requires eight ranks; MXFP4 supports power-of-two rank counts up to 32.
+NVFP4 supports four or eight ranks; MXFP4 supports power-of-two rank counts up to 32.
 
 Usage::
 
@@ -62,7 +62,7 @@ def _get_jit_module(factory, *args):
 
 def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
     args = (plan, b.num_sms)
-    # The NVFP4 fused ABI fixes the EP width at eight ranks.
+    # Keep the trailing fused rank argument compatible with existing JIT callers.
     if factory is not gen_megamoe_sm90_nvfp4_module:
         args += (b.group.size(),)
     args += (
@@ -74,6 +74,8 @@ def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
         b.activation_clamp,
         b.fast_math,
     )
+    if factory is gen_megamoe_sm90_nvfp4_module:
+        args += (b.group.size(),)
     module = _get_jit_module(factory, *args)
     getattr(module, entry)(
         y,
@@ -312,7 +314,7 @@ def nvfp4_mega_moe(
     Notes
     -----
     All tensors must be contiguous and on the buffer's CUDA device. NVFP4
-    requires eight ranks, which must call matching families in matching order.
+    supports four or eight ranks, which must call matching families in matching order.
     """
     b = symm_buffer
     m = int(num_tokens if num_tokens is not None else y.shape[0])
@@ -327,8 +329,8 @@ def nvfp4_mega_moe(
         l1_global_scales,
         l2_global_scales,
     )
-    if b.group.size() != 8:
-        raise ValueError("NVFP4 MegaMoE currently requires 8 ranks")
+    if b.group.size() not in (4, 8):
+        raise ValueError("NVFP4 MegaMoE requires 4 or 8 ranks")
 
     if kernel_family == "auto":
         kernel_family = "fused" if m <= family_threshold else "split"
