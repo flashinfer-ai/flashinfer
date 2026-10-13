@@ -770,7 +770,7 @@ _ARCH_REGISTRATIONS = {
             "nvfp4_decode_cluster": {
                 "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "49494e300c28e2607b8fbf53461f8feb7b54a6e5b7fa41eddacffa15a35f0d77",
+                "identity": "90fcb1d4fef96bd6530118ff3e4bff8557896974d8c9eef734b517858f74ed6b",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_cluster_kernel.cu",
@@ -780,7 +780,7 @@ _ARCH_REGISTRATIONS = {
             "nvfp4_decode_persistent": {
                 "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "976823fded0bf6ba6d147b8aa0f04e52a8c5e19650c8cc742f2512af729d42e6",
+                "identity": "56cff27e58b865c36ec815127729fed389174b2e82bc422054ae4372788afb71",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_persistent_kernel.cu",
@@ -794,7 +794,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_PV_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_PV_N16_OC1=1",
                 ],
-                "identity": "998454a7a8cc7c3574d3f78b6c199e0717046de533fbe91222d66878f35a9796",
+                "identity": "1ab6f68908e0ec65d3ecafc7a858be3ebd4edc29c783aa86310314afcb322ec8",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_pv_kernel.cu",
@@ -808,7 +808,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_PV_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_PV_N32_OC1=1",
                 ],
-                "identity": "9bcd65ba31af6217ee6c53d5152c0d25756b99ba87890abb3f617fd3bfd5ce3e",
+                "identity": "05aac533eaa644eaef18abe2a70d2b6ba6786cea0f951c6387daaaf0b3c9d164",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_pv_kernel.cu",
@@ -822,7 +822,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC1=1",
                 ],
-                "identity": "63f4919b648c4a79f3edeebef8454497e24e6cf350af705bd9099f3d76fca589",
+                "identity": "a826ee5e7616476f82726473f6c8aa62ae16a8df9aa336c138b23bde307185f6",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
@@ -836,7 +836,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC2=1",
                 ],
-                "identity": "a268b049641f10e38d4792fa0fdcb6b83a83a8fdc0f0bef0df88885eba4ac01b",
+                "identity": "320e783ebde4dccff0c692c4873a2a72eef43851034bbad4cd9d954968813865",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
@@ -850,7 +850,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC4=1",
                 ],
-                "identity": "c851cbecd250a26c803d03ad6c95e5fc5161953f7346730fb8d245dd2115d54c",
+                "identity": "65146b0ffd8417de0daea1c1eadb1cb656a9d51df57e7cf916e3ad6282814099",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
@@ -864,7 +864,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC1=1",
                 ],
-                "identity": "cf60c1787eaf95a6b39a7c382dc53e5096c446affecfe0fd736f5a278efac694",
+                "identity": "52d8d488ae988c41540b647555017665bc6a41755710104bbcb793371cabaa4c",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
@@ -878,7 +878,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC2=1",
                 ],
-                "identity": "3e88f3a7d8928a142d3ee2f7419901df92f9a618985cb45f4b8ace0c36afaf1c",
+                "identity": "743970168898bd8715fafbec926ca85851638f36fe98e06c3207159d33ddb965",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
@@ -892,7 +892,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC4=1",
                 ],
-                "identity": "18e871bd9b109d25df450ca8556fd9262425f7ba069ccbab6bfff782d4c27b73",
+                "identity": "f473d4c6e6558b9dd496a5434b2b0b379084e4aec88e848e94a7768cbe0877d4",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
@@ -902,11 +902,39 @@ _ARCH_REGISTRATIONS = {
             "nvfp4_decode_t64_n64_oc1": {
                 "arg_plan": _PLAN_NVFP4_G4 + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "e5328bbd7472ba2fd35bcc392aa07ed3396b1171bce689965363eaa12d1b09bd",
+                "identity": "112afaf2bf36df2d908dc52d8b5d4a0725b2d2269a271428569bd2f20ee9cc68",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_binding.cu",
+                ],
+            },
+            "nvfp4_decode_tile_h64_oc2": {
+                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
+                "compile_flags": [
+                    "--use_fast_math",
+                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_SELECT=1",
+                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_OC2=1",
+                ],
+                "identity": "71f55cc5b1359e1779563bf6ae77c6a2394fbee75a0e64141530ea5555348fc7",
+                "min_cuda_version": "13.4",
+                "sources": [
+                    "common/cake_dsv4_nvfp4_decode_tile_h64_kernel.cu",
+                    "common/cake_dsv4_nvfp4_decode_tile_h64_oc2_binding.cu",
+                ],
+            },
+            "nvfp4_decode_tile_h64_oc4": {
+                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
+                "compile_flags": [
+                    "--use_fast_math",
+                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_SELECT=1",
+                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_OC4=1",
+                ],
+                "identity": "4013e7af9db870f5258440007a656d4c1b48299ec9cf9f10902ef674cbfa7c51",
+                "min_cuda_version": "13.4",
+                "sources": [
+                    "common/cake_dsv4_nvfp4_decode_tile_h64_kernel.cu",
+                    "common/cake_dsv4_nvfp4_decode_tile_h64_oc4_binding.cu",
                 ],
             },
             "nvfp4_decode_tile_oc1": {
@@ -916,7 +944,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC1=1",
                 ],
-                "identity": "f5f68e08df3ea6a6cb64a1ea5907d9762349616a8a78b9844bff442af74872a4",
+                "identity": "8977d2fc4c310f99eb1f8f12d8d5216c65dd6ed8e46892e7f8a9a2084d5f7f69",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
@@ -930,7 +958,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC2=1",
                 ],
-                "identity": "f5f1ba5290c058be097831314165175852a32e2c05d4ce30016e167f6bf0e453",
+                "identity": "4117d74c17266464cf1ad3caefde5a46bbe09629c788efbb0580765ce764bd22",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
@@ -944,7 +972,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC4=1",
                 ],
-                "identity": "eaddf8e85236f19dcee73e42ba2e16452ffa3f65ac6887b286053ae551c41b71",
+                "identity": "770269d570d69bc70b2a1235850ae4b9b31c8a1407ba58a62afeb100494f355f",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
@@ -954,7 +982,7 @@ _ARCH_REGISTRATIONS = {
             "nvfp4_merge": {
                 "arg_plan": _PLAN_NVFP4_MERGE + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "a6f2ce7178afe7e71affc479deb6e431428cf029d321f975cea1b1e9335ee9f2",
+                "identity": "3868c9d64707b2cd86ce99cb43ba8b68a6032a493b99e10f0fbd7d5d3063c5a8",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_merge_kernel.cu",
@@ -1222,7 +1250,7 @@ _ARCH_REGISTRATIONS = {
             "nvfp4_decode_cluster": {
                 "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "1f16170b32d14cd79cc6be81144da4230ff8db9dec09b8056d0430039eb3533b",
+                "identity": "d23558ffc6ff0728296296fc6be7a246bae07e07d111ea06a938c126f1504cf8",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_cluster_kernel.cu",
@@ -1232,7 +1260,7 @@ _ARCH_REGISTRATIONS = {
             "nvfp4_decode_persistent": {
                 "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "c86a59db3d49d7c6015774312f6c92ef13365680e8f3c1ba88086119999a6925",
+                "identity": "97f66ada72365e7e4d20acc96ce2eb0d81f8fd3fd9cd736d3fd5db167a68f86c",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_persistent_kernel.cu",
@@ -1246,7 +1274,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_PV_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_PV_N16_OC1=1",
                 ],
-                "identity": "6fc9e70fc87034b7d25333477efa1473bdeaaca02392933ba9bd6b8e1b4d307b",
+                "identity": "9275dbe72169a9a2881877df4e1dbea4a8f593f6b23cb197faca4bd73bbb0b13",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_pv_kernel.cu",
@@ -1260,7 +1288,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_PV_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_PV_N32_OC1=1",
                 ],
-                "identity": "a84acafeeaa907d9595171f2dfbb8cf1dae73994409b01ebe9871532625524e3",
+                "identity": "b8b27c41d767d82c5502fd2d3249eaaf0e1ce5e98d336a60fabf0fe25e8cb256",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_pv_kernel.cu",
@@ -1274,7 +1302,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC1=1",
                 ],
-                "identity": "715a6268ad990b0e3ba92fd0960545b0e10c44e3d00aebd0e546d164380e57e4",
+                "identity": "5ea7107ed25486f1a914df6075bd19f17c6670f0f9a134f99d9d26e06d961a97",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
@@ -1288,7 +1316,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC2=1",
                 ],
-                "identity": "f7434754e7163c1933276bd9736d9cf7e82ec33c769495935cd672753ae417ae",
+                "identity": "3806003bd3a30bb085317ea3d03e1a729e930f5a529e3c6c6adbd05c93e47429",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
@@ -1302,7 +1330,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC4=1",
                 ],
-                "identity": "08e8c96a1771d46c803a2b2465a491942cb1edeba93f09be1a5a772f1f55e807",
+                "identity": "0385745419d8c9a36e543060694c1a53d752acf15e28fae311b877f8238c1a27",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
@@ -1316,7 +1344,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC1=1",
                 ],
-                "identity": "00b399753f787447f0fa09a0e58f80ed5dabec0a321bbadef826a785193a78b4",
+                "identity": "2686a9baf5d8d8791bdb866989f087fcd8619048738ee9f12d3a43941cb6a569",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
@@ -1330,7 +1358,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC2=1",
                 ],
-                "identity": "82cbea3ac9fe023b9fe31848a28d9b569c5747975ca96261118dc87eba227a78",
+                "identity": "5eb42d803c7e710fd698cb52bcdc8ffcbfc8f51efe62e334397b3df840df14a2",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
@@ -1344,7 +1372,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC4=1",
                 ],
-                "identity": "448d0695357cdf656a806d52134f73bf31b3adcc389cae2aabd8393515443571",
+                "identity": "948363dfaeed4cfe1b23c76ae1b2d21d65f8a2d6e10fa5c18522deceaf4fa32f",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
@@ -1354,11 +1382,39 @@ _ARCH_REGISTRATIONS = {
             "nvfp4_decode_t64_n64_oc1": {
                 "arg_plan": _PLAN_NVFP4_G4 + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "873302f41f18258c8e6c25601c35f56ad71c408964d4ecd49d765c8dcf9d69e5",
+                "identity": "9be19d7c73a37b35a0c0e174c575785087ae89dea9ed082419d849a8a0f9b160",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_binding.cu",
+                ],
+            },
+            "nvfp4_decode_tile_h64_oc2": {
+                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
+                "compile_flags": [
+                    "--use_fast_math",
+                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_SELECT=1",
+                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_OC2=1",
+                ],
+                "identity": "40b2368796b39f6eeb2cff3fdf3a0b6561ccc8079dbb67b83be8fc00c8dc1602",
+                "min_cuda_version": "13.4",
+                "sources": [
+                    "common/cake_dsv4_nvfp4_decode_tile_h64_kernel.cu",
+                    "common/cake_dsv4_nvfp4_decode_tile_h64_oc2_binding.cu",
+                ],
+            },
+            "nvfp4_decode_tile_h64_oc4": {
+                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
+                "compile_flags": [
+                    "--use_fast_math",
+                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_SELECT=1",
+                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_OC4=1",
+                ],
+                "identity": "bce172d7ad6ce6fae32984c60f65c165e43b5d85b81a645d5985e8dba6ea3262",
+                "min_cuda_version": "13.4",
+                "sources": [
+                    "common/cake_dsv4_nvfp4_decode_tile_h64_kernel.cu",
+                    "common/cake_dsv4_nvfp4_decode_tile_h64_oc4_binding.cu",
                 ],
             },
             "nvfp4_decode_tile_oc1": {
@@ -1368,7 +1424,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC1=1",
                 ],
-                "identity": "8a1f3023937588b3196960cfbbdc383889506c53d33a66c18e7d38921fdc62aa",
+                "identity": "64a4fb5ab31dc90a6ac00e6c81552c56c0966c9e32fceea013dca7b6169160c4",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
@@ -1382,7 +1438,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC2=1",
                 ],
-                "identity": "f5fa4b28ca6e0930f7af8e21e83fdf95f0068e3261bfe691e056608e3df5b4a8",
+                "identity": "92f16b7b832c8b9504985d144c84888ca32fd45da5eecd4cc93fb154906eb216",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
@@ -1396,7 +1452,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_SELECT=1",
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC4=1",
                 ],
-                "identity": "37fdb46c1fd7b6f665bc35807baf525028823f6d84d8aea2c9c6669d0de3a68e",
+                "identity": "f5a24fd8fcbf4ec5ddc74fc494db3f6037fb118b9c9067b80fafd873eec9bd36",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
@@ -1406,7 +1462,7 @@ _ARCH_REGISTRATIONS = {
             "nvfp4_merge": {
                 "arg_plan": _PLAN_NVFP4_MERGE + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "779c102eca2dbc30af8314b00055c1fd6cc84510da626b8f66b71e40a69956d5",
+                "identity": "7185d93fad5a359ea5d0a6dde1ba857d6f14b337d2e1e774339eedc198e9f263",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_merge_kernel.cu",

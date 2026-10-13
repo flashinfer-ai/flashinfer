@@ -21,10 +21,11 @@ import hashlib
 import os
 import shutil
 import subprocess
-from collections.abc import Mapping
+from collections import OrderedDict
+from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, NamedTuple, Optional, Tuple
 
 import torch
 from filelock import FileLock
@@ -98,23 +99,33 @@ class _Program:
 # the single place the Cake export refreshes; every program binding below
 # derives from it.  Two kernel families ship, each x {bf16, f16, f32 state} x
 # {batched, varlen}, plus one preprocess shared by both: the exact scan
-# (``exact_*``) and the chunk-parallel program (``chunkpar_*``).
+# (``exact_*``) and the chunk-parallel program (``chunkpar_*``).  The exact
+# scan ships two schedule variants of every program: the ring program
+# (``exact_<state>_<mode>``) and the ``_noring`` program (the same kernel built
+# with ``epilogue_ring=False``, bitwise-identical outputs), selected per call
+# by :func:`_exact_scan_variant` from host-known shape quantities.
 _SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_ff8a998f8c"
 _SCAN_MODULES = {
-    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_e2bea5f3e7",
-    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_1d9fc0c3c8",
-    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_0a79355dd1",
-    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_fca9cbf4e7",
-    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_2ac63fe21c",
-    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_fb7365f694",
+    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_3876f7208d",
+    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_f074fc128b",
+    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_2dc39c9955",
+    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_636342f6cc",
+    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_9759edcc11",
+    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_6037fe869d",
+    "exact_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_77156893a6",
+    "exact_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_0f475595b9",
+    "exact_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_d19039c163",
+    "exact_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_d11774ac8e",
+    "exact_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_bbd73b5202",
+    "exact_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_52f48bcff4",
 }
 _CHUNKPAR_MODULES = {
-    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_39deb388f5",
-    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_73359c8907",
-    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_289739d002",
-    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_8877d644f7",
-    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_8af2ca5619",
-    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_a92577a08a",
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_d34b53f551",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_2ee7eee952",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_889999950a",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_72cf27a680",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_70337c7f89",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_9837d3f677",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -138,8 +149,12 @@ _STATE_DTYPE_KEYS = {
 }
 # Dynamic shared memory (bytes) of each family's main kernel; refreshed by the
 # Cake export.  0 is the unfilled placeholder: the program refuses to build.
-_EXACT_SMEM_BYTES = 231936
-_CHUNKPAR_SMEM_BYTES = 231936
+_EXACT_SMEM_BYTES = 231808
+_CHUNKPAR_SMEM_BYTES = 232448
+# Main dynamic SMEM of the exact-scan ``_noring`` programs (the start schedule
+# keeps the prefix control placement); refreshed by the Cake export with the
+# ``exact_*_noring`` table entries.
+_EXACT_NORING_SMEM_BYTES = 232448
 
 
 # Positional launcher ABI shared by every program: preprocess arguments, its
@@ -294,12 +309,19 @@ def _scan(module: str) -> _Kernel:
     return _Kernel(module, f"kernel_{symbol}", threads=512, fast_math=True)
 
 
-def _program(name: str, module: str) -> _Program:
-    """Bind program ``<family>_<state>_<mode>`` to its generated main source."""
+# Main dynamic SMEM of a family's non-default schedule variants.
+_VARIANT_SMEM_BYTES = {("exact", "noring"): _EXACT_NORING_SMEM_BYTES}
 
-    family, state_key, _mode = name.split("_")
+
+def _program(name: str, module: str) -> _Program:
+    """Bind program ``<family>_<state>_<mode>[_<variant>]`` to its generated main source."""
+
+    family, state_key, _mode, *variant = name.split("_")
     code, bits = _STATE_DTYPE_CODES[state_key]
     host_template, main_args, smem_bytes = _FAMILY_HOST[family]
+    if variant:
+        (variant_name,) = variant
+        smem_bytes = _VARIANT_SMEM_BYTES[(family, variant_name)]
     return _Program(
         family,
         _SEGMENT_PREPROCESS,
@@ -318,12 +340,16 @@ _PROGRAMS: dict[str, _Program] = {
 }
 
 
-def _program_name(family: str, state_dtype: torch.dtype, mode_varlen: bool) -> str:
+def _program_name(
+    family: str, state_dtype: torch.dtype, mode_varlen: bool, variant: str = ""
+) -> str:
     """The program of ``family`` serving a state dtype in batched or
-    packed-varlen mode."""
+    packed-varlen mode; ``variant`` names a non-default schedule variant of the
+    family (``"noring"`` for the exact scan)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
-    return f"{family}_{_STATE_DTYPE_KEYS[state_dtype]}_{mode_key}"
+    suffix = f"_{variant}" if variant else ""
+    return f"{family}_{_STATE_DTYPE_KEYS[state_dtype]}_{mode_key}{suffix}"
 
 
 def _require_exported(name: str, program: _Program) -> None:
@@ -449,7 +475,9 @@ def _persistent_grid_size(*, total_work: int, sm_count: int) -> int:
 # of loom/examples/weave/
 # flashinfer_blackwell_mamba_ssd_combined_chunk_parallel_seed_v1.py), copied
 # verbatim: both copies must be refreshed together whenever the seed is
-# recalibrated.  Least-squares fits of the main-kernel time in microseconds:
+# recalibrated (CAKE-956 round 5, 2026-10-11: B200 step
+# b74734547976789d7eb7036b, B300 step 8ae022395365a025939cf937).
+# Least-squares fits of the main-kernel time in microseconds:
 #   exact scan     = serial_fixed + per_chunk(work_items) * chunks
 #     per_chunk is flat up to 32 concurrent (sequence, head) items and larger
 #     at 128 items (128 CTAs streaming x/B/C through L2); item counts in
@@ -460,18 +488,18 @@ def _persistent_grid_size(*, total_work: int, sm_count: int) -> int:
 _CHUNK_PARALLEL_COST_MODEL_US = {
     # (major, minor) compute capability -> calibrated constants.
     (10, 0): {  # B200, sm_100a
-        "serial_fixed": 5.4,
-        "serial_per_chunk_small": 2.68,
-        "serial_per_chunk_large": 4.58,
-        "cp_fixed": 29.9,
-        "cp_per_tile": 0.0627,
+        "serial_fixed": 4.99,
+        "serial_per_chunk_small": 2.556,
+        "serial_per_chunk_large": 2.758,
+        "cp_fixed": 25.0,
+        "cp_per_tile": 0.0491,
     },
     (10, 3): {  # B300 / GB300, sm_103a
-        "serial_fixed": 5.2,
-        "serial_per_chunk_small": 2.59,
-        "serial_per_chunk_large": 4.16,
-        "cp_fixed": 28.8,
-        "cp_per_tile": 0.0595,
+        "serial_fixed": 4.72,
+        "serial_per_chunk_small": 2.345,
+        "serial_per_chunk_large": 2.432,
+        "cp_fixed": 24.1,
+        "cp_per_tile": 0.0429,
     },
 }
 # Unmeasured capabilities use the B200 constants.
@@ -486,7 +514,8 @@ _CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE = _HEADDIM * _DSTATE * (4 + 2)
 # Grid barrier state: u32 ``[arrive, generation]``.
 _CHUNK_PARALLEL_GRID_BARRIER_WORDS = 2
 # ``auto`` applies the rule; ``always`` / ``never`` force the family.  Read on
-# every call.
+# every unprepared eager call; ``CakeSSDCombined.prepare`` reads it once and
+# freezes it for the call shape (a captured call never reads it).
 _CHUNK_PARALLEL_ENV = "FLASHINFER_CAKE_SSD_CHUNK_PARALLEL"
 _CHUNK_PARALLEL_MODES = ("auto", "always", "never")
 
@@ -501,6 +530,175 @@ def _chunk_parallel_mode() -> str:
             f"{_CHUNK_PARALLEL_ENV} must be auto, always or never; got {value!r}"
         )
     return mode
+
+
+def _stream_capturing(device: torch.device) -> bool:
+    """Whether the current CUDA stream of ``device`` -- the stream ``run``
+    launches on -- is recording a CUDA graph.
+
+    ``False`` where CUDA is unavailable or ``device`` is not a CUDA device,
+    so device-less hosts (the CPU-only loader tests) take the eager path
+    without touching the CUDA runtime.
+    """
+
+    if not torch.cuda.is_available() or device.type != "cuda":
+        return False
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
+
+
+class CakeSSDCombinedCaptureError(RuntimeError):
+    """A :meth:`CakeSSDCombined.run` inside CUDA-graph capture would have done
+    work a graph cannot record: materialise the workspace of a call shape
+    this runner has never run or prepared, or load (possibly build) a
+    program that has not been launched in this process; or
+    :meth:`CakeSSDCombined.prepare` was called under capture.  Run the call
+    shape eagerly once (or prepare it and run it once) before capturing it.
+    Allocations under capture (``out``, final states, packed-input copies)
+    are legal: PyTorch serves them from the graph's private pool."""
+
+
+class _WorkspaceKey(NamedTuple):
+    """Identity of a per-call-shape workspace.  The family override is part
+    of it because it selects the program and therefore the values the
+    workspace binds; the device index because the buffers live on it."""
+
+    device_index: Optional[int]
+    batch: int
+    seqlen: int
+    nchunks: int
+    num_segments: int
+    num_sequences: int
+    state_dtype: torch.dtype
+    from_cu_seqlens: bool
+    chunk_parallel_mode: str
+
+
+# ``_WorkspaceKey`` without the family override: what ``prepare`` freezes the
+# override for.
+_ShapeKey = Tuple[Optional[int], int, int, int, int, int, torch.dtype, bool]
+
+
+@dataclass(frozen=True)
+class PreparedSSDCombined:
+    """What :meth:`CakeSSDCombined.prepare` resolved for one call shape: the
+    program it launches, the workspace key it binds and both launch grids.
+    Whether a CUDA graph has since been captured with the shape is a runner
+    query (:meth:`CakeSSDCombined.is_captured`)."""
+
+    program_name: str
+    workspace_key: _WorkspaceKey
+    grid: tuple[int, int, int]
+    preprocess_grid: tuple[int, int, int]
+
+
+@dataclass
+class _WorkspaceEntry:
+    """One registered workspace; ``captured`` (a CUDA graph replays into it)
+    and ``prepared`` (:meth:`CakeSSDCombined.prepare` handed out its static
+    buffers) each pin it (``_WorkspaceRegistry``)."""
+
+    workspace: dict[str, Any]
+    captured: bool = False
+    prepared: bool = False
+
+
+class _WorkspaceRegistry:
+    """The keyed workspaces of one runner.
+
+    Unpinned entries form a bounded LRU (``capacity`` of them, the least
+    recently used evicted first), so returning to a recent call shape
+    re-allocates nothing while a sweep over many shapes cannot hoard device
+    memory.  An entry a CUDA graph was captured with is pinned: its tensors
+    are the addresses the graph replays, so evicting (or re-zeroing) it would
+    make the replays touch freed storage; an entry ``prepare`` materialised
+    is pinned too, because the static buffers it handed out must stay the
+    ones a later eager or captured call binds.  Pinned entries never count
+    against the capacity.  Pure host bookkeeping: keys and workspaces are
+    opaque here.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1:
+            raise ValueError(
+                f"workspace capacity must be a positive int, got {capacity!r}"
+            )
+        self.capacity = capacity
+        self._entries: OrderedDict[Hashable, _WorkspaceEntry] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __contains__(self, key: Hashable) -> bool:
+        return key in self._entries
+
+    def keys(self) -> list[Hashable]:
+        """Registered keys, least recently used first."""
+
+        return list(self._entries)
+
+    def get(self, key: Hashable) -> Optional[_WorkspaceEntry]:
+        """The entry of ``key`` (now the most recently used) or ``None``."""
+
+        entry = self._entries.get(key)
+        if entry is not None:
+            self._entries.move_to_end(key)
+        return entry
+
+    def add(self, key: Hashable, workspace: dict[str, Any]) -> _WorkspaceEntry:
+        """Register ``workspace`` under the new ``key`` as the most recently
+        used entry and evict the least recently used unpinned entries beyond
+        the capacity (never the one just added)."""
+
+        if key in self._entries:
+            raise KeyError(f"workspace {key!r} is already registered")
+        entry = _WorkspaceEntry(workspace)
+        self._entries[key] = entry
+        evictable = [
+            k for k, e in self._entries.items() if not (e.captured or e.prepared)
+        ]
+        for stale in evictable[: max(0, len(evictable) - self.capacity)]:
+            del self._entries[stale]
+        return entry
+
+    def hold(self, key: Hashable) -> _WorkspaceEntry:
+        """Mark ``key`` prepared: it is never evicted from now on."""
+
+        entry = self._entries[key]
+        entry.prepared = True
+        return entry
+
+    def pin(self, key: Hashable) -> _WorkspaceEntry:
+        """Mark ``key`` captured: it is never evicted from now on."""
+
+        entry = self._entries[key]
+        entry.captured = True
+        return entry
+
+    def captured(self, key: Hashable) -> bool:
+        return key in self._entries and self._entries[key].captured
+
+
+@dataclass
+class _LaunchPlan:
+    """Everything one call binds, resolved before any device work: the
+    stage values in launcher order, both grids and the packed-input copies
+    to issue first.  ``run`` executes it; ``prepare`` only builds it."""
+
+    program_name: str
+    arch: str
+    workspace_key: _WorkspaceKey
+    workspace: dict[str, Any]
+    preprocess: dict[str, object]
+    preprocess_grid: tuple[int, int, int]
+    main: dict[str, object]
+    grid: tuple[int, int, int]
+    pending_copies: list[tuple[torch.Tensor, torch.Tensor]]
+    out: Optional[torch.Tensor]
+    final: Optional[torch.Tensor]
+    # The chunk-parallel buffers the call binds (``None`` for the exact scan);
+    # a captured call pins them into its workspace.
+    chunk_parallel: Optional[dict[str, torch.Tensor]]
 
 
 def selection_quantities(
@@ -617,6 +815,13 @@ def _sequence_arguments(
     )
 
 
+# Programs launched in this process, by (name, arch).  Loading or building a
+# program is host work a CUDA graph cannot record, and the host shim resolves
+# its kernel handles on the first launch, so a captured call requires one
+# eager launch of its program first.
+_LOADED_PROGRAMS: set[tuple[str, str]] = set()
+
+
 def _launch_program(
     name: str,
     arch: str,
@@ -639,6 +844,7 @@ def _launch_program(
             cuda_stream,
         )
     )
+    _LOADED_PROGRAMS.add((name, arch))
 
 
 def _source_dir() -> Path:
@@ -713,6 +919,120 @@ def _render_host_source(template: str, name: str, program: _Program) -> str:
             )
         source = source.replace(placeholder, values[placeholder])
     return source
+
+
+# Host selection between the two exact-scan schedule variants (CAKE-956 round 5,
+# route lane).  Both variants compute bitwise-identical outputs; the ring
+# program (``exact_*``) is faster on every calibrated geometry except the ones
+# below, where its epilogue z refill queues behind the partial-segment scalar
+# stores of one-chunk work items.  Calibration = scan-kernel time ring / start
+# (CUPTI, cold L2, 3 rounds, arms alternating in one step) on NVIDIA B200
+# (nsc-svg-slurm-1-gpu-104) and GB300 (nvl72d423-T07), Nemotron-H geometry
+# nheads 128 / ngroups 8, bf16 state, D per head, initial states; steps
+# a64287477fdbbd7e1393d6c2 / aa3374884f3fb4da09ecd0d8 (84 cells) and
+# 54d7ca23fc6a62e86d35f518 / ec121ae14d1b35e5ba452d77 (28 boundary cells).
+# Kernel band 0.0035.  GB300 / B200 ring / start:
+#
+#   varlen, z, nseq x tokens      16      32      48      56      64      72      96     128
+#     nseq 1                   0.940   0.933      -       -   0.937      -   0.959   0.958   (B200 0.933-0.969)
+#     nseq 2                   0.974   0.984      -       -   0.999      -   0.978   0.976   (B200 0.959-0.998)
+#     nseq 3 / 4 (64 tok)          -       -      -       -  0.986 / 1.000-1.003             (B200 0.990 / 0.999-1.002)
+#     nseq 6 (64 tok)              -       -      -       -   1.009      -       -       -   (B200 1.006)
+#     nseq 8                   0.984   0.988  0.960   0.963   1.019   0.959   0.991   0.915   (B200 0.978 0.985 0.952 0.952 1.013 0.957 0.967 0.917)
+#     nseq 16                  0.960   0.974      -       -   1.009      -   0.979   0.917   (B200 0.963 0.977 1.011 0.965 0.918)
+#     nseq 32                  0.907   0.965      -       -   1.003      -   0.986   0.911   (B200 0.925 0.971 1.006 0.973 0.913)
+#     nseq 64                  0.862   0.914  0.958   0.949   1.008   0.969   0.988   0.901   (B200 0.882 0.938 0.956 0.949 1.000 0.960 0.977 0.906)
+#     nseq 128                 0.836   0.860      -       -   1.004      -   0.990   0.899   (B200 0.867 0.884 1.002 0.976 0.903)
+#   80 / 100 / 112 tokens (nseq 8 / 64): 0.949-0.988 on both archs; 127 tokens: 0.970-0.985 on both;
+#   60 / 63 / 65 / 68 tokens (nseq 8 / 64): 0.950-0.979 on both archs (steps 0043bcdea2f8b84c94a470ad /
+#   426afd144b4818c5731b89af); at 64 tokens nseq 5 1.001 / 0.994, nseq 7 1.000 / 0.999, nseq 12 0.999 / 1.005.
+#   Mixtures whose consecutive pairs sum to 128 tokens (two partial segments per chunk, tokens per sequence
+#   = 64 on average): [32, 96] x 4 1.006 / 1.005, [48, 80] x 4 1.007 / 1.003, [63, 65] x 4 1.008 / 1.007.
+#   varlen, no z, 64 tokens: nseq 8 0.992 / 0.990, nseq 64 0.987 / 0.980 (ring wins; the loss needs z).
+#   batched, z, initial states, batch x tokens 50 / 100 / 127 / 128: batch 1 0.965-0.979 (B200 0.948-0.959),
+#     batch 2 0.983-1.002 (B200 0.979-0.987), batch 8 0.929-0.949 (B200 0.939-0.949), batch 64 0.898-0.921 (B200 0.908-0.920);
+#     batch 2 x 25 / 75 tokens 0.988 / 0.993 (B200 0.975 / 0.977); batch 4 x 50 0.960 (B200 0.948).
+#   batched, no z, initial states: batch 64 0.898-0.920 (B200 0.908-0.921); batch 4 x 50 0.973 (B200 0.960);
+#     batch 2 x 25 0.990 (B200 0.991); batch 2 x 100 / 127 / 128 0.995 / 1.000 / 0.990 (B200 0.991 / 0.995 / 0.995);
+#     batch 2 x 50 0.995-1.008 over six readings per arch (B200 1.000-1.005); batch 2 x 60 1.000 (B200 1.000);
+#     batch 2 x 75 1.005 / 0.995 (B200 0.993 / 0.998); batch 2 x 90 0.987 (B200 0.995);
+#     batch 1 x 25 / 50 / 75 / 100 0.963-0.975 (B200 0.955-0.959); batch 3 x 50 / 75 0.992 / 0.985 (B200 0.986 / 0.981);
+#     batch 4 x 75 0.966 (B200 0.961); batch 8 x 50 0.944 (B200 0.948).
+#
+#   FI-level re-measurement of the 64-token window on the acceptance instrument (the
+#   FlashInfer call, CUPTI call span split per kernel, cold L2, 5 interleaved rounds,
+#   one process per arm; steps 2916e66a06685ae93d43293c GB300 / 9ac4a94a6de616b831f11b19
+#   B200), ring / start scan-kernel time, nseq x 64 tokens, z, initial states (GB300 / B200):
+#     bf16 state   nseq 1 0.937 / 0.940   nseq 2 1.011 / 1.001   nseq 3 0.996 / 0.989
+#     f32 state    nseq 1 0.939 / 0.941   nseq 2 1.003 / 0.975   nseq 3 0.978 / 0.974
+#   The 93-row gate row nem_v64_64 (2 x 64, bf16 state) read 1.018 / 1.017 / 1.013 on GB300
+#   in three earlier gates against 0.997 / 0.997 on B200, and its f32 twin 0.978-0.987 /
+#   0.977.  So with a 16-bit state the 2 x 64 cell is a measured loss on GB300 (four
+#   readings) and a tie on B200, and the 3 x 64 cell a tie on GB300 (B200 0.989):
+#   the start schedule begins at 2 sequences x 128 heads.  With an f32 state (twice
+#   the final-state bytes per item) the 2 x 64 and 3 x 64 cells keep winning on both
+#   archs, so its threshold stays at 4 x 128.  The kernel-level cells above read the
+#   bf16 2 x 64 cell as a tie (0.999 / 0.993-1.003); the FI-level reading decides
+#   because it is the acceptance instrument.  float16 state is unmeasured and
+#   follows bfloat16 (same state width).
+#
+# Rule: a measured losing cell goes to the start schedule (``_noring``); a
+# winning cell keeps the ring program; ties and unmeasured cells follow the ring
+# program only where the nearest measured cells win on BOTH archs, otherwise the
+# start schedule.  The varlen loss geometry is the one where consecutive
+# sequence pairs tile every 128-token chunk with two partial segments (both
+# one-chunk items on the scalar-store path): uniform 64-token sequences and
+# the pair-sum-128 mixtures, i.e. 64 tokens per sequence on average; uniform
+# 63 and 65 tokens win on both archs, so the window is exclusive of them; at
+# 64 tokens the item-count threshold is 2 sequences x 128 heads for a 16-bit
+# state (the FI-level 2 x 64 loss above) and 4 sequences x 128 heads for an
+# f32 state (nseq 3 wins, 4 / 5 tie and 6 loses).  The batched no-z batch-2
+# cells at 50-75 tokens are the only batched readings at or beyond the band
+# (batch 1, 3, 4, 8 and z calls win); 25 and 90 tokens win on both archs.
+# Only host-known quantities enter: the runner's mode / has_z / nheads /
+# state dtype and the call's batch, seqlen and sequence count
+# (``cu_seqlens.numel() - 1``, ``num_seqs`` or ``initial_states.shape[0]``);
+# no per-sequence lengths and no device synchronisation, so prepared / captured
+# shapes keep their program.
+_EXACT_NORING_VARLEN_MIN_ITEMS = {  # sequences x heads, by state dtype
+    torch.bfloat16: 2 * 128,
+    torch.float16: 2 * 128,
+    torch.float32: 4 * 128,
+}
+# exclusive bounds on tokens per sequence (average over the call)
+_EXACT_NORING_VARLEN_TOKENS = (63, 65)
+_EXACT_NORING_BATCHED_BATCH = 2
+_EXACT_NORING_BATCHED_SEQLEN = (25, 90)  # exclusive bounds
+
+
+def _exact_scan_variant(
+    *,
+    mode_varlen: bool,
+    has_z: bool,
+    nheads: int,
+    num_sequences: int,
+    total_tokens: int,
+    batch: int,
+    seqlen: int,
+    state_dtype: torch.dtype,
+) -> str:
+    """Schedule variant of the exact-scan program for one call shape: ``""`` (the
+    ring program) or ``"noring"`` (the start schedule), from host-known
+    quantities only (see the calibration table above)."""
+
+    if mode_varlen:
+        min_items = _EXACT_NORING_VARLEN_MIN_ITEMS[state_dtype]
+        if not has_z or num_sequences * nheads < min_items:
+            return ""
+        low, high = _EXACT_NORING_VARLEN_TOKENS
+        # tokens per sequence strictly inside (low, high), in integers
+        if low * num_sequences < total_tokens < high * num_sequences:
+            return "noring"
+        return ""
+    if has_z or batch != _EXACT_NORING_BATCHED_BATCH:
+        return ""
+    low, high = _EXACT_NORING_BATCHED_SEQLEN
+    return "noring" if low < seqlen < high else ""
 
 
 @functools.cache
@@ -799,9 +1119,11 @@ class CakeSSDCombined:
     which ``nheads`` is divisible by ``ngroups``.  Any positive sequence
     length is accepted: the kernels handle a partial trailing chunk, and a
     call shorter than one 128-token chunk (batched ``seqlen < 128`` or packed
-    varlen ``total < 128``) runs on zero-padded one-chunk copies of x/B/C and
-    a staged output owned by the runner, because the generated host pins a
-    128-row TMA box on the token axis (CAKE-1063; see ``run``).  The output
+    varlen ``total < 128``) binds the caller's tensors directly: the token
+    axis of the x/B/C/out tensor maps admits a global extent below the
+    128-row box, TMA zero-fills the rows past ``seqlen`` on loads and clips
+    them on stores, so the kernel sees exactly the state of a partial
+    trailing chunk.  The output
     is token-major ``[batch, seqlen, nheads, 64]`` (packed varlen:
     ``[1, total_seqlen, nheads, 64]``), written directly by the kernels.
     Every call issues one launcher call: the preprocess (which also derives
@@ -822,11 +1144,35 @@ class CakeSSDCombined:
     sequence of 32768 tokens with 8 heads runs about four times faster) and
     never 128-head calls.  The environment variable
     ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` (``auto``, the default;
-    ``always``; ``never``), read on every call, forces either family; any
-    other value is rejected.  The chunk-parallel workspace (32 KB f32 + 16 KB
-    bf16 per tile, grown only when a call needs more tiles, plus a two-word
-    grid-barrier state zeroed once per device) is owned by the runner.
-    :attr:`last_program_name` names the program of the most recent call.
+    ``always``; ``never``) forces either family; any other value is
+    rejected.  It is read on every unprepared eager call; :meth:`prepare`
+    reads it once and freezes the choice for the call shape.  The
+    chunk-parallel workspace (32 KB f32 + 16 KB bf16 per tile, grown only
+    when a call needs more tiles, plus a two-word grid-barrier state zeroed
+    once per device) is owned by the runner.  :attr:`last_program_name`
+    names the program of the most recent call.
+
+    Workspaces are kept per call shape in a small registry
+    (:attr:`workspace_capacity` uncaptured entries, least recently used
+    evicted first), so alternating between recent shapes re-allocates
+    nothing.  CUDA-graph capture: a call whose program has been launched in
+    this process may be recorded into a :class:`torch.cuda.CUDAGraph`; the
+    storage it allocates while captured (output, final states, a new
+    shape's workspace, packed copies) comes from the graph's private pool
+    and every replay reuses it, and the workspace it recorded is pinned --
+    never evicted, and its chunk-parallel buffers are kept when the
+    device's grow-only buffers are later replaced -- because the graph
+    replays into exactly those addresses.  :meth:`prepare` performs every
+    allocation, program build and environment read a call shape needs
+    ahead of time, so :meth:`run` for that shape with a static ``out=`` is
+    a pure launch (``_allocations_in_last_run`` stays 0); the prepared
+    workspace is pinned like a captured one.  A captured call refuses with
+    :class:`CakeSSDCombinedCaptureError` only when its call shape has never
+    run or been prepared on this runner (the workspace would be built by
+    recorded, not executed, kernels) or when its program has not been
+    launched in this process (loading or building a program, and the host
+    shim's first-launch kernel-handle resolution, cannot be recorded): run
+    the shape eagerly once before capturing it.
 
     Packed varlen has two forms.  ``cu_seqlens`` (int32 ``[num_seqs + 1]``,
     ``cu[0] == 0``, non-decreasing, ``cu[-1] == seqlen``, ``batch == 1``):
@@ -866,6 +1212,10 @@ class CakeSSDCombined:
     #: Program of the most recent :meth:`run` (``exact_*`` or
     #: ``chunkpar_*``); ``None`` before the first call.
     last_program_name: Optional[str] = None
+    #: Uncaptured per-shape workspaces a runner keeps (least recently used
+    #: evicted first); captured workspaces are pinned in addition.  Read when
+    #: the runner is constructed.
+    workspace_capacity: int = 8
 
     def __init__(
         self,
@@ -918,19 +1268,40 @@ class CakeSSDCombined:
         self.has_varlen = bool(has_varlen)
         self.has_z = bool(has_z)
         self.seq_idx_dtype = seq_idx_dtype
-        self._workspace_key: Optional[
-            Tuple[Optional[int], int, int, int, int, int, torch.dtype, bool, str]
-        ] = None
+        # Per-call-shape workspaces: a bounded LRU of uncaptured entries plus
+        # the pinned entries CUDA graphs were captured with.
+        self._workspaces = _WorkspaceRegistry(self.workspace_capacity)
+        # The workspace of the most recent call (diagnostics: tests read the
+        # preprocess-derived tables through it).
         self._workspace: Optional[dict[str, Any]] = None
+        # Family override frozen per call shape by ``prepare``: ``run`` never
+        # reads the environment for a prepared shape.
+        self._prepared_modes: dict[_ShapeKey, str] = {}
         self._dummy_cache: dict[Tuple[Optional[int], torch.dtype], torch.Tensor] = {}
-        self._seq_cumsum_key: Optional[Tuple[Optional[int], int]] = None
-        self._seq_cumsum_buf: Optional[torch.Tensor] = None
         self._preprocess_status: dict[Optional[int], torch.Tensor] = {}
         # Chunk-parallel main-kernel buffers per device (grow-only) and the
         # grid-barrier words per device (zeroed once); see
         # ``_chunk_parallel_workspace``.
         self._chunk_parallel_buffers: dict[Optional[int], dict[str, torch.Tensor]] = {}
         self._grid_barriers: dict[Optional[int], torch.Tensor] = {}
+        # Per-call bookkeeping: how many allocations the most recent call made
+        # (0 for a prepared shape with a static ``out``).
+        self._allocations_in_last_run = 0
+
+    def _allocating(self, what: str) -> None:
+        """Account one allocation of ``what`` by the current call.
+
+        Every allocation site of the launch path passes through here, so the
+        eager path can prove it allocated nothing
+        (``_allocations_in_last_run == 0`` after :meth:`prepare`).  Under
+        CUDA-graph capture an allocation is legal: PyTorch serves it from the
+        graph's private pool and every replay reuses that storage (the
+        behaviour callers already rely on when they capture a warm call);
+        :meth:`prepare` only makes the captured call allocation-free.
+        """
+
+        del what
+        self._allocations_in_last_run += 1
 
     def _preprocess_status_buffer(self, device: torch.device) -> torch.Tensor:
         """The runner-owned ``preprocess_status`` word (one int32 per device).
@@ -942,6 +1313,7 @@ class CakeSSDCombined:
 
         status = self._preprocess_status.get(device.index)
         if status is None:
+            self._allocating("the preprocess status word")
             status = torch.zeros(1, dtype=torch.int32, device=device)
             self._preprocess_status[device.index] = status
         return status
@@ -974,12 +1346,13 @@ class CakeSSDCombined:
         key = (device.index, dtype)
         value = self._dummy_cache.get(key)
         if value is None:
+            self._allocating(f"a {dtype} dummy operand")
             value = torch.empty(1, dtype=dtype, device=device)
             self._dummy_cache[key] = value
         return value
 
-    @staticmethod
     def _contiguous_input(
+        self,
         workspace: dict[str, Any],
         name: str,
         value: Optional[torch.Tensor],
@@ -989,175 +1362,171 @@ class CakeSSDCombined:
         Returns the tensor to bind and the source still to be copied into
         it, or ``None`` when the input is already contiguous.  The copies are
         issued together right before the launch so no Python runs between the
-        auxiliary device work and the kernels.
+        auxiliary device work and the kernels.  One buffer per (input, shape,
+        dtype) lives in the workspace for its lifetime and is never replaced,
+        so the address a captured graph copies into stays valid when a later
+        eager call of the same shape brings, say, a bf16 ``dt`` instead of an
+        f32 one.
         """
 
         if value is None or value.is_contiguous():
             return value, None
-        buffer_name = f"contiguous_{name}"
-        buffer = workspace.get(buffer_name)
-        if (
-            buffer is None
-            or buffer.shape != value.shape
-            or buffer.dtype != value.dtype
-            or buffer.device != value.device
-        ):
+        buffers: dict[tuple[str, tuple[int, ...], torch.dtype], torch.Tensor]
+        buffers = workspace["contiguous"]
+        buffer_key = (name, tuple(value.shape), value.dtype)
+        buffer = buffers.get(buffer_key)
+        if buffer is None:
+            self._allocating(f"a packed copy of the strided input {name}")
             buffer = torch.empty(
                 tuple(value.shape), dtype=value.dtype, device=value.device
             )
-            workspace[buffer_name] = buffer
+            buffers[buffer_key] = buffer
         return buffer, value
 
     def _get_workspace(
         self,
         *,
+        key: _WorkspaceKey,
         device: torch.device,
-        batch: int,
-        seqlen: int,
-        nchunks: int,
-        num_segments: int,
-        num_sequences: int,
-        from_cu_seqlens: bool = False,
         sm_count: int,
         capability: tuple[int, int],
-        chunk_parallel_mode: str,
     ) -> dict[str, Any]:
-        """The per-call-shape workspace, with the kernel family of the call.
+        """The workspace of ``key``: the registered one, or materialised now
+        (never under capture: ``_plan`` refuses an unregistered shape there).
 
-        The family (``workspace["program"]``) is a function of the key, the
-        device's SM count and capability (fixed per ``device.index``) and the
-        per-call ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` override, which is
-        therefore part of the key; the chunk-parallel buffers are bound only
-        when that family is selected.
+        The kernel family (``workspace["program"]``) is a function of the
+        key, which carries the ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` override
+        of the call, and of the device's SM count and capability (fixed per
+        ``device.index``).
         """
 
-        key = (
-            device.index,
-            batch,
-            seqlen,
-            nchunks,
-            num_segments,
-            num_sequences,
-            self.state_dtype,
-            from_cu_seqlens,
-            chunk_parallel_mode,
-        )
-        if self._workspace_key != key:
-            ids = torch.arange(num_segments, dtype=torch.int32, device=device)
-            chunks = ids % nchunks
-            starts = (ids // nchunks) * seqlen + chunks * _CHUNK_SIZE
-            # Batched segments are physical chunks; the trailing chunk of a
-            # sequence whose length is not a multiple of 128 is partial.
-            lengths = torch.clamp(seqlen - chunks * _CHUNK_SIZE, max=_CHUNK_SIZE)
-            sequence_offsets = (
-                torch.arange(num_sequences + 1, dtype=torch.int32, device=device)
-                * nchunks
+        entry = self._workspaces.get(key)
+        if entry is None:
+            self._allocating("the workspace of a new call shape")
+            entry = self._workspaces.add(
+                key,
+                self._materialize_workspace(
+                    key=key, device=device, sm_count=sm_count, capability=capability
+                ),
             )
-            tile_count = num_segments * self.nheads
-            chunk_parallel = chunk_parallel_selected(
+        self._workspace = entry.workspace
+        return entry.workspace
+
+    def _materialize_workspace(
+        self,
+        *,
+        key: _WorkspaceKey,
+        device: torch.device,
+        sm_count: int,
+        capability: tuple[int, int],
+    ) -> dict[str, Any]:
+        """Allocate the per-call-shape workspace of ``key`` and select its
+        kernel family.  The chunk-parallel buffers are per device, not per
+        shape: this only grows them to the shape's tile bound (the call binds
+        the device's current buffers, see ``_chunk_parallel_workspace``)."""
+
+        batch, seqlen, nchunks = key.batch, key.seqlen, key.nchunks
+        num_segments, num_sequences = key.num_segments, key.num_sequences
+        ids = torch.arange(num_segments, dtype=torch.int32, device=device)
+        chunks = ids % nchunks
+        starts = (ids // nchunks) * seqlen + chunks * _CHUNK_SIZE
+        # Batched segments are physical chunks; the trailing chunk of a
+        # sequence whose length is not a multiple of 128 is partial.
+        lengths = torch.clamp(seqlen - chunks * _CHUNK_SIZE, max=_CHUNK_SIZE)
+        tile_count = num_segments * self.nheads
+        chunk_parallel = chunk_parallel_selected(
+            nheads=self.nheads,
+            num_sequences=num_sequences,
+            num_segments=num_segments,
+            nchunks=nchunks,
+            mode_varlen=self.has_varlen,
+            sm_count=sm_count,
+            capability=capability,
+            mode=key.chunk_parallel_mode,
+        )
+        variant = (
+            ""
+            if chunk_parallel
+            else _exact_scan_variant(
+                mode_varlen=self.has_varlen,
+                has_z=self.has_z,
                 nheads=self.nheads,
                 num_sequences=num_sequences,
-                num_segments=num_segments,
-                nchunks=nchunks,
-                mode_varlen=self.has_varlen,
-                sm_count=sm_count,
-                capability=capability,
-                mode=chunk_parallel_mode,
+                # packed varlen: x is [1, total tokens, nheads, 64]
+                total_tokens=batch * seqlen,
+                batch=batch,
+                seqlen=seqlen,
+                state_dtype=self.state_dtype,
             )
-            self._workspace = {
-                "program": _program_name(
-                    "chunkpar" if chunk_parallel else "exact",
-                    self.state_dtype,
-                    self.has_varlen,
+        )
+        workspace: dict[str, Any] = {
+            "program": _program_name(
+                "chunkpar" if chunk_parallel else "exact",
+                self.state_dtype,
+                self.has_varlen,
+                variant,
+            ),
+            "starts": starts,
+            "lengths": lengths,
+            "delta": torch.empty(
+                (tile_count, _CHUNK_SIZE), dtype=torch.float16, device=device
+            ),
+            "cumsum": torch.empty(
+                (tile_count, _CHUNK_SIZE), dtype=torch.float32, device=device
+            ),
+            "dt_float": torch.empty(
+                (batch, seqlen, self.nheads),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "dt_bias_float": torch.empty(
+                self.nheads,
+                dtype=torch.float32,
+                device=device,
+            ),
+            # Bound when the caller passes no dt_bias; never written after
+            # allocation, so it costs no per-call fill.
+            "dt_bias_zero": torch.zeros(
+                self.nheads,
+                dtype=torch.float32,
+                device=device,
+            ),
+            "d_head": torch.empty(
+                self.nheads,
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            "final": torch.empty(
+                (num_sequences, self.nheads, _HEADDIM, _DSTATE),
+                dtype=self.state_dtype,
+                device=device,
+            ),
+            # Packed copies of strided public inputs (``_contiguous_input``).
+            "contiguous": {},
+        }
+        if self.has_varlen:
+            # The runner-owned ``seq_chunk_cumsum`` the preprocess fills when
+            # the caller supplies no vector (both packed-varlen forms).  Per
+            # shape rather than per sequence count so that a captured graph's
+            # vector is never replaced by a call of another shape.
+            workspace["seq_chunk_cumsum"] = torch.empty(
+                num_sequences + 1, dtype=torch.int32, device=device
+            )
+        if key.from_cu_seqlens:
+            # cu_seqlens form: the preprocess publishes the derived
+            # chunk_indices / chunk_offsets (+ the sentinel at the real
+            # segment count) into these [bound + 1] tables; the scan
+            # reads them with num_logical_chunks = bound.
+            workspace.update(
+                chunk_indices=torch.empty(
+                    num_segments + 1, dtype=torch.int32, device=device
                 ),
-                "starts": starts,
-                "lengths": lengths,
-                "sequence_offsets": sequence_offsets,
-                "delta": torch.empty(
-                    (tile_count, _CHUNK_SIZE), dtype=torch.float16, device=device
+                chunk_offsets=torch.empty(
+                    num_segments + 1, dtype=torch.int32, device=device
                 ),
-                "cumsum": torch.empty(
-                    (tile_count, _CHUNK_SIZE), dtype=torch.float32, device=device
-                ),
-                "dt_float": torch.empty(
-                    (batch, seqlen, self.nheads),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                "dt_bias_float": torch.empty(
-                    self.nheads,
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                # Bound when the caller passes no dt_bias; never written after
-                # allocation, so it costs no per-call fill.
-                "dt_bias_zero": torch.zeros(
-                    self.nheads,
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                "d_head": torch.empty(
-                    self.nheads,
-                    dtype=torch.bfloat16,
-                    device=device,
-                ),
-                "final": torch.empty(
-                    (num_sequences, self.nheads, _HEADDIM, _DSTATE),
-                    dtype=self.state_dtype,
-                    device=device,
-                ),
-            }
-            if from_cu_seqlens:
-                # cu_seqlens form: the preprocess publishes the derived
-                # chunk_indices / chunk_offsets (+ the sentinel at the real
-                # segment count) into these [bound + 1] tables; the scan
-                # reads them with num_logical_chunks = bound.
-                self._workspace.update(
-                    chunk_indices=torch.empty(
-                        num_segments + 1, dtype=torch.int32, device=device
-                    ),
-                    chunk_offsets=torch.empty(
-                        num_segments + 1, dtype=torch.int32, device=device
-                    ),
-                )
-            if seqlen < _CHUNK_SIZE:
-                # CAKE-1063: a call shorter than one chunk binds the x/B/C/out
-                # tensor maps to these one-chunk buffers (see ``run``).  The
-                # key fixes ``seqlen``, and ``run`` only ever writes rows
-                # ``[:seqlen]`` of the input buffers, so the pad rows
-                # ``[seqlen, 128)`` keep the zeros of this allocation for the
-                # lifetime of the workspace: no per-call re-zeroing.  The
-                # output stage is never read past ``seqlen``.
-                padded = (batch, _CHUNK_SIZE)
-                self._workspace.update(
-                    padded_x=torch.zeros(
-                        (*padded, self.nheads, _HEADDIM),
-                        dtype=torch.bfloat16,
-                        device=device,
-                    ),
-                    padded_B=torch.zeros(
-                        (*padded, self.ngroups, _DSTATE),
-                        dtype=torch.bfloat16,
-                        device=device,
-                    ),
-                    padded_C=torch.zeros(
-                        (*padded, self.ngroups, _DSTATE),
-                        dtype=torch.bfloat16,
-                        device=device,
-                    ),
-                    padded_out=torch.empty(
-                        (*padded, self.nheads, _HEADDIM),
-                        dtype=torch.bfloat16,
-                        device=device,
-                    ),
-                )
-            if chunk_parallel:
-                self._workspace.update(
-                    self._chunk_parallel_workspace(device, tile_count)
-                )
-            self._workspace_key = key
-        workspace = self._workspace
-        assert workspace is not None
+            )
+        if chunk_parallel:
+            self._chunk_parallel_workspace(device, tile_count)
         return workspace
 
     def _chunk_parallel_workspace(
@@ -1173,11 +1542,17 @@ class CakeSSDCombined:
         calls reuse them (the kernel addresses tiles below the call's bound
         only).  ``grid_barrier`` (u32 ``[arrive, generation]``) is allocated
         zeroed once per device and never re-zeroed: the kernel's arrive
-        counter self-resets and its generation word is free-running.
+        counter self-resets and its generation word is free-running.  A
+        workspace captured into a CUDA graph pins the buffers its graph
+        recorded (``workspace["chunk_parallel"]``, see ``run``), so a later
+        growth replaces the device's current buffers without freeing them; a
+        captured call never grows them (its shape ran eagerly first, so the
+        device's buffers already cover its tile bound).
         """
 
         buffers = self._chunk_parallel_buffers.get(device.index)
         if buffers is None or buffers["h_work"].shape[0] < tiles_bound:
+            self._allocating(f"chunk-parallel buffers for {tiles_bound} tiles")
             shape = (tiles_bound, _HEADDIM, _DSTATE)
             h_work = torch.empty(shape, dtype=torch.bfloat16, device=device)
             buffers = {
@@ -1188,25 +1563,12 @@ class CakeSSDCombined:
             self._chunk_parallel_buffers[device.index] = buffers
         grid_barrier = self._grid_barriers.get(device.index)
         if grid_barrier is None:
+            self._allocating("the chunk-parallel grid barrier")
             grid_barrier = torch.zeros(
                 _CHUNK_PARALLEL_GRID_BARRIER_WORDS, dtype=torch.uint32, device=device
             )
             self._grid_barriers[device.index] = grid_barrier
         return {**buffers, "grid_barrier": grid_barrier}
-
-    def _seq_chunk_cumsum_buffer(
-        self, device: torch.device, num_sequences: int
-    ) -> torch.Tensor:
-        """The runner-owned ``seq_chunk_cumsum`` the preprocess fills."""
-
-        size = num_sequences + 1
-        key = (device.index, size)
-        if self._seq_cumsum_key != key:
-            self._seq_cumsum_buf = torch.empty(size, dtype=torch.int32, device=device)
-            self._seq_cumsum_key = key
-        output = self._seq_cumsum_buf
-        assert output is not None
-        return output
 
     def run(
         self,
@@ -1234,6 +1596,210 @@ class CakeSSDCombined:
         num_seqs: Optional[int] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
     ):
+        """Run one forward: plan every host-side decision, then issue only
+        device work (the packed-input copies, then the single launcher call).
+
+        Inside CUDA-graph capture the plan may allocate ``out``, final states
+        and packed-input copies (from the graph's private pool) but never
+        materialise a workspace this runner has not seen eagerly, nor load
+        or build a program -- it refuses with
+        :class:`CakeSSDCombinedCaptureError` in those cases -- and the
+        workspace it binds is pinned, because the graph replays into those
+        addresses.
+        """
+
+        capturing = _stream_capturing(x.device)
+        plan = self._plan(
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            seq_chunk_cumsum=seq_chunk_cumsum,
+            update_seq_chunk_cumsum=update_seq_chunk_cumsum,
+            checkpoint_token_indices=checkpoint_token_indices,
+            checkpoint_state_slots=checkpoint_state_slots,
+            checkpoint_states=checkpoint_states,
+            out=out,
+            return_final_states=return_final_states,
+            num_seqs=num_seqs,
+            cu_seqlens=cu_seqlens,
+            capturing=capturing,
+            preparing=False,
+        )
+        self.last_program_name = plan.program_name
+        if capturing:
+            # The graph replays into exactly these addresses: pin the
+            # workspace (never evicted) and the chunk-parallel buffers it
+            # recorded (a later growth must not free them).
+            self._workspaces.pin(plan.workspace_key)
+            if plan.chunk_parallel is not None:
+                plan.workspace["chunk_parallel"] = plan.chunk_parallel
+        assert plan.out is not None
+        # Every host-side decision is made; from here on only device work is
+        # issued: the packed-input copies, then the single launcher call that
+        # runs the preprocess and the scan.
+        with torch.cuda.device(x.device):
+            for destination, source in plan.pending_copies:
+                destination.copy_(source)
+            _launch_program(
+                plan.program_name,
+                plan.arch,
+                preprocess=plan.preprocess,
+                preprocess_grid=plan.preprocess_grid,
+                main=plan.main,
+                main_grid=plan.grid,
+                cuda_stream=int(torch.cuda.current_stream(x.device).cuda_stream),
+            )
+        return plan.out, plan.final
+
+    def prepare(
+        self,
+        *,
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: Optional[torch.Tensor] = None,
+        z: Optional[torch.Tensor] = None,
+        dt_bias: Optional[torch.Tensor] = None,
+        dt_softplus: bool = False,
+        dt_limit: Tuple[float, float] = (0.0, float("inf")),
+        initial_states: Optional[torch.Tensor] = None,
+        seq_idx: Optional[torch.Tensor] = None,
+        chunk_indices: Optional[torch.Tensor] = None,
+        chunk_offsets: Optional[torch.Tensor] = None,
+        seq_chunk_cumsum: Optional[torch.Tensor] = None,
+        return_final_states: bool = True,
+        num_seqs: Optional[int] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
+    ) -> PreparedSSDCombined:
+        """Prepare a call shape eagerly so that :meth:`run` on it is a pure
+        launch, in particular inside CUDA-graph capture.
+
+        Performs every host-side decision and device-side preparation the
+        same :meth:`run` would perform, without launching a kernel: the
+        validation, the workspace of the shape (including the chunk-parallel
+        buffers when that family is selected), the packed copies of strided
+        inputs (prepare with the same strides the captured call will bring),
+        the dummy operands, the program build and load.  It reads
+        ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` once and freezes the family
+        choice for the shape: later :meth:`run` calls on it never consult the
+        environment.  With ``return_final_states`` it allocates the shape's
+        static final-states buffer, which such :meth:`run` calls then return
+        (the same tensor every call, overwritten by each launch) instead of
+        fresh storage.  The prepared shape's workspace is pinned: never
+        evicted for the lifetime of the runner.  A caller-owned
+        ``seq_chunk_cumsum`` given here is validated as :meth:`run` does with
+        ``update_seq_chunk_cumsum=True``; the checkpoint outputs are per-call
+        options of :meth:`run`.  The kernel handles of the host shim resolve
+        on the program's first launch, so run the shape eagerly once before
+        capturing it.  A static ``out`` is not required here; a captured
+        :meth:`run` without one allocates its output from the graph pool,
+        with one it allocates nothing.
+        """
+
+        if _stream_capturing(x.device):
+            raise CakeSSDCombinedCaptureError(
+                "Cake SSDCombined prepare() allocates and may build programs: call "
+                "it eagerly, outside CUDA-graph capture"
+            )
+        plan = self._plan(
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            seq_chunk_cumsum=seq_chunk_cumsum,
+            update_seq_chunk_cumsum=seq_chunk_cumsum is not None,
+            checkpoint_token_indices=None,
+            checkpoint_state_slots=None,
+            checkpoint_states=None,
+            out=out,
+            return_final_states=return_final_states,
+            num_seqs=num_seqs,
+            cu_seqlens=cu_seqlens,
+            capturing=False,
+            preparing=True,
+        )
+        _load_generated_program(plan.program_name, plan.arch)
+        # Only a successful preparation freezes the family choice and pins
+        # the workspace: a failed allocation or build leaves no trace.
+        shape: _ShapeKey = tuple(plan.workspace_key[:-1])
+        self._prepared_modes[shape] = plan.workspace_key.chunk_parallel_mode
+        self._workspaces.hold(plan.workspace_key)
+        return PreparedSSDCombined(
+            program_name=plan.program_name,
+            workspace_key=plan.workspace_key,
+            grid=plan.grid,
+            preprocess_grid=plan.preprocess_grid,
+        )
+
+    def is_captured(self, prepared: PreparedSSDCombined) -> bool:
+        """Whether a CUDA graph has been captured with ``prepared``'s call
+        shape on this runner (its workspace is then pinned as captured)."""
+
+        return self._workspaces.captured(prepared.workspace_key)
+
+    def _plan(
+        self,
+        *,
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: Optional[torch.Tensor],
+        z: Optional[torch.Tensor],
+        dt_bias: Optional[torch.Tensor],
+        dt_softplus: bool,
+        dt_limit: Tuple[float, float],
+        initial_states: Optional[torch.Tensor],
+        seq_idx: Optional[torch.Tensor],
+        chunk_indices: Optional[torch.Tensor],
+        chunk_offsets: Optional[torch.Tensor],
+        seq_chunk_cumsum: Optional[torch.Tensor],
+        update_seq_chunk_cumsum: bool,
+        checkpoint_token_indices: Optional[torch.Tensor],
+        checkpoint_state_slots: Optional[torch.Tensor],
+        checkpoint_states: Optional[torch.Tensor],
+        out: Optional[torch.Tensor],
+        return_final_states: bool,
+        num_seqs: Optional[int],
+        cu_seqlens: Optional[torch.Tensor],
+        capturing: bool,
+        preparing: bool,
+    ) -> _LaunchPlan:
+        """Validate one call and resolve everything it binds (``_LaunchPlan``).
+
+        ``capturing``: the call records into a CUDA graph, so nothing may be
+        allocated, built or read from the environment (named refusals).
+        ``preparing``: :meth:`prepare` is materialising the shape -- the
+        family override is read and frozen, a static final-states buffer is
+        allocated on request and a missing ``out`` leaves the output unbound.
+        """
+
+        self._allocations_in_last_run = 0
         batch, seqlen, nheads, headdim = x.shape
         if batch <= 0 or seqlen <= 0:
             raise ValueError(
@@ -1461,40 +2027,79 @@ class CakeSSDCombined:
                 )
             if not out.is_contiguous():
                 raise ValueError("out must be contiguous")
-        else:
+        elif not preparing:
             # Match SSDCombined's ownership contract: each allocation-returning
             # call owns fresh output storage that later calls cannot overwrite.
+            self._allocating("the output")
             out = torch.empty(expected_out, dtype=torch.bfloat16, device=x.device)
         # The kernel family is chosen with the workspace: it depends on the
-        # workspace key, the device (SM count, capability) and the per-call
-        # environment override.
+        # workspace key, the device (SM count, capability) and the family
+        # override.  ``prepare`` reads the override once and freezes it for
+        # the shape; an unprepared call (eager or captured) reads it per call.
         device_index = _cuda_device_index(x)
         arch = _target_arch(device_index)
         sm_count = _sm_count(device_index)
+        shape: _ShapeKey = (
+            x.device.index,
+            batch,
+            seqlen,
+            nchunks,
+            num_segments,
+            num_sequences,
+            self.state_dtype,
+            from_cu_seqlens,
+        )
+        if preparing:
+            mode = _chunk_parallel_mode()
+        else:
+            mode = self._prepared_modes.get(shape)
+            if mode is None:
+                mode = _chunk_parallel_mode()
+        key = _WorkspaceKey(*shape, mode)
+        if capturing and key not in self._workspaces:
+            # Materialising a workspace records its table-building kernels
+            # (segment ids, zero vectors) into the graph instead of running
+            # them: the tables would stay uninitialised until the first
+            # replay while the entry is pinned.
+            raise CakeSSDCombinedCaptureError(
+                "Cake SSDCombined call shape has not run on this runner: run it "
+                "eagerly once (or prepare() it) before capturing it into a CUDA "
+                "graph"
+            )
         workspace = self._get_workspace(
+            key=key,
             device=x.device,
-            batch=batch,
-            seqlen=seqlen,
-            nchunks=nchunks,
-            num_segments=num_segments,
-            num_sequences=num_sequences,
-            from_cu_seqlens=from_cu_seqlens,
             sm_count=sm_count,
             capability=_ARCH_CAPABILITIES[arch],
-            chunk_parallel_mode=_chunk_parallel_mode(),
         )
         program_name = workspace["program"]
         program = _PROGRAMS[program_name]
-        self.last_program_name = program_name
+        if capturing and (program_name, arch) not in _LOADED_PROGRAMS:
+            # Loading (possibly building) the program is host work a graph
+            # cannot record, and the host shim resolves its kernel handles
+            # on the first launch.
+            raise CakeSSDCombinedCaptureError(
+                f"Cake SSDCombined program {program_name} ({arch}) has not been "
+                "launched in this process: run the shape eagerly once before "
+                "capturing it"
+            )
         # The kernel needs valid storage even when final states are disabled.
-        # When they are returned, allocate caller-owned storage up front so
-        # repeated cached-runner calls do not alias and no post-kernel device
-        # copy adds another GPU activity to the measured route.
-        final_states_arg = (
-            torch.empty_like(workspace["final"])
-            if return_final_states
-            else workspace["final"]
-        )
+        # Returned final states live in fresh caller-owned storage per eager
+        # call (repeated cached-runner calls do not alias and no post-kernel
+        # device copy adds another GPU activity to the measured route) unless
+        # the shape was prepared with return_final_states: then the static
+        # buffer ``prepare`` allocated is bound (the address a captured graph
+        # replays into); a captured call without it allocates them from the
+        # graph pool.
+        if not return_final_states:
+            final_states_arg = workspace["final"]
+        else:
+            final_states_arg = workspace.get("final_static")
+            if final_states_arg is None:
+                self._allocating("the final states")
+                final_states_arg = torch.empty_like(workspace["final"])
+                if preparing:
+                    workspace["final_static"] = final_states_arg
         # The TMA descriptors preserve the physical strides of x/B/C,
         # including the row padding produced by framework projection splits.
         # Only inputs consumed through flat pointer indexing need packed,
@@ -1524,34 +2129,15 @@ class CakeSSDCombined:
         checkpoint_state_slots = packed(
             "checkpoint_state_slots", checkpoint_state_slots
         )
-        # CAKE-1063: calls shorter than one chunk.  The x/B/C/out tensor maps
-        # carry a fixed 128-row box on the token axis and the generated host
-        # rejects a global extent below the box, so when ``seqlen < 128`` the
-        # maps are bound to the runner-owned one-chunk buffers of the
-        # workspace: x/B/C are zero padded (valid rows copied in with the
-        # other pending copies), ``out`` is staged and its valid rows are
-        # copied back after the launch.  Every other argument stays logical
+        # A call shorter than one chunk (``seqlen < 128``) binds the caller's
+        # x/B/C/out directly: the token axis of the four tensor maps admits a
+        # global extent below the 128-row box (``allow_oob_box`` in the
+        # exported programs), TMA zero-fills the rows past ``seqlen`` on
+        # loads and clips them on stores.  Every argument stays logical
         # (``seqlen``, ``nchunks = 1``, dt, z, the preprocess tables, the
         # sequence metadata), so the kernel sees exactly the state of a
-        # partial trailing chunk of a longer call: the TMA zero fill past
-        # ``seqlen`` becomes explicit zero rows, the loader publishes a flat
-        # cumsum and a zero delta for those slots (batched) or clips the
-        # segment to ``seqlen`` (varlen), and ``z`` -- read through its
-        # pointer with the logical ``seqlen`` stride -- is guarded by
-        # ``row < chunk_tokens``.  The pad rows contribute exact zeros and
-        # the final states are unchanged.
-        staged_out = None
-        if seqlen < _CHUNK_SIZE:
-
-            def padded(name: str, value: torch.Tensor) -> torch.Tensor:
-                buffer = workspace[f"padded_{name}"]
-                pending_copies.append((buffer[:, :seqlen], value))
-                return buffer
-
-            x = padded("x", x)
-            B = padded("B", B)
-            C = padded("C", C)
-            staged_out = workspace["padded_out"]
+        # partial trailing chunk of a longer call; the pad rows contribute
+        # exact zeros and the final states are unchanged.
         assert x is not None and dt is not None and A is not None
         assert B is not None and C is not None
         seq_idx_int64 = seq_idx is not None and seq_idx.dtype == torch.int64
@@ -1595,11 +2181,11 @@ class CakeSSDCombined:
             cumsum_arg = (
                 seq_chunk_cumsum
                 if seq_chunk_cumsum is not None
-                else self._seq_chunk_cumsum_buffer(x.device, num_sequences)
+                else workspace["seq_chunk_cumsum"]
             )
         elif seq_chunk_cumsum is None:
             write_seq_chunk_cumsum = True
-            cumsum_arg = self._seq_chunk_cumsum_buffer(x.device, num_sequences)
+            cumsum_arg = workspace["seq_chunk_cumsum"]
         else:
             write_seq_chunk_cumsum = bool(update_seq_chunk_cumsum)
             cumsum_arg = seq_chunk_cumsum
@@ -1695,12 +2281,11 @@ class CakeSSDCombined:
         # same buffers; pass a valid packed dummy so the host checks do
         # not reject the descriptor-compatible public views.
         unused_bf16 = self._dummy(x.device, torch.bfloat16)
-        kernel_out = out if staged_out is None else staged_out
         main_values: dict[str, object] = {
             "x_map": x,
             "b_map": B,
             "c_map": C,
-            "out_map": kernel_out,
+            "out_map": out,
             "x": unused_bf16,
             "dt": dt_float,
             "delta_precomputed": workspace["delta"],
@@ -1721,7 +2306,7 @@ class CakeSSDCombined:
             "chunk_indices": chunk_indices_arg,
             "chunk_offsets": chunk_offsets_arg,
             "seq_chunk_cumsum": cumsum_arg,
-            "out_native": kernel_out,
+            "out_native": out,
             "nheads": self.nheads,
             "ngroups": self.ngroups,
             "batch": batch,
@@ -1741,37 +2326,39 @@ class CakeSSDCombined:
             "write_final_states": int(return_final_states),
             "checkpoint_state_count": checkpoint_state_count,
         }
+        chunk_parallel: Optional[dict[str, torch.Tensor]] = None
         if program.family == "chunkpar":
             # The state operand workspace is bound twice: as the ``h_map``
             # tensor map (the host builds the TMA descriptor from the bf16
             # [tiles, 64, 128] tensor) and as the u32 word view the phase-2
-            # chains store through.
+            # chains store through.  A captured workspace binds the buffers
+            # its graph recorded (pinned by ``run``); every other call binds
+            # the device's current grow-only buffers.
+            chunk_parallel = workspace.get("chunk_parallel")
+            if chunk_parallel is None:
+                chunk_parallel = self._chunk_parallel_workspace(
+                    x.device, num_segments * self.nheads
+                )
             main_values.update(
-                h_map=workspace["h_work"],
-                s_work=workspace["s_work"],
-                h_words=workspace["h_words"],
-                grid_barrier=workspace["grid_barrier"],
+                h_map=chunk_parallel["h_work"],
+                s_work=chunk_parallel["s_work"],
+                h_words=chunk_parallel["h_words"],
+                grid_barrier=chunk_parallel["grid_barrier"],
             )
-        # Every host-side decision is made; from here on only device work is
-        # issued: the packed-input copies, then the single launcher call that
-        # runs the preprocess and the scan, then (calls shorter than one
-        # chunk only) the stream-ordered copy of the staged output rows.
-        with torch.cuda.device(x.device):
-            for destination, source in pending_copies:
-                destination.copy_(source)
-            _launch_program(
-                program_name,
-                arch,
-                preprocess=preprocess_values,
-                preprocess_grid=preprocess_grid,
-                main=main_values,
-                main_grid=(grid, 1, 1),
-                cuda_stream=int(torch.cuda.current_stream(x.device).cuda_stream),
-            )
-            if staged_out is not None:
-                out.copy_(staged_out[:, :seqlen])
-        final = final_states_arg if return_final_states else None
-        return out, final
+        return _LaunchPlan(
+            program_name=program_name,
+            arch=arch,
+            workspace_key=key,
+            workspace=workspace,
+            preprocess=preprocess_values,
+            preprocess_grid=preprocess_grid,
+            main=main_values,
+            grid=(grid, 1, 1),
+            pending_copies=pending_copies,
+            out=out,
+            final=final_states_arg if return_final_states else None,
+            chunk_parallel=chunk_parallel,
+        )
 
 
-__all__ = ["CakeSSDCombined"]
+__all__ = ["CakeSSDCombined", "CakeSSDCombinedCaptureError", "PreparedSSDCombined"]
