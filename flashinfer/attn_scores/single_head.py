@@ -82,7 +82,8 @@ def single_head_paged_mqa_logits(
     workers = max(2 * get_device_sm_count(query.device) // batch, runs, 1)
     keys = (query, query_scales, key_cache, key_scales)
     tables = (context_lengths, requests, block_table)
-    _score("decode", rows, keys, (*tables, None, None, scores, max_context, workers, 0))
+    outputs = (None, None, None, None, scores)
+    _score("decode", rows, keys, (*tables, *outputs, max_context, workers, 0))
 
 
 def _score(mode: str, rows: int, keys: tuple, args: tuple) -> None:
@@ -141,6 +142,8 @@ def single_head_paged_mqa_threshold_select(
     top_k: int,
     query_scales: Optional[torch.Tensor] = None,
     key_scales: Optional[torch.Tensor] = None,
+    arrivals: Optional[torch.Tensor] = None,
+    ranges: Optional[torch.Tensor] = None,
 ) -> None:
     """Select the keys that score above each query row's threshold, in one pass
     over the row's paged keys and without writing its scores.
@@ -163,9 +166,19 @@ def single_head_paged_mqa_threshold_select(
     A row fits when its candidates fit ``capacity`` and, with at most ``top_k``
     ties, reach ``min(row_ends[r], top_k)``, as its counters tell. Its exact
     Top-``top_k`` keys are then among its written slots, and a threshold at or a
-    little below its ``top_k``-th largest score makes it fit. It runs as one
-    launch without host synchronization, so it can be captured in a CUDA graph
-    (run it once before capture to compile it).
+    little below its ``top_k``-th largest score makes it fit.
+
+    With ``arrivals`` (int32 ``[tiles]``, zeroed once and left zeroed by every
+    call), ``ranges`` (int32 ``[2, rows]``) and a ``capacity`` of at least
+    ``top_k - 1`` (the most keys a row can have above its cutoff), every row
+    fits. Any threshold then gives the same result, and only decides how often
+    a repair runs: the last CTA of a query tile to finish re-sweeps the tile for
+    each row that does not fit, and selects it again at its radix-selected
+    ``min(row_ends[r], top_k)``-th largest score, written back to
+    ``thresholds[r]``. It then writes the range of slots holding each row's
+    candidates and ties as ``ranges[:, r] = (start, stop)``. Other slots are
+    unspecified. It runs as one launch without host synchronization, so it can
+    be captured in a CUDA graph (run it once before capture to compile it).
     """
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("Threshold select needs CuTe DSL 4.7 or newer")
@@ -180,10 +193,18 @@ def single_head_paged_mqa_threshold_select(
         raise ValueError("Mismatched query rows (128 per tile) and per-row outputs")
     if max_context > 64 * width:
         raise ValueError("The block table must cover the context capacity")
+    if (arrivals is None) != (ranges is None):
+        raise ValueError("The repair takes both arrivals and ranges")
+    if ranges is not None and (
+        arrivals.shape[0] < tiles or ranges.shape[1] != tiles * 128
+    ):
+        raise ValueError("arrivals must hold a count per tile and ranges [2, rows]")
     if not 0 <= top_k < candidates.shape[1]:
         raise ValueError(
             "candidates must hold the top_k tie slots and at least one more"
         )
+    if ranges is not None and candidates.shape[1] - top_k < top_k - 1:
+        raise ValueError("The repair needs candidate slots for top_k - 1 keys")
     # CTAs per query tile: the fewest that give every SM the same number of CTAs
     # and keep each CTA's run within SELECT_TILES_PER_CTA. tiles * workers is a
     # multiple of the SM count exactly when workers is a multiple of unit.
@@ -193,7 +214,7 @@ def single_head_paged_mqa_threshold_select(
     workers = unit * -(-runs // unit)
     keys = (query, query_scales, key_cache, key_scales)
     tables = (row_ends, tile_requests, block_table)
-    outputs = (thresholds, counters, candidates)
+    outputs = (thresholds, counters, arrivals, ranges, candidates)
     _score("select", 128, keys, (*tables, *outputs, key_tiles * 128, workers, top_k))
 
 

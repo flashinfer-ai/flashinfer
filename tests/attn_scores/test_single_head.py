@@ -137,17 +137,19 @@ def test_single_head_paged_mqa_logits_match_reference_and_replay(
     ],
 )
 @pytest.mark.parametrize("keys", ["bf16", "nvfp4"])
+@pytest.mark.parametrize("repair", [False, True])
 @pytest.mark.parametrize("top_k", [64, 512, 2048])
 @torch.inference_mode()
 def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
-    query_lens, context_lens, top_k, keys
+    query_lens, context_lens, top_k, keys, repair
 ) -> None:
     """Causal 128-row tiles, odd ones reversed; rows 2 mod 8 score 0 (ties past
     the tie slots), rows 5 mod 8 NaN. Counts are exact, and each written slot
-    holds a distinct key of its class with its score (less the threshold)."""
+    holds a distinct key of its class with its score (less the threshold). The
+    repair reselects each row that misses at or below its Top-K cutoff."""
     torch.manual_seed(0)
     nvfp4, width = keys == "nvfp4", max(context_lens)
-    capacity, blocks = width // 2, -(-width // 64)
+    capacity, blocks = max(width // 2, top_k - 1), -(-width // 64)
     tiles = [(r, s) for r, n in enumerate(query_lens) for s in range(0, n, 128)]
     ends = torch.zeros(len(tiles), 128, dtype=torch.int32)
     for tile, (request, start) in enumerate(tiles):
@@ -168,11 +170,15 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
         query_scales.view(torch.uint8)[5::8] = 0x7F  # E4M3 NaN
     else:
         query[5::8] = torch.nan
-    thresholds = torch.empty(rows, device="cuda")
+    thresholds, requested = torch.empty(2, rows, device="cuda")
+    arrivals = torch.zeros(len(tiles), dtype=torch.int32, device="cuda")
+    ranges = torch.empty(2, rows, dtype=torch.int32, device="cuda")
+    repairs = dict(arrivals=arrivals, ranges=ranges) if repair else {}
     counters = torch.empty(rows, 2, dtype=torch.int32, device="cuda")
     candidates = torch.empty(rows, top_k + capacity, 2, dtype=torch.int32).cuda()
 
     def run() -> None:
+        thresholds.copy_(requested)
         counters.zero_()
         candidates.fill_(-1)
         single_head_paged_mqa_threshold_select(
@@ -184,6 +190,7 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
             top_k=top_k,
             query_scales=query_scales,
             key_scales=key_scales,
+            **repairs,
         )
 
     def reference() -> tuple[torch.Tensor, torch.Tensor]:
@@ -197,15 +204,30 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
         return scores, torch.arange(width, device="cuda") < ends[:, None]
 
     def check(scores: torch.Tensor, valid: torch.Tensor) -> None:
+        if repair:  # rows that fit keep the threshold, the others go at or below
+            need = valid.sum(1).clamp(max=top_k)
+            above = (valid & (scores > requested[:, None])).sum(1)
+            tied = (valid & ~(scores > requested[:, None])).sum(1)
+            tied -= (valid & (scores < requested[:, None])).sum(1)
+            fits = (above <= capacity) & (above + tied.clamp(max=top_k) >= need)
+            ranked = scores.masked_fill(~valid, -torch.inf).sort(1, descending=True)
+            cutoff = ranked[0].gather(1, (need - 1).clamp(min=0)[:, None])[:, 0]
+            assert torch.equal(thresholds[fits], requested[fits])
+            assert bool((thresholds[~fits] <= cutoff[~fits]).all())
         above = valid & (scores > thresholds[:, None])
         tied = valid & ~(scores > thresholds[:, None]) & ~(scores < thresholds[:, None])
         assert torch.equal(counters, torch.stack((above.sum(1), tied.sum(1)), 1).int())
         fit, tie = above.sum(1).clamp(max=capacity), tied.sum(1).clamp(max=top_k)
+        if repair:  # every row fits, its slots in its range
+            need = valid.sum(1).clamp(max=top_k)
+            assert bool(((fit + tie >= need) & (above.sum(1) <= capacity)).all())
+            assert torch.equal(ranges, torch.stack((top_k - tie, top_k + fit)).int())
         for row in range(rows):
             fitted, tied_count = int(fit[row]), int(tie[row])
             written = candidates[row, top_k - tied_count : top_k + fitted]
-            assert bool((candidates[row, : top_k - tied_count] == -1).all())
-            assert bool((candidates[row, top_k + fitted :] == -1).all())
+            if not repair:  # a repaired row's first sweep leaves stale slots
+                assert bool((candidates[row, : top_k - tied_count] == -1).all())
+                assert bool((candidates[row, top_k + fitted :] == -1).all())
             keys, bits = written.long().unbind(1)
             assert bool((keys >= 0).all()) and keys.unique().numel() == keys.numel()
             assert bool(tied[row, keys[:tied_count]].all())
@@ -218,7 +240,7 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
     scores, valid = reference()
     median = scores.nan_to_num(0).masked_fill(~valid, 0).median(1).values
     for threshold in (median, scores[:, 0].nan_to_num(0), -torch.inf, torch.inf):
-        thresholds[:] = threshold
+        requested[:] = threshold
         run()  # the first run compiles
         check(scores, valid)
     graph = torch.cuda.CUDAGraph()
@@ -226,7 +248,7 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
         run()
     ends.copy_((ends - 9).clamp(min=0))
     scores, valid = reference()
-    thresholds.copy_(scores.nan_to_num(0).masked_fill(~valid, 0).median(1).values)
+    requested.copy_(scores.nan_to_num(0).masked_fill(~valid, 0).median(1).values)
     graph.replay()
     check(scores, valid)
 
