@@ -206,7 +206,6 @@ def emit_annotations(audits: list[TraceAudit]) -> None:
 def _selftest() -> int:
     """Minimal self-test with synthetic data."""
     import tempfile
-    import os
 
     failures = 0
     with tempfile.TemporaryDirectory() as td:

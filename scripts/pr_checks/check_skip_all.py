@@ -56,7 +56,6 @@ import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
-from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -622,7 +621,7 @@ def _selftest() -> int:
                 name="pytest_nodeid",
                 value=f"tests/gdn/test_foo.py::test_something[{i}]",
             )
-            skip_el = ET.SubElement(
+            ET.SubElement(
                 tc, "skipped", message="ReplaySSM requires SM100/SM103"
             )
         tree = ET.ElementTree(root_el)
