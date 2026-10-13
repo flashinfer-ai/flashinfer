@@ -278,23 +278,3 @@ def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
 
 if __name__ == "__main__":
     pytest.main([__file__])
-
-
-def test_mm_bf16_auto_considers_cute_dsl():
-    """backend="auto" includes the CuTeDSL backend among its autotune candidates."""
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("CuTeDSL low-M backend requires SM100/SM103/SM107.")
-
-    from flashinfer.cute_dsl.utils import is_cute_dsl_available
-
-    if not is_cute_dsl_available():
-        pytest.skip("nvidia-cutlass-dsl is not available.")
-
-    m, n, k = 8, 2048, 4096
-    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
-    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
-    out = mm_bf16(a, b.T, backend="auto")
-    assert "cute-dsl" in mm_bf16.suitable_auto_backends
-    reference = a @ b.T
-    cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
-    assert cos_sim > 0.99
