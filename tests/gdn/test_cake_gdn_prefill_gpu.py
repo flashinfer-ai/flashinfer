@@ -113,6 +113,7 @@ def _make_case(
     num_v_heads=8,
     state_pool_padding=257,
     checkpoint_cu_dtype=torch.int32,
+    gates=True,
 ):
     generator = torch.Generator(device="cuda").manual_seed(20260828)
     hq, hv = num_q_heads, num_v_heads
@@ -189,8 +190,8 @@ def _make_case(
         "q": q.contiguous(),
         "k": k.contiguous(),
         "v": v.contiguous(),
-        "g": alpha.contiguous(),
-        "beta": beta.contiguous(),
+        "g": alpha.contiguous() if gates else None,
+        "beta": beta.contiguous() if gates else None,
         "scale": 1.0 / math.sqrt(128),
         "initial_state": initial_state,
         "output": torch.empty((total, heads, 128), dtype=io_dtype, device="cuda"),
@@ -801,6 +802,82 @@ def test_public_cake_gdn_prefill_int64_metadata_graph_owns_its_copy():
     assert torch.equal(case["output"], out_eager)
     assert torch.equal(case["output_state"], state_eager)
     del poison
+
+
+@torch.inference_mode()
+def test_public_cake_gdn_prefill_absent_gates_reuse_one_cached_unit_tensor():
+    """Calls without g and beta share one cached read-only all-ones gate tensor.
+
+    The compiled kernels read both gates from memory (``UNIT_GATES`` stays off),
+    so an absent gate used to be filled fresh on every call: one or two fill
+    kernels ahead of the main kernel.  The adapter now keeps one FP32 ones tensor
+    per device and ``[tokens, heads]`` shape and passes it for both gates.  The
+    output must match explicit unit gates bitwise, stay bitwise-identical across
+    launches, and the kernel must never write the shared tensor.
+    """
+    from flashinfer import gdn_prefill as prefill_mod
+
+    case = _make_case(
+        seq_lens=(64,) * 4,
+        num_q_heads=4,
+        num_k_heads=4,
+        num_v_heads=8,
+        gates=False,
+    )
+    assert case["g"] is None and case["beta"] is None
+    total_tokens = sum(case["seq_lens"])
+    num_o_heads = max(case["num_q_heads"], case["num_v_heads"])
+    device = case["q"].device
+
+    def launch(g, beta):
+        return chunk_gated_delta_rule(
+            q=case["q"],
+            k=case["k"],
+            v=case["v"],
+            g=g,
+            beta=beta,
+            scale=case["scale"],
+            initial_state=None,
+            output_final_state=False,
+            cu_seqlens=case["cu_seqlens"],
+            use_qk_l2norm_in_kernel=False,
+            output=case["output"],
+            use_cp=False,
+            backend="cake_gdn",
+        )
+
+    explicit_ones = torch.ones((total_tokens, num_o_heads), device=device)
+    launch(explicit_ones, explicit_ones.clone())
+    torch.cuda.synchronize()
+    expected = case["output"].clone()
+
+    prefill_mod._CAKE_GDN_UNIT_GATES.clear()
+    case["output"].zero_()
+    launch(None, None)
+    torch.cuda.synchronize()
+    first = case["output"].clone()
+    assert torch.equal(first, expected), "absent gates must act as explicit ones"
+
+    assert list(prefill_mod._CAKE_GDN_UNIT_GATES) == [
+        (device.index, total_tokens, num_o_heads)
+    ]
+    gates, _stream, _ready = next(iter(prefill_mod._CAKE_GDN_UNIT_GATES.values()))
+    assert gates.dtype == torch.float32
+    assert gates.is_contiguous()
+    assert tuple(gates.shape) == (total_tokens, num_o_heads)
+    assert gates.device == device
+    assert torch.equal(gates, torch.ones_like(gates))
+    assert prefill_mod._cake_gdn_unit_gates(total_tokens, num_o_heads, device) is gates
+
+    for _ in range(2):
+        case["output"].zero_()
+        launch(None, None)
+        torch.cuda.synchronize()
+        assert torch.equal(case["output"], first)
+    assert len(prefill_mod._CAKE_GDN_UNIT_GATES) == 1
+    assert torch.equal(gates, torch.ones_like(gates)), (
+        "the kernel must not write the shared unit gates"
+    )
 
 
 def test_public_cake_gdn_prefill_is_cuda_graph_safe():
