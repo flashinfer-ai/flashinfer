@@ -50,7 +50,7 @@ Example (Wrapper API with CUDA Graph):
     >>> g.replay()
 """
 
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, TypeVar
 
 import warnings
 import weakref
@@ -208,11 +208,17 @@ def _moe_hidden_size(w2_weight: torch.Tensor, localized_weights: Optional[list])
     return sum(widths)
 
 
-def _execute_on_streams(streams: list, fn: Callable[[int], None]) -> None:
-    """Call ``fn(i)`` with ``streams[i]`` current, forking from and joining to
-    the caller stream.
+_T = TypeVar("_T")
 
-    Mirrors ``torch.cuda.execute_on_streams`` (proposed in PyTorch PR 199128)
+
+def _execute_on_streams(
+    streams: Sequence[torch.cuda.Stream],
+    fn: Callable[..., _T],
+    *inputs: Sequence[Any],
+) -> list[_T]:
+    """Map corresponding input items to ``fn`` on each stream and return results.
+
+    Mirrors ``torch.cuda.execute_on_streams``
     for PyTorch builds without it. Each stream first waits for work already
     queued on the caller stream; the caller stream then waits for every
     callback's queued work, including work queued before a callback raised.
@@ -221,16 +227,21 @@ def _execute_on_streams(streams: list, fn: Callable[[int], None]) -> None:
     """
     if not streams:
         raise ValueError("Need at least one CUDA stream to execute on")
+    if not inputs:
+        raise ValueError("Need at least one input sequence")
+    if any(len(values) != len(streams) for values in inputs):
+        raise ValueError("Each input sequence must have one item per stream")
+    results = []
     caller_stream = torch.cuda.current_stream()
     start = torch.cuda.Event()
     start.record(caller_stream)
     done_events = []
     try:
-        for index, stream in enumerate(streams):
+        for stream, args in zip(streams, zip(*inputs, strict=True), strict=True):
             with torch.cuda.stream(stream):
                 stream.wait_event(start)
                 try:
-                    fn(index)
+                    results.append(fn(*args))
                 finally:
                     done = torch.cuda.Event()
                     done.record(stream)
@@ -238,25 +249,12 @@ def _execute_on_streams(streams: list, fn: Callable[[int], None]) -> None:
     finally:
         for done in done_events:
             caller_stream.wait_event(done)
+    return results
 
 
-def _resolve_stream_executor() -> Callable[[list, Callable[[int], None]], None]:
+def _resolve_stream_executor() -> Callable[..., list[Any]]:
     """Prefer PyTorch's fork/join helper; fall back to the in-repo mirror."""
-    executor = getattr(torch.cuda, "execute_on_streams", None)
-    if executor is not None:
-
-        def execute_with_indices(streams, fn):
-            # Upstream maps explicit input sequences to callbacks; it does not
-            # supply the domain index implicitly like the legacy helpers.
-            executor(streams, fn, range(len(streams)))
-
-        return execute_with_indices
-    try:
-        # Name used by earlier revisions of the PyTorch proposal.
-        from torch.cuda.green_contexts import execute_in_green_contexts
-    except ImportError:
-        return _execute_on_streams
-    return execute_in_green_contexts
+    return getattr(torch.cuda, "execute_on_streams", _execute_on_streams)
 
 
 def _get_cuda_graph_resources() -> Dict[str, Any]:
@@ -666,7 +664,7 @@ def _moe_core_impl(
         # The join also orders buffer reuse; record_stream is unnecessary and
         # could leave allocator events referencing destroyed green streams.
         # Per-expert/global scales are shared because only N is partitioned.
-        def _fc1_die(i, _ctx=None):
+        def _fc1_die(i):
             shard = localized_weights[i]
             blockscaled_contiguous_gather_grouped_gemm_act_fusion(
                 a=x,
@@ -714,7 +712,9 @@ def _moe_core_impl(
                 localized_memset_done.record(localized_memset_stream)
 
         try:
-            execute_on_streams(localized_streams, _fc1_die)
+            execute_on_streams(
+                localized_streams, _fc1_die, range(len(localized_streams))
+            )
         except BaseException:
             # Older executors skip the join when a callback raises.
             for stream in localized_streams:
@@ -812,7 +812,7 @@ def _moe_core_impl(
     if use_localized_path:
         # Both domains read the joined FC1 output and write disjoint hidden
         # columns. Each contracts the full intermediate, so no reduction is needed.
-        def _fc2_die(i, _ctx=None):
+        def _fc2_die(i):
             shard = localized_weights[i]
             blockscaled_contiguous_grouped_gemm_finalize_fusion(
                 a=intermediate,
@@ -843,7 +843,9 @@ def _moe_core_impl(
             )
 
         try:
-            execute_on_streams(localized_streams, _fc2_die)
+            execute_on_streams(
+                localized_streams, _fc2_die, range(len(localized_streams))
+            )
         except BaseException:
             for stream in localized_streams:
                 localization_main_stream.wait_stream(stream)

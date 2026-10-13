@@ -4630,13 +4630,11 @@ if __name__ == "__main__":
 
 
 @cute_dsl_available
-@pytest.mark.parametrize(
-    "localized, callback_arity", [(False, 1), (True, 1), (True, 2)]
-)
+@pytest.mark.parametrize("localized", [False, True])
 @pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("entrypoint", ["core", "functional"])
 def test_moe_core_preserves_fc2_output_dtype(
-    monkeypatch, localized, callback_arity, output_dtype, entrypoint
+    monkeypatch, localized, output_dtype, entrypoint
 ):
     from contextlib import nullcontext
 
@@ -4655,12 +4653,9 @@ def test_moe_core_preserves_fc2_output_dtype(
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
 
-    def execute(streams, fn):
-        for i in range(len(streams)):
-            if callback_arity == 1:
-                fn(i)
-            else:
-                fn(i, None)
+    def execute(streams, fn, *inputs):
+        assert list(inputs[0]) == list(range(len(streams)))
+        return [fn(*args) for args in zip(*inputs, strict=True)]
 
     monkeypatch.setattr(module, "_resolve_stream_executor", lambda: execute)
     calls = []
@@ -4732,15 +4727,8 @@ def test_localized_stream_executor_resolution(monkeypatch, available):
 
     from flashinfer.fused_moe.cute_dsl import fused_moe as module
 
-    streams = [object(), object()]
-    seen = []
-
-    def upstream(actual_streams, fn, *inputs):
-        assert actual_streams is streams
-        assert len(inputs) == 1
-        assert list(inputs[0]) == [0, 1]
-        for args in zip(*inputs, strict=True):
-            fn(*args)
+    def upstream(streams, fn, *inputs):
+        return [fn(*args) for args in zip(*inputs, strict=True)]
 
     def legacy(streams, fn):
         pass
@@ -4757,21 +4745,76 @@ def test_localized_stream_executor_resolution(monkeypatch, available):
         else None,
     )
     executor = module._resolve_stream_executor()
-    if available == "execute_on_streams":
-        executor(streams, seen.append)
-        assert seen == [0, 1]
+    expected = (
+        upstream if available == "execute_on_streams" else module._execute_on_streams
+    )
+    assert executor is expected
 
-        def fail(index):
-            seen.append(index)
+
+@cute_dsl_available
+@pytest.mark.parametrize("fail", [False, True])
+def test_localized_stream_fallback_inputs_and_join(monkeypatch, fail):
+    from contextlib import nullcontext
+    from unittest.mock import Mock, call
+
+    from flashinfer.fused_moe.cute_dsl import fused_moe as module
+
+    caller = Mock()
+    streams = [Mock(), Mock()]
+    start, first_done, second_done = Mock(), Mock(), Mock()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: caller)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(
+        torch.cuda, "Event", Mock(side_effect=[start, first_done, second_done])
+    )
+    seen = []
+
+    def work(index, value):
+        seen.append((index, value))
+        if fail:
             raise RuntimeError("callback failed")
+        return index + value
 
-        seen.clear()
+    if fail:
         with pytest.raises(RuntimeError, match="callback failed"):
-            executor(streams, fail)
-        assert seen == [0]
+            module._execute_on_streams(streams, work, [0, 1], [10, 20])
+        assert seen == [(0, 10)]
+        second_done.record.assert_not_called()
+        streams[1].wait_event.assert_not_called()
+        expected_done = [first_done]
     else:
-        expected = legacy if available == "legacy" else module._execute_on_streams
-        assert executor is expected
+        assert module._execute_on_streams(streams, work, [0, 1], [10, 20]) == [10, 21]
+        assert seen == [(0, 10), (1, 20)]
+        second_done.record.assert_called_once_with(streams[1])
+        streams[1].wait_event.assert_called_once_with(start)
+        expected_done = [first_done, second_done]
+    start.record.assert_called_once_with(caller)
+    streams[0].wait_event.assert_called_once_with(start)
+    first_done.record.assert_called_once_with(streams[0])
+    assert caller.wait_event.call_args_list == [call(done) for done in expected_done]
+
+
+@cute_dsl_available
+@pytest.mark.parametrize(
+    "streams, inputs, message",
+    [
+        ([], ([0],), "at least one CUDA stream"),
+        ([object()], (), "at least one input sequence"),
+        ([object()], ([0], []), "one item per stream"),
+    ],
+)
+def test_localized_stream_fallback_invalid_inputs(
+    monkeypatch, streams, inputs, message
+):
+    from unittest.mock import Mock
+
+    from flashinfer.fused_moe.cute_dsl import fused_moe as module
+
+    current_stream = Mock()
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+    with pytest.raises(ValueError, match=message):
+        module._execute_on_streams(streams, lambda *args: None, *inputs)
+    current_stream.assert_not_called()
 
 
 @cute_dsl_available
@@ -4802,9 +4845,9 @@ def test_localized_streams_are_joined_on_failure(
         if gemm == failed_gemm and kwargs["domain_id"] == failed_domain:
             raise error
 
-    def execute(streams, fn):
-        for i in range(len(streams)):
-            fn(i)
+    def execute(streams, fn, *inputs):
+        assert list(inputs[0]) == list(range(len(streams)))
+        return [fn(*args) for args in zip(*inputs, strict=True)]
 
     memset = Mock()
     finalize = Mock(side_effect=lambda **kw: launch("fc2", **kw))
