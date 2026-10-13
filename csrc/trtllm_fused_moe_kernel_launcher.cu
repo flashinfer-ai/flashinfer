@@ -1997,8 +1997,9 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
 #ifdef CAKE_STEPFUN_FC1
     // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
-    // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder keeps it
-    // only where both stages export the unit, and the ladder stays sorted for computeSelectedTileN.
+    // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung:
+    // cakeStepFunTileLadder keeps it only where both stages export the unit, and the ladder stays
+    // sorted for computeSelectedTileN.
     supported_tile_nums.push_back(256);
     supported_tile_nums = cakeStepFunTileLadder(
         supported_tile_nums, btg::Dtype::Bfloat16, btg::Dtype::Bfloat16, false,
@@ -3712,8 +3713,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
 #ifdef CAKE_STEPFUN_FC1
     // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
-    // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder keeps it
-    // only where both stages export the unit, and the ladder stays sorted for computeSelectedTileN.
+    // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung:
+    // cakeStepFunTileLadder keeps it only where both stages export the unit, and the ladder stays
+    // sorted for computeSelectedTileN.
     supported_tile_nums.push_back(256);
     supported_tile_nums = cakeStepFunTileLadder(
         supported_tile_nums, dtype_act, dtype_weights, false, static_cast<ActivationType>(act_type),
@@ -5356,8 +5358,9 @@ Array<Tensor> trtllm_bf16_moe(
                                        Bf16MoeLauncher::mSupportedTileNums.end());
 #ifdef CAKE_STEPFUN_FC1
   // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
-  // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder keeps it
-  // only where both stages export the unit, and the ladder stays sorted for computeSelectedTileN.
+  // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder
+  // keeps it only where both stages export the unit, and the ladder stays sorted for
+  // computeSelectedTileN.
   mSupportedTileN.push_back(256);
   mSupportedTileN = cakeStepFunTileLadder(
       mSupportedTileN, btg::Dtype::Bfloat16, btg::Dtype::Bfloat16, false, activation,
@@ -5481,8 +5484,9 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
                                        Fp8PerTensorLauncher::mSupportedTileNums.end());
 #ifdef CAKE_STEPFUN_FC1
   // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
-  // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder keeps it
-  // only where both stages export the unit, and the ladder stays sorted for computeSelectedTileN.
+  // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder
+  // keeps it only where both stages export the unit, and the ladder stays sorted for
+  // computeSelectedTileN.
   mSupportedTileN.push_back(256);
   mSupportedTileN = cakeStepFunTileLadder(
       mSupportedTileN, btg::Dtype::E4m3, btg::Dtype::E4m3, false, activation, use_shuffled_weight,
@@ -5611,8 +5615,9 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
                                        Fp8PerTensorLauncher::mSupportedTileNums.end());
 #ifdef CAKE_STEPFUN_FC1
   // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
-  // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder keeps it
-  // only where both stages export the unit, and the ladder stays sorted for computeSelectedTileN.
+  // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder
+  // keeps it only where both stages export the unit, and the ladder stays sorted for
+  // computeSelectedTileN.
   mSupportedTileN.push_back(256);
   mSupportedTileN = cakeStepFunTileLadder(
       mSupportedTileN, btg::Dtype::E4m3, btg::Dtype::E4m3, false, activation, use_shuffled_weight,
