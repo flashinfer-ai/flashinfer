@@ -150,6 +150,14 @@ one M class per process, two passes, per-row minimum.  (A single pass over the w
 rows heat the part and the small rows that follow swing; one M class per pass brings
 that to 1-2% median / 10% p90.)  The 1SM 128x128 column is from the B12 table.
 
+Caveat on the fixed-variant columns: within a row the bench times the variants in a
+fixed order, `auto` first, and on the power-bound wide rows the part is hotter by the
+time the pinned variants run.  mlp.gate_up tp2 (N=12800) at M=8192 is the worst case:
+`auto` measures 686 us and the pinned 256x128 tile, the same binary `auto` selected,
+968 us.  So on those rows the fixed columns are biased slow and the "oracle" can read
+worse than `auto`.  The plots take the per-row minimum over the variants *and* `auto`;
+a future sweep should interleave the variants per row (or pin clocks) instead.
+
 | M | auto / cuBLAS | oracle / cuBLAS | 256x128 | 256x160 | 256x192 | 1SM 128x128 | 256x128 split-K | 256x128 stream-K | auto / oracle |
 |---|---|---|---|---|---|---|---|---|---|
 | 1024 | 1.08 | 1.07 | 1.20 | 1.22 | 1.38 | 1.25 | 1.26 | 1.43 | 1.01 |
