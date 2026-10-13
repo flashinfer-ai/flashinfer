@@ -16,6 +16,7 @@
 #include <flashinfer/exception.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -1122,6 +1123,50 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config
   return {tile_N, config};
 }
 
+// When the default tactic is requested and the heuristic tile has no config whose cubin loads
+// on this driver (cubinLoads() in trtllm_batched_gemm_runner.cu), pick the nearest tile that has
+// one: larger tiles first (they hold the two-CTA kernels), then smaller ones. In every other case
+// tile_N is returned unchanged, so behaviour is identical where every cubin loads.
+template <typename LauncherMap>
+int64_t pickTileWithDefaultConfig(int64_t tile_N, int64_t config, LauncherMap const& launchers) {
+  if (config != -1) {
+    return tile_N;
+  }
+  auto hasDefault = [&launchers](int64_t t) {
+    auto it = launchers.find(static_cast<int32_t>(t));
+    return it != launchers.end() && it->second->default_config_available();
+  };
+  if (hasDefault(tile_N)) {
+    return tile_N;
+  }
+  std::vector<int64_t> tiles;
+  for (auto const& entry : launchers) {
+    tiles.push_back(entry.first);
+  }
+  std::sort(tiles.begin(), tiles.end());
+  std::vector<int64_t> order;
+  for (auto t : tiles) {
+    if (t > tile_N) {
+      order.push_back(t);
+    }
+  }
+  for (auto it = tiles.rbegin(); it != tiles.rend(); ++it) {
+    if (*it < tile_N) {
+      order.push_back(*it);
+    }
+  }
+  for (auto t : order) {
+    if (hasDefault(t)) {
+      std::fprintf(stderr,
+                   "[FlashInfer] tile_N %lld has no trtllm-gen kernel that loads on this driver; "
+                   "using tile_N %lld (GitHub #5322)\n",
+                   static_cast<long long>(tile_N), static_cast<long long>(t));
+      return t;
+    }
+  }
+  return tile_N;
+}
+
 // Validate the FC1 bias tensor against the selected BiasType. Currently only
 // BiasType::None and BiasType::Mn are exercised from the flashinfer MoE path
 inline void check_gemm1_bias_mn(Optional<TensorView> const& gemm1_bias,
@@ -1581,6 +1626,19 @@ class FusedMoeLauncher {
     this->moe_tactic = moe_tactic;
   }
 
+ public:
+  /** True when a default tactic exists for this launcher's tile on this device and driver. */
+  bool default_config_available() {
+    try {
+      int64_t tactic = -1;
+      prepare_moe_runner(tactic);
+      return true;
+    } catch (std::exception const&) {
+      return false;
+    }
+  }
+
+ protected:
   /** Allocate the FC workspaces required by the resolved complete tactic. */
   void prepare_moe_common(int64_t& moe_tactic) {
     prepare_moe_runner(moe_tactic);
@@ -5963,8 +6021,9 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     launchers_map[curr_tile_N] = std::move(launcher);
   }
 
-  auto const [tile_N, config] = resolveMoeTileAndConfig(config_index, mSupportedTileN, num_tokens,
-                                                        totalExpertsPerToken, totalLocalExperts);
+  auto const [resolved_tile_N, config] = resolveMoeTileAndConfig(
+      config_index, mSupportedTileN, num_tokens, totalExpertsPerToken, totalLocalExperts);
+  int64_t const tile_N = pickTileWithDefaultConfig(resolved_tile_N, config, launchers_map);
 
   // Get the launcher for the selected tile_N
   auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));
