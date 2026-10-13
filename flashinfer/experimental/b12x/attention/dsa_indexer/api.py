@@ -93,8 +93,8 @@ class Caps:
         index_mxfp4_page_bytes(self.page_size)
         if self.output_index_space != "logical" or self.topk != 512:
             raise ValueError("MXFP4 requires logical topk=512 output")
-        if self.num_q_heads > 32 or 32 % self.num_q_heads:
-            raise ValueError("MXFP4 index heads must divide 32")
+        if self.num_q_heads > 64 or 64 % self.num_q_heads:
+            raise ValueError("MXFP4 index heads must divide 64")
         if not 0 <= self.max_candidates <= 16384:
             raise ValueError("MXFP4 max_candidates must be in [0, 16384]")
         if self.candidate_topk_blocks not in (0, 2048):

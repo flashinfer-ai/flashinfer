@@ -418,7 +418,7 @@ def test_tensorcore_prefill_preserves_bf16_scores_and_selection(
 
 @pytest.mark.parametrize("exponents", [(-40, -4, 6, 40), (-6, -2, 3, 7)])
 @pytest.mark.parametrize("mode", ["decode", "prefill"])
-@pytest.mark.parametrize("heads", [8, 32])
+@pytest.mark.parametrize("heads", [8, 32, 64])
 def test_varied_scales_preserve_staged_rounding_against_fp64(
     indexer_session, exponents, mode, heads
 ):

@@ -107,8 +107,8 @@ def _validate_query(query: DsaIndexerQuery, _device: DeviceIdentity | None) -> N
             raise ValueError(
                 "MXFP4 requires logical top-k=512 and a positive page size"
             )
-        if query.num_q_heads > 32 or 32 % query.num_q_heads:
-            raise ValueError("MXFP4 index heads must divide 32")
+        if query.num_q_heads > 64 or 64 % query.num_q_heads:
+            raise ValueError("MXFP4 index heads must divide 64")
         if query.max_candidates and query.candidate_topk_blocks:
             raise ValueError("MXFP4 source and reindex candidates are exclusive")
 
