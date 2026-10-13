@@ -16,14 +16,9 @@ recipe (hardware, container, versions, harness invocation) is in the
 
 ## Microbenchmark results (2026-07-22, e2e_pipelined p50 µs)
 
-Measured at the `4_5_2-perf-fix` branch tip (`7d538173`) on
-**nvidia-cutlass-dsl 4.5.2** — the new default runtime (see "CuTe-DSL
-runtime sensitivity" below; the MR!27 WAR makes 4.5.2 the perf floor).
-Reproduces the previous reference (2026-07-21, dsl 4.6.1, tip `29e2d2f8`,
-CSV `model_shapes_20260721_111314_deepseek_v3.csv`) within run noise at
-every cell. Default geometry (7168 hidden / 2048 inter / 256 experts /
-top-8), 4x GB200, heuristic knobs, speedup vs `sm100_fp8_fp4_bf16_deepgemm` in parens;
-CSV `moe_ep_benchmark/model_shapes/results/model_shapes_20260722_130237.csv`:
+Measured with `nvidia-cutlass-dsl==4.5.2`, using the mainloop workaround
+below. Geometry: hidden 7168, intermediate 2048, 256 experts, top-8,
+4x GB200. Ratios compare against `sm100_fp8_fp4_bf16_deepgemm`.
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
 |---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
@@ -169,13 +164,12 @@ path) and `fi_dg` run the mxfp4 checkpoint.
   kernel property.
 - The headline decode cell reproduces at this branch tip within 0.6%.
 - **2026-07-22 revalidation on nvidia-cutlass-dsl 4.5.2** (vLLM 0.25.1's own
-  pin, no force-upgrade — the MR!27 WAR makes 4.5.2 the perf floor): the
+  pin, no force-upgrade — the mainloop workaround makes 4.5.2 the perf floor): the
   prefill-8k cell reproduces on the same metric (native 45,582 / fi_nvfp4
   53,623 tok/s = 1.176x); the decode-1k check was recorded as **total tok/s**
   (prompt + output: native 32,086 / fi_nvfp4 34,263 = 1.068x), a different
   metric from the headline's output tok/s — it corroborates the 1.07x speedup
-  ratio rather than the absolute cells (vllm_e2e RUNS.md runs 41-42,
-  `requick452_*.json`).
+  ratio rather than the absolute cells.
 
 ## Historical note: nvfp4 numbers before 2026-07-15 are invalid
 
@@ -195,8 +189,8 @@ noise (<= ~4% per cell); the tables above are the current reference.
 
 ## CuTe-DSL runtime sensitivity: `nvidia-cutlass-dsl[cu13]==4.5.2` (2026-07-15) — OBSOLETE
 
-> **OBSOLETE (2026-07-22):** the regression below is fixed by the MR!27
-> mainloop WAR (see the follow-up subsection) — 4.5.2 now runs at full
+> **OBSOLETE (2026-07-22):** the regression below is fixed by the mainloop
+> workaround (see the follow-up subsection) — 4.5.2 now runs at full
 > parity for both nvfp4 and mxfp8, and the perf floor is 4.5.2, not 4.6.1.
 > Kept for the record of what unpatched 4.5.2 codegen did.
 
@@ -230,13 +224,12 @@ Takeaways:
 Conclusion (2026-07-15): treat **4.6.1 as a performance floor**, not just a
 compile-compatibility floor — 4.5.2 is functional but leaves ~1.3-1.5x of
 nvfp4 kernel performance on the table.
-**Superseded for nvfp4 on 2026-07-22 by the MR!27 mainloop WAR — see the
+**Superseded for nvfp4 on 2026-07-22 by the mainloop workaround — see the
 follow-up below.**
 
-### Follow-up 2026-07-22: MR!27 mainloop WAR recovers nvfp4 on 4.5.2
+### Follow-up 2026-07-22: mainloop workaround recovers nvfp4 on 4.5.2
 
-`cutedsl_megamoe` MR!27 (ported in the `4_5_2-perf-fix` branch, single file
-`src/moe_nvfp4_swapab/kernel_fc12.py`) peels the last k-tile out of the
+`src/moe_nvfp4_swapab/kernel_fc12.py` peels the last k-tile out of the
 MMA-consumer mainloop when `cutlass.__version__ == 4.5.2` exactly
 (`cutlass.const_expr`-gated, so 4.6.1+ traces are unchanged). Rerun of the
 same sweep recipe with 4.5.2 pinned (CSVs
@@ -256,8 +249,8 @@ This matches the 4.6.1 reference table above within run noise at every
 point (e.g. nvfp4 bf16 428.0 vs 428.5 @1024, 609.3 vs 625.6 @2048, 1859.7
 vs 1923.5 @8192), i.e. the 34-54% regression is fully recovered and the
 dg-crossover / large-token win shape is restored. Correctness: the full
-`tests/moe_ep/run_tests.sh all` suite passed under pinned 4.5.2 (all 8
-sections, 2026-07-22, job 2427254).
+`tests/moe_ep/run_tests.sh all` suite passed under pinned 4.5.2 (all eight
+sections, 2026-07-22).
 
 mxfp8 needs no WAR: a same-day 4.5.2 sweep
 (`sweep_20260722_114210_fi_mega.csv`) matches the 4.6.1 mxfp8 reference
@@ -280,19 +273,9 @@ match the fast reference** — the codegen regression existed only in
 4.5.2 and was fixed upstream in 4.5.3, so the WAR's exact `== 4.5.2` gate
 is correct and every published version >= 4.5.2 runs at full performance.
 
-Support statement: **>= 4.5.2 at full performance** (4.5.2 via the MR!27
-WAR; 4.5.3 / 4.6.0 / 4.6.1 verified natively fast); < 4.5.2 unsupported
+Support statement: **>= 4.5.2 at full performance** (4.5.2 via the mainloop
+workaround; 4.5.3 / 4.6.0 / 4.6.1 verified natively fast); < 4.5.2 unsupported
 (4.5.0 fails at `cute.compile`, 4.5.1 unmeasured — the shim warns).
-
-The 4.7.0.dev internal drop (`nvidia-cutlass-dsl-internal`
-`0.3.0+20260721052439.f58f4a5`) also measures fast: nvfp4
-427.0/614.2/1907.7 µs @1024/2048/8192 (`sweep_20260722_142421_fi_mega.csv`)
-— compiles and runs cleanly. Note internal wheels report their own version
-scheme (`cutlass.__version__ == "0.3.0"`, dist name
-`nvidia-cutlass-dsl-internal`), so on internal drops the ==4.5.2 WAR gate
-is always OFF and the shim's <4.5.2 warning silently skips (dist lookup
-misses) — both are the right behavior as long as internal drops carry the
-4.5.3+ codegen fix, which this one does.
 
 ## The knob system (`shim/tuner.py`, `shim/autotune.py`)
 
@@ -444,9 +427,9 @@ Finalized and unfinalized output, and both routing-weight placements, have separ
 cache entries. Older entries without an output-mode field describe reduced
 output; entries from the removed explicit startup tuner are ignored.
 
-Use the actual per-rank workspace capacities for `--max-tokens`. With
-`--live-tokens`, the cache still keys on capacity, so distinct workload winners
-for the same capacity need separate cache files. Serving loads the winner with
+Use the actual per-rank workspace capacities for `--max-tokens`. The cache records
+`--live-tokens` alongside capacity, so distinct workload winners at the same
+capacity can share one cache file. Serving loads the winner with
 `knobs=None` and the matching `do_finalize` / `apply_topk_in_fc1` settings,
 falling back to the heuristic on a cache miss. Retune NVFP4 entries previously
 recorded without the correct routing-weight placement.
@@ -658,17 +641,10 @@ Takeaways at this (single-node NVLink) geometry, from the 2026-07-21 sweep:
 
 ### Sweep methodology + environment (reproduce recipe)
 
-**Hardware / software.**  One GB200 node, 4x NVIDIA GB200 (sm_100, cc
-10.0) over NVLink, driver 580.173.02.  Pyxis container image
-`flashinfer-ep-pt2605-mega_moe_ep-20260712.sqsh` (NGC 26.05 base):
-torch `2.12.0a0+5aff3928d8.nv26.05`, CUDA 13.2, `cuda-bindings 13.2.0`,
-`triton 3.7.0+nv26.5`, `deep_gemm 2.5.0+891d57b`,
-`nvshmem4py-cu13 0.3.1`; `nvidia-cutlass-dsl` upgraded in-container to
-**4.6.1** (>=4.5.2 suffices since the 2026-07-22 MR!27 WAR; the reference
-numbers were measured on 4.6.1 and 4.5.2 reproduces them within noise).
-FlashInfer = this branch,
-editable-installed inside the container
-(`PIP_CONSTRAINT="" BUILD_NIXL_EP=0 pip install --no-build-isolation -e .`).
+**Hardware / software.** One GB200 node with four GPUs (SM100, compute
+capability 10.0) over NVLink. Use a CUDA 13 environment with PyTorch,
+DeepGEMM, NVSHMEM and `nvidia-cutlass-dsl[cu13]>=4.5.2`. Install this
+checkout with `pip install --no-build-isolation -e .`.
 
 **Harness.**  `moe_ep_benchmark/bench_moe_ep_mega.py` via
 `SECTION=fi_mega GPUS=4 SEQ_LENS="1024 2048 4096 8192" run_sweep.sh`
@@ -702,16 +678,16 @@ CSVs.  `sm100_fp8_fp4_bf16_deepgemm` has no thunk API, so its "kernel" number lo
 
 ### Runbook (rerun the sweep)
 
-The harness lives at <https://github.com/mhoqueanik/moe_ep_benchmark>
-(bench env-knob reference in its README.md; SLURM/container details in
-its RUNBOOK.md).  `MEGA_IKR` / `MEGA_COMBINE_DTYPE` land in bench commit
-`a15fb01`.  On a SLURM + pyxis cluster with the image above:
+The harness lives at <https://github.com/mhoqueanik/moe_ep_benchmark>.
+Its README documents the benchmark flags. For a Slurm/Pyxis run, set
+`MEGA_BENCH_IMAGE` to a container image with the dependencies above:
 
 ```bash
-export ROOT=/path/to/workspace          # holds the image, the bench repo,
-export REPO=$ROOT/flashinfer-moe_ep     # and the flashinfer checkout
+export ROOT=/path/to/workspace
+export REPO=$ROOT/flashinfer
+export MEGA_BENCH_IMAGE=/path/to/prepared-image.sqsh
 srun -A <account> -p batch -N 1 --ntasks-per-node=1 --time=04:00:00 \
-  --container-image="$ROOT/flashinfer-ep-pt2605-mega_moe_ep-20260712.sqsh" \
+  --container-image="$MEGA_BENCH_IMAGE" \
   --container-mounts="$ROOT:$ROOT" --container-workdir="$REPO" \
   bash -lc '
     export FLASHINFER_DISABLE_VERSION_CHECK=1

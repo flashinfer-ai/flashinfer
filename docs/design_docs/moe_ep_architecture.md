@@ -561,7 +561,7 @@ unless noted):
 | mega deep_gemm (fp8_fp4) | 2026-07-31 | same run + variant job (multirank oracle) |
 | mega sm100_nvfp4_nvfp4_bf16_cutedsl (default, ikr, nvfp4/mxfp8 combine wires) | 2026-07-31 | 4x GB200 variant job |
 | mega sm100_mxfp8_mxfp8_bf16_cutedsl (default, ikr) | 2026-07-31 | 4x GB200 variant job |
-| mega sm90_fp8_fp8_bf16_pull_cutedsl (per_tensor/blockwise × swap_ab) | 2026-07-30 | Hopper, when landed (commit 7169aca9); not runnable on the SM100 cluster |
+| mega sm90_fp8_fp8_bf16_pull_cutedsl (per_tensor/blockwise × swap_ab) | 2026-07-30 | Hopper; not runnable on SM100 |
 | mega sm90_bf16_bf16_bf16_pull_cutedsl | 2026-10-08 | Hopper 4x H200, this branch |
 
 ## Forward flow
@@ -706,8 +706,10 @@ profile tag is required. This applies to SM90, SM100, and SM107 tuners.
 
 Lookup first matches capacity exactly, then selects the smallest recorded live
 bucket at least as large as the workload, or the largest bucket if none is
-large enough. Legacy entries without `live_tokens` retain capacity-based
-fallback. Default callers without a live count select for full capacity.
+large enough. Legacy entries without `live_tokens` count as full-capacity
+buckets. If the requested capacity has no buckets, lookup retains the
+capacity-based fallback. Default callers without a live count select for full
+capacity.
 
 Before CUDA graph capture, enumerate `layer.live_token_buckets(capacity)`, create
 `layer.create_workspace(capacity, live_tokens=bucket)`, and warm each handle.

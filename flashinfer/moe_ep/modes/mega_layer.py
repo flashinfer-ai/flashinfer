@@ -215,6 +215,8 @@ class MoEEpMegaLayer(nn.Module):
         graph capture. Only one live handle per (capacity, live_tokens) is allowed.
         ``live_tokens`` selects an offline workload profile without shrinking
         capacity. Handles retain their compiled tactics and stable addresses.
+        ``live_tokens=None`` selects full capacity, even when the layer has a
+        different default tuning profile.
         """
 
         if isinstance(max_tokens_per_rank, bool) or not isinstance(
@@ -248,11 +250,11 @@ class MoEEpMegaLayer(nn.Module):
             tuning_live_tokens=live_tokens,
         )
         self._kernel.validate_init(self._bootstrap, fleet_params)
-        is_default_capacity = (
-            live_tokens is None
-            and max_tokens_per_rank == self._fleet_params.max_tokens_per_rank
+        is_default_profile = (
+            max_tokens_per_rank == self._fleet_params.max_tokens_per_rank
+            and live_tokens == self._fleet_params.tuning_live_tokens
         )
-        if is_default_capacity and self._workspace is not None:
+        if is_default_profile and self._workspace is not None:
             # Transfer the already-lazy-allocated default profile into the
             # explicit handle without acquiring a second pooled reference.
             backend_workspace = self._workspace
@@ -264,7 +266,7 @@ class MoEEpMegaLayer(nn.Module):
             )
         handle = MoEEpMegaWorkspace(self, fleet_params, backend_workspace)
         self._workspaces[profile_key] = handle
-        if is_default_capacity:
+        if is_default_profile:
             self._default_workspace_handle = handle
         return handle
 
