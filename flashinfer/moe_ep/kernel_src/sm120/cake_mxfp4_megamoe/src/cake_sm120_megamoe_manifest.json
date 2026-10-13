@@ -2,7 +2,7 @@
  "arch": "sm_120a",
  "binding": {
   "path": "cake_sm120_megamoe_binding.cu",
-  "sha256": "1737b3b55de248bed1b2e595623faef9c5f52a2b6a409f44ace5407b26a8c770"
+  "sha256": "7d5fc70247b391e28fd72473828e8b1ece9488a6a39dea5d52d8b13c75214c17"
  },
  "device": {
   "entry": "cake_sm120_megamoe_kernel.cuh",

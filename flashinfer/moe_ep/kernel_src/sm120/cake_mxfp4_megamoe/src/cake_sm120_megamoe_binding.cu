@@ -42,6 +42,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cuda/atomic>
 #include <memory>
@@ -79,6 +81,18 @@ inline void CheckCu(CUresult status, const char* operation) {
 
 inline void CheckNccl(ncclResult_t status, const char* operation) {
   TVM_FFI_ICHECK(status == ncclSuccess) << operation << " failed: " << ncclGetErrorString(status);
+}
+
+// NCCL_GIN_ENABLE=0 switches GIN off but ncclCommQueryProperties still reports a GIN type, and
+// ncclDevCommCreate with GIN requirements then faults inside NCCL 2.30.7 (integer division by
+// zero in ncclGinDevCommSetup).  NCCL loads nccl.conf into the environment during communicator
+// init, so after init the environment also reflects a setting made there.
+inline bool GinDisabledByEnvironment() {
+  const char* value = std::getenv("NCCL_GIN_ENABLE");
+  if (value == nullptr || *value == '\0') return false;
+  char* end = nullptr;
+  long long parsed = std::strtoll(value, &end, 0);
+  return end != value && parsed == 0;
 }
 
 inline void CheckCpuInt64(const TensorView& t, const char* name) {
@@ -164,6 +178,12 @@ class TransportSession {
         << "NCCL communicator does not support the Device API";
     gin_type_ = static_cast<int>(properties.ginType);
     gin_available_ = properties.ginType != NCCL_GIN_TYPE_NONE;
+    if (gin_available_ && GinDisabledByEnvironment()) {
+      std::fprintf(stderr,
+                   "[cake_sm120_megamoe] rank %d: NCCL_GIN_ENABLE=0, continuing without GIN\n",
+                   rank_);
+      gin_available_ = false;
+    }
     lsa_team_count_ = properties.nLsaTeams;
 
     try {
@@ -176,9 +196,14 @@ class TransportSession {
         // Record the allocation before any further step that can throw, so Release() frees it.
         windows_.push_back(w);
         Window& stored = windows_.back();
-        CheckNccl(ncclCommWindowRegister(comm_, stored.pointer, stored.bytes, &stored.window,
-                                         NCCL_WIN_COLL_SYMMETRIC),
-                  "ncclCommWindowRegister");
+        ncclResult_t registered = ncclCommWindowRegister(comm_, stored.pointer, stored.bytes,
+                                                         &stored.window, NCCL_WIN_COLL_SYMMETRIC);
+        // Without GIN, NCCL can only register the window if every peer is load/store reachable.
+        TVM_FFI_ICHECK(registered == ncclSuccess)
+            << "ncclCommWindowRegister failed: " << ncclGetErrorString(registered)
+            << (gin_available_ ? ""
+                               : " (GIN is unavailable or disabled, so every EP peer must be "
+                                 "load/store reachable)");
         CheckCuda(cudaMemset(stored.pointer, 0, stored.bytes), "cudaMemset(window)");
       }
 

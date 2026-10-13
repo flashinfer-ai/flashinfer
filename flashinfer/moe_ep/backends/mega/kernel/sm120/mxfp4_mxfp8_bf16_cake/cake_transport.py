@@ -186,7 +186,8 @@ def validate_table(
                 )
             if cell == TRANSPORT_GIN and not gin_available:
                 raise ValueError(
-                    f"GIN selected for pair ({a},{b}) but GIN is unavailable"
+                    f"GIN selected for pair ({a},{b}) but GIN is unavailable "
+                    "(no GIN transport, or GIN disabled, e.g. NCCL_GIN_ENABLE=0)"
                 )
             if cell not in (TRANSPORT_LSA, TRANSPORT_GIN):
                 raise ValueError(f"unknown transport {cell!r} at ({a},{b})")

@@ -89,6 +89,15 @@ class TransportSession:
         module.transport_session_properties(self.handle, props)
         self.gin_available = bool(props[1])
         self.gin_type = int(props[2])
+        # GIN can be switched off at runtime (NCCL_GIN_ENABLE=0), in which case the native
+        # session falls back to LSA only; every rank must reach the same answer.
+        gathered_gin: list[Any] = [None] * world_size
+        dist.all_gather_object(gathered_gin, self.gin_available, group=group)
+        if any(bool(v) != self.gin_available for v in gathered_gin):
+            module.transport_session_close(self.handle)
+            raise RuntimeError(
+                f"ranks disagree about GIN availability: {[bool(v) for v in gathered_gin]}"
+            )
         self.lsa_team_count = int(props[3])
         peers = torch.zeros(len(names) * world_size, dtype=torch.int64)
         module.transport_session_peer_pointers(self.handle, peers)
