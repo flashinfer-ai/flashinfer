@@ -1009,6 +1009,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_wfp4afp8_humming: bool = False,
         profile_ids: Optional[List[int]] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        # 4over6 recipe (nvfp4_4over6_code()); the default reads the env.
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
@@ -1137,6 +1139,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             enable_pdl,
             activation_type,
             workspace_buffer,
+            nvfp4_4over6_code,
         )
 
         return (
@@ -1189,6 +1192,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_wfp4afp8_humming: bool = False,
         profile_ids: Optional[List[int]] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        # 4over6 recipe (nvfp4_4over6_code()); the default reads the env.
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> List[torch.Tensor]:
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -1322,6 +1327,7 @@ def cutlass_fused_moe(
     situ_beta: Optional[torch.Tensor] = None,
     situ_linear_beta: Optional[torch.Tensor] = None,
     backend: str = "cutlass",
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -1508,6 +1514,17 @@ def cutlass_fused_moe(
         prepared TP8-local SiTU complete call; output and workspace are required.
         See the Cake SiTU guide for its TRTLLM shuffled NVFP4 weight layout.
 
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 4over6 recipe for the activation quantizations inside the MoE
+        (the GEMM1 input when ``input`` is unquantized BF16, and the GEMM2
+        input). NVFP4×NVFP4 only; ``backend="cake"`` does not take it.
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off, environment ignored.
+        - :class:`NVFP44Over6Config`: that recipe. The caller's
+          ``fc2_act_global_scale`` must be built for the same ``e4m3_max``.
+
     Returns
     -------
     out: torch.Tensor
@@ -1528,6 +1545,27 @@ def cutlass_fused_moe(
         are not implemented for Blackwell architecture.
 
     """
+    # Reject an unhonorable pinned recipe before any device work. The NVFP4
+    # test mirrors the binding's isNvfp4Quant() plus the W4A16 flag.
+    is_nvfp4 = (
+        fc1_expert_weights.dtype == torch.int64
+        and input.dtype != torch.float8_e4m3fn
+        and not use_w4_group_scaling
+    )
+    if nvfp4_4over6 is _UNSET:
+        nvfp4_4over6_code_value = NVFP4_4OVER6_CODE_FROM_ENV
+    else:
+        if backend == "cake":
+            raise ValueError("backend='cake' does not take nvfp4_4over6")
+        resolved_nvfp4_4over6 = resolve_nvfp4_4over6(nvfp4_4over6)
+        if resolved_nvfp4_4over6 is not None and not is_nvfp4:
+            raise ValueError(
+                "nvfp4_4over6 requires NVFP4×NVFP4 (int64-packed NVFP4 weights "
+                "with BF16 or NVFP4 input); no other CUTLASS path quantizes "
+                "activations to NVFP4. Pass None to turn 4over6 off, or omit "
+                "it to read the environment."
+            )
+        nvfp4_4over6_code_value = nvfp4_4over6_code(resolved_nvfp4_4over6)
     if backend == "cake":
         from .cake_kimi_k3_situ import _cake_situ_fused_moe
 
@@ -1657,6 +1695,7 @@ def cutlass_fused_moe(
             use_wfp4afp8_humming=use_wfp4afp8_humming,
             profile_ids=profile_ids,
             workspace_buffer=workspace_buffer,
+            nvfp4_4over6_code=nvfp4_4over6_code_value,
         )
 
 

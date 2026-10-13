@@ -2363,6 +2363,9 @@ class _CutlassRunnerBase(MoERunner):
             profile_ids=profile_ids,
             workspace_buffer=self._workspace,
             **self._activation_params,
+            # Unset everywhere except on CutlassNvfp4Runner (QuantConfig
+            # rejects an explicit value for other activations).
+            nvfp4_4over6=self.config.quant.nvfp4_4over6,
         )
         return inputs[0]
 
@@ -2484,6 +2487,9 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
     """
 
     backend_key = "cutlass_nvfp4"
+    # Threaded as QuantParams::FP4 nvfp4_4over6_code; both of CUTLASS's NVFP4
+    # activation quantizations have 4over6 variants, so no per-token rule.
+    supports_nvfp4_4over6 = True
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_NVFP4_ARCHS
