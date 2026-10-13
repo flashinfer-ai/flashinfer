@@ -2703,6 +2703,10 @@ _DEFAULT_BACKEND = BackendOptions(
         CuTileMxfp8Bf16Config(),
         CuTileMxfp8Config(),
         CuTileNvfp4Bf16Config(),
+        CudnnFrostBf16Config(),
+        CudnnFrostMxfp8Config(),
+        CudnnFrostNvfp4Config(),
+        CudnnFrostMxfp8Mxfp4Config(),
     )
 )
 
