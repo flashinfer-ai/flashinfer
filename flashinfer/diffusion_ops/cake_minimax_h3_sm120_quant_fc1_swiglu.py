@@ -25,11 +25,11 @@ from ..jit.cake_minimax_h3_sm120_quant_fc1_swiglu import (
     gen_minimax_h3_sm120_quant_fc1_swiglu_module,
 )
 from ..utils import (
-    get_compute_capability,
     register_custom_op,
     register_fake_op,
     supported_compute_capability,
 )
+from .cake_minimax_h3_sm120_quant_gate import require_sm120
 
 # MiniMax-H3 video DiT block dimensions served by the generated kernels.
 MINIMAX_H3_HIDDEN = 5376
@@ -47,15 +47,6 @@ E4M3_MAX = 448.0
 E2M1_MAX = 6.0
 
 Scalar = Union[float, torch.Tensor]
-
-
-def _require_sm120(device: torch.device) -> None:
-    major, minor = get_compute_capability(device)
-    if (major, minor) != (12, 0):
-        raise NotImplementedError(
-            "MiniMax-H3 SM120 quantized FC1+SwiGLU is built for compute capability 12.0 "
-            f"(RTX 5090 / RTX PRO 6000 Blackwell) only, got {major}.{minor}"
-        )
 
 
 @functools.cache
@@ -103,7 +94,7 @@ def _check_common(
 ) -> Tuple[int, torch.device]:
     rows = _check_rows(x)
     device = x.device
-    _require_sm120(device)
+    require_sm120(device, "FC1+SwiGLU")
     _require("x", x, torch.bfloat16, (rows, MINIMAX_H3_HIDDEN), device)
     _require(
         "x_norm_weight", x_norm_weight, torch.bfloat16, (MINIMAX_H3_HIDDEN,), device

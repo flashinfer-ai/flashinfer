@@ -21,6 +21,8 @@ import pytest
 import torch
 
 import flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_fc1_swiglu as fc1_sm120
+import flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_gate as gate_sm120
+import flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_mlp as mlp_sm120
 import flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_out_proj as out_proj_sm120
 import flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_pre_attention as pre_sm120
 
@@ -35,13 +37,14 @@ HIDDEN = 5376
 ATTN_DIM = 7168
 QKV_WIDTH = 21504
 FC1_ROWS = 28672
+FC2_COLS = 14336
 ROWS = 4
 
 
 @pytest.fixture
 def mock_cc(monkeypatch, request):
     cc = request.param
-    for module in (fc1_sm120, out_proj_sm120, pre_sm120, fc1_public):
+    for module in (gate_sm120, fc1_public):
         monkeypatch.setattr(
             module, "get_compute_capability", lambda device, _cc=cc: _cc
         )
@@ -60,6 +63,10 @@ def _f32(shape, device):
     return torch.ones(shape, dtype=torch.float32, device=device)
 
 
+def _fp8(shape, device):
+    return torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
+
+
 def _calls(device):
     x = _bf16((ROWS, HIDDEN), device)
     norm = _bf16((HIDDEN,), device)
@@ -67,7 +74,7 @@ def _calls(device):
     index = torch.zeros((ROWS,), dtype=torch.int32, device=device)
     head = _bf16((128,), device)
     rope = _bf16((ROWS, 96), device)
-    fp8 = torch.float8_e4m3fn
+    index64 = torch.zeros((ROWS,), dtype=torch.int64, device=device)
     return {
         "fp8_pre_attention": lambda: pre_sm120.minimax_h3_fp8_pre_attention(
             x,
@@ -75,7 +82,7 @@ def _calls(device):
             adaln,
             adaln,
             index,
-            torch.zeros((QKV_WIDTH, HIDDEN), device=device).to(fp8),
+            _fp8((QKV_WIDTH, HIDDEN), device),
             _f32((QKV_WIDTH,), device),
             head,
             head,
@@ -101,7 +108,7 @@ def _calls(device):
             adaln,
             adaln,
             index,
-            torch.zeros((FC1_ROWS, HIDDEN), device=device).to(fp8),
+            _fp8((FC1_ROWS, HIDDEN), device),
             _f32((FC1_ROWS,), device),
         ),
         "fc1_swiglu_nvfp4_public": lambda: fc1_public.minimax_h3_fc1_swiglu_nvfp4(
@@ -117,7 +124,7 @@ def _calls(device):
         ),
         "fp8_out_proj": lambda: out_proj_sm120.minimax_h3_fp8_out_proj(
             _bf16((ROWS, ATTN_DIM), device),
-            torch.zeros((HIDDEN, ATTN_DIM), device=device).to(fp8),
+            _fp8((HIDDEN, ATTN_DIM), device),
             _f32((HIDDEN,), device),
             adaln,
             index,
@@ -133,6 +140,36 @@ def _calls(device):
             index,
             x,
         ),
+        "mlp_fp8": lambda: mlp_sm120.minimax_h3_mlp_fp8_sm120(
+            x,
+            norm,
+            adaln,
+            adaln,
+            index64,
+            adaln,
+            x,
+            _fp8((FC1_ROWS, HIDDEN), device),
+            _f32((FC1_ROWS,), device),
+            _fp8((HIDDEN, FC2_COLS), device),
+            _f32((HIDDEN,), device),
+        ),
+        "mlp_nvfp4": lambda: mlp_sm120.minimax_h3_mlp_nvfp4_sm120(
+            x,
+            norm,
+            adaln,
+            adaln,
+            index64,
+            adaln,
+            x,
+            _f32((1,), device),
+            _u8((FC1_ROWS, HIDDEN // 2), device),
+            _u8((FC1_ROWS * 336,), device),
+            1.0,
+            _f32((1,), device),
+            _u8((HIDDEN, FC2_COLS // 2), device),
+            _u8((HIDDEN * 896,), device),
+            1.0,
+        ),
     }
 
 
@@ -142,6 +179,8 @@ SM120_ONLY_ENTRIES = [
     "fc1_swiglu_fp8",
     "fp8_out_proj",
     "nvfp4_out_proj",
+    "mlp_fp8",
+    "mlp_nvfp4",
 ]
 # The public NVFP4 FC1 routes to the tcgen05 kernels below major 12, so only 12.x reaches this gate.
 CASES = [(e, cc) for e in SM120_ONLY_ENTRIES for cc in [(12, 1), (10, 0), (9, 0)]] + [
