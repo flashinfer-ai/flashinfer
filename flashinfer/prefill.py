@@ -3029,6 +3029,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 page_size=page_size,
                 causal=causal,
                 sm_scale=sm_scale,
+                float_workspace_buffer=self._float_workspace_buffer,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
                 use_cuda_graph=self._use_cuda_graph,

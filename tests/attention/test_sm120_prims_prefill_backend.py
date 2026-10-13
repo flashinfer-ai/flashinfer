@@ -463,11 +463,62 @@ def test_paged_kv_split_bounds():
     from flashinfer.attention.cute_dsl.sm120_fmha import _paged_kv_split_bounds
 
     # Long prefix: split, with every inner boundary inside the prefix all rows see.
-    bounds = _paged_kv_split_bounds([2048], [34816], 16, True, 128, 188, 0, 8)
+    bounds = _paged_kv_split_bounds([2048], [34816], 16, True, 128, 188, 0, 128, 8)
     assert len(bounds[0]) > 2 and bounds[0][0] == 0 and bounds[0][-1] == 272
     assert max(bounds[0][1:-1]) <= (34816 - 2048) // 128
     # Fresh causal prompt: no prefix all rows see, so no split.
-    assert _paged_kv_split_bounds([4096], [4096], 16, True, 128, 188, 0, 8) is None
+    assert _paged_kv_split_bounds([4096], [4096], 16, True, 128, 188, 0, 128, 8) is None
+    # Fixed size: a request's bounds do not depend on the rest of the batch.
+    alone = _paged_kv_split_bounds([64], [2112], 16, True, 128, 188, 512, 128, 8)
+    batch = _paged_kv_split_bounds(
+        [64, 8], [2112, 9000], 16, True, 128, 188, 512, 128, 8
+    )
+    assert alone == [[0, 4, 8, 12, 16, 17]]
+    assert batch[0][: len(alone[0])] == alone[0] and set(batch[0][len(alone[0]) :]) == {
+        17
+    }
+    # Fixed size needing more chunks than the float workspace holds.
+    with pytest.raises(ValueError, match="float workspace"):
+        _paged_kv_split_bounds([64], [2112], 16, True, 128, 188, 128, 4, 8)
+
+
+def test_paged_fixed_split_is_batch_invariant():
+    hq, hkv, d, page_size = 16, 2, 128, 16
+    pages = [ceil_div(2112, page_size), ceil_div(9000, page_size)]
+    q = _fp8((64 + 8, hq, d))
+    cache = _fp8((sum(pages), 2, hkv, page_size, d))
+    outs = []
+    for kv_lens, q_lens in (([2112], [64]), ([2112, 9000], [64, 8])):
+        n = len(kv_lens)
+        workspace = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "HND", backend="cute-dsl-prims"
+        )
+        wrapper.plan(
+            torch.tensor([0, *q_lens], device="cuda").cumsum(0, dtype=torch.int32),
+            torch.tensor([0, *pages[:n]], device="cuda").cumsum(0, dtype=torch.int32),
+            torch.arange(sum(pages[:n]), dtype=torch.int32, device="cuda"),
+            torch.tensor(
+                [
+                    kv - (p - 1) * page_size
+                    for kv, p in zip(kv_lens, pages, strict=False)
+                ],
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            hq,
+            hkv,
+            d,
+            page_size,
+            causal=True,
+            q_data_type=q.dtype,
+            kv_data_type=cache.dtype,
+            o_data_type=torch.bfloat16,
+            fixed_split_size=32,
+        )
+        assert wrapper._prims_backend._kv_split is not None
+        outs.append(wrapper.run(q[: sum(q_lens)], cache)[:64])
+    torch.testing.assert_close(outs[0], outs[1], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("all_ones_v", [True, False])
