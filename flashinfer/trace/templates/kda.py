@@ -277,7 +277,7 @@ fused_kda_decode_trace = TraceTemplate(
         "singleton == 1",
         "projection_groups == 3",
         "head_dim == 128",
-        "num_heads in (12, 24, 32, 48, 96)",
+        "num_heads in (8, 12, 24, 32, 48, 96)",
         "conv_width == 4",
         "conv_history == 3",
     ],

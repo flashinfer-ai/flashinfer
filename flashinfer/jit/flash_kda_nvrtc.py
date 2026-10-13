@@ -14,12 +14,6 @@ from filelock import FileLock
 from .cpp_ext import get_cuda_path
 
 
-_BODY_DEFINE = re.compile(
-    r'^#define FLASHKDA_GENERATED_BODY_FILE "([^"]+)"$', re.MULTILINE
-)
-_KERNEL_DEFINE = re.compile(
-    r"^#define FLASHKDA_GENERATED_KERNEL ([A-Za-z_][A-Za-z0-9_]*)$", re.MULTILINE
-)
 _C_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _TARGET_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
 _SCHEMA_VERSION = 1
@@ -117,36 +111,22 @@ def _write_atomic(path: Path, payload: bytes) -> None:
 def prepare_generated_flash_kda_cubin(
     build_dir: Path,
     *,
-    selector_path: Path,
     body_path: Path,
+    kernel_name: str,
     module_ident: str,
     target: str,
 ) -> Mapping[str, Path]:
     """Compile and return one content-addressed cubin for Ninja embedding."""
 
-    if _C_IDENTIFIER.fullmatch(module_ident) is None:
-        raise ValueError(
-            f"invalid generated FlashKDA module identifier: {module_ident!r}"
-        )
+    for label, value in (("module identifier", module_ident), ("kernel", kernel_name)):
+        if _C_IDENTIFIER.fullmatch(value) is None:
+            raise ValueError(f"invalid generated FlashKDA {label}: {value!r}")
     try:
         arch = _TARGET_ARCH[target]
     except KeyError as error:
         raise ValueError(
             f"unsupported generated FlashKDA NVRTC target: {target}"
         ) from error
-
-    selector = selector_path.read_text()
-    body_match = _BODY_DEFINE.search(selector)
-    kernel_match = _KERNEL_DEFINE.search(selector)
-    if body_match is None or kernel_match is None:
-        raise ValueError(
-            f"generated FlashKDA selector lacks body or kernel identity: {selector_path}"
-        )
-    if body_match.group(1) != body_path.name:
-        raise ValueError(
-            f"generated FlashKDA selector/body mismatch: {body_match.group(1)!r} "
-            f"!= {body_path.name!r}"
-        )
 
     source = body_path.read_bytes()
     include_dirs = _cuda_include_dirs()
@@ -166,7 +146,7 @@ def prepare_generated_flash_kda_cubin(
         "source_name": body_path.name,
         "source_sha256": _sha256(source),
         "module_ident": module_ident,
-        "kernel_name": kernel_match.group(1),
+        "kernel_name": kernel_name,
         "target": target,
         "arch": arch,
         "compile_options": list(options),

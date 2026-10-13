@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     import torch
@@ -23,6 +23,7 @@ class SplitKernelContext:
     fleet_params: "FleetParams"
     recv_topk_idx: Optional["torch.Tensor"] = None
     recv_topk_weights: Optional["torch.Tensor"] = None
+    recv_count: Optional["torch.Tensor"] = None
 
 
 class SplitKernelBackend(ABC):
@@ -179,12 +180,13 @@ class MegaKernelBackend(ABC):
         heap use and compiled sessions by the layer count.
         """
         self._ensure_ep_bootstrap(bootstrap)
-        key = self._workspace_pool_key(fleet_params)
-        if key is None:
+        request = self._workspace_pool_request(fleet_params)
+        if request is None:
             return self._allocate_workspace(fleet_params)
+        key, factory = request
         from .workspace_pool import acquire_workspace
 
-        return acquire_workspace(key, lambda: self._allocate_workspace(fleet_params))
+        return acquire_workspace(key, factory)
 
     @abstractmethod
     def _allocate_workspace(self, fleet_params: "FleetParams") -> Any:
@@ -198,6 +200,22 @@ class MegaKernelBackend(ABC):
         epilogue scalars, and knobs. Default is unpooled.
         """
         return None
+
+    def _workspace_pool_request(
+        self,
+        fleet_params: "FleetParams",
+    ) -> Optional[tuple[Any, Callable[[], Any]]]:
+        """Return one pool key and its matching allocation factory.
+
+        The default preserves the legacy backend contract. Backends whose
+        pool key depends on mutable external state can override this hook to
+        resolve that state once and capture the same frozen value in both the
+        key and factory.
+        """
+        key = self._workspace_pool_key(fleet_params)
+        if key is None:
+            return None
+        return key, lambda: self._allocate_workspace(fleet_params)
 
     def validate_forward(  # noqa: B027 - intentional no-op default
         self,
@@ -223,6 +241,23 @@ class MegaKernelBackend(ABC):
     ) -> None:
         """Optional init-time validation for user-supplied kernel-ready weights."""
 
+    def set_compile_tokens_per_rank(  # noqa: B027 - intentional no-op default
+        self,
+        workspace: Any,
+        compile_tokens_per_rank: int | None,
+    ) -> None:
+        """Select an optional per-invocation graph/compile token bucket.
+
+        The workspace capacity remains fixed by ``FleetParams``. Backends that
+        specialize kernels for smaller graph buckets override this hook. A
+        caller may only provide a non-``None`` value when every EP rank uses
+        the same value for the invocation.
+        """
+        if compile_tokens_per_rank is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support compile token buckets"
+            )
+
     def stage_inputs(  # noqa: B027 - intentional no-op default
         self,
         t: "MoEEpTensors",
@@ -231,6 +266,17 @@ class MegaKernelBackend(ABC):
         quantize_input: bool,
     ) -> None:
         """Copy or quantize activations into workspace buffers."""
+
+    def workspace_output(self, workspace: Any) -> "torch.Tensor":
+        """Return the stable output tensor owned by ``workspace``.
+
+        Backends that support zero-copy framework integration override this
+        method. Keeping the accessor on the backend avoids exposing private,
+        backend-specific workspace layouts to callers.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose a workspace output"
+        )
 
     @abstractmethod
     def compute(

@@ -231,6 +231,7 @@ class _ContextCompileSpec:
     packed_dense_k_mask: bool
     scheduler: _ContextScheduler
     head_dim_vo: int | None = None
+    two_cta_umma: bool = False
 
 
 @dataclass(frozen=True)
@@ -259,6 +260,7 @@ class _PagedContextCompileSpec:
 
 def _make_context_kernel(
     *,
+    device_index: int,
     input_qk_dtype,
     input_pv_dtype,
     output_dtype,
@@ -273,6 +275,8 @@ def _make_context_kernel(
     causal_single_kv_tile: bool,
     scheduler: _ContextScheduler,
     uses_ldtm_stat: bool,
+    fp8_psmem_early_token: bool = False,
+    two_cta_umma: bool = False,
     page_size: int | None = None,
     max_kv_len: int | None = None,
 ):
@@ -296,7 +300,7 @@ def _make_context_kernel(
         if use_paged_kv
         else {}
     )
-    return FmhaTs(
+    fmha = FmhaTs(
         qk_acc_dtype=cutlass.Float32,
         pv_acc_dtype=cutlass.Float32,
         in_qk_dtype=input_qk_dtype,
@@ -305,6 +309,8 @@ def _make_context_kernel(
         d=head_dim,
         d_v=head_dim_vo,
         is_persistent=is_persistent,
+        fp8_psmem_early_token=fp8_psmem_early_token,
+        two_cta_umma=two_cta_umma,
         is_causal=mask_type == "causal",
         has_variable_window=mask_type == "variable_window",
         balance_causal_workload=(
@@ -324,6 +330,7 @@ def _make_context_kernel(
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
         **paged_kwargs,
     )
+    return fmha
 
 
 def _validate_tensor(tensor: torch.Tensor, name: str) -> None:
@@ -501,6 +508,32 @@ def _dsl_supports_ldtm_stat() -> bool:
         return pkg_version.Version(dsl_version).release >= (4, 7, 0)
     except pkg_version.InvalidVersion:
         return False
+
+
+def _default_exp2_fma_pairs(device_index: int, cfg) -> int:
+    """FMA-pipe exp2 pairs per 16-pair softmax chunk on SM100 with 16-bit V.
+
+    Measured on B200. The paired D128 dense path is MUFU bound and takes 4.
+    Single-QKV dense takes 2. Causal is issue bound and takes 0. Callers can
+    set cfg.exp2_fma_pairs to any value on any path."""
+    if torch.cuda.get_device_capability(device_index) != (10, 0):
+        return 0
+    if cfg.v_dtype.width != 16 or cfg.is_causal:
+        return 0
+    if cfg.pv_half_overlap:
+        return 4
+    return 2 if cfg.single_qkv_instance else 0
+
+
+def _default_fp8_psmem_early_token(device_index: int) -> bool:
+    """Release the S0/S1 token early on the fp8 SMEM-P path, on for SM103."""
+    return torch.cuda.get_device_capability(device_index) == (10, 3)
+
+
+def _default_two_cta_umma(device_index: int) -> bool:
+    """Two-CTA UMMA for the dense paired D128 context kernel: on for SM103, where the
+    kernel is tensor-pipe bound and halving UMMA issues and K/V traffic per SM pays."""
+    return torch.cuda.get_device_capability(device_index) == (10, 3)
 
 
 def _default_uses_ldtm_stat(device_index: int) -> bool:
@@ -1461,6 +1494,7 @@ def _make_context_scheduler_probe(
         torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     }
     probe = _make_context_kernel(
+        device_index=geometry.device_index,
         input_qk_dtype=dtype_map[geometry.qk_dtype],
         input_pv_dtype=dtype_map[geometry.pv_dtype],
         output_dtype=dtype_map[geometry.output_dtype],
@@ -1578,6 +1612,27 @@ def _resolve_paged_plan_geometry(
     )
 
 
+def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
+    """Dense contiguous MHA or GQA at D=128 with bf16 QK runs the two-CTA UMMA
+    form, which pairs adjacent Q tiles of one head through the grid.
+    The two-CTA launch is non-persistent with heads on grid Y and batch on
+    grid Z. CUDA limits grid Y and Z to 65,535. Oversized geometries keep the
+    persistent flattened grid so the valid int32 plans stay launchable."""
+    return (
+        _default_two_cta_umma(geometry.device_index)
+        and geometry.head_dim == 128
+        and geometry.head_dim_vo in (None, 128)
+        and geometry.mask_type == "dense"
+        and not geometry.packed
+        and not geometry.head_paired
+        and torch.finfo(geometry.qk_dtype).bits in (8, 16)
+        and not (
+            geometry.batch_size > _CUDA_GRID_YZ_MAX
+            or geometry.num_qo_heads > _CUDA_GRID_YZ_MAX
+        )
+    )
+
+
 def _resolve_context_scheduler(geometry: _ContextPlanGeometry) -> _ContextScheduler:
     """Select a scheduler from plan-time work while keeping batch out of JIT."""
 
@@ -1585,6 +1640,9 @@ def _resolve_context_scheduler(geometry: _ContextPlanGeometry) -> _ContextSchedu
         geometry,
         causal_single_kv_tile=geometry.causal_single_kv_tile,
     )
+    if _two_cta_umma_geometry_eligible(geometry):
+        # Two-CTA pairs Q tiles through the grid, so no persistent scheduler.
+        return "nonpersistent"
     is_persistent = _contiguous_context_uses_persistent_scheduler(
         single_qkv_instance=probe.single_qkv_instance,
         head_paired=geometry.head_paired,
@@ -1664,6 +1722,7 @@ def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec
         causal_single_kv_tile=geometry.causal_single_kv_tile,
         packed_dense_k_mask=geometry.packed_dense_k_mask,
         scheduler=_resolve_context_scheduler(geometry),
+        two_cta_umma=_two_cta_umma_geometry_eligible(geometry),
     )
 
 
@@ -1718,6 +1777,7 @@ def _get_compiled_context(
     causal_single_kv_tile = compile_spec.causal_single_kv_tile
     packed_dense_k_mask = compile_spec.packed_dense_k_mask
     scheduler = compile_spec.scheduler
+    two_cta_umma = compile_spec.two_cta_umma
 
     import cutlass
     import cutlass.cute as cute
@@ -1736,6 +1796,7 @@ def _get_compiled_context(
     with torch.cuda.device(device_index):
         max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
     fmha = _make_context_kernel(
+        device_index=device_index,
         input_qk_dtype=input_qk_dtype,
         input_pv_dtype=input_pv_dtype,
         output_dtype=output_dtype,
@@ -1749,7 +1810,9 @@ def _get_compiled_context(
         has_q_offset=has_q_offset,
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler=scheduler,
+        two_cta_umma=two_cta_umma,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
     )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
@@ -1757,6 +1820,7 @@ def _get_compiled_context(
         fmha.cfg.uniform_seq_len_q = max_seq_len_q
         fmha.cfg.uniform_seq_len_k = max_seq_len_k
     fmha.cfg.has_q_offset = has_q_offset
+    fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
     if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
         raise RuntimeError(
             "context packed-K specialization assumes kv_tile_n="
@@ -1949,6 +2013,7 @@ def _get_compiled_paged_context(
     with torch.cuda.device(device_index):
         max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
     fmha = _make_context_kernel(
+        device_index=device_index,
         input_qk_dtype=input_qk_dtype,
         input_pv_dtype=input_pv_dtype,
         output_dtype=output_dtype,
@@ -1962,6 +2027,7 @@ def _get_compiled_paged_context(
         causal_single_kv_tile=False,
         scheduler=scheduler,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )
@@ -1971,6 +2037,7 @@ def _get_compiled_paged_context(
         fmha.cfg.uniform_seq_len_q = max_seq_len_q
         fmha.cfg.uniform_seq_len_k = max_kv_len
     fmha.cfg.has_q_offset = has_q_offset
+    fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
     fmha.cfg.paged_v_tail_is_zero = paged_v_tail_is_zero
     if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
         raise RuntimeError(

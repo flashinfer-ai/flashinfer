@@ -24,10 +24,19 @@ the last CTA to finish the tile.  Nothing about the plan is decided on the
 host, so a runner captured once into a CUDA Graph replays correctly for any
 KV-length distribution written into ``seq_lens`` later.  See
 ``README.md`` in this package and flashinfer-ai/flashinfer#4832.
+
+``q_len_per_req`` 3..8 (speculative / MTP verify) is served by the packed-row
+program: one ``8 * q_len``-row tile per ``(request, kv head)`` item so each KV
+chunk is streamed once per request, with the same on-device scheduler and a
+distributed merge (one to ``2 * q_len`` merge tickets per split tile, fewer
+and fatter for tiles with few chunks).  Other ``q_len_per_req`` values use
+the row-tile program.
 """
 
 from __future__ import annotations
 
+import functools
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
@@ -35,14 +44,21 @@ import torch
 import tvm_ffi
 
 from .cake_jit import (
-    MODULES,
+    KINDS,
+    PROGRAMS,
     load_cake_balanced_gqa_decode_module,
     select_module,
 )
 from .cake_bounds import (
     BLOCK_N,
     MAX_REQUESTS,
+    MTP_COUNTERS_PER_TILE,
+    MTP_PARTIAL_O_PER_SLOT,
+    MTP_STATS_PER_SLOT,
     max_items_bound,
+    mtp_max_items_bound,
+    mtp_n_rows,
+    uses_packed_mtp,
     workspace_bounds,
 )
 
@@ -50,14 +66,35 @@ HEAD_DIM = 128
 PAGE_SIZE = 16
 GROUP_RATIO = 8  # query heads per KV head served by one 8-row MMA tile
 PAGES_PER_BLOCK = BLOCK_N // PAGE_SIZE  # the loader fetches page ids 8 at a time
-PARTIAL_O_PER_SLOT = GROUP_RATIO * HEAD_DIM
+PARTIAL_O_PER_SLOT = GROUP_RATIO * HEAD_DIM  # row-tile program
 STATS_PER_SLOT = 16  # max[8] then sum[8]
+LOG2E = 1.4426950408889634
 QUEUE_COUNTERS = 4  # ticket, done CTAs (both reset in-kernel), L, total items
 WORKSPACE_ALIGN = 256
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
 # Exact keyword set of the generated program's ``run`` entry (bound by the
 # export's argument plan); ``grid`` is expanded to ``grid_x/y/z``.
+MTP_MAIN_KWARGS = (
+    "Q",
+    "K",
+    "V",
+    "O_ptr",
+    "page_table",
+    "seq_lens_kv",
+    "partial_o",
+    "partial_stats",
+    "tile_counters",
+    "queue_counters",
+    "max_pages_per_seq",
+    "softmax_scale_log2",
+    "num_q_heads",
+    "num_kv_heads",
+    "batch_size",
+    "q_len",
+    "max_items",
+    "grid",
+)
 MAIN_KWARGS = (
     "Qt",
     "K",
@@ -86,11 +123,29 @@ MAIN_KWARGS = (
 # ---------------------------------------------------------------------------
 
 
-def num_persistent_ctas(device: Optional[torch.device] = None) -> int:
-    """Grid size of the persistent launch: one CTA per SM."""
+def _device_index(device: Optional[torch.device] = None) -> int:
     if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+        return int(torch.cuda.current_device())
+    index = torch.device(device).index
+    return int(torch.cuda.current_device() if index is None else index)
+
+
+@functools.cache
+def _multi_processor_count(device_index: int) -> int:
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+@functools.cache
+def _device_arch(device_index: int) -> Optional[str]:
+    """``sm_100a`` / ``sm_103a`` of a device, ``None`` for other capabilities."""
+    return SUPPORTED_COMPUTE_CAPABILITIES.get(
+        torch.cuda.get_device_capability(device_index)
+    )
+
+
+def num_persistent_ctas(device: Optional[torch.device] = None) -> int:
+    """Grid size of the persistent launch: one CTA per SM (queried once per device)."""
+    return _multi_processor_count(_device_index(device))
 
 
 def _align(nbytes: int) -> int:
@@ -104,11 +159,20 @@ def workspace_layout(num_ctas: int, *, padded_table_ints: int = 0) -> dict:
     every batch); ``padded_table_ints`` is non-zero only when the caller's
     block table needs padding to a multiple of eight pages per request.
     """
+    # Both programs carve the same regions; the packed-row MTP program has the
+    # larger slots (64 x 128 FP32 O, 128 statistics words, two counters per
+    # split tile), so the layout is sized for it and bounds either kernel.
     max_split_items, max_split_tiles = workspace_bounds(num_ctas)
     sizes = [
-        ("partial_o", max_split_items * PARTIAL_O_PER_SLOT * 4),
-        ("partial_stats", max_split_items * STATS_PER_SLOT * 4),
-        ("tile_counters", max_split_tiles * 4),
+        (
+            "partial_o",
+            max_split_items * max(PARTIAL_O_PER_SLOT, MTP_PARTIAL_O_PER_SLOT) * 4,
+        ),
+        (
+            "partial_stats",
+            max_split_items * max(STATS_PER_SLOT, MTP_STATS_PER_SLOT) * 4,
+        ),
+        ("tile_counters", max_split_tiles * MTP_COUNTERS_PER_TILE * 4),
         ("queue_counters", QUEUE_COUNTERS * 4),
         ("page_table", padded_table_ints * 4),
     ]
@@ -147,8 +211,18 @@ def _round_up_pages(max_pages: int) -> int:
 
 
 def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape):
+    """View ``shape`` elements of ``dtype`` at the start of workspace region ``name``.
+
+    The regions are sized for the larger packed-row MTP slots; the row-tile
+    program uses a prefix of each region.
+    """
     offset, nbytes = layout[name]
-    return flat[offset : offset + nbytes].view(dtype).view(shape)
+    needed = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    if needed > nbytes:
+        raise ValueError(
+            f"workspace region {name!r} holds {nbytes} bytes, {needed} needed"
+        )
+    return flat[offset : offset + needed].view(dtype).view(shape)
 
 
 # ---------------------------------------------------------------------------
@@ -193,26 +267,40 @@ class BalancedGQADecodeRunner:
         return int(counters[2]), int(counters[3])
 
 
-def generated_program_available(device: torch.device) -> bool:
-    """True when this checkout registers a generated program for ``device``."""
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
-    return arch is not None and any(r["arch"] == arch for r in MODULES.values())
+def program_kind(q_len_per_req: int) -> str:
+    """``"row"`` or the packed MTP instance (``"mtp32"`` / ``"mtp64"``) for ``q_len_per_req``."""
+    if uses_packed_mtp(q_len_per_req):
+        return f"mtp{mtp_n_rows(q_len_per_req)}"
+    return "row"
+
+
+def generated_program_available(device: torch.device, q_len_per_req: int = 1) -> bool:
+    """True when this checkout registers the program serving ``q_len_per_req`` on ``device``."""
+    arch = _device_arch(_device_index(device))
+    program = KINDS.get(program_kind(q_len_per_req))
+    return (
+        arch is not None and program is not None and arch in PROGRAMS[program]["arches"]
+    )
 
 
 def bind_decode_payload(
-    arch: str, main_kwargs: dict, out: torch.Tensor, *, block_tables_padded: bool
+    arch: str,
+    main_kwargs: dict,
+    out: torch.Tensor,
+    *,
+    block_tables_padded: bool,
+    kind: str = "row",
 ) -> BalancedGQADecodeRunner:
     """Bind the prepared buffers to the generated physical argument order."""
-    module_name = select_module(arch)
-    record = MODULES[module_name]
-    physical = record["main"]
+    module_name = select_module(arch, kind)
+    record = PROGRAMS[module_name]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), main_kwargs["grid"], strict=True))
     arguments = tuple(
-        grid[name] if kind == "grid" else main_kwargs[name]
-        for kind, name in physical["arg_plan"]
+        grid[name] if slot == "grid" else main_kwargs[name]
+        for slot, name in record["arg_plan"]
     )
-    module = load_cake_balanced_gqa_decode_module(module_name, "main")
-    entry = getattr(module, physical["ffi_entry"])
+    module = load_cake_balanced_gqa_decode_module(module_name, arch)
+    entry = getattr(module, record["ffi_entry"])
     return BalancedGQADecodeRunner(
         module_name, main_kwargs, out, entry, arguments, block_tables_padded
     )
@@ -354,9 +442,9 @@ def prepare_balanced_batch_decode_with_kv_cache(
         raise ValueError("Expected all tensors on one CUDA device")
     if not all(t.is_contiguous() for t in tensors):
         raise ValueError("Expected contiguous tensors")
-    capability = torch.cuda.get_device_capability(device)
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
+    arch = _device_arch(_device_index(device))
     if arch is None:
+        capability = torch.cuda.get_device_capability(device)
         raise ValueError(
             "balanced GQA decode requires compute capability 10.0 or 10.3 "
             f"(got {capability[0]}.{capability[1]})"
@@ -385,22 +473,28 @@ def prepare_balanced_batch_decode_with_kv_cache(
         )
 
     max_split_items, max_split_tiles = workspace_bounds(num_ctas)
+    kind = program_kind(q_len_per_req)
+    packed = kind != "row"
     partial_o = _carve(
         flat,
         layout,
         "partial_o",
         torch.float32,
-        (max_split_items * PARTIAL_O_PER_SLOT,),
+        (max_split_items * (MTP_PARTIAL_O_PER_SLOT if packed else PARTIAL_O_PER_SLOT),),
     )
     partial_stats = _carve(
         flat,
         layout,
         "partial_stats",
         torch.float32,
-        (max_split_items * STATS_PER_SLOT,),
+        (max_split_items * (MTP_STATS_PER_SLOT if packed else STATS_PER_SLOT),),
     )
     tile_counters = _carve(
-        flat, layout, "tile_counters", torch.uint32, (max_split_tiles,)
+        flat,
+        layout,
+        "tile_counters",
+        torch.uint32,
+        (max_split_tiles * (MTP_COUNTERS_PER_TILE if packed else 1),),
     )
     queue_counters = _carve(
         flat, layout, "queue_counters", torch.uint32, (QUEUE_COUNTERS,)
@@ -423,28 +517,53 @@ def prepare_balanced_batch_decode_with_kv_cache(
         page_table.zero_()
         page_table[:, :max_pages].copy_(block_tables)
 
-    main_kwargs = dict(
-        Qt=query.view(total_q * num_q_heads, HEAD_DIM),
-        K=k_cache.view(num_pages * num_kv_heads, PAGE_SIZE, HEAD_DIM),
-        V=v_cache.view(num_pages * num_kv_heads, PAGE_SIZE, HEAD_DIM),
-        O_ptr=out,
-        page_table=page_table,
-        seq_lens_kv=seq_lens,
-        partial_o=partial_o,
-        partial_stats=partial_stats,
-        tile_counters=tile_counters,
-        queue_counters=queue_counters,
-        max_pages_per_seq=padded_pages,
-        softmax_scale=float(sm_scale),
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        group_ratio=GROUP_RATIO,
-        batch_size=batch,
-        q_len=q_len_per_req,
-        max_items=max_items_bound(batch, q_len_per_req, num_kv_heads, num_ctas),
-        grid=(num_ctas, 1, 1),
-    )
-    assert tuple(main_kwargs) == MAIN_KWARGS
+    if packed:
+        # Packed-row MTP program: Q is read in its natural [batch * q_len,
+        # num_q_heads, 128] layout by a 4-D TMA box (no host packing).
+        main_kwargs = dict(
+            Q=query,
+            K=k_cache.view(num_pages * num_kv_heads, PAGE_SIZE, HEAD_DIM),
+            V=v_cache.view(num_pages * num_kv_heads, PAGE_SIZE, HEAD_DIM),
+            O_ptr=out,
+            page_table=page_table,
+            seq_lens_kv=seq_lens,
+            partial_o=partial_o,
+            partial_stats=partial_stats,
+            tile_counters=tile_counters,
+            queue_counters=queue_counters,
+            max_pages_per_seq=padded_pages,
+            softmax_scale_log2=float(sm_scale) * LOG2E,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            batch_size=batch,
+            q_len=q_len_per_req,
+            max_items=mtp_max_items_bound(batch, q_len_per_req, num_kv_heads, num_ctas),
+            grid=(num_ctas, 1, 1),
+        )
+        assert tuple(main_kwargs) == MTP_MAIN_KWARGS
+    else:
+        main_kwargs = dict(
+            Qt=query.view(total_q * num_q_heads, HEAD_DIM),
+            K=k_cache.view(num_pages * num_kv_heads, PAGE_SIZE, HEAD_DIM),
+            V=v_cache.view(num_pages * num_kv_heads, PAGE_SIZE, HEAD_DIM),
+            O_ptr=out,
+            page_table=page_table,
+            seq_lens_kv=seq_lens,
+            partial_o=partial_o,
+            partial_stats=partial_stats,
+            tile_counters=tile_counters,
+            queue_counters=queue_counters,
+            max_pages_per_seq=padded_pages,
+            softmax_scale=float(sm_scale),
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            group_ratio=GROUP_RATIO,
+            batch_size=batch,
+            q_len=q_len_per_req,
+            max_items=max_items_bound(batch, q_len_per_req, num_kv_heads, num_ctas),
+            grid=(num_ctas, 1, 1),
+        )
+        assert tuple(main_kwargs) == MAIN_KWARGS
     return bind_decode_payload(
-        arch, main_kwargs, out, block_tables_padded=needs_padding
+        arch, main_kwargs, out, block_tables_padded=needs_padding, kind=kind
     )

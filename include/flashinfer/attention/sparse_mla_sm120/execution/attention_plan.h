@@ -69,7 +69,7 @@ inline bool has_prefill_heads(ModelType model, int variant, int heads) {
   return false;
 }
 
-#define SPARSE_MLA_EXTRA_PAGES(F) F(64) F(2)
+#define SPARSE_MLA_EXTRA_PAGES(F) F(64) F(32) F(2)
 
 template <typename F>
 PrefillLaunchResult visit_extra_page(int page, F&& call) {

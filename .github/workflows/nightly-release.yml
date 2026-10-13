@@ -147,6 +147,7 @@ jobs:
         id: build-cubin-wheel
         env:
           FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
+          FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS: 86400
         run: |
           echo "Building flashinfer-cubin with dev suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX}"
           echo "Git commit: $(git rev-parse HEAD)"
@@ -182,51 +183,9 @@ jobs:
           path: dist/*.whl
           retention-days: 7
 
-  build-flashinfer-jit-cache-provider-sccache:
-    name: Provider sccache (cu134, ${{ matrix.cpu_architecture }})
-    needs: setup
-    strategy:
-      matrix:
-        cpu_architecture: [x86_64, aarch64]
-    runs-on: [self-hosted, linux, "${{ matrix.cpu_architecture == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
-    steps:
-      - name: Cleanup
-        run: |
-          docker ps -q | xargs -r docker stop || true
-          docker ps -aq | xargs -r docker rm || true
-          sudo rm -rf ${{ github.workspace }}/* || true
-          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
-          docker system prune -f || true
-
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Build patched sccache
-        env:
-          CUDA_VERSION: '13.4'
-          DOCKER_IMAGE: ${{ matrix.cpu_architecture == 'aarch64' && 'pytorch/manylinuxaarch64-builder:cuda13.4' || 'pytorch/manylinux2_28-builder:cuda13.4' }}
-          SCCACHE_PATCHED_BINARY_PATH: /ci-cache/sccache-cu134/${{ matrix.cpu_architecture }}/sccache
-        run: |
-          mkdir -p "${GITHUB_WORKSPACE}/ci-cache"
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}:/workspace" \
-            -v "${GITHUB_WORKSPACE}/ci-cache:/ci-cache" \
-            -e CUDA_VERSION \
-            -e SCCACHE_PATCHED_BINARY_PATH \
-            -w /workspace \
-            "${DOCKER_IMAGE}" \
-            bash /workspace/scripts/build_patched_sccache.sh
-
-      - name: Upload patched sccache
-        uses: actions/upload-artifact@v4
-        with:
-          name: jit-cache-sccache-cu134-${{ matrix.cpu_architecture }}
-          path: ci-cache/sccache-cu134/${{ matrix.cpu_architecture }}/sccache
-          retention-days: 7
-
   build-flashinfer-jit-cache-provider:
     name: JIT cache provider (${{ matrix.cuda_label }}, ${{ matrix.cpu_architecture }}, ${{ matrix.provider_tag }})
-    needs: [setup, build-flashinfer-jit-cache-provider-sccache]
+    needs: setup
     strategy:
       fail-fast: false
       matrix:
@@ -245,17 +204,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: true
-
-      - name: Download patched sccache
-        if: matrix.cuda_label == 'cu134'
-        uses: actions/download-artifact@v4
-        with:
-          name: jit-cache-sccache-cu134-${{ matrix.cpu_architecture }}
-          path: ci-cache/sccache-cu134/${{ matrix.cpu_architecture }}
-
-      - name: Make patched sccache executable
-        if: matrix.cuda_label == 'cu134'
-        run: chmod +x ci-cache/sccache-cu134/${{ matrix.cpu_architecture }}/sccache
 
       - name: Build and validate provider wheel
         env:

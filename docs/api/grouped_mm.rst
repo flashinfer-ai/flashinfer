@@ -9,8 +9,13 @@ Grouped matrix multiplication APIs for Mixture-of-Experts (MoE) layers,
 where each expert holds its own weight matrix and tokens are routed to
 experts via an ``m_indptr`` cumulative-count tensor.
 
-The functions in this module mirror the dense ``flashinfer.gemm.mm_*`` APIs and dispatch to the cuDNN MoE backend,
-except for the SM120 cute-backend APIs, which dispatch to the cute backend.
+The functions in this module mirror the dense ``flashinfer.gemm.mm_*``
+APIs. The dense-style functions dispatch to the cuDNN MoE backend by default.
+``grouped_mm_bf16`` also accepts ``backend="cake"``, the experimental
+generated ragged BF16 backend for SM100 / SM103 / SM107
+(:ref:`apicake_moe_grouped_gemm`), which reads ``m_indptr``
+on the device and needs no padding. The SM120 MoE GEMM functions below
+dispatch to the cute backend.
 
 BF16 / FP16
 -----------

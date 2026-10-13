@@ -51,6 +51,15 @@ from .cute_dsl_cache_naming import make_kernel_name
 from .device_target import gdn_compile_options, gdn_device_target, target_arch
 from .dtype_compat import as_bf16
 
+
+def _mark_slot_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 16):
+    """Keep ReplaySSM inner dimensions static while making pool size dynamic."""
+    stride_order = tuple(range(torch_t.dim()))
+    return from_dlpack(torch_t, assumed_align=assumed_align).mark_compact_shape_dynamic(
+        mode=0, stride_order=stride_order, divisibility=1
+    )
+
+
 # ============================================================================
 # Global configuration for MTP (Multiple Token Processing) version
 # ============================================================================
@@ -197,6 +206,130 @@ def fma_pair(a1, a2, b1, b2, c1, c2):
     return result1, result2
 
 
+@cute.jit
+def _mtp_precompute_replayssm_step(
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    a: cute.Tensor,
+    b: cute.Tensor,
+    sQ: cute.Tensor,
+    sK: cute.Tensor,
+    sG: cute.Tensor,
+    sBeta: cute.Tensor,
+    sVdata: cute.Tensor,
+    replayssm_rawv: cute.Tensor,
+    replayssm_rawk: cute.Tensor,
+    replayssm_g: cute.Tensor,
+    replayssm_beta: cute.Tensor,
+    r_A_log,
+    r_dt_bias,
+    cache_idx,
+    i_n,
+    i_t,
+    i_h,
+    i_hv,
+    i_v,
+    lane_id,
+    physical_lane_id,
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],
+    vec_size: cutlass.Constexpr[int],
+    use_qk_l2norm: cutlass.Constexpr[bool],
+    use_smem_v: cutlass.Constexpr[bool],
+):
+    """Precompute one timestep and write its ReplaySSM inputs on one warp."""
+    r_q = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
+    )
+    r_k = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
+    )
+    r_q_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_k_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+
+    k_start = lane_id * vec_size
+    q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+    k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+    cute.autovec_copy(q_tile[(0, 0, 0, None)], r_q_bf16)
+    cute.autovec_copy(k_tile[(0, 0, 0, None)], r_k_bf16)
+
+    if i_v == 0 and i_hv % (HV // H) == 0:
+        for i in cutlass.range_constexpr(vec_size):
+            replayssm_rawk[(cache_idx, i_h, i_t, k_start + i)] = r_k_bf16[i]
+
+    v_cache_chunks: cutlass.Constexpr[int] = (tile_v + 31) // 32
+    for v_chunk in cutlass.range_constexpr(v_cache_chunks):
+        v_local = v_chunk * 32 + physical_lane_id
+        v_idx = i_v * tile_v + v_local
+        if v_local < tile_v and v_idx < V:
+            raw_v = v[(i_n, i_t, i_hv, v_idx)]
+            replayssm_rawv[(cache_idx, i_hv, i_t, v_idx)] = raw_v
+            if cutlass.const_expr(use_smem_v):
+                sVdata[(i_t, v_local)] = cutlass.Float32(raw_v)
+
+    for i in cutlass.range_constexpr(vec_size):
+        r_q[i] = cutlass.Float32(r_q_bf16[i])
+        r_k[i] = cutlass.Float32(r_k_bf16[i])
+
+    if cutlass.const_expr(use_qk_l2norm):
+        sum_q = cutlass.Float32(0.0)
+        sum_k = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(vec_size):
+            sum_q += r_q[i] * r_q[i]
+            sum_k += r_k[i] * r_k[i]
+        for offset in [16, 8, 4, 2, 1]:
+            sum_q += cute.arch.shuffle_sync_bfly(
+                sum_q, offset=offset, mask=-1, mask_and_clamp=31
+            )
+            sum_k += cute.arch.shuffle_sync_bfly(
+                sum_k, offset=offset, mask=-1, mask_and_clamp=31
+            )
+        inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
+        inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
+        for i in cutlass.range_constexpr(vec_size):
+            r_q[i] = r_q[i] * inv_norm_q_scaled
+            r_k[i] = r_k[i] * inv_norm_k
+    else:
+        for i in cutlass.range_constexpr(vec_size):
+            r_q[i] = r_q[i] * scale
+
+    for i in cutlass.range_constexpr(vec_size):
+        sQ[(i_t, k_start + i)] = r_q[i]
+        sK[(i_t, k_start + i)] = r_k[i]
+
+    r_a = cutlass.Float32(a[i_n, i_t, i_hv])
+    r_b = cutlass.Float32(b[i_n, i_t, i_hv])
+    x = r_a + r_dt_bias
+    beta_x = softplus_beta * x
+    # Avoid evaluating exp on the linear softplus branch.
+    softplus_x = x
+    if beta_x <= softplus_threshold:
+        softplus_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+            cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=True), fastmath=True
+        )
+    r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
+    r_beta = cutlass.Float32(1.0) / (
+        cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=True)
+    )
+    if lane_id == 0:
+        sG[i_t] = cute.exp(r_g_value, fastmath=True)
+        sBeta[i_t] = r_beta
+        if i_v == 0:
+            replayssm_g[(cache_idx, i_hv, i_t)] = r_g_value
+            replayssm_beta[(cache_idx, i_hv, i_t)] = r_beta
+
+
 # Optimized MTP kernel with ILP rows and SMEM v caching - used for BS >= 8
 @cute.kernel
 def gdn_verify_kernel_mtp(
@@ -217,6 +350,10 @@ def gdn_verify_kernel_mtp(
     h0_out_indices: cute.Tensor,  # [B] - output state indices (write)
     cu_seqlens: cute.Tensor,  # [B+1] - cumulative sequence lengths (for varlen)
     ssm_state_indices: cute.Tensor,  # [B, T] int32 - per-token pool slots (FLA-style); dummy when per_token_pool_scatter=False
+    replayssm_rawv: cute.Tensor,  # [pool_size, HV, T, V] bf16
+    replayssm_rawk: cute.Tensor,  # [pool_size, H, T, K] bf16
+    replayssm_g: cute.Tensor,  # [pool_size, HV, T] fp32 log-decay
+    replayssm_beta: cute.Tensor,  # [pool_size, HV, T] fp32 sigmoid beta
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -242,6 +379,7 @@ def gdn_verify_kernel_mtp(
     ],  # True: preload v into SMEM (large BS), False: GMEM reads
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
+    cache_replayssm: cutlass.Constexpr[bool],
 ):
     """
     Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
@@ -262,7 +400,7 @@ def gdn_verify_kernel_mtp(
     # Thread grouping: vec_size=4, so 32 threads/group (full warp), 4 groups/block
     threads_per_group: cutlass.Constexpr[int] = K // vec_size  # 32
     groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group  # 1
-    num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp  # 4
+    num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp
 
     # Lane position within group and group index
     lane_in_group = lane_id % threads_per_group
@@ -365,9 +503,52 @@ def gdn_verify_kernel_mtp(
             h_write_view = h0_source[(flat_write_idx, None, None)]
 
         # === WARP SPECIALIZATION: Phase 1 ===
-        # Warp 0: compute q/k/g/beta for all T timesteps, write to SMEM
-        # Warps 1-3: prefetch h-state for first ILP set during Phase 1 window
-        if warp_idx == 0:
+        # ReplaySSM assigns timesteps across all four warps and folds the raw
+        # window writes into the q/k/g/beta precompute. The normal path keeps
+        # the established warp-0 precompute + warps-1..3 state prefetch.
+        if cutlass.const_expr(cache_replayssm):
+            num_precompute_passes: cutlass.Constexpr[int] = (T + 3) // 4
+            for pass_idx in cutlass.range_constexpr(num_precompute_passes):
+                i_t_pre = pass_idx * 4 + warp_idx
+                if i_t_pre < T:
+                    _mtp_precompute_replayssm_step(
+                        q,
+                        k,
+                        v,
+                        a,
+                        b,
+                        sQ,
+                        sK,
+                        sG,
+                        sBeta,
+                        sVdata,
+                        replayssm_rawv,
+                        replayssm_rawk,
+                        replayssm_g,
+                        replayssm_beta,
+                        r_A_log,
+                        r_dt_bias,
+                        cache_idx,
+                        i_n,
+                        i_t_pre,
+                        i_h,
+                        i_hv,
+                        i_v,
+                        lane_in_group,
+                        lane_id,
+                        softplus_beta,
+                        softplus_threshold,
+                        scale,
+                        HV,
+                        H,
+                        K,
+                        V,
+                        tile_v,
+                        vec_size,
+                        use_qk_l2norm,
+                        use_smem_v,
+                    )
+        elif warp_idx == 0:
             # Warp 0: Phase 1 — compute and broadcast q, k, g, beta via SMEM
             for i_t in cutlass.range_constexpr(T):
                 q_tile = cute.local_tile(
@@ -376,8 +557,8 @@ def gdn_verify_kernel_mtp(
                 k_tile = cute.local_tile(
                     k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
                 )
-                cute.autovec_copy(q_tile, r_q_bf16)
-                cute.autovec_copy(k_tile, r_k_bf16)
+                cute.autovec_copy(q_tile[(0, 0, 0, None)], r_q_bf16)
+                cute.autovec_copy(k_tile[(0, 0, 0, None)], r_k_bf16)
 
                 for i in cutlass.range_constexpr(vec_size):
                     r_q[i] = cutlass.Float32(r_q_bf16[i])
@@ -445,7 +626,7 @@ def gdn_verify_kernel_mtp(
                 sG[i_t] = r_g
                 sBeta[i_t] = r_beta
 
-                if cutlass.const_expr(use_smem_v):
+                if cutlass.const_expr(use_smem_v and not cache_replayssm):
                     v_tile_start = i_v * tile_v
                     if tidx < tile_v:
                         v_global_idx = v_tile_start + tidx
@@ -512,7 +693,7 @@ def gdn_verify_kernel_mtp(
                     cute.autovec_copy(pf_a, cute.slice_(r_h, (0, None)))
 
             # Cooperatively preload v values if use_smem_v (warps 1-3 help too)
-            if cutlass.const_expr(use_smem_v):
+            if cutlass.const_expr(use_smem_v and not cache_replayssm):
                 for i_t in cutlass.range_constexpr(T):
                     v_tile_start = i_v * tile_v
                     if tidx < tile_v:
@@ -684,56 +865,57 @@ def gdn_verify_kernel_mtp(
                             r_h[7, i] += r_k[i] * vn7
 
                         # Cache intermediate state if needed
-                        if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
-                            it0 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v0, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), it0)
-                            it1 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v1, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), it1)
-                            it2 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v2, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (2, None)), it2)
-                            it3 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v3, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (3, None)), it3)
-                            it4 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v4, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (4, None)), it4)
-                            it5 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v5, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (5, None)), it5)
-                            it6 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v6, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (6, None)), it6)
-                            it7 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v7, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (7, None)), it7)
+                        if not cutlass.const_expr(cache_replayssm):
+                            if cache_intermediate_states:
+                                flat_idx = i_n * T * HV + i_t * HV + i_hv
+                                it0 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v0, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (0, None)), it0)
+                                it1 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v1, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (1, None)), it1)
+                                it2 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v2, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (2, None)), it2)
+                                it3 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v3, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (3, None)), it3)
+                                it4 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v4, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (4, None)), it4)
+                                it5 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v5, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (5, None)), it5)
+                                it6 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v6, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (6, None)), it6)
+                                it7 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v7, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (7, None)), it7)
 
                         # FLA-style per-token scatter: write h_{i_t+1} directly
                         # to pool[ssm_state_indices[i_n, i_t]] (a different slot
@@ -930,7 +1112,11 @@ def gdn_verify_kernel_mtp(
 
                 if v_idx_d < V:
                     # Load h for 4 V-rows. Warps 1-3 skip first quad (prefetched in Phase 1).
-                    if warp_idx == 0 or row_quad > 0:
+                    if (
+                        cutlass.const_expr(cache_replayssm)
+                        or warp_idx == 0
+                        or row_quad > 0
+                    ):
                         h_tile_a = cute.local_tile(
                             h_read_view,
                             (1, vec_size),
@@ -1052,18 +1238,34 @@ def gdn_verify_kernel_mtp(
 
                         # Full warp reduction for ALL 4 h@k dot products
                         for offset in [16, 8, 4, 2, 1]:
-                            sum_hk_a += cute.arch.shuffle_sync_bfly(
-                                sum_hk_a, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hk_b += cute.arch.shuffle_sync_bfly(
-                                sum_hk_b, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hk_c += cute.arch.shuffle_sync_bfly(
-                                sum_hk_c, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hk_d += cute.arch.shuffle_sync_bfly(
-                                sum_hk_d, offset=offset, mask=-1, mask_and_clamp=31
-                            )
+                            if cutlass.const_expr(offset < threads_per_group):
+                                shuffle_control: cutlass.Constexpr[int] = (
+                                    (32 - threads_per_group) << 8
+                                ) | (threads_per_group - 1)
+                                sum_hk_a += cute.arch.shuffle_sync_bfly(
+                                    sum_hk_a,
+                                    offset=offset,
+                                    mask=-1,
+                                    mask_and_clamp=shuffle_control,
+                                )
+                                sum_hk_b += cute.arch.shuffle_sync_bfly(
+                                    sum_hk_b,
+                                    offset=offset,
+                                    mask=-1,
+                                    mask_and_clamp=shuffle_control,
+                                )
+                                sum_hk_c += cute.arch.shuffle_sync_bfly(
+                                    sum_hk_c,
+                                    offset=offset,
+                                    mask=-1,
+                                    mask_and_clamp=shuffle_control,
+                                )
+                                sum_hk_d += cute.arch.shuffle_sync_bfly(
+                                    sum_hk_d,
+                                    offset=offset,
+                                    mask=-1,
+                                    mask_and_clamp=shuffle_control,
+                                )
 
                         # Step 3: Load v for ALL 4 rows, apply delta rule
                         if cutlass.const_expr(use_smem_v):
@@ -1205,18 +1407,34 @@ def gdn_verify_kernel_mtp(
 
                         # Full warp reduction for ALL 4 h@q dot products
                         for offset in [16, 8, 4, 2, 1]:
-                            sum_hq_a += cute.arch.shuffle_sync_bfly(
-                                sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_b += cute.arch.shuffle_sync_bfly(
-                                sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_c += cute.arch.shuffle_sync_bfly(
-                                sum_hq_c, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_d += cute.arch.shuffle_sync_bfly(
-                                sum_hq_d, offset=offset, mask=-1, mask_and_clamp=31
-                            )
+                            if cutlass.const_expr(offset < threads_per_group):
+                                shuffle_control_q: cutlass.Constexpr[int] = (
+                                    (32 - threads_per_group) << 8
+                                ) | (threads_per_group - 1)
+                                sum_hq_a += cute.arch.shuffle_sync_bfly(
+                                    sum_hq_a,
+                                    offset=offset,
+                                    mask=-1,
+                                    mask_and_clamp=shuffle_control_q,
+                                )
+                                sum_hq_b += cute.arch.shuffle_sync_bfly(
+                                    sum_hq_b,
+                                    offset=offset,
+                                    mask=-1,
+                                    mask_and_clamp=shuffle_control_q,
+                                )
+                                sum_hq_c += cute.arch.shuffle_sync_bfly(
+                                    sum_hq_c,
+                                    offset=offset,
+                                    mask=-1,
+                                    mask_and_clamp=shuffle_control_q,
+                                )
+                                sum_hq_d += cute.arch.shuffle_sync_bfly(
+                                    sum_hq_d,
+                                    offset=offset,
+                                    mask=-1,
+                                    mask_and_clamp=shuffle_control_q,
+                                )
 
                         # Write output for ALL 4 rows
                         if lane_in_group == 0:
@@ -1345,7 +1563,11 @@ def gdn_verify_kernel_mtp(
 
                 if v_idx_b < V:
                     # Load h for BOTH rows. Warps 1-3 skip first pair (prefetched).
-                    if warp_idx == 0 or row_pair > 0:
+                    if (
+                        cutlass.const_expr(cache_replayssm)
+                        or warp_idx == 0
+                        or row_pair > 0
+                    ):
                         h_tile_a = cute.local_tile(
                             h_read_view,
                             (1, vec_size),
@@ -1528,6 +1750,10 @@ def run_gdn_verify_kernel_mtp(
     h0_out_indices: cute.Tensor,
     cu_seqlens: cute.Tensor,
     ssm_state_indices: cute.Tensor,
+    replayssm_rawv: cute.Tensor,
+    replayssm_rawk: cute.Tensor,
+    replayssm_g: cute.Tensor,
+    replayssm_beta: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -1549,6 +1775,7 @@ def run_gdn_verify_kernel_mtp(
     use_smem_v: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
+    cache_replayssm: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     # h0_source has two possible layouts:
@@ -1595,6 +1822,10 @@ def run_gdn_verify_kernel_mtp(
         h0_out_indices,
         cu_seqlens,
         ssm_state_indices,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
         softplus_beta,
         softplus_threshold,
         scale,
@@ -1613,6 +1844,7 @@ def run_gdn_verify_kernel_mtp(
         use_smem_v,
         use_packed_fma,
         per_token_pool_scatter,
+        cache_replayssm,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -1642,6 +1874,10 @@ def gdn_verify_kernel_mtp_inline(
     h0_out_indices: cute.Tensor,  # [B] - output state indices (write)
     cu_seqlens: cute.Tensor,  # [B+1] - cumulative sequence lengths (for varlen)
     ssm_state_indices: cute.Tensor,  # [B, T] int32 - per-token pool slots (FLA-style); dummy when per_token_pool_scatter=False
+    replayssm_rawv: cute.Tensor,  # [pool_size, HV, T, V] bf16
+    replayssm_rawk: cute.Tensor,  # [pool_size, H, T, K] bf16
+    replayssm_g: cute.Tensor,  # [pool_size, HV, T] fp32 log-decay
+    replayssm_beta: cute.Tensor,  # [pool_size, HV, T] fp32 sigmoid beta
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -1666,6 +1902,7 @@ def gdn_verify_kernel_mtp_inline(
     ],  # True: preload v into SMEM (large BS), False: GMEM reads
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
+    cache_replayssm: cutlass.Constexpr[bool],
 ):
     """
     Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
@@ -1740,16 +1977,32 @@ def gdn_verify_kernel_mtp_inline(
 
     # Only process valid batch entries (cache_idx >= 0)
     if cache_idx >= 0:
+        if cutlass.const_expr(cache_replayssm):
+            for i_t_cache in cutlass.range_constexpr(T):
+                v_cache_idx = i_v * tile_v + tidx
+                if tidx < tile_v and v_cache_idx < V:
+                    raw_v_cache = v[(i_n, i_t_cache, i_hv, v_cache_idx)]
+                    replayssm_rawv[(cache_idx, i_hv, i_t_cache, v_cache_idx)] = (
+                        raw_v_cache
+                    )
+                    if cutlass.const_expr(use_smem_v):
+                        sVdata[(i_t_cache, tidx)] = cutlass.Float32(raw_v_cache)
+                if i_v == 0 and i_hv % (HV // H) == 0 and tidx < K:
+                    replayssm_rawk[(cache_idx, i_h, i_t_cache, tidx)] = k[
+                        (i_n, i_t_cache, i_h, tidx)
+                    ]
+
         # v10: Mini pre-compute — only v preload for use_smem_v (q/k/g/β inlined)
         if cutlass.const_expr(use_smem_v):
-            for i_t in cutlass.range_constexpr(T):
-                v_tile_start = i_v * tile_v
-                if tidx < tile_v:
-                    v_global_idx = v_tile_start + tidx
-                    if v_global_idx < V:
-                        sVdata[(i_t, tidx)] = cutlass.Float32(
-                            v[i_n, i_t, i_hv, v_global_idx]
-                        )
+            if cutlass.const_expr(not cache_replayssm):
+                for i_t in cutlass.range_constexpr(T):
+                    v_tile_start = i_v * tile_v
+                    if tidx < tile_v:
+                        v_global_idx = v_tile_start + tidx
+                        if v_global_idx < V:
+                            sVdata[(i_t, tidx)] = cutlass.Float32(
+                                v[i_n, i_t, i_hv, v_global_idx]
+                            )
             cute.arch.barrier()
 
         # Each group handles tile_v/num_groups V rows
@@ -1798,21 +2051,23 @@ def gdn_verify_kernel_mtp_inline(
             r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
             x_val = r_a_val + r_dt_bias
             beta_x_val = softplus_beta * x_val
-            exp_beta_x_val = cute.exp(beta_x_val, fastmath=True)
-            sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                cutlass.Float32(1.0) + exp_beta_x_val, fastmath=True
-            )
-            use_sp = (
-                cutlass.Float32(1.0)
-                if beta_x_val <= softplus_threshold
-                else cutlass.Float32(0.0)
-            )
-            sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x_val
+            # A masked 0 * exp(large_x) would still produce NaN.
+            sp_x = x_val
+            if beta_x_val <= softplus_threshold:
+                sp_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                    cutlass.Float32(1.0) + cute.exp(beta_x_val, fastmath=True),
+                    fastmath=True,
+                )
             r_g_value = -cute.exp(r_A_log, fastmath=True) * sp_x
             r_g_arr[i_t] = cute.exp(r_g_value, fastmath=True)
-            r_beta_arr[i_t] = cutlass.Float32(1.0) / (
+            r_beta_value = cutlass.Float32(1.0) / (
                 cutlass.Float32(1.0) + cute.exp(-r_b_val, fastmath=True)
             )
+            r_beta_arr[i_t] = r_beta_value
+            if cutlass.const_expr(cache_replayssm):
+                if i_v == 0 and tidx == 0:
+                    replayssm_g[(cache_idx, i_hv, i_t)] = r_g_value
+                    replayssm_beta[(cache_idx, i_hv, i_t)] = r_beta_value
 
         if cutlass.const_expr(ilp_rows == 4):
             # === 4-ROW ILP PATH (v10: inline pre-compute + deferred L2 norm) ===
@@ -1858,8 +2113,8 @@ def gdn_verify_kernel_mtp_inline(
                     k_tile = cute.local_tile(
                         k, (1, 1, 1, vec_size), (i_n, 0, i_h, lane_in_group)
                     )
-                    cute.autovec_copy(q_tile, r_q_bf16)
-                    cute.autovec_copy(k_tile, r_k_bf16)
+                    cute.autovec_copy(q_tile[(0, 0, 0, None)], r_q_bf16)
+                    cute.autovec_copy(k_tile[(0, 0, 0, None)], r_k_bf16)
                     for i in cutlass.range_constexpr(vec_size):
                         r_q[i] = cutlass.Float32(r_q_bf16[i])
                         r_k[i] = cutlass.Float32(r_k_bf16[i])
@@ -2122,8 +2377,8 @@ def gdn_verify_kernel_mtp_inline(
                                 (1, 1, 1, vec_size),
                                 (i_n, i_t + 1, i_h, lane_in_group),
                             )
-                            cute.autovec_copy(q_tile, r_q_bf16)
-                            cute.autovec_copy(k_tile, r_k_bf16)
+                            cute.autovec_copy(q_tile[(0, 0, 0, None)], r_q_bf16)
+                            cute.autovec_copy(k_tile[(0, 0, 0, None)], r_k_bf16)
                             for i in cutlass.range_constexpr(vec_size):
                                 r_q[i] = cutlass.Float32(r_q_bf16[i])
                                 r_k[i] = cutlass.Float32(r_k_bf16[i])
@@ -2207,8 +2462,8 @@ def gdn_verify_kernel_mtp_inline(
                         k_tile = cute.local_tile(
                             k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
                         )
-                        cute.autovec_copy(q_tile, r_q_bf16)
-                        cute.autovec_copy(k_tile, r_k_bf16)
+                        cute.autovec_copy(q_tile[(0, 0, 0, None)], r_q_bf16)
+                        cute.autovec_copy(k_tile[(0, 0, 0, None)], r_k_bf16)
                         for i in cutlass.range_constexpr(vec_size):
                             r_q_all[i_t, i] = cutlass.Float32(r_q_bf16[i])
                             r_k_all[i_t, i] = cutlass.Float32(r_k_bf16[i])
@@ -2415,6 +2670,10 @@ def run_gdn_verify_kernel_mtp_inline(
     h0_out_indices: cute.Tensor,
     cu_seqlens: cute.Tensor,
     ssm_state_indices: cute.Tensor,
+    replayssm_rawv: cute.Tensor,
+    replayssm_rawk: cute.Tensor,
+    replayssm_g: cute.Tensor,
+    replayssm_beta: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -2435,6 +2694,7 @@ def run_gdn_verify_kernel_mtp_inline(
     use_smem_v: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
+    cache_replayssm: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     # h0_source has two possible layouts:
@@ -2475,6 +2735,10 @@ def run_gdn_verify_kernel_mtp_inline(
         h0_out_indices,
         cu_seqlens,
         ssm_state_indices,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
         softplus_beta,
         softplus_threshold,
         scale,
@@ -2493,6 +2757,7 @@ def run_gdn_verify_kernel_mtp_inline(
         use_smem_v,
         use_packed_fma,
         per_token_pool_scatter,
+        cache_replayssm,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -2525,6 +2790,7 @@ def _mtp_kernel_name(
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
+    cache_replayssm: bool = False,
 ) -> str:
     """Specialization name within the gdn_decode_mtp module, encoding the
     kernel variant ("inline" or "warp") and every parameter that affects
@@ -2550,6 +2816,7 @@ def _mtp_kernel_name(
         use_smem_v,
         use_packed_fma,
         per_token_pool_scatter,
+        cache_replayssm,
     )
 
 
@@ -2574,6 +2841,7 @@ def _get_compiled_mtp_kernel(
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
+    cache_replayssm: bool = False,
 ):
     """Cache compiled optimized MTP kernel for given configuration."""
     return {}
@@ -2600,6 +2868,7 @@ def _get_compiled_mtp_kernel_inline(
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
+    cache_replayssm: bool = False,
 ):
     """Cache compiled inline MTP kernel (BS <= 2) for given configuration."""
     return {}
@@ -2634,6 +2903,11 @@ def run_mtp_decode(
     ssm_state_indices: Optional[torch.Tensor] = None,
     output_state_indices: Optional[torch.Tensor] = None,
     use_pool_indexing: bool = False,
+    cache_replayssm: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
 ):
     """Execute the appropriate MTP kernel based on batch size.
 
@@ -2665,7 +2939,12 @@ def run_mtp_decode(
         output_state_indices: Optional [B] write indices. Defaults to
             initial_state_indices. Negative entries skip the writeback for
             that batch slot (matching the read-side padding skip semantics).
+        cache_replayssm: Whether to persist only the fold-every-commit
+            ReplaySSM inputs instead of full intermediate states.
     """
+    if B == 0:
+        return
+
     # Kernel is bf16-only for q/k/v/a/b/output; stage non-bf16 caller output for writeback.
     q, k, v, a, b = as_bf16(q, k, v, a, b)
     output_writeback = None
@@ -2675,12 +2954,66 @@ def run_mtp_decode(
         output = output_writeback.to(torch.bfloat16)
 
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
-    _, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
+    tile_v, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
     use_inline_kernel = (B * HV) <= 128
     target = gdn_device_target(q.device)
     use_packed_fma = target.use_packed_fma
 
     per_token_pool_scatter = ssm_state_indices is not None
+
+    # SM100 frozen-state ReplaySSM fast path.  One CTA owns two adjacent
+    # (V=128, K=128) heads, shares their Q/K and Gram work, streams both FP32
+    # checkpoints with TMA, and uses tcgen05 for every state/K and state/Q dot.
+    # Keep the dispatch deliberately narrow until the remaining pool/scatter/
+    # update contracts are implemented by that specialization.
+    use_replayssm_tcgen = (
+        target.major == 10
+        and cache_replayssm
+        and disable_state_update
+        and not cache_intermediate_states
+        and not per_token_pool_scatter
+        and not use_pool_indexing
+        and output_writeback is None
+        and h0_source.dtype == torch.float32
+        and initial_state_indices.dtype == torch.int32
+        and 4 <= T <= 8
+        and K == 128
+        and V == 128
+        and HV % 2 == 0
+        and (HV // H) % 2 == 0
+        and 1 <= B <= 256
+        and use_qk_l2norm
+    )
+    if use_replayssm_tcgen:
+        assert replayssm_rawv is not None
+        assert replayssm_rawk is not None
+        assert replayssm_g is not None
+        assert replayssm_beta is not None
+        from .gdn_decode_mtp_replayssm_tcgen import (
+            run_gdn_verify_kernel_mtp_replayssm_tcgen,
+        )
+
+        run_gdn_verify_kernel_mtp_replayssm_tcgen(
+            h0_source,
+            A_log,
+            a,
+            dt_bias,
+            q,
+            k,
+            v,
+            b,
+            output,
+            initial_state_indices,
+            replayssm_rawv,
+            replayssm_rawk,
+            replayssm_g,
+            replayssm_beta,
+            T,
+            H,
+            HV,
+            scale,
+        )
+        return
 
     # cute.compile bakes pool strides; key them only for the 4D pool-indexing path.
     if use_pool_indexing:
@@ -2688,11 +3021,30 @@ def run_mtp_decode(
     else:
         pool_strides_key = None
 
-    # Polymorphic dtypes baked into the compile signature (q/k/v/a/b/output are pinned).
+    # Dynamic layouts still specialize on the inferred unit-stride dimension.
+    # Strided gate/input views must not reuse a contiguous tensor's ABI.
+    layout_key = tuple(
+        tuple(i for i, stride in enumerate(t.stride()) if stride == 1)
+        for t in (
+            A_log,
+            a,
+            dt_bias,
+            q,
+            k,
+            v,
+            b,
+            output,
+            initial_state_indices,
+            output_state_indices
+            if output_state_indices is not None
+            else initial_state_indices,
+        )
+    )
     dtype_key = (
         A_log.dtype,
         dt_bias.dtype,
         initial_state_indices.dtype,
+        layout_key,
     )
 
     if use_inline_kernel:
@@ -2716,6 +3068,7 @@ def run_mtp_decode(
             use_smem_v,
             use_packed_fma,
             per_token_pool_scatter,
+            cache_replayssm,
         )
         cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
     else:
@@ -2739,6 +3092,7 @@ def run_mtp_decode(
             use_smem_v,
             use_packed_fma,
             per_token_pool_scatter,
+            cache_replayssm,
         )
         cache = _get_compiled_mtp_kernel(*warp_cache_key)
 
@@ -2772,6 +3126,20 @@ def run_mtp_decode(
         if ssm_state_indices is not None
         else cache["default_ssm_state_indices"]
     )
+
+    if cache_replayssm:
+        assert replayssm_rawv is not None
+        assert replayssm_rawk is not None
+        assert replayssm_g is not None
+        assert replayssm_beta is not None
+    else:
+        # The ReplaySSM arguments are compile-time dead in the normal
+        # specialization. Reuse existing allocations to preserve the
+        # allocation-free launch path.
+        replayssm_rawv = v
+        replayssm_rawk = k
+        replayssm_g = A_log
+        replayssm_beta = A_log
 
     # Resolve write indices: default to read indices when output_state_indices is None.
     # `.to(initial_state_indices)` (passing the tensor, not just the dtype) realigns
@@ -2830,6 +3198,16 @@ def run_mtp_decode(
         ssm_idx_tensor = from_dlpack(
             ssm_state_indices_arg, assumed_align=16
         ).mark_layout_dynamic()
+        if cache_replayssm:
+            replayssm_rawv_tensor = _mark_slot_dynamic(replayssm_rawv)
+            replayssm_rawk_tensor = _mark_slot_dynamic(replayssm_rawk)
+            replayssm_g_tensor = _mark_slot_dynamic(replayssm_g)
+            replayssm_beta_tensor = _mark_slot_dynamic(replayssm_beta)
+        else:
+            replayssm_rawv_tensor = v_tensor
+            replayssm_rawk_tensor = k_tensor
+            replayssm_g_tensor = A_log_tensor
+            replayssm_beta_tensor = A_log_tensor
 
         compile_options = gdn_compile_options(
             q.device, cute.EnableTVMFFI(True), cute.GenerateLineInfo(True)
@@ -2854,6 +3232,10 @@ def run_mtp_decode(
                     h0_out_indices_tensor,
                     cu_seqlens_tensor,
                     ssm_idx_tensor,
+                    replayssm_rawv_tensor,
+                    replayssm_rawk_tensor,
+                    replayssm_g_tensor,
+                    replayssm_beta_tensor,
                     softplus_beta=1.0,
                     softplus_threshold=20.0,
                     scale=scale,
@@ -2876,6 +3258,7 @@ def run_mtp_decode(
                     use_smem_v=use_smem_v,
                     use_packed_fma=use_packed_fma,
                     per_token_pool_scatter=per_token_pool_scatter,
+                    cache_replayssm=cache_replayssm,
                     stream=stream,
                 ),
                 extra_key_files=(__file__,),
@@ -2900,6 +3283,10 @@ def run_mtp_decode(
                     h0_out_indices_tensor,
                     cu_seqlens_tensor,
                     ssm_idx_tensor,
+                    replayssm_rawv_tensor,
+                    replayssm_rawk_tensor,
+                    replayssm_g_tensor,
+                    replayssm_beta_tensor,
                     softplus_beta=1.0,
                     softplus_threshold=20.0,
                     scale=scale,
@@ -2922,6 +3309,7 @@ def run_mtp_decode(
                     use_smem_v=use_smem_v,
                     use_packed_fma=use_packed_fma,
                     per_token_pool_scatter=per_token_pool_scatter,
+                    cache_replayssm=cache_replayssm,
                     stream=stream,
                 ),
                 extra_key_files=(__file__,),
@@ -2946,6 +3334,10 @@ def run_mtp_decode(
         h0_out_indices,
         cu_seqlens,
         ssm_state_indices_arg,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
         cache_intermediate_states,
         stream,
     )

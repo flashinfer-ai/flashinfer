@@ -17,6 +17,7 @@ from typing import Literal, Optional, Sequence
 
 import torch
 import functools
+from typing_extensions import deprecated
 
 from ..api_logging import flashinfer_api
 
@@ -71,7 +72,7 @@ class _A2AState:
 
     phase: str = "idle"  # idle | dispatched
     local_num_tokens: Optional[int] = None
-    combine_payload_offset: Optional[int] = None
+    dispatch_payload_end: Optional[int] = None
     eplb_gathered_stats: Optional[torch.Tensor] = None
 
 
@@ -907,12 +908,27 @@ def moe_a2a_get_workspace_size_per_rank(
     )
 
 
+@deprecated(
+    "MoeAlltoAll is deprecated; use flashinfer.moe_ep.NVLinkOneSidedAlltoAll "
+    "(CakeAlltoAll for backend='cake'). Its implementation will "
+    "move into those classes."
+)
 class MoeAlltoAll:
     """
     Manages MoE All-to-All operations with proper workspace allocation and synchronization.
 
+    .. deprecated:: 0.7.1
+        Use :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll`
+        (:class:`flashinfer.moe_ep.CakeAlltoAll` for
+        ``backend="cake"``). The implementation of this class will move into
+        them; they will no longer wrap it.
+
     This class provides the throughput-optimized backend that supports multiple payloads
     per collective operation, explicit dispatch/combine phases, and workspace-backed tensors.
+
+    The first combine payload reserves a fixed region in the shared workspace.
+    Its hidden size and dtype width must remain constant across workspace users.
+    Size the workspace for the largest dispatch payload used by any layer.
 
     ``backend="trtllm"`` is the default, including on Blackwell. To opt in to
     the generated Blackwell kernels, pass ``backend="cake"`` at construction
@@ -929,8 +945,6 @@ class MoeAlltoAll:
         ...                      num_experts=8, hidden_size=4096, backend="cake")
     """
 
-    # Single shared workspace across the process
-    # _WORKSPACE: Optional[dict] = None
     _WORKSPACE_CACHE: dict[
         tuple[int, int, int, int, int, MoeAlltoAllBackend], dict
     ] = {}
@@ -1313,6 +1327,49 @@ class MoeAlltoAll:
         ]
         self._state.phase = "deleted"
 
+    def _reserve_combine_region(self, hidden_size: int, dtype: torch.dtype) -> int:
+        """Keep later dispatches away from combine data still read by peers."""
+        layout = (hidden_size, dtype.itemsize)
+        old_layout = self._WORKSPACE.get("combine_storage_layout")
+        if old_layout is not None:
+            if old_layout != layout:
+                raise ValueError(
+                    "Shared A2A workspace requires a stable combine shape and dtype size"
+                )
+            return self._WORKSPACE["combine_storage_offset"]
+
+        region_bytes = self.ep_size * self.max_num_tokens * hidden_size * dtype.itemsize
+        region_bytes = (region_bytes + 127) // 128 * 128
+        offset = (self.workspace_size_per_rank - region_bytes) // 128 * 128
+        aux_bytes = int(
+            self.metainfo[self._METAINFO_INDEX["PAYLOAD_DATA_OFFSET_INDEX"]]
+        )
+        if offset < aux_bytes:
+            raise ValueError("A2A workspace is too small for the combine region")
+        if self._state.dispatch_payload_end > offset:
+            raise ValueError(
+                "A2A dispatch payload overlaps the reserved combine region"
+            )
+        self._WORKSPACE["combine_storage_layout"] = layout
+        self._WORKSPACE["combine_storage_offset"] = offset
+        return offset
+
+    def _check_dispatch_region(self, payloads: list[torch.Tensor], max_tokens: int):
+        if not 0 < max_tokens <= self.max_num_tokens:
+            raise ValueError("runtime_max_tokens_per_rank exceeds A2A capacity")
+        end = int(self.metainfo[self._METAINFO_INDEX["PAYLOAD_DATA_OFFSET_INDEX"]])
+        end += (
+            self.ep_size
+            * max_tokens
+            * sum(payload.size(1) * payload.element_size() for payload in payloads)
+        )
+        end = (end + 127) // 128 * 128
+        limit = self._WORKSPACE.get(
+            "combine_storage_offset", self.workspace_size_per_rank
+        )
+        if end > limit:
+            raise ValueError("A2A dispatch payload exceeds its workspace region")
+
     @flashinfer_api
     def dispatch(
         self,
@@ -1363,9 +1420,7 @@ class MoeAlltoAll:
         if not self.mnnvl_mem.mapped:
             raise RuntimeError("MNNVL handles are unmapped")
         assert self._state.phase == "idle", "dispatch called twice without combine"
-        assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
-            "runtime_max_tokens_per_rank exceeds max_num_tokens"
-        )
+        self._check_dispatch_region(input_payloads, runtime_max_tokens_per_rank)
         if eplb_local_stats is not None:
             assert self.enable_eplb, (
                 "eplb_local_stats provided but instance was constructed with "
@@ -1381,7 +1436,7 @@ class MoeAlltoAll:
                 "with enable_rank_mask=True"
             )
 
-        recv_tensors, combine_payload_offset, eplb_gathered_stats = moe_a2a_dispatch(
+        recv_tensors, dispatch_payload_end, eplb_gathered_stats = moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
             self.workspace,
@@ -1398,9 +1453,8 @@ class MoeAlltoAll:
             recv_view_cache=self._recv_view_cache,
         )
 
-        # Update state
         self._state.local_num_tokens = token_selected_experts.size(0)
-        self._state.combine_payload_offset = combine_payload_offset
+        self._state.dispatch_payload_end = int(dispatch_payload_end)
         self._state.eplb_gathered_stats = eplb_gathered_stats
         self._state.phase = "dispatched"
 
@@ -1501,7 +1555,7 @@ class MoeAlltoAll:
             self.ep_rank,
             self.ep_size,
             self.top_k,
-            self._state.combine_payload_offset,
+            self._reserve_combine_region(payload.shape[-1], payload.dtype),
             payload_in_workspace,
             output_dtype,
             output_scales,
@@ -1560,13 +1614,15 @@ class MoeAlltoAll:
                 "get_combine_payload_tensor_in_workspace called before successful dispatch"
             )
 
-        element_size = torch.tensor([], dtype=dtype).element_size()
+        if not 0 < runtime_max_tokens_per_rank <= self.max_num_tokens:
+            raise ValueError("runtime_max_tokens_per_rank exceeds A2A capacity")
+        offset = self._reserve_combine_region(hidden_size, dtype)
         return moe_a2a_wrap_payload_tensor_in_workspace(
             self.workspace[self.ep_rank, :],
             [self.ep_size, runtime_max_tokens_per_rank],
-            self._state.combine_payload_offset,
-            self._state.combine_payload_offset
-            + self.ep_size * runtime_max_tokens_per_rank * hidden_size * element_size,
+            offset,
+            offset
+            + self.ep_size * runtime_max_tokens_per_rank * hidden_size * dtype.itemsize,
             dtype,
         )
 

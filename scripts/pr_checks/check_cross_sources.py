@@ -81,10 +81,6 @@ _ENV_VAR_EXCLUSIONS = {
     "FLASHINFER_ERROR",
     "FLASHINFER_INCLUDE_DIR",
     "FLASHINFER_LOG_INFO",
-    "FLASHINFER_NVFP4_4OVER6",
-    "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
-    "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
-    "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
     "FLASHINFER_B12X_FORCE_MOE_W4A16",
     "FLASHINFER_B12X_STATIC_COMPACT_CUTOVER_PAIRS",
     "FLASHINFER_B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS",
@@ -104,15 +100,31 @@ _ENV_VAR_EXCLUSIONS = {
     "FLASHINFER_EXTRA_LDFLAGS",
 }
 
+# Accessor functions whose first argument is an env var name.  The in-tree
+# wrappers have to be listed explicitly: a variable read only through
+# ``env_flag_enabled("X")`` never spells ``os.environ`` anywhere, so without
+# them the checker silently stops protecting that CLAUDE.md row.  The
+# alternation is deliberately unanchored, which is also what lets it match
+# aliased imports (``env_flag_enabled as _env_flag_enabled`` in
+# flashinfer/quantization/kernels/nvfp4_quantize.py) and ``std::getenv``.
+_ENV_VAR_ACCESSORS = (
+    r"os\.environ\.get|os\.getenv|std::getenv|getenv"
+    # flashinfer/quantization/nvfp4_quantization_utils.py
+    r"|env_flag_enabled"
+    # csrc/nv_internal/cpp/common/envUtils.cpp
+    r"|getBoolEnv|getStrEnv"
+)
+
 # Match env var reads of all common shapes:
 #   os.environ.get("X")            os.environ["X"]
 #   os.getenv("X")                 "X" in os.environ
 #   std::getenv("X")               getenv("X")
+#   env_flag_enabled("X")          getBoolEnv("X") / getStrEnv("X")
 #   ENV_NAME = "X"; os.environ.get(ENV_NAME)
 _ENV_VAR_READ_RE = re.compile(
-    r"""(?xs)
+    rf"""(?xs)
     (?:
-        (?:os\.environ\.get|os\.getenv|std::getenv|getenv)
+        (?:{_ENV_VAR_ACCESSORS})
             \(\s*['"](FLASHINFER_[A-Z][A-Z_0-9]*)
       | os\.environ\[\s*['"](FLASHINFER_[A-Z][A-Z_0-9]*)
       | ['"](FLASHINFER_[A-Z][A-Z_0-9]*)['"]\s+in\s+os\.environ
@@ -139,7 +151,7 @@ def _env_var_reads(text: str) -> list[tuple[int, str]]:
     for variable, name in assignments.items():
         variable_re = re.escape(variable)
         indirect_read_re = re.compile(
-            rf"(?:os\.environ\.get|os\.getenv|std::getenv|getenv)"
+            rf"(?:{_ENV_VAR_ACCESSORS})"
             rf"\(\s*{variable_re}\b"
             rf"|os\.environ\[\s*{variable_re}\b"
             rf"|\b{variable_re}\b\s+in\s+os\.environ"

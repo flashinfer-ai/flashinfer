@@ -1,6 +1,7 @@
 """Four-rank integration gate for the native MegaMoE terminal reducer.
 
-Run on four exact-SM100a GPUs from the FlashInfer repository root::
+Run on four exact-SM100a (B200) or SM103a (B300) GPUs from the FlashInfer
+repository root::
 
     torchrun --nproc_per_node=4 -m pytest \
         tests/moe_ep/test_mega_native_topk_reduce_multirank.py -v \
@@ -227,8 +228,8 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
 
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("native terminal reducer requires exact SM100a")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("native terminal reducer requires exact SM100a or SM103a")
 
     problem = _problem(rank, world_size)
     megakernel = _megakernel_config(problem, epilogue_via_config=True)

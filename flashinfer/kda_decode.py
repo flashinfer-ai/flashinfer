@@ -521,8 +521,8 @@ def fused_kda_decode(
 
     This operator fuses a width-four depthwise causal convolution with SiLU,
     one recurrent KDA update, and gated RMSNorm. It is specialized for
-    head dimension 128 and 12, 24, 32, 48, or 96 heads. ``conv_state`` and
-    ``state`` are updated in-place.
+    head dimension 128 and 8, 12, 24, 32, 48, or 96 heads. ``conv_state``
+    and ``state`` are updated in-place.
 
     Slot zero is reserved as a null slot. Rows whose ``state_indices`` value
     is non-positive produce zeros and do not update either cache.
@@ -676,11 +676,11 @@ def packed_fused_kda_decode(
     bfloat16-state and softplus-gate support. The optional
     ``t1_state_indices`` optimization is strictly T=1-only; passing it for
     T>1 fails closed. T>1 uses the SM10x CuTe DSL packed backend, which
-    requires FP32
-    recurrent state and a finite negative ``lower_bound``. Both paths require
-    head dimension 128, convolution width four, and 12, 24, 32, 48, or 96
-    heads. Other tensors follow :func:`fused_kda_decode`, with the packed row
-    count supplied by ``x``.
+    accepts float32 or bfloat16 recurrent state and requires a finite negative
+    ``lower_bound``. Both paths require head dimension 128 and convolution
+    width four; T=1 accepts 8, 12, 24, 32, 48, or 96 heads and T>1 accepts
+    12, 24, 32, 48, or 96 heads. Other tensors follow :func:`fused_kda_decode`,
+    with the packed row count supplied by ``x``.
 
     ``query_start_loc`` must be contiguous int32 of shape ``[N+1]``, start at
     zero, and contain nondecreasing offsets within ``x`` with active lengths no
@@ -735,7 +735,8 @@ def packed_fused_kda_decode(
             function.
         state:
             Paged recurrent state with shape ``[num_slots, H, 128, 128]``.
-            T=1 accepts float32 or bfloat16; T>1 requires float32.
+            float32 or bfloat16. T>1 keeps the recurrence in float32 and
+            rounds only when writing each bfloat16 checkpoint.
         output_gate:
             Gated RMSNorm logits with shape ``[num_rows, H, 128]`` or
             ``[1, num_rows, H, 128]`` and dtype bfloat16.

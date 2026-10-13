@@ -142,3 +142,16 @@ Grouped GEMM (Ampere/Hopper)
     :exclude-members: forward
 
     .. automethod:: __init__
+
+PrimsTS dense FP8 and NVFP4 GEMM (SM100, SM103, SM107)
+------------------------------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    fp8_linear
+    fp8_linear_swiglu
+    fp8_qkv_qknorm_rope
+    fp4_linear
+    fp4_linear_swiglu
+    fp4_qkv_qknorm_rope

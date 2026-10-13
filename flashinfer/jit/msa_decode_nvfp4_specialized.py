@@ -18,13 +18,20 @@ import functools
 from typing import Literal
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
+)
 
-MSADecodeNVFP4Target = Literal["sm100a", "sm103a"]
+MSADecodeNVFP4Target = Literal["sm100a", "sm103a", "sm107a"]
 
 _NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
     "sm103a": sm103a_nvcc_flags,
+    "sm107a": sm107a_nvcc_flags,
 }
 
 # ``gen_jit_spec`` adds ``-use_fast_math`` unconditionally, which turns on

@@ -1,0 +1,7 @@
+# The kernel modules in this directory are generated (rendered from the
+# manifest's source schedules; see cake_vsa_sm90_cute_manifest.json and the
+# banner of every module).  Generated DSL sources are kept out of lint and
+# format, as the other generated CuTe DSL sources listed in pyproject.toml;
+# the hand-written loader (__init__.py) stays under the repository rules.
+extend = "../../../pyproject.toml"
+extend-exclude = ["attention.py", "small_*.py"]
