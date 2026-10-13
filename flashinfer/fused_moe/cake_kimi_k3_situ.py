@@ -55,9 +55,20 @@ _LARGE_Q8I_ARCHES = ("sm_100a", "sm_103a")
 # keeps the BF16 expert output everywhere.
 _MID_Q8I_ARCHES = ("sm_103a",)
 _MID_Q8I_TOKENS = (4096,)
+# Architectures and token counts whose large route runs the routing histogram
+# and scatter kernels that privatize the expert histogram in per-CTA shared
+# memory and reserve a block of rows per CTA (1024 routed pairs per CTA; the
+# "large_q8i_p1024" selector) -- the 16384-token row of sm_100a today.  Every
+# other large row keeps the production routing kernels (256 pairs per CTA).
+_LARGE_P1024_ARCHES = ("sm_100a",)
+_LARGE_P1024_TOKENS = (16384,)
 # The 512- and 1024-token routes launch the routing kernel as one thread-block
 # cluster of this many CTAs (the kernel declares the matching cluster size).
 _ROUTE_MC_CLUSTER = 8
+# Routed (token, expert-slot) pairs one CTA of the routing histogram and
+# scatter kernels handles: 256 for the production kernels, 1024 for the
+# per-CTA privatized kernels of the "large_q8i_p1024" selector.
+_ROUTE_PAIRS_PER_CTA = {"large_q8i_p1024": 1024}
 # FC2 device-workfeed pools. The 16-token route runs an FC2 program built for
 # two resident CTAs per SM (__launch_bounds__(512, 2)), so its pool holds
 # 2 * SM // (_H // 128) rows (280 CTAs on a 148-SM part); the 32..256-token
@@ -197,6 +208,19 @@ _SELECTORS = {
         _generic(128, fc2="fc2:n128_q8i", finalize="finalize:n128_q8i"),
         None,
     ),
+    "large_q8i_p1024": (
+        _GENERIC,
+        _generic(
+            128,
+            fc2="fc2:n128_q8i",
+            finalize="finalize:n128_q8i",
+            extra={
+                "route_histogram": "route_histogram:n128_p1024",
+                "route_scatter": "route_scatter:n128_p1024",
+            },
+        ),
+        None,
+    ),
     8: (_GENERIC, _generic(8), None),
     16: (_GENERIC, _generic(16), None),
     32: (_GENERIC, _generic(32), None),
@@ -235,6 +259,8 @@ def _selector(arch, num_tokens):
             return "mid_q8i"
         return "mid_work5fd"
     if num_tokens in _LARGE_C7_TOKENS:
+        if arch in _LARGE_P1024_ARCHES and num_tokens in _LARGE_P1024_TOKENS:
+            return "large_q8i_p1024"
         return "large_q8i" if arch in _LARGE_Q8I_ARCHES else "large_c7"
     return tile_n
 
@@ -485,7 +511,8 @@ def _stage_constants(stage, views, prepared, num_tokens):
     max_tiles = prepared["max_tiles"]
     selector = prepared["selector"]
     workfeed = _SELECTORS[selector][2] is not None
-    route_grid = ((total_pairs + 255) // 256, 1, 1)
+    pairs_per_cta = _ROUTE_PAIRS_PER_CTA.get(selector, 256)
+    route_grid = ((total_pairs + pairs_per_cta - 1) // pairs_per_cta, 1, 1)
     route_views = {
         name: views[name]
         for name in (
