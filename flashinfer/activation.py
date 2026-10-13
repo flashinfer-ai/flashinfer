@@ -105,7 +105,7 @@ def silu_and_mul(
 
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------
@@ -149,7 +149,7 @@ def gelu_tanh_and_mul(
 
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------
@@ -189,7 +189,7 @@ def gelu_and_mul(
 
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------

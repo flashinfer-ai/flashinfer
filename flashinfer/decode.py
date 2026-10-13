@@ -2824,7 +2824,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse : bool
             Whether to return the logsumexp of attention scores, defaults to ``False``.
         enable_pdl : bool
-            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         window_left : Optional[int]
             Per-call sliding-window bound. Must either be ``None`` (default,
@@ -3874,7 +3874,7 @@ def trtllm_batch_decode_with_kv_cache(
         data copy overhead. Use ``HND`` for better performance.
 
     enable_pdl : Optional[bool] = None
-        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
         When set to ``None``, the backend will be chosen based on the device architecture and kernel availability.
 
     backend : str = "auto"
@@ -4704,7 +4704,7 @@ def xqa_batch_decode_with_kv_cache(
         The layout of the kv cache. Can be either ``NHD`` or ``HND``. Defaults to ``NHD``.
 
     enable_pdl : bool
-        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
         Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
 
     q_len_per_req : Optional[int] = 1

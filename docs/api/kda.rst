@@ -646,8 +646,8 @@ Persistent CuTe DSL prefill with FP32 state
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``recurrent_kda(..., backend="cute-dsl-persistent")`` selects the persistent
-M128/BT32 kernel adapted from
-`humanfia/kda-for-kda-release <https://github.com/humanfia/kda-for-kda-release>`_.
+M128/BT32 kernel adapted from humanfia/kda-for-kda-release, now
+`vendored in FlashInfer <https://github.com/flashinfer-ai/flashinfer/tree/main/flashinfer/kda_kernels/persistent>`_.
 It fuses Q/K L2 normalization, the bounded K3 gate, beta sigmoid, preparation,
 triangular solves and recurrence. A continuous five-stage preparation pipeline
 is shared across each CTA's sequence/head chains. Recurrent state and

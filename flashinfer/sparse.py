@@ -1389,7 +1389,7 @@ class BlockSparseAttentionWrapper:
         return_lse : bool
             Whether to return the log-sum-exp of attention logits
         enable_pdl : bool
-            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
 
         Returns
@@ -2107,7 +2107,7 @@ class VariableBlockSparseAttentionWrapper:
         return_lse : bool
             Whether to return the log-sum-exp of attention logits
         enable_pdl : bool
-            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
 
         Returns

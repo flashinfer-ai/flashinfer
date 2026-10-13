@@ -162,7 +162,7 @@ def rmsnorm(
         The output tensor, if specified, the kernel will update this tensor in place.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------
@@ -238,7 +238,7 @@ def rmsnorm_quant(
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     """
     scale = _normalize_scale_tensor(scale, input)
@@ -293,7 +293,7 @@ def fused_add_rmsnorm(
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
     """
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
@@ -354,7 +354,7 @@ def fused_add_rmsnorm_quant(
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
     """
     scale = _normalize_scale_tensor(scale, input)
     if enable_pdl is None or enable_pdl:
@@ -483,7 +483,7 @@ def gemma_rmsnorm(
         The output tensor, if specified, the kernel will update this tensor in place.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------
@@ -561,7 +561,7 @@ def gemma_fused_add_rmsnorm(
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
     """
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)

@@ -3439,7 +3439,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             directly when supported; other paths transpose and rescale as needed.
             A caller-provided :attr:`lse` must have the requested layout.
         enable_pdl : bool
-            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
             Only effective on backends and devices that support PDL.
         window_left : Optional[int]
             Per-call override for the left (inclusive) sliding-window size.  When
@@ -5299,7 +5299,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             directly when supported; other paths transpose and rescale as needed.
             A caller-provided :attr:`lse` must have the requested layout.
         enable_pdl : bool
-            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
             Only effective on backends and devices that support PDL.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
             Per-block scale factors for NVFP4 KV input.  Accepts either a single
@@ -6990,7 +6990,7 @@ def trtllm_batch_context_with_kv_cache(
     o_sf_vec_size : Optional[int] = None
         vector size for nvfp4 output tensor scale factor.
     enable_pdl : Optional[bool] = None
-        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
         Defaults to ``None``, which means it will be enabled if the device supports PDL.
     kv_layout : str = "HND"
         Layout of kv-cache, can be "HND" or "NHD", default is "HND".
