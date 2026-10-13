@@ -25,6 +25,7 @@ from flashinfer.cute_dsl.utils import (
     make_ptr,
 )
 from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from flashinfer.utils import get_compute_capability
 from .moe_activation import SWIGLUOAI_UNINTERLEAVE, is_gated_activation
 from .moe_direct_micro_kernel import (
     MoEDirectMicroKernel,
@@ -95,6 +96,10 @@ _MICRO_MAX_TOKENS = 8
 # kernel, and only at small intermediate sizes where its CUDA-core dots
 # keep up with per-token work. Measured on GB10, pending other GPUs.
 _DIRECT_MICRO_CUTOVER_PAIRS = 32
+# NVFP4 on RTX PRO 6000 (SM120): direct micro up to 8 tokens at top-8, with FC1
+# sized to finish in one round (measured with 256 experts, top-8, hidden 2048,
+# intermediate 512).
+_SM120_NVFP4_DIRECT_MICRO_CUTOVER_PAIRS = 65
 _DIRECT_MICRO_MAX_N = 512
 # Test/bench hook: force one backend ("direct_micro", "micro", "static",
 # "dynamic"). Deliberately module-level (a monkeypatch target), not an env var.
@@ -224,6 +229,16 @@ _DYNAMIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (640, 188),
     (1024, 147),
 )
+
+
+def _is_sm120_nvfp4(device: torch.device, quant_mode: str | None) -> bool:
+    """Whether the SM120 NVFP4 direct-micro values apply (never without a GPU)."""
+    return (
+        quant_mode == "nvfp4"
+        and device.type == "cuda"
+        and torch.cuda.is_available()
+        and get_compute_capability(_canonical_cuda_device(device)) == (12, 0)
+    )
 
 
 def _lookup_mac_ladder(
@@ -2110,6 +2125,7 @@ def _get_direct_micro_kernel(
     swiglu_beta: float = 1.0,
     swiglu_limit: float | None = None,
     device: torch.device | None = None,
+    one_round_fc1: bool = False,
 ):
     """Compile (or retrieve cached) the SM120 direct micro MoE kernel.
 
@@ -2139,6 +2155,7 @@ def _get_direct_micro_kernel(
         swiglu_beta,
         swiglu_limit,
         str(_canonical_cuda_device(device)) if device is not None else None,
+        one_round_fc1,
     )
     cached = _DIRECT_MICRO_LAUNCH_CACHE.get(launch_key)
     if cached is not None:
@@ -2160,6 +2177,7 @@ def _get_direct_micro_kernel(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         device=device,
+        one_round_fc1=one_round_fc1,
     )
     compile_key = ("direct_micro", kernel.__cache_key__, topk_ids_dtype)
     entry = _DIRECT_MICRO_KERNEL_CACHE.get(compile_key)
@@ -2298,13 +2316,19 @@ def launch_sm120_static_moe(
     )
     # Direct micro takes its band before the MMA micro decision. It reads
     # weights by global expert id, so EP shapes keep the compact path.
+    sm120_nvfp4 = _is_sm120_nvfp4(a.device, quant_mode)
+    direct_micro_cutover_pairs = (
+        _SM120_NVFP4_DIRECT_MICRO_CUTOVER_PAIRS
+        if sm120_nvfp4
+        else _DIRECT_MICRO_CUTOVER_PAIRS
+    )
     use_direct_micro = (
         quant_mode == "nvfp4"
         and workspace.state_E == num_experts
         and workspace.dm_barrier_count is not None
         and workspace.dm_barrier_count.numel() >= routed_rows + num_tokens * 16
         and num_tokens <= _MICRO_MAX_TOKENS
-        and (routed_rows < _DIRECT_MICRO_CUTOVER_PAIRS or direct_m4_source_shape)
+        and (routed_rows < direct_micro_cutover_pairs or direct_m4_source_shape)
         and family_n <= _DIRECT_MICRO_MAX_N
         and MoEDirectMicroKernel.is_supported(
             num_tokens, k, family_n, top_k, num_experts
@@ -2351,6 +2375,7 @@ def launch_sm120_static_moe(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             device=a.device,
+            one_round_fc1=sm120_nvfp4,
         )
         if not block_ok:
             if _FORCED_BACKEND == "direct_micro":
