@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 import warnings
 
 import pytest
@@ -38,6 +39,10 @@ from flashinfer.attention.prims_ts._block_sparse import config as sparse_config
 from flashinfer.attention.prims_ts._block_sparse.plan import (
     _INT8_QK_COMPUTE_CAPABILITIES,
 )
+from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
+    E4M3_MAX,
+    SOFTMAX_RESCALE_THRESHOLD_LOG2,
+)
 
 from tests.attention.test_attention_ts_block_sparse import (
     _HEAD_DIM,
@@ -54,8 +59,6 @@ _REQUIRES_INT8_QK_GPU = pytest.mark.skipif(
     or torch.cuda.get_device_capability() not in _INT8_QK_COMPUTE_CAPABILITIES,
     reason="INT8 Q/K Sage attention requires SM100",
 )
-# The kernel scales probabilities to the E4M3 maximum before quantizing them.
-_P_SCALE = 448.0
 # INT8 Q/K are drawn with this standard deviation and their scales divided by
 # it, so dequantized INT8 and E4M3 inputs share one distribution.
 _INT8_STD = 40.0
@@ -91,6 +94,7 @@ class _SageCase:
     qk_dtype: torch.dtype = _FP8
     out_dtype: torch.dtype = torch.bfloat16
     sage: SageAttentionConfig = SageAttentionConfig()
+    softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2
     mask_type: str = "dense"
     persistent: bool = False
     # "dense" plans use_block_sparse=False; "exact" and "proxy" route blocks.
@@ -101,10 +105,16 @@ class _SageCase:
     # Batch 1 takes Q scales near zero: masked INT8 lanes must still carry no
     # mass when ``sfQ * sfK`` is tiny.
     tiny_q_scales: bool = False
+    # One routing pattern serves every KV head.
+    share_pattern_across_kv_heads: bool = False
 
     @property
     def num_kv_blocks(self) -> int:
         return -(-self.seq_len_kv // self.kv_block_size)
+
+    @property
+    def num_pattern_heads(self) -> int:
+        return 1 if self.share_pattern_across_kv_heads else self.num_kv_heads
 
 
 _KV256 = dict(
@@ -161,6 +171,21 @@ _DENSE_CASES = (
         sage=SageAttentionConfig(q_block_size=4, k_block_size=1),
         persistent=True,
     ),
+    # A zero threshold keeps exact KV256 anchors and P at the full E4M3 range.
+    _SageCase(
+        "kv256_fp8_k16_exact_anchors_persistent",
+        **_KV256,
+        softmax_rescale_threshold_log2=0.0,
+        persistent=True,
+    ),
+    # Two Q heads per KV head and 32-token Q blocks keep the Q64 tile, which
+    # holds 32 tokens; 100 tokens leave the last Q tile four of them, and
+    # 2-token Q scale blocks span two rows of each head.
+    _SageCase(
+        "kv256_fp8_k16_q2_two_heads_ragged",
+        **{**_KV256, "seq_len_q": 100, "num_qo_heads": 4, "q_block_size": 32},
+        sage=SageAttentionConfig(q_block_size=2),
+    ),
 )
 _SPARSE_CASES = (
     _SageCase(
@@ -190,6 +215,20 @@ _SPARSE_CASES = (
         routes="proxy",
         sparse_format="bitmask",
     ),
+    # One binade defers small rises of a row maximum and re-anchors on larger ones.
+    _SageCase(
+        "kv256_proxy_fp8_k16_threshold1",
+        **_KV256,
+        softmax_rescale_threshold_log2=1.0,
+        routes="proxy",
+    ),
+    # Threshold log2(1.75) quantizes P at the power-of-two scale 256.
+    _SageCase(
+        "q128_exact_fp8_k16_p_scale256",
+        **_Q128,
+        softmax_rescale_threshold_log2=math.log2(1.75),
+        routes="exact",
+    ),
     # 33 summaries span three 16-summary scale blocks per batch.
     _SageCase(
         "q128_proxy_int8_k4_s16_persistent",
@@ -200,7 +239,18 @@ _SPARSE_CASES = (
         routes="proxy",
         persistent=True,
     ),
+    # Summary scales finer than the K scales: both kinds read 4-token words
+    # and the prepared scales repeat each K scale; one pattern serves both KV
+    # heads.
+    _SageCase(
+        "kv256_proxy_fp8_k16_s4_shared_pattern",
+        **_KV256,
+        sage=SageAttentionConfig(k_block_size=16, k_summary_block_size=4),
+        routes="proxy",
+        share_pattern_across_kv_heads=True,
+    ),
 )
+_CASES_BY_NAME = {case.name: case for case in _DENSE_CASES + _SPARSE_CASES}
 
 
 def _scale_slots(batch_size: int, seq_len: int, block_size: int) -> torch.Tensor:
@@ -245,9 +295,11 @@ def _random_inputs(case: _SageCase):
     params = SageAttentionParams(
         q_scale=q_scale / _SCALE_SHIFT,
         k_scale=k_scale * _SCALE_SHIFT,
-        v_scale=torch.empty((hkv, _HEAD_DIM), device="cuda").uniform_(0.25, 1.0),
+        v_scale=torch.empty((batch, hkv, _HEAD_DIM), device="cuda").uniform_(0.25, 1.0),
         v_mean=(
-            torch.randn((hkv, _HEAD_DIM), device="cuda") if case.sage.v_mean else None
+            torch.randn((batch, hkv, _HEAD_DIM), device="cuda")
+            if case.sage.v_mean
+            else None
         ),
     )
     summaries = None
@@ -270,7 +322,7 @@ def _random_inputs(case: _SageCase):
 
 
 def _random_patterns(case: _SageCase, generator: torch.Generator):
-    """Exact blocks per (batch, KV head, Q row).
+    """Exact blocks per (batch, pattern head, Q row).
 
     Odd rows keep the ragged final block; the first row of an exact case has
     no route, so its output stays zero despite a V mean.
@@ -290,7 +342,7 @@ def _random_patterns(case: _SageCase, generator: torch.Generator):
     return tuple(
         tuple(
             tuple(row(batch_idx, head_idx, row_idx) for row_idx in range(num_rows))
-            for head_idx in range(case.num_kv_heads)
+            for head_idx in range(case.num_pattern_heads)
         )
         for batch_idx in range(case.batch_size)
     )
@@ -342,6 +394,7 @@ def _plan(case: _SageCase, *, max_blocks_per_row: int | None = None):
             use_kv_valid_bits=case.use_token_mask,
             sparse_format=case.sparse_format,
             use_proxy_routes=case.routes == "proxy",
+            share_pattern_across_kv_heads=case.share_pattern_across_kv_heads,
         )
     select_scheduler = sparse_config._select_block_sparse_scheduler
     sparse_config._resolve_block_sparse_launch_spec.cache_clear()
@@ -372,6 +425,7 @@ def _plan(case: _SageCase, *, max_blocks_per_row: int | None = None):
                 v_data_type=_FP8 if case.qk_dtype == torch.int8 else None,
                 o_data_type=case.out_dtype,
                 sage_config=case.sage,
+                softmax_rescale_threshold_log2=case.softmax_rescale_threshold_log2,
                 **route_kwargs,
             )
     finally:
@@ -401,6 +455,7 @@ def _run(case: _SageCase, q, k, v, params, *, sm_scale, patterns, summaries, val
             sm_scale=sm_scale,
             sage=params,
             sage_config=None if case.sage == default_recipe else case.sage,
+            softmax_rescale_threshold_log2=case.softmax_rescale_threshold_log2,
         )
         torch.cuda.synchronize()
         return actual
@@ -468,11 +523,24 @@ def _row_folds(case: _SageCase, exact_blocks):
                 yield stream, source, torch.tensor(indices, device="cuda")
 
 
-def _fold(state, logits: torch.Tensor, values: torch.Tensor):
-    """Fold one set of columns into an online-softmax stream ``(max, sum, acc)``.
+def _anchor_headroom_log2(case: _SageCase) -> float:
+    """Binades the kernel lets a stream's exponent anchor lag its row maximum.
 
-    The row sum takes FP32 probabilities; the PV operand quantizes them to
-    E4M3 at ``448`` times their ratio to the stream's running maximum.
+    KV256 tiles and block-sparse routes defer anchor updates by the plan's
+    rescale threshold; other launches anchor on the exact running maximum.
+    """
+    if case.kv_tile == 256 or case.routes != "dense":
+        return case.softmax_rescale_threshold_log2
+    return 0.0
+
+
+def _fold(state, logits: torch.Tensor, values: torch.Tensor, headroom: float):
+    """Fold one set of columns into an online-softmax stream ``(anchor, sum, acc)``.
+
+    The stream keeps its anchor while the columns raise the row maximum by at
+    most ``headroom`` binades, as the kernel does. The row sum takes FP32
+    probabilities; the PV operand quantizes them to E4M3 at
+    ``E4M3_MAX * 2**-headroom`` times their ratio to the anchor.
     """
 
     if state is None:
@@ -481,8 +549,12 @@ def _fold(state, logits: torch.Tensor, values: torch.Tensor):
         state = (total - float("inf"), total, acc)
     running_max, total, acc = state
     new_max = torch.maximum(running_max, logits.amax(dim=-1))
+    lag_log2 = (new_max - running_max) * math.log2(math.e)
+    new_max = torch.where(
+        running_max.isfinite() & (lag_log2 <= headroom), running_max, new_max
+    )
     anchor = torch.where(new_max.isfinite(), new_max, 0.0)
-    probabilities = torch.exp(logits - anchor.unsqueeze(-1)) * _P_SCALE
+    probabilities = torch.exp(logits - anchor.unsqueeze(-1)) * E4M3_MAX * 2.0**-headroom
     correction = torch.exp(running_max - anchor)
     return (
         new_max,
@@ -498,10 +570,11 @@ def _reference(
     """FP32 attention on the dequantized inputs with the kernel's stream model.
 
     Every online-softmax stream quantizes its probabilities against its own
-    running maximum; a proxy summary of ``mass`` tokens weighs its
+    exponent anchor; a proxy summary of ``mass`` tokens weighs its
     probability by that mass. Rows without visible mass stay zero.
     """
 
+    headroom = _anchor_headroom_log2(case)
     q_real = _dequantize(q, params.q_scale, case.sage.q_block_size)
     k_real = _dequantize(k, params.k_scale, case.sage.k_block_size)
     if summaries is not None:
@@ -528,7 +601,7 @@ def _reference(
                 exact_blocks = (
                     range(case.num_kv_blocks)
                     if patterns is None
-                    else patterns[batch_idx][head_idx][row_idx]
+                    else patterns[batch_idx][head_idx % case.num_pattern_heads][row_idx]
                 )
                 streams = {}
                 for stream, source, index in _row_folds(case, exact_blocks):
@@ -555,7 +628,9 @@ def _reference(
                     logits = (logits * sm_scale + bias).masked_fill(
                         ~visible.unsqueeze(1), float("-inf")
                     )
-                    streams[stream] = _fold(streams.get(stream), logits, values.float())
+                    streams[stream] = _fold(
+                        streams.get(stream), logits, values.float(), headroom
+                    )
                 if not streams:
                     continue
                 maxima, totals, accs = (
@@ -567,9 +642,9 @@ def _reference(
                 )
                 total = (weights * totals).sum(dim=0).unsqueeze(-1)
                 result = (weights.unsqueeze(-1) * accs).sum(dim=0) / total
-                result = result * params.v_scale[head_idx]
+                result = result * params.v_scale[batch_idx, head_idx]
                 if params.v_mean is not None:
-                    result = result + params.v_mean[head_idx]
+                    result = result + params.v_mean[batch_idx, head_idx]
                 output[batch_idx, rows, heads] = torch.where(total > 0, result, 0.0)
     return output
 
@@ -615,6 +690,103 @@ def test_sage_matches_dequantized_reference(case: _SageCase) -> None:
 
     torch.manual_seed(20260908)
     _check_case(case, *_random_inputs(case))
+
+
+def _reference_sage_scales(layout, case: _SageCase, params) -> torch.Tensor:
+    """Build the prepared scales from the flat tensors as ``_SageScaleLayout`` describes them.
+
+    Per sequence (batch entry and KV head): each K section's atoms in word
+    order, a token past the section's length taking its last scale and
+    padding words zero; each Q tile's rows, a row past the tile's valid rows
+    repeating the last valid row's; then the ``sfV`` row and, with a mean,
+    the ``v_mean`` row.
+    """
+
+    batch, hkv = case.batch_size, case.num_kv_heads
+    sequences = torch.zeros((batch, hkv, layout.sequence_words), device="cuda")
+    sources = (params.k_scale, params.k_summary_scale)[: len(layout.k_sections)]
+    for section, scales in zip(layout.k_sections, sources, strict=True):
+        atoms = torch.arange(section.atoms, device="cuda")[:, None]
+        words = torch.arange(section.words_per_atom, device="cuda")
+        tokens = (atoms * 64 + words * section.tokens_per_word).clamp(
+            max=section.length - 1
+        )
+        slots = _scale_slots(batch, section.length, section.source_block_size)
+        columns = section.word_offset + atoms * section.atom_words + words
+        sequences[:, :, columns] = scales[:, slots[:, tokens]].permute(1, 0, 2, 3)
+    q_rows = layout.q_rows
+    tiles = torch.arange(q_rows.tiles, device="cuda")[:, None]
+    rows = torch.arange(q_rows.tile_size_q, device="cuda")
+    valid_rows = torch.tensor(
+        [q_rows.valid_rows(tile) for tile in range(q_rows.tiles)], device="cuda"
+    )[:, None]
+    rows = torch.minimum(rows, valid_rows - 1)
+    tokens = tiles * q_rows.tokens_per_tile + rows // q_rows.heads_q_per_kv
+    kv_heads = torch.arange(hkv, device="cuda")[:, None, None]
+    heads = kv_heads * q_rows.heads_q_per_kv + rows % q_rows.heads_q_per_kv
+    slots = _scale_slots(batch, q_rows.seq_len_q, q_rows.q_block_size)
+    q_words = params.q_scale[heads[None], slots[:, tokens][:, None]]
+    v_rows = layout.v_rows
+    sequences[:, :, q_rows.word_offset : v_rows.word_offset] = q_words.flatten(2)
+    rows = (params.v_scale,) + ((params.v_mean,) if layout.v_mean else ())
+    sequences[:, :, v_rows.word_offset :] = torch.cat(rows, dim=-1)
+    return sequences.flatten()
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            _CASES_BY_NAME[name],
+            id=name,
+            marks=(
+                _REQUIRES_INT8_QK_GPU
+                if _CASES_BY_NAME[name].qk_dtype == torch.int8
+                else ()
+            ),
+        )
+        for name in (
+            # Dense plans: one-token K scales; 16-token K scales under the
+            # persistent scheduler; two Q heads per KV head, 2-token Q blocks
+            # and a ragged last Q tile; 4-token K and 16-token Q blocks with a
+            # V mean; Q128 tiles of eight Q heads per KV head.
+            "kv256_fp8_k1_one_shot",
+            "kv256_fp8_k16_exact_anchors_persistent",
+            "kv256_fp8_k16_q2_two_heads_ragged",
+            "kv256_int8_k4_q16_mean_causal_persistent",
+            "q128_int8_k1_q4_persistent",
+            # Exact routes with a V mean; proxy routes with one-token summary
+            # scales; both mixed geometries, one with a shared pattern.
+            "q128_exact_fp8_k16_mean_token_mask",
+            "kv256_proxy_fp8_k16_s1_mean_bitmask",
+            "q128_proxy_int8_k4_s16_persistent",
+            "kv256_proxy_fp8_k16_s4_shared_pattern",
+        )
+    ],
+)
+@torch.no_grad()
+def test_prepared_sage_scales_match_flat_scales(case: _SageCase) -> None:
+    """The prepared scales hold every section's flat scales in the attention kernel's read order."""
+
+    torch.manual_seed(20260908)
+    q, k, v, params, summaries = _random_inputs(case)
+    patterns = None
+    if case.routes != "dense":
+        patterns = _random_patterns(case, torch.Generator().manual_seed(20260908))
+    valid = _token_mask(case) if case.use_token_mask else None
+    wrapper = _plan(
+        case, max_blocks_per_row=None if patterns is None else _widest_row(patterns)
+    )
+    wrapper.run(q, k, v, sage=params, **_routing(case, patterns, summaries, valid))
+    torch.cuda.synchronize()
+    state = wrapper._plan_state
+    layout = state.sage_scales_layout
+    assert layout.q_rows.tiles > 1
+    expected = _reference_sage_scales(layout, case, params)
+    assert state.sage_scales.shape == expected.shape
+    assert torch.equal(state.sage_scales, expected)
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -685,6 +857,18 @@ def test_int8_qk_plans_only_on_sm100(monkeypatch: pytest.MonkeyPatch) -> None:
             ValueError,
             "k_block_size",
             id="k-block-8",
+        ),
+        pytest.param(
+            {"softmax_rescale_threshold_log2": -1.0},
+            ValueError,
+            "softmax_rescale_threshold_log2",
+            id="negative-rescale-threshold",
+        ),
+        pytest.param(
+            {"softmax_rescale_threshold_log2": 9.0},
+            ValueError,
+            "softmax_rescale_threshold_log2",
+            id="rescale-threshold-above-8",
         ),
         pytest.param(
             {"q_block_size": 8, "kv_block_size": 8},

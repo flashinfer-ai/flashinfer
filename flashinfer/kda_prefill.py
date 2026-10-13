@@ -220,7 +220,7 @@ _FLASH_KDA_PERSISTENT_TASK_REFILL_CHUNKS = 2
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
 
-_PackedMetadataSignature = tuple[int, int, int, int, bool]
+_PackedMetadataSignature = tuple[Optional[int], int, int, int, bool]
 _PersistentTaskPlan = tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
 _PackedTaskMetadata = tuple[
     tuple[int, ...],
@@ -544,8 +544,12 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     Construct one workspace per captured
     :func:`flashinfer.kda.recurrent_kda` invocation on the graph's CUDA
     device. Warm it by invoking that function eagerly with the exact tensors
-    and capture stream, then synchronize that stream before capture. The
-    workspace owns optional final-state scratch, backend metadata, TMA
+    and capture stream, then synchronize that stream before capture. Packed
+    offsets must retain their warmed values through capture and replay.
+    Inference tensors have no version counter, so their offsets are reread on
+    every eager call.
+
+    The workspace owns optional final-state scratch, backend metadata, TMA
     descriptors, and schedule-specific scratch for the lifetime of the graph.
     On SM100-family devices this includes beta padding, M64/M128-N32/M128-N16
     and BT64 descriptor storage, small-BH packet-ring storage, and BT16
@@ -2648,8 +2652,10 @@ def _cached_packed_task_metadata(
 ) -> _PackedTaskMetadata:
     """Cache host-built sequence order and optional persistent task bins."""
 
+    version = None if cu_seqlens.is_inference() else int(cu_seqlens._version)
+    capturing = torch.cuda.is_current_stream_capturing()
     signature = (
-        int(cu_seqlens._version),
+        version,
         total_tokens,
         num_heads,
         sm_count,
@@ -2658,12 +2664,13 @@ def _cached_packed_task_metadata(
     with workspace._packed_metadata_lock:
         cached_metadata = workspace._packed_metadata
         if (
-            workspace._packed_metadata_tensor is cu_seqlens
+            (version is not None or capturing)
+            and workspace._packed_metadata_tensor is cu_seqlens
             and workspace._packed_metadata_signature == signature
             and cached_metadata is not None
         ):
             return cached_metadata
-        if torch.cuda.is_current_stream_capturing():
+        if capturing:
             raise RuntimeError(
                 "packed recurrent_kda prefill metadata is not warmed for "
                 "CUDA graph capture; eagerly invoke the same offsets once "
@@ -5503,10 +5510,13 @@ def _generated_affine_state_indices_i64(
 ) -> torch.Tensor:
     """Return the warmed int64 carrier used by the affine state scatter."""
 
-    source_version = int(state_indices._version)
+    source_version = (
+        None if state_indices.is_inference() else int(state_indices._version)
+    )
     destination_ptr = plan.state_indices_i64.data_ptr()
     if not (
         not capturing
+        and source_version is not None
         and workspace._generated_affine_state_indices_tensor is state_indices
         and workspace._generated_affine_state_indices_version == source_version
         and workspace._generated_affine_state_indices_destination_ptr == destination_ptr

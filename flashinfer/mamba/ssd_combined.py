@@ -269,8 +269,10 @@ class SSDCombined:
     returns a token-major view of it; the Cake kernels write the token-major
     ``[batch, seqlen, nheads, headdim]`` buffer directly and return it.  The
     Cake backend also accepts any positive ``seqlen``, including fewer than
-    ``chunk_size`` tokens per call (the host zero-pads x/B/C to one chunk and
-    stages the output; the kernels are unchanged), any positive ``chunk_size``
+    ``chunk_size`` tokens per call (the token axis of the x/B/C/out tensor
+    maps admits an extent below the 128-row box: TMA zero-fills the rows past
+    ``seqlen`` on loads and clips them on stores; the kernels are unchanged),
+    any positive ``chunk_size``
     (a caller convention: the Cake programs tile 128 tokens internally and the
     results are chunk-size independent up to rounding), the packed-varlen
     ``cu_seqlens`` form (the kernels derive the segment metadata on the
@@ -412,6 +414,75 @@ class SSDCombined:
 
         self._seq_cumsum_key = None
         self._seq_cumsum_buf = None
+
+    def prepare(
+        self,
+        *,
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: Optional[torch.Tensor] = None,
+        z: Optional[torch.Tensor] = None,
+        dt_bias: Optional[torch.Tensor] = None,
+        dt_softplus: bool = False,
+        dt_limit: Tuple[float, float] = (0.0, float("inf")),
+        initial_states: Optional[torch.Tensor] = None,
+        seq_idx: Optional[torch.Tensor] = None,
+        chunk_indices: Optional[torch.Tensor] = None,
+        chunk_offsets: Optional[torch.Tensor] = None,
+        seq_chunk_cumsum: Optional[torch.Tensor] = None,
+        return_final_states: bool = True,
+        num_seqs: Optional[int] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
+    ):
+        """Prepare a call shape eagerly so that :meth:`run` on it is a pure
+        launch that can be recorded into a CUDA graph (Cake backend only).
+
+        Delegates to :meth:`CakeSSDCombined.prepare`, which materialises the
+        shape's workspace (pinned from then on), builds and loads its
+        program and freezes the kernel-family choice without launching a
+        kernel; the arguments are those of :meth:`run` that determine the
+        shape.  Run the shape eagerly once after preparing it and before
+        capturing it (the host shim resolves its kernel handles on the first
+        launch).  After ``prepare(..., return_final_states=True)`` eager
+        :meth:`run` calls on the shape return the same static final-states
+        buffer every time (overwritten by each launch) instead of fresh
+        storage; a warm call captured without ``prepare`` allocates its
+        outputs from the graph's private pool.  Returns the
+        :class:`~flashinfer.mamba.cake_ssd_combined.PreparedSSDCombined`
+        record.  The CuTe backend has no prepared submission and raises
+        :class:`NotImplementedError`.
+        """
+
+        if self._backend != "cake":
+            raise NotImplementedError(
+                "SSDCombined.prepare requires backend='cake'; the CuTe backend has "
+                "no graph-capturable prepared submission"
+            )
+        return self._cake_runner.prepare(
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            seq_chunk_cumsum=seq_chunk_cumsum,
+            return_final_states=return_final_states,
+            num_seqs=num_seqs,
+            cu_seqlens=cu_seqlens,
+            out=out,
+        )
 
     # -- buffer cache helpers --------------------------------------------------
 
@@ -1006,8 +1077,8 @@ def ssd_combined_fwd(
         x: BF16 input tensor of shape
             ``[batch, seqlen, nheads, headdim]``; any positive ``seqlen`` is
             accepted (a partial trailing 128-token chunk is handled in-kernel;
-            a call shorter than one chunk is zero-padded to one chunk by the
-            host, which also stages its output).
+            a call shorter than one chunk binds the caller's tensors directly,
+            TMA zero-filling the rows past ``seqlen`` and clipping the store).
         dt: Per-token step sizes of shape ``[batch, seqlen, nheads]``.
         A: Float32 state-transition coefficients of shape ``[nheads]``.
         B: BF16 input projection of shape

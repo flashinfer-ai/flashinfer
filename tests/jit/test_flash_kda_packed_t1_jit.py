@@ -57,6 +57,20 @@ _FROZEN_BODY_END = "// END FROZEN GENERATED BODY\n"
             "-gencode=arch=compute_100f,code=sm_100f",
             100,
         ),
+        (
+            "tile8",
+            "sm107a",
+            (10, "7a"),
+            "-gencode=arch=compute_107a,code=sm_107a",
+            1070,
+        ),
+        (
+            "tile16",
+            "sm107a",
+            (10, "7a"),
+            "-gencode=arch=compute_107a,code=sm_107a",
+            1070,
+        ),
     ],
 )
 def test_flash_kda_packed_t1_jit_spec_and_frozen_body(
@@ -188,6 +202,7 @@ def test_flash_kda_packed_t1_binding_contract():
     assert "kHeadDim = 128" in binding
     assert "kTargetFamily = 100" in binding
     assert "kTargetSM100a = 1000" in binding
+    assert "kTargetSM107a = 1070" in binding
     assert "minor == 0 || minor == 3 || minor == 7" in binding
     assert "CHECK_LAST_DIM_CONTIGUOUS(mixed_qkv)" in binding
     assert "CHECK_INPUT_TYPE(mixed_qkv, dl_bfloat16)" in binding
@@ -213,6 +228,7 @@ def test_flash_kda_packed_t1_binding_contract():
         ({(10, "0a"), (10, "3a")}, "13.0", False, True),
         ({(10, "0f")}, "13.0", False, True),
         ({(10, "3f")}, "13.0", False, True),
+        ({(10, "7a")}, "13.0", False, True),
         ({(12, "0f")}, "13.0", False, False),
     ],
 )
