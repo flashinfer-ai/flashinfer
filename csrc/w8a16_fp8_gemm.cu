@@ -14,19 +14,22 @@
  * limitations under the License.
  */
 #include <flashinfer/gemm/w8a16_fp8_gemm.cuh>
+#include <flashinfer/gemm/w8a16_fp8_gemm_sm90_cutlass.cuh>
 
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
 
 // out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
-// `algo` selects the kernel variant on Blackwell; the Hopper launcher keeps its own
-// tile / split-K cost model (env overrides FLASHINFER_W8A16_FP8_TILE / _SPLITS) and
-// only accepts 0 (auto) here.
+// `algo` is the Hopper variant code (0 = the launcher's choice, 1 = the hand-written
+// kernel with its own tile / split-K cost model, 2.. = a CUTLASS mixed-input variant;
+// see W8A16Sm90Algo and flashinfer.gemm.w8a16_fp8_gemm's `algo` argument).  The
+// prepared weight layout belongs to the hand kernel only.
 void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorView scale,
                     ffi::Optional<TensorView> bias, bool weight_prepared,
                     ffi::Optional<TensorView> workspace, int64_t algo) {
-  TVM_FFI_ICHECK(algo == 0) << "algo is Blackwell-only; the Hopper launcher picks the tile";
+  TVM_FFI_ICHECK(algo >= 0 && algo <= gemm::kW8A16Sm90MaxAlgoCode)
+      << "algo must be 0 (auto) or a variant code 1.." << gemm::kW8A16Sm90MaxAlgoCode;
   CHECK_INPUT(act);     // [M, K], fp16/bf16, contiguous
   CHECK_INPUT(weight);  // [N, K], fp8 e4m3, contiguous
   CHECK_INPUT(out);     // [M, N], act dtype, contiguous
@@ -72,31 +75,61 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
     ws_ptr = static_cast<float*>(wsv.data_ptr());
     ws_bytes = wsv.numel() * 4;
   }
+  const int device_id = act.device().device_id;
   int num_sms = 0;
-  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, act.device().device_id);
+  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id);
 
-  ffi::CUDADeviceGuard device_guard(act.device().device_id);
+  ffi::CUDADeviceGuard device_guard(device_id);
   const cudaStream_t stream = get_stream(act.device());
 
+  const gemm::W8A16Sm90Algo variant = gemm::W8A16Sm90PickAlgo(
+      static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), num_sms, static_cast<int>(algo));
+  TVM_FFI_ICHECK(variant == gemm::W8A16Sm90Algo::kHand || !weight_prepared)
+      << "weight_prepared is a layout of the hand-written kernel (algo 'hand' / auto)";
+  if (variant != gemm::W8A16Sm90Algo::kHand) {
+    TVM_FFI_ICHECK(K % 16 == 0) << "K must be a multiple of 16 (16-byte TMA rows of fp8)";
+    TVM_FFI_ICHECK(N % 8 == 0) << "N must be a multiple of 8 (16-byte output rows)";
+  }
+
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(act.dtype(), c_type, [&] {
-    cudaError_t status = gemm::W8A16Fp8Gemm<c_type>(
-        static_cast<const c_type*>(act.data_ptr()),
-        static_cast<const __nv_fp8_e4m3*>(weight.data_ptr()),
-        static_cast<const float*>(scale.data_ptr()), static_cast<const c_type*>(bias_ptr),
-        static_cast<c_type*>(out.data_ptr()), static_cast<int>(M), static_cast<int>(N),
-        static_cast<int>(K), weight_prepared, ws_ptr, ws_bytes, num_sms, stream);
+    cudaError_t status;
+    if (variant == gemm::W8A16Sm90Algo::kHand) {
+      status = gemm::W8A16Fp8Gemm<c_type>(
+          static_cast<const c_type*>(act.data_ptr()),
+          static_cast<const __nv_fp8_e4m3*>(weight.data_ptr()),
+          static_cast<const float*>(scale.data_ptr()), static_cast<const c_type*>(bias_ptr),
+          static_cast<c_type*>(out.data_ptr()), static_cast<int>(M), static_cast<int>(N),
+          static_cast<int>(K), weight_prepared, ws_ptr, ws_bytes, num_sms, stream);
+    } else {
+      status = gemm::W8A16Fp8GemmSm90Cutlass<c_type>(
+          variant, static_cast<const c_type*>(act.data_ptr()),
+          static_cast<const __nv_fp8_e4m3*>(weight.data_ptr()),
+          static_cast<const float*>(scale.data_ptr()), static_cast<const c_type*>(bias_ptr),
+          static_cast<c_type*>(out.data_ptr()), static_cast<int>(M), static_cast<int>(N),
+          static_cast<int>(K), ws_ptr, static_cast<size_t>(ws_bytes), device_id, num_sms, stream);
+    }
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "w8a16_fp8_gemm failed with error code " << cudaGetErrorString(status);
     return true;
   });
 }
 
-// Workspace (bytes) the split-K path needs for this problem; 0 when it does not split.
+// Workspace (bytes) the chosen variant needs for this problem: the hand kernel's fp32
+// split-K partials, or the CUTLASS scheduler workspace (stream-K); 0 when none.
 int64_t w8a16_fp8_gemm_workspace_bytes(int64_t M, int64_t N, int64_t K, int64_t device_id,
                                        int64_t algo) {
-  TVM_FFI_ICHECK(algo == 0) << "algo is Blackwell-only; the Hopper launcher picks the tile";
+  TVM_FFI_ICHECK(algo >= 0 && algo <= gemm::kW8A16Sm90MaxAlgoCode)
+      << "algo must be 0 (auto) or a variant code 1.." << gemm::kW8A16Sm90MaxAlgoCode;
   int num_sms = 0;
   cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, static_cast<int>(device_id));
-  return gemm::W8A16Fp8GemmWorkspaceBytes(static_cast<int>(M), static_cast<int>(N),
-                                          static_cast<int>(K), num_sms);
+  const gemm::W8A16Sm90Algo variant = gemm::W8A16Sm90PickAlgo(
+      static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), num_sms, static_cast<int>(algo));
+  if (variant == gemm::W8A16Sm90Algo::kHand) {
+    return gemm::W8A16Fp8GemmWorkspaceBytes(static_cast<int>(M), static_cast<int>(N),
+                                            static_cast<int>(K), num_sms);
+  }
+  // Both activation dtypes share the mainloop / epilogue layout; bf16 sizes the workspace.
+  return static_cast<int64_t>(gemm::W8A16Fp8GemmSm90CutlassWorkspaceBytes<__nv_bfloat16>(
+      variant, static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+      static_cast<int>(device_id), num_sms));
 }

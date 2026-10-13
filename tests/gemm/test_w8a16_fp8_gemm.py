@@ -127,29 +127,42 @@ def test_w8a16_fp8_gemm_rejects_bad_inputs():
         w8a16_fp8_gemm(act[:, :32], w_fp8, scale)
 
 
-@pytest.mark.parametrize(
-    "algo",
-    [
-        "2sm256x128",
-        "2sm256x192",
-        "2sm256x256",
-        "1sm128x128",
-        "2sm256x128_splitk",
-        "2sm256x128_streamk",
-        "2sm256x160",
-    ],
-)
+_ALGOS_SM100 = [
+    "2sm256x128",
+    "2sm256x192",
+    "2sm256x256",
+    "1sm128x128",
+    "2sm256x128_splitk",
+    "2sm256x128_streamk",
+    "2sm256x160",
+]
+_ALGOS_SM90 = [
+    "hand",
+    "cutlass_128x256",
+    "cutlass_128x192",
+    "cutlass_128x160",
+    "cutlass_128x128",
+    "cutlass_64x256",
+    "cutlass_128x256_streamk",
+    "cutlass_128x192_streamk",
+]
+
+
+@pytest.mark.parametrize("algo", _ALGOS_SM100 + _ALGOS_SM90)
 @pytest.mark.parametrize("m,n,k", [(1024, 1024, 5120), (200, 1024, 5120), (4096, 128, 5120)])
 @pytest.mark.parametrize("bias", [False, True])
-def test_w8a16_fp8_gemm_algo(algo, m, n, k, bias):
-    """Every Blackwell kernel variant reachable through ``algo`` must agree with the
-    cast-copy reference; ``algo`` is rejected on other architectures."""
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_w8a16_fp8_gemm_algo(algo, m, n, k, bias, dtype):
+    """Every kernel variant reachable through ``algo`` must agree with the cast-copy
+    reference; a variant of another architecture is rejected."""
     dev = torch.device("cuda")
+    major = get_compute_capability(dev)[0]
+    mine = algo in (_ALGOS_SM100 if major == 10 else _ALGOS_SM90 if major == 9 else [])
     torch.manual_seed(0)
-    act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+    act = torch.randn(m, k, device=dev, dtype=dtype)
     w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
-    b = torch.randn(n, device=dev, dtype=torch.bfloat16) if bias else None
-    if get_compute_capability(dev)[0] != 10:
+    b = torch.randn(n, device=dev, dtype=dtype) if bias else None
+    if not mine:
         with pytest.raises(ValueError):
             w8a16_fp8_gemm(act, w_fp8, scale, bias=b, algo=algo)
         return

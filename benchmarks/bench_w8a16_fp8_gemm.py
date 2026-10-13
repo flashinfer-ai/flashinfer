@@ -355,7 +355,7 @@ def make_kernel(
 ) -> Callable[[], torch.Tensor] | None:
     """FlashInfer kernel; ``prepared`` uses the opt-in prepared weight layout
     (the one-time ``prepare_w8a16_fp8_weight`` copy is done here, untimed);
-    ``algo`` pins a Blackwell kernel variant (``--algo``)."""
+    ``algo`` pins a kernel variant (``--algo``; Hopper or Blackwell names)."""
     try:
         from flashinfer.gemm import prepare_w8a16_fp8_weight, w8a16_fp8_gemm
     except ImportError as e:
@@ -668,8 +668,8 @@ def parse_args(argv=None):
         type=str,
         nargs="+",
         default=None,
-        help="Blackwell only: one kernel:<algo> column per listed variant (auto, "
-        "2sm256x128, 2sm256x192, 2sm256x256, 1sm128x128), measured back to back; "
+        help="one kernel:<algo> column per listed variant, measured back to back "
+        "(Blackwell: 2sm256x128 ...; Hopper: hand, cutlass_128x256, cutlass_128x192 ...); "
         "default: a single kernel column with the launcher's model",
     )
     p.add_argument("--csv", type=str, default=None)

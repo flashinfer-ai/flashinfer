@@ -99,17 +99,37 @@ W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
 }
 
 
+# Hopper kernel variants selectable through ``algo``: ``hand`` is the hand-written
+# wgmma kernel with its own tile / split-K cost model, ``cutlass_*`` are the variants on
+# CUTLASS's mixed-input mainloop (weight rows x activation rows per CTA tile).  The codes
+# are the W8A16Sm90Algo enum values in include/flashinfer/gemm/w8a16_fp8_gemm_sm90_cutlass.cuh.
+W8A16_FP8_GEMM_ALGOS_SM90: dict[str, int] = {
+    "auto": 0,
+    "hand": 1,
+    "cutlass_128x256": 2,
+    "cutlass_128x192": 3,
+    "cutlass_128x160": 4,
+    "cutlass_128x128": 5,
+    "cutlass_64x256": 6,
+    "cutlass_128x256_streamk": 7,
+    "cutlass_128x192_streamk": 8,
+}
+
+
 def _algo_code(algo: Optional[str], device: torch.device) -> int:
     if algo is None or algo == "auto":
         return 0
-    if get_compute_capability(device)[0] != 10:
-        raise ValueError("algo is only selectable on Blackwell (sm_100a); use algo=None")
+    major = get_compute_capability(device)[0]
+    if major == 10:
+        table = W8A16_FP8_GEMM_ALGOS_SM100
+    elif major == 9:
+        table = W8A16_FP8_GEMM_ALGOS_SM90
+    else:
+        raise ValueError("algo is only selectable on Hopper / Blackwell; use algo=None")
     try:
-        return W8A16_FP8_GEMM_ALGOS_SM100[algo]
+        return table[algo]
     except KeyError:
-        raise ValueError(
-            f"unknown algo {algo!r}; one of {sorted(W8A16_FP8_GEMM_ALGOS_SM100)}"
-        ) from None
+        raise ValueError(f"unknown algo {algo!r}; one of {sorted(table)}") from None
 
 
 def prepare_w8a16_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -186,6 +206,12 @@ def w8a16_fp8_gemm(
     tiles.  On Blackwell it picks one of three 2SM tiles (256 weight rows by
     128, 192 or 256 activation rows) from the same kind of model; ``weight_prepared``
     is Hopper-only there.
+    algo: Optional[str]
+        Pins one kernel variant instead of the launcher's choice (benchmarking):
+        a key of ``W8A16_FP8_GEMM_ALGOS_SM100`` on Blackwell or of
+        ``W8A16_FP8_GEMM_ALGOS_SM90`` on Hopper (``hand`` = the wgmma kernel,
+        ``cutlass_<weight rows>x<activation rows>[_streamk]`` = the CUTLASS
+        mixed-input variants).  ``None`` / ``"auto"`` = the launcher decides.
 
     Returns
     -------
@@ -206,6 +232,8 @@ def w8a16_fp8_gemm(
         raise ValueError("weight_scale is one per-tensor value")
     if weight_prepared and get_compute_capability(act.device)[0] != 9:
         raise ValueError("weight_prepared=True is a Hopper-only layout")
+    if weight_prepared and algo not in (None, "auto", "hand"):
+        raise ValueError("weight_prepared=True is a layout of the hand-written Hopper kernel")
     if weight_scale.dtype != torch.float32:
         weight_scale = weight_scale.to(torch.float32)
     weight_scale = weight_scale.reshape(1)
