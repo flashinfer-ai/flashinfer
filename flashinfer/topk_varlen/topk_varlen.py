@@ -70,6 +70,7 @@ from ..trace.templates.topk import top_k_varlen_trace
 from ..topk import get_topk_module
 
 from ..cute_dsl.availability import is_cute_dsl_available
+from ..experimental.cudnn_topk_varlen.support import check_cudnn_top_k_varlen
 
 _CUTE_DSL_AVAILABLE = is_cute_dsl_available()
 
@@ -446,6 +447,10 @@ def _top_k_varlen_heuristic(
         order = ["radix_filter", "gvr_2"] + [
             b for b in order if b not in ("radix_filter", "gvr_2")
         ]
+    # The experimental checker admits only its enumerated auto geometries;
+    # backend_requirement has already applied the experimental-auto opt-in.
+    if "cudnn" in suitable_backends:
+        order.insert(0, "cudnn")
     return [b for b in order if b in suitable_backends]
 
 
@@ -1497,6 +1502,7 @@ def _run_radix_filter(
         "gvr_2": _gvr2_top_k_varlen_check,
         "radix_cutlass": _radix_cutlass_top_k_varlen_check,
         "radix_filter": _radix_filter_top_k_varlen_check,
+        "cudnn": check_cudnn_top_k_varlen,
     },
     heuristic_func=_top_k_varlen_heuristic,
 )
@@ -1512,7 +1518,7 @@ def top_k_varlen(
     out_indices: Optional[torch.Tensor] = None,
     out_values: Optional[torch.Tensor] = None,
     backend: Literal[
-        "radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "auto"
+        "radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "cudnn", "auto"
     ] = "auto",
     load_balance: bool = True,
     workspace: Optional[dict] = None,
@@ -1602,7 +1608,7 @@ def top_k_varlen(
     out_values : torch.Tensor, optional
         Pre-allocated values buffer (same dtype as ``logits``, same layout
         rules as ``out_indices``). Only used when ``return_values=True``.
-    backend : {"radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "auto"}, optional
+    backend : {"radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "cudnn", "auto"}, optional
         Backend to use.  Default ``"auto"``.
 
         ``"radix"``         — CuTe DSL single-pass multi-CTA radix top-K
@@ -1651,6 +1657,19 @@ def top_k_varlen(
                               accepted and ignored (the kernel takes no
                               hint), as for ``"radix"`` and
                               ``"radix_cutlass"``.
+        ``"cudnn"``         — Experimental, optional cuDNN Frontend
+                              ``IndexerTopKVarlen`` backend for contiguous
+                              BF16 scores on SM103/SM107. Indices only,
+                              no hint, T in [1,512], N in [1,262144],
+                              K in {512,1024,2048}. Requires a frontend build
+                              exposing that API and nvidia-cutlass-dsl >= 4.7
+                              (SM107: >= 4.8). Warm each geometry eagerly
+                              before capture; the plan has zero workspace
+                              and can serve independent concurrent graphs.
+                              Automatic routing requires
+                              ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``
+                              and an explicitly allowlisted shape. With the
+                              variable unset, existing auto routing is used.
         ``"auto"``          — shape/dtype-aware selection tracking the
                               measured per-config winner: gvr_2 for fp32,
                               hinted or hint-free (except hint-free
@@ -1910,7 +1929,13 @@ def top_k_varlen(
             (num_rows, top_k), dtype=logits.dtype, device=logits.device
         )
 
-    if backend == "radix":
+    if backend == "cudnn":
+        if return_values or pre_idx is not None:
+            raise ValueError("backend='cudnn' requires indices-only output and no hint")
+        from ..experimental.cudnn_topk_varlen.backend import run
+
+        out_i, out_v = run(logits, seq_lens, top_k, next_n, compress_ratio, out_indices)
+    elif backend == "radix":
         out_i, out_v = _run_radix(
             logits,
             seq_lens,
@@ -1987,7 +2012,7 @@ def top_k_varlen(
     else:
         raise ValueError(
             f"Unknown backend: {backend!r}. "
-            f"Expected 'radix', 'gvr', 'gvr_2', 'radix_cutlass', or 'radix_filter'."
+            f"Expected 'radix', 'gvr', 'gvr_2', 'radix_cutlass', 'radix_filter', or 'cudnn'."
         )
 
     return out_i, out_v
