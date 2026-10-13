@@ -1443,7 +1443,8 @@ def test_explicit_cake_cp_rejects_unsupported_domain_without_fallback(
     unsupported: str,
 ) -> None:
     calls: list[str] = []
-    capability = (10, 7) if unsupported == "architecture" else (10, 3)
+    # Compute capability 10.7 joined the Cake CP domain; 12.0 stays outside it.
+    capability = (12, 0) if unsupported == "architecture" else (10, 3)
     monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _device: 152)
     monkeypatch.setattr(
         gdn_prefill, "get_compute_capability", lambda _device: capability
@@ -2481,3 +2482,74 @@ def test_public_dispatcher_uses_generated_for_indexed_inplace_gqa(
     for row in range(candidate_state.shape[0]):
         if row not in selected:
             assert torch.equal(candidate_state[row], state_before[row])
+
+
+@pytest.mark.parametrize(
+    ("heads", "max_seqlen", "expected_chunk"),
+    [
+        (32, 65536, 11264),
+        (32, 32768, 5120),
+        (32, 16384, 2560),
+        (32, 8192, 1536),
+        (48, 65536, 16384),
+        (48, 32768, 8192),
+        (48, 16384, 4096),
+        (48, 8192, 2048),
+        (16, 65536, 5120),
+        (8, 65536, 2560),
+    ],
+)
+def test_sm107_physical_plan_avoids_a_long_second_wave(
+    monkeypatch: pytest.MonkeyPatch, heads: int, max_seqlen: int, expected_chunk: int
+) -> None:
+    monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device: "sm_107a")
+    monkeypatch.setattr(
+        gdn_cp.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=212),
+    )
+    q = SimpleNamespace(
+        shape=(max_seqlen, heads, 128), device=SimpleNamespace(), dtype=torch.float16
+    )
+    k = SimpleNamespace(shape=(max_seqlen, heads, 128))
+    v = SimpleNamespace(shape=(max_seqlen, heads, 128))
+    plan = gdn_cp._build_plan(q, k, v, num_seqs=1, max_seqlen=max_seqlen)
+    assert plan.cp_chunk_len == expected_chunk
+    chunks = gdn_cp._ceil_div(max_seqlen, plan.cp_chunk_len)
+    tail = max_seqlen - (chunks - 1) * plan.cp_chunk_len
+    # Either the grid fits one wave or the second wave is at most a chunk long.
+    assert heads * chunks <= 212 or 2 * tail <= plan.cp_chunk_len
+
+
+@pytest.mark.parametrize(
+    ("num_seqs", "heads", "max_seqlen", "total_tokens", "expected"),
+    [
+        (1, 8, 4096, 4096, True),
+        (1, 8, 2048, 2048, False),
+        (4, 8, 2048, 8192, False),
+        (2, 8, 4096, 8192, True),
+        (1, 16, 4096, 4096, True),
+        (2, 16, 4096, 8192, False),
+        (2, 16, 6144, 8192, True),
+        (1, 32, 4096, 4096, False),
+        (1, 32, 8192, 8192, True),
+        (1, 32, 65536, 65536, True),
+        (1, 48, 4096, 4096, False),
+        (1, 48, 8192, 8192, False),
+        (1, 48, 16384, 16384, True),
+        (1, 48, 65536, 65536, True),
+    ],
+)
+def test_sm107_auto_band_follows_the_measured_plan(
+    num_seqs: int, heads: int, max_seqlen: int, total_tokens: int, expected: bool
+) -> None:
+    assert (
+        gdn_prefill._cake_gdn_cp_sm107a_plan_pays(
+            num_seqs=num_seqs,
+            num_sab_heads=heads,
+            max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
+            num_sms=212,
+        )
+        is expected
+    )

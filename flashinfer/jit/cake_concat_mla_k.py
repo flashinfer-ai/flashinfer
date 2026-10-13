@@ -5,9 +5,10 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from . import env as jit_env
 from .core import (
@@ -16,16 +17,26 @@ from .core import (
     logger,
     sm100f_nvcc_flags,
     sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
 )
 
-CakeConcatMLAKTarget = Literal["sm100f", "sm103a"]
+CakeConcatMLAKTarget = Literal["sm100f", "sm103a", "sm107a"]
+# The single delivered module is arch-neutral source text (vector copy, no
+# tcgen05/TMA); the manifest pins the sm_103a render but each target below
+# compiles the same two translation units with its own flags.
 _TARGET_FLAGS = {
     "sm100f": sm100f_nvcc_flags,
     "sm103a": sm103a_nvcc_flags,
+    "sm107a": sm107a_nvcc_flags,
 }
 
 _MANIFEST_NAME = "cake_concat_mla_k_import_manifest.json"
-_EXPECTED_CONTRACT = {
+_SCHEMA = "cake.library_export.v5"
+_RENDER_ARCH = "sm_103a"
+_MODULE_NAME_RE = re.compile(r"cake_concat_mla_k_[0-9a-f]{20}")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_EXPECTED_CONTRACT: dict[str, Any] = {
+    "arches": [_RENDER_ARCH],
     "backend": "cake",
     "correctness": "byte_exact_copy_and_broadcast",
     "dtypes": [
@@ -41,6 +52,18 @@ _EXPECTED_CONTRACT = {
         "rope_dim": 64,
     },
     "input_layouts": ["contiguous", "nope_strided", "both_strided"],
+    "integration_files": [
+        "flashinfer/concat_ops.py",
+        "flashinfer/jit/cake_concat_mla_k.py",
+    ],
+    # The host wrapper mirrors this launch rule: one CTA copies two 1-byte
+    # tokens or one 2-byte token (six 16-byte vectors per thread either way).
+    "launch_policy": {
+        "block": [512, 1, 1],
+        "grid": "ceil(tokens / tokens_per_cta[element_bytes]), 1, 1",
+        "min_blocks_per_sm": 2,
+        "tokens_per_cta": {"element_bytes_1": 2, "element_bytes_2": 1},
+    },
     "mutation": "caller_owned_k_in_place",
     "operator": "concat_mla_k",
     "output_layouts": [
@@ -48,13 +71,16 @@ _EXPECTED_CONTRACT = {
         "caller_owned_leading_strided_uninitialized",
     ],
     "public_api": "flashinfer.concat_ops.concat_mla_k",
-    "return_value": None,
     "signature": "concat_mla_k(k, k_nope, k_rope) -> None",
-    "target": "sm_103a",
+    "stages": ["vector_copy"],
+    "stages_by_arch": {_RENDER_ARCH: ["vector_copy"]},
 }
 _EXPECTED_BUILD_CONTRACT = {
     "architecture_source": "modules[].arch",
     "binary_payloads": False,
+    "source_license_header_sha256": (
+        "dcf2449c2d70596e2c32bf1fa23720023965ff05857b85772decee99d830bf2f"
+    ),
     "target_infrastructure": {
         "binding_runtime": "flashinfer_tvm_ffi_utils",
         "headers_owned_by_target": True,
@@ -62,16 +88,49 @@ _EXPECTED_BUILD_CONTRACT = {
     },
     "translation_unit_model": "separate_device_and_binding",
 }
+_EXPECTED_ARG_PLAN = [
+    ["buffer", "k"],
+    ["buffer", "k_nope"],
+    ["buffer", "k_rope"],
+    ["parameter", "element_bytes"],
+    ["parameter", "k_stride_0_bytes"],
+    ["parameter", "k_stride_1_bytes"],
+    ["parameter", "k_nope_stride_0_bytes"],
+    ["parameter", "k_nope_stride_1_bytes"],
+    ["parameter", "k_rope_stride_0_bytes"],
+    ["parameter", "tokens"],
+    ["grid", "grid_x"],
+    ["grid", "grid_y"],
+    ["grid", "grid_z"],
+]
+_EXPECTED_LAUNCH: dict[str, Any] = {
+    "block": [512, 1, 1],
+    "cluster": [1, 1, 1],
+    "cluster_scheduling_policy": "spread",
+    "cooperative": False,
+    "dynamic_smem_bytes": 0,
+    "max_persistent_clusters": None,
+    "persistent_ctas_per_sm": 1,
+    "use_pdl": False,
+}
+_EXPECTED_BINDING_INFRASTRUCTURE = {
+    "runtime": "flashinfer_tvm_ffi_utils",
+    "target_owned_headers": ["tvm_ffi_utils.h"],
+}
+_EXPECTED_ROUTE_TEMPLATE = "flashinfer_blackwell_concat_mla_k_vector_copy"
+_HASH_KEYS = ("arg_plan_sha256", "closure_sha256")
 
 
 @dataclass(frozen=True)
 class CakeConcatMLAKModuleSpec:
-    """Verified source closure and cache identity for the exported module."""
+    """Verified source closure, cache identity and launch rule of the exported module."""
 
     module_ident: str
     closure_sha256: str
     device_path: Path
     binding_path: Path
+    tokens_per_cta: Mapping[int, int]
+    block: tuple[int, int, int]
 
 
 def _require_manifest(condition: bool, message: str) -> None:
@@ -106,11 +165,15 @@ def _get_include_dir() -> Path:
 
 
 def _verify_source(
-    csrc_dir: Path, path_value: object, sha256_value: object, label: str
+    csrc_dir: Path, item: object, expected_path: str, label: str
 ) -> Path:
-    _require_manifest(isinstance(path_value, str) and bool(path_value), f"{label}.path")
-    assert isinstance(path_value, str)
-    relative = PurePosixPath(path_value)
+    _require_manifest(isinstance(item, dict), f"{label} must be an object")
+    assert isinstance(item, dict)
+    path_value = item.get("path")
+    _require_manifest(
+        path_value == expected_path, f"{label}.path must be {expected_path}"
+    )
+    relative = PurePosixPath(expected_path)
     _require_manifest(
         not relative.is_absolute()
         and ".." not in relative.parts
@@ -119,22 +182,20 @@ def _verify_source(
         f"{label}.path must name one csrc/concat_mla file",
     )
     path = csrc_dir / relative.name
-    _require_manifest(
-        path.name.startswith("cake_concat_mla_k_") and path.suffix == ".cu",
-        f"{label}.path must use a cake_concat_mla_k CUDA filename",
-    )
     _require_manifest(path.is_file(), f"{label}.path does not exist: {path}")
+    sha256_value = item.get("sha256")
     _require_manifest(
         isinstance(sha256_value, str)
-        and len(sha256_value) == 64
-        and all(character in "0123456789abcdef" for character in sha256_value),
+        and _SHA256_RE.fullmatch(sha256_value) is not None,
         f"{label}.sha256 must be one full lowercase SHA-256",
     )
-    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    payload = path.read_bytes()
+    actual = hashlib.sha256(payload).hexdigest()
     _require_manifest(
         actual == sha256_value,
         f"{label}.sha256 mismatch: {actual} != {sha256_value}",
     )
+    _require_manifest(item.get("bytes") == len(payload), f"{label}.bytes mismatch")
     return path
 
 
@@ -152,11 +213,13 @@ def get_cake_concat_mla_k_module_spec() -> CakeConcatMLAKModuleSpec:
     csrc_dir = _get_csrc_dir()
     payload: Any = json.loads((csrc_dir / _MANIFEST_NAME).read_text())
     _require_manifest(isinstance(payload, dict), "root must be an object")
-    _require_manifest(payload.get("schema") == "cake.library_export.v1", "schema")
+    _require_manifest(payload.get("schema") == _SCHEMA, "schema")
     _require_manifest(payload.get("producer") == "cake", "producer")
+    _require_manifest(payload.get("public_namespace") == "cake", "public_namespace")
     _require_manifest(payload.get("artifact_kind") == "source_only", "artifact_kind")
     _require_manifest(payload.get("library") == "flashinfer", "library")
     _require_manifest(payload.get("name") == "cake_concat_mla_k", "name")
+    _require_manifest(payload.get("sequences") == [], "sequences")
     _require_manifest(payload.get("contract") == _EXPECTED_CONTRACT, "contract")
     _require_manifest(
         payload.get("build_contract") == _EXPECTED_BUILD_CONTRACT,
@@ -167,31 +230,67 @@ def get_cake_concat_mla_k_module_spec() -> CakeConcatMLAKModuleSpec:
     _require_manifest(isinstance(modules, list) and len(modules) == 1, "modules")
     module = modules[0]
     _require_manifest(isinstance(module, dict), "modules[0] must be an object")
-    _require_manifest(module.get("arch") == "sm_103a", "modules[0].arch")
+    name = module.get("name")
     _require_manifest(
-        module.get("name") == "cake_concat_mla_k_vector_copy", "modules[0].name"
+        isinstance(name, str) and _MODULE_NAME_RE.fullmatch(name) is not None,
+        "modules[0].name",
     )
-    _require_manifest(module.get("role") == "main", "modules[0].role")
+    assert isinstance(name, str)
+    _require_manifest(module.get("arch") == _RENDER_ARCH, "modules[0].arch")
+    _require_manifest(module.get("role") == "kernel", "modules[0].role")
     _require_manifest(module.get("ffi_entry") == "run", "modules[0].ffi_entry")
     _require_manifest(
-        module.get("compile_flags") == sm103a_nvcc_flags,
-        "modules[0].compile_flags",
+        module.get("kernel_symbol") == f"kernel_{name}", "modules[0].kernel_symbol"
     )
-    arg_plan = module.get("arg_plan")
+    module_ident = module.get("module_ident")
     _require_manifest(
-        isinstance(arg_plan, list) and bool(arg_plan), "modules[0].arg_plan"
+        module_ident == f"{name}_{_RENDER_ARCH}", "modules[0].module_ident"
+    )
+    assert isinstance(module_ident, str)
+    # FlashInfer owns the per-target flags; the render carries none.
+    _require_manifest(module.get("compile_flags") == [], "modules[0].compile_flags")
+    _require_manifest(module.get("tma_abi") == "grid_constant", "modules[0].tma_abi")
+    _require_manifest(module.get("specializations") == {}, "modules[0].specializations")
+    _require_manifest(
+        module.get("noncontiguous_tensors") == ["k", "k_nope", "k_rope"],
+        "modules[0].noncontiguous_tensors",
     )
     _require_manifest(
-        module.get("arg_plan_sha256") == _compact_sha256(arg_plan),
+        module.get("binding_infrastructure") == _EXPECTED_BINDING_INFRASTRUCTURE,
+        "modules[0].binding_infrastructure",
+    )
+    _require_manifest(
+        module.get("arg_plan") == _EXPECTED_ARG_PLAN, "modules[0].arg_plan"
+    )
+    _require_manifest(
+        module.get("arg_plan_sha256") == _compact_sha256(_EXPECTED_ARG_PLAN),
         "modules[0].arg_plan_sha256",
     )
-    translation_units = module.get("translation_units")
+    _require_manifest(module.get("launch") == _EXPECTED_LAUNCH, "modules[0].launch")
+    route = module.get("route")
     _require_manifest(
-        isinstance(translation_units, dict)
-        and translation_units.get("compile_separately") is True,
+        isinstance(route, dict)
+        and route.get("template") == _EXPECTED_ROUTE_TEMPLATE
+        and route.get("stage") == "vector_copy"
+        and route.get("specialization") == {},
+        "modules[0].route",
+    )
+    source_build = module.get("source_build")
+    _require_manifest(
+        isinstance(source_build, dict) and source_build.get("backend") == "cuda_cpp",
+        "modules[0].source_build",
+    )
+    device_value = f"csrc/concat_mla/{name}_kernel.cu"
+    binding_value = f"csrc/concat_mla/{name}_binding.cu"
+    _require_manifest(
+        module.get("translation_units")
+        == {
+            "binding": binding_value,
+            "compile_separately": True,
+            "device": device_value,
+        },
         "modules[0].translation_units",
     )
-
     closure = module.get("closure")
     _require_manifest(
         isinstance(closure, list) and len(closure) == 2,
@@ -202,85 +301,76 @@ def get_cake_concat_mla_k_module_spec() -> CakeConcatMLAKModuleSpec:
         for item in closure
         if isinstance(item, dict) and isinstance(item.get("path"), str)
     }
-    device_value = translation_units.get("device")
-    binding_value = translation_units.get("binding")
     _require_manifest(device_value in by_path, "device closure missing")
     _require_manifest(binding_value in by_path, "binding closure missing")
-    device_item = by_path[device_value]
-    binding_item = by_path[binding_value]
     device_path = _verify_source(
-        csrc_dir,
-        device_value,
-        device_item.get("sha256"),
-        "modules[0].device",
+        csrc_dir, by_path[device_value], device_value, "modules[0].device"
     )
     binding_path = _verify_source(
-        csrc_dir,
-        binding_value,
-        binding_item.get("sha256"),
-        "modules[0].binding",
+        csrc_dir, by_path[binding_value], binding_value, "modules[0].binding"
     )
     files = payload.get("files")
     _require_manifest(isinstance(files, list) and len(files) == 2, "files")
-    file_hashes = {
-        item.get("path"): item.get("sha256")
+    file_receipts = {
+        item.get("path"): (item.get("kind"), item.get("sha256"), item.get("bytes"))
         for item in files
-        if isinstance(item, dict)
-        and isinstance(item.get("path"), str)
-        and isinstance(item.get("sha256"), str)
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
     }
     _require_manifest(
-        file_hashes
+        file_receipts
         == {
-            device_value: device_item.get("sha256"),
-            binding_value: binding_item.get("sha256"),
+            device_value: (
+                "device_source",
+                by_path[device_value].get("sha256"),
+                by_path[device_value].get("bytes"),
+            ),
+            binding_value: (
+                "tvm_ffi_binding",
+                by_path[binding_value].get("sha256"),
+                by_path[binding_value].get("bytes"),
+            ),
         },
         "files must match the complete module closure",
     )
-
-    module_ident = module.get("module_ident")
     closure_sha256 = module.get("closure_sha256")
     _require_manifest(
-        isinstance(module_ident, str)
-        and module_ident.startswith("cake_concat_mla_k_")
-        and module_ident.replace("_", "").isalnum(),
-        "modules[0].module_ident",
-    )
-    _require_manifest(
         isinstance(closure_sha256, str)
-        and len(closure_sha256) == 64
-        and all(character in "0123456789abcdef" for character in closure_sha256),
+        and _SHA256_RE.fullmatch(closure_sha256) is not None,
         "modules[0].closure_sha256",
     )
+    assert isinstance(closure_sha256, str)
     identity_input = {
-        key: module[key]
-        for key in (
-            "arch",
-            "name",
-            "role",
-            "translation_units",
-            "kernel_symbol",
-            "module_ident",
-            "ffi_entry",
-            "binding_infrastructure",
-            "arg_plan",
-            "compile_flags",
-            "tma_abi",
-            "launch",
-            "route",
-            "closure",
-        )
+        key: value for key, value in module.items() if key not in _HASH_KEYS
     }
     _require_manifest(
         closure_sha256 == _compact_sha256(identity_input),
         "modules[0].closure_sha256 mismatch",
     )
+    tokens_per_cta = _EXPECTED_CONTRACT["launch_policy"]["tokens_per_cta"]
+    block = _EXPECTED_LAUNCH["block"]
     return CakeConcatMLAKModuleSpec(
         module_ident=module_ident,
         closure_sha256=closure_sha256,
         device_path=device_path,
         binding_path=binding_path,
+        tokens_per_cta={
+            1: int(tokens_per_cta["element_bytes_1"]),
+            2: int(tokens_per_cta["element_bytes_2"]),
+        },
+        block=(int(block[0]), int(block[1]), int(block[2])),
     )
+
+
+def cake_concat_mla_k_tokens_per_cta(element_bytes: int) -> int:
+    """Token window one CTA copies (the manifest's ``launch_policy``)."""
+
+    spec = get_cake_concat_mla_k_module_spec()
+    try:
+        return spec.tokens_per_cta[int(element_bytes)]
+    except KeyError:
+        raise ValueError(
+            f"the Cake concat MLA K module has no launch rule for {element_bytes}-byte elements"
+        ) from None
 
 
 def cake_concat_mla_k_target(device) -> CakeConcatMLAKTarget:
@@ -300,9 +390,17 @@ def cake_concat_mla_k_target(device) -> CakeConcatMLAKTarget:
         return "sm100f"
     if capability == (10, 3):
         return "sm103a"
+    if capability == (10, 7):
+        if not is_cuda_version_at_least("13.0"):
+            raise RuntimeError(
+                "Cake concat MLA K on compute capability 10.7 requires CUDA "
+                "13.0 or newer for the sm_107a target"
+            )
+        return "sm107a"
     raise RuntimeError(
         "the Cake concat MLA K backend requires compute capability 10.0 "
-        f"(SM100f) or 10.3 (SM103a), got {capability[0]}.{capability[1]}"
+        "(SM100f), 10.3 (SM103a) or 10.7 (SM107a), got "
+        f"{capability[0]}.{capability[1]}"
     )
 
 
@@ -347,6 +445,7 @@ __all__ = [
     "CakeConcatMLAKTarget",
     "CakeConcatMLAKModuleSpec",
     "cake_concat_mla_k_target",
+    "cake_concat_mla_k_tokens_per_cta",
     "gen_cake_concat_mla_k_module",
     "get_cake_concat_mla_k_module",
     "get_cake_concat_mla_k_module_spec",
