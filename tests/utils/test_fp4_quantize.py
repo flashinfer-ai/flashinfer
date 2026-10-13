@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from tests.test_helpers.pdl import late_store
 from tests.test_helpers.utils_fp4 import (
     cast_from_fp4,
     nvfp4_global_decode_scale_te,
@@ -2425,6 +2426,31 @@ def test_nvfp4_quantize_global_scale_dtype_regression(m: int, scale_dtype: torch
         f"Dequant magnitude off (median |deq/x|={ratio:.3f}) for m={m}, "
         f"scale_dtype={scale_dtype} -- global scale not applied correctly."
     )
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+# m >= 1024 with n % 512 == 0 takes the TMA kernel; smaller m takes the plain one.
+@pytest.mark.parametrize("shape", [(256, 2048), (1024, 2048)])
+def test_nvfp4_quantize_pdl_waits_for_global_scale(dtype, shape):
+    device = torch.device("cuda:0")
+    if not _is_fp4_supported(device):
+        pytest.skip("Nvfp4 requires compute capability >= 10 and CUDA >= 12.8")
+    torch.manual_seed(0)
+    x = torch.randn(shape, device=device, dtype=dtype) * 5
+    global_scale = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / x.float().abs().max()
+    expected_fp4, expected_sf = nvfp4_quantize(
+        x, global_scale, sfLayout=SfLayout.layout_128x4, enable_pdl=False
+    )
+
+    # The scale the previous kernel is still producing, as in a dynamic-scale pipeline.
+    scale = torch.full_like(global_scale, global_scale.item() / 4)
+    late_store(scale, global_scale.item())
+    fp4, sf = nvfp4_quantize(x, scale, sfLayout=SfLayout.layout_128x4, enable_pdl=True)
+
+    torch.testing.assert_close(
+        sf.view(torch.uint8), expected_sf.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(fp4, expected_fp4, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
