@@ -72,11 +72,10 @@ cuDNN Frost backend
 ~~~~~~~~~~~~~~~~~~~
 
 Frost is a stable ``MoELayer`` backend on SM107a, with additional BF16 support
-on SM120a. It can be selected explicitly
-with ``BackendOptions`` or admitted during autotuning alongside eligible
-backends. It does not require ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS``.
-Cold calls without autotuning use the configured backend pool; automatic Frost
-candidates are first created during autotuning and may be reused afterward.
+on SM120a. Its four configs are included in the default backend list and can
+also be selected through ``BackendOptions``. Candidates with unavailable weight
+views or unsupported input shapes are skipped. It does not require
+``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS``.
 
 .. list-table:: Supported configurations
    :header-rows: 1
@@ -130,9 +129,15 @@ The backend requires precomputed routing with contiguous int32 expert IDs and
 FP32 routing weights, and returns finalized BF16 output. It supports the default
 activation contracts; bias, expert parallelism, shared experts, custom activation
 parameters, and routing from logits are unsupported. BF16 uses the measured
-model shortlist. Quantized hidden/intermediate sizes must be divisible by 128;
-artifact and native-plan bounds are checked per call. Configure another backend
-alongside Frost if unsupported calls need a fallback.
+model shortlist. Quantized hidden/intermediate sizes must be divisible by 128.
+
+Quantized FC1 weight scales accept expert-major or branch-major storage and may
+be updated in place. For CUDA Graph replay, keep tensor pointers, shapes and
+layouts fixed and update tensors before replay on the same stream.
+
+After changing compiler or artifact configuration, call
+``layer.refresh_backends()`` outside CUDA Graph capture, or reconstruct the
+layer.
 
 The validated SM107 dependency baseline is PyTorch 2.14.1, CuTe DSL 4.8.0, TVM-FFI
 0.1.14.post1, and external PTXAS 13.4.92. CUDA 13.5 PTXAS is also validated.
@@ -146,11 +151,10 @@ PTXAS executable only supplies the assembler for Frost's DSL kernels.
 
 On SM107, set ``FLASHINFER_CUDNN_FROST_PTXAS=/path/to/ptxas`` when the DSL bundles an older
 assembler. ``CUDA_HOME`` alone does not replace that assembler. Unqualified
-assemblers are rejected before kernel execution, including when reusing a cached
-automatic runner. Automatic selection skips unavailable Frost candidates;
-explicit selection reports the missing requirement.
+assemblers are rejected when building or refreshing a runner. Automatic selection
+skips unavailable Frost candidates; explicit selection reports the missing requirement.
 Both external PTXAS and the bundled assembler must report CUDA 13.4 or newer.
-Admission checks the release version without imposing a patch-level minimum.
+There is no patch-level minimum.
 Use the latest assembler patch release for SM107 tensor-map updates.
 SM120 BF16 kernels do not update tensor maps and retain capability-based compiler
 admission without this SM107-specific assembler minimum.

@@ -116,8 +116,7 @@ from .backends.cudnn_frost.nvfp4.moe import CudnnFrostNvfp4MoeRunner
 from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
 from .utils import map_to_hybrid_bucket
 
-# Concrete host runners for explicit configs. Additional candidates use the
-# auto_candidates registration contract; device kernel loading stays deferred.
+# Concrete host runners for configured candidates; device kernel loading stays deferred.
 _RunnerT = Union[
     CudnnFrostBf16MoeRunner,
     CudnnFrostMxfp8MoeRunner,
@@ -244,8 +243,6 @@ class MoELayer:
 
         major, minor = get_compute_capability(self.device)
         arch = major * 10 + minor
-        self._arch = arch
-        self._automatic_runners: Dict[str, Any] = {}
 
         # Build one runner per compatible backend
         self.runners: List[_RunnerT] = []
@@ -407,22 +404,13 @@ class MoELayer:
         # here nor via a winner cached under the other mode, hence the
         # mode-qualified cache key below.
         mode = act_pack.routing_input_mode
-        exact_shape = any(
-            getattr(r, "requires_exact_shape", False) for r in self.runners
+        eligible = tuple(
+            index
+            for index, runner in enumerate(self.runners)
+            if mode in runner.supported_routing_modes
+            and runner.accepts(act_pack, weight_pack)
         )
-        configured = [
-            (index, r)
-            for index, r in enumerate(self.runners)
-            if mode in r.supported_routing_modes
-            and (
-                not getattr(r, "requires_exact_shape", False)
-                or r.accepts(act_pack, weight_pack)
-            )
-        ]
-        runners = [r for _, r in configured]
-        additional = self._additional_candidates(act_pack, weight_pack)
-        runners.extend(additional)
-        if not runners:
+        if not eligible:
             raise NotImplementedError(
                 f"MoELayer: none of the usable backends "
                 f"{[r.backend_key for r in self.runners]} support "
@@ -430,33 +418,12 @@ class MoELayer:
             )
 
         bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
-        # Optional plans can have exact geometry. Qualify their cache by both
-        # shape and eligible candidate set; rejected per-call layouts must not
-        # reuse a winner from a different set. Original bucket keys stay intact.
-        winner_key: tuple[Any, ...] = (
-            (
-                bucket,
-                mode,
-                "automatic",
-                tuple(r.backend_key for r in additional),
-                tuple(act_pack.hidden_states_q.shape),
-            )
-            if additional
-            else (bucket, mode)
-        )
-        if exact_shape:
-            # Include configured positions so filtering one of two exact-shape
-            # runners with the same key cannot reuse the other's cached winner.
-            winner_key = (
-                bucket,
-                mode,
-                "exact",
-                tuple(index for index, _ in configured),
-                tuple(r.backend_key for r in additional),
-                tuple(act_pack.hidden_states_q.shape),
-            )
+        # Candidate positions distinguish different options for the same backend
+        # and prevent changing weight views or shape eligibility from reusing a winner.
+        winner_key = (bucket, mode, eligible)
         winner = self._winners.get(winner_key)
         if winner is None:
+            runners = [self.runners[index] for index in eligible]
             winner = self._select_winner(act_pack, weight_pack, runners)
             self._winners[winner_key] = winner
             if len(self._winners) > 128:
@@ -465,32 +432,11 @@ class MoELayer:
             self._winners.move_to_end(winner_key)
         runner, tactic = winner
         self._last_winner_backend = runner.backend_key
-        if any(runner is candidate for candidate in additional):
-            from .auto_candidates import is_experimental_candidate
-            from ..api_logging import warn_experimental_backend_once
-
-            if is_experimental_candidate(runner.backend_key):
-                warn_experimental_backend_once("MoELayer", runner.backend_key)
-
         inputs = runner.pack_inputs(act_pack, weight_pack)
         return runner.forward(
             inputs,
             tactic=tactic,
             **runner.launch_kwargs_for(inputs),
-        )
-
-    def _additional_candidates(self, act_pack, weight_pack):
-        from .auto_candidates import additional_candidates
-
-        return additional_candidates(
-            self.config,
-            self.device,
-            getattr(self, "_arch", None),
-            act_pack,
-            weight_pack,
-            tuning=self.tuner.is_tuning_mode,
-            cache=getattr(self, "_automatic_runners", {}),
-            exclude={r.backend_key for r in self.runners},
         )
 
     def _select_winner(
@@ -567,3 +513,21 @@ class MoELayer:
         """Clear all cached per-bucket winners — next call re-tunes."""
         self._winners.clear()
         self._last_winner_backend = None
+
+    def refresh_backends(self) -> None:
+        """Refresh backend preparation and clear cached winners.
+
+        Call outside CUDA Graph capture after changing compiler or artifact
+        configuration. Backends with fixed preparation snapshots adopt the
+        current configuration; active packed calls and captured graphs keep
+        their existing resources. The next layer call selects a winner again.
+        """
+        self.reset_winner()
+        seen = set()
+        for runner in self.runners:
+            if id(runner) in seen:
+                continue
+            seen.add(id(runner))
+            refresh = getattr(runner, "refresh", None)
+            if refresh is not None:
+                refresh()

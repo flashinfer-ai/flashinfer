@@ -316,6 +316,7 @@ def test_cutile_single_runner_precompiles_bucket_before_caching(
     runner = SimpleNamespace(
         backend_key=CuTileBf16Runner.backend_key,
         supported_routing_modes=("pre_routed",),
+        accepts=Mock(return_value=True),
         pack_inputs=Mock(return_value=inputs),
         launch_kwargs_for=Mock(return_value=launch_kwargs),
         tuning_config_for=Mock(return_value=tuning_config),
@@ -326,7 +327,6 @@ def test_cutile_single_runner_precompiles_bucket_before_caching(
     layer.runners = [runner]
     layer.tuner = SimpleNamespace(choose_one=Mock(return_value=(runner, tactic)))
     layer._winners = OrderedDict()
-    monkeypatch.setattr(layer, "_additional_candidates", lambda *_: [])
 
     def precompile(packed_inputs, selected_tactic):
         assert packed_inputs is inputs
@@ -2573,6 +2573,19 @@ def test_sm12x_nvfp4_bf16_rejects_non_default_swiglu():
     runner = SM12xNvfp4Bf16Runner(config, torch.device("cpu"))
     with pytest.raises(NotImplementedError, match="default SwiGLU"):
         runner._check_activation_parameters()
+
+
+def test_sm12x_nvfp4_bf16_candidate_accepts_shared_weight_view():
+    runner = SM12xNvfp4Bf16Runner.__new__(SM12xNvfp4Bf16Runner)
+    shared, own = {}, {}
+    weights = MoEWeightPack({"cutile_nvfp4": shared})
+    assert runner.accepts(None, weights)
+    assert runner._weight_view(weights) is shared
+    weights.prepare_for(runner.backend_key, own)
+    assert runner.accepts(None, weights)
+    assert runner._weight_view(weights) is own
+    weights.native_views.clear()
+    assert not runner.accepts(None, weights)
 
 
 @sm12x_nvfp4_bf16_required
