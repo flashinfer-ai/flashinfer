@@ -361,7 +361,8 @@ def test_shell_passes_nccl_wheel_library_to_test_runner(
     # A child shell's export cannot configure the subsequent test process.
     installer.write_text("export LD_LIBRARY_PATH=/installer/only\n")
     modules = tmp_path / "modules"
-    for package in ("nvshmem", "nvidia/nccl"):
+    # Keep installed NVIDIA packages from overriding the NCCL stub.
+    for package in ("nvshmem", "nvidia", "nvidia/nccl"):
         directory = modules / package
         directory.mkdir(parents=True)
         (directory / "__init__.py").write_text("")
