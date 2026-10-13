@@ -685,9 +685,10 @@ class TllmGenFmhaKernel {
           tunedMaxNumCtasPerSeqKv,
           std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
       // Clamp >16 splits to 16 so small-batch long-KV decode keeps the CGA reduction.
-      if (numCtasPerSeqKv > kMaxCgaSmemReductionCtasPerSeqKv && params.mMaxSeqLenQ == 1 &&
-          params.mHeadDimV < 512 && !isDsv3MinLatencyMode &&
-          !selectKernelParams.mForceGmemReduction &&
+      // Multi-token (spec-decode) D256 is excluded: the clamp measured slightly slower there.
+      if (numCtasPerSeqKv > kMaxCgaSmemReductionCtasPerSeqKv &&
+          (params.mMaxSeqLenQ == 1 || params.mHeadDimV != 256) && params.mHeadDimV < 512 &&
+          !isDsv3MinLatencyMode && !selectKernelParams.mForceGmemReduction &&
           isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) &&
           flashinfer::ceil_div(maxAttentionWindow, kMaxCgaSmemReductionCtasPerSeqKv) <=
               kMaxSeqLenKvPerCtaForCgaClamp &&
