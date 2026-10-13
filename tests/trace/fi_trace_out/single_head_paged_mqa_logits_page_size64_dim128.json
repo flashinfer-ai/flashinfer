@@ -1,0 +1,120 @@
+{
+  "name": "single_head_paged_mqa_logits_page_size64_dim128",
+  "description": "Single-head paged MQA logits: FP32 dot products of query rows with their request's paged BF16 or NVFP4 keys (no head weights or ReLU). SM100/SM103.",
+  "op_type": "single_head_paged_mqa_logits",
+  "tags": [
+    "fi_api:flashinfer.attn_scores.single_head.single_head_paged_mqa_logits",
+    "arch:sm100",
+    "arch:sm103"
+  ],
+  "axes": {
+    "rows": {
+      "type": "var",
+      "description": "Query rows, 1 to 8 per request group."
+    },
+    "groups": {
+      "type": "var",
+      "description": "Groups of query rows, one request each."
+    },
+    "requests": {
+      "type": "var",
+      "description": "Block-table rows."
+    },
+    "pages": {
+      "type": "var",
+      "description": "Key cache pages."
+    },
+    "blocks": {
+      "type": "var",
+      "description": "64-key blocks per request."
+    },
+    "max_context": {
+      "type": "var",
+      "description": "Score columns: the context capacity."
+    },
+    "page_size": {
+      "type": "const",
+      "value": 64,
+      "description": "Keys per page."
+    },
+    "dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Elements per key: 128 BF16, or 64 NVFP4 bytes."
+    },
+    "scales": {
+      "type": "var",
+      "description": "NVFP4's E4M3 scales per key, one per 16 values."
+    }
+  },
+  "inputs": {
+    "query": {
+      "shape": [
+        "rows",
+        "dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "key_cache": {
+      "shape": [
+        "pages",
+        "page_size",
+        "dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "block_table": {
+      "shape": [
+        "requests",
+        "blocks"
+      ],
+      "dtype": "int32"
+    },
+    "context_lengths": {
+      "shape": [
+        "groups"
+      ],
+      "dtype": "int32"
+    },
+    "requests": {
+      "shape": [
+        "groups"
+      ],
+      "dtype": "int32"
+    },
+    "scores": {
+      "shape": [
+        "rows",
+        "max_context"
+      ],
+      "dtype": "float32"
+    },
+    "query_scales": {
+      "shape": [
+        "rows",
+        "scales"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    },
+    "key_scales": {
+      "shape": [
+        "pages",
+        "page_size",
+        "scales"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "scores": {
+      "shape": [
+        "rows",
+        "max_context"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}
