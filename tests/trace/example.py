@@ -37,6 +37,8 @@ gdn_prefill_qk4_v8_d128.json
 gdn_prefill_gates_q4_k4_v8_d128.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
+gather_key_sample_page_size64_dim128.json
+group_union_masks_top_k2048.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
@@ -117,11 +119,17 @@ prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_wrapper_combined_h8_kv8_d128_ps64.json
 prims_ts_paged_block_sparse_wrapper_tuple_h8_kv8_d128_ps64.json
 quantize_nvfp4_smooth_N3072.json
+quantize_write_index_k_nvfp4_dim128_page_size64_packed_dim64_scales8.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_nvfp4_quantize_k16384.json
+single_head_paged_mqa_logits_page_size64_dim128.json
+single_head_paged_mqa_logits_page_size64_dim64.json
+single_head_paged_mqa_threshold_select_page_size64_dim128_counters2_pair2.json
+thresholds_from_sample_counters2.json
+token_sparse_kv_indices_top_k2048_lists2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
@@ -2971,3 +2979,103 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
+
+# ── Token-sparse attention inputs: K/V slot lists, group unions and masks ─────
+from flashinfer.token_sparse import group_union_masks, token_sparse_kv_indices
+
+token_sparse_kv_indices.fi_trace(
+    save_dir=SAVE_DIR,
+    positions=torch.empty(4, 2048, dtype=torch.int32),
+    requests=torch.zeros(4, dtype=torch.int32),
+    block_table=torch.empty(2, 64, dtype=torch.int32),
+    block_tables=torch.empty(8, 2, 2048, dtype=torch.int32),
+    seq_lens=torch.empty(8, dtype=torch.int32),
+    requests_per_token=2,
+)
+
+group_union_masks.fi_trace(
+    save_dir=SAVE_DIR,
+    positions=torch.empty(8, 2048, dtype=torch.int32),
+    query_rows=torch.arange(8, dtype=torch.int32),
+    group_unions=torch.arange(2, dtype=torch.int32),
+    requests=torch.zeros(2, dtype=torch.int32),
+    block_table=torch.empty(1, 256, dtype=torch.int32),
+    union=torch.empty(2, 8192, dtype=torch.int32),
+    union_sizes=torch.empty(2, dtype=torch.int32),
+    mask=torch.empty(8, 256, dtype=torch.int32),
+    num_keys=16384,
+)
+
+# ── Single-head paged MQA logits ──────────────────────────────────────────────
+from flashinfer.attn_scores import (
+    gather_key_sample,
+    quantize_write_index_k_nvfp4,
+    single_head_paged_mqa_logits,
+    single_head_paged_mqa_threshold_select,
+    thresholds_from_sample,
+)
+
+single_head_paged_mqa_logits.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty(8, 128, dtype=torch.bfloat16),
+    key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),
+    block_table=torch.empty(4, 16, dtype=torch.int32),
+    context_lengths=torch.empty(4, dtype=torch.int32),
+    requests=torch.arange(4, dtype=torch.int32),
+    scores=torch.empty(8, 1024),
+)
+
+single_head_paged_mqa_logits.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty(8, 64, dtype=torch.uint8),
+    key_cache=torch.empty(64, 64, 64, dtype=torch.uint8),
+    block_table=torch.empty(4, 16, dtype=torch.int32),
+    context_lengths=torch.empty(4, dtype=torch.int32),
+    requests=torch.arange(4, dtype=torch.int32),
+    scores=torch.empty(8, 1024),
+    query_scales=torch.empty(8, 8, dtype=torch.float8_e4m3fn),
+    key_scales=torch.empty(64, 64, 8, dtype=torch.float8_e4m3fn),
+)
+
+quantize_write_index_k_nvfp4.fi_trace(
+    save_dir=SAVE_DIR,
+    key=torch.empty(16, 128, dtype=torch.bfloat16),
+    slots=torch.arange(16, dtype=torch.int64),
+    key_cache=torch.empty(4, 64, 64, dtype=torch.uint8),
+    key_scales=torch.empty(4, 64, 8, dtype=torch.float8_e4m3fn),
+)
+
+single_head_paged_mqa_threshold_select.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty(256, 128, dtype=torch.bfloat16),
+    key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),
+    row_ends=torch.empty(256, dtype=torch.int32),
+    tile_requests=torch.zeros(2, dtype=torch.int32),
+    block_table=torch.empty(1, 64, dtype=torch.int32),
+    thresholds=torch.empty(256),
+    counters=torch.empty(256, 2, dtype=torch.int32),
+    candidates=torch.empty(256, 4096, 2, dtype=torch.int32),
+    max_context=4096,
+    top_k=2048,
+    arrivals=torch.zeros(2, dtype=torch.int32),
+    ranges=torch.empty(2, 256, dtype=torch.int32),
+)
+
+gather_key_sample.fi_trace(
+    save_dir=SAVE_DIR,
+    key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),
+    block_table=torch.empty(2, 32, dtype=torch.int32),
+    offsets=torch.empty(128, dtype=torch.uint8),
+    sample_ends=torch.empty(2, dtype=torch.int32),
+    sample_keys=torch.empty(2, 128, 128, dtype=torch.bfloat16),
+    samples_per_run=3,
+    pages_per_run=2,
+)
+
+thresholds_from_sample.fi_trace(
+    save_dir=SAVE_DIR,
+    sample_scores=torch.empty(256, 128),
+    sample_top=torch.empty(256, 64, dtype=torch.int32),
+    thresholds=torch.empty(256),
+    counters=torch.empty(256, 2, dtype=torch.int32),
+)

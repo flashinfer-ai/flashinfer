@@ -292,14 +292,16 @@ void trtllm_paged_attention_launcher(
           : (sparse_mla_top_k_lens != nullptr ? TrtllmGenSparseMlaType::DynamicTokenSparse
                                               : TrtllmGenSparseMlaType::StaticTokenSparse);
   runner_params.mSparseMlaTopK = sparse_mla_top_k;
-  bool const is_dsv4_sparse_mla_decode =
-      isSparseMla(runner_params.mSparseMlaType) && head_dim_qk == 512 && head_dim_vo == 512;
-  bool const is_mla_decode = (head_dim_qk == 576 && head_dim_vo == 512) ||
-                             (head_dim_qk == 320 && head_dim_vo == 256) ||
-                             is_dsv4_sparse_mla_decode;
+  bool const is_mla_decode = runner_params.isMla();
   runner_params.sparseMlaTopKLensPtr = sparse_mla_top_k_lens;
   runner_params.mHasSlidingWindowKvPool = has_sliding_window_kv_pool;
-  TVM_FFI_ICHECK(is_mla_decode || sparse_mla_top_k <= 0) << "Only decode MLA supports sparse MLA";
+  // Static token-sparse MQA/GQA: one-token pages and one CTA per query token holding all its heads.
+  bool const is_sparse_gqa_decode = isSparseMla(runner_params.mSparseMlaType) && !is_mla_decode &&
+                                    sparse_mla_top_k_lens == nullptr && page_size == 1 &&
+                                    num_qo_heads / num_kv_heads <= 128;
+  TVM_FFI_ICHECK(is_mla_decode || is_sparse_gqa_decode || sparse_mla_top_k <= 0)
+      << "Token-sparse attention supports MLA decode, or MQA/GQA decode with page size 1, no "
+         "top-k lengths and at most 128 query heads per KV head";
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
   if (mode == TllmPagedAttentionMode::Context) {
@@ -316,8 +318,9 @@ void trtllm_paged_attention_launcher(
     // Note that kernel names are still labeled as using a dense mask even when maskType is
     // specified as causal, this is expected for better performance as each CTA will only process
     // one tokenQ in those cases, so dense mask works the same as causal mask.
-    runner_params.mMaskType =
-        is_mla_decode ? TrtllmGenAttentionMaskType::Dense : TrtllmGenAttentionMaskType::Causal;
+    runner_params.mMaskType = is_mla_decode || is_sparse_gqa_decode
+                                  ? TrtllmGenAttentionMaskType::Dense
+                                  : TrtllmGenAttentionMaskType::Causal;
     runner_params.mKernelType = FmhaKernelType::Generation;
     bool use_multi_block = true;
     runner_params.mTileScheduler =
