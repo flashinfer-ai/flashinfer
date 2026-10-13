@@ -783,11 +783,23 @@ def _launch(
                 ready_target = state.ready_epoch
             phase = state.next_phase
             world_size = call.world_size
+            facts = loader.device_facts(call.device_index)
+            # Tile width of the main program for this call (256, or 128 when
+            # the loader's table routes this class and shape to the N128 twin).
+            block_n = loader.main_block_n(
+                rows,
+                call.n,
+                world_size=world_size,
+                arch=call.arch,
+                dtype_name=call.dtype_name,
+                b_layout=call.b_layout,
+            )
             grid_x, grid_y, grid_z = loader.main_grid(
                 rows,
                 call.n,
                 world_size=world_size,
-                sm_count=loader.device_facts(call.device_index).sm_count,
+                sm_count=facts.sm_count,
+                block_n=block_n,
             )
             if sm_push:
                 # The SM push kernel and the main kernel run on the caller's
@@ -811,6 +823,7 @@ def _launch(
                     grid_x,
                     grid_y,
                     grid_z,
+                    block_n,
                     main_handle,
                     workspace.comm_handle,
                 )
@@ -839,6 +852,7 @@ def _launch(
                     grid_x,
                     grid_y,
                     grid_z,
+                    block_n,
                     main_handle,
                     workspace.comm_handle,
                 )
