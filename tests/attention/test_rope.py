@@ -19,6 +19,7 @@ import torch
 from tests.test_helpers.rope_reference import *
 
 import flashinfer
+from flashinfer.utils import get_compute_capability
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -404,6 +405,12 @@ def test_generalized_rope_quantize(
 
         if not is_cuda_tile_available():
             pytest.skip("cuda.tile not available")
+        capability = get_compute_capability(torch.device("cuda:0"))
+        if capability < (8, 9):
+            pytest.skip(
+                "cuTile rope_quantize FP8 requires SM89 or newer; "
+                f"got SM{capability[0]}{capability[1]}"
+            )
         # The cuTile fused rope+quant kernel is MLA-scoped: it addresses the key
         # tensor as 2D [tokens, rope_dim] (single shared latent K head), matching
         # the DeepSeek/MLA use case it targets. GQA/MHA pass a 3D
@@ -1728,6 +1735,31 @@ def test_mla_rope_quantize(
     torch.testing.assert_close(
         k_out_f8_ref.float(), k_out.float(), atol=1e-2, rtol=2e-1
     )
+
+
+def test_rope_quantize_fp8_cutile_rejects_pre_sm89(monkeypatch):
+    """Reject unsupported FP8 architectures before importing or tuning cuTile."""
+    monkeypatch.setattr(flashinfer.rope, "get_compute_capability", lambda _: (8, 6))
+
+    q_rope = torch.empty(1, 1, 2)
+    k_rope = torch.empty(1, 2)
+    q_nope = torch.empty(1, 1, 0)
+    k_nope = torch.empty(1, 0)
+    cos_sin_cache = torch.empty(1, 2, dtype=torch.float32)
+    pos_ids = torch.zeros(1, dtype=torch.int32)
+
+    with pytest.raises(NotImplementedError, match=r"requires SM89 or newer.*got SM86"):
+        flashinfer.rope.rope_quantize_fp8(
+            q_rope,
+            k_rope,
+            q_nope,
+            k_nope,
+            cos_sin_cache,
+            pos_ids,
+            is_neox=False,
+            quantize_dtype=torch.float8_e4m3fn,
+            backend="cutile",
+        )
 
 
 @pytest.mark.parametrize("unsupported", ["neox", "multi_head_key", "bad_backend"])
