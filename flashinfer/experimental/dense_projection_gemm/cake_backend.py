@@ -2231,8 +2231,11 @@ def plan_dense_projection_gemm(
 # pinned round-27 form (0).  ``pro`` changes the pair prologue / cleanup sync only - never the GEMM, the tile walk or
 # the store path - so a ``pro`` twin is the nearest registered program: the two other forms of the plan's own tile
 # walk come first, then every tile variant in the three forms.  A single-CTA row refuses pro (instance_key raises
-# ValueError), which the fallback loop skips like any other knob the row cannot take.
-_FALLBACK_PRO_FORMS = (dict(pro=15), dict(pro=0))
+# ValueError), which the fallback loop skips like any other knob the row cannot take.  A caller-forced tile family
+# (``cta_rows`` away from the rule's) drops the rule's ``pro`` with the other family knobs [Cake launcher], so the
+# forced-family variants must name the form: the architecture default 7 comes first (the form of most generated
+# pair programs), then 15 and 0.
+_FALLBACK_PRO_FORMS = (dict(pro=7), dict(pro=15), dict(pro=0))
 _FALLBACK_TILE_VARIANTS = (
     dict(cta_rows=256),
     dict(epi="reg"),
