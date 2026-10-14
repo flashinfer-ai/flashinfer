@@ -360,17 +360,13 @@ _SM107A_SEQ_TWINS: dict[str, tuple[str, ...]] = {
         "dvsplit_initial_f16io",
         "dvsplit_initial_f16io_gatepipe4",
     ),
-    # bf16 / f16-state dvsplit schedules (indexed or not): the same width lever on the
-    # low-precision state loads and stores, alignment-guarded on the indexed plans
+    # bf16 / f16-state dvsplit schedules with shipped records (the bf16 one indexed or
+    # not): the same width lever on the low-precision state loads and stores,
+    # alignment-guarded on the indexed plans
     "l7b_vec2lp": (
-        "dvsplit_bf16state",
-        "dvsplit_f16io_bf16state",
         "dvsplit_initial_bf16state",
-        "dvsplit_initial_f16io_bf16state",
         "dvsplit_initial_f16state",
         "dvsplit_initial_bf16state_indexed",
-        "dvsplit_initial_f16io_bf16state_indexed",
-        "dvsplit_initial_f16state_indexed",
     ),
 }
 CAKE_GDN_PREFILL_SEQ_ARCH_BODIES: dict[tuple[str, str], str] = {
