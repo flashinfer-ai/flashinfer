@@ -34,8 +34,10 @@ struct MultiTokenBand {
 };
 // Per-band table, checked before the shipped rule; kMultiTokenBandCount entries are live (the
 // trailing sentinel keeps the array non-empty).  Mirrors MULTI_TOKEN_BANDS of the Cake seed.
-constexpr int kMultiTokenBandCount = 0;
-constexpr MultiTokenBand kMultiTokenBands[kMultiTokenBandCount + 1] = {{0, 0, 1}};
+// Measured per-shape overrides (both seeds, both interleaved rounds, >= 1 % each); other T use the rule.
+constexpr int kMultiTokenBandCount = 2;
+constexpr MultiTokenBand kMultiTokenBands[kMultiTokenBandCount + 1] = {
+    {3393, 3393, 4}, {4096, 4096, 5}, {0, 0, 1}};
 
 inline bool is_specialized_k8g4_route(int64_t num_experts, int64_t n_group, int64_t topk_group,
                                       int64_t topk) {
