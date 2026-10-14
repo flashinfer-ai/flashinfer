@@ -119,6 +119,24 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
         )
 
+    supports_live_token_tuning = True
+    _knob_cache_module = (
+        "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.knob_cache"
+    )
+
+    def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
+        k = self._kernel_config
+        return dict(
+            dtype=k.kind,
+            world_size=self.ep_world_size,
+            hidden=fleet_params.token_hidden_size,
+            intermediate=k.intermediate_size,
+            num_experts=fleet_params.num_experts,
+            topk=k.top_k,
+            max_tokens=fleet_params.max_tokens_per_rank,
+            enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+        )
+
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         from ......kernel_src.sm100.cutedsl_megamoe import (
             get_symm_buffer_for_mxfp8_mega_moe,
@@ -138,7 +156,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
-            knobs=k.knobs if isinstance(k.knobs, dict) else None,
+            knobs=self._workspace_knobs(fleet_params),
         )
 
     def validate_forward(
@@ -242,7 +260,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             # so the candidate sweep stays in lockstep (see shim/autotune.py).
             from ......kernel_src.sm100.cutedsl_megamoe import autotune_mxfp8_mega_moe
 
-            autotune_mxfp8_mega_moe(
+            self._autotune_winner = autotune_mxfp8_mega_moe(
                 output,
                 transformed_weights[0],
                 transformed_weights[1],
@@ -294,7 +312,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             k.kind,
             _resolve_gate_up_clamp(k),
             k.enable_in_kernel_fc2_reduce,
-            knobs_pool_key(k.knobs),
+            knobs_pool_key(self._workspace_knobs(fleet_params)),
         )
 
     def _forget_workspace_state(self, workspace) -> None:

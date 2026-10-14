@@ -138,18 +138,6 @@ DECODE_TABLE: dict[str, dict[str, Any]] = {
         "qwarps": 8,
         "tstore": True,
     },
-    "5,28,2048": {
-        "route": "decode",
-        "tok": 128,
-        "split": 1,
-        "fused": False,
-        "persist": False,
-        "resident": False,
-        "qlanes": 16,
-        "stages": 3,
-        "qwarps": 8,
-        "tstore": 1,
-    },
     "5,28,4096": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
     "5,28,16384": {"route": "gemm", "gemm_bn": 192, "gemm_skf": 1, "gemm_bk": 128},
     "12,1,1": {
@@ -198,6 +186,7 @@ DECODE_TABLE: dict[str, dict[str, Any]] = {
         "qwarps": 8,
         "tstore": 1,
     },
+    "12,1,4096": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
     "12,1,16384": {"route": "gemm", "gemm_stages": 2, "gemm_ts_slots": 4},
     "12,28,1": {
         "route": "decode",
@@ -252,7 +241,6 @@ DECODE_TABLE: dict[str, dict[str, Any]] = {
         "qwarps": 8,
         "tstore": True,
     },
-    "12,28,4096": {"route": "gemm", "gemm_sk": 1, "gemm_sk_ksplit": 16},
     "12,28,16384": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
     "17,28,1": {
         "route": "decode",
@@ -349,6 +337,12 @@ DECODE_TABLE: dict[str, dict[str, Any]] = {
     },
     "24,2,1024": {"route": "gemm", "gemm_bn": 192},
     "24,2,2048": {"route": "gemm", "gemm_bn": 192},
+    "24,2,16384": {
+        "route": "gemm",
+        "gemm_bk": 128,
+        "gemm_stages": 2,
+        "gemm_ts_slots": 4,
+    },
     "48,28,1": {
         "route": "decode",
         "tok": 16,
@@ -431,6 +425,7 @@ DECODE_TABLE: dict[str, dict[str, Any]] = {
         "pf": 3,
         "mc": 2,
     },
+    "50,28,512": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
     "50,28,1024": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
     "56,6,1": {
         "route": "decode",
@@ -493,8 +488,15 @@ DECODE_TABLE: dict[str, dict[str, Any]] = {
         "resident": False,
     },
     "96,1,2048": {"route": "gemm", "gemm_bn": 192},
+    "96,1,4096": {
+        "route": "gemm",
+        "gemm_bk": 128,
+        "gemm_stages": 2,
+        "gemm_ts_slots": 4,
+    },
     "96,1,16384": {"route": "gemm", "gemm_stages": 2, "gemm_ts_slots": 4},
     "96,28,256": {"route": "gemm", "gemm_bn": 192, "gemm_pf": 2, "gemm_bk": 128},
+    "96,28,512": {"route": "gemm", "gemm_bn": 384},
     "96,28,1024": {"route": "gemm", "gemm_skf": 1, "gemm_bk": 128},
     "96,28,2048": {"route": "gemm", "gemm_skf": 1},
     "96,28,4096": {"route": "gemm", "gemm_skf": 1},
@@ -515,10 +517,11 @@ DECODE_TABLE: dict[str, dict[str, Any]] = {
         "resident": False,
         "tstore": True,
     },
-    "144,6,256": {"route": "gemm"},
+    "144,6,256": {"route": "gemm", "gemm_bk": 128},
     "144,6,512": {"route": "gemm", "gemm_pf": 2},
     "144,6,1024": {"route": "gemm", "gemm_pf": 2},
     "144,6,4096": {"route": "gemm", "gemm_pf": 1},
+    "144,6,16384": {"route": "gemm", "gemm_bk": 128},
     "192,2,1": {
         "route": "decode",
         "tok": 16,
@@ -536,6 +539,7 @@ DECODE_TABLE: dict[str, dict[str, Any]] = {
         "resident": False,
         "tstore": True,
     },
+    "192,2,256": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
     "192,2,1024": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
     "192,2,4096": {"route": "gemm", "gemm_bk": 128},
     "192,2,16384": {"route": "gemm", "gemm_bk": 128},
@@ -626,6 +630,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "stages": 3,
             "qwarps": 8,
             "xp": 1,
+            "quant_units": 2,
         },
         "1,28,1024": {
             "route": "decode",
@@ -638,6 +643,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "xb_stages": 3,
             "qlanes": 4,
             "stages": 2,
+            "pf": 1,
             "qwarps": 16,
             "xbh": 1,
             "qer": 1,
@@ -674,6 +680,19 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "stages": 4,
             "qwarps": 8,
             "epi_groups": 2,
+            "quant_units": 2,
+        },
+        "5,28,2048": {
+            "route": "decode",
+            "tok": 128,
+            "split": 1,
+            "fused": False,
+            "persist": False,
+            "resident": False,
+            "qlanes": 16,
+            "stages": 3,
+            "qwarps": 8,
+            "tstore": 1,
         },
         "12,1,512": {
             "route": "decode",
@@ -690,7 +709,6 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "tstore": 1,
         },
         "12,1,2048": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
-        "12,1,4096": {"route": "gemm"},
         "12,28,512": {
             "route": "decode",
             "tok": 64,
@@ -703,6 +721,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "qwarps": 8,
         },
         "12,28,2048": {"route": "gemm", "gemm_bn": 192, "gemm_pf": 2},
+        "12,28,4096": {"route": "gemm", "gemm_skp": 4},
         "17,28,8": {
             "route": "decode",
             "tok": 16,
@@ -762,6 +781,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
         },
         "18,6,2048": {"route": "gemm"},
         "18,6,4096": {"route": "gemm"},
+        "18,6,16384": {"route": "gemm"},
         "24,2,1": {
             "route": "decode",
             "tok": 16,
@@ -784,10 +804,8 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "tstore": 1,
         },
         "24,2,4096": {"route": "gemm"},
-        "24,2,16384": {"route": "gemm"},
         "48,28,512": {"route": "gemm", "gemm_bn": 192, "gemm_pf": 2},
         "48,28,1024": {"route": "gemm", "gemm_bn": 192, "gemm_pf": 1},
-        "50,28,512": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
         "50,28,2048": {"route": "gemm"},
         "50,28,4096": {"route": "gemm", "gemm_bk": 128},
         "56,6,256": {
@@ -854,12 +872,6 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
         },
         "96,1,512": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
         "96,1,1024": {"route": "gemm", "gemm_pf": 2},
-        "96,1,4096": {
-            "route": "gemm",
-            "gemm_bk": 128,
-            "gemm_stages": 2,
-            "gemm_ts_slots": 4,
-        },
         "96,28,1": {
             "route": "decode",
             "tok": 16,
@@ -885,7 +897,6 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "resident": False,
             "tstore": True,
         },
-        "96,28,512": {"route": "gemm", "gemm_sk": 1, "gemm_pf": 1},
         "144,6,1": {
             "route": "decode",
             "tok": 16,
@@ -896,7 +907,6 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "stages": 3,
         },
         "144,6,2048": {"route": "gemm", "gemm_pf": 1},
-        "144,6,16384": {"route": "gemm", "gemm_bk": 128},
         "192,2,8": {
             "route": "decode",
             "tok": 16,
@@ -910,8 +920,8 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "xbh": 1,
             "qer": 1,
         },
-        "192,2,256": {"route": "gemm"},
         "192,2,512": {"route": "gemm", "gemm_pf": 2},
+        "192,2,2048": {"route": "gemm"},
         "384,28,1": {
             "route": "decode",
             "tok": 16,
@@ -1017,6 +1027,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "epi_groups": 2,
             "quant_units": 2,
         },
+        "5,28,2048": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128, "gemm_cs": 2},
         "12,1,512": {
             "route": "decode",
             "tok": 64,
@@ -1029,7 +1040,6 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "qwarps": 8,
         },
         "12,1,2048": {"route": "gemm", "gemm_bn": 192, "gemm_pf": 2},
-        "12,1,4096": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
         "12,28,512": {
             "route": "decode",
             "tok": 64,
@@ -1043,6 +1053,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "tstore": 1,
         },
         "12,28,2048": {"route": "gemm", "gemm_bn": 192, "gemm_pf": 1},
+        "12,28,4096": {"route": "gemm", "gemm_bn": 384},
         "17,28,8": {
             "route": "decode",
             "tok": 16,
@@ -1108,7 +1119,8 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "quant_units": 2,
         },
         "18,6,2048": {"route": "gemm", "gemm_pf": 2, "quant_units": 2},
-        "18,6,4096": {"route": "gemm", "gemm_bk": 128},
+        "18,6,4096": {"route": "gemm", "gemm_pf": 1, "gemm_bk": 128},
+        "18,6,16384": {"route": "gemm", "gemm_bk": 128},
         "24,2,1": {
             "route": "decode",
             "tok": 16,
@@ -1131,15 +1143,8 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "quant_units": 2,
         },
         "24,2,4096": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
-        "24,2,16384": {
-            "route": "gemm",
-            "gemm_bk": 128,
-            "gemm_stages": 2,
-            "gemm_ts_slots": 4,
-        },
         "48,28,512": {"route": "gemm", "gemm_bn": 192, "gemm_pf": 2, "gemm_bk": 128},
-        "48,28,1024": {"route": "gemm", "gemm_skf": 1, "gemm_pf": 1},
-        "50,28,512": {"route": "gemm", "gemm_bk": 128},
+        "48,28,1024": {"route": "gemm", "gemm_bn": 384},
         "50,28,2048": {"route": "gemm", "gemm_bk": 128},
         "50,28,4096": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
         "56,6,256": {
@@ -1214,7 +1219,6 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
         },
         "96,1,512": {"route": "gemm", "gemm_bn": 192},
         "96,1,1024": {"route": "gemm", "gemm_pf": 4},
-        "96,1,4096": {"route": "gemm", "gemm_stages": 2, "gemm_ts_slots": 4},
         "96,28,1": {
             "route": "decode",
             "tok": 16,
@@ -1243,7 +1247,6 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "pf": 1,
             "tstore": True,
         },
-        "96,28,512": {"route": "gemm", "gemm_sk": 1, "gemm_pf": 2},
         "144,6,1": {
             "route": "decode",
             "tok": 16,
@@ -1253,7 +1256,6 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "resident": False,
         },
         "144,6,2048": {"route": "gemm", "gemm_pf": 2},
-        "144,6,16384": {"route": "gemm"},
         "192,2,8": {
             "route": "decode",
             "tok": 16,
@@ -1263,8 +1265,8 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "resident": False,
             "pf": 0,
         },
-        "192,2,256": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
         "192,2,512": {"route": "gemm", "gemm_bk": 128},
+        "192,2,2048": {"route": "gemm", "gemm_bk": 128},
         "384,28,1": {
             "route": "decode",
             "tok": 16,

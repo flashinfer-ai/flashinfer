@@ -79,6 +79,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.b12x.comm.roce" = ["*.c"]
 "flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
 "flashinfer.experimental.cake_lm_head_loss" = ["csrc/**"]
+"flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "sources.json", "README.md"]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
 "flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
 "flashinfer.experimental.msa_nvfp4_decode" = ["csrc/**"]
@@ -121,6 +122,14 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 # Generated SM90 BF16 Cake MegaMoE sources and manifest, compiled on demand.
 "flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe" = [
   "src/*.cu",
+  "src/*.json",
+]
+# Generated SM120 MXFP4 x MXFP8 Cake MegaMoE closure (sealed by its manifest) and
+# the hand-written binding / cubin carrier, compiled on demand.
+"flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe" = [
+  "*.md",
+  "src/*.cu",
+  "src/*.cuh",
   "src/*.json",
 ]
 # Generated SM100 BF16 rank-major mega-MoE CUDA bundle. The runtime validates

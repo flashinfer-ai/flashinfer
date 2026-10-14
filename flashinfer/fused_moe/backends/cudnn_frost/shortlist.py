@@ -10,9 +10,14 @@ from __future__ import annotations
 
 import functools
 import json
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 _FILENAME = "moe_shortlists.json"
+_TableKey = tuple[str, str, int, int, int, int]
+_ProfileChoices = tuple[tuple[str, ...], tuple[str, ...]]
+_ProfileMap = Mapping[int, _ProfileChoices]
 
 
 @functools.lru_cache(maxsize=8)
@@ -58,6 +63,19 @@ def _read(roots: tuple[Path, ...]) -> dict:
     return tables
 
 
+def capture_profiles(roots: tuple[Path, ...]) -> Mapping[_TableKey, _ProfileMap]:
+    """Detach an immutable shortlist snapshot from the shared reader cache."""
+    tables: dict[_TableKey, _ProfileMap] = {}
+    for key, profiles in _read(tuple(roots)).items():
+        tables[key] = MappingProxyType(
+            {
+                tokens: (tuple(first), tuple(second))
+                for tokens, (first, second) in profiles.items()
+            }
+        )
+    return MappingProxyType(tables)
+
+
 def select(
     roots, arch, activation, tokens, hidden, intermediate, experts, topk, first, second
 ):
@@ -69,6 +87,11 @@ def select(
     profiles = _read(tuple(roots)).get(
         (arch, activation, experts, hidden, intermediate, topk)
     )
+    return select_profiles(profiles, tokens, first, second)
+
+
+def select_profiles(profiles: _ProfileMap | None, tokens: int, first, second):
+    """Select stage identities using only the supplied shortlist snapshot."""
     if profiles is None:
         return first, second
     bucket = min((n for n in profiles if n >= tokens), default=max(profiles))
