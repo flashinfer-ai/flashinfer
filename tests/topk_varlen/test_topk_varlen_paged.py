@@ -413,3 +413,34 @@ def test_paged_boundary_ties_tie_aware_check():
         page_table=pt_pad,
         page_size=64,
     )
+
+
+def test_paged_empty_row_tie_aware_check():
+    """A request with seq_len 0 under paged output (reviewer's case: width 1024,
+    K=512, identity table, page_size=1) spans no pages and comes back all -1.
+    The trace checker accepts that row without touching the page map, and
+    rejects a slot in it instead of raising on an empty reduction; the same
+    through a random 64-column map."""
+    if not flashinfer.top_k_varlen.is_backend_supported("gvr_2", _cc()):
+        pytest.skip("gvr_2 not supported here")
+    from flashinfer.trace.templates.topk import _top_k_varlen_check as check
+
+    rows, n, k = 2, 1024, 512
+    lg = torch.randn((rows, n), dtype=torch.float32, device=_DEV)
+    lens = torch.tensor(
+        [0, n], dtype=torch.int32, device=_DEV
+    )  # empty request, then a full one
+    identity = (
+        torch.arange(n, dtype=torch.int32, device=_DEV).repeat(rows, 1).contiguous()
+    )
+    for page_size, pt in ((1, identity), (64, _page_table(rows, n, 64, seed=7))):
+        out, _ = flashinfer.top_k_varlen(
+            lg, lens, k, page_table=pt, page_size=page_size, backend="gvr_2"
+        )
+        torch.cuda.synchronize()
+        assert bool((out[0] == -1).all()), "an empty request must come back all -1"
+        kw = dict(logits=lg, seq_lens=lens, top_k=k, page_table=pt, page_size=page_size)
+        assert check(out, out, **kw)
+        bad = out.clone()
+        bad[0, 0] = 0  # a slot for a request that spans no pages
+        assert not check(out, bad, **kw)

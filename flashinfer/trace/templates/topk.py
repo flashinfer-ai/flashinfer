@@ -121,21 +121,27 @@ def _top_k_varlen_check(
             row_pt = pt64[r // next_n][: (n + ps - 1) // ps]
             valid = sel >= 0
             slots = sel[valid]
-            phys = slots // ps
-            if bool((phys > row_pt.max()).any()):
-                return False
-            inv = torch.full(
-                (int(row_pt.max().item()) + 1,),
-                -1,
-                dtype=torch.int64,
-                device=sel.device,
-            )
-            inv[row_pt] = torch.arange(row_pt.numel(), device=sel.device)
-            logical = inv[phys]
-            if bool((logical < 0).any()):
-                return False
-            sel = sel.clone()
-            sel[valid] = logical * ps + slots % ps
+            # an all-pad row (an empty request, or a full row wrongly padded)
+            # has nothing to map; the pad checks below decide it. A slot in a
+            # row that spans no pages is a failure, not an empty reduction.
+            if slots.numel():
+                if row_pt.numel() == 0:
+                    return False
+                phys = slots // ps
+                if bool((phys > row_pt.max()).any()):
+                    return False
+                inv = torch.full(
+                    (int(row_pt.max().item()) + 1,),
+                    -1,
+                    dtype=torch.int64,
+                    device=sel.device,
+                )
+                inv[row_pt] = torch.arange(row_pt.numel(), device=sel.device)
+                logical = inv[phys]
+                if bool((logical < 0).any()):
+                    return False
+                sel = sel.clone()
+                sel[valid] = logical * ps + slots % ps
         if absolute_indices:
             sel = torch.where(sel >= 0, sel - s, sel)  # -1 pads stay -1
         if n < top_k:
