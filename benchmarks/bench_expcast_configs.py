@@ -18,7 +18,7 @@ full-tile P publication, dtype-derived KV stages, scale 1/sqrt(D), no PDL.
 Timing: 5 warmups, 30 measured iterations, CUDA Graph, CUPTI/event fallback.
 TFLOP/s counts QK and PV GEMMs only (4*B*Hq*D*attended_pairs), accounting
 for bottom-right causal masking. Compilation/quantization/reference are excluded.
-Edit constants below; results go to profiling/expcast-b300/expcast_configs.csv. See EXPCAST.md.
+Edit constants below; results go to profiling/expcast-b200/expcast_configs_gqa.csv. See EXPCAST.md.
 """
 
 import csv
