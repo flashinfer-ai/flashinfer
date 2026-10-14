@@ -408,6 +408,7 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError(
                 "MegaMoE warmup cannot run during CUDA graph capture"
             )
+        uses_dummy_input = t is None
         if t is None:
             if not self._mega_config.quantize_input:
                 raise MoEEpConfigError(
@@ -459,6 +460,11 @@ class MoEEpMegaLayer(nn.Module):
                 ),
             )
         torch.cuda.synchronize()
+        if uses_dummy_input:
+            # The synthetic routing ids are int64, but some backends accept
+            # multiple input dtypes. Let the first real batch establish the
+            # steady-state signature instead of pinning it to the dummy batch.
+            self._forward_signatures.pop(id(_backend_workspace), None)
 
     def get_tuned_knobs(self) -> dict[str, Any]:
         """Return the selected knobs after a successful ``knobs="auto"`` warmup.
