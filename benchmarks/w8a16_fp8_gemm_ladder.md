@@ -185,6 +185,65 @@ clock / thermal state or a memory-system pathology of that shape (power-of-two N
 activation row stride) that the stream-K tile order dodges is not established.  Not
 pursued yet.
 
+### Version B15: tile-order swizzle for the weights that overflow L2 (Wed 14 Oct 2026)
+
+Igor's reading of the B14 plot: "mlp.gate_up tp1 is far from the peak at large M", and
+unlike the other large-M rows this one is not noise.  Both B14 passes agree: at M=44160
+/ 88320 every variant sits at 930-1150 TFLOP/s against cuBLAS's 1380-1390.  N=25600,
+K=5120: a 131 MB fp8 weight, just over B200's L2.  The Blackwell launcher never set
+`max_swizzle_size` (CUTLASS default 0 = plain raster) or `raster_order` (heuristic), so
+the 74 in-flight clusters walked the 100 weight tiles of one activation tile, then the
+next activation tile re-read the whole weight: 345 x 131 MB = 45 GB of L2 misses at
+M=44160, nearly the kernel's whole compute time in HBM traffic.  tp2 (65 MB) mostly fits,
+hence its 4% loss.  Same disease the Hopper line fixed in H3 (there it was the raster
+direction); it had never been applied here.
+
+New knobs `FLASHINFER_W8A16_FP8_SWIZZLE_SM100` / `_RASTER_SM100` (both sm100 schedulers
+take them), then swizzle 0 / 2 / 4 / 8 / 16 x raster heuristic / m / n on umb-b200-260,
+free-running, CUPTI, L2 flushed (`swzB_*`).  Kernel / cuBLAS, heuristic raster:
+
+| swizzle | gate_up tp1 M=44160, 256x128 | same, 256x192 | M=88320, 256x128 | 256x192 | und.q tp2 M=44160 (control), 256x128 |
+|---|---|---|---|---|---|
+| 0 (B14) | 1.52 | 1.20 | 1.43 | 1.18 | 0.98 |
+| 2 | 1.32 | 1.29 | 1.23 | 1.13 | 0.99 |
+| 4 | 1.18 | 1.11 | 1.16 | 1.05 | 1.00 |
+| 8 | 1.07 | 0.99 | 1.04 | 1.01 | 1.00 |
+| 16 | 1.05 | 0.99 | 1.01 | 0.99 | 1.00 |
+
+Raster `m` equals the heuristic (which resolves to `m` here); `n` without a swizzle is
+1.35-1.55x on every row.  gen.qkv tp1 (N=10240, 52 MB) wobbles +-10% in both
+directions with cuBLAS's own reference varying 5% between runs: the power cap.
+
+Swizzle 8 as a blanket default, full 24 x 6 grid, `auto`, swizzle 0 vs 8 back to back
+(`b15_s{0,8}_r*`): geomeans 1.05 / 1.08 at M=1024, 1.02 / 1.03, 0.99 / 1.00, 0.99 / 1.01,
+1.03 / 1.03, 1.04 / 1.04.  gate_up tp1 1.32 -> 0.98 / 0.99, mlp.down tp2 8-16% faster at
+M >= 44160, but the M=1024 rows lost for real (both of two repeats, `b15small_*`):
+mlp.down tp1 172 -> 209 us, mlp.down tp2 85 -> 101 us, attn.out tp1 57 -> 66 us.  At
+that size the whole problem is L2-resident and the swizzle only scrambles the wave
+packing of a two-wave grid.  Hence the rule in `W8A16Sm100PickSwizzle`: swizzle 8 when
+the fp8 weight is >= 64 MB (half of L2) and M >= 4096, else 0; the env pins a value for
+every shape.  The sm100 scheduler does not pad the grid to the swizzle size (residual
+tiles are not remapped), so the H3 padding guard is not needed here.
+
+Final B15 state (`sweepB15_b200_r*`, umb-b200-260, one pass per M class, `--algo auto
+2sm256x128 2sm256x192 2sm256x128_streamk` plus the torch cast-copy op, 110 tests pass),
+geomean kernel / cuBLAS per M class:
+
+| M | auto (B15) | auto (B14) | 256x128 | 256x192 | 256x128 stream-K | torch cast-copy | oracle of the four | mean cuBLAS TFLOP/s |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 1.05 | 1.08 | 1.17 | 1.35 | 1.43 | 3.79 | 1.05 | 1198 |
+| 2048 | 1.02 | 1.03 | 1.10 | 1.14 | 1.28 | 2.75 | 1.01 | 1415 |
+| 4096 | 0.99 | 1.00 | 1.02 | 1.07 | 1.11 | 1.94 | 0.99 | 1477 |
+| 8192 | 0.98 | 1.00 | 1.00 | 1.03 | 1.06 | 1.54 | 0.97 | 1496 |
+| 44160 | 0.98 | 1.01 | 1.00 | 1.00 | 1.04 | 1.10 | 0.96 | 1458 |
+| 88320 | 1.00 | 1.03 | 1.01 | 1.02 | 1.09 | 1.03 | 0.97 | 1441 |
+
+mlp.gate_up tp1 in this pass: 1.06 at M=44160, 1.04 at 88320 (0.98 / 0.99 in the
+swizzle-0-vs-8 grid an hour earlier; that spread is the box).  The B14 remark "widest
+power-bound rows 1.25-1.30x, clocks at 1.2 GHz" was wrong about the cause: the clock
+sits there for cuBLAS too, the gap was the L2 re-stream.  Plot:
+`plots/w8a16_b200_tflops_grid.png` is drawn from this sweep.
+
 ### Knobs and the `algo` argument
 
 `flashinfer.gemm.w8a16_fp8_gemm(..., algo=)` (Blackwell) pins a variant per call:
@@ -327,6 +386,7 @@ oracle).
 | B11 | (this commit) | `algo` argument on the Python op (codes 1-5, FFI `int64 algo`), `bench --algo a b ...` back-to-back columns, dispatcher refit: 256x192 eff 1.22 -> 1.02, 256x256 dropped from auto | WIN: auto / oracle 1.040 -> 1.014 |
 | B12 | fec33517e | batched split-K for the 256x128 tile (fp32 partials + reduce kernel, 128x16 fp32 epilogue tile), split rule for under-filled grids and long-K partial waves | WIN: M=1024 1.24 -> 1.10 x cuBLAS, M=2048 1.06 -> 1.04, und.kv rows 1.3-1.8x -> ~1.0x |
 | B14 | (this commit) | 256x160 tile (`2sm256x160`, 2 x 160 acc + 3 x 64 A TMEM columns) as a third tile height in the wave-fill model (eff 0.96) | WIN: M=1024 1.112 -> 1.076 x cuBLAS, M=2048 1.038 -> 1.027, M=44160 1.026 -> 1.008; N=5120 M=1024 rows 11-16% faster; ncu (line info, `ncu_reader`) first showed the small-M loss is wave fill + un-overlapped prologue/epilogue, every stall on a pipeline mbarrier, 54% tensor pipe vs 92% at M=8192 |
+| B15 | (this commit) | scheduler swizzle 8 for weights >= 64 MB at M >= 4096 (`W8A16Sm100PickSwizzle`; `FLASHINFER_W8A16_FP8_SWIZZLE_SM100` / `_RASTER_SM100` pin) | WIN: mlp.gate_up tp1 (N=25600) at M=44160 / 88320 1.32 -> 0.98 / 0.99 x cuBLAS, mlp.down tp2 8-16% faster there; no other row moves beyond noise |
 | B13 | cf6fb8984 + 4994d9979 | 256x128 tile under CUTLASS's SM100 stream-K scheduler (`2sm256x128_streamk`), dispatcher rule for a mostly-empty tail wave over >= 64-k-tile tiles | SMALL WIN: 3 rows (M=1024 N=5120 K >= 8192) 7-8% faster, two now under cuBLAS; M=1024 geomean 1.114 -> 1.103; everywhere else stream-K loses (1.43x at M=1024 overall when forced: per-fragment prologue + 128 KB accumulator round trip) |
 
 ### Why B10 works (PerfSim, gb100 model, Mon 12 Oct 2026)

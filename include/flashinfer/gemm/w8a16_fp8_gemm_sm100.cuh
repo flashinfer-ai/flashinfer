@@ -316,7 +316,7 @@ using W8A16Sm100Cfg2SM256x160 = W8A16Sm100Cfg<256, 160, 128, 2, true>;
 // scheduler's fixup before the epilogue.  Mutually exclusive with kSplitK.
 inline cutlass::gemm::kernel::detail::DecompositionMode W8A16Sm100StreamKModeEnv();
 inline cutlass::gemm::kernel::detail::ReductionMode W8A16Sm100StreamKReductionEnv();
-inline int W8A16Sm100SwizzleEnv();
+inline int W8A16Sm100PickSwizzle(int M, int N, int K);
 inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm100RasterEnv();
 
 template <typename T, typename Cfg, bool kSplitK = false, bool kStreamK = false>
@@ -419,7 +419,7 @@ struct W8A16Sm100Gemm {
     // Tile-order knobs of both sm100 schedulers (persistent and stream-K): how many
     // tiles the in-flight clusters group along the fast axis (L2 reuse of a weight band x
     // activation band instead of a line of tiles) and which axis walks fastest.
-    args.scheduler.max_swizzle_size = W8A16Sm100SwizzleEnv();
+    args.scheduler.max_swizzle_size = W8A16Sm100PickSwizzle(M, N, K);
     args.scheduler.raster_order = W8A16Sm100RasterEnv();
     if constexpr (kStreamK) {
       // Heuristic: data-parallel for the full waves, stream-K for the tiles of the last
@@ -550,20 +550,39 @@ inline cutlass::gemm::kernel::detail::ReductionMode W8A16Sm100StreamKReductionEn
 }
 
 // FLASHINFER_W8A16_FP8_SWIZZLE_SM100 = tile-group size handed to the sm100 schedulers as
-// max_swizzle_size (0 / 1 = plain raster: CUTLASS's default and what every version up to
-// B14 ran).  With S, the in-flight clusters cover S tiles along the fast axis and the
-// rest along the slow one, so a (weight band x activation band) working set stays in L2.
-// Motivation (Wed 14 Oct 2026): mlp.gate_up tp1, N=25600, whose 131 MB fp8 weight
-// overflows L2 and is re-streamed once per activation tile under the plain raster
-// (1080 vs cuBLAS 1390 TFLOP/s at M >= 44160).  Read once.
+// max_swizzle_size, overriding W8A16Sm100PickSwizzle for every shape.  0 / 1 = plain
+// raster: CUTLASS's default and what every version up to B14 ran.  Unset = the rule.
+// Read once.
 inline int W8A16Sm100SwizzleEnv() {
   static const int swizzle = [] {
     const char* s = std::getenv("FLASHINFER_W8A16_FP8_SWIZZLE_SM100");
-    if (s == nullptr || *s == '\0') return 0;
+    if (s == nullptr || *s == '\0') return -1;
     const int v = std::atoi(s);
     return v < 0 ? 0 : v;
   }();
   return swizzle;
+}
+
+// Version B15 (Wed 14 Oct 2026, B200, free-running clocks).  With a swizzle S the
+// in-flight clusters cover S tiles along the fast raster axis and the rest along the slow
+// one, so a (weight band x activation band) working set stays in L2 instead of a line of
+// tiles.  Where it matters: a weight that does not fit L2 and many activation tiles to
+// re-stream it for.  mlp.gate_up tp1 (N=25600, 131 MB fp8 weight) at M=44160 / 88320 went
+// from kernel / cuBLAS 1.20 / 1.18 (256x192) and 1.52 / 1.43 (256x128) to 0.99 / 1.01 and
+// 1.07 / 1.04 with swizzle 8 (16 the same within noise; 2 and 4 half-way); mlp.down tp2
+// (65 MB) gained 8-16% at those M.  Where it hurts: at M <= 2048 the swizzle only
+// scrambles the wave packing of a grid that is a couple of waves deep, and the long-K rows
+// lost 15-21% (mlp.down tp1 / tp2 at M=1024: 172 -> 209 us, 85 -> 101 us, both repeats).
+// Rows whose weight fits L2 (und.q tp2, gen.qkv tp1) do not move either way at large M.
+// So: 8 when the weight is at least half of L2 and there are >= 32 activation tiles,
+// else the plain raster.  The sm100 scheduler does not pad the tile grid to the swizzle
+// (residual tiles are simply not remapped), so no padding guard is needed.
+inline int W8A16Sm100PickSwizzle(int M, int N, int K) {
+  const int env = W8A16Sm100SwizzleEnv();
+  if (env >= 0) return env;
+  const long long weight_bytes = static_cast<long long>(N) * K;  // e4m3: one byte each
+  constexpr long long kHalfL2 = 64ll << 20;
+  return (weight_bytes >= kHalfL2 && M >= 4096) ? 8 : 0;
 }
 
 // FLASHINFER_W8A16_FP8_RASTER_SM100 = "heuristic" (default; CUTLASS picks) | "m" (walk
