@@ -42,11 +42,11 @@ def _reference(inputs, weight_before_norm: bool):
     return alpha * residual + beta * values
 
 
-def test_gated_residual_rmsnorm_supports_blackwell_devices():
+def test_gated_residual_rmsnorm_supports_supported_devices():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("SM100 or SM103 is required")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("SM100, SM103, or SM107 is required")
     assert supports_gated_residual_rmsnorm(*_inputs(1))
 
 
@@ -56,7 +56,7 @@ def test_gated_residual_rmsnorm_matches_reference(rows, weight_before_norm):
     inputs = _inputs(rows)
     if not supports_gated_residual_rmsnorm(*inputs):
         pytest.skip(
-            "gated residual RMSNorm requires BF16/FP32 tensors on SM100 or SM103"
+            "gated residual RMSNorm requires BF16/FP32 tensors on SM100, SM103, or SM107"
         )
     expected = _reference(inputs, weight_before_norm)
     api_inputs = list(inputs)
@@ -83,7 +83,7 @@ def test_gated_residual_rmsnorm_rejects_unsafe_layouts():
     inputs = list(_inputs(1))
     if not supports_gated_residual_rmsnorm(*inputs):
         pytest.skip(
-            "gated residual RMSNorm requires BF16/FP32 tensors on SM100 or SM103"
+            "gated residual RMSNorm requires BF16/FP32 tensors on SM100, SM103, or SM107"
         )
 
     strided_weight = torch.empty(2 * HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")[
@@ -109,7 +109,7 @@ def test_gated_residual_rmsnorm_cuda_graph(weight_before_norm):
     inputs = list(_inputs(17))
     if not supports_gated_residual_rmsnorm(*inputs):
         pytest.skip(
-            "gated residual RMSNorm requires BF16/FP32 tensors on SM100 or SM103"
+            "gated residual RMSNorm requires BF16/FP32 tensors on SM100, SM103, or SM107"
         )
     kwargs = {
         "eps": EPS,

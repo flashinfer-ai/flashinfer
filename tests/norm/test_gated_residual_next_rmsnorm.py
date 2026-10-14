@@ -59,7 +59,7 @@ def _assert_close(actual, expected):
 
 
 @pytest.mark.parametrize("alpha", [1, 1.0, 0.5, -1.0])
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 def test_scalar_alpha_support_and_dispatch(monkeypatch, alpha, capability):
     # Check scalar dispatch without a GPU or allocating an alpha vector.
     monkeypatch.setattr(norm, "_HAS_CUTE_DSL_FUSED_NORM", True)
@@ -92,7 +92,7 @@ def test_gated_residual_next_rmsnorm_matches_reference(rows, post_gain_center):
     torch.manual_seed(1000 + rows)
     inputs = _inputs(rows)
     if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM100 or SM103")
+        pytest.skip("gated residual next RMSNorm requires SM100, SM103, or SM107")
     kwargs = {}
     if post_gain_center is not None:
         kwargs = {
@@ -105,7 +105,7 @@ def test_gated_residual_next_rmsnorm_matches_reference(rows, post_gain_center):
 def test_gated_residual_next_rmsnorm_keeps_intermediate_fp32():
     inputs = list(_inputs(17))
     if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM100 or SM103")
+        pytest.skip("gated residual next RMSNorm requires SM100, SM103, or SM107")
     inputs[1].mul_(64.0)
     residual_out, ffn_input = _call(inputs)
     expected_residual, expected_ffn = _reference(inputs)
@@ -128,7 +128,7 @@ def test_scalar_alpha_matches_tensor(alpha, rows, post_input_scale):
     torch.manual_seed(1000 + rows)
     inputs = list(_inputs(rows))
     if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM100 or SM103")
+        pytest.skip("gated residual next RMSNorm requires SM100, SM103, or SM107")
     kwargs = {}
     if post_input_scale:
         kwargs = {"post_weight": inputs[2], "post_gain_center": 1.0}
@@ -145,7 +145,7 @@ def test_scalar_alpha_matches_tensor(alpha, rows, post_input_scale):
 def test_gated_residual_next_rmsnorm_rejects_unsafe_layouts():
     inputs = list(_inputs(1))
     if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM100 or SM103")
+        pytest.skip("gated residual next RMSNorm requires SM100, SM103, or SM107")
     strided_weight = torch.empty(2 * HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")[
         ::2
     ]
@@ -188,7 +188,7 @@ def test_gated_residual_next_rmsnorm_cuda_graph_uses_changed_inputs(
 ):
     inputs = list(_inputs(17))
     if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM100 or SM103")
+        pytest.skip("gated residual next RMSNorm requires SM100, SM103, or SM107")
     if alpha is not None:
         inputs[3] = alpha
     kwargs = {}

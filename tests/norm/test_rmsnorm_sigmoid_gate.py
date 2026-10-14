@@ -47,7 +47,7 @@ def _reference(x: torch.Tensor, gate: torch.Tensor, eps: float):
 @pytest.mark.parametrize("eps", [1e-5, 1e-3])
 def test_rmsnorm_sigmoid_gate_matches_strided_reference(tokens: int, eps: float):
     if not supports_rmsnorm_sigmoid_gate(torch.bfloat16, HEAD_DIM):
-        pytest.skip("SM103 RMSNorm sigmoid gate requires BF16 on B300")
+        pytest.skip("RMSNorm sigmoid gate requires BF16 on SM100, SM103, or SM107")
 
     x, gate, projection = _inputs(tokens, seed=919 + tokens)
     assert gate.stride()[1:] == (HEAD_DIM, 1)
@@ -67,7 +67,7 @@ def test_rmsnorm_sigmoid_gate_matches_strided_reference(tokens: int, eps: float)
 @pytest.mark.parametrize("tokens", [8, 64])
 def test_rmsnorm_sigmoid_gate_cuda_graph_uses_changed_inputs(tokens: int):
     if not supports_rmsnorm_sigmoid_gate(torch.bfloat16, HEAD_DIM):
-        pytest.skip("SM103 RMSNorm sigmoid gate requires BF16 on B300")
+        pytest.skip("RMSNorm sigmoid gate requires BF16 on SM100, SM103, or SM107")
 
     static_x, static_gate, projection = _inputs(tokens, seed=1001)
     rmsnorm_sigmoid_gate(static_x, static_gate, 1e-5)
@@ -104,7 +104,7 @@ def test_rmsnorm_sigmoid_gate_rejects_cpu_tensors():
 
 def test_rmsnorm_sigmoid_gate_rejects_misaligned_tensors():
     if not supports_rmsnorm_sigmoid_gate(torch.bfloat16, HEAD_DIM):
-        pytest.skip("SM103 RMSNorm sigmoid gate requires BF16 on B300")
+        pytest.skip("RMSNorm sigmoid gate requires BF16 on SM100, SM103, or SM107")
     numel = NUM_HEADS * HEAD_DIM
     x = torch.empty(numel + 1, dtype=torch.bfloat16, device="cuda")[1:].view(
         1, NUM_HEADS, HEAD_DIM

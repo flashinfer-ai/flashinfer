@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
-"""TP MoE finalize and post-expert RMSNorm on SM100/SM103.
+"""TP MoE finalize and post-expert RMSNorm on SM100/SM103/SM107.
 
 Candidate-owned collectives, no framework collective. The input is the raw
 permuted GEMM2 buffer plus its expanded-to-permuted row map; resolving that map
@@ -104,7 +104,7 @@ def _cur_stream(dev_ord, h=None):
 
 
 K_EXPERTS = 8
-_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
+_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 H_DIM = 4096
 VEC = 8
 NSLOT = 256  # >= max CTAs in the grid; one Lamport slot per CTA
@@ -1644,7 +1644,7 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
     if not _group_all(local_supported, device, group):
         if not local_supported:
             logger.warning(
-                "TP MoE finalize requires SM100/SM103 and at most %d SMs; got SM%d%d "
+                "TP MoE finalize requires SM100/SM103/SM107 and at most %d SMs; got SM%d%d "
                 "with %d SMs.",
                 NSLOT,
                 props.major,
@@ -1949,7 +1949,7 @@ def supports_tp_moe_finalize_rmsnorm(
     norm_weight: torch.Tensor,
     output: torch.Tensor,
 ) -> bool:
-    """Return whether tensors satisfy the TP SM100/SM103 kernel contract."""
+    """Return whether tensors satisfy the TP SM100/SM103/SM107 kernel contract."""
     if (
         not _WS.available
         or gemm2_permuted.ndim != 2

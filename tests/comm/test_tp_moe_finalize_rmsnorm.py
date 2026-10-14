@@ -819,8 +819,8 @@ def _path_worker(
 def test_tp_moe_finalize_rmsnorm_paths(
     world_size: int, path: str, routing_fp32: bool, weight_before_norm: bool
 ) -> None:
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("TP MoE finalize requires SM100 or SM103")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("TP MoE finalize requires SM100, SM103, or SM107")
     if "LOCAL_RANK" in os.environ:
         if int(os.environ["WORLD_SIZE"]) != world_size:
             pytest.skip("different torchrun world size")
@@ -848,8 +848,8 @@ def test_tp_moe_finalize_rmsnorm_paths(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_tp_moe_finalize_rmsnorm_eager_and_cudagraph(world_size: int) -> None:
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("TP MoE finalize requires SM100 or SM103")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("TP MoE finalize requires SM100, SM103, or SM107")
     if "LOCAL_RANK" in os.environ:
         if int(os.environ["WORLD_SIZE"]) != world_size:
             pytest.skip("different torchrun world size")
@@ -866,8 +866,8 @@ def test_tp_moe_finalize_rmsnorm_eager_and_cudagraph(world_size: int) -> None:
 def test_tp_moe_finalize_rmsnorm_allocation_failure_is_rank_consistent(
     world_size: int, site: str
 ) -> None:
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("TP MoE finalize requires SM100 or SM103")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("TP MoE finalize requires SM100, SM103, or SM107")
     if "LOCAL_RANK" in os.environ:
         if int(os.environ["WORLD_SIZE"]) != world_size:
             pytest.skip("different torchrun world size")
