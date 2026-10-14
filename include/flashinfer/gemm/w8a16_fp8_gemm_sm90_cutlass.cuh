@@ -172,8 +172,17 @@ struct W8A16Sm90GroupedParams : cutlass::gemm::kernel::detail::PersistentTileSch
   uint32_t group_ = 1;       // tiles of the slow dimension per group
   uint32_t tiles_fast_ = 0;  // tiles along the raster direction
   uint32_t tiles_slow_ = 0;
+  uint32_t full_groups_ = 0;             // tiles_slow_ / group_
+  uint32_t full_tiles_ = 0;              // full_groups_ * group_ * tiles_fast_
+  cutlass::FastDivmod div_group_tiles_;  // / (group_ * tiles_fast_)
+  cutlass::FastDivmod div_group_;        // / group_
+  cutlass::FastDivmod div_rem_;          // / (tiles_slow_ - full_groups_ * group_), or 1
 };
 
+// Index map: FastDivmod (multiply-high + shift, precomputed on the host), as CUTLASS's own
+// scheduler does.  A/B against the stock scheduler and a plain-division build (version H4,
+// mlp.gate_up tp1 M=44160, 5 interleaved rounds): 1.053 / 1.070 / 1.067 of cuBLAS free-running,
+// 14.87 / 14.83 / 14.99 ms and 3316 / 3320 / 3313 M instructions under ncu: one kernel.
 class W8A16Sm90GroupedTileScheduler
     : public cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90 {
   using Base = cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90;
@@ -188,12 +197,7 @@ class W8A16Sm90GroupedTileScheduler
   CUTLASS_HOST_DEVICE W8A16Sm90GroupedTileScheduler() {}
 
   CUTLASS_DEVICE explicit W8A16Sm90GroupedTileScheduler(Params const& p)
-      : Base(p),
-        blocks_(p.blocks_per_problem_),
-        group_(p.group_),
-        tiles_fast_(p.tiles_fast_),
-        tiles_slow_(p.tiles_slow_),
-        along_m_(p.raster_order_ == RasterOrder::AlongM) {
+      : Base(p), p_(&p), along_m_(p.raster_order_ == RasterOrder::AlongM) {
 #if defined(__CUDA_ARCH__)
     // Same start index as CUTLASS (one of gridDim.x / gridDim.y is 1 at cluster size 1).
     linear_ = uint64_t(blockIdx.x) * uint64_t(gridDim.y) + uint64_t(blockIdx.y);
@@ -220,6 +224,12 @@ class W8A16Sm90GroupedTileScheduler
     p.tiles_fast_ = along_m ? p.problem_tiles_m_ : p.problem_tiles_n_;
     p.tiles_slow_ = along_m ? p.problem_tiles_n_ : p.problem_tiles_m_;
     if (p.group_ > p.tiles_slow_) p.group_ = p.tiles_slow_ > 0 ? p.tiles_slow_ : 1;
+    p.full_groups_ = p.tiles_slow_ / p.group_;
+    p.full_tiles_ = p.full_groups_ * p.group_ * p.tiles_fast_;
+    const uint32_t rem = p.tiles_slow_ - p.full_groups_ * p.group_;
+    p.div_group_tiles_ = cutlass::FastDivmod(static_cast<int>(p.group_ * p.tiles_fast_));
+    p.div_group_ = cutlass::FastDivmod(static_cast<int>(p.group_));
+    p.div_rem_ = cutlass::FastDivmod(static_cast<int>(rem > 0 ? rem : 1));
     return p;
   }
 
@@ -230,34 +240,34 @@ class W8A16Sm90GroupedTileScheduler
 
   CUTLASS_DEVICE WorkTileInfo get_current_work() const { return work_for_linear_idx(linear_); }
 
-  CUTLASS_DEVICE WorkTileInfo work_for_linear_idx(uint64_t u) const {
-    if (u >= blocks_) return WorkTileInfo::invalid_work_tile();
-    const uint32_t g = group_;
-    const uint64_t group_tiles = uint64_t(g) * tiles_fast_;
-    const uint32_t full = tiles_slow_ / g;
-    const uint64_t gi = u / group_tiles;
-    uint32_t slow, fast;
-    if (gi < full) {
-      const uint64_t in = u - gi * group_tiles;
-      slow = static_cast<uint32_t>(gi) * g + static_cast<uint32_t>(in % g);
-      fast = static_cast<uint32_t>(in / g);
+  CUTLASS_DEVICE WorkTileInfo work_for_linear_idx(uint64_t u64) const {
+    Params const& p = *p_;
+    if (u64 >= p.blocks_per_problem_) return WorkTileInfo::invalid_work_tile();
+    // Tile counts here fit in int (CUTLASS's own FastDivmod paths assume the same).
+    const int u = static_cast<int>(u64);
+    int slow, fast;
+    if (static_cast<uint32_t>(u) < p.full_tiles_) {
+      int gi, in, q, r;
+      p.div_group_tiles_.fast_divmod(gi, in, u);
+      p.div_group_.fast_divmod(q, r, in);
+      slow = gi * static_cast<int>(p.group_) + r;
+      fast = q;
     } else {  // the remainder group, narrower, no padding
-      const uint32_t r = tiles_slow_ - full * g;
-      const uint64_t in = u - uint64_t(full) * group_tiles;
-      slow = full * g + static_cast<uint32_t>(in % r);
-      fast = static_cast<uint32_t>(in / r);
+      int q, r;
+      p.div_rem_.fast_divmod(q, r, u - static_cast<int>(p.full_tiles_));
+      slow = static_cast<int>(p.full_groups_ * p.group_) + r;
+      fast = q;
     }
-    const int32_t m = static_cast<int32_t>(along_m_ ? fast : slow);
-    const int32_t n = static_cast<int32_t>(along_m_ ? slow : fast);
-    return {m, n, 0, true};
+    return {along_m_ ? fast : slow, along_m_ ? slow : fast, 0, true};
   }
 
   CUTLASS_DEVICE void advance_to_next_work(uint32_t advance_count = 1) {
     linear_ += stride_ * uint64_t(advance_count);
   }
 
+  // Only validity is asked here (the consumer's per-tile last-tile test): no index map.
   CUTLASS_DEVICE bool is_last_tile(WorkTileInfo&, uint32_t advance_count = 1) const {
-    return !work_for_linear_idx(linear_ + stride_ * uint64_t(advance_count)).is_valid();
+    return linear_ + stride_ * uint64_t(advance_count) >= p_->blocks_per_problem_;
   }
 
   CUTLASS_DEVICE auto fetch_next_work(WorkTileInfo) {
@@ -272,8 +282,7 @@ class W8A16Sm90GroupedTileScheduler
   }
 
  private:
-  uint64_t blocks_ = 0;
-  uint32_t group_ = 1, tiles_fast_ = 0, tiles_slow_ = 0;
+  Params const* p_ = nullptr;  // the kernel's __grid_constant__ params
   bool along_m_ = true;
   uint64_t linear_ = 0;
   uint64_t stride_ = 1;
@@ -588,14 +597,21 @@ inline int W8A16Sm90PickSwizzle(int tiles_w, int tiles_a, int cluster_w, int max
   return 1;
 }
 
-// FLASHINFER_W8A16_FP8_SM90_GROUP = 0 (default: W8A16Sm90PickGroup's choice) | n >= 1: the
-// L2 group size of the grouped scheduler (tiles of the slow raster dimension per group).
-// Read on every call (a getenv per GEMM launch) so the benchmark can compare group sizes in
-// one process: CUDA-graph capture bakes the value in.  For benchmarking.
-inline int W8A16Sm90GroupEnv() {
-  const char* s = std::getenv("FLASHINFER_W8A16_FP8_SM90_GROUP");
+// FLASHINFER_W8A16_FP8_SM90_GROUP = 0 (W8A16Sm90PickGroup's choice) | n >= 1: the L2 group
+// size of the grouped scheduler (tiles of the slow raster dimension per group).  Unset at the
+// first read (production): cached, no getenv per launch.  Set at the first read (any value,
+// "0" included): re-read on every call, so the benchmark can switch group sizes per column
+// in one process (it sets "0" before the first GEMM; the graph capture bakes each value in).
+// For benchmarking.
+inline int W8A16Sm90GroupEnvParse(const char* s) {
   const int n = (s != nullptr && *s != '\0') ? std::atoi(s) : 0;
   return n > 0 ? n : 0;
+}
+
+inline int W8A16Sm90GroupEnv() {
+  static const bool live = std::getenv("FLASHINFER_W8A16_FP8_SM90_GROUP") != nullptr;
+  if (!live) return 0;
+  return W8A16Sm90GroupEnvParse(std::getenv("FLASHINFER_W8A16_FP8_SM90_GROUP"));
 }
 
 // L2 group of the grouped scheduler (version H4, ncu locked-clock sweep of the 48 rows at

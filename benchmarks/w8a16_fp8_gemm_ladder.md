@@ -434,8 +434,10 @@ variants use it; the stream-K variants keep CUTLASS's scheduler.  `W8A16Sm90Pick
 G = 4 if N*K >= 40 MB and >= 64 weight tiles, G = 2 if N*K >= 40 MB otherwise, 1 below 40
 MB or at M < 16384 (at M = 4096 / 8192 the group cuts reads 20-30% but the time moves
 +-1%, so those rows keep the H3 schedule bit for bit).  Env `FLASHINFER_W8A16_FP8_SM90_GROUP`
-overrides it, read per call so `--algo auto@g<n>` columns compare group sizes in one
-process.
+overrides it: cached as absent if unset at the first read, re-read per call only when it
+was set then (the bench sets it before the first GEMM, so `--algo auto@g<n>` columns
+compare group sizes in one process).  The index map uses FastDivmod precomputed on the host
+(CUTLASS's own scheduler does the same).
 
 **Raster per shape** (option c of the brief) was not pursued: with the weight grouped the
 `n` raster would only stream the activation instead, which is the 2x loss H3 already
@@ -485,6 +487,32 @@ Whole grid after the change (one free-running pass at M <= 8192 with 2 rounds, `
 M <= 8192 rows run the H3 code paths unchanged): 1.149 / 1.077 / 1.037 / 1.018 for M =
 1024-8192 against 1.146 / 1.073 / 1.026 / 1.007 in the freeH3 sweep, the same within this
 node-to-node spread.
+
+**Follow-up: the "3-5% at G = 1" on mlp.gate_up tp1 was noise.**  The H4 table shows
+mlp.gate_up tp1 at 1.06-1.07 with the grouped scheduler at G = 1 against 1.00-1.02 for "the
+H3 rule", which looked like the scheduler costing 3-5% on its own.  Settled with a
+temporary build carrying both schedulers (s4124-0106, `h4ab_*`), same process, 5
+interleaved rounds per row: stock CUTLASS scheduler / grouped G = 1 with plain integer
+division / grouped G = 1 with FastDivmod / grouped G = 4:
+
+| row | stock | G=1 plain div | G=1 FastDivmod | G=4 |
+|---|---|---|---|---|
+| mlp.gate_up tp1 44160 | 1.053 | 1.070 | 1.067 | **1.009** |
+| mlp.gate_up tp2 44160 | 1.059 | 1.060 | 1.057 | **1.010** |
+| mlp.gate_up tp1 88320 | 1.05 | 1.06 | 1.07 | **1.02** |
+| mlp.gate_up tp2 88320 | 1.05 | 1.05 | 1.04 | **1.01** |
+| geomean, 12 rows (gate_up / und.q / gen.qkv tp1-2), 44160 | 1.039 | 1.034 | 1.032 | 1.024 |
+| geomean, same, 88320 | 1.019 | 1.022 | 1.026 | 1.010 |
+
+ncu on mlp.gate_up tp1 44160 (locked clocks, counters only): 14.87 / 14.83 / 14.99 /
+14.77 ms, 3316 / 3320 / 3313 / 3305 M instructions, DRAM read 22.3 / 18.1 / 22.7 / 13.5 GB.
+The stock scheduler and the grouped one at G = 1 are the same kernel (instruction counts
+within 0.2%, times within 1%; the DRAM bytes of the ungrouped runs vary 18-23 GB between
+launches because which weight slices survive in L2 depends on CTA timing).  The H4 table's
+"H3 rule" 1.00-1.02 on that row was the spread of that particular run.  The FastDivmod map
+stays (no cost, matches CUTLASS); `is_last_tile` now only compares the next index against
+the work count instead of running the map.  The grouping itself is confirmed: G = 4 is
+4-5% under every G = 1 column on the four gate_up rows, in the same process.
 
 **Parked: narrow N / small M** (`~/code/worktrees/flashinfer/h4-parked/`, a patch plus
 the M = 1024 / 2048 sweep).  Tried 128x64 (cooperative), 64x128 and 64x64 (ping-pong), and
