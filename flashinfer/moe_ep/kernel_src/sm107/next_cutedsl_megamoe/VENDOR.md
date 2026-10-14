@@ -124,7 +124,7 @@ silently dropped by a fresh export. Paths below are relative to `src/sources/`.
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py` | Use that barrier for the Generic MMA/accumulator TMEM allocation rendezvous. |
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py` | N64 SFB/TMEM parity, valid-row TMA-gather extent and transaction accounting, and two gather warps for CGA4. |
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py` | Pass routing IDs to separate BF16 reduction, advertise masked-slot handling, and configure small-prefix CTA0 reset ownership. |
-| `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py` | Propagate masked reduction and admitted N64 geometry; support a one-row allocation in the gather descriptor and small-prefix CTA0 reset ownership. |
+| `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py` | Propagate masked reduction and admitted N64 geometry; support a one-row allocation in the gather descriptor, explicit router/all-role quiescence before reset, and small-prefix CTA0 reset ownership. |
 | `kernel_src/rubin/inference/mega/token_comm_gen_specialized.py` | Bound route metadata by the live extent, fence rewritten shared indices before async bulk publication, reuse the acquired extent in the sort body, skip invalid histogram/scatter work, and reuse the existing expert prefix for scale-factor offsets. |
 | `kernel_src/rubin/inference/mega/topk_reduce.py` | Predicate BF16 combine loads by routing validity, yielding exact zero for rows with no valid routes. |
 | `communication/nvlink_domain/token_comm.py` | Skip invalid-route histogram/scatter work, protect partial dump reads, fence generic shared-memory writes before async bulk size publication, and let CTA0 reset prefixes up to 16 KiB without a second grid join. |
@@ -146,8 +146,12 @@ EP1, and `MEGA_USE_NCU=1` keep the original distributed reset. The selected
 ownership is part of the generated kernel name.
 
 GenPhase uses the same size/EP/NCU eligibility rule, with its own tail protocol:
-retain the local producer-drain grid join and the single NVLink publication
-barrier. CTA0 clears every original local/shared reset prefix, then uses the
+drain the preceding router with `griddepcontrol_wait`, join every local warp
+role, then retain the local grid join and single NVLink publication barrier.
+These drains are required for both reset ownership choices: empty work can
+finish the epilogue while gather roles still acquire ready flags or the router
+still advances its refinement counter. A seven-pusher changing-route stress
+test covers early/late weights without changing the default 27-pusher geometry. CTA0 clears every original local/shared reset prefix, then uses the
 barrier's existing CTA rendezvous, system fence, peer notification and acquire.
 Only the post-reset grid join is omitted. Persistent grid/phase/signal counters
 are outside the reset prefix. GenPhase's reset bound depends on both top-k and

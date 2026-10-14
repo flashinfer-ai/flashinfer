@@ -60,6 +60,14 @@ def _barrier():
 def test_sparse_to_dense_graph_multirank(
     ep_runtime, family, kind, cluster, capacity, early
 ):
+    _check_sparse_to_dense_graph_multirank(
+        ep_runtime, family, kind, cluster, capacity, early
+    )
+
+
+def _check_sparse_to_dense_graph_multirank(
+    ep_runtime, family, kind, cluster, capacity, early
+):
     rank, world = ep_runtime
     hidden, intermediate, experts = 512, 256, 16
     # DATA CTA count depends on capacity * topk, not token capacity alone.
@@ -215,3 +223,19 @@ def test_sparse_to_dense_graph_multirank(
         _barrier()
         ws.destroy()
         _barrier()
+
+
+@pytest.mark.parametrize("early", [False, True])
+def test_sparse_to_dense_genphase_quiescence(ep_runtime, monkeypatch, early):
+    """Stress empty-work reset with slower payload progress per pusher warp."""
+    pkg.require_sm107_dsl()
+    pkg.bootstrap_paths()
+    from sources import RubinInferenceGenphaseMegaMoE
+
+    # This private geometry changes relative producer/consumer progress without
+    # changing the math. Empty work must drain both the router and all main
+    # roles before clearing readiness flags; epilogue completion is insufficient.
+    monkeypatch.setattr(RubinInferenceGenphaseMegaMoE, "pusher_cta_count", 7)
+    _check_sparse_to_dense_graph_multirank(
+        ep_runtime, "genphase", "mxfp8_e4m3", 4, 1024, early
+    )

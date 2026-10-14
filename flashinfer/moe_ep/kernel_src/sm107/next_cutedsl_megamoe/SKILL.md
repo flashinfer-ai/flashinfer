@@ -258,8 +258,12 @@ tests assert which path ran and validate changing routes across repeated replay.
 
 ### GenPhase tail reset ownership
 
-The GenPhase tail has one NVLink peer barrier, unlike Generic's two. Retain the
-local producer-drain grid join, then let CTA0 clear all small reset prefixes.
+The GenPhase tail has one NVLink peer barrier, unlike Generic's two. Before
+reset, drain the preceding router with `griddepcontrol_wait`, join ALL local
+warp roles with a CTA barrier, then perform the local grid join. Epilogue
+completion alone is insufficient on empty work: gather warps can still be
+acquiring ready flags, and refinement can still claim its final work counter.
+Only after these drains may CTA0 clear all small reset prefixes.
 Its existing publication-barrier CTA rendezvous and system fence order those
 stores before peer notification/acquire; only the post-reset grid prologue is
 omitted. EP1, prefixes above 16 KiB and NCU mode keep the original path. The
@@ -271,3 +275,9 @@ is bounded by local expert count as well as top-k. Use enough local experts to
 actually exceed 16 KiB, and assert the measured prefix size. An EP16 constructor
 case does not qualify EP16 execution. The multirank graph test asserts the
 selected ownership and checks every capacity row after changing-route replay.
+
+Detector: `test_sparse_to_dense_genphase_quiescence` uses seven pushers to
+stress relative payload/consumer progress and checks early/late weights across
+empty, sparse and restored graph replays. The default pusher count remains 27.
+A private delayed-gather diagnostic also times out without the drains and
+passes with them; delay instrumentation must never enter performance results.

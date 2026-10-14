@@ -19,9 +19,9 @@ nothing pushes results back: FC1 gathers straight from the dense received plane,
 and the FC2 epilogue warps send results to their owning rank themselves through
 the bulk reduce-add. Twelve warps cover every role.
 
-The kernel owns the workspace tail reset. Because it outlives the communication
-kernel, it is the only participant that can safely zero the counters, which it
-does after the local producer-drain grid join and before peer publication.
+The kernel owns the workspace tail reset. It first drains the preceding
+communication grid and joins all local warp roles, then performs the local
+grid join before clearing counters and publishing to peers.
 A final NVLink barrier makes the clearing visible before the next invocation.
 """
 
@@ -1174,40 +1174,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
 
-            epilogue_thread_count = 32 * len(self.epilogue_warp_ids)
-
-            iket.range_push("tail.grid_sync_before_reset")
-            self.tail_barrier.sync(
-                epilogue_thread_count, Int32(self.promised_launchable_sm_count), linear_cta_idx, thread_idx
-            )
-            iket.range_pop()
-
-            iket.range_push("tail.reset_workspace")
-            if cutlass.const_expr(self.tail_reset_single_cta):
-                # The original full grid join above establishes producer completion.
-                # CTA0 owns every reset store, including multiple rounds if needed.
-                # NvlinkBarrier's existing CTA rendezvous then joins these stores
-                # before its unchanged system fence and peer notification sequence.
-                if linear_cta_idx == Int32(0):
-                    self._device_workspace.reset_tail_space("shared", thread_idx, epilogue_thread_count)
-                    self._device_workspace.reset_tail_space("local", thread_idx, epilogue_thread_count)
-            else:
-                total_reset_threads = self.promised_launchable_sm_count * epilogue_thread_count
-                global_reset_thread = linear_cta_idx * Int32(epilogue_thread_count) + thread_idx
-                self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
-                self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
-            iket.range_pop()
-
-            iket.range_push("tail.nvlink_publish")
-            self.tail_barrier.arrive_and_wait(
-                epilogue_thread_count,
-                Int32(self.promised_launchable_sm_count),
-                linear_cta_idx,
-                thread_idx,
-                prologue_grid_sync=not self.tail_reset_single_cta,
-                epilogue_grid_sync=False,
-            )
-            iket.range_pop()
             iket.range_pop()
 
         if (warp_idx >= Int32(self.gather_b_warp_ids[0])) & (warp_idx <= Int32(self.gather_b_warp_ids[-1])):
@@ -1241,6 +1207,47 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 )
                 iket.range_pop()
 
+
+        # Empty routes do not force epilogue work to depend on every consumer.
+        # Drain the preceding router (including final refinement claims), then
+        # join every local role before any CTA can reset its ready counters.
+        cute.arch.griddepcontrol_wait()
+        cute.arch.sync_threads()
+        if warp_idx < len(self.epilogue_warp_ids):
+            epilogue_thread_count = 32 * len(self.epilogue_warp_ids)
+
+            iket.range_push("tail.grid_sync_before_reset")
+            self.tail_barrier.sync(
+                epilogue_thread_count, Int32(self.promised_launchable_sm_count), linear_cta_idx, thread_idx
+            )
+            iket.range_pop()
+
+            iket.range_push("tail.reset_workspace")
+            if cutlass.const_expr(self.tail_reset_single_cta):
+                # The role/router drains and grid join above establish quiescence.
+                # CTA0 owns every reset store, including multiple rounds if needed.
+                # NvlinkBarrier's existing CTA rendezvous then joins these stores
+                # before its unchanged system fence and peer notification sequence.
+                if linear_cta_idx == Int32(0):
+                    self._device_workspace.reset_tail_space("shared", thread_idx, epilogue_thread_count)
+                    self._device_workspace.reset_tail_space("local", thread_idx, epilogue_thread_count)
+            else:
+                total_reset_threads = self.promised_launchable_sm_count * epilogue_thread_count
+                global_reset_thread = linear_cta_idx * Int32(epilogue_thread_count) + thread_idx
+                self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
+                self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
+            iket.range_pop()
+
+            iket.range_push("tail.nvlink_publish")
+            self.tail_barrier.arrive_and_wait(
+                epilogue_thread_count,
+                Int32(self.promised_launchable_sm_count),
+                linear_cta_idx,
+                thread_idx,
+                prologue_grid_sync=not self.tail_reset_single_cta,
+                epilogue_grid_sync=False,
+            )
+            iket.range_pop()
 
         self.tail_barrier.remove_device_members()
         self._device_workspace.remove_device_members()
