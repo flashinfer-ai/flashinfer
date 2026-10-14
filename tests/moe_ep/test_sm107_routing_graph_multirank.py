@@ -47,17 +47,24 @@ def _barrier():
 
 @pytest.mark.parametrize("early", [False, True])
 @pytest.mark.parametrize(
-    "family,kind,cluster",
+    "family,kind,cluster,capacity",
     [
-        ("inference", "mxfp8_e4m3", 4),
-        ("genphase", "mxfp8_e4m3", 4),
-        ("genphase", "mxfp8_e4m3", 2),
-        ("genphase", "mxfp4_mxfp8", 4),
+        ("inference", "mxfp8_e4m3", 4, 1024),
+        ("inference", "mxfp8_e4m3", 4, 2048),
+        ("inference", "mxfp4_mxfp8", 4, 1024),
+        ("genphase", "mxfp8_e4m3", 4, 1024),
+        ("genphase", "mxfp8_e4m3", 2, 1024),
+        ("genphase", "mxfp4_mxfp8", 4, 1024),
     ],
 )
-def test_sparse_to_dense_graph_multirank(ep_runtime, family, kind, cluster, early):
+def test_sparse_to_dense_graph_multirank(
+    ep_runtime, family, kind, cluster, capacity, early
+):
     rank, world = ep_runtime
-    hidden, intermediate, experts, topk, capacity = 512, 256, 16, 4, 1024
+    hidden, intermediate, experts = 512, 256, 16
+    # DATA CTA count depends on capacity * topk, not token capacity alone.
+    # Exceed 16384 routes so the 2048-capacity case exercises two DATA CTAs.
+    topk = 10 if capacity == 2048 else 4
     torch.manual_seed(16447)
     w1 = (
         torch.randn(experts, 2 * intermediate, hidden, device="cuda") / hidden**0.5
@@ -97,6 +104,10 @@ def test_sparse_to_dense_graph_multirank(ep_runtime, family, kind, cluster, earl
     graph = torch.cuda.CUDAGraph()
     failures = []
     try:
+        if family == "inference":
+            assert ws.kernel.token_comm._router.router_data_cta_count == (
+                2 if capacity == 2048 else 1
+            )
         torch.manual_seed(17000 + rank)
         x = torch.randn(capacity, hidden, device="cuda").bfloat16()
         qx, sx = pkg.quantize_mxfp8_block32(x, torch.float8_e4m3fn)
@@ -135,7 +146,8 @@ def test_sparse_to_dense_graph_multirank(ep_runtime, family, kind, cluster, earl
                 for pos in (0, 16, 63, 64, 127, 128, 255, 256, 1023):
                     ids[pos, pos % topk] = (pos + rank) % experts
             elif state == "asymmetric":
-                ids[(0, 1, 129, capacity)[rank % 4] :] = -1
+                valid_counts = (0, capacity) if world == 2 else (0, 1, 129, capacity)
+                ids[valid_counts[rank % len(valid_counts)] :] = -1
                 ids[::3, 0] = -1
             # Keep pointers, descriptors and graph fixed; change their contents.
             ws.topk_idx.copy_(ids)
@@ -157,7 +169,7 @@ def test_sparse_to_dense_graph_multirank(ep_runtime, family, kind, cluster, earl
             graph.replay()
             torch.cuda.synchronize()
             first = ws.output_activation.clone()
-            for _ in range(16):
+            for _ in range(64):
                 graph.replay()
             torch.cuda.synchronize()
             inactive = ~((ids >= 0) & (ids < experts)).any(dim=1)

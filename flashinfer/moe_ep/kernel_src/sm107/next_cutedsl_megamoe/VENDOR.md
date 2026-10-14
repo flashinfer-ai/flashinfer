@@ -127,14 +127,14 @@ silently dropped by a fresh export. Paths below are relative to `src/sources/`.
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py` | Propagate masked reduction and admitted N64 geometry; support a one-row allocation in the gather descriptor. |
 | `kernel_src/rubin/inference/mega/token_comm_gen_specialized.py` | Bound route metadata by the live extent, skip invalid histogram/scatter work, and reuse the existing expert prefix for scale-factor offsets. |
 | `kernel_src/rubin/inference/mega/topk_reduce.py` | Predicate BF16 combine loads by routing validity, yielding exact zero for rows with no valid routes. |
+| `communication/nvlink_domain/token_comm.py` | Skip invalid-route histogram/scatter work, protect partial dump reads, and fence generic shared-memory writes before async bulk size publication. |
 
-The Generic router `communication/nvlink_domain/token_comm.py` remains the
-pinned implementation. A proposed invalid-route histogram/scatter shortcut was
-withdrawn after an EP4 captured-graph sparse-to-dense regression; it is not an
-exception to carry forward. The regression is retained in
-`tests/moe_ep/test_sm107_routing_graph_multirank.py`: every capacity row is checked
-after dense, empty, tail-only, sparse-hole, asymmetric-rank, and dense-restoration
-states, on both the first and repeated replays, with early/late routing weights.
+The Generic router shortcut is retained with an async-proxy publication fence
+before the shared-memory histogram/size totals are consumed by bulk copy and
+bulk reduction. A CTA barrier alone is insufficient: the sparse multirank graph
+regression fails with only an extra barrier and passes with the proxy fence.
+The regression covers early/late weights, changing routes, and full-capacity
+output checks; the multi-CTA Generic path is included at capacity 2048 and top-k 10.
 
 FlashInfer-owned `shim/block_scaled.py` admits the geometries listed above and
 omits BF16 masked-slot preclear only when the kernel advertises masked reduction.

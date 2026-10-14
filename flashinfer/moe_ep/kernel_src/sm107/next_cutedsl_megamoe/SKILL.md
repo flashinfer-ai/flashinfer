@@ -211,3 +211,18 @@ validation logs. The package-data rule already includes this directory's
   preserve process-group/NVSHMEM ownership semantics through the backend API.
 - The sibling SM90/SM100/SM120 drops have their own pins and policies; do not
   copy their files into the Rubin closure outside documented upstream exports.
+
+### Generic router async publication
+
+Before `cp.async.bulk` or `cp.reduce.async.bulk` reads histogram/size data from
+shared memory, every generic-proxy writer executes an async shared-memory proxy
+fence, followed by a CTA barrier before the elected lanes issue the transfer.
+A plain `sync_threads()` does not establish this cross-proxy ordering. Keep this
+contract when changing histogram/scatter work or moving publication.
+
+Detector: run `test_sm107_routing_graph_multirank.py` on native SM107 with EP2/EP4.
+It checks sparse/asymmetric/dense transitions, poisoned combine slots, early/late
+weights, and the Generic multi-CTA path at capacity 2048 and top-k 10. The test asserts the
+actual DATA CTA count: capacity alone does not select this path; the routed-token
+capacity must exceed 16384. Inspect all capacity rows
+after both the first and sixty-fifth graph replay.

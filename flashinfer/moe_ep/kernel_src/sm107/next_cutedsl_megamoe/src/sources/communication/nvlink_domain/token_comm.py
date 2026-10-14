@@ -703,6 +703,11 @@ class _MetadataPushRouter(KernelComponent):
 
     @cute.jit
     def _broadcast_sizes_to_peers(self, smem_expert_counts: cute.Tensor) -> Callable[[], None]:
+        # TMA reads the async proxy; a CTA barrier alone does not publish
+        # generic-proxy histogram/size writes to that proxy. Fence every writer
+        # before allowing the elected lanes to issue the bulk transfers.
+        cute.arch.fence_proxy(kind="async.shared", space="cta")
+        cute.arch.sync_threads()
         block_thread_count = self.router_warps_per_cta * 32
         row_bytes = Int32(self.expert_count_padded * 4)
         matrix_address = self._device_workspace.ptr(self.sizes_by_rank_region).toint()
@@ -909,11 +914,13 @@ class _MetadataPushRouter(KernelComponent):
         register_count = cute.size(expert_registers)
         within_expert_indices = cute.make_rmem_tensor((register_count,), cutlass.Int32)
         for register_idx in cutlass.range_constexpr(register_count):
-            within_expert_indices[register_idx] = Int32(
-                cute.arch.atomic_add(
-                    histogram.iterator + expert_registers[register_idx], Int32(1), sem="relaxed", scope="cta"
+            within_expert_indices[register_idx] = Int32(0)
+            if expert_registers[register_idx] != Int32(self.expert_count_padded):
+                within_expert_indices[register_idx] = Int32(
+                    cute.arch.atomic_add(
+                        histogram.iterator + expert_registers[register_idx], Int32(1), sem="relaxed", scope="cta"
+                    )
                 )
-            )
         cute.arch.sync_threads()
         return within_expert_indices
 
@@ -931,11 +938,14 @@ class _MetadataPushRouter(KernelComponent):
         for register_idx in cutlass.range_constexpr(register_count):
             token_idx, topk_slot = self._router_value_coordinate(register_idx, topk_index_type)
             flat_topk_index = token_idx * Int32(self.topk) + topk_slot
-            destination = expert_run_starts[expert_registers[register_idx]] + within_expert_indices[register_idx]
-            if cutlass.const_expr(self.apply_topk_at_fc1):
-                sorted_elements[destination] = _SortedElement(flat_topk_index, score_registers[register_idx]).pack()
-            else:
-                sorted_elements[destination] = _SortedElement(flat_topk_index, None).pack()
+            # Dump reads only the valid prefix. Invalid entries need neither
+            # unique histogram offsets nor writes beyond that prefix.
+            if expert_registers[register_idx] != Int32(self.expert_count_padded):
+                destination = expert_run_starts[expert_registers[register_idx]] + within_expert_indices[register_idx]
+                if cutlass.const_expr(self.apply_topk_at_fc1):
+                    sorted_elements[destination] = _SortedElement(flat_topk_index, score_registers[register_idx]).pack()
+                else:
+                    sorted_elements[destination] = _SortedElement(flat_topk_index, None).pack()
 
     @cute.jit
     def _router_value_coordinate(self, register_idx: int, topk_index_type: type) -> Tuple[Int32, Int32]:
@@ -956,7 +966,11 @@ class _MetadataPushRouter(KernelComponent):
         for dump_round in cutlass.range(dump_round_count, unroll=4):
             position = Int32(dump_round * block_thread_count) + self._router_thread_idx
             predicate = Int32(position < total_valid_routes)
-            element = _SortedElement.from_packed(sorted_elements[position])
+            # A partial final dump round still executes predicated stores
+            # in every lane. Inactive lanes must read an initialized slot;
+            # the nonempty valid prefix guarantees slot zero exists.
+            read_position = predicate * position
+            element = _SortedElement.from_packed(sorted_elements[read_position])
             metadata = TokenSrcMetadata(
                 src_rank=Int32(self._router_local_rank),
                 src_token=(element.flat_topk_index // Int32(self.topk)),
