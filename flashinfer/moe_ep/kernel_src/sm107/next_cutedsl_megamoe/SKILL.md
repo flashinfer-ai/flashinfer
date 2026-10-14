@@ -27,7 +27,9 @@ kernel_src/sm107/next_cutedsl_megamoe/
 └── TUNING.md               ← tuning and benchmark conventions
 ```
 
-**Keep `src/` byte-for-byte equal to the pinned upstream export.**
+**Keep `src/` byte-for-byte equal to the pinned upstream export, except for the
+explicit local patches inventoried in `VENDOR.md`.**
+Reapply and requalify those patches after an export until upstream absorbs them.
 Record the exporter revision, selected kernels and generated transformations in
 `VENDOR.md`. Fix device/exporter code upstream and re-export; put FlashInfer
 adaptation in `shim/` and the backend wrappers.
@@ -84,8 +86,9 @@ sha256sum next/export_src.py
 ```
 
 The current selection includes the generic and GenPhase inference kernels.
-Select GenPhase with `kernel_variant="genphase"` and preserve its fixed cluster
-and bulk-store requirements when adapting the launcher. Select additional
+Select GenPhase with `kernel_variant="genphase"` and preserve its admitted
+cluster/tile combinations and bulk-store requirements documented in `VENDOR.md`
+when adapting the launcher. Select additional
 kernels when their FlashInfer integration is included in the update.
 The export may include dependencies from other kernel families; record their
 source mappings rather than manually removing them.
@@ -132,8 +135,10 @@ layouts, ownership and reset semantics can change while names remain stable.
 
 Preserve the integration's correctness fixes when adapting: physical K-major
 weight concatenation, bounded preprocessing temporaries, padded physical router
-capacity, per-launch masked-slot clearing/output resets, routing validation,
-and normalization and scalar-override semantics. Recheck warmed graph bindings
+capacity, per-launch masked-slot handling/output resets, routing validation,
+and normalization and scalar-override semantics. Separate BF16 reduction masks
+invalid slots; quantized combine and in-kernel reduction still require their
+respective clears. Recheck warmed graph bindings
 across different weights/streams and safe workspace teardown if those contracts
 change.
 

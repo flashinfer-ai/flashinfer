@@ -1,6 +1,7 @@
 # Vendoring record: next_cutedsl_megamoe
 
-This directory contains one upstream kernel snapshot.
+This directory contains one pinned upstream kernel snapshot plus the explicit
+local patches recorded below.
 [SKILL.md](SKILL.md) describes updates; [TUNING.md](TUNING.md) covers measurements.
 
 ## Upstream
@@ -20,7 +21,7 @@ This directory contains one upstream kernel snapshot.
   Their dependency closure is exported to `src/sources/`: 32 implementation
   modules and nine generated package initializers, 41 files total.
 - **Verification**: two independent exports at the pinned commit produced
-  identical file lists and bytes. The local comment edit is listed below.
+  identical file lists and bytes before local patches. The exceptions are listed below.
   The exporter validates internal import closure and rejects
   unresolved imports and dependencies outside its external-module allowlist.
 
@@ -37,7 +38,8 @@ export manifest/log and file hashes with the integration evidence.
 
 ## Policy
 
-- `src/` is a **verbatim copy of the pinned upstream export output**. Do not
+- `src/` starts from a **verbatim copy of the pinned upstream export output**;
+  the explicit local exceptions below must be reapplied and qualified. Do not
   hand-edit, format or inject files into it. Compare it with a regenerated
   export, rather than expecting every generated file to match a raw upstream path.
 - All FlashInfer adaptation lives in `shim/`, re-exported through `__init__.py`;
@@ -58,8 +60,12 @@ Shared helpers, schedulers, communication and workspace code come from the
 same pinned snapshot.
 
 `RubinInferenceGenphaseMegaMoE` (`BlockScaledSwapAbGenphaseMoeKernel`) is selected
-with `kernel_variant="genphase"`. It requires uniform `(4, 1)` clusters,
-`fc2_use_bulk=True`, and at most 1024 tokens per rank. Combine remains BF16.
+with `kernel_variant="genphase"`. It requires `fc2_use_bulk=True`, at most
+1024 tokens per rank, and uniform clusters (no mixed-CGA fallback). The
+inherited tile-N 128/256 configurations use `(4, 1)` clusters. The local
+`(256, 64, 128)` decode tile additionally admits MXFP8 E4M3 with `(2, 1)` or
+`(4, 1)` clusters, and MXFP4 weights/MXFP8 E4M3 activations with `(4, 1)`
+clusters. Other N64 combinations remain rejected. Combine remains BF16.
 Tile K is 256 for NVFP4 activations and 128 for MXFP8 activations.
 SiTU requires both beta parameters, matching the exported kernel.
 
@@ -106,11 +112,38 @@ transformations, not manual FlashInfer patches.
 
 ## Local differences
 
-The comment above `pusher_cta_count` in
-`src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py`
-describes the residency requirement without device-specific counts. Kernel
-logic and configuration values are unchanged. All other exported files match
-the pinned upstream export.
+The existing comment above `pusher_cta_count` in the GenPhase kernel describes
+residency without device-specific counts. In addition, FlashInfer PR
+[#6447](https://github.com/flashinfer-ai/flashinfer/pull/6447) carries the following
+local device patches. They are not part of upstream `1667b47a` and must not be
+silently dropped by a fresh export. Paths below are relative to `src/sources/`.
+
+| File | Local exception |
+| --- | --- |
+| `helpers/ptx_helpers.py` | Counted, unaligned CTA barrier helper for the actual participating warps. |
+| `kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py` | Use that barrier for the Generic MMA/accumulator TMEM allocation rendezvous. |
+| `kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py` | N64 SFB/TMEM parity, valid-row TMA-gather extent and transaction accounting, and two gather warps for CGA4. |
+| `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py` | Pass routing IDs to separate BF16 reduction and advertise masked-slot handling to the shim. |
+| `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py` | Propagate masked reduction and admitted N64 geometry; support a one-row allocation in the gather descriptor. |
+| `kernel_src/rubin/inference/mega/token_comm_gen_specialized.py` | Bound route metadata by the live extent, skip invalid histogram/scatter work, and reuse the existing expert prefix for scale-factor offsets. |
+| `kernel_src/rubin/inference/mega/topk_reduce.py` | Predicate BF16 combine loads by routing validity, yielding exact zero for rows with no valid routes. |
+
+The Generic router `communication/nvlink_domain/token_comm.py` remains the
+pinned implementation. A proposed invalid-route histogram/scatter shortcut was
+withdrawn after an EP4 captured-graph sparse-to-dense regression; it is not an
+exception to carry forward. The regression is retained in
+`tests/moe_ep/test_sm107_routing_graph_multirank.py`: every capacity row is checked
+after dense, empty, tail-only, sparse-hole, asymmetric-rank, and dense-restoration
+states, on both the first and repeated replays, with early/late routing weights.
+
+FlashInfer-owned `shim/block_scaled.py` admits the geometries listed above and
+omits BF16 masked-slot preclear only when the kernel advertises masked reduction.
+Quantized combine and in-kernel reduction retain their existing clearing rules.
+This shim change is outside the exported payload. The local patch inventory
+above is separate from the historical upstream qualification evidence; run the
+registered strict single/multirank suites when updating or rebasing these patches.
+All remaining exported implementation files retain the pinned export, apart
+from the previously documented comment.
 
 ## Related trees
 
