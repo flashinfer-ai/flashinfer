@@ -387,6 +387,15 @@ class Sm107BlockScaledMoeConfig:
                 raise ValueError(
                     "GenPhase requires tile N 128 or 256, or an admitted N64 decode geometry."
                 )
+            if n64_decode and self.world_size > 1 and mode == "phase_interleave":
+                # EP1 phase-interleave coverage does not establish multirank
+                # liveness: an EP2 dense/replay case stalls with this geometry.
+                # Reject before allocation or compilation; autotune applies
+                # this same config validation through is_valid_sm107.
+                raise ValueError(
+                    "GenPhase N64 with world_size > 1 requires grouped scheduling; "
+                    "multirank phase_interleave is not qualified."
+                )
             if tiler[2] != 2 * instruction_k:
                 raise ValueError(
                     f"GenPhase {self.quant_kind} requires tile K {2 * instruction_k} "

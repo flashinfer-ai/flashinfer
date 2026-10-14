@@ -111,6 +111,47 @@ def test_genphase_tuner_exposes_only_admitted_n64_candidates(kind):
     assert {candidate["mma_tiler_mnk"][1] for candidate in candidates} >= {128, 256}
 
 
+@pytest.mark.parametrize("world", [1, 2, 4, 8])
+@pytest.mark.parametrize(
+    "kind, cluster",
+    [("mxfp8_e4m3", (2, 1)), ("mxfp8_e4m3", (4, 1)), ("mxfp4_mxfp8", (4, 1))],
+)
+def test_genphase_n64_multirank_schedule_admission(world, kind, cluster):
+    cfg = _config(
+        world_size=world,
+        quant_kind=kind,
+        mma_tiler_mnk=(256, 64, 128),
+        cluster_shape_mn=cluster,
+        fc2_tma_stages=1,
+        epi_flag_batches=(1, 4),
+        work_id_mode="atomic_counter",
+    )
+    assert pkg.is_valid_sm107({"schedule_policy": ("grouped", None)}, cfg)
+    for hint in (None, 1):
+        phase = {"schedule_policy": ("phase_interleave", hint)}
+        if world == 1:
+            assert pkg.is_valid_sm107(phase, cfg)
+            assert (
+                dataclasses.replace(cfg, **phase).schedule_policy
+                == phase["schedule_policy"]
+            )
+        else:
+            assert not pkg.is_valid_sm107(phase, cfg)
+            with pytest.raises(ValueError, match="N64 .* requires grouped scheduling"):
+                dataclasses.replace(cfg, **phase)
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+def test_genphase_n128_multirank_phase_admission_is_unchanged(world):
+    cfg = _config(world_size=world, quant_kind="mxfp8_e4m3")
+    phase = {
+        "schedule_policy": ("phase_interleave", None),
+        "work_id_mode": "atomic_counter",
+    }
+    assert pkg.is_valid_sm107(phase, cfg)
+    assert dataclasses.replace(cfg, **phase).resolved_mma_tiler_mnk[1] == 128
+
+
 _MODES = [
     ("inference", "bf16"),
     ("genphase", "bf16"),

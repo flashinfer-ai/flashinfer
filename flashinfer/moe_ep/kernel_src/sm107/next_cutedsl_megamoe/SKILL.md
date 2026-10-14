@@ -189,6 +189,14 @@ source/environment identity. Existing benchmark numerical and configuration
 checks validate measured points. Reuse existing results when the implementation,
 environment, and workload are unchanged. Check links and commands for documentation edits.
 
+Qualify scheduling modes independently at each admitted EP degree. EP1 and EP4
+passes do not establish EP2 liveness: N64 phase-interleave has stalled in an EP2
+dense/replay check. Keep multirank N64 grouped-only until that mode has its own
+qualified repair. Check both direct config construction and `is_valid_sm107`
+with `test_genphase_n64_multirank_schedule_admission`; native grouped route
+transitions must continue to pass at EP2 and EP4. A timeout is a failed gate,
+not a configuration to include in a performance baseline.
+
 ### 7. Update the record and review the diff
 
 Update `VENDOR.md` with the full upstream SHA, date, closure, any export/local
