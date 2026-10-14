@@ -2226,13 +2226,25 @@ def plan_dense_projection_gemm(
 # Knob variants the registry fallback tries, nearest first (see ``plan_dense_projection_gemm``): the tall tile,
 # the register epilogue (the canonical-T templates), then BLOCK_N = 128.  The TMA L2 promotion and the raster group
 # width are launch parameters since round 11: they select no program and are not variants.
-_FALLBACK_KNOB_VARIANTS = (
+# Round 33: a row planned at a T outside the export contract takes the architecture default ``pro`` form (7), but
+# the generated pair programs of a row may carry only the row's adopted form (15 = + the CTA-local exit) or the
+# pinned round-27 form (0).  ``pro`` changes the pair prologue / cleanup sync only - never the GEMM, the tile walk or
+# the store path - so a ``pro`` twin is the nearest registered program: the two other forms of the plan's own tile
+# walk come first, then every tile variant in the three forms.  A single-CTA row refuses pro (instance_key raises
+# ValueError), which the fallback loop skips like any other knob the row cannot take.
+_FALLBACK_PRO_FORMS = (dict(pro=15), dict(pro=0))
+_FALLBACK_TILE_VARIANTS = (
     dict(cta_rows=256),
     dict(epi="reg"),
     dict(epi="reg", f32_v8=True),
     dict(epi="reg", cta_rows=256),
     dict(block_n=128),
     dict(block_n=128, epi="reg"),
+)
+_FALLBACK_KNOB_VARIANTS = _FALLBACK_PRO_FORMS + tuple(
+    dict(tile, **pro)
+    for tile in _FALLBACK_TILE_VARIANTS
+    for pro in ({}, *_FALLBACK_PRO_FORMS)
 )
 
 
