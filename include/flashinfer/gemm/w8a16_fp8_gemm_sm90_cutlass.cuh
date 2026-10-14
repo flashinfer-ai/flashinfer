@@ -43,6 +43,7 @@
 #include <cuda_fp8.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -170,16 +171,20 @@ struct W8A16Sm90CutlassType<half> {
 // kTileA: activation rows per CTA tile (N' = wgmma N), any multiple of 8 up to 256.
 // kTileK: 64 fp8 bytes of weight per row per stage; with the 16-bit activation that is
 //         8 KB + kTileA * 128 B per stage (40 KB for 256 rows: 5 stages in 227 KB).
-template <int kTileW, int kTileA, int kTileK = 64>
+// kCluster: CTAs per cluster along the weight-row dimension.  2 = the two CTAs take
+//         adjacent weight tiles of the same activation tile, which TMA multicasts to both
+//         (the hand kernel's arrangement): halves the activation's L2 -> SMEM traffic.
+template <int kTileW, int kTileA, int kTileK = 64, int kCluster = 1>
 struct W8A16Sm90Cfg {
   static_assert(kTileW == 128 || kTileW == 64, "128 rows = cooperative, 64 rows = ping-pong");
   static_assert(kTileA % 8 == 0 && kTileA <= 256, "wgmma N is a multiple of 8 up to 256");
+  static_assert(kCluster == 1 || kCluster == 2, "cluster of 1 or 2 CTAs");
   static constexpr int kW = kTileW;
   static constexpr int kA = kTileA;
   static constexpr int kK = kTileK;
   static constexpr bool kCooperative = kTileW == 128;
   using TileShape = cute::Shape<cute::Int<kTileW>, cute::Int<kTileA>, cute::Int<kTileK>>;
-  using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+  using ClusterShape = cute::Shape<cute::Int<kCluster>, cute::_1, cute::_1>;
   using MainloopSchedule =
       std::conditional_t<kCooperative, cutlass::gemm::KernelTmaWarpSpecializedCooperative,
                          cutlass::gemm::KernelTmaWarpSpecializedPingpong>;
@@ -193,10 +198,13 @@ using W8A16Sm90Cfg128x192 = W8A16Sm90Cfg<128, 192>;  // wave-fill heights (see P
 using W8A16Sm90Cfg128x160 = W8A16Sm90Cfg<128, 160>;
 using W8A16Sm90Cfg128x128 = W8A16Sm90Cfg<128, 128>;
 using W8A16Sm90Cfg64x256 = W8A16Sm90Cfg<64, 256>;  // ping-pong: 2 tiles in flight per SM
+// W8A16Sm90Cfg<128, 256, 64, 2> (activation multicast pair) was swept on Tue 13 Oct 2026:
+// within +-2% of the cluster-1 tile on all 144 rows, so it is not instantiated.
 
 inline cutlass::gemm::kernel::detail::DecompositionMode W8A16Sm90StreamKModeEnv();
 inline cutlass::gemm::kernel::detail::ReductionMode W8A16Sm90StreamKReductionEnv();
 inline int W8A16Sm90SwizzleEnv();
+inline int W8A16Sm90PickSwizzle(int tiles_w, int tiles_a, int cluster_w, int max_swizzle);
 inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm90RasterEnv();
 
 template <typename T, typename Cfg, bool kStreamK = false>
@@ -273,8 +281,12 @@ struct W8A16Sm90Gemm {
     fusion.dBias = {cute::_1{}, cute::_0{}, 0};
     // Tile walk order of the persistent scheduler (both the plain and the stream-K one):
     // the raster direction and how many tile rows / columns are grouped so that the
-    // operand slab they share stays in L2.  CUTLASS's default is no grouping.
-    args.scheduler.max_swizzle_size = W8A16Sm90SwizzleEnv();
+    // operand slab they share stays in L2.  CUTLASS's default is no grouping; the group
+    // size is capped per problem because the scheduler pads the tile grid to it.
+    const int tiles_w = (N + Cfg::kW - 1) / Cfg::kW;
+    const int tiles_a = (M + Cfg::kA - 1) / Cfg::kA;
+    args.scheduler.max_swizzle_size = W8A16Sm90PickSwizzle(
+        tiles_w, tiles_a, cute::size<0>(typename Cfg::ClusterShape{}), W8A16Sm90SwizzleEnv());
     args.scheduler.raster_order = W8A16Sm90RasterEnv();
     if constexpr (kStreamK) {
       args.scheduler.decomposition_mode = W8A16Sm90StreamKModeEnv();
@@ -375,86 +387,130 @@ inline cutlass::gemm::kernel::detail::ReductionMode W8A16Sm90StreamKReductionEnv
   return mode;
 }
 
-// FLASHINFER_W8A16_FP8_SM90_SWIZZLE = 1 | 2 | 4 | 8 (default): tile-group size of the
-// persistent scheduler's L2 swizzle.  FLASHINFER_W8A16_FP8_SM90_RASTER = "heuristic"
-// (default) | "m" | "n": raster direction (M = along the weight tiles, N = along the
-// activation tiles).  CUTLASS's own default is no grouping (1), and that is where the
-// CUTLASS mainloop looked 12% slower than the hand kernel: ncu at locked clocks on
-// gen.qkv tp1 M=8192 (N=10240 K=5120), Tue 13 Oct 2026, 128x256 tile: swizzle 1 =
-// 1.261 ms at 56% of DRAM peak, swizzle 8 = 1.117 ms, the hand kernel 1.121 ms.  The
-// raster direction does not matter once the groups are 8 wide.  For benchmarking; read once.
+// FLASHINFER_W8A16_FP8_SM90_RASTER = "m" (default) | "n" | "heuristic": which tiles
+// consecutive CTAs of the persistent scheduler take.  "m" walks the weight tiles of one
+// activation tile (the activation tile stays in L2, the weight streams), "n" walks the
+// activation tiles of one weight tile.  CUTLASS's heuristic picks "n" whenever there are
+// at least as many weight tiles as activation tiles (N >= M/2), and for this operand
+// layout that is 2x slower once the activation outgrows L2: mlp.gate_up tp1 M=44160 31.1
+// vs 14.9 ms, mlp.down tp1 33.2 vs 14.5, gen.qkv tp1 12.9 vs 5.8 (ncu, locked clocks,
+// Tue 13 Oct 2026); "m" is never worse than the heuristic on the 144-row table.
+//
+// FLASHINFER_W8A16_FP8_SM90_SWIZZLE = 1 (default) | 2 | 4 | 8: upper bound on the
+// scheduler's L2 tile-group size (W8A16Sm90PickSwizzle may lower it).  Version H1 made 8
+// the default because it recovered 12% on gen.qkv tp1 M=8192; that was the heuristic's
+// "n" raster being papered over by the grouping.  With "m" the group buys nothing (1.046
+// vs 1.054 ms on that shape, equal on five others) and it pads the tile grid, so it is
+// off.  Both for benchmarking; read once.
 inline int W8A16Sm90SwizzleEnv() {
   static const int v = [] {
     const char* s = std::getenv("FLASHINFER_W8A16_FP8_SM90_SWIZZLE");
-    const int n = (s != nullptr && *s != '\0') ? std::atoi(s) : 8;
-    return (n == 1 || n == 2 || n == 4 || n == 8) ? n : 8;
+    const int n = (s != nullptr && *s != '\0') ? std::atoi(s) : 1;
+    return (n == 1 || n == 2 || n == 4 || n == 8) ? n : 1;
   }();
   return v;
+}
+
+// The swizzle is not free: CUTLASS's persistent and stream-K schedulers round BOTH tile
+// counts up to a multiple of (swizzle x cluster) and run the padding tiles (TMA zero-fills
+// them, the epilogue drops them; see round_up in tile_scheduler_params.h).  With swizzle 8
+// that is 10 -> 16 weight tiles on N=1280 (ncu, Tue 13 Oct 2026: 1.6x the HGMMA count of the
+// hand kernel, 247 vs 162 us) and 4 -> 8 activation tiles on M=1024.  CUTLASS also shrinks
+// the swizzle on its own when the smaller tile count is under 6 / 3 / 2 (get_log_swizzle_size),
+// so the waste is computed for the size it will actually use.  Largest size whose padding
+// costs at most 0.5% of the tiles, 1 if none does: even 1.7% of padding (M=44160 = 173
+// activation tiles -> 176) cost 3-5% at that size, while the grouping itself is worth 11% on
+// gen.qkv tp1 M=8192 (80 x 32 tiles, no padding) and nothing on the M=44160 shapes.
+inline int W8A16Sm90PickSwizzle(int tiles_w, int tiles_a, int cluster_w, int max_swizzle) {
+  const int min_dim = tiles_w < tiles_a ? tiles_w : tiles_a;
+  const long long real = 1LL * tiles_w * tiles_a;
+  for (int s = max_swizzle; s >= 1; s /= 2) {
+    int e = 1;  // what CUTLASS turns `s` into
+    if (s >= 8 && min_dim >= 6) {
+      e = 8;
+    } else if (s >= 4 && min_dim >= 3) {
+      e = 4;
+    } else if (s >= 2 && min_dim >= 2) {
+      e = 2;
+    }
+    if (s > 1 && e == 1) continue;  // same as 1: decide there
+    const int mw = e * cluster_w;
+    const long long padded = 1LL * ((tiles_w + mw - 1) / mw * mw) * ((tiles_a + e - 1) / e * e);
+    if (padded * 1000 <= real * 1005) return s;
+  }
+  return 1;
 }
 
 inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm90RasterEnv() {
   using R = cutlass::gemm::kernel::detail::RasterOrderOptions;
   static const R v = [] {
     const char* s = std::getenv("FLASHINFER_W8A16_FP8_SM90_RASTER");
-    if (s != nullptr && std::strcmp(s, "m") == 0) return R::AlongM;
     if (s != nullptr && std::strcmp(s, "n") == 0) return R::AlongN;
-    return R::Heuristic;
+    if (s != nullptr && std::strcmp(s, "heuristic") == 0) return R::Heuristic;
+    return R::AlongM;
   }();
   return v;
 }
 
-// Version H2: the dispatcher over the hand kernel and the CUTLASS variants, fitted to the
-// locked-clock sweep of Tue 13 Oct 2026 (H100 SXM s4124-0125, every launch timed by ncu at
-// base clocks with the caches flushed, 24 Cosmos3 shapes x 6 M classes, each variant / the
-// bf16 cuBLAS GEMM measured next to it).  Geomean kernel / cuBLAS per M class:
+// Version H3: the dispatcher over the CUTLASS variants and the hand kernel, fitted to the
+// locked-clock sweep of Tue 13 Oct 2026 (H100 SXM ipp2-0148 / ipp2-0069, every launch timed
+// by ncu at base clocks, 24 Cosmos3 shapes x 6 M classes, each variant / the bf16 cuBLAS
+// GEMM measured next to it) taken AFTER the scheduler's padding tiles were removed (see
+// W8A16Sm90PickSwizzle; version H2 was fitted to padded CUTLASS numbers).  Geomean kernel /
+// cuBLAS per M class:
 //
-//   M       hand   this rule   per-row oracle
-//   1024    1.34   1.19        1.18
-//   2048    1.20   1.12        1.10
-//   4096    1.09   1.08        1.06
-//   8192    1.05   1.05        1.03
-//   44160   1.03   1.03        1.00
-//   88320   0.99   0.99        0.94
+//   M       hand   CUTLASS 128x256   this rule (measured)   per-row oracle
+//   1024    1.32   1.65              1.19                   1.16
+//   2048    1.20   1.33              1.10                   1.08
+//   4096    1.09   1.15              1.06                   1.04
+//   8192    1.04   1.06              1.02                   1.01
+//   44160   1.03   1.04              1.01                   1.01
+//   88320   1.03   1.02              1.01                   1.00
 //
-// What the data says, in terms of the 128x256 CTA tile's wave count (units = weight tiles
-// x activation tiles, 132 SMs):
-//   * full waves (> 3): the hand kernel is at cuBLAS; the CUTLASS 128x256 mainloop with
-//     L2 swizzle 8 is 0-10% behind it across the table (equal on the one shape profiled
-//     under ncu --set full), so the hand kernel keeps those rows.  Exception: M <= 2048
-//     with a wide N (mlp.gate_up / gen.qkv at TP 1-2), where stream-K balances the tail
-//     and wins 2-7%.
-//   * a partial first wave (<= 1.5): with a long K (>= 4096) and N >= 5120, stream-K cuts
-//     the tiles along K and wins 25-30% over the hand kernel's split-K (attn.out, mlp.down,
-//     gen.qkv tp2 at M=1024); with a short K or a modest N the 64x256 ping-pong tile
-//     (two tiles in flight per SM, 2x the CTAs of 128x256) wins 10-25%; N below 1024 is
-//     the hand kernel's split-K territory on every row (CUTLASS's stream-K / split-K has a
-//     ~40 us floor on those).
-//   * 1.5-3 waves: ping-pong for N >= 5120 (and N >= 2560 at M >= 4096), stream-K for
-//     K >= 12800 or N >= 8192, otherwise the hand kernel.
-// Worst row of the rule against the hand kernel: gen.qkv tp8 M=2048 (+7%).  128x192 /
-// 128x160 / 128x128 never win a row that matters (the register-sourced mainloop converts
-// the weight once per activation tile, so narrower tiles convert more per flop); they stay
-// `algo`-only.
+// Without the padding, the CUTLASS 128x256 mainloop and the hand kernel are the same
+// kernel to within 2% on every row with N > 512 (same tensor-pipe utilisation, same stall
+// mix under ncu); a cluster of 2 with the activation tile multicast changes nothing (+-2%).
+// What remains is wave quantisation of the 128x256 tile (units = weight tiles x activation
+// tiles over 132 SMs), so the rule reads the wave count and how full the last wave is:
+//   * one partial wave (<= 1.5): a long K (>= 4096) with at least 0.7 of a wave -> stream-K
+//     splits the tiles along K (attn.out / mlp.down / gen.qkv at M=1024-2048: 25-30% over
+//     the hand kernel's split-K); otherwise the 64x256 ping-pong tile, which puts 2x the
+//     CTAs on the machine (10-25%).
+//   * more than 1.5 waves: a last wave that is >= 0.8 full costs nothing -> 128x256; a
+//     sliver of a last wave (< 0.15, e.g. mlp.gate_up tp4 at M=4096: 6.06 waves) -> stream-K
+//     (2-10%); in between, ping-pong up to 3 waves (gen.qkv tp8 at M=8192: 2.42 waves,
+//     12%), 128x256 beyond.
+//   * N <= 512 (und.kv at TP 2-8): the hand kernel's split-K up to M=4096 (CUTLASS's
+//     stream-K has a ~40 us floor there), the 128x128 tile for under a wave, 128x256 above.
+// Worst row of the rule against the per-row oracle: und.kv tp4 M=4096 (+12%, 27 us).
+// The hand kernel is left with 8 of the 144 rows.  128x192 / 128x160 never win a row (the
+// register-sourced mainloop converts the weight once per activation tile, so narrower
+// tiles convert more per flop); they stay `algo`-only.
 inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int algo = 0) {
   const W8A16Sm90Algo forced = W8A16Sm90AlgoFromCode(algo);
   if (forced != W8A16Sm90Algo::kAuto) return forced;
   const W8A16Sm90Algo env = W8A16Sm90AlgoEnv();
   if (env != W8A16Sm90Algo::kAuto) return env;
-  if (N <= 1024 || K % 16 != 0 || N % 8 != 0) return W8A16Sm90Algo::kHand;
-  const double units = static_cast<double>((N + 127) / 128) * ((M + 255) / 256);
-  const double waves = units / std::max(num_sms, 1);
+  if (K % 16 != 0 || N % 8 != 0) return W8A16Sm90Algo::kHand;  // CUTLASS alignment
+  const long long units = 1LL * ((N + 127) / 128) * ((M + 255) / 256);
+  const double waves = static_cast<double>(units) / std::max(num_sms, 1);
+  const double frac = waves - std::floor(waves);
+  if (N <= 512) {
+    if (units <= 32 && M <= 4096) return W8A16Sm90Algo::kHand;
+    if (waves < 0.75) return W8A16Sm90Algo::kCutlass128x128;
+    return W8A16Sm90Algo::kCutlass128x256;
+  }
   if (waves <= 1.5) {
-    if (K >= 4096 && N >= 5120) return W8A16Sm90Algo::kCutlass128x256StreamK;
-    if ((K <= 3200 || N <= 2048) && !(N <= 1024 && M >= 4096)) return W8A16Sm90Algo::kCutlass64x256;
-    return W8A16Sm90Algo::kHand;
+    if (K >= 4096 && waves >= 0.7) return W8A16Sm90Algo::kCutlass128x256StreamK;
+    if (N <= 2048 || K <= 3200) return W8A16Sm90Algo::kCutlass64x256;
+    return W8A16Sm90Algo::kCutlass128x256;
   }
-  if (waves <= 3.0) {
-    if (K >= 12800 || N >= 8192) return W8A16Sm90Algo::kCutlass128x256StreamK;
-    if (N >= 5120 || (N >= 2560 && M >= 4096)) return W8A16Sm90Algo::kCutlass64x256;
-    return W8A16Sm90Algo::kHand;
-  }
-  if (M <= 2048 && K >= 4096) return W8A16Sm90Algo::kCutlass128x256StreamK;
-  return W8A16Sm90Algo::kHand;
+  if (frac >= 0.8) return W8A16Sm90Algo::kCutlass128x256;
+  // A sliver of a last wave is worth spreading along K only while it is a visible share
+  // of the run (0.1 of 262 waves is not; stream-K's fix-up traffic is).
+  if (frac < 0.15 && K >= 2048 && waves <= 16.0) return W8A16Sm90Algo::kCutlass128x256StreamK;
+  if (waves <= 3.0) return W8A16Sm90Algo::kCutlass64x256;
+  return W8A16Sm90Algo::kCutlass128x256;
 }
 
 // Workspace bytes of a CUTLASS variant (0 for the hand kernel: its own function sizes

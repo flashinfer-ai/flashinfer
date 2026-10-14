@@ -126,7 +126,7 @@ benchmark (plus TP 1, so 144 rows); a separate JIT module picked by compute capa
 (`gen_w8a16_fp8_gemm_sm100_module`), the Hopper module is untouched.  No prepared weight
 layout on Blackwell.
 
-## Hopper, CUTLASS line (versions H1 / H2, Tue 13 Oct 2026)
+## Hopper, CUTLASS line (versions H1 / H2 / H3, Tue 13 Oct 2026)
 
 `include/flashinfer/gemm/w8a16_fp8_gemm_sm90_cutlass.cuh`: the same op on CUTLASS's sm90
 mixed-input mainloop (`sm90_mma_tma_gmma_rs_warpspecialized_mixed_input`: TMA to smem, each
@@ -217,6 +217,119 @@ Results: `/home/scratch.ishovkun_gpu/w8a16-results/hopper/` (`sweepH1b_*`, `swee
 free-running per-variant; `sweepH1d_{rows,ncu}_*` the locked-clock sweep; `ncuH1_*`
 `--set full` reports of the hand kernel and the 256 / 192 / 160 / 128 tiles, and the nine
 swizzle / raster settings).
+
+**Read the H1 / H2 CUTLASS numbers above with the next section in mind: every CUTLASS
+column was taken with the scheduler computing padding tiles on the shapes whose tile counts
+are not multiples of 8 (N = 1280, 2560, 3200, 6400 and M = 44160 / 88320), which is where
+the "0-10% full-wave gap" came from.**
+
+### Version H3: why CUTLASS looked slower, and the dispatcher refitted (Tue 13 Oct 2026)
+
+The question was why the CUTLASS mainloop trailed the hand kernel at all when the one
+`--set full` profile said the two were equal.  `ncu --set full --import-source yes` on the
+shape with the widest gap, gen.qkv tp8 M=8192 (N=1280, K=5120): the CUTLASS kernel ran
+247 us to the hand kernel's 162 with the tensor pipe *busier* (89.6% vs 72.7%), and the
+opcode counts said why: 1,310,720 HGMMA to the hand kernel's 819,200, 1.6x, with the same
+factor on L2 sectors, smem wavefronts and instructions.  It was not running the same work
+slower; it was doing 60% more work.  `tile_scheduler_params.h` rounds *both* tile counts
+up to a multiple of `swizzle x cluster` (`problem_blocks_m = round_up(.., (1 << log_swizzle)
+* cluster_m)`, same in the stream-K scheduler) and the kernel runs the padding tiles: TMA
+zero-fills them, the epilogue drops them.  With the swizzle 8 that H1 made the default,
+N=1280 is 16 weight tiles instead of 10 (+60%), N=3200 is 32 instead of 25 (+28%), N=6400
+is 56 instead of 50 (+12%), N=2560 is 24 instead of 20 (+20%), and M=44160 / 88320 pay 1.7-2%
+on the activation side.  The 12% swizzle-8 win of H1 was measured on gen.qkv tp1 (80 x 32
+tiles): a shape the padding cannot touch.  Forcing swizzle 1 on N=1280 gives 159.5 us,
+i.e. the hand kernel's time with fewer instructions.
+
+Fix, first half: `W8A16Sm90PickSwizzle` caps `max_swizzle_size` per problem at the largest
+group whose padding is at most 0.5% of the tiles (CUTLASS's own shrink rule for small tile
+counts is replicated so the waste is computed for the size it will actually use), else 1;
+0.5% because 1.7% of padding at M=44160 cost 3-5% (attn.out tp1: 4.60 vs 4.82 ms).  The
+env variable is now the cap, not the value.
+
+Fix, second half, found when the dispatcher's first `auto` sweep ran mlp.gate_up tp1 at
+M=44160 in 31 ms instead of 15: the swizzle was never the real knob.  CUTLASS's raster
+heuristic takes "along N" (consecutive CTAs walk the activation tiles of one weight tile)
+whenever there are at least as many weight tiles as activation tiles, N >= M/2 here, and
+for this operand layout that streams the 16-bit activation instead of the fp8 weight:
+2x slower once the activation outgrows L2 (mlp.gate_up tp1 31.1 vs 14.9 ms, mlp.down tp1
+33.2 vs 14.5, gen.qkv tp1 12.9 vs 5.8 at M=44160; gen.qkv tp1 M=8192 1.155 vs 1.046 ms).
+The H1 "swizzle 8 recovers 12%" was the grouping papering over that raster on a shape the
+padding could not touch.  With the raster forced along the weight tiles the group buys
+nothing (gen.qkv tp1 M=8192: 1.046 vs 1.054 ms; equal on five other shapes), so the
+defaults are now raster `m` and swizzle cap 1 (`FLASHINFER_W8A16_FP8_SM90_RASTER`,
+`FLASHINFER_W8A16_FP8_SM90_SWIZZLE`).
+
+The whole CUTLASS column was re-swept at locked clocks (`sweepH3_*`, H100 ipp2-0148 for
+M <= 8192; its GPU then fell off the bus and ipp2-0069 took M = 44160 / 88320; the hand
+kernel re-measured alongside).  Also swept: `W8A16Sm90Cfg<128, 256, 64, 2>`, a cluster of
+two CTAs sharing the activation tile by TMA multicast, the hand kernel's arrangement.
+Geomean kernel / cuBLAS per M class:
+
+| M | hand (v37) | c128x256 | c128x256 cluster 2 | c128x128 | c64x256 | c128x256 stream-K | best CUTLASS per row | oracle (all) |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 1.32 | 1.65 | 1.66 | 1.56 | 1.29 | 1.40 | 1.24 | 1.17 |
+| 2048 | 1.20 | 1.33 | 1.34 | 1.38 | 1.13 | 1.24 | 1.11 | 1.08 |
+| 4096 | 1.09 | 1.15 | 1.15 | 1.30 | 1.12 | 1.12 | 1.05 | 1.05 |
+| 8192 | 1.04 | 1.06 | 1.06 | 1.25 | 1.16 | 1.07 | 1.01 | 1.01 |
+| 44160 | 1.03 | 1.04 | 1.04 | 1.25 | 1.74 | 1.06 | 1.03 | 1.02 |
+| 88320 | 1.03 | 1.02 | 1.03 | 1.28 | 1.67 | 1.06 | 1.01 | 1.01 |
+
+What changed against the H1 table: with N > 512 the CUTLASS 128x256 tile and the hand
+kernel are the same kernel to within 2% on every row, at every M (M=4096 still shows 1.15
+vs 1.09 only because of the und.kv N <= 512 rows, where the hand kernel's split-K is
+unmatched below M=8192).  The cluster-2 multicast changes nothing (+-2% everywhere, not
+instantiated).  The H1 "hand beats cuBLAS by 15% at M=88320" rows did not reproduce on
+either new node: the H1 sweep's cuBLAS p90 spread at that M was 1.44, so they were the
+first node's thermal state, not a kernel property.  What is left on Hopper is wave
+quantisation of a tile that cannot be made shorter (the register-sourced conversion), and
+the 44160 rows were still measured with 1.7% padding (the cap was tightened to 0.5%
+afterwards; the swizzle-1 probe above says they move to the hand kernel's numbers).
+
+The dispatcher (`W8A16Sm90PickAlgo`) was refitted to read the 128x256 tile's wave count and
+the fill of its last wave: one partial wave -> stream-K when K >= 4096 and the wave is at
+least 0.7 full, else the 64x256 ping-pong tile; more than 1.5 waves -> 128x256 when the last
+wave is >= 0.8 full, stream-K when it is a sliver (< 0.15, K >= 2048, and only up to 16
+waves, beyond which the sliver is not worth stream-K's fix-up traffic), ping-pong in
+between up to 3 waves, 128x256 beyond; N <= 512 -> the hand kernel's
+split-K up to M=4096 (units <= 32), 128x128 under 0.75 of a wave, 128x256 above.  Evaluated
+row by row on the sweep:
+
+| M | hand (v37) / cuBLAS | H2 rule on this data | H3 rule | oracle / cuBLAS |
+|---|---|---|---|---|
+| 1024 | 1.32 | 1.17 | 1.18 | 1.17 |
+| 2048 | 1.20 | 1.11 | 1.09 | 1.08 |
+| 4096 | 1.09 | 1.08 | 1.06 | 1.05 |
+| 8192 | 1.04 | 1.04 | 1.02 | 1.01 |
+| 44160 | 1.03 | 1.03 | 1.04 | 1.02 |
+| 88320 | 1.03 | 1.03 | 1.02 | 1.01 |
+
+Picks over the 144 rows: 128x256 85, stream-K 24, 64x256 24, hand 8, 128x128 3.  Worst
+row against the per-row oracle: und.kv tp4 M=4096 (+12%, a 27 us kernel).  The measured
+`auto` column (dispatcher running, same method, raster `m`, no padding) is in the table
+below; the 44160 rows improve on the variant sweep, which still carried 1.7% of padding.
+
+| M | hand (v37) / cuBLAS | H3 auto / cuBLAS (measured) | oracle / cuBLAS |
+|---|---|---|---|
+| 1024 | 1.32 | 1.19 | 1.16 |
+| 2048 | 1.20 | 1.10 | 1.08 |
+| 4096 | 1.09 | 1.06 | 1.04 |
+| 8192 | 1.04 | 1.02 | 1.01 |
+| 44160 | 1.03 | 1.01 | 1.01 |
+| 88320 | 1.03 | 1.01 | 1.00 |
+
+Against the hand kernel row by row: faster by more than 10% on 29 of the 144 rows (up to
+28% on attn.out tp1 / mlp.down tp4 at M=1024), slower by more than 5% on 4 (worst und.kv
+tp4 M=2048, +10% on a 17 us kernel, where the dispatcher does call the hand kernel; that
+is run-to-run noise at that size).  Where the Hopper line now stands: at cuBLAS from
+M=8192 up, and the remaining 2-19% at smaller M is the wave quantisation of a 128x256 tile
+that the register-sourced conversion keeps from getting shorter.  The hand kernel is called
+for 8 of the 144 rows (N <= 512, M <= 4096); deleting it would cost those rows 5-30%.
+
+Results: `sweepH3_{rows,ncu}_*` (variants and `auto`), `ncuH3_*` (`--set full` with source
+of both kernels on gen.qkv tp8 / mlp.gate_up tp8 / mlp.down tp4 M=88320 / gen.qkv tp1),
+`swz_*` and `swz44_*` (the swizzle / raster probes), all under
+`/home/scratch.ishovkun_gpu/w8a16-results/hopper/`.
 
 ## Why not the Hopper design
 
