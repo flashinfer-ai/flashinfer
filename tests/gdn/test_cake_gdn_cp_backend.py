@@ -600,19 +600,91 @@ def _cu32_arches_only(name: str, arch: str) -> bool:
 
 
 @pytest.mark.parametrize(
-    ("arch", "io_dtype", "heads", "seq_lens", "max_seqlen", "cu_dtype", "expected_t", "host_stages"),
+    (
+        "arch",
+        "io_dtype",
+        "heads",
+        "seq_lens",
+        "max_seqlen",
+        "cu_dtype",
+        "expected_t",
+        "host_stages",
+    ),
     [
         # GB300 fp16 Hk16 alias class: the cu32 rule wins over the alias for int32 ...
-        ("sm_103a", torch.float16, (16, 16, 64), (1536, 257), 1536, torch.int32, "t_precompute_cu32", False),
+        (
+            "sm_103a",
+            torch.float16,
+            (16, 16, 64),
+            (1536, 257),
+            1536,
+            torch.int32,
+            "t_precompute_cu32",
+            False,
+        ),
         # ... and int64 keeps today's alias.
-        ("sm_103a", torch.float16, (16, 16, 64), (1536, 257), 1536, torch.int64, "t_precompute_gb300_hv48_min6", False),
-        ("sm_100a", torch.bfloat16, (2, 2, 16), (512, 512), 512, torch.int32, "t_precompute_bf16_cu32", False),
-        ("sm_100a", torch.bfloat16, (2, 2, 16), (512, 512), 512, torch.int64, "t_precompute_bf16", False),
+        (
+            "sm_103a",
+            torch.float16,
+            (16, 16, 64),
+            (1536, 257),
+            1536,
+            torch.int64,
+            "t_precompute_gb300_hv48_min6",
+            False,
+        ),
+        (
+            "sm_100a",
+            torch.bfloat16,
+            (2, 2, 16),
+            (512, 512),
+            512,
+            torch.int32,
+            "t_precompute_bf16_cu32",
+            False,
+        ),
+        (
+            "sm_100a",
+            torch.bfloat16,
+            (2, 2, 16),
+            (512, 512),
+            512,
+            torch.int64,
+            "t_precompute_bf16",
+            False,
+        ),
         # sm_107a ships no cu32 program: the host keeps the per-launch cast.
-        ("sm_107a", torch.bfloat16, (2, 2, 16), (512, 512), 512, torch.int32, "t_precompute_bf16", True),
+        (
+            "sm_107a",
+            torch.bfloat16,
+            (2, 2, 16),
+            (512, 512),
+            512,
+            torch.int32,
+            "t_precompute_bf16",
+            True,
+        ),
         # Stage 1 does not run for an all-empty batch: the host casts once per launch.
-        ("sm_100a", torch.float16, (1, 1, 1), (0, 0, 0), 0, torch.int32, "t_precompute", True),
-        ("sm_100a", torch.float16, (1, 1, 1), (0, 0, 0), 0, torch.int64, "t_precompute", False),
+        (
+            "sm_100a",
+            torch.float16,
+            (1, 1, 1),
+            (0, 0, 0),
+            0,
+            torch.int32,
+            "t_precompute",
+            True,
+        ),
+        (
+            "sm_100a",
+            torch.float16,
+            (1, 1, 1),
+            (0, 0, 0),
+            0,
+            torch.int64,
+            "t_precompute",
+            False,
+        ),
     ],
 )
 def test_build_plan_selects_cu32_before_the_gb300_alias(
@@ -635,11 +707,18 @@ def test_build_plan_selects_cu32_before_the_gb300_alias(
     monkeypatch.setattr(gdn_cp, "has_gdn_cp_kernel", _cu32_arches_only)
     hq, hk, hv = heads
     total = sum(seq_lens)
-    q = SimpleNamespace(shape=(total, hq, 128), device=SimpleNamespace(), dtype=io_dtype)
+    q = SimpleNamespace(
+        shape=(total, hq, 128), device=SimpleNamespace(), dtype=io_dtype
+    )
     k = SimpleNamespace(shape=(total, hk, 128))
     v = SimpleNamespace(shape=(total, hv, 128))
     plan = gdn_cp._build_plan(
-        q, k, v, num_seqs=len(seq_lens), max_seqlen=max_seqlen, cu_seqlens_dtype=cu_dtype
+        q,
+        k,
+        v,
+        num_seqs=len(seq_lens),
+        max_seqlen=max_seqlen,
+        cu_seqlens_dtype=cu_dtype,
     )
     assert plan.t_kernel == expected_t
     assert plan.cu_seqlens_dtype == cu_dtype
@@ -650,14 +729,22 @@ def test_build_plan_selects_cu32_before_the_gb300_alias(
     assert default.host_stages_cu_seqlens is False
     with pytest.raises(TypeError):
         gdn_cp._build_plan(
-            q, k, v, num_seqs=len(seq_lens), max_seqlen=max_seqlen, cu_seqlens_dtype=torch.float32
+            q,
+            k,
+            v,
+            num_seqs=len(seq_lens),
+            max_seqlen=max_seqlen,
+            cu_seqlens_dtype=torch.float32,
         )
 
 
 def test_has_gdn_cp_kernel_handles_flat_and_per_arch_tables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    modules = {"p100": {"arches": ["sm_100a"]}, "pall": {"arches": ["sm_100a", "sm_103a"]}}
+    modules = {
+        "p100": {"arches": ["sm_100a"]},
+        "pall": {"arches": ["sm_100a", "sm_103a"]},
+    }
     monkeypatch.setattr(gdn_cp_jit, "MODULES", modules)
     monkeypatch.setattr(gdn_cp_jit, "KERNELS", {"a": "p100", "b": "pall"})
     assert gdn_cp_jit.has_gdn_cp_kernel("a", "sm_100a") is True
@@ -665,7 +752,9 @@ def test_has_gdn_cp_kernel_handles_flat_and_per_arch_tables(
     assert gdn_cp_jit.has_gdn_cp_kernel("b", "sm_103a") is True
     assert gdn_cp_jit.has_gdn_cp_kernel("missing", "sm_100a") is False
     monkeypatch.setattr(
-        gdn_cp_jit, "KERNELS", {"sm_100a": {"a": "p100", "b": "pall"}, "sm_103a": {"b": "pall"}}
+        gdn_cp_jit,
+        "KERNELS",
+        {"sm_100a": {"a": "p100", "b": "pall"}, "sm_103a": {"b": "pall"}},
     )
     assert gdn_cp_jit.has_gdn_cp_kernel("a", "sm_100a") is True
     assert gdn_cp_jit.has_gdn_cp_kernel("a", "sm_103a") is False
@@ -677,9 +766,13 @@ def test_has_gdn_cp_kernel_handles_flat_and_per_arch_tables(
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
 @pytest.mark.parametrize("name", ["t_precompute_cu32", "t_precompute_bf16_cu32"])
-def test_cu32_stage1_registry_arg_plan_matches_the_host_call(arch: str, name: str) -> None:
+def test_cu32_stage1_registry_arg_plan_matches_the_host_call(
+    arch: str, name: str
+) -> None:
     if not gdn_cp_jit.has_gdn_cp_kernel(name, arch):
-        pytest.skip(f"{name} for {arch} is integrated into the registry by the Cake export")
+        pytest.skip(
+            f"{name} for {arch} is integrated into the registry by the Cake export"
+        )
     record = gdn_cp_jit.MODULES[gdn_cp_jit.program_for(name, arch)]
     assert [list(entry) for entry in record["arg_plan"]] == [
         ["tma_buffer", "K"],
@@ -2139,7 +2232,6 @@ def test_frozen_graph_matches_reference_and_preserves_inputs(
     assert (prepared.cu_seqlens is cu_seqlens) == (cu_dtype == torch.int64)
 
 
-
 def _cuda_kernel_names(profile: torch.profiler.profile) -> list[str]:
     return [
         event.name
@@ -2176,7 +2268,15 @@ def test_direct_composite_launches_only_the_four_stages_for_both_prefix_dtypes(
     for cu_dtype in (torch.int32, torch.int64):
         cu_seqlens = prefix.to(cu_dtype)
         prepared = gdn_cp.prepare_gdn_cp_prefill(
-            q, k, v, alpha, beta, cu_seqlens, state, max_seqlen=512, _capture_graph=False
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            cu_seqlens,
+            state,
+            max_seqlen=512,
+            _capture_graph=False,
         )
         torch.cuda.synchronize()
         with torch.profiler.profile(
@@ -2192,7 +2292,10 @@ def test_direct_composite_launches_only_the_four_stages_for_both_prefix_dtypes(
             assert prepared.plan.t_kernel == f"{expected_t}_cu32"
             assert prepared.plan.host_stages_cu_seqlens is False
         else:
-            assert prepared.plan.t_kernel in (expected_t, "t_precompute_gb300_hv48_min6")
+            assert prepared.plan.t_kernel in (
+                expected_t,
+                "t_precompute_gb300_hv48_min6",
+            )
             assert prepared.cu_seqlens is cu_seqlens
         assert torch.equal(prepared.cu_seqlens, prefix)
         assert torch.equal(cu_seqlens, prefix.to(cu_dtype))

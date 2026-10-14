@@ -628,7 +628,9 @@ def cake_gdn_prefill_geometries(
             or any(specializations[key] != value for key, value in fixed.items())
         ):
             continue
-        geometries.add(tuple(int(specializations[key]) for key in geometry_keys))
+        geometries.add(
+            tuple(int(specializations[key]) for key in geometry_keys)  # type: ignore[arg-type]
+        )
     return frozenset(geometries)
 
 
