@@ -518,10 +518,12 @@ jobs:
           TOOL_DIR="$RUNNER_TEMP/watcher-ci-tool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           mkdir -p "$TOOL_DIR"
           cp .ci-evidence-trusted/scripts/pr_checks/ci_execution_manifest.py "$TOOL_DIR/writer.py"
+          cp .ci-evidence-trusted/scripts/pr_checks/ci_execution_hardware.py "$TOOL_DIR/hardware.py"
           python3 -I "$TOOL_DIR/writer.py" initialize \
             --workspace "$GITHUB_WORKSPACE" \
             --plan "$RUNNER_TEMP/watcher-ci-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/plan.json" \
             --lane "$WATCHER_LANE_JSON" \
+            --hardware-context "$TOOL_DIR/context.json" \
             --output "$RUNNER_TEMP/watcher-ci-result-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
       - name: Show Node Info
@@ -544,7 +546,8 @@ jobs:
               python3 -I "$RUNNER_TEMP/watcher-ci-tool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/writer.py" run \
                 --workspace "$GITHUB_WORKSPACE" \
                 --output "$RUNNER_TEMP/watcher-ci-result-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -- \
-                bash ci/bash.sh "${DOCKER_IMAGE}" -e SOURCE_GIT_SHA "$WATCHER_CHECKOUT_SHA" "$@"
+                bash ci/bash.sh "${DOCKER_IMAGE}" -e SOURCE_GIT_SHA "$WATCHER_CHECKOUT_SHA" \
+                  -v "$RUNNER_TEMP/watcher-ci-tool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" /watcher-ci-evidence:ro "$@"
             else
               bash ci/bash.sh "${DOCKER_IMAGE}" "$@"
             fi
@@ -554,13 +557,18 @@ jobs:
             exit 1
           fi
           mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
+          TEST_COMMAND=("./scripts/${TEST_SCRIPT}")
+          if [ -n "$WATCHER_REQUEST_KEY" ]; then
+            TEST_COMMAND=(python3 -I -S /watcher-ci-evidence/hardware.py run --kind cpu \
+              --context /watcher-ci-evidence/context.json -- "${TEST_COMMAND[@]}")
+          fi
           run_test \
             -e SCCACHE_BUCKET "${SCCACHE_BUCKET}" \
             -e SCCACHE_REGION "${SCCACHE_REGION}" \
             -e AWS_ACCESS_KEY_ID \
             -e AWS_SECRET_ACCESS_KEY \
             -e SCCACHE_STATS_DIR /workspace/sccache-stats \
-            --no-gpu "./scripts/${TEST_SCRIPT}"
+            --no-gpu "${TEST_COMMAND[@]}"
 
       - name: Display sccache stats
         if: always() && matrix.kind == 'aot'
@@ -602,7 +610,8 @@ jobs:
               python3 -I "$RUNNER_TEMP/watcher-ci-tool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/writer.py" run \
                 --workspace "$GITHUB_WORKSPACE" \
                 --output "$RUNNER_TEMP/watcher-ci-result-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -- \
-                bash ci/bash.sh "${DOCKER_IMAGE}" -e SOURCE_GIT_SHA "$WATCHER_CHECKOUT_SHA" "$@"
+                bash ci/bash.sh "${DOCKER_IMAGE}" -e SOURCE_GIT_SHA "$WATCHER_CHECKOUT_SHA" \
+                  -v "$RUNNER_TEMP/watcher-ci-tool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" /watcher-ci-evidence:ro "$@"
             else
               bash ci/bash.sh "${DOCKER_IMAGE}" "$@"
             fi
@@ -614,6 +623,7 @@ jobs:
               exit 1
               ;;
           esac
+          TEST_COMMAND=("./scripts/${TEST_SCRIPT}")
           if [ -n "${TEST_PATH_ARG:-}" ]; then
             # Read into an array and expand quoted, rather than relying on word
             # splitting: this keeps the shell safe on its own terms instead of
@@ -626,10 +636,13 @@ jobs:
             # to unit_test_runner.py, whose parser takes the scope as an option (or the
             # TEST_PATH env var, which ci/bash.sh does not forward into the container).
             # Bare paths fail argument-preflight with "unrecognized arguments".
-            run_test "./scripts/${TEST_SCRIPT}" --test-path "${TEST_TARGETS[@]}"
-          else
-            run_test "./scripts/${TEST_SCRIPT}"
+            TEST_COMMAND+=(--test-path "${TEST_TARGETS[@]}")
           fi
+          if [ -n "$WATCHER_REQUEST_KEY" ]; then
+            TEST_COMMAND=(python3 -I -S /watcher-ci-evidence/hardware.py run --kind gpu \
+              --context /watcher-ci-evidence/context.json -- "${TEST_COMMAND[@]}")
+          fi
+          run_test "${TEST_COMMAND[@]}"
 
       - name: Make JUnit XML readable
         if: ${{ always() && (inputs.watcher_request_key != '' || matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}

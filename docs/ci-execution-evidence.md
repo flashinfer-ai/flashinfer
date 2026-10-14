@@ -54,6 +54,34 @@ the evidence. Hardware and ranks are `not_recorded` unless actual observations
 are available; runner labels, CUDA image labels and job configuration are never
 converted to observed GPU usage or rank participation.
 
+## Actual container inventory
+
+Watcher lanes also mount a trusted stdlib inventory helper read-only and run it
+inside the same container immediately before the unchanged lane script. Its
+separate probe process has a 20-second deadline and 64 KiB output limit; it reads
+the actual container checkout and uses CUDA driver enumeration for GPU name and
+compute capability. CPU lanes record the actual platform architecture. Failures
+emit an explicit unavailable reason and do not replace the original test exit.
+
+The helper emits one context-bound pre-test frame, including a fresh nonce and
+its trusted source digest. The host writer accepts only that first frame and
+keeps the observation outside the PR-mounted workspace. Later test stdout is
+opaque and cannot replace the accepted inventory. The retained artifact has kind
+`hardware-observation`, schema version 1, kind field
+`watcher-ci-hardware-observation`, and `{context, capturedAt, hardware}`. Context
+pins all plan/request/checkout/run/attempt/lane identity, `planRunAttempt`,
+`captureNonce`, and `probeSha256`. `result.hardwareContext` retains the expected
+binding; the original JSON receives a normal path/hash/size descriptor.
+
+`hardware` includes `status`, `source`, `devices`, `gpuCount`, `cpuArchitecture`,
+`gpuUseProven: false`, and `rankParticipation: not_recorded`. Observed GPU entries
+have `ordinal`, `name`, `computeCapability`, and normalized `hardwareTarget`.
+GPU source is `container-cuda-driver` with `enumeration: cuda-visible`; CPU source
+is `container-platform`. Missing/failed inventory is an explicit coverage gap.
+Inventory describes visible devices before the lane, not devices used by kernels
+or participating distributed ranks. Existing same-runner source trust boundaries
+still apply; this is not isolation from arbitrary host-level PR scripts.
+
 The consumer must independently verify the provider run/attempt/workflow/actor,
 all planned job names and actual job states, merge ancestry, artifact identities,
 and complete execution results against the requested scope. Zero executed cases,
@@ -81,6 +109,6 @@ exit-code preservation, missing/linked/oversized artifacts and attempt identity.
 They do not call GitHub, allocate runners/GPUs or execute contributor tests:
 
 ```bash
-python3 -m unittest discover -s tests/ci -p 'test_ci_execution_manifest.py'
+python3 -m unittest discover -s tests/ci -p 'test_ci_execution*.py'
 python3 -m unittest discover -s tests/ci -p 'test_ci_request*.py'
 ```

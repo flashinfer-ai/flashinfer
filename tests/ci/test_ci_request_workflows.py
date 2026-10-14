@@ -153,6 +153,10 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn('writer.py" run', step["run"])
                 self.assertIn('-e SOURCE_GIT_SHA "$WATCHER_CHECKOUT_SHA"', step["run"])
                 self.assertNotIn("continue-on-error", step)
+                self.assertIn("/watcher-ci-evidence:ro", step["run"])
+                self.assertIn(
+                    "/watcher-ci-evidence/hardware.py run --kind", step["run"]
+                )
 
     def test_dispatch_does_not_also_trigger_a_label_run(self):
         job = self.commands["jobs"]["handle-command"]

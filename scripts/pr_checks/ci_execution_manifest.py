@@ -9,6 +9,7 @@ provider job state. A started lane entrypoint is not proof that pytest ran.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -303,7 +304,7 @@ def checked_plan(path, environment, event, workspace):
     return plan
 
 
-def initialize(plan, lane, workspace, output, run_attempt=None):
+def initialize(plan, lane, workspace, output, run_attempt=None, hardware_context=None):
     if plan["skipBuild"] or lane not in plan["matrix"]["include"]:
         raise ValueError("Lane was not scheduled in this plan")
     output = Path(output)
@@ -339,8 +340,120 @@ def initialize(plan, lane, workspace, output, run_attempt=None):
         "ranks": {"status": "not_recorded"},
         "artifactErrors": [],
     }
+    if hardware_context is not None:
+        probe = Path(hardware_context).parent / "hardware.py"
+        context = {
+            key: result[key]
+            for key in (
+                *IDENTITY,
+                "matrixDigest",
+                "laneKey",
+                "jobName",
+                "planRunAttempt",
+            )
+        }
+        context.update(
+            captureNonce=os.urandom(24).hex(), probeSha256=digest(read_regular(probe))
+        )
+        result["hardwareContext"] = context
+        write_json(hardware_context, context)
     write_json(output / "result.json", result)
     return result
+
+
+class HardwareFrame:
+    """Accept only the first pre-test frame; later PR stdout cannot update it."""
+
+    MAGIC = b"WATCHER_CI_HARDWARE_V1:"
+    MAX_LINE = 131072
+
+    def __init__(self, context):
+        self.context = context
+        self.pending = b""
+        self.discard = False
+        self.seen = False
+        self.document = None
+
+    def feed(self, chunk):
+        if self.context is None or self.seen:
+            return
+        self.pending += chunk
+        while b"\n" in self.pending:
+            line, self.pending = self.pending.split(b"\n", 1)
+            if self.discard:
+                self.discard = False
+                continue
+            if line.startswith(self.MAGIC):
+                self.seen = True
+                try:
+                    if len(line) > self.MAX_LINE:
+                        raise ValueError("Hardware frame exceeds bound")
+                    data = base64.b64decode(line[len(self.MAGIC) :], validate=True)
+                    if len(data) > 65536:
+                        raise ValueError("Hardware payload exceeds bound")
+                    document = json_value(data)
+                    if (
+                        document.get("schemaVersion") != 1
+                        or document.get("kind") != "watcher-ci-hardware-observation"
+                        or document.get("context") != self.context
+                    ):
+                        raise ValueError("Hardware frame identity mismatch")
+                    validate_hardware(document["hardware"])
+                    self.document = document
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    pass
+                self.pending = b""
+                return
+        if len(self.pending) > self.MAX_LINE:
+            if self.pending.startswith(self.MAGIC):
+                self.seen = True
+            self.pending = b""
+            self.discard = True
+
+
+def validate_hardware(value):
+    if (
+        not isinstance(value, dict)
+        or value.get("status") not in ("observed", "unavailable")
+        or value.get("gpuUseProven") is not False
+        or value.get("rankParticipation") != "not_recorded"
+    ):
+        raise ValueError(
+            "Hardware observation must not imply GPU use or rank participation"
+        )
+    if value["status"] == "unavailable":
+        if not isinstance(value.get("reason"), str) or len(value["reason"]) > 200:
+            raise ValueError("Bounded missing-inventory reason required")
+        return
+    if value.get("source") == "container-platform":
+        if value.get("devices") != [] or value.get("gpuCount") is not None:
+            raise ValueError("CPU inventory cannot assert GPU observations")
+        return
+    devices = value.get("devices")
+    if (
+        value.get("source") != "container-cuda-driver"
+        or value.get("enumeration") != "cuda-visible"
+        or not isinstance(devices, list)
+        or not 1 <= len(devices) <= 16
+        or type(value.get("gpuCount")) is not int
+        or value["gpuCount"] != len(devices)
+    ):
+        raise ValueError("Actual CUDA-visible device inventory required")
+    for ordinal, device in enumerate(devices):
+        capability = (
+            device.get("computeCapability") if isinstance(device, dict) else None
+        )
+        if (
+            not isinstance(capability, str)
+            or not re.fullmatch(r"[1-9][0-9]?\.[0-9]", capability)
+            or type(device.get("ordinal")) is not int
+            or device["ordinal"] != ordinal
+            or device.get("hardwareTarget") != "sm" + capability.replace(".", "")
+            or not isinstance(device.get("name"), str)
+            or not 1 <= len(device["name"]) <= 200
+            or any(ord(c) < 32 for c in device["name"])
+        ):
+            raise ValueError("Malformed observed GPU property")
 
 
 def run_command(output, workspace, argv):
@@ -354,12 +467,23 @@ def run_command(output, workspace, argv):
     if actual != result["testedCheckoutSha"] or parents != result["checkoutParents"]:
         raise ValueError("Checkout changed before lane execution")
     process = None
+    hardware = HardwareFrame(result.get("hardwareContext"))
     try:
-        process = subprocess.Popen(argv, cwd=workspace)
+        process = subprocess.Popen(
+            argv, cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
         result.update(
             commandStarted=True, startedAt=datetime.now(timezone.utc).isoformat()
         )
         write_json(path, result)
+        while True:
+            chunk = process.stdout.read(65536)
+            if not chunk:
+                break
+            hardware.feed(chunk)
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+        process.stdout.close()
         code = process.wait()
         if code < 0:
             code = 128 - code
@@ -373,6 +497,28 @@ def run_command(output, workspace, argv):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+    if result.get("hardwareContext"):
+        if hardware.document is not None:
+            hardware_path = Path(output) / "evidence/hardware.json"
+            write_json(hardware_path, hardware.document)
+            data = read_regular(hardware_path)
+            result["hardware"] = hardware.document["hardware"]
+            result["evidence"].append(
+                {
+                    "kind": "hardware-observation",
+                    "path": "evidence/hardware.json",
+                    "sha256": digest(data),
+                    "size": len(data),
+                }
+            )
+        else:
+            result["hardware"] = {
+                "status": "unavailable",
+                "source": "container-hardware-probe",
+                "reason": "Actual container hardware frame missing or failed identity validation",
+                "gpuUseProven": False,
+                "rankParticipation": "not_recorded",
+            }
     result.update(exitCode=code, finishedAt=datetime.now(timezone.utc).isoformat())
     write_json(path, result)
     return code
@@ -406,7 +552,7 @@ def finalize(output, workspace):
         if root.is_symlink() or not root.is_dir():
             raise ValueError("JUnit output directory unavailable")
         total = entries = 0
-        evidence = []
+        evidence = list(result.get("evidence", []))
         for directory, directories, files in os.walk(root, followlinks=False):
             if len(Path(directory).relative_to(root).parts) > 16:
                 raise ValueError("Artifact directory depth exceeds bound")
@@ -458,6 +604,7 @@ def main():
     parser.add_argument("--matrix", type=Path)
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--lane")
+    parser.add_argument("--hardware-context", type=Path)
     parser.add_argument("--skip-build", choices=("true", "false"), default="false")
     arguments = sys.argv[1:]
     separator = arguments.index("--") if "--" in arguments else len(arguments)
@@ -492,6 +639,7 @@ def main():
             args.workspace,
             args.output,
             positive(os.environ["GITHUB_RUN_ATTEMPT"]),
+            args.hardware_context,
         )
         with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
             stream.write("lane_key=" + result["laneKey"] + "\n")
