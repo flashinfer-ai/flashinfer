@@ -123,7 +123,7 @@ class BatchedGemmWorkQueue(WorkQueue):
             # Decode the physical cluster ordinal as feature-first logical
             # work, preserving both CTA rank and the scheduler validity bit.
             ordinal = n_idx * (grid_m // cluster_m) + m_idx // cluster_m
-            # TS owns this result type, which can differ from the public scheduler's.
+            # Use task scheduling's WorkTileInfo to satisfy its task-local type check.
             work_tile = WorkTileInfo(
                 (
                     (ordinal // grid_n) * cluster_m + m_idx % cluster_m,
