@@ -38,7 +38,7 @@ def _config(**overrides):
         {"cluster_shape_mn": (2, 1)},
         {"fallback_cluster_shape_mn": (2, 1)},
         {"fc2_use_bulk": False},
-        {"mma_tiler_mnk": (256, 64, 128)},
+        {"mma_tiler_mnk": (128, 64, 128)},
         {"sf_padding_block": 256},
         {"token_in_flag_batch": 2},
         {"token_back_mode": "standalone_warps"},
@@ -70,6 +70,45 @@ def test_genphase_candidates_respect_fixed_geometry(kind):
     with pytest.raises(ValueError, match="GenPhase .* requires tile K"):
         _config(quant_kind=kind, **deep_k)
     assert not pkg.is_valid_sm107(deep_k, cfg)
+
+
+@pytest.mark.parametrize(
+    "kind, cluster, supported",
+    [
+        ("mxfp8_e4m3", (2, 1), True),
+        ("mxfp8_e4m3", (4, 1), True),
+        ("mxfp4_mxfp8", (4, 1), True),
+        ("mxfp4_mxfp8", (2, 1), False),
+        ("mxfp8_e5m2", (4, 1), False),
+        ("nvfp4", (4, 1), False),
+    ],
+)
+def test_genphase_n64_dtype_and_cluster_admission(kind, cluster, supported):
+    knobs = dict(
+        quant_kind=kind,
+        mma_tiler_mnk=(256, 64, 128),
+        cluster_shape_mn=cluster,
+        fc2_tma_stages=1,
+        epi_flag_batches=(1, 4),
+    )
+    if supported:
+        cfg = _config(**knobs)
+        assert cfg.mma_tiler_mnk == (256, 64, 128)
+    else:
+        with pytest.raises(ValueError):
+            _config(**knobs)
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+def test_genphase_tuner_exposes_only_admitted_n64_candidates(kind):
+    candidates = pkg.sm107_candidates(kind, kernel_variant="genphase")
+    n64 = [candidate for candidate in candidates if candidate["mma_tiler_mnk"][1] == 64]
+    assert len(n64) == (3 if kind in ("mxfp8_e4m3", "mxfp4_mxfp8") else 0)
+    for candidate in n64:
+        assert pkg.is_valid_sm107(candidate, _config(quant_kind=kind))
+        assert candidate["fc2_tma_stages"] == 1
+        assert candidate["reduce_topk_in_kernel"] is False
+    assert {candidate["mma_tiler_mnk"][1] for candidate in candidates} >= {128, 256}
 
 
 _MODES = [

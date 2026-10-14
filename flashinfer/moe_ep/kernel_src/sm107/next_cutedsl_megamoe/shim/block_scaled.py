@@ -364,15 +364,29 @@ class Sm107BlockScaledMoeConfig:
         if self.kernel_variant == "genphase":
             if self.padded_tokens_per_rank > 1024:
                 raise ValueError("GenPhase supports at most 1024 tokens per rank.")
+            n64_decode = (
+                self.cluster_shape_mn in ((2, 1), (4, 1))
+                and tiler == (256, 64, 128)
+                and (
+                    self.quant_kind == "mxfp8_e4m3"
+                    or (
+                        self.quant_kind == "mxfp4_mxfp8"
+                        and self.cluster_shape_mn == (4, 1)
+                    )
+                )
+            )
             if (
-                self.cluster_shape_mn != (4, 1)
-                or self.fallback_cluster_shape_mn is not None
-            ):
-                raise ValueError("GenPhase requires uniform cluster_shape_mn=(4, 1).")
+                self.cluster_shape_mn != (4, 1) and not n64_decode
+            ) or self.fallback_cluster_shape_mn is not None:
+                raise ValueError(
+                    "GenPhase requires uniform cluster (4, 1), or an admitted N64 decode geometry at (2, 1) or (4, 1)."
+                )
             if not self.fc2_use_bulk:
                 raise ValueError("GenPhase requires fc2_use_bulk=True.")
-            if tiler[1] not in (128, 256):
-                raise ValueError("GenPhase requires tile N 128 or 256.")
+            if tiler[1] not in (128, 256) and not n64_decode:
+                raise ValueError(
+                    "GenPhase requires tile N 128 or 256, or an admitted N64 decode geometry."
+                )
             if tiler[2] != 2 * instruction_k:
                 raise ValueError(
                     f"GenPhase {self.quant_kind} requires tile K {2 * instruction_k} "
@@ -733,7 +747,7 @@ class Sm107BlockScaledSymmBuffer:
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
             self.output_activation.zero_()
-        else:
+        elif not getattr(self.kernel, "masks_invalid_combine_slots", False):
             # Invalid routes do not write a combine slot. Clear those slots on
             # every launch so a masked route cannot reuse an earlier result.
             invalid = (self.topk_idx < 0) | (

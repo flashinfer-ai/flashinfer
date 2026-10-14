@@ -31,6 +31,7 @@ from typing import ClassVar, Optional, Tuple
 import cuda.bindings.driver as cuda
 
 import cutlass
+from .....helpers.ptx_helpers import barrier_sync_unaligned
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
@@ -126,6 +127,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
+        self.cluster_shape_mn = tuple(impl_desc.get("cluster_shape_mn", (4, 1)))
 
         for field_name, fixed_value, supplied_value in (
             ("cluster_shape_mn", self.cluster_shape_mn, impl_desc.get("cluster_shape_mn")),
@@ -165,6 +167,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         self.mma_instruction_mnk = impl_desc["mma_instruction_mnk"]
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
+        self.active_gather_b_warp_count = 2 if self.mma_tiler_mnk[1] == 64 and self.cluster_shape_mn == (4, 1) else 4
+        self.scheduler_consumer_thread_count = (7 + self.active_gather_b_warp_count) * 32
         self.schedule_policy = impl_desc["schedule_policy"]
         if len(self.schedule_policy) != 2:
             raise ValueError("schedule_policy must contain a mode and hint.")
@@ -257,8 +261,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             raise ValueError("The generation-phase communication component provides no token-back path.")
         self._device_workspace = self._build_device_workspace()
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
+        self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel and not self.combine_format.is_quantized
         self._topk_reduce = (
-            None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format)
+            None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format, num_experts=self.expert_count)
         )
 
     # ------------------------------------------------------------------
@@ -351,11 +356,19 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             )
         if (instruction_m, instruction_n) != (mma_m, mma_n):
             raise NotImplementedError("Rubin Genphase MegaMoE does not implement M/N instruction repetition.")
-        # Tile N 64 is excluded because it turns on the halved SFB tile index and
-        # the SFB TMEM shift, and 512 is excluded because the FC1 gather needs one
-        # B row per 128-byte swizzle atom (see the mainloop's gather geometry).
-        if mma_n not in (128, 256):
-            raise ValueError(f"mma_tiler N must be 128 or 256, got {mma_n}.")
+        # The additional decode geometry is deliberately bounded to the
+        # MXFP8 and mixed-FP4 paths with two-CTA MMA and two or four gather warps.
+        if self.cluster_shape_mn != (4, 1) or self.mma_tiler_mnk[1] == 64:
+            if not (
+                self.cluster_shape_mn in ((2, 1), (4, 1))
+                and self.mma_tiler_mnk == (256, 64, 128)
+                and self.use_2cta_instrs
+                and (self.quant_kind == QuantKind.mxfp8_e4m3
+                     or (self.quant_kind == QuantKind.mxfp4_mxfp8 and self.cluster_shape_mn == (4, 1)))
+            ):
+                raise ValueError("GenPhase N64 requires MXFP8 E4M3 (or mixed FP4 at CGA4), tile (256, 64, 128), and cluster (2, 1) or (4, 1).")
+        if mma_n not in (64, 128, 256):
+            raise ValueError(f"mma_tiler N must be 64, 128, or 256, got {mma_n}.")
         if mma_k % instruction_k != 0:
             raise ValueError("mma_tiler K must be divisible by instruction K.")
         if mma_k % (self.sf_vec_size * 4) != 0:
@@ -711,10 +724,16 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         # FC1's B is the dense (source rank, source token) plane the communication
         # kernel filled, indexed by `gather_index` rather than by a pool row, so it
         # carries no per-expert offset.
+        # Gather4 always issues a 2D TMA instruction. A static singleton row
+        # mode is otherwise dropped from the descriptor at EP1 capacity one.
+        # Keep that extent dynamic so the descriptor retains both dimensions.
+        gather_rows = dense_activation.shape[0]
+        if cutlass.const_expr(gather_rows == 1):
+            gather_rows = cutlass.Int32(gather_rows)
         fc1_b = cute.make_tensor(
             dense_activation.iterator,
             cute.make_layout(
-                (dense_activation.shape[0], cutlass.Int32(hidden), singleton),
+                (gather_rows, cutlass.Int32(hidden), singleton),
                 stride=(dense_activation.stride[0], dense_activation.stride[1], 0),
             ),
         )
@@ -868,7 +887,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         )
         if cutlass.const_expr(not self.reduce_topk_in_kernel):
             reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
-            self._topk_reduce(pre_reduced_activation, None, output_activation, reduce_scores, stream)
+            self._topk_reduce(pre_reduced_activation, None, output_activation, reduce_scores, stream, topk_indices=topk_indices)
 
     # ------------------------------------------------------------------
     # Device entry
@@ -1120,7 +1139,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             iket.range_pop()
             sched_consumer = scheduler.make_consumer()
             tmem_allocator.allocate(self._mainloop.num_tmem_alloc_cols)
-            tmem_allocator.wait_for_alloc()
+            barrier_sync_unaligned(self._mainloop.tmem_allocation_barrier_id, 32 * (1 + self._mainloop.num_accumulator_consumer_warps_per_cta))
             tmem_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
             self.epilogue.run(
                 self._smem_workspace,
@@ -1175,31 +1194,35 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
 
         if (warp_idx >= Int32(self.gather_b_warp_ids[0])) & (warp_idx <= Int32(self.gather_b_warp_ids[-1])):
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
-            iket.range_push("genphase.gather_b1")
-            iket.range_push("gather_b1.wait_input_ready")
-            # `gather_index` is local, published by this rank's sort workers; the
-            # payload flag is written by peers, hence the wider scope.
-            spin_wait(
-                self._device_workspace.ptr(self.token_comm.token_data_ready_region),
-                lambda value: value == Int32(self.token_comm.payload_ready_target),
-                scope="sys",
-            )
-            spin_wait(
-                self._device_workspace.ptr(self.token_comm.metadata_ready_region),
-                lambda value: value == Int32(self.token_comm.metadata_ready_target),
-                scope="gpu",
-            )
-            iket.range_pop()
-            sched_consumer = scheduler.make_consumer()
-            self._mainloop.run_tma_gather_b1(
-                fc1_tma_b_atom=fc1_tma_b_atom,
-                gather_index=gather_index,
-                ab_pipeline=token_pipeline,
-                ab_pipeline_state=gather_b_pipeline_state,
-                sched_consumer=sched_consumer,
-                gather_warp_idx=warp_idx - Int32(self.gather_b_warp_ids[0]),
-            )
-            iket.range_pop()
+            # Every sibling executes warpgroup register deallocation above;
+            # only the active gather warps consume work and issue Gather4.
+            if warp_idx < Int32(self.gather_b_warp_ids[0] + self.active_gather_b_warp_count):
+                iket.range_push("genphase.gather_b1")
+                iket.range_push("gather_b1.wait_input_ready")
+                # `gather_index` is local, published by this rank's sort workers; the
+                # payload flag is written by peers, hence the wider scope.
+                spin_wait(
+                    self._device_workspace.ptr(self.token_comm.token_data_ready_region),
+                    lambda value: value == Int32(self.token_comm.payload_ready_target),
+                    scope="sys",
+                )
+                spin_wait(
+                    self._device_workspace.ptr(self.token_comm.metadata_ready_region),
+                    lambda value: value == Int32(self.token_comm.metadata_ready_target),
+                    scope="gpu",
+                )
+                iket.range_pop()
+                sched_consumer = scheduler.make_consumer()
+                self._mainloop.run_tma_gather_b1(
+                    fc1_tma_b_atom=fc1_tma_b_atom,
+                    gather_index=gather_index,
+                    ab_pipeline=token_pipeline,
+                    ab_pipeline_state=gather_b_pipeline_state,
+                    sched_consumer=sched_consumer,
+                    gather_warp_idx=warp_idx - Int32(self.gather_b_warp_ids[0]),
+                )
+                iket.range_pop()
+
 
         self.tail_barrier.remove_device_members()
         self._device_workspace.remove_device_members()
