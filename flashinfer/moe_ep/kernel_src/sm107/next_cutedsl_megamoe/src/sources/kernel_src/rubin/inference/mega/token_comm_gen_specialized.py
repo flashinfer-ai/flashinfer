@@ -1146,12 +1146,11 @@ class GenphaseTokenComm(KernelComponent):
                 tma_load_1d(score_stage.iterator, topk_scores.iterator, load_mbarrier, Int32(score_plane_bytes))
         cute.arch.mbarrier_wait(load_mbarrier, 0)
 
-        active_routes = Int32(self.routes_per_rank)
         active_routes = self._canonicalize_sparse_wire_indices(index_stage, thread_idx, smem_base)
-        wire_bytes = Int32(self.topk_slab_elements * 4)
         wire_bytes = ((active_routes + Int32(3)) // Int32(4)) * Int32(16)
-        # Every thread rewrote its own share of the staged plane; the single thread
-        # that copies the plane out reads all of it.
+        # Every writer must publish its rewritten indices to the async proxy
+        # before the elected thread issues the TMA bulk read of shared memory.
+        cute.arch.fence_proxy(kind="async.shared", space="cta")
         cute.arch.sync_threads()
 
         # The peer's slab address is this rank's slab address shifted by the
@@ -1193,7 +1192,6 @@ class GenphaseTokenComm(KernelComponent):
             # Each destination's `topk_ready[source]` slot has exactly one
             # producer, so the consumer can wait on an exact value.
             own_ready_slot = device_workspace.ptr(self.topk_ready_region) + local_rank
-            publication = Int32(1)
             # Exactly one producer owns this slot. Zero remains not-ready;
             # one publishes an empty source, and larger values carry its
             # last valid flat route plus one. The existing tail resets it.
@@ -1542,9 +1540,9 @@ class GenphaseTokenComm(KernelComponent):
         )) - Int32(1)
         iket.range_pop()
         if active_routes <= Int32(self.threads_per_cta):
-            self._run_sort_impl(device_workspace, local_rank, smem_base, source_rank, thread_idx, 1)
+            self._run_sort_impl(device_workspace, local_rank, smem_base, source_rank, thread_idx, active_routes, 1)
         else:
-            self._run_sort_impl(device_workspace, local_rank, smem_base, source_rank, thread_idx,
+            self._run_sort_impl(device_workspace, local_rank, smem_base, source_rank, thread_idx, active_routes,
                                 ceil_div(self.routes_per_rank, self.threads_per_cta))
 
     @cute.jit
@@ -1555,6 +1553,7 @@ class GenphaseTokenComm(KernelComponent):
         smem_base: cute.Pointer,
         source_rank: Int32,
         thread_idx: Int32,
+        active_routes: Int32,
         sort_round_limit: cutlass.Constexpr[int],
     ) -> None:
         """Bucket one source rank's routes by local expert, then place them.
@@ -1574,24 +1573,14 @@ class GenphaseTokenComm(KernelComponent):
             if bucket < Int32(self.histogram_bucket_count):
                 histogram[bucket] = Int32(0)
 
-        # Spans the release, not just the poll: what matters is when the whole CTA
-        # is let through, and the same holds for every other wait range below.
+        # _run_sort already acquired this source's publication and extent.
+        # Keep the CTA join: histogram initialization must finish before any
+        # lane increments another lane's bucket. Keep its existing IKET range.
         iket.range_push("sort.wait_topk")
-        if thread_idx == Int32(0):
-            spin_wait(
-                device_workspace.ptr(self.topk_ready_region) + source_rank,
-                lambda value: value != Int32(0),
-                scope="sys",
-            )
         cute.arch.sync_threads()
         iket.range_pop()
 
         iket.range_push("sort.count")
-        active_routes = Int32(self.routes_per_rank)
-        active_routes = Int32(cute.arch.load(
-            device_workspace.ptr(self.topk_ready_region) + source_rank,
-            Int32, sem="acquire", scope="sys"
-        )) - Int32(1)
         route_rounds = sort_round_limit
         buckets = cute.make_rmem_tensor((route_rounds,), cutlass.Int32)
         offsets = cute.make_rmem_tensor((route_rounds,), cutlass.Int32)

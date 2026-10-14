@@ -125,7 +125,7 @@ silently dropped by a fresh export. Paths below are relative to `src/sources/`.
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py` | N64 SFB/TMEM parity, valid-row TMA-gather extent and transaction accounting, and two gather warps for CGA4. |
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py` | Pass routing IDs to separate BF16 reduction and advertise masked-slot handling to the shim. |
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py` | Propagate masked reduction and admitted N64 geometry; support a one-row allocation in the gather descriptor. |
-| `kernel_src/rubin/inference/mega/token_comm_gen_specialized.py` | Bound route metadata by the live extent, skip invalid histogram/scatter work, and reuse the existing expert prefix for scale-factor offsets. |
+| `kernel_src/rubin/inference/mega/token_comm_gen_specialized.py` | Bound route metadata by the live extent, fence rewritten shared indices before async bulk publication, reuse the acquired extent in the sort body, skip invalid histogram/scatter work, and reuse the existing expert prefix for scale-factor offsets. |
 | `kernel_src/rubin/inference/mega/topk_reduce.py` | Predicate BF16 combine loads by routing validity, yielding exact zero for rows with no valid routes. |
 | `communication/nvlink_domain/token_comm.py` | Skip invalid-route histogram/scatter work, protect partial dump reads, and fence generic shared-memory writes before async bulk size publication. |
 

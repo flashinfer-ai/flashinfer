@@ -226,3 +226,17 @@ weights, and the Generic multi-CTA path at capacity 2048 and top-k 10. The test 
 actual DATA CTA count: capacity alone does not select this path; the routed-token
 capacity must exceed 16384. Inspect all capacity rows
 after both the first and sixty-fifth graph replay.
+
+### GenPhase publication and sort reuse
+
+`_run_exchange` rewrites the shared-memory index plane before TMA copies it to
+peers. Every writer must execute the async shared-memory proxy fence before the
+existing CTA join; a successful numerical run does not replace this ordering
+contract. This is the same generic-to-async boundary as Generic size publication.
+
+`_run_sort` acquires one published route extent and passes it to the selected
+sort body. Do not repeat the ready poll/acquire there, but retain the CTA barrier
+after histogram initialization: it orders zero stores before other lanes perform
+histogram atomics. Keep the existing IKET range around that join for trace
+continuity. Validate empty, late-valid, holey and dense-restored captured graphs
+on EP4 plus repeated launches across supported quantization formats.
