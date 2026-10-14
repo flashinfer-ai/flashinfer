@@ -171,13 +171,15 @@ def discover(
 
 
 def clear_artifact_cache() -> None:
-    """Refresh artifact metadata shared by selection, admission and packing."""
+    """Clear shared discovery caches for future builds and explicit refreshes."""
     global _artifact_cache_version
 
     from ..shortlist import _read
-    from .moe import _selected_kernels_cached
+    from .moe import _cached_artifact_roots, _selected_kernels_cached
 
     _artifact_cache_version += 1
+    runtime.artifact_root.cache_clear()
+    _cached_artifact_roots.cache_clear()
     discover.cache_clear()
     _selected_kernels_cached.cache_clear()
     _read.cache_clear()

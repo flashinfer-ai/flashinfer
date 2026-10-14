@@ -1395,6 +1395,9 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
         def build(self):
             events.append("build")
 
+        def accepts(self, act_pack, weight_pack):
+            return True
+
         def pack_inputs(self, act_pack, weight_pack):
             events.append("pack_inputs")
             return []

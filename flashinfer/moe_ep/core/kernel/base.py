@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -79,6 +80,9 @@ class MegaKernelBackend(ABC):
     # this capability during backend registration.  Keep the default false so
     # existing backends retain the materializing output path.
     supports_output_view: bool = False
+    supports_unfinalized_output: bool = False
+    supports_live_token_tuning: bool = False
+    _knob_cache_module: str
 
     def __init__(self, config: object) -> None:
         self._config = config
@@ -87,6 +91,7 @@ class MegaKernelBackend(ABC):
         self._ep_comm_group: Any = None
         self._ep_rank: int = 0
         self._ep_world_size: int = 0
+        self._profile_knobs: dict[tuple[int, int | None], dict] = {}
 
     @classmethod
     @abstractmethod
@@ -187,6 +192,35 @@ class MegaKernelBackend(ABC):
         from .workspace_pool import acquire_workspace
 
         return acquire_workspace(key, factory)
+
+    def _tuning_key(self, fleet_params: "FleetParams") -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _tuning_cache(self) -> Any:
+        return importlib.import_module(self._knob_cache_module)
+
+    def live_token_buckets(self, fleet_params: "FleetParams") -> list[int]:
+        """Offline workload profiles available at this exact capacity."""
+        if not self.supports_live_token_tuning:
+            return []
+        knobs = getattr(self._config, "knobs", None)
+        if isinstance(knobs, dict) or knobs == "auto":
+            return []
+        return self._tuning_cache().live_token_buckets(**self._tuning_key(fleet_params))
+
+    def _workspace_knobs(self, fleet_params: "FleetParams") -> dict | None:
+        knobs = getattr(self._config, "knobs", None)
+        if isinstance(knobs, dict):
+            return knobs
+        if knobs == "auto":
+            return None
+        key = (fleet_params.max_tokens_per_rank, fleet_params.tuning_live_tokens)
+        if key not in self._profile_knobs:
+            self._profile_knobs[key] = self._tuning_cache().resolve_knobs(
+                **self._tuning_key(fleet_params),
+                live_tokens=fleet_params.tuning_live_tokens,
+            )[0]
+        return self._profile_knobs[key]
 
     @abstractmethod
     def _allocate_workspace(self, fleet_params: "FleetParams") -> Any:
@@ -289,6 +323,14 @@ class MegaKernelBackend(ABC):
         """Run the fused kernel. ``output=None`` (cutedsl backends) returns a
         zero-copy view of the workspace output, valid under stream ordering
         until the next launch on this session's buffers."""
+
+    def compute_unfinalized(
+        self,
+        workspace: Any,
+        transformed_weights: Any,
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+        """Return borrowed GEMM2 rows, remaining weights, and route-to-row indices."""
+        raise NotImplementedError("this MegaMoE backend cannot defer top-k reduction")
 
     def destroy(self, workspace: Any) -> None:
         """Release durable workspace resources (pool-aware, refcounted)."""
