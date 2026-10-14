@@ -16,6 +16,15 @@
 """
 MoE Communication Benchmark Routine
 
+Deprecated: this routine times the module-level moe_a2a_* ops
+(``backend="trtllm"``), which no flashinfer.moe_ep communication backend uses.
+Migrate to the flashinfer.moe_ep benchmarks:
+
+- Dispatch and combine only: ``benchmarks/moe_ep/core/comm/bench_moe_ep_comm.py``
+  (nvlink_one_sided, cake and nvlink_two_sided backends).
+- Dispatch, MoE computation and combine as one layer (what ``--real_math``
+  approximates here): ``benchmarks/moe_ep/bench_moe_ep.py``.
+
 This module provides benchmarking for MoE All-to-All communication operations
 using FlashInfer's functional moe_a2a_* ops. Designed to run with mpirun for
 multi-GPU benchmarking.
@@ -279,6 +288,13 @@ def run_moe_comm_test(args):
         list: List of dictionaries containing performance results
     """
     if args.routine == "moe_a2a_dispatch_combine":
+        if MPI.COMM_WORLD.Get_rank() == 0:
+            print(
+                "[WARNING] moe_a2a_dispatch_combine is deprecated. Use "
+                "benchmarks/moe_ep/core/comm/bench_moe_ep_comm.py for dispatch and "
+                "combine, or benchmarks/moe_ep/bench_moe_ep.py for dispatch, MoE "
+                "computation and combine."
+            )
         return test_moe_a2a_dispatch_combine(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")

@@ -1,8 +1,10 @@
 """Benchmark MoE expert-parallel dispatch/combine of any MoEEpCommunication backend.
 
-Only the communication is timed: ``MoEEpCommunication.dispatch()`` and
-``MoEEpCommunication.combine()``. Input quantization and the simulated expert
-output happen outside the timed phases.
+This is a communication-only benchmark. Only ``MoEEpCommunication.dispatch()``
+and ``MoEEpCommunication.combine()`` are timed; input quantization and the
+simulated expert output happen outside the timed phases, and no expert GEMM
+runs between them. To time dispatch, expert computation and combine together
+as one MoE layer, use ``benchmarks/moe_ep/bench_moe_ep.py``.
 
 dispatch_us and combine_us report CUPTI kernel spans (first kernel start to
 last kernel end of each phase), using CUDA graph replay by default or eager
