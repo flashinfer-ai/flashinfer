@@ -33,6 +33,11 @@ class MoEEpTensors:
     recv_count: Optional["torch.Tensor"] = None
     num_tokens_per_expert: Optional["torch.Tensor"] = None
     output: Optional["torch.Tensor"] = None
+    # Rows to stage without routes (bool or uint8 [>= num_tokens], True = padding
+    # row -> every topk id -1), folded into the route staging instead of a separate
+    # masking pass by the caller. Honoured by the SM107 NVFP4 mega backend; the
+    # other backends ignore it.
+    route_padding_mask: Optional["torch.Tensor"] = None
 
     @property
     def num_tokens(self) -> int:

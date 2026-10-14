@@ -71,12 +71,19 @@ topology. See the [NVSHMEM environment variable reference](https://docs.nvidia.c
 | Determinism | In-kernel FC2 reduction is opt-in and requires early routing weights; repeatability must be characterized separately |
 
 Routing value checks use device assertions so they remain active on graph
-replay without a host synchronization. Invalid routing can invalidate the
+replay without a host synchronization. The NVFP4 backend's one-launch route
+staging folds these checks into its kernel;
+`FLASHINFER_SM107_MEGA_CHECK_ROUTES=0` compiles them out for routers that
+already guarantee valid routes, and inputs that fall back to the torch
+staging are always validated. Invalid routing can invalidate the
 worker's CUDA context, as with other invalid CUDA indexing operations.
 Use separate worker processes for negative device-assertion tests. Valid
 masked routes are supported; their combine slots are cleared each launch.
-This clearing and routing validation have a performance cost that belongs
-in the measured kernel and full-forward spans respectively.
+NVFP4 workspaces of the inference kernel with BF16 combine and the separate
+top-k reduce skip that clear: their reduce covers the staged rows and masks
+invalid slots as it loads them.
+This clearing (or masking) and routing validation have a performance cost
+that belongs in the measured kernel and full-forward spans respectively.
 
 The shim rounds physical token capacity up by at most three rows to keep
 four-int router loads in bounds. The public live-token limit is unchanged.
@@ -178,9 +185,12 @@ Per-call tensors on `MoEEpTensors` override the matching config tensor. An
 omitted override restores the config default, or one if the config also omits
 it. Scalars have shape `[E_local]`, are contiguous FP32 tensors on the input
 device, and follow local expert order. Their device assertions remain active
-in graph replay. Values are copied into stable workspace buffers on every
-forward, including empty batches, so sequential pooled layers do not share
-stale values. Update captured source tensor contents in place for graph replay.
+in graph replay. Contiguous FP32 per-call tensors are bound as launch
+arguments on every forward, including empty batches, so sequential pooled
+layers do not share stale values; keep them alive while launches or captured
+graphs use them. Other values are copied into stable workspace buffers, and an
+omitted scalar resets its buffer to one. Update captured source tensor
+contents in place for graph replay.
 
 For `quantize_input=False`, input bytes and scales are copied unchanged;
 `input_norm_const` does not requantize them. The caller must supply alphas

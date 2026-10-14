@@ -20,6 +20,12 @@ def make_workspace_config(
     tuning = {name: getattr(k, name) for name in KNOB_KEYS if hasattr(k, name)}
     tuning["reduce_topk_in_kernel"] = k.in_kernel_fc2_reduce
     tuning.update(overrides)
+    if k.max_sm_count is not None:
+        # An SM budget (e.g. to leave SMs to a concurrent shared-expert MLP on a
+        # side stream) needs a uniform cluster launch: the mixed-CGA fallback
+        # occupancy is resolved from the hardware probe, so cached / heuristic
+        # knobs that name a fallback cluster are launched uniformly instead.
+        tuning["fallback_cluster_shape_mn"] = None
     for name in (
         "mma_tiler_mnk",
         "cluster_shape_mn",
@@ -200,3 +206,34 @@ def validate_weight_layout(weight, scale, *, scale_dtype) -> None:
         raise MoEEpConfigError("SM107 weights and scales must be on the same device")
     if weight.data_ptr() % 16 or scale.data_ptr() % 16:
         raise MoEEpConfigError("SM107 weights and scales must be 16-byte aligned")
+
+
+def stage_routing_plane(topk_ids, topk_weights, workspace, pad_mask=None):
+    """Stage (+ validate) the routing plane.
+
+    ``pad_mask`` (optional, ``[>= num_tokens]``): rows to stage without routes; they are
+    left out of the route check on both paths.
+    Returns ``(routed, ids, weights)``: ``routed`` is True when the one-launch Triton path
+    wrote the workspace plane; otherwise ``ids`` / ``weights`` are the (masked) tensors the
+    caller copies (after the torch route validation)."""
+    from .route_stage import stage_routes
+
+    num_experts = workspace.config.num_total_experts
+    routed = stage_routes(
+        topk_ids,
+        topk_weights,
+        workspace.topk_idx,
+        workspace.topk_weights,
+        num_experts,
+        pad_mask=pad_mask,
+    )
+    ids, weights = topk_ids, topk_weights
+    if not routed and pad_mask is not None:
+        # Padding rows: no routes, and zero weights so that the route check skips
+        # them, as the one-launch path does.
+        pad = pad_mask[: ids.shape[0]].to(torch.bool).unsqueeze(1)
+        ids = torch.where(pad, torch.full_like(ids, -1), ids)
+        weights = torch.where(pad, torch.zeros_like(weights), weights)
+    if not routed:
+        validate_routing_values(ids, weights, num_experts)
+    return routed, ids, weights

@@ -21,9 +21,9 @@ from ......core.validation.common import (
 )
 from ......weights import MoEWeightPack
 from ..validation import (
+    stage_routing_plane,
     validate_input_norm_const,
     validate_nvfp4_scalars,
-    validate_routing_values,
 )
 from .config import Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 from .staging import stage_mega_moe_inputs, validate_sm107_nvfp4_forward_inputs
@@ -228,25 +228,25 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
     def stage_inputs(
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
-        validate_routing_values(
-            t.topk_ids, t.topk_weights, workspace.config.num_total_experts
+        # One launch: route validation + int32/fp32 routing staging + tail mask.
+        routed, topk_ids, topk_weights = stage_routing_plane(
+            t.topk_ids,
+            t.topk_weights,
+            workspace,
+            pad_mask=getattr(t, "route_padding_mask", None),
         )
-        for name, value in self._scalar_values(t).items():
-            target = getattr(workspace, name)
-            if value is None:
-                target.fill_(1.0)
-            else:
-                target.copy_(value)
+        self._stage_scalars(t, workspace)
         if quantize_input:
             staged = stage_mega_moe_inputs(
                 t.hidden_states,
-                t.topk_weights,
-                t.topk_ids,
+                topk_weights,
+                topk_ids,
                 workspace.x,
                 workspace.x_sf,
                 workspace.topk_idx,
                 workspace.topk_weights,
                 input_norm_const=self._kernel_config.input_norm_const,
+                routes_staged=routed,
             )
             workspace.note_staged_tokens(staged)
             return
@@ -262,11 +262,44 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             workspace.x_sf[:num_tokens, :sf_cols].view(torch.uint8).copy_(
                 t.scales.view(torch.uint8)
             )
-            workspace.topk_idx[:num_tokens].copy_(t.topk_ids.to(torch.int32))
-            workspace.topk_weights[:num_tokens].copy_(t.topk_weights.to(torch.float32))
-        if num_tokens < capacity:
+            if not routed:
+                workspace.topk_idx[:num_tokens].copy_(topk_ids.to(torch.int32))
+                workspace.topk_weights[:num_tokens].copy_(
+                    topk_weights.to(torch.float32)
+                )
+        if num_tokens < capacity and not routed:
             workspace.topk_idx[num_tokens:capacity].fill_(-1)
         workspace.note_staged_tokens(num_tokens)
+
+    def _stage_scalars(self, t: "MoEEpTensors", workspace: Any) -> None:
+        """Per-call NVFP4 epilogue scalars.
+
+        Contiguous fp32 ``[E_local]`` tensors on the workspace device are BOUND as
+        the launch arguments (``workspace.bind_scalars``): no per-call DtoD copies
+        into the pooled workspace tensors (3 launches per MoE layer). Any other
+        value is copied into the workspace tensor and ``None`` resets it to ones,
+        as before; the launch then uses the workspace tensor."""
+        values = self._scalar_values(t)
+        bind = hasattr(workspace, "bind_scalars")
+        bound = {}
+        for name, value in values.items():
+            target = getattr(workspace, name)
+            if (
+                bind
+                and isinstance(value, torch.Tensor)
+                and value.dtype == torch.float32
+                and value.is_contiguous()
+                and value.device == target.device
+                and value.shape == target.shape
+            ):
+                bound[name] = value
+                continue
+            if value is None:
+                target.fill_(1.0)
+            else:
+                target.copy_(value)
+        if bind:
+            workspace.bind_scalars(bound)
 
     def compute(
         self,

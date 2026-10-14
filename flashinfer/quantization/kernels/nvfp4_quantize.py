@@ -2507,6 +2507,40 @@ def _get_compiled_kernel_nvfp4_tma(
     return compiled_kernel, kernel_obj.rows_per_block
 
 
+def _nvfp4_outputs(
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    m: int,
+    k: int,
+    scale_output_size: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fresh ``(fp4 [m, k/2], flat scale [scale_output_size])`` buffers, or views of the
+    caller-owned ``out`` destinations (validated: dtype, contiguity, device, size)."""
+    if out is None:
+        return (
+            torch.empty(m, k // 2, dtype=torch.uint8, device=device),
+            torch.empty(scale_output_size, dtype=torch.uint8, device=device),
+        )
+    fp4_out, sf_out = out
+    for name, t in (("fp4_out", fp4_out), ("sf_out", sf_out)):
+        if t.dtype != torch.uint8 or not t.is_contiguous() or t.device != device:
+            raise ValueError(
+                f"nvfp4_quantize_cute_dsl out={name} must be a contiguous uint8 "
+                f"tensor on {device}"
+            )
+    if tuple(fp4_out.shape) != (m, k // 2):
+        raise ValueError(
+            f"nvfp4_quantize_cute_dsl out fp4 shape {tuple(fp4_out.shape)} != {(m, k // 2)}"
+        )
+    flat = sf_out.view(-1)
+    if flat.numel() < scale_output_size:
+        raise ValueError(
+            f"nvfp4_quantize_cute_dsl out scale buffer holds {flat.numel()} bytes, "
+            f"the selected kernel writes {scale_output_size}"
+        )
+    return fp4_out, flat[:scale_output_size]
+
+
 @flashinfer_api
 def nvfp4_quantize_cute_dsl(
     input: torch.Tensor,
@@ -2515,6 +2549,7 @@ def nvfp4_quantize_cute_dsl(
     enable_pdl: bool | None = None,
     # Appended last so existing positional construction keeps working.
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to NVFP4 format using the CuTe-DSL kernel.
 
@@ -2550,6 +2585,14 @@ def nvfp4_quantize_cute_dsl(
         - ``None``: 4over6 off. The environment is ignored.
         - :class:`NVFP44Over6Config`: on with exactly that recipe. The
           environment is ignored.
+
+    out : (torch.Tensor, torch.Tensor), optional
+        Caller-owned destinations ``(fp4_out, sf_out)``: ``fp4_out`` a contiguous
+        ``uint8 [M, K/2]`` view, ``sf_out`` a contiguous ``uint8`` buffer whose
+        flat prefix receives the scale factors (it must hold at least the padded
+        scale size of the selected path; with the linear layout and M below the
+        TMA crossover that is exactly ``M * K/16``). The kernels write straight
+        into them (no extra copy); the returned tensors are views of them.
 
     Returns
     -------
@@ -2679,9 +2722,8 @@ def nvfp4_quantize_cute_dsl(
             (padded_m + rows_per_block - 1) // rows_per_block, tma_target_grid
         )
 
-        fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
-        scale_output = torch.empty(
-            scale_output_size, dtype=torch.uint8, device=input.device
+        fp4_output, scale_output = _nvfp4_outputs(
+            out, m, k, scale_output_size, input.device
         )
 
         kernel_fn(
@@ -2740,9 +2782,8 @@ def nvfp4_quantize_cute_dsl(
             target_grid,
         )
 
-        fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
-        scale_output = torch.empty(
-            scale_output_size, dtype=torch.uint8, device=input.device
+        fp4_output, scale_output = _nvfp4_outputs(
+            out, m, k, scale_output_size, input.device
         )
 
         kernel_fn(
@@ -2763,9 +2804,8 @@ def nvfp4_quantize_cute_dsl(
         padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
         scale_output_size = padded_m * padded_sf_cols
 
-        fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
-        scale_output = torch.empty(
-            scale_output_size, dtype=torch.uint8, device=input.device
+        fp4_output, scale_output = _nvfp4_outputs(
+            out, m, k, scale_output_size, input.device
         )
 
         use_tile = (

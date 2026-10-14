@@ -109,8 +109,31 @@ transformations, not manual FlashInfer patches.
 The comment above `pusher_cta_count` in
 `src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py`
 describes the residency requirement without device-specific counts. Kernel
-logic and configuration values are unchanged. All other exported files match
-the pinned upstream export.
+logic and configuration values are unchanged.
+
+One FlashInfer-owned kernel fix, pending upstream (the pinned commit and
+upstream `main` up to `413da003` have the same code):
+
+- `src/sources/kernel_src/schedulers/fc12_scheduler.py`,
+  `PhaseInterleavedFc12Scheduler._wait_for_fc1_prologue_claims`: the
+  phase-interleave scheduler no longer sets `fc1_exhausted` from its CTA-local
+  peek of the global FC1 work-ID counter. Every CTA of a cluster runs the claim
+  state machine itself and interprets the leader's broadcast work ID against
+  its own stream choice, so that state must only change on cluster-uniform
+  inputs. When the runtime FC1 stream is shorter than the static FC1 watermark
+  (tiny per-rank work, e.g. DP dummy batches), the last terminal FC1 claims of
+  other clusters can push the counter across the watermark between the peeks
+  of two CTAs of one cluster (late-starting clusters make this likely). The
+  CTAs then disagreed on `fc1_exhausted`, mapped the next broadcast ID to
+  different phases, and the cluster deadlocked (CTAs leaving the claim loop
+  while the leader keeps claiming, or 2-CTA MMA / multicast pairs on different
+  tiles): one rank 2 CTAs short of the tail grid sync, its peers waiting in
+  the NVLink drain barrier. The peek now only shortens this CTA's wait; FC1
+  exhaustion is learned from a claimed ID like any other stream end, at the
+  cost of at most one extra terminal FC1 claim per cluster. Re-apply this fix
+  when the drop is re-exported until upstream carries it.
+
+All other exported files match the pinned upstream export.
 
 ## Related trees
 
