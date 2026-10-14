@@ -4992,6 +4992,21 @@ def fast_decode_plan(
                 f"this wrapper was planned with {frozen_q_len}, got "
                 f"{q_len_per_req}. Use a separate wrapper per q_len_per_req."
             )
+    if not self.is_cuda_graph_enabled:
+        # Outside CUDA graphs the metadata tensors become the wrapper's
+        # buffers as-is and run() hands their pointers to the kernel, so they
+        # must already be on the wrapper's device; plan() is the path that
+        # copies host metadata over. Checked before any plan state changes.
+        for name, tensor in (
+            ("indptr", indptr),
+            ("indices", indices),
+            ("last_page_len", last_page_len),
+        ):
+            if tensor.device != self.device:
+                raise ValueError(
+                    f"{name} must be on the wrapper's device {self.device}, got "
+                    f"{tensor.device}; use plan() for host metadata"
+                )
     is_causal = q_len_per_req > 1
     self._q_len_per_req = q_len_per_req
     if logits_soft_cap is None:
