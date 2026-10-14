@@ -244,6 +244,18 @@ power-bound rows 1.25-1.30x, clocks at 1.2 GHz" was wrong about the cause: the c
 sits there for cuBLAS too, the gap was the L2 re-stream.  Plot:
 `plots/w8a16_b200_tflops_grid.png` is drawn from this sweep.
 
+What is left on the two widest rows (umb-b200-240, each implementation alone for 400
+launches with `nvidia-smi dmon` sampling, `clockB_*`): mlp.gate_up tp1 M=88320 cuBLAS
+17045 us at 1002 W / 1130 MHz, auto 17374 us (1.019) at 910 W / 1095-1231 MHz, pinned
+256x192 17285 us (1.014) at 987 W / 1132 MHz; tp2 cuBLAS 8528 us at 1002 W / 1127 MHz,
+auto 8907 us (1.045) at 934 W / 1080 MHz, 256x192 8931 us at 989 W / 1117 MHz.  Same
+clock and slightly less power than cuBLAS, so the remaining 2-5% is not the dequant's
+energy; it is whatever cuBLAS's tile order still saves in L2 traffic.  Swizzle 16 / 32
+on tp2 (`swzC_*`) is indistinguishable from 8 inside the +-10% single-pass scatter of
+this box (cuBLAS itself read 6912 to 8212 us on tp1 M=44160 across three passes minutes
+apart).  Not pursued further: the candidates left are TMA cache hints (evict-last on the
+weight) and 256 B L2 promotion, each worth a couple of percent at most.
+
 ### Knobs and the `algo` argument
 
 `flashinfer.gemm.w8a16_fp8_gemm(..., algo=)` (Blackwell) pins a variant per call:
