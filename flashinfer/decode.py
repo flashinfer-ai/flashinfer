@@ -2102,7 +2102,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         # backend="auto" may resolve to cudnn; decided per plan() so that the
         # q_len_per_req / buffer checks below already know the path.
-        self._cudnn_auto = self._auto_prefers_cudnn(
+        cudnn_auto = self._auto_prefers_cudnn(
             q_data_type,
             kv_data_type,
             o_data_type,
@@ -2125,13 +2125,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if (
             disable_split_kv
             and not self.use_tensor_cores
-            and not self._uses_cudnn
+            and not (self._backend == "cudnn" or cudnn_auto)
             and self._backend != "cutile"
         ):
             raise ValueError(
                 "disable_split_kv is not supported by CUDA-core decode; "
                 "use use_tensor_cores=True with backend='fa2'."
             )
+        # A rejected split option must leave the previous plan's route intact.
+        self._cudnn_auto = cudnn_auto
         if self.is_cuda_graph_enabled:
             # The resolved backend is part of the frozen CUDA-graph shape: a
             # captured graph replays the kernels it was captured with, and
