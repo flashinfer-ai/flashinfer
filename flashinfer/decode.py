@@ -4872,6 +4872,13 @@ def fast_decode_plan(
     cuDNN uses the regular planner to refresh its KV lengths and block table;
     compatible prepared graphs are still reused. The copy-elision below is
     specific to the FA2/FA3 module, not cuDNN's metadata contract.
+
+    On the copy-eliding path, indptr, indices, and last_page_len must already
+    be on the wrapper's device, including in CUDA graph mode; otherwise a
+    ValueError is raised. Use plan() for host metadata. The separate
+    global_override_indptr_cpu argument remains a CPU planning override.
+    In CUDA graph mode, callers must keep the supplied metadata consistent
+    with the wrapper's preallocated buffers; this function does not copy it.
     """
     batch_size = len(last_page_len)
     wants_cudnn = self._backend == "cudnn"
@@ -4944,6 +4951,12 @@ def fast_decode_plan(
             disable_split_kv=disable_split_kv,
             q_len_per_req=q_len_per_req,
         )
+    for name, tensor in (
+        ("indptr", indptr),
+        ("indices", indices),
+        ("last_page_len", last_page_len),
+    ):
+        check_shape_dtype_device(tensor, None, None, self.device, name)
     if q_len_per_req < 1:
         raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
     if q_len_per_req > 1 and not self.use_tensor_cores:
