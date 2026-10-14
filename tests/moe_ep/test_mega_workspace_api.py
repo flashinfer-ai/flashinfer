@@ -418,7 +418,9 @@ def test_unfinalized_output_requires_explicit_backend_opt_in():
     from flashinfer.moe_ep import MoEEpConfigError
 
     layer, _, _ = _make_layer()
-    with pytest.raises(MoEEpConfigError, match="finalize_mode=NONE"):
+    with pytest.raises(
+        MoEEpConfigError, match="requires finalize_mode=FinalizeMode.NONE"
+    ):
         layer.forward_unfinalized(_inputs(8))
     layer._kernel.supports_unfinalized_output = True
     with pytest.raises(MoEEpConfigError, match="requires forward_unfinalized"):
@@ -450,7 +452,7 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
     raw = SimpleNamespace(
         x=torch.empty(capacity, hidden, dtype=torch.bfloat16),
         hidden=hidden,
-        combine_output=partials,
+        output_activation=None,
         topk_idx=torch.empty(capacity, top_k, dtype=torch.int32),
         topk_weights=torch.randn(capacity, top_k, dtype=torch.float32),
         _frontend=mock.Mock(),
@@ -481,7 +483,12 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
             cutedsl_megamoe, "get_symm_buffer_for_bf16_mega_moe", allocate
         )
         launch = raw._frontend.run
-        launch.side_effect = lambda inputs, *, num_tokens: partials[:num_tokens]
+        launch.side_effect = lambda inputs, *, num_tokens: None
+        raw._frontend.custom_finalize_workspace.return_value = (
+            partials,
+            partials,
+            None,
+        )
     else:
         config_cls = Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
         monkeypatch.setattr(
