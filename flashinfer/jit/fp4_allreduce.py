@@ -16,10 +16,14 @@ limitations under the License.
 
 # JIT loader of the NVFP4-transport tensor-parallel all-reduce programs
 # (``csrc/fp4_allreduce``).  The programs are generated: one kernel per
-# (world size, input format, phase-B variant, rank) at a fixed row capacity,
-# listed in ``PROGRAMS`` next to the hand-written binding of each world size.
-# Every program is compiled for the device it runs on (sm_100a / sm_103a /
-# sm_107a) with the exact flag set below and without fast math.
+# (family, world size, input format[, output format], phase-B variant, rank)
+# at a fixed row capacity, listed in ``PROGRAMS`` next to the hand-written
+# binding of each (family, world size).  Two families: ``allreduce`` (the
+# bfloat16 all-reduce, world sizes 2 and 4) and ``rmsnorm`` (world size 2, the
+# all-reduce fused with the residual add and the Gemma RMSNorm; bfloat16,
+# NVFP4 or MXFP8 output; eps and the weight bias are compiled in).  Every
+# program is compiled for the device it runs on (sm_100a / sm_103a / sm_107a)
+# with the exact flag set below and without fast math.
 
 from __future__ import annotations
 
@@ -44,8 +48,15 @@ SOURCE_PACKAGE = "fp4_allreduce"
 HIDDEN = 6144
 RECORD_BYTES = 3456  # NVFP4 input record: 3072 E2M1 value bytes + 384 E4M3 scale bytes
 CAPACITY = 16384  # rows the delivered programs are specialised for
-WORLD_SIZES = (2, 4)
+FAMILIES = ("allreduce", "rmsnorm")
+WORLD_SIZES = (2, 4)  # allreduce family
+RMSNORM_WORLD_SIZES = (2,)  # rmsnorm family
 INPUT_FORMATS = ("bf16", "nvfp4")
+OUTPUT_FORMATS = ("bf16", "nvfp4", "mxfp8")  # rmsnorm family (allreduce: bf16 only)
+RMSNORM_EPS = 1e-06  # compiled into the fused-norm programs
+RMSNORM_WEIGHT_BIAS = (
+    1.0  # Gemma: y = z * rsqrt(mean(z^2) + eps) * (weight_bias + weight)
+)
 
 PROGRAMS: dict = {
     "tp2": {
@@ -276,6 +287,98 @@ PROGRAMS: dict = {
             },
         ],
     },
+    "tp2_rmsnorm": {
+        "family": "rmsnorm",
+        "algo": "oneshot",
+        "binding": "fp4_allreduce_tp2_rmsnorm_binding.cu",
+        "block": {"bf16": 224, "nvfp4": 192},
+        "dynamic_smem_bytes": {"bf16": 214784, "nvfp4": 198656},
+        "formats": [
+            ["bf16", "bf16"],
+            ["nvfp4", "bf16"],
+            ["bf16", "nvfp4"],
+            ["bf16", "mxfp8"],
+        ],
+        "eps": 1e-06,
+        "weight_bias": 1.0,
+        "variants": 1,
+        "variant_rule": None,
+        "ctrl_words": 4,
+        "table_entries": 2,
+        "row_multiple": 4,
+        "max_grid": 65536,
+        "capacity": 16384,
+        "nvfp4_value_bytes": 3072,
+        "nvfp4_scales_per_row": 384,
+        "mxfp8_value_bytes": 6144,
+        "mxfp8_scales_per_row": 192,
+        "kernels": [
+            {
+                "symbol": "kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384",
+                "source": "fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384_device.cu",
+                "input_format": "bf16",
+                "output_format": "bf16",
+                "rank": 0,
+                "variant": 0,
+            },
+            {
+                "symbol": "kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r1_cap16384",
+                "source": "fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r1_cap16384_device.cu",
+                "input_format": "bf16",
+                "output_format": "bf16",
+                "rank": 1,
+                "variant": 0,
+            },
+            {
+                "symbol": "kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_r0_cap16384",
+                "source": "fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_r0_cap16384_device.cu",
+                "input_format": "bf16",
+                "output_format": "mxfp8",
+                "rank": 0,
+                "variant": 0,
+            },
+            {
+                "symbol": "kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_r1_cap16384",
+                "source": "fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_r1_cap16384_device.cu",
+                "input_format": "bf16",
+                "output_format": "mxfp8",
+                "rank": 1,
+                "variant": 0,
+            },
+            {
+                "symbol": "kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_r0_cap16384",
+                "source": "fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_r0_cap16384_device.cu",
+                "input_format": "bf16",
+                "output_format": "nvfp4",
+                "rank": 0,
+                "variant": 0,
+            },
+            {
+                "symbol": "kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_r1_cap16384",
+                "source": "fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_r1_cap16384_device.cu",
+                "input_format": "bf16",
+                "output_format": "nvfp4",
+                "rank": 1,
+                "variant": 0,
+            },
+            {
+                "symbol": "kernel_fp4_allreduce_tp2_lnorm_nvfp4_bf16_fused_r0_cap16384",
+                "source": "fp4_allreduce_tp2_lnorm_nvfp4_bf16_fused_r0_cap16384_device.cu",
+                "input_format": "nvfp4",
+                "output_format": "bf16",
+                "rank": 0,
+                "variant": 0,
+            },
+            {
+                "symbol": "kernel_fp4_allreduce_tp2_lnorm_nvfp4_bf16_fused_r1_cap16384",
+                "source": "fp4_allreduce_tp2_lnorm_nvfp4_bf16_fused_r1_cap16384_device.cu",
+                "input_format": "nvfp4",
+                "output_format": "bf16",
+                "rank": 1,
+                "variant": 0,
+            },
+        ],
+    },
 }
 
 COMPILE_FLAGS: list[str] = []
@@ -305,36 +408,64 @@ def _source_dir() -> Path:
     )
 
 
-def program_table(world_size: int) -> dict:
-    """The delivered program set of one world size (``PROGRAMS["tp<world_size>"]``)."""
-    key = f"tp{int(world_size)}"
+def _table_key(world_size: int, family: str) -> str:
+    if family not in FAMILIES:
+        raise ValueError(f"fp4_allreduce families are {FAMILIES}, got {family!r}")
+    base = f"tp{int(world_size)}"
+    return base if family == "allreduce" else f"{base}_{family}"
+
+
+def world_sizes(family: str = "allreduce") -> tuple[int, ...]:
+    """World sizes delivered for ``family``."""
+    if family == "allreduce":
+        return WORLD_SIZES
+    if family == "rmsnorm":
+        return RMSNORM_WORLD_SIZES
+    raise ValueError(f"fp4_allreduce families are {FAMILIES}, got {family!r}")
+
+
+def program_table(world_size: int, family: str = "allreduce") -> dict:
+    """The delivered program set of one (family, world size) (``PROGRAMS["tp<world_size>[_<family>]"]``)."""
+    key = _table_key(world_size, family)
     if key not in PROGRAMS:
         raise ValueError(
-            f"fp4_allreduce supports world sizes {WORLD_SIZES}, got {world_size}"
+            f"fp4_allreduce family {family!r} supports world sizes {world_sizes(family)}, got {world_size}"
         )
     return PROGRAMS[key]
 
 
-def kernel_names(world_size: int | None = None) -> tuple[str, ...]:
-    """Kernel symbols of one world size (or of every delivered program)."""
-    sizes = WORLD_SIZES if world_size is None else (int(world_size),)
+def kernel_names(
+    world_size: int | None = None, family: str = "allreduce"
+) -> tuple[str, ...]:
+    """Kernel symbols of one (family, world size) (or of every world size of the family)."""
+    sizes = world_sizes(family) if world_size is None else (int(world_size),)
     return tuple(
-        kernel["symbol"] for size in sizes for kernel in program_table(size)["kernels"]
+        kernel["symbol"]
+        for size in sizes
+        for kernel in program_table(size, family)["kernels"]
     )
 
 
-def kernel_name(world_size: int, input_format: str, rank: int, variant: int) -> str:
-    """Kernel symbol of one (world size, input format, rank, phase-B variant)."""
-    for kernel in program_table(world_size)["kernels"]:
+def kernel_name(
+    world_size: int,
+    input_format: str,
+    rank: int,
+    variant: int,
+    family: str = "allreduce",
+    output_format: str = "bf16",
+) -> str:
+    """Kernel symbol of one (family, world size, input format, output format, rank, phase-B variant)."""
+    for kernel in program_table(world_size, family)["kernels"]:
         if (
             kernel["input_format"] == input_format
+            and kernel.get("output_format", "bf16") == output_format
             and int(kernel["rank"]) == int(rank)
             and int(kernel["variant"]) == int(variant)
         ):
             return kernel["symbol"]
     raise KeyError(
-        f"no fp4_allreduce program for world_size={world_size} input_format={input_format!r} "
-        f"rank={rank} variant={variant}"
+        f"no fp4_allreduce program for family={family!r} world_size={world_size} input_format={input_format!r} "
+        f"output_format={output_format!r} rank={rank} variant={variant}"
     )
 
 
@@ -351,14 +482,17 @@ def target_arch(device_index: int) -> Fp4AllReduceArch:
     return arch
 
 
-def phase_b_variant(rows: int, grid: int, world_size: int) -> int:
+def phase_b_variant(
+    rows: int, grid: int, world_size: int, family: str = "allreduce"
+) -> int:
     """The phase-B variant the binding selects for ``rows`` on ``grid`` CTAs.
 
     The two-shot (world size 4) kernels come in three variants chosen from the
-    rows each CTA owns; the one-shot kernels have a single program.  Every rank
-    evaluates this rule on the same grid, so every rank runs the same variant.
+    rows each CTA owns; the one-shot kernels (world size 2, both families) have
+    a single program.  Every rank evaluates this rule on the same grid, so every
+    rank runs the same variant.
     """
-    rule = program_table(world_size)["variant_rule"]
+    rule = program_table(world_size, family)["variant_rule"]
     if rule is None:
         return 0
     per_cta = int(rows) // int(grid)
@@ -369,15 +503,14 @@ def phase_b_variant(rows: int, grid: int, world_size: int) -> int:
     return 1
 
 
-@functools.cache
-def gen_fp4_allreduce_module(world_size: int, arch: Fp4AllReduceArch) -> JitSpec:
-    """One JIT module per (world size, architecture): the generated device units plus the binding."""
-    table = program_table(world_size)
+def _jit_spec(world_size: int, arch: Fp4AllReduceArch, family: str) -> JitSpec:
+    table = program_table(world_size, family)
     source_dir = _source_dir()
     sources = [source_dir / kernel["source"] for kernel in table["kernels"]]
     sources.append(source_dir / table["binding"])
+    suffix = "" if family == "allreduce" else f"_{family}"
     return gen_jit_spec(
-        name=f"{SOURCE_PACKAGE}_tp{int(world_size)}_{arch}",
+        name=f"{SOURCE_PACKAGE}{suffix}_tp{int(world_size)}_{arch}",
         sources=sources,
         extra_cuda_cflags=[*_NVCC_FLAGS[arch], *COMPILE_FLAGS],
         use_fast_math=False,
@@ -385,24 +518,61 @@ def gen_fp4_allreduce_module(world_size: int, arch: Fp4AllReduceArch) -> JitSpec
 
 
 @functools.cache
+def gen_fp4_allreduce_module(world_size: int, arch: Fp4AllReduceArch) -> JitSpec:
+    """One JIT module per (world size, architecture) of the all-reduce family: the generated device units plus the binding."""
+    return _jit_spec(int(world_size), arch, "allreduce")
+
+
+@functools.cache
 def get_fp4_allreduce_module(world_size: int, arch: Fp4AllReduceArch):
     return gen_fp4_allreduce_module(int(world_size), arch).build_and_load()
+
+
+@functools.cache
+def gen_fp4_allreduce_rmsnorm_module(
+    world_size: int, arch: Fp4AllReduceArch
+) -> JitSpec:
+    """One JIT module per (world size, architecture) of the fused-norm family: the generated device units plus the binding."""
+    return _jit_spec(int(world_size), arch, "rmsnorm")
+
+
+@functools.cache
+def get_fp4_allreduce_rmsnorm_module(world_size: int, arch: Fp4AllReduceArch):
+    return gen_fp4_allreduce_rmsnorm_module(int(world_size), arch).build_and_load()
+
+
+def get_module(world_size: int, arch: Fp4AllReduceArch, family: str = "allreduce"):
+    """The built module of one (family, world size, architecture)."""
+    if family == "allreduce":
+        return get_fp4_allreduce_module(int(world_size), arch)
+    if family == "rmsnorm":
+        return get_fp4_allreduce_rmsnorm_module(int(world_size), arch)
+    raise ValueError(f"fp4_allreduce families are {FAMILIES}, got {family!r}")
 
 
 __all__ = [
     "CAPACITY",
     "COMPILE_FLAGS",
+    "FAMILIES",
     "HIDDEN",
     "INPUT_FORMATS",
+    "OUTPUT_FORMATS",
     "PROGRAMS",
     "RECORD_BYTES",
+    "RMSNORM_EPS",
+    "RMSNORM_WEIGHT_BIAS",
+    "RMSNORM_WORLD_SIZES",
     "SOURCE_PACKAGE",
     "WORLD_SIZES",
     "gen_fp4_allreduce_module",
+    "gen_fp4_allreduce_rmsnorm_module",
     "get_fp4_allreduce_module",
+    "get_fp4_allreduce_rmsnorm_module",
+    "get_module",
     "kernel_name",
     "kernel_names",
     "phase_b_variant",
     "program_table",
     "target_arch",
+    "world_sizes",
 ]

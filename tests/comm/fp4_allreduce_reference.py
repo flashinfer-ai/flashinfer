@@ -30,11 +30,20 @@ limitations under the License.
 # ``fma(e2m1(q), e4m3(sf) * rs, acc)`` in rank order from +0.  The one-shot
 # output is ``bf16(acc)``; the two-shot owner re-encodes the float32 sum with
 # fresh row scales and the output is the decode of that record.
+#
+# The fused residual + RMSNorm family keeps the float32 one-shot sum:
+# ``z = sum + residual`` (float32), ``residual_out = bf16(z)`` (bitwise),
+# ``y = (z * rsqrt(mean(z^2) + eps)) * (1 + weight)`` in float32, then
+# ``bf16(y)`` or the ``fp4_quantize`` / ``mxfp8_quantize`` quantisation of that
+# bfloat16 ``y`` (bitwise against those kernels on the fused kernel's own ``y``).
+# The kernels sum ``z^2`` in their own order, so ``y`` is compared with a
+# tolerance (``atol = rtol = 1e-2``) and the bfloat16 ulp distance is reported.
 
 from __future__ import annotations
 
 import math
-from typing import Sequence
+from dataclasses import dataclass
+from typing import Optional, Sequence
 
 import torch
 
@@ -44,11 +53,34 @@ BLOCKS_PER_ROW = HIDDEN // BLOCK  # 384
 VALUE_BYTES = HIDDEN // 2  # 3072 packed E2M1 bytes
 SCALE_BYTES = BLOCKS_PER_ROW  # 384 E4M3 bytes
 RECORD_BYTES = VALUE_BYTES + SCALE_BYTES  # 3456
-ROW_AMAX_TARGET = 2688.0  # 448 (E4M3 max) * 6 (E2M1 max)
+ROW_AMAX_TARGET = 2688.0  # row amax maps onto the largest encodable product: E4M3 scale 448 x E2M1 value 6
 E4M3_MAX = 448.0
 SOURCE_MAGNITUDES = (1.0, 0.5, 2.0, 0.25, 1.5, 0.75, 3.0, 0.125)
 OUTLIER_COUNT = 32
 OUTLIER_MAGNITUDE = 40.0
+# Fused residual + RMSNorm family (world size 2).
+NORM_EPS = 1e-6
+NORM_WEIGHT_BIAS = 1.0  # Gemma: y = z * rinv * (weight_bias + weight)
+NEGATIVE_CONTROL_WEIGHT_BIAS = (
+    1.0 + 2.0**-7
+)  # a reference with this bias must fail the y tolerance
+RESIDUAL_SOURCE_RANK = (
+    5  # residual stream: magnitude 0.75 plus outliers (same tensor on every rank)
+)
+RESIDUAL_SEED_XOR = 0x5E5
+WEIGHT_SOURCE_RANK = (
+    7  # norm weight: magnitude 0.125, no outliers, so 1 + weight stays in [0.4, 1.6]
+)
+WEIGHT_SEED = 4242
+SCALE_ROW_TILE = (
+    128  # swizzled output scale tensors cover rows padded to a multiple of 128
+)
+NVFP4_OUTPUT_SCALES_PER_ROW = 384  # one E4M3 scale per 16 values
+MXFP8_OUTPUT_SCALES_PER_ROW = 192  # one UE8M0 scale per 32 values
+RSQRT_FORM_DEVICE = "rsqrt.approx.f32"  # torch.rsqrt on CUDA float32 (libdevice rsqrtf)
+RSQRT_FORM_IEEE = (
+    "ieee_rn_f64"  # 1 / sqrt in float64 rounded once to float32 (CPU tensors)
+)
 _E2M1_VALUES = (
     0.0,
     0.5,
@@ -378,12 +410,14 @@ def _hash_u32_int(a: int) -> int:
     return a ^ (a >> 16)
 
 
-def generate_rank_input(rows: int, source_rank: int, seed: int, device) -> torch.Tensor:
+def generate_rank_input(
+    rows: int, source_rank: int, seed: int, device, *, outliers: bool = True
+) -> torch.Tensor:
     """bfloat16 ``[rows, 6144]`` partial of ``source_rank``.
 
     Box-Muller Gaussian scaled by ``SOURCE_MAGNITUDES[source_rank % 8]`` plus 32
-    outliers of ``+-40 * magnitude`` at hashed positions; deterministic in
-    ``(rows, source_rank, seed)`` on any device.
+    outliers of ``+-40 * magnitude`` at hashed positions (``outliers=False``
+    omits them); deterministic in ``(rows, source_rank, seed)`` on any device.
     """
     n = rows * HIDDEN
     mag = SOURCE_MAGNITUDES[source_rank & 7]
@@ -395,6 +429,8 @@ def generate_rank_input(rows: int, source_rank: int, seed: int, device) -> torch
     u2 = (h2 >> 8).to(torch.float32) * (1.0 / 16777216.0)
     x = torch.sqrt(-2.0 * torch.log(u1)) * torch.cos(2.0 * math.pi * u2) * mag
     x = x.to(torch.bfloat16)
+    if not outliers:
+        return x.reshape(rows, HIDDEN)
     positions: list[int] = []
     values: list[float] = []
     for k in range(OUTLIER_COUNT):
@@ -407,3 +443,252 @@ def generate_rank_input(rows: int, source_rank: int, seed: int, device) -> torch
         values, dtype=torch.float32, device=device
     ).to(torch.bfloat16)
     return x.reshape(rows, HIDDEN)
+
+
+def generate_residual(rows: int, seed: int, device) -> torch.Tensor:
+    """Residual stream of one call: bfloat16 ``[rows, 6144]``, the same on every rank (seeded by the call, not the rank)."""
+    return generate_rank_input(
+        rows, RESIDUAL_SOURCE_RANK, (int(seed) ^ RESIDUAL_SEED_XOR) & _U32_MASK, device
+    )
+
+
+def generate_weight(seed: int, device) -> torch.Tensor:
+    """Norm weight: bfloat16 ``[6144]`` of magnitude 0.125 without outliers (``1 + weight`` stays in ``[0.4, 1.6]``)."""
+    return generate_rank_input(
+        1,
+        WEIGHT_SOURCE_RANK,
+        (WEIGHT_SEED ^ int(seed)) & _U32_MASK,
+        device,
+        outliers=False,
+    )[0]
+
+
+# ---------------------------------------------------------------------------
+# Fused residual + RMSNorm epilogue (family "rmsnorm")
+# ---------------------------------------------------------------------------
+
+
+def rsqrt_f32(x_f32: torch.Tensor) -> tuple[torch.Tensor, str]:
+    """``rsqrt`` of a float32 tensor and the form used.
+
+    On CUDA tensors ``torch.rsqrt`` evaluates ``rsqrtf`` = the ``rsqrt.approx.f32``
+    instruction, which agrees with the kernels' ``rsqrt.approx.ftz.f32`` on the
+    normal arguments the norm produces (``mean(z^2) + eps >= eps``).  On CPU
+    tensors the IEEE float64 ``1 / sqrt`` rounded once to float32 is used.
+    """
+    if x_f32.is_cuda:
+        return torch.rsqrt(x_f32), RSQRT_FORM_DEVICE
+    return (1.0 / torch.sqrt(x_f32.to(torch.float64))).to(
+        torch.float32
+    ), RSQRT_FORM_IEEE
+
+
+@dataclass
+class FusedNormReference:
+    """Reference of one fused call (tensors ``[rows, 6144]`` unless noted)."""
+
+    y_f32: torch.Tensor  # (z * rinv) * (weight_bias + weight) in float32
+    y_bf16: torch.Tensor  # bf16(y_f32): the comparison target of the bfloat16 output
+    residual_out: torch.Tensor  # bf16(z), compared bitwise
+    ss: torch.Tensor  # [rows] float32 sum of z^2 (exact float64 sum rounded once)
+    rinv: torch.Tensor  # [rows] float32 rsqrt(ss / 6144 + eps)
+    weight_bias: float
+    eps: float
+    rsqrt_form: str
+
+
+def fused_norm_from_sum(
+    acc_f32: torch.Tensor,
+    residual_bf16: torch.Tensor,
+    weight_bf16: torch.Tensor,
+    *,
+    weight_bias: float = NORM_WEIGHT_BIAS,
+    eps: float = NORM_EPS,
+) -> FusedNormReference:
+    """``z = acc + float(residual)``; ``residual_out = bf16(z)``; ``ss = sum z^2``; ``rinv = rsqrt(ss / 6144 + eps)``;
+    ``y = (z * rinv) * (weight_bias + float(weight))`` -- one float32 rounding per operation; ``ss`` is the exact
+    float64 sum rounded once (the best float32 value; a kernel's summation order deviates by a few float32 ulps)."""
+    rows = acc_f32.shape[0]
+    z = f32_add_rn(acc_f32, residual_bf16.to(torch.float32))
+    residual_out = z.to(torch.bfloat16)
+    z64 = z.to(torch.float64)
+    ss = (z64 * z64).sum(dim=1).to(torch.float32)
+    arg = f32_add_rn(
+        f32_div_rn(ss, torch.full_like(ss, float(HIDDEN))),
+        torch.full_like(ss, float(eps)),
+    )
+    rinv, form = rsqrt_f32(arg)
+    scale = f32_add_rn(
+        torch.full((HIDDEN,), float(weight_bias), dtype=torch.float32, device=z.device),
+        weight_bf16.to(torch.float32),
+    )
+    y = f32_mul_rn(
+        f32_mul_rn(z, rinv.reshape(rows, 1).expand(rows, HIDDEN)),
+        scale.reshape(1, HIDDEN).expand(rows, HIDDEN),
+    )
+    return FusedNormReference(
+        y_f32=y,
+        y_bf16=y.to(torch.bfloat16),
+        residual_out=residual_out,
+        ss=ss,
+        rinv=rinv,
+        weight_bias=float(weight_bias),
+        eps=float(eps),
+        rsqrt_form=form,
+    )
+
+
+def reference_fused_rmsnorm(
+    x_bf16_by_rank: Optional[Sequence[torch.Tensor]] = None,
+    residual_bf16: Optional[torch.Tensor] = None,
+    weight_bf16: Optional[torch.Tensor] = None,
+    *,
+    records_by_rank: Optional[Sequence[torch.Tensor]] = None,
+    global_scales: Optional[Sequence[float]] = None,
+    weight_bias: float = NORM_WEIGHT_BIAS,
+    eps: float = NORM_EPS,
+) -> FusedNormReference:
+    """Reference of ``fp4_allreduce_rmsnorm`` (bfloat16 partials) or ``fp4_allreduce_rmsnorm_nvfp4`` (records).
+
+    The float32 one-shot codec sum of the two ranks (rank order) feeds
+    :func:`fused_norm_from_sum`; ``weight_bias`` other than 1 builds a wrong
+    reference for the negative control.
+    """
+    if residual_bf16 is None or weight_bf16 is None:
+        raise ValueError("residual_bf16 and weight_bf16 are required")
+    if tuple(weight_bf16.shape) != (HIDDEN,):
+        raise ValueError(f"weight must be a [{HIDDEN}] bfloat16 row")
+    if records_by_rank is not None:
+        if global_scales is None:
+            raise ValueError("records_by_rank needs global_scales")
+        if len(records_by_rank) != 2:
+            raise ValueError("the fused-norm family is the two-rank one-shot exchange")
+        acc = _records_sum(records_by_rank, global_scales)
+    else:
+        if x_bf16_by_rank is None:
+            raise ValueError("x_bf16_by_rank or records_by_rank is required")
+        if len(x_bf16_by_rank) != 2:
+            raise ValueError("the fused-norm family is the two-rank one-shot exchange")
+        acc = _codec_sum(x_bf16_by_rank)
+    return fused_norm_from_sum(
+        acc, residual_bf16, weight_bf16, weight_bias=weight_bias, eps=eps
+    )
+
+
+def bf16_ulp_distance(a_bf16: torch.Tensor, b_bf16: torch.Tensor) -> torch.Tensor:
+    """Elementwise distance of two bfloat16 tensors in bfloat16 steps (signed-magnitude key; ``+-0`` coincide)."""
+
+    def key(t: torch.Tensor) -> torch.Tensor:
+        bits = t.view(torch.int16).to(torch.int32) & 0xFFFF
+        mag = bits & 0x7FFF
+        return torch.where((bits & 0x8000) != 0, -mag, mag)
+
+    return (key(a_bf16) - key(b_bf16)).abs()
+
+
+def check_normalised_output(
+    y_bf16: torch.Tensor,
+    ref: FusedNormReference,
+    *,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
+) -> dict:
+    """Compare a bfloat16 ``y`` with the reference: tolerance violations (the acceptance), non-finite count and the
+    bfloat16 ulp profile (a correct kernel differs from ``bf16(y_f32)`` by at most one step on a small fraction of the
+    elements, from its own ``z^2`` summation order)."""
+    y = y_bf16.to(torch.float32)
+    bound = atol + rtol * ref.y_f32.abs()
+    violations = int(((y - ref.y_f32).abs() > bound).sum().item())
+    non_finite = int((~torch.isfinite(y)).sum().item())
+    ulp = bf16_ulp_distance(y_bf16, ref.y_bf16)
+    n = int(ulp.numel())
+    return {
+        "elements": n,
+        "violations": violations,
+        "non_finite": non_finite,
+        "max_ulp": int(ulp.max().item()) if n else 0,
+        "ulp1_fraction": (float((ulp == 1).sum().item()) / n) if n else 0.0,
+        "passed": violations == 0 and non_finite == 0,
+    }
+
+
+def output_global_scale(y_bf16: torch.Tensor) -> torch.Tensor:
+    """Float32 ``[1]`` device tensor ``fl32(2688 / amax(y))``: the input global scale of ``fp4_quantize`` for ``y``."""
+    amax = y_bf16.to(torch.float32).abs().amax().reshape(1)
+    return f32_div_rn(torch.full_like(amax, ROW_AMAX_TARGET), amax).contiguous()
+
+
+def padded_scale_rows(rows: int) -> int:
+    """Rows covered by a swizzled scale tensor (``rows`` rounded up to a multiple of 128)."""
+    return (int(rows) + SCALE_ROW_TILE - 1) // SCALE_ROW_TILE * SCALE_ROW_TILE
+
+
+def unswizzle_scales_128x4(
+    flat_u8: torch.Tensor, rows: int, scales_per_row: int
+) -> torch.Tensor:
+    """``[padded rows * scales_per_row]`` swizzled bytes -> ``[rows, scales_per_row]`` block-order scales.
+
+    The 128x4 layout stores scale ``(m, k)`` at ``(m // 128) * kt * 512 + (k // 4) * 512
+    + (m % 32) * 16 + ((m % 128) // 32) * 4 + (k % 4)`` with ``kt = scales_per_row // 4``.
+    """
+    mt = padded_scale_rows(rows) // SCALE_ROW_TILE
+    kt = int(scales_per_row) // 4
+    need = mt * kt * 512
+    if flat_u8.numel() < need:
+        raise ValueError(
+            f"swizzled scale tensor has {flat_u8.numel()} bytes, need {need}"
+        )
+    tiles = flat_u8.reshape(-1)[:need].reshape(mt, kt, 32, 4, 4)
+    return (
+        tiles.permute(0, 3, 2, 1, 4)
+        .reshape(mt * SCALE_ROW_TILE, kt * 4)[: int(rows), : int(scales_per_row)]
+        .contiguous()
+    )
+
+
+def nvfp4_output_reference(
+    y_bf16: torch.Tensor, global_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``fp4_quantize`` of ``y`` (16-value E4M3 block scales, 128x4 swizzle, candidate search off):
+    ``(values u8 [rows, 3072], scales u8 [padded rows * 384])``."""
+    from flashinfer import fp4_quantize
+
+    rows = int(y_bf16.shape[0])
+    values, scales = fp4_quantize(
+        y_bf16.contiguous(),
+        global_scale=global_scale.reshape(1).to(torch.float32),
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=True,
+        is_sf_8x4_layout=False,
+        is_global_scale_inversed=False,
+        backend="cuda",
+        nvfp4_4over6=None,
+    )
+    values = values.view(torch.uint8).reshape(rows, VALUE_BYTES).contiguous()
+    need = padded_scale_rows(rows) * NVFP4_OUTPUT_SCALES_PER_ROW
+    scales = scales.view(torch.uint8).reshape(-1)
+    if scales.numel() < need:
+        raise RuntimeError(
+            f"fp4_quantize returned {scales.numel()} scale bytes, expected >= {need}"
+        )
+    return values, scales[:need].contiguous()
+
+
+def mxfp8_output_reference(y_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``mxfp8_quantize`` of ``y`` (32-value UE8M0 block scales, 128x4 swizzle):
+    ``(values u8 [rows, 6144], scales u8 [padded rows * 192])``."""
+    from flashinfer import mxfp8_quantize
+
+    rows = int(y_bf16.shape[0])
+    values, scales = mxfp8_quantize(
+        y_bf16.contiguous(), is_sf_swizzled_layout=True, alignment=32, backend="cuda"
+    )
+    values = values.view(torch.uint8).reshape(rows, HIDDEN).contiguous()
+    need = padded_scale_rows(rows) * MXFP8_OUTPUT_SCALES_PER_ROW
+    scales = scales.view(torch.uint8).reshape(-1)
+    if scales.numel() < need:
+        raise RuntimeError(
+            f"mxfp8_quantize returned {scales.numel()} scale bytes, expected >= {need}"
+        )
+    return values, scales[:need].contiguous()

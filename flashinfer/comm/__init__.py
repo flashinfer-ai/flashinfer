@@ -1,10 +1,12 @@
 from .cuda_ipc import CudaRTLibrary, create_shared_buffer, free_shared_buffer
 from .fp4_allreduce import Fp4AllReduceFusedNormOutput as Fp4AllReduceFusedNormOutput
+from .fp4_allreduce import Fp4AllReduceFusedNormResult as Fp4AllReduceFusedNormResult
 from .fp4_allreduce import Fp4AllReduceFusedNormSpec as Fp4AllReduceFusedNormSpec
 from .fp4_allreduce import Fp4AllReduceWorkspace as Fp4AllReduceWorkspace
 from .fp4_allreduce import fp4_allreduce as fp4_allreduce
 from .fp4_allreduce import fp4_allreduce_nvfp4 as fp4_allreduce_nvfp4
 from .fp4_allreduce import fp4_allreduce_rmsnorm as fp4_allreduce_rmsnorm
+from .fp4_allreduce import fp4_allreduce_rmsnorm_nvfp4 as fp4_allreduce_rmsnorm_nvfp4
 from .dlpack_utils import pack_strided_memory
 from .mapping import Mapping
 from .trtllm_ar import AllReduceFusionOp as AllReduceFusionOp

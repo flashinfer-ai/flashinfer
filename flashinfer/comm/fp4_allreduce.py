@@ -22,8 +22,13 @@ limitations under the License.
 # identical on every rank.  World size 2 runs a one-shot exchange, world size
 # 4 a two-shot exchange (owner ``row % 4`` reduces, re-encodes and all-gathers;
 # three phase-B variants are chosen per call from the rows each CTA owns).
-# The quantisation follows the codec of the NVFP4 all-reduce reference by
-# Fan Shi (https://github.com/fans-nv/fp4-all-reduce, commit 2878bf5).
+# The ``rmsnorm`` family fuses the one-shot exchange (world size 2) with the
+# residual add and the Gemma RMSNorm: ``z = sum + residual`` is kept in float32,
+# ``residual_out = bf16(z)``, ``y = z * rsqrt(mean(z^2) + eps) * (1 + weight)``
+# is written as bfloat16 or quantised to NVFP4 / MXFP8 in the layouts of
+# ``fp4_quantize`` / ``mxfp8_quantize``.  The quantisation follows the codec of
+# the NVFP4 all-reduce reference by Fan Shi
+# (https://github.com/fans-nv/fp4-all-reduce, commit 2878bf5).
 
 from __future__ import annotations
 
@@ -36,14 +41,16 @@ import torch.distributed as dist
 
 from ..jit.fp4_allreduce import (
     CAPACITY,
+    FAMILIES,
     HIDDEN,
     RECORD_BYTES,
-    WORLD_SIZES,
-    get_fp4_allreduce_module,
+    RMSNORM_EPS,
+    get_module,
     kernel_name,
     phase_b_variant,
     program_table,
     target_arch,
+    world_sizes,
 )
 from .cuda_ipc import create_shared_buffer, free_shared_buffer
 from .dlpack_utils import pack_strided_memory
@@ -57,7 +64,13 @@ ROTATION = 3  # receive buffers per window: three-slot rotation with in-kernel r
 SENTINEL_VALUE_WORD = 0x88888888
 SENTINEL_SCALE_WORD = 0xFFFFFFFF
 SENTINEL_ROW_SCALE_WORD = 0x80000000
-FAMILIES = ("allreduce",)  # delivered program families of the workspace layout
+SCALE_ROW_TILE = (
+    128  # swizzled output scale tensors cover rows padded to a multiple of 128
+)
+NVFP4_OUTPUT_VALUE_BYTES = 3072  # 6144 E2M1 values per row
+NVFP4_OUTPUT_SCALES_PER_ROW = 384  # one E4M3 scale per 16 values
+MXFP8_OUTPUT_VALUE_BYTES = 6144  # one E4M3 byte per value
+MXFP8_OUTPUT_SCALES_PER_ROW = 192  # one UE8M0 scale per 32 values
 
 
 def _page_align(size: int) -> int:
@@ -93,6 +106,7 @@ class RegionPlan:
 class WindowPlan:
     """Receive-window layout of one rank (see :func:`window_plan`)."""
 
+    family: str
     world_size: int
     capacity: int
     ctrl_words: int
@@ -120,43 +134,55 @@ def _slot_array_fills(offset: int, rows: int) -> tuple[FillPlan, ...]:
     )
 
 
+def _oneshot_region(name: str, world_size: int, capacity: int) -> RegionPlan:
+    """Three rotation buffers of ``world_size * capacity`` planar slot rows (value / scale / row-scale planes)."""
+    slot_rows = world_size * capacity
+    buffer = _page_align(slot_rows * SLOT_ROW_BYTES)
+    fills = tuple(
+        fill
+        for index in range(ROTATION)
+        for fill in _slot_array_fills(index * buffer // 4, slot_rows)
+    )
+    return RegionPlan(name, ROTATION * buffer, fills)
+
+
 def window_plan(
     world_size: int, capacity: int = CAPACITY, family: str = "allreduce"
 ) -> WindowPlan:
     """Receive-window layout and sentinel fills of one rank.
 
-    World size 2 (one-shot) owns two windows: the one-shot window (three rotation
-    buffers of ``2 * capacity`` slot rows of 3472 bytes laid out as a value plane,
-    a scale plane and a row-scale plane) and the NVFP4-input window (three buffers
-    of ``2 * capacity`` records of 3456 bytes, armed with the value sentinel over
-    the value bytes and the scale sentinel over the scale bytes of every record).
-    World size 4 (two-shot) owns one window of three buffers, each a
-    reduce-scatter and an all-gather slot array of ``4 * ceil(capacity / 4)``
-    slot rows.  Every buffer is page aligned.
+    Family ``allreduce``, world size 2 (one-shot) owns two windows: the one-shot
+    window (three rotation buffers of ``2 * capacity`` slot rows of 3472 bytes
+    laid out as a value plane, a scale plane and a row-scale plane) and the
+    NVFP4-input window (three buffers of ``2 * capacity`` records of 3456 bytes,
+    armed with the value sentinel over the value bytes and the scale sentinel
+    over the scale bytes of every record).  World size 4 (two-shot) owns one
+    window of three buffers, each a reduce-scatter and an all-gather slot array
+    of ``4 * ceil(capacity / 4)`` slot rows.  Family ``rmsnorm`` (world size 2)
+    owns one one-shot window of the same planar layout; its NVFP4 input travels
+    on that window with the static row scale in the row-scale plane, so no
+    record window exists.  Every buffer is page aligned.
     """
     if family not in FAMILIES:
         raise ValueError(
             f"unknown fp4_allreduce family {family!r}; delivered families: {FAMILIES}"
         )
-    if world_size not in WORLD_SIZES:
+    if world_size not in world_sizes(family):
         raise ValueError(
-            f"fp4_allreduce supports world sizes {WORLD_SIZES}, got {world_size}"
+            f"fp4_allreduce family {family!r} supports world sizes {world_sizes(family)}, "
+            f"got {world_size}"
         )
     if capacity != CAPACITY:
         raise ValueError(
             "the delivered fp4_allreduce programs are specialised for a capacity "
             f"of {CAPACITY} rows, got {capacity}"
         )
-    table = program_table(world_size)
-    if world_size == 2:
+    table = program_table(world_size, family)
+    if family == "rmsnorm":
+        regions = (_oneshot_region("rmsnorm", world_size, capacity),)
+    elif world_size == 2:
         slot_rows = world_size * capacity
-        oneshot_buffer = _page_align(slot_rows * SLOT_ROW_BYTES)
         record_buffer = _page_align(slot_rows * RECORD_BYTES)
-        oneshot_fills = tuple(
-            fill
-            for buffer in range(ROTATION)
-            for fill in _slot_array_fills(buffer * oneshot_buffer // 4, slot_rows)
-        )
         record_fills = tuple(
             FillPlan(
                 buffer * record_buffer // 4,
@@ -169,7 +195,7 @@ def window_plan(
             for buffer in range(ROTATION)
         )
         regions = (
-            RegionPlan("oneshot", ROTATION * oneshot_buffer, oneshot_fills),
+            _oneshot_region("oneshot", world_size, capacity),
             RegionPlan("nvfp4", ROTATION * record_buffer, record_fills),
         )
     else:
@@ -187,6 +213,7 @@ def window_plan(
         )
         regions = (RegionPlan("twoshot", ROTATION * buffer_bytes, fills),)
     plan = WindowPlan(
+        family,
         world_size,
         capacity,
         int(table["ctrl_words"]),
@@ -195,8 +222,8 @@ def window_plan(
     )
     if plan.table_entries != int(table["table_entries"]):
         raise RuntimeError(
-            f"the window plan of world size {world_size} yields {plan.table_entries} "
-            f"table entries, the binding expects {table['table_entries']}"
+            f"the window plan of family {family!r} world size {world_size} yields "
+            f"{plan.table_entries} table entries, the binding expects {table['table_entries']}"
         )
     return plan
 
@@ -229,13 +256,17 @@ def _arm(words: torch.Tensor, fills: tuple[FillPlan, ...]) -> None:
 class Fp4AllReduceWorkspace:
     """Per-rank state of the NVFP4-transport all-reduce, created collectively.
 
-    Every rank of ``group`` (world size 2 or 4) constructs one instance with the
-    same ``capacity``: the receive windows are shared through CUDA IPC, armed
-    with their Lamport sentinels and published in the peer window table; the
-    call-state words start at zero.  The CTA count is the SM count of the device
-    and must agree on every rank.  ``destroy()`` releases the shared windows and
-    is collective as well.  Construction loads (and on first use compiles) the
-    JIT module of the device's architecture.
+    Every rank of ``group`` constructs one instance with the same ``capacity``
+    and ``family`` (``"allreduce"``: world size 2 or 4, the bfloat16 all-reduce;
+    ``"rmsnorm"``: world size 2, the all-reduce fused with the residual add and
+    the RMSNorm).  The receive windows are shared through CUDA IPC, armed with
+    their Lamport sentinels and published in the peer window table; the
+    call-state words start at zero.  Each family keeps its own windows and
+    call state, so one workspace serves the calls of its family only.  The CTA
+    count is the SM count of the device and must agree on every rank.
+    ``destroy()`` releases the shared windows and is collective as well.
+    Construction loads (and on first use compiles) the JIT module of the
+    device's architecture.
     """
 
     def __init__(
@@ -250,12 +281,17 @@ class Fp4AllReduceWorkspace:
             raise RuntimeError(
                 "fp4_allreduce requires an initialized torch.distributed process group"
             )
+        if family not in FAMILIES:
+            raise ValueError(
+                f"unknown fp4_allreduce family {family!r}; delivered families: {FAMILIES}"
+            )
         self.group = dist.group.WORLD if group is None else group
         self.world_size = int(dist.get_world_size(self.group))
         self.rank = int(dist.get_rank(self.group))
-        if self.world_size not in WORLD_SIZES:
+        if self.world_size not in world_sizes(family):
             raise ValueError(
-                f"fp4_allreduce supports world sizes {WORLD_SIZES}, got a group of {self.world_size}"
+                f"fp4_allreduce family {family!r} supports world sizes {world_sizes(family)}, "
+                f"got a group of {self.world_size}"
             )
         device = torch.device(torch.cuda.current_device() if device is None else device)
         if device.type != "cuda":
@@ -266,7 +302,7 @@ class Fp4AllReduceWorkspace:
         self.plan = window_plan(self.world_size, capacity, family)
         self.capacity = int(capacity)
         self.arch = target_arch(index)
-        self.module = get_fp4_allreduce_module(self.world_size, self.arch)
+        self.module = get_module(self.world_size, self.arch, family)
         grid = int(torch.cuda.get_device_properties(index).multi_processor_count)
         gathered = [
             torch.zeros(1, dtype=torch.int64, device=self.device)
@@ -323,18 +359,32 @@ class Fp4AllReduceWorkspace:
 
     def variant(self, rows: int) -> int:
         """The phase-B variant a call with ``rows`` rows runs on this workspace's grid."""
-        return phase_b_variant(int(rows), self.grid, self.world_size)
+        return phase_b_variant(int(rows), self.grid, self.world_size, self.family)
 
-    def kernel_name(self, input_format: str, rows: int) -> str:
-        """Kernel symbol this rank launches for ``rows`` rows of ``input_format`` (``"bf16"`` or ``"nvfp4"``)."""
-        return kernel_name(self.world_size, input_format, self.rank, self.variant(rows))
+    def kernel_name(
+        self, input_format: str, rows: int, output_format: str = "bf16"
+    ) -> str:
+        """Kernel symbol this rank launches for ``rows`` rows of ``input_format`` (and, for the fused-norm family, ``output_format``)."""
+        return kernel_name(
+            self.world_size,
+            input_format,
+            self.rank,
+            self.variant(rows),
+            self.family,
+            output_format,
+        )
 
 
-def _check_workspace(workspace: Fp4AllReduceWorkspace) -> None:
+def _check_workspace(workspace: Fp4AllReduceWorkspace, family: str) -> None:
     if not isinstance(workspace, Fp4AllReduceWorkspace):
         raise TypeError("workspace must be a Fp4AllReduceWorkspace")
     if workspace.closed:
         raise RuntimeError("the fp4_allreduce workspace has been destroyed")
+    if workspace.family != family:
+        raise ValueError(
+            f"this call needs a workspace of family {family!r}, got one of family "
+            f"{workspace.family!r}"
+        )
 
 
 def _check_rows(rows: int, workspace: Fp4AllReduceWorkspace) -> None:
@@ -342,8 +392,8 @@ def _check_rows(rows: int, workspace: Fp4AllReduceWorkspace) -> None:
         raise ValueError(f"rows must be in (0, {workspace.capacity}], got {rows}")
     if rows % workspace.plan.row_multiple:
         raise ValueError(
-            f"world size {workspace.world_size} needs rows to be a multiple of "
-            f"{workspace.plan.row_multiple}, got {rows}"
+            f"family {workspace.family!r} with world size {workspace.world_size} needs rows "
+            f"to be a multiple of {workspace.plan.row_multiple}, got {rows}"
         )
 
 
@@ -364,16 +414,51 @@ def _check_activation(
         raise ValueError(f"{name} must live on {workspace.device}, got {x.device}")
 
 
+def _check_records(
+    records: torch.Tensor,
+    global_scales: torch.Tensor,
+    workspace: Fp4AllReduceWorkspace,
+) -> None:
+    if (
+        records.dim() != 2
+        or records.shape[1] != RECORD_BYTES
+        or records.dtype != torch.uint8
+        or not records.is_contiguous()
+    ):
+        raise ValueError(
+            f"records must be a contiguous uint8 [rows, {RECORD_BYTES}] tensor, "
+            f"got {tuple(records.shape)} {records.dtype}"
+        )
+    if records.device != workspace.device:
+        raise ValueError(
+            f"records must live on {workspace.device}, got {records.device}"
+        )
+    if (
+        global_scales.dim() != 1
+        or global_scales.numel() < workspace.world_size
+        or global_scales.dtype != torch.float32
+        or not global_scales.is_contiguous()
+        or global_scales.device != workspace.device
+    ):
+        raise ValueError(
+            f"global_scales must be a contiguous float32 [{workspace.world_size}] tensor on "
+            f"{workspace.device}"
+        )
+
+
 def _output(
-    out: Optional[torch.Tensor], rows: int, workspace: Fp4AllReduceWorkspace
+    out: Optional[torch.Tensor],
+    rows: int,
+    workspace: Fp4AllReduceWorkspace,
+    name: str = "out",
 ) -> torch.Tensor:
     if out is None:
         return torch.empty(
             (rows, HIDDEN), dtype=torch.bfloat16, device=workspace.device
         )
-    _check_activation(out, workspace, "out")
+    _check_activation(out, workspace, name)
     if out.shape[0] != rows:
-        raise ValueError(f"out must have {rows} rows, got {out.shape[0]}")
+        raise ValueError(f"{name} must have {rows} rows, got {out.shape[0]}")
     return out
 
 
@@ -393,7 +478,7 @@ def fp4_allreduce(
         most the workspace capacity, a multiple of 4 for world size 4, and the
         same on every rank of the call.
     workspace : Fp4AllReduceWorkspace
-        The collective workspace of the group.
+        The collective workspace of the group (family ``"allreduce"``).
     out : torch.Tensor, optional
         Contiguous bfloat16 ``[rows, 6144]`` output; allocated when omitted.
     launch_with_pdl : bool
@@ -408,7 +493,7 @@ def fp4_allreduce(
         given and performs no host synchronisation, so it can be captured into
         a CUDA graph.
     """
-    _check_workspace(workspace)
+    _check_workspace(workspace, "allreduce")
     _check_activation(x, workspace, "x")
     rows = int(x.shape[0])
     _check_rows(rows, workspace)
@@ -448,7 +533,7 @@ def fp4_allreduce_nvfp4(
         Contiguous float32 ``[world_size]`` tensor holding the static scale of
         every rank's records; identical on every rank.
     workspace : Fp4AllReduceWorkspace
-        The collective workspace of the group.
+        The collective workspace of the group (family ``"allreduce"``).
     out : torch.Tensor, optional
         Contiguous bfloat16 ``[rows, 6144]`` output; allocated when omitted.
     launch_with_pdl : bool
@@ -460,32 +545,8 @@ def fp4_allreduce_nvfp4(
         ``out``: the rank-order sum of the decoded records (``record_r`` decoded
         with ``global_scales[r]``), bitwise identical on every rank.
     """
-    _check_workspace(workspace)
-    if (
-        records.dim() != 2
-        or records.shape[1] != RECORD_BYTES
-        or records.dtype != torch.uint8
-        or not records.is_contiguous()
-    ):
-        raise ValueError(
-            f"records must be a contiguous uint8 [rows, {RECORD_BYTES}] tensor, "
-            f"got {tuple(records.shape)} {records.dtype}"
-        )
-    if records.device != workspace.device:
-        raise ValueError(
-            f"records must live on {workspace.device}, got {records.device}"
-        )
-    if (
-        global_scales.dim() != 1
-        or global_scales.numel() < workspace.world_size
-        or global_scales.dtype != torch.float32
-        or not global_scales.is_contiguous()
-        or global_scales.device != workspace.device
-    ):
-        raise ValueError(
-            f"global_scales must be a contiguous float32 [{workspace.world_size}] tensor on "
-            f"{workspace.device}"
-        )
+    _check_workspace(workspace, "allreduce")
+    _check_records(records, global_scales, workspace)
     rows = int(records.shape[0])
     _check_rows(rows, workspace)
     out = _output(out, rows, workspace)
@@ -511,23 +572,222 @@ class Fp4AllReduceFusedNormOutput(enum.Enum):
     MXFP8 = "mxfp8"
 
 
+_OUTPUT_CODES = {
+    Fp4AllReduceFusedNormOutput.BF16: 0,
+    Fp4AllReduceFusedNormOutput.NVFP4: 1,
+    Fp4AllReduceFusedNormOutput.MXFP8: 2,
+}
+
+
 @dataclass(frozen=True)
 class Fp4AllReduceFusedNormSpec:
     """Request of the fused epilogue: residual add, then RMSNorm scaled by ``1 + weight``.
 
-    ``weight`` is a ``[6144]`` tensor, ``eps`` the RMSNorm epsilon and ``output``
-    the precision of the normalised result (NVFP4 and MXFP8 outputs carry their
-    block scales next to the packed values).
+    ``weight`` is a contiguous bfloat16 ``[6144]`` tensor on the workspace device,
+    ``eps`` the RMSNorm epsilon (the delivered programs are compiled for
+    ``1e-6``; another value is rejected) and ``output`` the precision of the
+    normalised result.  ``global_scale`` is required for the NVFP4 output: a
+    float32 ``[1]`` tensor on the device holding the quantiser's input global
+    scale (``448 * 6 / amax(y)`` in the convention of ``fp4_quantize``); it is read
+    by the kernel, never by the host, so the call stays graph capturable.
     """
 
     weight: torch.Tensor
-    eps: float
+    eps: float = RMSNORM_EPS
     output: Fp4AllReduceFusedNormOutput = Fp4AllReduceFusedNormOutput.BF16
+    global_scale: Optional[torch.Tensor] = None
+
+
+@dataclass(frozen=True)
+class Fp4AllReduceFusedNormResult:
+    """Outputs of one fused call.
+
+    ``residual_out`` is ``bf16(sum + residual)`` (``[rows, 6144]``).  With the
+    bfloat16 output ``out`` holds ``y``; with the NVFP4 output ``values`` holds
+    the packed E2M1 pairs (uint8 ``[rows, 3072]``, element ``2i`` in the low
+    nibble) and ``scales`` the 128x4-swizzled E4M3 block scales (uint8,
+    ``ceil(rows / 128) * 128 * 384`` bytes); with the MXFP8 output ``values``
+    holds E4M3 bytes (``[rows, 6144]``, ``torch.float8_e4m3fn``) and ``scales``
+    the swizzled UE8M0 scales (uint8, ``ceil(rows / 128) * 128 * 192`` bytes) --
+    the layouts ``fp4_quantize`` / ``mxfp8_quantize`` produce for ``y``.  Scale
+    bytes of padding rows are left untouched (zero when allocated here).
+    """
+
+    output: Fp4AllReduceFusedNormOutput
+    residual_out: torch.Tensor
+    out: Optional[torch.Tensor] = None
+    values: Optional[torch.Tensor] = None
+    scales: Optional[torch.Tensor] = None
 
 
 def delivered_families() -> tuple[str, ...]:
-    """Program families the installed sources deliver (the fused epilogue is not among them yet)."""
+    """Program families the installed sources deliver."""
     return FAMILIES
+
+
+def padded_scale_rows(rows: int) -> int:
+    """Rows covered by a swizzled output scale tensor (``rows`` rounded up to a multiple of 128)."""
+    return (int(rows) + SCALE_ROW_TILE - 1) // SCALE_ROW_TILE * SCALE_ROW_TILE
+
+
+def fused_norm_scale_bytes(rows: int, output: Fp4AllReduceFusedNormOutput) -> int:
+    """Bytes of the swizzled scale tensor of a quantised fused-norm output for ``rows`` rows."""
+    if output == Fp4AllReduceFusedNormOutput.NVFP4:
+        return padded_scale_rows(rows) * NVFP4_OUTPUT_SCALES_PER_ROW
+    if output == Fp4AllReduceFusedNormOutput.MXFP8:
+        return padded_scale_rows(rows) * MXFP8_OUTPUT_SCALES_PER_ROW
+    raise ValueError("the bfloat16 output has no scale tensor")
+
+
+def _check_spec(
+    spec: Fp4AllReduceFusedNormSpec, workspace: Fp4AllReduceWorkspace
+) -> None:
+    if not isinstance(spec, Fp4AllReduceFusedNormSpec):
+        raise TypeError("spec must be a Fp4AllReduceFusedNormSpec")
+    if not isinstance(spec.output, Fp4AllReduceFusedNormOutput):
+        raise TypeError("spec.output must be a Fp4AllReduceFusedNormOutput")
+    if float(spec.eps) != RMSNORM_EPS:
+        raise ValueError(
+            f"the delivered fused-norm programs are compiled for eps {RMSNORM_EPS!r}, got {spec.eps!r}"
+        )
+    weight = spec.weight
+    if (
+        weight.dim() != 1
+        or weight.numel() != HIDDEN
+        or weight.dtype != torch.bfloat16
+        or not weight.is_contiguous()
+    ):
+        raise ValueError(
+            f"spec.weight must be a contiguous bfloat16 [{HIDDEN}] tensor, got "
+            f"{tuple(weight.shape)} {weight.dtype}"
+        )
+    if weight.device != workspace.device:
+        raise ValueError(
+            f"spec.weight must live on {workspace.device}, got {weight.device}"
+        )
+    if spec.output == Fp4AllReduceFusedNormOutput.NVFP4:
+        scale = spec.global_scale
+        if scale is None:
+            raise ValueError("the NVFP4 output needs spec.global_scale")
+        if (
+            scale.dtype != torch.float32
+            or scale.numel() < 1
+            or not scale.is_contiguous()
+            or scale.device != workspace.device
+        ):
+            raise ValueError(
+                f"spec.global_scale must be a contiguous float32 tensor on {workspace.device}"
+            )
+    elif spec.global_scale is not None:
+        raise ValueError("spec.global_scale belongs to the NVFP4 output")
+
+
+def _residual_out(
+    residual: torch.Tensor,
+    residual_out: Optional[torch.Tensor],
+    rows: int,
+    workspace: Fp4AllReduceWorkspace,
+) -> torch.Tensor:
+    residual_out = _output(residual_out, rows, workspace, "residual_out")
+    if residual_out.data_ptr() == residual.data_ptr():
+        raise ValueError("residual_out must not alias residual")
+    return residual_out
+
+
+def _quantised_outputs(
+    spec: Fp4AllReduceFusedNormSpec,
+    rows: int,
+    workspace: Fp4AllReduceWorkspace,
+    values: Optional[torch.Tensor],
+    scales: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if spec.output == Fp4AllReduceFusedNormOutput.NVFP4:
+        shape, dtype = (rows, NVFP4_OUTPUT_VALUE_BYTES), torch.uint8
+    else:
+        shape, dtype = (rows, MXFP8_OUTPUT_VALUE_BYTES), torch.float8_e4m3fn
+    if values is None:
+        values = torch.empty(shape, dtype=dtype, device=workspace.device)
+    elif (
+        tuple(values.shape) != shape
+        or values.dtype not in (dtype, torch.uint8)
+        or not values.is_contiguous()
+        or values.device != workspace.device
+    ):
+        raise ValueError(
+            f"values must be a contiguous {dtype} {shape} tensor on {workspace.device}, "
+            f"got {tuple(values.shape)} {values.dtype}"
+        )
+    need = fused_norm_scale_bytes(rows, spec.output)
+    if scales is None:
+        scales = torch.zeros((need,), dtype=torch.uint8, device=workspace.device)
+    elif (
+        scales.dtype != torch.uint8
+        or scales.numel() < need
+        or not scales.is_contiguous()
+        or scales.device != workspace.device
+    ):
+        raise ValueError(
+            f"scales must be a contiguous uint8 tensor of at least {need} bytes on "
+            f"{workspace.device}"
+        )
+    return values, scales
+
+
+def _launch_fused(
+    workspace: Fp4AllReduceWorkspace,
+    *,
+    source: torch.Tensor,
+    input_scales: Optional[torch.Tensor],
+    input_format: int,
+    residual: torch.Tensor,
+    spec: Fp4AllReduceFusedNormSpec,
+    out: Optional[torch.Tensor],
+    values: Optional[torch.Tensor],
+    scales: Optional[torch.Tensor],
+    residual_out: Optional[torch.Tensor],
+    launch_with_pdl: bool,
+) -> Fp4AllReduceFusedNormResult:
+    rows = int(source.shape[0])
+    _check_rows(rows, workspace)
+    _check_activation(residual, workspace, "residual")
+    if residual.shape[0] != rows:
+        raise ValueError(f"residual must have {rows} rows, got {residual.shape[0]}")
+    _check_spec(spec, workspace)
+    residual_out = _residual_out(residual, residual_out, rows, workspace)
+    if spec.output == Fp4AllReduceFusedNormOutput.BF16:
+        if values is not None or scales is not None:
+            raise ValueError("values / scales belong to the quantised outputs")
+        out = _output(out, rows, workspace)
+        values = scales = None
+    else:
+        if out is not None:
+            raise ValueError("out belongs to the bfloat16 output")
+        values, scales = _quantised_outputs(spec, rows, workspace, values, scales)
+    workspace.module.fp4_allreduce_rmsnorm(
+        source,
+        input_scales,
+        residual,
+        spec.weight,
+        out,
+        values,
+        scales,
+        spec.global_scale,
+        residual_out,
+        workspace.ctrl,
+        workspace.table,
+        workspace.rank,
+        input_format,
+        _OUTPUT_CODES[spec.output],
+        workspace.grid,
+        bool(launch_with_pdl),
+    )
+    return Fp4AllReduceFusedNormResult(
+        output=spec.output,
+        residual_out=residual_out,
+        out=out,
+        values=values,
+        scales=scales,
+    )
 
 
 def fp4_allreduce_rmsnorm(
@@ -537,20 +797,104 @@ def fp4_allreduce_rmsnorm(
     workspace: Fp4AllReduceWorkspace,
     *,
     out: Optional[torch.Tensor] = None,
+    values: Optional[torch.Tensor] = None,
+    scales: Optional[torch.Tensor] = None,
     residual_out: Optional[torch.Tensor] = None,
     launch_with_pdl: bool = True,
-) -> torch.Tensor:
+) -> Fp4AllReduceFusedNormResult:
     """All-reduce ``x`` through the NVFP4 transport, add ``residual`` and apply the RMSNorm of ``spec``.
 
-    The fused programs are not part of the delivered sources: the call raises
-    ``NotImplementedError`` naming the delivered families.  The signature is the
-    extension point of that delivery (``residual_out`` receives the summed
-    residual; ``out`` the normalised result in the precision of ``spec.output``).
+    The sum is the rank-order sum of the NVFP4-quantised partials (as
+    :func:`fp4_allreduce`), kept in float32: ``z = sum + residual``,
+    ``residual_out = bf16(z)``, ``y = z * rsqrt(mean(z^2) + eps) * (1 + weight)``.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Contiguous bfloat16 ``[rows, 6144]`` partial of this rank; ``rows`` is a
+        multiple of 4, at most the workspace capacity and the same on every rank.
+    residual : torch.Tensor
+        Contiguous bfloat16 ``[rows, 6144]`` residual stream of this rank (the
+        same tensor on every rank gives rank-identical outputs).
+    spec : Fp4AllReduceFusedNormSpec
+        Weight, eps, output precision and (NVFP4) global scale.
+    workspace : Fp4AllReduceWorkspace
+        The collective workspace of the group (family ``"rmsnorm"``).
+    out : torch.Tensor, optional
+        Bfloat16 output buffer ``[rows, 6144]`` (bfloat16 output only).
+    values, scales : torch.Tensor, optional
+        Buffers of a quantised output (see :class:`Fp4AllReduceFusedNormResult`);
+        ``scales`` may be larger than needed.
+    residual_out : torch.Tensor, optional
+        Bfloat16 ``[rows, 6144]`` buffer for the summed residual; must not alias
+        ``residual``.
+    launch_with_pdl : bool
+        Launch with the programmatic-stream-serialization attribute.
+
+    Returns
+    -------
+    Fp4AllReduceFusedNormResult
+        The output tensors (the given buffers, or freshly allocated ones).  The
+        call allocates nothing when every buffer is given and performs no host
+        synchronisation, so it can be captured into a CUDA graph.
     """
-    _check_workspace(workspace)
-    raise NotImplementedError(
-        f"fp4_allreduce_rmsnorm with a {spec.output.value} output is not delivered by these "
-        f"sources; delivered families: {delivered_families()}"
+    _check_workspace(workspace, "rmsnorm")
+    _check_activation(x, workspace, "x")
+    return _launch_fused(
+        workspace,
+        source=x,
+        input_scales=None,
+        input_format=0,
+        residual=residual,
+        spec=spec,
+        out=out,
+        values=values,
+        scales=scales,
+        residual_out=residual_out,
+        launch_with_pdl=launch_with_pdl,
+    )
+
+
+def fp4_allreduce_rmsnorm_nvfp4(
+    records: torch.Tensor,
+    global_scales: torch.Tensor,
+    residual: torch.Tensor,
+    spec: Fp4AllReduceFusedNormSpec,
+    workspace: Fp4AllReduceWorkspace,
+    *,
+    out: Optional[torch.Tensor] = None,
+    residual_out: Optional[torch.Tensor] = None,
+    launch_with_pdl: bool = True,
+) -> Fp4AllReduceFusedNormResult:
+    """Sum pre-quantised NVFP4 records, add ``residual`` and apply the RMSNorm of ``spec`` (bfloat16 output).
+
+    ``records`` and ``global_scales`` are as in :func:`fp4_allreduce_nvfp4`; the
+    delivered programs produce the bfloat16 output for this input, so
+    ``spec.output`` must be ``Fp4AllReduceFusedNormOutput.BF16``.  The other
+    parameters and the result are those of :func:`fp4_allreduce_rmsnorm`.
+    """
+    _check_workspace(workspace, "rmsnorm")
+    _check_records(records, global_scales, workspace)
+    if (
+        isinstance(spec, Fp4AllReduceFusedNormSpec)
+        and spec.output != Fp4AllReduceFusedNormOutput.BF16
+    ):
+        raise ValueError(
+            "the fused-norm programs deliver the quantised outputs for bfloat16 input only; "
+            "NVFP4 records produce the bfloat16 output"
+        )
+    return _launch_fused(
+        workspace,
+        source=records,
+        input_scales=global_scales,
+        input_format=1,
+        residual=residual,
+        spec=spec,
+        out=out,
+        values=None,
+        scales=None,
+        residual_out=residual_out,
+        launch_with_pdl=launch_with_pdl,
     )
 
 
@@ -559,6 +903,7 @@ __all__ = [
     "FAMILIES",
     "FillPlan",
     "Fp4AllReduceFusedNormOutput",
+    "Fp4AllReduceFusedNormResult",
     "Fp4AllReduceFusedNormSpec",
     "Fp4AllReduceWorkspace",
     "RegionPlan",
@@ -567,5 +912,8 @@ __all__ = [
     "fp4_allreduce",
     "fp4_allreduce_nvfp4",
     "fp4_allreduce_rmsnorm",
+    "fp4_allreduce_rmsnorm_nvfp4",
+    "fused_norm_scale_bytes",
+    "padded_scale_rows",
     "window_plan",
 ]
