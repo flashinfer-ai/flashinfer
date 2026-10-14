@@ -27,7 +27,10 @@ are GLOBAL across the EP group, including empty ranks below eight tokens:
         --num-tokens 1,2,4,8,16,32,64,128,256,512,4096,8192,16384
 
 The default ``--model deepseek-v3`` preserves the original workload.
-``--model glm5`` selects D6144/E2048/N256/K8 with SwiGLU.
+``--model glm5 --parallel-modes ep --precomputed-routing`` selects
+D6144/E2048/N256/K8 with SwiGLU and ungrouped sigmoid/bias top-k scaled by 2.5,
+matching GLM-5's ``n_group=1``/``topk_group=1`` router. Like K3, it routes on the
+CPU outside timing because the native grouped router rejects single-group top-8.
 ``--model kimi-k3 --parallel-modes ep --precomputed-routing`` selects the
 routed latent D3584/E3072/N896/K16 core with SiTU(4,25), using synthetic NVFP4
 weights. K3's outer latent projections, RMSNorm, shared experts, router GEMM,
@@ -120,7 +123,12 @@ class ModelConfig(DeepSeekConfig):
 
 MODEL_CONFIGS = {
     "deepseek-v3": ModelConfig(),
-    "glm5": ModelConfig(hidden_size=6144),
+    "glm5": ModelConfig(
+        hidden_size=6144,
+        n_group=1,
+        topk_group=1,
+        routing_backend="cpu_sigmoid_topk",
+    ),
     "deepseek-v41-flash": ModelConfig(
         hidden_size=5120,
         intermediate_size=2304,
@@ -2029,7 +2037,7 @@ def main():
         choices=tuple(MODEL_CONFIGS),
         default="deepseek-v3",
         help=(
-            "Synthetic routed-MoE shape/activation preset; kimi-k3 and "
+            "Synthetic routed-MoE shape/activation preset; glm5, kimi-k3 and "
             "deepseek-v41-flash require EP precomputed routing."
         ),
     )
