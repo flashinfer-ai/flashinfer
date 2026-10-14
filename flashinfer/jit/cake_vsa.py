@@ -166,6 +166,14 @@ PROFILES: dict[str, Profile] = {
         smem_bytes=232448,
         defines=("CAKE_VSA_ABI=2", "CAKE_VSA_OUT_BOX_COLS=32"),
     ),
+    # Regenerated with the device source by the Cake exporter; do not edit by hand.
+    "blk64_balanced": Profile(
+        source="cake_vsa_blk64_balanced.cu",
+        kernel="kernel_flashinfer_vsa_blk64_balanced_m64n256_ws_sm100",
+        threads=384,
+        smem_bytes=232320,
+        defines=("CAKE_VSA_ABI=4",),
+    ),
     "fp16_direct": Profile(
         source="cake_vsa_fp16_direct.cu",
         kernel="kernel_minimax_sparse_prefill_union_sm100",

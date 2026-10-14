@@ -18,14 +18,15 @@
 // Shared tvm-ffi launcher for the Cake SM100/SM103 block-sparse attention
 // profiles.  flashinfer/jit/cake_vsa.py compiles this translation unit once per
 // (profile, architecture) and embeds that profile's cubin; the profile is
-// selected through the defines below, so the ten kernel profiles share one
+// selected through the defines below, so the eleven kernel profiles share one
 // host source.
 //
 //   CAKE_VSA_KERNEL           kernel symbol (identifier)
 //   CAKE_VSA_THREADS          thread-block size
 //   CAKE_VSA_SMEM_BYTES       dynamic shared memory
 //   CAKE_VSA_ABI              1 = block-mask profiles, 2 = block-64 direct
-//                             profiles, 3 = FP16 direct (q2k) profile
+//                             profiles, 3 = FP16 direct (q2k) profile,
+//                             4 = block-64 balanced shared-BSR profile
 //   CAKE_VSA_FP16             Q/K/V/out are float16 (default bfloat16)
 //   CAKE_VSA_Q_LAYOUT         0 = 4D 64-column-split TMA, 1 = 3D TMA,
 //                             2 = plain pointer                       (ABI 1)
@@ -38,6 +39,18 @@
 //   CAKE_VSA_BSR_INDICES      int32 BSR columns replace the uint8 mask
 //                             and total_tiles follows selected_blocks (ABI 1)
 //   CAKE_VSA_OUT_BOX_COLS     out TMA box columns (64 or 32)          (ABI 2)
+//
+// ABI 4 (blk64_balanced) kernel arguments, in order: q, k, v (CUtensorMap, the
+// ABI-2 head-major Q split and K/V split encodings), out (bf16*), lse (float*),
+// indptr (int32[MB + 1]), indices (int32[nnz]) -- one block selection shared by
+// every head --, sequence_q, query_blocks, total_tiles (= MB * num_heads),
+// num_heads, softmax_scale_log2, return_lse, queue_counters (uint32[4]),
+// order_debug (int32*), debug_order, trace_out (uint32*).  queue_counters must
+// be zero before the first launch; the kernel's last claim resets word 0, so a
+// CUDA graph replays without host work.  order_debug receives the tile of each
+// ticket only when debug_order != 0 (it then needs total_tiles entries) and
+// trace_out is never written by the shipped kernel: both are one-element
+// workspaces in production.
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -64,7 +77,7 @@
 #error "CAKE_VSA_SMEM_BYTES must give the dynamic shared memory size"
 #endif
 #ifndef CAKE_VSA_ABI
-#error "CAKE_VSA_ABI must select the launcher ABI (1, 2 or 3)"
+#error "CAKE_VSA_ABI must select the launcher ABI (1, 2, 3 or 4)"
 #endif
 
 #define CAKE_VSA_STRINGIFY_(x) #x
@@ -569,8 +582,95 @@ void Run(TensorView q, TensorView k, TensorView k_scale, TensorView v, TensorVie
   Launch(q, kargs, grid_x, grid_y, grid_z);
 }
 
+#elif CAKE_VSA_ABI == 4
+
+void Run(TensorView q, TensorView k, TensorView v, TensorView out, TensorView lse,
+         TensorView indptr, TensorView indices, TensorView queue_counters,
+         TensorView order_debug, TensorView trace_out, int64_t sequence_q,
+         int64_t query_blocks, int64_t total_tiles, int64_t num_heads,
+         double softmax_scale_log2, int64_t return_lse, int64_t debug_order, int64_t grid_x,
+         int64_t grid_y, int64_t grid_z) {
+  check_input(q, kIoDtype, "q");
+  check_input(k, kIoDtype, "k");
+  check_input(v, kIoDtype, "v");
+  check_input(out, kIoDtype, "out");
+  check_input(lse, dl_float32, "lse");
+  check_input(indptr, dl_int32, "indptr");
+  check_input(indices, dl_int32, "indices");
+  check_input(queue_counters, dl_uint32, "queue_counters");
+  check_input(order_debug, dl_int32, "order_debug");
+  check_input(trace_out, dl_uint32, "trace_out");
+  CheckI32(sequence_q, "sequence_q");
+  CheckI32(query_blocks, "query_blocks");
+  CheckI32(total_tiles, "total_tiles");
+  CheckI32(num_heads, "num_heads");
+  CheckI32(return_lse, "return_lse");
+  CheckI32(debug_order, "debug_order");
+  for (const TensorView* t :
+       {&k, &v, &out, &lse, &indptr, &indices, &queue_counters, &order_debug, &trace_out}) {
+    check_same_device(*t, q, "tensor argument", "q");
+  }
+  TVM_FFI_CHECK(out.ndim() == 3, ValueError) << "out must have rank 3, got " << out.ndim();
+  TVM_FFI_CHECK(out.size(-1) == 128, ValueError)
+      << "out dimension -1 must equal 128, got " << out.size(-1);
+  TVM_FFI_CHECK(query_blocks > 0 && (sequence_q + 63) / 64 == query_blocks, ValueError)
+      << "query_blocks must equal ceil(sequence_q / 64), got " << query_blocks << " for "
+      << sequence_q << " query rows";
+  TVM_FFI_CHECK(total_tiles == HostExtent(query_blocks, num_heads), ValueError)
+      << "total_tiles must equal " << HostExtent(query_blocks, num_heads) << ", got "
+      << total_tiles;
+  check_extent(out, HostExtent(sequence_q, num_heads, 128), "out");
+  if (return_lse != 0) {
+    check_extent(lse, HostExtent(sequence_q, num_heads), "lse");
+  }
+  check_extent(indptr, query_blocks + 1, "indptr");
+  check_extent(queue_counters, 4, "queue_counters");
+  check_extent(order_debug, debug_order != 0 ? total_tiles : 1, "order_debug");
+  check_extent(trace_out, 1, "trace_out");
+
+  const DLDevice dev = q.device();
+  tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
+  TVM_FFI_CHECK(cudaSetDevice(dev.device_id) == cudaSuccess, RuntimeError)
+      << "cudaSetDevice(" << dev.device_id << ") failed";
+  CUtensorMap p_q = EncodeQHeadMajorSplit(q);
+  CUtensorMap p_k = EncodeKvSplit(k, "k");
+  CUtensorMap p_v = EncodeKvSplit(v, "v");
+  void* p_out = out.data_ptr();
+  void* p_lse = lse.data_ptr();
+  void* p_indptr = indptr.data_ptr();
+  void* p_indices = indices.data_ptr();
+  void* p_queue_counters = queue_counters.data_ptr();
+  void* p_order_debug = order_debug.data_ptr();
+  void* p_trace_out = trace_out.data_ptr();
+  int32_t v_sequence_q = (int32_t)sequence_q;
+  int32_t v_query_blocks = (int32_t)query_blocks;
+  int32_t v_total_tiles = (int32_t)total_tiles;
+  int32_t v_num_heads = (int32_t)num_heads;
+  float v_softmax_scale_log2 = (float)softmax_scale_log2;
+  int32_t v_return_lse = (int32_t)return_lse;
+  int32_t v_debug_order = (int32_t)debug_order;
+  void* kargs[] = {&p_q,
+                   &p_k,
+                   &p_v,
+                   &p_out,
+                   &p_lse,
+                   &p_indptr,
+                   &p_indices,
+                   &v_sequence_q,
+                   &v_query_blocks,
+                   &v_total_tiles,
+                   &v_num_heads,
+                   &v_softmax_scale_log2,
+                   &v_return_lse,
+                   &p_queue_counters,
+                   &p_order_debug,
+                   &v_debug_order,
+                   &p_trace_out};
+  Launch(q, kargs, grid_x, grid_y, grid_z);
+}
+
 #else
-#error "CAKE_VSA_ABI must be 1, 2 or 3"
+#error "CAKE_VSA_ABI must be 1, 2, 3 or 4"
 #endif
 
 }  // namespace
