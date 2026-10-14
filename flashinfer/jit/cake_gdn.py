@@ -779,23 +779,37 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
 
 
 # The fp32-state T=1 K-major (nontranspose) bodies (`direct_fp32_t1_nontranspose_*`) are
-# routed per (architecture, batch band): the shipped `_small` body (eight CTAs per state
+# routed per (architecture, rule band): the shipped `_small` body (eight CTAs per state
 # head) below 32 batch rows and the shipped large body (one CTA per state head) from 32
-# on, except that Rubin (sm_107a) runs the `mid4` twin in the small band -- four CTAs per
-# state head, each owning one Kx32 value panel over 128-byte state segments; same per-lane
-# statements and accumulation order, bitwise-identical output and state.  B200 / B300 keep
-# the shipped bodies.  Mirrors `NONTRANSPOSE_SMALL_BATCH_THRESHOLD` /
-# `NONTRANSPOSE_FP32_T1_ARCH_BODIES` / `NONTRANSPOSE_FP32_T1_CTAS_PER_STATE` /
-# `select_nontranspose_fp32_t1_body` in loom.examples.weave.gdn_decode_pretranspose (the
-# Cake tree cross-checks these copies).
+# on, except on Rubin (sm_107a), which runs the `mid4` twin in the small band -- four CTAs
+# per state head, each owning one Kx32 value panel over 128-byte state segments -- and the
+# `tilev32_x2` twin in the large band's wave-fit range 32 <= B < 35 -- two CTAs per state
+# head, each owning half of the V ring tiles (the single-CTA grid of 1024 .. 1088 CTAs on
+# 212 SMs becomes 2048 .. 2176 CTAs of half the work; the split pays on this edge of the
+# band only).  Both twins keep the per-lane statements and the accumulation order:
+# bitwise-identical output and state.  B200 / B300 keep the shipped bodies.  The rule
+# band folds onto the band of the shipped body / route id through the `_RULE_BANDS`
+# table, so route ids keep naming `small` / `large` (plus the twin suffix).  Mirrors
+# `NONTRANSPOSE_SMALL_BATCH_THRESHOLD` / `NONTRANSPOSE_LARGE_WAVEFIT_BATCH_LIMIT` /
+# `NONTRANSPOSE_FP32_T1_RULE_BANDS` / `NONTRANSPOSE_FP32_T1_ARCH_BODIES` /
+# `NONTRANSPOSE_FP32_T1_CTAS_PER_STATE` / `select_nontranspose_fp32_t1_body` in
+# loom.examples.weave.gdn_decode_pretranspose (the Cake tree cross-checks these copies).
 CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD = 32
+CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT = 35
 CAKE_GDN_NONTRANSPOSE_FP32_T1_BASE_SCHEDULES: dict[str, str] = {
     "small": "gdn_decode_nontranspose_fp32_t1_small",
     "large": "gdn_decode_nontranspose_fp32_t1",
 }
-# ((architecture, band) -> schedule of the twin the rule routes there)
+# (rule band -> band of the shipped body and of the route id)
+CAKE_GDN_NONTRANSPOSE_FP32_T1_RULE_BANDS: dict[str, str] = {
+    "small": "small",
+    "large_wavefit": "large",
+    "large": "large",
+}
+# ((architecture, rule band) -> schedule of the twin the rule routes there)
 CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES: dict[tuple[str, str], str] = {
     ("sm_107a", "small"): "gdn_decode_nontranspose_fp32_t1_mid4",
+    ("sm_107a", "large_wavefit"): "gdn_decode_nontranspose_fp32_t1_tilev32_x2",
 }
 # CTAs per state head each nontranspose fp32 T=1 body launches (the host grid is B * HV
 # times this), keyed by the record's schedule.
@@ -803,7 +817,18 @@ CAKE_GDN_NONTRANSPOSE_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
     "gdn_decode_nontranspose_fp32_t1_small": 8,
     "gdn_decode_nontranspose_fp32_t1": 1,
     "gdn_decode_nontranspose_fp32_t1_mid4": 4,
+    "gdn_decode_nontranspose_fp32_t1_tilev32_x2": 2,
 }
+
+
+def cake_gdn_nontranspose_fp32_t1_rule_band(batch_size: int) -> str:
+    """Rule band of ``batch_size`` rows: ``small`` (B < 32), ``large_wavefit`` (32 <= B < 35) or ``large``."""
+
+    if int(batch_size) < CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD:
+        return "small"
+    if int(batch_size) < CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT:
+        return "large_wavefit"
+    return "large"
 
 
 def cake_gdn_nontranspose_fp32_t1_route(
@@ -811,13 +836,10 @@ def cake_gdn_nontranspose_fp32_t1_route(
 ) -> tuple[str, str]:
     """``(schedule, route id)`` of the fp32-state T=1 K-major decode for ``batch_size`` rows on ``arch``."""
 
-    band = (
-        "small"
-        if int(batch_size) < CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD
-        else "large"
-    )
+    rule_band = cake_gdn_nontranspose_fp32_t1_rule_band(batch_size)
+    band = CAKE_GDN_NONTRANSPOSE_FP32_T1_RULE_BANDS[rule_band]
     base = CAKE_GDN_NONTRANSPOSE_FP32_T1_BASE_SCHEDULES[band]
-    schedule = CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES.get((arch, band), base)
+    schedule = CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES.get((arch, rule_band), base)
     route = f"flashinfer.gdn_decode.direct_fp32_t1_nontranspose_{band}"
     if schedule != base:
         route += "_" + schedule.removeprefix("gdn_decode_nontranspose_fp32_t1_")

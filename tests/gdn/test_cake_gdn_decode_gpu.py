@@ -964,7 +964,9 @@ def _launch_bf16_serving(
     )
 
 
-@pytest.mark.parametrize("batch_size", [1, 32])
+# B 1 / 31: small band (mid4 on sm_107a); 32 / 34: the wave-fit range (tilev32_x2 on
+# sm_107a); 35: the large body on every architecture.
+@pytest.mark.parametrize("batch_size", [1, 31, 32, 34, 35])
 def test_exported_decode_matches_torch_on_caller_stream(batch_size: int) -> None:
     tensors = _make_inputs(batch_size)
     initial_state = tensors["state"].clone()
