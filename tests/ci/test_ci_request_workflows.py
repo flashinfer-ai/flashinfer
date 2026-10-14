@@ -85,10 +85,17 @@ class WorkflowTests(unittest.TestCase):
             ]
             self.assertTrue(checkouts)
             for checkout in checkouts:
-                self.assertEqual(
-                    checkout["with"]["ref"],
-                    "${{ inputs.watcher_checkout_sha || github.sha }}",
-                )
+                if checkout.get("name") == "Checkout trusted execution evidence writer":
+                    self.assertEqual(
+                        checkout["with"]["ref"], "${{ github.workflow_sha }}"
+                    )
+                    self.assertEqual(checkout["if"], "inputs.watcher_request_key != ''")
+                    self.assertEqual(checkout["with"]["path"], ".ci-evidence-trusted")
+                else:
+                    self.assertEqual(
+                        checkout["with"]["ref"],
+                        "${{ inputs.watcher_checkout_sha || github.sha }}",
+                    )
                 self.assertIs(checkout["with"]["persist-credentials"], False)
 
     def test_requested_source_secret_access_requires_verified_internal_route(self):
@@ -117,6 +124,35 @@ class WorkflowTests(unittest.TestCase):
             self.test["jobs"]["setup"]["outputs"]["request_is_fork"],
             "${{ needs.gate.outputs.request_is_fork }}",
         )
+
+    def test_execution_manifests_are_watcher_only_and_keep_attempt_history(self):
+        setup = self.test["jobs"]["setup"]
+        test = self.test["jobs"]["test"]
+        plan = step_named(setup, "Upload watcher CI plan")
+        lane = step_named(test, "Upload watcher lane execution evidence")
+        for step in [plan, lane]:
+            self.assertIn("inputs.watcher_request_key != ''", step["if"])
+            self.assertIn(
+                "${{ github.run_id }}-${{ github.run_attempt }}", step["with"]["name"]
+            )
+            self.assertNotIn("overwrite", step["with"])
+        self.assertIn("lane_key", lane["with"]["name"])
+        download = step_named(test, "Download watcher CI plan")
+        self.assertEqual(
+            download["with"]["name"], "${{ needs.setup.outputs.watcher_plan_artifact }}"
+        )
+        self.assertEqual(
+            setup["outputs"]["watcher_plan_artifact"],
+            "${{ steps.watcher-plan.outputs.artifact_name }}",
+        )
+        finish = step_named(test, "Finalize watcher lane evidence")
+        self.assertIn("always()", finish["if"])
+        self.assertIn("steps.watcher-lane.outcome", finish["if"])
+        for step in test["steps"]:
+            if step.get("name") == "Run Test":
+                self.assertIn('writer.py" run', step["run"])
+                self.assertIn('-e SOURCE_GIT_SHA "$WATCHER_CHECKOUT_SHA"', step["run"])
+                self.assertNotIn("continue-on-error", step)
 
     def test_dispatch_does_not_also_trigger_a_label_run(self):
         job = self.commands["jobs"]["handle-command"]

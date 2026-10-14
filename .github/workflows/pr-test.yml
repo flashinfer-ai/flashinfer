@@ -152,6 +152,7 @@ jobs:
       skip_build: ${{ steps.check.outputs.skip }}
       test_matrix: ${{ steps.matrix.outputs.matrix }}
       test_count: ${{ steps.matrix.outputs.count }}
+      watcher_plan_artifact: ${{ steps.watcher-plan.outputs.artifact_name }}
       # Surfaced so the required check can say a green result was scoped.
       test_scope: ${{ steps.scope.outputs.test_path }}
       request_is_fork: ${{ needs.gate.outputs.request_is_fork }}
@@ -388,6 +389,37 @@ jobs:
           echo "count=$(jq '.include | length' matrix.json)" >> $GITHUB_OUTPUT
           jq -r '.include[].name' matrix.json
 
+
+      # This writer comes from the workflow revision, never the requested PR.
+      - name: Checkout trusted execution evidence writer
+        if: inputs.watcher_request_key != ''
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-evidence-trusted
+          persist-credentials: false
+
+      - name: Record actual watcher CI plan
+        id: watcher-plan
+        if: inputs.watcher_request_key != ''
+        env:
+          GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SKIP_BUILD: ${{ steps.check.outputs.skip }}
+        run: |
+          python3 -I .ci-evidence-trusted/scripts/pr_checks/ci_execution_manifest.py plan \
+            --workspace "$GITHUB_WORKSPACE" --matrix matrix.json \
+            --skip-build "$SKIP_BUILD" \
+            --output "$RUNNER_TEMP/watcher-ci-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/plan.json"
+
+      - name: Upload watcher CI plan
+        if: always() && inputs.watcher_request_key != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: watcher-ci-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/watcher-ci-plan-${{ github.run_id }}-${{ github.run_attempt }}/plan.json
+          if-no-files-found: warn
+          retention-days: 30
+
   # ---------------------------------------------------------------------------
   # Tests - AOT build imports and GPU unit tests
   #
@@ -416,6 +448,10 @@ jobs:
       # Empty for every lane except the experimental one. Quoted at the use site and
       # never interpolated into script text - it originates from the PR body.
       TEST_PATH_ARG: ${{ matrix.test_path }}
+      WATCHER_REQUEST_KEY: ${{ inputs.watcher_request_key }}
+      WATCHER_CHECKOUT_SHA: ${{ inputs.watcher_checkout_sha }}
+      WATCHER_LANE_JSON: ${{ toJSON(matrix) }}
+      GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
     steps:
       - name: Cleanup
         if: matrix.kind != 'h100'
@@ -458,6 +494,36 @@ jobs:
           # checkout, and submodules authenticate during the checkout itself.
           persist-credentials: false
 
+      - name: Checkout trusted execution evidence writer
+        if: inputs.watcher_request_key != ''
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-evidence-trusted
+          persist-credentials: false
+
+      - name: Download watcher CI plan
+        if: inputs.watcher_request_key != ''
+        uses: actions/download-artifact@v4
+        with:
+          # Failed-job reruns inherit the successful Setup job and its artifact.
+          name: ${{ needs.setup.outputs.watcher_plan_artifact }}
+          path: ${{ runner.temp }}/watcher-ci-plan-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Initialize watcher lane evidence
+        id: watcher-lane
+        if: inputs.watcher_request_key != ''
+        run: |
+          # The trusted writer is not part of the workspace mounted into Docker.
+          TOOL_DIR="$RUNNER_TEMP/watcher-ci-tool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$TOOL_DIR"
+          cp .ci-evidence-trusted/scripts/pr_checks/ci_execution_manifest.py "$TOOL_DIR/writer.py"
+          python3 -I "$TOOL_DIR/writer.py" initialize \
+            --workspace "$GITHUB_WORKSPACE" \
+            --plan "$RUNNER_TEMP/watcher-ci-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/plan.json" \
+            --lane "$WATCHER_LANE_JSON" \
+            --output "$RUNNER_TEMP/watcher-ci-result-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
         env:
@@ -473,12 +539,22 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ (!inputs.watcher_request_key || needs.setup.outputs.request_is_fork == 'false') && secrets.SCCACHE_AWS_ACCESS_KEY_ID || '' }}
           AWS_SECRET_ACCESS_KEY: ${{ (!inputs.watcher_request_key || needs.setup.outputs.request_is_fork == 'false') && secrets.SCCACHE_AWS_SECRET_ACCESS_KEY || '' }}
         run: |
+          run_test() {
+            if [ -n "$WATCHER_REQUEST_KEY" ]; then
+              python3 -I "$RUNNER_TEMP/watcher-ci-tool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/writer.py" run \
+                --workspace "$GITHUB_WORKSPACE" \
+                --output "$RUNNER_TEMP/watcher-ci-result-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -- \
+                bash ci/bash.sh "${DOCKER_IMAGE}" -e SOURCE_GIT_SHA "$WATCHER_CHECKOUT_SHA" "$@"
+            else
+              bash ci/bash.sh "${DOCKER_IMAGE}" "$@"
+            fi
+          }
           if [ "${TEST_SCRIPT}" != "task_test_jit_cache_package_build_import.sh" ]; then
             echo "::error::Unexpected AOT test script: ${TEST_SCRIPT}"
             exit 1
           fi
           mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
-          bash ci/bash.sh "${DOCKER_IMAGE}" \
+          run_test \
             -e SCCACHE_BUCKET "${SCCACHE_BUCKET}" \
             -e SCCACHE_REGION "${SCCACHE_REGION}" \
             -e AWS_ACCESS_KEY_ID \
@@ -521,6 +597,16 @@ jobs:
       - name: Run Test
         if: matrix.kind != 'aot'
         run: |
+          run_test() {
+            if [ -n "$WATCHER_REQUEST_KEY" ]; then
+              python3 -I "$RUNNER_TEMP/watcher-ci-tool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/writer.py" run \
+                --workspace "$GITHUB_WORKSPACE" \
+                --output "$RUNNER_TEMP/watcher-ci-result-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -- \
+                bash ci/bash.sh "${DOCKER_IMAGE}" -e SOURCE_GIT_SHA "$WATCHER_CHECKOUT_SHA" "$@"
+            else
+              bash ci/bash.sh "${DOCKER_IMAGE}" "$@"
+            fi
+          }
           case "${TEST_SCRIPT}" in
             task_jit_run_tests_part[1-5].sh|task_jit_run_tests_t4.sh|task_run_unit_tests.sh) ;;
             *)
@@ -540,17 +626,33 @@ jobs:
             # to unit_test_runner.py, whose parser takes the scope as an option (or the
             # TEST_PATH env var, which ci/bash.sh does not forward into the container).
             # Bare paths fail argument-preflight with "unrecognized arguments".
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" --test-path "${TEST_TARGETS[@]}"
+            run_test "./scripts/${TEST_SCRIPT}" --test-path "${TEST_TARGETS[@]}"
           else
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}"
+            run_test "./scripts/${TEST_SCRIPT}"
           fi
 
       - name: Make JUnit XML readable
-        if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
+        if: ${{ always() && (inputs.watcher_request_key != '' || matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
         run: |
           if [ -d junit ]; then
             sudo chmod -R a+rX junit
           fi
+
+      - name: Finalize watcher lane evidence
+        if: always() && inputs.watcher_request_key != '' && steps.watcher-lane.outcome == 'success'
+        run: |
+          python3 -I "$RUNNER_TEMP/watcher-ci-tool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/writer.py" finalize \
+            --workspace "$GITHUB_WORKSPACE" \
+            --output "$RUNNER_TEMP/watcher-ci-result-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+      - name: Upload watcher lane execution evidence
+        if: always() && inputs.watcher_request_key != '' && steps.watcher-lane.outputs.lane_key != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: watcher-ci-result-${{ steps.watcher-lane.outputs.lane_key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/watcher-ci-result-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Upload JUnit XML and telemetry
         if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}

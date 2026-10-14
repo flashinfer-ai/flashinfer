@@ -158,6 +158,14 @@ Run specific test function:
 pytest tests/attention/test_hopper.py::test_single_prefill
 ```
 
+### Correlated CI execution evidence
+
+Watcher-correlated `PR Test` runs publish attempt-bound setup and lane manifests,
+plus original JUnit/sharding artifacts. See [CI execution evidence](docs/ci-execution-evidence.md)
+for the source/runtime trust boundaries and local tests. These records describe
+what executed; a successful submission or configured runner is not test coverage.
+Ordinary human-triggered CI and its existing lane intersections remain unchanged.
+
 ### Skipping Tests Based on CUDA Architecture
 
 Use `flashinfer.utils` functions to skip tests on unsupported GPU architectures:
