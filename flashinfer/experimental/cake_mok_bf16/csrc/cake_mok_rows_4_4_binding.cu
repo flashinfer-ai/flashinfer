@@ -21,7 +21,7 @@
 extern "C" __global__ void kernel_cake_mok_rows_4_4(int* __restrict__ topk_all, int* __restrict__ counts, int* __restrict__ tokens_per_expert, int* __restrict__ num_tokens, int* __restrict__ schedule_peer_rank, int* __restrict__ schedule_peer_token_idx, int local_tokens, int top_k, int capacity, int rank);
 
 
-namespace cake_host_shim_b691d94df6e3bb12 {
+namespace cake_host_shim_80543ca2c984da22 {
 
 using tvm::ffi::TensorView;
 
@@ -84,13 +84,18 @@ void Run(TensorView arg_topk_all, TensorView arg_counts, TensorView arg_tokens_p
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(1024u, 1u, 1u);
 
-  cudaError_t launch_status = cudaLaunchKernel(
-      reinterpret_cast<const void*>(kernel_cake_mok_rows_4_4), grid, block, kargs, 128u, stream);
+  cudaLaunchConfig_t config{};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = 128u;
+  config.stream = stream;
+  cudaError_t launch_status = cudaLaunchKernelExC(
+      &config, reinterpret_cast<const void*>(kernel_cake_mok_rows_4_4), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernel for kernel_cake_mok_rows_4_4 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_mok_rows_4_4 failed: "
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_b691d94df6e3bb12
+}  // namespace cake_host_shim_80543ca2c984da22
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_b691d94df6e3bb12::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_80543ca2c984da22::Run);

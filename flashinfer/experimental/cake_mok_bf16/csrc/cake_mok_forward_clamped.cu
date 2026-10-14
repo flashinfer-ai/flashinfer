@@ -88,6 +88,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_TOTAL 232448
 #define THREADS 256
 #define CAKE_TMEM_HOLD_OFFSET 336
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -129,13 +130,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
 
 
 
@@ -205,7 +199,7 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
 kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap x_routed, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wd_shared, const __grid_constant__ CUtensorMap wg_routed, const __grid_constant__ CUtensorMap wu_routed, const __grid_constant__ CUtensorMap wd_routed, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_routed_out, const __grid_constant__ CUtensorMap hidden_shared_in, const __grid_constant__ CUtensorMap hidden_routed_in, const __grid_constant__ CUtensorMap y_shared, const __grid_constant__ CUtensorMap y_routed, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ y_routed_ptr, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ y_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int* __restrict__ y_ready, int* __restrict__ y_done, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit)
 {
     const int tid = threadIdx.x;
@@ -259,28 +253,28 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
     // Kernel setup ops
-    __nv_bfloat16* a_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int a_smem_addr = smem + 1024;
-    __nv_bfloat16* b_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
-    const int b_smem_addr = smem + 66560;
-    __nv_bfloat16* b_hi = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
-    const int b_hi_addr = smem + 132096;
-    __nv_bfloat16* d_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 206848);
-    const int d_smem_addr = smem + 206848;
-    __nv_bfloat16* dispatch_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int dispatch_smem_addr = smem + 1024;
-    unsigned int* dispatch_words = reinterpret_cast<unsigned int*>(smem_raw + 1024);
-    const int dispatch_words_addr = smem + 1024;
-    float* range_weights = reinterpret_cast<float*>(smem_raw + 197632);
-    const int range_weights_addr = smem + 197632;
-    int* range_flags = reinterpret_cast<int*>(smem_raw + 199168);
-    const int range_flags_addr = smem + 199168;
-    int* combine_schedule = reinterpret_cast<int*>(smem_raw + 197632);
-    const int combine_schedule_addr = smem + 197632;
-    float* dispatch_weights = reinterpret_cast<float*>(smem_raw + 199680);
-    const int dispatch_weights_addr = smem + 199680;
-    __nv_bfloat16* combine_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int combine_smem_addr = smem + 1024;
+    __nv_bfloat16* a_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_A_SMEM_OFF);
+    const int a_smem_addr = smem + SMEM_A_SMEM_OFF;
+    __nv_bfloat16* b_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_B_SMEM_OFF);
+    const int b_smem_addr = smem + SMEM_B_SMEM_OFF;
+    __nv_bfloat16* b_hi = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_B_HI_OFF);
+    const int b_hi_addr = smem + SMEM_B_HI_OFF;
+    __nv_bfloat16* d_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_D_SMEM_OFF);
+    const int d_smem_addr = smem + SMEM_D_SMEM_OFF;
+    __nv_bfloat16* dispatch_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_DISPATCH_SMEM_OFF);
+    const int dispatch_smem_addr = smem + SMEM_DISPATCH_SMEM_OFF;
+    unsigned int* dispatch_words = reinterpret_cast<unsigned int*>(smem_raw + SMEM_DISPATCH_WORDS_OFF);
+    const int dispatch_words_addr = smem + SMEM_DISPATCH_WORDS_OFF;
+    float* range_weights = reinterpret_cast<float*>(smem_raw + SMEM_RANGE_WEIGHTS_OFF);
+    const int range_weights_addr = smem + SMEM_RANGE_WEIGHTS_OFF;
+    int* range_flags = reinterpret_cast<int*>(smem_raw + SMEM_RANGE_FLAGS_OFF);
+    const int range_flags_addr = smem + SMEM_RANGE_FLAGS_OFF;
+    int* combine_schedule = reinterpret_cast<int*>(smem_raw + SMEM_COMBINE_SCHEDULE_OFF);
+    const int combine_schedule_addr = smem + SMEM_COMBINE_SCHEDULE_OFF;
+    float* dispatch_weights = reinterpret_cast<float*>(smem_raw + SMEM_DISPATCH_WEIGHTS_OFF);
+    const int dispatch_weights_addr = smem + SMEM_DISPATCH_WEIGHTS_OFF;
+    __nv_bfloat16* combine_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_COMBINE_SMEM_OFF);
+    const int combine_smem_addr = smem + SMEM_COMBINE_SMEM_OFF;
     int tokens = num_tokens[0];
     int shared_rows = local_tokens / 256;
     int shared_fused = shared_rows * (intermediate / 256);

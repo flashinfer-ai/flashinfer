@@ -21,7 +21,7 @@
 extern "C" __global__ void kernel_cake_mok_epilogue_forward_8(__nv_bfloat16* __restrict__ shared, __nv_bfloat16* __restrict__ routed, float* __restrict__ scores, unsigned int* __restrict__ output, int tokens, int hidden, int ctas);
 
 
-namespace cake_host_shim_213b2766324d0df5 {
+namespace cake_host_shim_44aae65f6841f9d8 {
 
 using tvm::ffi::TensorView;
 
@@ -95,13 +95,18 @@ void Run(TensorView arg_shared, TensorView arg_routed, TensorView arg_scores, Te
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(256u, 1u, 1u);
 
-  cudaError_t launch_status = cudaLaunchKernel(
-      reinterpret_cast<const void*>(kernel_cake_mok_epilogue_forward_8), grid, block, kargs, 111616u, stream);
+  cudaLaunchConfig_t config{};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = 111616u;
+  config.stream = stream;
+  cudaError_t launch_status = cudaLaunchKernelExC(
+      &config, reinterpret_cast<const void*>(kernel_cake_mok_epilogue_forward_8), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernel for kernel_cake_mok_epilogue_forward_8 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_mok_epilogue_forward_8 failed: "
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_213b2766324d0df5
+}  // namespace cake_host_shim_44aae65f6841f9d8
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_213b2766324d0df5::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_44aae65f6841f9d8::Run);
