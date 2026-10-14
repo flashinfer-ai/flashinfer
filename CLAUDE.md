@@ -230,6 +230,11 @@ writes accumulator fragments directly, reducing dynamic shared memory from
 64 KiB to 48 KiB and permitting two resident CTAs on SM120. Single-buffer K/V
 reuse includes CTA barriers after each GEMM's final shared reads; omitting
 them can produce nondeterministic results when multiple CTAs are resident.
+The SM120 GLM specialization now uses official 128-byte tensor maps for TMA
+Q/K/V loads (CUDA 12.8+), retaining the original FP8 MMA/softmax arithmetic.
+Causal query tiles run in descending order with heads varying fastest to avoid
+tail imbalance. Two mbarriers add 16 bytes to the 48 KiB shared allocation.
+The TMA launcher requires uniform padded BSHD storage with equal Q/KV heads.
 Other shapes and layouts retain their original tiling and epilogue. When
 testing source changes, ensure a prebuilt `data/aot/trtllm_fmha_v2` artifact
 is not masking the new JIT build.

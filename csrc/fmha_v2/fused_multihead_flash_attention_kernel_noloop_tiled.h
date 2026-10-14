@@ -114,13 +114,19 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& kernel_para
 
   // The loop -- each CTA works on a different loop iteration.
   int const ctas_per_o_row = (Cta_tile_o::VALID_N + Cta_tile_o::N - 1) / Cta_tile_o::N;
-  int const q_loop = blockIdx.x / ctas_per_o_row;
+  // Causal tiles near the end of Q have the most KV work. Schedule those
+  // first across all heads to avoid a long tail of partially occupied SMs.
+  int const linear_tile = blockIdx.x + gridDim.x * blockIdx.y;
+  int const q_loop = Kernel_traits::USE_TMA_GLM && Kernel_traits::CAUSAL_MASK
+                         ? gridDim.x - 1 - linear_tile / params.h
+                         : blockIdx.x / ctas_per_o_row;
   // Each CTA works on a specific row partition of O.
   int const o_part = blockIdx.x % ctas_per_o_row;
   // The block index for the batch.
   int const bidb = blockIdx.z;
   // The block index for the head.
-  int const bidh = blockIdx.y;
+  int const bidh = Kernel_traits::USE_TMA_GLM && Kernel_traits::CAUSAL_MASK ? linear_tile % params.h
+                                                                            : blockIdx.y;
   // The thread index.
   int const tidx = threadIdx.x;
 
