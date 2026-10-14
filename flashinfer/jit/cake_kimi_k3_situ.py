@@ -514,6 +514,56 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a": "981d0cee885906e98556",
         },
     },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_8adb088a23619bcf252f": {
+        "role": "kernel",
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_8adb088a23619bcf252f_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_8adb088a23619bcf252f_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "binding_style": "prepared_stage",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["tma_buffer", "C"],
+            ["buffer", "SFC"],
+            ["buffer", "total_tiles"],
+            ["buffer", "x"],
+            ["buffer", "qx"],
+            ["buffer", "topk_ids"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_tile_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "scale_c"],
+            ["buffer", "scale_gate"],
+            ["buffer", "clamp_limit"],
+            ["buffer", "act_alpha"],
+            ["buffer", "act_beta"],
+            ["parameter", "M_out"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "tma_workspace_bytes": 0,
+        "arches": ["sm_103a"],
+        "closure_sha256": "fedd745b8ca580adff9d09f283c9eb3945fde9b70801b7eba506fa292c05a60f",
+        "carried": {
+            "target_revision": "c68f810df573fb2099e3afac27c309e6116eefd9",
+            "sm_103a": "8adb088a23619bcf252f",
+        },
+    },
     "cake_kimi_k3_nvfp4_situ_routed_moe_8bef6fee644a2ec7d899": {
         "role": "kernel",
         "sources": [
@@ -729,7 +779,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "specializations": {},
         "tma_workspace_bytes": 0,
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "3141889cf9641ea16acc887949074bda0ad155d2b07a830c56370c781f372b28",
+        "closure_sha256": "d57f083513d8f74ad93a90fa9441b996b558369336f9cb798aa758e9a2307119",
     },
     "cake_kimi_k3_nvfp4_situ_routed_moe_a264957aa770dad84302": {
         "role": "kernel",
@@ -767,12 +817,11 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "specializations": {},
         "tma_workspace_bytes": 0,
-        "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "1885a8883778f90bc2c1aaf897649a736f142fd077778553bde68c08f374b963",
+        "arches": ["sm_100a"],
+        "closure_sha256": "31bfe9246695e8311899b9a4477fe3e1e1c6feacbd4ca18bee79236d48a1083d",
         "carried": {
             "target_revision": "f8d3729e9c85d20afdf4a1e672771cdb157e0e33",
             "sm_100a": "a264957aa770dad84302",
-            "sm_103a": "25d4d98ede49a13aec62",
         },
     },
     "cake_kimi_k3_nvfp4_situ_routed_moe_af08a3678dee668769ef": {
@@ -943,7 +992,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "specializations": {},
         "tma_workspace_bytes": 0,
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "89b8c6661c6172a6fa6d6a1a52fd94219cc25db34a541bfaf589ec59b5d0389f",
+        "closure_sha256": "549ab4f0c2c90d2916ce5c14e3d5c55fe9be626f9d6d29323caab7abae942fc4",
     },
     "cake_kimi_k3_nvfp4_situ_routed_moe_cf193d0feedc02c4cb8d": {
         "role": "kernel",
@@ -1085,7 +1134,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "specializations": {},
         "tma_workspace_bytes": 0,
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "e398987054a4a28774ca70a75377b70516c0f30cbd924595a893f8120075e370",
+        "closure_sha256": "9992bf9f66e8d8589ed856bc4521b78d5fb57cf6b6b67279833eaabb7a2e281a",
     },
     "cake_kimi_k3_nvfp4_situ_routed_moe_eb341800f93919d98c45": {
         "role": "kernel",
@@ -1229,12 +1278,11 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "specializations": {},
         "tma_workspace_bytes": 0,
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a"],
         "closure_sha256": "ec4100ce2a8b69190390be9ab24a5431e46a607d631b9609ee0a70c517b7c159",
         "carried": {
             "target_revision": "f8d3729e9c85d20afdf4a1e672771cdb157e0e33",
             "sm_100a": "f381f4e96597e3db04c2",
-            "sm_103a": "514fc6854375e720c5ad",
         },
     },
     "cake_kimi_k3_nvfp4_situ_routed_moe_f732ff559a0b5d60dbe9": {
@@ -1334,8 +1382,8 @@ KERNELS: dict[str, dict[str, str]] = {
         "fc1:n32": "cake_kimi_k3_nvfp4_situ_routed_moe_21e60b8de2ebfd3e71bd",
         "fc1:n32_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_93e2350178fff1f9c9ac",
         "fc1:n8": "cake_kimi_k3_nvfp4_situ_routed_moe_d8a21008075dd1af4de1",
+        "fc1:n8_s2a": "cake_kimi_k3_nvfp4_situ_routed_moe_8adb088a23619bcf252f",
         "fc1:n8_s3b": "cake_kimi_k3_nvfp4_situ_routed_moe_b2c812c6b0328fbe0449",
-        "fc1:n8_small": "cake_kimi_k3_nvfp4_situ_routed_moe_a264957aa770dad84302",
         "fc2:n128": "cake_kimi_k3_nvfp4_situ_routed_moe_1b1fd4abd86b36aca7f2",
         "fc2:n16": "cake_kimi_k3_nvfp4_situ_routed_moe_d49ae2797759f6ac37fb",
         "fc2:n16_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_43cac4c0eddfbf24a375",
@@ -1355,7 +1403,6 @@ KERNELS: dict[str, dict[str, str]] = {
         "fused_router:single_cta_v16": "cake_kimi_k3_nvfp4_situ_routed_moe_4fd6f9d8778fe6e5e68a",
         "quant": "cake_kimi_k3_nvfp4_situ_routed_moe_df166979b48ef2b54cf3",
         "quant:n32_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_92ed1deb1d0aa6e28892",
-        "quant_route:m1": "cake_kimi_k3_nvfp4_situ_routed_moe_f381f4e96597e3db04c2",
         "quant_route:s2b": "cake_kimi_k3_nvfp4_situ_routed_moe_cf193d0feedc02c4cb8d",
         "route_histogram": "cake_kimi_k3_nvfp4_situ_routed_moe_8bef6fee644a2ec7d899",
         "route_prefix": "cake_kimi_k3_nvfp4_situ_routed_moe_50228c4ae81ee9f8d962",
@@ -1367,7 +1414,7 @@ KERNELS: dict[str, dict[str, str]] = {
 
 # Programs carried from the previous generation of this directory because their
 # producer is not regenerated yet (each record above names the carried source
-# of every architecture under "carried"). Regeneration follow-up; the routes
+# of every architecture it is delivered for under "carried"). Regeneration follow-up; the routes
 # that launch them are covered by the behavioural tests of this backend.
 CARRIED_PROGRAMS: list[str] = [
     "cake_kimi_k3_nvfp4_situ_routed_moe_13ccea112756c78b4f7f",
@@ -1378,6 +1425,7 @@ CARRIED_PROGRAMS: list[str] = [
     "cake_kimi_k3_nvfp4_situ_routed_moe_4fd6f9d8778fe6e5e68a",
     "cake_kimi_k3_nvfp4_situ_routed_moe_79b9dbe1233312e2e015",
     "cake_kimi_k3_nvfp4_situ_routed_moe_8835f78612501d1d1d48",
+    "cake_kimi_k3_nvfp4_situ_routed_moe_8adb088a23619bcf252f",
     "cake_kimi_k3_nvfp4_situ_routed_moe_91e741e16955d57e9c7c",
     "cake_kimi_k3_nvfp4_situ_routed_moe_920a885b92d4dbd32aaf",
     "cake_kimi_k3_nvfp4_situ_routed_moe_92ed1deb1d0aa6e28892",
