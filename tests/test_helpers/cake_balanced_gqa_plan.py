@@ -15,13 +15,16 @@ limitations under the License.
 
 Host mirror of the on-device balanced paged-GQA decode work planner.
 
-The decode kernel plans its own work on the GPU from the device ``seq_lens``
-buffer: one scheduler warp derives the chunk length ``L`` (in KV block pairs of
-256 tokens) and four length buckets, then decodes every ticket online while
-the other warps run the attention pipeline.  Neither the kernel nor the host
-layer calls this module; it is a test-only reference so the plan the kernel
-publishes in its workspace counters can be checked exactly, and it documents
-the scheduling rule.
+The decode kernels (the ``csrc/cake_fmha`` components ``decode_balanced_bf16``
+and ``decode_balanced_bf16_mtp_n32`` / ``_n64``) plan their own work on the GPU
+from the device ``seq_lens`` buffer: one scheduler warp derives the chunk
+length ``L`` (in KV block pairs of 256 tokens) and four length buckets, then
+decodes every ticket online while the other warps run the attention pipeline.
+Neither the kernels nor the host layer call this module; it is a test-only
+reference so the ``(chunk pairs, total items)`` a kernel publishes in its
+reserved workspace slot can be checked exactly, and it documents the
+scheduling rules.  The first part mirrors the row-tile kernel; the packed-row
+MTP planner follows at the end.
 
 Work unit: one KV block pair (``PAIR_TOKENS`` tokens).  Request ``b`` with KV
 length ``S_b`` is chunked by the pair count of its *shortest* query row,
@@ -49,9 +52,12 @@ from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
     DEFAULT_PAIRS_MIN,
     MAX_BALANCE_FACTOR,
     MAX_REQUESTS,
+    MTP_INLINE_MERGE_CHUNKS,
     NUM_BUCKETS,
     PAIR_TOKENS,
     TARGET_CHUNK_PAIRS,
+    mtp_reduce_items,
+    mtp_reduce_shift,
 )
 
 
@@ -448,6 +454,10 @@ __all__ = [
     "chunk_pairs_for",
     "even_split_chunk_pairs",
     "length_bucket",
+    "mtp_chunk_pairs",
+    "mtp_device_plan",
+    "mtp_fit_chunk_pairs",
+    "mtp_plan_cost",
     "plan_balanced_work",
     "simulate_greedy_makespan",
     "split_is_worthwhile",
@@ -455,37 +465,106 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# Packed-row MTP program (q_len_per_req 3..8)
+# Packed-row MTP programs (q_len_per_req 3..8)
 # ---------------------------------------------------------------------------
 
-# Planner cost model of the packed-row kernel, in quarter pairs (mirrors the kernel).
-MTP_ITEM_OVERHEAD_PAIRS = 1
-MTP_MERGE_WAVE_PAIRS = 1
-MTP_MERGE_ROWCHUNKS_PER_QUARTER_PAIR = 6
-MTP_INLINE_MERGE_ROWCHUNKS = 18  # in-place fold of a two-chunk tile ~ 3/4 pair
+# Planner cost model of the packed-row kernels in quarter pairs (mirror of the
+# device model of ``decode_balanced_bf16_mtp_n32`` / ``_n64``; integer
+# arithmetic only, so the device reproduces it exactly).  The packed kernels
+# plan ``items_per_chunk = num_kv_heads`` from the full request length, so
+# their plan does not depend on ``q_len_per_req``.
+MTP_ITEM_OVERHEAD_PAIRS = 20  # fixed cost of one item: Q box, pipeline fill, epilogue
+MTP_SM_SHARE_FLOOR_PCT = (
+    55  # a partial wave streams faster per CTA, down to 55 % of the full-occupancy time
+)
+MTP_SPREAD_PCT = (
+    5  # finish spread of the last wave: ~5 % of its item length, scaled by occupancy
+)
+MTP_REDUCE_TICKET_QUARTER_PAIRS = (
+    11  # fixed tail of a reduce ticket: publication, push, pop, token, fold start
+)
+MTP_REDUCE_QUARTER_PAIRS_PER_CHUNK = (
+    1  # one slice streams its share of a partial in about a quarter pair
+)
+MTP_INLINE_FOLD_QUARTER_PAIRS = 8  # two-chunk tile: in-place fold by the last arriver
 MTP_COARSE_CANDIDATES = 3  # the planner also evaluates 2, 3, 4 x ceil(total / CTAs)
+MTP_FIT_SEARCH_LANES = (
+    31  # the single-wave fit is sampled at (L_hi - L_1) / 31 resolution by 32 lanes
+)
+MTP_FIT_PAIRS_MIN = 1  # the single-wave fit may go down to one pair
+
+
+def mtp_plan_cost(
+    chunk_pairs: int, tickets: int, n_chunks: Sequence[int], num_ctas: int
+) -> int:
+    """Planner cost of a candidate chunk length in quarter pairs.
+
+    Full waves cost ``4 * (L + MTP_ITEM_OVERHEAD_PAIRS)`` each.  The last wave
+    has ``a`` active CTAs: its streaming shrinks with occupancy down to
+    ``MTP_SM_SHARE_FLOOR_PCT`` of the full-occupancy time
+    (``4 * L * max(a, floor) // C``), plus the item overhead and a
+    finish-spread term ``4 * L * MTP_SPREAD_PCT * a // (100 * C)``.  The merge
+    tail of the longest split tile follows: the in-place fold for two chunks,
+    otherwise a reduce ticket streaming its slice of ``n_max`` partials.
+    """
+    waves = _ceil_div(tickets, num_ctas)
+    a_last = tickets - (waves - 1) * num_ctas
+    floor = (num_ctas * MTP_SM_SHARE_FLOOR_PCT + 99) // 100
+    cost = 4 * (waves - 1) * (chunk_pairs + MTP_ITEM_OVERHEAD_PAIRS)
+    cost += (4 * chunk_pairs * max(a_last, floor)) // num_ctas
+    cost += 4 * MTP_ITEM_OVERHEAD_PAIRS
+    cost += (4 * chunk_pairs * MTP_SPREAD_PCT * a_last) // (100 * num_ctas)
+    n_max = max(n_chunks) if n_chunks else 0
+    if n_max == MTP_INLINE_MERGE_CHUNKS:
+        cost += MTP_INLINE_FOLD_QUARTER_PAIRS
+    elif n_max > MTP_INLINE_MERGE_CHUNKS:
+        slices = 1 << mtp_reduce_shift(n_max)
+        cost += MTP_REDUCE_TICKET_QUARTER_PAIRS
+        cost += MTP_REDUCE_QUARTER_PAIRS_PER_CHUNK * _ceil_div(n_max, slices)
+    return cost
+
+
+def mtp_fit_chunk_pairs(
+    pairs: Sequence[int], *, num_kv_heads: int, num_ctas: int
+) -> Optional[int]:
+    """Single-wave fit candidate (mirror of the device lane search).
+
+    Batches whose whole tiles fit the grid: the smallest length in
+    ``[L_1, L_hi]``, sampled at ``(L_hi - L_1) / 31`` resolution, whose chunk
+    items fit one wave; ``L_1 = max(ceil(total / CTAs), MTP_FIT_PAIRS_MIN)``
+    and ``L_hi = ceil(total / (CTAs - whole items))`` (every request rounds up
+    less than one chunk, so it always fits) or whole tiles.  ``None`` when the
+    whole tiles alone exceed the grid.
+    """
+    whole_items = len(pairs) * num_kv_heads
+    if whole_items > num_ctas:
+        return None
+    total_work = sum(pairs) * num_kv_heads
+    l_one = max(_ceil_div(total_work, num_ctas), MTP_FIT_PAIRS_MIN)
+    l_hi = max(pairs)
+    if whole_items < num_ctas:
+        l_hi = min(l_hi, _ceil_div(total_work, num_ctas - whole_items))
+    l_hi = max(l_hi, l_one)
+    step = max(_ceil_div(l_hi - l_one, MTP_FIT_SEARCH_LANES), 1)
+    for lane in range(MTP_FIT_SEARCH_LANES + 1):
+        cand = min(l_one + lane * step, l_hi)
+        if sum(_ceil_div(p, cand) for p in pairs) * num_kv_heads <= num_ctas:
+            return cand
+    return None
 
 
 def mtp_chunk_pairs(
-    seq_lens: Sequence[int], *, q_len: int, num_kv_heads: int, num_ctas: int
+    seq_lens: Sequence[int], *, num_kv_heads: int, num_ctas: int
 ) -> int:
-    """Chunk length chosen by the packed-row MTP kernel's device planner.
+    """Chunk length chosen by the packed-row kernels' device planner.
 
-    The packed kernel plans ``items_per_chunk = num_kv_heads`` from the longest
-    query row.  It starts from ``chunk_pairs_for`` (``q_len = 1``) and then
-    evaluates ``ceil(total / (k * CTAs))`` for ``k = 1..MAX_BALANCE_FACTOR``,
-    that length, whole tiles and ``2, 3, 4 x ceil(total / CTAs)`` (below whole
-    tiles), keeping the smallest cost in quarter pairs
-    ``4 * waves * (L + 1) + 4 * merge_waves + ceil(max_rowchunks / 6)`` (ties go
-    to the earlier candidate), where ``max_rowchunks`` is the longest fold: a
-    merge ticket's rows per warp x chunks, or 18 for a two-chunk tile folded
-    in place by its last chunk item.
+    Starts from the row-tile rule for ``q_len = 1`` items without the
+    multi-wave fill (``chunk_pairs_for``), then evaluates ``ceil(total / (k *
+    CTAs))`` for ``k = 1..MAX_BALANCE_FACTOR``, that base length, whole tiles,
+    ``2, 3, 4 x ceil(total / CTAs)`` below whole tiles and, for ragged
+    batches, the single-wave fit (``mtp_fit_chunk_pairs``), keeping the
+    smallest ``mtp_plan_cost``; ties go to the earlier candidate.
     """
-    from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
-        MTP_INLINE_MERGE_CHUNKS,
-        mtp_merge_slices_for,
-    )
-
     pairs = [_ceil_div(int(s), PAIR_TOKENS) for s in seq_lens]
     total_work = sum(pairs) * num_kv_heads
     base, _ = chunk_pairs_for(
@@ -495,69 +574,43 @@ def mtp_chunk_pairs(
         num_ctas=num_ctas,
         fill_uniform=False,
     )
-    best_cost, best = None, base
-    prev = 0
     l_one = max(_ceil_div(total_work, num_ctas), DEFAULT_PAIRS_MIN)
-    for kc in range(MAX_BALANCE_FACTOR + 2 + MTP_COARSE_CANDIDATES):
-        if kc < MAX_BALANCE_FACTOR:
-            cand = max(_ceil_div(total_work, (kc + 1) * num_ctas), DEFAULT_PAIRS_MIN)
-        elif kc == MAX_BALANCE_FACTOR:
-            cand = base
-        elif kc == MAX_BALANCE_FACTOR + 1:
-            cand = max(pairs)
-        else:
-            cand = l_one * (kc - MAX_BALANCE_FACTOR)
-            if cand >= max(pairs):
-                continue  # whole tiles already evaluated
-        if cand == prev:
-            continue
-        prev = cand
+    candidates = [
+        max(_ceil_div(total_work, k * num_ctas), DEFAULT_PAIRS_MIN)
+        for k in range(1, MAX_BALANCE_FACTOR + 1)
+    ]
+    candidates += [base, max(pairs)]
+    candidates += [
+        l_one * m for m in range(2, 2 + MTP_COARSE_CANDIDATES) if l_one * m < max(pairs)
+    ]
+    if 8 * (max(pairs) - min(pairs)) > max(pairs):
+        # Near-uniform batches skip the fit: their even split already is the
+        # single-wave fit.
+        fit = mtp_fit_chunk_pairs(pairs, num_kv_heads=num_kv_heads, num_ctas=num_ctas)
+        if fit is not None:
+            candidates.append(fit)
+    best: Optional[tuple[int, int]] = None
+    for cand in candidates:
         n_chunks = [_ceil_div(p, cand) for p in pairs]
-        tickets = sum(n_chunks) * num_kv_heads
-        merge_tickets = (
-            sum(mtp_merge_slices_for(n, q_len) for n in n_chunks if n > 1)
-            * num_kv_heads
-        )
-        waves = _ceil_div(tickets, num_ctas)
-        merge_waves = _ceil_div(merge_tickets, num_ctas)
-        max_rowchunks = max(
-            (
-                (2 * q_len // mtp_merge_slices_for(n, q_len)) * n
-                if n > MTP_INLINE_MERGE_CHUNKS
-                else MTP_INLINE_MERGE_ROWCHUNKS
-                for n in n_chunks
-                if n >= MTP_INLINE_MERGE_CHUNKS
-            ),
-            default=0,
-        )
-        cost = (
-            4 * waves * (cand + MTP_ITEM_OVERHEAD_PAIRS)
-            + 4 * merge_waves * MTP_MERGE_WAVE_PAIRS
-            + _ceil_div(max_rowchunks, MTP_MERGE_ROWCHUNKS_PER_QUARTER_PAIR)
-        )
-        if best_cost is None or cost < best_cost:
-            best_cost, best = cost, cand
-    return best
+        cost = mtp_plan_cost(cand, sum(n_chunks) * num_kv_heads, n_chunks, num_ctas)
+        if best is None or cost < best[0]:
+            best = (cost, cand)
+    return best[1]
 
 
 def mtp_device_plan(
-    seq_lens: Sequence[int], *, q_len: int, num_kv_heads: int, num_ctas: int
+    seq_lens: Sequence[int], *, num_kv_heads: int, num_ctas: int
 ) -> tuple[int, int]:
-    """``(chunk_pairs, tickets)`` the packed-row kernel publishes in its queue counters."""
-    from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
-        mtp_merge_items,
-    )
-
-    chunk = mtp_chunk_pairs(
-        seq_lens, q_len=q_len, num_kv_heads=num_kv_heads, num_ctas=num_ctas
-    )
+    """``(chunk_pairs, tickets)`` the packed-row kernels publish in the plan-facts slot."""
+    chunk = mtp_chunk_pairs(seq_lens, num_kv_heads=num_kv_heads, num_ctas=num_ctas)
     plan = plan_balanced_work(
         seq_lens,
         q_len=1,
         num_kv_heads=num_kv_heads,
         num_ctas=num_ctas,
         chunk_pairs=chunk,
+        pairs_min=min(chunk, DEFAULT_PAIRS_MIN),
     )
-    return chunk, plan.num_items + mtp_merge_items(
-        seq_lens, q_len_per_req=q_len, num_kv_heads=num_kv_heads, chunk_pairs=chunk
+    return chunk, plan.num_items + mtp_reduce_items(
+        seq_lens, num_kv_heads=num_kv_heads, chunk_pairs=chunk
     )

@@ -19,6 +19,10 @@ import random
 import pytest
 import torch
 
+from flashinfer.cake_fmha import (
+    cake_fmha_balanced_counter_bytes,
+    cake_fmha_balanced_workspace_bytes,
+)
 from flashinfer.decode import prepare_balanced_batch_decode_with_kv_cache
 from flashinfer.experimental.balanced_gqa_decode import cake_backend, cake_bounds
 from flashinfer.experimental.balanced_gqa_decode.cake_backend import (
@@ -33,11 +37,14 @@ from flashinfer.experimental.balanced_gqa_decode.cake_backend import (
 from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
     MAX_BALANCE_FACTOR,
     MAX_REQUESTS,
+    MTP_REDUCE_SLICES_MAX,
     NUM_BUCKETS,
     PAIR_TOKENS,
     max_items_bound,
     mtp_max_items_bound,
     mtp_n_rows,
+    mtp_reduce_items,
+    mtp_reduce_shift,
     uses_packed_mtp,
     workspace_bounds,
 )
@@ -46,6 +53,8 @@ from tests.test_helpers.cake_balanced_gqa_plan import (
     length_bucket,
     mtp_chunk_pairs,
     mtp_device_plan,
+    mtp_fit_chunk_pairs,
+    mtp_plan_cost,
     plan_balanced_work,
     simulate_greedy_makespan,
 )
@@ -240,15 +249,15 @@ def test_plan_rejects_bad_inputs():
 
 def test_workspace_layout_is_shape_independent():
     layout = workspace_layout(160)
-    assert layout["page_table"] == (layout["page_table"][0], 0)
-    total = balanced_gqa_decode_workspace_size(num_sms=160)
-    assert total == layout["total"]
-    assert total == balanced_gqa_decode_workspace_size(
-        num_sms=160, batch=1024, max_pages=64
-    )
-    padded = balanced_gqa_decode_workspace_size(num_sms=160, batch=4, max_pages=9)
-    assert padded == total + cake_backend._align(4 * 16 * 4)
-    for name in ("partial_o", "partial_stats", "tile_counters", "queue_counters"):
+    assert layout["total"] == balanced_gqa_decode_workspace_size(num_sms=160)
+    # The adapter's two buffers, sized for the packed-row programs (64-row
+    # slots, four counter words per tile); the row program's smaller slots fit
+    # the same regions, so one workspace serves every q_len_per_req.
+    assert layout["partials"] == (0, cake_fmha_balanced_workspace_bytes(160, 8))
+    assert layout["counters"][1] == cake_fmha_balanced_counter_bytes(160, 8)
+    assert cake_fmha_balanced_workspace_bytes(160, 1) <= layout["partials"][1]
+    assert cake_fmha_balanced_counter_bytes(160, 1) <= layout["counters"][1]
+    for name in ("partials", "counters"):
         assert layout[name][0] % cake_backend.WORKSPACE_ALIGN == 0
 
 
@@ -269,6 +278,13 @@ def test_validate_inputs_accepts_contract_shapes():
     assert validate_balanced_gqa_decode_inputs(
         query, k_cache, v_cache, block_tables, seq_lens, q_len_per_req=7
     ) == (2, 8, 1, 64)
+    # q_len_per_req 2 and above 8 have no program: rejected before any launch.
+    for q_len in (2, 9):
+        query, k_cache, v_cache, block_tables, seq_lens = _host_tensors(q_len=q_len)
+        with pytest.raises(ValueError, match="q_len_per_req 1 .* or 3..8"):
+            validate_balanced_gqa_decode_inputs(
+                query, k_cache, v_cache, block_tables, seq_lens, q_len_per_req=q_len
+            )
 
 
 @pytest.mark.parametrize(
@@ -316,7 +332,7 @@ def _require_program(q_len=1):
         pytest.skip("balanced GQA decode requires an SM100/SM103 GPU")
     if not cake_backend.generated_program_available(torch.device("cuda", 0), q_len):
         pytest.skip(
-            f"no generated balanced GQA decode program ({cake_backend.program_kind(q_len)}) "
+            f"no balanced GQA decode component ({cake_backend.component_name(q_len)}) "
             f"registered for {arch}"
         )
 
@@ -390,18 +406,14 @@ def make_inputs(
 
 def _workspace(device):
     return torch.empty(
-        balanced_gqa_decode_workspace_size(device, batch=MAX_REQUESTS, max_pages=9),
-        dtype=torch.uint8,
-        device=device,
+        balanced_gqa_decode_workspace_size(device), dtype=torch.uint8, device=device
     )
 
 
 def _expected_device_plan(seq_lens, *, q_len, num_kv_heads, num_ctas):
     """``(chunk_pairs, tickets)`` the selected program publishes for this batch."""
     if uses_packed_mtp(q_len):
-        return mtp_device_plan(
-            seq_lens, q_len=q_len, num_kv_heads=num_kv_heads, num_ctas=num_ctas
-        )
+        return mtp_device_plan(seq_lens, num_kv_heads=num_kv_heads, num_ctas=num_ctas)
     mirror = plan_balanced_work(
         seq_lens, q_len=q_len, num_kv_heads=num_kv_heads, num_ctas=num_ctas
     )
@@ -425,7 +437,7 @@ def _run_and_check(seq_lens, num_kv_heads, *, q_len=1, seed=0, pad_pages=True):
         q_len_per_req=q_len,
         out=out,
     )
-    assert runner.block_tables_padded == (block_tables.shape[1] % 8 != 0)
+    assert runner.component == cake_backend.component_name(q_len)
     result = runner()
     assert result is out
     torch.cuda.synchronize()
@@ -444,9 +456,9 @@ def _run_and_check(seq_lens, num_kv_heads, *, q_len=1, seed=0, pad_pages=True):
     assert runner.device_plan() == _expected_device_plan(
         seq_lens, q_len=q_len, num_kv_heads=num_kv_heads, num_ctas=runner.num_ctas
     )
-    counters = runner.main_kwargs["queue_counters"].tolist()
+    counters = runner.queue_counters.tolist()
     assert counters[0] == 0 and counters[1] == 0
-    assert int(runner.main_kwargs["tile_counters"].sum().item()) == 0
+    assert int(runner.tile_counters.sum().item()) == 0
     return runner, (query, k_cache, v_cache, block_tables, seq_lens_dev, out)
 
 
@@ -469,8 +481,6 @@ def _run_and_check(seq_lens, num_kv_heads, *, q_len=1, seed=0, pad_pages=True):
             3,
         ),  # consecutive chunk items per CTA
         ([60008], 1, 8),  # longest packed tile, one 60k request
-        ([130, 8000, 519, 4096], 8, 2),  # q_len 2 stays on the row-tile program
-        ([64, 3000], 1, 9),  # q_len 9 stays on the row-tile program
     ],
 )
 def test_balanced_decode_matches_reference(seq_lens, num_kv_heads, q_len):
@@ -478,7 +488,8 @@ def test_balanced_decode_matches_reference(seq_lens, num_kv_heads, q_len):
     _run_and_check(seq_lens, num_kv_heads, q_len=q_len, seed=len(seq_lens))
 
 
-def test_unpadded_block_table_is_copied():
+def test_unpadded_block_table_is_read_in_place():
+    """A table width that is not a multiple of eight pages needs no padded copy."""
     _require_program()
     _run_and_check([1000, 3000, 2000], 1, seed=3, pad_pages=False)
 
@@ -529,9 +540,7 @@ def test_graph_replay_follows_device_lengths_mtp():
     runner, (query, k_cache, v_cache, block_tables, seq_lens_dev, out) = _run_and_check(
         seq_lens, 8, q_len=7, seed=606
     )
-    assert runner.module_name == cake_backend.select_module(
-        cake_backend._device_arch(query.device.index), "mtp64"
-    )
+    assert runner.component == "decode_balanced_bf16_mtp_n64"
     sm_scale = HEAD_DIM**-0.5
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -561,12 +570,12 @@ def test_graph_replay_follows_device_lengths_mtp():
         )
         torch.testing.assert_close(out, expected, atol=ATOL, rtol=RTOL)
         assert runner.device_plan() == mtp_device_plan(
-            new_lens, q_len=7, num_kv_heads=8, num_ctas=runner.num_ctas
+            new_lens, num_kv_heads=8, num_ctas=runner.num_ctas
         )
 
 
 def test_packed_mtp_bounds_and_chunk_length():
-    """Host-side facts of the packed-row program (no GPU)."""
+    """Host-side facts of the packed-row programs (no GPU)."""
     assert [uses_packed_mtp(q) for q in (1, 2, 3, 8, 9)] == [
         False,
         False,
@@ -580,23 +589,64 @@ def test_packed_mtp_bounds_and_chunk_length():
         and mtp_n_rows(5) == 64
         and mtp_n_rows(8) == 64
     )
-    assert mtp_max_items_bound(16, 7, 1, 148) == 16 + 16 * 148 + 8 * 148 * 14
-    agentx = AGENTX_LENGTHS[:16]
-    # 8516 pairs on 148 CTAs: 155 coarse tickets would leave a 2x tail; three waves of L=20 do not.
-    assert mtp_chunk_pairs(agentx, q_len=7, num_kv_heads=1, num_ctas=148) == 20
-    assert mtp_chunk_pairs([4096] * 8, q_len=7, num_kv_heads=8, num_ctas=148) == 8
+    # Ticket-loop bound of the adapter: whole tiles, every possible split item
+    # and the most reduce tickets per split tile.
     assert (
-        mtp_chunk_pairs([1024] * 64, q_len=7, num_kv_heads=1, num_ctas=148) == 2
-    )  # two-chunk tiles fold in place: one wave of 2-pair chunks, no tickets
-    assert (
-        mtp_chunk_pairs([60007], q_len=7, num_kv_heads=1, num_ctas=148) == 4
-    )  # coarser chunks halve the fourteen merge tickets' fold
-    chunk, tickets = mtp_device_plan(
-        [300, 257, 5000, 777], q_len=7, num_kv_heads=2, num_ctas=148
+        mtp_max_items_bound(16, 1, 148)
+        == 16 + 16 * 148 + 8 * 148 * MTP_REDUCE_SLICES_MAX
     )
-    # 28 chunk items; the 5000-token tile (10 chunks) takes 14 tickets per kv
-    # head, the 777-token tile (2 chunks) is folded in place.
-    assert (chunk, tickets) == (2, 28 + 2 * 14)
+    # Reduce tickets per split tile follow the longest split tile of the launch;
+    # two-chunk tiles fold in place and take none.
+    assert [mtp_reduce_shift(n) for n in (3, 4, 5, 8, 9, 16, 17, 200)] == [
+        0,
+        0,
+        1,
+        1,
+        2,
+        2,
+        3,
+        3,
+    ]
+    assert mtp_reduce_items([4096] * 8, num_kv_heads=8, chunk_pairs=8) == 0
+    assert mtp_reduce_items([4096] * 8, num_kv_heads=8, chunk_pairs=6) == 8 * 8
+    assert mtp_reduce_items([60007], num_kv_heads=1, chunk_pairs=2) == 8
+    assert mtp_reduce_items([60007], num_kv_heads=1, chunk_pairs=16) == 4
+    # Cost model: full waves, a partial last wave at the per-SM share floor
+    # with its finish spread, then the merge tail of the longest split tile.
+    c = 148
+    floor = (c * 55 + 99) // 100
+    assert mtp_plan_cost(8, c, [1] * c, c) == 4 * (8 + 20) + (4 * 8 * 5) // 100
+    assert mtp_plan_cost(16, 64, [1] * 64, c) == (4 * 16 * floor) // c + 4 * 20 + (
+        4 * 16 * 5 * 64
+    ) // (100 * c)
+    assert mtp_plan_cost(8, 128, [2] * 64, c) == mtp_plan_cost(8, 128, [1] * 128, c) + 8
+    assert mtp_plan_cost(8, 300, [2, 5], c) == mtp_plan_cost(8, 300, [1, 1], c) + 11 + 3
+    # Chunk length: the AgentX batch fits one wave at L = 60 on 148 CTAs (59
+    # on 152); ten copies of it exceed the grid as whole tiles.
+    agentx = AGENTX_LENGTHS[:16]
+    pairs = [_ceil_div(s, PAIR_TOKENS) for s in agentx]
+    assert mtp_fit_chunk_pairs(pairs, num_kv_heads=1, num_ctas=148) == 60
+    assert mtp_fit_chunk_pairs(pairs * 10, num_kv_heads=1, num_ctas=148) is None
+    assert mtp_chunk_pairs(agentx, num_kv_heads=1, num_ctas=148) == 60
+    assert mtp_chunk_pairs(agentx, num_kv_heads=1, num_ctas=152) == 59
+    # Uniform 8 x 4096 x 8 heads: 128 half tiles in one wave (in-place fold).
+    assert mtp_chunk_pairs([4096] * 8, num_kv_heads=8, num_ctas=148) == 8
+    # 64 short requests fit one wave of whole 4-pair tiles.
+    assert mtp_chunk_pairs([1024] * 64, num_kv_heads=1, num_ctas=148) == 4
+    # One 60k request: 59 four-pair chunks and eight reduce slices.
+    assert mtp_chunk_pairs([60007], num_kv_heads=1, num_ctas=148) == 4
+    # Uniform 16 x 32768 x 8 heads: 128 whole tiles in one wave.
+    assert mtp_chunk_pairs([32768] * 16, num_kv_heads=8, num_ctas=148) == 128
+    # Small ragged batch: the single-wave fit goes down to one pair (56 chunk
+    # items in one wave); the 5000- and 777-token tiles (20 and 4 chunks) take
+    # eight reduce tickets per kv head each, the 256-token tiles (2 chunks) fold
+    # in place.
+    assert mtp_chunk_pairs([300, 257, 5000, 777], num_kv_heads=2, num_ctas=148) == 1
+    assert mtp_reduce_items([300, 257, 5000, 777], num_kv_heads=2, chunk_pairs=1) == 32
+    assert mtp_device_plan([300, 257, 5000, 777], num_kv_heads=2, num_ctas=148) == (
+        1,
+        56 + 32,
+    )
 
 
 def test_launch_makes_no_allocation():

@@ -16,5 +16,6 @@ limitations under the License.
 
 # Experimental Cake backend: on-device load-balanced BF16 paged GQA decode
 # for SM100 / SM103 (flashinfer-ai/flashinfer#4832).  The public entry point is
-# ``flashinfer.decode.prepare_balanced_batch_decode_with_kv_cache``; kernels,
-# host planning and JIT registration live in this package.
+# ``flashinfer.decode.prepare_balanced_batch_decode_with_kv_cache``; the host
+# layer lives in this package and launches the ``csrc/cake_fmha`` balanced
+# components through the production Cake FMHA loaders.

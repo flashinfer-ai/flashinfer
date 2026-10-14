@@ -15,12 +15,9 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeFmhaTensorMap { uint64_t opaque[16]; };
-struct __align__(64) CakeFmhaTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeFmhaTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeFmhaTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-template <int N>
-struct __align__(128) CakeFmhaTensorMapPack { CakeFmhaTensorMap maps[N]; };
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -29,7 +26,6 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -104,6 +100,7 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #define TILE_Q 8
 #define PAGE_SIZE 16
 #define NUM_KV_STAGES 8
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -126,52 +123,6 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count) : "memory");
-}
-
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
 
 
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
@@ -187,54 +138,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         "@P1 bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
         "}\n"
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
@@ -256,71 +159,6 @@ __device__ __forceinline__ void mbarrier_wait_hint(
         :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
 }
 
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
 
 __device__ __forceinline__ void tcgen05_mma_f8f6f4(
     int taddr, uint64_t a_desc, uint64_t b_desc,
@@ -336,10 +174,6 @@ __device__ __forceinline__ void tcgen05_mma_f8f6f4(
          : "memory");
 }
 
-
-__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3FFFFULL) >> 4ULL;
-}
 
 
 union MmaSmemDesc {
@@ -420,65 +254,9 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 }
 
 
-__device__ __forceinline__ void fma_f32x2_inplace(float2* a, float2 b, float2 c) {
-    unsigned long long r;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(r)
-        : "l"(*(unsigned long long*)a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    *(unsigned long long*)a = r;
-}
-
-__device__ __forceinline__ void fma_f32x2_noftz_inplace(float2* a, float2 b, float2 c) {
-    unsigned long long r;
-    asm("fma.rn.f32x2 %0, %1, %2, %3;"
-        : "=l"(r)
-        : "l"(*(unsigned long long*)a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    *(unsigned long long*)a = r;
-}
-
-__device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
-    asm("mul.rn.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("mul.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void add_f32x2_inplace(float2* a, float2 b) {
-    asm("add.rn.ftz.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void add_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("add.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void sub_f32x2_inplace(float2* a, float2 b) {
-    asm("sub.rn.ftz.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void sub_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("sub.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
 __device__ __forceinline__ float2 add_f32x2(float2 a, float2 b) {
     float2 r;
     asm("add.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.f32x2 %0, %1, %2;"
         : "=l"(*(unsigned long long*)&r)
         : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
     return r;
@@ -492,438 +270,12 @@ __device__ __forceinline__ float2 sub_f32x2(float2 a, float2 b) {
     return r;
 }
 
-__device__ __forceinline__ float2 sub_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("sub.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ void fma_scale_x32(
-    float* sv, const float2* scale2, const float2* neg_max2)
-{
-    float2* sv_2 = reinterpret_cast<float2*>(sv);
-    #pragma unroll
-    for (int j = 0; j < 16; j++)
-        fma_f32x2_inplace(&sv_2[j], *scale2, *neg_max2);
-}
-
-__device__ __forceinline__ float2 fma_f32x2(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rn.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
 
 // ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
-
-__device__ __forceinline__ float2 add_f32x2_rn_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rn_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rz_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rz_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rz.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rm_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rm.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rm_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rm.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rp_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rp.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rp_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rp.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rn_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rn_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rz_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rz_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rz.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rm_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rm.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rm_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rm.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rp_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rp.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rp_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rp.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rn_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rn_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rn.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
 
 __device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c) {
     float2 r;
     asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rn_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rn.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rz_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rz_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rz_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rz.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rz_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rz.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rm_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rm.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rm_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rm.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rm_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rm.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rm_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rm.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rp_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rp.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rp_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rp.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rp_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rp.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rp.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
         : "=l"(*(unsigned long long*)&r)
         : "l"(*(const unsigned long long*)&a),
           "l"(*(const unsigned long long*)&b),
@@ -946,28 +298,7 @@ __device__ __forceinline__ void elect_commit2(int mbar_addr0, int mbar_addr1) {
 }
 
 
-__device__ __forceinline__ void tcgen05_commit2(int mbar_addr0, int mbar_addr1) {
-    asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%0];\n\t"
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%1];\n\t"
-        :: "r"(mbar_addr0), "r"(mbar_addr1) : "memory");
-}
 
-
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
-
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
 
 
 __device__ __forceinline__ void tma_5d_gmem2smem(
@@ -981,18 +312,6 @@ __device__ __forceinline__ void tma_5d_gmem2smem(
 }
 
 
-__device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
-    asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tmem_ld_x4_wait(float* dst, int addr) {
-    tmem_ld_x4(dst, addr);
-    asm volatile("tcgen05.wait::ld.sync.aligned;");
-}
 
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
@@ -1004,8 +323,8 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(512, 1) void
-kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, __half* __restrict__ O_ptr, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale_log2, float output_scale, int num_q_heads, int num_kv_heads, int group_ratio, int batch_size, int q_len, unsigned int max_items)
+__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
+kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __half* __restrict__ O_ptr, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale_log2, float output_scale, int num_q_heads, int num_kv_heads, int group_ratio, int batch_size, int q_len, unsigned int max_items)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1013,11 +332,11 @@ kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, CakeFmhaTe
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#else
+#if __CUDA_ARCH__ == 1000
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
+#else
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 #endif
 
     const int mbar_base = smem;
@@ -1053,12 +372,6 @@ kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, CakeFmhaTe
     const int num_bids = gridDim.x;
 
     const int cta_rank = 0;
-    if (tid == 0) {
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(K)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(V)) : "memory");
-    }
-    __syncthreads();
-
 
     // Kernel setup ops
     float* smem_corr_reduce = reinterpret_cast<float*>(smem_raw + 1024);
@@ -1095,8 +408,8 @@ kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, CakeFmhaTe
     const int sched_seq_lens_addr = smem + 140176;
     int* smem_pg = reinterpret_cast<int*>(smem_raw + 144384);
     const int smem_pg_addr = smem + 144384;
-    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(K)) : "memory");
-    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(V)) : "memory");
+    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory");
+    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&V))) : "memory");
 
     // Mbarrier init (27 pipeline groups, 0 ordered-sequence groups, 59 barriers)
     // Mbarriers at smem_raw[0..472)
@@ -1237,9 +550,9 @@ kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, CakeFmhaTe
             const int wg_tid = warp_in_wg * 32 + lane;
             int col_pair = wg_tid % 4;
             int col_pair_base = col_pair * 2;
-            float* my_exch_ptr = ((is_wg1 != 0) ? smem_exch1 : smem_exch0);
-            unsigned int* my_exch_u32_ptr = ((is_wg1 != 0) ? smem_exch1_u32 : smem_exch0_u32);
-            uint8_t* my_p_base = ((is_wg1 != 0) ? smem_p1 : smem_p0);
+            float* my_exch_ptr = ((is_wg1 != 0) ? (smem_exch1) : (smem_exch0));
+            unsigned int* my_exch_u32_ptr = ((is_wg1 != 0) ? (smem_exch1_u32) : (smem_exch0_u32));
+            uint8_t* my_p_base = ((is_wg1 != 0) ? (smem_p1) : (smem_p0));
             int my_p_swz_base = ((is_wg1 != 0) ? smem_p1_addr : smem_p0_addr) / 128 % 8;
             float sv[8];
             float sv_lo[4];
@@ -1727,10 +1040,10 @@ kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, CakeFmhaTe
                             }
                             int spec_page = page_table[spec_pt_base + spec_page_idx];
                             if (spec_nb < 2) {
-                                asm volatile("cp.async.bulk.prefetch.tensor.5d.L2.global.tile [%0, {%1, %2, %3, %4, %5}];" :: "l"((uint64_t)(K)), "r"((int)(0)), "r"((int)(0)), "r"((int)(0)), "r"((int)(spec_head)), "r"((int)(spec_page)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.5d.L2.global.tile [%0, {%1, %2, %3, %4, %5}];" :: "l"((uint64_t)((&K))), "r"((int)(0)), "r"((int)(0)), "r"((int)(0)), "r"((int)(spec_head)), "r"((int)(spec_page)) : "memory");
                             }
                             if (spec_nb == 2) {
-                                asm volatile("cp.async.bulk.prefetch.tensor.5d.L2.global.tile [%0, {%1, %2, %3, %4, %5}];" :: "l"((uint64_t)(V)), "r"((int)(0)), "r"((int)(0)), "r"((int)(0)), "r"((int)(spec_head)), "r"((int)(spec_page)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.5d.L2.global.tile [%0, {%1, %2, %3, %4, %5}];" :: "l"((uint64_t)((&V))), "r"((int)(0)), "r"((int)(0)), "r"((int)(0)), "r"((int)(spec_head)), "r"((int)(spec_page)) : "memory");
                             }
                         }
                     }
@@ -3161,7 +2474,7 @@ kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, CakeFmhaTe
                     unsigned int bucket_start = 0;
                     #pragma unroll
                     for (int bi_4 = 0; bi_4 < 3; bi_4++) {
-                        if (ticket >= bucket_end[bi_4]) {
+                        if (bucket_end[bi_4] <= ticket) {
                             bucket = bi_4 + 1;
                             bucket_start = bucket_end[bi_4];
                         }
@@ -3625,7 +2938,7 @@ kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, CakeFmhaTe
                         #pragma unroll
                         for (int pg_i = 0; pg_i < 8; pg_i++) {
                             int toff = pg_i * 2048;
-                            tma_5d_gmem2smem(ldst + toff, K, 0, 0, 0, kv_head_idx_1, pg_k[pg_i], kv_full_addr + (kv_stage) * 8);
+                            tma_5d_gmem2smem(ldst + toff, (&K), 0, 0, 0, kv_head_idx_1, pg_k[pg_i], kv_full_addr + (kv_stage) * 8);
                         }
                     }
                 }
@@ -3656,7 +2969,7 @@ kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, CakeFmhaTe
                         #pragma unroll
                         for (int pg_i_1 = 0; pg_i_1 < 8; pg_i_1++) {
                             int ntoff = pg_i_1 * 2048;
-                            tma_5d_gmem2smem(kdst + ntoff, K, 0, 0, 0, kv_head_idx_1, pg_nk[pg_i_1], kv_full_addr + (k_stage) * 8);
+                            tma_5d_gmem2smem(kdst + ntoff, (&K), 0, 0, 0, kv_head_idx_1, pg_nk[pg_i_1], kv_full_addr + (k_stage) * 8);
                         }
                         int pg_v[8];
                         int pg_base_addr_0 = smem_pg_addr + (unsigned int)(pg_v_stage * 128) + (unsigned int)(ni_1 % 4 * 32);
@@ -3675,7 +2988,7 @@ kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, CakeFmhaTe
                         #pragma unroll
                         for (int pg_i_2 = 0; pg_i_2 < 8; pg_i_2++) {
                             int vtoff = pg_i_2 * 2048;
-                            tma_5d_gmem2smem(vdst + vtoff, V, 0, 0, 0, kv_head_idx_1, pg_v[pg_i_2], kv_full_addr + (stage) * 8);
+                            tma_5d_gmem2smem(vdst + vtoff, (&V), 0, 0, 0, kv_head_idx_1, pg_v[pg_i_2], kv_full_addr + (stage) * 8);
                         }
                         if (ni_1 == gate_block) {
                             mbarrier_arrive(claim_gate_addr);
@@ -3924,7 +3237,7 @@ kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, CakeFmhaTe
                             #pragma unroll
                             for (int pg_i_3 = 0; pg_i_3 < 8; pg_i_3++) {
                                 int ntoff_1 = pg_i_3 * 2048;
-                                tma_5d_gmem2smem(kdst_1 + ntoff_1, K, 0, 0, 0, kv_head_n, pg_nk_1[pg_i_3], kv_full_addr + (k_stage_1) * 8);
+                                tma_5d_gmem2smem(kdst_1 + ntoff_1, (&K), 0, 0, 0, kv_head_n, pg_nk_1[pg_i_3], kv_full_addr + (k_stage_1) * 8);
                             }
                         }
                         int pg_v_1[8];
@@ -3946,7 +3259,7 @@ kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, CakeFmhaTe
                         #pragma unroll
                         for (int pg_i_4 = 0; pg_i_4 < 8; pg_i_4++) {
                             int vtoff_1 = pg_i_4 * 2048;
-                            tma_5d_gmem2smem(vdst_1 + vtoff_1, V, 0, 0, 0, kv_head_idx_1, pg_v_1[pg_i_4], kv_full_addr + (stage_1) * 8);
+                            tma_5d_gmem2smem(vdst_1 + vtoff_1, (&V), 0, 0, 0, kv_head_idx_1, pg_v_1[pg_i_4], kv_full_addr + (stage_1) * 8);
                         }
                     }
                 }
