@@ -152,8 +152,8 @@ def main():
                             * kv_len
                         )
                         for qk_mode in QK_MODES:
-                            qs, ks, qsf, ksf, qscale, kscale = (
-                                quantize_blockscaled_qk(q, k, qk_mode)
+                            qs, ks, qsf, ksf, qscale, kscale = quantize_blockscaled_qk(
+                                q, k, qk_mode
                             )
                             qscale, kscale = float(qscale), float(kscale)
                             q_dequant = dequantize_blockscaled(
@@ -197,9 +197,7 @@ def main():
                                 kernel_fn=ref_kernel,
                             )
                             for variant in ["exp2", "expcast", "regular"]:
-                                exp_mode = (
-                                    "expcast" if variant == "expcast" else "exp2"
-                                )
+                                exp_mode = "expcast" if variant == "expcast" else "exp2"
                                 if variant == "regular":
                                     kernel = compile_cute_dsl_fmha_kernel(
                                         torch.bfloat16,
@@ -284,7 +282,9 @@ def main():
                                 pairs = q_len * kv_len
                                 if causal:
                                     n = min(q_len, kv_len)
-                                    pairs = n * (n + 1) // 2 + q_len * max(kv_len - q_len, 0)
+                                    pairs = n * (n + 1) // 2 + q_len * max(
+                                        kv_len - q_len, 0
+                                    )
                                 flops = 4 * BATCH_SIZE * Q_HEADS * HEAD_DIM * pairs
                                 row = {
                                     "q_len": q_len,
