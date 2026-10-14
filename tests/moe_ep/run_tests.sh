@@ -351,6 +351,9 @@ run_oracle_sm107() {
     tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py -v -s \
     tests/moe_ep/test_sm107_kernel_boundaries.py \
     tests/moe_ep/test_sm107_genphase_kernel.py \
+    tests/moe_ep/test_sm107_genphase_cga2_kernel.py \
+    tests/moe_ep/test_sm107_masked_combine.py \
+    tests/moe_ep/test_sm107_routing_graph.py \
     tests/moe_ep/test_sm107_combine_kernel.py \
     -m arch_rubin
 }
@@ -372,6 +375,7 @@ run_mega_sm107() {
   CUTE_DSL_ARCH=sm_107a "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py -v \
+    tests/moe_ep/test_sm107_routing_graph_multirank.py \
     -m "gpu_2 and arch_rubin"
 }
 
