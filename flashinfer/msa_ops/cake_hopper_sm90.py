@@ -25,12 +25,15 @@ and L2 policy of the decode regime, key-split count of the prefill regime;
 top-k select: columns per CTA and tile groups per column; sparse prefill: the
 v1 / v2 kernel by pages per sequence), the scratch contract of the split
 decode, and the CUDA-graph rules.  Dispatch reads host-known scalars and
-tensor metadata only; nothing here synchronizes the stream.  Plans, route
-checks and the per-geometry launch templates (program, grid, kernel scalars,
-retained buffers) are resolved once per host-known key (``functools.lru_cache``;
-every key is a tuple of ints / bools / dtypes / the device index, never a
-tensor) and never invalidated: they are pure functions of the key and of the
-import-time program registry (host round 1).
+tensor metadata only; nothing here synchronizes the stream.  Argument
+admission (each launcher's checks, keyed on shapes, dtypes, contiguity and
+strides), plans, route checks and the per-geometry launch templates (program,
+grid, kernel scalars and retained buffers bound into the argument order) are
+resolved once per host-known key (``functools.lru_cache``; every key is a
+tuple of ints / bools / dtypes / shapes / the device index, never a tensor)
+and never invalidated: they are pure functions of the key and of the
+import-time program registry (host round 1).  A rejected geometry is never
+cached: its launcher raises on every call, as before.
 
 Routing on SM90 stays in ``flashinfer.msa_ops._sm90_dispatch``: it keeps the
 surface's raise rules (paged KV only, K and V interleaved in one allocation,
@@ -139,6 +142,17 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
+def _optional_meta(
+    tensor: Optional[torch.Tensor],
+) -> Optional[tuple[torch.dtype, bool, int]]:
+    """``(dtype, contiguity, element count)`` of an optional metadata tensor, ``None`` when it is absent: the
+    admission-key component standing for ``q_offset`` / ``num_valid_pages``."""
+
+    if tensor is None:
+        return None
+    return tensor.dtype, tensor.is_contiguous(), tensor.numel()
+
+
 @functools.cache
 def _num_sms(device_index: int) -> int:
     """Multiprocessor count of one device, resolved once."""
@@ -195,32 +209,39 @@ class _Program:
             for kind, argument in plan
         )
 
-    def launch(
-        self,
-        grid: tuple[int, int, int],
-        constants: Optional[dict[str, Any]] = None,
-        **arguments: Any,
-    ) -> None:
-        """Launch on the current torch stream with the generated argument order.
+    def bind(self, grid: tuple[int, int, int], constants: dict[str, Any]) -> _Launch:
+        """The launch of one geometry, bound once: the grid scalars and ``constants`` (a launch template's kernel
+        scalars and retained buffers) take their place in the argument order as values; every other name is a
+        per-call argument, read at launch time."""
 
-        ``constants`` holds the arguments of a launch template resolved once per geometry (kernel scalars, retained
-        buffers); ``arguments`` the per-call tensors.  A name present in both is taken from ``arguments``.
-        """
+        slots: list[tuple[bool, Any]] = []
+        for is_grid, key in self.slots:
+            if is_grid:
+                slots.append((False, int(grid[key])))
+            elif key in constants:
+                slots.append((False, constants[key]))
+            else:
+                slots.append((True, key))
+        return _Launch(self.entry, tuple(slots))
 
-        if constants:
-            values = [
-                int(grid[key])
-                if is_grid
-                else (arguments[key] if key in arguments else constants[key])
-                for is_grid, key in self.slots
-            ]
-        else:
-            values = [
-                int(grid[key]) if is_grid else arguments[key]
-                for is_grid, key in self.slots
-            ]
+
+class _Launch:
+    """One geometry's launch: the generated argument order with the bound values in place and ``(True, name)``
+    where a per-call argument goes."""
+
+    __slots__ = ("entry", "slots")
+
+    def __init__(self, entry: Any, slots: tuple[tuple[bool, Any], ...]) -> None:
+        self.entry = entry
+        self.slots = slots
+
+    def __call__(self, **arguments: Any) -> None:
+        """Launch on the current torch stream with the per-call ``arguments`` (tensors and scalars by name)."""
+
         with _ffi_stream_context():
-            self.entry(*values)
+            self.entry(
+                *[arguments[key] if per_call else key for per_call, key in self.slots]
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -314,10 +335,10 @@ def preload_programs(kinds: Optional[Iterable[str]] = None) -> dict[str, int]:
 
     Explicit opt-in.  By default a program is built and loaded at the first eager use of its route -- nothing up
     front, and what a per-geometry eager warm-up before capture (vLLM's capture loop) relies on.  Preloading a kind
-    costs one nvcc build per program not yet in the JIT cache (about 4 s each: 22 / 24 / 23 / 4 / 6 programs for
-    sparse decode / proxy decode / top-k select / proxy prefill / sparse prefill) and about 10 ms per prebuilt
-    program.  Returns the number of programs this call loaded, per kind.  Raises under capture and for an unknown
-    kind.
+    costs one nvcc build per program not yet in the JIT cache (about 4 s each; the programs of a kind are read from
+    ``ROUTES``: 22 / 24 / 32 / 5 / 6 for sparse decode / proxy decode / top-k select / proxy prefill / sparse
+    prefill, 89 in all) and about 10 ms per prebuilt program.  Returns the number of programs this call loaded, per
+    kind.  Raises under capture and for an unknown kind.
     """
 
     selected = PROGRAM_KINDS if kinds is None else tuple(kinds)
@@ -644,7 +665,7 @@ def _decode_template(
     seqlen_q: int,
     max_pages: int,
     device_index: int,
-) -> tuple[_Program, tuple[int, int, int], dict[str, Any]]:
+) -> _Launch:
     """The launch of one decode geometry resolved once: program, grid and the per-plan arguments (kernel scalars,
     the trace carrier, the retained split scratch).  Pure in its key; the per-call tensors join at launch time.
     A first use under CUDA-graph capture raises exactly as the eager-first rules of the buffers did (nothing cached)."""
@@ -677,11 +698,92 @@ def _decode_template(
             device, items=items, splits=plan.splits, nc=plan.nc
         )
         constants.update(part_o=part_o, part_ml=part_ml, counters=counters, done=done)
-    return (
-        _program(plan.route),
-        plan.grid(total_q=total_q, num_kv_heads=num_kv_heads),
-        constants,
+    return _program(plan.route).bind(
+        plan.grid(total_q=total_q, num_kv_heads=num_kv_heads), constants
     )
+
+
+@functools.lru_cache(maxsize=4096)
+def _admit_sparse_decode(
+    *,
+    q_shape: tuple[int, ...],
+    q_dtype: torch.dtype,
+    q_contiguous: bool,
+    k_shape: tuple[int, ...],
+    k_dtype: torch.dtype,
+    k_stride: tuple[int, ...],
+    v_shape: tuple[int, ...],
+    v_dtype: torch.dtype,
+    v_stride: tuple[int, ...],
+    seqlen_q: int,
+    q2k_indices_shape: tuple[int, ...],
+    q2k_indices_dtype: torch.dtype,
+    q2k_indices_contiguous: bool,
+    page_table_shape: tuple[int, ...],
+    page_table_dtype: torch.dtype,
+    page_table_contiguous: bool,
+    seqused_k_dtype: torch.dtype,
+    seqused_k_contiguous: bool,
+    seqused_k_numel: int,
+    out_shape: tuple[int, ...],
+    out_dtype: torch.dtype,
+    out_contiguous: bool,
+) -> tuple[int, int, int, int]:
+    """Admission of one sparse-decode geometry, resolved once per metadata key (shapes, dtypes, contiguity, strides
+    -- never a tensor): the checks of ``hopper_msa_sparse_decode_attention`` in their order, raising as they always
+    did (a raising call is never cached, so a rejected geometry raises on every call), then the derived
+    ``(total_q, num_q_heads, num_kv_heads, max_pages)``."""
+
+    total_q, num_q_heads, head_dim = (int(x) for x in q_shape)
+    if head_dim != _HEAD_DIM:
+        raise ValueError(f"head_dim must be {_HEAD_DIM}, got {head_dim}")
+    if q_dtype != torch.bfloat16 or not q_contiguous:
+        raise ValueError("SM90 sparse decode needs contiguous bf16 q")
+    if k_dtype != torch.float8_e4m3fn or v_dtype != torch.float8_e4m3fn:
+        raise ValueError("SM90 sparse decode needs an fp8 e4m3 KV cache")
+    if (
+        len(k_shape) != 4
+        or k_shape[2] != _BLOCK_SIZE
+        or k_shape[3] != _HEAD_DIM
+        or k_shape != v_shape
+    ):
+        raise ValueError(
+            f"paged k/v must be (num_pages, num_kv_heads, {_BLOCK_SIZE}, {_HEAD_DIM})"
+        )
+    if k_stride[-1] != 1 or v_stride[-1] != 1:
+        raise ValueError("k and v must be dense along head_dim")
+    num_kv_heads = int(k_shape[1])
+    if seqlen_q <= 0 or total_q % seqlen_q:
+        raise ValueError(
+            f"q rows ({total_q}) must be batch_size * seqlen_q ({seqlen_q})"
+        )
+    batch = total_q // seqlen_q
+    if q2k_indices_dtype != torch.int32 or not q2k_indices_contiguous:
+        raise ValueError("q2k_indices must be contiguous int32")
+    if tuple(q2k_indices_shape) != (num_kv_heads, total_q, _TOPK):
+        raise NotImplementedError(
+            f"SM90 sparse decode serves q2k_indices of shape (num_kv_heads, total_q, {_TOPK}); "
+            f"got {tuple(q2k_indices_shape)}"
+        )
+    if (
+        page_table_dtype != torch.int32
+        or not page_table_contiguous
+        or len(page_table_shape) != 2
+    ):
+        raise ValueError("page_table must be contiguous int32 (batch_size, max_pages)")
+    if int(page_table_shape[0]) != batch:
+        raise ValueError(
+            f"page_table has {page_table_shape[0]} rows for batch_size {batch}"
+        )
+    if (
+        seqused_k_dtype != torch.int32
+        or not seqused_k_contiguous
+        or int(seqused_k_numel) != batch
+    ):
+        raise ValueError(f"seqused_k must be contiguous int32 with {batch} entries")
+    if out_shape != q_shape or out_dtype != torch.bfloat16 or not out_contiguous:
+        raise ValueError("out must be a contiguous bf16 tensor shaped like q")
+    return total_q, num_q_heads, num_kv_heads, int(page_table_shape[1])
 
 
 def hopper_msa_sparse_decode_attention(
@@ -706,57 +808,31 @@ def hopper_msa_sparse_decode_attention(
     rejects ``q_offset`` and ``causal=False`` instead of ignoring them.
     """
 
-    total_q, num_q_heads, head_dim = (int(x) for x in q.shape)
-    if head_dim != _HEAD_DIM:
-        raise ValueError(f"head_dim must be {_HEAD_DIM}, got {head_dim}")
-    if q.dtype != torch.bfloat16 or not q.is_contiguous():
-        raise ValueError("SM90 sparse decode needs contiguous bf16 q")
-    if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
-        raise ValueError("SM90 sparse decode needs an fp8 e4m3 KV cache")
-    if (
-        k.ndim != 4
-        or k.shape[2] != _BLOCK_SIZE
-        or k.shape[3] != _HEAD_DIM
-        or k.shape != v.shape
-    ):
-        raise ValueError(
-            f"paged k/v must be (num_pages, num_kv_heads, {_BLOCK_SIZE}, {_HEAD_DIM})"
-        )
-    if k.stride(-1) != 1 or v.stride(-1) != 1:
-        raise ValueError("k and v must be dense along head_dim")
-    num_kv_heads = int(k.shape[1])
-    if seqlen_q <= 0 or total_q % seqlen_q:
-        raise ValueError(
-            f"q rows ({total_q}) must be batch_size * seqlen_q ({seqlen_q})"
-        )
-    batch = total_q // seqlen_q
-    if q2k_indices.dtype != torch.int32 or not q2k_indices.is_contiguous():
-        raise ValueError("q2k_indices must be contiguous int32")
-    if tuple(q2k_indices.shape) != (num_kv_heads, total_q, _TOPK):
-        raise NotImplementedError(
-            f"SM90 sparse decode serves q2k_indices of shape (num_kv_heads, total_q, {_TOPK}); "
-            f"got {tuple(q2k_indices.shape)}"
-        )
-    if (
-        page_table.dtype != torch.int32
-        or not page_table.is_contiguous()
-        or page_table.ndim != 2
-    ):
-        raise ValueError("page_table must be contiguous int32 (batch_size, max_pages)")
-    if int(page_table.shape[0]) != batch:
-        raise ValueError(
-            f"page_table has {page_table.shape[0]} rows for batch_size {batch}"
-        )
-    if (
-        seqused_k.dtype != torch.int32
-        or not seqused_k.is_contiguous()
-        or int(seqused_k.numel()) != batch
-    ):
-        raise ValueError(f"seqused_k must be contiguous int32 with {batch} entries")
-    if out.shape != q.shape or out.dtype != torch.bfloat16 or not out.is_contiguous():
-        raise ValueError("out must be a contiguous bf16 tensor shaped like q")
-    max_pages = int(page_table.shape[1])
-    program, grid, constants = _decode_template(
+    total_q, num_q_heads, num_kv_heads, max_pages = _admit_sparse_decode(
+        q_shape=q.shape,
+        q_dtype=q.dtype,
+        q_contiguous=q.is_contiguous(),
+        k_shape=k.shape,
+        k_dtype=k.dtype,
+        k_stride=k.stride(),
+        v_shape=v.shape,
+        v_dtype=v.dtype,
+        v_stride=v.stride(),
+        seqlen_q=seqlen_q,
+        q2k_indices_shape=q2k_indices.shape,
+        q2k_indices_dtype=q2k_indices.dtype,
+        q2k_indices_contiguous=q2k_indices.is_contiguous(),
+        page_table_shape=page_table.shape,
+        page_table_dtype=page_table.dtype,
+        page_table_contiguous=page_table.is_contiguous(),
+        seqused_k_dtype=seqused_k.dtype,
+        seqused_k_contiguous=seqused_k.is_contiguous(),
+        seqused_k_numel=seqused_k.numel(),
+        out_shape=out.shape,
+        out_dtype=out.dtype,
+        out_contiguous=out.is_contiguous(),
+    )
+    launch = _decode_template(
         total_q=total_q,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
@@ -767,9 +843,7 @@ def hopper_msa_sparse_decode_attention(
     scale = (
         1.0 / math.sqrt(_HEAD_DIM) if softmax_scale is None else float(softmax_scale)
     )
-    program.launch(
-        grid,
-        constants,
+    launch(
         Q32=q.view(torch.uint32),
         K=k.view(torch.uint8),
         V=v.view(torch.uint8),
@@ -848,7 +922,7 @@ def _proxy_decode_template(
     pt_stride: int,
     has_qoff: bool,
     device_index: int,
-) -> tuple[_Program, tuple[int, int, int], dict[str, Any]]:
+) -> _Launch:
     """The launch of one decode-regime proxy geometry resolved once: program, grid (CTA order) and kernel scalars."""
 
     batch_fast = plan_proxy_score(
@@ -873,7 +947,102 @@ def _proxy_decode_template(
         proxy_route(q_dtype=q_dtype, num_q_heads=num_q_heads, max_seqlen_q=max_seqlen_q)
     )
     grid = (batch, max_k_tiles, 1) if batch_fast else (max_k_tiles, batch, 1)
-    return program, grid, constants
+    return program.bind(grid, constants)
+
+
+@functools.lru_cache(maxsize=4096)
+def _admit_proxy_decode(
+    *,
+    q_shape: tuple[int, ...],
+    q_dtype: torch.dtype,
+    q_contiguous: bool,
+    k_shape: tuple[int, ...],
+    k_dtype: torch.dtype,
+    k_contiguous: bool,
+    max_seqlen_q: int,
+    batch_size: int,
+    page_table_shape: tuple[int, ...],
+    page_table_dtype: torch.dtype,
+    page_table_stride: tuple[int, ...],
+    seqused_k_dtype: torch.dtype,
+    seqused_k_contiguous: bool,
+    seqused_k_numel: int,
+    per_head_shape: tuple[int, ...],
+    per_head_dtype: torch.dtype,
+    per_head_contiguous: bool,
+    q_offset_meta: Optional[tuple[torch.dtype, bool, int]],
+) -> tuple[int, int, int, int, int, int]:
+    """Admission of one decode-regime proxy geometry, resolved once per metadata key (never a tensor): the checks of
+    ``hopper_msa_proxy_score_decode`` in their order, raising as they always did (a raising call is never cached),
+    then the derived ``(total_q, num_q_heads, max_seqlen_q, batch, max_k_tiles, num_pages)``."""
+
+    total_q, num_q_heads, head_dim = (int(x) for x in q_shape)
+    if head_dim != _HEAD_DIM:
+        raise ValueError(f"head_dim must be {_HEAD_DIM}, got {head_dim}")
+    if (
+        len(k_shape) != 4
+        or k_shape[1] != 1
+        or k_shape[2] != _BLOCK_SIZE
+        or k_shape[3] != _HEAD_DIM
+    ):
+        raise ValueError(
+            f"the MSA index cache must be (num_pages, 1, {_BLOCK_SIZE}, {_HEAD_DIM})"
+        )
+    if q_dtype != k_dtype or not q_contiguous or not k_contiguous:
+        raise ValueError(
+            "q and the index cache must be contiguous tensors of one dtype"
+        )
+    if not proxy_decode_route_available(
+        q_dtype=q_dtype,
+        num_q_heads=num_q_heads,
+        num_kv_heads=int(k_shape[1]),
+        max_seqlen_q=max_seqlen_q,
+    ):
+        raise NotImplementedError(
+            f"no Cake SM90 proxy-score program for dtype {q_dtype}, Hq {num_q_heads}, max_seqlen_q {max_seqlen_q}"
+        )
+    sq = int(max_seqlen_q)
+    batch = int(batch_size)
+    if total_q != batch * sq:
+        raise ValueError(
+            f"decode proxy needs total_q == batch_size * max_seqlen_q ({batch} * {sq}), got {total_q}"
+        )
+    if (
+        page_table_dtype != torch.int32
+        or len(page_table_shape) != 2
+        or page_table_stride[1] != 1
+    ):
+        raise ValueError(
+            "page_table must be int32 (batch_size, max_pages) with unit column stride"
+        )
+    if int(page_table_shape[0]) != batch:
+        raise ValueError(
+            f"page_table has {page_table_shape[0]} rows for batch_size {batch}"
+        )
+    if (
+        seqused_k_dtype != torch.int32
+        or not seqused_k_contiguous
+        or int(seqused_k_numel) != batch
+    ):
+        raise ValueError(f"seqused_k must be contiguous int32 with {batch} entries")
+    num_heads, max_k_tiles, out_q = (int(x) for x in per_head_shape)
+    if (
+        (num_heads, out_q) != (num_q_heads, total_q)
+        or per_head_dtype != torch.float32
+        or not per_head_contiguous
+    ):
+        raise ValueError(
+            f"per_head must be contiguous float32 ({num_q_heads}, max_k_tiles, {total_q})"
+        )
+    if int(page_table_shape[1]) < max_k_tiles:
+        raise ValueError("page_table is narrower than max_k_tiles")
+    if q_offset_meta is not None and (
+        q_offset_meta[0] != torch.int32
+        or not q_offset_meta[1]
+        or int(q_offset_meta[2]) != batch
+    ):
+        raise ValueError(f"q_offset must be contiguous int32 with {batch} entries")
+    return total_q, num_q_heads, sq, batch, max_k_tiles, int(k_shape[0])
 
 
 def hopper_msa_proxy_score_decode(
@@ -889,80 +1058,33 @@ def hopper_msa_proxy_score_decode(
 ) -> torch.Tensor:
     """MSA proxy score, decode regime, on compute capability 9.0.  Writes ``per_head``."""
 
-    total_q, num_q_heads, head_dim = (int(x) for x in q.shape)
-    if head_dim != _HEAD_DIM:
-        raise ValueError(f"head_dim must be {_HEAD_DIM}, got {head_dim}")
-    if (
-        k.ndim != 4
-        or k.shape[1] != 1
-        or k.shape[2] != _BLOCK_SIZE
-        or k.shape[3] != _HEAD_DIM
-    ):
-        raise ValueError(
-            f"the MSA index cache must be (num_pages, 1, {_BLOCK_SIZE}, {_HEAD_DIM})"
-        )
-    if q.dtype != k.dtype or not q.is_contiguous() or not k.is_contiguous():
-        raise ValueError(
-            "q and the index cache must be contiguous tensors of one dtype"
-        )
-    if not proxy_decode_route_available(
+    total_q, num_q_heads, sq, batch, max_k_tiles, num_pages = _admit_proxy_decode(
+        q_shape=q.shape,
         q_dtype=q.dtype,
-        num_q_heads=num_q_heads,
-        num_kv_heads=int(k.shape[1]),
+        q_contiguous=q.is_contiguous(),
+        k_shape=k.shape,
+        k_dtype=k.dtype,
+        k_contiguous=k.is_contiguous(),
         max_seqlen_q=max_seqlen_q,
-    ):
-        raise NotImplementedError(
-            f"no Cake SM90 proxy-score program for dtype {q.dtype}, Hq {num_q_heads}, max_seqlen_q {max_seqlen_q}"
-        )
-    sq = int(max_seqlen_q)
-    batch = int(batch_size)
-    if total_q != batch * sq:
-        raise ValueError(
-            f"decode proxy needs total_q == batch_size * max_seqlen_q ({batch} * {sq}), got {total_q}"
-        )
-    if (
-        page_table.dtype != torch.int32
-        or page_table.ndim != 2
-        or page_table.stride(1) != 1
-    ):
-        raise ValueError(
-            "page_table must be int32 (batch_size, max_pages) with unit column stride"
-        )
-    if int(page_table.shape[0]) != batch:
-        raise ValueError(
-            f"page_table has {page_table.shape[0]} rows for batch_size {batch}"
-        )
-    if (
-        seqused_k.dtype != torch.int32
-        or not seqused_k.is_contiguous()
-        or int(seqused_k.numel()) != batch
-    ):
-        raise ValueError(f"seqused_k must be contiguous int32 with {batch} entries")
-    num_heads, max_k_tiles, out_q = (int(x) for x in per_head.shape)
-    if (
-        (num_heads, out_q) != (num_q_heads, total_q)
-        or per_head.dtype != torch.float32
-        or not per_head.is_contiguous()
-    ):
-        raise ValueError(
-            f"per_head must be contiguous float32 ({num_q_heads}, max_k_tiles, {total_q})"
-        )
-    if int(page_table.shape[1]) < max_k_tiles:
-        raise ValueError("page_table is narrower than max_k_tiles")
-    if q_offset is not None and (
-        q_offset.dtype != torch.int32
-        or not q_offset.is_contiguous()
-        or int(q_offset.numel()) != batch
-    ):
-        raise ValueError(f"q_offset must be contiguous int32 with {batch} entries")
-    num_pages = int(k.shape[0])
+        batch_size=batch_size,
+        page_table_shape=page_table.shape,
+        page_table_dtype=page_table.dtype,
+        page_table_stride=page_table.stride(),
+        seqused_k_dtype=seqused_k.dtype,
+        seqused_k_contiguous=seqused_k.is_contiguous(),
+        seqused_k_numel=seqused_k.numel(),
+        per_head_shape=per_head.shape,
+        per_head_dtype=per_head.dtype,
+        per_head_contiguous=per_head.is_contiguous(),
+        q_offset_meta=_optional_meta(q_offset),
+    )
     if q.dtype == torch.float8_e4m3fn:
         q2 = q.view(torch.uint8).view(total_q * num_q_heads, _HEAD_DIM)
         k2 = k.view(torch.uint8).view(num_pages * _BLOCK_SIZE, _HEAD_DIM)
     else:
         q2 = q.view(total_q * num_q_heads, _HEAD_DIM)
         k2 = k.view(num_pages * _BLOCK_SIZE, _HEAD_DIM)
-    program, grid, constants = _proxy_decode_template(
+    launch = _proxy_decode_template(
         q_dtype=q.dtype,
         num_q_heads=num_q_heads,
         max_seqlen_q=sq,
@@ -974,9 +1096,7 @@ def hopper_msa_proxy_score_decode(
         has_qoff=q_offset is not None,
         device_index=_device_index(q.device),
     )
-    program.launch(
-        grid,
-        constants,
+    launch(
         Q=q2,
         K=k2,
         out=per_head,
@@ -1587,7 +1707,7 @@ def _proxy_prefill_template(
     pt_stride: int,
     has_qoff: bool,
     device_index: int,
-) -> tuple[_Program, tuple[int, int, int], dict[str, Any]]:
+) -> _Launch:
     """The launch of one prefill-regime proxy geometry resolved once: program, grid and kernel scalars."""
 
     plan = plan_proxy_score_prefill(
@@ -1607,7 +1727,105 @@ def _proxy_prefill_template(
         nsplit=plan.nsplit,
         trace=_trace_carrier(torch.device("cuda", device_index)),
     )
-    return _program(plan.route), plan.grid(hq=hq, batch=batch), constants
+    return _program(plan.route).bind(plan.grid(hq=hq, batch=batch), constants)
+
+
+@functools.lru_cache(maxsize=4096)
+def _admit_proxy_prefill(
+    *,
+    q_shape: tuple[int, ...],
+    q_dtype: torch.dtype,
+    q_contiguous: bool,
+    k_shape: tuple[int, ...],
+    k_dtype: torch.dtype,
+    k_contiguous: bool,
+    use_fp32_acc: bool,
+    batch_size: int,
+    cu_seqlens_q_dtype: torch.dtype,
+    cu_seqlens_q_contiguous: bool,
+    cu_seqlens_q_numel: int,
+    page_table_shape: tuple[int, ...],
+    page_table_dtype: torch.dtype,
+    page_table_stride: tuple[int, ...],
+    seqused_k_dtype: torch.dtype,
+    seqused_k_contiguous: bool,
+    seqused_k_numel: int,
+    per_head_shape: tuple[int, ...],
+    per_head_dtype: torch.dtype,
+    per_head_contiguous: bool,
+    q_offset_meta: Optional[tuple[torch.dtype, bool, int]],
+    max_seqlen_q: int,
+) -> tuple[int, int, int, int, int]:
+    """Admission of one prefill-regime proxy geometry, resolved once per metadata key (never a tensor): the checks
+    of ``hopper_msa_proxy_score_prefill`` in their order, raising as they always did (a raising call is never
+    cached), then the derived ``(total_q, num_q_heads, batch, max_k_tiles, num_pages)``."""
+
+    total_q, num_q_heads, head_dim = (int(x) for x in q_shape)
+    if head_dim != _HEAD_DIM:
+        raise ValueError(f"head_dim must be {_HEAD_DIM}, got {head_dim}")
+    if len(k_shape) != 4 or k_shape[2] != _BLOCK_SIZE or k_shape[3] != _HEAD_DIM:
+        raise ValueError(
+            f"the MSA index cache must be (num_pages, num_kv_heads, {_BLOCK_SIZE}, {_HEAD_DIM})"
+        )
+    if q_dtype != torch.float8_e4m3fn or k_dtype != torch.float8_e4m3fn:
+        raise NotImplementedError(
+            "SM90 proxy-score prefill requires fp8 e4m3 q with an fp8 e4m3 index cache"
+        )
+    if not q_contiguous or not k_contiguous:
+        raise ValueError("q and the index cache must be contiguous")
+    if not proxy_prefill_route_available(
+        q_dtype=q_dtype, num_kv_heads=int(k_shape[1]), use_fp32_acc=use_fp32_acc
+    ):
+        raise NotImplementedError(
+            f"no Cake SM90 proxy-score prefill program for Hkv {int(k_shape[1])}, use_fp32_acc={bool(use_fp32_acc)}"
+        )
+    batch = int(batch_size)
+    if (
+        cu_seqlens_q_dtype != torch.int32
+        or not cu_seqlens_q_contiguous
+        or int(cu_seqlens_q_numel) != batch + 1
+    ):
+        raise ValueError(
+            f"cu_seqlens_q must be contiguous int32 with {batch + 1} entries"
+        )
+    if (
+        page_table_dtype != torch.int32
+        or len(page_table_shape) != 2
+        or page_table_stride[1] != 1
+    ):
+        raise ValueError(
+            "page_table must be int32 (batch_size, max_pages) with unit column stride"
+        )
+    if int(page_table_shape[0]) != batch:
+        raise ValueError(
+            f"page_table has {page_table_shape[0]} rows for batch_size {batch}"
+        )
+    if (
+        seqused_k_dtype != torch.int32
+        or not seqused_k_contiguous
+        or int(seqused_k_numel) != batch
+    ):
+        raise ValueError(f"seqused_k must be contiguous int32 with {batch} entries")
+    num_heads, max_k_tiles, out_q = (int(x) for x in per_head_shape)
+    if (
+        (num_heads, out_q) != (num_q_heads, total_q)
+        or per_head_dtype != torch.float32
+        or not per_head_contiguous
+    ):
+        raise ValueError(
+            f"per_head must be contiguous float32 ({num_q_heads}, max_k_tiles, {total_q})"
+        )
+    if int(page_table_shape[1]) < max_k_tiles:
+        raise ValueError("page_table is narrower than max_k_tiles")
+    if q_offset_meta is not None and (
+        q_offset_meta[0] != torch.int32
+        or not q_offset_meta[1]
+        or int(q_offset_meta[2]) != batch
+    ):
+        raise ValueError(f"q_offset must be contiguous int32 with {batch} entries")
+    if int(max_seqlen_q) <= 0:
+        raise ValueError(f"max_seqlen_q must be positive, got {max_seqlen_q}")
+    return total_q, num_q_heads, batch, max_k_tiles, int(k_shape[0])
 
 
 def hopper_msa_proxy_score_prefill(
@@ -1631,73 +1849,31 @@ def hopper_msa_proxy_score_prefill(
     kernel (no host allocation, graph-safe).
     """
 
-    total_q, num_q_heads, head_dim = (int(x) for x in q.shape)
-    if head_dim != _HEAD_DIM:
-        raise ValueError(f"head_dim must be {_HEAD_DIM}, got {head_dim}")
-    if k.ndim != 4 or k.shape[2] != _BLOCK_SIZE or k.shape[3] != _HEAD_DIM:
-        raise ValueError(
-            f"the MSA index cache must be (num_pages, num_kv_heads, {_BLOCK_SIZE}, {_HEAD_DIM})"
-        )
-    if q.dtype != torch.float8_e4m3fn or k.dtype != torch.float8_e4m3fn:
-        raise NotImplementedError(
-            "SM90 proxy-score prefill requires fp8 e4m3 q with an fp8 e4m3 index cache"
-        )
-    if not q.is_contiguous() or not k.is_contiguous():
-        raise ValueError("q and the index cache must be contiguous")
-    if not proxy_prefill_route_available(
-        q_dtype=q.dtype, num_kv_heads=int(k.shape[1]), use_fp32_acc=use_fp32_acc
-    ):
-        raise NotImplementedError(
-            f"no Cake SM90 proxy-score prefill program for Hkv {int(k.shape[1])}, use_fp32_acc={bool(use_fp32_acc)}"
-        )
-    batch = int(batch_size)
-    if (
-        cu_seqlens_q.dtype != torch.int32
-        or not cu_seqlens_q.is_contiguous()
-        or int(cu_seqlens_q.numel()) != batch + 1
-    ):
-        raise ValueError(
-            f"cu_seqlens_q must be contiguous int32 with {batch + 1} entries"
-        )
-    if (
-        page_table.dtype != torch.int32
-        or page_table.ndim != 2
-        or page_table.stride(1) != 1
-    ):
-        raise ValueError(
-            "page_table must be int32 (batch_size, max_pages) with unit column stride"
-        )
-    if int(page_table.shape[0]) != batch:
-        raise ValueError(
-            f"page_table has {page_table.shape[0]} rows for batch_size {batch}"
-        )
-    if (
-        seqused_k.dtype != torch.int32
-        or not seqused_k.is_contiguous()
-        or int(seqused_k.numel()) != batch
-    ):
-        raise ValueError(f"seqused_k must be contiguous int32 with {batch} entries")
-    num_heads, max_k_tiles, out_q = (int(x) for x in per_head.shape)
-    if (
-        (num_heads, out_q) != (num_q_heads, total_q)
-        or per_head.dtype != torch.float32
-        or not per_head.is_contiguous()
-    ):
-        raise ValueError(
-            f"per_head must be contiguous float32 ({num_q_heads}, max_k_tiles, {total_q})"
-        )
-    if int(page_table.shape[1]) < max_k_tiles:
-        raise ValueError("page_table is narrower than max_k_tiles")
-    if q_offset is not None and (
-        q_offset.dtype != torch.int32
-        or not q_offset.is_contiguous()
-        or int(q_offset.numel()) != batch
-    ):
-        raise ValueError(f"q_offset must be contiguous int32 with {batch} entries")
-    if int(max_seqlen_q) <= 0:
-        raise ValueError(f"max_seqlen_q must be positive, got {max_seqlen_q}")
-    num_pages = int(k.shape[0])
-    program, grid, constants = _proxy_prefill_template(
+    total_q, num_q_heads, batch, max_k_tiles, num_pages = _admit_proxy_prefill(
+        q_shape=q.shape,
+        q_dtype=q.dtype,
+        q_contiguous=q.is_contiguous(),
+        k_shape=k.shape,
+        k_dtype=k.dtype,
+        k_contiguous=k.is_contiguous(),
+        use_fp32_acc=use_fp32_acc,
+        batch_size=batch_size,
+        cu_seqlens_q_dtype=cu_seqlens_q.dtype,
+        cu_seqlens_q_contiguous=cu_seqlens_q.is_contiguous(),
+        cu_seqlens_q_numel=cu_seqlens_q.numel(),
+        page_table_shape=page_table.shape,
+        page_table_dtype=page_table.dtype,
+        page_table_stride=page_table.stride(),
+        seqused_k_dtype=seqused_k.dtype,
+        seqused_k_contiguous=seqused_k.is_contiguous(),
+        seqused_k_numel=seqused_k.numel(),
+        per_head_shape=per_head.shape,
+        per_head_dtype=per_head.dtype,
+        per_head_contiguous=per_head.is_contiguous(),
+        q_offset_meta=_optional_meta(q_offset),
+        max_seqlen_q=max_seqlen_q,
+    )
+    launch = _proxy_prefill_template(
         hq=num_q_heads,
         batch=batch,
         max_k_tiles=max_k_tiles,
@@ -1708,9 +1884,7 @@ def hopper_msa_proxy_score_prefill(
         has_qoff=q_offset is not None,
         device_index=_device_index(q.device),
     )
-    program.launch(
-        grid,
-        constants,
+    launch(
         Q=q.view(torch.uint8),
         K=k.view(torch.uint8).view(
             num_pages * int(k.shape[1]) * _BLOCK_SIZE, _HEAD_DIM
@@ -1957,7 +2131,7 @@ def _topk_template(
     masked: bool,
     nvp: bool,
     device_index: int,
-) -> tuple[_Program, tuple[int, int, int], dict[str, Any]]:
+) -> _Launch:
     """The launch of one top-k geometry resolved once: program, grid and kernel scalars (the never-read int32 filler
     of the form without per-token valid pages included)."""
 
@@ -1981,7 +2155,7 @@ def _topk_template(
     )
     if not nvp:
         constants["nvp"] = _int32_dummy(torch.device("cuda", device_index))
-    return _program(plan.route), (-(-total_q // plan.c), num_heads, 1), constants
+    return _program(plan.route).bind((-(-total_q // plan.c), num_heads, 1), constants)
 
 
 def topk_route_available(
@@ -2005,6 +2179,59 @@ def topk_route_available(
     )
 
 
+@functools.lru_cache(maxsize=4096)
+def _admit_topk_select(
+    *,
+    topk: int,
+    max_score_shape: tuple[int, ...],
+    max_score_dtype: torch.dtype,
+    max_score_contiguous: bool,
+    output_shape: tuple[int, ...],
+    output_dtype: torch.dtype,
+    output_contiguous: bool,
+    force_begin_blocks: int,
+    force_end_blocks: int,
+    num_valid_pages_meta: Optional[tuple[torch.dtype, bool, int]],
+) -> tuple[int, int, int, int, int]:
+    """Admission of one top-k geometry, resolved once per metadata key (never a tensor): the checks of
+    ``hopper_msa_topk_select`` in their order, raising as they always did (a raising call is never cached), then the
+    derived ``(num_heads, tiles, total_q, force_begin_blocks, force_end_blocks)``."""
+
+    if topk != _TOPK:
+        raise NotImplementedError(
+            f"SM90 msa_topk_select supports topk={_TOPK} only, got {topk}"
+        )
+    if (
+        len(max_score_shape) != 3
+        or max_score_dtype != torch.float32
+        or not max_score_contiguous
+    ):
+        raise ValueError(
+            "max_score must be a contiguous fp32 (num_qo_heads, max_k_tiles, total_q) tensor"
+        )
+    hq, tiles, total_q = (int(x) for x in max_score_shape)
+    if (
+        tuple(output_shape) != (total_q, hq, _TOPK)
+        or output_dtype != torch.int32
+        or not output_contiguous
+    ):
+        raise ValueError(
+            f"output must be a contiguous int32 ({total_q}, {hq}, {_TOPK}) tensor, got {tuple(output_shape)}"
+        )
+    fb, fe = int(force_begin_blocks), int(force_end_blocks)
+    if fb < 0 or fe < 0 or fb + fe > _TOPK:
+        raise ValueError(
+            f"force_begin_blocks + force_end_blocks must be 0..{_TOPK}, got {fb} + {fe}"
+        )
+    if num_valid_pages_meta is not None and (
+        num_valid_pages_meta[0] != torch.int32
+        or not num_valid_pages_meta[1]
+        or int(num_valid_pages_meta[2]) != total_q
+    ):
+        raise ValueError("num_valid_pages must be a contiguous int32 (total_q,) tensor")
+    return hq, tiles, total_q, fb, fe
+
+
 def hopper_msa_topk_select(
     max_score: torch.Tensor,
     topk: int,
@@ -2022,67 +2249,38 @@ def hopper_msa_topk_select(
     synchronisation (graph-capturable).
     """
 
-    if topk != _TOPK:
-        raise NotImplementedError(
-            f"SM90 msa_topk_select supports topk={_TOPK} only, got {topk}"
-        )
-    if (
-        max_score.ndim != 3
-        or max_score.dtype != torch.float32
-        or not max_score.is_contiguous()
-    ):
-        raise ValueError(
-            "max_score must be a contiguous fp32 (num_qo_heads, max_k_tiles, total_q) tensor"
-        )
-    hq, tiles, total_q = (int(x) for x in max_score.shape)
-    if (
-        tuple(output.shape) != (total_q, hq, _TOPK)
-        or output.dtype != torch.int32
-        or not output.is_contiguous()
-    ):
-        raise ValueError(
-            f"output must be a contiguous int32 ({total_q}, {hq}, {_TOPK}) tensor, got {tuple(output.shape)}"
-        )
-    fb, fe = int(force_begin_blocks), int(force_end_blocks)
-    if fb < 0 or fe < 0 or fb + fe > _TOPK:
-        raise ValueError(
-            f"force_begin_blocks + force_end_blocks must be 0..{_TOPK}, got {fb} + {fe}"
-        )
-    nvp = None
-    if num_valid_pages is not None:
-        if (
-            num_valid_pages.dtype != torch.int32
-            or not num_valid_pages.is_contiguous()
-            or int(num_valid_pages.numel()) != total_q
-        ):
-            raise ValueError(
-                "num_valid_pages must be a contiguous int32 (total_q,) tensor"
-            )
-        nvp = num_valid_pages
+    hq, tiles, total_q, fb, fe = _admit_topk_select(
+        topk=topk,
+        max_score_shape=max_score.shape,
+        max_score_dtype=max_score.dtype,
+        max_score_contiguous=max_score.is_contiguous(),
+        output_shape=output.shape,
+        output_dtype=output.dtype,
+        output_contiguous=output.is_contiguous(),
+        force_begin_blocks=force_begin_blocks,
+        force_end_blocks=force_end_blocks,
+        num_valid_pages_meta=_optional_meta(num_valid_pages),
+    )
     device_index = _device_index(max_score.device)
-    program, grid, constants = _topk_template(
+    launch = _topk_template(
         num_heads=hq,
         tiles=tiles,
         total_q=total_q,
         num_sms=_num_sms(device_index),
         masked=fb > 0 or fe > 0,
-        nvp=nvp is not None,
+        nvp=num_valid_pages is not None,
         device_index=device_index,
     )
-    if nvp is not None:
-        program.launch(
-            grid,
-            constants,
+    if num_valid_pages is not None:
+        launch(
             S=max_score.view(torch.uint32),
-            nvp=nvp,
+            nvp=num_valid_pages,
             out=output,
             fb=fb,
             fe=fe,
         )
     else:
-        program.launch(
-            grid, constants, S=max_score.view(torch.uint32), out=output, fb=fb, fe=fe
-        )
+        launch(S=max_score.view(torch.uint32), out=output, fb=fb, fe=fe)
     return output
 
 
@@ -2169,7 +2367,7 @@ def _prefill_template(
     batch: int,
     use_q_offset: bool,
     device_index: int,
-) -> tuple[_Program, tuple[int, int, int], dict[str, Any]]:
+) -> _Launch:
     """The launch of one sparse-prefill geometry resolved once: program, grid and kernel scalars."""
 
     plan = plan_sparse_prefill(
@@ -2191,7 +2389,119 @@ def _prefill_template(
         zero_u32=0,
         trace=_trace_carrier(torch.device("cuda", device_index)),
     )
-    return _program(plan.route), (groups, num_kv_heads, 1), constants
+    return _program(plan.route).bind((groups, num_kv_heads, 1), constants)
+
+
+@functools.lru_cache(maxsize=4096)
+def _admit_sparse_prefill(
+    *,
+    q_shape: tuple[int, ...],
+    q_dtype: torch.dtype,
+    q_contiguous: bool,
+    k_shape: tuple[int, ...],
+    k_dtype: torch.dtype,
+    k_stride: tuple[int, ...],
+    k_element_size: int,
+    v_shape: tuple[int, ...],
+    v_dtype: torch.dtype,
+    v_stride: tuple[int, ...],
+    kv_offset: int,
+    q2k_indices_shape: tuple[int, ...],
+    q2k_indices_dtype: torch.dtype,
+    q2k_indices_contiguous: bool,
+    cu_seqlens_q_shape: tuple[int, ...],
+    cu_seqlens_q_dtype: torch.dtype,
+    cu_seqlens_q_contiguous: bool,
+    cu_seqlens_q_numel: int,
+    page_table_shape: tuple[int, ...],
+    page_table_dtype: torch.dtype,
+    page_table_contiguous: bool,
+    seqused_k_dtype: torch.dtype,
+    seqused_k_contiguous: bool,
+    seqused_k_numel: int,
+    q_offset_meta: Optional[tuple[torch.dtype, bool, int]],
+    out_shape: tuple[int, ...],
+    out_dtype: torch.dtype,
+    out_contiguous: bool,
+) -> tuple[int, int, int, int, int]:
+    """Admission of one sparse-prefill geometry, resolved once per metadata key (shapes, dtypes, contiguity, strides,
+    the byte distance of ``v`` from ``k`` -- never a tensor): the checks of ``hopper_msa_sparse_attention`` in their
+    order, including the interleaved-cache test, raising as they always did (a raising call is never cached), then
+    the derived ``(total_q, num_q_heads, num_kv_heads, batch, max_pages)``."""
+
+    total_q, num_q_heads, head_dim = (int(x) for x in q_shape)
+    if head_dim != _HEAD_DIM:
+        raise ValueError(f"head_dim must be {_HEAD_DIM}, got {head_dim}")
+    if q_dtype != torch.bfloat16 or not q_contiguous:
+        raise ValueError("SM90 sparse prefill needs contiguous bf16 q")
+    if k_dtype != torch.float8_e4m3fn or v_dtype != torch.float8_e4m3fn:
+        raise ValueError("SM90 sparse prefill needs an fp8 e4m3 KV cache")
+    if (
+        len(k_shape) != 4
+        or k_shape[2] != _BLOCK_SIZE
+        or k_shape[3] != _HEAD_DIM
+        or k_shape != v_shape
+        or k_stride != v_stride
+    ):
+        raise ValueError(
+            f"paged k/v must be matching (num_pages, num_kv_heads, {_BLOCK_SIZE}, {_HEAD_DIM}) views"
+        )
+    num_kv_heads = int(k_shape[1])
+    if (
+        k_stride[-1] != 1
+        or k_stride[-2] != 2 * _HEAD_DIM
+        or k_stride[1] != _BLOCK_SIZE * 2 * _HEAD_DIM
+        or k_stride[0] != num_kv_heads * _BLOCK_SIZE * 2 * _HEAD_DIM
+        or kv_offset != _HEAD_DIM * k_element_size
+    ):
+        raise NotImplementedError(
+            "SM90 sparse prefill needs K and V as the halves of one dense interleaved "
+            f"(num_pages, num_kv_heads, {_BLOCK_SIZE}, {2 * _HEAD_DIM}) cache"
+        )
+    if q2k_indices_dtype != torch.int32 or not q2k_indices_contiguous:
+        raise ValueError("q2k_indices must be contiguous int32")
+    if tuple(q2k_indices_shape) != (num_kv_heads, total_q, _TOPK):
+        raise NotImplementedError(
+            f"SM90 sparse prefill serves q2k_indices of shape (num_kv_heads, total_q, {_TOPK}); "
+            f"got {tuple(q2k_indices_shape)}"
+        )
+    if (
+        cu_seqlens_q_dtype != torch.int32
+        or not cu_seqlens_q_contiguous
+        or len(cu_seqlens_q_shape) != 1
+        or int(cu_seqlens_q_numel) < 2
+    ):
+        raise ValueError("cu_seqlens_q must be contiguous int32 (batch_size + 1,)")
+    batch = int(cu_seqlens_q_numel) - 1
+    if (
+        page_table_dtype != torch.int32
+        or not page_table_contiguous
+        or len(page_table_shape) != 2
+        or int(page_table_shape[0]) != batch
+    ):
+        raise ValueError(
+            f"page_table must be contiguous int32 (batch_size={batch}, max_pages)"
+        )
+    if (
+        seqused_k_dtype != torch.int32
+        or not seqused_k_contiguous
+        or int(seqused_k_numel) != batch
+    ):
+        raise ValueError(f"seqused_k must be contiguous int32 with {batch} entries")
+    if q_offset_meta is not None and (
+        q_offset_meta[0] != torch.int32
+        or not q_offset_meta[1]
+        or int(q_offset_meta[2]) != batch
+    ):
+        raise ValueError(f"q_offset must be contiguous int32 with {batch} entries")
+    if out_shape != q_shape or out_dtype != torch.bfloat16 or not out_contiguous:
+        raise ValueError("out must be a contiguous bf16 tensor shaped like q")
+    max_pages = int(page_table_shape[1])
+    if max_pages > _PF_MAX_BLOCKS:
+        raise NotImplementedError(
+            f"SM90 sparse prefill unions at most {_PF_MAX_BLOCKS} blocks per sequence, got {max_pages}"
+        )
+    return total_q, num_q_heads, num_kv_heads, batch, max_pages
 
 
 def hopper_msa_sparse_attention(
@@ -2216,79 +2526,37 @@ def hopper_msa_sparse_attention(
     scratch, no allocation: graph-capturable as is.
     """
 
-    total_q, num_q_heads, head_dim = (int(x) for x in q.shape)
-    if head_dim != _HEAD_DIM:
-        raise ValueError(f"head_dim must be {_HEAD_DIM}, got {head_dim}")
-    if q.dtype != torch.bfloat16 or not q.is_contiguous():
-        raise ValueError("SM90 sparse prefill needs contiguous bf16 q")
-    if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
-        raise ValueError("SM90 sparse prefill needs an fp8 e4m3 KV cache")
-    if (
-        k.ndim != 4
-        or k.shape[2] != _BLOCK_SIZE
-        or k.shape[3] != _HEAD_DIM
-        or k.shape != v.shape
-        or k.stride() != v.stride()
-    ):
-        raise ValueError(
-            f"paged k/v must be matching (num_pages, num_kv_heads, {_BLOCK_SIZE}, {_HEAD_DIM}) views"
-        )
-    num_kv_heads = int(k.shape[1])
-    if (
-        k.stride(-1) != 1
-        or k.stride(-2) != 2 * _HEAD_DIM
-        or k.stride(1) != _BLOCK_SIZE * 2 * _HEAD_DIM
-        or k.stride(0) != num_kv_heads * _BLOCK_SIZE * 2 * _HEAD_DIM
-        or v.data_ptr() - k.data_ptr() != _HEAD_DIM * k.element_size()
-    ):
-        raise NotImplementedError(
-            "SM90 sparse prefill needs K and V as the halves of one dense interleaved "
-            f"(num_pages, num_kv_heads, {_BLOCK_SIZE}, {2 * _HEAD_DIM}) cache"
-        )
-    if q2k_indices.dtype != torch.int32 or not q2k_indices.is_contiguous():
-        raise ValueError("q2k_indices must be contiguous int32")
-    if tuple(q2k_indices.shape) != (num_kv_heads, total_q, _TOPK):
-        raise NotImplementedError(
-            f"SM90 sparse prefill serves q2k_indices of shape (num_kv_heads, total_q, {_TOPK}); "
-            f"got {tuple(q2k_indices.shape)}"
-        )
-    if (
-        cu_seqlens_q.dtype != torch.int32
-        or not cu_seqlens_q.is_contiguous()
-        or cu_seqlens_q.ndim != 1
-        or int(cu_seqlens_q.numel()) < 2
-    ):
-        raise ValueError("cu_seqlens_q must be contiguous int32 (batch_size + 1,)")
-    batch = int(cu_seqlens_q.numel()) - 1
-    if (
-        page_table.dtype != torch.int32
-        or not page_table.is_contiguous()
-        or page_table.ndim != 2
-        or int(page_table.shape[0]) != batch
-    ):
-        raise ValueError(
-            f"page_table must be contiguous int32 (batch_size={batch}, max_pages)"
-        )
-    if (
-        seqused_k.dtype != torch.int32
-        or not seqused_k.is_contiguous()
-        or int(seqused_k.numel()) != batch
-    ):
-        raise ValueError(f"seqused_k must be contiguous int32 with {batch} entries")
-    if q_offset is not None and (
-        q_offset.dtype != torch.int32
-        or not q_offset.is_contiguous()
-        or int(q_offset.numel()) != batch
-    ):
-        raise ValueError(f"q_offset must be contiguous int32 with {batch} entries")
-    if out.shape != q.shape or out.dtype != torch.bfloat16 or not out.is_contiguous():
-        raise ValueError("out must be a contiguous bf16 tensor shaped like q")
-    max_pages = int(page_table.shape[1])
-    if max_pages > _PF_MAX_BLOCKS:
-        raise NotImplementedError(
-            f"SM90 sparse prefill unions at most {_PF_MAX_BLOCKS} blocks per sequence, got {max_pages}"
-        )
-    program, grid, constants = _prefill_template(
+    total_q, num_q_heads, num_kv_heads, batch, max_pages = _admit_sparse_prefill(
+        q_shape=q.shape,
+        q_dtype=q.dtype,
+        q_contiguous=q.is_contiguous(),
+        k_shape=k.shape,
+        k_dtype=k.dtype,
+        k_stride=k.stride(),
+        k_element_size=k.element_size(),
+        v_shape=v.shape,
+        v_dtype=v.dtype,
+        v_stride=v.stride(),
+        kv_offset=v.data_ptr() - k.data_ptr(),
+        q2k_indices_shape=q2k_indices.shape,
+        q2k_indices_dtype=q2k_indices.dtype,
+        q2k_indices_contiguous=q2k_indices.is_contiguous(),
+        cu_seqlens_q_shape=cu_seqlens_q.shape,
+        cu_seqlens_q_dtype=cu_seqlens_q.dtype,
+        cu_seqlens_q_contiguous=cu_seqlens_q.is_contiguous(),
+        cu_seqlens_q_numel=cu_seqlens_q.numel(),
+        page_table_shape=page_table.shape,
+        page_table_dtype=page_table.dtype,
+        page_table_contiguous=page_table.is_contiguous(),
+        seqused_k_dtype=seqused_k.dtype,
+        seqused_k_contiguous=seqused_k.is_contiguous(),
+        seqused_k_numel=seqused_k.numel(),
+        q_offset_meta=_optional_meta(q_offset),
+        out_shape=out.shape,
+        out_dtype=out.dtype,
+        out_contiguous=out.is_contiguous(),
+    )
+    launch = _prefill_template(
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
         max_pages=max_pages,
@@ -2300,9 +2568,7 @@ def hopper_msa_sparse_attention(
     scale = (
         1.0 / math.sqrt(_HEAD_DIM) if softmax_scale is None else float(softmax_scale)
     )
-    program.launch(
-        grid,
-        constants,
+    launch(
         Q32=q.view(torch.uint32),
         K=k.view(torch.uint8),
         V=v.view(torch.uint8),
