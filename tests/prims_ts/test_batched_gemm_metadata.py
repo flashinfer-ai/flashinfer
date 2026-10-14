@@ -35,6 +35,7 @@ def test_partial_route_map_padding_keeps_trt_absolute_limits():
     cfg = SimpleNamespace(
         use_early_exit=0,
         is_persistent=False,
+        token_metadata_stride=1,
     )
 
     _, mn_limit, route_map = _launch_metadata_lists(
@@ -69,6 +70,7 @@ def test_early_exit_route_map_padding_is_not_semantic_metadata():
     cfg = SimpleNamespace(
         use_early_exit=1,
         is_persistent=True,
+        token_metadata_stride=1,
     )
 
     _, _, route_map = _launch_metadata_lists(
