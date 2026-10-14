@@ -556,6 +556,97 @@ hand on 7 rows), `h4p4_*` (und.kv tiles, mlp.down groups, clock-alone runs),
 counters), `h4_probe_r{1024,2048}.csv` (the parked small-M sweep), under
 `/home/scratch.ishovkun_gpu/w8a16-results/hopper/`.
 
+### Version H5: the gap that was not there (Wed 14 Oct 2026)
+
+The H100 plot (drawn from the single-pass `freeH3_*` sweep) showed `auto` above the torch
+cast-copy column (dequantize the weight to bf16, then cuBLAS) on the small-N rows at M =
+44160 / 88320 (und.kv tp1-8, und.q tp8, gen.qkv tp8, N <= 1280): e.g. und.kv tp1 44160 1.116
+of cast, gen.qkv tp8 88320 1.109, und.kv tp8 44160 1.067.  The suspicion was that the
+register-sourced mainloop idles the tensor pipe while the math warpgroups convert the fp8
+weight fragments, which a shared-memory conversion stage would hide.  No code changed in
+H5; this section is the measurement that says why not.
+
+**The cast column, current code (c93a53ba9), 5 interleaved rounds, cast / cuBLAS / auto
+timed in the same rounds** (s4124-0106, no thermal events, `h5b_*`):
+
+| row | N | M | cast / cuBLAS | auto / cuBLAS | **auto / cast** |
+|---|---|---|---|---|---|
+| und.q tp1 | 8192 | 44160 | 1.025 | 1.006 | 0.982 |
+| und.kv tp1 | 1024 | 44160 | 1.042 | 0.993 | 0.952 |
+| gen.qkv tp1 | 10240 | 44160 | 1.031 | 1.012 | 0.981 |
+| und.q tp2 | 4096 | 44160 | 1.055 | 1.005 | 0.953 |
+| und.kv tp2 | 512 | 44160 | 1.060 | 0.972 | 0.917 |
+| gen.qkv tp2 | 5120 | 44160 | 1.077 | 1.006 | 0.934 |
+| und.q tp4 | 2048 | 44160 | 1.069 | 1.018 | 0.952 |
+| und.kv tp4 | 256 | 44160 | 1.057 | 0.987 | 0.933 |
+| gen.qkv tp4 | 2560 | 44160 | 1.051 | 1.024 | 0.974 |
+| und.q tp8 | 1024 | 44160 | 1.074 | 1.004 | 0.935 |
+| und.kv tp8 | 128 | 44160 | 1.054 | 0.995 | 0.944 |
+| gen.qkv tp8 | 1280 | 44160 | 1.065 | 0.997 | 0.936 |
+| und.q tp1 | 8192 | 88320 | 1.027 | 1.035 | 1.008 |
+| und.kv tp1 | 1024 | 88320 | 1.038 | 1.037 | 0.999 |
+| gen.qkv tp1 | 10240 | 88320 | 1.016 | 1.010 | 0.995 |
+| und.q tp2 | 4096 | 88320 | 1.028 | 0.988 | 0.961 |
+| und.kv tp2 | 512 | 88320 | 1.062 | 0.996 | 0.938 |
+| gen.qkv tp2 | 5120 | 88320 | 1.024 | 1.000 | 0.976 |
+| und.q tp4 | 2048 | 88320 | 1.044 | 1.014 | 0.972 |
+| und.kv tp4 | 256 | 88320 | 1.036 | 0.990 | 0.956 |
+| gen.qkv tp4 | 2560 | 88320 | 1.059 | 0.996 | 0.941 |
+| und.q tp8 | 1024 | 88320 | 1.021 | 1.019 | 0.998 |
+| und.kv tp8 | 128 | 88320 | 1.039 | 1.008 | 0.970 |
+| gen.qkv tp8 | 1280 | 88320 | 1.008 | 1.026 | 1.018 |
+
+The flagged rows were the H3 code measured in one pass on a different node (the same rows
+now: 0.952 / 0.944 / 0.935 / 1.018 / 0.998 / 0.938 of cast).  The cast is also not a rounding
+error at this size: it costs 1-8% over cuBLAS.
+
+**ncu, auto vs the cuBLAS kernel, M = 88320** (locked clocks, counters only, `--set full`,
+one launch each, SM clocks equal within 1% per row; `h5n_*.ncu-repz`):
+
+| row | tiles (ours / cuBLAS) | time | tensor pipe active | DRAM read | instructions | issue slots busy |
+|---|---|---|---|---|---|---|
+| und.q tp8 (N=1024) | 128x256 / 256x128 | 1.101 / 1.093 ms (+0.7%) | 96.2 / 96.9% | 1.04 / 1.15 GB | 264 / 109 M | 27.6 / 11.6% |
+| gen.qkv tp8 (N=1280) | 128x256 / 320x128 | 1.425 / 1.391 ms (+2.4%) | 96.2 / 95.9% | 1.13 / 1.21 GB | 330 / 190 M | 26.8 / 15.9% |
+| und.kv tp4 (N=256) | 128x192 / 128x192 | 340.7 / 343.9 us (-0.9%) | 73.9 / 72.7% | 0.91 / 0.92 GB | 87 / 45 M | 27.5 / 13.9% |
+| und.kv tp8 (N=128) | 128x256 / 128x256 | 337.4 / 333.7 us (+1.1%) | 39.2 / 42.5% | 0.91 / 0.91 GB | 44 / 14 M | 13.5 / 4.4% |
+| und.q tp1 (N=8192, reference) | 128x256 / 192x192 | 9.30 / 9.10 ms (+2.2%) | 96.5 / 97.1% | 6.98 / 8.87 GB | 2109 / 974 M | 27.7 / 12.9% |
+
+* The tensor pipe does not idle during the conversion: 96% active for both kernels where
+  the GEMM is MMA-bound.  The conversion makes us issue 2-3x the instructions, but the issue
+  slots are 27% busy; it fits beside the wgmma.  A shared-memory conversion stage (the
+  Blackwell design) would buy nothing here and was not built.
+* und.kv at N = 128-256 is HBM-bound for both kernels: they read the same 0.91 GB per launch
+  (the 1.8 GB activation, streamed once, the rest from L2) at about 2.7 TB/s.  We are at
+  cuBLAS within +-1%.
+* We read the same or fewer DRAM bytes than cuBLAS on every row (the m raster walks the
+  weight tiles fastest, so the activation streams once).
+* The remaining 0.7-2.4% at equal tensor-pipe utilisation is the wave tail of the tile
+  choice (gen.qkv tp8: 3450 tiles of 128x256 = 26.1 waves, a 14%-full last wave), which the
+  H4 floor check already showed is not worth a dispatcher rule (64x256 1.00, 128x192 1.02,
+  auto 1.01 at 5 rounds).
+
+**Whole grid for the plot** (`freeH4_r*.csv`, all 24 shapes x 6 M, one M class per process,
+`--rounds 5`, `--impls cast cublas kernel --algo auto hand`, same node).  Geomean per M
+class, lower is better:
+
+| M | auto / cuBLAS | hand (v37) / cuBLAS | cast / cuBLAS | auto / cast | rows with auto > cast |
+|---|---|---|---|---|---|
+| 1024 | 1.134 | 1.263 | 2.802 | 0.405 | 0 / 24 |
+| 2048 | 1.069 | 1.165 | 2.002 | 0.534 | 0 / 24 |
+| 4096 | 1.033 | 1.075 | 1.544 | 0.670 | 0 / 24 |
+| 8192 | 1.018 | 1.049 | 1.291 | 0.789 | 0 / 24 |
+| 44160 | 1.007 | 1.026 | 1.055 | 0.955 | 1 / 24 |
+| 88320 | 1.011 | 1.026 | 1.029 | 0.982 | 4 / 24 |
+
+The five rows over cast are all within 1.5% of it, and all are tp1 or long-K shapes where
+the dequant is a small share of the work (cast / cuBLAS 1.01-1.02): gen.qkv tp1 44160 /
+88320 (1.004 / 1.004), und.kv tp1 88320 (1.015), attn.out tp1 88320 (1.000), mlp.down tp4
+88320 (1.013).  None is a small-N row.
+
+Results: `h5b_*` (cast column), `h5n_*` (ncu reports and extracts), `freeH4_r*.csv` /
+`freeH4_dmon_r*.txt` (the plot grid; also packed as `../freeH4.tgz`), under
+`/home/scratch.ishovkun_gpu/w8a16-results/hopper/`.
+
 ## Why not the Hopper design
 
 tcgen05.mma takes both operands from shared memory (or A from TMEM), so the fp8 -> bf16
