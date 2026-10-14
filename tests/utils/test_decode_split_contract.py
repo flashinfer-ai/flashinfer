@@ -137,6 +137,30 @@ def test_auto_cudnn_resolution_precedes_cuda_core_validation(monkeypatch, entryp
     assert not calls
 
 
+@pytest.mark.parametrize("use_tensor_cores", [False, True])
+@pytest.mark.parametrize("disable_split_kv", [False, True])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_cutile_workspace_query_does_not_use_another_backend(
+    monkeypatch, use_tensor_cores, disable_split_kv, use_cuda_graph
+):
+    wrapper, calls = _wrapper(monkeypatch, use_tensor_cores, use_cuda_graph, "cutile")
+    wrapper._jit_module = None
+
+    def unexpected_backend(*args, **kwargs):
+        pytest.fail("cuTile workspace query reached another backend's module")
+
+    def unexpected_copy(*args, **kwargs):
+        pytest.fail("unsupported workspace query reached metadata transfer")
+
+    monkeypatch.setattr(decode, "get_batch_decode_module", unexpected_backend)
+    monkeypatch.setattr(decode, "get_batch_prefill_module", unexpected_backend)
+    monkeypatch.setattr(torch.Tensor, "to", unexpected_copy)
+    monkeypatch.setattr(torch.Tensor, "copy_", unexpected_copy)
+    with pytest.raises(NotImplementedError, match="workspace_size.*cutile"):
+        _call(wrapper, "workspace_size", disable_split_kv)
+    assert not calls
+
+
 @pytest.mark.parametrize("entrypoint", ["plan", "fast_decode_plan"])
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_rejected_replan_preserves_active_cudnn_route(

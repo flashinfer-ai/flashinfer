@@ -1635,6 +1635,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         device/stream selector for the underlying module query.  This method
         does not allocate buffers and does not mutate cached plan state.
 
+        This query is not available for ``cute-dsl``, ``trtllm-gen``, ``cudnn``,
+        or ``cutile`` backends and raises ``NotImplementedError`` for them.
+
         Parameters
         ----------
         indptr : torch.Tensor
@@ -1749,7 +1752,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             disable_split_kv=disable_split_kv,
         ):
             backend = "cudnn"
-        if backend in ("cute-dsl", "trtllm-gen", "cudnn"):
+        if backend in ("cute-dsl", "trtllm-gen", "cudnn", "cutile"):
             raise NotImplementedError(
                 f"workspace_size is not available for decode backend {backend!r}"
             )
