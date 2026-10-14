@@ -486,8 +486,8 @@ class CutlassMoeFCRunnerInterface {
                       MOEParallelismConfig parallelism_config, bool const enable_alltoall,
                       bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
                       bool use_mxfp8_act_scaling, bool min_latency_mode,
-                      MoeMinLatencyParams& min_latency_params, bool enable_pdl,
-                      cudaStream_t stream) = 0;
+                      MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
+                      int64_t expected_m = -1) = 0;
 
   // Aliases for profiling the gemms
   virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -712,36 +712,35 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               MOEParallelismConfig parallelism_config, bool const enable_alltoall, bool use_lora,
               LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
               bool use_mxfp8_act_scaling, bool min_latency_mode,
-              MoeMinLatencyParams& min_latency_params, bool enable_pdl,
-              cudaStream_t stream) override;
+              MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
+              int64_t expected_m = -1) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
-  static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
-                                  Sm90Wfp4Afp8Mode>& gemm_runner,
-                    // This argument must not be null if fp8 block scaling is being used.
-                    // The gemm_runner will be ignored in that case. NOTE: it would
-                    // be great if we could consolidate gemm_runner and fp8_blockscale_gemm_runner.
-                    // For now, they don't share the same interface, so we just use two separate
-                    // arguments.
-                    DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
-                    T* const output, void* const intermediate_result,
-                    int64_t const* const expert_first_token_offset,
-                    int const* const permuted_token_selected_experts,
-                    TmaWarpSpecializedGroupedGemmInput const tma_ws_input_template,
-                    WeightType const* const fc1_expert_weights,
-                    ScaleBiasType const* const fc1_expert_biases,
-                    int64_t const* const num_valid_tokens_ptr,
-                    ScaleBiasType const* const fc1_int_scales, float const* const fc1_fp8_dequant,
-                    float const* const fc2_fp8_quant, float* const act_fp8_token_scale,
-                    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
-                    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat,
-                    QuantParams quant_params, int64_t const num_rows,
-                    int64_t const expanded_num_rows, int64_t const hidden_size,
-                    int64_t const inter_size, int const num_experts_per_node,
-                    ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
-                    bool bias_is_broadcast, cudaStream_t stream,
-                    cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-                    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl);
+  static void gemm1(
+      MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>&
+          gemm_runner,
+      // This argument must not be null if fp8 block scaling is being used.
+      // The gemm_runner will be ignored in that case. NOTE: it would
+      // be great if we could consolidate gemm_runner and fp8_blockscale_gemm_runner.
+      // For now, they don't share the same interface, so we just use two separate
+      // arguments.
+      DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
+      T* const output, void* const intermediate_result,
+      int64_t const* const expert_first_token_offset,
+      int const* const permuted_token_selected_experts,
+      TmaWarpSpecializedGroupedGemmInput const tma_ws_input_template,
+      WeightType const* const fc1_expert_weights, ScaleBiasType const* const fc1_expert_biases,
+      int64_t const* const num_valid_tokens_ptr, ScaleBiasType const* const fc1_int_scales,
+      float const* const fc1_fp8_dequant, float const* const fc2_fp8_quant,
+      float* const act_fp8_token_scale,
+      TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
+      TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat, QuantParams quant_params,
+      int64_t const num_rows, int64_t const expanded_num_rows, int64_t const hidden_size,
+      int64_t const inter_size, int const num_experts_per_node,
+      ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
+      bool bias_is_broadcast, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config,
+      bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
+      bool enable_pdl, int64_t expected_m = -1);
 
   static void gemm2(
       MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>&
@@ -763,7 +762,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       void* fc2_lora, cudaStream_t stream, MOEParallelismConfig parallelism_config,
       bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config,
       bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
-      bool enable_pdl);
+      bool enable_pdl, int64_t expected_m = -1);
 
   // Overrides to allow us to forward on to the internal functions with the pointers using the
   // correct type
@@ -993,7 +992,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                             int64_t const expanded_num_rows, int64_t const hidden_size,
                             int64_t const inter_size, int const num_experts_per_node,
                             ActivationParams fc1_activation_type, QuantParams& quant_params,
-                            bool enable_pdl, cudaStream_t stream);
+                            bool enable_pdl, cudaStream_t stream, int64_t expected_m = -1);
 
   static void BlockScaleFC2(
       DeepSeekBlockScaleGemmRunner& gemm_runner, T const* const input, void* const gemm_output,
@@ -1006,7 +1005,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       int64_t const expanded_num_rows, int64_t const hidden_size,
       int64_t const unpadded_hidden_size, int64_t const inter_size,
       int64_t const num_experts_per_node, int64_t const k, MOEParallelismConfig parallelism_config,
-      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream);
+      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream,
+      int64_t expected_m = -1);
 
   T const* applyPrequantScale(void* smoothed_act, void const* permuted_data,
                               void const* prequant_scales, int64_t const* num_valid_tokens_ptr,

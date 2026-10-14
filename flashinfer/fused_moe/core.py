@@ -625,6 +625,23 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
     return input_tensor.view(M, K // blockK, blockK).permute(1, 0, 2).contiguous()
 
 
+def _validate_cutlass_moe_expected_m(
+    expected_m: Optional[int],
+    *,
+    use_deepseek_fp8_block_scale: bool,
+    min_latency_mode: bool,
+    backend: str,
+) -> None:
+    if expected_m is None:
+        return
+    if type(expected_m) is not int or not 0 < expected_m <= 2**32 - 1:
+        raise ValueError("expected_m must be a positive integer fitting in uint32")
+    if backend != "cutlass" or not use_deepseek_fp8_block_scale or min_latency_mode:
+        raise NotImplementedError(
+            "expected_m requires the CUTLASS DeepSeek FP8 block-scale MoE backend"
+        )
+
+
 @functools.cache
 def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
     if backend in ("120", "121"):
@@ -1000,7 +1017,15 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_wfp4afp8_humming: bool = False,
         profile_ids: Optional[List[int]] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        expected_m: Optional[int] = None,
     ) -> List[torch.Tensor]:
+        if expected_m is not None:
+            _validate_cutlass_moe_expected_m(
+                expected_m,
+                use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+                min_latency_mode=min_latency_mode,
+                backend="cutlass",
+            )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
 
@@ -1128,6 +1153,11 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             enable_pdl,
             activation_type,
             workspace_buffer,
+            *(
+                []
+                if min_latency_mode
+                else [expected_m if expected_m is not None else -1]
+            ),
         )
 
         return (
@@ -1180,6 +1210,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_wfp4afp8_humming: bool = False,
         profile_ids: Optional[List[int]] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        expected_m: Optional[int] = None,
     ) -> List[torch.Tensor]:
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -1313,6 +1344,7 @@ def cutlass_fused_moe(
     situ_beta: Optional[torch.Tensor] = None,
     situ_linear_beta: Optional[torch.Tensor] = None,
     backend: str = "cutlass",
+    expected_m: Optional[int] = None,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -1499,6 +1531,16 @@ def cutlass_fused_moe(
         prepared TP8-local SiTU complete call; output and workspace are required.
         See the Cake SiTU guide for its TRTLLM shuffled NVFP4 weight layout.
 
+    expected_m : Optional[int]
+        Expected number of tokens per local expert for DeepGEMM configuration selection.
+        Supported only by CUTLASS DeepSeek FP8 block-scale MoE on SM90 with DeepGEMM
+        enabled. ``None`` preserves the existing estimate. A positive integer fitting
+        in uint32 applies to both expert GEMMs in this call only; it does not change
+        routing, workspace capacity, or the runner's stored estimate. Choose a hint
+        based on the local routing distribution; an underestimate can reduce performance
+        for skewed routing. Set it before CUDA graph capture; replay retains the
+        captured configuration.
+
     Returns
     -------
     out: torch.Tensor
@@ -1519,6 +1561,13 @@ def cutlass_fused_moe(
         are not implemented for Blackwell architecture.
 
     """
+    if expected_m is not None:
+        _validate_cutlass_moe_expected_m(
+            expected_m,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            min_latency_mode=min_latency_mode,
+            backend=backend,
+        )
     if backend == "cake":
         from .cake_kimi_k3_situ import _cake_situ_fused_moe
 
@@ -1648,6 +1697,7 @@ def cutlass_fused_moe(
             use_wfp4afp8_humming=use_wfp4afp8_humming,
             profile_ids=profile_ids,
             workspace_buffer=workspace_buffer,
+            expected_m=expected_m,
         )
 
 
