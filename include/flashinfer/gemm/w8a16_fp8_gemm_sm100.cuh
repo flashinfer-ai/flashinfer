@@ -263,15 +263,21 @@ struct W8A16Sm100CutlassType<half> {
 // kTileA: activation rows per CTA tile (N'), up to the MMA's 256.
 // kAInSmem: converted A operand staged in smem (SS MMA) instead of TMEM; required when
 // two accumulator stages of kTileA columns already fill TMEM (kTileA == 256).
-template <int kTileW, int kTileA, int kTileK, int kClusterM, bool k2SM, bool kAInSmem = false>
+// kClusterN: CTAs (2SM pairs) along the activation dimension that share one weight tile;
+// the weight TMA load is multicast to all of them (version B16 experiment for the weights
+// that overflow L2: halves the weight's L2 -> SMEM traffic and doubles the activation band
+// per weight footprint).
+template <int kTileW, int kTileA, int kTileK, int kClusterM, bool k2SM, bool kAInSmem = false,
+          int kClusterN = 1>
 struct W8A16Sm100Cfg {
   static constexpr int kW = kTileW;
   static constexpr int kA = kTileA;
   static constexpr int kK = kTileK;
   static constexpr int kCluster = kClusterM;
+  static constexpr int kClusterAct = kClusterN;
   static constexpr bool kTwoSM = k2SM;
   using TileShape = cute::Shape<cute::Int<kTileW>, cute::Int<kTileA>, cute::Int<kTileK>>;
-  using ClusterShape = cute::Shape<cute::Int<kClusterM>, cute::_1, cute::_1>;
+  using ClusterShape = cute::Shape<cute::Int<kClusterM>, cute::Int<kClusterN>, cute::_1>;
   using MainloopSchedule = std::conditional_t<
       k2SM,
       std::conditional_t<kAInSmem, cutlass::gemm::KernelW8A16MixedInput2SmSmemSm100,
@@ -299,6 +305,10 @@ using W8A16Sm100Cfg2SM256x192 = W8A16Sm100Cfg<256, 192, 128, 2, true>;
 // TMA / epilogue predication, and the transform work per k-tile (the weight tile) is
 // the same, so the taller tile costs only its extra MMA.
 using W8A16Sm100Cfg2SM256x160 = W8A16Sm100Cfg<256, 160, 128, 2, true>;
+// Version B16 experiment: cluster (2, 2, 1): two 2SM pairs on neighbouring activation
+// tiles, weight tile multicast between them.
+using W8A16Sm100Cfg2SM256x128C2 = W8A16Sm100Cfg<256, 128, 128, 2, true, false, 2>;
+using W8A16Sm100Cfg2SM256x192C2 = W8A16Sm100Cfg<256, 192, 128, 2, true, false, 2>;
 
 // Rung B12: split-K.  With kSplitK the kernel runs as a *batch* of `splits` GEMMs over
 // K-slices in one launch (batch stride = the slice length along K for A and B, one
@@ -497,9 +507,11 @@ enum class W8A16Sm100Tile {
   k2SM256x192 = 4,
   k2SM256x128SplitK = 5,  // version B12: 256x128 tile, batched K-slices + fp32 reduce
   k2SM256x128StreamK = 6,  // version B13: 256x128 tile under the stream-K scheduler
-  k2SM256x160 = 7          // version B14: 160-row tile for wave quantisation
+  k2SM256x160 = 7,         // version B14: 160-row tile for wave quantisation
+  k2SM256x128C2 = 8,       // version B16 experiment: cluster (2,2,1), weight multicast
+  k2SM256x192C2 = 9
 };
-constexpr int kW8A16Sm100MaxTileCode = 7;
+constexpr int kW8A16Sm100MaxTileCode = 9;
 constexpr int kW8A16Sm100MaxSplits = 8;
 
 inline W8A16Sm100Tile W8A16Sm100TileFromCode(int code) {
@@ -520,6 +532,8 @@ inline W8A16Sm100Tile W8A16Sm100TileEnv() {
     if (std::strcmp(s, "2sm256x128_splitk") == 0) return W8A16Sm100Tile::k2SM256x128SplitK;
     if (std::strcmp(s, "2sm256x128_streamk") == 0) return W8A16Sm100Tile::k2SM256x128StreamK;
     if (std::strcmp(s, "2sm256x160") == 0) return W8A16Sm100Tile::k2SM256x160;
+    if (std::strcmp(s, "2sm256x128_c2") == 0) return W8A16Sm100Tile::k2SM256x128C2;
+    if (std::strcmp(s, "2sm256x192_c2") == 0) return W8A16Sm100Tile::k2SM256x192C2;
     return W8A16Sm100Tile::kAuto;
   }();
   return tile;
@@ -605,7 +619,21 @@ inline int W8A16Sm100PickSwizzle(int M, int N, int K) {
   if (env >= 0) return env;
   const long long weight_bytes = static_cast<long long>(N) * K;  // e4m3: one byte each
   constexpr long long kHalfL2 = 64ll << 20;
-  return (weight_bytes >= kHalfL2 && M >= 4096) ? 8 : 0;
+  if (weight_bytes < kHalfL2 || M < 4096) return 0;
+  // Version B16: the group size scales with 1/K.  ncu on umb-b200-240 (cycles constant at
+  // 19.2 M on every setting, the SM clock following the DRAM bytes one to one):
+  //   mlp.down tp1  K=25600 M=88320 256x192: swizzle 2 / 4 / 8 / 16 -> DRAM 36 / 26 / 39 / 69 GB,
+  //                 clock 1.22 / 1.27 / 1.20 / 1.08 GHz, time 15.7 / 15.1 / 16.0 / 17.9 ms
+  //                 (cuBLAS 20.7 GB, 14.7 ms);
+  //   mlp.gate_up tp2 K=5120 M=44160 256x128: 4 / 8 / 16 / 32 -> 4.1 / 3.2 / 1.9 / 3.7 GB,
+  //                 time 3.82 / 3.75 / 3.69 / 3.88 ms (cuBLAS 2.4 GB, 3.56 ms).
+  // The band of S weight tiles (S x 256 rows x K bytes) wants to stay around 10-26 MB:
+  // S = 24 MB / (256 K) rounded down to a power of two, clamped to [2, 16].
+  const long long band_bytes = 24ll << 20;
+  const long long s = band_bytes / (256ll * K);
+  int pow2 = 2;
+  while (pow2 * 2 <= s && pow2 < 16) pow2 *= 2;
+  return pow2;
 }
 
 // FLASHINFER_W8A16_FP8_RASTER_SM100 = "heuristic" (default; CUTLASS picks) | "m" (walk
@@ -762,6 +790,12 @@ size_t W8A16Fp8GemmSm100WorkspaceBytes(int M, int N, int K, int device_id, int n
     case W8A16Sm100Tile::k2SM256x160:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x160>::WorkspaceBytes(M, N, K, device_id,
                                                                         num_sms);
+    case W8A16Sm100Tile::k2SM256x128C2:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128C2>::WorkspaceBytes(M, N, K, device_id,
+                                                                          num_sms);
+    case W8A16Sm100Tile::k2SM256x192C2:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x192C2>::WorkspaceBytes(M, N, K, device_id,
+                                                                          num_sms);
     default:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128>::WorkspaceBytes(M, N, K, device_id,
                                                                         num_sms);
@@ -801,6 +835,14 @@ cudaError_t W8A16Fp8GemmSm100(const T* act, const __nv_fp8_e4m3* weight, const f
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x160>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,
                                                              num_sms, stream);
+    case W8A16Sm100Tile::k2SM256x128C2:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128C2>::Run(
+          act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
+          stream);
+    case W8A16Sm100Tile::k2SM256x192C2:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x192C2>::Run(
+          act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
+          stream);
     default:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,

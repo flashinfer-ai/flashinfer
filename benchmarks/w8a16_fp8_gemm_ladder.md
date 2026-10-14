@@ -265,6 +265,82 @@ activation costs 30% on tp1 because, under the swizzle, the activation tile is e
 operand the eight in-flight weight tiles share.  LOSER; the knob stays at `normal`.  What
 is left for those two rows is 256 B L2 promotion on the weight descriptor, untried.
 
+Cluster (2, 2, 1) with the weight tile multicast to two 2SM pairs on neighbouring
+activation tiles (`2sm256x128_c2` / `2sm256x192_c2`, algo codes 8 / 9, never chosen by
+`auto`; `c2_p*`): two passes of five back-to-back columns on umb-b200-240, kernel / cuBLAS.
+mlp.down tp1 M=44160: plain 128 1.16-1.21, c2 1.26; plain 192 1.11-1.13, c2 1.24-1.25.
+mlp.gate_up tp2 M=44160: 128 1.11-1.13 vs c2 1.06-1.13; 192 0.96-1.09 vs c2 1.08-1.16.
+und.q tp2 (control): 128 0.90-1.06 vs c2 1.05-1.31.  LOSER everywhere: the weight's
+L2 -> SMEM traffic was not the bottleneck, and a 4-CTA cluster packs worse.  Kept as
+algo-only variants for A/B runs.
+
+### Version B16: the clock follows the DRAM bytes; swizzle scaled by 1/K (Wed 14 Oct 2026)
+
+Why mlp.down tp1 (N=5120, K=25600) and mlp.gate_up tp2 were still 1.10-1.15 of cuBLAS
+at M >= 44160 with every tile.  ncu `--set full`, locked clocks, mlp.down tp1 M=88320,
+our auto (256x192) vs cuBLAS (nvjet 256x256, k-tile 64):
+
+| | ours | cuBLAS |
+|---|---|---|
+| tensor pipe active | 97.1% | 96.4% |
+| SM cycles elapsed | 19.21 M | 19.56 M |
+| SM clock during the kernel | 1.188 GHz | 1.333 GHz |
+| time | 16.17 ms | 14.68 ms |
+| DRAM read | 40 GB | 20.7 GB |
+| L2 bytes | 164 GB | 125 GB |
+| SMEM wavefronts | 597 M | 9.5 M |
+
+In cycles we are 2% faster than cuBLAS and both tensor pipes are saturated; the whole gap
+is the SM clock, 11% lower for our kernel even under ncu's lock, because the chip's
+power / current limiter follows the memory traffic.  Which traffic: sweeping the swizzle
+on this row (`b16_swz`) leaves the cycle count at 19.2 M in every setting while the clock
+moves with the DRAM bytes one to one (shared-memory traffic does not matter: the 256x256
+tile has 2x the SMEM wavefronts and the highest clock):
+
+| mlp.down tp1 M=88320, 256x192 | swizzle 2 | 4 | 8 (B15) | 16 | 20 | raster n, 0 |
+|---|---|---|---|---|---|---|
+| DRAM read | 36 GB | 26 GB | 39 GB | 69 GB | 77 GB | 93 GB |
+| SM clock | 1.22 | 1.27 | 1.20 | 1.08 | 1.06 | 1.01 GHz |
+| time | 15.7 | 15.1 | 16.0 | 17.9 | 18.3 | 19.1 ms |
+
+| mlp.gate_up tp2 M=44160, 256x128 | 4 | 8 (B15) | 16 | 32 |
+|---|---|---|---|---|
+| DRAM read | 4.1 | 3.2 | 1.9 | 3.7 GB |
+| time | 3.82 | 3.75 | 3.69 | 3.88 ms |
+
+The B15 constant 8 was fitted on K=5120.  The band of S weight tiles (S x 256 x K bytes)
+wants to stay around 10-26 MB, so S scales with 1/K: `W8A16Sm100PickSwizzle` now returns
+24 MB / (256 K) rounded down to a power of two in [2, 16] (16 at K=5120, 8 at 12800, 4
+at 25600) for weights >= 64 MB at M >= 4096.  Checks on the interpolated rows (`b16_swz2`):
+mlp.down tp2 (K=12800) M=88320: 4 / 8 / 16 -> 9.9 / 8.5 / 19.5 GB; mlp.gate_up tp1
+(K=5120) M=88320: 8 / 16 -> 9.0 / 6.8 GB, 14.17 / 14.04 ms; mlp.down tp1 M=44160: 2 / 4 /
+8 -> 17.6 / 12.7 / 15.7 GB; mlp.down tp1 M=8192: 0 / 4 -> 4.2 / 2.9 GB, 1.45 / 1.38 ms.
+Not pursued: raster `n` is 1.3-2x worse without a group and never better with one; the
+256x256 tile reaches cuBLAS's clock (1.315 GHz, 26-29 GB) but needs 8% more cycles for its
+SMEM-staged A operand.
+
+Confirm (umbriel-b200-017, free-running, three passes alternating the rule and the B15
+constant 8 per pass, median kernel / cuBLAS; `b16c_*`; 122 tests pass).  The K=12800
+rows get swizzle 8 under both settings, so they calibrate the pass-to-pass noise (+-3%):
+
+| row | B15 (8) | B16 (rule) |
+|---|---|---|
+| mlp.down tp1 (K=25600) M=44160 | 1.155 | 0.995 |
+| mlp.down tp1 M=88320 | 1.051 | 1.025 |
+| mlp.gate_up tp1 (K=5120) M=44160 | 1.012 | 0.978 |
+| mlp.gate_up tp1 M=88320 | 1.017 | 0.998 |
+| mlp.gate_up tp2 M=44160 | 1.098 | 1.059 |
+| mlp.gate_up tp2 M=88320 | 1.049 | 1.052 |
+| mlp.down tp2 (K=12800, same code) M=44160 / 88320 | 1.108 / 0.977 | 1.130 / 0.970 |
+| M=4096 / 8192 rows | 0.98-1.04 | 0.85-1.05 |
+
+mlp.gate_up tp2 at 1.05-1.06 is what is left on Blackwell at large M (2.4 vs our 1.9 GB
+of DRAM is not it; the remaining clock difference there is unexplained).
+
+Lesson for the whole line, both arches: on a power-capped part a GEMM at 97% tensor-pipe
+utilisation is not "compute-bound, done"; every DRAM byte costs clock, and cuBLAS's edge on
+the wide rows was never its mainloop but its L2 footprint.
+
 On the "oracle" line of the plots: five interleaved passes of every variant on the und.q
 rows (`undq_p*`) put `auto` at or within 1-2% of the median-best variant on all 18 rows,
 while a single pass of the same kernel on und.q tp4 at M >= 44160 ranges 0.74-1.22 of

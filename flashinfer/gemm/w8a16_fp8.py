@@ -96,6 +96,8 @@ W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
     "2sm256x128_splitk": 5,
     "2sm256x128_streamk": 6,
     "2sm256x160": 7,
+    "2sm256x128_c2": 8,
+    "2sm256x192_c2": 9,
 }
 
 
