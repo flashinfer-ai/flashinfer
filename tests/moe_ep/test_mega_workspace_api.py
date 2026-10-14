@@ -8,6 +8,8 @@ from unittest import mock
 
 import pytest
 
+from flashinfer.moe_ep import FinalizeMode
+
 
 def _fake_deep_gemm_transformed(
     *,
@@ -237,7 +239,7 @@ def test_live_profile_pool_shares_only_equal_tactics(monkeypatch, tmp_path):
     config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
-        do_finalize=False,
+        finalize_mode=FinalizeMode.NONE,
         apply_routing_weights_before_fc2=False,
     )
     backend = create_mega_kernel(config)
@@ -416,7 +418,7 @@ def test_unfinalized_output_requires_explicit_backend_opt_in():
     from flashinfer.moe_ep import MoEEpConfigError
 
     layer, _, _ = _make_layer()
-    with pytest.raises(MoEEpConfigError, match="do_finalize=False"):
+    with pytest.raises(MoEEpConfigError, match="finalize_mode=NONE"):
         layer.forward_unfinalized(_inputs(8))
     layer._kernel.supports_unfinalized_output = True
     with pytest.raises(MoEEpConfigError, match="requires forward_unfinalized"):
@@ -493,7 +495,7 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
         config_cls(
             intermediate_size=128,
             top_k=top_k,
-            do_finalize=False,
+            finalize_mode=FinalizeMode.NONE,
             **options,
         )
     )
@@ -570,7 +572,9 @@ def test_finalized_and_unfinalized_workspaces_have_distinct_pool_keys(
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     config = getattr(moe_ep, config_name)(intermediate_size=128, top_k=2)
     finalized = create_mega_kernel(config)
-    unfinalized = create_mega_kernel(dataclasses.replace(config, do_finalize=False))
+    unfinalized = create_mega_kernel(
+        dataclasses.replace(config, finalize_mode=FinalizeMode.NONE)
+    )
     bootstrap = moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
     finalized.bind_ep_bootstrap(bootstrap)
     unfinalized.bind_ep_bootstrap(bootstrap)
@@ -579,7 +583,7 @@ def test_finalized_and_unfinalized_workspaces_have_distinct_pool_keys(
     assert finalized._workspace_pool_key(fleet) != unfinalized._workspace_pool_key(
         fleet
     )
-    with pytest.raises(ValueError, match="requires do_finalize=False"):
+    with pytest.raises(ValueError, match="requires finalize_mode=NONE"):
         finalized.compute_unfinalized(None, ())
 
 
@@ -592,7 +596,7 @@ def test_w4a16_unfinalized_launch_failure_releases_staging_sources(monkeypatch):
 
     kernel = create_mega_kernel(
         Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=128, top_k=2, do_finalize=False
+            intermediate_size=128, top_k=2, finalize_mode=FinalizeMode.NONE
         )
     )
     workspace = SimpleNamespace(_staging_inputs=(torch.empty(3, 128),))

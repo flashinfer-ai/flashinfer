@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Optional
 
+from flashinfer.moe_ep.config import FinalizeMode, validate_finalize_mode
+
 if TYPE_CHECKING:
     import torch
 
@@ -31,11 +33,12 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     fast_math: bool = True
     # Enables in_kernel_fc2_reduce, autotune may still disable this if it is faster
     enable_in_kernel_fc2_reduce: bool = False
-    # Forwards the actual token count to the top-k function to prevent wasted work
-    # when max_num_tokens is larger than the actual token count.
-    use_persistent_finalize_kernel: bool = False
-    # Caller-owned CUDA int32 (1,) live-token count the reducer reads; the
-    # workspace borrows it and never writes it. Update before every forward.
+    # NONE makes MoEEpMegaLayer.forward return per-route outputs for caller
+    # finalization; it requires fixed/offline-tuned knobs.
+    finalize_mode: FinalizeMode = FinalizeMode.AUTO
+    # Caller-owned CUDA int32 (1,) live-token count the PERSISTENT finalize kernel
+    # reads; the workspace borrows it and never writes it. Update before every
+    # forward.
     num_valid_tokens_tensor: Optional["torch.Tensor"] = None
     # Kernel tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
@@ -46,9 +49,32 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     knobs: dict | str | None = None
 
     def __post_init__(self) -> None:
-        if self.use_persistent_finalize_kernel and self.num_valid_tokens_tensor is None:
-            raise ValueError(
-                "use_persistent_finalize_kernel=True requires "
-                "num_valid_tokens_tensor: a caller-owned CUDA int32 tensor of "
-                "shape (1,) holding the live token count."
+        validate_finalize_mode(
+            self.finalize_mode,
+            (
+                FinalizeMode.AUTO,
+                FinalizeMode.DEFAULT,
+                FinalizeMode.PERSISTENT,
+                FinalizeMode.NONE,
+            ),
+            self.num_valid_tokens_tensor,
+        )
+        if self.finalize_mode is FinalizeMode.NONE:
+            if self.enable_in_kernel_fc2_reduce:
+                raise ValueError(
+                    "finalize_mode=NONE requires enable_in_kernel_fc2_reduce=False."
+                )
+            if self.knobs == "auto":
+                raise ValueError(
+                    "finalize_mode=NONE requires fixed/offline-tuned knobs."
+                )
+
+    @property
+    def resolved_finalize_mode(self) -> FinalizeMode:
+        if self.finalize_mode is FinalizeMode.AUTO:
+            return (
+                FinalizeMode.DEFAULT
+                if self.num_valid_tokens_tensor is None
+                else FinalizeMode.PERSISTENT
             )
+        return self.finalize_mode

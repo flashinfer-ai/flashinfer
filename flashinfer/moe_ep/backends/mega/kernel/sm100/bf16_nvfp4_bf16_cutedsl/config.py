@@ -6,6 +6,8 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from flashinfer.moe_ep.config import FinalizeMode, validate_finalize_mode
+
 if TYPE_CHECKING:
     import torch
 
@@ -52,18 +54,22 @@ class Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     situ_beta: float | None = None
     situ_linear_beta: float | None = None
     activation_clamp: float | None = None
-    # False exposes per-route outputs through MoEEpMegaLayer.forward_unfinalized().
-    do_finalize: bool = True
+    # NONE makes MoEEpMegaLayer.forward return per-route outputs.
+    finalize_mode: FinalizeMode = FinalizeMode.AUTO
 
     def __post_init__(self) -> None:
-        if not self.do_finalize:
+        validate_finalize_mode(
+            self.finalize_mode,
+            (FinalizeMode.AUTO, FinalizeMode.DEFAULT, FinalizeMode.NONE),
+        )
+        if self.finalize_mode is FinalizeMode.NONE:
             if self.enable_in_kernel_fc2_reduce:
                 raise ValueError(
-                    "do_finalize=False requires enable_in_kernel_fc2_reduce=False."
+                    "finalize_mode=NONE requires enable_in_kernel_fc2_reduce=False."
                 )
             if self.knobs == "auto":
                 raise ValueError(
-                    "do_finalize=False requires fixed/offline-tuned knobs."
+                    "finalize_mode=NONE requires fixed/offline-tuned knobs."
                 )
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")

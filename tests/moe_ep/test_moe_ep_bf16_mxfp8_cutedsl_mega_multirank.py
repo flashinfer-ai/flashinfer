@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from flashinfer.moe_ep import FinalizeMode
+
 from flashinfer.moe_ep.core.validation.common import is_bf16_mxfp8_cutedsl_supported
 
 if TYPE_CHECKING:
@@ -178,7 +180,11 @@ def _megakernel_config(
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
         enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        use_persistent_finalize_kernel=use_persistent_finalize_kernel,
+        finalize_mode=(
+            FinalizeMode.PERSISTENT
+            if use_persistent_finalize_kernel
+            else FinalizeMode.AUTO
+        ),
         num_valid_tokens_tensor=num_valid_tokens_tensor,
         knobs=knobs,
     )

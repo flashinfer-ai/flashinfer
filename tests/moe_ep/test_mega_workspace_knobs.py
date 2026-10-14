@@ -136,7 +136,7 @@ def test_execution_uses_selected_backend_and_clears_destroyed_state(
     for handle in (default, other):
         kernel, raw = handle._kernel, handle._backend_workspace
         assert (
-            layer.forward_unfinalized(tensors, workspace=handle)
+            layer.forward(tensors, workspace=handle)
             is kernel.compute_unfinalized.return_value
         )
         kernel.stage_inputs.assert_called_with(tensors, raw, quantize_input=True)

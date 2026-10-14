@@ -70,6 +70,7 @@ class MegaMoEMxfp8Config:
     enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
     use_persistent_finalize_kernel: bool = False
+    use_custom_finalize: bool = False
     token_back_by_dispatch: bool = False
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
@@ -113,6 +114,16 @@ class MegaMoEMxfp8Config:
         if self.in_kernel_fc2_reduce and self.token_back_by_dispatch:
             raise ValueError(
                 "in_kernel_fc2_reduce and token_back_by_dispatch cannot both be True."
+            )
+        if self.use_custom_finalize and (
+            self.enable_in_kernel_fc2_reduce or self.in_kernel_fc2_reduce
+        ):
+            raise ValueError(
+                "use_custom_finalize requires in_kernel_fc2_reduce to be disabled."
+            )
+        if self.use_custom_finalize and self.use_persistent_finalize_kernel:
+            raise ValueError(
+                "use_custom_finalize and use_persistent_finalize_kernel cannot be used together."
             )
         m, n, _k = self.mma_tiler_mnk
         if (m, n) != (256, 256) or not self.use_2cta_instrs:
@@ -302,6 +313,29 @@ class MegaMoEMxfp8Frontend:
             torch.cuda.synchronize()
         return mega.launch_output
 
+    def custom_finalize_workspace(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Return the zero-copy per-route partials and their canonical root descriptor."""
+        if not self.config.use_custom_finalize:
+            raise RuntimeError("custom finalize mode is not enabled")
+        mega = self._mega
+        if mega is None or mega.compiled is None:
+            raise RuntimeError(
+                "custom finalize workspace is unavailable before compilation"
+            )
+        descriptor = mega.kernel.topk_reduce_input_region()
+        root = mega.shared_workspace
+        byte_offset = int(descriptor["byte_offset"])
+        nbytes = int(descriptor["nbytes"])
+        raw = root.narrow(0, byte_offset, nbytes)
+        partials = raw.view(torch.bfloat16).view(tuple(descriptor["shape"]))
+        if partials.data_ptr() != root.data_ptr() + byte_offset:
+            raise RuntimeError("borrowed combine view does not match its root offset")
+        if partials.data_ptr() % int(descriptor["alignment"]):
+            raise RuntimeError("borrowed combine view violates canonical alignment")
+        return partials, root, dict(descriptor)
+
     def make_launch_thunk(
         self,
         inputs: MegaMoEMxfp8Inputs,
@@ -386,6 +420,7 @@ class MegaMoEMxfp8Frontend:
             c.epi_flag_batch,
             c.in_kernel_fc2_reduce,
             c.use_persistent_finalize_kernel,
+            c.use_custom_finalize,
             c.token_back_by_dispatch,
             self._gate_up_clamp,
             c.enable_iket,
@@ -438,7 +473,7 @@ class MegaMoEMxfp8Frontend:
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
-            skip_topk_reduce=False,
+            skip_topk_reduce=c.use_custom_finalize,
             topk_reduce_persistent=c.use_persistent_finalize_kernel,
             # kernel renamed the bool token_back_by_dispatch -> token_back_mode enum:
             # dispatch-reuse maps to "reuse_dispatch_warps", default to "epi_warps".
@@ -838,11 +873,15 @@ class MegaMoEMxfp8SymmBuffer:
     _frontend: MegaMoEMxfp8Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
+    _unfinalized_route_map: torch.Tensor | None = None
+    _unfinalized_weights: torch.Tensor | None = None
 
     def destroy(self) -> None:
         """Release symmetric-heap allocations and compiled kernel workspaces."""
         if self._destroyed:
             return
+        self._unfinalized_route_map = None
+        self._unfinalized_weights = None
         self._frontend.release()
         for root in self._sym_roots:
             free_sym_tensor(root)
@@ -868,6 +907,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     activation_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
     use_persistent_finalize_kernel: bool = False,
+    use_custom_finalize: bool = False,
     num_valid_tokens_tensor: Optional[torch.Tensor] = None,
     knobs: Optional[dict] = None,
 ) -> MegaMoEMxfp8SymmBuffer:
@@ -916,6 +956,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         gate_up_clamp=clamp,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         use_persistent_finalize_kernel=use_persistent_finalize_kernel,
+        use_custom_finalize=use_custom_finalize,
     )
     from .knob_cache import resolve_knobs
     from .tuner import with_knobs
@@ -934,6 +975,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
             topk=num_topk,
             max_tokens=num_max_tokens,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+            use_custom_finalize=use_custom_finalize,
         )
     # TODO Add explicit validity checks
     cfg = with_knobs(cfg, knobs)

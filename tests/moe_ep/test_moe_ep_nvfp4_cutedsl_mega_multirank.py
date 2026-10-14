@@ -31,6 +31,8 @@ import os
 
 import pytest
 
+from flashinfer.moe_ep import FinalizeMode
+
 # This test verifies the mega path only through the cutedsl_megamoe shim public
 # API (``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``); it never imports the
 # src/ kernel packages directly, so a new src/ drop can't silently break it.
@@ -1907,7 +1909,7 @@ def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
         top_k=2,
         enable_in_kernel_fc2_reduce=True,
     )
-    assert cfg.do_finalize is True
+    assert cfg.finalize_mode is FinalizeMode.AUTO
     kernel = create_mega_kernel(cfg)
     assert kernel.kernel_name() == kernel_name
     assert not kernel.supports_unfinalized_output
@@ -1915,7 +1917,7 @@ def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
     cfg_unfinalized = config_cls(
         intermediate_size=128,
         top_k=2,
-        do_finalize=False,
+        finalize_mode=FinalizeMode.NONE,
     )
     assert create_mega_kernel(cfg_unfinalized).supports_unfinalized_output
 
@@ -1924,16 +1926,16 @@ def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
         persistent_cfg = config_cls(
             intermediate_size=128,
             top_k=2,
-            use_persistent_finalize_kernel=True,
+            finalize_mode=FinalizeMode.PERSISTENT,
             num_valid_tokens_tensor=num_valid_tokens_tensor,
         )
-        assert persistent_cfg.use_persistent_finalize_kernel
+        assert persistent_cfg.finalize_mode is FinalizeMode.PERSISTENT
         assert persistent_cfg.num_valid_tokens_tensor is num_valid_tokens_tensor
         with pytest.raises(ValueError, match="requires num_valid_tokens_tensor"):
             config_cls(
                 intermediate_size=128,
                 top_k=2,
-                use_persistent_finalize_kernel=True,
+                finalize_mode=FinalizeMode.PERSISTENT,
             )
         assert cfg.combine_dtype == "bf16"
         cfg_q = config_cls(intermediate_size=128, top_k=2, combine_dtype="nvfp4")
@@ -1958,11 +1960,11 @@ def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
 def test_cutedsl_deferred_output_rejects_incompatible_modes(config_name, incompatible):
     from flashinfer import moe_ep
 
-    with pytest.raises(ValueError, match="do_finalize=False requires"):
+    with pytest.raises(ValueError, match="finalize_mode=NONE requires"):
         getattr(moe_ep, config_name)(
             intermediate_size=128,
             top_k=2,
-            do_finalize=False,
+            finalize_mode=FinalizeMode.NONE,
             **incompatible,
         )
 
@@ -1970,9 +1972,12 @@ def test_cutedsl_deferred_output_rejects_incompatible_modes(config_name, incompa
 def test_nvfp4_deferred_output_rejects_quantized_combine():
     from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 
-    with pytest.raises(ValueError, match="do_finalize=False requires"):
+    with pytest.raises(ValueError, match="finalize_mode=NONE requires"):
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=128, top_k=2, do_finalize=False, combine_dtype="mxfp8"
+            intermediate_size=128,
+            top_k=2,
+            finalize_mode=FinalizeMode.NONE,
+            combine_dtype="mxfp8",
         )
 
 

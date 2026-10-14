@@ -50,6 +50,7 @@ class MegaMoEBf16Config:
     gate_up_clamp: Optional[float] = None
     apply_routing_weights_before_fc2: bool = True
     enable_iket: bool = False
+    use_custom_finalize: bool = False
 
     def __post_init__(self) -> None:
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
@@ -84,6 +85,12 @@ class MegaMoEBf16Config:
         if self.in_kernel_fc2_reduce and self.token_back_mode == "epi_warps":
             raise ValueError(
                 "in_kernel_fc2_reduce requires standalone or reused dispatch token-back."
+            )
+        if self.use_custom_finalize and (
+            self.enable_in_kernel_fc2_reduce or self.in_kernel_fc2_reduce
+        ):
+            raise ValueError(
+                "use_custom_finalize requires in_kernel_fc2_reduce to be disabled."
             )
 
     @property
@@ -181,6 +188,7 @@ class MegaMoEBf16Frontend:
             self._gate_up_clamp,
             c.apply_routing_weights_before_fc2,
             c.enable_iket,
+            c.use_custom_finalize,
         )
 
     def _ensure_compiled(self, inputs: MegaMoEBf16Inputs) -> _CompiledMega:
@@ -222,7 +230,7 @@ class MegaMoEBf16Frontend:
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
-            skip_topk_reduce=False,
+            skip_topk_reduce=c.use_custom_finalize,
             token_back_by_dispatch=c.token_back_mode != "epi_warps",
             token_back_mode=c.token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
@@ -308,6 +316,29 @@ class MegaMoEBf16Frontend:
         if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
         return inputs.output_activation[:n]
+
+    def custom_finalize_workspace(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Return the zero-copy per-route partials and their canonical root descriptor."""
+        if not self.config.use_custom_finalize:
+            raise RuntimeError("custom finalize mode is not enabled")
+        mega = self._mega
+        if mega is None or mega.compiled is None:
+            raise RuntimeError(
+                "custom finalize workspace is unavailable before compilation"
+            )
+        descriptor = mega.kernel.topk_reduce_input_region()
+        root = mega.shared_workspace
+        byte_offset = int(descriptor["byte_offset"])
+        nbytes = int(descriptor["nbytes"])
+        raw = root.narrow(0, byte_offset, nbytes)
+        partials = raw.view(torch.bfloat16).view(tuple(descriptor["shape"]))
+        if partials.data_ptr() != root.data_ptr() + byte_offset:
+            raise RuntimeError("borrowed combine view does not match its root offset")
+        if partials.data_ptr() % int(descriptor["alignment"]):
+            raise RuntimeError("borrowed combine view violates canonical alignment")
+        return partials, root, dict(descriptor)
 
     def make_launch_thunk(self, inputs: MegaMoEBf16Inputs) -> Callable[[], None]:
         self._validate(inputs, inputs.activation.shape[0])
@@ -432,6 +463,7 @@ def get_symm_buffer_for_bf16_mega_moe(
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
+    use_custom_finalize: bool = False,
     knobs: Optional[dict] = None,
 ) -> MegaMoEBf16SymmBuffer:
     clamp = resolve_gate_up_clamp(
@@ -454,6 +486,7 @@ def get_symm_buffer_for_bf16_mega_moe(
             topk=num_topk,
             max_tokens=num_max_tokens,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+            use_custom_finalize=use_custom_finalize,
         )
     cfg = MegaMoEBf16Config(
         rank=rank,
@@ -465,6 +498,7 @@ def get_symm_buffer_for_bf16_mega_moe(
         intermediate=intermediate,
         gate_up_clamp=clamp,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        use_custom_finalize=use_custom_finalize,
     )
     if not is_valid_bf16_for_config(cfg, knobs):
         raise ValueError(

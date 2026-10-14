@@ -231,6 +231,7 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
+        FinalizeMode,
         FleetParams,
         MegaConfig,
         MoEEpMegaLayer,
@@ -271,7 +272,7 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
             problem,
             epilogue_via_config=True,
             apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
-            do_finalize=False,
+            finalize_mode=FinalizeMode.NONE,
             knobs=None,
         )
     else:
@@ -284,7 +285,7 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
             intermediate_size=intermediate,
             top_k=topk,
             gate_up_clamp=1.5,
-            do_finalize=False,
+            finalize_mode=FinalizeMode.NONE,
             **(
                 {"apply_routing_weights_before_fc2": apply_routing_weights_before_fc2}
                 if backend == "w4a16"
@@ -359,7 +360,9 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
                 fleet_params=FleetParams(8, capacity, hidden),
                 weights=MoEWeightPack(w13=w13, w2=w2),
                 backend=MegaConfig(
-                    megakernel=dataclasses.replace(config, do_finalize=True),
+                    megakernel=dataclasses.replace(
+                        config, finalize_mode=FinalizeMode.DEFAULT
+                    ),
                     quantize_input=False,
                     transformed_weights=layer._transformed,
                 ),

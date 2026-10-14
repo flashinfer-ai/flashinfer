@@ -32,6 +32,8 @@ import os
 
 import pytest
 
+from flashinfer.moe_ep import FinalizeMode
+
 # This test verifies the mega path only through the cutedsl_megamoe shim public
 # API (``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``); it never imports the
 # src/ kernel packages directly, so a new src/ drop can't silently break it.
@@ -1030,15 +1032,15 @@ def test_mxfp8_cutedsl_mega_kernel_is_registered():
     config = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
-        use_persistent_finalize_kernel=True,
+        finalize_mode=FinalizeMode.PERSISTENT,
         num_valid_tokens_tensor=torch.zeros(1, dtype=torch.int32),
     )
     kernel = create_mega_kernel(config)
     assert kernel.kernel_name() == "sm100_mxfp8_mxfp8_bf16_cutedsl"
-    assert config.use_persistent_finalize_kernel
+    assert config.finalize_mode is FinalizeMode.PERSISTENT
     with pytest.raises(ValueError, match="requires num_valid_tokens_tensor"):
         Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=128,
             top_k=2,
-            use_persistent_finalize_kernel=True,
+            finalize_mode=FinalizeMode.PERSISTENT,
         )

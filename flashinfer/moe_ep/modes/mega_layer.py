@@ -172,9 +172,9 @@ class MoEEpMegaLayer(nn.Module):
     def _preprocess_weights(self) -> None:
         if self._transformed is not None:
             return
-        assert (
-            self._weights is not None
-        ), "source weight pack was released but no transformed weights exist"
+        assert self._weights is not None, (
+            "source weight pack was released but no transformed weights exist"
+        )
         self._transformed = self._kernel.preprocess_weights(
             self._weights, self._fleet_params
         )
@@ -669,7 +669,7 @@ class MoEEpMegaLayer(nn.Module):
         until the next launch reuses the pooled physical workspace.
         """
         if self._kernel.supports_unfinalized_output:
-            raise MoEEpConfigError("do_finalize=False requires forward_unfinalized()")
+            raise MoEEpConfigError("finalize_mode=NONE requires forward_unfinalized()")
         if return_workspace_view and t.output is not None:
             raise MoEEpConfigError(
                 "return_workspace_view=True cannot be combined with t.output"
@@ -726,7 +726,7 @@ class MoEEpMegaLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return GEMM2 rows, remaining routing weights, and a route-to-row map.
 
-        Requires ``do_finalize=False``. Results are contiguous BF16
+        Requires ``finalize_mode=FinalizeMode.NONE``. Results are contiguous BF16
         ``[T * top_k, hidden]`` rows, FP32 ``[T, top_k]`` weights, and an int32
         ``[T, top_k]`` identity map whose entries index the first result.
         Weights are one when ``apply_routing_weights_before_fc2=True`` already
@@ -740,7 +740,7 @@ class MoEEpMegaLayer(nn.Module):
         """
         if not self._kernel.supports_unfinalized_output:
             raise MoEEpConfigError(
-                "forward_unfinalized() requires a backend with do_finalize=False"
+                "forward_unfinalized() requires finalize_mode=FinalizeMode.NONE"
             )
         _, backend_workspace, kernel, quantize_input, transformed_weights = (
             self._prepare_inputs(t, workspace=workspace)

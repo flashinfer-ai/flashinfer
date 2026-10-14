@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ......config import BootstrapConfig, FleetParams
+from ......config import BootstrapConfig, FinalizeMode, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import nvfp4_cutedsl_runtime_requirements
@@ -51,7 +51,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
-        self.supports_unfinalized_output = not config.do_finalize
+        self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         self._thunk_states: dict[tuple, tuple] = {}
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.
@@ -91,6 +91,16 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             # the binding bound is TMA row alignment, not the dg SF word.
             alignment=64,
         )
+        if (
+            self._kernel_config.finalize_mode is FinalizeMode.CAKE
+            and not self._cake_reducer_supported(fleet_params)
+        ):
+            raise ValueError(
+                "finalize_mode=CAKE requires a supported device, "
+                "max_tokens_per_rank in (256, 4096), hidden=4096, top_k=6, "
+                "enable_in_kernel_fc2_reduce=False, combine_dtype='bf16' and "
+                "apply_routing_weights_before_fc2=True."
+            )
 
     def preprocess_weights(
         self,
@@ -137,8 +147,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             combine_dtype=k.combine_dtype,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
-            use_custom_finalize=not k.do_finalize
-            or self._uses_native_topk_reduce(fleet_params),
+            use_custom_finalize=self._finalize_mode(fleet_params)
+            in (FinalizeMode.NONE, FinalizeMode.CAKE),
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -146,6 +156,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
         k = self._kernel_config
         fp = fleet_params
+        mode = self._finalize_mode(fleet_params)
         workspace = get_symm_buffer_for_mega_moe(
             fp.num_experts,
             fp.max_tokens_per_rank,
@@ -163,12 +174,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             situ_linear_beta=k.situ_linear_beta,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
-            use_custom_finalize=(
-                not k.do_finalize or self._uses_native_topk_reduce(fleet_params)
-            ),
-            use_persistent_finalize_kernel=(
-                k.use_persistent_finalize_kernel and k.do_finalize
-            ),
+            use_custom_finalize=mode in (FinalizeMode.NONE, FinalizeMode.CAKE),
+            use_persistent_finalize_kernel=mode is FinalizeMode.PERSISTENT,
             num_valid_tokens_tensor=k.num_valid_tokens_tensor,
             combine_dtype=k.combine_dtype,
             fc1_alpha=k.fc1_alpha,
@@ -176,7 +183,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc1_norm_const=k.fc1_norm_const,
             knobs=self._workspace_knobs(fleet_params),
         )
-        if not k.do_finalize:
+        if mode is FinalizeMode.NONE:
             workspace._unfinalized_route_map = torch.arange(
                 fp.max_tokens_per_rank * k.top_k,
                 dtype=torch.int32,
@@ -189,7 +196,20 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             )
         return workspace
 
+    def _finalize_mode(self, fleet_params: FleetParams) -> FinalizeMode:
+        k = self._kernel_config
+        if k.finalize_mode is not FinalizeMode.AUTO:
+            return k.finalize_mode
+        if self._cake_reducer_supported(fleet_params):
+            return FinalizeMode.CAKE
+        if k.num_valid_tokens_tensor is not None:
+            return FinalizeMode.PERSISTENT
+        return FinalizeMode.DEFAULT
+
     def _uses_native_topk_reduce(self, fleet_params: FleetParams) -> bool:
+        return self._finalize_mode(fleet_params) is FinalizeMode.CAKE
+
+    def _cake_reducer_supported(self, fleet_params: FleetParams) -> bool:
         """Whether this exact workspace can use the frozen Cake reducer.
 
         The reducer is published for the datacenter-Blackwell targets that
@@ -204,7 +224,6 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             and fleet_params.token_hidden_size == 4096
             and k.top_k == 6
             and not k.enable_in_kernel_fc2_reduce
-            and not k.use_persistent_finalize_kernel
             and k.combine_dtype == "bf16"
             and k.apply_routing_weights_before_fc2
         )
@@ -400,7 +419,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         from ......kernel_src.sm100.cutedsl_megamoe import staged_tokens
 
         if self.supports_unfinalized_output:
-            raise ValueError("do_finalize=False requires compute_unfinalized()")
+            raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
         if output is not None:
             num_tokens = output.shape[0]
         else:
@@ -488,7 +507,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         from ......kernel_src.sm100.cutedsl_megamoe import staged_tokens
 
         if not self.supports_unfinalized_output:
-            raise ValueError("compute_unfinalized() requires do_finalize=False")
+            raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
         num_tokens = staged_tokens(workspace.topk_idx)
         if num_tokens is None:
             raise ValueError("compute_unfinalized() requires stage_inputs() first")
@@ -534,9 +553,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             k.situ_linear_beta,
             k.apply_routing_weights_before_fc2,
             k.enable_in_kernel_fc2_reduce,
-            k.do_finalize,
-            self._uses_native_topk_reduce(fleet_params),
-            k.use_persistent_finalize_kernel,
+            self._finalize_mode(fleet_params),
             epilogue_pool_key(k.num_valid_tokens_tensor),
             k.combine_dtype,
             epilogue_pool_key(k.fc1_alpha),

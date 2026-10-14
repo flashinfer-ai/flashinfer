@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ......config import BootstrapConfig, FleetParams
+from ......config import BootstrapConfig, FinalizeMode, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import mxfp8_cutedsl_runtime_requirements
@@ -51,6 +51,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig = config
+        self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.
         self._autotune_pending = config.knobs == "auto"
@@ -135,6 +136,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+            use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -144,7 +146,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
 
         k = self._kernel_config
         fp = fleet_params
-        return get_symm_buffer_for_mxfp8_mega_moe(
+        workspace = get_symm_buffer_for_mxfp8_mega_moe(
             fp.num_experts,
             fp.max_tokens_per_rank,
             k.top_k,
@@ -156,10 +158,21 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
-            use_persistent_finalize_kernel=k.use_persistent_finalize_kernel,
+            use_persistent_finalize_kernel=k.resolved_finalize_mode
+            is FinalizeMode.PERSISTENT,
+            use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
             num_valid_tokens_tensor=k.num_valid_tokens_tensor,
             knobs=self._workspace_knobs(fleet_params),
         )
+        if k.finalize_mode is FinalizeMode.NONE:
+            workspace._unfinalized_route_map = torch.arange(
+                fp.max_tokens_per_rank * k.top_k,
+                dtype=torch.int32,
+                device=workspace.topk_idx.device,
+            ).view(fp.max_tokens_per_rank, k.top_k)
+            # The kernel folds routing weights into FC1.
+            workspace._unfinalized_weights = torch.ones_like(workspace.topk_weights)
+        return workspace
 
     def validate_forward(
         self,
@@ -240,6 +253,8 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     ) -> torch.Tensor:
         from ......kernel_src.sm100.cutedsl_megamoe import mxfp8_mega_moe, staged_tokens
 
+        if self.supports_unfinalized_output:
+            raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
         if output is not None:
             num_tokens = output.shape[0]
         else:
@@ -289,6 +304,50 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         # ordering (valid until the next launch on this session's buffers).
         return output if output is not None else view
 
+    def compute_unfinalized(
+        self,
+        workspace: Any,
+        transformed_weights: TransformedMegaWeights,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from ......kernel_src.sm100.cutedsl_megamoe import (
+            MegaMoEMxfp8Inputs,
+            staged_tokens,
+        )
+
+        if not self.supports_unfinalized_output:
+            raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
+        num_tokens = staged_tokens(workspace.topk_idx)
+        if num_tokens is None:
+            raise ValueError("compute_unfinalized() requires stage_inputs() first")
+        clamp = _resolve_gate_up_clamp(self._kernel_config)
+        if clamp is not None:
+            workspace._frontend.set_gate_up_clamp(clamp)
+        # Launch the full padded buffer even when this rank has no live tokens.
+        workspace._frontend.run(
+            MegaMoEMxfp8Inputs(
+                activation=workspace.x,
+                activation_sf=workspace.x_sf,
+                topk_idx=workspace.topk_idx,
+                topk_weights=workspace.topk_weights,
+                fc1_weight=transformed_weights[0][0],
+                fc1_weight_sf=transformed_weights[0][1],
+                fc2_weight=transformed_weights[1][0],
+                fc2_weight_sf=transformed_weights[1][1],
+                output_activation=workspace.output_activation,
+                num_valid_tokens=workspace.num_valid_tokens,
+            ),
+            num_tokens=None,
+            sync=False,
+        )
+        partials, _root, _region = workspace._frontend.custom_finalize_workspace()
+        return (
+            partials[:num_tokens].view(
+                num_tokens * self._kernel_config.top_k, workspace.hidden
+            ),
+            workspace._unfinalized_weights[:num_tokens],
+            workspace._unfinalized_route_map[:num_tokens],
+        )
+
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
         k = self._kernel_config
         if k.knobs == "auto":
@@ -314,7 +373,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             k.kind,
             _resolve_gate_up_clamp(k),
             k.enable_in_kernel_fc2_reduce,
-            k.use_persistent_finalize_kernel,
+            k.resolved_finalize_mode,
             epilogue_pool_key(k.num_valid_tokens_tensor),
             knobs_pool_key(self._workspace_knobs(fleet_params)),
         )
