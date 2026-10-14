@@ -87,7 +87,7 @@ def _i32t(ptr, shape, stride):
 
 
 class VTranspose:
-    """kv[p, h, key, D:2D] -> vt[p, h, d, slot(key)]  (fp8, keys innermost).
+    """kv[p, h, key, D:2D] -> vt[p, h, d, key]  (fp8, keys innermost).
 
     slot(n) = 32*(n>>5) + 16*(n&1) + 4*((n>>1)&3) + ((n>>3)&3) makes the FP8
     WGMMA A fragment a bit-identical relabel of the QK f32 accumulator.
@@ -145,7 +145,6 @@ class VTranspose:
         sInC = cute.make_tensor(sIn + d, cute.make_layout(128, stride=SPAD))
         for kci in cutlass.range_constexpr(4):
             kc = 4 * (cutlass.Int32(tidx) // D) + kci
-            r0 = 32 * (kc // 2) + (kc % 2)
             for i in cutlass.range_constexpr(16):
                 # Defensive NaN clamp on V. The causal mask only sanitizes the
                 # SCORES; a NaN in V survives it because 0 * NaN = NaN in the PV
@@ -153,7 +152,7 @@ class VTranspose:
                 # fmax(NaN, x) returns x (IEEE maxNum). Cheap here: the transpose
                 # is a memory-bound copy run once per page, not once per
                 # (page, query-tile) visit.
-                xv = cutlass.Float32(sInC[r0 + 8 * (i % 4) + 2 * (i // 4)])
+                xv = cutlass.Float32(sInC[kc * 16 + i])
                 xv = cute.arch.fmin(cute.arch.fmax(xv, F8_LO), F8_HI)
                 vb[0, i] = xv.to(f8)
             cute.autovec_copy(vb, cute.make_tensor(sOut + d * SPAD + kc * 16, l16))
@@ -166,18 +165,6 @@ class VTranspose:
                 cute.make_tensor(sOut + (c // 8) * SPAD + (c % 8) * 16, l16), buf
             )
             cute.autovec_copy(buf, gOut[(None, None), (c // 8, c % 8)])
-
-
-@cute.jit
-def _acc_to_fp8_A(acc):
-    """QK f32 accumulator -> FP8 WGMMA A fragment (pure register relabel)."""
-    f8 = cutlass.Float8E4M3FN
-    operand = cute.make_rmem_tensor(
-        cute.make_layout(((4, 2, 2), 1, (1, 4)), stride=((4, 2, 1), 0, (0, 16))), f8
-    )
-    operand_as_acc = cute.make_tensor(operand.iterator, acc.layout)
-    operand_as_acc.store(acc.load().to(f8))
-    return operand
 
 
 # --- plain-Python (undecorated) helpers: trace-time loops, safe to call from
@@ -216,6 +203,10 @@ def _soft_half(i, acc_s, l_i, slog2):
         acc_s.iterator + 2 * i, cute.make_layout((2, PG // 8), stride=(1, 4))
     )
     pv = cute.math.exp2(rs.load() * slog2, fastmath=True)
+    # Round to the fp8 the PV gemm will actually consume BEFORE summing: the
+    # numerator sees fp8(P) and the denominator must see the same values, or a
+    # one-key window returns V scaled by fp8(P)/P.
+    pv = pv.to(cutlass.Float8E4M3FN).to(f32)
     rs.store(pv)
     l_i[i] = l_i[i] + pv.reduce(cute.ReductionOp.ADD, f32(0.0), 0)
 
@@ -281,7 +272,7 @@ class MsaSparseAttnFp8:
             self.f16,
             (1, 1, 1),
             (MMA_M, D),
-            warpgroup.OperandSource.RMEM,
+            warpgroup.OperandSource.SMEM,
         )
 
         ka = warpgroup.make_smem_layout_atom(
@@ -292,6 +283,7 @@ class MsaSparseAttnFp8:
         lV1 = cute.tile_to_shape(ka, (D, PG), order=(0, 1))
         lK = cute.tile_to_shape(ka, (PG, D, 1), order=(0, 1, 2))
         lV = cute.tile_to_shape(ka, (D, PG, 1), order=(0, 1, 2))
+        lP = cute.tile_to_shape(ka, (MMA_M, PG, 1), order=(0, 1, 2))
 
         k_atom, tK = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(), mKV, lK1, (PG, D)
@@ -315,6 +307,7 @@ class MsaSparseAttnFp8:
             sV: cute.struct.Align[cute.struct.MemRange[f8, cute.cosize(lV)], 1024]
             sK: cute.struct.Align[cute.struct.MemRange[f8, cute.cosize(lK)], 1024]
             sQ: cute.struct.Align[cute.struct.MemRange[f8, cute.cosize(lQ)], 1024]
+            sP: cute.struct.Align[cute.struct.MemRange[f8, cute.cosize(lP)], 1024]
 
         self.shared_storage = SharedStorage
         gK = cute.group_modes(cute.flat_divide(tK, (PG, D)), 0, 2)
@@ -353,6 +346,7 @@ class MsaSparseAttnFp8:
             lQ,
             lK,
             lV,
+            lP,
             sq,
             gps,
         ).launch(
@@ -365,7 +359,7 @@ class MsaSparseAttnFp8:
 
     @cute.kernel
     def tkernel(self, mKV, mVT):
-        """kv[p, h, key, D:2D] -> vt[p, h, d, slot(key)]  (fp8, keys innermost)."""
+        """kv[p, h, key, D:2D] -> vt[p, h, d, key]  (fp8, keys innermost)."""
         f8 = self.f8
         tidx, _, _ = cute.arch.thread_idx()
         pg, h, _ = cute.arch.block_idx()
@@ -394,7 +388,6 @@ class MsaSparseAttnFp8:
         sInC = cute.make_tensor(sIn + d, cute.make_layout(128, stride=SPAD))
         for kci in cutlass.range_constexpr(4):
             kc = 4 * (cutlass.Int32(tidx) // D) + kci
-            r0 = 32 * (kc // 2) + (kc % 2)
             for i in cutlass.range_constexpr(16):
                 # Defensive NaN clamp on V. The causal mask only sanitizes the
                 # SCORES; a NaN in V survives it because 0 * NaN = NaN in the PV
@@ -402,7 +395,7 @@ class MsaSparseAttnFp8:
                 # fmax(NaN, x) returns x (IEEE maxNum). Cheap here: the transpose
                 # is a memory-bound copy run once per page, not once per
                 # (page, query-tile) visit.
-                xv = cutlass.Float32(sInC[r0 + 8 * (i % 4) + 2 * (i // 4)])
+                xv = cutlass.Float32(sInC[kc * 16 + i])
                 xv = cute.arch.fmin(cute.arch.fmax(xv, F8_LO), F8_HI)
                 vb[0, i] = xv.to(f8)
             cute.autovec_copy(vb, cute.make_tensor(sOut + d * SPAD + kc * 16, l16))
@@ -434,6 +427,7 @@ class MsaSparseAttnFp8:
         lQ,
         lK,
         lV,
+        lP,
         sq,
         gps,
     ):
@@ -463,6 +457,8 @@ class MsaSparseAttnFp8:
         sQ = st.sQ.get_tensor(lQ.outer, swizzle=lQ.inner)
         sK = st.sK.get_tensor(lK.outer, swizzle=lK.inner)
         sV = st.sV.get_tensor(lV.outer, swizzle=lV.inner)
+        sP = st.sP.get_tensor(lP.outer, swizzle=lP.inner)
+        sPw = sP[None, None, 0]
 
         if warp == 0:
             with cute.arch.elect_one():
@@ -605,6 +601,10 @@ class MsaSparseAttnFp8:
         tSrQ = qk_thr.make_fragment_A(qk_thr.partition_A(sQ))
         tSrK = qk_thr.make_fragment_B(qk_thr.partition_B(sK))[(None, None, None, 0)]
         tOrV = pv_thr.make_fragment_B(pv_thr.partition_B(sV))[(None, None, None, 0)]
+        tOrP = pv_thr.make_fragment_A(pv_thr.partition_A(sP))[(None, None, None, 0)]
+        tScS = qk_mma.get_slice(tidx).partition_C(
+            cute.make_identity_tensor((MMA_M, PG))
+        )
         acc_s = qk_thr.make_fragment_C(qk_thr.partition_shape_C((MMA_M, PG)))
         acc_o = pv_thr.make_fragment_C(pv_thr.partition_shape_C((MMA_M, D)))
         acc_o.fill(0.0)
@@ -671,23 +671,25 @@ class MsaSparseAttnFp8:
             base = blk * PG + cbase
             live0 = ((msk_j >> tl0) & 1) != 0
             live1 = ((msk_j >> tl1) & 1) != 0
-            keep = cutlass.Uint32(0)
             if live0:
                 if blk >= ow0:
                     _mask_half(0, acc_s, (qp0 - base).to(f32))
                 _soft_half(0, acc_s, l_i, slog2)
-                keep = keep | cutlass.Uint32(0x0000FFFF)
             if live1:
                 if blk >= ow1:
                     _mask_half(1, acc_s, (qp1 - base).to(f32))
                 _soft_half(1, acc_s, l_i, slog2)
-                keep = keep | cutlass.Uint32(0xFFFF0000)
 
-            tOrP = _acc_to_fp8_A(acc_s)
-            if keep != cutlass.Uint32(0xFFFFFFFF):
-                tOrP32 = cute.coalesce(cute.recast_tensor(tOrP, cutlass.Uint32))
-                for kk in cutlass.range_constexpr(PG // 8):
-                    tOrP32[kk] = tOrP32[kk] & keep
+            # The f32 accumulator hands a thread two consecutive columns per
+            # 8-wide group; the fp8 WGMMA A operand wants four consecutive k in
+            # one register, and those live in a different lane.  Stage P through
+            # SMEM (what sparse_decode does) rather than relabelling registers.
+            cute.arch.barrier()
+            for e in cutlass.range_constexpr(cute.size(acc_s)):
+                lv = live0 if cutlass.const_expr(((e >> 1) & 1) == 0) else live1
+                sPw[tScS[e]] = (acc_s[e] if lv else f32(0.0)).to(f8)
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.barrier()
             cute.arch.mbarrier_wait(mbar + 1, j % 2)
             warpgroup.fence()
             cute.gemm(pv_mma, acc_o, tOrP, tOrV, acc_o)

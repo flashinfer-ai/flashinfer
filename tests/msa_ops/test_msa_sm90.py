@@ -601,3 +601,38 @@ def test_topk_select_20way_tie_reviewer_repro(hq, tiles, nq):
 def test_sm90_is_advertised_as_supporting_packed_kv():
     """vLLM selects the FlashInfer MSA path off this flag; losing it silently serves Triton."""
     assert flashinfer.msa_ops.SUPPORTS_PACKED_KV is True
+
+
+@pytest.mark.parametrize("hq,hkv", [(8, 1), (16, 1)])
+def test_prefill_single_key_window_returns_v_exactly(hq, hkv):
+    """Token 0 attends exactly one key, so the output must be V[0] bit-exactly.
+
+    softmax over a one-element window is 1.0, which leaves no room for rounding:
+    any permutation of P, any double-counting, and any mismatch between the fp8
+    operand the PV gemm consumes and the f32 sum used to normalise it all show up
+    here as a scale or a wrong row. Longer windows average those away.
+    """
+    dev = "cuda"
+    torch.manual_seed(0)
+    kv = (torch.randn(1, hkv, BLK_KV, 2 * HEAD_DIM, device=dev) / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = kv[..., :HEAD_DIM], kv[..., HEAD_DIM:]
+    n = 32
+    q = (torch.randn(n, hq, HEAD_DIM, device=dev) * 0.25).to(torch.bfloat16)
+    idx = torch.full((hkv, n, TOPK), -1, dtype=torch.int32, device=dev)
+    idx[:, :, 0] = 0
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        torch.tensor([0, n], dtype=torch.int32, device=dev),
+        page_table=torch.zeros(1, 1, dtype=torch.int32, device=dev),
+        seqused_k=torch.full((1,), n, dtype=torch.int32, device=dev),
+        causal=True,
+        softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+    ).float()
+    v0 = kv[0, 0, 0, HEAD_DIM:].float()
+    for h in range(hq):
+        torch.testing.assert_close(out[0, h], v0, atol=0.0, rtol=0.0)
