@@ -154,6 +154,41 @@ memory do not support this lifecycle.
 
     .. automethod:: __init__
 
+NVFP4-Transport AllReduce
+-------------------------
+
+``fp4_allreduce`` sums ``[rows, 6144]`` bfloat16 activations over a two- or
+four-rank NCCL process group through NVFP4 records: every rank quantises its
+rows (E2M1 values, E4M3 block scales, one float32 row scale), pushes them into
+Lamport receive windows of its peers and decodes the gathered records in rank
+order, so the result is bitwise identical on every rank.  World size 2 runs a
+one-shot exchange, world size 4 a two-shot exchange whose owner ranks reduce,
+re-encode and all-gather.  The quantisation follows the NVFP4 all-reduce
+reference by Fan Shi (``fans-nv/fp4-all-reduce``, commit ``2878bf5``).
+
+A ``Fp4AllReduceWorkspace`` is created collectively on every rank of the group
+with the same capacity (the row count the generated programs are specialised
+for); it shares the receive windows through CUDA IPC, arms their sentinels and
+publishes the peer window table.  Calls accept any row count up to the capacity
+(a multiple of 4 for world size 4), perform no allocation when ``out`` is given
+and no host synchronisation, so they can be captured into CUDA graphs; the
+``launch_with_pdl`` flag issues the kernel as a programmatic dependent launch.
+``fp4_allreduce_nvfp4`` accepts pre-quantised records with one static scale per
+rank.  SM100, SM103 and SM107 devices are routed to their own compilation of the
+same generated sources.  ``fp4_allreduce_rmsnorm`` and its typed specification
+are the extension point of the fused residual + RMSNorm epilogue; its programs
+are not part of this delivery and the call raises ``NotImplementedError``.
+
+.. autosummary::
+    :toctree: ../generated
+
+    Fp4AllReduceWorkspace
+    fp4_allreduce
+    fp4_allreduce_nvfp4
+    fp4_allreduce_rmsnorm
+    Fp4AllReduceFusedNormSpec
+    Fp4AllReduceFusedNormOutput
+
 FP8 Quantized AllReduce
 -----------------------
 
