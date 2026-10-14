@@ -23,7 +23,7 @@
 #define TMEM_SCORES1_OFFSET 128
 #define TMEM_OUTPUT0_OFFSET 256
 #define TMEM_OUTPUT1_OFFSET 384
-#define NUM_KV_PIPE_STAGES 1
+#define NUM_KV_PIPE_STAGES 2
 #define SMEM_SCALE_SMEM_OFF 1024
 #define SMEM_SCALE_SMEM_STAGE_BYTES 4096
 #define SMEM_SCALE_SMEM_STRIDE 4096
@@ -36,10 +36,10 @@
 #define SMEM_KV_SMEM_OFF 70656
 #define SMEM_KV_SMEM_STAGE_BYTES 32768
 #define SMEM_KV_SMEM_STRIDE 32768
-#define SMEM_V_SMEM_OFF 103424
+#define SMEM_V_SMEM_OFF 136192
 #define SMEM_V_SMEM_STAGE_BYTES 32768
 #define SMEM_V_SMEM_STRIDE 32768
-#define SMEM_Q2K_SMEM_OFF 136192
+#define SMEM_Q2K_SMEM_OFF 201728
 #define SMEM_Q2K_SMEM_STAGE_BYTES 4096
 #define SMEM_Q2K_SMEM_STRIDE 4096
 #define SMEM_KV_QUANT_SMEM_OFF 5120
@@ -48,7 +48,7 @@
 #define SMEM_KV_NVFP4_SCALE_SMEM_OFF 5120
 #define SMEM_KV_NVFP4_SCALE_SMEM_STAGE_BYTES 1024
 #define SMEM_KV_NVFP4_SCALE_SMEM_STRIDE 1024
-#define SMEM_TOTAL 140288
+#define SMEM_TOTAL 205824
 #define THREADS 512
 #define FOLDED_GQA_GROUP 8
 #define FOLDED_TOKENS_PER_STAGE 16
@@ -58,7 +58,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap k_scale, const __grid_constant__ CUtensorMap v, const __grid_constant__ CUtensorMap v_scale, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, int* __restrict__ q2k_indices, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ q_offsets, int* __restrict__ kv_lens, int* __restrict__ page_table, int total_q, int num_q_heads, int num_kv_heads, int topk, int batch_size, int uniform_q_len, int max_pages, int causal, int derive_q_offset, float softmax_scale_log2, float k_global_scale, float v_global_scale, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
+kernel_cake_blackwell_msa_04f607bad91a7de6910b(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap k_scale, const __grid_constant__ CUtensorMap v, const __grid_constant__ CUtensorMap v_scale, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, int* __restrict__ q2k_indices, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ q_offsets, int* __restrict__ kv_lens, int* __restrict__ page_table, int total_q, int num_q_heads, int num_kv_heads, int topk, int batch_size, int uniform_q_len, int max_pages, int causal, int derive_q_offset, float softmax_scale_log2, float k_global_scale, float v_global_scale, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -77,18 +77,18 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
     #define q_full_addr (mbar_base + 0)
     #define q2k_full_addr (mbar_base + 16)
     #define kv_full_addr (mbar_base + 24)
-    #define kv_empty_addr (mbar_base + 32)
-    #define v_full_addr (mbar_base + 40)
-    #define v_empty_addr (mbar_base + 48)
-    #define kv_src_full_addr (mbar_base + 56)
-    #define kv_src_empty_addr (mbar_base + 64)
-    #define s_full_addr (mbar_base + 72)
-    #define p_full_addr (mbar_base + 88)
-    #define p_full_tail_addr (mbar_base + 104)
-    #define corr_sig_addr (mbar_base + 120)
-    #define corr_done_addr (mbar_base + 136)
-    #define o_full_addr (mbar_base + 152)
-    #define tmem_dealloc_addr (mbar_base + 168)
+    #define kv_empty_addr (mbar_base + 40)
+    #define v_full_addr (mbar_base + 56)
+    #define v_empty_addr (mbar_base + 72)
+    #define kv_src_full_addr (mbar_base + 88)
+    #define kv_src_empty_addr (mbar_base + 96)
+    #define s_full_addr (mbar_base + 104)
+    #define p_full_addr (mbar_base + 120)
+    #define p_full_tail_addr (mbar_base + 136)
+    #define corr_sig_addr (mbar_base + 152)
+    #define corr_done_addr (mbar_base + 168)
+    #define o_full_addr (mbar_base + 184)
+    #define tmem_dealloc_addr (mbar_base + 200)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -113,8 +113,8 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
     uint8_t* kv_nvfp4_scale_smem = reinterpret_cast<uint8_t*>(smem_raw + SMEM_KV_NVFP4_SCALE_SMEM_OFF);
     const int kv_nvfp4_scale_smem_addr = smem + SMEM_KV_NVFP4_SCALE_SMEM_OFF;
 
-    // Mbarrier init (15 pipeline groups, 0 ordered-sequence groups, 22 barriers)
-    // Mbarriers at smem_raw[0..176)
+    // Mbarrier init (15 pipeline groups, 0 ordered-sequence groups, 26 barriers)
+    // Mbarriers at smem_raw[0..208)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -124,39 +124,43 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
             mbarrier_init(smem + 8, 1);
             // q2k_full: 1 barriers, init_count=32
             mbarrier_init(smem + 16, 32);
-            // kv_full: 1 barriers, init_count=1
+            // kv_full: 2 barriers, init_count=1
             mbarrier_init(smem + 24, 1);
-            // --- pipeline 'kv_pipe' ---
-            // kv_empty: 1 barriers, init_count=1
             mbarrier_init(smem + 32, 1);
-            // v_full: 1 barriers, init_count=1
+            // --- pipeline 'kv_pipe' ---
+            // kv_empty: 2 barriers, init_count=1
             mbarrier_init(smem + 40, 1);
-            // v_empty: 1 barriers, init_count=1
             mbarrier_init(smem + 48, 1);
-            // kv_src_full: 1 barriers, init_count=1
+            // v_full: 2 barriers, init_count=1
             mbarrier_init(smem + 56, 1);
-            // kv_src_empty: 1 barriers, init_count=1
             mbarrier_init(smem + 64, 1);
-            // s_full: 2 barriers, init_count=1
+            // v_empty: 2 barriers, init_count=1
             mbarrier_init(smem + 72, 1);
             mbarrier_init(smem + 80, 1);
+            // kv_src_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 88, 1);
+            // kv_src_empty: 1 barriers, init_count=1
+            mbarrier_init(smem + 96, 1);
+            // s_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 104, 1);
+            mbarrier_init(smem + 112, 1);
             // p_full: 2 barriers, init_count=256
-            mbarrier_init(smem + 88, 256);
-            mbarrier_init(smem + 96, 256);
+            mbarrier_init(smem + 120, 256);
+            mbarrier_init(smem + 128, 256);
             // p_full_tail: 2 barriers, init_count=128
-            mbarrier_init(smem + 104, 128);
-            mbarrier_init(smem + 112, 128);
-            // corr_sig: 2 barriers, init_count=128
-            mbarrier_init(smem + 120, 128);
-            mbarrier_init(smem + 128, 128);
-            // corr_done: 2 barriers, init_count=128
             mbarrier_init(smem + 136, 128);
             mbarrier_init(smem + 144, 128);
-            // o_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 152, 1);
-            mbarrier_init(smem + 160, 1);
-            // tmem_dealloc: 1 barriers, init_count=128
+            // corr_sig: 2 barriers, init_count=128
+            mbarrier_init(smem + 152, 128);
+            mbarrier_init(smem + 160, 128);
+            // corr_done: 2 barriers, init_count=128
             mbarrier_init(smem + 168, 128);
+            mbarrier_init(smem + 176, 128);
+            // o_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 184, 1);
+            mbarrier_init(smem + 192, 1);
+            // tmem_dealloc: 1 barriers, init_count=128
+            mbarrier_init(smem + 200, 128);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -164,9 +168,9 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 176);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 208);
     if (warp == 0) {
-        int _tmem_hold = smem + 176;
+        int _tmem_hold = smem + 208;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -1355,7 +1359,8 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
             }
             elect_commit(s_full_addr + 8);
             elect_commit(kv_empty_addr + (kv_stage) * 8);
-            kv_phase ^= 1;
+            kv_stage += 1;
+            if (kv_stage == 2) { kv_stage = 0; kv_phase ^= 1; }
             int first_pv = 1;
             unsigned int _phase_p_full_0 = 0;
             unsigned int _phase_p_full_tail_0 = 0;
@@ -1363,8 +1368,8 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
             unsigned int _phase_p_full_tail_1 = 0;
             #pragma unroll 1
             for (int __1 = 0; __1 < num_n_blocks_2 - 1; __1++) {
-                unsigned int v_stage = kv_stage;
-                unsigned int v_phase = kv_phase ^ 1;
+                unsigned int v_stage = kv_stage ^ 1;
+                unsigned int v_phase = kv_phase ^ 1 - kv_stage;
                 {
                     mbarrier_wait(v_full_addr + (v_stage) * 8, v_phase);
                 }
@@ -1434,7 +1439,8 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
                     :: "r"(tmem_output0), "r"(_mma_b_lo_3), "r"(tmem_scores0 + 64), "r"(1));
                 unsigned int k_stage = kv_stage;
                 unsigned int k_phase = kv_phase;
-                kv_phase ^= 1;
+                kv_stage += 1;
+                if (kv_stage == 2) { kv_stage = 0; kv_phase ^= 1; }
                 mbarrier_wait(kv_full_addr + (k_stage) * 8, k_phase);
                 int _mma_a_lo_4 = make_warp_uniform(((q0_smem_addr) >> 4) & 0x3FFF);
                 int _mma_b_lo_4 = make_warp_uniform((((kv_smem_addr) >> 4) & 0x3FFF) + (k_stage) * 2048);
@@ -1597,11 +1603,11 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
                 first_pv = 0;
             }
             {
-                mbarrier_wait(v_full_addr + (kv_stage) * 8, kv_phase ^ 1);
+                mbarrier_wait(v_full_addr + (kv_stage ^ 1) * 8, kv_phase ^ 1 - kv_stage);
             }
             mbarrier_wait(p_full_addr, _phase_p_full_0);
             _phase_p_full_0 ^= 1;
-            int _mma_b_lo_8 = make_warp_uniform(((((v_smem_addr) >> 4) & 0x3FFF) | 0x4000000) + (kv_stage) * 2048);
+            int _mma_b_lo_8 = make_warp_uniform(((((v_smem_addr) >> 4) & 0x3FFF) | 0x4000000) + (kv_stage ^ 1) * 2048);
             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1641,7 +1647,7 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
                     :: "r"(tmem_output0), "r"(_mma_b_lo_8), "r"(tmem_scores0 + 64), "r"(((first_pv) ? 0 : 1)));
             mbarrier_wait(p_full_tail_addr, _phase_p_full_tail_0);
             _phase_p_full_tail_0 ^= 1;
-            int _mma_b_lo_9 = make_warp_uniform(((((v_smem_addr) >> 4) & 0x3FFF) | 0x4000000) + (kv_stage) * 2048);
+            int _mma_b_lo_9 = make_warp_uniform(((((v_smem_addr) >> 4) & 0x3FFF) | 0x4000000) + (kv_stage ^ 1) * 2048);
             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1665,7 +1671,7 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
                     :: "r"(tmem_output0), "r"(_mma_b_lo_9), "r"(tmem_scores0 + 64), "r"(1));
             mbarrier_wait(p_full_addr + 8, _phase_p_full_1);
             _phase_p_full_1 ^= 1;
-            int _mma_b_lo_10 = make_warp_uniform(((((v_smem_addr) >> 4) & 0x3FFF) | 0x4000000) + (kv_stage) * 2048);
+            int _mma_b_lo_10 = make_warp_uniform(((((v_smem_addr) >> 4) & 0x3FFF) | 0x4000000) + (kv_stage ^ 1) * 2048);
             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1705,7 +1711,7 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
                     :: "r"(tmem_output1), "r"(_mma_b_lo_10), "r"(tmem_scores1 + 64), "r"(((first_pv) ? 0 : 1)));
             mbarrier_wait(p_full_tail_addr + 8, _phase_p_full_tail_1);
             _phase_p_full_tail_1 ^= 1;
-            int _mma_b_lo_11 = make_warp_uniform(((((v_smem_addr) >> 4) & 0x3FFF) | 0x4000000) + (kv_stage) * 2048);
+            int _mma_b_lo_11 = make_warp_uniform(((((v_smem_addr) >> 4) & 0x3FFF) | 0x4000000) + (kv_stage ^ 1) * 2048);
             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1728,7 +1734,7 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
                     "}\n"
                     :: "r"(tmem_output1), "r"(_mma_b_lo_11), "r"(tmem_scores1 + 64), "r"(1));
             {
-                elect_commit(v_empty_addr + (kv_stage) * 8);
+                elect_commit(v_empty_addr + (kv_stage ^ 1) * 8);
             }
             elect_commit2(o_full_addr, o_full_addr + 8);
             unsigned int _phase_tmem_dealloc_0 = 0;
@@ -1853,18 +1859,31 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
                 int token_base = k_start_3 + n_block_1 * 128;
                 int page_head = kv_head_3;
                 {
+                    int physical_page = page_table[batch_3 * max_pages + n_block_1];
+                    if (physical_page < 0) {
+                        physical_page = 0;
+                    }
+                    token_base = 0;
+                    page_head = physical_page * num_kv_heads + kv_head_3;
+                }
+                {
                     mbarrier_wait(kv_empty_addr + (load_stage) * 8, _phase_kv_empty);
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 32768);
                         int token0 = token_base;
                         int token1 = token_base + 64;
+                        {
+                            token0 = 0;
+                            token1 = 64;
+                        }
                         tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768, (&k), 0, token0, 0, page_head, kv_full_addr + (load_stage) * 8);
                         tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 8192, (&k), 0, token1, 0, page_head, kv_full_addr + (load_stage) * 8);
                         tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 16384, (&k), 0, token0, 1, page_head, kv_full_addr + (load_stage) * 8);
                         tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 24576, (&k), 0, token1, 1, page_head, kv_full_addr + (load_stage) * 8);
                     }
                 }
-                _phase_kv_empty ^= 1;
+                load_stage += 1;
+                if (load_stage == 2) { load_stage = 0; _phase_kv_empty ^= 1; }
             }
         }
     }
@@ -1947,17 +1966,30 @@ kernel_cake_blackwell_msa_dfcd2b635c0668260507(const __grid_constant__ CUtensorM
                     int n_block_2 = num_n_blocks_4 - 1 - n_iter_2;
                     int token_base_1 = k_start_4 + n_block_2 * 128;
                     int page_head_1 = kv_head_4;
+                    {
+                        int physical_page_1 = page_table[batch_4 * max_pages + n_block_2];
+                        if (physical_page_1 < 0) {
+                            physical_page_1 = 0;
+                        }
+                        token_base_1 = 0;
+                        page_head_1 = physical_page_1 * num_kv_heads + kv_head_4;
+                    }
                     mbarrier_wait(v_empty_addr + (v_stage_1) * 8, _phase_v_empty);
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(v_full_addr + (v_stage_1) * 8, 32768);
                         int token0_1 = token_base_1;
                         int token1_1 = token_base_1 + 64;
+                        {
+                            token0_1 = 0;
+                            token1_1 = 64;
+                        }
                         tma_4d_gmem2smem(v_smem_addr + v_stage_1 * 32768, (&v), 0, token0_1, 0, page_head_1, v_full_addr + (v_stage_1) * 8);
                         tma_4d_gmem2smem(v_smem_addr + v_stage_1 * 32768 + 8192, (&v), 0, token1_1, 0, page_head_1, v_full_addr + (v_stage_1) * 8);
                         tma_4d_gmem2smem(v_smem_addr + v_stage_1 * 32768 + 16384, (&v), 0, token0_1, 1, page_head_1, v_full_addr + (v_stage_1) * 8);
                         tma_4d_gmem2smem(v_smem_addr + v_stage_1 * 32768 + 24576, (&v), 0, token1_1, 1, page_head_1, v_full_addr + (v_stage_1) * 8);
                     }
-                    _phase_v_empty ^= 1;
+                    v_stage_1 += 1;
+                    if (v_stage_1 == 2) { v_stage_1 = 0; _phase_v_empty ^= 1; }
                 }
             }
         }
