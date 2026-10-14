@@ -21,11 +21,12 @@ the bulk reduce-add. Twelve warps cover every role.
 
 The kernel owns the workspace tail reset. Because it outlives the communication
 kernel, it is the only participant that can safely zero the counters, which it
-does between two NVLink barriers so that no rank observes a half-cleared
-workspace or exits before the clearing is visible.
+does after the local producer-drain grid join and before peer publication.
+A final NVLink barrier makes the clearing visible before the next invocation.
 """
 
 import math
+import os
 from typing import ClassVar, Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -260,6 +261,13 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         if self.epilogue.token_back_enabled:
             raise ValueError("The generation-phase communication component provides no token-back path.")
         self._device_workspace = self._build_device_workspace()
+        # This selects ownership only; every original tail-reset byte is cleared.
+        # Keep the original grid-counter phase convention during NCU replay.
+        self.tail_reset_single_cta = (
+            self.world_size > 1
+            and sum(self._device_workspace.tail_reset_bytes(space) for space in ("local", "shared")) <= 16384
+            and os.environ.get("MEGA_USE_NCU", "0") != "1"
+        )
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
         self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel and not self.combine_format.is_quantized
         self._topk_reduce = (
@@ -535,6 +543,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             f"work{self.work_id_mode}_"
             f"fc2store{'ublk' if self.epilogue.fc2_use_ublk else 'stg'}_"
             f"fc2tmastages{self.epilogue.fc2_tma_stages}_"
+            f"singlectareset{int(self.tail_reset_single_cta)}_"
             f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_"
             f"pusher{self.pusher_cta_count}_refine{self.refine_participant_groups}x{self.refine_output_stages}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
@@ -1174,10 +1183,19 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             iket.range_pop()
 
             iket.range_push("tail.reset_workspace")
-            total_reset_threads = self.promised_launchable_sm_count * epilogue_thread_count
-            global_reset_thread = linear_cta_idx * Int32(epilogue_thread_count) + thread_idx
-            self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
-            self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
+            if cutlass.const_expr(self.tail_reset_single_cta):
+                # The original full grid join above establishes producer completion.
+                # CTA0 owns every reset store, including multiple rounds if needed.
+                # NvlinkBarrier's existing CTA rendezvous then joins these stores
+                # before its unchanged system fence and peer notification sequence.
+                if linear_cta_idx == Int32(0):
+                    self._device_workspace.reset_tail_space("shared", thread_idx, epilogue_thread_count)
+                    self._device_workspace.reset_tail_space("local", thread_idx, epilogue_thread_count)
+            else:
+                total_reset_threads = self.promised_launchable_sm_count * epilogue_thread_count
+                global_reset_thread = linear_cta_idx * Int32(epilogue_thread_count) + thread_idx
+                self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
+                self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
             iket.range_pop()
 
             iket.range_push("tail.nvlink_publish")
@@ -1186,7 +1204,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 Int32(self.promised_launchable_sm_count),
                 linear_cta_idx,
                 thread_idx,
-                prologue_grid_sync=True,
+                prologue_grid_sync=not self.tail_reset_single_cta,
                 epilogue_grid_sync=False,
             )
             iket.range_pop()

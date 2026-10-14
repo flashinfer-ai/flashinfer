@@ -115,6 +115,14 @@ def test_sparse_to_dense_graph_multirank(
             assert ws.kernel.token_comm._router.router_data_cta_count == (
                 2 if capacity == 2048 else 1
             )
+        else:
+            reset_bytes = sum(
+                ws.kernel._device_workspace.tail_reset_bytes(space)
+                for space in ("local", "shared")
+            )
+            assert ws.kernel.tail_reset_single_cta is (
+                reset_bytes <= 16384 and os.environ.get("MEGA_USE_NCU", "0") != "1"
+            )
         torch.manual_seed(17000 + rank)
         x = torch.randn(capacity, hidden, device="cuda").bfloat16()
         qx, sx = pkg.quantize_mxfp8_block32(x, torch.float8_e4m3fn)

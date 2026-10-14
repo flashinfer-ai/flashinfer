@@ -124,16 +124,20 @@ def test_routing_graph_changes(monkeypatch, kind, early, family, capacity):
 
 @pytest.mark.arch_rubin
 @pytest.mark.parametrize(
-    "world,capacity,ncu,single_cta",
+    "family,world,capacity,experts,topk,ncu,single_cta",
     [
-        (1, 1024, False, False),
-        (4, 1024, False, True),
-        (4, 1024, True, False),
-        (4, 16384, False, False),
+        ("inference", 1, 1024, 16, 4, False, False),
+        ("inference", 4, 1024, 16, 4, False, True),
+        ("inference", 4, 1024, 16, 4, True, False),
+        ("inference", 4, 16384, 16, 4, False, False),
+        ("genphase", 1, 1024, 16, 4, False, False),
+        ("genphase", 4, 1024, 16, 4, False, True),
+        ("genphase", 4, 1024, 16, 4, True, False),
+        ("genphase", 16, 1024, 256, 16, False, False),
     ],
 )
 def test_tail_reset_ownership_for_workspace(
-    monkeypatch, world, capacity, ncu, single_cta
+    monkeypatch, family, world, capacity, experts, topk, ncu, single_cta
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("Requires SM107")
@@ -143,22 +147,27 @@ def test_tail_reset_ownership_for_workspace(
     pkg.bootstrap_paths()
     monkeypatch.setenv("MEGA_USE_NCU", "1" if ncu else "0")
     cfg = pkg.Sm107BlockScaledMoeConfig(
-        num_total_experts=16,
+        num_total_experts=experts,
         max_tokens_per_rank=capacity,
-        num_topk=4,
+        num_topk=topk,
         hidden=512,
         intermediate=256,
         rank=0,
         world_size=world,
         quant_kind="mxfp8_e4m3",
-        kernel_variant="inference",
+        kernel_variant=family,
+        mma_tiler_mnk=(256, 64, 128),
+        fc2_tma_stages=1,
+        fc2_use_bulk=True,
     )
-    # Build the real region layout without allocating model weights or buffers.
+    # Build real layouts without allocating weights or buffers. GenPhase reset
+    # size depends on min(topk, local experts), not just capacity * topk.
     kernel = pkg.Sm107BlockScaledSymmBuffer._build_kernel(cfg)
     reset_bytes = sum(
         kernel._device_workspace.tail_reset_bytes(space)
         for space in ("local", "shared")
     )
-    assert (reset_bytes > 16384) == (capacity == 16384)
-    assert kernel.token_comm.tail_reset_single_cta is single_cta
+    assert (reset_bytes > 16384) == (world > 1 and not ncu and not single_cta)
+    reset_owner = kernel.token_comm if family == "inference" else kernel
+    assert reset_owner.tail_reset_single_cta is single_cta
     assert f"singlectareset{int(single_cta)}_" in kernel.name()

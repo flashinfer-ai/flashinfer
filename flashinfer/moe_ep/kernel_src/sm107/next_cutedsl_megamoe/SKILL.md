@@ -255,3 +255,19 @@ and NCU mode retain the original path.
 Detector: `test_tail_reset_ownership_for_workspace` constructs real layouts for
 small/large prefixes and checks the generated name; the single/multirank graph
 tests assert which path ran and validate changing routes across repeated replay.
+
+### GenPhase tail reset ownership
+
+The GenPhase tail has one NVLink peer barrier, unlike Generic's two. Retain the
+local producer-drain grid join, then let CTA0 clear all small reset prefixes.
+Its existing publication-barrier CTA rendezvous and system fence order those
+stores before peer notification/acquire; only the post-reset grid prologue is
+omitted. EP1, prefixes above 16 KiB and NCU mode keep the original path. The
+persistent grid/phase/signal counters remain outside the reset prefix.
+
+Detector: `test_tail_reset_ownership_for_workspace` checks both families using
+real layouts. GenPhase capacity cannot exceed 1024; its worst-case row count
+is bounded by local expert count as well as top-k. Use enough local experts to
+actually exceed 16 KiB, and assert the measured prefix size. An EP16 constructor
+case does not qualify EP16 execution. The multirank graph test asserts the
+selected ownership and checks every capacity row after changing-route replay.
