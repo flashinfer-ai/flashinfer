@@ -1,4 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -3989,6 +3990,63 @@ def test_attention_ts_context_packed_dense_k_bounds_exclude_peer_requests():
         rtol=0.0,
         atol=1e-3,
     )
+
+
+@pytest.mark.parametrize("paged", (False, True), ids=("contiguous", "paged"))
+@pytest.mark.parametrize("window_left", (-1, 31), ids=("causal", "sliding-window"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_packed_query_tails(paged: bool, window_left: int) -> None:
+    """Partial packed Q tiles stay correct in eager launches and graph replay."""
+
+    # Cover a tile crossing into the next request, a partial second tile,
+    # and a final tile extending beyond the packed allocation.
+    case_args = dict(
+        q_lengths=(3, 130, 1),
+        k_lengths=(33, 160, 17),
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        mask_type="causal",
+        window_left=window_left,
+        output_dtype=torch.bfloat16,
+        output_scale=1.0,
+        seed=2026101401,
+    )
+    metadata = None
+    if paged:
+        case = _make_paged_context_case(qk_dtype=torch.bfloat16, **case_args)
+        reference = case.reference
+        wrapper = BatchPrefillPagedTSWrapper()
+        metadata = _plan_paged_wrapper(wrapper, case)
+        actual = _run_paged_wrapper(wrapper, case, metadata)
+        q, k, v = reference.q, case.k_cache, case.v_cache
+    else:
+        reference = _make_context_case(
+            qkv_dtype=torch.bfloat16, packed=True, **case_args
+        )
+        wrapper = BatchPrefillTSWrapper()
+        _plan_wrapper(wrapper, reference)
+        actual = _run_wrapper(wrapper, reference)
+        q, k, v = reference.q, reference.k, reference.v
+    _assert_context_correct(actual, reference)
+
+    graph_out = torch.full_like(q, float("nan"), dtype=reference.output_dtype)
+    graph = _capture_context_graph(
+        wrapper,
+        q,
+        k,
+        v,
+        graph_out,
+        metadata,
+        qo_indptr=reference.qo_indptr,
+        kv_indptr=reference.kv_indptr,
+    )
+    q.neg_()
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_context_correct(graph_out, reference)
 
 
 @pytest.mark.arch_blackwell
