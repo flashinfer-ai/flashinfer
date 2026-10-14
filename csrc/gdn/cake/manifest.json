@@ -9000,6 +9000,2384 @@
       },
       "threads": 128,
       "tma_abi": "pointer"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_2e85138c2c19",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_f5cc64e35b",
+        "path": "host/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_2e85138c2c19.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_2e85138c2c19",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_6e1dd335f88c.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": -1,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": -1,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_da9151333224",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_f668846ca8",
+        "path": "host/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_da9151333224.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_da9151333224",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_e333de409794.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": -1,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_d21fbffa8c3f",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_3481174232",
+        "path": "host/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_d21fbffa8c3f.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_d21fbffa8c3f",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_6dd8be605d18.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 0,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 0,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_545801c23e3b",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_fe5980a978",
+        "path": "host/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_545801c23e3b.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_545801c23e3b",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_c1694671e650.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 0,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_5a5b03cd8bdc",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_5ea847fac2",
+        "path": "host/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_5a5b03cd8bdc.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_5a5b03cd8bdc",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_7a014178fa9d.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 1,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_2838d017424c",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_ce7fbb07a3",
+        "path": "host/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_2838d017424c.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_2838d017424c",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_8805e2007283.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 2,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_5fa86f1bbd8f",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_e7a20e6653",
+        "path": "host/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_5fa86f1bbd8f.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_5fa86f1bbd8f",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_bdab83765bc6.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_50abdc8a949c",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_c635442bc1",
+        "path": "host/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_50abdc8a949c.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_50abdc8a949c",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_ce8fc6b6e9ff.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 6,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_45687be1dc10",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_4a33ac0840",
+        "path": "host/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_45687be1dc10.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_45687be1dc10",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_sm107a_l7_vec2_780d238f85d0.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 2,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_c41dc09d9aa9",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_ef9145a5ef",
+        "path": "host/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_c41dc09d9aa9.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_c41dc09d9aa9",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_757998a6c50a.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": -1,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": -1,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_c7933f9b15de",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_85395a9771",
+        "path": "host/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_c7933f9b15de.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_c7933f9b15de",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_1914ad7cbe92.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": -1,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_8d4bc9b15eb5",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_458ab818dd",
+        "path": "host/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_8d4bc9b15eb5.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_8d4bc9b15eb5",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_9179f7a1232f.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 0,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 0,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_8093137a4f6c",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_983b54000a",
+        "path": "host/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_8093137a4f6c.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_8093137a4f6c",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_727e1a6362eb.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 0,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_d846f27e312b",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_a7d59c1667",
+        "path": "host/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_d846f27e312b.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_d846f27e312b",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_339a8ea66613.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 1,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_59e85be8077f",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_5607a3b8e0",
+        "path": "host/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_59e85be8077f.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_59e85be8077f",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_387df88a31f7.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 2,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_0ba1a8f6eca6",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_088230af91",
+        "path": "host/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_0ba1a8f6eca6.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_0ba1a8f6eca6",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_335088de0577.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_07755dcc79e1",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_a031effe6a",
+        "path": "host/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_07755dcc79e1.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_07755dcc79e1",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_d7f4ac3a6dac.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 6,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_f84a26b89605",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_d65e29df1e",
+        "path": "host/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_f84a26b89605.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_f84a26b89605",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_a77121860e8f.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 2,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_ee3d5a47f47f",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_c5b4dba9df",
+        "path": "host/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_ee3d5a47f47f.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_ee3d5a47f47f",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_5f363485bb78.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 1,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 2,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_2b0ba806c460",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_fada2431f7",
+        "path": "host/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_2b0ba806c460.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_2b0ba806c460",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_52855667ea2b.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 1,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 2,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 0,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_805fd7f7b98d",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_538c6e0486",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_805fd7f7b98d.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_805fd7f7b98d",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_2542fd8b8e34.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": -1,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": -1,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_e5e48bfdef0b",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_1575ef5ae3",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_e5e48bfdef0b.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_e5e48bfdef0b",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_9920e6406df7.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 2,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_0b662e48299a",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_fff007be3d",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_0b662e48299a.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_0b662e48299a",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_0677348c75bb.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_9618789b4fa0",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_5cbf157859",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_9618789b4fa0.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_9618789b4fa0",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_a6dd47237f5e.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 6,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_00bd866b100e",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_7a8e40ffab",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_00bd866b100e.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_00bd866b100e",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_ba67a275061a.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": -1,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": -1,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_520a53610811",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_6a2dd0f373",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_520a53610811.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_520a53610811",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_6b6e3ba3621c.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 0,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_25f5b9ea1e56",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_8cd57742b5",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_25f5b9ea1e56.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_25f5b9ea1e56",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_27a5359c84c6.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 4,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_9f0cd8139b4e",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp_afd94e5843",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp_9f0cd8139b4e.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_9f0cd8139b4e",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp_f86b8e21d4d2.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 4,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 1
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_086fa1f39a1b",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp_3bc697025e",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp_086fa1f39a1b.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_086fa1f39a1b",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp_0cce658aa035.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 1
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_dc0a334f8396",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp_0714e3f738",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp_dc0a334f8396.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_dc0a334f8396",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp_9428e68bd9af.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 3,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 1
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_0ebaac19d59c",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_a7ada1c6e1",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_0ebaac19d59c.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_0ebaac19d59c",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_faaae1cd83e2.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_0f4d9cc10344",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp_3efe3977b2",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp_0f4d9cc10344.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_0f4d9cc10344",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp_f63a7255bbfe.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_indexed_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 1,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 3,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 1
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_897fad4b341a",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_aab05838a5",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_897fad4b341a.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_897fad4b341a",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_e7289bd71f04.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": -1,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": -1,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_fa12c713e224",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_ab95526344",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_fa12c713e224.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_fa12c713e224",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_5af50799f65a.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 4,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_2a3fd653b6d5",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_36913d7640",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_2a3fd653b6d5.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_2a3fd653b6d5",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_403bf2921c8e.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_96dfe30edab9",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_459e21c980",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_96dfe30edab9.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_96dfe30edab9",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_848909460935.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 2,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_3c6af6b0a114",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_e9128f0995",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_3c6af6b0a114.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_3c6af6b0a114",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_cfadc2cce04b.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_b5fe63834663",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_68956d34da",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_b5fe63834663.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_b5fe63834663",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_712a62e2183d.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 3,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_865d26cf5d50",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_a32a89dec4",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_865d26cf5d50.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_865d26cf5d50",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_ed1a882cb307.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 4,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_5e4264fc928e",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_2fe1995bd2",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_5e4264fc928e.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_5e4264fc928e",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_1319db9eb732.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_a10ac7097ac8",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_a1324fc520",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_a10ac7097ac8.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_a10ac7097ac8",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_5fd63fdb9f5e.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 6,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_903c026f3418",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_67b27e22d5",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_903c026f3418.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_903c026f3418",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_1208d4df72aa.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": -1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": -1,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_dd05359db36b",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_90783bfe28",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_dd05359db36b.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_dd05359db36b",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_17644a7d28bf.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": -1,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": -1,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_38fa956a1e8f",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_2af17f41e1",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_38fa956a1e8f.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_38fa956a1e8f",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_60af31d9c2e7.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 4,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_b68cf72b1398",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_25aadc2f6c",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_b68cf72b1398.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_b68cf72b1398",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_39945ae11c58.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_2dcc250c24b8",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_a4aecc5686",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_2dcc250c24b8.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_2dcc250c24b8",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_a6a972bede4f.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 2,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_32804ca12569",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_61745912df",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_32804ca12569.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_32804ca12569",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_06a2fb4e558b.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_9b69259a5dff",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_6221b260d1",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_9b69259a5dff.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_9b69259a5dff",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_5abb89d6e2dd.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 3,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_07db4380c362",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_e840690e5e",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_07db4380c362.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_07db4380c362",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_0096d488da73.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 4,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_0bbc67fee836",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_ee7cb27829",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_0bbc67fee836.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_0bbc67fee836",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_580b5c564091.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_b35dbcfded48",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_0df1b2a931",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_b35dbcfded48.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_b35dbcfded48",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_e196028eb5dd.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": -1,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": -1,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_7de0b4d8f20c",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_7045359f98",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_7de0b4d8f20c.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_7de0b4d8f20c",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_2dc34324541b.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 0,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_c04c1bbfa580",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_d87185eb73",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_c04c1bbfa580.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_c04c1bbfa580",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp_879776db9e76.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_79082f16bd95",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_6bc0075260",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_79082f16bd95.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_79082f16bd95",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_ace961c23c1e.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 4,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_92bd4a9cb855",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_71db79790e",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_92bd4a9cb855.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_92bd4a9cb855",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_7ca0877ca441.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 3,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_f9173f558be4",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_68f166a054",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_f9173f558be4.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_f9173f558be4",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_f981072fc6c2.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 3,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_9a88f173a2ef",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_6b5e6c816c",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_9a88f173a2ef.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_9a88f173a2ef",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_088d7c9a0c5e.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "defines": {},
+      "domain": "prefill",
+      "dynamic_smem_bytes": 226048,
+      "host_binding": {
+        "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_9958cc0ee23b",
+        "module_ident": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_8aeae7262a",
+        "path": "host/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_9958cc0ee23b.cc"
+      },
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_9958cc0ee23b",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_d8ec86b55c77.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "source_symbol": "flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp",
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 4,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      },
+      "threads": 384,
+      "tma_abi": "grid_constant"
     }
   ]
 }

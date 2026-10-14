@@ -343,6 +343,52 @@ def _prefill_schedule_attr(
     return "_".join(pieces)
 
 
+# Rubin (sm_107a) twins of the sequential (non-CP) prefill kernel, routed per (architecture,
+# shipped schedule): the dvsplit fp32-state schedules run the `l7_vec2` body and the dvsplit
+# bf16 / f16-state schedules the `l7b_vec2lp` body (8-byte state I/O on the initial-state
+# load, the final-state store and the checkpoint stores; every arithmetic operation keeps its
+# operands, order and rounding, so the output is bitwise identical to the shipped body).  An
+# indexed-state plan (`USE_STATE_INDICES`) traces its own `_indexed` schedule, keyed as such.
+# Mirrors `PREFILL_SEQ_ARCH_BODIES` in loom.examples.weave.flashinfer_blackwell_gdn_prefill
+# (the Cake tree cross-checks this copy).
+_SM107A_SEQ_TWINS: dict[str, tuple[str, ...]] = {
+    # fp32-state dvsplit schedules: 8-byte fp32 state I/O
+    "l7_vec2": (
+        "dvsplit",
+        "dvsplit_f16io",
+        "dvsplit_initial",
+        "dvsplit_initial_f16io",
+        "dvsplit_initial_f16io_gatepipe4",
+    ),
+    # bf16 / f16-state dvsplit schedules with shipped records (the bf16 one indexed or
+    # not): the same width lever on the low-precision state loads and stores,
+    # alignment-guarded on the indexed plans
+    "l7b_vec2lp": (
+        "dvsplit_initial_bf16state",
+        "dvsplit_initial_f16state",
+        "dvsplit_initial_bf16state_indexed",
+    ),
+}
+CAKE_GDN_PREFILL_SEQ_ARCH_BODIES: dict[tuple[str, str], str] = {
+    ("sm_107a", f"flashinfer_blackwell_gdn_prefill_{suffix}"): body
+    for body, suffixes in _SM107A_SEQ_TWINS.items()
+    for suffix in suffixes
+}
+
+
+def cake_gdn_prefill_seq_schedule(
+    arch: CakeGDNArch, schedule_attr: str, *, use_state_indices: bool
+) -> str:
+    """The sequential prefill schedule `arch` runs for the shipped `schedule_attr`.
+
+    The shipped schedule itself, or its per-architecture twin
+    (`<schedule>_sm107a_<body>`, a record of its own in the manifest).
+    """
+    symbol = f"{schedule_attr}_indexed" if use_state_indices else schedule_attr
+    body = CAKE_GDN_PREFILL_SEQ_ARCH_BODIES.get((arch, symbol), "base")
+    return schedule_attr if body == "base" else f"{schedule_attr}_sm107a_{body}"
+
+
 def _variant_for(
     *, domain: str, schedule_attr: str, specializations: dict[str, int | float]
 ) -> dict[str, Any]:
@@ -513,6 +559,9 @@ def select_cake_gdn_prefill_variant(
         single_chunk=single_chunk,
         gatepipe4=gatepipe4,
         fullgrid_vhold=fullgrid_vhold,
+    )
+    schedule_attr = cake_gdn_prefill_seq_schedule(
+        arch, schedule_attr, use_state_indices=use_state_indices
     )
     specializations: dict[str, int | float] = {
         "ENABLE_CHECKPOINTS": int(enable_checkpoints),
@@ -1138,6 +1187,7 @@ __all__ = [
     "CakeGDNRoute",
     "CakeGDNUnsupportedError",
     "arch_for_compute_capability",
+    "cake_gdn_prefill_seq_schedule",
     "compile_cake_gdn_cubin",
     "load_cake_gdn_kernel",
     "select_cake_gdn_decode_variant",
