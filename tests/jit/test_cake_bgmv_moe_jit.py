@@ -298,7 +298,10 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
 
     spec = cake_bgmv_moe.gen_cake_bgmv_moe_generic_module(rank, dtype, arch)
     uri = cake_bgmv_moe.get_cake_bgmv_moe_generic_uri(rank, dtype, arch)
-    metadata = cake_bgmv_moe._generic_metadata(rank, dtype)
+    # The body is selected per (dtype, rank, arch): the compute-capability-10.7 generic
+    # bf16 rank-32 bundle binds its merge-in-expand record, every other combination the
+    # shared body.
+    metadata = cake_bgmv_moe._generic_metadata(rank, dtype, arch)
 
     assert spec.name == uri
     assert (
@@ -341,6 +344,13 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
     assert "atomicAdd(&reinterpret_cast<float" not in body
     binding = spec.sources[0].read_text()
     assert f'#define CAKE_BGMV_MOE_BODY_FILE "{metadata.body}"' in binding
+    merge_in_expand = (
+        1 if (arch == "sm107a" and (dtype, rank) == ("bfloat16", 32)) else 0
+    )
+    assert metadata.body.endswith("_sm107a.cu") == bool(merge_in_expand)
+    assert (
+        f"#define CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND {merge_in_expand}" in binding
+    )
     assert f"#define CAKE_BGMV_MOE_RANK {rank}" in binding
     assert f"#define CAKE_BGMV_MOE_CC_MAJOR {cc[0]}" in binding
     assert f"#define CAKE_BGMV_MOE_CC_MINOR {cc[1]}" in binding
