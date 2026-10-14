@@ -469,19 +469,17 @@ def _cute_dsl_mm_bf16_requirement(
     ] = "cudnn",
 ):
     if out_dtype != torch.bfloat16:
-        raise ValueError("The CuTeDSL low-M backend requires bfloat16 output.")
+        raise ValueError("The CuTeDSL backend requires bfloat16 output.")
     if out is not None and out.dtype != torch.bfloat16:
-        raise ValueError("The CuTeDSL low-M backend requires a bfloat16 out tensor.")
+        raise ValueError("The CuTeDSL backend requires a bfloat16 out tensor.")
     if not is_sm100a_supported(a.device):
-        raise ValueError(
-            "The CuTeDSL low-M backend requires SM100/SM103 with CUDA 12.8+."
-        )
+        raise ValueError("The CuTeDSL backend requires SM100/SM103 with CUDA 12.8+.")
     if a.ndim != 2 or b.ndim != 2:
-        raise ValueError("The CuTeDSL low-M backend requires 2D inputs.")
+        raise ValueError("The CuTeDSL backend requires 2D inputs.")
     if not a.is_contiguous():
-        raise ValueError("The CuTeDSL low-M backend requires row-major A.")
+        raise ValueError("The CuTeDSL backend requires row-major A.")
     if not b.T.is_contiguous():
-        raise ValueError("The CuTeDSL low-M backend requires column-major B.")
+        raise ValueError("The CuTeDSL backend requires column-major B.")
     if b.shape[0] != a.shape[1]:
         raise ValueError(
             f"Incompatible shapes: A is {tuple(a.shape)}, B is {tuple(b.shape)}."
@@ -489,7 +487,7 @@ def _cute_dsl_mm_bf16_requirement(
     if b.device != a.device:
         raise ValueError("A and B must be on the same CUDA device.")
     if out is not None and not out.is_contiguous():
-        raise ValueError("The CuTeDSL low-M backend requires row-major output.")
+        raise ValueError("The CuTeDSL backend requires row-major output.")
     if bias is not None and (
         bias.device != a.device
         or bias.shape != (b.shape[1],)
@@ -501,9 +499,13 @@ def _cute_dsl_mm_bf16_requirement(
     from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
     if not is_cute_dsl_available():
-        raise LibraryError("The CuTeDSL low-M backend requires nvidia-cutlass-dsl.")
+        raise LibraryError("The CuTeDSL backend requires nvidia-cutlass-dsl.")
 
     if a.shape[0] > _CUTE_DSL_BF16_MAX_M:
+        from .kernels.dense_bf16_gemm_sm100 import supports
+
+        if supports(a, b, bias, out):
+            return True
         # Served by the cuBLASLt fallback runner of the cute-dsl runner set;
         # pdl is ignored there because cuBLASLt has no PDL API.
         return _cublaslt_mm_bf16_requirement(
@@ -730,16 +732,19 @@ def mm_bf16(
             persistent-scheduled GEMM with per-shape exhaustive autotune; ignores
             ``bias`` / ``pdl``. Requires SM >= 90.
         ``"cute-dsl"`` uses standalone Blackwell low-M kernels for M <= 32
-        (direct, cluster Split-K and warp Split-K) and cuBLASLt above that.
+        (direct, cluster Split-K and warp Split-K) and, above that, a
+        persistent kernel (no bias; N and K nonzero multiples of 8; A, B and
+        ``out`` 16-byte aligned), else cuBLASLt, which ignores ``pdl``.
         It is never auto-selected; serving frameworks must select it
         explicitly. Without autotuning, M > 32 runs cuBLASLt; below, the
         direct kernel runs where its shape heuristic applies, otherwise the
         warp Split-K kernel whenever it is eligible (N % 16 == 0, K % 128 == 0
         with at most 64 K tiles; requires CuTe DSL >= 4.7), and
         cluster Split-K otherwise. With autotuning, one call profiles the
-        available low-M kernels on their supported buckets and a single
-        cuBLASLt fallback runner on each M > 32 bucket, so a single large-M
-        warm-up tunes both ranges; with bias the direct kernel is excluded.
+        available low-M kernels on their supported buckets and the persistent
+        and cuBLASLt runners on each M > 32 bucket, so a single large-M
+        warm-up tunes both ranges; with bias the direct and persistent kernels
+        are excluded.
         Direct and warp Split-K reuse compiled kernels across M for matching
         tactics, while each M bucket still tunes independently.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
@@ -826,8 +831,9 @@ def mm_bf16(
             ["tinygemm"], a, b, bias, pdl, out, out_dtype, backend
         )
     elif backend == "cute-dsl":
-        # One runner set covers both M ranges (cuBLASLt above 32, ignoring
-        # pdl), so one autotune call profiles both; see _cute_dsl_bf16_runners.
+        # One runner set covers both M ranges (persistent kernel or cuBLASLt
+        # above 32), so one autotune call profiles both; see
+        # _cute_dsl_bf16_runners.
         backends = ["cute-dsl"]
     else:
         backends = [backend]
@@ -2250,8 +2256,9 @@ class _CuteDSLBf16Runner(TunableRunner):
     ``_cute_dsl_bf16_runners`` lists every runner of the backend so that one
     autotune call profiles each of them on the buckets it owns; a runner
     returns no tactics for a profile whose M it does not serve. The defaults
-    here describe the CuTe-DSL kernels (M <= ``_CUTE_DSL_BF16_MAX_M``, one
-    cache-key layout); the cuBLASLt fallback overrides them. After autotuner
+    here describe the low-M CuTe-DSL kernels (M <= ``_CUTE_DSL_BF16_MAX_M``,
+    one cache-key layout); the persistent and cuBLASLt runners override them
+    for M > ``_CUTE_DSL_BF16_MAX_M``. After autotuner
     selection, ``supports_inputs`` and ``is_tactic_compatible`` are re-checked
     against the real inputs because a cached entry can come from a bucket on
     the other side of ``_CUTE_DSL_BF16_MAX_M`` or from another M.
@@ -2492,6 +2499,51 @@ def _cute_dsl_direct_bf16_gemm_runner(
 
 
 @functools.cache
+def _cute_dsl_persistent_bf16_gemm_runner(compute_capability: int):
+    from .kernels.dense_bf16_gemm_sm100 import (
+        TACTICS,
+        prepare_persistent_dense,
+        run_persistent_dense,
+        supports,
+    )
+
+    class CuteDSLPersistentBf16Runner(_CuteDSLBf16Runner):
+        """Persistent tensor-core GEMM for M > _CUTE_DSL_BF16_MAX_M without bias."""
+
+        def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
+            a, b, bias, _, out, *_ = inputs
+            return a.shape[0] > _CUTE_DSL_BF16_MAX_M and supports(a, b, bias, out)
+
+        def is_tactic_compatible(
+            self, inputs: List[torch.Tensor], tactic: object
+        ) -> bool:
+            return tactic == -1 or (
+                isinstance(tactic, (tuple, list)) and tuple(tactic) in TACTICS
+            )
+
+        def get_valid_tactics(
+            self, inputs: List[torch.Tensor], profile: OptimizationProfile
+        ) -> List[tuple]:
+            return list(TACTICS) if self.supports_inputs(inputs) else []
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=-1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, _, pdl, out, *_ = inputs
+            tactic = TACTICS[0] if tactic == -1 else tactic
+            if do_preparation:
+                prepare_persistent_dense(a, pdl, tactic)
+                return out
+            return run_persistent_dense(a, b, out, pdl, tactic)
+
+    return CuteDSLPersistentBf16Runner(compute_capability)
+
+
+@functools.cache
 def _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability: int):
     cublaslt_runner = get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner()
 
@@ -2536,10 +2588,13 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[_CuteDSLBf16Runne
     """Return the runners of ``backend="cute-dsl"`` for ``inputs``, best first.
 
     Keep every available runner for synthesized buckets: low-M kernels serve
-    M <= 32, and only the cuBLASLt fallback offers tactics above 32.
-    Runtime-supported runners come first so ``[0]`` is a valid no-autotune
-    default. Within that group, prefer direct where its shape heuristic applies,
-    then warp, then cluster Split-K.
+    M <= 32; above 32 the persistent kernel serves bias-free aligned shapes and
+    the cuBLASLt fallback serves the rest. Runtime-supported runners come
+    first so ``[0]`` is a valid no-autotune default. Within that group, prefer
+    direct where its shape heuristic applies, then warp, then cluster Split-K,
+    then cuBLASLt ahead of persistent: untuned, the persistent default tactic
+    is slower than cuBLASLt's heuristic on B200, so it only runs when
+    autotuning selects it.
     """
     from ..cute_dsl.availability import is_cute_dsl_experimental_available
     from .kernels.dense_bf16_gemm_direct import prefer_direct_bf16_gemm_sm100
@@ -2557,6 +2612,7 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[_CuteDSLBf16Runne
         else None
     )
     cluster_splitk = _cute_dsl_splitk_bf16_gemm_runner(compute_capability)
+    persistent = _cute_dsl_persistent_bf16_gemm_runner(compute_capability)
     fallback = _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability)
 
     prefer_direct = direct.supports_inputs(inputs) and prefer_direct_bf16_gemm_sm100(
@@ -2568,7 +2624,7 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[_CuteDSLBf16Runne
         else (warp_splitk, cluster_splitk, direct)
     )
     return sorted(
-        (runner for runner in (*kernels, fallback) if runner is not None),
+        (runner for runner in (*kernels, fallback, persistent) if runner is not None),
         key=lambda runner: not runner.supports_inputs(inputs),
     )
 
