@@ -193,6 +193,7 @@ from .jit.cake_sparse_mla_sm120_dsv41_mixed import (
     gen_cake_sparse_mla_sm120_dsv41_mixed_module,
 )
 from .jit.cake_concat_mla_kv_quant_fp8 import gen_concat_mla_kv_quant_fp8_aot_modules
+from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
@@ -214,6 +215,10 @@ from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.cake_sampling import gen_cake_sampling_module
+from .moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+    cake_sm120_megamoe_available,
+    gen_cake_sm120_megamoe_aot_modules,
+)
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
 
@@ -680,12 +685,18 @@ def gen_all_modules(
         jit_specs.append(gen_cake_fmha_compat_module("sm100a"))
     if has_sm103a_exact:
         jit_specs.append(gen_cake_fmha_compat_module("sm103a"))
-    # Cake fused MLA context K/V pack (attention side, not MoE): one build per
-    # (exact target, head group).
+    # Fused MLA context K/V pack (attention side, not MoE), two backends behind
+    # concat_mla_kv_quant_fp8: the Cake programs, one build per (exact target,
+    # head group) ...
     if has_sm100a_exact:
         jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm100a"))
     if has_sm103a_exact:
         jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm103a"))
+    # ... and the specialized kernel (auto's pick for 12 local heads), one
+    # module, pre-built for the same exact Blackwell targets as the Cake
+    # programs (other targets JIT it on first use).
+    if has_sm100a_exact or has_sm103a_exact:
+        jit_specs.append(gen_mla_kv_pack_fp8_module())
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
@@ -858,6 +869,22 @@ def gen_all_modules(
             jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm100a"))
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
+        # For cuDNN grouped_mm unified MoE API
+        if any(
+            (
+                has_sm80,
+                has_sm90,
+                has_sm100,
+                has_sm100f,
+                has_sm103,
+                has_sm107,
+                has_sm110,
+                has_sm120,
+                has_sm120f,
+                has_sm121,
+            )
+        ):
+            jit_specs.append(gen_moe_utils_module())
         if has_cake_megamoe_topk_reduce_sm100a:
             jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_100a"))
         if has_cake_megamoe_topk_reduce_sm103a:
@@ -910,7 +937,6 @@ def gen_all_modules(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=True)
             )
             jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
-            jit_specs.append(gen_moe_utils_module())
         if has_sm100a_exact or has_sm103a_exact:
             jit_specs.append(gen_alphamoe_fused_router_module())
         if has_sm100 or has_sm103:
@@ -944,6 +970,11 @@ def gen_all_modules(
         if has_sm120:
             jit_specs.append(gen_cudnn_frost_moe_module("bf16", "sm_120a"))
             jit_specs.append(gen_fp4_quantization_sm120_module())
+            # Cake SM120 MXFP4 x MXFP8 MegaMoE (moe_ep backend sm120_mxfp4_mxfp8_bf16_cake):
+            # the binding and the default DeepSeek-V4-Flash device instances.  Both need
+            # the NCCL 2.30.7 Device API (headers + library) at build time.
+            if cake_sm120_megamoe_available():
+                jit_specs.extend(gen_cake_sm120_megamoe_aot_modules())
         if has_sm121:
             jit_specs.append(gen_fp4_quantization_sm121_module())
         if has_sm120 or has_sm121:
