@@ -7,14 +7,19 @@ Kernels for LLM sampling.
 
 .. important::
 
-   Batch-length ``seed`` and ``offset`` tensors now apply one value per output
-   row. Previously, all rows used element zero, even when a batch-length tensor
-   was supplied. Calls with distinct values in these tensors can therefore
-   produce different samples after this fix. Scalar values, length-one tensors,
-   and calls using a shared ``torch.Generator`` retain their existing behavior.
+   Tensor ``seed`` and ``offset`` values identify request-local random streams.
+   Each tensor must have length one (broadcast) or one element per output row.
+   The seed/offset pair is mixed into a Philox seed independently of batch
+   position, including for single-row batches. Tensor offsets are stream keys,
+   not skip-ahead positions within a shared stream. Change the offset for a
+   new sampling call, and use distinct keys for independent requests.
 
-   The output row index still feeds the Philox subsequence. Per-row seeds do not
-   make sampling invariant to batch position, even with the same seed and offset.
+   This changes the previous length-one tensor behavior as well as batch-length
+   tensor behavior. Repeating a pair, whether with ``torch.full((B,), seed)`` or
+   length-one tensors, replays the same stream in every row; identical input
+   distributions therefore produce identical tokens. Scalar seed/offset values
+   and calls using ``torch.Generator`` retain their existing row-dependent
+   subsequences and skip-ahead offsets.
 
 .. seealso::
 
