@@ -363,11 +363,30 @@ def make_kernel(
         return None
     out = torch.empty(act.shape[0], w_fp8.shape[0], dtype=act.dtype, device=act.device)
     w_use = prepare_w8a16_fp8_weight(w_fp8) if prepared else w_fp8
+    # "<algo>@g<n>": Hopper L2 group size n for this column (FLASHINFER_W8A16_FP8_SM90_GROUP,
+    # read per call; the graph capture bakes it in).
+    group = None
+    if algo is not None and "@g" in algo:
+        algo, g = algo.split("@g")
+        group = g
+        algo = None if algo == "auto" else algo
 
     def run() -> torch.Tensor:
-        return w8a16_fp8_gemm(
-            act, w_use, scale, bias=bias, out=out, weight_prepared=prepared, algo=algo
-        )
+        if group is not None:
+            os.environ["FLASHINFER_W8A16_FP8_SM90_GROUP"] = group
+        try:
+            return w8a16_fp8_gemm(
+                act,
+                w_use,
+                scale,
+                bias=bias,
+                out=out,
+                weight_prepared=prepared,
+                algo=algo,
+            )
+        finally:
+            if group is not None:
+                os.environ.pop("FLASHINFER_W8A16_FP8_SM90_GROUP", None)
 
     return run
 
@@ -451,8 +470,21 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
         torch.cuda.synchronize()
         max_abs[name], max_rel[name] = _errors(out, ref)
         del out
-        tag = f"w8a16[{layer} tp{tp} M={m} N={n} K={k}] {name}"
-        us[name], _, _ = _time_kernel(args, lambda: fn(), tag)
+    # --rounds R: R passes over the implementations (order rotated each pass), median per
+    # implementation across passes.  At large M the GPU sits on its power cap and the clock
+    # drifts between back-to-back measurements; interleaving keeps that drift out of the
+    # per-row ratios.
+    names = list(impls)
+    per_round: dict[str, list[float]] = {name: [] for name in names}
+    for rnd in range(args.rounds):
+        order = names[rnd % len(names) :] + names[: rnd % len(names)]
+        for name in order:
+            fn = impls[name]
+            tag = f"w8a16[{layer} tp{tp} M={m} N={n} K={k}] {name}"
+            t, _, _ = _time_kernel(args, lambda: fn(), tag)
+            per_round[name].append(t)
+    for name in names:
+        us[name] = statistics.median(per_round[name])
 
     passed: bool | None = None
     kernel_cols = [c for c in impls if c.startswith("kernel")]
@@ -504,7 +536,9 @@ def _kernel_variants(args) -> list[tuple[str, bool, str | None]]:
     out: list[tuple[str, bool, str | None]] = []
     if "kernel" in args.impls:
         if args.algo:
-            out += [(f"kernel:{a}", False, None if a == "auto" else a) for a in args.algo]
+            out += [
+                (f"kernel:{a}", False, None if a == "auto" else a) for a in args.algo
+            ]
         else:
             out.append(("kernel", False, None))
     if "kernel_prep" in args.impls:
@@ -556,7 +590,9 @@ def print_table(rows: list[Row], args) -> None:
 
 
 def write_csv(rows: list[Row], path: str, args) -> None:
-    variants = [name for name, _, _ in _kernel_variants(args) if name.startswith("kernel:")]
+    variants = [
+        name for name, _, _ in _kernel_variants(args) if name.startswith("kernel:")
+    ]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(
@@ -647,6 +683,12 @@ def parse_args(argv=None):
         choices=["cast", "cublas", "kernel", "kernel_prep"],
     )
     p.add_argument("--iters", type=int, default=50)
+    p.add_argument(
+        "--rounds",
+        type=int,
+        default=1,
+        help="interleaved passes over the implementations per row (median across passes)",
+    )
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-l2-flush", dest="l2_flush", action="store_false")

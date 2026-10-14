@@ -152,6 +152,144 @@ struct NumericArrayConverter<cutlass::half_t, cutlass::float_e4m3_t, 4, Round> {
 
 }  // namespace cutlass
 
+// Version H4: a persistent tile scheduler that groups tiles for L2 without padding the tile
+// grid.  CUTLASS's sm90 persistent scheduler implements its L2 swizzle by rounding both tile
+// counts up to a multiple of the swizzle size and running the padding tiles (see
+// W8A16Sm90PickSwizzle), so H3 had to run the large-M rows ungrouped: the 132 CTAs in flight
+// walk ~132 weight tiles of ONE activation tile, and every activation tile re-streams the
+// weight from HBM once the weight is larger than what fits next to it in the 50 MB L2.  This
+// scheduler walks the same linear work index as CUTLASS's (swizzle 1, so its grid and
+// work count are exact), but maps it the way the hand kernel does: groups of G tiles of the
+// slow dimension (activation tiles for raster "m"), the fast dimension walked within a group,
+// and a last, narrower group for the remainder instead of padding.  G = 1 is exactly
+// CUTLASS's order.  Cluster size 1 only; the stream-K variants keep CUTLASS's scheduler.
+namespace flashinfer {
+namespace gemm {
+
+struct W8A16Sm90GroupedTileSchedulerTag {};
+
+struct W8A16Sm90GroupedParams : cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90Params {
+  uint32_t group_ = 1;       // tiles of the slow dimension per group
+  uint32_t tiles_fast_ = 0;  // tiles along the raster direction
+  uint32_t tiles_slow_ = 0;
+};
+
+class W8A16Sm90GroupedTileScheduler
+    : public cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90 {
+  using Base = cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90;
+
+ public:
+  using Params = W8A16Sm90GroupedParams;
+  using Arguments = Base::Arguments;  // max_swizzle_size carries the group size
+  using WorkTileInfo = Base::WorkTileInfo;
+  using RasterOrder = Base::RasterOrder;
+  using RasterOrderOptions = Base::RasterOrderOptions;
+
+  CUTLASS_HOST_DEVICE W8A16Sm90GroupedTileScheduler() {}
+
+  CUTLASS_DEVICE explicit W8A16Sm90GroupedTileScheduler(Params const& p)
+      : Base(p),
+        blocks_(p.blocks_per_problem_),
+        group_(p.group_),
+        tiles_fast_(p.tiles_fast_),
+        tiles_slow_(p.tiles_slow_),
+        along_m_(p.raster_order_ == RasterOrder::AlongM) {
+#if defined(__CUDA_ARCH__)
+    // Same start index as CUTLASS (one of gridDim.x / gridDim.y is 1 at cluster size 1).
+    linear_ = uint64_t(blockIdx.x) * uint64_t(gridDim.y) + uint64_t(blockIdx.y);
+    stride_ = uint64_t(gridDim.x) * uint64_t(gridDim.y) * uint64_t(gridDim.z);
+#endif
+  }
+
+  template <class ProblemShapeMNKL, class TileShape, class ClusterShape>
+  static Params to_underlying_arguments(ProblemShapeMNKL problem_shape_mnkl, TileShape tile_shape,
+                                        ClusterShape cluster_shape,
+                                        cutlass::KernelHardwareInfo const& hw_info,
+                                        Arguments const& arguments, void* workspace = nullptr,
+                                        const uint32_t = 1, uint32_t = 1u) {
+    static_assert(cute::size(ClusterShape{}) == 1, "grouped scheduler: cluster size 1 only");
+    Arguments a = arguments;
+    a.max_swizzle_size = 1;  // CUTLASS's own swizzle (and its padding) off
+    Params p;
+    static_cast<cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90Params&>(p) =
+        Base::to_underlying_arguments(problem_shape_mnkl, tile_shape, cluster_shape, hw_info, a,
+                                      workspace);
+    p.group_ =
+        static_cast<uint32_t>(arguments.max_swizzle_size > 1 ? arguments.max_swizzle_size : 1);
+    const bool along_m = p.raster_order_ == RasterOrder::AlongM;
+    p.tiles_fast_ = along_m ? p.problem_tiles_m_ : p.problem_tiles_n_;
+    p.tiles_slow_ = along_m ? p.problem_tiles_n_ : p.problem_tiles_m_;
+    if (p.group_ > p.tiles_slow_) p.group_ = p.tiles_slow_ > 0 ? p.tiles_slow_ : 1;
+    return p;
+  }
+
+  template <class ClusterShape>
+  CUTLASS_DEVICE WorkTileInfo initial_work_tile_info(ClusterShape) {
+    return get_current_work();
+  }
+
+  CUTLASS_DEVICE WorkTileInfo get_current_work() const { return work_for_linear_idx(linear_); }
+
+  CUTLASS_DEVICE WorkTileInfo work_for_linear_idx(uint64_t u) const {
+    if (u >= blocks_) return WorkTileInfo::invalid_work_tile();
+    const uint32_t g = group_;
+    const uint64_t group_tiles = uint64_t(g) * tiles_fast_;
+    const uint32_t full = tiles_slow_ / g;
+    const uint64_t gi = u / group_tiles;
+    uint32_t slow, fast;
+    if (gi < full) {
+      const uint64_t in = u - gi * group_tiles;
+      slow = static_cast<uint32_t>(gi) * g + static_cast<uint32_t>(in % g);
+      fast = static_cast<uint32_t>(in / g);
+    } else {  // the remainder group, narrower, no padding
+      const uint32_t r = tiles_slow_ - full * g;
+      const uint64_t in = u - uint64_t(full) * group_tiles;
+      slow = full * g + static_cast<uint32_t>(in % r);
+      fast = static_cast<uint32_t>(in / r);
+    }
+    const int32_t m = static_cast<int32_t>(along_m_ ? fast : slow);
+    const int32_t n = static_cast<int32_t>(along_m_ ? slow : fast);
+    return {m, n, 0, true};
+  }
+
+  CUTLASS_DEVICE void advance_to_next_work(uint32_t advance_count = 1) {
+    linear_ += stride_ * uint64_t(advance_count);
+  }
+
+  CUTLASS_DEVICE bool is_last_tile(WorkTileInfo&, uint32_t advance_count = 1) const {
+    return !work_for_linear_idx(linear_ + stride_ * uint64_t(advance_count)).is_valid();
+  }
+
+  CUTLASS_DEVICE auto fetch_next_work(WorkTileInfo) {
+    advance_to_next_work();
+    return cute::make_tuple(get_current_work(), true);
+  }
+
+  template <class TileSchedulerPipeline, class TileSchedulerPipelineState>
+  CUTLASS_DEVICE auto fetch_next_work(WorkTileInfo w, TileSchedulerPipeline&,
+                                      TileSchedulerPipelineState) {
+    return fetch_next_work(w);
+  }
+
+ private:
+  uint64_t blocks_ = 0;
+  uint32_t group_ = 1, tiles_fast_ = 0, tiles_slow_ = 0;
+  bool along_m_ = true;
+  uint64_t linear_ = 0;
+  uint64_t stride_ = 1;
+};
+
+}  // namespace gemm
+}  // namespace flashinfer
+
+namespace cutlass::gemm::kernel::detail {
+template <class ArchTag, class TileShape, class ClusterShape, uint32_t SchedulerPipelineStageCount>
+struct TileSchedulerSelector<flashinfer::gemm::W8A16Sm90GroupedTileSchedulerTag, ArchTag, TileShape,
+                             ClusterShape, SchedulerPipelineStageCount> {
+  using Scheduler = flashinfer::gemm::W8A16Sm90GroupedTileScheduler;
+};
+}  // namespace cutlass::gemm::kernel::detail
+
 namespace flashinfer {
 namespace gemm {
 
@@ -206,6 +344,7 @@ inline cutlass::gemm::kernel::detail::ReductionMode W8A16Sm90StreamKReductionEnv
 inline int W8A16Sm90SwizzleEnv();
 inline int W8A16Sm90PickSwizzle(int tiles_w, int tiles_a, int cluster_w, int max_swizzle);
 inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm90RasterEnv();
+inline int W8A16Sm90PickGroup(int M, int N, int K, int tile_w, int tile_a);
 
 template <typename T, typename Cfg, bool kStreamK = false>
 struct W8A16Sm90Gemm {
@@ -227,8 +366,9 @@ struct W8A16Sm90Gemm {
   static constexpr int kAlignD = 128 / cutlass::sizeof_bits<ElementD>::value;    // 8
 
   // D = alpha * acc + bias[row]; alpha is the per-tensor weight scale, bias is per M' (= N).
-  using FusionOp = cutlass::epilogue::fusion::LinCombPerRowBias<ElementD, ElementCompute, ElementBias,
-                                                                ElementD, float, kAlignD>;
+  using FusionOp =
+      cutlass::epilogue::fusion::LinCombPerRowBias<ElementD, ElementCompute, ElementBias, ElementD,
+                                                   float, kAlignD>;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, typename Cfg::TileShape,
@@ -244,7 +384,12 @@ struct W8A16Sm90Gemm {
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
       typename Cfg::MainloopSchedule>::CollectiveOp;
 
-  using TileSchedulerTag = std::conditional_t<kStreamK, cutlass::gemm::StreamKScheduler, void>;
+  // Plain persistent variants (cluster 1) run the grouped scheduler above; at group 1 it is
+  // CUTLASS's own order.
+  static constexpr bool kGrouped = !kStreamK && cute::size(typename Cfg::ClusterShape{}) == 1;
+  using TileSchedulerTag =
+      std::conditional_t<kStreamK, cutlass::gemm::StreamKScheduler,
+                         std::conditional_t<kGrouped, W8A16Sm90GroupedTileSchedulerTag, void>>;
   using GemmKernel =
       cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,
                                            CollectiveEpilogue, TileSchedulerTag>;
@@ -285,8 +430,11 @@ struct W8A16Sm90Gemm {
     // size is capped per problem because the scheduler pads the tile grid to it.
     const int tiles_w = (N + Cfg::kW - 1) / Cfg::kW;
     const int tiles_a = (M + Cfg::kA - 1) / Cfg::kA;
-    args.scheduler.max_swizzle_size = W8A16Sm90PickSwizzle(
-        tiles_w, tiles_a, cute::size<0>(typename Cfg::ClusterShape{}), W8A16Sm90SwizzleEnv());
+    args.scheduler.max_swizzle_size =
+        kGrouped
+            ? W8A16Sm90PickGroup(M, N, K, Cfg::kW, Cfg::kA)
+            : W8A16Sm90PickSwizzle(tiles_w, tiles_a, cute::size<0>(typename Cfg::ClusterShape{}),
+                                   W8A16Sm90SwizzleEnv());
     args.scheduler.raster_order = W8A16Sm90RasterEnv();
     if constexpr (kStreamK) {
       args.scheduler.decomposition_mode = W8A16Sm90StreamKModeEnv();
@@ -305,8 +453,7 @@ struct W8A16Sm90Gemm {
 
   static cudaError_t Run(const T* act, const __nv_fp8_e4m3* weight, const float* scale,
                          const T* bias, T* out, int M, int N, int K, void* workspace,
-                         size_t workspace_bytes, int device_id, int num_sms,
-                         cudaStream_t stream) {
+                         size_t workspace_bytes, int device_id, int num_sms, cudaStream_t stream) {
     auto args = MakeArguments(act, weight, scale, bias, out, M, N, K, device_id, num_sms);
     Gemm gemm;
     if (Gemm::get_workspace_size(args) > workspace_bytes) return cudaErrorInvalidValue;
@@ -337,7 +484,7 @@ constexpr int kW8A16Sm90MaxAlgoCode = 8;
 
 inline W8A16Sm90Algo W8A16Sm90AlgoFromCode(int code) {
   return (code >= 1 && code <= kW8A16Sm90MaxAlgoCode) ? static_cast<W8A16Sm90Algo>(code)
-                                                     : W8A16Sm90Algo::kAuto;
+                                                      : W8A16Sm90Algo::kAuto;
 }
 
 // FLASHINFER_W8A16_FP8_ALGO_SM90 = "hand" | "cutlass_128x256" | "cutlass_128x192" |
@@ -441,6 +588,35 @@ inline int W8A16Sm90PickSwizzle(int tiles_w, int tiles_a, int cluster_w, int max
   return 1;
 }
 
+// FLASHINFER_W8A16_FP8_SM90_GROUP = 0 (default: W8A16Sm90PickGroup's choice) | n >= 1: the
+// L2 group size of the grouped scheduler (tiles of the slow raster dimension per group).
+// Read on every call (a getenv per GEMM launch) so the benchmark can compare group sizes in
+// one process: CUDA-graph capture bakes the value in.  For benchmarking.
+inline int W8A16Sm90GroupEnv() {
+  const char* s = std::getenv("FLASHINFER_W8A16_FP8_SM90_GROUP");
+  const int n = (s != nullptr && *s != '\0') ? std::atoi(s) : 0;
+  return n > 0 ? n : 0;
+}
+
+// L2 group of the grouped scheduler (version H4, ncu locked-clock sweep of the 48 rows at
+// M = 44160 / 88320, Wed 14 Oct 2026): ungrouped, the 132 CTAs in flight cover ~one
+// activation tile and every activation tile re-reads the whole weight; that only matters once
+// the weight is a large share of the 50 MB L2.  N*K >= 40 MB: 4 activation tiles per group
+// when there are >= 64 weight tiles (und.q / gen.qkv / mlp.gate_up tp1, mlp.gate_up tp2:
+// DRAM reads 2.0-2.7x lower, 1-3% faster), else 2 (mlp.down tp1 / tp2, attn.out tp1).
+// Smaller weights stay ungrouped: there the group only adds activation re-reads (und.q tp4
+// 0.67 -> 0.87 GB at group 4).  M below 16384 stays ungrouped too: at M = 4096 / 8192 the
+// group cuts DRAM reads 20-30% but the time does not move (+-1%), so those rows keep H3's
+// exact schedule.
+inline int W8A16Sm90PickGroup(int M, int N, int K, int tile_w, int tile_a) {
+  if (const int g = W8A16Sm90GroupEnv()) return g;
+  const long long weight_bytes = 1LL * N * K;
+  const int tiles_w = (N + tile_w - 1) / tile_w;
+  (void)tile_a;
+  if (weight_bytes < 40LL * 1000 * 1000 || M < 16384) return 1;
+  return tiles_w >= 64 ? 4 : 2;
+}
+
 inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm90RasterEnv() {
   using R = cutlass::gemm::kernel::detail::RasterOrderOptions;
   static const R v = [] {
@@ -498,6 +674,10 @@ inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int alg
   if (N <= 512) {
     if (units <= 32 && M <= 4096) return W8A16Sm90Algo::kHand;
     if (waves < 0.75) return W8A16Sm90Algo::kCutlass128x128;
+    // Version H4: und.kv tp2-8 at M = 44160 / 88320 (2-4 weight tiles, 0.2-0.7 ms): the
+    // 128x192 tile is 0.93-1.03 of cuBLAS where 128x256 is 0.97-1.10 (free-running, 3
+    // interleaved rounds, Wed 14 Oct 2026).
+    if (M >= 16384) return W8A16Sm90Algo::kCutlass128x192;
     return W8A16Sm90Algo::kCutlass128x256;
   }
   if (waves <= 1.5) {
@@ -516,8 +696,8 @@ inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int alg
 // Workspace bytes of a CUTLASS variant (0 for the hand kernel: its own function sizes
 // its split-K partials).
 template <typename T>
-size_t W8A16Fp8GemmSm90CutlassWorkspaceBytes(W8A16Sm90Algo algo, int M, int N, int K,
-                                             int device_id, int num_sms) {
+size_t W8A16Fp8GemmSm90CutlassWorkspaceBytes(W8A16Sm90Algo algo, int M, int N, int K, int device_id,
+                                             int num_sms) {
   switch (algo) {
     case W8A16Sm90Algo::kCutlass128x256:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256>::WorkspaceBytes(M, N, K, device_id, num_sms);

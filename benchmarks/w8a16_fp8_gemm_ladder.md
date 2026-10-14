@@ -364,6 +364,145 @@ of both kernels on gen.qkv tp8 / mlp.gate_up tp8 / mlp.down tp4 M=88320 / gen.qk
 `swz_*` and `swz44_*` (the swizzle / raster probes), all under
 `/home/scratch.ishovkun_gpu/w8a16-results/hopper/`.
 
+### Version H4: large M, measured cleanly, and an L2 grouping that does not pad (Wed 14 Oct 2026)
+
+Phase 1 of H4 was the 48 rows at M = 44160 / 88320, where the free-running H3 sweep had
+`auto` at 1.05 / 1.02 of cuBLAS with single rows at 1.10-1.17 (und.kv tp1 44160 1.17, und.q
+tp4 44160 1.14, attn.out tp8 44160 1.10, mlp.gate_up tp1 44160 1.08, mlp.down tp4 88320
+1.13) while the locked-clock sweep had them all within 1-3%.  (The narrow-N / small-M work
+was parked half-way: see the end of this section.)
+
+**Most of those rows were the measurement.**  Two of the four H100s this ran on were not
+usable: ipp2-0720 and ipp2-0711 dropped off the PCIe bus mid-sweep (Xid 79, node needs a
+reboot), and s4124-0130 was thermally throttling hard enough to halve every number
+(`SW Thermal Slowdown` counter climbing, SM clock 435-1590 MHz under load, cuBLAS
+gen.qkv tp1 M=44160 at 13.1 ms instead of 6.4).  A bench pass on that node gave geomeans of
+1.14 / 1.12 with rows from 0.8 to 1.9, i.e. noise.  The usable node (s4124-0129) stays at
+1245-1665 MHz on the 700 W cap with no thermal events; and the bench got `--rounds R`: each
+row's implementations are timed R times in rotated order and the median taken, so the
+clock drifting under the power cap lands on every column alike instead of on whichever
+column happened to run hot.  With R = 3, two passes, the H3 dispatcher itself measures
+1.020 / 1.016 (column `cutlass_128x256`-equivalent rows below) and nothing scatters past
++-8%.  Clock: one implementation alone for ~4 s on mlp.down tp4 M=88320 (`h4p4_clock_*`):
+cuBLAS 1432-1504 MHz / 550-629 W, auto 1346-1414 MHz / 574-604 W, hand 1180-1440 MHz:
+the same power-capped clock band within its own run-to-run spread, so no row here is
+explained by energy per flop.
+
+**What was real, part 1: und.kv at TP 2-8 (N = 128-512).**  2-4 weight tiles x 173-345
+activation tiles; the 128x256 tile ran them at 1.06-1.10 of cuBLAS.  The 128x192 tile is
+0.93-1.03 on all six rows (`h4p4_kv_*`, 3 rounds): with so few weight tiles the run is
+bound by streaming the activation once, and a 192-row tile gives 33% more CTAs in the last
+wave (173 x 2 = 346 tiles of 256 rows = 2.62 waves; 230 x 2 = 460 tiles of 192 = 3.48).
+Dispatcher: N <= 512 and M >= 16384 -> 128x192.
+
+**What was real, part 2: L2 traffic (the Blackwell B15 lead).**  With swizzle 1 (H3's
+default, because CUTLASS's swizzle pads the tile grid) the 132 CTAs in flight walk ~132
+weight tiles of one or two activation tiles, so each activation tile re-reads the weight
+from HBM once it no longer fits in L2 next to the activation band.  ncu (locked clocks,
+counters only, `h4n_*`, `h4g_ncu_*`) agrees: DRAM bytes read per kernel, CUTLASS 128x256
+ungrouped vs cuBLAS:
+
+| row | cuBLAS | H3 (no group) | group 2 | group 4 | group 8 |
+|---|---|---|---|---|---|
+| mlp.gate_up tp1 M=44160 | 12.2 GB, 14.13 ms | 22.6 GB, 1.055x | 13.7 GB, 1.030x | **8.4 GB, 1.024x** | 9.9 GB, 1.032x |
+| mlp.gate_up tp1 M=88320 | 24.9 GB, 28.35 ms | 45.0 GB, 1.051x | 29.7 GB, 1.031x | **20.0 GB, 1.023x** | 25.9 GB, 1.033x |
+| und.q tp1 M=44160 | 4.2 GB, 4.49 ms | 5.2 GB, 1.037x | 4.5 GB, 1.029x | **3.1 GB, 1.022x** | 3.4 GB, 1.033x |
+| gen.qkv tp1 M=44160 | 7.1 GB, 5.78 ms | 8.1 GB, 1.013x | 5.3 GB, 0.999x | **3.7 GB, 0.992x** | 4.2 GB, 1.000x |
+| mlp.down tp1 M=44160 | 26.3 GB, 14.85 ms | 22.8 GB, 0.979x | **18.1 GB, 0.967x** | 18.5 GB, 0.974x | 29.3 GB, 1.009x |
+| und.q tp4 M=44160 | 0.93 GB, 1.08 ms | **0.67 GB, 1.013x** | 0.76 GB, 1.020x | 0.87 GB, 1.029x | 1.13 GB, 1.041x |
+| attn.out tp8 M=44160 | 0.21 GB, 0.59 ms | **0.10 GB, 1.033x** | 0.12 GB | 0.14 GB | 0.16 GB, 1.043x |
+
+The 10 MB weight of und.q tp4 already stays in L2; there the group only makes the
+activation re-read, and that row's H3 "1.14" was the noise above (1.01 measured cleanly,
+ncu 1.013).  Same for attn.out tp8: H3 already reads half of cuBLAS's bytes, the remaining
+3-5% is not memory.  Where the weight is >= 40 MB (und.q / gen.qkv / mlp.gate_up / mlp.down /
+attn.out tp1, mlp.gate_up / mlp.down tp2), a group of 4 activation tiles cuts DRAM reads
+1.6-2.7x and buys 1-3% of time; 2 is the better size for the 40-weight-tile shapes (N =
+5120) and 8 is worse than 4 everywhere (an 8-tile activation band, 8 x 256 x K x 2 B = 21 MB
+at K = 5120, crowds the weight out of L2 again).  The time win is small because these
+kernels run at 720-750 TFLOP/s already and HBM was never the bound; it is the traffic (and
+the HBM energy under the power cap) that moves.
+
+**The scheduler** (`W8A16Sm90GroupedTileScheduler` in `w8a16_fp8_gemm_sm90_cutlass.cuh`,
+selected by a tag through CUTLASS's `TileSchedulerSelector`): a subclass of CUTLASS's sm90
+persistent scheduler that keeps its swizzle at 1 (so grid size, work count and everything
+the kernel asks of the scheduler are CUTLASS's own, no padding) and replaces only the
+linear-index -> (weight tile, activation tile) map: groups of G activation tiles, the
+weight tiles walked inside a group, and the last group narrower instead of padded (the
+hand kernel's rasterisation).  G = 1 is CUTLASS's order exactly.  All plain cluster-1
+variants use it; the stream-K variants keep CUTLASS's scheduler.  `W8A16Sm90PickGroup`:
+G = 4 if N*K >= 40 MB and >= 64 weight tiles, G = 2 if N*K >= 40 MB otherwise, 1 below 40
+MB or at M < 16384 (at M = 4096 / 8192 the group cuts reads 20-30% but the time moves
++-1%, so those rows keep the H3 schedule bit for bit).  Env `FLASHINFER_W8A16_FP8_SM90_GROUP`
+overrides it, read per call so `--algo auto@g<n>` columns compare group sizes in one
+process.
+
+**Raster per shape** (option c of the brief) was not pursued: with the weight grouped the
+`n` raster would only stream the activation instead, which is the 2x loss H3 already
+documented.
+
+Result, free-running, CUPTI, L2 flushed, `--rounds 3`, two passes on s4124-0129, ratio to
+the cuBLAS measured in the same rounds (`h4_conf_p{1,2}_r*.csv`).  "H3 sweep" is the
+single-pass freeH3 column the brief started from (a different node).  "H3 rule, this node"
+is the H3 choice re-measured here: the `auto@g1` column (same tiles as H3, grouping off),
+and on und.kv tp2-8 the `cutlass_128x256` column (H3's tile there; group 1 on those rows).
+Each H4 change on its own: the tile change shows in `auto@g1` on und.kv, the grouping in
+`auto` vs `auto@g1` elsewhere.
+
+| row | M | H3 sweep | H3 rule, this node | **H4 auto** | hand |
+|---|---|---|---|---|---|
+| und.kv tp1 | 44160 | 1.17 | 1.02 | 1.00 | 1.00 |
+| und.kv tp2 | 44160 | 1.08 | 1.10 | **0.95** | 1.12 |
+| und.kv tp8 | 44160 | 1.13 | 1.08 | **1.00** | 1.09 |
+| und.kv tp2 | 88320 | 1.09 | 1.06 | **1.00** | 1.06 |
+| und.kv tp4 | 88320 | 1.06 | 1.09 | **0.98** | 1.18 |
+| und.q tp4 | 44160 | 1.14 | 1.02 | 1.01 | 1.00 |
+| und.q tp8 | 44160 | 1.11 | 0.99 | 1.00 | 0.99 |
+| attn.out tp8 | 44160 | 1.10 | 1.04 | 1.05 | 1.04 |
+| mlp.gate_up tp1 | 44160 | 1.08 | 1.06 | **1.03** | 1.01 |
+| mlp.gate_up tp1 | 88320 | 1.04 | 1.07 | **1.03** | 1.03 |
+| mlp.gate_up tp2 | 44160 | 1.07 | 1.04 | **1.00** | 0.99 |
+| mlp.gate_up tp2 | 88320 | 1.05 | 1.07 | **1.05** | 1.04 |
+| mlp.down tp4 | 88320 | 1.13 | 1.05 | 1.02 | 1.06 |
+| attn.out tp2 | 88320 | 1.11 | 1.00 | 1.04 | 1.04 |
+
+| M | H3 rule / cuBLAS (this node) | **H4 auto** | hand (v37) |
+|---|---|---|---|
+| 44160 | 1.022 | **1.009** | 1.021 |
+| 88320 | 1.014 | **1.003** | 1.024 |
+
+So the "1.10-1.17" rows split three ways: und.q tp4 / tp8, und.kv tp1, mlp.down tp4,
+attn.out tp2 were the old node's clock (1.00-1.05 here with the H3 code); und.kv tp2-8 were
+real and are fixed by the 128x192 tile (6-11%); mlp.gate_up tp1 / tp2 were real and are the
+L2 traffic, fixed partly by the grouping (3-4%; the ncu table above says the remaining
+2-3% is not DRAM).  Rows over 1.04 left: attn.out tp8 44160 (1.05; ncu 1.033 with half of
+cuBLAS's DRAM reads: a 0.6 ms kernel, the wave tail of 40 x 173 tiles on 132 SMs, not
+memory), gen.qkv tp4 44160 (1.05, ncu 1.02), mlp.gate_up tp2 88320 (1.05, the same in every
+column incl. hand), attn.out tp2 88320 (1.04, 1.00 at group 1 in this run, 1.01-1.04 at
+group 2 under ncu: within the spread).  Nothing got slower beyond +-4% single-row scatter.
+
+Whole grid after the change (one free-running pass at M <= 8192 with 2 rounds, `h4_grid_*`;
+M <= 8192 rows run the H3 code paths unchanged): 1.149 / 1.077 / 1.037 / 1.018 for M =
+1024-8192 against 1.146 / 1.073 / 1.026 / 1.007 in the freeH3 sweep, the same within this
+node-to-node spread.
+
+**Parked: narrow N / small M** (`~/code/worktrees/flashinfer/h4-parked/`, a patch plus
+the M = 1024 / 2048 sweep).  Tried 128x64 (cooperative), 64x128 and 64x64 (ping-pong), and
+plain split-K through the stream-K scheduler (`DecompositionMode::SplitK`) on 128x64 /
+128x128 / 128x256.  Small tiles lose 1.5-2.5x on wide N (the register-sourced conversion
+per activation tile again); 64x128 is the one that wins rows: und.q tp8 and und.kv tp1 at
+M=1024 (1.38 -> 1.11 and 1.36 -> 1.07 of cuBLAS) and und.kv tp2 at M=2048 (1.36 -> 1.09).
+CUTLASS's split-K does not: 24-45 us where the hand kernel's split-K + reduce takes 14 us
+(und.kv tp8 M=1024); its reduction runs serially through the workspace and the deterministic
+mode serialises the peers.  gen.qkv tp8 (N=1280) at M <= 2048 stays at 1.24-1.52 with
+nothing on the menu better than the hand kernel.
+
+Results: `h4n_*` (ncu, 48 rows x groups 1/2/4/8), `h4g_ncu_*` (ncu incl. group 16 and
+hand on 7 rows), `h4p4_*` (und.kv tiles, mlp.down groups, clock-alone runs),
+`h4_conf_*` (the table), `h4_grid_*` (whole grid), `h4f_*`, `h4m_*` (M = 4096 / 8192 group
+counters), `h4_probe_r{1024,2048}.csv` (the parked small-M sweep), under
+`/home/scratch.ishovkun_gpu/w8a16-results/hopper/`.
+
 ## Why not the Hopper design
 
 tcgen05.mma takes both operands from shared memory (or A from TMEM), so the fp8 -> bf16
