@@ -696,6 +696,12 @@ inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int alg
     if (M >= 16384) return W8A16Sm90Algo::kCutlass128x192;
     return W8A16Sm90Algo::kCutlass128x256;
   }
+  // Version H4: short K at large M (attn.out tp8, K = 1024: 16 k-tiles per tile) -> the
+  // 64x256 ping-pong tile, whose two tiles in flight per SM hide the epilogue behind the
+  // short mainloop: 0.94-0.99 / 0.97 of cuBLAS at M = 44160 / 88320 vs 1.00-1.02 for 128x256
+  // (5 interleaved rounds).  At K >= 2048 it loses 6-23%.  The weight is small here, so
+  // W8A16Sm90PickGroup leaves it ungrouped.
+  if (K <= 1024 && M >= 16384) return W8A16Sm90Algo::kCutlass64x256;
   if (waves <= 1.5) {
     if (K >= 4096 && waves >= 0.7) return W8A16Sm90Algo::kCutlass128x256StreamK;
     if (N <= 2048 || K <= 3200) return W8A16Sm90Algo::kCutlass64x256;

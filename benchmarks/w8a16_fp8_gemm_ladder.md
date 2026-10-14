@@ -514,6 +514,31 @@ stays (no cost, matches CUTLASS); `is_last_tile` now only compares the next inde
 the work count instead of running the map.  The grouping itself is confirmed: G = 4 is
 4-5% under every G = 1 column on the four gate_up rows, in the same process.
 
+**Floor check of the rows still above 1.04, and one dispatcher miss.**  Each pinned to
+128x256 / 64x256 / 128x192 at group 1 / 2 / 4 and to 128x256 stream-K, 5 interleaved
+rounds (`h4fl_*`, `h4fl2_*`):
+
+* gen.qkv tp4 44160: auto 1.024, best 128x192 at group 1 0.989; a two-pass repeat gives
+  1.01 vs 1.00.  Nothing beats auto by more than 3%: a floor.
+* mlp.gate_up tp2 88320: auto (group 4) 1.020, group 2 1.008 (the order flips between runs),
+  stream-K 1.045, 128x192 1.08-1.12, 64x256 1.31-1.65.  A floor.
+* attn.out tp8 (N = 5120, K = 1024): the 64x256 ping-pong tile, ungrouped, beats 128x256 in
+  every run: 0.94 / 0.99 vs 1.00 / 1.01 at M = 44160, 0.97 vs 1.02 at 88320.  16 k-tiles per
+  tile is a short mainloop, and two tiles in flight per SM hide the epilogue behind it.  It
+  does not carry to longer K: 6-23% worse on attn.out / mlp.down / gen.qkv tp2 / tp4 and
+  mlp.down tp8 (K = 2048-12800), a tie on attn.out tp4 (K = 2048).  Dispatcher: K <= 1024 and
+  M >= 16384 -> 64x256 (the weight is 5 MB, so it stays ungrouped); of the 48 large-M rows
+  only attn.out tp8 matches.
+
+Re-confirm with the rule (`h4c2_*`, 48 rows, `--rounds 3`, two passes): geomean auto /
+cuBLAS 1.008 / 1.008 at M = 44160 / 88320 (128x256 pinned 1.018 / 1.007, hand 1.026 /
+1.020).  attn.out tp8: 0.96 / 0.96 at 44160 (128x256 in the same rounds 1.02 / 1.04), 1.06 /
+1.01 at 88320 (1.17 / 0.99), and 1.01 vs 1.11 in a 5-round repeat.  Six rows moved by more
+than 3% against the previous confirm (gen.qkv tp2 44160, mlp.down tp2 44160 / 88320,
+attn.out tp4 44160, und.q tp4 88320, gen.qkv tp8 88320) although their code path did not
+change (the new rule does not fire on them); a 5-round, two-pass repeat (`h4c3_*`) puts all
+six at 0.98-1.02, equal to 128x256 pinned in the same rounds: run-to-run spread at 3 rounds.
+
 **Parked: narrow N / small M** (`~/code/worktrees/flashinfer/h4-parked/`, a patch plus
 the M = 1024 / 2048 sweep).  Tried 128x64 (cooperative), 64x128 and 64x64 (ping-pong), and
 plain split-K through the stream-K scheduler (`DecompositionMode::SplitK`) on 128x64 /
