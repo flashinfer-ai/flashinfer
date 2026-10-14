@@ -37,7 +37,9 @@ def warmup_jit():
     yield
 
 
-@pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
+@pytest.mark.parametrize(
+    "dim", [128, 256, 512, 855, 1710, 2048, 3420, 4096, 11008, 16384]
+)
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])
 @pytest.mark.parametrize("enable_pdl", [True, False])
@@ -51,7 +53,9 @@ def test_fused_silu_mul(dim, batch_size, seq_len, enable_pdl):
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
+@pytest.mark.parametrize(
+    "dim", [128, 256, 512, 855, 1710, 2048, 3420, 4096, 11008, 16384]
+)
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])
 @pytest.mark.parametrize("enable_pdl", [True, False])
@@ -65,7 +69,9 @@ def test_fused_gelu_tanh_mul(dim, batch_size, seq_len, enable_pdl):
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
+@pytest.mark.parametrize(
+    "dim", [128, 256, 512, 855, 1710, 2048, 3420, 4096, 11008, 16384]
+)
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])
 @pytest.mark.parametrize("enable_pdl", [True, False])

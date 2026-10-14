@@ -1880,11 +1880,12 @@ __device__ inline RegColWiseVec loadGmemColWiseVecWithDup(ShmQWiseVec const& gme
   for (uint32_t i = 0; i < exactDiv(ShmQWiseVec::size, gmma::instNBase); i++) {
     static_assert(nbThrdsPerInstNBase * RegColWiseVec::size ==
                   exactDiv(ShmQWiseVec::size, GmmaAccCoreMat::cols));
-    uint32_t const clampedIdx = mha::min(i * nbThrdsPerInstNBase + idx, bound);
-    uint32_t const baseOffset = clampedIdx * GmmaAccCoreMat::cols;
+    uint32_t const baseOffset = (i * nbThrdsPerInstNBase + idx) * GmmaAccCoreMat::cols;
 #pragma unroll
     for (uint32_t j = 0; j < GmmaAccCoreMat::cols; j++) {
-      ret[i][j] = gmemVec[baseOffset + j];
+      // Clamp per element: `bound` is the max valid element index and the gmem vector holds only
+      // bound+1 floats (< ShmQWiseVec::size). Padding lanes duplicate the last valid element.
+      ret[i][j] = gmemVec[mha::min(baseOffset + j, bound)];
     }
   }
   return ret;

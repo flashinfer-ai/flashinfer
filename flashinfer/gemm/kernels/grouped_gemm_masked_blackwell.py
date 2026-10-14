@@ -55,8 +55,6 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass._mlir.dialects import llvm
 from flashinfer.utils import get_compute_capability
-from flashinfer.api_logging import flashinfer_api
-from flashinfer.trace.templates.gemm import grouped_gemm_nt_masked_trace
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
@@ -313,44 +311,49 @@ class MaskedScheduler:
         ]
         accum_tile_m = self._accum_tile_m
         batch_idx = self._current_batch_idx
+        num_batches = self.params.masked_m.shape[0]
 
-        while (
-            (
-                accum_tile_m
-                + cute.ceil_div(
-                    self.params.masked_m[batch_idx],
-                    self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
-                )
-            )
-            * num_tiles_n
-            <= current_work_linear_idx
-            and batch_idx < self.params.masked_m.shape[0]
-        ):
-            if cutlass.const_expr(
-                (dsm_pending_packed is not None)
-                and (self.params.dst_signals is not None)
-            ):
-                dsm_pending_packed = with_byte(
-                    dsm_pending_packed,
-                    index=batch_idx,
-                    value=dsm_counter + (num_c_stage - 1),
-                )
-
-            accum_tile_m += cute.ceil_div(
+        # NOTE: `masked_m[batch_idx]` must only be read under a control-flow
+        # guard that `batch_idx` is in bounds. A combined condition like
+        # `masked_m[batch_idx] ... and batch_idx < num_batches` is NOT safe:
+        # dynamic `and` in the DSL may evaluate both operands (no Python
+        # short-circuit), so `masked_m[num_batches]` could be read
+        # out-of-bounds once all batches are consumed, causing illegal
+        # memory access (CUDA error 700).
+        keep_running = batch_idx < num_batches
+        while keep_running:
+            num_tiles_m_cur = cute.ceil_div(
                 self.params.masked_m[batch_idx],
                 self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
             )
-            batch_idx += Int32(1)
+            if (accum_tile_m + num_tiles_m_cur) * num_tiles_n <= (
+                current_work_linear_idx
+            ):
+                if cutlass.const_expr(
+                    (dsm_pending_packed is not None)
+                    and (self.params.dst_signals is not None)
+                ):
+                    dsm_pending_packed = with_byte(
+                        dsm_pending_packed,
+                        index=batch_idx,
+                        value=dsm_counter + (num_c_stage - 1),
+                    )
+
+                accum_tile_m += num_tiles_m_cur
+                batch_idx += Int32(1)
+                keep_running = batch_idx < num_batches
+            else:
+                keep_running = cutlass.Boolean(False)
 
         self._accum_tile_m = accum_tile_m
         self._current_batch_idx = batch_idx
 
-        is_valid = self._current_batch_idx < self.params.masked_m.shape[0]
+        is_valid = batch_idx < num_batches
         if is_valid:
             is_valid = (
-                self._accum_tile_m
+                accum_tile_m
                 + cute.ceil_div(
-                    self.params.masked_m[self._current_batch_idx],
+                    self.params.masked_m[batch_idx],
                     self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
                 )
             ) * num_tiles_n > current_work_linear_idx
@@ -361,14 +364,14 @@ class MaskedScheduler:
         if cutlass.const_expr(is_swap_ab):
             cur_cluster_coord = (
                 current_work_linear_idx % num_tiles_n,
-                current_work_linear_idx // num_tiles_n - self._accum_tile_m,
-                self._current_batch_idx,
+                current_work_linear_idx // num_tiles_n - accum_tile_m,
+                batch_idx,
             )
         else:
             cur_cluster_coord = (
-                current_work_linear_idx // num_tiles_n - self._accum_tile_m,
+                current_work_linear_idx // num_tiles_n - accum_tile_m,
                 current_work_linear_idx % num_tiles_n,
-                self._current_batch_idx,
+                batch_idx,
             )
 
         # cur_tile_coord is a tuple of i32 values
@@ -653,7 +656,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
         """
-        supported_sm_versions = ["sm_100", "sm_103"]
+        supported_sm_versions = ["sm_100", "sm_103", "sm_107"]
         assert sm_version in supported_sm_versions, (
             f"{supported_sm_versions} are the only supported SM versions for cute-dsl backend, but encountered {sm_version}"
         )
@@ -3500,8 +3503,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     return tensor_api
 
 
-@flashinfer_api(trace=grouped_gemm_nt_masked_trace)
-def grouped_gemm_nt_masked(
+def _grouped_gemm_nt_masked_sm100(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
@@ -3524,7 +3526,11 @@ def grouped_gemm_nt_masked(
     is_swap_ab: bool = False,
     **kwargs,
 ):
-    r"""Masked, batched, block-scaled GEMM on Blackwell SM100.
+    """
+    SM100/SM103 (Blackwell) implementation of masked grouped GEMM.
+
+    This is the arch-specific implementation; use ``grouped_gemm_nt_masked``
+    from ``grouped_gemm_masked_wrapper`` as the public entry point.
 
     Executes a masked, batched matrix multiplication with scale factors and
     optional per-batch alpha scaling on the output.  ``alpha`` is currently
@@ -3747,3 +3753,14 @@ def grouped_gemm_nt_masked(
         barrier_flag_local_tensor_gpu=barrier_flag_local,
         barrier_flag_multicast_tensor_gpu=barrier_flag_multicast,
     )
+
+
+# Backwards compatibility: ``grouped_gemm_nt_masked`` used to live in this module
+# and moved to ``grouped_gemm_masked_wrapper`` when SM107 support was added, since
+# it now dispatches on compute capability rather than being Blackwell-specific.
+# Re-exported here so the previous import path keeps working; prefer importing it
+# from ``flashinfer.gemm``. The import is deferred to module scope only (the
+# wrapper does not import this module at import time), so it introduces no cycle.
+from .grouped_gemm_masked_wrapper import (  # noqa: E402
+    grouped_gemm_nt_masked as grouped_gemm_nt_masked,
+)

@@ -2,7 +2,13 @@ from .gemm_base import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm_base import bmm_bf16 as bmm_bf16
 from .gemm_base import bmm_fp8 as bmm_fp8
 from .gemm_base import bmm_mxfp8 as bmm_mxfp8
+from .gemm_base import gemm_alpha_beta as gemm_alpha_beta
+from .gemm_base import masked_bmm as masked_bmm
+from .gemm_base import masked_scaled_bmm as masked_scaled_bmm
 from .gemm_base import mm_bf16 as mm_bf16
+from .gemm_base import ragged_bmm as ragged_bmm
+from .gemm_base import ragged_block_scaled_bmm as ragged_block_scaled_bmm
+from .gemm_base import ragged_scaled_bmm as ragged_scaled_bmm
 from .gemm_base import mm_fp4 as mm_fp4
 from .gemm_base import mm_fp8 as mm_fp8
 from .gemm_base import mm_mxfp8 as mm_mxfp8
@@ -21,42 +27,117 @@ from .gemm_base import (
 from .gemm_base import gemm_fp8_nt_blockscaled as gemm_fp8_nt_blockscaled
 from .gemm_base import gemm_fp8_nt_groupwise as gemm_fp8_nt_groupwise
 from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwise
+from .gemm_base import (
+    group_gemm_fp8_nt_groupwise_contiguous as group_gemm_fp8_nt_groupwise_contiguous,
+)
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
+from .cake_grouped_fp8_gemm import (
+    PreparedGroupGemmFp8NtGroupwiseContiguous as PreparedGroupGemmFp8NtGroupwiseContiguous,
+)
+from .cake_grouped_fp8_gemm import (
+    prepare_group_gemm_fp8_nt_groupwise_contiguous as prepare_group_gemm_fp8_nt_groupwise_contiguous,
+)
+from .cake_grouped_fp8_fused_silu_quant import (
+    PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant as PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant,
+)
+from .cake_grouped_fp8_fused_silu_quant import (
+    prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant as prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant,
+)
+from .cake_batch_deepgemm_fp8 import (
+    PreparedBatchDeepGemmFp8NtGroupwise as PreparedBatchDeepGemmFp8NtGroupwise,
+)
+from .cake_batch_deepgemm_fp8 import (
+    prepare_batch_deepgemm_fp8_nt_groupwise as prepare_batch_deepgemm_fp8_nt_groupwise,
+)
+from .kimi_k3_fp8_projection import (
+    allocate_kimi_k3_fp8_projection_workspace as allocate_kimi_k3_fp8_projection_workspace,
+)
+from .kimi_k3_fp8_projection import kimi_k3_fp8_projection as kimi_k3_fp8_projection
+from .kimi_k3_fp8_projection import (
+    kimi_k3_fp8_projection_launcher as kimi_k3_fp8_projection_launcher,
+)
+from .kimi_k3_fp8_projection import (
+    prepare_kimi_k3_fp8_projection as prepare_kimi_k3_fp8_projection,
+)
+from .kimi_k3_fp8_projection import (
+    prepare_kimi_k3_fp8_projection_weights as prepare_kimi_k3_fp8_projection_weights,
+)
 
 from .gemm_bf16_fp4 import (
     mm_bf16_fp4 as mm_bf16_fp4,
     prepare_bf16_fp4_weights as prepare_bf16_fp4_weights,
 )
 
+from .gemm_svdquant import (
+    mm_nvfp4_svdquant as mm_nvfp4_svdquant,
+    nvfp4_quantize_smooth as nvfp4_quantize_smooth,
+    svdquant_linear as svdquant_linear,
+)
+
+# Dense PrimsTS FP8/NVFP4 GEMMs are imported lazily enough that installations
+# without the experimental CuTe DSL can still import flashinfer.gemm.  The DSL
+# is required only when one of these APIs is launched.
+from ..prims_ts.gemm import fp4_linear as fp4_linear
+from ..prims_ts.gemm import fp4_linear_swiglu as fp4_linear_swiglu
+from ..prims_ts.gemm import fp4_qkv_qknorm_rope as fp4_qkv_qknorm_rope
+from ..prims_ts.gemm import fp8_linear as fp8_linear
+from ..prims_ts.gemm import fp8_linear_swiglu as fp8_linear_swiglu
+from ..prims_ts.gemm import fp8_qkv_qknorm_rope as fp8_qkv_qknorm_rope
+
 from .routergemm import (
     mm_M1_16_K6144_N256 as mm_M1_16_K6144_N256,
     mm_M1_16_K7168_N128 as mm_M1_16_K7168_N128,
     mm_M1_16_K7168_N256 as mm_M1_16_K7168_N256,
+    mm_M1_16_K7168_N256_bf16 as mm_M1_16_K7168_N256_bf16,
+    mm_M1_16_K7168_N384 as mm_M1_16_K7168_N384,
+    mm_M1_16_K7168_N384_bf16 as mm_M1_16_K7168_N384_bf16,
+    mm_M1_16_K7168_N896 as mm_M1_16_K7168_N896,
+    mm_M1_16_K7168_N896_bf16 as mm_M1_16_K7168_N896_bf16,
     tinygemm_bf16 as tinygemm_bf16,
 )
 
 # Import CuTe-DSL kernels if available
 _cute_dsl_kernels = []
 try:
-    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.cute_dsl.availability import (
+        is_cute_dsl_available,
+        is_rubin_cute_dsl_available,
+    )
 
     if is_cute_dsl_available():
-        from .kernels.grouped_gemm_masked_blackwell import (
+        from .kernels.grouped_gemm_masked_wrapper import (
             grouped_gemm_nt_masked as grouped_gemm_nt_masked,
+        )
+        from .kernels.grouped_gemm_masked_blackwell import (
             Sm100BlockScaledPersistentDenseGemmKernel as Sm100BlockScaledPersistentDenseGemmKernel,
             create_scale_factor_tensor as create_scale_factor_tensor,
+        )
+        from .kernels.cute_dsl.low_latency_blockscaled_gemm import (
+            LowLatencyBlockscaledGemmKernel as LowLatencyBlockscaledGemmKernel,
         )
 
         _cute_dsl_kernels = [
             "grouped_gemm_nt_masked",
             "Sm100BlockScaledPersistentDenseGemmKernel",
             "create_scale_factor_tensor",
+            "LowLatencyBlockscaledGemmKernel",
         ]
+
+        # The SM107 kernel imports cutlass.utils.rubin_helpers at module scope,
+        # which only exists from CuTe DSL 4.8. Gate it separately and extend the
+        # export list incrementally: sharing the try/except above would let an
+        # older DSL take the Blackwell exports down with it.
+        if is_rubin_cute_dsl_available():
+            from .kernels.grouped_gemm_masked_rubin import (
+                Sm107BlockScaledPersistentDenseGemmKernel as Sm107BlockScaledPersistentDenseGemmKernel,
+            )
+
+            _cute_dsl_kernels.append("Sm107BlockScaledPersistentDenseGemmKernel")
 except ImportError:
     pass
 
 try:
-    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
     if is_cute_dsl_available():
         from .kernels.dense_blockscaled_gemm_sm120_b12x import (
@@ -105,12 +186,35 @@ __all__ = (
         "gemm_fp8_nt_blockscaled",
         "gemm_fp8_nt_groupwise",
         "group_gemm_fp8_nt_groupwise",
+        "group_gemm_fp8_nt_groupwise_contiguous",
+        "prepare_group_gemm_fp8_nt_groupwise_contiguous",
+        "PreparedGroupGemmFp8NtGroupwiseContiguous",
+        "prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant",
+        "PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant",
+        "prepare_batch_deepgemm_fp8_nt_groupwise",
+        "PreparedBatchDeepGemmFp8NtGroupwise",
+        "allocate_kimi_k3_fp8_projection_workspace",
+        "kimi_k3_fp8_projection",
+        "kimi_k3_fp8_projection_launcher",
+        "prepare_kimi_k3_fp8_projection",
+        "prepare_kimi_k3_fp8_projection_weights",
         "fp8_blockscale_gemm_sm90",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
+        "fp8_linear",
+        "fp8_linear_swiglu",
+        "fp8_qkv_qknorm_rope",
+        "fp4_linear",
+        "fp4_linear_swiglu",
+        "fp4_qkv_qknorm_rope",
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
         "mm_M1_16_K7168_N256",
+        "mm_M1_16_K7168_N256_bf16",
+        "mm_M1_16_K7168_N384",
+        "mm_M1_16_K7168_N384_bf16",
+        "mm_M1_16_K7168_N896",
+        "mm_M1_16_K7168_N896_bf16",
         "tinygemm_bf16",
     ]
     + _cute_dsl_kernels

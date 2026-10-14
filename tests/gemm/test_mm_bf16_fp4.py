@@ -46,7 +46,7 @@ def _dequantize_bf16_fp4_torch(b, b_descale, alpha, n, k, block_size):
 
 # Backends covered by the cross-backend contract tests.  New backends get
 # appended here as they land.
-ALL_BACKENDS = ["cudnn", "cute-dsl"]
+ALL_BACKENDS = ["cudnn", "cute-dsl", "cute-dsl-native"]
 
 
 def _skip_if_backend_unavailable(backend: str) -> None:
@@ -83,6 +83,7 @@ PROBLEM_SIZES = [
     (4, 256, 512),
     (16, 256, 256),
     # mid: typical decode at a few model widths
+    (1, 512, 2048),  # small-n decode: the fallback's static split-K region
     (1, 1024, 1024),
     (4, 1024, 1024),
     (16, 1024, 1024),
@@ -270,6 +271,248 @@ def test_backend_out_dtype_override(backend):
     assert out.dtype == torch.float16
 
 
+@pytest.mark.parametrize("m,n,k", [(1, 2048, 7168), (16, 10304, 2688)])
+def test_cute_dsl_every_tactic_matches_reference(m, n, k):
+    """Every enumerated cute-dsl tactic matches the reference and is
+    run-to-run deterministic (the autotuner only exercises the winner).
+    Shapes cover even and uneven K splits plus padded M rows."""
+    _skip_if_backend_unavailable("cute-dsl")
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+        _SM100_BF16_FP4_TACTICS,
+        _bf16_fp4_cute_dsl_tactic_configs,
+        _cute_dsl_bf16_fp4_runner,
+        _cute_dsl_sm100_bf16_fp4_runner,
+        _prepare_bf16_fp4_alpha,
+    )
+    from flashinfer.utils import get_device_sm_count
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cute-dsl"
+    )
+
+    weight_fp32 = _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
+    ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
+
+    cc_major = get_compute_capability(device)[0]
+    if cc_major == 10:
+        runner = _cute_dsl_sm100_bf16_fp4_runner(enable_pdl=True)
+        tactics = tuple(enumerate(_SM100_BF16_FP4_TACTICS))
+        sf_for_launch = sf_p
+    else:
+        runner = _cute_dsl_bf16_fp4_runner(enable_pdl=True)
+        tactics = tuple(
+            enumerate(
+                _bf16_fp4_cute_dsl_tactic_configs(n, k, get_device_sm_count(device))
+            )
+        )
+        sf_for_launch = sf_p.view(torch.uint8).contiguous()
+
+    alpha_l = _prepare_bf16_fp4_alpha(alpha_p, device)
+    for tactic_index, cfg in tactics:
+        if cc_major == 12 and cfg[7] == "gemv" and m != 1:
+            continue
+        tactic = cfg if cc_major == 10 else tactic_index
+        outs = []
+        for _ in range(2):
+            out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+            runner.forward(
+                [a, b_p, sf_for_launch, alpha_l, torch.bfloat16, out, 16],
+                tactic=tactic,
+            )
+            outs.append(out)
+        torch.cuda.synchronize()
+        _assert_close_to_reference(
+            outs[0], ref, f"cute-dsl tactic {tactic_index} {cfg}"
+        )
+        assert torch.equal(outs[0], outs[1]), (
+            f"tactic {tactic_index} {cfg} is not deterministic across runs"
+        )
+
+
+def test_cute_dsl_gemv_fp16_out():
+    """The m=1 stream GEMV honors fp16 output (compiled per c_dtype, so the
+    bf16-only every-tactic test doesn't cover it)."""
+    _skip_if_backend_unavailable("cute-dsl")
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+        _bf16_fp4_cute_dsl_tactic_configs,
+        _cute_dsl_bf16_fp4_runner,
+        _prepare_bf16_fp4_alpha,
+    )
+    from flashinfer.utils import get_device_sm_count
+
+    device = torch.device("cuda")
+    m, n, k = 1, 2048, 7168
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cute-dsl"
+    )
+    ref = (a.float() @ _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16).T).to(
+        torch.float16
+    )
+
+    if get_compute_capability(device)[0] != 12:
+        pytest.skip("the stream GEMV is offered on SM12x only")
+    runner = _cute_dsl_bf16_fp4_runner(enable_pdl=True)
+    sf_u8 = sf_p.view(torch.uint8).contiguous()
+    alpha_l = _prepare_bf16_fp4_alpha(alpha_p, device)
+    gemv = [
+        i
+        for i, c in enumerate(
+            _bf16_fp4_cute_dsl_tactic_configs(n, k, get_device_sm_count(device))
+        )
+        if c[7] == "gemv"
+    ]
+    assert gemv, "expected gemv tactics for this shape"
+    for tactic in gemv:
+        out = torch.empty((m, n), device=device, dtype=torch.float16)
+        runner.forward([a, b_p, sf_u8, alpha_l, torch.float16, out, 16], tactic=tactic)
+        torch.cuda.synchronize()
+        assert out.dtype == torch.float16
+        _assert_close_to_reference(out, ref, f"cute-dsl gemv fp16 tactic {tactic}")
+
+
+def test_cute_dsl_fallback_gemv_selector():
+    """Pin the m=1 gemv fallback: expected picks are the measured-best
+    splits on 84/188-SM parts for the Qwen decode shapes."""
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import _select_bf16_fp4_gemv_split
+
+    assert _select_bf16_fp4_gemv_split(34816, 5120, 12, 84) == 4
+    assert _select_bf16_fp4_gemv_split(34816, 5120, 12, 188) == 7
+    assert _select_bf16_fp4_gemv_split(5120, 17408, 12, 84) == 21
+    assert _select_bf16_fp4_gemv_split(5120, 17408, 12, 188) == 47
+    # lm_head is wide enough to hit the target unsplit (the vLLM case).
+    assert _select_bf16_fp4_gemv_split(248320, 5120, 12, 84) == 1
+    assert _select_bf16_fp4_gemv_split(248320, 5120, 12, 188) == 1
+    # Non-SM12x, unpadded n, and starved grids stay on the MMA heuristic.
+    assert _select_bf16_fp4_gemv_split(34816, 5120, 10, 148) is None
+    assert _select_bf16_fp4_gemv_split(34800, 5120, 12, 84) is None
+    assert _select_bf16_fp4_gemv_split(64, 2048, 12, 84) is None
+
+
+def test_cute_dsl_fallback_gemv_matches_reference():
+    """tactic=-1 at m=1 routes through the gemv fallback; check its output."""
+    _skip_if_backend_unavailable("cute-dsl")
+    import flashinfer.gemm.gemm_bf16_fp4_cute_dsl as mod
+    from flashinfer.utils import get_device_sm_count
+
+    device = torch.device("cuda")
+    m, n, k = 1, 2048, 7168
+    cc_major = get_compute_capability(device)[0]
+    sm_count = get_device_sm_count(device)
+    if mod._select_bf16_fp4_gemv_split(n, k, cc_major, sm_count) is None:
+        pytest.skip("gemv fallback not offered on this device")
+
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cute-dsl"
+    )
+    ref = (a.float() @ _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16).T).to(
+        torch.bfloat16
+    )
+    runner = mod._cute_dsl_bf16_fp4_runner(enable_pdl=True)
+    sf_u8 = sf_p.view(torch.uint8).contiguous()
+    alpha_l = mod._prepare_bf16_fp4_alpha(alpha_p, device)
+    out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+    runner.forward([a, b_p, sf_u8, alpha_l, torch.bfloat16, out, 16], tactic=-1)
+    torch.cuda.synchronize()
+    _assert_close_to_reference(out, ref, "cute-dsl gemv fallback")
+
+
+def test_cute_dsl_fallback_k_splits_selector():
+    """Pin the no-autotune fallback's static split-K rule.
+
+    Expected picks mirror the autotuner's choices on 48/84/188-SM parts.
+    """
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+        _select_bf16_fp4_k_splits,
+        _select_bf16_fp4_tile_shape,
+    )
+
+    def pick(m, n, k, sm_count):
+        tile, _ = _select_bf16_fp4_tile_shape(m, n, k)
+        return _select_bf16_fp4_k_splits(m, n, k, tile, sm_count)
+
+    # Strong underfill: the chosen split scales with the SM count.
+    assert pick(1, 512, 2048, 48) == 4
+    assert pick(1, 512, 2048, 84) == 8
+    assert pick(1, 512, 4096, 188) == 8
+    assert pick(1, 1024, 4096, 48) == 2
+    assert pick(1, 1024, 4096, 84) == 4
+    # The pick never exceeds the K-tile count.
+    assert pick(1, 512, 512, 188) == 4
+    assert pick(1, 128, 128, 188) == 1
+    # Grids that already fill the GPU do not split.
+    assert pick(1, 2048, 2048, 48) == 1
+    assert pick(1, 2048, 4096, 84) == 1
+    assert pick(1, 4096, 512, 48) == 1
+    assert pick(1, 14336, 4096, 188) == 1
+    # tile_k=64 shapes split on their (32, 64, 64) base tile.
+    assert pick(1, 512, 2112, 84) == 8
+    # m > 16 picks larger tiles, which the tactic space never pairs with splits.
+    assert pick(64, 512, 2048, 84) == 1
+    assert pick(512, 512, 2048, 84) == 1
+
+
+def test_cute_dsl_sm100_fallback_tactic_selector():
+    """Pin the SM100/103 no-autotune tactic pick on a 148-SM part."""
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+        _SM100_BF16_FP4_TACTICS,
+        _select_sm100_bf16_fp4_default_tactic,
+    )
+
+    tactics = list(_SM100_BF16_FP4_TACTICS)
+
+    def pick(m, n, sm_count=148):
+        return _select_sm100_bf16_fp4_default_tactic(tactics, m, n, sm_count)
+
+    # The row tile widens with m.
+    assert pick(1, 4096)[0][:2] == (128, 8)
+    assert pick(128, 4096)[0][:2] == (128, 32)
+    assert pick(512, 4096)[0][:2] == (128, 128)
+    assert pick(2048, 4096)[0][:2] == (128, 128)
+    # ...and is monotonically non-decreasing in m, for each projection.
+    for n in (4096, 6656, 19968):
+        widths = [pick(m, n)[0][1] for m in (1, 8, 32, 128, 512, 2048, 4096)]
+        assert widths == sorted(widths), f"n={n} row tiles not monotonic: {widths}"
+
+    # A smaller part fills with fewer tiles and affords a wider one.  Not
+    # monotonic in sm_count though: wave quantization breaks it, e.g. m=512,
+    # n=6656 picks 128 / 64 / 192 rows on 132 / 148 / 188 SMs.
+    assert pick(128, 4096, 78)[0][1] > pick(128, 4096, 264)[0][1]
+
+    # Ties resolve to raster-along-N.
+    assert all(
+        p[2] is False for p in (pick(1, 4096), pick(512, 4096), pick(2048, 6656))
+    )
+
+    # Deterministic, and only ever returns a tactic from the candidate list.
+    assert pick(512, 4096) == pick(512, 4096)
+    assert pick(512, 4096) in tactics
+
+
+def test_cute_dsl_sm100_dense_kernel_uses_opt_level_2():
+    """Pin ``--opt-level 2`` on the SM100/103 dense W4A16 compile.
+
+    The CuTe-DSL default is 3, which is slower for this kernel (nvbug 6661624).
+    Opt levels are numerically identical, so no other test catches a change.
+    """
+    import inspect
+
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import _get_sm100_bf16_fp4_kernel
+
+    src = inspect.getsource(_get_sm100_bf16_fp4_kernel)
+    assert "--opt-level 2" in src, "SM100 dense W4A16 must compile at opt-level 2"
+    assert "--opt-level 3" not in src
+
+
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_backend_preallocated_out(backend):
     """Caller-provided out tensor is written in place."""
@@ -311,6 +554,25 @@ def test_backend_shape_mismatch_raises(backend):
             alpha_p,
             backend=backend,
         )
+
+
+def test_cute_dsl_prepare_uses_architecture_specific_layout():
+    """SM100 keeps 128x4 SF storage; SM12x uses the legacy linear repack."""
+    _skip_if_backend_unavailable("cute-dsl")
+    device = torch.device("cuda")
+    n, k = 192, 192
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+
+    b_p, sf_p, _ = prepare_bf16_fp4_weights(b_fp4, b_sf, alpha, backend="cute-dsl")
+    major, minor = get_compute_capability(device)
+    if major * 10 + minor in (100, 103, 107):
+        assert b_p.dtype == torch.uint8
+        assert b_p.shape == b_fp4.shape
+        assert sf_p.data_ptr() == b_sf.data_ptr()
+        assert sf_p.dim() == 6
+    else:
+        assert b_p.dtype == torch.int32
+        assert sf_p.shape == (k // 16, n)
 
 
 # =============================================================================

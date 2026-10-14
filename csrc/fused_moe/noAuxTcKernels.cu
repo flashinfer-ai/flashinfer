@@ -9,6 +9,11 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tvm_ffi_utils.h"
 
+#ifdef FLASHINFER_CAKE_BACKEND
+#include "cake_deepseek_fused_routing/cake_deepseek_fused_routing_kernels.cu"
+#include "cake_deepseek_fused_routing_launch.cuh"
+#endif
+
 using tvm::ffi::Optional;
 
 namespace cg = cooperative_groups;
@@ -233,6 +238,29 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                    int64_t const topk_group, int64_t const topk, double const routed_scaling_factor,
                    bool const launch_with_pdl, cudaStream_t const stream,
                    int16_t* routing_replay_out) {
+#ifdef FLASHINFER_CAKE_BACKEND
+  bool const cake_common = num_tokens > 0 && num_experts > 0 && n_group > 0 &&
+                           num_experts % n_group == 0 && topk > 0 && topk <= 8 &&
+                           topk <= num_experts && topk_group > 0 && topk_group <= n_group &&
+                           topk_group * n_group >= topk;
+  bool const cake_single_group = cake_common && (n_group == 1) && (num_experts <= NumKimiK2Experts);
+  int64_t const cake_experts_per_group = n_group > 0 ? num_experts / n_group : 0;
+  bool const cake_multi_group = cake_common && (n_group >= 2) && (n_group <= 8) &&
+                                (topk_group <= 4) && (num_experts <= NumDeepseekExperts) &&
+                                (cake_experts_per_group >= 2) &&
+                                (cake_experts_per_group <= WARP_SIZE) &&
+                                (cake_experts_per_group * topk_group <= MaxNumExpertsUnit);
+  TLLM_CHECK_WITH_INFO(cake_single_group || cake_multi_group,
+                       "invokeNoAuxTc: unsupported configuration (n_group=%ld, num_experts=%ld, "
+                       "topk_group=%ld). Please use original pytorch implementation.",
+                       n_group, num_experts, topk_group);
+  auto const status = flashinfer::cake_deepseek_fused_routing::launch<InputT, BiasT>(
+      scores, bias, topk_values, topk_indices, routing_replay_out, num_tokens, num_experts, n_group,
+      topk_group, topk, routed_scaling_factor, launch_with_pdl, stream);
+  TLLM_CHECK_WITH_INFO(status == cudaSuccess, "Cake fused routing launch failed: %s",
+                       cudaGetErrorString(status));
+  sync_check_cuda_error(stream);
+#else
   // Check if we can use the optimized deepseek_v3_topk_kernel
   bool const is_single_group = (n_group == 1) && (num_experts <= NumKimiK2Experts);
 
@@ -280,6 +308,7 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                          "original pytorch implementation.",
                          n_group, num_experts, topk_group);
   }
+#endif
 }
 
 #define INSTANTIATE_NOAUX_TC(InputT, BiasT, OutputT, IdxT)                              \
@@ -326,6 +355,12 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
       << "scores and bias must be CUDA tensors";
   TVM_FFI_ICHECK(scores.device().device_id == bias.device().device_id)
       << "scores and bias must be on the same device";
+  // Both kernels address scores as a dense [num_tokens, num_experts] row-major matrix and write
+  // dense [num_tokens, topk] outputs; strided views are rejected instead of silently misread.
+  CHECK_CONTIGUOUS(scores);
+  CHECK_CONTIGUOUS(bias);
+  CHECK_CONTIGUOUS(topk_values);
+  CHECK_CONTIGUOUS(topk_indices);
   TVM_FFI_ICHECK(bias.dim() == 1 && bias.numel() == num_experts)
       << "bias must be 1D with length == number of experts (%ld)";
   TVM_FFI_ICHECK(num_experts % n_group == 0) << "num_experts should be divisible by n_group";
@@ -367,6 +402,7 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
     TVM_FFI_ICHECK(replay.sizes()[1] == topk) << "routing_replay_out dim1 must equal topk";
     TVM_FFI_ICHECK(encode_dlpack_dtype(replay.dtype()) == int16_code_val)
         << "routing_replay_out must be int16 dtype";
+    CHECK_CONTIGUOUS(replay);
     replay_ptr = reinterpret_cast<int16_t*>(replay.data_ptr());
   }
 

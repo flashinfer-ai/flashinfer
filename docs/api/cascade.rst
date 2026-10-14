@@ -27,7 +27,7 @@ Cascade Attention Wrapper Classes
 
 .. autoclass:: MultiLevelCascadeAttentionWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
 

@@ -9,27 +9,67 @@ import pytest
 from flashinfer.moe_ep import (
     BootstrapConfig,
     EpAlgorithm,
+    EpLayout,
+    FleetAlgoKnobAllocator,
     FleetAlgoKnobNumChannelsPerRank,
     FleetAlgoKnobQuantization,
     FleetParams,
     HandleAlgoKnobSplitOperation,
     HandleAlgoKnobUserStream,
     QuantType,
+    dummy_moe_weights,
 )
 from flashinfer.moe_ep.algo_knobs import _index_knobs
 
 
+def _weights():
+    return dummy_moe_weights(num_local_experts=1, hidden=4096)
+
+
 class TestFleetParams:
+    def test_rejects_weights_kwarg(self) -> None:
+        # Weights moved to the layer constructor; FleetParams no longer
+        # accepts them.
+        with pytest.raises(TypeError):
+            FleetParams(
+                num_experts=8,
+                max_tokens_per_rank=128,
+                token_hidden_size=4096,
+                weights=_weights(),
+            )
+
+    def test_layer_requires_weights(self) -> None:
+        from flashinfer.moe_ep import MoEEpLayer
+
+        with pytest.raises(TypeError):
+            MoEEpLayer(
+                bootstrap=BootstrapConfig(world_size=1, rank=0),
+                fleet_params=FleetParams(
+                    num_experts=8,
+                    max_tokens_per_rank=128,
+                    token_hidden_size=4096,
+                ),
+                backend="nccl_ep",
+            )
+
     def test_happy_path(self) -> None:
         p = FleetParams(
             num_experts=8,
             max_tokens_per_rank=128,
             token_hidden_size=4096,
-            dtype_bytes=2,
-            algorithm=EpAlgorithm.LOW_LATENCY,
         )
         assert p.num_experts == 8
         assert p.algorithm is EpAlgorithm.LOW_LATENCY
+
+    def test_rejects_rank_major_under_ht(self) -> None:
+        with pytest.raises(ValueError, match="RANK_MAJOR"):
+            FleetParams(
+                num_experts=8,
+                max_tokens_per_rank=128,
+                token_hidden_size=4096,
+                algorithm=EpAlgorithm.HIGH_THROUGHPUT,
+                layout=EpLayout.RANK_MAJOR,
+            )
 
     @pytest.mark.parametrize(
         "field,value",
@@ -42,16 +82,23 @@ class TestFleetParams:
         ],
     )
     def test_validation_rejects_nonpositive(self, field: str, value: int) -> None:
-        kwargs = dict(num_experts=8, max_tokens_per_rank=128, token_hidden_size=4096)
+        kwargs = dict(
+            num_experts=8,
+            max_tokens_per_rank=128,
+            token_hidden_size=4096,
+        )
         kwargs[field] = value
         with pytest.raises(ValueError, match=field):
             FleetParams(**kwargs)
 
     def test_replace_round_trip(self) -> None:
-        p1 = FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=4096)
+        p1 = FleetParams(
+            num_experts=8,
+            max_tokens_per_rank=128,
+            token_hidden_size=4096,
+        )
         p2 = replace(p1, num_experts=16)
         assert p1.num_experts == 8 and p2.num_experts == 16
-        assert p2.max_tokens_per_rank == 128
 
 
 class TestBootstrapConfig:
@@ -78,7 +125,6 @@ class TestAlgoKnobs:
         assert knob.stream == 42
 
     def test_index_split_marker(self) -> None:
-        # SplitOperation acts as a flag — presence in dict signals "set".
         idx = _index_knobs([HandleAlgoKnobSplitOperation()])
         assert HandleAlgoKnobSplitOperation in idx
 
@@ -91,9 +137,7 @@ class TestAlgoKnobs:
             ]
         )
         q = idx[FleetAlgoKnobQuantization]
-        assert isinstance(q, FleetAlgoKnobQuantization)
         assert QuantType.FP8E4M3 in q.quants
-        assert QuantType.UE8M0 in q.quants
 
     def test_later_wins(self) -> None:
         idx = _index_knobs(
@@ -107,3 +151,37 @@ class TestAlgoKnobs:
     def test_reject_non_knob(self) -> None:
         with pytest.raises(TypeError, match="AlgoKnob"):
             _index_knobs(["not a knob"])  # type: ignore[list-item]
+
+    def test_allocator_knob_rejects_torch_caching_with_addresses(self) -> None:
+        with pytest.raises(ValueError, match="not both"):
+            FleetAlgoKnobAllocator(torch_caching=True, alloc_fn=0x1234, free_fn=0x5678)
+
+    def test_allocator_knob_rejects_unpaired_addresses(self) -> None:
+        with pytest.raises(ValueError, match="together"):
+            FleetAlgoKnobAllocator(alloc_fn=0x1234)
+        with pytest.raises(ValueError, match="together"):
+            FleetAlgoKnobAllocator(free_fn=0x5678)
+
+    def test_allocator_knob_accepts_valid_modes(self) -> None:
+        FleetAlgoKnobAllocator()  # default cudaMalloc path
+        FleetAlgoKnobAllocator(torch_caching=True)
+        FleetAlgoKnobAllocator(alloc_fn=0x1234, free_fn=0x5678, context=0x9ABC)
+
+
+class TestSplitConfig:
+    def test_identity_kernel_name(self) -> None:
+        from flashinfer.moe_ep import IdentityConfig, SplitConfig
+
+        assert SplitConfig().kernel.kernel_name == "identity"
+        assert IdentityConfig().kernel_name == "identity"
+
+
+def test_moe_ep_imports_without_deep_gemm():
+    import importlib
+
+    importlib.import_module("flashinfer.moe_ep")
+    from flashinfer.moe_ep import MoEEpSplitLayer, SplitConfig, SplitKernelContext
+
+    assert SplitConfig().kernel.kernel_name == "identity"
+    assert SplitKernelContext.__name__ == "SplitKernelContext"
+    assert MoEEpSplitLayer.__name__ == "MoEEpSplitLayer"

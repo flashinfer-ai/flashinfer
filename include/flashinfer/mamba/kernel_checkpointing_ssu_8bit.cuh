@@ -257,11 +257,12 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs_sm80(Layout acc_layout)
 // The caller's single __syncthreads between all replay passes and
 // compute_output_8bit provides smem.CB_scaled / smem.x / smem.z visibility.
 template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT,
-          typename FragYDxT>
+          typename FragYDxT, bool SEPARATE_SCALE_INPUT = false>
 __device__ __forceinline__ void replay_state_mma_8bit_chain(
     SmemT& smem, CheckpointingSsuParams const& params, int warp, int lane, int prev_k, int d_tile,
     int64_t cache_slot, int head, bool must_checkpoint, FragYDxT& frag_y_DxT,
-    float (&encode_scale_per_row_out)[2], float (&total_scale_out)[2]) {
+    float (&encode_scale_per_row_out)[2], float (&total_scale_out)[2],
+    float const* separate_state_scale_input = nullptr, int64_t separate_state_scale_base = 0) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "replay_state_mma_8bit_chain requires 2-byte input_t");
   static_assert(sizeof(state_t) == 1,
@@ -311,12 +312,20 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
   int const warp_d_base = warp * M_PER_WARP;
 
   // ── Per-row decode_scale for state init.
-  auto const* __restrict__ state_scale_ptr = reinterpret_cast<float const*>(params.state_scale);
+  auto const* __restrict__ state_scale_ptr = [&] {
+    if constexpr (SEPARATE_SCALE_INPUT) {
+      return separate_state_scale_input;
+    } else {
+      return reinterpret_cast<float const*>(params.state_scale);
+    }
+  }();
   int64_t const state_scale_base = cache_slot * params.state_scale_stride_seq +
                                    (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
+  int64_t const state_scale_read_base =
+      SEPARATE_SCALE_INPUT ? separate_state_scale_base : state_scale_base;
   float decode_scale_in[D_ROWS_PER_THREAD];
-  decode_scale_in[0] = state_scale_ptr[state_scale_base + warp_d_base + lane_d];
-  decode_scale_in[1] = state_scale_ptr[state_scale_base + warp_d_base + lane_d + 8];
+  decode_scale_in[0] = state_scale_ptr[state_scale_read_base + warp_d_base + lane_d];
+  decode_scale_in[1] = state_scale_ptr[state_scale_read_base + warp_d_base + lane_d + 8];
   float total_scale[D_ROWS_PER_THREAD];
   total_scale[0] = decode_scale_in[0] * total_decay;
   total_scale[1] = decode_scale_in[1] * total_decay;
@@ -341,7 +350,8 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
   // ── Bake dB coefficients into frag_A once (8 scale ops), replacing 16×
   // per-N-pass compute_dB_scaling on frag_B (64 scale ops).
   // dB coefficients c[k] baked into frag_A once, replacing per-N-pass B scaling.
-  apply_dA_coeff<MAX_WINDOW_PAD_MMA_K>(frag_A_replay, smem, total_cumAdt, prev_k, lane);
+  apply_dA_coeff<MAX_WINDOW_PAD_MMA_K>(frag_A_replay, smem.old_cumAdt, smem.old_dt, total_cumAdt,
+                                       prev_k, lane);
 
   // ── B operand (replay): old_B per-pass.
   auto layout_B_replay = make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, DSTATE>();
@@ -602,7 +612,8 @@ __device__ __forceinline__ void encode_state_replay_8bit(
   cute::copy(s2r_A, smem_A_s2r, frag_A_replay_view);
 
   // dB coefficients baked into frag_A (same identity as PASS 1).
-  apply_dA_coeff<MAX_WINDOW_PAD_MMA_K>(frag_A_replay, smem, total_cumAdt, prev_k, lane);
+  apply_dA_coeff<MAX_WINDOW_PAD_MMA_K>(frag_A_replay, smem.old_cumAdt, smem.old_dt, total_cumAdt,
+                                       prev_k, lane);
 
   auto layout_B_replay = make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, DSTATE>();
   Tensor smem_B_full = make_tensor(
@@ -1359,8 +1370,8 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
   if (cache_slot == params.pad_slot_id) return;
 
-  auto const* __restrict__ buf_idx_ptr = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
-  int const buf_read = __ldg(&buf_idx_ptr[cache_slot]);
+  auto const* __restrict__ ring_start_ptr = reinterpret_cast<int32_t const*>(params.ring_start);
+  int const ring_start = __ldg(&ring_start_ptr[cache_slot]);
 
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
   int const prev_k = prev_ptr[cache_slot];
@@ -1400,8 +1411,7 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   int64_t const out_seq_base = outer * params.out_stride_seq;
 
   bool const must_checkpoint = (prev_k + seq_len > MAX_WINDOW);
-  int const buf_write = must_checkpoint ? (1 - buf_read) : buf_read;
-  int const write_offset = must_checkpoint ? 0 : prev_k;
+  int const write_offset = prev_k;  // ring: appends at (start + prev_k + i) % L on BOTH branches
 
   // ── Load scalars (A, dt_bias, D) ──
   auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
@@ -1419,21 +1429,21 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   if constexpr (ENABLE_PDL) {
     load_pre_pdl_wait_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
                            NUM_WARPS>(smem, params, lane, warp, d_tile, head, group_idx, cache_slot,
-                                      buf_read, A_val, dt_bias_val, dt_seq_base, z_seq_base,
+                                      ring_start, A_val, dt_bias_val, dt_seq_base, z_seq_base,
                                       seq_len);
-    gdc_wait();
+    cudaGridDependencySynchronize();
     load_post_pdl_wait_data<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
         smem, params, lane, warp, d_tile, head, group_idx, outer, seq_len);
   } else {
     load_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-        smem, params, lane, warp, d_tile, head, group_idx, cache_slot, buf_read, A_val, dt_bias_val,
-        outer, seq_len);
+        smem, params, lane, warp, d_tile, head, group_idx, cache_slot, ring_start, A_val,
+        dt_bias_val, outer, seq_len);
   }
 
   // ── store_old_B hoist (warps 0,1 only, d_tile == 0) ──
   if (d_tile == 0 && warp < 2) {
     store_old_B<input_t, NPREDICTED, DSTATE, HEADS_PER_GROUP>(
-        smem, params, warp, lane, head, group_idx, cache_slot, buf_write, write_offset, seq_len);
+        smem, params, warp, lane, head, group_idx, cache_slot, ring_start, write_offset, seq_len);
   }
 
   // ── CB precompute (4-warp split): warps 0,1 compute CB_scaled (new tokens);
@@ -1468,25 +1478,19 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   // target tensors only the next SSU step reads, not the immediate
   // downstream kernel — safe to signal first. ──
   if constexpr (ENABLE_PDL) {
-    gdc_launch_dependents();
+    cudaTriggerProgrammaticLaunchCompletion();
   }
 
   // ── Phase 3: cache writes (old_x, dt_proc, cumAdt) ──
   store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,
-                                                   cache_slot, write_offset, seq_len);
+                                                   cache_slot, ring_start, write_offset, seq_len);
   if (d_tile == 0 && warp == 0 && lane < seq_len) {
-    auto* __restrict__ old_dt_w = reinterpret_cast<float*>(params.old_dt);
-    int64_t const dt_w_base = cache_slot * params.old_dt_stride_seq +
-                              buf_write * params.old_dt_stride_dbuf +
-                              head * params.old_dt_stride_head;
-    old_dt_w[dt_w_base + write_offset + lane] = smem.dt_proc[lane];
-  }
-  if (d_tile == 0 && warp == 1 && lane < seq_len) {
-    auto* __restrict__ old_cumAdt_w = reinterpret_cast<float*>(params.old_cumAdt);
-    int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_seq +
-                              buf_write * params.old_cumAdt_stride_dbuf +
-                              head * params.old_cumAdt_stride_head;
-    old_cumAdt_w[ca_w_base + write_offset + lane] = smem.cumAdt[lane];
+    auto* __restrict__ dt_cache_w = reinterpret_cast<float*>(params.dt_cache);
+    int64_t const dt_w_base =
+        cache_slot * params.dt_cache_stride_seq + head * params.dt_cache_stride_head;
+    int dst = ring_start + write_offset + lane;
+    if (dst >= params.ring_buffer_len) dst -= params.ring_buffer_len;
+    dt_cache_w[dt_w_base + dst] = smem.dt_proc[lane];
   }
 }
 

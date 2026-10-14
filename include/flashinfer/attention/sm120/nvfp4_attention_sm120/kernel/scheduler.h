@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include "cute/tensor.hpp"
 #include "cutlass/fast_math.h"
 
@@ -93,7 +95,36 @@ class StaticPersistentTileScheduler {
             args.is_causal};
   }
 
-  static dim3 get_grid_dim(Arguments const& args, int num_sm) { return {uint32_t(num_sm)}; }
+  static dim3 get_grid_dim(Arguments const& args, int num_sm) {
+    int const total_blocks = args.num_blocks_m * args.num_head * args.num_batch;
+    if (!args.is_causal) {
+      int const waves = cute::ceil_div(total_blocks, num_sm);
+      // Use the smallest persistent grid that preserves the same maximum
+      // number of work tiles per CTA. This removes CTAs that would retire one
+      // wave early and reduces producer/TMA contention for short shapes.
+      return {uint32_t(cute::ceil_div(total_blocks, waves))};
+    }
+
+    int grid = std::min(total_blocks, num_sm);
+    if (args.num_blocks_m <= 32 && total_blocks > grid) {
+      // Pick the nearest grid size whose persistent stride is coprime to the
+      // number of M blocks. Combined with the heavy/light row order below,
+      // this avoids repeatedly assigning the same triangular work classes to
+      // a CTA. For 32 M blocks on a 188-SM GPU this selects 187 CTAs.
+      auto gcd = [](int a, int b) {
+        while (b != 0) {
+          int const remainder = a % b;
+          a = b;
+          b = remainder;
+        }
+        return a;
+      };
+      while (grid > 1 && gcd(grid, args.num_blocks_m) != 1) {
+        --grid;
+      }
+    }
+    return {uint32_t(grid)};
+  }
 
   struct WorkTileInfo {
     int tile_idx;
@@ -104,10 +135,20 @@ class StaticPersistentTileScheduler {
     CUTLASS_DEVICE
     cute::tuple<int32_t, int32_t, int32_t> get_block_coord(Params const& params) const {
       int m_block, bidh, bidb;
-      bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(m_block, tile_idx));
+      int const flat_head = params.m_block_divmod.divmod(m_block, tile_idx);
       if (params.is_causal) {
-        m_block = params.num_blocks_m - 1 - m_block;
+        if (params.num_blocks_m <= 32) {
+          // Visit high, low, next-high, next-low. With a coprime persistent
+          // stride this minimizes the maximum triangular work assigned to any
+          // CTA, which determines the short-shape kernel tail.
+          m_block = (m_block & 1) ? (m_block >> 1) : (params.num_blocks_m - 1 - (m_block >> 1));
+        } else if ((flat_head & 1) == 0) {
+          // Alternate the M traversal direction across heads/batches. This
+          // balances long causal shapes while retaining all SMs.
+          m_block = params.num_blocks_m - 1 - m_block;
+        }
       }
+      bidb = params.head_divmod.divmod(bidh, flat_head);
       return {m_block, bidh, bidb};
     }
   };

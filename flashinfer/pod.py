@@ -436,6 +436,7 @@ class PODWithPagedKVCacheWrapper:
             -1,  # fixed_split_size
             False,  # disable_split_kv
             0,  # num_colocated_ctas
+            0,  # uniform_q_len
         )
 
         self._indptr_type = indptr.dtype
@@ -722,10 +723,6 @@ class PODWithPagedKVCacheWrapper:
             out_d *= v_scale
 
         return (out_p, out_d)
-
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect."""
-        pass
 
 
 class BatchPODWithPagedKVCacheWrapper:
@@ -1083,6 +1080,7 @@ class BatchPODWithPagedKVCacheWrapper:
             -1,  # fixed_split_size
             False,  # disable_split_kv
             0,  # num_colocated_ctas
+            0,  # uniform_q_len
         )
 
         num_colocated_ctas = self._plan_info_d[0]
@@ -1109,6 +1107,7 @@ class BatchPODWithPagedKVCacheWrapper:
             -1,  # fixed_split_size
             False,  # disable_split_kv
             num_colocated_ctas,
+            0,  # uniform_q_len
         )
         self._indptr_type = kv_indptr_p.dtype
         self._pos_encoding_mode = pos_encoding_mode
@@ -1349,7 +1348,3 @@ class BatchPODWithPagedKVCacheWrapper:
             out_d *= v_scale
 
         return ((out_p, out_d), (lse_p, lse_d)) if return_lse else (out_p, out_d)
-
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect."""
-        pass

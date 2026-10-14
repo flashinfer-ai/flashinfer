@@ -9,7 +9,7 @@ import sys
 import sysconfig
 from packaging.version import Version
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Mapping, Optional
 
 import tvm_ffi
 import torch
@@ -112,6 +112,18 @@ def get_nvcc_parallelism_flags() -> List[str]:
     return [f"--threads={threads}"]
 
 
+@functools.lru_cache(maxsize=1)
+def host_compiler_is_gcc() -> bool:
+    """Whether the compiler nvcc forwards -Xcompiler flags to is GCC.
+
+    Cached because the underlying torch helper shells out to the compiler.
+    """
+    from torch.utils.cpp_extension import check_compiler_is_gcc, get_cxx_compiler
+
+    host_compiler = os.environ.get("CC", get_cxx_compiler())
+    return check_compiler_is_gcc(host_compiler)
+
+
 def join_multiline(vs: List[str]) -> str:
     return " $\n    ".join(vs)
 
@@ -208,7 +220,9 @@ def build_cuda_cflags(
         ]
 
     cpp_ext_initial_compilation_context = CompilationContext()
-    global_flags = cpp_ext_initial_compilation_context.get_nvcc_flags_list()
+    global_flags = cpp_ext_initial_compilation_context.get_nvcc_flags_list(
+        map_sm107_to_100f=True
+    )
     if extra_cuda_cflags is not None:
         # Check if module provides architecture flags
         module_has_gencode = any(
@@ -243,11 +257,18 @@ def generate_ninja_build_for_op(
     extra_ldflags: Optional[List[str]],
     extra_include_dirs: Optional[List[Path]],
     needs_device_linking: bool = False,
+    embedded_cubins: Optional[Mapping[str, Path]] = None,
+    extra_cuda_cflags_by_source: Optional[Mapping[Path, List[str]]] = None,
 ) -> str:
     cuda_home = get_cuda_path()
     common_cflags = build_common_cflags(cuda_home, extra_include_dirs)
     cflags = build_cflags(common_cflags, extra_cflags)
     cuda_cflags = build_cuda_cflags(common_cflags, extra_cuda_cflags)
+    cuda_arch_flags = [flag for flag in cuda_cflags if flag.startswith("-gencode=")]
+    cuda_cflags_by_source = {
+        Path(source).resolve(): build_cuda_cflags(common_cflags, flags)
+        for source, flags in (extra_cuda_cflags_by_source or {}).items()
+    }
 
     ldflags = [
         "-shared",
@@ -284,6 +305,7 @@ def generate_ninja_build_for_op(
         "post_cflags =",
         "cuda_cflags = " + join_multiline(cuda_cflags),
         "cuda_post_cflags =",
+        "cuda_arch_flags = " + join_multiline(cuda_arch_flags),
         "ldflags = " + join_multiline(ldflags),
         "",
         "rule compile",
@@ -298,12 +320,22 @@ def generate_ninja_build_for_op(
         "",
     ]
 
+    if embedded_cubins:
+        lines.extend(
+            [
+                "rule embed_cubin",
+                f"  command = {sys.executable} -m tvm_ffi.utils.embed_cubin "
+                "--output-obj $out --input-obj $in --cubin $cubin --name $cubin_name",
+                "",
+            ]
+        )
+
     # Add nvcc linking rule for device code
     if needs_device_linking:
         lines.extend(
             [
                 "rule nvcc_link",
-                "  command = $nvcc -shared $in $ldflags -o $out",
+                "  command = $nvcc -shared $cuda_arch_flags $in $ldflags -o $out",
                 "",
             ]
         )
@@ -330,6 +362,34 @@ def generate_ninja_build_for_op(
         obj = str((output_dir / obj_name).resolve())
         objects.append(obj)
         lines.append(f"build {obj}: {cmd} {source.resolve()}")
+        if source.resolve() in cuda_cflags_by_source:
+            lines.append(
+                "  cuda_cflags = "
+                + join_multiline(cuda_cflags_by_source[source.resolve()])
+            )
+
+    if embedded_cubins:
+        if not objects:
+            raise ValueError("embedded cubins require at least one host object")
+        current_obj = objects[0]
+        for index, (cubin_name, cubin_path) in enumerate(
+            sorted(embedded_cubins.items())
+        ):
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cubin_name) is None:
+                raise ValueError(f"invalid embedded cubin identifier: {cubin_name!r}")
+            resolved_cubin = Path(cubin_path).resolve(strict=True)
+            embedded_obj = str(
+                (output_dir / f"embedded_{index}_{Path(current_obj).name}").resolve()
+            )
+            lines.extend(
+                [
+                    f"build {embedded_obj}: embed_cubin {current_obj} | {resolved_cubin}",
+                    f"  cubin = {resolved_cubin}",
+                    f"  cubin_name = {cubin_name}",
+                ]
+            )
+            current_obj = embedded_obj
+        objects[0] = current_obj
 
     lines.append("")
     link_rule = "nvcc_link" if needs_device_linking else "link"
@@ -348,7 +408,12 @@ def _get_num_workers() -> Optional[int]:
     return None
 
 
-def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
+def run_ninja(
+    workdir: Path,
+    ninja_file: Path,
+    verbose: bool,
+    max_jobs: Optional[int] = None,
+) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     command = [
         "ninja",
@@ -358,7 +423,7 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
         "-f",
         str(ninja_file.resolve()),
     ]
-    num_workers = _get_num_workers()
+    num_workers = max_jobs if max_jobs is not None else _get_num_workers()
     if num_workers is not None:
         command += ["-j", str(num_workers)]
 

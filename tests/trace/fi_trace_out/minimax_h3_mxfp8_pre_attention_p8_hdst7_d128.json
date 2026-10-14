@@ -1,0 +1,189 @@
+{
+  "name": "minimax_h3_mxfp8_pre_attention_p8_hdst7_d128",
+  "description": "BF16 RMSNorm and indexed AdaLN, prepacked MXFP8 QKV GEMM, Q/K RMSNorm and split-half NeoX RoPE, followed by destination-major E4M3 and UE8M0 packing.",
+  "op_type": "minimax_h3_mxfp8_pre_attention",
+  "tags": [
+    "fi_api:flashinfer.cake_minimax_h3.MiniMaxH3Mxfp8PreAttention.run",
+    "stage:pre_attention",
+    "status:verified",
+    "dtype:mxfp8"
+  ],
+  "axes": {
+    "M": {
+      "type": "var",
+      "description": "Token rows."
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 5376
+    },
+    "qkv_width": {
+      "type": "const",
+      "value": 21504
+    },
+    "adaln_rows": {
+      "type": "const",
+      "value": 9
+    },
+    "rope_width": {
+      "type": "const",
+      "value": 96
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 56
+    },
+    "P": {
+      "type": "const",
+      "value": 8,
+      "description": "Destination partitions."
+    },
+    "heads_per_destination": {
+      "type": "const",
+      "value": 7
+    },
+    "qkv_kinds": {
+      "type": "const",
+      "value": 3
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "weight_scale_elements": {
+      "type": "var"
+    },
+    "output_scale_stride": {
+      "type": "var"
+    }
+  },
+  "constraints": [
+    "P * heads_per_destination == 56"
+  ],
+  "inputs": {
+    "x": {
+      "shape": [
+        "M",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "x_norm_weight": {
+      "shape": [
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "adaln_scale": {
+      "shape": [
+        "adaln_rows",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "adaln_shift": {
+      "shape": [
+        "adaln_rows",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "adaln_index": {
+      "shape": [
+        "M"
+      ],
+      "dtype": "int32"
+    },
+    "qkv_weight_q": {
+      "shape": [
+        "qkv_width",
+        "hidden_size"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "qkv_weight_sf": {
+      "shape": [
+        "weight_scale_elements"
+      ],
+      "dtype": "uint8"
+    },
+    "q_norm_weight": {
+      "shape": [
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k_norm_weight": {
+      "shape": [
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "rope_cos_sin": {
+      "shape": [
+        "M",
+        "rope_width"
+      ],
+      "dtype": "bfloat16"
+    },
+    "out_q": {
+      "shape": [
+        "P",
+        "M",
+        "heads_per_destination",
+        "qkv_kinds",
+        "head_dim"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Caller-owned destination-major E4M3 output."
+    },
+    "out_sf": {
+      "shape": [
+        "P",
+        "output_scale_stride"
+      ],
+      "dtype": "uint8",
+      "description": "Caller-owned destination-major UE8M0 scale output."
+    },
+    "debug_q_bf16": {
+      "shape": [
+        "M",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true
+    },
+    "debug_k_bf16": {
+      "shape": [
+        "M",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "out_q": {
+      "shape": [
+        "P",
+        "M",
+        "heads_per_destination",
+        "qkv_kinds",
+        "head_dim"
+      ],
+      "dtype": "float8_e4m3fn",
+      "param": "out_q"
+    },
+    "out_sf": {
+      "shape": [
+        "P",
+        "output_scale_stride"
+      ],
+      "dtype": "uint8",
+      "param": "out_sf"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

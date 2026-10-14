@@ -23,6 +23,9 @@ from . import env as jit_env
 from .core import gen_jit_spec, logger, current_compilation_context
 
 
+BGMV_MOE_SUPPORTED_MAJOR_VERSIONS = (9, 10, 11, 12)
+
+
 def _get_bgmv_moe_csrc_dir() -> Path:
     """Get the path to the BGMV MoE CUDA source directory.
 
@@ -58,7 +61,7 @@ def gen_bgmv_moe_module():
     Generate the JIT compilation spec for the BGMV MoE CUDA kernels.
 
     This compiles the multi-LoRA MoE BGMV shrink/expand kernel pair.
-    Supports SM70+ (V100, A100, H100, B200).
+    The JIT integration currently targets SM90 and newer architectures.
 
     Returns:
         JitSpec that can be built and loaded.
@@ -97,7 +100,8 @@ def gen_bgmv_moe_module():
         if not src_path.exists():
             raise FileNotFoundError(f"BGMV MoE source file not found: {src_path}")
         dest_path = gen_directory / fname
-        shutil.copy(src_path, dest_path)
+        # copy2 keeps source mtimes; a fresh mtime forces a full ninja rebuild (#4782)
+        shutil.copy2(src_path, dest_path)
         sources.append(dest_path)
 
     # Copy headers to gen directory
@@ -105,11 +109,11 @@ def gen_bgmv_moe_module():
         src_path = csrc_dir / fname
         if not src_path.exists():
             raise FileNotFoundError(f"BGMV MoE header file not found: {src_path}")
-        shutil.copy(src_path, gen_directory / fname)
+        shutil.copy2(src_path, gen_directory / fname)
 
-    # Get nvcc flags for supported architectures (SM70+)
+    # Get nvcc flags for the architectures supported by this JIT integration.
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10, 11, 12]  # SM90+ (H100, B200)
+        supported_major_versions=BGMV_MOE_SUPPORTED_MAJOR_VERSIONS
     )
 
     spec = gen_jit_spec(

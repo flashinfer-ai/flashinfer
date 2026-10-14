@@ -1,0 +1,415 @@
+"""SM90 (Hopper) pull-style FP8 mega-MoE kernel backend.
+
+The fused kernel consumes FP8 expert weights in kernel-ready layout (K-major
+fp8 weights + per-mode scale planes + the fp8 dequant-scale vectors).
+``MoEWeightPack`` supplies canonical bf16 ``w13``/``w2``;
+``preprocess_weights()`` quantizes them per ``fp8_scale_mode`` (per-tensor
+scalars or DeepGEMM-style 128x128 block scales).
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+from ......config import BootstrapConfig, FleetParams
+from ......core.kernel.base import MegaKernelBackend
+from ......core.kernel.registry import register_mega_kernel
+from ......core.runtime import sm90_pull_fp8_runtime_requirements
+from ......core.validation.common import (
+    validate_mega_arch_sm90,
+    validate_mega_fleet_params,
+)
+from ......weights import MoEWeightPack
+from .config import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
+from .staging import (
+    stage_mega_moe_inputs,
+    staged_tokens,
+    validate_sm90_fp8_forward_inputs,
+)
+from .weights import (
+    TransformedMegaWeights,
+    preprocess_mega_weights,
+    validate_transformed_mega_weights,
+)
+
+if TYPE_CHECKING:
+    from ......tensors import MoEEpTensors
+
+
+def _resolve_gate_up_clamp(
+    config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
+) -> float | None:
+    if config.gate_up_clamp is not None:
+        return config.gate_up_clamp
+    return config.activation_clamp
+
+
+@register_mega_kernel(
+    "sm90_fp8_fp8_bf16_pull_cutedsl", deprecated_aliases=("sm90_pull_fp8",)
+)
+class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
+    def __init__(self, config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig) -> None:
+        super().__init__(config)
+        self._kernel_config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig = config
+        if config.knobs is not None:
+            if not (isinstance(config.knobs, dict) or config.knobs == "auto"):
+                raise ValueError(
+                    f"knobs must be None, a knob dict, or 'auto'; got {config.knobs!r}"
+                )
+            if any(
+                v is not None
+                for v in (
+                    config.swap_ab,
+                    config.pingpong,
+                    config.mma_tiler_mnk,
+                    config.cluster_shape_mnk,
+                )
+            ):
+                raise ValueError(
+                    "knobs= is mutually exclusive with the explicit geometry "
+                    "fields (swap_ab / pingpong / mma_tiler_mnk / "
+                    "cluster_shape_mnk)"
+                )
+        # knobs="auto": tune at the first compute() (weights + staged inputs
+        # exist there), then keep the winner for the session.
+        self._autotune_pending = config.knobs == "auto"
+        if self._autotune_pending:
+            import warnings
+
+            warnings.warn(
+                "knobs='auto' runs a COLLECTIVE compile+timing sweep at the "
+                "first forward — never use it inside a serving engine. Tune "
+                "offline instead (python -m flashinfer.moe_ep.tune); winners "
+                "persist in the knob cache and knobs=None then resolves them "
+                "with a pure lookup.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+    @classmethod
+    def kernel_name(cls) -> str:
+        return "sm90_fp8_fp8_bf16_pull_cutedsl"
+
+    def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
+        return sm90_pull_fp8_runtime_requirements(bootstrap)
+
+    def validate_init(
+        self,
+        bootstrap: BootstrapConfig,
+        fleet_params: FleetParams,
+    ) -> None:
+        validate_mega_arch_sm90()
+        validate_mega_fleet_params(
+            fleet_params,
+            bootstrap.world_size,
+            intermediate_size=self._kernel_config.intermediate_size,
+            top_k=self._kernel_config.top_k,
+            # cutedsl tiles are tail-safe (ceil-div + predicated epilogue);
+            # the per-tensor bound is TMA row alignment + SF-word packing (64).
+            # Blockwise scales are 128x128 (Fp8WeightScaleBlock*), so blockwise
+            # sessions need the full 128.
+            alignment=(
+                128 if self._kernel_config.fp8_scale_mode == "blockwise" else 64
+            ),
+        )
+
+    def preprocess_weights(
+        self,
+        weights: MoEWeightPack,
+        fleet_params: FleetParams,
+    ) -> TransformedMegaWeights:
+        k = self._kernel_config
+        return preprocess_mega_weights(
+            weights,
+            intermediate_size=k.intermediate_size,
+            hidden_size=fleet_params.token_hidden_size,
+            kind=k.kind,
+            fp8_scale_mode=k.fp8_scale_mode,
+            fc1_activation_dequant_scale=k.fc1_activation_dequant_scale,
+            fc2_activation_dequant_scale=k.fc2_activation_dequant_scale,
+        )
+
+    def validate_transformed_weights(
+        self,
+        transformed_weights: TransformedMegaWeights,
+        bootstrap: BootstrapConfig,
+        fleet_params: FleetParams,
+    ) -> None:
+        k = self._kernel_config
+        validate_transformed_mega_weights(
+            transformed_weights,
+            intermediate_size=k.intermediate_size,
+            hidden_size=fleet_params.token_hidden_size,
+            kind=k.kind,
+            fp8_scale_mode=k.fp8_scale_mode,
+            world_size=self.ep_world_size,
+            num_experts=fleet_params.num_experts,
+        )
+
+    supports_live_token_tuning = True
+    _knob_cache_module = "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.knob_cache"
+
+    def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
+        k = self._kernel_config
+        return dict(
+            dtype=k.kind,
+            world_size=self.ep_world_size,
+            hidden=fleet_params.token_hidden_size,
+            intermediate=k.intermediate_size,
+            num_experts=fleet_params.num_experts,
+            topk=k.top_k,
+            max_tokens=fleet_params.max_tokens_per_rank,
+            fp8_scale_mode=k.fp8_scale_mode,
+            gate_up_clamp=_resolve_gate_up_clamp(k),
+        )
+
+    def _has_explicit_geometry(self) -> bool:
+        k = self._kernel_config
+        return any(
+            value is not None
+            for value in (k.swap_ab, k.pingpong, k.mma_tiler_mnk, k.cluster_shape_mnk)
+        )
+
+    def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
+        if self._has_explicit_geometry():
+            return []
+        return super().live_token_buckets(fleet_params)
+
+    def _workspace_knobs(self, fleet_params: FleetParams) -> dict | None:
+        if self._has_explicit_geometry():
+            return None
+        return super()._workspace_knobs(fleet_params)
+
+    def _frontend_config_kwargs(self, fleet_params: FleetParams) -> dict[str, Any]:
+        k = self._kernel_config
+        fp = fleet_params
+        return {
+            "num_total_experts": fp.num_experts,
+            "num_max_tokens": fp.max_tokens_per_rank,
+            "num_topk": k.top_k,
+            "hidden": fp.token_hidden_size,
+            "intermediate": k.intermediate_size,
+            "rank": self.ep_rank,
+            "world_size": self.ep_world_size,
+            "kind": k.kind,
+            "fp8_scale_mode": k.fp8_scale_mode,
+            "fp8_accum_mode": k.fp8_accum_mode,
+            "knobs": self._workspace_knobs(fleet_params),
+            "swap_ab": k.swap_ab,
+            "pingpong": k.pingpong,
+            "mma_tiler_mnk": k.mma_tiler_mnk,
+            "cluster_shape_mnk": k.cluster_shape_mnk,
+            "load_balance_mode": k.load_balance_mode,
+            "gate_up_clamp": _resolve_gate_up_clamp(k),
+            "activation_clamp": k.activation_clamp,
+            "in_kernel_fc2_reduce": k.enable_in_kernel_fc2_reduce,
+            "token_back_by_dispatch": k.token_back_by_dispatch,
+            "token_back_mode": k.token_back_mode,
+            "dedup_dispatch": k.dedup_dispatch,
+            "grouped_token_back": k.grouped_token_back,
+            "combine_format": k.combine_format,
+            "active_dispatch_warps": k.active_dispatch_warps,
+            "compact_pull_buffer": k.compact_pull_buffer,
+            "fc1_store_offload": k.fc1_store_offload,
+            "fc1_early_done_publish": k.fc1_early_done_publish,
+            "fold_producer_warps": k.fold_producer_warps,
+            "generate_c": k.generate_c,
+            "tail_split_pairs": k.tail_split_pairs,
+        }
+
+    def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
+        # Backend talks only to the pull_style_cutedsl_megakernel shim (never
+        # src/ directly).
+        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+            get_symm_buffer_for_hopper_fp8_mega_moe,
+        )
+
+        return get_symm_buffer_for_hopper_fp8_mega_moe(
+            **self._frontend_config_kwargs(fleet_params)
+        )
+
+    def validate_forward(
+        self,
+        t: "MoEEpTensors",
+        fleet_params: FleetParams,
+        *,
+        quantize_input: bool,
+    ) -> None:
+        validate_sm90_fp8_forward_inputs(
+            t.hidden_states,
+            t.topk_ids,
+            t.topk_weights,
+            fleet_params,
+            top_k=self._kernel_config.top_k,
+            quantize_input=quantize_input,
+            kind=self._kernel_config.kind,
+            fp8_scale_mode=self._kernel_config.fp8_scale_mode,
+            scales=t.scales,
+        )
+
+    def stage_inputs(
+        self,
+        t: "MoEEpTensors",
+        workspace: Any,
+        *,
+        quantize_input: bool,
+    ) -> None:
+        num_tokens = t.hidden_states.shape[0]
+        k = self._kernel_config
+        if quantize_input:
+            stage_mega_moe_inputs(
+                t.hidden_states,
+                t.topk_weights,
+                t.topk_ids,
+                workspace.x,
+                workspace.x_sf,
+                workspace.topk_idx,
+                workspace.topk_weights,
+                kind=k.kind,
+                fp8_scale_mode=k.fp8_scale_mode,
+                fc1_activation_dequant_scale=k.fc1_activation_dequant_scale,
+            )
+        else:
+            # Pre-staged fp8 + scales: byte-copy into the symmetric buffers.
+            # Backend talks only to the pull_style_cutedsl_megakernel shim.
+            if k.fp8_scale_mode == "blockwise":
+                from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+                    Fp8BlockScaleK,
+                )
+
+                sf_cols = workspace.hidden // Fp8BlockScaleK
+                assert t.scales is not None
+                workspace.x_sf[:num_tokens].zero_()
+                workspace.x_sf[:num_tokens, :sf_cols].copy_(
+                    t.scales[:num_tokens, :sf_cols].to(torch.float32)
+                )
+            else:
+                from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+                    Fp8E8M0SfVecSize,
+                    ceil_div,
+                )
+
+                sf_cols = ceil_div(workspace.hidden, Fp8E8M0SfVecSize)
+                assert t.scales is not None
+                # Full-row zero first: the mult-of-4 pad SF bytes ride the
+                # dispatch LDG.32 words and must be defined.
+                workspace.x_sf[:num_tokens].view(torch.uint8).zero_()
+                workspace.x_sf[:num_tokens, :sf_cols].view(torch.uint8).copy_(
+                    t.scales[:num_tokens, :sf_cols].view(torch.uint8)
+                )
+
+            workspace.x[:num_tokens].view(torch.uint8).copy_(
+                t.hidden_states[:num_tokens].view(torch.uint8)
+            )
+            workspace.topk_idx[:num_tokens].copy_(t.topk_ids)
+            workspace.topk_weights[:num_tokens].copy_(t.topk_weights)
+            capacity = workspace.x.shape[0]
+            if num_tokens < capacity:
+                workspace.topk_idx[num_tokens:capacity].fill_(-1)
+            from .staging import _note_staged_tokens
+
+            _note_staged_tokens(workspace.topk_idx, num_tokens)
+
+    def compute(
+        self,
+        workspace: Any,
+        transformed_weights: TransformedMegaWeights,
+        *,
+        output: torch.Tensor | None,
+    ) -> torch.Tensor:
+        # Backend talks only to the pull_style_cutedsl_megakernel shim.
+        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+            hopper_fp8_mega_moe,
+        )
+
+        if output is not None:
+            num_tokens = output.shape[0]
+        else:
+            if self._autotune_pending:
+                raise ValueError(
+                    "compute(output=None) is incompatible with knobs='auto' "
+                    "(the autotune sweep needs a caller output buffer)"
+                )
+            staged = staged_tokens(workspace.topk_idx)
+            if staged is None:
+                raise ValueError(
+                    "compute(output=None) requires stage_inputs() to have "
+                    "staged this workspace first"
+                )
+            num_tokens = staged
+
+        kcfg = self._kernel_config
+        if self._autotune_pending:
+            # COLLECTIVE: every EP rank reaches this first compute() together,
+            # so the candidate sweep stays in lockstep (see shim/autotune.py).
+            from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+                autotune_hopper_fp8_mega_moe,
+            )
+
+            self._autotune_winner = autotune_hopper_fp8_mega_moe(
+                output,
+                transformed_weights[0],
+                transformed_weights[1],
+                workspace,
+                num_tokens=num_tokens,
+                gate_up_clamp=_resolve_gate_up_clamp(kcfg),
+                activation_clamp=kcfg.activation_clamp,
+                process_group=(
+                    self._ep_comm_group
+                    if self._ep_comm_group is not None
+                    else (self.ep_comm_group if self.ep_world_size > 1 else None)
+                ),
+            )
+            # Cleared only on success: if the collective tune raises, a retried
+            # compute() re-attempts it (all ranks fail together, so lockstep
+            # holds).
+            self._autotune_pending = False
+        view = hopper_fp8_mega_moe(
+            output,
+            transformed_weights[0],
+            transformed_weights[1],
+            workspace,
+            num_tokens=num_tokens,
+            gate_up_clamp=_resolve_gate_up_clamp(kcfg),
+            activation_clamp=kcfg.activation_clamp,
+            fast_math=kcfg.fast_math,
+        )
+        # output=None -> zero-copy: the kernel's reduced result stays in the
+        # workspace and the caller consumes the [:n] view under stream
+        # ordering (valid until the next launch on this session's buffers).
+        return output if output is not None else view
+
+    def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
+        request = self._workspace_pool_request(fleet_params)
+        return request[0] if request is not None else None
+
+    def _workspace_pool_key_from_config(self, resolved_config: Any) -> Any:
+        import torch
+
+        return (
+            "sm90_fp8_fp8_bf16_pull_cutedsl",
+            torch.cuda.current_device(),
+            id(self._ep_comm_group),
+            resolved_config,
+        )
+
+    def _workspace_pool_request(self, fleet_params: FleetParams) -> Any:
+        if self._kernel_config.knobs == "auto":
+            # Autotuning mutates the frontend; keep these sessions unpooled.
+            return None
+        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+            _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config,
+            resolve_hopper_fp8_mega_moe_config,
+        )
+
+        resolved_config = resolve_hopper_fp8_mega_moe_config(
+            **self._frontend_config_kwargs(fleet_params)
+        )
+        key = self._workspace_pool_key_from_config(resolved_config)
+        return key, lambda: (
+            _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config(
+                resolved_config
+            )
+        )

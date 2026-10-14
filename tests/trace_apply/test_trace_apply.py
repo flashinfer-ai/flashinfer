@@ -93,8 +93,9 @@ def _ref_rmsnorm(x, w, eps=1e-6):
 
 
 @pytest.fixture(autouse=True)
-def _reset_trace_apply():
-    """Apply is process-global; ensure every test starts and ends disabled."""
+def _reset_trace_apply(monkeypatch: pytest.MonkeyPatch):
+    """Reset process-global Apply state without requiring a CUDA device."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     ta.disable_apply()
     yield
     ta.disable_apply()
@@ -200,6 +201,51 @@ def test_stateful_plan_run_namespace_and_candidate_kwargs():
     assert ck["k_cache"] is k_cache and ck["v_cache"] is v_cache
     assert ck["kv_indptr"] is kv_indptr and ck["kv_indices"] is kv_indices
     assert ck["sm_scale"] == 0.125
+
+
+def test_mla_stateful_adapter_recovers_moved_wrapper_plan_state():
+    from flashinfer.trace_apply.plan_capture import adapter_for
+
+    moved = "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run"
+    import flashinfer.mla  # noqa: F401  # Registers the moved wrapper trace.
+
+    reg = _registry_by_fi_api()
+    assert moved in reg
+    run_original, templates = reg[moved]
+    template = templates[0]
+    adapter = adapter_for(moved)
+    assert adapter is not None
+
+    class _Wrapper:
+        _kv_indptr_buf = torch.tensor([0, 1, 2], dtype=torch.int32)
+        _kv_indices_buf = torch.tensor([3, 4], dtype=torch.int32)
+        _sm_scale = 0.125
+
+    q_nope = torch.empty(2, 4, 8, dtype=torch.bfloat16)
+    q_pe = torch.empty(2, 4, 3, dtype=torch.bfloat16)
+    ckv_cache = torch.empty(5, 7, 8, dtype=torch.bfloat16)
+    kpe_cache = torch.empty(5, 7, 3, dtype=torch.bfloat16)
+    build_ns = _stateful_namespace_builder(run_original, template, adapter)
+    namespace = build_ns((_Wrapper(), q_nope, q_pe, ckv_cache, kpe_cache), {})
+
+    candidate_kwargs = adapt.build_candidate_kwargs(template, namespace)
+    assert candidate_kwargs["kv_indptr"].tolist() == [0, 1, 2]
+    assert candidate_kwargs["kv_indices"].tolist() == [3, 4]
+    assert candidate_kwargs["sm_scale"] == 0.125
+
+
+def test_mla_trace_apply_accepts_historical_and_moved_wrapper_keys():
+    from flashinfer.trace_apply.plan_capture import adapter_for
+
+    historical = "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run"
+    moved = "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run"
+    import flashinfer.mla  # noqa: F401  # Registers the MLA wrapper trace.
+
+    reg = _registry_by_fi_api()
+    assert historical in reg
+    assert moved in reg
+    assert adapter_for(historical) is not None
+    assert adapter_for(moved) is not None
 
 
 def test_output_adapt_value_returning_returns_value():
@@ -601,3 +647,236 @@ def test_solutions_positional_and_keyword_equivalent():
 def test_enable_apply_empty_is_noop():
     assert ta.enable_apply({}) == 0
     assert not ta.is_enabled()
+
+
+def test_multi_template_apply_uses_only_selected_metadata(monkeypatch):
+    """A runtime-selected template owns extraction, plan state, and outputs."""
+
+    from flashinfer.api_logging import _TRACE_DISPATCHERS
+    import flashinfer.trace_apply.apply as apply_module
+    from flashinfer.trace.template import Const, Tensor, TraceTemplate
+    from flashinfer.trace_apply import plan_capture
+    from flashinfer.trace_apply.plan_capture import StatefulAdapter
+
+    def make_template(name, state_param, *, destination=True):
+        output = (
+            Tensor(["width"], dtype_from="state", param="target")
+            if destination
+            else Tensor(["width"], dtype_from="state")
+        )
+        return TraceTemplate(
+            op_type="synthetic_multi_template",
+            name_prefix=name,
+            axes={"width": Const(abbrev="w")},
+            inputs={"state": Tensor(["width"], param=state_param)},
+            outputs={"output": output},
+        )
+
+    other = make_template("other", "other_state")
+    broken = make_template("broken", "broken_state")
+    selected = make_template("selected", "selected_state")
+    no_destination = make_template(
+        "no_destination", "no_destination_state", destination=False
+    )
+    unknown = make_template("unknown", "unknown_state")
+
+    def fail_to_build_extractors():
+        raise ValueError("invalid template")
+
+    monkeypatch.setattr(broken, "_build_axis_extractors", fail_to_build_extractors)
+    templates = [other, broken, selected, no_destination]
+    extractor_maps = build_extractor_maps(templates)
+    state = torch.empty(4)
+    assert extractor_maps[1] is None
+    assert extract_axes(extractor_maps, {"selected_state": state}) == {"width": 4}
+
+    class Owner:
+        def plan(self):
+            return None
+
+        def run(self, target, other_state=None) -> None:
+            del other_state
+            target.fill_(-1)
+
+    original = Owner.run
+    modes = {
+        "broken": broken,
+        "selected": selected,
+        "no_destination": no_destination,
+        "unknown": unknown,
+    }
+
+    def dispatch(*, self, save_dir=None, name=None, **_kwargs):
+        del save_dir, name
+        return modes[self.mode]
+
+    fi_api = "tests.synthetic_multi_template.Owner.run"
+    adapter = StatefulAdapter(plan_attr="plan", self_attrs={"state": "_state"})
+    monkeypatch.setattr(
+        apply_module,
+        "_registry_by_fi_api",
+        lambda: {fi_api: (original, templates)},
+    )
+    monkeypatch.setattr(apply_module, "_resolve_target", lambda _fi_api: (Owner, "run"))
+    monkeypatch.setattr(apply_module, "_build_alias_map", lambda: {})
+    monkeypatch.setitem(_TRACE_DISPATCHERS, original, dispatch)
+    monkeypatch.setattr(plan_capture, "is_stateful", lambda name: name == fi_api)
+    monkeypatch.setattr(plan_capture, "adapter_for", lambda _name: adapter)
+
+    def should_not_run(**_kwargs):
+        raise AssertionError("unselected solution was called")
+
+    def selected_solution(*, state):
+        return torch.ones_like(state)
+
+    assert (
+        ta.enable_apply(
+            {
+                "broken_w4": should_not_run,
+                "broken": should_not_run,
+                "selected_w4": selected_solution,
+                "no_destination_w4": should_not_run,
+                "unknown_w4": should_not_run,
+            }
+        )
+        == 1
+    )
+
+    owner = Owner()
+    owner._state = state
+    target = torch.zeros_like(state)
+    owner.mode = "selected"
+    assert owner.run(target, other_state=torch.empty(7)) is None
+    torch.testing.assert_close(target, torch.ones_like(target))
+
+    for mode in ("broken", "no_destination", "unknown"):
+        owner.mode = mode
+        target.zero_()
+        assert owner.run(target) is None
+        torch.testing.assert_close(target, -torch.ones_like(target))
+
+
+# ===========================================================================
+# Live MoE APIs: the per-call template dispatcher picks S=0 vs S>0
+# ===========================================================================
+
+MOE_FP8_API = "flashinfer.fused_moe.core.trtllm_fp8_block_scale_moe"
+MOE_FP4_API = "flashinfer.fused_moe.core.trtllm_fp4_block_scale_moe"
+_DEEPSEEK_V3 = 2
+
+
+def _fp8_moe_kwargs(num_shared, *, T=8, E=32, H=256, I=128):
+    rows, bs = E + num_shared, 128
+    return dict(
+        routing_logits=torch.randn(T, E, dtype=torch.float32),
+        routing_bias=torch.zeros(E, dtype=torch.bfloat16),
+        hidden_states=torch.zeros(T, H, dtype=torch.float8_e4m3fn),
+        hidden_states_scale=torch.ones(H // bs, T, dtype=torch.float32),
+        gemm1_weights=torch.zeros(rows, 2 * I, H, dtype=torch.float8_e4m3fn),
+        gemm1_weights_scale=torch.ones(rows, 2 * I // bs, H // bs, dtype=torch.float32),
+        gemm2_weights=torch.zeros(rows, H, I, dtype=torch.float8_e4m3fn),
+        gemm2_weights_scale=torch.ones(rows, H // bs, I // bs, dtype=torch.float32),
+        num_experts=E,
+        top_k=8,
+        n_group=8,
+        topk_group=4,
+        intermediate_size=I,
+        local_expert_offset=0,
+        local_num_experts=E,
+        routed_scaling_factor=2.5,
+        routing_method_type=_DEEPSEEK_V3,
+        num_fused_shared_experts=num_shared,
+    )
+
+
+def _fp4_moe_kwargs(num_shared, *, T=2, E=8, H=256, I=128):
+    rows = E + num_shared
+    ones = torch.ones(rows, dtype=torch.float32)
+    return dict(
+        routing_logits=torch.randn(T, E, dtype=torch.bfloat16),
+        routing_bias=torch.zeros(E, dtype=torch.bfloat16),
+        hidden_states=torch.zeros(T, H // 2, dtype=torch.uint8),
+        hidden_states_scale=torch.ones(T, H // 16, dtype=torch.float8_e4m3fn),
+        gemm1_weights=torch.zeros(rows, 2 * I, H // 2, dtype=torch.uint8),
+        gemm1_weights_scale=torch.ones(rows, 2 * I, H // 16, dtype=torch.float8_e4m3fn),
+        gemm1_bias=None,
+        gemm1_alpha=ones,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=torch.zeros(rows, H, I // 2, dtype=torch.uint8),
+        gemm2_weights_scale=torch.ones(rows, H, I // 16, dtype=torch.float8_e4m3fn),
+        gemm2_bias=None,
+        output1_scale_scalar=ones,
+        output1_scale_gate_scalar=ones,
+        output2_scale_scalar=ones,
+        num_experts=E,
+        top_k=2,
+        n_group=2,
+        topk_group=1,
+        intermediate_size=I,
+        local_expert_offset=0,
+        local_num_experts=E,
+        routed_scaling_factor=2.5,
+        routing_method_type=_DEEPSEEK_V3,
+        num_fused_shared_experts=num_shared,
+    )
+
+
+def _moe_definition_name(fi_api, call_kwargs):
+    """The name the wrapper computes: dispatcher-selected template + its axes."""
+    from flashinfer.api_logging import _TRACE_DISPATCHERS
+
+    original, _templates = _registry_by_fi_api()[fi_api]
+    namespace = bind_namespace(original, (), call_kwargs)
+    template = _TRACE_DISPATCHERS[original](save_dir=None, name=None, **namespace)
+    axes = extract_axes(build_extractor_maps([template]), namespace)
+    return template.definition_name(axes)
+
+
+@pytest.mark.parametrize(
+    "fi_api, make_kwargs",
+    [(MOE_FP8_API, _fp8_moe_kwargs), (MOE_FP4_API, _fp4_moe_kwargs)],
+    ids=["fp8", "fp4"],
+)
+def test_moe_apply_dispatches_shared_experts_sibling(monkeypatch, fi_api, make_kwargs):
+    """S>0 and S=0 calls of one API resolve to different definitions, and a
+    name registered for only one of them falls back to the original for the other."""
+    import functools
+
+    import flashinfer.fused_moe.core as core
+
+    attr = fi_api.rsplit(".", 1)[1]
+    shared_name = _moe_definition_name(fi_api, make_kwargs(1))
+    routed_name = _moe_definition_name(fi_api, make_kwargs(0))
+    assert "shared_experts" in shared_name and "_s1_" in shared_name
+    assert "shared_experts" not in routed_name
+
+    calls = []
+
+    @functools.wraps(getattr(core, attr))
+    def cpu_original(*args, **kwargs):
+        calls.append("original")
+        return torch.zeros(1)
+
+    def shared_solution(**kwargs):
+        calls.append("shared")
+        return torch.zeros(1)
+
+    def routed_solution(**kwargs):
+        calls.append("routed")
+        return torch.zeros(1)
+
+    monkeypatch.setattr(core, attr, cpu_original)
+    assert ta.enable_apply({shared_name: shared_solution, routed_name: routed_solution})
+    getattr(core, attr)(**make_kwargs(1))
+    getattr(core, attr)(**make_kwargs(0))
+    assert calls == ["shared", "routed"]
+    assert ta.stats().get(fi_api, {}).get("hit", 0) == 2
+
+    # Only the S>0 name registered: S=0 must reach the original, not the sibling.
+    calls.clear()
+    ta.enable_apply({shared_name: shared_solution})
+    getattr(core, attr)(**make_kwargs(0))
+    getattr(core, attr)(**make_kwargs(1))
+    assert calls == ["original", "shared"]
+    assert ta.stats().get(fi_api, {}).get("fallback_no_candidate", 0) >= 1

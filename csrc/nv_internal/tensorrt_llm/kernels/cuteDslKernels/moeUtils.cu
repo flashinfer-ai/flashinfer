@@ -160,7 +160,7 @@ template <typename InputType, typename TopKScaleType, int32_t kThreadsPerBlock>
 __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* output,
                                    int32_t const* expanded_idx_to_permuted_idx,
                                    TopKScaleType const* topk_scales, int32_t const hidden_size,
-                                   int32_t const top_k) {
+                                   int32_t const top_k, bool const input_is_expanded) {
   using AccumType = float;
   int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
   // Need int64_t to prevent overflow when computing pointer offsets.
@@ -181,14 +181,16 @@ __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* o
       rmemAccum[j] = 0;
     }
     for (int32_t k = 0; k < top_k; k++) {
-      int32_t const permuted_idx = expanded_idx_to_permuted_idx[token_idx * top_k + k];
+      int32_t const expanded_idx = token_idx * top_k + k;
+      int32_t const permuted_idx = expanded_idx_to_permuted_idx[expanded_idx];
       if (permuted_idx < 0) {
         continue;
       }
+      int32_t const input_idx = input_is_expanded ? expanded_idx : permuted_idx;
       auto const* src_ptr =
-          reinterpret_cast<ElemCopyType const*>(permuted_input) + permuted_idx * kCopyPerToken;
+          reinterpret_cast<ElemCopyType const*>(permuted_input) + input_idx * kCopyPerToken;
       *reinterpret_cast<ElemCopyType*>(rmem) = src_ptr[i];
-      TopKScaleType const scale = topk_scales[token_idx * top_k + k];
+      TopKScaleType const scale = topk_scales[expanded_idx];
 
 #pragma unroll
       for (int32_t j = 0; j < kElemPerCopy; j++) {
@@ -211,7 +213,7 @@ template <typename InputType, typename TopKScaleType>
 void moeUnpermute(InputType const* permuted_input, InputType* output,
                   int32_t const* expanded_idx_to_permuted_idx, TopKScaleType const* topk_scales,
                   int32_t const num_tokens, int32_t const hidden_size, int32_t const top_k,
-                  bool enable_pdl, cudaStream_t stream) {
+                  bool input_is_expanded, bool enable_pdl, cudaStream_t stream) {
   int32_t constexpr kThreadsPerBlock = 256;
   int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
   TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by %d.",
@@ -233,15 +235,15 @@ void moeUnpermute(InputType const* permuted_input, InputType* output,
   config.numAttrs = 1;
   config.attrs = attrs;
   cudaLaunchKernelEx(&config, kernel, permuted_input, output, expanded_idx_to_permuted_idx,
-                     topk_scales, hidden_size, top_k);
+                     topk_scales, hidden_size, top_k, input_is_expanded);
 }
 
-#define INSTANTIATE_MOE_UNPERMUTE(InputType, TopKScaleType)                                  \
-  template void moeUnpermute<InputType>(InputType const* permuted_input, InputType* output,  \
-                                        int32_t const* expanded_idx_to_permuted_idx,         \
-                                        TopKScaleType const* topk_scales,                    \
-                                        int32_t const num_tokens, int32_t const hidden_size, \
-                                        int32_t const top_k, bool enable_pdl, cudaStream_t stream)
+#define INSTANTIATE_MOE_UNPERMUTE(InputType, TopKScaleType)                          \
+  template void moeUnpermute<InputType>(                                             \
+      InputType const* permuted_input, InputType* output,                            \
+      int32_t const* expanded_idx_to_permuted_idx, TopKScaleType const* topk_scales, \
+      int32_t const num_tokens, int32_t const hidden_size, int32_t const top_k,      \
+      bool input_is_expanded, bool enable_pdl, cudaStream_t stream)
 
 INSTANTIATE_MOE_UNPERMUTE(half, float);
 INSTANTIATE_MOE_UNPERMUTE(half, half);
@@ -369,33 +371,47 @@ __global__ void moeActivationKernel(InputType const* input, InputType* output,
   cudaGridDependencySynchronize();
 #endif
 
+  // Each thread takes (permuted_idx, copy) items of the flattened
+  // [num_tokens, kCopyPerToken] space with a grid stride, so every thread has work
+  // even when a row is narrower than the block, and consecutive threads read
+  // consecutive 16-byte copies. The item index is stepped as a (row, copy) pair to
+  // keep 64-bit divisions out of the loop.
   int32_t const num_tokens = num_non_exiting_tiles[0] * tile_size;
-  for (int32_t permuted_idx = blockIdx.x; permuted_idx < num_tokens; permuted_idx += gridDim.x) {
-    int32_t const tile_idx = permuted_idx / tile_size;
-    if (permuted_idx >= tile_idx_to_mn_limit[tile_idx]) {
+  int64_t const first = static_cast<int64_t>(blockIdx.x) * kThreadsPerBlock + threadIdx.x;
+  int64_t const stride = static_cast<int64_t>(gridDim.x) * kThreadsPerBlock;
+  int32_t const row_step = static_cast<int32_t>(stride / kCopyPerToken);
+  int32_t const copy_step = static_cast<int32_t>(stride % kCopyPerToken);
+  int32_t permuted_idx = static_cast<int32_t>(first / kCopyPerToken);
+  int32_t i = static_cast<int32_t>(first % kCopyPerToken);
+  for (; permuted_idx < num_tokens; permuted_idx += row_step, i += copy_step) {
+    if (i >= kCopyPerToken) {
+      i -= kCopyPerToken;
+      if (++permuted_idx >= num_tokens) {
+        break;
+      }
+    }
+    if (permuted_idx >= tile_idx_to_mn_limit[permuted_idx / tile_size]) {
       continue;
     }
     auto const* src_ptr = reinterpret_cast<ElemCopyType const*>(input) +
                           permuted_idx * kCopyPerToken * (ActFn::IS_GLU ? 2 : 1);
     auto* dst_ptr = reinterpret_cast<ElemCopyType*>(output) + permuted_idx * kCopyPerToken;
-    for (int32_t i = threadIdx.x; i < kCopyPerToken; i += kThreadsPerBlock) {
-      *reinterpret_cast<ElemCopyType*>(rmem) = src_ptr[i];
-      if constexpr (ActFn::IS_GLU) {
-        *reinterpret_cast<ElemCopyType*>(rmemGate) = src_ptr[i + kCopyPerToken];
+    *reinterpret_cast<ElemCopyType*>(rmem) = src_ptr[i];
+    if constexpr (ActFn::IS_GLU) {
+      *reinterpret_cast<ElemCopyType*>(rmemGate) = src_ptr[i + kCopyPerToken];
 #pragma unroll
-        for (int32_t j = 0; j < kElemPerCopy; j++) {
-          rmem[j] = static_cast<InputType>(
-              act(static_cast<ComputeType>(rmemGate[j]), static_cast<ComputeType>(rmem[j])));
-        }
-      } else {
-#pragma unroll
-        for (int32_t j = 0; j < kElemPerCopy; j++) {
-          rmem[j] = static_cast<InputType>(act(static_cast<ComputeType>(rmem[j])));
-        }
+      for (int32_t j = 0; j < kElemPerCopy; j++) {
+        rmem[j] = static_cast<InputType>(
+            act(static_cast<ComputeType>(rmemGate[j]), static_cast<ComputeType>(rmem[j])));
       }
-
-      dst_ptr[i] = *reinterpret_cast<ElemCopyType*>(rmem);
+    } else {
+#pragma unroll
+      for (int32_t j = 0; j < kElemPerCopy; j++) {
+        rmem[j] = static_cast<InputType>(act(static_cast<ComputeType>(rmem[j])));
+      }
     }
+
+    dst_ptr[i] = *reinterpret_cast<ElemCopyType*>(rmem);
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -410,8 +426,8 @@ void moeActivation(InputType const* input, InputType* output, int32_t const* til
                    int32_t const tile_size, bool enable_pdl, cudaStream_t stream) {
   int32_t constexpr kThreadsPerBlock = 256;
   int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
-  TLLM_CHECK_WITH_INFO(interm_size % kElemPerCopy == 0, "interm_size must be divisible by %d.",
-                       kElemPerCopy);
+  TLLM_CHECK_WITH_INFO(interm_size > 0 && interm_size % kElemPerCopy == 0,
+                       "interm_size must be a positive multiple of %d.", kElemPerCopy);
 
   using namespace cutlass_kernels;
 
@@ -447,7 +463,12 @@ void moeActivation(InputType const* input, InputType* output, int32_t const* til
 
   static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   int32_t const maxBlocksPerSM = getMaxActiveBlocksPerSM(kernel, kThreadsPerBlock, 0);
-  int32_t const blocks = std::min(smCount * maxBlocksPerSM, max_num_permuted_tokens);
+  // One thread per 16-byte input copy of the worst-case rows, capped at one full wave.
+  int64_t const maxItems =
+      static_cast<int64_t>(max_num_permuted_tokens) * (interm_size / kElemPerCopy);
+  int32_t const blocks = static_cast<int32_t>(std::max<int64_t>(
+      1, std::min<int64_t>(static_cast<int64_t>(smCount) * maxBlocksPerSM,
+                           (maxItems + kThreadsPerBlock - 1) / kThreadsPerBlock)));
   int32_t const threads = kThreadsPerBlock;
 
   cudaLaunchConfig_t config;

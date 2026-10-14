@@ -252,9 +252,11 @@ struct Compute {
 
     // Mutex between two compute groups.
     OrderedMutexAccessor mutex_accessor(shared->compute_mutex, warpgroup_id, SYNC_BARRIER);
-    // Notify warpgroup 0 to execute HGMMA first (overlap HGMMA and Softmax Math Instructions).
-    if (ENABLE_MUTEX && warpgroup_id == 1 && Kernel_traits::ELEMENT_BYTES == 2) {
-      mutex_accessor.arrive();
+    // Bootstrap the ordered-mbarrier: WG1 pre-arrives so WG0's first wait() does not deadlock.
+    if constexpr (ENABLE_MUTEX) {
+      if (warpgroup_id == 1) {
+        mutex_accessor.arrive();
+      }
     }
 
     // While loop for different heads.
@@ -436,10 +438,12 @@ struct Compute {
       Circular_buffer_kv_reader& cbr_v, OrderedMutexAccessor& mutex, uint32_t* skip_softmax_vote,
       bool complete = false) {
     // Skip-softmax vote initialization
-    if (tidx == 0) {
-      // Note that we need a named_barrier_wait in compute_single_tile to make sure init is before
-      // voting.
-      *skip_softmax_vote = 1;
+    if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX) {
+      if (tidx == 0) {
+        // Note that we need a named_barrier_wait in compute_single_tile to make sure init is before
+        // voting.
+        *skip_softmax_vote = 1;
+      }
     }
 // load the scales of K/V from global memory
 #define LOAD_SCALES_KV(dst, which, blocks_per_step, block_size)                            \
@@ -464,8 +468,9 @@ struct Compute {
     float scales_k[SAGE_BLOCKS_PER_STEP_K];
     LOAD_SCALES_K(scales_k)
 
-    // Wait until another warpgroup has already executed HGMMA.
-    if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 2) {
+    // Hold the mutex only around BMM1 (wait here, arrive after) so softmax runs outside the lock
+    // and overlaps the other warpgroup's BMM1 GMMA.
+    if constexpr (ENABLE_MUTEX) {
       mutex.wait();
     }
 
@@ -474,7 +479,9 @@ struct Compute {
 
     // If skip_softmax is enabled, make sure there is no racing between the initialization and
     // writing of skip_softmax_vote.
-    named_barrier_wait(Kernel_traits::SKIP_SOFTMAX_BARRIER_ID + threadIdx.x / 128, 128);
+    if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX) {
+      named_barrier_wait(Kernel_traits::SKIP_SOFTMAX_BARRIER_ID + threadIdx.x / 128, 128);
+    }
 
     // BMM1 (Q x K').
     warpgroup_arrive();
@@ -505,13 +512,9 @@ struct Compute {
       cbr.advance();
     }
 
-    if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 2) {
-      // Notify another warpgroup to execute HGMMA.
+    if constexpr (ENABLE_MUTEX) {
+      // Release right after BMM1 so the other warpgroup's BMM1 overlaps this group's softmax.
       mutex.arrive();
-    }
-    if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1) {
-      // Wait until another warpgroup has already executed QGMMA.
-      mutex.named_bar_wait();
     }
 
     // Fragment p for BMM2 input
@@ -538,10 +541,6 @@ struct Compute {
 
     // Softmax Exp, max/sum, and update scales. If returns false we skip the rest.
     if (!softmax.compute_and_update_scale<IS_FIRST_COL>(p_max, p_sum, skip_softmax_vote)) {
-      if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1) {
-        // Notify another warpgroup to execute QGMMA.
-        mutex.named_bar_arrive();
-      }
       // Need to wait V, otherwise compute-sanitizer synccheck will fail.
       int ready2 = cbr_v.peek();
       if (!ready2) {
@@ -564,11 +563,6 @@ struct Compute {
 
     // Update flash attention scales and pack it for BMM2
     softmax.pack<IS_FIRST_COL>(ctile_o, frag_p);
-
-    if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1) {
-      // Notify another warpgroup to execute QGMMA.
-      mutex.named_bar_arrive();
-    }
 
     // Wait until v buffer is ready.
     int ready = cbr_v.peek();

@@ -10,6 +10,7 @@ class AlphaProcessor:
     CUMSUM_LOG = 0
     CUMPROD = 1
     CUMPROD_SCALE = 2
+    CUMPROD_END_RCP = 2
     CUMPROD_NEG_END_RCP = 2
     NUM_CHANNELS = 3
 
@@ -19,6 +20,7 @@ class AlphaProcessor:
         vecs: cute.Tensor,
         scale: cutlass.Float32,
         channel2_neg_end_rcp: cutlass.Constexpr = False,
+        channel2_end_rcp: cutlass.Constexpr = False,
     ):
         WARP_SIZE = 32
         blk_q = cute.size(vecs.shape[0])
@@ -45,7 +47,7 @@ class AlphaProcessor:
             carry = cute.arch.shuffle_sync(frag[i - 1], 31)
             frag[i] = frag[i] + carry
 
-        if cutlass.const_expr(channel2_neg_end_rcp):
+        if cutlass.const_expr(channel2_neg_end_rcp or channel2_end_rcp):
             end_log = cute.arch.shuffle_sync(frag[num_iters - 1], 31)
         for i in cutlass.range_constexpr(num_iters):
             vecs_32[lane_id, i, AlphaProcessor.CUMSUM_LOG] = frag[i]
@@ -55,5 +57,9 @@ class AlphaProcessor:
                 vecs_32[
                     lane_id, i, AlphaProcessor.CUMPROD_NEG_END_RCP
                 ] = -cute.math.exp2(end_log - frag[i], fastmath=True)
+            elif cutlass.const_expr(channel2_end_rcp):
+                vecs_32[lane_id, i, AlphaProcessor.CUMPROD_END_RCP] = cute.math.exp2(
+                    end_log - frag[i], fastmath=True
+                )
             else:
                 vecs_32[lane_id, i, AlphaProcessor.CUMPROD_SCALE] = cumprod * scale

@@ -390,7 +390,8 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
 
 namespace utils {
 
-#define FINAL_MASK 0xffffffff
+static constexpr int kWarpSize = 32;
+static constexpr unsigned int kFullWarpMask = 0xffffffffU;
 
 template <typename T, int NUM>
 __inline__ __device__ T warpReduceSumV2(T* val) {
@@ -398,7 +399,24 @@ __inline__ __device__ T warpReduceSumV2(T* val) {
   for (int i = 0; i < NUM; i++) {
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1)
-      val[i] += __shfl_xor_sync(FINAL_MASK, val[i], mask, 32);
+      val[i] += __shfl_xor_sync(kFullWarpMask, val[i], mask, kWarpSize);
+  }
+  return (T)(0.0f);
+}
+
+template <typename T, int NUM>
+__inline__ __device__ T warpReduceSumPartialV2(T* val, int active_lanes) {
+  int lane = threadIdx.x & (kWarpSize - 1);
+  unsigned int active_mask = active_lanes == kWarpSize ? kFullWarpMask : (1U << active_lanes) - 1;
+#pragma unroll
+  for (int i = 0; i < NUM; i++) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      T other = __shfl_xor_sync(active_mask, val[i], mask, kWarpSize);
+      if ((lane ^ mask) < active_lanes) {
+        val[i] += other;
+      }
+    }
   }
   return (T)(0.0f);
 }
@@ -408,8 +426,15 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
   static __shared__ T shared[NUM][33];
   int lane = threadIdx.x & 0x1f;
   int wid = threadIdx.x >> 5;
+  int warp_count = ceil_div(blockDim.x, kWarpSize);
+  int tail_lanes = blockDim.x & (kWarpSize - 1);
+  bool is_partial_warp = tail_lanes != 0 && wid == warp_count - 1;
 
-  warpReduceSumV2<T, NUM>(val);
+  if (is_partial_warp) {
+    warpReduceSumPartialV2<T, NUM>(val, tail_lanes);
+  } else {
+    warpReduceSumV2<T, NUM>(val);
+  }
 
   if (lane == 0) {
 #pragma unroll
@@ -420,12 +445,16 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
 
   __syncthreads();
 
-  bool is_mask = threadIdx.x < (blockDim.x >> 5);
+  bool is_mask = threadIdx.x < warp_count;
 #pragma unroll
   for (int i = 0; i < NUM; i++) {
     val[i] = is_mask ? shared[i][lane] : (T)(0.0f);
   }
-  warpReduceSumV2<T, NUM>(val);
+  if (is_partial_warp) {
+    warpReduceSumPartialV2<T, NUM>(val, tail_lanes);
+  } else {
+    warpReduceSumV2<T, NUM>(val);
+  }
   return (T)0.0f;
 }
 
@@ -435,7 +464,24 @@ __inline__ __device__ T warpReduceMaxV2(T* val) {
   for (int i = 0; i < NUM; i++) {
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
-      val[i] = fmaxf(val[i], __shfl_xor_sync(FINAL_MASK, val[i], mask, 32));
+      val[i] = fmaxf(val[i], __shfl_xor_sync(kFullWarpMask, val[i], mask, kWarpSize));
+    }
+  }
+  return (T)(0.0f);
+}
+
+template <typename T, int NUM>
+__inline__ __device__ T warpReduceMaxPartialV2(T* val, int active_lanes) {
+  int lane = threadIdx.x & (kWarpSize - 1);
+  unsigned int active_mask = active_lanes == kWarpSize ? kFullWarpMask : (1U << active_lanes) - 1;
+#pragma unroll
+  for (int i = 0; i < NUM; i++) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      T other = __shfl_xor_sync(active_mask, val[i], mask, kWarpSize);
+      if ((lane ^ mask) < active_lanes) {
+        val[i] = fmaxf(val[i], other);
+      }
     }
   }
   return (T)(0.0f);
@@ -446,8 +492,15 @@ __inline__ __device__ T blockReduceMaxV2(T* val) {
   static __shared__ T shared[NUM][33];
   int lane = threadIdx.x & 0x1f;
   int wid = threadIdx.x >> 5;
+  int warp_count = ceil_div(blockDim.x, kWarpSize);
+  int tail_lanes = blockDim.x & (kWarpSize - 1);
+  bool is_partial_warp = tail_lanes != 0 && wid == warp_count - 1;
 
-  warpReduceMaxV2<T, NUM>(val);
+  if (is_partial_warp) {
+    warpReduceMaxPartialV2<T, NUM>(val, tail_lanes);
+  } else {
+    warpReduceMaxV2<T, NUM>(val);
+  }
 
   if (lane == 0) {
 #pragma unroll
@@ -458,13 +511,17 @@ __inline__ __device__ T blockReduceMaxV2(T* val) {
 
   __syncthreads();
 
-  bool is_mask = threadIdx.x < (blockDim.x >> 5);
+  bool is_mask = threadIdx.x < warp_count;
 #pragma unroll
   for (int i = 0; i < NUM; i++) {
     val[i] = is_mask ? shared[i][lane]
                      : maths::cuda_cast<T>(-cuda::std::numeric_limits<float>::infinity());
   }
-  warpReduceMaxV2<T, NUM>(val);
+  if (is_partial_warp) {
+    warpReduceMaxPartialV2<T, NUM>(val, tail_lanes);
+  } else {
+    warpReduceMaxV2<T, NUM>(val);
+  }
   return (T)0.0f;
 }
 
@@ -961,10 +1018,23 @@ class Barrier {
       m_flag_value = next_flag(m_flag_value);
       // To avoid the ABA problem, we need to synchronize the correct flag value to all
       // barrier_flags, even if the corresponding CTA has not been launched.
-      for (int flag_idx = blockIdx.x; flag_idx < details::kBarrierFlagCount;
+      // The slot of this block is written last: the peer only waits on that slot, so its
+      // release store must order the stores to the slots of CTAs that are not launched now.
+      // Otherwise a later launch with a larger grid can see a slot still holding the flag
+      // from two barriers ago, which also differs from prev_flag, and pass early.
+      //
+      // The other slots can be relaxed. In a later launch, CTA j waits on slot j until it
+      // differs from prev_flag. Within a launch, slot j is written only by the peer's CTA j
+      // as its own slot, with a release store, so the store that ends the wait always pairs
+      // with the acquire load. The relaxed value backfilled into slot j by an earlier launch
+      // is ordered before that launch's own-slot release, which this rank acquired, and that
+      // launch completes before the later one starts; so the wait cannot observe the older
+      // flag from before the backfill.
+      for (int flag_idx = blockIdx.x + gridDim.x; flag_idx < details::kBarrierFlagCount;
            flag_idx += gridDim.x) {
-        st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
+        st_flag_relaxed(m_target_flag + flag_idx * NRanks, m_flag_value);
       }
+      st_flag(m_target_flag + blockIdx.x * NRanks, m_flag_value);
       while (ld_flag(m_current_flag) == prev_flag(m_flag_value)) {
       }
     }
@@ -974,6 +1044,10 @@ class Barrier {
  protected:
   __device__ __forceinline__ void st_flag(int* addr, int flag) {
     asm volatile("st.global.release.sys.b32 [%1], %0;" ::"r"(flag), "l"(addr));
+  }
+
+  __device__ __forceinline__ void st_flag_relaxed(int* addr, int flag) {
+    asm volatile("st.global.relaxed.sys.b32 [%1], %0;" ::"r"(flag), "l"(addr));
   }
 
   __device__ __forceinline__ int ld_flag(int* addr) {
@@ -1450,7 +1524,6 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   int tot_access = index_helper.tot_access;
   vec_t<T, VEC_SIZE> clear_vec;
   clear_vec.fill(neg_zero_v<T>);
-  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
@@ -1458,6 +1531,10 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
     cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
+  // Constructed after the grid dependency sync: the constructor loads rms_gamma and
+  // residual_in, and under PDL this kernel can start before the producer that writes
+  // residual_in has completed.
+  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
   LamportComm<NRanks> comm(params.workspace, params.rank);
   int clear_access = comm.clear_size / VEC_SIZE;
 
@@ -1518,10 +1595,12 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
   int access_id = index_helper.access_id;
   int access_stride = index_helper.access_stride;
   int tot_access = index_helper.tot_access;
-  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
+  // Constructed after the grid dependency sync, for the same reason as the one-shot
+  // kernel above.
+  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
   SyncComm<NRanks> comm(params.workspace);
 #pragma unroll
   for (int r = 0; r < NRanks; ++r) {
@@ -1646,12 +1725,12 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
     }
   }
   int threads_per_token = params.hidden_dim / VEC_SIZE;
-  int cluster_size;
-  if (SM >= 90) {
-    cluster_size = 8;
-  } else {
-    cluster_size = 1;
-  }
+  // Clamp to the largest cluster the device can launch.
+  static const int max_cluster_size =
+      GetMaxClusterSize(reinterpret_cast<void const*>(
+                            allreduce_fusion_kernel_oneshot_lamport<Pattern, T, NRanks, Fp32Acc>),
+                        128);
+  int cluster_size = std::min(8, max_cluster_size);
   while (threads_per_token % cluster_size != 0 && cluster_size > 1) {
     cluster_size /= 2;
   }

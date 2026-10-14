@@ -33,6 +33,32 @@ namespace norm {
 
 using namespace tensorrt_llm::common;
 
+template <typename T>
+struct QuantTypeStaticVals;
+
+template <>
+struct QuantTypeStaticVals<int8_t> {
+  static constexpr float MAX_VAL = 127.f;
+  static constexpr float MIN_SCALING_FACTOR = 0.f;
+  static constexpr float MIN_SCALING_FACTOR_RCP = FLT_MAX;
+};
+
+// Same values as TRT-LLM quantTypeUtils.cuh; MIN_SCALING_FACTOR bound follows
+// https://github.com/pytorch/FBGEMM/blob/main/fbgemm_gpu/experimental/gen_ai/src/quantize/quantize.cu
+template <>
+struct QuantTypeStaticVals<__nv_fp8_e4m3> {
+  static constexpr float MAX_VAL = 448.f;
+  static constexpr float MIN_SCALING_FACTOR = 1.0f / (448.f * 512.f);
+  static constexpr float MIN_SCALING_FACTOR_RCP = 448.f * 512.f;
+};
+
+template <>
+struct QuantTypeStaticVals<__nv_fp8_e5m2> {
+  static constexpr float MAX_VAL = 57344.f;
+  static constexpr float MIN_SCALING_FACTOR = 1.0f / (57344.f * 512.f);
+  static constexpr float MIN_SCALING_FACTOR_RCP = 57344.f * 512.f;
+};
+
 template <uint32_t VEC_SIZE, typename T>
 __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* __restrict__ output,
                               const uint32_t d, const uint32_t stride_input,
@@ -199,6 +225,7 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
   __syncthreads();
 
   float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+  constexpr float max_val = QuantTypeStaticVals<O>::MAX_VAL;
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
@@ -214,7 +241,7 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
       output_vec[j] =
           float(input_vec[j]) * rms_rcp * (weight_bias + float(weight_vec[j])) * scale_inv;
-      output_vec[j] = fmaxf(-448.0f, fminf(output_vec[j], 448.0f));
+      output_vec[j] = fmaxf(-max_val, fminf(output_vec[j], max_val));
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       output_vec.cast_store(output + bx * stride_output + i * num_threads * VEC_SIZE +
@@ -583,6 +610,7 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
   __syncthreads();
 
   float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+  constexpr float max_val = QuantTypeStaticVals<O>::MAX_VAL;
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<float, VEC_SIZE> output_vec;
@@ -598,7 +626,7 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
       output_vec[j] = x_vec[j] * rms_rcp * (weight_bias + float(weight_vec[j])) * scale_inv;
-      output_vec[j] = fmaxf(-448.0f, fminf(output_vec[j], 448.0f));
+      output_vec[j] = fmaxf(-max_val, fminf(output_vec[j], max_val));
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       output_vec.cast_store(output + bx * stride_output + i * num_threads * VEC_SIZE +
@@ -644,6 +672,143 @@ cudaError_t FusedAddRMSNormQuant(T* input, T* residual, T* weight, O* output, ui
                                             weight_bias, scale, eps));
   });
 
+  return cudaSuccess;
+}
+
+// Fused Add-residual + RMSNorm + 1x128 fp8 block-quant producer. The block-scaled sibling of
+// FusedAddRMSNormQuant: instead of a scalar per-tensor scale it emits one fp32 scale per 1x128
+// block, in the column-major TMA-aligned (d/128, round_up(M,4)) layout that flashinfer's fp8
+// block-scaled GEMMs consume (flashinfer/deep_gemm.py check_sf_layout: stride(-2)==1,
+// stride(-1)==round_up(M,4)). One CTA per token row; num_threads = d/VEC_SIZE cover the row in a
+// single wave (host picks VEC_SIZE so num_threads<=1024). kLanesPerBlock = 128/VEC_SIZE
+// consecutive, warp-local threads own one 1x128 block, so its amax is a register-only warp-subgroup
+// reduction. Requires d % (32*VEC_SIZE) == 0 and d % 128 == 0. Emits: fp8 output[M,d]; fp32
+// block_scale; bf16 residual (hidden+residual, pre-norm, in place); bf16 normed_out. The fp8 is
+// quantized from the T-rounded normed so it exactly matches normed_out (a bf16 consumer's re-quant
+// is identical).
+template <uint32_t VEC_SIZE, typename T, typename O>
+__global__ void FusedAddRMSNormFP8BlockQuantKernel(
+    T* __restrict__ input, T* __restrict__ residual, T* __restrict__ weight, O* __restrict__ output,
+    float* __restrict__ block_scale, T* __restrict__ normed_out, const uint32_t d,
+    const uint32_t stride_input, const uint32_t stride_residual, const uint32_t stride_output,
+    const uint32_t stride_normed, const uint32_t scale_stride_m, float eps) {
+  constexpr uint32_t kQuantBlock = 128;
+  constexpr uint32_t kLanesPerBlock = kQuantBlock / VEC_SIZE;  // threads covering one 1x128 block
+  const uint32_t bx = blockIdx.x;                              // token row m
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  constexpr uint32_t warp_size = 32;
+  const uint32_t num_warps = blockDim.y;
+  const uint32_t thread_id = tx + ty * warp_size;
+  const uint32_t col = thread_id * VEC_SIZE;
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+
+  // Pass 1: x = input + residual; write pre-norm residual in place; accumulate sum of squares.
+  vec_t<T, VEC_SIZE> input_vec, residual_vec, weight_vec;
+  input_vec.load(input + bx * stride_input + col);
+  residual_vec.load(residual + bx * stride_residual + col);
+  weight_vec.load(weight + col);
+  float x[VEC_SIZE];
+  float sum_sq = 0.f;
+#pragma unroll
+  for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+    x[j] = float(input_vec[j]) + float(residual_vec[j]);
+    sum_sq += x[j] * x[j];
+    residual_vec[j] = (T)x[j];
+  }
+  residual_vec.store(residual + bx * stride_residual + col);
+
+  // Cross-CTA sum reduction (warp shfl -> smem -> first-warp shfl), then rms reciprocal.
+  extern __shared__ float smem[];
+#pragma unroll
+  for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2)
+    sum_sq += math::shfl_xor_sync(sum_sq, offset);
+  smem[ty] = sum_sq;
+  __syncthreads();
+  if (ty == 0) {
+    float s = (tx < num_warps) ? smem[tx] : 0.f;
+#pragma unroll
+    for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2)
+      s += math::shfl_xor_sync(s, offset);
+    smem[0] = s;
+  }
+  __syncthreads();
+  const float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+  constexpr float max_val = 448.0f;  // fp8 e4m3 amax (1x128 block-scale activations are e4m3)
+
+  // Pass 2: normed = round_T(x * rms * weight); write bf16 normed_out; per-128-block amax.
+  float normed[VEC_SIZE];
+  vec_t<T, VEC_SIZE> normed_vec;
+  float lamax = 0.f;
+#pragma unroll
+  for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+    T nb = (T)(x[j] * rms_rcp * float(weight_vec[j]));  // round to T before amax/quant
+    normed[j] = float(nb);
+    normed_vec[j] = nb;
+    lamax = fmaxf(lamax, fabsf(normed[j]));
+  }
+  normed_vec.store(normed_out + bx * stride_normed + col);
+
+  // amax over the 1x128 block: kLanesPerBlock consecutive lanes reduce within their warp subgroup.
+#pragma unroll
+  for (uint32_t offset = kLanesPerBlock / 2; offset > 0; offset /= 2)
+    lamax = fmaxf(lamax, math::shfl_xor_sync(lamax, offset));
+  const float amax = fmaxf(lamax, 1e-4f);
+  if ((thread_id % kLanesPerBlock) == 0)  // one scale per 1x128 block, column-major (TMA) layout
+    block_scale[(col / kQuantBlock) * scale_stride_m + bx] = amax / max_val;
+
+  // Quantize the T-rounded normed to fp8.
+  const float inv = max_val / amax;
+  vec_t<float, VEC_SIZE> out_vec;
+#pragma unroll
+  for (uint32_t j = 0; j < VEC_SIZE; ++j) out_vec[j] = normed[j] * inv;
+  out_vec.cast_store(output + bx * stride_output + col);
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+// Host launcher. VEC_SIZE is chosen by d so num_threads = d/VEC_SIZE <= 1024 (single wave), with
+// 128 % VEC_SIZE == 0 for the block reduction. The kernel has no per-thread bounds guard, so d must
+// be a whole number of warps of vectors: d <= 16384 and d % (32*VEC_SIZE) == 0 (VEC_SIZE=8 for
+// d<=8192 -> d%256==0; VEC_SIZE=16 for d<=16384 -> d%512==0). Returns cudaErrorInvalidValue
+// otherwise. scale_stride_m = round_up(batch_size, 4) (the block_scale column stride, elements).
+template <typename T, typename O>
+cudaError_t FusedAddRMSNormFP8BlockQuant(T* input, T* residual, T* weight, O* output,
+                                         float* block_scale, T* normed_out, uint32_t batch_size,
+                                         uint32_t d, uint32_t stride_input,
+                                         uint32_t stride_residual, uint32_t stride_output,
+                                         uint32_t stride_normed, uint32_t scale_stride_m,
+                                         float eps = 1e-5, bool enable_pdl = false,
+                                         cudaStream_t stream = 0) {
+  const uint32_t vec_size = (d <= 8192) ? 8 : 16;  // num_threads = d/vec_size <= 1024
+  if (d == 0 || d > 16384 || d % (32 * vec_size) != 0)
+    return cudaErrorInvalidValue;  // kernel covers the row single-wave with no bounds guard
+  const uint32_t num_threads = d / vec_size;
+  const uint32_t num_warps = ceil_div(num_threads, 32);
+  dim3 nblks(batch_size);
+  dim3 nthrs(32, num_warps);
+  const uint32_t smem_size = ceil_div(num_warps, 4) * 4 * sizeof(float);
+
+  cudaLaunchConfig_t config;
+  config.gridDim = nblks;
+  config.blockDim = nthrs;
+  config.dynamicSmemBytes = smem_size;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel = FusedAddRMSNormFP8BlockQuantKernel<VEC_SIZE, T, O>;
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+        &config, kernel, input, residual, weight, output, block_scale, normed_out, d, stride_input,
+        stride_residual, stride_output, stride_normed, scale_stride_m, eps));
+  });
   return cudaSuccess;
 }
 
@@ -719,16 +884,6 @@ cudaError_t GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batc
 
   return cudaSuccess;
 }
-
-template <typename T>
-struct QuantTypeStaticVals;
-
-template <>
-struct QuantTypeStaticVals<int8_t> {
-  static constexpr float MAX_VAL = 127.f;
-  static constexpr float MIN_SCALING_FACTOR = 0.f;
-  static constexpr float MIN_SCALING_FACTOR_RCP = FLT_MAX;
-};
 
 template <typename Tf, typename T>
 __inline__ __device__ Tf compute_layernorm(Tf val, float s_mean, float s_variance, T const* gemma,
@@ -827,8 +982,10 @@ __global__ void generalLayerNorm(T const* input, Tw const* gemma, Tw const* beta
   bool const with_per_tensor_scaling = scale_orig_quant_per_tensor != nullptr;
   bool const with_per_token_sum = sum_per_token != nullptr;
 
-  const float_packed_t scale_orig_quant =
-      cuda_cast<float_packed_t>(with_per_tensor_scaling ? *scale_orig_quant_per_tensor : 0.0f);
+  // The reciprocal makes the per-tensor path follow the flashinfer convention
+  // out = normed / scale, matching RMSNormQuant.
+  const float_packed_t scale_orig_quant = cuda_cast<float_packed_t>(
+      with_per_tensor_scaling ? 1.0f / (*scale_orig_quant_per_tensor) : 0.0f);
   T_scalar amax = 1e-6f;
   local_sum = 0.f;
 
@@ -952,7 +1109,6 @@ cudaError_t LayerNorm(T* input, Tw* gemma, Tw* beta, T* out, uint32_t tokens, ui
                             (std::is_same<T, half>::value || std::is_same<T, __nv_bfloat16>::value);
 
   // Enable min_scaling factor if it is fp8 row-wise per-token quantization
-  // TODO(kaixih): add support for fp8 quantization if needed
   bool has_fp8_min_scaling = false;
   float* clamp_ptr = nullptr;
   float* scale = nullptr;
@@ -976,6 +1132,49 @@ cudaError_t LayerNorm(T* input, Tw* gemma, Tw* beta, T* out, uint32_t tokens, ui
   }
   return cudaSuccess;
 }
+
+#ifdef ENABLE_FP8
+template <typename T, typename Tw, typename QuantT>
+cudaError_t LayerNormQuant(T* input, Tw* gemma, Tw* beta, QuantT* out_quant, float* scale,
+                           uint32_t tokens, uint32_t hidden_dim, float eps = 1e-5,
+                           cudaStream_t stream = 0) {
+  dim3 grid(tokens);
+  dim3 block(min(hidden_dim, 1024));
+  // Make sure block.x is multiple of 32 for warp shuffle to work
+  block.x = 32 * ((block.x + 31) / 32);
+
+  constexpr size_t vec_size = 2;
+  const size_t shmem_size = hidden_dim * sizeof(T);
+  bool const use_vec_type = (hidden_dim % vec_size == 0) &&
+                            (std::is_same<T, half>::value || std::is_same<T, __nv_bfloat16>::value);
+
+  // Per-tensor scaling path: the non-quantized output is never written and the
+  // fp8 cast saturates, so no extra clamp is needed.
+  T* normed_output = nullptr;
+  bool has_fp8_min_scaling = false;
+  float* clamp_ptr = nullptr;
+  float* dynamic_scale = nullptr;
+  float* sum_per_token = nullptr;
+  bool use_diff_of_squares = false;
+
+  if (use_vec_type) {
+    using Tp = typename packed_as<T, vec_size>::type;
+    using Twp = typename packed_as<Tw, vec_size>::type;
+    // QuantT stays scalar here; the kernel re-packs it via
+    // packed_as<QuantT, num_elems<Tp>::value> to match the vectorized T.
+    dispatch_layernorm_type(
+        reinterpret_cast<Tp const*>(input), reinterpret_cast<Twp const*>(gemma),
+        reinterpret_cast<Twp const*>(beta), reinterpret_cast<Tp*>(normed_output), eps, tokens,
+        hidden_dim, clamp_ptr, scale, dynamic_scale, sum_per_token, out_quant, has_fp8_min_scaling,
+        grid, block, shmem_size, stream, use_diff_of_squares);
+  } else {
+    dispatch_layernorm_type(input, gemma, beta, normed_output, eps, tokens, hidden_dim, clamp_ptr,
+                            scale, dynamic_scale, sum_per_token, out_quant, has_fp8_min_scaling,
+                            grid, block, shmem_size, stream, use_diff_of_squares);
+  }
+  return cudaGetLastError();
+}
+#endif  // ENABLE_FP8
 
 }  // namespace norm
 

@@ -1,0 +1,218 @@
+{
+  "arch": "sm_120a",
+  "bytes_per_token": 384,
+  "candidates_per_chunk": 64,
+  "decode_params": [
+    "q",
+    "kv_cache",
+    "indices",
+    "extra_kv_cache",
+    "extra_indices",
+    "topk_length",
+    "extra_topk_length",
+    "attn_sink",
+    "output",
+    "out_lse",
+    "mid_out",
+    "mid_lse",
+    "topk",
+    "extra_topk",
+    "page_size",
+    "page_stride_bytes",
+    "extra_page_size",
+    "extra_page_stride_bytes",
+    "scratch_split_stride",
+    "chunks_per_block",
+    "sm_scale",
+    "lse_scale",
+    "write_direct"
+  ],
+  "decode_smem_bytes": 90240,
+  "decode_smem_bytes_two_tile": 100480,
+  "decode_sources": [
+    "cake_sparse_mla_dsv4_nvfp4_h112.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h128.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h16.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h32.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h48.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h64.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h8.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h80.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h96.cu"
+  ],
+  "decode_sources_kept": false,
+  "decode_threads": 320,
+  "entry": "cake_sparse_mla_sm120_dsv4_nvfp4_decode",
+  "family": "cake_sparse_mla_sm120_dsv4_nvfp4",
+  "generated_at": "2026-10-03T21:16:37Z",
+  "generator": "sm120-dsv4-nvfp4-sparse-mla-flashinfer-export",
+  "head_counts": [
+    8,
+    16,
+    32,
+    48,
+    64,
+    80,
+    96,
+    112,
+    128
+  ],
+  "head_dim": 512,
+  "header": "cake_sparse_mla_dsv4_nvfp4_kernels.h",
+  "heads_per_block": 16,
+  "identity": "9137a41af15f6411febb18aecc9d08948133df1b6988e90e09bddc2d781bcc22",
+  "identity_scope": "sha256 over sorted (file name, file text without the provenance header)",
+  "kernel_commit": "917e54848e82bcb5c39db366caf2ec1acfa27b48",
+  "kernel_tree_modified": false,
+  "max_chunks_per_block": 16,
+  "merge_params": [
+    "mid_out",
+    "mid_lse",
+    "attn_sink",
+    "output",
+    "out_lse",
+    "num_splits",
+    "scratch_split_stride",
+    "lse_scale"
+  ],
+  "merge_threads": 256,
+  "module_head_counts": [
+    8,
+    16,
+    32,
+    48,
+    64,
+    80,
+    96,
+    112,
+    128
+  ],
+  "prefill_entry": "cake_sparse_mla_sm120_dsv4_nvfp4_prefill",
+  "prefill_head_counts": [
+    16,
+    32,
+    48,
+    64,
+    80,
+    96,
+    112,
+    128
+  ],
+  "prefill_head_tiles": {
+    "112": [
+      1
+    ],
+    "128": [
+      1,
+      2,
+      4
+    ],
+    "16": [
+      1
+    ],
+    "32": [
+      1,
+      2
+    ],
+    "48": [
+      1
+    ],
+    "64": [
+      1,
+      2,
+      4
+    ],
+    "80": [
+      1
+    ],
+    "96": [
+      1,
+      2
+    ]
+  },
+  "prefill_kernel_commit": "917e54848e82bcb5c39db366caf2ec1acfa27b48",
+  "prefill_max_chunks": 16,
+  "prefill_min_blocks_per_sm": 1,
+  "prefill_params": [
+    "q",
+    "kv_cache",
+    "indices",
+    "extra_kv_cache",
+    "extra_indices",
+    "topk_length",
+    "extra_topk_length",
+    "attn_sink",
+    "output",
+    "out_lse",
+    "num_tokens",
+    "topk",
+    "extra_topk",
+    "page_size",
+    "page_stride_bytes",
+    "extra_page_size",
+    "extra_page_stride_bytes",
+    "sm_scale",
+    "lse_scale",
+    "q_evict_first",
+    "grid_head_blocks_first"
+  ],
+  "prefill_ring_stages": {
+    "1": [
+      2,
+      3
+    ],
+    "2": [
+      2
+    ],
+    "4": [
+      2
+    ]
+  },
+  "prefill_smem_bytes": {
+    "1": 73856,
+    "2": 81536,
+    "4": 96896
+  },
+  "prefill_smem_bytes_three_stages": {
+    "1": 98688
+  },
+  "prefill_sources": [
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h112.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h128.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h16.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h32.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h48.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h64.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h80.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h96.cu"
+  ],
+  "prefill_threads": 384,
+  "sources": [
+    "cake_sparse_mla_dsv4_nvfp4_binding.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h112.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h128.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h16.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h32.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h48.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h64.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h8.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h80.cu",
+    "cake_sparse_mla_dsv4_nvfp4_h96.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h112.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h128.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h16.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h32.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h48.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h64.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h80.cu",
+    "cake_sparse_mla_dsv4_nvfp4_prefill_h96.cu"
+  ],
+  "tree_commit": "917e54848e82bcb5c39db366caf2ec1acfa27b48",
+  "two_tile_head_counts": [
+    32,
+    64,
+    96,
+    128
+  ],
+  "value_dim": 512
+}

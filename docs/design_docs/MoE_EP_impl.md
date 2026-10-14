@@ -2,7 +2,7 @@
 
 How the FlashInfer **MoE expert-parallel** API is put together and how to use it, walked
 through the multi-GPU correctness test `tests/moe_ep/test_moe_ep_compute_correctness.py`.
-For container/build/run and benchmark numbers see `benchmarks/MoE_benchmarks.md`.
+For container/build/run and benchmark numbers see `benchmarks/moe_ep/MoE_benchmarks.md`.
 
 `MoEEpLayer` runs one MoE layer split across ranks as **dispatch → per-expert grouped GEMM
 → combine**, over a pluggable transport (`nccl_ep` or `nixl_ep`). The expert GEMM reuses the
@@ -13,17 +13,20 @@ lives in dispatch/combine).
 
 | Symbol | Role |
 |---|---|
-| `MoEEpLayer(bootstrap, fleet_params, backend, compute_config, weights)` | the layer (`nn.Module`) |
+| `MoEEpLayer(bootstrap, fleet_params, weights, fleet_knobs=(), backend=...)` | the layer (`nn.Module`) |
 | `MoEEpTensors(hidden_states, topk_ids, topk_weights)` | per-rank forward inputs |
 | `BootstrapConfig(world_size, rank, stream, nccl_comm)` | transport bootstrap |
 | `FleetParams(num_experts, max_tokens_per_rank, token_hidden_size, dtype_bytes, algorithm, layout)` | EP geometry |
 | `EpAlgorithm.{LOW_LATENCY, HIGH_THROUGHPUT}`, `EpLayout.{EXPERT_MAJOR, RANK_MAJOR, FLAT}` | algorithm / receive layout |
-| `compute_config: MoEConfig`, `weights: MoEWeightPack` | the expert GEMM (from `flashinfer.fused_moe.api`) |
+| `FleetAlgoKnobFaultTolerance(enabled, timeout_ms, reconcile_timeout_s, coordinator_takeover_s)` | opt-in rank masking (LL only) |
+| `supports_fault_tolerance(backend)` | can this host serve the FT API? |
+| `Fleet.{query_fault, query_active_mask, set_active_mask, reconcile_active_mask, clear_faults, active_mask_epoch}` | FT runtime API — mask is `int32[world]`, `1 = active` |
+| `weights: MoEWeightPack` (layer arg) + `SplitConfig(kernel=FusedMoeKernelConfig(moe_config: MoEConfig))` | the expert GEMM (config from `flashinfer.fused_moe.api`) |
 
 `create_fleet(...)` raises `MoEEpNotBuiltError` (with rebuild hint) if the backend extension
 isn't present; `available_backends()` lists what's built.
 
-## 2. Call stack — `MoEEpLayer.forward(t)`
+## 2. Call stack — `MoEEpLayer.forward(t)` (Fleet/Handle path)
 
 ```
 forward(t: MoEEpTensors)                                   # flashinfer/moe_ep/layer.py
@@ -33,7 +36,7 @@ forward(t: MoEEpTensors)                                   # flashinfer/moe_ep/l
 │                  HandleAlgoKnobTopKWeights(weights=t.topk_weights)])#   the chosen Layout
 ├─ handle.dispatch(DispatchInputParams(x=[t.hidden_states]))         # → _dispatch_ll / _dispatch_ll_rank_major
 │      → nccl.ep dispatch + complete  →  DispatchOutput(expert_tensors, recv_topk_idx/weights)  #   / _dispatch_ht
-├─ _inner_compute(d):                                                # the EP→compute bridge
+├─ kernel.compute(_fleet_kernel_context(d)):                         # the EP→compute bridge
 │      EXPERT_MAJOR → build_activation_pack(...)        ┐ flatten 3D recv → token-major
 │      RANK_MAJOR/HT → build_activation_pack_rank_major ┘ pack (selected_experts, final_scales)
 │      → MoELayer(compute_config)(act_pack, weights)     # per-expert grouped GEMM (top_k=1 local)
@@ -49,7 +52,7 @@ events capture their GPU time; `dispatch` host-syncs internally, which doesn't p
 
 The handle backend (`flashinfer/moe_ep/nccl_ep/handle.py`) is where the three I/O contracts
 live, and where the host-call fast path (`NV_FI_EP_FAST_PATH`) and burn-down probes (`EP_PROFILE_HOST`)
-are wired (see `benchmarks/MoE_benchmarks.md` §3.2).
+are wired (see `benchmarks/moe_ep/MoE_benchmarks.md` §3.2).
 
 ## 3. Algorithm / layout contracts
 
@@ -99,7 +102,8 @@ Step by step (`_run_one_layout`):
        BootstrapConfig(world_size, rank, stream=torch.cuda.current_stream().cuda_stream, nccl_comm=None),
        FleetParams(num_experts, max_tokens_per_rank=TOKENS_PER_RANK, token_hidden_size=HIDDEN,
                    dtype_bytes=2, algorithm=EpAlgorithm.LOW_LATENCY, layout=layout),
-       backend="nccl_ep", compute_config=cfg, weights=wp,
+       weights=wp,
+       backend=SplitConfig(comm=NcclEpConfig(), kernel=FusedMoeKernelConfig(moe_config=cfg)),
    )
    ```
 5. **Run** — `y = layer.forward(MoEEpTensors(hidden_states=x, topk_ids=topk_ids,
@@ -138,6 +142,6 @@ Related single-GPU tests: `test_compute_bridge.py` (layout-bridge unit tests),
 `smoke_nccl_ep.py` / `smoke_nixl_ep.py`.
 
 ## 6. Pointers
-- Container, how to run, benchmark numbers, the host-call fast path: `benchmarks/MoE_benchmarks.md`.
+- Container, how to run, benchmark numbers, the host-call fast path: `benchmarks/moe_ep/MoE_benchmarks.md`.
 - Backend handle (I/O contracts, fast path, profiling): `flashinfer/moe_ep/nccl_ep/handle.py`.
 - EP→compute bridge: `flashinfer/moe_ep/_compute_bridge.py`; layer: `flashinfer/moe_ep/layer.py`.

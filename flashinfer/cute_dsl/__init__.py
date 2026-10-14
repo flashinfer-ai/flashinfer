@@ -25,19 +25,26 @@ This module provides high-performance GPU kernels implemented using NVIDIA CuTe-
     removed in a future release.
 """
 
-from .utils import (
+from .availability import (
     is_cute_dsl_available,
-    make_ptr,
-    get_cutlass_dtype,
-    torch_to_cutlass_dtype,
-    get_num_sm,
-    convert_sf_to_mma_layout,
-    convert_sf_from_mma_layout,
-    get_mma_sf_shape,
+    is_rubin_cute_dsl_available,
+    is_cute_dsl_experimental_available,
+    is_cute_dsl_arch_supported,
+    require_cute_dsl_arch,
 )
 
 # Conditionally import CuTe-DSL kernels
 if is_cute_dsl_available():
+    from .utils import (
+        make_ptr,
+        get_cutlass_dtype,
+        torch_to_cutlass_dtype,
+        get_num_sm,
+        convert_sf_to_mma_layout,
+        convert_sf_from_mma_layout,
+        get_mma_sf_shape,
+    )
+
     # Deprecated GEMM symbols: re-exported for backwards compatibility.
     # Use flashinfer.gemm instead.
     from .blockscaled_gemm import (
@@ -74,20 +81,25 @@ if is_cute_dsl_available():
     )
 
 __all__ = [
-    # Utils (always available)
+    # Availability probes (always importable, DSL present or not)
     "is_cute_dsl_available",
-    "make_ptr",
-    "get_cutlass_dtype",
-    "torch_to_cutlass_dtype",
-    "get_num_sm",
-    # Scale factor layout conversion utilities
-    "convert_sf_to_mma_layout",
-    "convert_sf_from_mma_layout",
-    "get_mma_sf_shape",
+    "is_rubin_cute_dsl_available",
+    "is_cute_dsl_experimental_available",
+    "is_cute_dsl_arch_supported",
+    "require_cute_dsl_arch",
 ]
 
 if is_cute_dsl_available():
     __all__ += [
+        # Utils
+        "make_ptr",
+        "get_cutlass_dtype",
+        "torch_to_cutlass_dtype",
+        "get_num_sm",
+        # Scale factor layout conversion utilities
+        "convert_sf_to_mma_layout",
+        "convert_sf_from_mma_layout",
+        "get_mma_sf_shape",
         # Blockscaled GEMM (deprecated, use flashinfer.gemm instead)
         "grouped_gemm_nt_masked",
         "Sm100BlockScaledPersistentDenseGemmKernel",

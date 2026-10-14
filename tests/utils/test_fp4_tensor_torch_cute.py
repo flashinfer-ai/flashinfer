@@ -25,6 +25,10 @@ def copy_torch_fp4_tensor(a_ptr: cute.Pointer, b_ptr: cute.Pointer):
 def test_fp4_tensor_torch_cute():
     if not is_cute_dsl_available():
         pytest.skip("cute-dsl is not available")
+    from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+    if not is_cute_dsl_arch_supported(*torch.cuda.get_device_capability(0)):
+        pytest.skip("installed CuTe DSL does not support this GPU architecture")
 
     a = torch.randint(
         0, 128, size=(3, 4), dtype=torch.uint8, device=torch.device("cuda:0")

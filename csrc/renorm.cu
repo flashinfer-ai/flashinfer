@@ -60,7 +60,7 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
 
 void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
                         Optional<TensorView> maybe_top_k_arr, int64_t top_k_val,
-                        TensorView row_states_buffer) {
+                        bool is_deterministic, TensorView row_states_buffer) {
   CHECK_INPUT(probs);
   CHECK_INPUT(row_states_buffer);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
@@ -81,7 +81,7 @@ void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
         static_cast<c_type*>(probs.data_ptr()), static_cast<c_type*>(renorm_probs.data_ptr()),
         has_top_k_arr ? static_cast<int*>(maybe_top_k_arr.value().data_ptr()) : nullptr, batch_size,
         top_k_val, vocab_size, static_cast<sampling::RadixRowState*>(row_states_buffer.data_ptr()),
-        stream);
+        is_deterministic, stream);
     return true;
   });
 
@@ -117,6 +117,14 @@ void top_k_mask_logits(TensorView logits, TensorView mask_logits,
     return true;
   });
 
+  if (status == cudaErrorNotSupported) {
+    TVM_FFI_ICHECK(false)
+        << "top_k_mask_logits does not support multi-CTA execution on GPUs with 16 or fewer "
+           "SMs because its cross-CTA software barrier cannot guarantee forward progress "
+        << "(vocab_size=" << vocab_size
+        << "). Use top_k_top_p_sampling_from_logits(..., filter_apply_order=\"joint\") when "
+           "joint filtering semantics are acceptable, or configure another sampling backend.";
+  }
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopKMaskLogits failed with error code " << cudaGetErrorString(status);
 }

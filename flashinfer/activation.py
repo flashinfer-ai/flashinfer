@@ -35,6 +35,12 @@ from .utils import (
     get_compute_capability,
 )
 from .quantization.fp4_quantization import get_fp4_quantization_module
+from .quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    _UNSET,
+    nvfp4_4over6_code,
+    resolve_nvfp4_4over6,
+)
 
 
 @functools.cache
@@ -61,6 +67,14 @@ def get_act_and_mul_module(act_func_name: str):
 
     # Register the module
     return SimpleNamespace(**{fname: _act_and_mul})
+
+
+def _check_act_and_mul_input(input: torch.Tensor) -> None:
+    # The kernel picks a vector width that divides hidden_size, so any even
+    # last dimension (2 * hidden_size) is supported; it no longer has to be a
+    # multiple of 16 bytes.
+    if input.shape[-1] % 2 != 0:
+        raise ValueError("The last dimension must be even (2 * hidden_size).")
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
@@ -100,8 +114,7 @@ def silu_and_mul(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
+    _check_act_and_mul_input(input)
     if out is not None:
         _check_shape(input, out)
     else:
@@ -145,8 +158,7 @@ def gelu_tanh_and_mul(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
+    _check_act_and_mul_input(input)
     if out is not None:
         _check_shape(input, out)
     else:
@@ -186,8 +198,7 @@ def gelu_and_mul(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
+    _check_act_and_mul_input(input)
     if out is not None:
         _check_shape(input, out)
     else:
@@ -205,6 +216,8 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
     a,
     mask,
     a_global_sf,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ):
     r"""Fused SiLU + mul + per-expert NVFP4 quantization with a per-row mask.
 
@@ -221,6 +234,14 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
         expert-assignment mask).
     a_global_sf : torch.Tensor
         Global scale factor of shape ``[1]`` with dtype ``float32``.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off. The environment is ignored.
+        - :class:`NVFP44Over6Config`: on with exactly that recipe. The
+          environment is ignored.
 
     Returns
     -------
@@ -236,6 +257,7 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
         multiple of 4.  Here ``sf_vec_size`` is fixed at ``16`` (NVFP4),
         matching :func:`flashinfer.quantization.nvfp4_quantize`.
     """
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"
     a_fp4, a_sf = get_fp4_quantization_module(
@@ -244,5 +266,6 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
         a,
         mask,
         a_global_sf,
+        nvfp4_4over6_code(nvfp4_4over6_config),
     )
     return a_fp4, a_sf

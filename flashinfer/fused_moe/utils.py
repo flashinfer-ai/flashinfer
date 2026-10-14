@@ -1,15 +1,51 @@
 import contextlib
+import functools
 import logging
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import torch
 
-from ..utils import ceil_div, round_up
+from flashinfer.utils import ceil_div, next_positive_power_of_2, round_up
+
+from ..tllm_enums import ActivationType
 
 logger = logging.getLogger(__name__)
+
+_CUTILE_PERMUTE_TILE_CAP = 16384
+# A single-CTA histogram avoids multi-stage routing overhead at decode sizes.
+_CUTILE_PERMUTE_SMALL_MAX_ASSIGNMENTS = 24
+
+
+def _cutile_permute_shape(
+    num_assignments: int, num_experts: int
+) -> tuple[int, int, int]:
+    """Return the cuTile routing histogram's expert/chunk dimensions."""
+    epow2 = next_positive_power_of_2(num_experts)
+    max_chunk = max(8, _CUTILE_PERMUTE_TILE_CAP // epow2)
+    target_chunks = max(8, _CUTILE_PERMUTE_TILE_CAP // (4 * epow2))
+    chunk = min(
+        max(8, max_chunk // 2),
+        max(8, next_positive_power_of_2(num_assignments) // target_chunks),
+    )
+    if 32 * max_chunk <= num_assignments < 128 * max_chunk:
+        # Bound the histogram count after the initial parallelism ramp.
+        chunk = max_chunk
+    elif num_assignments >= 128 * max_chunk:
+        # Reintroduce chunks to expose enough CTAs for large routing batches.
+        chunk = min(32, max(8, max_chunk // 2))
+    num_chunks = max(1, (num_assignments + chunk - 1) // chunk)
+    return epow2, chunk, next_positive_power_of_2(num_chunks)
+
+
+def _cutile_max_permuted_rows(
+    num_assignments: int, num_experts: int, block_size: int
+) -> int:
+    """Upper-bound cuTile expert-padded rows without charging empty experts."""
+    return num_assignments + min(num_assignments, num_experts) * (block_size - 1)
+
 
 is_torch_compiling_flag = False
 
@@ -173,40 +209,6 @@ def _(sf, rows, cols, scaling_vector_size=16):
     return sf.new_empty(sz)
 
 
-def next_positive_power_of_2(x: int) -> int:
-    """Return the smallest power of 2 that is ``>= x``.
-
-    Returns 1 when *x* < 1.  Safe for use inside ``torch.compile``
-    (avoids ``bit_length()``).
-    """
-    if x < 1:
-        return 1
-
-    # Following code is equivalent to 1 << (x - 1).bit_length()
-    # But this impl does not contain bit_length() so can be used by torch compile.
-    # It can correctly handle 64bit number which should be enough for now.
-    n = x - 1
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    n |= n >> 32
-    return n + 1
-
-
-def last_positive_power_of_2(x: int) -> int:
-    """Return the largest power of 2 that is ``<= x``.
-
-    If *x* is itself a power of 2, returns *x*.
-    """
-    next = next_positive_power_of_2(x)
-    if next == x:
-        return next
-
-    return next // 2
-
-
 def nearest_in_buckets(x: int, buckets: List[int]) -> int:
     """Snap *x* to the nearest power-of-2 bucket, clamped to ``[buckets[0], buckets[-1]]``."""
     return min(max(next_positive_power_of_2(x), buckets[0]), buckets[-1])
@@ -292,6 +294,18 @@ def map_to_hybrid_bucket(x: int, max_num_tokens: int) -> int:
     return min(next_positive_power_of_2(x), max_num_tokens)
 
 
+@functools.cache
+def make_hybrid_bucket_mapper(max_num_tokens: int) -> Callable[[int], int]:
+    """Return a stable callable that maps token counts to hybrid buckets.
+
+    Cached by ``max_num_tokens`` so the same object is returned on every call
+    with the same argument.  This keeps AutoTuner._find_nearest_profile's
+    lru_cache key stable — a fresh ``lambda`` or ``partial`` on every inference
+    call would produce a new key each time and cause unbounded cache growth.
+    """
+    return functools.partial(map_to_hybrid_bucket, max_num_tokens=max_num_tokens)
+
+
 def map_to_hybrid_bucket_uncapped(x: int) -> int:
     """One-argument variant for use as a function reference in GEMM tuning.
 
@@ -308,86 +322,6 @@ def map_to_hybrid_bucket_uncapped(x: int) -> int:
     if x <= _PHASE3_END:
         return _ceil_to_step(x, _PHASE3_STEP)
     return next_positive_power_of_2(x)
-
-
-def round_to_nearest_bucket(
-    x: int, buckets: Sequence[int], round_map: bool = False
-) -> int:
-    """Map *x* to the nearest bucket using floor or ceil semantics.
-
-    Args:
-        x: The value to map.
-        buckets: Bucket values in **ascending** order.  Must not be empty.
-        round_map: Rounding direction.
-
-            * ``False`` (default) -- **floor**: return the largest bucket
-              that is ``<= x``.  If *x* is smaller than every bucket, the
-              smallest bucket is returned (clamped).
-            * ``True`` -- **ceil**: return the smallest bucket that is
-              ``>= x``.  If *x* is larger than every bucket, the largest
-              bucket is returned (clamped).
-
-    Returns:
-        The matched bucket value.  Always one of the elements in *buckets*.
-
-    Examples::
-
-        >>> round_to_nearest_bucket(350, [100, 200, 500, 1000])
-        200
-        >>> round_to_nearest_bucket(350, [100, 200, 500, 1000], round_map=True)
-        500
-        >>> round_to_nearest_bucket(2000, [100, 200, 500, 1000], round_map=True)
-        1000
-    """
-    if len(buckets) == 0:
-        raise ValueError("buckets must be non-empty")
-    if round_map:
-        for b in buckets:
-            if b >= x:
-                return b
-        return buckets[-1]
-    else:
-        for b in reversed(buckets):
-            if b <= x:
-                return b
-        return buckets[0]
-
-
-def make_bucket_mapper(buckets: Tuple[int, ...], round_map: bool = False):
-    """Create a mapper function for :class:`DynamicTensorSpec.map_to_tuning_buckets`.
-
-    The returned callable maps any integer *x* to the nearest value in
-    *buckets*, using floor or ceil semantics controlled by *round_map*.
-    Duplicates in *buckets* are removed and values are sorted internally.
-
-    Args:
-        buckets: The set of allowed bucket values.
-        round_map: If ``False`` (default) the mapper rounds **down** (floor);
-            if ``True`` it rounds **up** (ceil).  In both cases the result is
-            clamped to the bucket range -- see
-            :func:`round_to_nearest_bucket` for details.
-
-    Returns:
-        A ``Callable[[int], int]`` suitable for passing as
-        ``map_to_tuning_buckets`` to :class:`DynamicTensorSpec`.
-
-    Examples::
-
-        >>> mapper = make_bucket_mapper((100, 200, 500, 1000), round_map=False)
-        >>> mapper(350)
-        200
-        >>> mapper_up = make_bucket_mapper((100, 200, 500, 1000), round_map=True)
-        >>> mapper_up(350)
-        500
-    """
-    if len(buckets) == 0:
-        raise ValueError("buckets must be non-empty")
-    sorted_buckets = tuple(sorted(set(buckets)))
-
-    def _mapper(x: int) -> int:
-        return round_to_nearest_bucket(x, sorted_buckets, round_map)
-
-    return _mapper
 
 
 def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):
@@ -429,7 +363,11 @@ def get_piecewise_cuda_graph_flag() -> bool:
 
 
 def make_random_topk_ids(
-    num_experts: int, num_tokens: int, top_k: int, device: torch.device
+    num_experts: int,
+    num_tokens: int,
+    top_k: int,
+    device: torch.device,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """
     Pick ``top_k`` distinct experts (no replacement) for each of ``num_tokens`` tokens.
@@ -449,4 +387,34 @@ def make_random_topk_ids(
     weights = torch.ones((), device=device, dtype=torch.float32).expand(
         num_tokens, num_experts
     )
-    return torch.multinomial(weights, top_k, replacement=False).to(torch.int32)
+    return torch.multinomial(weights, top_k, replacement=False, generator=generator).to(
+        torch.int32
+    )
+
+
+def get_b12x_activation_name(activation_type: ActivationType) -> str:
+    """Map an activation enum to its b12x kernel name.
+
+    Validate typed scalars before this conversion. Unsupported types raise
+    ``ValueError``; backend selection should expose them as ``NotImplementedError``.
+    """
+    if activation_type is ActivationType.Swiglu:
+        return "silu"
+    if activation_type is ActivationType.GegluTanh:
+        return "gelu_tanh"
+    if activation_type is ActivationType.Relu2:
+        return "relu2"
+    raise ValueError(f"Unsupported b12x activation type {activation_type!r}.")
+
+
+def resolve_b12x_activation_name(activation) -> str:
+    """Resolve a typed activation, rejecting scalars b12x cannot represent."""
+    from .api import SwiGLU
+
+    if activation is None:
+        activation = SwiGLU()
+    if isinstance(activation, SwiGLU) and activation != SwiGLU():
+        raise NotImplementedError(
+            f"b12x cannot represent non-default SwiGLU scalars; got {activation!r}."
+        )
+    return get_b12x_activation_name(activation.type)

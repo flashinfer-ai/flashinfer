@@ -61,6 +61,9 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 namespace tensorrt_llm::kernels::cutlass_kernels_oss {
+#if defined(ENABLE_FP4)
+using tensorrt_llm::kernels::cutlass_kernels::Fp4Type;
+#endif
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
@@ -72,12 +75,12 @@ auto getDispatchFunctionForSM100(cutlass_extensions::EpilogueScheduleType epilog
     auto select_dynamic_cga = [epilogue_schedule](auto dynamic_cga_t) {
 #if defined(ENABLE_FP4)
       constexpr bool is_block_scaled =
-          IsMXFPX || std::is_same_v<T, __nv_fp4_e2m1> || std::is_same_v<WeightType, __nv_fp4_e2m1>;
+          IsMXFPX || std::is_same_v<T, Fp4Type> || std::is_same_v<WeightType, Fp4Type>;
 #else
       constexpr bool is_block_scaled = IsMXFPX;
 #endif
       if constexpr ((!is_block_scaled || Arch::kMinComputeCapability == 103) &&
-                    FUSION != EpilogueFusion::FINALIZE) {
+                    FUSION != EpilogueFusion::FINALIZE && FUSION != EpilogueFusion::ACTIVATION) {
         auto func_map = std::array{
             &kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
                 Arch, T, WeightType, OutputType, cutlass::epilogue::PtrArrayNoSmemWarpSpecialized,
@@ -97,7 +100,8 @@ auto getDispatchFunctionForSM100(cutlass_extensions::EpilogueScheduleType epilog
                       "SM103 should support both epilogue schedules");
         TLLM_CHECK_WITH_INFO(
             epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA,
-            "No Smem epilogue schedule is not supported for block scaled types or finalize fusion");
+            "No Smem epilogue schedule is not supported for block scaled types, finalize "
+            "fusion, or activation fusion");
         return &kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
             Arch, T, WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized,
             EpilogueTag, FUSION, TileShape, ClusterShape, IsMXFPX, decltype(dynamic_cga_t)::value,
@@ -107,8 +111,13 @@ auto getDispatchFunctionForSM100(cutlass_extensions::EpilogueScheduleType epilog
     return dynamic_cga ? select_dynamic_cga(tensorrt_llm::common::ConstBool<true>{})
                        : select_dynamic_cga(tensorrt_llm::common::ConstBool<false>{});
   };
-  return swap_ab ? select_swap_ab(tensorrt_llm::common::ConstBool<true>{})
-                 : select_swap_ab(tensorrt_llm::common::ConstBool<false>{});
+  if constexpr (FUSION == EpilogueFusion::ACTIVATION) {
+    TLLM_CHECK_WITH_INFO(!swap_ab, "Activation epilogue fusion does not support swap_ab tactics");
+    return select_swap_ab(tensorrt_llm::common::ConstBool<false>{});
+  } else {
+    return swap_ab ? select_swap_ab(tensorrt_llm::common::ConstBool<true>{})
+                   : select_swap_ab(tensorrt_llm::common::ConstBool<false>{});
+  }
 }
 
 template <typename Arch, typename T, typename WeightType, typename OutputType, typename EpilogueTag,
@@ -162,7 +171,7 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
   else {
 #if defined(ENABLE_FP4)
     constexpr static bool is_wfp4afp8 =
-        std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
+        std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, Fp4Type>;
 #else
     constexpr static bool is_wfp4afp8 = false;
 #endif
@@ -243,7 +252,7 @@ constexpr bool are_tile_shapes_supported_sm100() {
 
   if constexpr (Arch::kMinComputeCapability == 103) {
 #if defined(ENABLE_FP4)
-    return std::is_same_v<DataType, __nv_fp4_e2m1> && std::is_same_v<WeightType, __nv_fp4_e2m1> &&
+    return std::is_same_v<DataType, Fp4Type> && std::is_same_v<WeightType, Fp4Type> &&
            TileM == 128 && (TileN == 128 || TileN == 256);
 #else
     return false;
@@ -255,8 +264,7 @@ constexpr bool are_tile_shapes_supported_sm100() {
   }
 
 #ifdef ENABLE_FP4
-  if constexpr (std::is_same_v<DataType, __nv_fp4_e2m1> ||
-                std::is_same_v<WeightType, __nv_fp4_e2m1>) {
+  if constexpr (std::is_same_v<DataType, Fp4Type> || std::is_same_v<WeightType, Fp4Type>) {
     // if (TileN % 64 != 0 || TileN < 128)
     // {
     //     return false;
@@ -455,9 +463,10 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
     }
 #if defined(ENABLE_FP4) && defined(COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS)
     // Check this before SM100 because we fall back to SM100 if not NVFP4
-    else if (gemm_config.sm_version == 103 && std::is_same_v<T, __nv_fp4_e2m1> &&
-             std::is_same_v<WeightType, __nv_fp4_e2m1>) {
-      if constexpr (kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<
+    else if (gemm_config.sm_version == 103 && std::is_same_v<T, Fp4Type> &&
+             std::is_same_v<WeightType, Fp4Type>) {
+      if constexpr (FUSION != EpilogueFusion::ACTIVATION &&
+                    kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<
                         T, WeightType, EpilogueTag, FUSION>()) {
         switch (gemm_config.tile_config_sm100) {
           SHAPE_CASE(103, 128, 128, 128)
@@ -473,21 +482,32 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
     else if (gemm_config.sm_version >= 100 && gemm_config.sm_version < 120) {
       if constexpr (kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<
                         T, WeightType, EpilogueTag, FUSION>()) {
-        switch (gemm_config.tile_config_sm100) {
-          SHAPE_CASE(100, 64, 32, 128)
-          SHAPE_CASE(100, 64, 64, 128)
-          SHAPE_CASE(100, 64, 128, 128)
-          SHAPE_CASE(100, 64, 256, 128)
+        if constexpr (FUSION == EpilogueFusion::ACTIVATION) {
+          // Match the activation operations emitted by generate_kernels.py. The K dimension in
+          // the tactic enum is bytes; SHAPE_CASE converts it to elements for each input dtype.
+          switch (gemm_config.tile_config_sm100) {
+            SHAPE_CASE(100, 128, 64, 128)
+            SHAPE_CASE(100, 128, 128, 128)
+            SHAPE_CASE(100, 128, 256, 128)
+            DEFAULT_CASE(100)
+          }
+        } else {
+          switch (gemm_config.tile_config_sm100) {
+            SHAPE_CASE(100, 64, 32, 128)
+            SHAPE_CASE(100, 64, 64, 128)
+            SHAPE_CASE(100, 64, 128, 128)
+            SHAPE_CASE(100, 64, 256, 128)
 
-          SHAPE_CASE(100, 128, 16, 128)
-          SHAPE_CASE(100, 128, 32, 128)
-          SHAPE_CASE(100, 128, 64, 128)
-          SHAPE_CASE(100, 128, 128, 128)
-          SHAPE_CASE(100, 128, 256, 128)
+            SHAPE_CASE(100, 128, 16, 128)
+            SHAPE_CASE(100, 128, 32, 128)
+            SHAPE_CASE(100, 128, 64, 128)
+            SHAPE_CASE(100, 128, 128, 128)
+            SHAPE_CASE(100, 128, 256, 128)
 
-          // SHAPE_CASE(100, 128, 128, 64)
-          // SHAPE_CASE(100, 128, 256, 64)
-          DEFAULT_CASE(100)
+            // SHAPE_CASE(100, 128, 128, 64)
+            // SHAPE_CASE(100, 128, 256, 64)
+            DEFAULT_CASE(100)
+          }
         }
       } else {
         TLLM_THROW("Unsupported SM100 configuration requested");
@@ -517,7 +537,16 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
 
   bool const use_mxfpx = hopper_input.fpX_block_scaling_type ==
                          TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-  if (use_mxfpx) {
+  if constexpr (FUSION == EpilogueFusion::ACTIVATION) {
+    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
+      TLLM_CHECK_WITH_INFO(use_mxfpx, "MXFP8 activation epilogue fusion requires block scaling");
+      dispatch_by_mxfpx(tensorrt_llm::common::ConstBool<true>{});
+    } else {
+      TLLM_CHECK_WITH_INFO(!use_mxfpx,
+                           "BF16 activation epilogue fusion does not use block scaling");
+      dispatch_by_mxfpx(tensorrt_llm::common::ConstBool<false>{});
+    }
+  } else if (use_mxfpx) {
     dispatch_by_mxfpx(tensorrt_llm::common::ConstBool<true>{});
   } else {
     dispatch_by_mxfpx(tensorrt_llm::common::ConstBool<false>{});

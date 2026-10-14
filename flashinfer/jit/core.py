@@ -1,11 +1,23 @@
+import abc
 import dataclasses
 import functools
 import logging
 import os
+import threading
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union, Hashable
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Hashable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+)
 
 import tvm_ffi
 from filelock import FileLock
@@ -93,10 +105,29 @@ class FlashInferJITLogger(logging.Logger):
 logger = FlashInferJITLogger("flashinfer.jit")
 
 
+def refresh_current_compilation_context() -> CompilationContext:
+    """Refresh the cached compilation context in place.
+
+    Many JIT modules import ``current_compilation_context`` directly from this
+    module, so mutating the shared object keeps those aliases in sync while
+    still allowing us to re-probe the currently visible CUDA devices.
+    """
+
+    refreshed = CompilationContext()
+    current_compilation_context.TARGET_CUDA_ARCHS.clear()
+    current_compilation_context.TARGET_CUDA_ARCHS.update(refreshed.TARGET_CUDA_ARCHS)
+    return current_compilation_context
+
+
 def check_cuda_arch():
+    compilation_context = current_compilation_context
+    # Retry empty detection, but trust populated metadata: forked workers must
+    # reuse the parent's architecture set without reinitializing CUDA.
+    if not compilation_context.TARGET_CUDA_ARCHS:
+        compilation_context = refresh_current_compilation_context()
     # Collect all detected CUDA architectures
     eligible = False
-    for major, minor in current_compilation_context.TARGET_CUDA_ARCHS:
+    for major, minor in compilation_context.TARGET_CUDA_ARCHS:
         if major >= 8:
             eligible = True
         elif major == 7 and minor.isdigit():
@@ -105,7 +136,10 @@ def check_cuda_arch():
 
     # Raise error only if all detected architectures are lower than sm75
     if not eligible:
-        raise RuntimeError("FlashInfer requires GPUs with sm75 or higher")
+        raise RuntimeError(
+            "FlashInfer requires GPUs with sm75 or higher. "
+            f"Detected TARGET_CUDA_ARCHS={sorted(compilation_context.TARGET_CUDA_ARCHS)}."
+        )
 
 
 def clear_cache_dir():
@@ -130,6 +164,7 @@ sm90a_nvcc_flags = [
 sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
 sm103a_nvcc_flags = ["-gencode=arch=compute_103a,code=sm_103a"] + common_nvcc_flags
 sm100f_nvcc_flags = ["-gencode=arch=compute_100f,code=sm_100f"] + common_nvcc_flags
+sm107a_nvcc_flags = ["-gencode=arch=compute_107a,code=sm_107a"] + common_nvcc_flags
 sm110a_nvcc_flags = ["-gencode=arch=compute_110a,code=sm_110a"] + common_nvcc_flags
 sm120a_nvcc_flags = ["-gencode=arch=compute_120a,code=sm_120a"] + common_nvcc_flags
 sm120f_nvcc_flags = ["-gencode=arch=compute_120f,code=sm_120f"] + common_nvcc_flags
@@ -161,7 +196,7 @@ class JitSpecRegistry:
     """Global registry to track all JitSpecs"""
 
     def __init__(self):
-        self._specs: Dict[str, JitSpec] = {}
+        self._specs: Dict[str, "JitSpec"] = {}
         self._creation_times: Dict[str, datetime] = {}
 
     def register(self, spec: "JitSpec") -> None:
@@ -181,14 +216,21 @@ class JitSpecRegistry:
 
         spec = self._specs[name]
         library_path = spec.get_library_path() if spec.is_compiled else None
+        if isinstance(spec, JitSpecNvcc):
+            sources = spec.sources
+            needs_device_linking = spec.needs_device_linking
+        else:
+            # other backends have no source list.
+            sources = []
+            needs_device_linking = False
 
         return JitSpecStatus(
             name=spec.name,
             created_at=self._creation_times[name],
             is_compiled=spec.is_compiled,
             library_path=library_path,
-            sources=spec.sources,
-            needs_device_linking=spec.needs_device_linking,
+            sources=sources,
+            needs_device_linking=needs_device_linking,
         )
 
     def get_all_statuses(self) -> List[JitSpecStatus]:
@@ -214,8 +256,193 @@ class JitSpecRegistry:
 jit_spec_registry = JitSpecRegistry()
 
 
+class JitSpec(abc.ABC):
+    """Abstract base for JIT-compiled kernel modules.
+
+    Concrete subclasses implement one compilation toolchain each
+    (``JitSpecNvcc`` for nvcc/ninja modules, ``JitSpecCuteDsl`` for CuTe-DSL
+    kernels; future DSLs follow the same shape). The shared lifecycle policy
+    lives in the concrete `build_and_load` template method: cached-
+    artifact fast path, cross-process locking with a double-check, and
+    ``FLASHINFER_DISABLE_JIT`` enforcement.
+
+    Subclass contract:
+
+    - `try_load` returns the cached artifact only when it is present
+      AND known-valid; it may conservatively return ``None`` even when
+      artifacts exist (e.g. nvcc delegates JIT-path freshness to ninja, so
+      only the AOT artifact is returned here).
+    - `build` produces or refreshes on-disk artifacts. It must be
+      idempotent and may be internally incremental. It runs under the
+      ``lock_path`` lock when invoked via `build_and_load`, so it must
+      not re-acquire that lock.
+    - `load` loads the artifact that `build` produced. It may
+      return an object retained in memory by `build` instead of
+      re-reading from disk.
+    """
+
+    name: str
+
+    @property
+    @abc.abstractmethod
+    def lock_path(self) -> Path: ...
+
+    @property
+    @abc.abstractmethod
+    def is_compiled(self) -> bool:
+        """Whether a valid on-disk artifact exists for this spec."""
+        ...
+
+    @abc.abstractmethod
+    def get_library_path(self) -> Path:
+        """Path of the primary on-disk artifact (.so / .o)."""
+        ...
+
+    def get_library_paths(self) -> tuple[Path, ...]:
+        """Paths of all on-disk artifacts used by this spec."""
+        return (self.get_library_path(),)
+
+    @abc.abstractmethod
+    def try_load(self) -> Optional[Any]:
+        """Return the cached artifact, or None when absent or not known-valid.
+
+        Exception contract: must NOT raise for artifact-level problems
+        (missing, stale, corrupt, unloadable) — log and return None so
+        build_and_load() falls through to build(). An exception escaping
+        try_load() is a programming error and propagates.
+        """
+        ...
+
+    @abc.abstractmethod
+    def build(self) -> None:
+        """Produce or refresh on-disk artifacts.
+
+        Exception contract: must raise when no usable kernel can result
+        (compilation failure, JIT disabled for direct callers). If the
+        kernel compiles but writing it to disk fails, build() may log and
+        continue instead of raising, as long as load() can still return
+        the compiled kernel (e.g. kept in memory).
+        """
+        ...
+
+    @abc.abstractmethod
+    def load(self) -> Any:
+        """Load the artifact that build() produced; raises on failure.
+
+        Called by build_and_load() only after a successful build(), so a
+        failure here is a genuine error, not a cache miss.
+        """
+        ...
+
+    def build_and_load(self) -> Any:
+        cached = self.try_load()
+        if cached is not None:
+            return cached
+
+        with FileLock(self.lock_path, thread_local=False):
+            # Another process may have built the artifact while we waited.
+            cached = self.try_load()
+            if cached is not None:
+                return cached
+
+            if os.environ.get("FLASHINFER_DISABLE_JIT"):
+                raise MissingJITCacheError(
+                    "JIT compilation is disabled via FLASHINFER_DISABLE_JIT "
+                    "environment variable, but the required module is not "
+                    "found in the JIT cache. Please add the missing module "
+                    "to the JIT cache build configuration.",
+                    spec=self,
+                )
+
+            self.build()
+            return self.load()
+
+
+class _HeterogeneousAOTModule:
+    """Dispatch calls across architecture-specific copies of one AOT module."""
+
+    def __init__(
+        self,
+        loaded_modules: Sequence[tuple[jit_env.AOTArtifact, Any]],
+        fallback_loader: Callable[[], Any],
+    ) -> None:
+        self._loaded_modules = tuple(loaded_modules)
+        self._fallback_loader = fallback_loader
+        self._fallback_module: Any = None
+        self._fallback_lock = threading.Lock()
+        self._attribute_cache: Dict[str, Any] = {}
+
+    def _get_fallback_module(self) -> Any:
+        if self._fallback_module is None:
+            with self._fallback_lock:
+                if self._fallback_module is None:
+                    self._fallback_module = self._fallback_loader()
+        return self._fallback_module
+
+    def _select_attribute(
+        self,
+        accessor: Callable[[Any], Any],
+        candidates: Sequence[tuple[jit_env.AOTArtifact, Any]],
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ) -> Any:
+        target_architectures = jit_env._cuda_architectures_for_call(args, kwargs)
+        ranked = []
+        if target_architectures:
+            for artifact, attribute in candidates:
+                if artifact.cuda_architectures is None:
+                    continue
+                score = jit_env._provider_compatibility_score(
+                    artifact.cuda_architectures, target_architectures
+                )
+                if score is not None:
+                    ranked.append((score, artifact.provider_id, attribute))
+        elif len(candidates) == 1:
+            return candidates[0][1]
+
+        if ranked:
+            return max(ranked, key=lambda candidate: candidate[:2])[2]
+        return accessor(self._get_fallback_module())
+
+    def _get_dispatched_attribute(self, accessor: Callable[[Any], Any]) -> Any:
+        candidates = []
+        for artifact, module in self._loaded_modules:
+            try:
+                candidates.append((artifact, accessor(module)))
+            except (AttributeError, KeyError):
+                continue
+
+        if candidates and all(callable(attribute) for _, attribute in candidates):
+
+            def dispatch(*args: Any, **kwargs: Any) -> Any:
+                attribute = self._select_attribute(accessor, candidates, args, kwargs)
+                return attribute(*args, **kwargs)
+
+            return dispatch
+        return self._select_attribute(accessor, candidates, (), {})
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self._attribute_cache[name]
+        except KeyError:
+            attribute = self._get_dispatched_attribute(
+                lambda module: getattr(module, name)
+            )
+            self._attribute_cache[name] = attribute
+            return attribute
+
+    def __getitem__(self, key: Any) -> Any:
+        return self._get_dispatched_attribute(lambda module: module[key])
+
+    def _resolve_for_current_device(self) -> Any:
+        """Resolve an AOT copy or build the fallback before a captured call."""
+        return self._select_attribute(
+            lambda module: module, self._loaded_modules, (), {}
+        )
+
+
 @dataclasses.dataclass
-class JitSpec:
+class JitSpecNvcc(JitSpec):
     name: str
     sources: List[Path]
     extra_cflags: Optional[List[str]]
@@ -224,6 +451,9 @@ class JitSpec:
     extra_include_dirs: Optional[List[Path]]
     is_class: bool = False
     needs_device_linking: bool = False
+    post_load_adapter: Optional[Callable[[Any], Any]] = None
+    embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None
+    extra_cuda_cflags_by_source: Optional[Mapping[Path, List[str]]] = None
 
     @property
     def ninja_path(self) -> Path:
@@ -242,6 +472,12 @@ class JitSpec:
             return self.aot_path
         return self.jit_library_path
 
+    def get_library_paths(self) -> tuple[Path, ...]:
+        artifacts = self.aot_artifacts
+        if artifacts:
+            return tuple(artifact.path for artifact in artifacts)
+        return (self.jit_library_path,)
+
     def get_object_paths(self) -> List[Path]:
         object_paths = []
         jit_dir = self.build_dir
@@ -254,11 +490,15 @@ class JitSpec:
 
     @property
     def aot_path(self) -> Path:
-        return jit_env.FLASHINFER_AOT_DIR / self.name / f"{self.name}.so"
+        return jit_env.get_aot_path(self.name)
+
+    @property
+    def aot_artifacts(self) -> tuple[jit_env.AOTArtifact, ...]:
+        return jit_env.get_aot_artifacts(self.name)
 
     @property
     def is_aot(self) -> bool:
-        return self.aot_path.exists()
+        return bool(self.aot_artifacts)
 
     @property
     def is_compiled(self) -> bool:
@@ -271,6 +511,11 @@ class JitSpec:
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
         self.build_dir.mkdir(parents=True, exist_ok=True)
+        embedded_cubins = (
+            self.embedded_cubin_factory(self.build_dir)
+            if self.embedded_cubin_factory is not None
+            else None
+        )
         content = generate_ninja_build_for_op(
             name=self.name,
             sources=self.sources,
@@ -279,6 +524,8 @@ class JitSpec:
             extra_ldflags=self.extra_ldflags,
             extra_include_dirs=self.extra_include_dirs,
             needs_device_linking=self.needs_device_linking,
+            embedded_cubins=embedded_cubins,
+            extra_cuda_cflags_by_source=self.extra_cuda_cflags_by_source,
         )
         write_if_different(ninja_path, content)
 
@@ -286,7 +533,48 @@ class JitSpec:
     def is_ninja_generated(self) -> bool:
         return self.ninja_path.exists()
 
-    def build(self, verbose: bool, need_lock: bool = True) -> None:
+    def try_load(self) -> Optional[Any]:
+        # Only the AOT artifact is known-valid without building.
+        # The freshness of the JIT-path .so is owned by ninja's dependency scan,
+        # so a cache miss here routes build_and_load() through build(),
+        # where ninja no-ops if everything is up to date.
+        artifacts = self.aot_artifacts
+        if artifacts:
+            loaded_modules = []
+            for artifact in artifacts:
+                try:
+                    module = self.load(artifact.path)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to load AOT artifact {artifact.path}: {e}. "
+                        "Trying another provider or falling back to JIT build."
+                    )
+                    continue
+                if artifact.cuda_architectures is None:
+                    return module
+                loaded_modules.append((artifact, module))
+
+            if not loaded_modules:
+                return None
+            target_architectures = jit_env._target_cuda_architectures()
+            if len(loaded_modules) == 1:
+                provider_architectures = loaded_modules[0][0].cuda_architectures
+                assert provider_architectures is not None
+                if jit_env._provider_covers_targets(
+                    provider_architectures, target_architectures
+                ):
+                    return loaded_modules[0][1]
+            return _HeterogeneousAOTModule(
+                loaded_modules, self._build_and_load_jit_fallback
+            )
+        return None
+
+    def _build_and_load_jit_fallback(self) -> Any:
+        with FileLock(self.lock_path, thread_local=False):
+            self.build()
+            return self.load()
+
+    def build(self, verbose: Optional[bool] = None, need_lock: bool = False) -> None:
         if os.environ.get("FLASHINFER_DISABLE_JIT"):
             raise MissingJITCacheError(
                 "JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
@@ -294,29 +582,27 @@ class JitSpec:
                 "Please add the missing module to the JIT cache build configuration.",
                 spec=self,
             )
+        if verbose is None:
+            verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
         lock = (
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )
         with lock:
+            is_cold_build = not self.jit_library_path.exists()
             self.write_ninja()
+            if is_cold_build:
+                logger.info_once(
+                    "Building JIT module %s; this can take several minutes on "
+                    "first use.",
+                    self.name,
+                )
             run_ninja(self.build_dir, self.ninja_path, verbose)
 
-    def load(self, so_path: Path):
-        return tvm_ffi.load_module(str(so_path))
-
-    def build_and_load(self):
-        if self.is_aot:
-            return self.load(self.aot_path)
-
-        # Guard both build and load with the same lock to avoid race condition
-        # where another process is building the library and removes the .so file.
-        with FileLock(self.lock_path, thread_local=False):
-            so_path = self.jit_library_path
-            verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
-            self.build(verbose, need_lock=False)
-            result = self.load(so_path)
-
-        return result
+    def load(self, so_path: Optional[Path] = None):
+        module = tvm_ffi.load_module(str(so_path or self.jit_library_path))
+        if self.post_load_adapter is not None:
+            return self.post_load_adapter(module)
+        return module
 
     def get_compile_commands(self) -> List[dict]:
         """
@@ -360,6 +646,12 @@ class JitSpec:
         ]
         cflags_expanded = expand_flags(cflags, common_cflags_expanded)
         cuda_cflags_expanded = expand_flags(cuda_cflags, common_cflags_expanded)
+        cuda_cflags_by_source = {
+            Path(source).resolve(): expand_flags(
+                build_cuda_cflags(common_cflags, flags), common_cflags_expanded
+            )
+            for source, flags in (self.extra_cuda_cflags_by_source or {}).items()
+        }
 
         # Get compilers
         cxx = os.environ.get("CXX", "c++")
@@ -375,7 +667,9 @@ class JitSpec:
 
             if is_cuda:
                 compiler = nvcc
-                flags = cuda_cflags_expanded
+                flags = cuda_cflags_by_source.get(
+                    source.resolve(), cuda_cflags_expanded
+                )
                 object_suffix = ".cuda.o"
             else:
                 compiler = cxx
@@ -409,7 +703,19 @@ def gen_jit_spec(
     extra_ldflags: Optional[List[str]] = None,
     extra_include_paths: Optional[List[Union[str, Path]]] = None,
     needs_device_linking: bool = False,
+    post_load_adapter: Optional[Callable[[Any], Any]] = None,
+    embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None,
+    use_fast_math: bool = True,
+    extra_cuda_cflags_by_source: Optional[Mapping[Union[str, Path], List[str]]] = None,
 ) -> JitSpec:
+    """Create a CUDA build specification.
+
+    For named CUDA sources, ``extra_cuda_cflags_by_source`` replaces the shared
+    ``extra_cuda_cflags`` and opts out of the default ``-use_fast_math``. Other
+    build defaults still apply; request fast math explicitly when required.
+    Sources absent from the mapping retain the shared flags and defaults,
+    including the module-wide ``use_fast_math`` setting.
+    """
     check_cuda_arch()
     # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
     debug_env = os.environ.get("FLASHINFER_JIT_DEBUG")
@@ -430,13 +736,15 @@ def gen_jit_spec(
 
     cuda_cflags = [
         *get_nvcc_parallelism_flags(),
-        "-use_fast_math",
         "-Xfatbin=-compress-all",  # Ensure all device binaries are compressed
+        "--compress-mode=size",
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
         "-DFLASHINFER_ENABLE_FP8_E4M3",
         "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
+    if use_fast_math:
+        cuda_cflags.insert(len(get_nvcc_parallelism_flags()), "-use_fast_math")
     if not cuda_cflags_has_std:
         cuda_cflags.insert(0, "-std=c++17")
 
@@ -461,10 +769,30 @@ def gen_jit_spec(
 
     if extra_cflags is not None:
         cflags += extra_cflags
+    cuda_cflags_by_source = None
+    if extra_cuda_cflags_by_source is not None:
+        cuda_sources = {
+            Path(source).resolve() for source in sources if Path(source).suffix == ".cu"
+        }
+        cuda_cflags_by_source = {}
+        for raw_source, source_flags in extra_cuda_cflags_by_source.items():
+            source = Path(raw_source).resolve()
+            if source not in cuda_sources:
+                raise ValueError(
+                    f"CUDA flags refer to a source outside this JIT spec: {source}"
+                )
+            source_defaults = [
+                flag
+                for flag in cuda_cflags
+                if flag != "-use_fast_math" and not flag.startswith("-std=")
+            ]
+            if not any(flag.startswith("-std=") for flag in source_flags):
+                source_defaults.insert(0, "-std=c++17")
+            cuda_cflags_by_source[source] = source_defaults + list(source_flags)
     if extra_cuda_cflags is not None:
         cuda_cflags += extra_cuda_cflags
 
-    spec = JitSpec(
+    spec = JitSpecNvcc(
         name=name,
         sources=[Path(x) for x in sources],
         extra_cflags=cflags,
@@ -476,6 +804,9 @@ def gen_jit_spec(
             else None
         ),
         needs_device_linking=needs_device_linking,
+        post_load_adapter=post_load_adapter,
+        embedded_cubin_factory=embedded_cubin_factory,
+        extra_cuda_cflags_by_source=cuda_cflags_by_source,
     )
 
     # Register the spec in the global registry
@@ -499,6 +830,11 @@ def build_jit_specs(
 ) -> None:
     lines: List[str] = []
     for spec in specs:
+        if not isinstance(spec, JitSpecNvcc):
+            raise TypeError(
+                f"build_jit_specs only supports nvcc modules, got "
+                f"{type(spec).__name__} for {spec.name}"
+            )
         if skip_prebuilt and spec.aot_path.exists():
             continue
         lines.append(f"subninja {spec.ninja_path}")
@@ -513,4 +849,14 @@ def build_jit_specs(
     with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
         ninja_path = tmpdir / "flashinfer_jit.ninja"
         write_if_different(ninja_path, "\n".join(lines))
-        run_ninja(jit_env.FLASHINFER_JIT_DIR, ninja_path, verbose)
+        prebuild_max_jobs = os.environ.get("FLASHINFER_JIT_PREBUILD_MAX_JOBS")
+        run_ninja(
+            jit_env.FLASHINFER_JIT_DIR,
+            ninja_path,
+            verbose,
+            max_jobs=(
+                int(prebuild_max_jobs)
+                if prebuild_max_jobs is not None and prebuild_max_jobs.isdigit()
+                else None
+            ),
+        )

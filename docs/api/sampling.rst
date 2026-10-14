@@ -5,6 +5,17 @@ flashinfer.sampling
 
 Kernels for LLM sampling.
 
+.. important::
+
+   Batch-length ``seed`` and ``offset`` tensors now apply one value per output
+   row. Previously, all rows used element zero, even when a batch-length tensor
+   was supplied. Calls with distinct values in these tensors can therefore
+   produce different samples after this fix. Scalar values, length-one tensors,
+   and calls using a shared ``torch.Generator`` retain their existing behavior.
+
+   The output row index still feeds the Philox subsequence. Per-row seeds do not
+   make sampling invariant to batch position, even with the same seed and offset.
+
 .. seealso::
 
   For efficient Top-K selection (without sampling), see :ref:`apitopk` which provides

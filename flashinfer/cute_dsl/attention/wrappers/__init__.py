@@ -7,3 +7,4 @@ from .batch_decode import (
     BatchDecodeCuteDSLWrapper,
     BatchDecodePagedCuteDSLWrapper,
 )
+from .batch_hca import cute_dsl_hca_decode

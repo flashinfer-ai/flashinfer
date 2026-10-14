@@ -24,8 +24,10 @@ All imports are re-exported here for backwards compatibility.
 """
 
 # Re-export everything from the new location
-from flashinfer.gemm.kernels.grouped_gemm_masked_blackwell import (
+from flashinfer.gemm.kernels.grouped_gemm_masked_wrapper import (
     grouped_gemm_nt_masked,
+)
+from flashinfer.gemm.kernels.grouped_gemm_masked_blackwell import (
     Sm100BlockScaledPersistentDenseGemmKernel,
     create_scale_factor_tensor,
     get_cute_dsl_compiled_masked_gemm_kernel,

@@ -9,33 +9,23 @@ from flashinfer import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
 )
+from flashinfer.autotuner import AutoTuner
 from flashinfer.fp8_quantization import mxfp8_quantize
+from flashinfer.gemm import gemm_base
+from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
 from flashinfer.utils import get_compute_capability
 
 
-def _get_min_cosine_sim(
-    is_sf_swizzled_layout: bool, scale: float | None = None
-) -> float:
-    if is_sf_swizzled_layout:
-        return 0.98
-
-    # Lower accuracy for non-swizzled layout
-    if scale is not None:
-        if scale < 0.5 or scale > 10.0:
-            # For very small or large scales, we expect lower accuracy
-            return 0.8
-    return 0.84
+_MIN_COS_SIM = 0.98
 
 
 def _assert_cosine_similarity(
     reference: torch.Tensor,
     result: torch.Tensor,
-    is_sf_swizzled_layout: bool,
     *,
     use_float: bool = False,
     context: str = "",
 ) -> float:
-    min_cos_sim = _get_min_cosine_sim(is_sf_swizzled_layout)
     if use_float:
         reference = reference.float()
         result = result.float()
@@ -45,17 +35,11 @@ def _assert_cosine_similarity(
         reference.reshape(-1), result.reshape(-1), dim=0
     ).item()
 
-    if context:
-        message = (
-            f"{context} Cosine similarity {cos_sim:.4f} is too low "
-            f"(expected > {min_cos_sim}, {is_sf_swizzled_layout=})."
-        )
-    else:
-        message = (
-            f"Cosine similarity {cos_sim:.4f} is too low "
-            f"(expected > {min_cos_sim}, {is_sf_swizzled_layout=})."
-        )
-    assert cos_sim > min_cos_sim, message
+    prefix = f"{context} " if context else ""
+    assert cos_sim > _MIN_COS_SIM, (
+        f"{prefix}Cosine similarity {cos_sim:.4f} is too low "
+        f"(expected > {_MIN_COS_SIM})."
+    )
     return cos_sim
 
 
@@ -69,6 +53,12 @@ def _skip_if_unsupported(backend: str = "cutlass"):
             "Skipping test because mm_mxfp8 backend is not supported on compute "
             f"capability {compute_capability_number}."
         )
+    if backend == "b12x":
+        if torch.version.cuda is None or int(torch.version.cuda.split(".")[0]) < 13:
+            pytest.skip("b12x mm_mxfp8 requires CUDA 13+")
+        # Not a hasattr(MmaMXF8Op) probe: the op exists on versions the gate rejects.
+        if not _b12x_mxfp8_dsl_supported():
+            pytest.skip("b12x mm_mxfp8 requires nvidia-cutlass-dsl >= 4.6.0")
 
 
 def _run_mm_mxfp8(
@@ -76,7 +66,6 @@ def _run_mm_mxfp8(
     n,
     k,
     input_dtype,
-    is_sf_swizzled_layout,
     out_dtype,
     backend,
     auto_tuning,
@@ -85,40 +74,23 @@ def _run_mm_mxfp8(
 ):
     _skip_if_unsupported(backend)
 
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    is_sm12x = compute_capability[0] == 12
-
-    if is_sm12x and not is_sf_swizzled_layout:
-        pytest.skip(
-            "SM12x only supports swizzled 1D scales; no backend handles non-swizzled layout."
-        )
-
     if backend == "trtllm":
-        if not is_sf_swizzled_layout:
-            pytest.skip("trtllm must have swizzled scales")
         if k % 256 != 0:
             pytest.skip("trtllm does not support non-multiple of 256")
         if out_dtype != torch.bfloat16:
             pytest.skip("trtllm does not support non-bfloat16 output")
-    if backend == "cutlass":
-        if is_sf_swizzled_layout and use_8x4_sf_layout_for_a:
-            pytest.skip("cutlass doesn't support 8x4 swizzle layout")
-    if backend == "cute-dsl" and not is_sf_swizzled_layout:
-        pytest.skip(
-            "cute-dsl mm_mxfp8 currently supports only swizzled 1D scale layout."
-        )
+    if backend == "b12x" and k % 128 != 0:
+        pytest.skip("b12x requires K % 128 == 0")
+    if backend == "cutlass" and use_8x4_sf_layout_for_a:
+        pytest.skip("cutlass doesn't support 8x4 swizzle layout")
 
     input = torch.randn([m, k], device="cuda", dtype=input_dtype)
     mat2 = torch.randn([n, k], device="cuda", dtype=input_dtype)
 
-    if is_sf_swizzled_layout:
-        sflayout_a = SfLayout.layout_128x4
-        sflayout_b = SfLayout.layout_128x4
-    else:
-        sflayout_a = SfLayout.layout_linear
-        sflayout_b = SfLayout.layout_linear
-    if is_sf_swizzled_layout and use_8x4_sf_layout_for_a:
-        sflayout_a = SfLayout.layout_8x4
+    sflayout_a = (
+        SfLayout.layout_8x4 if use_8x4_sf_layout_for_a else SfLayout.layout_128x4
+    )
+    sflayout_b = SfLayout.layout_128x4
 
     input_mxfp8, mat2_mxfp8, input_descale, mat2_descale = _prepare_mxfp8_tensors(
         input,
@@ -149,7 +121,7 @@ def _run_mm_mxfp8(
     assert res.device.type == "cuda"
     assert torch.isfinite(res).all(), "Output contains NaN/Inf values"
 
-    _assert_cosine_similarity(reference, res, is_sf_swizzled_layout)
+    _assert_cosine_similarity(reference, res)
 
 
 def _prepare_mxfp8_tensors(
@@ -179,30 +151,52 @@ def _prepare_mxfp8_tensors(
         weight_scale = shuffle_matrix_sf_a(
             weight_scale.reshape(n, k // 32), 128, num_elts_per_sf=32
         ).reshape(-1)
-    if sf_layout_input == SfLayout.layout_linear:
-        input_scale = input_scale.view(m, k // 32)
-    if sf_layout_weight == SfLayout.layout_linear:
-        weight_scale = weight_scale.view(n, k // 32).t()
     return input_mxfp8, weight_mxfp8, input_scale, weight_scale
+
+
+def _mxfp8_cute_dsl_tactics(m, n, k=128):
+    """Tactics the cute-dsl runner offers for (m, n, k); compiles no kernel."""
+    device = torch.device("cuda")
+    a = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=device)
+    b = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=device).T
+    a_sf = torch.empty((max(m, 128) * k // 32,), dtype=torch.uint8, device=device)
+    b_sf = torch.empty((max(n, 128) * k // 32,), dtype=torch.uint8, device=device)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+    major, minor = get_compute_capability(device)
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(major, minor, True, torch.bfloat16)
+    return runner.get_valid_tactics([a, b, a_sf, b_sf, torch.bfloat16, out, None], None)
+
+
+def test_mm_mxfp8_cute_dsl_narrow_tiles_only_within_32_tokens():
+    """Narrow N tiles (< 64) address the 128-wide SFB tile through a shifted
+    TMEM column; an odd shift faults in tcgen05.mma, so the runner must only
+    offer them while the kernel-N extent (n, or m when A and B are swapped)
+    is at most 32."""
+    _skip_if_unsupported("cute-dsl")
+    for m, n in ((128, 128), (128, 64), (64, 128)):
+        narrow = [t for t in _mxfp8_cute_dsl_tactics(m, n) if t[0][1] < 64]
+        assert narrow == [], (m, n, narrow)
+    # kernel-N = n = 32: narrow tiles only without the A/B swap
+    narrow = [t for t in _mxfp8_cute_dsl_tactics(128, 32) if t[0][1] < 64]
+    assert narrow and all(not t[2] for t in narrow), narrow
+    # kernel-N = m = 32: narrow tiles only with the A/B swap
+    narrow = [t for t in _mxfp8_cute_dsl_tactics(32, 128) if t[0][1] < 64]
+    assert narrow and all(t[2] for t in narrow), narrow
 
 
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])
 @pytest.mark.parametrize("n", [128, 256, 512, 1024])
 @pytest.mark.parametrize("k", [128, 256, 512, 1024, 2048, 2560, 3200])
-@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "trtllm"])
+@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "trtllm", "b12x"])
 @pytest.mark.parametrize("auto_tuning", [True, False])
-def test_mm_mxfp8(
-    m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, backend, auto_tuning
-):
+def test_mm_mxfp8(m, n, k, input_dtype, out_dtype, backend, auto_tuning):
     _run_mm_mxfp8(
         m,
         n,
         k,
         input_dtype,
-        is_sf_swizzled_layout,
         out_dtype,
         backend,
         auto_tuning,
@@ -214,19 +208,15 @@ def test_mm_mxfp8(
 @pytest.mark.parametrize("m", [128, 256, 1024, 2048, 4096])
 @pytest.mark.parametrize("n", [2688, 5376, 8192, 12288, 16384])
 @pytest.mark.parametrize("k", [4096, 8192])
-@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "trtllm", "auto"])
-def test_mm_mxfp8_large_dimensions(
-    m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, backend
-):
+@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "trtllm", "b12x", "auto"])
+def test_mm_mxfp8_large_dimensions(m, n, k, input_dtype, out_dtype, backend):
     _run_mm_mxfp8(
         m,
         n,
         k,
         input_dtype,
-        is_sf_swizzled_layout,
         out_dtype,
         backend,
         auto_tuning=False,
@@ -236,29 +226,486 @@ def test_mm_mxfp8_large_dimensions(
 
 
 @pytest.mark.parametrize(
-    "m,n,k",
+    "m,n,k,backend",
     [
-        (4, 6144, 4096),
-        (8, 6144, 4096),
-        (16, 6144, 4096),
-        (32, 2688, 1856),
-        (32, 1856, 2688),
-        (32, 2688, 4096),
-        (32, 5376, 4096),
+        (4, 6144, 4096, "cutlass"),
+        (8, 6144, 4096, "cutlass"),
+        (16, 6144, 4096, "cutlass"),
+        (32, 2688, 1856, "cutlass"),
+        (32, 1856, 2688, "cutlass"),
+        (32, 2688, 4096, "cutlass"),
+        (32, 5376, 4096, "cutlass"),
+        # GPT-OSS-120B (K padded to 128)
+        (1, 1280, 2944, "cutedsl_low_latency"),
+        (8, 1280, 2944, "cutedsl_low_latency"),
+        (1, 2880, 1024, "cutedsl_low_latency"),
+        (8, 2880, 1024, "cutedsl_low_latency"),
+        # DeepSeek-V3
+        (1, 7168, 2048, "cutedsl_low_latency"),
+        (8, 7168, 2048, "cutedsl_low_latency"),
+        (1, 3072, 1536, "cutedsl_low_latency"),
+        (7, 3072, 1536, "cutedsl_low_latency"),
+        (3, 129, 384, "cutedsl_low_latency"),
     ],
 )
-def test_mm_mxfp8_small_m(m, n, k):
+def test_mm_mxfp8_small_m(m, n, k, backend):
     _run_mm_mxfp8(
         m,
         n,
         k,
         torch.bfloat16,
-        True,  # swizzled scales are the intended fast path
         torch.bfloat16,
-        "cutlass",
+        backend,
         auto_tuning=False,
         provide_out=True,
     )
+
+
+@pytest.mark.parametrize(
+    "m,k",
+    [
+        (1, 768),
+        (16, 1536),
+        (32, 2048),
+    ],
+)
+def test_mm_mxfp8_b12x_low_m(m, k):
+    _run_mm_mxfp8(
+        m,
+        256,
+        k,
+        torch.bfloat16,
+        torch.bfloat16,
+        "b12x",
+        auto_tuning=False,
+        provide_out=True,
+    )
+
+
+@pytest.mark.parametrize("m,n,k", [(2048, 1024, 128), (2048, 1024, 256)])
+def test_mm_mxfp8_b12x_short_k_multi_wave(m, n, k):
+    # One K tile and more work tiles than SMs stress the epilogue smem
+    # handoff between a persistent CTA's work tiles. m=2048 keeps the
+    # launch multi-wave on the largest SM120 parts and misses the
+    # autotuner cache the parametrized suite fills. Repeats, since a bad
+    # handoff shows up as a timing-dependent mismatch.
+    for _ in range(3):
+        _run_mm_mxfp8(
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            torch.bfloat16,
+            "b12x",
+            auto_tuning=False,
+            provide_out=True,
+        )
+
+
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 64])
+@pytest.mark.parametrize("n,k", [(6144, 4096), (2688, 4096)])
+def test_mm_mxfp8_b12x_decode_m(m, n, k):
+    _run_mm_mxfp8(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        torch.bfloat16,
+        "b12x",
+        auto_tuning=False,
+        provide_out=True,
+    )
+
+
+@pytest.mark.parametrize("auto_tuning", [False, True])
+@pytest.mark.parametrize(
+    "m,k",
+    [
+        (1, 768),
+        (8, 4096),
+        (16, 1536),
+        (32, 2048),
+    ],
+)
+def test_mm_mxfp8_cute_dsl_low_m(m, k, auto_tuning):
+    if not auto_tuning:
+        # A cached winner would replace the untuned default runner and tactic.
+        AutoTuner.get().clear_cache()
+    _run_mm_mxfp8(
+        m,
+        256,
+        k,
+        torch.bfloat16,
+        torch.bfloat16,
+        "cute-dsl",
+        auto_tuning=auto_tuning,
+        provide_out=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "a_scale,b_scale,expected",
+    [
+        # E8M0 0x00 is 2**-127 (subnormal in FP32), not zero.
+        (0x00, 0xFE, 256.0),
+        # E8M0 0xFF is NaN.
+        (0x7F, 0xFF, float("nan")),
+    ],
+)
+def test_mm_mxfp8_cute_dsl_special_scale_encodings(a_scale, b_scale, expected):
+    _skip_if_unsupported("cute-dsl")
+    m, n, k = 1, 128, 256
+    # Only the tensor shapes come from the quantizer; data and scales are set below.
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        torch.ones([m, k], device="cuda", dtype=torch.bfloat16),
+        torch.ones([n, k], device="cuda", dtype=torch.bfloat16),
+        SfLayout.layout_128x4,
+        SfLayout.layout_128x4,
+        "cute-dsl",
+    )
+    input_mxfp8.view(torch.uint8).fill_(0x38)  # E4M3 1.0
+    weight_mxfp8.view(torch.uint8).fill_(0x38)
+    input_scale.fill_(a_scale)
+    weight_scale.fill_(b_scale)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    # The untuned default for this shape is the warp split-K runner.
+    AutoTuner.get().clear_cache()
+    mm_mxfp8(
+        input_mxfp8,
+        weight_mxfp8.T,
+        input_scale,
+        weight_scale,
+        out=out,
+        backend="cute-dsl",
+    )
+    torch.testing.assert_close(
+        out.float(), torch.full_like(out, expected, dtype=torch.float32), equal_nan=True
+    )
+
+
+# Triggers the dependent launch first, spins, and only then writes the weight and
+# its scales, so a dependent GEMM that reads them before griddepcontrol.wait sees
+# the NaN bytes left in the buffers.
+_PDL_PRODUCER_CUDA = r"""
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <torch/extension.h>
+
+#include <cstdint>
+
+__global__ void trigger_then_write_kernel(uint8_t* w_out, const uint8_t* w_in, int64_t w_n,
+                                          uint8_t* s_out, const uint8_t* s_in, int64_t s_n,
+                                          int64_t spin_cycles) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+  int64_t start = clock64();
+  while (clock64() - start < spin_cycles) {
+  }
+  int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < w_n;
+       i += stride) {
+    w_out[i] = w_in[i];
+  }
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < s_n;
+       i += stride) {
+    s_out[i] = s_in[i];
+  }
+}
+
+void pdl_delayed_producer(at::Tensor w_out, at::Tensor w_in, at::Tensor s_out,
+                          at::Tensor s_in, int64_t spin_cycles) {
+  TORCH_CHECK(w_out.numel() * w_out.element_size() == w_in.numel() * w_in.element_size());
+  TORCH_CHECK(s_out.numel() * s_out.element_size() == s_in.numel() * s_in.element_size());
+  trigger_then_write_kernel<<<64, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      static_cast<uint8_t*>(w_out.data_ptr()), static_cast<const uint8_t*>(w_in.data_ptr()),
+      w_out.numel() * w_out.element_size(), static_cast<uint8_t*>(s_out.data_ptr()),
+      static_cast<const uint8_t*>(s_in.data_ptr()), s_out.numel() * s_out.element_size(),
+      spin_cycles);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+"""
+
+
+@pytest.mark.parametrize("auto_tuning", [False, True])
+@pytest.mark.parametrize("m,n,k", [(1, 1152, 1536), (16, 2304, 2048), (32, 256, 2048)])
+def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
+    """The cute-dsl GEMM launches with PDL; it must not read the weight or its
+    scales before the kernel that writes them has finished."""
+    _skip_if_unsupported("cute-dsl")
+    from torch.utils.cpp_extension import load_inline
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    producer = load_inline(
+        name="test_mm_mxfp8_pdl_producer",
+        cpp_sources=[
+            "void pdl_delayed_producer(at::Tensor w_out, at::Tensor w_in, "
+            "at::Tensor s_out, at::Tensor s_in, int64_t spin_cycles);"
+        ],
+        cuda_sources=[_PDL_PRODUCER_CUDA],
+        extra_cuda_cflags=[
+            f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+        ],
+        functions=["pdl_delayed_producer"],
+        verbose=False,
+    )
+
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
+    )
+    reference = torch.mm(input, weight.T)
+    # NaN in E4M3 (0x7F) and in E8M0 (0xFF): a stale read poisons the output.
+    stale_weight = torch.empty_like(weight_mxfp8)
+    stale_scale = torch.empty_like(weight_scale)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+
+    if not auto_tuning:
+        AutoTuner.get().clear_cache()
+    else:
+        with autotune(True):
+            mm_mxfp8(
+                input_mxfp8,
+                weight_mxfp8.T,
+                input_scale,
+                weight_scale,
+                out=out,
+                backend="cute-dsl",
+            )
+    for _ in range(5):
+        stale_weight.view(torch.uint8).fill_(0x7F)
+        stale_scale.view(torch.uint8).fill_(0xFF)
+        torch.cuda.synchronize()
+        producer.pdl_delayed_producer(
+            stale_weight, weight_mxfp8, stale_scale, weight_scale, 4_000_000
+        )
+        mm_mxfp8(
+            input_mxfp8,
+            stale_weight.T,
+            input_scale,
+            stale_scale,
+            out=out,
+            backend="cute-dsl",
+        )
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all(), (
+            "the GEMM read the weight before it was written"
+        )
+        _assert_cosine_similarity(reference, out)
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("auto_tuning", [False, True])
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 1536, 1024),
+        (100, 4096, 1024),  # M % 8 != 0
+        (256, 1536, 6144),
+        (4096, 6144, 1536),
+        (256, 1536, 544),  # K % 128 != 0: the last 128-wide K tile is partial
+        (129, 4096, 2080),
+    ],
+)
+def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
+    """On SM107, mm_mxfp8(backend="cute-dsl") runs the SM107 kernel and is correct."""
+    _skip_if_unsupported("cute-dsl")
+    from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
+
+    if not is_rubin_cute_dsl_available():
+        pytest.skip(
+            "The SM107 cute-dsl mm_mxfp8 path requires CuTe DSL >= 4.8 "
+            "(cutlass.utils.rubin_helpers)."
+        )
+
+    # Record the tactics the SM107 runner launches; it only builds the SM107 kernel.
+    sm107_tactics_run = []
+    make_sm107_runner = gemm_base._cute_dsl_gemm_mxfp8_sm107_runner  # pyright: ignore[reportPrivateUsage]
+
+    def recording_sm107_runner(*args, **kwargs):
+        runner = make_sm107_runner(*args, **kwargs)
+        forward = runner.forward
+
+        def recording_forward(inputs, tactic=None, **forward_kwargs):
+            sm107_tactics_run.append(tactic)
+            return forward(inputs, tactic=tactic, **forward_kwargs)
+
+        runner.forward = recording_forward
+        return runner
+
+    monkeypatch.setattr(
+        gemm_base, "_cute_dsl_gemm_mxfp8_sm107_runner", recording_sm107_runner
+    )
+    _run_mm_mxfp8(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        torch.bfloat16,
+        "cute-dsl",
+        auto_tuning=auto_tuning,
+        provide_out=True,
+    )
+
+    assert sm107_tactics_run, "mm_mxfp8 did not use the SM107 kernel"
+    if auto_tuning:
+        # The last launch is the run with the tuned SM107 tactic.
+        assert isinstance(sm107_tactics_run[-1], tuple), sm107_tactics_run[-1]
+        return
+    assert sm107_tactics_run == [-1], sm107_tactics_run
+
+    # Autotuning launches every tactic but only checks the one it picks, so also
+    # run every SM107 tactic for this shape against the reference.
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
+    )
+    reference = torch.mm(input, weight.T)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+    inputs = [
+        input_mxfp8,
+        weight_mxfp8.T,
+        input_scale,
+        weight_scale,
+        torch.bfloat16,
+        out,
+        workspace,
+    ]
+    runner = make_sm107_runner(torch.bfloat16)
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert tactics
+    for tactic in tactics:
+        out.zero_()
+        runner(inputs, tactic=tactic)
+        _assert_cosine_similarity(reference, out)
+
+
+def test_mm_mxfp8_cute_dsl_stale_split_k_tactic_falls_back():
+    """A low-M cached tactic must not fail when reused for a larger M."""
+    _skip_if_unsupported("cute-dsl")
+
+    m, n, k = 64, 256, 2048
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input,
+        weight,
+        SfLayout.layout_128x4,
+        SfLayout.layout_128x4,
+        "cute-dsl",
+    )
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(  # pyright: ignore[reportPrivateUsage]
+        major, minor, True, torch.bfloat16
+    )
+    runner(
+        [
+            input_mxfp8,
+            weight_mxfp8.T,
+            input_scale,
+            weight_scale,
+            torch.bfloat16,
+            out,
+            workspace,
+        ],
+        # Valid for M=32, but not for the runtime M=64 above.
+        tactic=((128, 32), (1, 1), True, False, 2),
+    )
+
+    _assert_cosine_similarity(torch.mm(input, weight.T), out)
+
+
+@pytest.mark.parametrize("m", [40, 64])
+@pytest.mark.parametrize("tile_n", [8, 16, 32])
+def test_mm_mxfp8_cute_dsl_stale_narrow_tile_tactic_falls_back(m, tile_n):
+    """A narrow swap-AB tactic tuned for M<=32 must not be replayed at M>32.
+
+    Narrow (< 64) N tiles cover at most 32 kernel-N columns; replaying one at
+    a larger runtime M used to fault with cudaErrorMisalignedAddress.
+    """
+    _skip_if_unsupported("cute-dsl")
+
+    n, k = 256, 2048
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input,
+        weight,
+        SfLayout.layout_128x4,
+        SfLayout.layout_128x4,
+        "cute-dsl",
+    )
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(  # pyright: ignore[reportPrivateUsage]
+        major, minor, True, torch.bfloat16
+    )
+    runner(
+        [
+            input_mxfp8,
+            weight_mxfp8.T,
+            input_scale,
+            weight_scale,
+            torch.bfloat16,
+            out,
+            workspace,
+        ],
+        tactic=((128, tile_n), (1, 1), True, False, 1),
+    )
+    torch.cuda.synchronize()
+
+    _assert_cosine_similarity(torch.mm(input, weight.T), out)
+
+
+@pytest.mark.parametrize(
+    "ab_dtype_name,sf_dtype_name,sf_vec_size",
+    [
+        ("Float4E2M1FN", "Float8E4M3FN", 16),  # NVFP4
+        ("Float4E2M1FN", "Float8E8M0FNU", 32),  # MXFP4
+        ("Float8E4M3FN", "Float8E8M0FNU", 32),  # MXFP8
+    ],
+)
+@pytest.mark.parametrize("tile_n", [8, 16, 32])
+def test_narrow_tile_can_implement_boundary(
+    ab_dtype_name, sf_dtype_name, sf_vec_size, tile_n
+):
+    """CPU-only: a narrow N tile is accepted at kernel N = 32, rejected at 33."""
+    cutlass = pytest.importorskip("cutlass")
+    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100 import (
+        Sm100BlockScaledPersistentDenseGemmKernel,
+    )
+
+    def can_implement(tile_n, kernel_n):
+        # swap_ab orientation: kernel M = weight N, kernel N = tokens.
+        return Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
+            getattr(cutlass, ab_dtype_name),
+            getattr(cutlass, sf_dtype_name),
+            sf_vec_size,
+            cutlass.BFloat16,
+            (128, tile_n),
+            (1, 1),
+            256,
+            kernel_n,
+            2048,
+            1,
+            "k",
+            "k",
+            "m",
+        )
+
+    assert can_implement(tile_n, 32)
+    assert not can_implement(tile_n, 33)
+    # Control: a 64-wide tile at N = 33 is accepted, so the rejection above
+    # comes from the narrow-tile bound, not from a dtype or alignment check.
+    assert can_implement(64, 33)
 
 
 def test_mm_mxfp8_invalid_input_dtype():
@@ -302,16 +749,9 @@ def test_mm_mxfp8_invalid_ndim():
         )
 
 
-@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
-def test_mm_mxfp8_find_minimum_cosine_similarity(is_sf_swizzled_layout):
+def test_mm_mxfp8_find_minimum_cosine_similarity():
     """Sweep value scales and enforce a minimum cosine similarity."""
     _skip_if_unsupported()
-
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] == 12 and not is_sf_swizzled_layout:
-        pytest.skip(
-            "SM12x only supports swizzled 1D scales; no backend handles non-swizzled layout."
-        )
 
     m, n, k = 256, 4096, 4096
 
@@ -327,8 +767,8 @@ def test_mm_mxfp8_find_minimum_cosine_similarity(is_sf_swizzled_layout):
         input_mxfp8, mat2_mxfp8, input_descale, mat2_descale = _prepare_mxfp8_tensors(
             input_data,
             mat2,
-            SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear,
-            SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear,
+            SfLayout.layout_128x4,
+            SfLayout.layout_128x4,
             backend="cutlass",
         )
 
@@ -350,13 +790,12 @@ def test_mm_mxfp8_find_minimum_cosine_similarity(is_sf_swizzled_layout):
         results.append((value_scale, cos_sim))
 
     print("\n" + "=" * 60)
-    print(f"MXFP8 Cosine Similarity vs Value Scale Summary ({is_sf_swizzled_layout=})")
+    print("MXFP8 Cosine Similarity vs Value Scale Summary")
     print("=" * 60)
 
     fail_test: bool = False
     for scale, sim in results:
-        min_cosine_sim = _get_min_cosine_sim(is_sf_swizzled_layout, scale)
-        fail = sim < min_cosine_sim
+        fail = sim < _MIN_COS_SIM
 
         status = "[OK]" if not fail else "[FAIL]"
         print(f"  {status} Scale={scale:8.3f}: cos_sim={sim:.4f}")
@@ -508,57 +947,6 @@ def test_mm_mxfp8_llm_full_layer_simulation():
     )
 
 
-def test_mm_mxfp8_scale_contiguity_requirement():
-    """Test behavior with non-contiguous scale tensors."""
-    _skip_if_unsupported()
-
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] == 12:
-        pytest.skip(
-            "SM12x only supports swizzled 1D scales; this test uses non-swizzled 2D scales."
-        )
-
-    m, n, k = 256, 4096, 4096
-
-    input_bf16 = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
-    weight_bf16 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
-
-    input_fp8, input_scale = mxfp8_quantize(input_bf16, is_sf_swizzled_layout=False)
-    weight_fp8, weight_scale = mxfp8_quantize(weight_bf16, is_sf_swizzled_layout=False)
-
-    input_descale = input_scale.view(m, k // 32)
-
-    weight_scale_2d = weight_scale.view(n, k // 32)
-    weight_descale_noncontig = weight_scale_2d.t()  # Non-contiguous!
-
-    assert not weight_descale_noncontig.is_contiguous(), (
-        "Expected non-contiguous tensor"
-    )
-
-    output = mm_mxfp8(
-        input_fp8,
-        weight_fp8.T,
-        input_descale,
-        weight_descale_noncontig,
-        out_dtype=torch.bfloat16,
-        backend="cutlass",
-    )
-    assert torch.isfinite(output).all()
-
-    weight_descale_contig = weight_descale_noncontig.contiguous()
-    assert weight_descale_contig.is_contiguous()
-
-    output = mm_mxfp8(
-        input_fp8,
-        weight_fp8.T,
-        input_descale,
-        weight_descale_contig,
-        out_dtype=torch.bfloat16,
-        backend="cutlass",
-    )
-    assert torch.isfinite(output).all(), "Output with contiguous scale should be valid"
-
-
 @pytest.mark.parametrize("m", [128, 256, 512, 1024, 2048, 4096, 8192, 16384])
 def test_mm_mxfp8_scale_1d_tensor_interpretation(m):
     """Check that 1D swizzled scales have the expected size."""
@@ -606,3 +994,18 @@ def test_mm_mxfp8_scale_1d_tensor_interpretation(m):
 
     assert output.shape == (m, n)
     assert torch.isfinite(output).all()
+
+
+def test_trtllm_raises_for_linear_b_descale():
+    a = torch.empty((1, 256), dtype=torch.float8_e4m3fn)
+    b = torch.empty((256, 128), dtype=torch.float8_e4m3fn)
+    a_descale = torch.empty((1024,), dtype=torch.uint8)
+    b_descale = torch.empty((8, 128), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="2D linear scales are not supported"):
+        gemm_base._trtllm_gemm_mxfp8_requirement(  # pyright: ignore[reportPrivateUsage]
+            a,
+            b,
+            a_descale,
+            b_descale,
+        )

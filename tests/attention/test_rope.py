@@ -17,19 +17,29 @@ limitations under the License.
 import pytest
 import torch
 from tests.test_helpers.rope_reference import *
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 
 import flashinfer
+from flashinfer.utils import get_compute_capability
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("qkv_len", [1, 4, 19, 204])
-@pytest.mark.parametrize("num_qo_heads", [8, 16])
-@pytest.mark.parametrize("num_kv_heads", [8])
-@pytest.mark.parametrize("offset", [0, 15, 99])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
-@pytest.mark.parametrize("llama_version", ["llama", "llama31"])
-@pytest.mark.parametrize("partial_rotary_factor", [0.25, 0.5, 0.75, 1.0])
-@pytest.mark.parametrize("inplace", [False, True])
+@parametrize_product(
+    {
+        "batch_size": [1, 19, 99, 989],
+        "qkv_len": [1, 4, 19, 204],
+        "num_qo_heads": [8, 16],
+        "num_kv_heads": [8],
+        "offset": [0, 15, 99],
+        "head_dim": [64, 128, 256],
+        "llama_version": ["llama", "llama31"],
+        "partial_rotary_factor": [0.25, 0.5, 0.75, 1.0],
+        "inplace": [False, True],
+    },
+    regular=pairwise_product_cases,
+)
 def test_rope(
     batch_size,
     qkv_len,
@@ -136,17 +146,22 @@ def test_rope(
     torch.testing.assert_close(k_rope_ref, k_rope, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("qkv_len", [1, 4, 19, 204])
-@pytest.mark.parametrize("num_qo_heads", [8, 16])
-@pytest.mark.parametrize("num_kv_heads", [8])
-@pytest.mark.parametrize("offset", [0, 15, 99])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
-@pytest.mark.parametrize("llama_version", ["llama", "llama31"])
-@pytest.mark.parametrize("partial_rotary_factor", [0.25, 0.5, 0.75, 1.0])
-@pytest.mark.parametrize("inplace", [False, True])
-@pytest.mark.parametrize("interleave", [True, False])
-@pytest.mark.parametrize("idtype", [torch.int32, torch.int64])
+@parametrize_product(
+    {
+        "batch_size": [1, 19, 99, 989],
+        "qkv_len": [1, 4, 19, 204],
+        "num_qo_heads": [8, 16],
+        "num_kv_heads": [8],
+        "offset": [0, 15, 99],
+        "head_dim": [64, 128, 256],
+        "llama_version": ["llama", "llama31"],
+        "partial_rotary_factor": [0.25, 0.5, 0.75, 1.0],
+        "inplace": [False, True],
+        "interleave": [True, False],
+        "idtype": [torch.int32, torch.int64],
+    },
+    regular=pairwise_product_cases,
+)
 def test_rope_pos_ids(
     batch_size,
     qkv_len,
@@ -360,31 +375,34 @@ def test_rope_cos_sin_cache(
     torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize(
-    "attention_type,num_qo_heads,num_kv_heads,rope_dim,no_rope_dim",
-    [
-        # MLA: Multiple Q heads, single shared K/V head
-        ("mla", 128, 1, 64, 512),
-        ("mla", 64, 1, 128, 256),
-        ("mla", 128, 1, 64, 128),  # Explicit DeepSeek R1 MLA config case
-        ("mla", 32, 1, 32, 96),
-        # GQA: Multiple Q heads, fewer K/V heads (grouped)
-        ("gqa", 32, 8, 64, 64),
-        ("gqa", 64, 16, 128, 128),
-        ("gqa", 24, 6, 32, 96),
-        ("gqa", 32, 8, 128, 0),  # Llama3 8B standard config
-        ("gqa", 64, 8, 128, 0),  # Llama3 70B standard config
-        ("gqa", 64, 8, 64, 0),  # (plausible) GPT-OSS config
-        # MHA: Equal Q and K/V heads
-        ("mha", 32, 32, 64, 64),
-        ("mha", 16, 16, 128, 128),
-        ("mha", 8, 8, 32, 96),
-    ],
+@pytest.mark.parametrize("backend", ["cuda", "cutile"])
+@parametrize_product(
+    {
+        "attention_type,num_qo_heads,num_kv_heads,rope_dim,no_rope_dim": [
+            # MLA: Multiple Q heads, single shared K/V head
+            ("mla", 128, 1, 64, 512),
+            ("mla", 64, 1, 128, 256),
+            ("mla", 128, 1, 64, 128),  # Explicit DeepSeek R1 MLA config case
+            ("mla", 32, 1, 32, 96),
+            # GQA: Multiple Q heads, fewer K/V heads (grouped)
+            ("gqa", 32, 8, 64, 64),
+            ("gqa", 64, 16, 128, 128),
+            ("gqa", 24, 6, 32, 96),
+            ("gqa", 32, 8, 128, 0),  # Llama3 8B standard config
+            ("gqa", 64, 8, 128, 0),  # Llama3 70B standard config
+            ("gqa", 64, 8, 64, 0),  # (plausible) GPT-OSS config
+            # MHA: Equal Q and K/V heads
+            ("mha", 32, 32, 64, 64),
+            ("mha", 16, 16, 128, 128),
+            ("mha", 8, 8, 32, 96),
+        ],
+        "num_tokens": [1, 19, 128, 199, 899, 2047],
+        "input_dtype": [torch.float16, torch.bfloat16],
+        "quant_dtype": [torch.float8_e4m3fn, torch.float8_e5m2],
+        "enable_pdl": [True, False],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("num_tokens", [1, 19, 128, 199, 899, 2047])
-@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-@pytest.mark.parametrize("enable_pdl", [True, False])
 def test_generalized_rope_quantize(
     attention_type,
     num_qo_heads,
@@ -395,8 +413,37 @@ def test_generalized_rope_quantize(
     input_dtype,
     quant_dtype,
     enable_pdl,
+    backend,
 ):
     """Test generalized rope + quantization for MLA, GQA, and MHA architectures."""
+    if backend == "cutile":
+        from flashinfer.cutile.cutile_common import is_cuda_tile_available
+
+        if not is_cuda_tile_available():
+            pytest.skip("cuda.tile not available")
+        capability = get_compute_capability(torch.device("cuda:0"))
+        if capability < (9, 0):
+            pytest.skip(
+                "cuTile rope_quantize FP8 requires SM90 or newer; "
+                f"got SM{capability[0]}{capability[1]}"
+            )
+        # The cuTile fused rope+quant kernel is MLA-scoped: it addresses the key
+        # tensor as 2D [tokens, rope_dim] (single shared latent K head), matching
+        # the DeepSeek/MLA use case it targets. GQA/MHA pass a 3D
+        # [tokens, kv_heads, rope_dim] key, which the kernel cannot index.
+        if attention_type != "mla":
+            pytest.skip(
+                "cuTile rope_quantize supports MLA-style 2D key tensors only "
+                "(single shared K head); GQA/MHA multi-head K is not supported."
+            )
+        # cuTile backend currently validates only e4m3fn output and ignores PDL;
+        # gate to its supported subset to avoid redundant / unsupported cases.
+        if quant_dtype != torch.float8_e4m3fn:
+            pytest.skip("cuTile rope_quantize backend supports float8_e4m3fn only.")
+        if enable_pdl:
+            pytest.skip(
+                "cuTile rope_quantize backend ignores PDL; covered with enable_pdl=False."
+            )
     device = "cuda:0"
     # Fixed seed for reproducibility across tests
     torch.manual_seed(0)
@@ -470,6 +517,7 @@ def test_generalized_rope_quantize(
         quant_scale_q=1.0,
         quant_scale_kv=1.0,
         enable_pdl=enable_pdl,
+        backend=backend,
     )
 
     # Verify results
@@ -489,34 +537,36 @@ def test_generalized_rope_quantize(
     )
 
 
-@pytest.mark.parametrize(
-    "attention_type,num_qo_heads,num_kv_heads,rope_dim,no_rope_dim",
-    [
-        # MLA: Multiple Q heads, single shared K/V head
-        ("mla", 128, 1, 64, 512),
-        ("mla", 64, 1, 128, 256),
-        ("mla", 128, 1, 64, 128),  # Explicit DeepSeek R1 MLA config case
-        ("mla", 32, 1, 32, 96),
-        # GQA: Multiple Q heads, fewer K/V heads (grouped)
-        ("gqa", 32, 8, 64, 64),
-        ("gqa", 64, 16, 128, 128),
-        ("gqa", 24, 6, 32, 96),
-        ("gqa", 32, 8, 128, 0),  # Llama3 8B standard config
-        ("gqa", 64, 8, 128, 0),  # Llama3 70B standard config
-        ("gqa", 64, 8, 64, 0),  # (plausible) GPT-OSS config
-        # MHA: Equal Q and K/V heads
-        ("mha", 32, 32, 64, 64),
-        ("mha", 16, 16, 128, 128),
-        ("mha", 8, 8, 32, 96),
-    ],
+@parametrize_product(
+    {
+        "attention_type,num_qo_heads,num_kv_heads,rope_dim,no_rope_dim": [
+            # MLA: Multiple Q heads, single shared K/V head
+            ("mla", 128, 1, 64, 512),
+            ("mla", 64, 1, 128, 256),
+            ("mla", 128, 1, 64, 128),
+            ("mla", 32, 1, 32, 96),
+            # GQA: Multiple Q heads, fewer K/V heads (grouped)
+            ("gqa", 32, 8, 64, 64),
+            ("gqa", 64, 16, 128, 128),
+            ("gqa", 24, 6, 32, 96),
+            ("gqa", 32, 8, 128, 0),
+            ("gqa", 64, 8, 128, 0),
+            ("gqa", 64, 8, 64, 0),
+            # MHA: Equal Q and K/V heads
+            ("mha", 32, 32, 64, 64),
+            ("mha", 16, 16, 128, 128),
+            ("mha", 8, 8, 32, 96),
+        ],
+        "num_tokens": [1, 19, 128, 199, 899, 2047],
+        "input_dtype": [torch.float16, torch.bfloat16],
+        "quant_dtype": [torch.float8_e4m3fn, torch.float8_e5m2],
+        "enable_pdl": [True, False],
+        "kv_layout": ["NHD", "HND"],
+        "page_size": [16, 32],
+        "rope_idtype": [torch.int32, torch.int64],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("num_tokens", [1, 19, 128, 199, 899, 2047])
-@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-@pytest.mark.parametrize("enable_pdl", [True, False])
-@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
-@pytest.mark.parametrize("page_size", [16, 32])
-@pytest.mark.parametrize("rope_idtype", [torch.int32, torch.int64])
 def test_generalized_rope_quantize_append_kv_cache(
     attention_type,
     num_qo_heads,
@@ -814,28 +864,30 @@ def test_generalized_rope_quantize_append_kv_cache(
         )
 
 
-@pytest.mark.parametrize(
-    "attention_type,num_qo_heads,num_kv_heads,rope_dim,no_rope_dim",
-    [
-        # MLA: Multiple Q heads, single shared K/V head
-        ("mla", 128, 1, 64, 512),
-        ("mla", 32, 1, 32, 96),
-        # GQA: Multiple Q heads, fewer K/V heads (grouped)
-        ("gqa", 32, 8, 64, 64),
-        ("gqa", 32, 8, 128, 0),  # Llama3 8B standard config
-        # MHA: Equal Q and K/V heads
-        ("mha", 32, 32, 64, 64),
-        ("mha", 16, 16, 128, 128),
-    ],
+@parametrize_product(
+    {
+        "attention_type,num_qo_heads,num_kv_heads,rope_dim,no_rope_dim": [
+            # MLA: Multiple Q heads, single shared K/V head
+            ("mla", 128, 1, 64, 512),
+            ("mla", 32, 1, 32, 96),
+            # GQA: Multiple Q heads, fewer K/V heads (grouped)
+            ("gqa", 32, 8, 64, 64),
+            ("gqa", 32, 8, 128, 0),  # Llama3 8B standard config
+            # MHA: Equal Q and K/V heads
+            ("mha", 32, 32, 64, 64),
+            ("mha", 16, 16, 128, 128),
+        ],
+        "num_existing_tokens": [10, 50],
+        "num_new_tokens": [1, 8],
+        "input_dtype": [torch.float16, torch.bfloat16],
+        "quant_dtype": [torch.float8_e4m3fn, torch.float8_e5m2],
+        "enable_pdl": [True, False],
+        "kv_layout": ["NHD", "HND"],
+        "page_size": [16, 32],
+        "rope_idtype": [torch.int32, torch.int64],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("num_existing_tokens", [10, 50])
-@pytest.mark.parametrize("num_new_tokens", [1, 8])
-@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-@pytest.mark.parametrize("enable_pdl", [True, False])
-@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
-@pytest.mark.parametrize("page_size", [16, 32])
-@pytest.mark.parametrize("rope_idtype", [torch.int32, torch.int64])
 def test_rope_quantize_fp8_append_paged_kv_cache_decode(
     attention_type,
     num_qo_heads,
@@ -1703,6 +1755,83 @@ def test_mla_rope_quantize(
     torch.testing.assert_close(
         k_out_f8_ref.float(), k_out.float(), atol=1e-2, rtol=2e-1
     )
+
+
+@pytest.mark.parametrize("capability", [(8, 6), (8, 9)])
+def test_rope_quantize_fp8_cutile_rejects_pre_sm90(monkeypatch, capability):
+    """Reject unsupported FP8 architectures before importing or tuning cuTile."""
+    monkeypatch.setattr(flashinfer.rope, "get_compute_capability", lambda _: capability)
+
+    q_rope = torch.empty(1, 1, 2)
+    k_rope = torch.empty(1, 2)
+    q_nope = torch.empty(1, 1, 0)
+    k_nope = torch.empty(1, 0)
+    cos_sin_cache = torch.empty(1, 2, dtype=torch.float32)
+    pos_ids = torch.zeros(1, dtype=torch.int32)
+
+    expected = rf"requires SM90 or newer.*got SM{capability[0]}{capability[1]}"
+    with pytest.raises(NotImplementedError, match=expected):
+        flashinfer.rope.rope_quantize_fp8(
+            q_rope,
+            k_rope,
+            q_nope,
+            k_nope,
+            cos_sin_cache,
+            pos_ids,
+            is_neox=False,
+            quantize_dtype=torch.float8_e4m3fn,
+            backend="cutile",
+        )
+
+
+@pytest.mark.parametrize("unsupported", ["neox", "multi_head_key", "bad_backend"])
+def test_rope_quantize_fp8_cutile_rejects_unsupported(unsupported):
+    """The cuTile dispatch guards must raise, not fall through to CUDA or the kernel.
+
+    The parametrized test above only *skips* NeoX / GQA / MHA for the cuTile
+    backend, so without this the documented contract is never exercised.
+    """
+    from flashinfer.cutile.cutile_common import is_cuda_tile_available
+
+    if not is_cuda_tile_available():
+        pytest.skip("cuda.tile not available")
+
+    device, dt = "cuda:0", torch.bfloat16
+    num_tokens, rope_dim, no_rope_dim, num_qo_heads = 4, 64, 512, 8
+    kv_heads = 2
+
+    q_rope = torch.randn(num_tokens, num_qo_heads, rope_dim, dtype=dt, device=device)
+    q_nope = torch.randn(num_tokens, num_qo_heads, no_rope_dim, dtype=dt, device=device)
+    # 2D key = the supported MLA layout; 3D key = the rejected GQA/MHA layout.
+    k_rope_2d = torch.randn(num_tokens, rope_dim, dtype=dt, device=device)
+    k_nope_2d = torch.randn(num_tokens, no_rope_dim, dtype=dt, device=device)
+    k_rope_3d = torch.randn(num_tokens, kv_heads, rope_dim, dtype=dt, device=device)
+    k_nope_3d = torch.randn(num_tokens, kv_heads, no_rope_dim, dtype=dt, device=device)
+    cos_sin_cache = torch.randn(
+        num_tokens, rope_dim, dtype=torch.float32, device=device
+    )
+    pos_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
+
+    k_rope = k_rope_3d if unsupported == "multi_head_key" else k_rope_2d
+    k_nope = k_nope_3d if unsupported == "multi_head_key" else k_nope_2d
+
+    kwargs = dict(
+        q_rope=q_rope,
+        k_rope=k_rope,
+        q_nope=q_nope,
+        k_nope=k_nope,
+        cos_sin_cache=cos_sin_cache,
+        pos_ids=pos_ids,
+        quant_scale_q=1.0,
+        quant_scale_kv=1.0,
+        is_neox=(unsupported == "neox"),
+        backend="cuitle" if unsupported == "bad_backend" else "cutile",
+    )
+    # A misspelled backend must be rejected outright rather than silently
+    # running the CUDA path.
+    expected = ValueError if unsupported == "bad_backend" else NotImplementedError
+    with pytest.raises(expected):
+        flashinfer.rope.rope_quantize_fp8(**kwargs)
 
 
 if __name__ == "__main__":

@@ -83,6 +83,24 @@ STATEFUL_ADAPTERS: dict[str, StatefulAdapter] = {
             "kv_indices": "kv_indices",
             "sm_scale": "sm_scale",
         },
+        self_attrs={
+            "kv_indptr": "_kv_indptr_buf",
+            "kv_indices": "_kv_indices_buf",
+            "sm_scale": "_sm_scale",
+        },
+    ),
+    "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run": StatefulAdapter(
+        plan_attr="plan",
+        plan_inputs={
+            "kv_indptr": "kv_indptr",
+            "kv_indices": "kv_indices",
+            "sm_scale": "sm_scale",
+        },
+        self_attrs={
+            "kv_indptr": "_kv_indptr_buf",
+            "kv_indices": "_kv_indices_buf",
+            "sm_scale": "_sm_scale",
+        },
     ),
 }
 

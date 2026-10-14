@@ -13,11 +13,11 @@
 # limitations under the License.
 
 """
-Recurrent KDA (Key-Driven Attention) Benchmark
+Recurrent KDA (Kimi Delta Attention) Benchmark
 
-Benchmarks recurrent KDA decode with per-K-dimension gating. T=1 uses the
-standard decode path; T>1 uses fused speculative decode with
-num_spec_tokens=T-1.
+Benchmarks the recurrent KDA register-tile kernel with per-K-dimension gating.
+T=1 is standard decode; T>1 is fused speculative decode with
+``num_spec_tokens=T-1``.
 KDA differs from GDN by having gate g[B, T, HV, K] instead of a scalar gate.
 
 Usage:
@@ -35,7 +35,8 @@ from flashinfer.testing import bench_gpu_time
 
 # Import the recurrent KDA kernel
 try:
-    from flashinfer.kda_decode import _RECURRENT_KDA_AVAILABLE, recurrent_kda
+    from flashinfer import recurrent_kda
+    from flashinfer.kda_decode import _RECURRENT_KDA_AVAILABLE
 
     RECURRENT_KDA_AVAILABLE = _RECURRENT_KDA_AVAILABLE
 except ImportError:
@@ -56,7 +57,7 @@ def recurrent_kda_flops(
     seq_len: int = 1,
 ) -> int:
     """
-    Calculate FLOPs for KDA (Key-Driven Attention) decode.
+    Calculate FLOPs for KDA (Kimi Delta Attention) decode.
 
     8 * K * V FLOPs per token per head:
     1. k @ state (prediction):    2 * K * V
@@ -233,7 +234,7 @@ def run_recurrent_kda_benchmark(args, dtype):
     """Run recurrent KDA decode benchmarks."""
     if not RECURRENT_KDA_AVAILABLE:
         print("Error: recurrent KDA kernel is not available.")
-        print("Make sure flashinfer.kda_decode.recurrent_kda is importable.")
+        print("Make sure flashinfer.recurrent_kda is importable.")
         return
 
     invalid_seq_lens = [t for t in args.seq_len if t < 1]

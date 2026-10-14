@@ -1,0 +1,376 @@
+"""Kernel backend ABCs and per-iteration context."""
+
+from __future__ import annotations
+
+import importlib
+from abc import ABC, abstractmethod
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+if TYPE_CHECKING:
+    import torch
+
+    from ...config import BootstrapConfig, FleetParams
+    from ...tensors import MoEEpTensors
+    from ...weights import MoEWeightPack
+
+
+@dataclass(frozen=True)
+class SplitKernelContext:
+    """Per-iteration inputs for a split-path inner kernel."""
+
+    expert_tensors: "torch.Tensor"
+    num_tokens: int
+    fleet_params: "FleetParams"
+    recv_topk_idx: Optional["torch.Tensor"] = None
+    recv_topk_weights: Optional["torch.Tensor"] = None
+    recv_count: Optional["torch.Tensor"] = None
+
+
+class SplitKernelBackend(ABC):
+    """Compute backend invoked after dispatch on the split EP path."""
+
+    def __init__(self, config: object) -> None:
+        self._config = config
+        self._transformed_weights: Any = None
+
+    @classmethod
+    @abstractmethod
+    def kernel_name(cls) -> str: ...
+
+    @classmethod
+    def requires_weights(cls) -> bool:
+        return True
+
+    def validate_init(  # noqa: B027 - intentional no-op default
+        self,
+        bootstrap: "BootstrapConfig",
+        fleet_params: "FleetParams",
+    ) -> None:
+        """Optional init-time validation beyond shared checks."""
+
+    def preprocess_weights(
+        self,
+        weights: "MoEWeightPack",
+        fleet_params: "FleetParams",
+    ) -> Any:
+        """Transform canonical weights into the layout this kernel expects."""
+        self._transformed_weights = weights
+        return weights
+
+    def pack_dispatch_payload(self, x: "torch.Tensor") -> "torch.Tensor":
+        """Optionally transform the token payload before EP dispatch.
+
+        Default: identity (BF16 tokens on the wire). A backend that quantizes
+        activations may override this to send a packed quantized payload and
+        unpack it in :meth:`compute`. ``FleetParams`` keeps describing the
+        LOGICAL bf16 token; the packed row's byte width must not exceed
+        ``token_hidden_size * dtype_bytes`` (the transport's per-token byte
+        budget)."""
+        return x
+
+    @abstractmethod
+    def compute(self, ctx: SplitKernelContext) -> "torch.Tensor": ...
+
+
+class MegaKernelBackend(ABC):
+    """Fused kernel backend that owns comm + local MoE on the mega EP path."""
+
+    # Backends opt in to returning a workspace-backed output view by setting
+    # this capability during backend registration.  Keep the default false so
+    # existing backends retain the materializing output path.
+    supports_output_view: bool = False
+    supports_unfinalized_output: bool = False
+    supports_live_token_tuning: bool = False
+    _knob_cache_module: str
+
+    def __init__(self, config: object) -> None:
+        self._config = config
+        self._transformed_weights: Any = None
+        self._ep_bootstrap: BootstrapConfig | None = None
+        self._ep_comm_group: Any = None
+        self._ep_rank: int = 0
+        self._ep_world_size: int = 0
+        self._profile_knobs: dict[tuple[int, int | None], dict] = {}
+        self._autotune_winner: dict[str, Any] | None = None
+
+    def get_tuned_knobs(self) -> dict[str, Any]:
+        """Return a copy of the last completed automatic tuning result."""
+        if self._autotune_winner is None:
+            raise RuntimeError(
+                "MegaMoE has no completed automatic tuning result; "
+                "call warmup() on a layer configured with knobs='auto' first"
+            )
+        return deepcopy(self._autotune_winner)
+
+    @classmethod
+    @abstractmethod
+    def kernel_name(cls) -> str: ...
+
+    def runtime_requirements(self, bootstrap: "BootstrapConfig") -> frozenset[str]:
+        """Process resources this mega kernel needs (``torch_dist``, ``nvshmem``, …)."""
+        from ...core.runtime import TORCH_DIST
+
+        return frozenset({TORCH_DIST})
+
+    def bind_ep_bootstrap(self, bootstrap: "BootstrapConfig") -> None:
+        """Resolve EP rank/world once; comm group when dist is available."""
+        self._ep_bootstrap = bootstrap
+        self._ep_rank = bootstrap.rank
+        self._ep_world_size = bootstrap.world_size
+        self._ep_comm_group = None
+        self._try_resolve_ep_comm_group(bootstrap)
+
+    def _try_resolve_ep_comm_group(self, bootstrap: "BootstrapConfig") -> None:
+        import torch.distributed as dist
+
+        from ...core.bootstrap_utils import (
+            bootstrap_comm_group,
+            bootstrap_ep_rank_world,
+        )
+
+        if bootstrap.process_group is not None or dist.is_initialized():
+            self._ep_comm_group = bootstrap_comm_group(bootstrap)
+            self._ep_rank, self._ep_world_size = bootstrap_ep_rank_world(bootstrap)
+
+    def _ensure_ep_bootstrap(self, bootstrap: "BootstrapConfig") -> None:
+        if self._ep_bootstrap is not bootstrap:
+            self.bind_ep_bootstrap(bootstrap)
+        elif self._ep_comm_group is None:
+            self._try_resolve_ep_comm_group(bootstrap)
+
+    @property
+    def ep_comm_group(self) -> "torch.distributed.ProcessGroup":
+        if self._ep_comm_group is None and self._ep_bootstrap is not None:
+            self._try_resolve_ep_comm_group(self._ep_bootstrap)
+        if self._ep_comm_group is None:
+            raise RuntimeError(
+                "EP comm group is unavailable; initialize torch.distributed "
+                "or set BootstrapConfig.process_group before workspace allocation"
+            )
+        return self._ep_comm_group
+
+    @property
+    def ep_rank(self) -> int:
+        if self._ep_bootstrap is None:
+            raise RuntimeError(
+                "EP bootstrap is not bound; call bind_ep_bootstrap() first"
+            )
+        return self._ep_rank
+
+    @property
+    def ep_world_size(self) -> int:
+        if self._ep_bootstrap is None:
+            raise RuntimeError(
+                "EP bootstrap is not bound; call bind_ep_bootstrap() first"
+            )
+        return self._ep_world_size
+
+    def validate_init(  # noqa: B027 - intentional no-op default
+        self,
+        bootstrap: "BootstrapConfig",
+        fleet_params: "FleetParams",
+    ) -> None:
+        """Optional init-time validation beyond shared checks."""
+
+    def preprocess_weights(
+        self,
+        weights: "MoEWeightPack",
+        fleet_params: "FleetParams",
+    ) -> Any:
+        """Transform canonical weights into the layout this kernel expects."""
+        return weights
+
+    def prepare_workspace(
+        self,
+        bootstrap: "BootstrapConfig",
+        fleet_params: "FleetParams",
+    ) -> Any:
+        """Bind EP bootstrap (once) and allocate symmetric-memory workspace.
+
+        Workspaces are shared across layer instances through the process-level
+        pool when the backend provides a pool key (see
+        :mod:`.workspace_pool`): all MoE layers of a model typically have
+        identical EP geometry, and per-layer symm buffers multiply NVSHMEM
+        heap use and compiled sessions by the layer count.
+        """
+        self._ensure_ep_bootstrap(bootstrap)
+        request = self._workspace_pool_request(fleet_params)
+        if request is None:
+            return self._allocate_workspace(fleet_params)
+        key, factory = request
+        from .workspace_pool import acquire_workspace
+
+        return acquire_workspace(key, factory)
+
+    def _tuning_key(self, fleet_params: "FleetParams") -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _tuning_cache(self) -> Any:
+        return importlib.import_module(self._knob_cache_module)
+
+    def live_token_buckets(self, fleet_params: "FleetParams") -> list[int]:
+        """Offline workload profiles available at this exact capacity."""
+        if not self.supports_live_token_tuning:
+            return []
+        knobs = getattr(self._config, "knobs", None)
+        if isinstance(knobs, dict) or knobs == "auto":
+            return []
+        return self._tuning_cache().live_token_buckets(**self._tuning_key(fleet_params))
+
+    def _workspace_knobs(self, fleet_params: "FleetParams") -> dict | None:
+        knobs = getattr(self._config, "knobs", None)
+        if isinstance(knobs, dict):
+            return knobs
+        if knobs == "auto":
+            return None
+        key = (fleet_params.max_tokens_per_rank, fleet_params.tuning_live_tokens)
+        if key not in self._profile_knobs:
+            self._profile_knobs[key] = self._tuning_cache().resolve_knobs(
+                **self._tuning_key(fleet_params),
+                live_tokens=fleet_params.tuning_live_tokens,
+            )[0]
+        return self._profile_knobs[key]
+
+    @abstractmethod
+    def _allocate_workspace(self, fleet_params: "FleetParams") -> Any:
+        """Backend-specific symmetric-memory / workspace allocation."""
+
+    def _workspace_pool_key(self, fleet_params: "FleetParams") -> Any:
+        """Hashable sharing key for the workspace pool, or ``None`` (no pool).
+
+        Must capture EVERYTHING baked into the workspace at allocation:
+        geometry, EP identity, dtype/kind, clamp, combine wire, config-level
+        epilogue scalars, and knobs. Default is unpooled.
+        """
+        return None
+
+    def _workspace_pool_request(
+        self,
+        fleet_params: "FleetParams",
+    ) -> Optional[tuple[Any, Callable[[], Any]]]:
+        """Return one pool key and its matching allocation factory.
+
+        The default preserves the legacy backend contract. Backends whose
+        pool key depends on mutable external state can override this hook to
+        resolve that state once and capture the same frozen value in both the
+        key and factory.
+        """
+        key = self._workspace_pool_key(fleet_params)
+        if key is None:
+            return None
+        return key, lambda: self._allocate_workspace(fleet_params)
+
+    def validate_forward(  # noqa: B027 - intentional no-op default
+        self,
+        t: "MoEEpTensors",
+        fleet_params: "FleetParams",
+        *,
+        quantize_input: bool,
+    ) -> None:
+        """Optional per-iteration validation before staging/compute."""
+
+    def validate_capture_ready(  # noqa: B027 - intentional no-op default
+        self,
+        workspace: Any,
+        transformed_weights: Any,
+    ) -> None:
+        """Fail before staging if a selected workspace has lazy capture work."""
+
+    def validate_transformed_weights(  # noqa: B027 - intentional no-op default
+        self,
+        transformed_weights: Any,
+        bootstrap: "BootstrapConfig",
+        fleet_params: "FleetParams",
+    ) -> None:
+        """Optional init-time validation for user-supplied kernel-ready weights."""
+
+    def set_compile_tokens_per_rank(  # noqa: B027 - intentional no-op default
+        self,
+        workspace: Any,
+        compile_tokens_per_rank: int | None,
+    ) -> None:
+        """Select an optional per-invocation graph/compile token bucket.
+
+        The workspace capacity remains fixed by ``FleetParams``. Backends that
+        specialize kernels for smaller graph buckets override this hook. A
+        caller may only provide a non-``None`` value when every EP rank uses
+        the same value for the invocation.
+        """
+        if compile_tokens_per_rank is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support compile token buckets"
+            )
+
+    def stage_inputs(  # noqa: B027 - intentional no-op default
+        self,
+        t: "MoEEpTensors",
+        workspace: Any,
+        *,
+        quantize_input: bool,
+    ) -> None:
+        """Copy or quantize activations into workspace buffers."""
+
+    def workspace_output(self, workspace: Any) -> "torch.Tensor":
+        """Return the stable output tensor owned by ``workspace``.
+
+        Backends that support zero-copy framework integration override this
+        method. Keeping the accessor on the backend avoids exposing private,
+        backend-specific workspace layouts to callers.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose a workspace output"
+        )
+
+    @abstractmethod
+    def compute(
+        self,
+        workspace: Any,
+        transformed_weights: Any,
+        *,
+        output: "torch.Tensor | None",
+    ) -> "torch.Tensor":
+        """Run the fused kernel. ``output=None`` (cutedsl backends) returns a
+        zero-copy view of the workspace output, valid under stream ordering
+        until the next launch on this session's buffers."""
+
+    def compute_unfinalized(
+        self,
+        workspace: Any,
+        transformed_weights: Any,
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+        """Return borrowed GEMM2 rows, remaining weights, and route-to-row indices."""
+        raise NotImplementedError("this MegaMoE backend cannot defer top-k reduction")
+
+    def destroy(self, workspace: Any) -> None:
+        """Release durable workspace resources (pool-aware, refcounted)."""
+        if workspace is None:
+            return
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "mega workspace release cannot run during CUDA graph capture"
+            )
+        from .workspace_pool import release_workspace
+
+        # Backend-local launch state belongs to this owner even when the
+        # physical workspace is pooled with other backend instances.
+        self._forget_local_workspace_state(workspace)
+        if release_workspace(workspace):
+            self._forget_workspace_state(workspace)
+            workspace.destroy()
+
+    def _forget_local_workspace_state(self, workspace: Any) -> None:  # noqa: B027
+        """Drop this backend instance's memoized state for ``workspace``.
+
+        Called for every owner release, including non-final pooled releases.
+        """
+
+    def _forget_workspace_state(self, workspace: Any) -> None:  # noqa: B027
+        """Drop process-global state keyed on this workspace's buffers.
+
+        Called on the last release, just before ``workspace.destroy()`` frees
+        the buffers (whose addresses the symmetric heap may reuse). Default is
+        a no-op; backends with cross-owner memos override this."""

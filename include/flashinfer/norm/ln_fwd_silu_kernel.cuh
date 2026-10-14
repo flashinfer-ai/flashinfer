@@ -161,7 +161,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA, DESIRED_OCCUPANCY) void l
   // Load gamma and beta into shared memory or registers
 #pragma unroll
   for (int b = 0; b < BATCH_SIZE; b++) {
-// CL-14115: The unroll factor 128 for LDGS was chosen based on the compilation/perf results for
+// The unroll factor 128 for LDGS was chosen based on the compilation/perf results for
 // APEX LN_fwd engines
 #pragma unroll 128
     for (int it = 0; it < LDGS; it++) {

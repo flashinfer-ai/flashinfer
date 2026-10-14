@@ -21,7 +21,7 @@
 #include "cutlass_extensions/epilogue_helpers.h"
 
 #ifdef ENABLE_FP4
-#include <cuda_fp4.h>
+#include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
 #endif
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
@@ -32,12 +32,15 @@ template <typename T, typename WeightType,
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
               TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidSM120MOESpecialisation() {
+  if constexpr (Fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION) {
+    return false;
+  }
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)  // TODO Is there a better choice
 #if defined(ENABLE_FP4)
-  return ((cutlass::platform::is_same<T, __nv_fp4_e2m1>::value &&
+  return ((cutlass::platform::is_same<T, Fp4Type>::value &&
            cutlass::platform::is_same<T, WeightType>::value) ||
           (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
-           cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value)) &&
+           cutlass::platform::is_same<WeightType, Fp4Type>::value)) &&
          cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
 #else
   return false;
@@ -53,11 +56,21 @@ template <typename T, typename WeightType,
               TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidBlackwellMOESpecialisation() {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)  // TODO Is there a better choice
+  if constexpr (Fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION) {
+    constexpr bool is_bf16 = cutlass::platform::is_same<T, __nv_bfloat16>::value;
+#if defined(ENABLE_FP8)
+    constexpr bool is_mxfp8 = cutlass::platform::is_same<T, __nv_fp8_e4m3>::value;
+#else
+    constexpr bool is_mxfp8 = false;
+#endif
+    return (is_bf16 || is_mxfp8) && cutlass::platform::is_same<T, WeightType>::value &&
+           cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
+  }
 #if defined(ENABLE_FP4)
   return (cutlass::platform::is_same<T, WeightType>::value ||
 #if defined(ENABLE_FP4)
           (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
-           cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value)
+           cutlass::platform::is_same<WeightType, Fp4Type>::value)
 #else
           false
 #endif
@@ -78,17 +91,19 @@ template <typename T, typename WeightType,
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
               TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidHopperMOESpecialisation() {
+  if constexpr (Fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION) {
+    return false;
+  }
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
   return (cutlass::platform::is_same<T, WeightType>::value ||
           (cutlass::platform::is_same<cutlass::uint4b_t, WeightType>::value &&
            cutlass::platform::is_same<T, __nv_fp8_e4m3>::value)
 #ifdef ENABLE_FP4
-          || (cutlass::platform::is_same<__nv_fp4_e2m1, WeightType>::value &&
-              !cutlass::platform::is_same<T, __nv_fp8_e4m3>::value)
+          || cutlass::platform::is_same<Fp4Type, WeightType>::value
 #endif
-              )
+          )
 #ifdef ENABLE_FP4
-         && !cutlass::platform::is_same<T, __nv_fp4_e2m1>::value
+         && !cutlass::platform::is_same<T, Fp4Type>::value
 #endif
          && cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
 #else
@@ -103,7 +118,7 @@ template <typename T, typename WeightType,
               TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidTmaWarpSpecializedMOESpecialisation() {
   // Check at least one of the implementations are valid
-  return isValidSM120MOESpecialisation<T, WeightType>() ||
+  return isValidSM120MOESpecialisation<T, WeightType, EpilogueTag, Fusion>() ||
          isValidBlackwellMOESpecialisation<T, WeightType, EpilogueTag, Fusion>() ||
          isValidHopperMOESpecialisation<T, WeightType, EpilogueTag, Fusion>();
 }
@@ -115,7 +130,7 @@ template <typename T, typename WeightType,
               TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidAmpereMOESpecialisation() {
 #ifdef ENABLE_FP4
-  return !std::is_same_v<T, __nv_fp4_e2m1> && !std::is_same_v<WeightType, __nv_fp4_e2m1>;
+  return !std::is_same_v<T, Fp4Type> && !std::is_same_v<WeightType, Fp4Type>;
 #else
   return true;  // Default to true
 #endif

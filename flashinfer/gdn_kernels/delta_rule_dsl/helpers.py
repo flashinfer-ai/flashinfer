@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+import torch
 import cutlass
 import cutlass.cute as cute
 import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
@@ -13,6 +14,22 @@ from cutlass._mlir.dialects import llvm
 
 def round_down(a: int, b: int) -> int:
     return (a // b) * b
+
+
+def state_dtype_to_cutlass(dtype: torch.dtype) -> type[cutlass.Numeric]:
+    state_dtypes = {
+        torch.float32: cutlass.Float32,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float16: cutlass.Float16,
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+    }
+    if dtype not in state_dtypes:
+        raise ValueError(
+            f"Unsupported state dtype {dtype}, expected float32, bfloat16, "
+            "float16, float8_e4m3fn, or float8_e5m2"
+        )
+    return state_dtypes[dtype]
 
 
 @dataclass(frozen=True)
