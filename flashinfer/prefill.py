@@ -8191,9 +8191,9 @@ def fmha_v2_prefill_sm120(
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Run SM120 FMHA v2 with contiguous, separate Q/K/V tensors.
 
-    Supports FP8 E4M3 standard MHA self-attention with equal Q/K/V head counts
-    and head dimensions of 64 or 128, and BF16 output. GQA and MQA are not
-    supported by this entry point. ``scale_bmm1`` combines the Q and K
+    Supports FP8 E4M3 MHA, GQA, and MQA self-attention with head dimensions
+    of 64 or 128 and BF16 output. The query head count must be divisible by
+    the K/V head count. ``scale_bmm1`` combines the Q and K
     dequantization scales with the attention scale; ``scale_bmm2`` is the V
     dequantization scale. Set ``causal=False`` for dense / bidirectional
     attention. Q/K/V/O use fixed-shape ``[batch, seq_len, heads, head_dim]``
@@ -8211,7 +8211,8 @@ def fmha_v2_prefill_sm120(
     Parameters
     ----------
     query, key, value : torch.Tensor
-        Contiguous FP8 E4M3 Q, K, and V tensors in BSHD layout.
+        Contiguous FP8 E4M3 tensors in BSHD layout. Q has ``num_heads`` heads;
+        K and V have the same, possibly smaller, head count.
     out : torch.Tensor
         Caller-owned contiguous BF16 output tensor in BSHD layout.
     num_heads, head_dim, seq_len : int
@@ -8242,13 +8243,17 @@ def fmha_v2_prefill_sm120(
     if not all(t.device == query.device for t in (key, value, out)):
         raise ValueError("query, key, value, and out must be on the same device.")
     expected_prefix = (query.shape[0], seq_len, num_heads)
-    if (
-        query.shape[:3] != expected_prefix
-        or key.shape[:3] != expected_prefix
-        or value.shape[:3] != expected_prefix
-        or out.shape[:3] != expected_prefix
-    ):
-        raise ValueError("tensor shapes must match batch, seq_len, and num_heads.")
+    if query.shape[:3] != expected_prefix or out.shape[:3] != expected_prefix:
+        raise ValueError(
+            "query and out shapes must match batch, seq_len, and num_heads."
+        )
+    if key.shape[:2] != expected_prefix[:2] or value.shape[:3] != key.shape[:3]:
+        raise ValueError(
+            "key and value must have matching batch, seq_len, and KV head count."
+        )
+    num_kv_heads = key.shape[2]
+    if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
+        raise ValueError("num_heads must be divisible by a positive KV head count.")
     if (
         head_dim not in (64, 128)
         or query.shape[3] != head_dim
@@ -8310,17 +8315,23 @@ def fmha_v2_prefill_deepseek(
     scale_bmm1_d: Optional[torch.Tensor] = None,
     scale_bmm2_d: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """
+    """Run causal SM12x FMHA v2 for DeepSeek MLA or 128-dimension GQA.
+
+    Supports the DeepSeek Q/K=192, V=128 layout and FP8 E4M3 Q/K/V=128
+    with BF16 output, including GLM-4.7's 96 query heads and 8 K/V heads.
+    The 128-dimension path accepts MHA, GQA, and MQA with the same
+    requirements as :func:`fmha_v2_prefill_sm120`.
+
     Parameters
     ----------
     query : torch.Tensor
         query tensor with shape [batch_size, seq_len, num_heads, head_dim]
     key : torch.Tensor
-        key tensor with shape [batch_size, seq_len, num_heads, head_dim]
+        key tensor with shape [batch_size, seq_len, num_kv_heads, head_dim]
     value : torch.Tensor
-        value tensor with shape [batch_size, seq_len, num_heads, head_dim]
+        value tensor with shape [batch_size, seq_len, num_kv_heads, 128]
     out : torch.Tensor
-        output tensor with shape [batch_size, seq_len, num_heads, head_dim]
+        output tensor with shape [batch_size, seq_len, num_heads, 128]
     return_lse : bool
         whether to return the log-sum-exp of attention output
     num_heads : int
@@ -8353,12 +8364,32 @@ def fmha_v2_prefill_deepseek(
     """
     if not is_sm12x_supported(query.device):
         raise ValueError("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4 or out.ndim != 4:
+        raise ValueError("query, key, value, and out must be 4D BSHD tensors.")
     if query.shape[1] != seq_len:
         raise ValueError("query sequence length must match seq_len.")
     if return_lse and lse is None:
         raise ValueError("lse must be provided when return_lse=True.")
+    if query.shape[3] == 128:
+        return fmha_v2_prefill_sm120(
+            query,
+            key,
+            value,
+            out,
+            num_heads,
+            head_dim,
+            seq_len,
+            scale_softmax,
+            scale_bmm1,
+            scale_bmm2,
+            causal=True,
+            return_lse=return_lse,
+            lse=lse,
+            scale_bmm1_d=scale_bmm1_d,
+            scale_bmm2_d=scale_bmm2_d,
+        )
     assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
-        "currently only support deepseek r1 192 query and 128 value"
+        "supported Q/K and V head dimensions are 192/128 and 128/128"
     )
     return _fmha_v2_prefill_sm120_run(
         query,
