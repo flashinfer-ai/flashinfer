@@ -71,7 +71,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_blackwell_msa_98c92f02bd60a94e4167(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int num_requests, float softmax_scale_log2, int msa_max_pages)
+kernel_cake_blackwell_msa_39cb68eb4d9014c99900(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int num_requests, float softmax_scale_log2, int msa_max_pages)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -91,12 +91,13 @@ kernel_cake_blackwell_msa_98c92f02bd60a94e4167(const __grid_constant__ CUtensorM
     #define kv_full_addr (mbar_base + 8)
     #define kv_src_full_addr (mbar_base + 40)
     #define kv_empty_addr (mbar_base + 72)
-    #define s_full_addr (mbar_base + 104)
-    #define p_full_addr (mbar_base + 120)
-    #define corr_sig_addr (mbar_base + 136)
-    #define corr_done_addr (mbar_base + 152)
-    #define o_full_addr (mbar_base + 168)
-    #define decode_done_addr (mbar_base + 184)
+    #define kv_raw_empty_addr (mbar_base + 104)
+    #define s_full_addr (mbar_base + 136)
+    #define p_full_addr (mbar_base + 152)
+    #define corr_sig_addr (mbar_base + 168)
+    #define corr_done_addr (mbar_base + 184)
+    #define o_full_addr (mbar_base + 200)
+    #define decode_done_addr (mbar_base + 216)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -131,8 +132,8 @@ kernel_cake_blackwell_msa_98c92f02bd60a94e4167(const __grid_constant__ CUtensorM
     float* decode_row_sum = reinterpret_cast<float*>(smem_raw + SMEM_DECODE_ROW_SUM_OFF);
     const int decode_row_sum_addr = smem + SMEM_DECODE_ROW_SUM_OFF;
 
-    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 24 barriers)
-    // Mbarriers at smem_raw[0..192)
+    // Mbarrier init (11 pipeline groups, 0 ordered-sequence groups, 28 barriers)
+    // Mbarriers at smem_raw[0..224)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -155,23 +156,28 @@ kernel_cake_blackwell_msa_98c92f02bd60a94e4167(const __grid_constant__ CUtensorM
             mbarrier_init(smem + 80, 1);
             mbarrier_init(smem + 88, 1);
             mbarrier_init(smem + 96, 1);
-            // s_full: 2 barriers, init_count=1
+            // kv_raw_empty: 4 barriers, init_count=1
             mbarrier_init(smem + 104, 1);
             mbarrier_init(smem + 112, 1);
+            mbarrier_init(smem + 120, 1);
+            mbarrier_init(smem + 128, 1);
+            // s_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 136, 1);
+            mbarrier_init(smem + 144, 1);
             // p_full: 2 barriers, init_count=256
-            mbarrier_init(smem + 120, 256);
-            mbarrier_init(smem + 128, 256);
+            mbarrier_init(smem + 152, 256);
+            mbarrier_init(smem + 160, 256);
             // corr_sig: 2 barriers, init_count=128
-            mbarrier_init(smem + 136, 128);
-            mbarrier_init(smem + 144, 128);
+            mbarrier_init(smem + 168, 128);
+            mbarrier_init(smem + 176, 128);
             // corr_done: 2 barriers, init_count=128
-            mbarrier_init(smem + 152, 128);
-            mbarrier_init(smem + 160, 128);
-            // o_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 168, 1);
-            mbarrier_init(smem + 176, 1);
-            // decode_done: 1 barriers, init_count=128
             mbarrier_init(smem + 184, 128);
+            mbarrier_init(smem + 192, 128);
+            // o_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 200, 1);
+            mbarrier_init(smem + 208, 1);
+            // decode_done: 1 barriers, init_count=128
+            mbarrier_init(smem + 216, 128);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -179,9 +185,9 @@ kernel_cake_blackwell_msa_98c92f02bd60a94e4167(const __grid_constant__ CUtensorM
     __syncwarp();
 
     // TMEM alloc (128 columns, 96 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 192);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 224);
     if (warp == 0) {
-        int _tmem_hold = smem + 192;
+        int _tmem_hold = smem + 224;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -200,15 +206,8 @@ kernel_cake_blackwell_msa_98c92f02bd60a94e4167(const __grid_constant__ CUtensorM
     const int tmem_tmem_stats0 = taddr + 64;
     const int tmem_tmem_stats1 = taddr + 80;
 
-    // ---- Ordered hardware-WG register redistribution ----
-    // Dec phase frees registers before any WG attempts inc.
-    if (warp >= 12 && warp <= 15) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
-    }
-
     // ---- Role: softmax ----
     if (warp <= 7) {
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 192;");
         { // softmax_main
             int is_wg1 = ((warp >= 4) ? 1 : 0);
             int group_size = 16;
@@ -396,7 +395,6 @@ kernel_cake_blackwell_msa_98c92f02bd60a94e4167(const __grid_constant__ CUtensorM
     }
     // ---- Role: correction ----
     if (warp >= 8 && warp <= 11) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 80;");
         { // correction_main
             const int tmem_row_base_v_1 = warp % 4 * 32;
             const int corr_row = tmem_row_base_v_1 << 16;
@@ -1002,7 +1000,7 @@ kernel_cake_blackwell_msa_98c92f02bd60a94e4167(const __grid_constant__ CUtensorM
                     msa_valid_cols = valid_cols_1;
                     smem_page_indices[native_ni] = msa_valid_cols;
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    mbarrier_wait(kv_empty_addr + (native_kv_stage) * 8, native_kv_phase);
+                    mbarrier_wait(kv_raw_empty_addr + (native_kv_stage) * 8, native_kv_phase);
                     mbarrier_arrive_expect_tx(kv_src_full_addr + (native_kv_stage) * 8, 16384);
                     int native_dst = smem_kv_addr + (unsigned int)(native_kv_stage * 32768);
                     int token0 = msa_token_base;
@@ -1062,7 +1060,7 @@ kernel_cake_blackwell_msa_98c92f02bd60a94e4167(const __grid_constant__ CUtensorM
                     msa_token_base_1 = token_base_1;
                     msa_page_head_1 = page_head_1;
                     msa_valid_cols_1 = valid_cols_2;
-                    mbarrier_wait(kv_empty_addr + (native_stage) * 8, 0);
+                    mbarrier_wait(kv_raw_empty_addr + (native_stage) * 8, 0);
                     mbarrier_arrive_expect_tx(kv_src_full_addr + (native_stage) * 8, 16384);
                     int native_dst_1 = smem_kv_addr + (unsigned int)(native_stage * 32768);
                     int token0_1 = msa_token_base_1;
@@ -1117,7 +1115,7 @@ kernel_cake_blackwell_msa_98c92f02bd60a94e4167(const __grid_constant__ CUtensorM
                         msa_next_valid_cols = valid_cols_4;
                         smem_page_indices[native_next_ni] = msa_next_valid_cols;
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        mbarrier_wait(kv_empty_addr + (native_stage) * 8, 1);
+                        mbarrier_wait(kv_raw_empty_addr + (native_stage) * 8, 1);
                         mbarrier_arrive_expect_tx(kv_src_full_addr + (native_stage) * 8, 16384);
                         int native_kdst = smem_kv_addr + (unsigned int)(native_stage * 32768);
                         int token0_7 = msa_next_token_base;
@@ -1141,82 +1139,23 @@ kernel_cake_blackwell_msa_98c92f02bd60a94e4167(const __grid_constant__ CUtensorM
                 }
                 mbarrier_wait(kv_src_full_addr + (ni) * 8, 0);
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                mbarrier_wait(kv_empty_addr + (ni) * 8, 1);
                 {
                     const char* _src_ptr = smem_raw + (smem_kv_fp8_addr + (unsigned int)(ni * 16384) - smem);
                     char* _dst_ptr = smem_raw + (smem_kv_addr + (unsigned int)(ni * 32768) - smem);
                     const int _tid = (int)threadIdx.x - (14) * 32;
-                    #pragma unroll 4
-                    for (int _off = _tid; _off < 2048; _off += 64) {
-                        uint64_t _src64 = reinterpret_cast<const uint64_t*>(_src_ptr)[_off];
-                        uint32_t _out_x16x2[4];
+                    uint64_t _src_buf[16];
+                    #pragma unroll
+                    for (int _outer = 0; _outer < 2; ++_outer) {
                         #pragma unroll
-                        for (int _cv = 0; _cv < 4; ++_cv) {
-                            uint16_t _e4m3x2 = (uint16_t)((_src64 >> (_cv * 16)) & 0xFFFFull);
-                            _out_x16x2[_cv] = cvt_bf16x2_e4m3x2_v(_e4m3x2);
+                        for (int _base = _outer * 1024; _base < (_outer + 1) * 1024; _base += 64) {
+                            int _off = _base + _tid;
+                            _src_buf[(_base / 64) % 16] = reinterpret_cast<const uint64_t*>(_src_ptr)[_off];
                         }
-                        uint4 _dst4 = make_uint4(_out_x16x2[0], _out_x16x2[1], _out_x16x2[2], _out_x16x2[3]);
-                        int _elt = _off * 8;
-                        int _row = (((_elt % 128) / 64) * 128) + (_elt / 128);
-                        int _byte_off = (_row * 128) + (((_elt % 64) * 16) / 8);
-                        int _swz_off = _byte_off ^ ((_row % 8) * 16);
-                        *reinterpret_cast<uint4*>(_dst_ptr + _swz_off) = _dst4;
-                    }
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                }
-                asm volatile("barrier.sync 10, 64;" ::: "memory");
-                if (warp == 14) {
-                    if (elect_sync()) {
-                        mbarrier_arrive(kv_full_addr + (ni) * 8);
-                    }
-                }
-            }
-            #pragma unroll 1
-            for (int ni_1 = 0; ni_1 < 16; ni_1++) {
-                if (num_n_blocks_4 <= ni_1) {
-                    break;
-                }
-                int stage = ni_1 % 4;
-                mbarrier_wait(kv_src_full_addr + (stage) * 8, 1);
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                {
-                    const char* _src_ptr = smem_raw + (smem_kv_fp8_addr + (unsigned int)(stage * 16384) - smem);
-                    char* _dst_ptr = smem_raw + (smem_kv_addr + (unsigned int)(stage * 32768) - smem);
-                    const int _tid = (int)threadIdx.x - (14) * 32;
-                    #pragma unroll 4
-                    for (int _off = _tid; _off < 2048; _off += 64) {
-                        uint64_t _src64 = reinterpret_cast<const uint64_t*>(_src_ptr)[_off];
-                        uint32_t _out_x16x2[4];
                         #pragma unroll
-                        for (int _cv = 0; _cv < 4; ++_cv) {
-                            uint16_t _e4m3x2 = (uint16_t)((_src64 >> (_cv * 16)) & 0xFFFFull);
-                            _out_x16x2[_cv] = cvt_bf16x2_e4m3x2_v(_e4m3x2);
-                        }
-                        uint4 _dst4 = make_uint4(_out_x16x2[0], _out_x16x2[1], _out_x16x2[2], _out_x16x2[3]);
-                        int _elt = _off * 8;
-                        int _row = (((_elt % 128) / 64) * 128) + (_elt / 128);
-                        int _byte_off = (_row * 128) + (((_elt % 64) * 16) / 8);
-                        int _swz_off = _byte_off ^ ((_row % 8) * 16);
-                        *reinterpret_cast<uint4*>(_dst_ptr + _swz_off) = _dst4;
-                    }
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                }
-                asm volatile("barrier.sync 10, 64;" ::: "memory");
-                if (warp == 14) {
-                    if (elect_sync()) {
-                        mbarrier_arrive(kv_full_addr + (stage) * 8);
-                    }
-                }
-                int next_ni = ni_1 + 4;
-                if (next_ni < num_n_blocks_4) {
-                    mbarrier_wait(kv_src_full_addr + (stage) * 8, 0);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    {
-                        const char* _src_ptr = smem_raw + (smem_kv_fp8_addr + (unsigned int)(stage * 16384) - smem);
-                        char* _dst_ptr = smem_raw + (smem_kv_addr + (unsigned int)(stage * 32768) - smem);
-                        const int _tid = (int)threadIdx.x - (14) * 32;
-                        #pragma unroll 4
-                        for (int _off = _tid; _off < 2048; _off += 64) {
-                            uint64_t _src64 = reinterpret_cast<const uint64_t*>(_src_ptr)[_off];
+                        for (int _base = _outer * 1024; _base < (_outer + 1) * 1024; _base += 64) {
+                            int _off = _base + _tid;
+                            uint64_t _src64 = _src_buf[(_base / 64) % 16];
                             uint32_t _out_x16x2[4];
                             #pragma unroll
                             for (int _cv = 0; _cv < 4; ++_cv) {
@@ -1230,12 +1169,107 @@ kernel_cake_blackwell_msa_98c92f02bd60a94e4167(const __grid_constant__ CUtensorM
                             int _swz_off = _byte_off ^ ((_row % 8) * 16);
                             *reinterpret_cast<uint4*>(_dst_ptr + _swz_off) = _dst4;
                         }
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                }
+                asm volatile("barrier.sync 10, 64;" ::: "memory");
+                if (warp == 14) {
+                    if (elect_sync()) {
+                        mbarrier_arrive(kv_full_addr + (ni) * 8);
+                        mbarrier_arrive(kv_raw_empty_addr + (ni) * 8);
+                    }
+                }
+            }
+            #pragma unroll 1
+            for (int ni_1 = 0; ni_1 < 16; ni_1++) {
+                if (num_n_blocks_4 <= ni_1) {
+                    break;
+                }
+                int stage = ni_1 % 4;
+                mbarrier_wait(kv_src_full_addr + (stage) * 8, 1);
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                mbarrier_wait(kv_empty_addr + (stage) * 8, 0);
+                {
+                    const char* _src_ptr = smem_raw + (smem_kv_fp8_addr + (unsigned int)(stage * 16384) - smem);
+                    char* _dst_ptr = smem_raw + (smem_kv_addr + (unsigned int)(stage * 32768) - smem);
+                    const int _tid = (int)threadIdx.x - (14) * 32;
+                    uint64_t _src_buf[16];
+                    #pragma unroll
+                    for (int _outer = 0; _outer < 2; ++_outer) {
+                        #pragma unroll
+                        for (int _base = _outer * 1024; _base < (_outer + 1) * 1024; _base += 64) {
+                            int _off = _base + _tid;
+                            _src_buf[(_base / 64) % 16] = reinterpret_cast<const uint64_t*>(_src_ptr)[_off];
+                        }
+                        #pragma unroll
+                        for (int _base = _outer * 1024; _base < (_outer + 1) * 1024; _base += 64) {
+                            int _off = _base + _tid;
+                            uint64_t _src64 = _src_buf[(_base / 64) % 16];
+                            uint32_t _out_x16x2[4];
+                            #pragma unroll
+                            for (int _cv = 0; _cv < 4; ++_cv) {
+                                uint16_t _e4m3x2 = (uint16_t)((_src64 >> (_cv * 16)) & 0xFFFFull);
+                                _out_x16x2[_cv] = cvt_bf16x2_e4m3x2_v(_e4m3x2);
+                            }
+                            uint4 _dst4 = make_uint4(_out_x16x2[0], _out_x16x2[1], _out_x16x2[2], _out_x16x2[3]);
+                            int _elt = _off * 8;
+                            int _row = (((_elt % 128) / 64) * 128) + (_elt / 128);
+                            int _byte_off = (_row * 128) + (((_elt % 64) * 16) / 8);
+                            int _swz_off = _byte_off ^ ((_row % 8) * 16);
+                            *reinterpret_cast<uint4*>(_dst_ptr + _swz_off) = _dst4;
+                        }
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                }
+                asm volatile("barrier.sync 10, 64;" ::: "memory");
+                if (warp == 14) {
+                    if (elect_sync()) {
+                        mbarrier_arrive(kv_full_addr + (stage) * 8);
+                        mbarrier_arrive(kv_raw_empty_addr + (stage) * 8);
+                    }
+                }
+                int next_ni = ni_1 + 4;
+                if (next_ni < num_n_blocks_4) {
+                    mbarrier_wait(kv_src_full_addr + (stage) * 8, 0);
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    mbarrier_wait(kv_empty_addr + (stage) * 8, 1);
+                    {
+                        const char* _src_ptr = smem_raw + (smem_kv_fp8_addr + (unsigned int)(stage * 16384) - smem);
+                        char* _dst_ptr = smem_raw + (smem_kv_addr + (unsigned int)(stage * 32768) - smem);
+                        const int _tid = (int)threadIdx.x - (14) * 32;
+                        uint64_t _src_buf[16];
+                        #pragma unroll
+                        for (int _outer = 0; _outer < 2; ++_outer) {
+                            #pragma unroll
+                            for (int _base = _outer * 1024; _base < (_outer + 1) * 1024; _base += 64) {
+                                int _off = _base + _tid;
+                                _src_buf[(_base / 64) % 16] = reinterpret_cast<const uint64_t*>(_src_ptr)[_off];
+                            }
+                            #pragma unroll
+                            for (int _base = _outer * 1024; _base < (_outer + 1) * 1024; _base += 64) {
+                                int _off = _base + _tid;
+                                uint64_t _src64 = _src_buf[(_base / 64) % 16];
+                                uint32_t _out_x16x2[4];
+                                #pragma unroll
+                                for (int _cv = 0; _cv < 4; ++_cv) {
+                                    uint16_t _e4m3x2 = (uint16_t)((_src64 >> (_cv * 16)) & 0xFFFFull);
+                                    _out_x16x2[_cv] = cvt_bf16x2_e4m3x2_v(_e4m3x2);
+                                }
+                                uint4 _dst4 = make_uint4(_out_x16x2[0], _out_x16x2[1], _out_x16x2[2], _out_x16x2[3]);
+                                int _elt = _off * 8;
+                                int _row = (((_elt % 128) / 64) * 128) + (_elt / 128);
+                                int _byte_off = (_row * 128) + (((_elt % 64) * 16) / 8);
+                                int _swz_off = _byte_off ^ ((_row % 8) * 16);
+                                *reinterpret_cast<uint4*>(_dst_ptr + _swz_off) = _dst4;
+                            }
+                        }
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     }
                     asm volatile("barrier.sync 10, 64;" ::: "memory");
                     if (warp == 14) {
                         if (elect_sync()) {
                             mbarrier_arrive(kv_full_addr + (stage) * 8);
+                            mbarrier_arrive(kv_raw_empty_addr + (stage) * 8);
                         }
                     }
                 }
