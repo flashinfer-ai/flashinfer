@@ -149,9 +149,11 @@ _topk_warmed_devices_lock = threading.Lock()
 # from its source and asserts the plan and every _TOPK_* constant agree with the module over a shape
 # grid; tools/msa_rebench/dev/topk_v2_check.py repeats the check on the GPU steps.
 _TOPK_QT = 16
-_TOPK_SLICES = (1, 2, 4, 8)
+_TOPK_SLICES = (1, 2, 4, 8, 16)
 _TOPK_WAVE_CTAS = 444
 _TOPK_CTA_FIXED_BLOCKS = 1536
+_TOPK_CTA_STAGE_ONLY_BLOCKS = 512
+_TOPK_CTA_SLICE_BLOCKS = 112
 _TOPK_MIN_SLICE = 32
 _TOPK_MAX_INDEX_BITS = 22
 _TOPK_CAND_CAP = 64
@@ -161,23 +163,36 @@ _TOPK_STREAM_MAX_ROWS = 512
 _TOPK_STREAM_MAX_NVP = 1024
 _TOPK_ROUTE_RADIX = "topk_select"
 _TOPK_ROUTE_STREAMING = "topk_select_streaming"
+# 32-query instance (MSA ceiling Goal lever T4): two queries per lane, u16-packed histogram, 2 CTAs/SM.
+_TOPK_Q32_WAVE_CTAS = 296
+_TOPK_Q32_MIN_Q = 32
+_TOPK_Q32_MIN_SLICE = 1024
+_TOPK_Q32_MAX_SLICE = 65535
+_TOPK_ROUTE_Q32 = "topk_select_q32"
+_TOPK_KEQ_MAX_SLEN = 512
+_TOPK_ROUTE_KEQ = "topk_select_keq"
 _topk_workspaces: dict[int, dict[str, torch.Tensor]] = {}
 _topk_workspaces_lock = threading.Lock()
 
 
 def _topk_grid_plan(
-    total_q: int, num_heads: int, num_valid_pages: int, max_k_tiles: int
+    total_q: int, num_heads: int, num_valid_pages: int, max_k_tiles: int, qpack: int = 1
 ) -> dict:
-    """Shape-only plan: over ``s in (1,2,4,8)`` with ``ceil(nvp / s) >= 32`` (else ``s = 1``), ``S`` minimises
-    ``ceil(groups * s / 444) * (1536 + ceil(nvp / s))`` (ties: the larger ``s``); ``bid = (h * S + s) * num_qtiles + qtile``."""
+    """Shape-only plan: over ``s in (1,2,4,8,16)`` with ``ceil(nvp / s) >= 32`` (else ``s = 1``), ``S`` minimises
+    ``ceil(groups * s / W) * (fixed(s) + ceil(nvp / s) + 112 * s)`` with ``fixed(s) = 1536`` for a slice above the
+    candidate cap (multi-pass CTA) and ``512`` for a slice within it (stage-only CTA); ``W`` = 444 for the 16-query
+    program, 296 for the 32-query instance ``qpack = 2``; ties: the larger ``s``; ``bid = (h * S + s) * num_qtiles + qtile``."""
     total_q = int(total_q)
     num_heads = int(num_heads)
     num_valid_pages = int(num_valid_pages)
     max_k_tiles = int(max_k_tiles)
+    qpack = int(qpack)
     if min(total_q, num_heads, num_valid_pages, max_k_tiles) <= 0:
         raise ValueError(
             "topk grid plan requires positive total_q, num_heads, num_valid_pages, max_k_tiles"
         )
+    if qpack not in (1, 2):
+        raise ValueError("qpack must be 1 (16-query program) or 2 (32-query program)")
     if num_heads * max_k_tiles >= 2**31:
         raise ValueError("num_heads * max_k_tiles must fit in int32")
     if total_q * num_heads * _TOPK >= 2**31:
@@ -187,7 +202,9 @@ def _topk_grid_plan(
         raise ValueError(
             f"max_k_tiles must be <= 2**{_TOPK_MAX_INDEX_BITS}, got {max_k_tiles}"
         )
-    num_qtiles = (total_q + _TOPK_QT - 1) // _TOPK_QT
+    qt = _TOPK_QT * qpack
+    wave_ctas = _TOPK_WAVE_CTAS if qpack == 1 else _TOPK_Q32_WAVE_CTAS
+    num_qtiles = (total_q + qt - 1) // qt
     groups = num_heads * num_qtiles
     fitting = [
         c for c in _TOPK_SLICES if -(-num_valid_pages // c) >= _TOPK_MIN_SLICE
@@ -195,8 +212,14 @@ def _topk_grid_plan(
     num_slices = fitting[0]
     best_cost = None
     for candidate in fitting:
-        waves = -(-(groups * candidate) // _TOPK_WAVE_CTAS)
-        cost = waves * (_TOPK_CTA_FIXED_BLOCKS + -(-num_valid_pages // candidate))
+        waves = -(-(groups * candidate) // wave_ctas)
+        cand_slice = -(-num_valid_pages // candidate)
+        fixed = (
+            _TOPK_CTA_FIXED_BLOCKS
+            if cand_slice > _TOPK_CAND_CAP
+            else _TOPK_CTA_STAGE_ONLY_BLOCKS
+        )
+        cost = waves * (fixed + cand_slice + _TOPK_CTA_SLICE_BLOCKS * candidate)
         if best_cost is None or cost <= best_cost:
             best_cost = cost
             num_slices = candidate
@@ -212,17 +235,32 @@ def _topk_grid_plan(
         "grid": grid,
         "index_bits": index_bits,
         "bmax_words": grid * chunks * _TOPK_BMAX_WORDS_PER_CHUNK,
+        "qpack": qpack,
     }
+
+
+def _topk_radix_route(slice_len: int) -> str:
+    """The radix select's production instance for a planned slice (duplicated verbatim from
+    loom/examples/weave/minimax_sparse_topk_select_v2_sm100.py::topk_radix_route): ``topk_select_keq`` (the
+    lever T9 pass-0 all-equal fold) for a streamed slice above the candidate cap ``_TOPK_CAND_CAP`` and up to
+    ``_TOPK_KEQ_MAX_SLEN`` blocks, ``topk_select`` for a stage-only slice (the fold cannot fire) and beyond the
+    bound -- a cost choice, both instances are bit-identical on every input."""
+    if _TOPK_CAND_CAP < int(slice_len) <= _TOPK_KEQ_MAX_SLEN:
+        return _TOPK_ROUTE_KEQ
+    return _TOPK_ROUTE_RADIX
 
 
 def _topk_route(
     total_q: int, num_heads: int, num_valid_pages: int, max_k_tiles: int
 ) -> str:
     """Shape-only program choice (duplicated verbatim from
-    loom/examples/weave/minimax_sparse_topk_select_v2_sm100.py::topk_route): ``topk_select`` (the query-tiled
-    radix select) or ``topk_select_streaming`` (the one-CTA-per-row program) for small latency-bound
-    multi-pass grids: at most ``_TOPK_STREAM_MAX_ROWS`` rows, at most ``_TOPK_STREAM_MAX_NVP`` valid pages
-    and a planned slice above the candidate cap."""
+    loom/examples/weave/minimax_sparse_topk_select_v2_sm100.py::topk_route): ``topk_select_streaming`` (the
+    one-CTA-per-row program) for small latency-bound multi-pass grids -- at most ``_TOPK_STREAM_MAX_ROWS`` rows,
+    at most ``_TOPK_STREAM_MAX_NVP`` valid pages and a planned slice above the candidate cap; ``topk_select_q32``
+    (the 32-query instance) for an even ``total_q >= _TOPK_Q32_MIN_Q`` whose 32-query plan has a slice in
+    ``[_TOPK_Q32_MIN_SLICE, _TOPK_Q32_MAX_SLICE]``; otherwise one of the query-tiled radix select's two 16-query
+    production instances by the planned slice (``_topk_radix_route``): ``topk_select_keq`` for a streamed
+    slice in (``_TOPK_CAND_CAP``, ``_TOPK_KEQ_MAX_SLEN``], ``topk_select`` otherwise."""
     plan = _topk_grid_plan(total_q, num_heads, num_valid_pages, max_k_tiles)
     if (
         int(total_q) * int(num_heads) <= _TOPK_STREAM_MAX_ROWS
@@ -230,21 +268,30 @@ def _topk_route(
         and plan["slice_len"] > _TOPK_CAND_CAP
     ):
         return _TOPK_ROUTE_STREAMING
-    return _TOPK_ROUTE_RADIX
+    if int(total_q) % 2 == 0 and int(total_q) >= _TOPK_Q32_MIN_Q:
+        plan32 = _topk_grid_plan(total_q, num_heads, num_valid_pages, max_k_tiles, 2)
+        if _TOPK_Q32_MIN_SLICE <= plan32["slice_len"] <= _TOPK_Q32_MAX_SLICE:
+            return _TOPK_ROUTE_Q32
+    return _topk_radix_route(plan["slice_len"])
 
 
 def _topk_workspace(
-    device: torch.device, groups: int, num_slices: int, bmax_words: int, capturing: bool
+    device: torch.device,
+    groups: int,
+    num_slices: int,
+    bmax_words: int,
+    capturing: bool,
+    qt: int = _TOPK_QT,
 ):
     """Per-device ``(partials u64, counters u32, block_max u32)`` grown eagerly to the largest plan seen.
 
     ``counters`` is zeroed once on (re)allocation and self-resets through the kernel's ``atom.inc``
     semaphore, so eager launches and graph replays share one buffer; ``block_max`` (the per-block tile
     maxima of the histogram pass) is fully rewritten by every launch before it is read.  Growth under
-    capture is refused.
+    capture is refused.  ``qt`` is the program's queries per CTA (16; 32 for the lever-T4 instance).
     """
     index = _device_index(device)
-    need_partials = groups * num_slices * _TOPK * _TOPK_QT if num_slices > 1 else 1
+    need_partials = groups * num_slices * _TOPK * qt if num_slices > 1 else 1
     need_counters = groups if num_slices > 1 else 1
     need_bmax = max(int(bmax_words), 1)
     with _topk_workspaces_lock:
@@ -2586,10 +2633,12 @@ def blackwell_msa_topk_select(
 ) -> torch.Tensor:
     """Select exact top-16 block indices on compute capability 10.0/10.3/10.7.
 
-    One launch: the query-tiled radix-select program, or -- for small latency-bound multi-pass grids
-    (``_topk_route``: at most 512 rows, at most 1024 valid pages, planned slice above the candidate
-    cap) -- the one-CTA-per-row streaming program; both implement the same order (IEEE numeric,
-    ties by ascending block index).  Shapes whose plan splits the valid pages over ``S > 1`` K-slices
+    One launch: the query-tiled radix-select program -- in its ``topk_select_keq`` instance (lever T9
+    pass-0 all-equal fold) for a planned slice above the candidate cap (64) and at most 512 blocks
+    (``_topk_radix_route``), its ``topk_select`` instance for a stage-only slice and beyond --
+    or -- for small latency-bound multi-pass grids (``_topk_route``: at most 512 rows, at most 1024 valid
+    pages, planned slice above the candidate cap) -- the one-CTA-per-row streaming program; all implement
+    the same order (IEEE numeric, ties by ascending block index) and are bit-identical on every input.  Shapes whose plan splits the valid pages over ``S > 1`` K-slices
     use a per-device workspace (``partials`` u64, self-resetting ``counters``, ``block_max`` tile
     maxima) that is allocated by the first eager call for the largest shape seen; under CUDA-graph
     capture a missing warm-up or an insufficient workspace raises ``RuntimeError``.  The workspace is
@@ -2642,7 +2691,8 @@ def blackwell_msa_topk_select(
         raise RuntimeError(
             "msa_topk_select must be invoked eagerly on this device before CUDA graph capture"
         )
-    if _topk_route(total_q, num_heads, valid, max_k_tiles) == _TOPK_ROUTE_STREAMING:
+    route = _topk_route(total_q, num_heads, valid, max_k_tiles)
+    if route == _TOPK_ROUTE_STREAMING:
         _program(f"{_TOPK_ROUTE_STREAMING}:main", target).launch(
             (total_q * num_heads, 1, 1),
             max_score=max_score,
@@ -2658,15 +2708,26 @@ def blackwell_msa_topk_select(
             with _topk_warmed_devices_lock:
                 _topk_warmed_devices.add(warm_key)
         return output
-    plan = _topk_grid_plan(total_q, num_heads, valid, max_k_tiles)
+    # The 32-query instance (lever T4) loads a lane's query pair with one 8-byte load: a score tensor whose
+    # storage offset is only 4-byte aligned takes the 16-query instance (same selection, bit for bit).
+    qpack = 2 if route == _TOPK_ROUTE_Q32 and max_score.data_ptr() % 8 == 0 else 1
+    # (a 16-query launch runs the instance of the route key; the alignment fallback of a ``topk_select_q32`` shape
+    # runs ``topk_select``, as the source dispatcher does)
+    program_key = (
+        _TOPK_ROUTE_Q32
+        if qpack == 2
+        else (_TOPK_ROUTE_KEQ if route == _TOPK_ROUTE_KEQ else _TOPK_ROUTE_RADIX)
+    )
+    plan = _topk_grid_plan(total_q, num_heads, valid, max_k_tiles, qpack)
     partials, counters, block_max = _topk_workspace(
         max_score.device,
         plan["groups"],
         plan["num_slices"],
         plan["bmax_words"],
         capturing,
+        _TOPK_QT * qpack,
     )
-    _program(f"{_TOPK_ROUTE_RADIX}:main", target).launch(
+    _program(f"{program_key}:main", target).launch(
         (plan["grid"], 1, 1),
         max_score=max_score,
         output=output,
