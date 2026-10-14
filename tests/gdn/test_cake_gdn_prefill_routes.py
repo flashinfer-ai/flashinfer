@@ -7,30 +7,36 @@ import pytest
 from flashinfer.jit import cake_gdn
 
 PREFIX = "flashinfer.cake_gdn.generated.prefill:"
+TABLE = cake_gdn.CAKE_GDN_PREFILL_SEQ_ARCH_BODIES
 ROUTED = sorted(
     {
-        schedule
-        for (arch, schedule) in cake_gdn.CAKE_GDN_PREFILL_SEQ_ARCH_BODIES
+        schedule.removesuffix("_indexed")
+        for (arch, schedule) in TABLE
         if arch == "sm_107a"
     }
 )
 
 
 @pytest.mark.parametrize("schedule", ROUTED)
-def test_sm107a_routes_the_vec2_twin_of_the_dvsplit_fp32_schedules(schedule):
+def test_sm107a_routes_the_vec2_state_io_twins_per_shipped_schedule(schedule):
+    body = TABLE[("sm_107a", schedule)]
+    assert body in ("l7_vec2", "l7b_vec2lp")
     twin = cake_gdn.cake_gdn_prefill_seq_schedule(
         "sm_107a", schedule, use_state_indices=False
     )
-    assert twin == f"{schedule}_sm107a_l7_vec2"
+    assert twin == f"{schedule}_sm107a_{body}"
+    indexed_body = TABLE.get(("sm_107a", f"{schedule}_indexed"), "base")
     indexed = cake_gdn.cake_gdn_prefill_seq_schedule(
         "sm_107a", schedule, use_state_indices=True
     )
-    assert indexed == schedule
+    expected = schedule if indexed_body == "base" else f"{schedule}_sm107a_{indexed_body}"
+    assert indexed == expected
     for arch in ("sm_100a", "sm_103a"):
-        shipped = cake_gdn.cake_gdn_prefill_seq_schedule(
-            arch, schedule, use_state_indices=False
-        )
-        assert shipped == schedule
+        for use_state_indices in (False, True):
+            shipped = cake_gdn.cake_gdn_prefill_seq_schedule(
+                arch, schedule, use_state_indices=use_state_indices
+            )
+            assert shipped == schedule
 
 
 def test_every_shipped_sm107a_record_of_a_routed_schedule_has_its_twin_record():

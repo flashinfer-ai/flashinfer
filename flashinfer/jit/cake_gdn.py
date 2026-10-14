@@ -344,21 +344,39 @@ def _prefill_schedule_attr(
 
 
 # Rubin (sm_107a) twins of the sequential (non-CP) prefill kernel, routed per (architecture,
-# shipped schedule): the dvsplit fp32-state schedules run the `l7_vec2` body (8-byte state
-# I/O on the initial-state load, the final-state store and the checkpoint stores; every
-# arithmetic operation keeps its operands, order and rounding, so the output is bitwise
-# identical to the shipped body).  The indexed-state plans (`USE_STATE_INDICES`) trace their
-# own `_indexed` schedule and keep the shipped body.  Mirrors `PREFILL_SEQ_ARCH_BODIES` in
-# loom.examples.weave.flashinfer_blackwell_gdn_prefill (the Cake tree cross-checks this copy).
+# shipped schedule): the dvsplit fp32-state schedules run the `l7_vec2` body and the dvsplit
+# bf16 / f16-state schedules the `l7b_vec2lp` body (8-byte state I/O on the initial-state
+# load, the final-state store and the checkpoint stores; every arithmetic operation keeps its
+# operands, order and rounding, so the output is bitwise identical to the shipped body).  An
+# indexed-state plan (`USE_STATE_INDICES`) traces its own `_indexed` schedule, keyed as such.
+# Mirrors `PREFILL_SEQ_ARCH_BODIES` in loom.examples.weave.flashinfer_blackwell_gdn_prefill
+# (the Cake tree cross-checks this copy).
+_SM107A_SEQ_TWINS: dict[str, tuple[str, ...]] = {
+    # fp32-state dvsplit schedules: 8-byte fp32 state I/O
+    "l7_vec2": (
+        "dvsplit",
+        "dvsplit_f16io",
+        "dvsplit_initial",
+        "dvsplit_initial_f16io",
+        "dvsplit_initial_f16io_gatepipe4",
+    ),
+    # bf16 / f16-state dvsplit schedules (indexed or not): the same width lever on the
+    # low-precision state loads and stores, alignment-guarded on the indexed plans
+    "l7b_vec2lp": (
+        "dvsplit_bf16state",
+        "dvsplit_f16io_bf16state",
+        "dvsplit_initial_bf16state",
+        "dvsplit_initial_f16io_bf16state",
+        "dvsplit_initial_f16state",
+        "dvsplit_initial_bf16state_indexed",
+        "dvsplit_initial_f16io_bf16state_indexed",
+        "dvsplit_initial_f16state_indexed",
+    ),
+}
 CAKE_GDN_PREFILL_SEQ_ARCH_BODIES: dict[tuple[str, str], str] = {
-    ("sm_107a", "flashinfer_blackwell_gdn_prefill_dvsplit"): "l7_vec2",
-    ("sm_107a", "flashinfer_blackwell_gdn_prefill_dvsplit_f16io"): "l7_vec2",
-    ("sm_107a", "flashinfer_blackwell_gdn_prefill_dvsplit_initial"): "l7_vec2",
-    ("sm_107a", "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io"): "l7_vec2",
-    (
-        "sm_107a",
-        "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4",
-    ): "l7_vec2",
+    ("sm_107a", f"flashinfer_blackwell_gdn_prefill_{suffix}"): body
+    for body, suffixes in _SM107A_SEQ_TWINS.items()
+    for suffix in suffixes
 }
 
 
