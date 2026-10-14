@@ -6021,9 +6021,14 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     launchers_map[curr_tile_N] = std::move(launcher);
   }
 
+  // The probe below runs on the device of hidden_states; the tile may not change once routing
+  // metadata was prepared for it (DA body preparation and replay).
+  ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
   auto const [resolved_tile_N, config] = resolveMoeTileAndConfig(
       config_index, mSupportedTileN, num_tokens, totalExpertsPerToken, totalLocalExperts);
-  int64_t const tile_N = pickTileWithDefaultConfig(resolved_tile_N, config, launchers_map);
+  int64_t const tile_N = (is_da_body_preparation || !da_routing_metadata.empty())
+                             ? resolved_tile_N
+                             : pickTileWithDefaultConfig(resolved_tile_N, config, launchers_map);
 
   // Get the launcher for the selected tile_N
   auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));

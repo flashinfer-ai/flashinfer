@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -40,15 +41,15 @@ using namespace batchedGemm::gemm;
 using namespace batchedGemm::trtllm::gen;
 
 static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
+// Serialises the cubin probes, the pre-loads and their inserts into the module cache above.
+static std::mutex globalTrtllmGenBatchedGemmModuleMutex;
 
 namespace {
 
-// Loads the cubin of `config` into `cache` with checked CUresults, so that
-// BatchedGemmInterface::run() finds the module in the cache and never reaches its own
-// unchecked cuModuleLoadData / cuModuleGetFunction (GitHub #5322). The key must match the
-// one built inside BatchedGemmInterface::run(): the raw context id bytes plus the function name.
-CUresult preloadModule(BatchedGemmConfig const& config, BatchedGemmInterface::ModuleCache& cache,
-                       std::string* failedCall) {
+// Key prefix of the current CUDA context: the raw context id bytes, exactly as
+// BatchedGemmInterface::run() builds its module-cache key. Modules and probe results are
+// per context, so a result from one device never applies to another.
+CUresult currentContextKey(std::string* key, std::string* failedCall) {
   CUcontext ctx = nullptr;
   CUresult res = cuCtxGetCurrent(&ctx);
   if (res == CUDA_SUCCESS && ctx == nullptr) {
@@ -65,8 +66,22 @@ CUresult preloadModule(BatchedGemmConfig const& config, BatchedGemmInterface::Mo
     *failedCall = "cuCtxGetId";
     return res;
   }
-  std::string const key = std::string(reinterpret_cast<char*>(&ctxId), sizeof(ctxId)) +
-                          std::string(config.mFunctionName);
+  *key = std::string(reinterpret_cast<char*>(&ctxId), sizeof(ctxId));
+  return CUDA_SUCCESS;
+}
+
+// Loads the cubin of `config` into `cache` with checked CUresults, so that
+// BatchedGemmInterface::run() finds the module in the cache and never reaches its own
+// unchecked cuModuleLoadData / cuModuleGetFunction (GitHub #5322). The caller holds
+// globalTrtllmGenBatchedGemmModuleMutex.
+CUresult preloadModule(BatchedGemmConfig const& config, BatchedGemmInterface::ModuleCache& cache,
+                       std::string* failedCall) {
+  std::string ctxKey;
+  CUresult res = currentContextKey(&ctxKey, failedCall);
+  if (res != CUDA_SUCCESS) {
+    return res;
+  }
+  std::string const key = ctxKey + std::string(config.mFunctionName);
   if (cache.find(key) != cache.end()) {
     return CUDA_SUCCESS;
   }
@@ -107,20 +122,29 @@ bool skipUnloadableCubins() {
   return enabled;
 }
 
-// A load is tried twice before a cubin counts as unloadable: on the affected drivers some
-// two-CTA kernels fail once and load on the second attempt.
+// Probe results are keyed per CUDA context like the module cache. A load is tried twice before
+// a cubin counts as unloadable: on the affected drivers some two-CTA kernels fail once and load
+// on the second attempt.
 bool cubinLoads(BatchedGemmConfig const& config) {
   if (!skipUnloadableCubins()) {
     return true;
   }
   static std::unordered_map<std::string, bool> probed;
-  std::string const name(config.mFunctionName);
+  std::lock_guard<std::mutex> lock(globalTrtllmGenBatchedGemmModuleMutex);
+  std::string failedCall;
+  std::string ctxKey;
+  CUresult res = currentContextKey(&ctxKey, &failedCall);
+  if (res != CUDA_SUCCESS) {
+    std::fprintf(stderr, "[FlashInfer] %s returned CUresult %d while probing trtllm-gen cubin %s\n",
+                 failedCall.c_str(), static_cast<int>(res), config.mFunctionName);
+    return false;
+  }
+  std::string const name = ctxKey + std::string(config.mFunctionName);
   auto const it = probed.find(name);
   if (it != probed.end()) {
     return it->second;
   }
-  std::string failedCall;
-  CUresult res = preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
+  res = preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
   if (res != CUDA_SUCCESS) {
     res = preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
   }
@@ -515,7 +539,11 @@ void TrtllmGenBatchedGemmRunner::run(
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
   std::string failedCall;
-  auto const loadRes = preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
+  CUresult loadRes = CUDA_SUCCESS;
+  {
+    std::lock_guard<std::mutex> lock(globalTrtllmGenBatchedGemmModuleMutex);
+    loadRes = preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
+  }
   FLASHINFER_CHECK(loadRes == CUDA_SUCCESS, failedCall, " returned CUresult ",
                    static_cast<int>(loadRes), " for trtllm-gen cubin ", config.mFunctionName,
                    " (numBatches: ", numBatches, ", GemmMNK: ", m, " ", n, " ", k, ")");
