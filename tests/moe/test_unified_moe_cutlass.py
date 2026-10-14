@@ -71,6 +71,10 @@ from flashinfer.utils import (
 )
 
 
+# Cold H100 CI compilation reached 153.2 GiB host RSS.
+pytestmark = pytest.mark.host_memory_heavy
+
+
 _CUTLASS_ACTIVATIONS = (
     SwiGLU(),
     SwiGLUStep(),

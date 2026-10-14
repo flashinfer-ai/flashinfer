@@ -10,6 +10,10 @@ import flashinfer
 from flashinfer.utils import is_sm90a_supported
 
 
+# H100 CI peak host RSS: 306.6 GiB.
+pytestmark = pytest.mark.host_memory_heavy
+
+
 @functools.lru_cache(maxsize=2)
 def _workspace_buffer_on(device_index: int, size_mb: int) -> torch.Tensor:
     return torch.zeros(
