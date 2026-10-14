@@ -271,3 +271,34 @@ def test_adjacent_offsets_do_not_share_draws(name):
         for delta in (1, 2, 3):
             shifted = sample(seed=seed, offset=offsets + delta, deterministic=True)
             assert (shifted == actual - delta).float().mean().item() < 0.02
+
+
+@pytest.mark.parametrize("name", ["top_k_8", "top_k_50", "top_p", "min_p"])
+def test_adjacent_offsets_rejection_sampling_matches_scalar_control(name):
+    """Nonuniform proposals expose overlapping draws in rejection sampling."""
+    batch_size, vocab_size = 8192, 4096
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    logits = torch.randn(vocab_size, device="cuda", generator=generator)
+    probs = logits.softmax(dim=-1).repeat(batch_size, 1)
+    functions = {
+        "top_k_8": partial(sampling.top_k_sampling_from_probs, probs, 8),
+        "top_k_50": partial(sampling.top_k_sampling_from_probs, probs, 50),
+        "top_p": partial(sampling.top_p_sampling_from_probs, probs, 0.8),
+        "min_p": partial(sampling.min_p_sampling_from_probs, probs, 0.1),
+    }
+    sample = functions[name]
+    offsets = torch.arange(batch_size, device="cuda", dtype=torch.int64)
+    actual = sample(
+        seed=torch.tensor([17], device="cuda", dtype=torch.int64),
+        offset=offsets,
+        deterministic=True,
+    )
+    control = sample(seed=17, offset=0, deterministic=True)
+    actual_duplicates = (actual[1:] == actual[:-1]).float().mean().item()
+    control_duplicates = (control[1:] == control[:-1]).float().mean().item()
+    # Small top-k naturally repeats tokens often. Compare against independent
+    # scalar subsequences rather than treating those collisions as RNG overlap.
+    assert abs(actual_duplicates - control_duplicates) < 0.02, (
+        f"{name}: tensor duplicate rate {actual_duplicates:.4f}, "
+        f"scalar control {control_duplicates:.4f}"
+    )

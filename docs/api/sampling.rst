@@ -14,12 +14,20 @@ Kernels for LLM sampling.
    not skip-ahead positions within a shared stream. Change the offset for a
    new sampling call, and use distinct keys for independent requests.
 
-   This changes the previous length-one tensor behavior as well as batch-length
+   **Breaking change:** this changes the previous length-one tensor behavior,
+   including broadcast RNG tensors used with CUDA graphs, as well as batch-length
    tensor behavior. Repeating a pair, whether with ``torch.full((B,), seed)`` or
    length-one tensors, replays the same stream in every row; identical input
    distributions therefore produce identical tokens. Scalar seed/offset values
    and calls using ``torch.Generator`` retain their existing row-dependent
    subsequences and skip-ahead offsets.
+
+   To migrate CUDA-graph callers that previously broadcast one seed/offset pair,
+   allocate a seed or offset tensor with one distinct key per request and keep
+   those keys with the requests when reordering or compacting the batch. Update
+   offsets between sampling calls. Broadcasting a pair deliberately replays the
+   same random stream across rows, even when their distributions differ; it does
+   not provide independent draws for those rows.
 
 .. seealso::
 
