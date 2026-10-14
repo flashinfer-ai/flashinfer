@@ -881,13 +881,17 @@ of a complete tactic does not isolate the speedup of any one field.
 
 ### Bounded candidates and cache replay
 
-The normal MXFP4 list starts from 17 deduplicated base tactics drawn from the
-block-permutation and published-exact manifests and two H20-derived anchors.
-For H7168/I3072/E384/EP4, optional N8/readiness choices expand these to 23;
+The normal MXFP4 list starts from 18 deduplicated base tactics drawn from the
+block-permutation and published-exact manifests, two H20-derived anchors,
+and a folded M256/N64/K128 candidate measured on H100 and H200. The K128
+candidate keeps N64 eligible for intermediate widths such as 640; it uses
+CGA1x1x1, group 330, one scheduler stage, one dispatch warp, early FC1
+publication and direct FC1 stores.
+For H7168/I3072/E384/EP4, optional N8/readiness choices expand these to 24;
 three large-token configurations and 12 distinct tail-pair neighbors bring
-the total to 38. Every model considers the same bounded extension catalog,
+the total to 39. Every model considers the same bounded extension catalog,
 then filters candidates through tile alignment and strategy eligibility.
-Other shapes can therefore have fewer than 38 candidates. Token capacity
+Other shapes can therefore have fewer than 39 candidates. Token capacity
 changes ordering, not the union; the untuned heuristic buckets are unchanged.
 
 Online `knobs="auto"` and offline `flashinfer.moe_ep.tune` use the same
