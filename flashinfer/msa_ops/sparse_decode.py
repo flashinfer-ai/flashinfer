@@ -342,13 +342,8 @@ def msa_sparse_decode_attention(
             "MSASparseAttentionWorkspace is only used by the compute "
             "capability 10.0/10.3/10.7 backend"
         )
-    import cutlass
-    import cutlass.cute as cute
-
     from ..utils import is_sm12x_supported
     from ._sm90_dispatch import is_sm90a_device as is_sm90a_supported
-    from .cute_dsl.sparse_decode_sm12x import SparseDecodeForwardSm12x
-    from ._common import _q_offset_explicit
 
     sm90 = is_sm90a_supported(q.device)
     if not (sm90 or is_sm12x_supported(q.device)):
@@ -466,6 +461,12 @@ def msa_sparse_decode_attention(
             softmax_scale=softmax_scale,
             v_global_scale=v_global_scale,
         )
+    import cutlass
+    import cutlass.cute as cute
+
+    from .cute_dsl.sparse_decode_sm12x import SparseDecodeForwardSm12x
+    from ._common import _q_offset_explicit
+
     if out is not None:
         raise NotImplementedError(
             "out= is implemented by the compute capability 10.0/10.3/10.7 "

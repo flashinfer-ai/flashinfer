@@ -147,7 +147,7 @@ def preload_sm90_programs(kinds: Optional[Iterable[str]] = None) -> dict[str, in
     or that want the build cost at model load, call this once per process.
     Kinds: ``sparse_decode``, ``proxy_decode``, ``proxy_prefill``,
     ``topk_select``, ``sparse_prefill``; about 4 s per program not yet in the
-    JIT cache (79 programs in all), ~10 ms per prebuilt one.  Returns the
+    JIT cache (89 programs in all), ~10 ms per prebuilt one.  Returns the
     programs loaded per kind.
     """
     from .cake_hopper_sm90 import preload_programs

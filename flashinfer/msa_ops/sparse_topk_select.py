@@ -210,8 +210,6 @@ def msa_topk_select(
     if topk != 16:
         raise ValueError(f"topk must be 16, got {topk}")
 
-    from .cute_dsl.topk_select_countrank_sm12x import _MAX_BLOCKS
-
     num_qo_heads, max_k_tiles, total_qo_len = max_score.shape
 
     if num_valid_pages is None:
@@ -248,10 +246,6 @@ def msa_topk_select(
         # from different metadata.
         nvp_dev = num_valid_pages
         nvp_scalar = 0
-        # Cannot dispatch on the runtime values without a sync, so bound by the
-        # allocated tile count. Conservative: picks radix when max_k_tiles
-        # exceeds the SMEM cap even if every token is actually shorter.
-        small = int(max_k_tiles) <= _MAX_BLOCKS
     else:
         # Input guards (the radix kernel does not clamp internally): an
         # out-of-range num_valid_pages reads max_score out of bounds, and
@@ -269,10 +263,6 @@ def msa_topk_select(
             )
         nvp_dev = _dummy_nvp(max_score.device.index)
         nvp_scalar = int(num_valid_pages)
-        # Dispatch on the runtime valid-page count: the count-rank kernel only
-        # ever touches blocks below num_valid_pages, regardless of the allocated
-        # score dimension.
-        small = nvp_scalar <= _MAX_BLOCKS
 
     if output is None:
         output = torch.empty(
@@ -310,6 +300,15 @@ def msa_topk_select(
         _MIN_BLOCKS,
         _MIN_CHUNKS,
     )
+    from .cute_dsl.topk_select_countrank_sm12x import _MAX_BLOCKS
+
+    # Count-rank (small) or radix. Per-token extents cannot dispatch on the
+    # runtime values without a sync, so bound by the allocated tile count
+    # (conservative: picks radix when max_k_tiles exceeds the SMEM cap even if
+    # every token is actually shorter). A scalar count dispatches on the
+    # runtime valid-page count: the count-rank kernel only ever touches blocks
+    # below num_valid_pages, regardless of the allocated score dimension.
+    small = (int(max_k_tiles) if per_token_nvp else nvp_scalar) <= _MAX_BLOCKS
 
     # topk_select_chunked_sm12x explains why chunked wins on both small and
     # full grids; per-token extents stay on the single-kernel paths.

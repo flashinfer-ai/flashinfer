@@ -28,7 +28,7 @@ from ..trace.templates.msa import (
 )
 from ..utils import get_device_sm_count, is_sm12x_supported
 from ._sm90_dispatch import is_sm90a_device as is_sm90a_supported
-from ._common import _BLK_KV
+from ._common import _BLK_KV, _q_offset_explicit
 
 # NVFP4 scale granularity: one e4m3 block scale per 16 e2m1 elements.
 _SF_VEC_SIZE = 16
@@ -390,24 +390,6 @@ def msa_proxy_score(
         ``(num_qo_heads, max_k_tiles, total_q)``, or
         ``(1, max_k_tiles, total_q)`` when ``reduce_heads=True``.
     """
-    import cutlass
-    import cutlass.cute as cute
-
-    from .cute_dsl.proxy_score_sm12x import (
-        MsaProxyScoreDecodeKeyMajorSm12x,
-        MsaProxyScoreDecodePackedFp8Sm12x,
-        MsaProxyScoreDecodePackedSm12x,
-        MsaProxyScoreDecodeStreamSm12x,
-        MsaProxyScoreSm12x,
-    )
-    from ._common import (
-        _compile_cache,
-        _cutlass_dtype,
-        _fake,
-        _q_offset_explicit,
-        _q_offset_tensor,
-    )
-
     sm90 = is_sm90a_supported(q.device)
     if not (sm90 or is_sm12x_supported(q.device)):
         raise RuntimeError(
@@ -456,7 +438,6 @@ def msa_proxy_score(
         pt_dev = _proxy_dummies(dev.index)[0]
         batch_size = k_len_or_cu.numel() - 1
 
-    cu_q_dev = cu_seqlens_q.to(dev)
     max_seqlen_q, max_k_tiles = _resolve_proxy_dims(
         cu_seqlens_q, k_len_or_cu, max_seqlen_q, max_k_tiles, output, k_is_lengths=paged
     )
@@ -508,6 +489,19 @@ def msa_proxy_score(
         torch.amax(per_head, dim=0, keepdim=True, out=output)
         return output
 
+    import cutlass
+    import cutlass.cute as cute
+
+    from .cute_dsl.proxy_score_sm12x import (
+        MsaProxyScoreDecodeKeyMajorSm12x,
+        MsaProxyScoreDecodePackedFp8Sm12x,
+        MsaProxyScoreDecodePackedSm12x,
+        MsaProxyScoreDecodeStreamSm12x,
+        MsaProxyScoreSm12x,
+    )
+    from ._common import _compile_cache, _cutlass_dtype, _fake, _q_offset_tensor
+
+    cu_q_dev = cu_seqlens_q.to(dev)
     group_size = num_qo_heads // num_kv_heads
     _PACK_ROWS = 64  # bf16 MMA q-tile rows (== m_block_size)
     p = 1
