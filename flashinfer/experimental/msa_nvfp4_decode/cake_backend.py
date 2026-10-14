@@ -35,13 +35,25 @@ a CUDA Graph.  When the architecture also registers the short-item program,
 batches whose requests span at most ``max_pages`` (four) selected pages run it
 instead: one eight-CTA cluster of register-MMA CTAs per work item, two CTAs
 per selected page, partials merged through distributed shared memory.
+
+``use_cache_hit=True`` selects the request-packed union program instead of
+the per-(token, KV head) programs for a uniform ``seqlen_q`` in ``[2, 4]``:
+one work unit per (request, KV head) whose ``seqlen_q`` query tokens share
+one CTA (query-group width ``union_q`` = 2 for ``seqlen_q <= 2``, else 4;
+``seqlen_q == 3`` runs the width-4 program with an empty phantom token) and
+stream every page of their top-k union once, per-token masks selecting the
+MMA columns; small unit counts split each unit across a cluster of 2, 4 or 8
+CTAs that merge their partials through distributed shared memory
+(``union_split_factor``).  ``False`` keeps the programs above, ``"auto"``
+currently resolves to ``False`` on every shape (a measured device-side
+policy is future work), and ``True`` at ``seqlen_q == 1`` is a no-op.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import torch
 import tvm_ffi
@@ -51,11 +63,14 @@ from .cake_jit import (
     ARG_PLANS,
     PROGRAMS,
     load_program,
+    program_loaded,
     programs_for,
     select_program,
+    select_union_program,
     short_program,
     tail_programs,
     toolchain_supports,
+    union_programs,
 )
 
 HEAD_DIM = 128
@@ -75,6 +90,14 @@ SUPPORTED_COMPUTE_CAPABILITIES = {
 }
 LN2 = math.log(2.0)
 STRIDE_LIMIT = 2**31  # the short program's page / head byte strides are int32
+# Request-packed union programs (``use_cache_hit=True``): a uniform seqlen_q
+# in this range; the query-group widths the programs are traced for and the
+# cluster split factors the registry may hold.
+UNION_MIN_SEQLEN_Q = 2
+UNION_MAX_SEQLEN_Q = 4
+UNION_Q_VALUES = (2, 4)
+UNION_SPLIT_FACTORS = (1, 2, 4, 8)
+USE_CACHE_HIT_VALUES = (False, True, "auto")
 
 # Argument-plan names the persistent program's ABI still lists but never
 # reads (the global-partial merge path they belonged to is not built).  They
@@ -203,6 +226,97 @@ def tail_plan(
 
 
 # ---------------------------------------------------------------------------
+# Request-packed union program (``use_cache_hit=True``)
+# ---------------------------------------------------------------------------
+
+
+def validate_use_cache_hit(value: Any) -> Union[bool, str]:
+    """Accept exactly ``False``, ``True`` or ``"auto"`` (identity checks: ``1 == True`` must not pass)."""
+    if value is False or value is True:
+        return value
+    if isinstance(value, str) and value == "auto":
+        return "auto"
+    raise ValueError('use_cache_hit must be False, True or "auto"')
+
+
+def union_route_applies(seqlen_q: int) -> bool:
+    """True when ``use_cache_hit=True`` selects the union program: a uniform ``seqlen_q`` in ``[2, 4]``.
+
+    The remaining domain conditions -- NVFP4 paged KV in the contract's views,
+    BF16 queries, causal right-aligned decode tokens, top-k 16 and ``q`` rows
+    equal to ``batch * seqlen_q`` -- are this API's input contract
+    (:func:`validate_msa_nvfp4_decode_inputs`).
+    """
+    return UNION_MIN_SEQLEN_Q <= int(seqlen_q) <= UNION_MAX_SEQLEN_Q
+
+
+def union_program_available(arch: str) -> bool:
+    """True when this checkout registers union programs for ``arch`` and can compile them."""
+    return toolchain_supports(arch) and bool(union_programs(arch))
+
+
+def union_q_for(seqlen_q: int) -> int:
+    """Query-group width of the union program: 2 for ``seqlen_q <= 2``, else 4.
+
+    ``seqlen_q == 3`` runs the width-4 program; its phantom token has empty
+    selection masks and its rows are never stored.
+    """
+    return 2 if int(seqlen_q) <= 2 else 4
+
+
+def union_split_factor(total_units: int, num_sms: int, union_pairs_max: int) -> int:
+    """Cluster split factor S of the union decode: one ``(S, 1, 1)`` cluster per (request, KV head) unit.
+
+    S = 1 when the units alone occupy more than half the SMs (``units * 2 >
+    num_sms``) or a unit cannot hold four page pairs (``union_pairs_max`` =
+    ``(min(16 * union_q, max_pages) + 1) // 2`` below 4); otherwise S doubles
+    from 1 while ``S < 8``, ``2 S <= union_pairs_max`` and ``units * 2 S <=
+    num_sms`` -- the largest power of two at most eight whose ``units x S``
+    single-unit CTAs fit one wave and whose ranks can each own a page pair
+    (16 units on 148 SMs: 128 CTAs, S = 8; 32 units: S = 4; 64 units: S = 2).
+    Rank r streams the union pages of block-id class ``id & (S - 1) == r``; an
+    empty class runs the empty-unit epilogue.
+    """
+    units = max(1, int(total_units))
+    max_pairs = int(union_pairs_max)
+    if max_pairs < 4 or units * 2 > int(num_sms):
+        return 1
+    splits = 1
+    while splits < 8 and splits * 2 <= max_pairs and units * splits * 2 <= int(num_sms):
+        splits *= 2
+    return splits
+
+
+def union_plan(
+    *, total_q: int, seqlen_q: int, num_kv_heads: int, max_pages: int, num_sms: int
+) -> tuple[int, int, int, tuple[int, int, int]]:
+    """``(union_q, splits, total_units, grid)`` of a union launch on a part with ``num_sms`` SMs.
+
+    Cluster programs (S > 1) run exactly one unit per CTA -- their merge
+    barriers are single-use -- so the grid is ``total_units x S`` CTAs; the
+    unsplit program keeps a persistent ``min(units, SMs)`` grid.
+    """
+    union_q = union_q_for(seqlen_q)
+    total_units = (int(total_q) // int(seqlen_q)) * int(num_kv_heads)
+    if total_units <= 0:
+        raise ValueError("union decode requires at least one (request, KV head) unit")
+    union_pairs_max = (min(TOPK * union_q, max(int(max_pages), 0)) + 1) // 2
+    splits = union_split_factor(total_units, int(num_sms), union_pairs_max)
+    if splits > 1:
+        grid = (total_units * splits, 1, 1)
+    else:
+        grid = (max(1, min(total_units, int(num_sms))), 1, 1)
+    return union_q, splits, total_units, grid
+
+
+def _is_capturing() -> bool:
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except RuntimeError:  # pragma: no cover - no CUDA context
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Short-item cluster program (work items of at most ``max_pages`` pages)
 # ---------------------------------------------------------------------------
 
@@ -277,7 +391,7 @@ class MSANvfp4DecodeRunner:
 
     program: str
     arch: str
-    route: str  # ``persistent`` split-KV program or ``short`` cluster program
+    route: str  # ``persistent`` split-KV, ``short`` cluster or ``union`` request-packed program
     splits: int
     tail: bool  # last-round split: cluster units on the remainder items only
     grid: tuple[int, int, int]
@@ -285,6 +399,7 @@ class MSANvfp4DecodeRunner:
     out: torch.Tensor
     lse: torch.Tensor
     entry: Callable[..., Any]
+    union_q: Optional[int] = None  # query-group width of a ``union`` program, else None
 
     def launch(self) -> torch.Tensor:
         # Tensor maps are encoded by the host binding and passed by value.
@@ -475,6 +590,7 @@ def prepare_msa_nvfp4_sparse_decode(
     softmax_scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
+    use_cache_hit: Union[bool, str] = "auto",
     backend: str = "cake",
 ) -> MSANvfp4DecodeRunner:
     """Validate and bind one NVFP4 paged-KV sparse decode step.
@@ -490,9 +606,23 @@ def prepare_msa_nvfp4_sparse_decode(
     memory.  A batch of more items than resident CTAs takes the registered
     last-round-split program instead when that shortens the makespan
     (``tail_plan``; ``runner.tail``).
+
+    ``use_cache_hit`` selects the schedule for the ``seqlen_q`` tokens of a
+    request (every token still attends only its own sixteen selected pages).
+    ``False`` keeps the programs above.  ``True`` binds the request-packed
+    union program (``route == "union"``): the tokens of one request share one
+    CTA -- or one cluster of ``splits`` CTAs (``union_split_factor``) -- and
+    every page of their top-k union streams once; available for a uniform
+    ``seqlen_q`` in ``[2, 4]`` (``union_route_applies``), a ``ValueError`` for
+    a larger ``seqlen_q``, and a no-op at ``seqlen_q == 1``.  ``"auto"`` (the
+    default) currently resolves to the ``False`` programs on every shape; a
+    measured device-side policy is future work.  Under CUDA-graph capture
+    ``True`` requires the selected union program to have been built before
+    capture (prepare the same shape once eagerly first).
     """
     if backend != "cake":
         raise ValueError("NVFP4 MSA decode supports backend='cake'")
+    use_cache_hit = validate_use_cache_hit(use_cache_hit)
     batch, num_q_heads, num_kv_heads, num_pages, max_pages = (
         validate_msa_nvfp4_decode_inputs(
             q,
@@ -510,6 +640,16 @@ def prepare_msa_nvfp4_sparse_decode(
             lse=lse,
         )
     )
+    # Explicit ``True`` outside the union domain is a request that cannot be
+    # honoured; at seqlen_q == 1 the switch is a contract no-op.
+    union = use_cache_hit is True and int(seqlen_q) != 1
+    if union and not union_route_applies(seqlen_q):
+        raise ValueError(
+            "use_cache_hit=True requires the request-packed union decode domain: "
+            f"a uniform seqlen_q in [{UNION_MIN_SEQLEN_Q}, {UNION_MAX_SEQLEN_Q}] "
+            f"with q rows == batch * seqlen_q (got seqlen_q={int(seqlen_q)}; "
+            "seqlen_q == 1 is a no-op)"
+        )
     device = q.device
     tensors = [q, k, v, k_scale, v_scale, q2k_indices, page_table, seqused_k]
     tensors += [t for t in (out, lse) if t is not None]
@@ -547,6 +687,52 @@ def prepare_msa_nvfp4_sparse_decode(
     metadata = dict(
         kv_indices=page_table, task_kind=q2k_indices, task_kv_head=seqused_k
     )
+
+    if union:
+        # The union branch precedes every per-token route, as in the source
+        # dispatcher.  The plan is a function of host scalars and the device
+        # SM count only; the selection tensor is read through its two
+        # int32-element strides (head-major ``(num_kv_heads, total_q, 16)``).
+        union_q, splits, _total_units, grid = union_plan(
+            total_q=total_q,
+            seqlen_q=int(seqlen_q),
+            num_kv_heads=num_kv_heads,
+            max_pages=max_pages,
+            num_sms=get_device_sm_count(device),
+        )
+        name = select_union_program(arch, union_q=union_q, splits=splits)
+        if _is_capturing() and not program_loaded(name, arch):
+            raise ValueError(
+                "use_cache_hit=True under CUDA-graph capture requires the union decode "
+                "program to be built before capture; prepare the same shape once eagerly first"
+            )
+        values = dict(
+            Q=q,
+            K=k.view(torch.uint8),
+            K_scale=k_scale.view(torch.uint8),
+            V=v.view(torch.uint8),
+            V_scale=v_scale.view(torch.uint8),
+            O=out,
+            msa_lse=lse,
+            **metadata,
+            **scalars,
+            q2k_token_stride=int(q2k_indices.stride(1)),
+            q2k_head_stride=int(q2k_indices.stride(0)),
+        )
+        entry, arguments = _bind(name, arch, "union", values, grid, {})
+        return MSANvfp4DecodeRunner(
+            name,
+            arch,
+            "union",
+            int(splits),
+            False,
+            grid,
+            arguments,
+            out,
+            lse,
+            entry,
+            union_q=int(union_q),
+        )
 
     if short_route_applies(arch, max_pages):
         name = short_program(arch)

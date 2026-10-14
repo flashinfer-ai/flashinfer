@@ -38,6 +38,9 @@ def test_moe_layer_autodump(tmp_path, monkeypatch):
         backend_key = "cudnn_frost_nvfp4"
         supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
 
+        def accepts(self, act, weights):
+            return True
+
         def pack_inputs(self, act, weights):
             return [act.hidden_states_q]
 
@@ -51,7 +54,6 @@ def test_moe_layer_autodump(tmp_path, monkeypatch):
     layer.runners = [runner]
     layer.tuner = SimpleNamespace(is_tuning_mode=False)
     layer._winners = OrderedDict()
-    monkeypatch.setattr(layer, "_additional_candidates", lambda *args: [])
     monkeypatch.setattr(layer, "_select_winner", lambda *args: (runner, -1))
     monkeypatch.setenv("FLASHINFER_TRACE_DUMP", "1")
     monkeypatch.setenv("FLASHINFER_TRACE_DUMP_DIR", str(tmp_path))

@@ -1,5 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
-"""Shared geometry policy for dtype-specific Frost automatic candidates."""
+"""Weight-view aliases and input geometry policy for Frost MoELayer candidates."""
 
 _SHORTLIST_TOP_K = {
     (12, 7168, 3072): (1, 2, 4),

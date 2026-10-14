@@ -4334,3 +4334,99 @@ def test_cake_decode_balanced_hd256_matches_reference_and_replays(
         atol=1e-2,
         rtol=1e-2,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_cake_decode_bf16_hd256_smallm_cuda_graph_without_prewarm() -> None:
+    """Serving-style CUDA graph use of the small-M hd256 route.
+
+    Capture with no eager prewarm and a transient query/output (graph-pool
+    addresses), then replay across growing KV lengths with other GPU work
+    between launches, the way a decode loop interleaves layers. Guards the
+    by-value TMA descriptors, the self-resetting merge tickets kept in
+    ``multi_ctas_kv_counter_buffer`` (no per-launch memset node), and the
+    softmax/correction ``corr_scale`` ordering whose mbarrier parity could
+    alias and deadlock a CTA under exactly this interleaving.
+    """
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+        pytest.skip("Cake FMHA requires SM100 or SM103")
+
+    from flashinfer.utils import (
+        get_device_sm_count,
+        get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    )
+
+    # Qwen3.5-35B-A3B TP=2 verify: 7 query rows x 8 heads over one KV head.
+    q_len, num_q_heads, head_dim, page_size, max_ctx = 7, 8, 256, 64, 65536
+    gen = torch.Generator(device=device).manual_seed(0)
+    num_pages = max_ctx // page_size + 8
+    key_cache = 0.5 * torch.randn(
+        (num_pages, 1, page_size, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=gen,
+    )
+    value_cache = torch.randn(
+        (num_pages, 1, page_size, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=gen,
+    )
+    block_tables = (
+        torch.randperm(num_pages, device=device, generator=gen)[: max_ctx // page_size]
+        .to(torch.int32)
+        .view(1, -1)
+    )
+    seq_lens = torch.tensor([60000], dtype=torch.int32, device=device)
+    q_src = torch.empty(
+        (q_len, num_q_heads, head_dim), dtype=torch.bfloat16, device=device
+    )
+    workspace = torch.zeros(256 << 20, dtype=torch.uint8, device=device)
+    counter = torch.zeros(
+        get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            1, num_q_heads, get_device_sm_count(device)
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    scale = head_dim**-0.5
+
+    def run():
+        query = q_src * 1.0  # transient tensor, graph-pool address inside capture
+        return decode.trtllm_batch_decode_with_kv_cache(
+            query=query,
+            kv_cache=(key_cache, value_cache),
+            workspace_buffer=workspace,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_ctx,
+            bmm1_scale=scale,
+            bmm2_scale=1.0,
+            window_left=-1,
+            out_dtype=torch.bfloat16,
+            q_len_per_req=q_len,
+            multi_ctas_kv_counter_buffer=counter,
+            backend="cake",
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):  # no eager call before capture
+        out = run()
+
+    pages = block_tables[0].long()
+    k_all = key_cache[pages, 0].reshape(-1, head_dim).float()
+    v_all = value_cache[pages, 0].reshape(-1, head_dim).float()
+    for kv_len in range(60000, 60000 + 3 * 128, 3):  # crosses page/block edges
+        q_src.normal_(generator=gen)
+        seq_lens.fill_(kv_len)
+        graph.replay()
+        # Dense bottom-right-causal reference; also the interleaved GPU work.
+        scores = (q_src.float() @ k_all[:kv_len].T) * scale
+        pos = torch.arange(kv_len, device=device)
+        limit = kv_len - q_len + torch.arange(q_len, device=device)
+        scores = scores.masked_fill(pos > limit[:, None, None], float("-inf"))
+        ref = torch.softmax(scores, dim=-1) @ v_all[:kv_len]
+        torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+    torch.cuda.synchronize()
+    assert counter.count_nonzero().item() == 0, "merge tickets must self-reset"

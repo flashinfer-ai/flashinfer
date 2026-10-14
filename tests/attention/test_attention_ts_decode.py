@@ -2032,7 +2032,6 @@ def _apply_speculative_tail_markers(case):
     return _with_reference(case)
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_BLACKWELL_PRIMTS_GPU
 @pytest.mark.parametrize(
     ("dtype", "page_size"), ((torch.bfloat16, 16), (torch.float16, 128))
@@ -2454,7 +2453,6 @@ def test_attention_ts_decode_register_reallocation_fits_initial_cta_pool(
     assert requested <= threads * initial_per_thread
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_launch_and_plan_reject_unsafe_int32_kv_bound() -> None:
     """Standalone launch and reusable planning share the padded-coordinate cap."""
@@ -2982,7 +2980,6 @@ def test_attention_ts_decode_page_offsets_cross_window_schedule_is_safe(
     _Q_TOKEN_KV_BLOCK_SPARSE_TP_HEAD_GEOMETRIES,
     ids=("tp1", "tp2", "tp4", "tp6", "tp8", "tp12", "tp24"),
 )
-@pytest.mark.arch_blackwell
 @_REQUIRES_PAGE4_PRIMTS_GPU
 def test_attention_ts_decode_page4_q_token_kv_block_sparse_causal_all_tp_geometries(
     tp_size: int,
@@ -3011,7 +3008,6 @@ def test_attention_ts_decode_page4_q_token_kv_block_sparse_causal_all_tp_geometr
     _exercise_auto_case(case)
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PAGE4_PRIMTS_GPU
 def test_attention_ts_decode_prepared_dynamic_block_table_eager_and_graph() -> None:
     """Prepared launches support padded page rows and dynamic Q storage."""
@@ -3137,7 +3133,6 @@ def test_attention_ts_decode_prepared_dynamic_block_table_eager_and_graph() -> N
     _Q_TOKEN_KV_BLOCK_SPARSE_TP_HEAD_GEOMETRIES,
     ids=("tp1", "tp2", "tp4", "tp6", "tp8", "tp12", "tp24"),
 )
-@pytest.mark.arch_blackwell
 @_REQUIRES_PAGE4_PRIMTS_GPU
 def test_attention_ts_decode_page4_encoded_subpages_all_tp_geometries(
     tp_size: int,
@@ -3228,7 +3223,6 @@ def test_attention_ts_decode_page4_encoded_subpages_all_tp_geometries(
     _assert_case_correct(one_shot, case)
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PAGE4_PRIMTS_GPU
 @pytest.mark.parametrize("group_size", (2, 4, 5))
 def test_attention_ts_decode_grouped_keeps_split_reduction(
@@ -3385,7 +3379,6 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
     _assert_case_correct(output, case)
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PAGE4_PRIMTS_GPU
 @pytest.mark.parametrize("kv_tokens", (240, 256, 2528))
 @pytest.mark.parametrize("batch_size", (1, 4))
@@ -3620,7 +3613,6 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
     torch.testing.assert_close(output.float(), reference, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PAGE4_PRIMTS_GPU
 def test_attention_ts_decode_page4_inert_block_table_row_is_zero() -> None:
     """Reserve locator -1 plus length one for CUDA-graph padding rows."""
@@ -4345,7 +4337,6 @@ def test_attention_ts_nvfp4_cache_contract():
         )
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("batch_size", [1, 4], ids=lambda value: f"b{value}")
 @pytest.mark.parametrize(
@@ -4481,7 +4472,6 @@ def test_attention_ts_decode_mixed_precision(
     _assert_case_correct(explicit_out, case)
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
     ("q_dtype", "kv_dtype", "output_dtype"),
@@ -4582,7 +4572,6 @@ def test_attention_ts_decode_keeps_alias_schedule_is_race_free(
         )
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PAGE4_PRIMTS_GPU
 def test_attention_ts_decode_runtime_kv_ceil_div_covers_int32_domain() -> None:
     """Keep runtime K-tile and page ceilings safe through signed Int32 max."""
@@ -4901,7 +4890,6 @@ def test_attention_ts_decode_failed_replan_preserves_published_state(
     assert wrapper._plan_state.planned_seq_lens_device is previous_seq_lens
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_plan_snapshots_seq_lens_and_replan_replaces_them() -> None:
     """Plan-owned GPU lengths are immutable snapshots of the host values."""
@@ -5120,7 +5108,6 @@ def test_attention_ts_decode_plan_owned_validation_uses_host_seq_lens() -> None:
     )
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_runtime_owned_seq_lens_remain_dynamic_in_graph() -> None:
     """Run-owned lengths may change values and identity across graph replays."""
@@ -5206,7 +5193,6 @@ def test_attention_ts_decode_runtime_owned_seq_lens_remain_dynamic_in_graph() ->
         "active-page-id-out-of-range",
     ),
 )
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_run_rejects_malformed_fixed_metadata_values(
     runtime_seq_lens,
@@ -5235,7 +5221,6 @@ def test_attention_ts_decode_run_rejects_malformed_fixed_metadata_values(
         )
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_block_table_structure_accepts_padded_rows() -> None:
     """The native table requires compact rows, not a compact outer stride."""
@@ -5279,7 +5264,6 @@ def test_attention_ts_decode_block_table_structure_accepts_padded_rows() -> None
     ),
     ids=("sequence-empty", "table-too-narrow", "active-page-id-out-of-range"),
 )
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_one_shot_rejects_malformed_fixed_metadata(
     seq_lens,
@@ -5300,7 +5284,6 @@ def test_attention_ts_decode_one_shot_rejects_malformed_fixed_metadata(
         )
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_one_shot_rejects_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
@@ -5319,7 +5302,6 @@ def test_attention_ts_decode_one_shot_rejects_graph_capture(
 
 
 @pytest.mark.parametrize("packed_q", (False, True), ids=("fixed", "packed"))
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_rejects_per_request_causal_q_longer_than_kv(
     packed_q: bool,
@@ -5910,7 +5892,6 @@ def test_fmha_split_control_rejects_conflicting_explicit_requests(controls):
         make_decode_config(split_kv=False, **controls)
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_BLACKWELL_PRIMTS_GPU
 @pytest.mark.parametrize("dtype", (torch.bfloat16,))
 @pytest.mark.parametrize("packed", (False, True), ids=("fixed", "packed"))
@@ -6709,7 +6690,6 @@ def test_attention_ts_decode_mixed_kv_dtype_resources_build(
         pytest.param(False, 8, id="swaps"),
     ),
 )
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_mixed_kv_dtype_accuracy(
     monkeypatch: pytest.MonkeyPatch,
@@ -6988,7 +6968,6 @@ def test_attention_ts_decode_runtime_q_features_use_structural_persistence(
     assert multi_wave.use_split_kv is False
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_persistent_d256_graph_reloads_page_ids():
     """Persistence must cover a partial second wave and reload page IDs."""
@@ -7068,7 +7047,6 @@ def test_attention_ts_decode_persistent_d256_graph_reloads_page_ids():
     assert not torch.allclose(graph_out.float(), eager.float(), rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
     ("kv_len", "expected_kv_lengths_mode"),
@@ -7112,7 +7090,6 @@ def test_attention_ts_decode_static_fp8_d128_odd_kv_tail_is_finite(
             torch.testing.assert_close(output, first_output, rtol=0, atol=0)
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_standalone_graph_reloads_all_live_metadata():
     """Replay reloads Q offsets, lengths, and a padded fixed page table."""
@@ -7270,7 +7247,6 @@ def test_attention_ts_speculative_mask_oracle_distinguishes_tail_visibility():
     )
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_packed_q_sliding_window_public_parity():
     """Use cumulative Q lengths as the sole runtime ragged-Q definition."""
@@ -7335,12 +7311,15 @@ def test_attention_ts_decode_packed_q_sliding_window_public_parity():
     torch.testing.assert_close(one_shot, eager, rtol=0, atol=0)
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_packed_q_sliding_window_clc_persistent():
     """Run live packed offsets and sliding bounds through the CLC scheduler."""
 
-    q_lens = tuple((3, 5, 7)[batch_idx % 3] for batch_idx in range(22))
+    # The scheduler picks CLC persistence only when the direct launch exceeds
+    # one wave, so scale the 22-request shape (sized for 148 SMs) with the SM count.
+    sm_count = torch.cuda.get_device_properties("cuda").multi_processor_count
+    num_requests = 22 * -(-sm_count // 148)
+    q_lens = tuple((3, 5, 7)[batch_idx % 3] for batch_idx in range(num_requests))
     max_seq_len_q = max(q_lens)
     case = _make_decode_case(
         kv_lens=(257,) * len(q_lens),
@@ -7387,7 +7366,6 @@ def test_attention_ts_decode_packed_q_sliding_window_clc_persistent():
         ),
     ),
 )
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_clc_persistent_dtype_head_dim_product(
     qkv_dtype: torch.dtype,
@@ -7444,7 +7422,6 @@ def test_attention_ts_decode_clc_persistent_dtype_head_dim_product(
         ),
     ),
 )
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_persistent_effective_k_domain_parity(
     qkv_dtype: torch.dtype,
@@ -7478,7 +7455,6 @@ def test_attention_ts_decode_persistent_effective_k_domain_parity(
     assert policy["kv_lengths_mode"] == "dynamic"
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_static_sliding_domain_uses_runtime_lengths():
     """A direct sliding plan guards the effective domain after leading skips."""
@@ -7513,7 +7489,6 @@ def test_attention_ts_decode_static_sliding_domain_uses_runtime_lengths():
     ),
     _FMHA_CASES,
 )
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_compact_variable_k_acceptance(
     case_kwargs,
@@ -7561,7 +7536,6 @@ def test_attention_ts_decode_compact_variable_k_acceptance(
     )
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("qkv_dtype", (torch.bfloat16, torch.float16))
 def test_attention_ts_decode_qfirst_auto_selects_q64_kv256(
@@ -7592,7 +7566,6 @@ def test_attention_ts_decode_qfirst_auto_selects_q64_kv256(
     assert policy["use_split_kv"] is False
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
     ("qkv_dtype", "kv_len", "num_heads", "forced_mode", "expect_separate"),
@@ -7664,7 +7637,6 @@ def test_attention_ts_decode_q64_kv256_split_launch(
     assert policy["use_separate_reduction_kernel"] is expect_separate
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
     (
@@ -7750,7 +7722,6 @@ def test_attention_ts_decode_q64_kv256_boundaries(
         assert policy["use_split_kv"] is False
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("packed_query", (False, True), ids=("fixed", "packed"))
 def test_attention_ts_decode_reuses_compiled_topology_across_batch_sizes(
@@ -7799,7 +7770,6 @@ def test_attention_ts_decode_reuses_compiled_topology_across_batch_sizes(
     (1, 8, 15, 16, 32),
     ids=lambda value: f"gqa{value}",
 )
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_head_dim_gqa_product(
     head_dim: int,
@@ -7852,7 +7822,6 @@ def test_attention_ts_decode_head_dim_gqa_product(
 
 @pytest.mark.parametrize("head_dim", (64, 128, 256), ids=lambda value: f"d{value}")
 @pytest.mark.parametrize("head_ratio", (33, 65), ids=lambda value: f"gqa{value}")
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_wide_fp8_gqa_accuracy(
     head_dim: int,
@@ -7890,7 +7859,6 @@ def test_attention_ts_decode_wide_fp8_gqa_accuracy(
 )
 @pytest.mark.parametrize("mask_type", ("dense", "causal"))
 @pytest.mark.parametrize("seq_len_q", (2, 8), ids=lambda value: f"sq{value}")
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_fixed_q_dtype_mask_product(
     qkv_dtype: torch.dtype,
@@ -7919,7 +7887,6 @@ def test_attention_ts_decode_fixed_q_dtype_mask_product(
     _exercise_auto_case(case)
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_non_power_of_two_q_above_16k_kv():
     """Exercise arbitrary fixed SQ and a KV bound beyond the former 16K cap."""
@@ -7949,7 +7916,6 @@ def test_attention_ts_decode_non_power_of_two_q_above_16k_kv():
     ),
 )
 @pytest.mark.parametrize("mask_type", ("dense", "causal"))
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_packed_fp8_q_mask_product(
     q_lens: tuple[int, ...],
@@ -7991,7 +7957,6 @@ def test_attention_ts_decode_packed_fp8_q_mask_product(
     ),
 )
 @pytest.mark.parametrize("head_dim", (64, 256), ids=lambda value: f"d{value}")
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_missing_dtype_head_dim_product(
     qkv_dtype: torch.dtype,
@@ -8021,7 +7986,6 @@ def test_attention_ts_decode_missing_dtype_head_dim_product(
 
 @pytest.mark.parametrize("page_size", (16, 32, 64, 128))
 @pytest.mark.parametrize("cache_form", ("combined", "tuple"))
-@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_page_cache_sliding_product(
     page_size: int,
@@ -8074,7 +8038,6 @@ def test_attention_ts_decode_page_cache_sliding_product(
     assert policy["window_left"] == 127
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_BLACKWELL_PRIMTS_GPU
 @pytest.mark.parametrize(
     ("group", "dim", "ratio", "block", "page", "packed", "shared", "batch"),
@@ -8210,7 +8173,6 @@ def test_q_token_sparse_geometry_graph(
     check()
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_BLACKWELL_PRIMTS_GPU
 @pytest.mark.parametrize(
     (
@@ -8367,7 +8329,6 @@ def test_q_token_sparse_membership_capacity_and_per_head_reduction(
     check()
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_BLACKWELL_PRIMTS_GPU
 @pytest.mark.parametrize(
     ("storage", "fmt"),
@@ -8523,7 +8484,6 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
     torch.testing.assert_close(out, expected, rtol=0.03, atol=0.01)
 
 
-@pytest.mark.arch_blackwell
 @_REQUIRES_BLACKWELL_PRIMTS_GPU
 @pytest.mark.parametrize("dtype", (torch.bfloat16,))
 def test_dense_encoded_eight_token_fragments(dtype):

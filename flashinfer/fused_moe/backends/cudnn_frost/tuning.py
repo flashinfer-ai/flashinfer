@@ -4,6 +4,7 @@
 from itertools import product
 
 from ....autotuner import AutoTuner, TunableRunner, TuningConfig
+from ...utils import map_to_hybrid_bucket
 from .cache import retain_graph_resources
 from .heuristics import POLICY_VERSION
 
@@ -12,13 +13,19 @@ def prepared_state(runner, inputs, *, hidden_multiplier=1):
     state = runner.launch_state_for(inputs)
     if state is not None:
         return state
-    # The autotuner synthesizes plain tensor lists. Exact-shape plans were
-    # prepared by pack_inputs before this profile is visited.
+    # The autotuner synthesizes plain tensor lists. Find the same bucket state
+    # prepared by pack_inputs; its native executors accept the actual shape.
     t, h = inputs[1].shape
-    for key in reversed(runner._plans):
-        if key[:2] == (t, h * hidden_multiplier):
-            return runner._plans[key]
-    return None
+    bucket = map_to_hybrid_bucket(t, runner.config.execution.tune_max_num_tokens)
+    return runner._plans.get(
+        (
+            bucket,
+            h * hidden_multiplier,
+            runner.config.experts.intermediate_size,
+            runner.config.routing.num_experts,
+            runner.config.routing.top_k,
+        )
+    )
 
 
 class _StageRunner(TunableRunner):
