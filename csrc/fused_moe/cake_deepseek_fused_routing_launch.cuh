@@ -16,12 +16,28 @@ namespace flashinfer::cake_deepseek_fused_routing {
 // On compute capability 10.7 the E=256 G=8 topk_group=4 topk=8 route above kMultiTokenMaxCtas
 // tokens uses the multi-token CTA members of
 // cake_deepseek_fused_routing/cake_deepseek_fused_routing_kernels_sm107a_mt.cu instead: one
-// 256-thread CTA routes tokens_per_cta tokens, the smallest of {2, 4, 8} that keeps the grid at or
-// below kMultiTokenMaxCtas CTAs (else 8).  Every other launch keeps the one-token kernels.
+// 256-thread CTA routes tokens_per_cta tokens.  The members exist for every value of
+// kMultiTokenMembers (2..8).  tokens_per_cta comes from the per-band table kMultiTokenBands
+// (inclusive token ranges; a measured winner is adopted as a table entry) and, outside its bands,
+// from the shipped rule: the smallest of kMultiTokenRuleChoices {2, 4, 8} that keeps the grid at
+// or below kMultiTokenMaxCtas CTAs (else 8).  Every other launch keeps the one-token kernels.
 constexpr int64_t kMultiTokenMaxCtas = 848;
 constexpr int kMultiTokenMajor = 10;
 constexpr int kMultiTokenMinor = 7;
-constexpr int kMultiTokenChoices[] = {2, 4, 8};
+constexpr int kMultiTokenMembers[] = {2, 3, 4, 5, 6, 7, 8};
+constexpr int kMultiTokenRuleChoices[] = {2, 4, 8};
+
+struct MultiTokenBand {
+  int64_t token_lo;    // inclusive, > kMultiTokenMaxCtas
+  int64_t token_hi;    // inclusive
+  int tokens_per_cta;  // one of kMultiTokenMembers
+};
+// Per-band table, checked before the shipped rule; kMultiTokenBandCount entries are live (the
+// trailing sentinel keeps the array non-empty).  Mirrors MULTI_TOKEN_BANDS of the Cake seed.
+// Measured per-shape overrides (both seeds, both interleaved rounds, >= 1 % each); other T use the rule.
+constexpr int kMultiTokenBandCount = 2;
+constexpr MultiTokenBand kMultiTokenBands[kMultiTokenBandCount + 1] = {
+    {3393, 3393, 4}, {4096, 4096, 5}, {0, 0, 1}};
 
 inline bool is_specialized_k8g4_route(int64_t num_experts, int64_t n_group, int64_t topk_group,
                                       int64_t topk) {
@@ -48,16 +64,23 @@ inline bool device_has_multi_token_members() {
 }
 
 // Tokens one CTA routes for this launch: 1 (the one-token kernels) unless the device has the
-// multi-token members, the route is the specialized one and num_tokens > kMultiTokenMaxCtas.
+// multi-token members, the route is the specialized one and num_tokens > kMultiTokenMaxCtas; then
+// the band table entry covering num_tokens, else the shipped rule.
 inline int tokens_per_cta_for(int64_t num_tokens, int64_t num_experts, int64_t n_group,
                               int64_t topk_group, int64_t topk) {
   if (n_group <= 1 || num_tokens <= kMultiTokenMaxCtas) return 1;
   if (!is_specialized_k8g4_route(num_experts, n_group, topk_group, topk)) return 1;
   if (!device_has_multi_token_members()) return 1;
-  for (int choice : kMultiTokenChoices) {
+  for (int band = 0; band < kMultiTokenBandCount; ++band) {
+    if (kMultiTokenBands[band].token_lo <= num_tokens &&
+        num_tokens <= kMultiTokenBands[band].token_hi) {
+      return kMultiTokenBands[band].tokens_per_cta;
+    }
+  }
+  for (int choice : kMultiTokenRuleChoices) {
     if ((num_tokens + choice - 1) / choice <= kMultiTokenMaxCtas) return choice;
   }
-  return kMultiTokenChoices[2];
+  return kMultiTokenRuleChoices[2];
 }
 
 template <typename ScoreT, typename BiasT>
@@ -102,10 +125,38 @@ cudaError_t launch(ScoreT* scores, BiasT* bias, ScoreT* topk_values, int32_t* to
                     ScoreT, BiasT>,
                 scores, bias, topk_values, topk_indices, replay_bytes, tokens32, experts32, topk32,
                 groups32, top_groups32, scaling32, has_replay);
+          case 3:
+            return cudaLaunchKernelEx(
+                &config,
+                cake_deepseek_routing_sm107a_mt::kernel_cake_deepseek_routing_grouped_k8g4_mt3<
+                    ScoreT, BiasT>,
+                scores, bias, topk_values, topk_indices, replay_bytes, tokens32, experts32, topk32,
+                groups32, top_groups32, scaling32, has_replay);
           case 4:
             return cudaLaunchKernelEx(
                 &config,
                 cake_deepseek_routing_sm107a_mt::kernel_cake_deepseek_routing_grouped_k8g4_mt4<
+                    ScoreT, BiasT>,
+                scores, bias, topk_values, topk_indices, replay_bytes, tokens32, experts32, topk32,
+                groups32, top_groups32, scaling32, has_replay);
+          case 5:
+            return cudaLaunchKernelEx(
+                &config,
+                cake_deepseek_routing_sm107a_mt::kernel_cake_deepseek_routing_grouped_k8g4_mt5<
+                    ScoreT, BiasT>,
+                scores, bias, topk_values, topk_indices, replay_bytes, tokens32, experts32, topk32,
+                groups32, top_groups32, scaling32, has_replay);
+          case 6:
+            return cudaLaunchKernelEx(
+                &config,
+                cake_deepseek_routing_sm107a_mt::kernel_cake_deepseek_routing_grouped_k8g4_mt6<
+                    ScoreT, BiasT>,
+                scores, bias, topk_values, topk_indices, replay_bytes, tokens32, experts32, topk32,
+                groups32, top_groups32, scaling32, has_replay);
+          case 7:
+            return cudaLaunchKernelEx(
+                &config,
+                cake_deepseek_routing_sm107a_mt::kernel_cake_deepseek_routing_grouped_k8g4_mt7<
                     ScoreT, BiasT>,
                 scores, bias, topk_values, topk_indices, replay_bytes, tokens32, experts32, topk32,
                 groups32, top_groups32, scaling32, has_replay);
