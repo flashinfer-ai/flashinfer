@@ -187,6 +187,14 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
 #define check_timeout(s, budget) ((clock64() - (s)) > (budget))
 #endif
 
+// Abort the kernel. The launch fails and the error surfaces on the host at the
+// next synchronizing CUDA call. The memory clobber keeps the compiler from
+// moving memory accesses across the trap.
+__device__ __forceinline__ void kernel_trap()
+{
+    asm volatile("trap;" ::: "memory");
+}
+
 // ============================================================================
 // Helper Functions for Expert-to-Rank Mapping
 // ============================================================================
@@ -254,7 +262,7 @@ __device__ __forceinline__ bool wait_round_flag(
 
     printf("%s: rank %d timed out waiting for rank %d flag=%u expected=%u\n", phase, rank_id, peer_rank, observed,
         expected);
-    asm volatile("trap;" ::: "memory");
+    kernel_trap();
     return false;
 }
 
@@ -669,7 +677,7 @@ __device__ __forceinline__ void cft_fabric_try_put_counted(
     (void) src;
     (void) size;
     (void) mbar;
-    asm volatile("trap;" ::: "memory");
+    kernel_trap();
 #else
     uint32_t src_smem = static_cast<uint32_t>(__cvta_generic_to_shared(src));
     uint32_t mbar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
@@ -686,7 +694,7 @@ __device__ __forceinline__ void cft_fabric_try_put_counted(
 __device__ __forceinline__ void cft_fabric_submit()
 {
 #if !TLLM_CFT_HAS_CUDA_13_4_SUPPORT
-    asm volatile("trap;" ::: "memory");
+    kernel_trap();
 #else
     asm volatile("fabric.submit;" ::: "memory");
 #endif
@@ -695,7 +703,7 @@ __device__ __forceinline__ void cft_fabric_submit()
 __device__ __forceinline__ void cft_fabric_wait_reads()
 {
 #if !TLLM_CFT_HAS_CUDA_13_4_SUPPORT
-    asm volatile("trap;" ::: "memory");
+    kernel_trap();
 #else
     asm volatile("fabric.wait.sync_restrict::reads;" ::: "memory");
 #endif
@@ -1008,7 +1016,7 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
                         "dispatch: ---Rank %d timed out recv_counters from rank %d"
                         " parity=%u observed=%d\n",
                         rank_id, peer_rank, parity, recv_count);
-                    asm volatile("trap;");
+                    kernel_trap();
                 }
             } while (recv_count == -1);
         }
@@ -1081,7 +1089,7 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
                     printf("dispatch(counted): ---Rank %d timed out data from rank %d counter=%llu expected=%llu\n",
                         rank_id, peer_rank, (unsigned long long) current_data_counter,
                         (unsigned long long) data_target);
-                    asm volatile("trap;");
+                    kernel_trap();
                 }
                 ptrs.dispatch_counter_baseline[peer_rank] = data_target;
             }
@@ -1104,7 +1112,7 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
     (void) ep_size;
     (void) num_experts;
     (void) eplb_stats_num_experts;
-    asm volatile("trap;" ::: "memory");
+    kernel_trap();
 }
 #endif // TLLM_MOE_A2A_COMPILE_SM100
 
@@ -1806,7 +1814,7 @@ __global__ void moeA2ACombinePushKernel_Cft(
 #else
     // Launched only on the CFT path, which requires sm_100+; fail loudly rather than
     // completing with an empty body.
-    asm volatile("trap;" ::: "memory");
+    kernel_trap();
 #endif
 }
 
@@ -1874,7 +1882,7 @@ __global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int ma
                             "target=%llu\n",
                             rank_id, my_token, kk, slot, (unsigned long long) current_combine_counter,
                             (unsigned long long) combine_base, (unsigned long long) combine_target);
-                        asm volatile("trap;");
+                        kernel_trap();
                         return;
                     }
                 }
@@ -1917,7 +1925,7 @@ __global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int ma
 #else
     // Launched only on the CFT path, which requires sm_100+; fail loudly rather than
     // completing with an empty body.
-    asm volatile("trap;" ::: "memory");
+    kernel_trap();
 #endif // TLLM_MOE_A2A_COMPILE_SM100
 }
 
