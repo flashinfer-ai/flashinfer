@@ -76,7 +76,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_deepgemm_dense_mqa_91cbeec64695cc5dd3f0(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta)
+kernel_cake_deepgemm_dense_mqa_63c7e49139b05539648a(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -136,6 +136,70 @@ kernel_cake_deepgemm_dense_mqa_91cbeec64695cc5dd3f0(const __grid_constant__ CUte
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SF_Q))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SF_KV))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Weights))) : "memory"); }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    unsigned int scan_span_offset_pre = (3 * SM_COUNT + 1) / 2 * 2;
+    if (tid < 32) {
+        unsigned int qidx = tid;
+        unsigned int splits = 0;
+        unsigned int cost = 0;
+        if (qidx < (unsigned int)num_q_blocks) {
+            unsigned int start = 4294967295;
+            unsigned int end = 0;
+            #pragma unroll
+            for (int qi = 0; qi < 4; qi++) {
+                unsigned int _min_0 = ((qidx * 4 + (unsigned int)qi) < ((unsigned int)seq_len - 1) ? (qidx * 4 + (unsigned int)qi) : ((unsigned int)seq_len - 1));
+                unsigned int row = _min_0;
+                unsigned int _min_1 = (((unsigned int)cu_seq_len_k_start[row]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[row]) : ((unsigned int)seq_len_kv));
+                unsigned int _min_2 = ((start) < (_min_1) ? (start) : (_min_1));
+                start = _min_2;
+                unsigned int _min_3 = (((unsigned int)cu_seq_len_k_end[row]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[row]) : ((unsigned int)seq_len_kv));
+                unsigned int _max_0 = ((end) > (_min_3) ? (end) : (_min_3));
+                end = _max_0;
+            }
+            unsigned int base = start / 4 * 4;
+            unsigned int splits_0 = (end - base + 255) / 256;
+            unsigned int cost_1 = splits_0;
+            if (splits_0 != 0) {
+                cost_1 += 1;
+            }
+            splits = splits_0;
+            cost = cost_1;
+            local_base[qidx] = base;
+            local_splits[qidx] = splits_0;
+            if (bid == 0) {
+                ScheduleMeta[scan_span_offset_pre + 2 * qidx] = base;
+                ScheduleMeta[scan_span_offset_pre + 2 * qidx + 1] = splits_0;
+            }
+        }
+        unsigned long long scanned = ((unsigned long long)splits << 32) + (unsigned long long)cost;
+        unsigned long long _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, scanned, 1, 32);
+        unsigned long long preceding_w = _shfl_up_0;
+        if (lane >= 1) {
+            scanned += preceding_w;
+        }
+        unsigned long long _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, scanned, 2, 32);
+        unsigned long long preceding_w_0 = _shfl_up_1;
+        if (lane >= 2) {
+            scanned += preceding_w_0;
+        }
+        unsigned long long _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, scanned, 4, 32);
+        unsigned long long preceding_w_1 = _shfl_up_2;
+        if (lane >= 4) {
+            scanned += preceding_w_1;
+        }
+        unsigned long long _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, scanned, 8, 32);
+        unsigned long long preceding_w_2 = _shfl_up_3;
+        if (lane >= 8) {
+            scanned += preceding_w_2;
+        }
+        unsigned long long _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, scanned, 16, 32);
+        unsigned long long preceding_w_3 = _shfl_up_4;
+        if (lane >= 16) {
+            scanned += preceding_w_3;
+        }
+        local_work[qidx] = (unsigned int)(scanned >> 32);
+        local_cost[qidx] = (unsigned int)scanned;
+    }
 
     // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[206464..206720)
@@ -208,71 +272,7 @@ kernel_cake_deepgemm_dense_mqa_91cbeec64695cc5dd3f0(const __grid_constant__ CUte
     const int tmem_tmem_acc = taddr;
     const int tmem_tmem_sf_q = taddr + 384;
     const int tmem_tmem_sf_kv = taddr + 388;
-    asm volatile("griddepcontrol.wait;" ::: "memory");
     unsigned int scan_span_offset = (3 * SM_COUNT + 1) / 2 * 2;
-    if (tid < 32) {
-        unsigned int qidx = tid;
-        unsigned int splits = 0;
-        unsigned int cost = 0;
-        if (qidx < (unsigned int)num_q_blocks) {
-            unsigned int start = 4294967295;
-            unsigned int end = 0;
-            #pragma unroll
-            for (int qi = 0; qi < 4; qi++) {
-                unsigned int _min_0 = ((qidx * 4 + (unsigned int)qi) < ((unsigned int)seq_len - 1) ? (qidx * 4 + (unsigned int)qi) : ((unsigned int)seq_len - 1));
-                unsigned int row = _min_0;
-                unsigned int _min_1 = (((unsigned int)cu_seq_len_k_start[row]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[row]) : ((unsigned int)seq_len_kv));
-                unsigned int _min_2 = ((start) < (_min_1) ? (start) : (_min_1));
-                start = _min_2;
-                unsigned int _min_3 = (((unsigned int)cu_seq_len_k_end[row]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[row]) : ((unsigned int)seq_len_kv));
-                unsigned int _max_0 = ((end) > (_min_3) ? (end) : (_min_3));
-                end = _max_0;
-            }
-            unsigned int base = start / 4 * 4;
-            unsigned int splits_0 = (end - base + 255) / 256;
-            unsigned int cost_1 = splits_0;
-            if (splits_0 != 0) {
-                cost_1 += 1;
-            }
-            splits = splits_0;
-            cost = cost_1;
-            local_base[qidx] = base;
-            local_splits[qidx] = splits_0;
-            if (bid == 0) {
-                ScheduleMeta[scan_span_offset + 2 * qidx] = base;
-                ScheduleMeta[scan_span_offset + 2 * qidx + 1] = splits_0;
-            }
-        }
-        unsigned long long scanned = ((unsigned long long)splits << 32) + (unsigned long long)cost;
-        unsigned long long _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, scanned, 1, 32);
-        unsigned long long preceding_w = _shfl_up_0;
-        if (lane >= 1) {
-            scanned += preceding_w;
-        }
-        unsigned long long _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, scanned, 2, 32);
-        unsigned long long preceding_w_0 = _shfl_up_1;
-        if (lane >= 2) {
-            scanned += preceding_w_0;
-        }
-        unsigned long long _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, scanned, 4, 32);
-        unsigned long long preceding_w_1 = _shfl_up_2;
-        if (lane >= 4) {
-            scanned += preceding_w_1;
-        }
-        unsigned long long _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, scanned, 8, 32);
-        unsigned long long preceding_w_2 = _shfl_up_3;
-        if (lane >= 8) {
-            scanned += preceding_w_2;
-        }
-        unsigned long long _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, scanned, 16, 32);
-        unsigned long long preceding_w_3 = _shfl_up_4;
-        if (lane >= 16) {
-            scanned += preceding_w_3;
-        }
-        local_work[qidx] = (unsigned int)(scanned >> 32);
-        local_cost[qidx] = (unsigned int)scanned;
-    }
-    __syncthreads();
     if (tid == 0) {
         unsigned int scan_blocks = (unsigned int)num_q_blocks;
         unsigned int total_work = local_work[scan_blocks - 1];
