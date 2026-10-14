@@ -224,6 +224,14 @@ SM12x: contiguous FP8 E4M3 Q/K/V with head dimensions 256/256 and BF16/FP16
 output. Apply RoPE upstream; NoPE and RoPE share the FP8 dtype and scalar
 scale. GLM's fused QK scale is `q_scale * k_scale / 16`.
 
+The SM120 GLM 256/256 specialization keeps 64-token outer Q tiles but uses
+full Q/K head tiles and 64-token PV reduction tiles for FP8-to-BF16/FP16.
+The full operands fit within the existing 64 KiB output-staging allocation.
+Single-buffer K/V reuse includes CTA barriers after each GEMM's final shared
+reads. Other shapes and layouts retain their original tiling. When testing
+source changes, exclude stale prebuilt `data/aot/trtllm_fmha_v2` artifacts so
+they cannot mask the new JIT build.
+
 ## Code Linting
 
 Run all pre-commit hooks:

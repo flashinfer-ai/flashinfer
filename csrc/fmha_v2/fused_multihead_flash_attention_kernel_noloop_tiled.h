@@ -359,6 +359,12 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
       smem_k.move_to_next_read_buffer();
     }  // end BMM1 tail loop
 
+    // Full tiles have one K buffer. All warps must finish reading it before
+    // the BMM2 tail prefetch overwrites it for the next KV iteration.
+    if constexpr (!Kernel_traits::USE_GRANULAR_TILING) {
+      __syncthreads();
+    }
+
     // Store the P matrix.
 #if defined(STORE_P)
     gmem_p.store(acc_p);
@@ -529,6 +535,11 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
 
       smem_v.move_to_next_read_buffer();
     }  // end BMM2 tail loop
+
+    // Likewise, release the single V buffer before the next BMM1 tail load.
+    if constexpr (!Kernel_traits::USE_GRANULAR_TILING) {
+      __syncthreads();
+    }
 
   }  // Inner loop over the key/value sequence length.
 

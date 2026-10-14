@@ -2093,6 +2093,24 @@ def selected_mask_types(kspec: kernel_spec) -> tuple[str, str, str, str]:
     return padding_mask, causal_mask, sliding_or_chunked_causal_mask, custom_mask
 
 
+def _use_full_glm_tiles(kspec: kernel_spec) -> bool:
+    # Keep outer Q tiling, but avoid reloading Q/K in four 64-column pieces.
+    # Full Q/K/V tiles fit within the existing 64 KiB output-staging allocation.
+    return (
+        kspec.sm == 120
+        and kspec.dtype == "e4m3_fp32"
+        and kspec.output_dtype in ("bf16", "fp16")
+        and (kspec.head_size, kspec.head_size_v) == (256, 256)
+        and kspec.input_layout == InputLayout.SEPARATE_Q_K_V
+        and kspec.tiled
+        and kspec.warps_m == 4
+        and kspec.warps_n == kspec.ctas_per_head == 1
+        and not kspec.is_mtp
+        and kspec.loop_step == kspec.kv_loop_step == 64
+        and kspec.sage_block_sizes is None
+    )
+
+
 def get_kernel_code(kspec: kernel_spec, kname: str, lname: str) -> str | None:
     min_cuda_version = 0  # no restriction
 
@@ -2184,7 +2202,7 @@ def get_kernel_code(kspec: kernel_spec, kname: str, lname: str) -> str | None:
         pass
     if kspec.enable_attn_logit_softcapping:
         flags |= 2048
-    if kspec.tiled:
+    if kspec.tiled and not _use_full_glm_tiles(kspec):
         flags |= 4096
     if kspec.is_mtp:
         flags |= 8192
@@ -2967,7 +2985,7 @@ def get_kernel_traits_code(specs_names: list[tuple[kernel_spec, str, str, str]])
             pass
         if kspec.enable_attn_logit_softcapping:
             flags |= 2048
-        if kspec.tiled:
+        if kspec.tiled and not _use_full_glm_tiles(kspec):
             flags |= 4096
         if kspec.is_mtp:
             flags |= 8192
