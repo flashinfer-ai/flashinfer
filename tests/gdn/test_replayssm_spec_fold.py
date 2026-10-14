@@ -261,8 +261,8 @@ def test_replayssm_verify(batch, steps, heads, hv, variant):
 )
 @pytest.mark.parametrize("tcgen", [False, True])
 def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
-    if tcgen and (steps < 4 or not normalize or track):
-        pytest.skip("tcgen commit requires normalized T=4..8 without tracking")
+    if tcgen and (steps < 4 or not normalize):
+        pytest.skip("tcgen commit requires normalized T=4..8")
     # The extra full-accept row preserves final-step tracking coverage at T=3,
     # where the first full-accept row exercises an intermediate tracked step.
     counts = list(range(steps + 1)) + [steps, 0, steps]
@@ -413,8 +413,8 @@ def test_replayssm_commit_non_prefix_path(backend):
 @pytest.mark.parametrize("track", [False, True])
 def test_replayssm_commit_path_cycles(steps, backend, track):
     """Every accepted length over a non-prefix path, with null and zero rows."""
-    if backend == "tcgen05" and (steps < 4 or track):
-        pytest.skip("tcgen commit requires T=4..8 without tracking")
+    if backend == "tcgen05" and steps < 4:
+        pytest.skip("tcgen commit requires T=4..8")
     counts = list(range(steps + 1)) + [steps, 0]
     batch = len(counts)
     args, cache = _inputs(batch, steps)
@@ -772,7 +772,6 @@ def test_replayssm_cuda_graph(backend):
     "invalid",
     [
         "backend",
-        "tcgen_track",
         "tcgen_norm",
         "tcgen_short_window",
         "track_pair",
@@ -789,12 +788,6 @@ def test_replayssm_commit_validation(invalid):
     args = gdn_replayssm_commit_trace.init()
     if invalid == "backend":
         args["backend"] = "invalid"
-    if invalid == "tcgen_track":
-        args.update(
-            backend="tcgen05",
-            track_state_indices=args["state_indices"],
-            track_steps=args["accept_lens"],
-        )
     if invalid == "tcgen_short_window":
         args = gdn_replayssm_commit_trace.init(seq_len=3)
         args["backend"] = "tcgen05"

@@ -79,6 +79,7 @@ def _gdn_replayssm_fold_kernel(
     NULL_BLOCK_ID: cutlass.Constexpr[int],
     HAS_TRACK: cutlass.Constexpr[bool],
     HAS_PATHS: cutlass.Constexpr[bool],
+    TRACK_ONLY: cutlass.Constexpr[bool],
 ):
     row_tile, i_n, layer_head = cute.arch.block_idx()
     lane = cute.arch.lane_idx()
@@ -92,6 +93,17 @@ def _gdn_replayssm_fold_kernel(
     requested_slot = state_indices[i_n]
     n_commit = accept_lens[i_n]
     is_live = requested_slot > NULL_BLOCK_ID and n_commit > 0
+    if cutlass.const_expr(TRACK_ONLY):
+        # Only rows with a live track slot and an in-range step have work, and
+        # they replay just up to that step; the live slot is left to the fold.
+        track_step_early = track_steps[i_n]
+        is_live = (
+            is_live
+            and track_indices[i_n] > NULL_BLOCK_ID
+            and track_step_early >= 0
+            and track_step_early < n_commit
+        )
+        n_commit = track_step_early + 1
     safe_slot = requested_slot
     if not is_live:
         safe_slot = cutlass.Int32(0)
@@ -225,7 +237,8 @@ def _gdn_replayssm_fold_kernel(
                     )
                     cute.copy(copy_f32x4, state_registers, track_state)
 
-        cute.copy(copy_f32x4, state_registers, global_state)
+        if cutlass.const_expr(not TRACK_ONLY):
+            cute.copy(copy_f32x4, state_registers, global_state)
 
 
 @cute.jit
@@ -249,6 +262,7 @@ def _launch_gdn_replayssm_fold(
     NULL_BLOCK_ID: cutlass.Constexpr[int],
     HAS_TRACK: cutlass.Constexpr[bool],
     HAS_PATHS: cutlass.Constexpr[bool],
+    TRACK_ONLY: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     rows_per_cta = WARPS_PER_CTA * _ROWS_PER_WARP
@@ -338,6 +352,7 @@ def _launch_gdn_replayssm_fold(
         NULL_BLOCK_ID,
         HAS_TRACK,
         HAS_PATHS,
+        TRACK_ONLY,
     ).launch(
         grid=(row_tiles, state_indices.shape[0], NUM_LAYERS * HV),
         block=(WARPS_PER_CTA * 32, 1, 1),
@@ -519,11 +534,9 @@ def commit_gdn_replayssm_fold_all_layers(
         if tensor.data_ptr() % 16:
             raise ValueError(f"{name} must have a 16-byte aligned base address")
 
-    supports_tcgen = (
-        4 <= max_cache_len <= 8 and use_qk_l2norm_in_kernel and not has_track
-    )
+    supports_tcgen = 4 <= max_cache_len <= 8 and use_qk_l2norm_in_kernel
     if backend == "tcgen05" and not supports_tcgen:
-        raise ValueError("tcgen05 commit requires normalized T=4..8 without tracking")
+        raise ValueError("tcgen05 commit requires normalized T=4..8")
     if B == 0:
         return
     # Short windows and small grids do not amortize the tensor-core setup.
@@ -531,11 +544,92 @@ def commit_gdn_replayssm_fold_all_layers(
     prefer_tcgen = max_cache_len == 8 or (
         max_cache_len in (6, 7) and B > 1 and num_layers * B * HV >= 256
     )
+    # The tracked snapshot pass is an extra launch; it pays off from B * HV ~ 256.
+    if has_track and B * HV < 256:
+        prefer_tcgen = False
+
+    def run_simt(track_only: bool) -> None:
+        flat_slots = num_layers * num_slots
+        state = checkpoint_state.view(flat_slots, HV, V, K)
+        rawv = rawv_cache.view(flat_slots, HV, max_cache_len, V)
+        rawk = rawk_cache.view(flat_slots, H, max_cache_len, K)
+        log_g = g_cache.view(flat_slots, HV, max_cache_len)
+        beta = beta_cache.view(flat_slots, HV, max_cache_len)
+
+        key = (
+            target.compile_key,
+            num_layers,
+            H,
+            HV,
+            max_cache_len,
+            warps_per_cta,
+            bool(use_qk_l2norm_in_kernel),
+            int(null_block_id),
+            bool(has_track),
+            has_paths,
+            track_only,
+        )
+        cache = _CACHE.setdefault(key, {})
+        stream = cuda.CUstream(
+            torch.cuda.current_stream(device=checkpoint_state.device).cuda_stream
+        )
+        compile_options = gdn_compile_options(
+            checkpoint_state.device,
+            cute.EnableTVMFFI(True),
+            cute.GenerateLineInfo(True),
+        )
+        if "compiled" not in cache:
+            cache["compiled"] = build_and_load_cute_dsl_kernel(
+                "gdn_replayssm_spec_fold",
+                make_kernel_name("fold", target.arch, *key[1:]),
+                lambda: cute.compile[compile_options](
+                    _launch_gdn_replayssm_fold,
+                    _mark_leading_dynamic(state),
+                    _mark_leading_dynamic(rawv),
+                    _mark_leading_dynamic(rawk),
+                    _mark_leading_dynamic(log_g),
+                    _mark_leading_dynamic(beta),
+                    _mark_leading_dynamic(ssm_state_indices),
+                    _mark_leading_dynamic(accept_lens),
+                    _mark_leading_dynamic(track_indices),
+                    _mark_leading_dynamic(track_steps),
+                    _mark_leading_dynamic(paths_flat),
+                    NUM_LAYERS=num_layers,
+                    H=H,
+                    HV=HV,
+                    MAX_CACHE_LEN=max_cache_len,
+                    WARPS_PER_CTA=warps_per_cta,
+                    USE_QK_L2NORM=bool(use_qk_l2norm_in_kernel),
+                    NULL_BLOCK_ID=int(null_block_id),
+                    HAS_TRACK=bool(has_track),
+                    HAS_PATHS=has_paths,
+                    TRACK_ONLY=track_only,
+                    stream=stream,
+                ),
+                extra_key_files=(__file__,),
+            )
+        cache["compiled"](
+            state,
+            rawv,
+            rawk,
+            log_g,
+            beta,
+            ssm_state_indices,
+            accept_lens,
+            track_indices,
+            track_steps,
+            paths_flat,
+            stream,
+        )
+
     if supports_tcgen and (
         backend == "tcgen05" or (backend == "auto" and prefer_tcgen)
     ):
         from .gdn_replayssm_spec_fold_tcgen import run_replayssm_fold_tcgen
 
+        if has_track:
+            # Snapshot tracked rows from the untouched checkpoint, then fold.
+            run_simt(True)
         run_replayssm_fold_tcgen(
             checkpoint_state,
             rawv_cache,
@@ -548,75 +642,7 @@ def commit_gdn_replayssm_fold_all_layers(
             accept_paths=paths_flat if has_paths else None,
         )
         return
-
-    flat_slots = num_layers * num_slots
-    state = checkpoint_state.view(flat_slots, HV, V, K)
-    rawv = rawv_cache.view(flat_slots, HV, max_cache_len, V)
-    rawk = rawk_cache.view(flat_slots, H, max_cache_len, K)
-    log_g = g_cache.view(flat_slots, HV, max_cache_len)
-    beta = beta_cache.view(flat_slots, HV, max_cache_len)
-
-    key = (
-        target.compile_key,
-        num_layers,
-        H,
-        HV,
-        max_cache_len,
-        warps_per_cta,
-        bool(use_qk_l2norm_in_kernel),
-        int(null_block_id),
-        bool(has_track),
-        has_paths,
-    )
-    cache = _CACHE.setdefault(key, {})
-    stream = cuda.CUstream(
-        torch.cuda.current_stream(device=checkpoint_state.device).cuda_stream
-    )
-    compile_options = gdn_compile_options(
-        checkpoint_state.device, cute.EnableTVMFFI(True), cute.GenerateLineInfo(True)
-    )
-    if "compiled" not in cache:
-        cache["compiled"] = build_and_load_cute_dsl_kernel(
-            "gdn_replayssm_spec_fold",
-            make_kernel_name("fold", target.arch, *key[1:]),
-            lambda: cute.compile[compile_options](
-                _launch_gdn_replayssm_fold,
-                _mark_leading_dynamic(state),
-                _mark_leading_dynamic(rawv),
-                _mark_leading_dynamic(rawk),
-                _mark_leading_dynamic(log_g),
-                _mark_leading_dynamic(beta),
-                _mark_leading_dynamic(ssm_state_indices),
-                _mark_leading_dynamic(accept_lens),
-                _mark_leading_dynamic(track_indices),
-                _mark_leading_dynamic(track_steps),
-                _mark_leading_dynamic(paths_flat),
-                NUM_LAYERS=num_layers,
-                H=H,
-                HV=HV,
-                MAX_CACHE_LEN=max_cache_len,
-                WARPS_PER_CTA=warps_per_cta,
-                USE_QK_L2NORM=bool(use_qk_l2norm_in_kernel),
-                NULL_BLOCK_ID=int(null_block_id),
-                HAS_TRACK=bool(has_track),
-                HAS_PATHS=has_paths,
-                stream=stream,
-            ),
-            extra_key_files=(__file__,),
-        )
-    cache["compiled"](
-        state,
-        rawv,
-        rawk,
-        log_g,
-        beta,
-        ssm_state_indices,
-        accept_lens,
-        track_indices,
-        track_steps,
-        paths_flat,
-        stream,
-    )
+    run_simt(False)
 
 
 __all__ = ["commit_gdn_replayssm_fold_all_layers"]

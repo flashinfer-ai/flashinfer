@@ -1611,11 +1611,12 @@ def gated_delta_rule_replayssm_commit(
         Largest reserved/invalid slot; must be >= -1. Default -1.
 
     backend : {"auto", "simt", "tcgen05"}
-        Without tracking and with normalized K, auto selects TF32 tcgen05
-        for T=8, or T=6/7 when B>1 and ``layers * B * HV >= 256``. Otherwise it uses
-        FP32 SIMT. Shorter accepted prefixes may favor explicit ``simt``;
-        auto does not read accepted lengths back to the host.
-        Explicit ``tcgen05`` supports normalized T=4..8 without tracking.
+        With normalized K, auto selects TF32 tcgen05 for T=8, or T=6/7 when
+        B>1 and ``layers * B * HV >= 256``. Otherwise it uses FP32 SIMT. Shorter
+        accepted prefixes may favor explicit ``simt``; auto does not read
+        accepted lengths back to the host. Explicit ``tcgen05`` supports
+        normalized T=4..8. Tracking adds a short FP32 SIMT pass that writes the
+        tracked snapshots from the untouched checkpoint before the fold.
         Use ``simt`` to retain FP32 contractions.
 
     Notes
