@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TraceTemplate for top_k_varlen (GVR / radix decode-step top-K)."""
+"""TraceTemplate for top_k_varlen (per-row varlen top-K: decode rows or
+prefill windows)."""
 
 import torch
 
@@ -20,23 +21,44 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
 @torch.no_grad()
-def _top_k_varlen_reference(logits, seq_lens, top_k, pre_idx=None, **_unused):
-    """Per-row top-K with seq_lens masking. Reference uses torch.topk on each row."""
+def _top_k_varlen_reference(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    row_starts=None,
+    absolute_indices=False,
+    **_unused,
+):
+    """Per-row top-K with seq_lens masking (window ``[row_starts[r],
+    row_starts[r] + seq_lens[r])`` with window-local indices when
+    ``row_starts`` is given, absolute columns with ``absolute_indices``).
+    Reference uses torch.topk on each row."""
     num_rows, N = logits.shape
     indices = torch.empty(num_rows, top_k, dtype=torch.int32, device=logits.device)
     logits_f32 = logits.to(torch.float32)
     for r in range(num_rows):
-        n = int(seq_lens[r].item())
-        row = logits_f32[r, :n]
+        # the kernel clamps a negative start to 0 and a start past the width
+        # to the width (an empty window); the window end is clamped to the width
+        s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0
+        n = max(min(s + int(seq_lens[r].item()), N) - s, 0)
+        row = logits_f32[r, s : s + n]
         _, idx = torch.topk(row, min(top_k, n), largest=True, sorted=False)
-        indices[r, : len(idx)] = idx.to(torch.int32)
+        indices[r, : len(idx)] = idx.to(torch.int32) + (s if absolute_indices else 0)
         if len(idx) < top_k:
             indices[r, len(idx) :] = -1
     return indices
 
 
 def _top_k_varlen_check(
-    reference_outputs, actual_outputs, logits=None, seq_lens=None, top_k=None, **_unused
+    reference_outputs,
+    actual_outputs,
+    logits=None,
+    seq_lens=None,
+    top_k=None,
+    row_starts=None,
+    absolute_indices=False,
+    **_unused,
 ):
     """Tie-safe value check: every selected value must be >= the row's K-th largest.
 
@@ -67,14 +89,31 @@ def _top_k_varlen_check(
         return True
 
     logits_f32 = logits.to(torch.float32)
+    N = logits_f32.shape[1]
     for r in range(act.shape[0]):
-        n = int(seq_lens[r].item())
+        s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0
+        n = max(min(s + int(seq_lens[r].item()), N) - s, 0)
+        sel = act[r].long()  # window-local indices (absolute: shift back by s)
+        if absolute_indices:
+            sel = torch.where(sel >= 0, sel - s, sel)  # -1 pads stay -1
         if n < top_k:
+            # short window: every window position exactly once (the identity
+            # set, in any order) and top_k - n pads of -1 -- never skipped
+            valid = sel[sel >= 0]
+            if int((sel < 0).sum()) != top_k - n or valid.numel() != n:
+                return False
+            if n and not torch.equal(
+                torch.sort(valid).values, torch.arange(n, device=sel.device)
+            ):
+                return False
             continue
-        row = logits_f32[r, :n]
+        row = logits_f32[r, s : s + n]
         kth = torch.topk(row, top_k).values[-1].item()
-        sel = act[r].long()
-        if (logits_f32[r][sel] < kth - 1e-5).any():
+        # a -1 pad in a full row, or any index outside the window, is a
+        # failure -- not a wrap-around gather or a device-side index assert
+        if bool((sel < 0).any()) or bool((sel >= n).any()):
+            return False
+        if (row[sel] < kth - 1e-5).any():
             return False
     return True
 
@@ -113,30 +152,75 @@ top_k_varlen_trace = TraceTemplate(
     op_type="topk",
     name_prefix="top_k_varlen",
     description=(
-        "Decode-step top-K selection over batched logits with per-request seq_lens. "
-        "GVR (Blackwell sm_100+) or masked-radix fallback backend."
+        "Per-row top-K over batched logits with per-request seq_lens: decode rows, "
+        "or windows of a packed prefill-indexer layout when row_starts is given. "
+        "Backends: gvr, gvr_2, radix, radix_filter (CuTe DSL; see top_k_varlen for "
+        "each one's GPU list) and the masked-radix radix_cutlass fallback (every GPU)."
     ),
     axes={
-        "batch_size": Var(description="Number of decode requests."),
-        "max_seq_len": Const(abbrev="n", description="Logits row width (padded)."),
+        "batch_size": Var(
+            description=(
+                "Number of rows: requests in decode mode, query tokens in windowed "
+                "(prefill) mode."
+            )
+        ),
+        # the width axis is num_cols (the logits shape), distinct from the API's
+        # windowed-mode bound max_window_len (a scalar input below) and from
+        # init()'s max_seq_len, which sizes the example buffer
+        "num_cols": Const(abbrev="n", description="Logits row width (padded)."),
         "top_k": Const(abbrev="k", description="Number of top elements per row."),
     },
     inputs={
         "logits": Tensor(
-            ["batch_size", "max_seq_len"],
-            description="Decode-step attention logits (bfloat16 / float16 / float32).",
+            ["batch_size", "num_cols"],
+            description="Scores, one row per query token (bfloat16 / float16 / float32).",
         ),
         "seq_lens": Tensor(
             ["batch_size"],
             dtype="int32",
-            description="Effective KV-cache length per request.",
+            description=(
+                "Decode mode: each request's KV length in tokens. Windowed (prefill) "
+                "mode: each row's window length in columns."
+            ),
         ),
         "top_k": Scalar("int32", description="K — number of top elements to select."),
         "pre_idx": Tensor(
             ["batch_size", "top_k"],
             dtype="int32",
             optional=True,
-            description="Previous-step top-K indices (GVR warm-start hint).",
+            description=(
+                "Decode mode only: a hint of each request's top-k indices, a warm "
+                "start for the backends that take one."
+            ),
+        ),
+        "row_starts": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Windowed (prefill) mode: row r ranks "
+                "logits[r, row_starts[r] : row_starts[r] + seq_lens[r]] and "
+                "returns window positions (logits columns with "
+                "absolute_indices=True)."
+            ),
+        ),
+        "absolute_indices": Scalar(
+            "bool",
+            optional=True,
+            description=(
+                "Windowed (prefill) mode: return logits columns instead of window "
+                "positions."
+            ),
+        ),
+        "max_window_len": Scalar(
+            "int32",
+            optional=True,
+            description=(
+                "Windowed (prefill) mode: upper bound on every window length, in "
+                "columns (defaults to the logits width); fixed for a captured graph, "
+                "so it must hold at every replay. Refused with ValueError without "
+                "row_starts."
+            ),
         ),
     },
     outputs={

@@ -49,7 +49,8 @@ def test_fp8_format_accepts_every_backend():
 
 
 # (num_query_tokens, num_heads, sparse_topk, extra_topk, sm_count) -> (variant, num_splits, tiles_per_split, grid, merge_heads_per_cta)
-# generated from the Cake production plans of the 76 contract rows of the DSv4 NVFP4 shape ledger at the exportable SM counts
+# generated from the Cake production plans of the 76 contract rows of the DSv4 NVFP4 shape ledger at the exportable SM counts;
+# the H64 one-tile rows at 2 or 4 CTAs per work item run the H64 tile member (same grid and split count as the tile member)
 _CAKE_PLAN_TABLE = {
     (1, 16, 128, 0, 148): ("nvfp4_decode_swap_n16_oc4", 1, 1, 4, 1),
     (1, 16, 128, 0, 152): ("nvfp4_decode_swap_n16_oc4", 1, 1, 4, 1),
@@ -59,16 +60,16 @@ _CAKE_PLAN_TABLE = {
     (1, 32, 128, 0, 152): ("nvfp4_decode_swap_n32_oc4", 1, 1, 4, 1),
     (1, 32, 512, 0, 148): ("nvfp4_decode_swap_n32_oc4", 4, 1, 16, 1),
     (1, 32, 512, 0, 152): ("nvfp4_decode_swap_n32_oc4", 4, 1, 16, 1),
-    (1, 64, 128, 0, 148): ("nvfp4_decode_tile_oc4", 1, 1, 4, 1),
-    (1, 64, 128, 0, 152): ("nvfp4_decode_tile_oc4", 1, 1, 4, 1),
-    (1, 64, 512, 0, 148): ("nvfp4_decode_tile_oc4", 4, 1, 16, 1),
-    (1, 64, 512, 0, 152): ("nvfp4_decode_tile_oc4", 4, 1, 16, 1),
+    (1, 64, 128, 0, 148): ("nvfp4_decode_tile_h64_oc4", 1, 1, 4, 1),
+    (1, 64, 128, 0, 152): ("nvfp4_decode_tile_h64_oc4", 1, 1, 4, 1),
+    (1, 64, 512, 0, 148): ("nvfp4_decode_tile_h64_oc4", 4, 1, 16, 1),
+    (1, 64, 512, 0, 152): ("nvfp4_decode_tile_h64_oc4", 4, 1, 16, 1),
     (1, 128, 128, 0, 148): ("nvfp4_decode_tile_oc4", 1, 1, 4, 1),
     (1, 128, 128, 0, 152): ("nvfp4_decode_tile_oc4", 1, 1, 4, 1),
     (1, 128, 512, 0, 148): ("nvfp4_decode_tile_oc4", 4, 1, 16, 1),
     (1, 128, 512, 0, 152): ("nvfp4_decode_tile_oc4", 4, 1, 16, 1),
-    (3, 64, 128, 132, 148): ("nvfp4_decode_tile_oc4", 3, 1, 36, 2),
-    (3, 64, 128, 132, 152): ("nvfp4_decode_tile_oc4", 3, 1, 36, 2),
+    (3, 64, 128, 132, 148): ("nvfp4_decode_tile_h64_oc4", 3, 1, 36, 2),
+    (3, 64, 128, 132, 152): ("nvfp4_decode_tile_h64_oc4", 3, 1, 36, 2),
     (4, 32, 128, 0, 148): ("nvfp4_decode_swap_n32_oc4", 1, 1, 16, 1),
     (4, 32, 128, 0, 152): ("nvfp4_decode_swap_n32_oc4", 1, 1, 16, 1),
     (5, 16, 128, 0, 148): ("nvfp4_decode_swap_n16_oc4", 1, 1, 20, 1),
@@ -93,10 +94,10 @@ _CAKE_PLAN_TABLE = {
     (8, 32, 128, 0, 152): ("nvfp4_decode_swap_n32_oc4", 1, 1, 32, 2),
     (8, 32, 512, 0, 148): ("nvfp4_decode_swap_n32_oc4", 4, 1, 128, 2),
     (8, 32, 512, 0, 152): ("nvfp4_decode_swap_n32_oc4", 4, 1, 128, 2),
-    (8, 64, 128, 0, 148): ("nvfp4_decode_tile_oc4", 1, 1, 32, 4),
-    (8, 64, 128, 0, 152): ("nvfp4_decode_tile_oc4", 1, 1, 32, 4),
-    (8, 64, 512, 0, 148): ("nvfp4_decode_tile_oc2", 4, 1, 64, 4),
-    (8, 64, 512, 0, 152): ("nvfp4_decode_tile_oc2", 4, 1, 64, 4),
+    (8, 64, 128, 0, 148): ("nvfp4_decode_tile_h64_oc4", 1, 1, 32, 4),
+    (8, 64, 128, 0, 152): ("nvfp4_decode_tile_h64_oc4", 1, 1, 32, 4),
+    (8, 64, 512, 0, 148): ("nvfp4_decode_tile_h64_oc2", 4, 1, 64, 4),
+    (8, 64, 512, 0, 152): ("nvfp4_decode_tile_h64_oc2", 4, 1, 64, 4),
     (8, 128, 128, 0, 148): ("nvfp4_decode_tile_oc4", 1, 1, 32, 8),
     (8, 128, 128, 0, 152): ("nvfp4_decode_tile_oc4", 1, 1, 32, 8),
     (8, 128, 128, 132, 148): ("nvfp4_decode_tile_oc2", 3, 1, 48, 8),
@@ -117,8 +118,8 @@ _CAKE_PLAN_TABLE = {
     (12, 32, 128, 0, 152): ("nvfp4_decode_swap_n32_oc4", 1, 1, 48, 4),
     (12, 32, 128, 512, 148): ("nvfp4_decode_swap_n32_oc2", 5, 1, 120, 4),
     (12, 32, 128, 512, 152): ("nvfp4_decode_swap_n32_oc2", 5, 1, 120, 4),
-    (12, 64, 128, 0, 148): ("nvfp4_decode_tile_oc4", 1, 1, 48, 8),
-    (12, 64, 128, 0, 152): ("nvfp4_decode_tile_oc4", 1, 1, 48, 8),
+    (12, 64, 128, 0, 148): ("nvfp4_decode_tile_h64_oc4", 1, 1, 48, 8),
+    (12, 64, 128, 0, 152): ("nvfp4_decode_tile_h64_oc4", 1, 1, 48, 8),
     (12, 64, 128, 512, 148): ("nvfp4_decode_tile_oc1", 5, 1, 60, 8),
     (12, 64, 128, 512, 152): ("nvfp4_decode_tile_oc1", 5, 1, 60, 8),
     (12, 128, 128, 0, 148): ("nvfp4_decode_tile_oc4", 1, 1, 48, 16),
@@ -143,8 +144,8 @@ _CAKE_PLAN_TABLE = {
     (32, 32, 128, 0, 152): ("nvfp4_decode_swap_n32_oc4", 1, 1, 128, 8),
     (32, 32, 512, 0, 148): ("nvfp4_decode_swap_n32_oc1", 4, 1, 128, 8),
     (32, 32, 512, 0, 152): ("nvfp4_decode_swap_n32_oc1", 4, 1, 128, 8),
-    (32, 64, 128, 0, 148): ("nvfp4_decode_tile_oc2", 1, 1, 64, 16),
-    (32, 64, 128, 0, 152): ("nvfp4_decode_tile_oc2", 1, 1, 64, 16),
+    (32, 64, 128, 0, 148): ("nvfp4_decode_tile_h64_oc2", 1, 1, 64, 16),
+    (32, 64, 128, 0, 152): ("nvfp4_decode_tile_h64_oc2", 1, 1, 64, 16),
     (32, 64, 512, 0, 148): ("nvfp4_decode_tile_oc1", 4, 1, 128, 16),
     (32, 64, 512, 0, 152): ("nvfp4_decode_tile_oc1", 4, 1, 128, 16),
     (32, 128, 128, 0, 148): ("nvfp4_decode_tile_oc2", 1, 1, 64, 16),
@@ -234,6 +235,9 @@ def test_nvfp4_variant_names():
     )
     assert cake._nvfp4_variant_name("tile", o_chunks=2) == "nvfp4_decode_tile_oc2"
     assert (
+        cake._nvfp4_variant_name("tile_h64", o_chunks=4) == "nvfp4_decode_tile_h64_oc4"
+    )
+    assert (
         cake._nvfp4_variant_name("t64", tile_n=64, o_chunks=1)
         == "nvfp4_decode_t64_n64_oc1"
     )
@@ -241,7 +245,7 @@ def test_nvfp4_variant_names():
         cake._nvfp4_variant_name("pv", o_chunks=1)
     with pytest.raises(ValueError, match="unknown NVFP4 family member"):
         cake._nvfp4_variant_name("merge")
-    assert len(set(_NVFP4_VARIANTS)) == len(_NVFP4_VARIANTS) == 15
+    assert len(set(_NVFP4_VARIANTS)) == len(_NVFP4_VARIANTS) == 17
 
 
 def test_nvfp4_plan_head_tiles_and_caps():
@@ -255,7 +259,11 @@ def test_nvfp4_plan_head_tiles_and_caps():
             sm_count=148,
         )
         assert plan.num_head_tiles == 1
-        assert plan.member == ("swap" if heads <= 32 else "tile")
+        # 4 tokens x 1 tile = 4 work items -> 4 CTAs per work item: H64 takes the H64 tile member
+        assert plan.member == (
+            "swap" if heads <= 32 else "tile_h64" if heads <= 64 else "tile"
+        )
+        assert plan.o_chunks == 4
     with pytest.raises(ValueError, match="num_heads"):
         _nvfp4_plan(
             num_query_tokens=4,

@@ -215,6 +215,9 @@ def autotune_bf16_nvfp4_mega_moe(
     winner = candidates[best]
     frontend.apply_knobs(winner)
     p50_s = float(t[best])
+    from flashinfer.moe_ep.core.tuning import tuning_live_tokens
+
+    live_tokens = tuning_live_tokens(num_tokens, cfg.num_tokens_per_rank, process_group)
     if cfg.rank == 0:
         from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import record_knobs
 
@@ -227,8 +230,10 @@ def autotune_bf16_nvfp4_mega_moe(
             num_experts=cfg.num_total_experts,
             topk=cfg.num_topk,
             max_tokens=cfg.num_tokens_per_rank,
+            live_tokens=live_tokens,
             combine_dtype="bf16",
             apply_topk_in_fc1=cfg.apply_topk_in_fc1,
+            defer_topk_reduce=cfg.defer_topk_reduce,
             p50_us=p50_s * 1e6,
             source="autotune_graph_events",
         )

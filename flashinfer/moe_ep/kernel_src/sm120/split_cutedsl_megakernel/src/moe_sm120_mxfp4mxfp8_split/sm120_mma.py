@@ -140,8 +140,6 @@ def _arch_mma_m16n8k32_mxfp8(
     b_dtype: Type[cutlass.Numeric],
     acc_dtype: Type[cutlass.Numeric],
     sf_dtype: Type[cutlass.Numeric],
-    byte_id_a: int = 0,
-    byte_id_b: int = 0,
     thread_id_a: int = 0,
     thread_id_b: int = 0,
     loc=None,
@@ -158,6 +156,7 @@ def _arch_mma_m16n8k32_mxfp8(
     sfa_i8 = sfa_scalar.bitcast(cutlass.Int8, loc=loc, ip=ip)
     sfb_i8 = sfb_scalar.bitcast(cutlass.Int8, loc=loc, ip=ip)
 
+    # Byte selectors are for packed 32-bit scale words, not these scalar bytes.
     shape_attr = _pack_shape((MMA_M, MMA_N, MMA_K), loc=loc, ip=ip).type.attribute
     res = _cute_nvgpu_ir.arch_mma_SM120_block_scaled(
         [acc_dtype.mlir_type] * 4,
@@ -186,8 +185,6 @@ def _arch_mma_m16n8k32_mxfp8(
         sfb_i8.ir_value(loc=loc, ip=ip),
         thread_id_a=thread_id_a,
         thread_id_b=thread_id_b,
-        byte_id_a=cutlass.Int16(byte_id_a).ir_value(loc=loc, ip=ip),
-        byte_id_b=cutlass.Int16(byte_id_b).ir_value(loc=loc, ip=ip),
         loc=loc,
         ip=ip,
     )
