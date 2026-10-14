@@ -758,6 +758,44 @@ jobs:
             echo "$REPORT"
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # Save the report for the PR comment step.
+          echo "$REPORT" > "$RUNNER_TEMP/skip-all-report.md"
+
+      - name: Comment on PR about skip-all findings
+        if: steps.skip-all.outputs.skip_all_found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Build comment body from the saved report.
+          {
+            echo "⚠️ **Skip-all detection (IKL-569)**"
+            echo ""
+            echo "Some changed test files had **all nodes skipped** on every CI lane."
+            echo "This means CI passed without executing any of the new or modified tests."
+            echo ""
+            echo "<details>"
+            echo "<summary>Full report</summary>"
+            echo ""
+            cat "$RUNNER_TEMP/skip-all-report.md"
+            echo ""
+            echo "</details>"
+            echo ""
+            echo "Please check whether the skipped tests are expected (e.g. SM arch not"
+            echo "available on any lane) or indicate a gap in CI coverage."
+          } > "$RUNNER_TEMP/skip-all-comment.md"
+
+          # Avoid duplicate comments on re-runs by deleting any prior bot comment
+          # with our marker.
+          EXISTING=$(gh api \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --paginate --jq '.[] | select(.body | contains("Skip-all detection (IKL-569)")) | .id')
+          for ID in $EXISTING; do
+            gh api -X DELETE "/repos/${{ github.repository }}/issues/comments/${ID}" || true
+          done
+
+          gh pr comment "$PR_NUMBER" --body-file "$RUNNER_TEMP/skip-all-comment.md"
+
       - name: Check trace reference coverage
         id: trace-coverage
         if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
