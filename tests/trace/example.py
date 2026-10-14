@@ -130,6 +130,7 @@ top_p_sampling_v151936.json
 trtllm_bf16_moe_topk2_e8_h1024_i512.json
 trtllm_bf16_routed_moe_topk2_e8_h1024.json
 trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3.json
+trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3_nvfp4_4over61.json
 trtllm_fp8_block_scale_routed_moe_topk2_e8_h1024.json
 trtllm_fp8_per_tensor_scale_moe_topk2_e8_h1024_i512.json
 trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
@@ -2018,6 +2019,19 @@ flashinfer.prims_ts_fp4_block_scale_moe.fi_trace(
 )
 flashinfer.prims_ts_fp4_block_scale_routed_moe.fi_trace(
     topk_ids=_pts_moe_packed_topk,
+    **_pts_moe_fp4_common,
+)
+from flashinfer.quantization.nvfp4_quantization_utils import (  # noqa: E402
+    NVFP44Over6Config,
+)
+
+# An explicit 4over6 recipe adds the derived nvfp4_4over6 axis (wire code 1
+# for the default recipe); the definitions above leave it unset and so carry
+# no such axis.
+flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe.fi_trace(
+    topk_ids=_pts_moe_packed_topk,
+    per_token_scale=torch.ones(_pts_moe_T, dtype=torch.float32, device=device),
+    nvfp4_4over6=NVFP44Over6Config(),
     **_pts_moe_fp4_common,
 )
 

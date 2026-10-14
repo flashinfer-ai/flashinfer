@@ -1512,6 +1512,70 @@ def test_fi_trace_creates_nested_save_dir(tmp_path):
     assert json.loads(files[0].read_text())["name"] == defn["name"]
 
 
+def test_const_extract_axis_appears_only_when_derived():
+    """``Const(extract=)`` leaves the definition untouched when it yields None."""
+    from flashinfer.trace.template import Const, TraceTemplate, Tensor, Var
+
+    tmpl = TraceTemplate(
+        op_type="probe",
+        axes={
+            "rows": Var(),
+            "cols": Const(abbrev="c"),
+            "flag": Const(
+                abbrev="f",
+                extract=lambda kw: None if kw.get("flag") is None else int(kw["flag"]),
+            ),
+        },
+        inputs={"x": Tensor(["rows", "cols"])},
+        outputs={"y": Tensor(["rows", "cols"], dtype="bfloat16")},
+    )
+    trace = tmpl.build_fi_trace_fn("probe.api")
+    x = torch.empty(4, 8, device="meta")
+
+    absent = trace(x=x)
+    assert absent["name"] == "probe_c8"
+    assert "flag" not in absent["axes"]
+
+    present = trace(x=x, flag=0)
+    assert present["name"] == "probe_c8_f0"
+    assert present["axes"]["flag"]["value"] == 0
+
+
+def test_cutlass_fused_moe_fi_trace_nvfp4_4over6_axis():
+    """The recipe axis records the wire code: unset omits it, ``None`` is 0."""
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        NVFP44Over6Config,
+        nvfp4_4over6_code,
+    )
+
+    e, h, i, k, s = 4, 256, 512, 2, 16
+    kwargs = dict(
+        input=torch.empty(s, h, dtype=torch.bfloat16, device="meta"),
+        token_selected_experts=torch.empty(s, k, dtype=torch.int32, device="meta"),
+        token_final_scales=torch.empty(s, k, dtype=torch.float32, device="meta"),
+        fc1_expert_weights=torch.empty(
+            e, 2 * i, h, dtype=torch.bfloat16, device="meta"
+        ),
+        fc2_expert_weights=torch.empty(e, h, i, dtype=torch.bfloat16, device="meta"),
+        output_dtype=torch.bfloat16,
+        quant_scales=[],
+    )
+    trace = flashinfer.fused_moe.cutlass_fused_moe.fi_trace
+
+    unset = trace(**kwargs)
+    assert "nvfp4_4over6" not in unset["axes"]
+    assert unset["name"] == "cutlass_fused_moe_e4_h256_i512_topk2"
+
+    off = trace(**kwargs, nvfp4_4over6=None)
+    assert off["axes"]["nvfp4_4over6"]["value"] == 0
+    assert off["name"] == "cutlass_fused_moe_e4_h256_i512_topk2_nvfp4_4over60"
+
+    recipe = NVFP44Over6Config(e4m3_max=256)
+    pinned = trace(**kwargs, nvfp4_4over6=recipe)
+    assert pinned["axes"]["nvfp4_4over6"]["value"] == nvfp4_4over6_code(recipe)
+    assert pinned["name"].endswith(f"_nvfp4_4over6{nvfp4_4over6_code(recipe)}")
+
+
 def test_fi_trace_filename_matches_definition_name(tmp_path):
     """The written filename is exactly '<definition_name>.json'."""
     from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
