@@ -482,7 +482,9 @@ def test_bf16_kv_cache_is_rejected_by_sparse_attention():
 
 
 @sm90_only
-@pytest.mark.parametrize("fill", ["nan", "nan_k_only", "nan_v_only", "garbage", "zeros"])
+@pytest.mark.parametrize(
+    "fill", ["nan", "nan_k_only", "nan_v_only", "garbage", "zeros"]
+)
 def test_prefill_ignores_page_bytes_past_seqused_k(fill):
     """Page memory beyond seqused_k must not reach the result.
 
@@ -494,15 +496,15 @@ def test_prefill_ignores_page_bytes_past_seqused_k(fill):
     torch.manual_seed(0)
     batch, qlen, hq, hkv, mkt = 1, 128, 8, 1, 8
     npages = mkt * batch
-    kv = (torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4)
+    kv = torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4
     # sequence ends mid-page; everything after it is "uninitialized"
     seqlen = mkt * BLK_KV - 50
     last_pg, off = seqlen // BLK_KV, seqlen % BLK_KV
     if fill == "nan":
         kv[last_pg, :, off:, :] = float("nan")
-    elif fill == "nan_k_only":          # K tail NaN, V tail finite
+    elif fill == "nan_k_only":  # K tail NaN, V tail finite
         kv[last_pg, :, off:, :HEAD_DIM] = float("nan")
-    elif fill == "nan_v_only":          # V tail NaN, K tail finite
+    elif fill == "nan_v_only":  # V tail NaN, K tail finite
         kv[last_pg, :, off:, HEAD_DIM:] = float("nan")
     elif fill == "garbage":
         kv[last_pg, :, off:, :] = 1e4
@@ -516,14 +518,23 @@ def test_prefill_ignores_page_bytes_past_seqused_k(fill):
     page_table = torch.arange(npages, dtype=torch.int32, device="cuda").view(batch, mkt)
     seqused_k = torch.full((batch,), seqlen, dtype=torch.int32, device="cuda")
     out = msa_sparse_attention(
-        q, k, v, idx, cu_q, page_table=page_table, seqused_k=seqused_k,
-        causal=True, softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=1.0 / math.sqrt(HEAD_DIM),
     )
     assert torch.isfinite(out.float()).all(), f"{fill} tail leaked into the output"
 
 
 @sm90_only
-@pytest.mark.parametrize("pattern", ["all_equal", "few_distinct", "tied_top16", "ties_with_pad"])
+@pytest.mark.parametrize(
+    "pattern", ["all_equal", "few_distinct", "tied_top16", "ties_with_pad"]
+)
 def test_topk_select_returns_distinct_blocks_under_ties(pattern):
     """Exact score ties must not yield duplicate block indices.
 
@@ -535,20 +546,32 @@ def test_topk_select_returns_distinct_blocks_under_ties(pattern):
     torch.manual_seed(0)
     num_qo_heads, max_k_tiles, total_q = 4, 64, 32
     if pattern == "all_equal":
-        scores = torch.full((num_qo_heads, max_k_tiles, total_q), 1.0,
-                            dtype=torch.float32, device="cuda")
-    elif pattern == "few_distinct":                     # 4 values over 64 tiles
+        scores = torch.full(
+            (num_qo_heads, max_k_tiles, total_q),
+            1.0,
+            dtype=torch.float32,
+            device="cuda",
+        )
+    elif pattern == "few_distinct":  # 4 values over 64 tiles
         base = torch.tensor([3.0, 2.0, 1.0, 0.0], device="cuda")
-        scores = base.repeat(max_k_tiles // 4)[None, :, None].expand(
-            num_qo_heads, max_k_tiles, total_q).contiguous()
-    elif pattern == "tied_top16":                       # 16 tied winners, rest lower
-        scores = torch.zeros(num_qo_heads, max_k_tiles, total_q,
-                             dtype=torch.float32, device="cuda")
+        scores = (
+            base.repeat(max_k_tiles // 4)[None, :, None]
+            .expand(num_qo_heads, max_k_tiles, total_q)
+            .contiguous()
+        )
+    elif pattern == "tied_top16":  # 16 tied winners, rest lower
+        scores = torch.zeros(
+            num_qo_heads, max_k_tiles, total_q, dtype=torch.float32, device="cuda"
+        )
         scores[:, :16, :] = 5.0
-    else:                                               # ties plus padding
-        scores = torch.full((num_qo_heads, max_k_tiles, total_q), 2.0,
-                            dtype=torch.float32, device="cuda")
-        scores[:, 8:, :] = float("-inf")                # only 8 valid tiles
+    else:  # ties plus padding
+        scores = torch.full(
+            (num_qo_heads, max_k_tiles, total_q),
+            2.0,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        scores[:, 8:, :] = float("-inf")  # only 8 valid tiles
     out = msa_topk_select(scores, TOPK)
     bad = []
     for t in range(total_q):
