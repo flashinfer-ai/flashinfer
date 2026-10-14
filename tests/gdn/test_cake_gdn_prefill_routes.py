@@ -29,7 +29,9 @@ def test_sm107a_routes_the_vec2_state_io_twins_per_shipped_schedule(schedule):
     indexed = cake_gdn.cake_gdn_prefill_seq_schedule(
         "sm_107a", schedule, use_state_indices=True
     )
-    expected = schedule if indexed_body == "base" else f"{schedule}_sm107a_{indexed_body}"
+    expected = (
+        schedule if indexed_body == "base" else f"{schedule}_sm107a_{indexed_body}"
+    )
     assert indexed == expected
     for arch in ("sm_100a", "sm_103a"):
         for use_state_indices in (False, True):
