@@ -113,6 +113,7 @@ class TestBf16Fc1TmaRoute:
         top_k=1,
         swap_ab=False,
         act_kind=0,
+        pipeline_stages=4,
     ):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -132,7 +133,7 @@ class TestBf16Fc1TmaRoute:
             tile_k=128,
             mma_n=tile_n,
             epi_tile_n=tile_n,
-            **uniform_pipeline_stage_overrides(4),
+            **uniform_pipeline_stage_overrides(pipeline_stages),
             **cfg,
         )
         assert result
@@ -175,6 +176,17 @@ class TestBf16Fc1TmaRoute:
 
     def test_tma_route_nonrounded_topk(self):
         self._run(num_experts=3, num_tokens=130, top_k=2, swap_ab=False)
+
+    @pytest.mark.parametrize("tile_n", [16, 32, 128])
+    def test_tma_route_swap_partial_tile(self, tile_n):
+        self._run(
+            num_experts=3,
+            num_tokens=130,
+            top_k=2,
+            swap_ab=True,
+            tile_n=tile_n,
+            pipeline_stages=3,
+        )
 
 
 class TestBf16Fc1ActivationValidation:

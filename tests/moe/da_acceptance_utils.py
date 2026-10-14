@@ -7,7 +7,8 @@ import math
 import pytest
 import torch
 
-from benchmarks.bench_trtllm_moe_da import BenchmarkShape, _benchmark_precision
+from benchmarks.bench_moe_da import BenchmarkShape, _benchmark_precision
+from flashinfer.fused_moe.da_tuner import FullOpMeasurementCache
 from flashinfer.utils import get_compute_capability
 
 
@@ -21,6 +22,24 @@ PRODUCTION_PRECISIONS = (
     "mxfp8",
     "mxint4",
 )
+_COUNTERBALANCED_GRAPH_ITERATIONS = 2
+
+
+def force_profile_winner_crossover(monkeypatch) -> None:
+    """Keep forced graph-body choices distinct while still profiling real kernels."""
+    profile = FullOpMeasurementCache.measure
+    winners = {}
+
+    def measured_crossover(self, key, measure):
+        elapsed = profile(self, key, measure)
+        if key[1] != "da":
+            return elapsed
+        # Forced search returns its chosen body without measuring alternatives. Retain that
+        # first body as the exemplar winner, with a decisive synthetic crossover for pruning.
+        winner = winners.setdefault((self, key[0]), key[2])
+        return 1.0 if key[2] == winner else 2.0
+
+    monkeypatch.setattr(FullOpMeasurementCache, "measure", measured_crossover)
 
 
 def require_sm100() -> None:
@@ -81,7 +100,7 @@ def run_matched_public_graphs(
         cache,
         tune,
         0,
-        1,
+        _COUNTERBALANCED_GRAPH_ITERATIONS,
     )
     # Validate numerical, timing, policy, and topology fields exposed to benchmark users.
     assert len(rows) == len(distributions)

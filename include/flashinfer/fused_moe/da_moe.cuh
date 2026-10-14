@@ -200,11 +200,12 @@ inline cudaError_t GetGraphEdgeCount(cudaGraph_t graph, size_t* edge_count) {
 
 /** Read the concrete predecessor nodes attached to one CUDA Graph node. */
 inline cudaError_t GetGraphNodeDependenciesView(cudaGraphNode_t node, cudaGraphNode_t* dependencies,
+                                                cudaGraphEdgeData* edge_data,
                                                 size_t* num_dependencies) {
 #if CUDART_VERSION >= 13000
-  return cudaGraphNodeGetDependencies(node, dependencies, nullptr, num_dependencies);
+  return cudaGraphNodeGetDependencies(node, dependencies, edge_data, num_dependencies);
 #else
-  return cudaGraphNodeGetDependencies(node, dependencies, num_dependencies);
+  return cudaGraphNodeGetDependencies_v2(node, dependencies, edge_data, num_dependencies);
 #endif
 }
 
@@ -212,7 +213,7 @@ inline cudaError_t GetGraphNodeDependenciesView(cudaGraphNode_t node, cudaGraphN
 inline cudaError_t GetGraphNodeDependencies(cudaGraphNode_t node,
                                             std::vector<cudaGraphNode_t>* dependencies) {
   size_t num_dependencies = 0;
-  cudaError_t status = GetGraphNodeDependenciesView(node, nullptr, &num_dependencies);
+  cudaError_t status = GetGraphNodeDependenciesView(node, nullptr, nullptr, &num_dependencies);
   if (status != cudaSuccess) {
     return status;
   }
@@ -220,7 +221,15 @@ inline cudaError_t GetGraphNodeDependencies(cudaGraphNode_t node,
   if (num_dependencies == 0) {
     return cudaSuccess;
   }
-  return GetGraphNodeDependenciesView(node, dependencies->data(), &num_dependencies);
+  // PDL edges require metadata; omitting it makes CUDA reject a lossy query.
+  std::vector<cudaGraphEdgeData> edge_data(num_dependencies);
+  status =
+      GetGraphNodeDependenciesView(node, dependencies->data(), edge_data.data(), &num_dependencies);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  dependencies->resize(num_dependencies);
+  return cudaSuccess;
 }
 
 /** Return whether two dependency lists contain the same concrete graph nodes. */
@@ -279,6 +288,8 @@ inline cudaError_t ValidateWorkspaceLaneSequence(const ActiveCaptureContext& con
 
   // Any current frontier node transitively descending from the previous conditional establishes
   // the happens-before path inherited by both sibling roots of the next invocation.
+  // Conditional nodes have only full-completion outgoing edges. Later kernel-to-kernel PDL
+  // edges can overlap those kernels, but cannot let them start before this conditional finishes.
   for (cudaGraphNode_t dependency : context.dependencies) {
     bool depends_on = false;
     cudaError_t status = GraphNodeDependsOn(dependency, previous_conditional_node, &depends_on);
@@ -292,6 +303,26 @@ inline cudaError_t ValidateWorkspaceLaneSequence(const ActiveCaptureContext& con
   }
   *is_serialized = false;
   return cudaSuccess;
+}
+
+/** Identify one newly launched root even when CUDA retains older frontier nodes. */
+inline cudaError_t GetNewCaptureFrontierNode(const ActiveCaptureContext& before,
+                                             const ActiveCaptureContext& after,
+                                             cudaGraphNode_t* node) {
+  *node = nullptr;
+  if (before.capture_id != after.capture_id || before.graph != after.graph) {
+    return cudaErrorInvalidValue;
+  }
+  for (cudaGraphNode_t dependency : after.dependencies) {
+    if (std::find(before.dependencies.begin(), before.dependencies.end(), dependency) ==
+        before.dependencies.end()) {
+      if (*node != nullptr) {
+        return cudaErrorInvalidValue;
+      }
+      *node = dependency;
+    }
+  }
+  return *node == nullptr ? cudaErrorInvalidValue : cudaSuccess;
 }
 
 /** Snapshot the active stream capture graph and its current dependency frontier. */
@@ -490,7 +521,7 @@ __device__ __forceinline__ void DASortCountsWarpBitonicDescending(int* counts, i
   __syncthreads();
 }
 
-/** Sort a two-item-per-thread count vector in descending order with CUB radix sort. */
+/** Sort a bounded items-per-thread count vector in descending order with CUB radix sort. */
 template <int ItemsPerThread>
 __device__ __forceinline__ void DASortCountsCubDescending(int* counts, int num_experts,
                                                           int64_t count_upper_bound) {
@@ -627,17 +658,19 @@ template <int MaxExemplars>
 __device__ __forceinline__ void DAComputeSimilarities(const int* counts,
                                                       const float* exemplar_spectra,
                                                       float* similarities, int num_experts,
+                                                      int num_local_experts,
                                                       int num_selector_exemplars) {
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   if (warp < num_selector_exemplars && warp < MaxExemplars) {
     const float* exemplar = exemplar_spectra + warp * num_experts;
     float partial = 0.0F;
-    for (int index = lane; index < num_experts; index += kDASelectorBlockThreads) {
+    // Spectra keep their global row stride, but the sorted nonzero prefix is rank-local.
+    for (int index = lane; index < num_local_experts; index += kDASelectorBlockThreads) {
 #pragma unroll
       for (int offset = 0; offset < kDASelectorBlockThreads; offset += 32) {
         const int element = index + offset;
-        if (element < num_experts) {
+        if (element < num_local_experts) {
           partial += static_cast<float>(counts[element]) * exemplar[element];
         }
       }
@@ -653,16 +686,14 @@ __device__ __forceinline__ void DAComputeSimilarities(const int* counts,
 
 /** Sort the live spectrum, choose its nearest exemplar, and activate the mapped body. */
 template <int MaxExperts, int MaxExemplars>
-__device__ __forceinline__ void DAFinishSelection(int* counts, float* similarities,
-                                                  const float* exemplar_spectra,
-                                                  const int32_t* exemplar_body_indices,
-                                                  int num_experts, int num_selector_exemplars,
-                                                  int64_t assignment_numel, int sort_items,
-                                                  cudaGraphConditionalHandle conditional_handle,
-                                                  int32_t* selected_body) {
+__device__ __forceinline__ void DAFinishSelection(
+    int* counts, float* similarities, const float* exemplar_spectra,
+    const int32_t* exemplar_body_indices, int num_experts, int num_local_experts,
+    int num_selector_exemplars, int64_t assignment_numel, int sort_items,
+    cudaGraphConditionalHandle conditional_handle, int32_t* selected_body) {
   int sort_length = static_cast<int>(DANextPowerOfTwo(static_cast<unsigned int>(sort_items)));
   sort_length = min(sort_length, MaxExperts);
-  for (int index = threadIdx.x + num_experts; index < sort_length; index += blockDim.x) {
+  for (int index = threadIdx.x + num_local_experts; index < sort_length; index += blockDim.x) {
     counts[index] = 0;
   }
   __syncthreads();
@@ -673,14 +704,16 @@ __device__ __forceinline__ void DAFinishSelection(int* counts, float* similariti
     } else if (sort_length <= kDASelectorBlockThreads) {
       DASortCountsRegisterBitonicDescending(counts, sort_length);
     } else {
-      static_assert(MaxExperts <= 2 * kDASelectorBlockThreads,
-                    "DA selector supports at most two radix-sort items per thread");
-      DASortCountsCubDescending<2>(counts, num_experts, assignment_numel);
+      constexpr int kItemsPerThread =
+          (MaxExperts + kDASelectorBlockThreads - 1) / kDASelectorBlockThreads;
+      static_assert(kItemsPerThread <= 4,
+                    "DA selector supports at most four radix-sort items per thread");
+      DASortCountsCubDescending<kItemsPerThread>(counts, num_local_experts, assignment_numel);
     }
   }
 
   DAComputeSimilarities<MaxExemplars>(counts, exemplar_spectra, similarities, num_experts,
-                                      num_selector_exemplars);
+                                      num_local_experts, num_selector_exemplars);
   __syncthreads();
   if (threadIdx.x == 0) {
     int nearest_exemplar = 0;
@@ -697,16 +730,55 @@ __device__ __forceinline__ void DAFinishSelection(int* counts, float* similariti
   }
 }
 
+/** Accumulate one CTA's local expert counts from the explicit routing representation. */
+template <int MaxExperts, bool PackedRoutingEntries, typename RoutingEntry>
+__device__ __forceinline__ void DAAccumulateHistogram(const RoutingEntry* routing_entries,
+                                                      int64_t assignment_numel,
+                                                      int local_expert_offset,
+                                                      int num_local_experts,
+                                                      unsigned int* histogram) {
+  using BlockHistogram = cub::BlockHistogram<unsigned short, kDASelectorBlockThreads,
+                                             kDASelectorHistogramItemsPerThread, MaxExperts + 1,
+                                             cub::BLOCK_HISTO_ATOMIC>;
+  __shared__ typename BlockHistogram::TempStorage histogram_storage;
+
+  BlockHistogram(histogram_storage).InitHistogram(histogram);
+  __syncthreads();
+  for (int64_t base = blockIdx.x * blockDim.x * kDASelectorHistogramItemsPerThread;
+       base < assignment_numel;
+       base += gridDim.x * blockDim.x * kDASelectorHistogramItemsPerThread) {
+    unsigned short items[kDASelectorHistogramItemsPerThread];
+#pragma unroll
+    for (int item = 0; item < kDASelectorHistogramItemsPerThread; ++item) {
+      const int64_t index = base + threadIdx.x + item * blockDim.x;
+      int expert = -1;
+      if (index < assignment_numel) {
+        expert = routing_entries[index];
+        if constexpr (PackedRoutingEntries) {
+          expert >>= 16;
+        }
+      }
+      const bool is_local =
+          expert >= local_expert_offset && expert < local_expert_offset + num_local_experts;
+      items[item] =
+          static_cast<unsigned short>(is_local ? expert - local_expert_offset : MaxExperts);
+    }
+    BlockHistogram(histogram_storage).Composite(items, histogram);
+    __syncthreads();
+  }
+}
+
 /** Select the nearest uploaded load spectrum from packed or unpacked routing entries. */
 template <int MaxExperts, int MaxExemplars, bool PackedRoutingEntries = false,
           typename RoutingEntry = int32_t>
 __global__ void DASelectorKernel(const RoutingEntry* routing_entries, int64_t assignment_numel,
-                                 int num_experts, const float* exemplar_spectra,
+                                 int num_experts, int local_expert_offset, int num_local_experts,
+                                 const float* exemplar_spectra,
                                  const int32_t* exemplar_body_indices, int num_selector_exemplars,
                                  cudaGraphConditionalHandle conditional_handle,
                                  int32_t* selected_body) {
-  static_assert(MaxExperts <= 2 * kDASelectorBlockThreads,
-                "DA selector supports at most two expert bins per thread");
+  static_assert(MaxExperts <= 4 * kDASelectorBlockThreads,
+                "DA selector supports at most four expert bins per thread");
   static_assert(MaxExperts < USHRT_MAX,
                 "DA selector expert and sentinel bins must fit in unsigned short");
   static_assert(MaxExemplars <= kDASelectorBlockThreads / 32,
@@ -725,36 +797,58 @@ __global__ void DASelectorKernel(const RoutingEntry* routing_entries, int64_t as
   __shared__ int counts[MaxExperts];
   __shared__ unsigned int histogram[MaxExperts + 1];
   __shared__ float similarities[MaxExemplars];
-  using BlockHistogram = cub::BlockHistogram<unsigned short, kDASelectorBlockThreads,
-                                             kDASelectorHistogramItemsPerThread, MaxExperts + 1,
-                                             cub::BLOCK_HISTO_ATOMIC>;
-  __shared__ typename BlockHistogram::TempStorage histogram_storage;
+  DAAccumulateHistogram<MaxExperts, PackedRoutingEntries>(
+      routing_entries, assignment_numel, local_expert_offset, num_local_experts, histogram);
 
-  BlockHistogram(histogram_storage).InitHistogram(histogram);
-  __syncthreads();
-  for (int64_t base = 0; base < assignment_numel;
-       base += blockDim.x * kDASelectorHistogramItemsPerThread) {
-    unsigned short items[kDASelectorHistogramItemsPerThread];
-#pragma unroll
-    for (int item = 0; item < kDASelectorHistogramItemsPerThread; ++item) {
-      const int64_t index = base + threadIdx.x + item * blockDim.x;
-      int expert = -1;
-      if (index < assignment_numel) {
-        expert = routing_entries[index];
-        if constexpr (PackedRoutingEntries) {
-          expert >>= 16;
-        }
-      }
-      items[item] =
-          static_cast<unsigned short>(expert >= 0 && expert < num_experts ? expert : MaxExperts);
-    }
-    BlockHistogram(histogram_storage).Composite(items, histogram);
-    __syncthreads();
-  }
-
-  const int sort_items = DACompactCountsForSort(counts, histogram, num_experts);
+  const int sort_items = DACompactCountsForSort(counts, histogram, num_local_experts);
   DAFinishSelection<MaxExperts, MaxExemplars>(
-      counts, similarities, exemplar_spectra, exemplar_body_indices, num_experts,
+      counts, similarities, exemplar_spectra, exemplar_body_indices, num_experts, num_local_experts,
+      num_selector_exemplars, assignment_numel, sort_items, conditional_handle, selected_body);
+}
+
+/** Keep small scans in one launch; large scans amortize a separate histogram reduction. */
+inline int DASelectorHistogramBlocks(int64_t assignment_numel) {
+  constexpr int kItemsPerBlock = kDASelectorBlockThreads * kDASelectorHistogramItemsPerThread;
+  // B200 crossover is above the small-input regime; eight chunks retain a conservative margin.
+  if (assignment_numel < 8 * kItemsPerBlock) return 1;
+  return static_cast<int>(
+      std::min<int64_t>(64, (assignment_numel + kItemsPerBlock - 1) / kItemsPerBlock));
+}
+
+/** Write complete per-CTA histograms so replay never depends on cleared scratch state. */
+template <int MaxExperts, bool PackedRoutingEntries = false, typename RoutingEntry = int32_t>
+__global__ void DAHistogramKernel(const RoutingEntry* routing_entries, int64_t assignment_numel,
+                                  int local_expert_offset, int num_local_experts,
+                                  int32_t* partial_histograms) {
+  __shared__ unsigned int histogram[MaxExperts + 1];
+  DAAccumulateHistogram<MaxExperts, PackedRoutingEntries>(
+      routing_entries, assignment_numel, local_expert_offset, num_local_experts, histogram);
+  for (int expert = threadIdx.x; expert < num_local_experts; expert += blockDim.x) {
+    partial_histograms[blockIdx.x * num_local_experts + expert] = histogram[expert];
+  }
+}
+
+/** Reduce complete histograms and publish the same body decision as the single-CTA selector. */
+template <int MaxExperts, int MaxExemplars>
+__global__ void DASelectFromHistogramsKernel(
+    const int32_t* partial_histograms, int num_histograms, int num_experts, int num_local_experts,
+    int64_t assignment_numel, const float* exemplar_spectra, const int32_t* exemplar_body_indices,
+    int num_selector_exemplars, cudaGraphConditionalHandle conditional_handle,
+    int32_t* selected_body) {
+  __shared__ int histogram[MaxExperts];
+  __shared__ int counts[MaxExperts];
+  __shared__ float similarities[MaxExemplars];
+  for (int expert = threadIdx.x; expert < num_local_experts; expert += blockDim.x) {
+    int count = 0;
+    for (int block = 0; block < num_histograms; ++block) {
+      count += partial_histograms[block * num_local_experts + expert];
+    }
+    histogram[expert] = count;
+  }
+  __syncthreads();
+  const int sort_items = DACompactCountsForSort(counts, histogram, num_local_experts);
+  DAFinishSelection<MaxExperts, MaxExemplars>(
+      counts, similarities, exemplar_spectra, exemplar_body_indices, num_experts, num_local_experts,
       num_selector_exemplars, assignment_numel, sort_items, conditional_handle, selected_body);
 }
 

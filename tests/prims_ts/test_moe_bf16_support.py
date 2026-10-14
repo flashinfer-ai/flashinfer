@@ -30,8 +30,9 @@ from flashinfer.prims_ts.moe.config_mapper import (
     map_trtllm_nvfp4_moe_tactic,
     valid_prims_ts_mxfp4_mxfp8_moe_tactics,
 )
-from flashinfer.prims_ts.moe import support
+from flashinfer.prims_ts.moe import config_mapper, support
 from flashinfer.prims_ts.moe.runner import (
+    _PrimsTsMoERunnerMixin,
     _filter_valid_moe_tactics,
     _routed_token_capacity,
 )
@@ -251,6 +252,36 @@ def test_kimi_k3_tile_selection_keeps_128_and_adds_192(num_tokens):
         num_local_experts=56,
         supported_tiles=SUPPORTED_MXFP4_MXFP8_TILE_N,
     ) == (128, 192, 256)
+
+
+@pytest.mark.parametrize("num_tokens", [64, 8192])
+@pytest.mark.parametrize(
+    "enumerator,supported_tiles",
+    [
+        (
+            config_mapper.valid_prims_ts_bf16_moe_tactics,
+            config_mapper.SUPPORTED_BF16_TILE_N,
+        ),
+        (
+            config_mapper.valid_prims_ts_nvfp4_moe_tactics,
+            config_mapper.SUPPORTED_NVFP4_TILE_N,
+        ),
+        (
+            config_mapper.valid_prims_ts_mxfp4_mxfp8_moe_tactics,
+            SUPPORTED_MXFP4_MXFP8_TILE_N,
+        ),
+    ],
+)
+def test_autotune_keeps_supported_tiles_across_token_counts(
+    num_tokens, enumerator, supported_tiles
+):
+    tactics = enumerator(num_tokens=num_tokens, top_k=6, num_local_experts=48)
+    unpruned = enumerator(top_k=6, num_local_experts=48)
+    # Kernel compatibility may exclude a tile (e.g. BF16 tile 256); token
+    # occupancy must not remove any otherwise valid tactic.
+    assert tactics == unpruned
+    assert {8, 16, 32, 64, 128} <= {tile_n for tile_n, _ in tactics}
+    assert {tile_n for tile_n, _ in tactics} <= set(supported_tiles)
 
 
 def test_kimi_k3_n192_pair_uses_compact_scale_factor_copies():
@@ -639,6 +670,76 @@ def test_runner_filter_drops_unbuildable_json_tactics():
     assert filtered == [[8, valid_pair.moe_config_index]]
 
 
+def test_factorized_space_skips_unbuildable_candidates_before_choosing_anchor():
+    runner = SimpleNamespace(get_valid_tactics=lambda *_: [-1, [8, 0], [8, 1]])
+
+    def resolve(tactic):
+        if tactic == [8, 0]:
+            raise ValueError("SMEM usage exceeds hardware capacity")
+        return SimpleNamespace(
+            tile_n=8,
+            moe_config_index=1,
+            fc1=SimpleNamespace(prims_ts_gemm_config_index=10),
+            fc2=SimpleNamespace(prims_ts_gemm_config_index=20),
+        )
+
+    space = _PrimsTsMoERunnerMixin._factorized_tactic_space(runner, [], resolve)
+    assert space.tiles == (8,)
+    assert space.anchor(8).tactic == (8, 1)
+    assert space.resolve_public_tactic([8, 1]).fc1 == 10
+    runner.get_valid_tactics = lambda *_: [[8, 0]]
+    with pytest.raises(ValueError, match="cannot be empty"):
+        _PrimsTsMoERunnerMixin._factorized_tactic_space(runner, [], resolve)
+
+
+def test_default_tactic_checks_buildability_before_accepting_fallback_tile(monkeypatch):
+    checked = []
+
+    def make_pair(**kwargs):
+        return SimpleNamespace(tile_n=kwargs["tile_n"])
+
+    def ensure_pair(pair, **kwargs):
+        checked.append(pair.tile_n)
+        if pair.tile_n == 64:
+            raise ValueError("SMEM usage exceeds hardware capacity")
+
+    monkeypatch.setattr(config_mapper, "_make_default_json_moe_config_pair", make_pair)
+    monkeypatch.setattr(config_mapper, "_make_json_moe_config_pair", make_pair)
+    monkeypatch.setattr(config_mapper, "_ensure_pair_buildable", ensure_pair)
+    pair = config_mapper._required_json_moe_config_pair(
+        tile_n=64, moe_config_index=-1, dtype_label="BF16", fallback_tile_ns=(64, 32)
+    )
+    assert pair.tile_n == 32
+    assert checked == [64, 32]
+    # A concrete caller-selected tactic must never be replaced with another tile.
+    with pytest.raises(ValueError, match="SMEM usage"):
+        config_mapper._required_json_moe_config_pair(
+            tile_n=64, moe_config_index=0, dtype_label="BF16"
+        )
+    with pytest.raises(ValueError, match="SMEM usage"):
+        config_mapper._required_json_moe_config_pair(
+            tile_n=64, moe_config_index=-1, dtype_label="BF16", fallback_tile_ns=(64,)
+        )
+
+
+@pytest.mark.parametrize("num_tokens", [512, 8192])
+def test_relu2_default_tactic_is_buildable_for_nemotron_routed_geometry(num_tokens):
+    from flashinfer.prims_ts import is_prims_ts_device_supported
+
+    if not torch.cuda.is_available() or not is_prims_ts_device_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("PrimsTS supported device required")
+    pair = map_trtllm_bf16_moe_tactic(
+        -1,
+        activation_type=int(ActivationType.Relu2),
+        num_tokens=num_tokens,
+        top_k=22,
+        num_local_experts=128,
+    )
+    assert pair.moe_config_index >= 0
+
+
 def test_config_mapper_matches_default_tile_selection():
     pair = map_trtllm_bf16_moe_tactic(
         [-1, -1],
@@ -693,7 +794,7 @@ def test_support_reports_missing_dependencies(monkeypatch):
 
 def test_support_rejects_lora_after_dependency_and_device_checks(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
     ok, reason = support.is_prims_ts_bf16_supported(
         _runner(),
         _inputs(gemm1_lora_delta=torch.empty((1,), dtype=torch.bfloat16)),
@@ -706,7 +807,7 @@ def test_support_rejects_lora_after_dependency_and_device_checks(monkeypatch):
 
 def test_support_accepts_shuffled_major_k(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_bf16_supported(
         _runner(),
@@ -722,7 +823,7 @@ def test_support_accepts_shuffled_major_k(monkeypatch):
 
 def test_support_accepts_block_major_k(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_bf16_supported(
         _runner(weight_layout=WeightLayout.BlockMajorK),
@@ -738,7 +839,7 @@ def test_support_accepts_block_major_k(monkeypatch):
 
 def test_support_accepts_swiglu_oa_params(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_bf16_supported(
         _runner(),
@@ -757,7 +858,7 @@ def test_support_accepts_swiglu_oa_params(monkeypatch):
 
 def test_support_accepts_kimi_k3_situ_params(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_bf16_supported(
         _runner(activation_type=ActivationType.Situ),
@@ -775,7 +876,7 @@ def test_support_accepts_kimi_k3_situ_params(monkeypatch):
 
 def test_support_rejects_oa_params_for_non_swiglu(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_bf16_supported(
         _runner(activation_type=ActivationType.Geglu),
@@ -803,7 +904,7 @@ def test_support_accepts_locally_configured_activations(
     monkeypatch, activation_type: ActivationType
 ):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_bf16_supported(
         _runner(activation_type=activation_type),
@@ -829,7 +930,7 @@ def test_support_rejects_activations_without_local_config(
     monkeypatch, activation_type: ActivationType
 ):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_bf16_supported(
         _runner(activation_type=activation_type),
@@ -846,7 +947,7 @@ def test_support_rejects_activations_without_local_config(
 
 def test_support_accepts_nvfp4_per_token_scale_local_config(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_nvfp4_supported(
         _runner(
@@ -877,7 +978,7 @@ def test_support_accepts_fp8_per_tensor_llama4_routing_scale_tactic_with_sfa(
     monkeypatch,
 ):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_fp8_per_tensor_supported(
         _runner(
@@ -907,7 +1008,7 @@ def test_support_accepts_fp8_per_tensor_llama4_routing_scale_tactic_with_sfa(
 
 def test_support_accepts_fp8_per_tensor_routing_scale_without_sfa(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_fp8_per_tensor_supported(
         _runner(
@@ -937,7 +1038,7 @@ def test_support_accepts_fp8_per_tensor_bf16_routing_scale_dtype(
     monkeypatch,
 ):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_fp8_per_tensor_supported(
         _runner(
@@ -965,7 +1066,7 @@ def test_support_accepts_fp8_per_tensor_bf16_routing_scale_dtype(
 
 def test_support_rejects_fp8_per_tensor_mismatched_sfa_sfb_dtype(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_fp8_per_tensor_supported(
         _runner(
@@ -998,7 +1099,7 @@ def test_support_rejects_fp8_per_tensor_mismatched_sfa_sfb_dtype(monkeypatch):
 
 def test_support_rejects_fp8_per_tensor_sigmoid_routing(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_fp8_per_tensor_supported(
         _runner(
@@ -1019,7 +1120,7 @@ def test_support_rejects_fp8_per_tensor_sigmoid_routing(monkeypatch):
 
 def test_support_rejects_fp8_per_tensor_deepseekv3_non_gated(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_fp8_per_tensor_supported(
         _runner(
@@ -1041,7 +1142,7 @@ def test_support_rejects_fp8_per_tensor_deepseekv3_non_gated(monkeypatch):
 
 def test_support_rejects_unshuffled_major_k(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_bf16_supported(
         _runner(use_shuffled_weight=False),

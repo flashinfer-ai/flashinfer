@@ -102,22 +102,36 @@ class JitSpecCuteDsl(JitSpec):
         kernel_name: str,
         compile_fn: Callable[[], Any],
         source_sha256: str,
+        enable_tvm_ffi: bool = True,
+        load_symbol: Optional[str] = None,
+        native_function_prefix: Optional[str] = None,
     ):
+        """Describe one persistable CuTe-DSL kernel and its exported ABI."""
         self.module_name = module_name
         self.kernel_name = sanitize_symbol_name(kernel_name)
         self.compile_fn = compile_fn
+        if not enable_tvm_ffi and (
+            load_symbol is None or native_function_prefix is None
+        ):
+            raise ValueError(
+                "Native CuTe exports require a load symbol and function prefix"
+            )
+        self.enable_tvm_ffi = enable_tvm_ffi
+        self.native_function_prefix = native_function_prefix
         self.module_dir_name = sanitize_symbol_name(
             f"{module_name}_{_get_compile_arch()}_cute_dsl"
         )
         self.name = f"{self.module_dir_name}/{self.kernel_name}"
         self.module_dir = jit_env.FLASHINFER_JIT_DIR / self.module_dir_name
         self.object_path = self.module_dir / f"{self.kernel_name}.o"
-        self.symbol = f"{module_name}_{self.kernel_name}"
+        self.symbol = load_symbol or f"{module_name}_{self.kernel_name}"
         self.expected_meta = {
             "arch": _get_compile_arch(),
             "cute_dsl_version": _get_cute_dsl_version(),
             "source_sha256": source_sha256,
         }
+        if not enable_tvm_ffi:
+            self.expected_meta["abi"] = "native"
         # Set by build(): the freshly compiled in-process kernel, returned by
         # load() so a build is never followed by a redundant JITLink reload.
         self._compiled_kernel: Optional[Any] = None
@@ -243,7 +257,9 @@ class JitSpecCuteDsl(JitSpec):
     def _load_from_disk(self) -> Any:
         import cutlass.cute as cute
 
-        module = cute.runtime.load_module(str(self.object_path), enable_tvm_ffi=True)
+        module = cute.runtime.load_module(
+            str(self.object_path), enable_tvm_ffi=self.enable_tvm_ffi
+        )
         return getattr(module, self.symbol)
 
     def _export(self) -> None:
@@ -251,9 +267,19 @@ class JitSpecCuteDsl(JitSpec):
         tmp_object_path = self.object_path.with_suffix(f".o.tmp.{os.getpid()}")
         tmp_meta_path = self.meta_path.with_suffix(f".json.tmp.{os.getpid()}")
         try:
-            self._compiled_kernel.export_to_c(
-                str(tmp_object_path), function_name=self.symbol
-            )
+            if self.enable_tvm_ffi:
+                self._compiled_kernel.export_to_c(
+                    str(tmp_object_path), function_name=self.symbol
+                )
+            else:
+                # Native CuTe exports preserve the compiled function's source symbol and do
+                # not accept TVM-FFI's single-object export contract. dump_to_object avoids
+                # generating a C header, which cannot represent the explicit CUstream argument.
+                if self.native_function_prefix is None:
+                    raise ValueError("Native CuTe exports require a function prefix")
+                tmp_object_path.write_bytes(
+                    self._compiled_kernel.dump_to_object(self.native_function_prefix)
+                )
             os.replace(tmp_object_path, self.object_path)
             # meta.json is the module's commit marker: written after the
             # object file is in place so a crash never leaves a loadable
@@ -283,6 +309,10 @@ def build_and_load_cute_dsl_kernel(
     kernel_name: str,
     compile_fn: Callable[[], Any],
     extra_key_files: Sequence[str] = (),
+    *,
+    enable_tvm_ffi: bool = True,
+    load_symbol: Optional[str] = None,
+    native_function_prefix: Optional[str] = None,
 ) -> Any:
     """Compile a CuTe-DSL kernel with a persistent on-disk cache.
 
@@ -298,17 +328,26 @@ def build_and_load_cute_dsl_kernel(
     kernel_name : str
         Specialization name of the kernel.
     compile_fn : Callable[[], Any]
-        Zero-argument closure performing the
-        ``cute.compile(..., options="--enable-tvm-ffi")`` call.
+        Zero-argument closure performing ``cute.compile``. TVM-FFI callers must
+        enable that ABI in their compile options; native callers retain their
+        original pointer and stream argument contract.
     extra_key_files : Sequence[str]
         Source files whose content participates in cache invalidation.
         Shared by all kernels of the module; a change wipes and lazily
         rebuilds the whole module directory.
+    enable_tvm_ffi : bool
+        Load the exported object through TVM-FFI when true, or retain its native
+        CuTe ABI when false.
+    load_symbol : Optional[str]
+        Source-level symbol to load for a native-ABI export. Required when
+        ``enable_tvm_ffi`` is false; TVM-FFI callers normally leave this unset.
+    native_function_prefix : Optional[str]
+        Unique prefix embedded in a native CuTe object. Required with the native ABI.
 
     Returns
     -------
-    A TVM-FFI callable taking the same positional arguments as the
-    compiled kernel.
+    A callable preserving the compiled kernel's selected TVM-FFI or native
+    CuTe ABI.
     """
     if cute_dsl_cache_disabled():
         return compile_fn()
@@ -325,5 +364,13 @@ def build_and_load_cute_dsl_kernel(
         )
         return compile_fn()
 
-    spec = JitSpecCuteDsl(module_name, kernel_name, compile_fn, source_sha256)
+    spec = JitSpecCuteDsl(
+        module_name,
+        kernel_name,
+        compile_fn,
+        source_sha256,
+        enable_tvm_ffi=enable_tvm_ffi,
+        load_symbol=load_symbol,
+        native_function_prefix=native_function_prefix,
+    )
     return spec.build_and_load()

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
 import torch
+from cuda.bindings import runtime as cudart
 
-from benchmarks.bench_trtllm_moe_da import (
+from benchmarks.bench_moe_da import (
     _canonical_inputs,
     _capture,
     _matching_diagnostic,
@@ -23,21 +25,29 @@ from flashinfer.fused_moe import (
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8PerTensorConfig,
+    populate_trtllm_moe_routing_metadata_,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_moe_acquire_da_graph_leases,
     trtllm_moe_allocate_routing_metadata,
+    trtllm_moe_allocate_routing_metadata_multi_tile,
     trtllm_moe_da_diagnostics,
     trtllm_moe_release_da_resources,
 )
 from flashinfer.fused_moe.da_tuner import DADistribution, RoutingRealizationFactory
+from flashinfer.fused_moe.tactic_search import (
+    FactorizedSearch,
+    FactorizedTactic,
+    FactorizedTacticSpace,
+)
 from flashinfer.tllm_enums import RoutingInputMode, RoutingMethodType
 
 from tests.moe.da_acceptance_utils import (
     PRODUCTION_PRECISIONS,
     compact_shape,
+    force_profile_winner_crossover,
     deepseek_l0_shape,
     require_sm100,
     run_matched_public_graphs,
@@ -84,6 +94,474 @@ def _matching_from_logits_diagnostic(shape, distributions):
             f"Expected one FP8 FromLogits DA diagnostic, found {len(matches)}"
         )
     return matches[0]
+
+
+def _assert_routing_metadata_slots_equivalent(actual, expected, expert_ids) -> None:
+    """Check metadata and bijective expert-grouped mappings, allowing atomic row order."""
+    assert torch.equal(actual.total_num_padded_tokens, expected.total_num_padded_tokens)
+    assert torch.equal(actual.expert_weights, expected.expert_weights)
+    assert torch.equal(actual.num_tokens_per_expert, expected.num_tokens_per_expert)
+    assert torch.equal(actual.num_non_exiting_ctas, expected.num_non_exiting_ctas)
+    num_ctas = int(actual.num_non_exiting_ctas.item())
+    assert torch.equal(
+        actual.cta_idx_xy_to_batch_idx[:num_ctas],
+        expected.cta_idx_xy_to_batch_idx[:num_ctas],
+    )
+    assert torch.equal(
+        actual.cta_idx_xy_to_mn_limit[:num_ctas],
+        expected.cta_idx_xy_to_mn_limit[:num_ctas],
+    )
+    ids = expert_ids.flatten().long()
+    counts = torch.bincount(ids, minlength=actual.num_tokens_per_expert.numel())
+    assert torch.equal(actual.num_tokens_per_expert, counts)
+    padded = (counts + actual.tile_n - 1) // actual.tile_n * actual.tile_n
+    offsets = padded.cumsum(0) - padded
+    num_rows = int(padded.sum().item())
+    assert int(actual.total_num_padded_tokens.item()) == num_rows
+    for slot in (actual, expected):
+        permutation = slot.expanded_idx_to_permuted_idx.flatten().long()
+        # Each assignment has one unique row within its expert's live prefix.
+        assert permutation.unique().numel() == ids.numel()
+        assert torch.all(permutation >= offsets[ids])
+        assert torch.all(permutation < offsets[ids] + counts[ids])
+        inverse = torch.full((num_rows,), -1, dtype=torch.int32, device=ids.device)
+        inverse[permutation] = torch.arange(
+            expert_ids.shape[0], dtype=torch.int32, device=ids.device
+        ).repeat_interleave(expert_ids.shape[1])
+        assert torch.equal(slot.permuted_idx_to_token_idx[:num_rows], inverse)
+
+
+def _capture_kernel_node_count(invoke) -> int:
+    """Capture one invocation and count kernel nodes without timing it."""
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    try:
+        with torch.cuda.graph(graph):
+            invoke()
+
+        raw_graph = getattr(graph, "raw_cuda_graph", None)
+        if raw_graph is None:
+            pytest.skip("This PyTorch build does not expose raw CUDA Graph handles")
+        graph_handle = cudart.cudaGraph_t(int(raw_graph()))
+        status, _, node_count = cudart.cudaGraphGetNodes(graph_handle)
+        assert status == cudart.cudaError_t.cudaSuccess
+        status, nodes, _ = cudart.cudaGraphGetNodes(graph_handle, node_count)
+        assert status == cudart.cudaError_t.cudaSuccess
+        kernel_count = 0
+        for node in nodes:
+            status, node_type = cudart.cudaGraphNodeGetType(node)
+            assert status == cudart.cudaError_t.cudaSuccess
+            kernel_count += (
+                node_type == cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel
+            )
+        return kernel_count
+    finally:
+        graph.reset()
+
+
+# Fused routing capacity and exactness
+
+
+@pytest.mark.parametrize("num_tokens", (2048, 2049, 8192))
+@pytest.mark.parametrize("num_experts,top_k", ((256, 8), (512, 22)))
+@pytest.mark.parametrize(
+    "tile_ns",
+    (
+        (256,),
+        (64, 128),
+        (8, 16, 64),
+        (64, 128, 192),
+        (8, 16, 32, 64, 128),
+        (8, 16, 32, 64, 96, 128, 192, 256),
+    ),
+)
+@pytest.mark.parametrize(
+    "routing_input_mode,expert_id_dtype",
+    (
+        (RoutingInputMode.PackedPrecomputed, torch.int32),
+        (RoutingInputMode.UnpackedPrecomputed, torch.int16),
+        (RoutingInputMode.UnpackedPrecomputed, torch.int32),
+    ),
+)
+def test_fused_multi_tile_routing_matches_independent_tiles_at_capacity_boundaries(
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    routing_input_mode: RoutingInputMode,
+    expert_id_dtype: torch.dtype,
+    tile_ns: tuple[int, ...],
+) -> None:
+    """Fused and independent tiles must describe the same expert-grouped assignments."""
+    require_sm100()
+
+    # Give every token unique experts with deterministic wraparound, plus nonuniform live weights.
+    token_index = torch.arange(num_tokens, dtype=torch.int64).unsqueeze(1)
+    topk_index = torch.arange(top_k, dtype=torch.int64).unsqueeze(0)
+    expert_ids = ((token_index * 13 + topk_index * 17) % num_experts).to(
+        device="cuda", dtype=expert_id_dtype
+    )
+    routing_weights = (
+        (topk_index + 1).expand(num_tokens, -1).to(torch.bfloat16)
+        / float(top_k * (top_k + 1) // 2)
+    ).to(device="cuda")
+    if routing_input_mode is RoutingInputMode.PackedPrecomputed:
+        routing_ids = (
+            expert_ids.to(torch.int32)
+            .bitwise_left_shift(16)
+            .bitwise_or(
+                routing_weights.view(torch.int16).to(torch.int32).bitwise_and(0xFFFF)
+            )
+        )
+        routing_weights_arg = None
+    else:
+        routing_ids = expert_ids
+        routing_weights_arg = routing_weights
+
+    # Materialize an arbitrary tile mixture with one fused launch, then independently materialize
+    # the same slots through the public one-tile ABI to establish equivalent metadata.
+    fused = trtllm_moe_allocate_routing_metadata_multi_tile(
+        routing_ids,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        num_local_experts=num_experts,
+        tile_ns=tile_ns,
+        routing_input_mode=routing_input_mode,
+        topk_weights=routing_weights_arg,
+    )
+    for slot in fused.slots:
+        slot.permuted_idx_to_token_idx.fill_(-12345)
+    populate_trtllm_moe_routing_metadata_(fused, routing_ids, routing_weights_arg)
+    references = []
+    for tile_n in tile_ns:
+        single = trtllm_moe_allocate_routing_metadata_multi_tile(
+            routing_ids,
+            num_experts=num_experts,
+            top_k=top_k,
+            local_expert_offset=0,
+            num_local_experts=num_experts,
+            tile_ns=(tile_n,),
+            routing_input_mode=routing_input_mode,
+            topk_weights=routing_weights_arg,
+        )
+        populate_trtllm_moe_routing_metadata_(single, routing_ids, routing_weights_arg)
+        references.append(single.slots[0])
+    torch.cuda.synchronize()
+
+    for actual, expected in zip(fused.slots, references, strict=True):
+        assert actual.tile_n == expected.tile_n
+        _assert_routing_metadata_slots_equivalent(actual, expected, expert_ids)
+
+
+@pytest.mark.parametrize("num_tokens", (2730, 2731, 8192))
+@pytest.mark.parametrize("representation", ("int16", "int32", "packed"))
+@pytest.mark.parametrize("geometry", ((384, 48, 317, 6), (1024, 640, 317, 32)))
+def test_native_da_selector_replays_live_local_histograms(
+    num_tokens: int, representation: str, geometry: tuple[int, int, int, int]
+) -> None:
+    """Real SWITCH bodies follow a CPU oracle across the histogram launch boundary."""
+    from flashinfer.fused_moe.core import (
+        TrtllmDaSwitchCaptureState,
+        _get_trtllm_da_body_capture_lock,
+        _get_trtllm_da_body_capture_stream,
+        get_trtllm_moe_sm100_module,
+    )
+    from flashinfer.fused_moe.da_moe import DAGraphTopology
+
+    require_sm100()
+    runtime = get_trtllm_moe_sm100_module()
+    num_experts, local_experts, offset, top_k = geometry
+    assignments = torch.arange(num_tokens * top_k).reshape(num_tokens, top_k)
+    # Every row has distinct local experts and one remote expert. Include empty local work.
+    routes = []
+    for active in (local_experts, top_k, 2 * top_k):
+        ids = assignments.remainder(active) + offset
+        ids[:, -1] = 0
+        routes.append(ids)
+    routes.append(assignments.remainder(top_k))
+
+    def spectrum(ids):
+        local = ids[(ids >= offset) & (ids < offset + local_experts)] - offset
+        counts = (
+            torch.bincount(local, minlength=local_experts)
+            .double()
+            .sort(descending=True)
+            .values
+        )
+        return torch.nn.functional.pad(counts, (0, num_experts - local_experts))
+
+    reference = torch.stack([spectrum(ids) for ids in routes[:3]])
+    reference = torch.nn.functional.normalize(reference, dim=1)
+    spectra = reference.float().cuda()
+    bodies = torch.tensor([0, 1, 0], dtype=torch.int32, device="cuda")
+    weights = torch.full(
+        (num_tokens, top_k), 1 / top_k, dtype=torch.bfloat16, device="cuda"
+    )
+
+    def encode(ids):
+        if representation == "packed":
+            return (ids.to(device="cuda", dtype=torch.int32) << 16) | (
+                weights.view(torch.int16).to(torch.int32) & 0xFFFF
+            )
+        return ids.to(device="cuda", dtype=getattr(torch, representation))
+
+    live = encode(routes[0])
+    mode = (
+        RoutingInputMode.PackedPrecomputed
+        if representation == "packed"
+        else RoutingInputMode.UnpackedPrecomputed
+    )
+    weight_arg = None if representation == "packed" else weights
+    metadata = trtllm_moe_allocate_routing_metadata_multi_tile(
+        live,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=offset,
+        num_local_experts=local_experts,
+        tile_ns=(8, 64),
+        routing_input_mode=mode,
+        topk_weights=weight_arg,
+    )
+    selected = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+    observed = [torch.full_like(selected, -1) for _ in range(2)]
+    executed = [torch.full_like(selected, -1) for _ in range(2)]
+    live_inputs = (live, encode(routes[1]))
+    scratch = runtime.allocate_da_selector_workspace(live, local_experts)
+    device_index = torch.cuda.current_device()
+    stream = _get_trtllm_da_body_capture_stream(device_index)
+    for output, stamp in zip(observed, executed, strict=True):
+        output.copy_(selected)
+        stamp.fill_(0)
+        stamp.fill_(1)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            capture_id, previous_node = 0, 0
+            for ids, output, stamp in zip(live_inputs, observed, executed, strict=True):
+                # Different inputs share one serialized metadata/histogram lane.
+                state = TrtllmDaSwitchCaptureState.from_native(
+                    runtime.begin_da_switch_capture(
+                        ids,
+                        num_experts,
+                        top_k,
+                        offset,
+                        local_experts,
+                        list(metadata.tile_ns),
+                        metadata.flat_tensors(),
+                        int(mode),
+                        weight_arg,
+                        spectra,
+                        bodies,
+                        3,
+                        selected,
+                        scratch,
+                        2,
+                        capture_id,
+                        previous_node,
+                    )
+                )
+                with _get_trtllm_da_body_capture_lock(device_index):
+                    for body, handle in enumerate(state.body_graph_handles):
+                        runtime.begin_da_body_capture(
+                            device_index, stream.handle, handle
+                        )
+                        with torch.cuda.stream(stream.external_stream):
+                            stamp.fill_(body)
+                        runtime.end_da_body_capture(device_index, stream.handle, handle)
+                topology = DAGraphTopology.from_native(
+                    runtime.finish_da_switch_capture(ids, state.to_native())
+                )
+                assert topology.is_selector_preamble_parallelizable
+                assert topology.is_workspace_lane_serialized
+                output.copy_(selected)
+                capture_id = topology.capture_id
+                previous_node = state.conditional_node_handle
+        for ids in (*routes, routes[1], routes[0]):
+            second_ids = routes[0] if torch.equal(ids, routes[1]) else routes[1]
+            expected = []
+            for live_ids, payload in zip(live_inputs, (ids, second_ids), strict=True):
+                exemplar = (reference @ spectrum(payload)).argmax().item()
+                expected.append((0, 1, 0)[exemplar])
+                live_ids.copy_(encode(payload))
+            for _ in range(3):
+                # Poison retained scratch to catch missing writes and stale replay accumulation.
+                scratch.fill_(123456)
+                selected.fill_(-1)
+                for output, stamp in zip(observed, executed, strict=True):
+                    output.fill_(-1)
+                    stamp.fill_(-1)
+                graph.replay()
+                torch.cuda.synchronize()
+                assert [output.item() for output in observed] == expected
+                assert [stamp.item() for stamp in executed] == expected
+    finally:
+        graph.reset()
+
+
+@pytest.mark.parametrize("tile_ns", ((8,), (64, 128, 256), (64, 128, 192)))
+@pytest.mark.parametrize("num_experts", (256, 512))
+def test_long_multi_tile_routing_handles_local_and_nonlocal_experts(
+    tile_ns, num_experts
+) -> None:
+    """The extended-capacity permutation pass must ignore a nonlocal route."""
+    require_sm100()
+    num_tokens = 2049
+    local_expert_offset = 112
+    num_local_experts = 56
+    expert_ids = torch.empty((num_tokens, 2), device="cuda", dtype=torch.int32)
+    expert_ids[:, 0] = local_expert_offset
+    expert_ids[:, 1] = 0
+    routing_weights = torch.full(
+        (num_tokens, 2), 0.5, device="cuda", dtype=torch.bfloat16
+    )
+
+    metadata = trtllm_moe_allocate_routing_metadata_multi_tile(
+        expert_ids,
+        num_experts=num_experts,
+        top_k=2,
+        local_expert_offset=local_expert_offset,
+        num_local_experts=num_local_experts,
+        tile_ns=tile_ns,
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        topk_weights=routing_weights,
+    )
+    for slot in metadata.slots:
+        slot.permuted_idx_to_token_idx.fill_(-12345)
+    populate_trtllm_moe_routing_metadata_(metadata, expert_ids, routing_weights)
+    torch.cuda.synchronize()
+
+    for slot in metadata.slots:
+        expanded = slot.expanded_idx_to_permuted_idx.view(num_tokens, 2)
+        assert torch.all(expanded[:, 0] >= 0)
+        assert torch.all(expanded[:, 1] == -1)
+        assert slot.num_tokens_per_expert[local_expert_offset] == num_tokens
+        assert slot.num_tokens_per_expert[0] == 0
+        num_rows = int(slot.total_num_padded_tokens.item())
+        inverse = torch.full((num_rows,), -1, device="cuda", dtype=torch.int32)
+        inverse[expanded[:, 0].long()] = torch.arange(
+            num_tokens, device="cuda", dtype=torch.int32
+        )
+        assert torch.equal(slot.permuted_idx_to_token_idx[:num_rows], inverse)
+
+
+@pytest.mark.parametrize(
+    "routing_input_mode",
+    (RoutingInputMode.PackedPrecomputed, RoutingInputMode.UnpackedPrecomputed),
+)
+@pytest.mark.parametrize("tile_ns", ((8, 32), (64, 128, 256)))
+def test_fused_multi_tile_routing_supports_da_capacity_bounds(
+    routing_input_mode: RoutingInputMode,
+    tile_ns: tuple[int, ...],
+) -> None:
+    """The fused preamble must cover 1024 global experts and top-k 32."""
+    require_sm100()
+    num_tokens = 257
+    num_experts = 1024
+    top_k = 32
+    local_expert_offset = 480
+    num_local_experts = 64
+    token_index = torch.arange(num_tokens, device="cuda", dtype=torch.int32).unsqueeze(
+        1
+    )
+    topk_index = torch.arange(top_k, device="cuda", dtype=torch.int32).unsqueeze(0)
+    expert_ids = (token_index * 37 + topk_index * 53) % num_experts
+    routing_weights = torch.full(
+        (num_tokens, top_k),
+        1.0 / top_k,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    if routing_input_mode is RoutingInputMode.PackedPrecomputed:
+        routing_ids = expert_ids.bitwise_left_shift(16).bitwise_or(
+            routing_weights.view(torch.int16).to(torch.int32).bitwise_and(0xFFFF)
+        )
+        routing_weights_arg = None
+    else:
+        routing_ids = expert_ids
+        routing_weights_arg = routing_weights
+
+    metadata = trtllm_moe_allocate_routing_metadata_multi_tile(
+        routing_ids,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=local_expert_offset,
+        num_local_experts=num_local_experts,
+        tile_ns=tile_ns,
+        routing_input_mode=routing_input_mode,
+        topk_weights=routing_weights_arg,
+    )
+    populate_trtllm_moe_routing_metadata_(metadata, routing_ids, routing_weights_arg)
+    torch.cuda.synchronize()
+
+    expected_counts = torch.bincount(
+        expert_ids.flatten().to(torch.int64), minlength=num_experts
+    ).to(torch.int32)
+    local_mask = torch.zeros(num_experts, device="cuda", dtype=torch.bool)
+    local_mask[local_expert_offset : local_expert_offset + num_local_experts] = True
+    expected_counts[~local_mask] = 0
+    expected_live = local_mask[expert_ids.to(torch.int64)].flatten()
+    for slot in metadata.slots:
+        assert torch.equal(slot.num_tokens_per_expert, expected_counts)
+        assert torch.equal(slot.expanded_idx_to_permuted_idx >= 0, expected_live)
+
+
+def test_fused_multi_tile_routing_uses_one_kernel_node() -> None:
+    """Fused population captures one kernel instead of one kernel per tile."""
+    require_sm100()
+    num_tokens = 8192
+    num_experts = 256
+    top_k = 8
+    tile_ns = (8, 16, 64)
+    token_index = torch.arange(num_tokens, device="cuda", dtype=torch.int32).unsqueeze(
+        1
+    )
+    topk_index = torch.arange(top_k, device="cuda", dtype=torch.int32).unsqueeze(0)
+    expert_ids = (token_index * 13 + topk_index * 17) % num_experts
+    weights = torch.full(
+        (num_tokens, top_k), 1.0 / top_k, device="cuda", dtype=torch.bfloat16
+    )
+    packed = expert_ids.bitwise_left_shift(16).bitwise_or(
+        weights.view(torch.int16).to(torch.int32).bitwise_and(0xFFFF)
+    )
+
+    # Allocate graph-stable outputs once so capture contains only the exported fused
+    # population kernel or its matched three-launch decomposition.
+    fused = trtllm_moe_allocate_routing_metadata_multi_tile(
+        packed,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        num_local_experts=num_experts,
+        tile_ns=tile_ns,
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+    )
+    independent = tuple(
+        trtllm_moe_allocate_routing_metadata_multi_tile(
+            packed,
+            num_experts=num_experts,
+            top_k=top_k,
+            local_expert_offset=0,
+            num_local_experts=num_experts,
+            tile_ns=(tile_n,),
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        )
+        for tile_n in tile_ns
+    )
+
+    def populate_fused() -> None:
+        """Populate every tile through one public fused FFI call."""
+        populate_trtllm_moe_routing_metadata_(fused, packed)
+
+    def populate_independent() -> None:
+        """Populate the matched tile outputs through three public FFI calls."""
+        for metadata in independent:
+            populate_trtllm_moe_routing_metadata_(metadata, packed)
+
+    populate_fused()
+    populate_independent()
+    torch.cuda.synchronize()
+    assert _capture_kernel_node_count(populate_fused) == 1
+    assert _capture_kernel_node_count(populate_independent) == len(tile_ns)
 
 
 def test_same_shape_layers_share_one_serial_workspace_lane() -> None:
@@ -273,11 +751,12 @@ def test_from_logits_ep_tuning_accepts_global_selector_ids() -> None:
             lease.release()
 
 
-@pytest.mark.parametrize("num_tokens", (2048, 4096, 8192))
-def test_from_logits_large_token_capture_falls_back_deliberately(
+@pytest.mark.parametrize("num_tokens", (2048, 2049, 8192))
+def test_from_logits_large_token_capture_installs_da_switch(
     num_tokens: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Large public FromLogits calls must execute DA or a diagnosed ordinary fallback."""
+    """Boundary-sized public FromLogits calls must capture a complete DA switch."""
     require_sm100()
     shape = replace(
         compact_shape(num_tokens=num_tokens),
@@ -337,14 +816,40 @@ def test_from_logits_large_token_capture_falls_back_deliberately(
             tune_max_num_tokens=shape.num_tokens,
         )
 
-    distributions = ("uniform", "ddist:4")
+    distributions = (
+        "uniform",
+        "ddist:1.1",
+        "ddist:1.5",
+        "ddist:2",
+        "ddist:3",
+        "ddist:4",
+    )
+    selection_index = 0
+
+    def select_distinct_tile_body(
+        self: FactorizedSearch,
+        space: FactorizedTacticSpace,
+        measure: Callable[[FactorizedTactic, bool], float],
+    ) -> FactorizedTactic:
+        """Choose alternating legal tile anchors without relying on runtime timings."""
+        del self, measure
+        nonlocal selection_index
+        if len(space.tiles) < 2:
+            raise RuntimeError("The capacity test requires two legal routing tiles")
+        selected = space.anchor(space.tiles[selection_index % 2])
+        selection_index += 1
+        return selected
+
+    monkeypatch.setattr(FactorizedSearch, "search", select_distinct_tile_body)
+    force_profile_winner_crossover(monkeypatch)
     with _temporary_environment(
         FLASHINFER_DIST_AWARE_AUTOTUNE="1",
         FLASHINFER_DA_DISTRIBUTIONS=",".join(distributions),
         FLASHINFER_DA_BASELINE_GUARD="0",
     ):
-        # The native 256-expert preamble admits 2,048 tokens. Larger shapes deliberately publish
-        # an ordinary policy before DA candidate preparation instead of leaking an allocator error.
+        # Alternate legal tile anchors across admitted distributions so capture exercises a
+        # deterministic multi-body path at the old boundary, immediately above it, and at the
+        # new immutable capacity. Candidate bodies are still profiled by the public DA lifecycle.
         with autotune(True, tuning_buckets=(shape.num_tokens,)):
             invoke()
         invoke()
@@ -355,14 +860,10 @@ def test_from_logits_large_token_capture_falls_back_deliberately(
         graph.replay()
         torch.cuda.synchronize()
         diagnostic = _matching_from_logits_diagnostic(shape, distributions)
-        if num_tokens == 2048:
-            assert diagnostic["policy"] in {"da_single_body", "da_switch"}
-        else:
-            assert diagnostic["policy"] == "da_fallback"
-            assert "supports at most 2048 tokens" in str(
-                diagnostic["capture_fallback_reason"]
-            )
-            assert not leases
+        assert diagnostic["policy"] == "da_switch"
+        assert diagnostic["capture_fallback_reason"] is None
+        assert diagnostic["topology"]["conditional_node_count"] == 1
+        assert leases
         assert torch.isfinite(output).all()
     finally:
         torch.cuda.synchronize()

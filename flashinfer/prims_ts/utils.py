@@ -20,6 +20,10 @@ import importlib.util
 import os
 from pathlib import Path
 
+import torch
+
+from flashinfer.utils import get_compute_capability
+
 
 def configure_cute_dsl_cache_dir() -> str:
     """Set a stable CuTe DSL file-cache directory if the user did not choose one."""
@@ -46,6 +50,19 @@ def is_prims_ts_available() -> bool:
         )
     except ModuleNotFoundError:
         return False
+
+
+def is_prims_ts_device_supported(device: torch.device) -> bool:
+    """Return whether Prims-TS kernels support the device's CUDA architecture.
+
+    This checks device support only. Use :func:`is_prims_ts_available` to check
+    dependencies; individual kernels also validate their operation configuration.
+    Non-CUDA devices and environments without CUDA return ``False``.
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    major, minor = get_compute_capability(device)
+    return (major, minor) in ((10, 0), (10, 3))
 
 
 def get_prims_ts_compile_options() -> str:

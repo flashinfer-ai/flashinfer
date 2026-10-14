@@ -298,7 +298,7 @@ def test_deepseek_fp8_mapper_rejects_trtllm_unsupported_tile256():
 
 def test_mxfp8_block_support_accepts_swiglu_oa_params(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_fp8_block_scale_supported(
         _runner(weight_layout=WeightLayout.BlockMajorK),
@@ -319,7 +319,7 @@ def test_mxfp8_block_support_accepts_swiglu_oa_params(monkeypatch):
 
 def test_mxfp8_block_support_accepts_bias(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_fp8_block_scale_supported(
         _runner(),
@@ -339,7 +339,7 @@ def test_mxfp8_block_support_accepts_bias(monkeypatch):
 
 def test_deepseek_fp8_support_rejects_oa_params(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_fp8_block_scale_supported(
         _runner(
@@ -360,7 +360,7 @@ def test_deepseek_fp8_support_rejects_oa_params(monkeypatch):
 
 def test_deepseek_fp8_support_rejects_bias(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
-    monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
+    monkeypatch.setattr(support, "is_prims_ts_device_supported", lambda device: True)
 
     ok, reason = support.is_prims_ts_fp8_block_scale_supported(
         _runner(

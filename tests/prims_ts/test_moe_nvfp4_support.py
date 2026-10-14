@@ -15,6 +15,8 @@
 import pytest
 import torch
 
+from flashinfer.prims_ts import is_prims_ts_device_supported
+
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     DType,
     RouteImpl,
@@ -34,6 +36,38 @@ _requires_non_sm107_prims_ts = pytest.mark.skipif(
     torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7),
     reason="NVFP4 Prims-TS kernels support SM100 and SM103, not SM107",
 )
+
+
+@pytest.mark.parametrize("tile_n,num_tokens", [(128, 257), (256, 257), (256, 513)])
+def test_nvfp4_fc1_quantized_tma_store_warp_groups(tile_n, num_tokens):
+    """Each epilogue group must stage its own FP4 bytes before TMA stores."""
+    if not torch.cuda.is_available() or not is_prims_ts_device_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("PrimsTS device support required")
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    pair = map_trtllm_nvfp4_moe_tactic(
+        [tile_n, 0],
+        num_tokens=num_tokens,
+        top_k=2,
+        num_local_experts=2,
+        has_gemm1_alpha=True,
+        has_gemm1_beta=True,
+        has_gemm1_clamp_limit=True,
+    )
+    assert reference_check(
+        num_experts=2,
+        num_tokens=num_tokens,
+        top_k=2,
+        problem_n=512,
+        problem_k=512,
+        gemm1_alpha_value=1.702,
+        gemm1_beta_value=1.0,
+        gemm1_clamp_limit_value=7.0,
+        repeat_launches=5,
+        **pair.fc1.cfg.kwargs,
+    )
 
 
 def _find_bs1_ldgsts_persistent_pair():
