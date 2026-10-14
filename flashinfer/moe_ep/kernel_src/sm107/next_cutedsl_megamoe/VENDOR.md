@@ -123,11 +123,11 @@ silently dropped by a fresh export. Paths below are relative to `src/sources/`.
 | `helpers/ptx_helpers.py` | Counted, unaligned CTA barrier helper for the actual participating warps. |
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py` | Use that barrier for the Generic MMA/accumulator TMEM allocation rendezvous. |
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py` | N64 SFB/TMEM parity, valid-row TMA-gather extent and transaction accounting, and two gather warps for CGA4. |
-| `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py` | Pass routing IDs to separate BF16 reduction and advertise masked-slot handling to the shim. |
+| `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py` | Pass routing IDs to separate BF16 reduction, advertise masked-slot handling, and configure small-prefix CTA0 reset ownership. |
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py` | Propagate masked reduction and admitted N64 geometry; support a one-row allocation in the gather descriptor. |
 | `kernel_src/rubin/inference/mega/token_comm_gen_specialized.py` | Bound route metadata by the live extent, fence rewritten shared indices before async bulk publication, reuse the acquired extent in the sort body, skip invalid histogram/scatter work, and reuse the existing expert prefix for scale-factor offsets. |
 | `kernel_src/rubin/inference/mega/topk_reduce.py` | Predicate BF16 combine loads by routing validity, yielding exact zero for rows with no valid routes. |
-| `communication/nvlink_domain/token_comm.py` | Skip invalid-route histogram/scatter work, protect partial dump reads, and fence generic shared-memory writes before async bulk size publication. |
+| `communication/nvlink_domain/token_comm.py` | Skip invalid-route histogram/scatter work, protect partial dump reads, fence generic shared-memory writes before async bulk size publication, and let CTA0 reset prefixes up to 16 KiB without a second grid join. |
 
 The Generic router shortcut is retained with an async-proxy publication fence
 before the shared-memory histogram/size totals are consumed by bulk copy and
@@ -135,6 +135,15 @@ bulk reduction. A CTA barrier alone is insufficient: the sparse multirank graph
 regression fails with only an extra barrier and passes with the proxy fence.
 The regression covers early/late weights, changing routes, and full-capacity
 output checks; the multi-CTA Generic path is included at capacity 2048 and top-k 10.
+
+The Generic tail keeps the producer-drain grid join and both NVLink peer
+barriers. For EP greater than one and at most 16 KiB of combined local/shared
+reset prefixes, CTA0 clears all original reset bytes and skips the second grid
+prologue. CTA0 joins after the drain's thread-zero peer wait/phase increment,
+so no reset writer or next-phase reader can overtake that wait. The publication
+barrier orders all CTA0 reset writers before peer signaling. Larger prefixes,
+EP1, and `MEGA_USE_NCU=1` keep the original distributed reset. The selected
+ownership is part of the generated kernel name.
 
 FlashInfer-owned `shim/block_scaled.py` admits the geometries listed above and
 omits BF16 masked-slot preclear only when the kernel advertises masked reduction.

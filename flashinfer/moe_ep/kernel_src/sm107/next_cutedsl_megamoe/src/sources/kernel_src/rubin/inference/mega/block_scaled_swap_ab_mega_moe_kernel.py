@@ -236,6 +236,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         if self.epilogue.sf_vec_size != self.sf_vec_size:
             raise ValueError("Epilogue and Mainloop scale vector sizes must match.")
         self._device_workspace = self._build_device_workspace()
+        self.token_comm._configure_tail_reset_ownership(self._device_workspace)
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
         self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel and not self.combine_format.is_quantized
         self._topk_reduce = (
@@ -463,6 +464,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"work{self.work_id_mode}_"
             f"fc2store{'tma' if self.epilogue.fc2_use_tma else 'ublk' if self.epilogue.fc2_use_ublk else 'stg'}_"
             f"fc2tmastages{self.epilogue.fc2_tma_stages}_"
+            f"singlectareset{int(self.token_comm.tail_reset_single_cta)}_"
             f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_ctas{self.mixed_cga_config.total_cta_cnt}_"
             f"tokeninflag{self.token_in_flag_batch}_tokenback{self.token_back_mode}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"

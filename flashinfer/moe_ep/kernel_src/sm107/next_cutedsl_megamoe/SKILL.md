@@ -240,3 +240,18 @@ after histogram initialization: it orders zero stores before other lanes perform
 histogram atomics. Keep the existing IKET range around that join for trace
 continuity. Validate empty, late-valid, holey and dense-restored captured graphs
 on EP4 plus repeated launches across supported quantization formats.
+
+
+### Generic tail reset ownership
+
+For small reset prefixes, CTA0 owns all clear stores. Preserve the first
+producer-drain grid join, both peer barriers, and the CTA0 rendezvous after the
+first peer wait/phase increment. Only the second barrier's grid prologue is
+removed. Its existing CTA rendezvous/fence publishes every reset writer before
+peer signaling. Do not clear the persistent grid/phase counters: they are
+`zero_on_first_allocate`, outside the reset prefix. EP1, prefixes above 16 KiB,
+and NCU mode retain the original path.
+
+Detector: `test_tail_reset_ownership_for_workspace` constructs real layouts for
+small/large prefixes and checks the generated name; the single/multirank graph
+tests assert which path ran and validate changing routes across repeated replay.

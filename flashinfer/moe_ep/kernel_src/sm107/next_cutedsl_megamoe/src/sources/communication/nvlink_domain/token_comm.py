@@ -1159,6 +1159,7 @@ class TokenCommNonDeterministic(KernelComponent):
         self._validate_configuration()
         self._router = _MetadataPushRouter(problem_desc, impl_desc)
         self._nvlink_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.grid_sync_barrier_id)
+        self.tail_reset_single_cta = False
         self._device_workspace = None
         self._token_comm_args = None
         self._local_rank = None
@@ -2102,6 +2103,16 @@ class TokenCommNonDeterministic(KernelComponent):
             return Int32(cute.arch.shuffle_sync(claimed_token, Int32(0)))
         return current_token + global_worker_count
 
+    def _configure_tail_reset_ownership(self, workspace: DeviceWorkspace) -> None:
+        # One CTA avoids a second grid join for small reset prefixes.
+        # Bound the clear work so a large CTA-local loop cannot replace the saved join.
+        # NCU replay keeps the original grid-counter phase behavior.
+        self.tail_reset_single_cta = (
+            self.world_size > 1
+            and sum(workspace.tail_reset_bytes(space) for space in ("local", "shared")) <= 16384
+            and os.environ.get("MEGA_USE_NCU", "0") != "1"
+        )
+
     @cute.jit
     def reset_tail(self) -> None:
         """Reset communication state with the four token-in transfer warps."""
@@ -2118,11 +2129,20 @@ class TokenCommNonDeterministic(KernelComponent):
             epilogue_grid_sync=False,
         )
         iket.range_pop()
-        total_reset_threads = self.promised_launchable_sm_count * self.transfer_thread_count
-        global_reset_thread = self._linear_cta_idx * Int32(self.transfer_thread_count) + transfer_thread_idx
         iket.range_push("tail.reset_workspace")
-        self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
-        self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
+        if cutlass.const_expr(self.tail_reset_single_cta):
+            # The peer wait and phase increment are performed by thread0.
+            # Join all four transfer warps before clearing peer-visible state
+            # or loading the next peer-barrier phase without a grid prologue.
+            if self._linear_cta_idx == Int32(0):
+                self._nvlink_barrier._cta_rendezvous(self.transfer_thread_count)
+                self._device_workspace.reset_tail_space("shared", transfer_thread_idx, self.transfer_thread_count)
+                self._device_workspace.reset_tail_space("local", transfer_thread_idx, self.transfer_thread_count)
+        else:
+            total_reset_threads = self.promised_launchable_sm_count * self.transfer_thread_count
+            global_reset_thread = self._linear_cta_idx * Int32(self.transfer_thread_count) + transfer_thread_idx
+            self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
+            self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
         iket.range_pop()
         iket.range_push("tail.nvlink_publish")
         self._nvlink_barrier.arrive_and_wait(
@@ -2130,7 +2150,7 @@ class TokenCommNonDeterministic(KernelComponent):
             Int32(self.promised_launchable_sm_count),
             self._linear_cta_idx,
             transfer_thread_idx,
-            prologue_grid_sync=True,
+            prologue_grid_sync=not self.tail_reset_single_cta,
             epilogue_grid_sync=False,
         )
         iket.range_pop()

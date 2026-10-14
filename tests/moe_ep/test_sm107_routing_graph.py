@@ -48,6 +48,7 @@ def test_routing_graph_changes(monkeypatch, kind, early, family, capacity):
     graph = None
     try:
         if family == "inference":
+            assert not ws.kernel.token_comm.tail_reset_single_cta
             # Exercise both the contiguous dump and the segmented multi-CTA dump.
             assert ws.kernel.token_comm._router.router_data_cta_count == (
                 2 if capacity == 4096 else 1
@@ -119,3 +120,45 @@ def test_routing_graph_changes(monkeypatch, kind, early, family, capacity):
         if graph is not None:
             graph.reset()
         ws.destroy()
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize(
+    "world,capacity,ncu,single_cta",
+    [
+        (1, 1024, False, False),
+        (4, 1024, False, True),
+        (4, 1024, True, False),
+        (4, 16384, False, False),
+    ],
+)
+def test_tail_reset_ownership_for_workspace(
+    monkeypatch, world, capacity, ncu, single_cta
+):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Requires SM107")
+    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as pkg
+
+    pkg.require_sm107_dsl()
+    pkg.bootstrap_paths()
+    monkeypatch.setenv("MEGA_USE_NCU", "1" if ncu else "0")
+    cfg = pkg.Sm107BlockScaledMoeConfig(
+        num_total_experts=16,
+        max_tokens_per_rank=capacity,
+        num_topk=4,
+        hidden=512,
+        intermediate=256,
+        rank=0,
+        world_size=world,
+        quant_kind="mxfp8_e4m3",
+        kernel_variant="inference",
+    )
+    # Build the real region layout without allocating model weights or buffers.
+    kernel = pkg.Sm107BlockScaledSymmBuffer._build_kernel(cfg)
+    reset_bytes = sum(
+        kernel._device_workspace.tail_reset_bytes(space)
+        for space in ("local", "shared")
+    )
+    assert (reset_bytes > 16384) == (capacity == 16384)
+    assert kernel.token_comm.tail_reset_single_cta is single_cta
+    assert f"singlectareset{int(single_cta)}_" in kernel.name()
