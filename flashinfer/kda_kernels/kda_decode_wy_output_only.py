@@ -215,7 +215,7 @@ class KdaDecodeWyOutputOnlyKernel:
         # 0 = flashinfer recurrent_kda (only negative slots are padding).
         self._null_min = int(null_min)
         # Tree-structured drafts: per-token parent indices instead of a
-        # prefix. Requires parent[i] < i (see the host wrapper).
+        # prefix. Requires parent[i] < i for i >= 1 (see the host wrapper).
         self._has_paths = bool(has_paths)
         if self._dropin:
             self._emit = True
@@ -781,7 +781,8 @@ class KdaDecodeWyOutputOnlyKernel:
             if tidx == Int32(0):
                 for _at in cutlass.range_constexpr(T):
                     _m = Int32(1) << Int32(_at)
-                    if const_expr(_at < self._n_valid):
+                    # The root has no in-draft parent whatever the entry says.
+                    if const_expr(0 < _at < self._n_valid):
                         _p = gParents[(pid_b, _at)]
                         if _p >= Int32(0):
                             _m = _m | sAnc[_p]
@@ -2057,9 +2058,10 @@ def _assert_verify_parents(parents: torch.Tensor) -> None:
     if not _VALIDATE_VERIFY_PARENTS:
         return
     steps = torch.arange(parents.shape[1], device=parents.device, dtype=parents.dtype)
+    # The root entry is ignored by the kernel, so 0 is as valid as -1 there.
     torch._assert_async(
-        ((parents >= -1) & (parents < steps)).all(),
-        "verify_parents[:, i] must be in [-1, i)",
+        ((parents >= -1) & (parents < steps.clamp_min(1))).all(),
+        "verify_parents[:, i] must be in [-1, i) (the root may be -1 or 0)",
     )
 
 

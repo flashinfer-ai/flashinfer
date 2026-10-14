@@ -123,6 +123,15 @@ def test_chain_parents_reproduce_the_prefix_path():
     assert _rel(masked, prefix) < 2e-2
 
 
+def test_root_parent_zero_equals_root_parent_minus_one():
+    """SGLang writes 0 for the root; the kernel must read it as no parent."""
+    a = _inputs()
+    parents = list(TREES["topk4_depth2"])
+    canonical = _run(a, parents).clone()
+    parents[0] = 0
+    assert torch.equal(_run(a, parents), canonical)
+
+
 def test_tree_differs_from_chain_where_the_tree_forks():
     """Guards against the kernel silently ignoring verify_parents."""
     a = _inputs()

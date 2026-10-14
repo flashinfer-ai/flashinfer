@@ -142,6 +142,22 @@ def test_tree_parents_match_the_ancestor_replay_oracle(name):
     assert err < 5e-3, f"{name}: relative error {err:.3e}"
 
 
+def test_root_parent_zero_equals_root_parent_minus_one():
+    """SGLang writes 0 for the root; the kernel must read it as no parent."""
+    args, cache = _inputs()
+    parents = list(TREES["topk4_depth2"])
+    canonical = _run(args, cache, parents).clone()
+    parents[0] = 0
+    assert torch.equal(_run(args, cache, parents), canonical)
+
+
+def test_verify_parents_raise_when_the_tcgen_path_is_not_taken():
+    """T=3 falls back to the fp32 kernel, which must not drop the tree."""
+    args, cache = _inputs(steps=3)
+    with pytest.raises(ValueError, match="tcgen05"):
+        _run(args, cache, [-1, 0, 0])
+
+
 def test_tree_differs_from_chain_where_the_tree_forks():
     """Guards against the kernel silently ignoring verify_parents."""
     args, cache = _inputs()
