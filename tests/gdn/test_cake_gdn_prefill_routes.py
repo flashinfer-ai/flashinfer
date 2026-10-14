@@ -20,7 +20,7 @@ ROUTED = sorted(
 @pytest.mark.parametrize("schedule", ROUTED)
 def test_sm107a_routes_the_vec2_state_io_twins_per_shipped_schedule(schedule):
     body = TABLE[("sm_107a", schedule)]
-    assert body in ("l7_vec2", "l7b_vec2lp")
+    assert body in ("l7_vec2", "l7b_vec2lp", "st2s_vec2lp")
     twin = cake_gdn.cake_gdn_prefill_seq_schedule(
         "sm_107a", schedule, use_state_indices=False
     )

@@ -344,8 +344,8 @@ def _prefill_schedule_attr(
 
 
 # Rubin (sm_107a) twins of the sequential (non-CP) prefill kernel, routed per (architecture,
-# shipped schedule): the dvsplit fp32-state schedules run the `l7_vec2` body and the dvsplit
-# bf16 / f16-state schedules the `l7b_vec2lp` body (8-byte state I/O on the initial-state
+# shipped schedule): the dvsplit fp32-state schedules run the `l7_vec2` body, the dvsplit
+# bf16-state schedules the `l7b_vec2lp` body (8-byte state I/O on the initial-state
 # load, the final-state store and the checkpoint stores; every arithmetic operation keeps its
 # operands, order and rounding, so the output is bitwise identical to the shipped body).  An
 # indexed-state plan (`USE_STATE_INDICES`) traces its own `_indexed` schedule, keyed as such.
@@ -365,9 +365,12 @@ _SM107A_SEQ_TWINS: dict[str, tuple[str, ...]] = {
     # alignment-guarded on the indexed plans
     "l7b_vec2lp": (
         "dvsplit_initial_bf16state",
-        "dvsplit_initial_f16state",
         "dvsplit_initial_bf16state_indexed",
     ),
+    # The f16-state schedule runs the smem-staged final-state store twin
+    # (`vec2_state_io_lp` + `st2_stage`) on CC 10.7; a per-plan record whose outputs
+    # are bitwise identical to the shipped body.
+    "st2s_vec2lp": ("dvsplit_initial_f16state",),
 }
 CAKE_GDN_PREFILL_SEQ_ARCH_BODIES: dict[tuple[str, str], str] = {
     ("sm_107a", f"flashinfer_blackwell_gdn_prefill_{suffix}"): body
