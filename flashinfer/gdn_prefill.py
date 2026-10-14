@@ -74,6 +74,17 @@ _CAKE_GDN_HOST_INTS: collections.OrderedDict[
     tuple[weakref.ReferenceType[torch.Tensor], tuple[int, ...]],
 ] = collections.OrderedDict()
 
+# Read-only all-ones FP32 ``[tokens, heads]`` gates for calls without ``g`` or
+# ``beta``, keyed by (device index, tokens, heads).  The compiled kernels keep
+# ``UNIT_GATES`` off and read both gates from memory, so an absent gate used to
+# be filled fresh on every call (one or two fill kernels ahead of the main
+# kernel).  Bounded by entry count and by the total bytes of the cached tensors.
+_CAKE_GDN_UNIT_GATES_MAX = 64
+_CAKE_GDN_UNIT_GATES_MAX_BYTES = 64 << 20
+_CAKE_GDN_UNIT_GATES: collections.OrderedDict[
+    tuple[int, int, int], tuple[torch.Tensor, int, torch.cuda.Event]
+] = collections.OrderedDict()
+
 
 @functools.cache
 def _cake_gdn_arch(device_index: int) -> "_cake_gdn.CakeGDNArch":
@@ -180,6 +191,61 @@ def _cake_gdn_i32(values: torch.Tensor) -> torch.Tensor:
     while len(_CAKE_GDN_I32_COPIES) > _CAKE_GDN_HOST_INTS_MAX:
         _CAKE_GDN_I32_COPIES.popitem(last=False)
     return converted
+
+
+def _cake_gdn_unit_gates(
+    total_seq_len: int, num_o_heads: int, device: torch.device
+) -> torch.Tensor:
+    """Return the shared all-ones FP32 ``[tokens, heads]`` gate for an absent g / beta.
+
+    The compiled kernels keep ``UNIT_GATES`` off and read both gates from memory,
+    so a call without ``g`` or ``beta`` used to fill a fresh ``torch.ones`` tensor
+    on every call (one or two fill kernels ahead of the main kernel).  One tensor
+    per device and shape now serves every such call.  It is read-only by contract
+    and shared by all callers of the same shape on the same device.  During CUDA
+    Graph capture a fresh tensor is always allocated, so the graph's private pool
+    owns it; the cache is neither consulted nor filled then.  Eagerly, a tensor
+    consumed on a stream other than the one that produced it first waits for the
+    producing fill (an event recorded right after it) and is recorded on the
+    consuming stream, so the LRU, bounded by entry count and total bytes, can drop
+    it safely.  A single request above the byte bound bypasses the cache.
+    """
+
+    device_index = int(
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    cuda_device = torch.device("cuda", device_index)
+    shape = (total_seq_len, num_o_heads)
+    if torch.cuda.is_current_stream_capturing():
+        return torch.ones(shape, dtype=torch.float32, device=cuda_device)
+    key = (device_index, total_seq_len, num_o_heads)
+    raw_stream = _cake_gdn_current_raw_stream(device_index)
+    cached = _CAKE_GDN_UNIT_GATES.get(key)
+    if cached is not None:
+        _CAKE_GDN_UNIT_GATES.move_to_end(key)
+        gates = cached[0]
+        if cached[1] != raw_stream:
+            consumer = torch.cuda.current_stream(device_index)
+            consumer.wait_event(cached[2])
+            gates.record_stream(consumer)
+        return gates
+    gates = torch.ones(shape, dtype=torch.float32, device=cuda_device)
+    if gates.numel() * gates.element_size() > _CAKE_GDN_UNIT_GATES_MAX_BYTES:
+        return gates
+    ready = torch.cuda.Event()
+    ready.record(torch.cuda.current_stream(device_index))
+    _CAKE_GDN_UNIT_GATES[key] = (gates, raw_stream, ready)
+    total_bytes = sum(
+        entry[0].numel() * entry[0].element_size()
+        for entry in _CAKE_GDN_UNIT_GATES.values()
+    )
+    while (
+        len(_CAKE_GDN_UNIT_GATES) > _CAKE_GDN_UNIT_GATES_MAX
+        or total_bytes > _CAKE_GDN_UNIT_GATES_MAX_BYTES
+    ):
+        _key, (evicted, _stream, _ready) = _CAKE_GDN_UNIT_GATES.popitem(last=False)
+        total_bytes -= evicted.numel() * evicted.element_size()
+    return gates
 
 
 def _cake_gdn_host_ints(values: torch.Tensor, *, purpose: str) -> tuple[int, ...]:
@@ -375,12 +441,14 @@ def _run_cake_gdn_prefill(
 
     gate = g
     if gate is None:
-        gate = torch.ones(
-            (total_seq_len, num_o_heads), dtype=torch.float32, device=q.device
-        )
+        gate = _cake_gdn_unit_gates(total_seq_len, num_o_heads, q.device)
     update_gate = beta
     if update_gate is None:
-        update_gate = torch.ones_like(gate)
+        if g is None:
+            # Both absent: the kernel reads one shared unit-gate tensor twice.
+            update_gate = gate
+        else:
+            update_gate = _cake_gdn_unit_gates(total_seq_len, num_o_heads, q.device)
     for name, tensor in (("g", gate), ("beta", update_gate)):
         if (
             tensor.dtype != torch.float32

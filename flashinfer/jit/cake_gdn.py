@@ -343,6 +343,52 @@ def _prefill_schedule_attr(
     return "_".join(pieces)
 
 
+# Rubin (sm_107a) twins of the sequential (non-CP) prefill kernel, routed per (architecture,
+# shipped schedule): the dvsplit fp32-state schedules run the `l7_vec2` body and the dvsplit
+# bf16 / f16-state schedules the `l7b_vec2lp` body (8-byte state I/O on the initial-state
+# load, the final-state store and the checkpoint stores; every arithmetic operation keeps its
+# operands, order and rounding, so the output is bitwise identical to the shipped body).  An
+# indexed-state plan (`USE_STATE_INDICES`) traces its own `_indexed` schedule, keyed as such.
+# Mirrors `PREFILL_SEQ_ARCH_BODIES` in loom.examples.weave.flashinfer_blackwell_gdn_prefill
+# (the Cake tree cross-checks this copy).
+_SM107A_SEQ_TWINS: dict[str, tuple[str, ...]] = {
+    # fp32-state dvsplit schedules: 8-byte fp32 state I/O
+    "l7_vec2": (
+        "dvsplit",
+        "dvsplit_f16io",
+        "dvsplit_initial",
+        "dvsplit_initial_f16io",
+        "dvsplit_initial_f16io_gatepipe4",
+    ),
+    # bf16 / f16-state dvsplit schedules with shipped records (the bf16 one indexed or
+    # not): the same width lever on the low-precision state loads and stores,
+    # alignment-guarded on the indexed plans
+    "l7b_vec2lp": (
+        "dvsplit_initial_bf16state",
+        "dvsplit_initial_f16state",
+        "dvsplit_initial_bf16state_indexed",
+    ),
+}
+CAKE_GDN_PREFILL_SEQ_ARCH_BODIES: dict[tuple[str, str], str] = {
+    ("sm_107a", f"flashinfer_blackwell_gdn_prefill_{suffix}"): body
+    for body, suffixes in _SM107A_SEQ_TWINS.items()
+    for suffix in suffixes
+}
+
+
+def cake_gdn_prefill_seq_schedule(
+    arch: CakeGDNArch, schedule_attr: str, *, use_state_indices: bool
+) -> str:
+    """The sequential prefill schedule `arch` runs for the shipped `schedule_attr`.
+
+    The shipped schedule itself, or its per-architecture twin
+    (`<schedule>_sm107a_<body>`, a record of its own in the manifest).
+    """
+    symbol = f"{schedule_attr}_indexed" if use_state_indices else schedule_attr
+    body = CAKE_GDN_PREFILL_SEQ_ARCH_BODIES.get((arch, symbol), "base")
+    return schedule_attr if body == "base" else f"{schedule_attr}_sm107a_{body}"
+
+
 def _variant_for(
     *, domain: str, schedule_attr: str, specializations: dict[str, int | float]
 ) -> dict[str, Any]:
@@ -514,6 +560,9 @@ def select_cake_gdn_prefill_variant(
         gatepipe4=gatepipe4,
         fullgrid_vhold=fullgrid_vhold,
     )
+    schedule_attr = cake_gdn_prefill_seq_schedule(
+        arch, schedule_attr, use_state_indices=use_state_indices
+    )
     specializations: dict[str, int | float] = {
         "ENABLE_CHECKPOINTS": int(enable_checkpoints),
         "HEAD_GROUP_LOG2": _power_of_two_log2(num_o_heads // min_heads),
@@ -629,7 +678,9 @@ def cake_gdn_bf16_t1_route(
 # of the serial recurrence, fully unrolled token loop; bitwise-identical output),
 # B200/B300 keep the shipped body.  Mirrors
 # loom.examples.weave.gdn_decode_pretranspose.select_bf16_verify_tile16_body.
-CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES: dict[str, str] = {"sm_107a": "tile16_vpre"}
+CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES: dict[str, str] = {
+    "sm_107a": "tile16_vpre_es_pro"
+}
 
 
 def cake_gdn_bf16_verify_tile16_schedule(arch: CakeGDNArch) -> str:
@@ -649,12 +700,20 @@ CAKE_GDN_BF16_WIDE_ARCH_BODIES: dict[str, str] = {"sm_107a": "wide128_vpre"}
 # `..._mtp_t4_splitv8`) is routed per architecture as well: Rubin (sm_107a) runs its
 # `_pro` twin (producer phase parallel over the draft tokens, every independent global
 # load issued before the first reduction; bitwise-identical output), B200 / B300 keep
-# the shipped body.  The verify body `..._mtp_t2_inline_tile8` is the same everywhere.
-# Mirrors the splitv8 entry of `FP32_MTP_ARCH_BODIES` / `select_fp32_mtp_body` in
-# loom.examples.weave.gdn_decode_pretranspose; keyed by architecture here because the
-# table applies to that one base (the resolver consults it for the splitv8 row only).
-CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[str, str] = {
-    "sm_107a": "gdn_decode_pretranspose_mtp_t4_splitv8_pro"
+# the shipped body.  The verify body `..._mtp_t2_inline_tile8` runs its `_bb` twin on
+# Rubin as well (softplus branch as a select, cache-row moves hoisted out of the
+# slot-valid branch, merged output-store conditions; bitwise-identical output).
+# Mirrors `FP32_MTP_ARCH_BODIES` / `select_fp32_mtp_body` in
+# loom.examples.weave.gdn_decode_pretranspose, keyed by (architecture, base schedule).
+CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[tuple[str, str], str] = {
+    (
+        "sm_107a",
+        "gdn_decode_pretranspose_mtp_t4_splitv8",
+    ): "gdn_decode_pretranspose_mtp_t4_splitv8_pro",
+    (
+        "sm_107a",
+        "gdn_decode_pretranspose_mtp_t2_inline_tile8",
+    ): "gdn_decode_pretranspose_mtp_t2_inline_tile8_bb",
 }
 # The fp32-state T=1 pretranspose body (`..._splitv8`, route `indexed_fp32_t1_splitv8`)
 # is routed per architecture by the state-head count B*HV: Rubin (sm_107a) runs the
@@ -666,10 +725,16 @@ CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[str, str] = {
 # `FP32_T1_SPLITV8_ARCH_BANDS` / `select_fp32_t1_splitv8_route` in
 # loom.examples.weave.gdn_decode_pretranspose (the Cake tree cross-checks these copies).
 CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS = 256
+# Rubin register-direct body `splitv8_reg` (eight CTAs per state head, state rows loaded
+# straight into registers) in the band 64 < state heads < 256; `splitv8` up to 64 heads,
+# the `splitv8_tilev32` twin from 256 on.  Bitwise-identical output, only the state load
+# path changes.  Mirrors `FP32_T1_SPLITV8_REG_MIN_STATE_HEADS`.
+CAKE_GDN_FP32_T1_SPLITV8_REG_MIN_STATE_HEADS = 64
 # (largest state-head count of the band or None for the open last band, body)
 CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_107a": (
-        (CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS - 1, "splitv8"),
+        (CAKE_GDN_FP32_T1_SPLITV8_REG_MIN_STATE_HEADS, "splitv8"),
+        (CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS - 1, "splitv8_reg"),
         (None, "splitv8_tilev32"),
     ),
 }
@@ -679,6 +744,7 @@ CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS: dict[str, tuple[tuple[int | None, str], ...
 CAKE_GDN_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
     "gdn_decode_pretranspose_splitv8": 8,
     "gdn_decode_pretranspose_splitv8_tilev32": 4,
+    "gdn_decode_pretranspose_splitv8_reg": 8,
 }
 
 
@@ -705,6 +771,66 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
     if ctas_per_state is None:
         raise CakeGDNUnsupportedError(
             f"{variant_name!r} ({schedule}) is not an fp32-state T=1 pretranspose record"
+        )
+    return ctas_per_state
+
+
+# The fp32-state T=1 K-major (nontranspose) bodies (`direct_fp32_t1_nontranspose_*`) are
+# routed per (architecture, batch band): the shipped `_small` body (eight CTAs per state
+# head) below 32 batch rows and the shipped large body (one CTA per state head) from 32
+# on, except that Rubin (sm_107a) runs the `mid4` twin in the small band -- four CTAs per
+# state head, each owning one Kx32 value panel over 128-byte state segments; same per-lane
+# statements and accumulation order, bitwise-identical output and state.  B200 / B300 keep
+# the shipped bodies.  Mirrors `NONTRANSPOSE_SMALL_BATCH_THRESHOLD` /
+# `NONTRANSPOSE_FP32_T1_ARCH_BODIES` / `NONTRANSPOSE_FP32_T1_CTAS_PER_STATE` /
+# `select_nontranspose_fp32_t1_body` in loom.examples.weave.gdn_decode_pretranspose (the
+# Cake tree cross-checks these copies).
+CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD = 32
+CAKE_GDN_NONTRANSPOSE_FP32_T1_BASE_SCHEDULES: dict[str, str] = {
+    "small": "gdn_decode_nontranspose_fp32_t1_small",
+    "large": "gdn_decode_nontranspose_fp32_t1",
+}
+# ((architecture, band) -> schedule of the twin the rule routes there)
+CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES: dict[tuple[str, str], str] = {
+    ("sm_107a", "small"): "gdn_decode_nontranspose_fp32_t1_mid4",
+}
+# CTAs per state head each nontranspose fp32 T=1 body launches (the host grid is B * HV
+# times this), keyed by the record's schedule.
+CAKE_GDN_NONTRANSPOSE_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
+    "gdn_decode_nontranspose_fp32_t1_small": 8,
+    "gdn_decode_nontranspose_fp32_t1": 1,
+    "gdn_decode_nontranspose_fp32_t1_mid4": 4,
+}
+
+
+def cake_gdn_nontranspose_fp32_t1_route(
+    batch_size: int, arch: CakeGDNArch
+) -> tuple[str, str]:
+    """``(schedule, route id)`` of the fp32-state T=1 K-major decode for ``batch_size`` rows on ``arch``."""
+
+    band = (
+        "small"
+        if int(batch_size) < CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD
+        else "large"
+    )
+    base = CAKE_GDN_NONTRANSPOSE_FP32_T1_BASE_SCHEDULES[band]
+    schedule = CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES.get((arch, band), base)
+    route = f"flashinfer.gdn_decode.direct_fp32_t1_nontranspose_{band}"
+    if schedule != base:
+        route += "_" + schedule.removeprefix("gdn_decode_nontranspose_fp32_t1_")
+    return schedule, route
+
+
+@functools.cache
+def cake_gdn_nontranspose_fp32_t1_ctas_per_state(variant_name: str) -> int:
+    """CTAs per state head the fp32-state T=1 K-major record ``variant_name`` launches (read from its schedule)."""
+
+    record = _kernel_record(variant_name)
+    schedule = record["source_schedule"].rsplit(":", 1)[-1]
+    ctas_per_state = CAKE_GDN_NONTRANSPOSE_FP32_T1_CTAS_PER_STATE.get(schedule)
+    if ctas_per_state is None:
+        raise CakeGDNUnsupportedError(
+            f"{variant_name!r} ({schedule}) is not an fp32-state T=1 nontranspose record"
         )
     return ctas_per_state
 
@@ -992,9 +1118,7 @@ def select_cake_gdn_decode_variant(
                 "B4/B16/B64 T4 update rows"
             )
         base_attr, route = selected
-        schedule_attr = base_attr
-        if base_attr == "gdn_decode_pretranspose_mtp_t4_splitv8":
-            schedule_attr = CAKE_GDN_FP32_MTP_ARCH_BODIES.get(arch, base_attr)
+        schedule_attr = CAKE_GDN_FP32_MTP_ARCH_BODIES.get((arch, base_attr), base_attr)
         mtp_specializations: dict[str, int | float] = {
             "H": num_q_heads,
             "HV": num_v_heads,
@@ -1031,12 +1155,10 @@ def select_cake_gdn_decode_variant(
             "splitv8"
         )
     elif layout == "nontranspose":
-        if batch_size < 32:
-            schedule_attr = "gdn_decode_nontranspose_fp32_t1_small"
-            route = "flashinfer.gdn_decode.direct_fp32_t1_nontranspose_small"
-        else:
-            schedule_attr = "gdn_decode_nontranspose_fp32_t1"
-            route = "flashinfer.gdn_decode.direct_fp32_t1_nontranspose_large"
+        # The body follows the batch band per architecture (sm_107a runs the `mid4`
+        # twin below 32 rows); the route id names a twin and the host reads the
+        # record's CTAs per state head for the grid.
+        schedule_attr, route = cake_gdn_nontranspose_fp32_t1_route(batch_size, arch)
     else:
         raise CakeGDNUnsupportedError(f"unsupported decode state layout {layout}")
     record = _variant_for(
@@ -1065,6 +1187,7 @@ __all__ = [
     "CakeGDNRoute",
     "CakeGDNUnsupportedError",
     "arch_for_compute_capability",
+    "cake_gdn_prefill_seq_schedule",
     "compile_cake_gdn_cubin",
     "load_cake_gdn_kernel",
     "select_cake_gdn_decode_variant",
