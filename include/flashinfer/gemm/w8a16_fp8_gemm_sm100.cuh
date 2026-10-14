@@ -628,12 +628,13 @@ inline int W8A16Sm100PickSwizzle(int M, int N, int K) {
   //   mlp.gate_up tp2 K=5120 M=44160 256x128: 4 / 8 / 16 / 32 -> 4.1 / 3.2 / 1.9 / 3.7 GB,
   //                 time 3.82 / 3.75 / 3.69 / 3.88 ms (cuBLAS 2.4 GB, 3.56 ms).
   // The band of S weight tiles (S x 256 rows x K bytes) wants to stay around 10-26 MB:
-  // S = 24 MB / (256 K) rounded down to a power of two, clamped to [2, 16].
+  // S = 24 MB / (256 K) rounded to the nearest integer, clamped to [2, 16] (16 at K=5120,
+  // 8 at 12800, 4 at 25600; the sm100 scheduler takes any group size).  Steady-state
+  // check on mlp.down tp1 M=88320 (`b17_fine`): 3 / 4 / 5 / 6 -> 1.04 / 1.04 / 1.02 / 1.03
+  // of cuBLAS, i.e. flat within noise around the DRAM minimum at 4-5.
   const long long band_bytes = 24ll << 20;
-  const long long s = band_bytes / (256ll * K);
-  int pow2 = 2;
-  while (pow2 * 2 <= s && pow2 < 16) pow2 *= 2;
-  return pow2;
+  const long long s = (band_bytes + 128ll * K) / (256ll * K);
+  return static_cast<int>(s < 2 ? 2 : s > 16 ? 16 : s);
 }
 
 // FLASHINFER_W8A16_FP8_RASTER_SM100 = "heuristic" (default; CUTLASS picks) | "m" (walk
@@ -729,6 +730,12 @@ inline W8A16Sm100Tile W8A16Sm100PickTile(int M, int N, int K, int num_sms, int a
   if (forced != W8A16Sm100Tile::kAuto) return forced;
   const W8A16Sm100Tile env = W8A16Sm100TileEnv();
   if (env != W8A16Sm100Tile::kAuto) return env;
+  // Version B17: a weight of <= 128 rows (und.kv tp8, N=128) fills only half of the 2SM
+  // tile's 256 weight rows, so every 2SM variant runs twice the MMA for the same bytes;
+  // the 1SM 128x128 tile has no padding there.  M=88320, 5 interleaved rounds, kernel /
+  // cuBLAS: auto (256x128) 1.09-1.13, 1SM 128x128 1.00-1.01, split-K 1.20-1.27, stream-K
+  // 1.13-1.20 (`flush_*_undkv8`).  Small M on that row stays with split-K (B12).
+  if (N <= 128 && M >= 16384) return W8A16Sm100Tile::k1SM128x128;
   // Version B13: a mostly-empty last wave over deep tiles is balanced by stream-K.
   if (W8A16Sm100UseStreamK(M, N, K, num_sms)) return W8A16Sm100Tile::k2SM256x128StreamK;
   // Version B12: under-filled grids and long-K partial waves split K instead of choosing

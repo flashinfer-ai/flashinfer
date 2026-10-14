@@ -337,6 +337,44 @@ rows get swizzle 8 under both settings, so they calibrate the pass-to-pass noise
 mlp.gate_up tp2 at 1.05-1.06 is what is left on Blackwell at large M (2.4 vs our 1.9 GB
 of DRAM is not it; the remaining clock difference there is unexplained).
 
+### Version B17: every row at M=88320, and how to measure one (Wed 14 Oct 2026)
+
+Igor's goal: every one of the 24 shapes at M=88320 on par with cuBLAS or better, no
+averages.  Bar: median kernel / cuBLAS <= 1.02, two independent runs agreeing.
+
+**Measurement first.**  Three things that looked like kernel gaps were the bench:
+1. Fixed column order.  The bench timed `cast`, then `cublas`, then the kernel columns, in
+   that order, every row; on the 1000 W part the first column runs coolest.  That is how
+   the cast-copy path (a dequant kernel plus the same cuBLAS GEMM) "beat" standalone cuBLAS
+   by 10% on mlp.gate_up tp4 (3649 vs 4042 us).  ncu, one launch each, same clock:
+   cast-path GEMM 3.46 ms, standalone cuBLAS 3.46 ms, ours 3.40 ms.  The bench now has
+   `--rounds R` (ported from the Hopper line): R passes per row with the column order
+   rotated, every implementation included, median per column.
+2. Short bursts.  With 20 launches per column the GPU never reaches a steady power state
+   and rows flip 0.95 <-> 1.04 between two 5-round runs (`flush_*`); the per-iteration L2
+   flush is not the cause (same scatter without it).  With 200 launches per column and 3
+   rotated rounds, two independent runs agree within 1% on nearly every row (`long_*`).
+   That is the method for any per-row claim at large M; it is also the production regime
+   for a 5-17 ms kernel.  Isolated 1000-launch bursts (`lim_*`): und.q tp2 ours 2540 us at
+   482 W / 1756 MHz vs cuBLAS 2616 us at 658 W / 1522 MHz; mlp.down tp4 3948 vs 4114 us.
+3. The best-variant line of the plots (minimum over six noisy columns) is gone.
+
+**Two fixes.**  und.kv tp8 (N=128): the 2SM tiles pad the 128-row weight to 256 and run
+twice the MMA for the same bytes; the 1SM 128x128 tile has no padding.  Steady state at
+M=88320: auto 1.13 -> 1.00 (`W8A16Sm100PickTile`: N <= 128 and M >= 16384 -> 1SM).  And
+the swizzle rule rounds to the nearest integer instead of a power of two (the sm100
+scheduler takes any group size), so K=25600 gets 4, not 2.
+
+**Where the fine grid ends** (`b17_fine`, steady state, kernel / cuBLAS at M=88320):
+mlp.down tp1 (K=25600) swizzle 3 / 4 / 5 / 6: auto 1.04 / 1.04 / 1.02 / 1.03, 192-row tile
+1.04 / 1.03 / 1.02 / 1.03; mlp.down tp2 (K=12800) 6 / 8 / 10 / 12: 1.02 / 1.04 / 1.02 /
+1.08 (160-row tile 1.02 / 1.02 / 1.02 / 1.08); mlp.gate_up tp2 12 / 16 / 20 / 24: 1.00 /
+1.00 / 1.02 / 1.02.  mlp.down tp1 / tp2 sit at 1.02-1.04 with every tile order: cuBLAS
+runs them with a 256x256 tile (half our L2 bytes per flop, 125 vs 150-164 GB), and our
+256x256 tile reaches its clock but spends 8% more cycles staging the converted A in SMEM
+because two 256-column accumulator stages fill TMEM.  A 256x224 tile with A in TMEM
+would need a single A stage (2 x 224 + 64 = 512 columns): untried, the next lever.
+
 Lesson for the whole line, both arches: on a power-capped part a GEMM at 97% tensor-pipe
 utilisation is not "compute-bound, done"; every DRAM byte costs clock, and cuBLAS's edge on
 the wide rows was never its mainloop but its L2 footprint.
