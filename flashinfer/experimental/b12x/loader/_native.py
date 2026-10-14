@@ -21,6 +21,10 @@ _LOCK = threading.Lock()
 
 
 def _build() -> Path:
+    if os.name == "nt":
+        from ._native_windows import build
+
+        return build()
     import torch
     from flashinfer.jit.cpp_ext import get_cuda_path
 
@@ -128,6 +132,10 @@ def _build() -> Path:
 @functools.cache
 def load():
     with _LOCK:
+        if os.name == "nt":
+            from ._native_windows import dll_directories
+
+            dll_directories()
         spec = importlib.util.spec_from_file_location("_b12x_loader_storage", _build())
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

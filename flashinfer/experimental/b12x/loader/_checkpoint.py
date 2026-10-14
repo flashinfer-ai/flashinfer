@@ -54,7 +54,11 @@ class DirectWeightSession:
         self.native = load()
         if read_mode == "auto":
             caps = self.native.capabilities(device)
-            read_mode = "bounce" if caps["host_page_tables"] else "gds"
+            read_mode = (
+                "bounce" if os.name == "nt" or caps["host_page_tables"] else "gds"
+            )
+        if os.name == "nt" and read_mode == "gds":
+            raise ValueError("GPUDirect Storage checkpoint reads require Linux")
         if read_mode != "gds" and shared_read_group is not None:
             raise ValueError("shared checkpoint reads require the gds transport")
         self.read_mode = read_mode
@@ -239,7 +243,11 @@ class DirectWeightSession:
     def manifest(self, path):
         import torch
 
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECT | os.O_CLOEXEC)
+        fd = (
+            self.native.direct_open(os.fspath(path))
+            if os.name == "nt"
+            else os.open(path, os.O_RDONLY | os.O_DIRECT | os.O_CLOEXEC)
+        )
         self.files.append(fd)
         if self.shared_read_group is not None:
             self.file_identities[fd] = self._file_identity(fd)

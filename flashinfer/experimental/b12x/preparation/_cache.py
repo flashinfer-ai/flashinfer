@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
+from filelock import FileLock
 
 from .types import FrozenMapping
 
@@ -163,8 +163,7 @@ class SelectionCache:
         }
         self._validate(update)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.with_suffix(".lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with FileLock(self.path.with_suffix(".lock")):
             records = self._read()
             records.update(update)
             temporary = None

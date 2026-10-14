@@ -67,6 +67,32 @@ def valid_object(object_path: Path, manifest_path: Path, cache_key: str) -> bool
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        import ctypes as c
+
+        kernel = c.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = (
+            c.c_wchar_p,
+            c.c_uint32,
+            c.c_uint32,
+            c.c_void_p,
+            c.c_uint32,
+            c.c_uint32,
+            c.c_void_p,
+        )
+        kernel.CreateFileW.restype = c.c_void_p
+        kernel.FlushFileBuffers.argtypes = (c.c_void_p,)
+        kernel.CloseHandle.argtypes = (c.c_void_p,)
+        # GENERIC_WRITE, shared read/write/delete, OPEN_EXISTING, BACKUP_SEMANTICS.
+        handle = kernel.CreateFileW(str(path), 0x40000000, 7, None, 3, 0x02000000, None)
+        if handle == c.c_void_p(-1).value:
+            raise c.WinError(c.get_last_error())
+        try:
+            if not kernel.FlushFileBuffers(handle):
+                raise c.WinError(c.get_last_error())
+        finally:
+            kernel.CloseHandle(handle)
+        return
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)
