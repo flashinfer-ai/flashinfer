@@ -1789,6 +1789,20 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
         dispatch_bits = phase_bits;
     } else {
         int iteration = 0;
+        int result = 0;
+        if (cluster - comm_clusters >= 0) {
+            if (shared_tasks > cluster - comm_clusters) {
+                if (cluster - comm_clusters >= 2 * shared_gate_tasks && cluster - comm_clusters < 2 * shared_gate_tasks + shared_swiglu) {
+                    result = 1;
+                }
+            } else {
+                int mini_task = (cluster - comm_clusters - shared_tasks) % mini_tasks;
+                if (mini_task >= 2 * mini_gate && mini_task < 2 * mini_gate + mini_swiglu) {
+                    result = 1;
+                }
+            }
+        }
+        int current_local = result;
         while (cluster >= 0 && cluster < true_clusters) {
             if (tid / 32 == 5) {
                 if (warp == 5) {
@@ -1807,19 +1821,6 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                 }
             }
             int compute = cluster - comm_clusters;
-            int result = 0;
-            if (compute >= 0) {
-                if (compute < shared_tasks) {
-                    if (compute >= 2 * shared_gate_tasks && compute < 2 * shared_gate_tasks + shared_swiglu) {
-                        result = 1;
-                    }
-                } else {
-                    int mini_task = (compute - shared_tasks) % mini_tasks;
-                    if (mini_task >= 2 * mini_gate && mini_task < 2 * mini_gate + mini_swiglu) {
-                        result = 1;
-                    }
-                }
-            }
             if (compute < shared_gate_tasks) {
                 int col_blocks_1 = (intermediate + 512 - 1) / 512;
                 int x = -1;
@@ -5633,10 +5634,11 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                     }
                 }
             }
-            if (result != 0 && cluster >= 0 && result_0 == 0) {
+            if (current_local != 0 && cluster >= 0 && result_0 == 0) {
                 asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
                 asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
             }
+            current_local = result_0;
             iteration = iteration + 1;
         }
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");

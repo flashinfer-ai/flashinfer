@@ -4338,6 +4338,92 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
         }
     } else {
         int iteration = 0;
+        int shared_tasks_0 = shared_down + shared_swiglu + shared_dx + 3 * shared_wgrad;
+        int mini_bwd_1 = mini_down + mini_swiglu + mini_dx;
+        int mini_replay_2 = 2 * mini_replay_gate + mini_replay_swiglu;
+        int weight_tasks = experts * routed_wgrad;
+        int _min_24 = ((tokens) < (macro_size) ? (tokens) : (macro_size));
+        int saved_minis_3 = (_min_24 + mini_size - 1) / mini_size;
+        int saved_tasks = saved_minis_3 * mini_bwd_1 + 3 * weight_tasks;
+        int replay_macro_tasks = macro_size / mini_size * (mini_replay_2 + mini_bwd_1) + 3 * weight_tasks;
+        int kind = -1;
+        int task_4 = 0;
+        int macro_1 = 0;
+        int mini_1 = 0;
+        int shared = 0;
+        if (cluster - comm_clusters >= 0 && true_compute > cluster - comm_clusters) {
+            if (shared_tasks_0 > cluster - comm_clusters) {
+                shared = 1;
+                if (shared_down > cluster - comm_clusters) {
+                    kind = 0;
+                    task_4 = cluster - comm_clusters;
+                } else if (cluster - comm_clusters < shared_down + shared_swiglu) {
+                    kind = 1;
+                    task_4 = cluster - comm_clusters - shared_down;
+                } else {
+                    if (cluster - comm_clusters < shared_down + shared_swiglu + shared_dx) {
+                        kind = 2;
+                        task_4 = cluster - comm_clusters - shared_down - shared_swiglu;
+                    } else {
+                        int weight_task = cluster - comm_clusters - shared_down - shared_swiglu - shared_dx;
+                        kind = 3 + weight_task / shared_wgrad;
+                        task_4 = weight_task % shared_wgrad;
+                    }
+                }
+            } else {
+                int routed = cluster - comm_clusters - shared_tasks_0;
+                int macro_task = routed;
+                int replay_tasks = 0;
+                if (routed >= saved_tasks) {
+                    macro_1 = 1 + (routed - saved_tasks) / replay_macro_tasks;
+                    macro_task = (routed - saved_tasks) % replay_macro_tasks;
+                    int _min_25 = ((tokens - macro_1 * macro_size) < (macro_size) ? (tokens - macro_1 * macro_size) : (macro_size));
+                    int macro_minis = (_min_25 + mini_size - 1) / mini_size;
+                    replay_tasks = macro_minis * mini_replay_2;
+                }
+                int _min_26 = ((tokens - macro_1 * macro_size) < (macro_size) ? (tokens - macro_1 * macro_size) : (macro_size));
+                int macro_minis_1 = (_min_26 + mini_size - 1) / mini_size;
+                if (macro_task < replay_tasks) {
+                    mini_1 = macro_task / mini_replay_2;
+                    int mini_task = macro_task % mini_replay_2;
+                    if (mini_task < mini_replay_gate) {
+                        kind = 6;
+                        task_4 = mini_task;
+                    } else if (mini_task < 2 * mini_replay_gate) {
+                        kind = 7;
+                        task_4 = mini_task - mini_replay_gate;
+                    } else {
+                        kind = 8;
+                        task_4 = mini_task - 2 * mini_replay_gate;
+                    }
+                } else {
+                    int bwd_task = macro_task - replay_tasks;
+                    if (bwd_task < macro_minis_1 * mini_bwd_1) {
+                        mini_1 = bwd_task / mini_bwd_1;
+                        int mini_task_1 = bwd_task % mini_bwd_1;
+                        if (mini_task_1 < mini_down) {
+                            kind = 0;
+                            task_4 = mini_task_1;
+                        } else if (mini_task_1 < mini_down + mini_swiglu) {
+                            kind = 1;
+                            task_4 = mini_task_1 - mini_down;
+                        } else {
+                            kind = 2;
+                            task_4 = mini_task_1 - mini_down - mini_swiglu;
+                        }
+                    } else {
+                        int weight_task_1 = bwd_task - macro_minis_1 * mini_bwd_1;
+                        kind = 3 + weight_task_1 / weight_tasks;
+                        task_4 = weight_task_1 % weight_tasks;
+                    }
+                }
+            }
+        }
+        int kind_4 = kind;
+        int task_5 = task_4;
+        int macro_6 = macro_1;
+        int mini_7 = mini_1;
+        int shared_8 = shared;
         while (cluster >= 0 && cluster < true_clusters) {
             if (tid / 32 == 5) {
                 if (warp == 5) {
@@ -4355,97 +4441,16 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                     }
                 }
             }
-            int shared_tasks_0 = shared_down + shared_swiglu + shared_dx + 3 * shared_wgrad;
-            int mini_bwd_1 = mini_down + mini_swiglu + mini_dx;
-            int mini_replay_2 = 2 * mini_replay_gate + mini_replay_swiglu;
-            int weight_tasks = experts * routed_wgrad;
-            int _min_24 = ((tokens) < (macro_size) ? (tokens) : (macro_size));
-            int saved_minis_3 = (_min_24 + mini_size - 1) / mini_size;
-            int saved_tasks = saved_minis_3 * mini_bwd_1 + 3 * weight_tasks;
-            int replay_macro_tasks = macro_size / mini_size * (mini_replay_2 + mini_bwd_1) + 3 * weight_tasks;
-            int kind = -1;
-            int task_4 = 0;
-            int macro_1 = 0;
-            int mini_1 = 0;
-            int shared = 0;
-            if (cluster - comm_clusters >= 0 && true_compute > cluster - comm_clusters) {
-                if (shared_tasks_0 > cluster - comm_clusters) {
-                    shared = 1;
-                    if (shared_down > cluster - comm_clusters) {
-                        kind = 0;
-                        task_4 = cluster - comm_clusters;
-                    } else if (cluster - comm_clusters < shared_down + shared_swiglu) {
-                        kind = 1;
-                        task_4 = cluster - comm_clusters - shared_down;
-                    } else {
-                        if (cluster - comm_clusters < shared_down + shared_swiglu + shared_dx) {
-                            kind = 2;
-                            task_4 = cluster - comm_clusters - shared_down - shared_swiglu;
-                        } else {
-                            int weight_task = cluster - comm_clusters - shared_down - shared_swiglu - shared_dx;
-                            kind = 3 + weight_task / shared_wgrad;
-                            task_4 = weight_task % shared_wgrad;
-                        }
-                    }
-                } else {
-                    int routed = cluster - comm_clusters - shared_tasks_0;
-                    int macro_task = routed;
-                    int replay_tasks = 0;
-                    if (routed >= saved_tasks) {
-                        macro_1 = 1 + (routed - saved_tasks) / replay_macro_tasks;
-                        macro_task = (routed - saved_tasks) % replay_macro_tasks;
-                        int _min_25 = ((tokens - macro_1 * macro_size) < (macro_size) ? (tokens - macro_1 * macro_size) : (macro_size));
-                        int macro_minis = (_min_25 + mini_size - 1) / mini_size;
-                        replay_tasks = macro_minis * mini_replay_2;
-                    }
-                    int _min_26 = ((tokens - macro_1 * macro_size) < (macro_size) ? (tokens - macro_1 * macro_size) : (macro_size));
-                    int macro_minis_1 = (_min_26 + mini_size - 1) / mini_size;
-                    if (macro_task < replay_tasks) {
-                        mini_1 = macro_task / mini_replay_2;
-                        int mini_task = macro_task % mini_replay_2;
-                        if (mini_task < mini_replay_gate) {
-                            kind = 6;
-                            task_4 = mini_task;
-                        } else if (mini_task < 2 * mini_replay_gate) {
-                            kind = 7;
-                            task_4 = mini_task - mini_replay_gate;
-                        } else {
-                            kind = 8;
-                            task_4 = mini_task - 2 * mini_replay_gate;
-                        }
-                    } else {
-                        int bwd_task = macro_task - replay_tasks;
-                        if (bwd_task < macro_minis_1 * mini_bwd_1) {
-                            mini_1 = bwd_task / mini_bwd_1;
-                            int mini_task_1 = bwd_task % mini_bwd_1;
-                            if (mini_task_1 < mini_down) {
-                                kind = 0;
-                                task_4 = mini_task_1;
-                            } else if (mini_task_1 < mini_down + mini_swiglu) {
-                                kind = 1;
-                                task_4 = mini_task_1 - mini_down;
-                            } else {
-                                kind = 2;
-                                task_4 = mini_task_1 - mini_down - mini_swiglu;
-                            }
-                        } else {
-                            int weight_task_1 = bwd_task - macro_minis_1 * mini_bwd_1;
-                            kind = 3 + weight_task_1 / weight_tasks;
-                            task_4 = weight_task_1 % weight_tasks;
-                        }
-                    }
-                }
-            }
             unsigned int gemm_phase = gemm_bits;
             unsigned int swiglu_phase = swiglu_bits;
             unsigned int replay_phase = replay_bits;
             int row_count = 2 * (intermediate / 128);
             int shared_rows = local_tokens / 256;
-            int shared_down_4 = shared_rows * (intermediate / 256);
-            int i_tiles_5 = intermediate / 128;
+            int shared_down_0 = shared_rows * (intermediate / 256);
+            int i_tiles_1 = intermediate / 128;
             int h_tiles = hidden / 128;
-            if (shared != 0) {
-                if (kind == 0) {
+            if (shared_8 != 0) {
+                if (kind_4 == 0) {
                     int col_blocks_2 = (hidden + 512 - 1) / 512;
                     {
                         col_blocks_2 = (intermediate + 512 - 1) / 512;
@@ -4457,17 +4462,17 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                     int k_end = 0;
                     int first = 0;
                     int row_blocks = local_tokens / 256;
-                    if (task_4 < row_blocks * col_blocks_2) {
-                        int supergroup = task_4 / (row_blocks * 8);
+                    if (task_5 < row_blocks * col_blocks_2) {
+                        int supergroup = task_5 / (row_blocks * 8);
                         int full_cols = col_blocks_2 / 8 * 8;
                         int row_6 = 0;
                         int col_49 = 0;
-                        if (task_4 < row_blocks * full_cols) {
-                            row_6 = task_4 % (row_blocks * 8) / 8;
-                            col_49 = supergroup * 8 + task_4 % 8;
+                        if (task_5 < row_blocks * full_cols) {
+                            row_6 = task_5 % (row_blocks * 8) / 8;
+                            col_49 = supergroup * 8 + task_5 % 8;
                         } else {
-                            row_6 = (task_4 - row_blocks * full_cols) / (col_blocks_2 - full_cols);
-                            col_49 = full_cols + (task_4 - row_blocks * full_cols) % (col_blocks_2 - full_cols);
+                            row_6 = (task_5 - row_blocks * full_cols) / (col_blocks_2 - full_cols);
+                            col_49 = full_cols + (task_5 - row_blocks * full_cols) % (col_blocks_2 - full_cols);
                         }
                         if ((supergroup & 1) != 0) {
                             row_6 = row_blocks - row_6 - 1;
@@ -4771,12 +4776,12 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                         }
                     }
                     gemm_phase = phase_bits_1;
-                } else if (kind == 1) {
+                } else if (kind_4 == 1) {
                     unsigned int phase_bits_2 = swiglu_phase;
                     int col_blocks_3 = intermediate / 128;
                     int num_tiles = local_tokens / 128 * col_blocks_3;
                     int macro_row_offset = 0;
-                    int first_tile_1 = task_4 * 16 + cta_rank_0 * 8;
+                    int first_tile_1 = task_5 * 16 + cta_rank_0 * 8;
                     int tile_end = num_tiles;
                     int _min_30 = ((8) < (tile_end - first_tile_1) ? (8) : (tile_end - first_tile_1));
                     int _max_3 = ((0) > (_min_30) ? (0) : (_min_30));
@@ -4984,7 +4989,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                     }
                     swiglu_phase = phase_bits_2;
                 } else {
-                    if (kind == 2) {
+                    if (kind_4 == 2) {
                         int col_blocks_4 = (intermediate + 512 - 1) / 512;
                         {
                             col_blocks_4 = (hidden + 512 - 1) / 512;
@@ -4996,17 +5001,17 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                         int k_end_1 = 0;
                         int first_1 = 0;
                         int row_blocks_1 = local_tokens / 256;
-                        if (task_4 < row_blocks_1 * col_blocks_4) {
-                            int supergroup_1 = task_4 / (row_blocks_1 * 8);
+                        if (task_5 < row_blocks_1 * col_blocks_4) {
+                            int supergroup_1 = task_5 / (row_blocks_1 * 8);
                             int full_cols_1 = col_blocks_4 / 8 * 8;
                             int row_11 = 0;
                             int col_54 = 0;
-                            if (task_4 < row_blocks_1 * full_cols_1) {
-                                row_11 = task_4 % (row_blocks_1 * 8) / 8;
-                                col_54 = supergroup_1 * 8 + task_4 % 8;
+                            if (task_5 < row_blocks_1 * full_cols_1) {
+                                row_11 = task_5 % (row_blocks_1 * 8) / 8;
+                                col_54 = supergroup_1 * 8 + task_5 % 8;
                             } else {
-                                row_11 = (task_4 - row_blocks_1 * full_cols_1) / (col_blocks_4 - full_cols_1);
-                                col_54 = full_cols_1 + (task_4 - row_blocks_1 * full_cols_1) % (col_blocks_4 - full_cols_1);
+                                row_11 = (task_5 - row_blocks_1 * full_cols_1) / (col_blocks_4 - full_cols_1);
+                                col_54 = full_cols_1 + (task_5 - row_blocks_1 * full_cols_1) % (col_blocks_4 - full_cols_1);
                             }
                             if ((supergroup_1 & 1) != 0) {
                                 row_11 = row_blocks_1 - row_11 - 1;
@@ -5331,7 +5336,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                             }
                         }
                         gemm_phase = phase_bits_3;
-                    } else if (kind == 3) {
+                    } else if (kind_4 == 3) {
                         int col_blocks_5 = (local_tokens + 512 - 1) / 512;
                         {
                             col_blocks_5 = (intermediate + 512 - 1) / 512;
@@ -5344,7 +5349,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                         int first_2 = 0;
                         int row_blocks_2 = hidden / 256;
                         int expert_idx = 0;
-                        int local_task = task_4;
+                        int local_task = task_5;
                         int _max_5 = ((row_blocks_2 * col_blocks_5) > (intermediate / 256 * ((hidden + 512 - 1) / 512)) ? (row_blocks_2 * col_blocks_5) : (intermediate / 256 * ((hidden + 512 - 1) / 512)));
                         int stride = _max_5;
                         k_end_2 = local_tokens;
@@ -5679,7 +5684,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                         }
                         gemm_phase = phase_bits_4;
                     } else {
-                        if (kind == 4) {
+                        if (kind_4 == 4) {
                             int col_blocks_6 = (local_tokens + 512 - 1) / 512;
                             {
                                 col_blocks_6 = (hidden + 512 - 1) / 512;
@@ -5692,7 +5697,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                             int first_3 = 0;
                             int row_blocks_3 = intermediate / 256;
                             int expert_idx_1 = 0;
-                            int local_task_1 = task_4;
+                            int local_task_1 = task_5;
                             int _max_7 = ((row_blocks_3 * col_blocks_6) > (hidden / 256 * ((intermediate + 512 - 1) / 512)) ? (row_blocks_3 * col_blocks_6) : (hidden / 256 * ((intermediate + 512 - 1) / 512)));
                             int stride_1 = _max_7;
                             k_end_3 = local_tokens;
@@ -6039,7 +6044,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                 }
                             }
                             gemm_phase = phase_bits_5;
-                        } else if (kind == 5) {
+                        } else if (kind_4 == 5) {
                             int col_blocks_7 = (local_tokens + 512 - 1) / 512;
                             {
                                 col_blocks_7 = (hidden + 512 - 1) / 512;
@@ -6052,7 +6057,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                             int first_4 = 0;
                             int row_blocks_4 = intermediate / 256;
                             int expert_idx_2 = 0;
-                            int local_task_2 = task_4;
+                            int local_task_2 = task_5;
                             int _max_9 = ((row_blocks_4 * col_blocks_7) > (hidden / 256 * ((intermediate + 512 - 1) / 512)) ? (row_blocks_4 * col_blocks_7) : (hidden / 256 * ((intermediate + 512 - 1) / 512)));
                             int stride_2 = _max_9;
                             k_end_4 = local_tokens;
@@ -6402,7 +6407,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                         }
                     }
                 }
-            } else if (kind == 6) {
+            } else if (kind_4 == 6) {
                 int col_blocks_8 = (intermediate + 256 - 1) / 256;
                 int x_5 = -1;
                 int y_5 = -1;
@@ -6410,10 +6415,10 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                 int k_start_5 = 0;
                 int k_end_5 = 0;
                 int first_5 = 0;
-                int first_block = (macro_1 * (macro_size / mini_size) + mini_1) * (mini_size / 256);
+                int first_block = (macro_6 * (macro_size / mini_size) + mini_7) * (mini_size / 256);
                 int _min_45 = ((first_block + mini_size / 256) < (tokens / 256) ? (first_block + mini_size / 256) : (tokens / 256));
                 int end_block = _min_45;
-                int block = first_block + task_4 / col_blocks_8;
+                int block = first_block + task_5 / col_blocks_8;
                 if (block < end_block) {
                     int index_2 = counts[3 * experts + block];
                     int offset_12 = counts[experts + index_2] / 256;
@@ -6421,30 +6426,30 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                     int first_row_1 = _max_11;
                     int _min_46 = ((end_block) < (offset_12 + counts[index_2] / 256) ? (end_block) : (offset_12 + counts[index_2] / 256));
                     int rows_3 = _min_46 - first_row_1;
-                    int supergroup_5 = (task_4 - (first_row_1 - first_block) * col_blocks_8) / (rows_3 * 8);
+                    int supergroup_5 = (task_5 - (first_row_1 - first_block) * col_blocks_8) / (rows_3 * 8);
                     int full_cols_5 = col_blocks_8 / 8 * 8;
                     int row_23 = 0;
                     int col_66 = 0;
-                    if (task_4 - (first_row_1 - first_block) * col_blocks_8 < rows_3 * full_cols_5) {
-                        row_23 = (task_4 - (first_row_1 - first_block) * col_blocks_8) % (rows_3 * 8) / 8;
-                        col_66 = supergroup_5 * 8 + (task_4 - (first_row_1 - first_block) * col_blocks_8) % 8;
+                    if (task_5 - (first_row_1 - first_block) * col_blocks_8 < rows_3 * full_cols_5) {
+                        row_23 = (task_5 - (first_row_1 - first_block) * col_blocks_8) % (rows_3 * 8) / 8;
+                        col_66 = supergroup_5 * 8 + (task_5 - (first_row_1 - first_block) * col_blocks_8) % 8;
                     } else {
-                        row_23 = (task_4 - (first_row_1 - first_block) * col_blocks_8 - rows_3 * full_cols_5) / (col_blocks_8 - full_cols_5);
-                        col_66 = full_cols_5 + (task_4 - (first_row_1 - first_block) * col_blocks_8 - rows_3 * full_cols_5) % (col_blocks_8 - full_cols_5);
+                        row_23 = (task_5 - (first_row_1 - first_block) * col_blocks_8 - rows_3 * full_cols_5) / (col_blocks_8 - full_cols_5);
+                        col_66 = full_cols_5 + (task_5 - (first_row_1 - first_block) * col_blocks_8 - rows_3 * full_cols_5) % (col_blocks_8 - full_cols_5);
                     }
                     if ((supergroup_5 & 1) != 0) {
                         row_23 = rows_3 - row_23 - 1;
                     }
-                    x_5 = first_row_1 + row_23 - macro_1 * (macro_size / 256);
+                    x_5 = first_row_1 + row_23 - macro_6 * (macro_size / 256);
                     y_5 = col_66;
                     expert_5 = index_2;
                 }
                 unsigned int phase_bits_7 = gemm_phase;
                 int has_hi_5 = 0;
-                int global_mini_5 = macro_1 * (macro_size / mini_size) + mini_1;
-                int macro_rows_5 = macro_1 * (macro_size / 256);
+                int global_mini_5 = macro_6 * (macro_size / mini_size) + mini_7;
+                int macro_rows_5 = macro_6 * (macro_size / 256);
                 int iterations_5 = hidden / 128;
-                int macro_k = macro_1 * (macro_size / 128);
+                int macro_k = macro_6 * (macro_size / 128);
                 if (expert_5 < 0) {
                     if (tid == 0) {
                     }
@@ -6524,7 +6529,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                     asm volatile(
                                         "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                         " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                        :: "r"(smem_v54_addr + (unsigned int)(ring_11 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&wg_sc)), "r"(0), "r"(0), "r"((expert_5 * i_tiles_5 + y_5 * 2 + cta_rank_0) * (hidden / 128) + idx_11),
+                                        :: "r"(smem_v54_addr + (unsigned int)(ring_11 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&wg_sc)), "r"(0), "r"(0), "r"((expert_5 * i_tiles_1 + y_5 * 2 + cta_rank_0) * (hidden / 128) + idx_11),
                                            "r"(((scales_arrived_addr + (ring_11) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)) : "memory");
                                     phase_bits_7 = phase_bits_7 ^ (unsigned int)(1 << 16 + ring_11);
                                     ring_11 = (ring_11 + 1) % 4;
@@ -7326,7 +7331,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                 }
                 gemm_phase = phase_bits_7;
             } else {
-                if (kind == 7) {
+                if (kind_4 == 7) {
                     int col_blocks_9 = (intermediate + 256 - 1) / 256;
                     int x_6 = -1;
                     int y_6 = -1;
@@ -7334,10 +7339,10 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                     int k_start_6 = 0;
                     int k_end_6 = 0;
                     int first_6 = 0;
-                    int first_block_1 = (macro_1 * (macro_size / mini_size) + mini_1) * (mini_size / 256);
+                    int first_block_1 = (macro_6 * (macro_size / mini_size) + mini_7) * (mini_size / 256);
                     int _min_49 = ((first_block_1 + mini_size / 256) < (tokens / 256) ? (first_block_1 + mini_size / 256) : (tokens / 256));
                     int end_block_1 = _min_49;
-                    int block_2 = first_block_1 + task_4 / col_blocks_9;
+                    int block_2 = first_block_1 + task_5 / col_blocks_9;
                     if (block_2 < end_block_1) {
                         int index_3 = counts[3 * experts + block_2];
                         int offset_13 = counts[experts + index_3] / 256;
@@ -7345,30 +7350,30 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                         int first_row_2 = _max_14;
                         int _min_50 = ((end_block_1) < (offset_13 + counts[index_3] / 256) ? (end_block_1) : (offset_13 + counts[index_3] / 256));
                         int rows_4 = _min_50 - first_row_2;
-                        int supergroup_6 = (task_4 - (first_row_2 - first_block_1) * col_blocks_9) / (rows_4 * 8);
+                        int supergroup_6 = (task_5 - (first_row_2 - first_block_1) * col_blocks_9) / (rows_4 * 8);
                         int full_cols_6 = col_blocks_9 / 8 * 8;
                         int row_24 = 0;
                         int col_67 = 0;
-                        if (task_4 - (first_row_2 - first_block_1) * col_blocks_9 < rows_4 * full_cols_6) {
-                            row_24 = (task_4 - (first_row_2 - first_block_1) * col_blocks_9) % (rows_4 * 8) / 8;
-                            col_67 = supergroup_6 * 8 + (task_4 - (first_row_2 - first_block_1) * col_blocks_9) % 8;
+                        if (task_5 - (first_row_2 - first_block_1) * col_blocks_9 < rows_4 * full_cols_6) {
+                            row_24 = (task_5 - (first_row_2 - first_block_1) * col_blocks_9) % (rows_4 * 8) / 8;
+                            col_67 = supergroup_6 * 8 + (task_5 - (first_row_2 - first_block_1) * col_blocks_9) % 8;
                         } else {
-                            row_24 = (task_4 - (first_row_2 - first_block_1) * col_blocks_9 - rows_4 * full_cols_6) / (col_blocks_9 - full_cols_6);
-                            col_67 = full_cols_6 + (task_4 - (first_row_2 - first_block_1) * col_blocks_9 - rows_4 * full_cols_6) % (col_blocks_9 - full_cols_6);
+                            row_24 = (task_5 - (first_row_2 - first_block_1) * col_blocks_9 - rows_4 * full_cols_6) / (col_blocks_9 - full_cols_6);
+                            col_67 = full_cols_6 + (task_5 - (first_row_2 - first_block_1) * col_blocks_9 - rows_4 * full_cols_6) % (col_blocks_9 - full_cols_6);
                         }
                         if ((supergroup_6 & 1) != 0) {
                             row_24 = rows_4 - row_24 - 1;
                         }
-                        x_6 = first_row_2 + row_24 - macro_1 * (macro_size / 256);
+                        x_6 = first_row_2 + row_24 - macro_6 * (macro_size / 256);
                         y_6 = col_67;
                         expert_6 = index_3;
                     }
                     unsigned int phase_bits_8 = gemm_phase;
                     int has_hi_6 = 0;
-                    int global_mini_6 = macro_1 * (macro_size / mini_size) + mini_1;
-                    int macro_rows_6 = macro_1 * (macro_size / 256);
+                    int global_mini_6 = macro_6 * (macro_size / mini_size) + mini_7;
+                    int macro_rows_6 = macro_6 * (macro_size / 256);
                     int iterations_6 = hidden / 128;
-                    int macro_k_1 = macro_1 * (macro_size / 128);
+                    int macro_k_1 = macro_6 * (macro_size / 128);
                     if (expert_6 < 0) {
                         if (tid == 0) {
                         }
@@ -7448,7 +7453,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                         asm volatile(
                                             "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                            :: "r"(smem_v54_addr + (unsigned int)(ring_14 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&wu_sc)), "r"(0), "r"(0), "r"((expert_6 * i_tiles_5 + y_6 * 2 + cta_rank_0) * (hidden / 128) + idx_14),
+                                            :: "r"(smem_v54_addr + (unsigned int)(ring_14 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&wu_sc)), "r"(0), "r"(0), "r"((expert_6 * i_tiles_1 + y_6 * 2 + cta_rank_0) * (hidden / 128) + idx_14),
                                                "r"(((scales_arrived_addr + (ring_14) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)) : "memory");
                                         phase_bits_8 = phase_bits_8 ^ (unsigned int)(1 << 16 + ring_14);
                                         ring_14 = (ring_14 + 1) % 4;
@@ -8249,13 +8254,13 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                         }
                     }
                     gemm_phase = phase_bits_8;
-                } else if (kind == 8) {
+                } else if (kind_4 == 8) {
                     unsigned int phase_bits_9 = replay_phase;
                     int col_blocks_10 = intermediate / 128;
                     int num_tiles_1 = tokens / 128 * col_blocks_10;
-                    int macro_row_offset_1 = macro_1 * (macro_size / 128);
-                    int first_tile_2 = task_4 * 6 + cta_rank_0 * 3;
-                    int global_mini_7 = macro_1 * (macro_size / mini_size) + mini_1;
+                    int macro_row_offset_1 = macro_6 * (macro_size / 128);
+                    int first_tile_2 = task_5 * 6 + cta_rank_0 * 3;
+                    int global_mini_7 = macro_6 * (macro_size / mini_size) + mini_7;
                     int mini_tiles = mini_size / 128 * col_blocks_10;
                     first_tile_2 = first_tile_2 + global_mini_7 * mini_tiles;
                     int _min_53 = ((num_tiles_1) < ((global_mini_7 + 1) * mini_tiles) ? (num_tiles_1) : ((global_mini_7 + 1) * mini_tiles));
@@ -9397,7 +9402,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                     }
                     replay_phase = phase_bits_9;
                 } else {
-                    if (kind == 0) {
+                    if (kind_4 == 0) {
                         int col_blocks_11 = (intermediate + 512 - 1) / 512;
                         int x_7 = -1;
                         int y_7 = -1;
@@ -9405,10 +9410,10 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                         int k_start_7 = 0;
                         int k_end_7 = 0;
                         int first_7 = 0;
-                        int first_block_2 = (macro_1 * (macro_size / mini_size) + mini_1) * (mini_size / 256);
+                        int first_block_2 = (macro_6 * (macro_size / mini_size) + mini_7) * (mini_size / 256);
                         int _min_60 = ((first_block_2 + mini_size / 256) < (tokens / 256) ? (first_block_2 + mini_size / 256) : (tokens / 256));
                         int end_block_2 = _min_60;
-                        int block_3 = first_block_2 + task_4 / col_blocks_11;
+                        int block_3 = first_block_2 + task_5 / col_blocks_11;
                         if (block_3 < end_block_2) {
                             int index_4 = counts[3 * experts + block_3];
                             int offset_14 = counts[experts + index_4] / 256;
@@ -9416,36 +9421,36 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                             int first_row_4 = _max_17;
                             int _min_61 = ((end_block_2) < (offset_14 + counts[index_4] / 256) ? (end_block_2) : (offset_14 + counts[index_4] / 256));
                             int rows_5 = _min_61 - first_row_4;
-                            int supergroup_7 = (task_4 - (first_row_4 - first_block_2) * col_blocks_11) / (rows_5 * 8);
+                            int supergroup_7 = (task_5 - (first_row_4 - first_block_2) * col_blocks_11) / (rows_5 * 8);
                             int full_cols_7 = col_blocks_11 / 8 * 8;
                             int row_34 = 0;
                             int col_74 = 0;
-                            if (task_4 - (first_row_4 - first_block_2) * col_blocks_11 < rows_5 * full_cols_7) {
-                                row_34 = (task_4 - (first_row_4 - first_block_2) * col_blocks_11) % (rows_5 * 8) / 8;
-                                col_74 = supergroup_7 * 8 + (task_4 - (first_row_4 - first_block_2) * col_blocks_11) % 8;
+                            if (task_5 - (first_row_4 - first_block_2) * col_blocks_11 < rows_5 * full_cols_7) {
+                                row_34 = (task_5 - (first_row_4 - first_block_2) * col_blocks_11) % (rows_5 * 8) / 8;
+                                col_74 = supergroup_7 * 8 + (task_5 - (first_row_4 - first_block_2) * col_blocks_11) % 8;
                             } else {
-                                row_34 = (task_4 - (first_row_4 - first_block_2) * col_blocks_11 - rows_5 * full_cols_7) / (col_blocks_11 - full_cols_7);
-                                col_74 = full_cols_7 + (task_4 - (first_row_4 - first_block_2) * col_blocks_11 - rows_5 * full_cols_7) % (col_blocks_11 - full_cols_7);
+                                row_34 = (task_5 - (first_row_4 - first_block_2) * col_blocks_11 - rows_5 * full_cols_7) / (col_blocks_11 - full_cols_7);
+                                col_74 = full_cols_7 + (task_5 - (first_row_4 - first_block_2) * col_blocks_11 - rows_5 * full_cols_7) % (col_blocks_11 - full_cols_7);
                             }
                             if ((supergroup_7 & 1) != 0) {
                                 row_34 = rows_5 - row_34 - 1;
                             }
-                            x_7 = first_row_4 + row_34 - macro_1 * (macro_size / 256);
+                            x_7 = first_row_4 + row_34 - macro_6 * (macro_size / 256);
                             y_7 = col_74;
                             expert_7 = index_4;
                         }
                         unsigned int phase_bits_10 = gemm_phase;
                         int has_hi_7 = 0;
                         has_hi_7 = (int)((y_7 * 2 + 1) * 256 < intermediate);
-                        int global_mini_8 = macro_1 * (macro_size / mini_size) + mini_1;
-                        int macro_rows_7 = macro_1 * (macro_size / 256);
+                        int global_mini_8 = macro_6 * (macro_size / mini_size) + mini_7;
+                        int macro_rows_7 = macro_6 * (macro_size / 256);
                         int iterations_7 = hidden / 128;
-                        int macro_k_2 = macro_1 * (macro_size / 128);
+                        int macro_k_2 = macro_6 * (macro_size / 128);
                         if (expert_7 < 0) {
                             if (tid == 0) {
                                 bool enabled_value_12 = macros > 1;
                                 if (enabled_value_12 != 0) {
-                                    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_1))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_6))), "r"(static_cast<unsigned int>(1)) : "memory");
                                 }
                             }
                         } else if (tid / 32 == 7) {
@@ -9529,12 +9534,12 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                             asm volatile(
                                                 "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                                 " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                                :: "r"(smem_v54_addr + (unsigned int)(ring_17 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&wd_t_sc)), "r"(0), "r"(0), "r"((expert_7 * i_tiles_5 + y_7 * 4 + cta_rank_0) * (hidden / 128) + idx_17),
+                                                :: "r"(smem_v54_addr + (unsigned int)(ring_17 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&wd_t_sc)), "r"(0), "r"(0), "r"((expert_7 * i_tiles_1 + y_7 * 4 + cta_rank_0) * (hidden / 128) + idx_17),
                                                    "r"(((scales_arrived_addr + (ring_17) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)) : "memory");
                                             asm volatile(
                                                 "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                                 " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                                :: "r"(smem_v55_addr + (unsigned int)(ring_17 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&wd_t_sc)), "r"(0), "r"(0), "r"((expert_7 * i_tiles_5 + y_7 * 4 + 2 + cta_rank_0) * (hidden / 128) + idx_17),
+                                                :: "r"(smem_v55_addr + (unsigned int)(ring_17 * 1024) + (unsigned int)(cta_rank_0 * 512)), "l"((&wd_t_sc)), "r"(0), "r"(0), "r"((expert_7 * i_tiles_1 + y_7 * 4 + 2 + cta_rank_0) * (hidden / 128) + idx_17),
                                                    "r"(((scales_arrived_addr + (ring_17) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)) : "memory");
                                             phase_bits_10 = phase_bits_10 ^ (unsigned int)(1 << 16 + ring_17);
                                             ring_17 = (ring_17 + 1) % 4;
@@ -9624,7 +9629,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                         }
                                     }
                                     if (tid == 0) {
-                                        int previous_offset_7 = (macro_1 + 1) * macro_size;
+                                        int previous_offset_7 = (macro_6 + 1) * macro_size;
                                         int output_row_5 = x_7 * 256 + cta_rank_0 * 128;
                                         int _min_64 = ((macro_size) < (tokens - previous_offset_7) ? (macro_size) : (tokens - previous_offset_7));
                                         if (output_row_5 < _min_64) {
@@ -9738,21 +9743,21 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                                 asm volatile("cp.async.bulk.wait_group 0;");
                                                 bool enabled_value_15 = 1;
                                                 if (enabled_value_15 != 0) {
-                                                    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(dh_ready)) + (shared_down_4 + (macro_rows_7 + x_7) * (intermediate / 256) + y_7 * 2))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                                    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(dh_ready)) + (shared_down_0 + (macro_rows_7 + x_7) * (intermediate / 256) + y_7 * 2))), "r"(static_cast<unsigned int>(1)) : "memory");
                                                 }
                                                 bool enabled_value_0_1 = macros > 1;
                                                 if (enabled_value_0_1 != 0) {
                                                     asm volatile("cp.async.bulk.wait_group 0;");
                                                     bool enabled_value_1_1 = 1;
                                                     if (enabled_value_1_1 != 0) {
-                                                        asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_1))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                                        asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_6))), "r"(static_cast<unsigned int>(1)) : "memory");
                                                     }
                                                 }
                                                 if (has_hi_7 != 0) {
                                                     asm volatile("cp.async.bulk.wait_group 0;");
                                                     bool enabled_value_1_2 = 1;
                                                     if (enabled_value_1_2 != 0) {
-                                                        asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(dh_ready)) + (shared_down_4 + (macro_rows_7 + x_7) * (intermediate / 256) + y_7 * 2 + 1))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                                        asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(dh_ready)) + (shared_down_0 + (macro_rows_7 + x_7) * (intermediate / 256) + y_7 * 2 + 1))), "r"(static_cast<unsigned int>(1)) : "memory");
                                                     }
                                                 }
                                             }
@@ -9762,14 +9767,14 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                             }
                         }
                         gemm_phase = phase_bits_10;
-                    } else if (kind == 1) {
+                    } else if (kind_4 == 1) {
                         unsigned int phase_bits_11 = swiglu_phase;
                         int col_blocks_12 = intermediate / 128;
                         int num_tiles_2 = tokens / 128 * col_blocks_12;
-                        int macro_row_offset_2 = macro_1 * (macro_size / 128);
+                        int macro_row_offset_2 = macro_6 * (macro_size / 128);
                         int macro_tiles_5 = macro_size / 128;
-                        int first_tile_3 = task_4 * 4 + cta_rank_0 * 2;
-                        int global_mini_9 = macro_1 * (macro_size / mini_size) + mini_1;
+                        int first_tile_3 = task_5 * 4 + cta_rank_0 * 2;
+                        int global_mini_9 = macro_6 * (macro_size / mini_size) + mini_7;
                         int mini_tiles_1 = mini_size / 128 * col_blocks_12;
                         first_tile_3 = first_tile_3 + global_mini_9 * mini_tiles_1;
                         int _min_65 = ((num_tiles_2) < ((global_mini_9 + 1) * mini_tiles_1) ? (num_tiles_2) : ((global_mini_9 + 1) * mini_tiles_1));
@@ -9788,16 +9793,16 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                     mbarrier_arrive_expect_tx(swiglu_arrived_addr, 66560);
                                     int parent_5 = row_37 / 2 * (intermediate / 256) + col_77 / 2;
                                     int32_t _relaxed_ld_40;
-                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_40) : "l"(dh_ready + (shared_down_4 + parent_5)) : "memory");
+                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_40) : "l"(dh_ready + (shared_down_0 + parent_5)) : "memory");
                                     int value_20 = _relaxed_ld_40;
                                     while (value_20 < 2) {
                                         asm volatile("nanosleep.u32 %0;" :: "r"(16));
                                         int32_t _relaxed_ld_41;
-                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_41) : "l"(dh_ready + (shared_down_4 + parent_5)) : "memory");
+                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_41) : "l"(dh_ready + (shared_down_0 + parent_5)) : "memory");
                                         value_20 = _relaxed_ld_41;
                                     }
                                     asm volatile("fence.acquire.gpu;" ::: "memory");
-                                    bool enabled_value_16 = macro_1 > 0;
+                                    bool enabled_value_16 = macro_6 > 0;
                                     if (enabled_value_16 != 0) {
                                         int32_t _relaxed_ld_42;
                                         asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_42) : "l"(replay_gu + parent_5) : "memory");
@@ -9827,16 +9832,16 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                     mbarrier_arrive_expect_tx(swiglu_arrived_addr + 8, 66560);
                                     int parent_6 = row_38 / 2 * (intermediate / 256) + col_78 / 2;
                                     int32_t _relaxed_ld_44;
-                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_44) : "l"(dh_ready + (shared_down_4 + parent_6)) : "memory");
+                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_44) : "l"(dh_ready + (shared_down_0 + parent_6)) : "memory");
                                     int value_21 = _relaxed_ld_44;
                                     while (value_21 < 2) {
                                         asm volatile("nanosleep.u32 %0;" :: "r"(16));
                                         int32_t _relaxed_ld_45;
-                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_45) : "l"(dh_ready + (shared_down_4 + parent_6)) : "memory");
+                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_45) : "l"(dh_ready + (shared_down_0 + parent_6)) : "memory");
                                         value_21 = _relaxed_ld_45;
                                     }
                                     asm volatile("fence.acquire.gpu;" ::: "memory");
-                                    bool enabled_value_17 = macro_1 > 0;
+                                    bool enabled_value_17 = macro_6 > 0;
                                     if (enabled_value_17 != 0) {
                                         int32_t _relaxed_ld_46;
                                         asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_46) : "l"(replay_gu + parent_6) : "memory");
@@ -11130,12 +11135,12 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                         if (tid == 0) {
                             bool enabled_value_18 = macros > 1;
                             if (enabled_value_18 != 0) {
-                                asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_1))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_6))), "r"(static_cast<unsigned int>(1)) : "memory");
                             }
                         }
                         swiglu_phase = phase_bits_11;
                     } else {
-                        if (kind == 2) {
+                        if (kind_4 == 2) {
                             int col_blocks_13 = (hidden + 512 - 1) / 512;
                             int x_8 = -1;
                             int y_8 = -1;
@@ -11143,10 +11148,10 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                             int k_start_8 = 0;
                             int k_end_8 = 0;
                             int first_8 = 0;
-                            int first_block_3 = (macro_1 * (macro_size / mini_size) + mini_1) * (mini_size / 256);
+                            int first_block_3 = (macro_6 * (macro_size / mini_size) + mini_7) * (mini_size / 256);
                             int _min_82 = ((first_block_3 + mini_size / 256) < (tokens / 256) ? (first_block_3 + mini_size / 256) : (tokens / 256));
                             int end_block_3 = _min_82;
-                            int block_4 = first_block_3 + task_4 / col_blocks_13;
+                            int block_4 = first_block_3 + task_5 / col_blocks_13;
                             if (block_4 < end_block_3) {
                                 int index_5 = counts[3 * experts + block_4];
                                 int offset_17 = counts[experts + index_5] / 256;
@@ -11154,36 +11159,36 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                 int first_row_6 = _max_20;
                                 int _min_83 = ((end_block_3) < (offset_17 + counts[index_5] / 256) ? (end_block_3) : (offset_17 + counts[index_5] / 256));
                                 int rows_6 = _min_83 - first_row_6;
-                                int supergroup_8 = (task_4 - (first_row_6 - first_block_3) * col_blocks_13) / (rows_6 * 8);
+                                int supergroup_8 = (task_5 - (first_row_6 - first_block_3) * col_blocks_13) / (rows_6 * 8);
                                 int full_cols_8 = col_blocks_13 / 8 * 8;
                                 int row_43 = 0;
                                 int col_81 = 0;
-                                if (task_4 - (first_row_6 - first_block_3) * col_blocks_13 < rows_6 * full_cols_8) {
-                                    row_43 = (task_4 - (first_row_6 - first_block_3) * col_blocks_13) % (rows_6 * 8) / 8;
-                                    col_81 = supergroup_8 * 8 + (task_4 - (first_row_6 - first_block_3) * col_blocks_13) % 8;
+                                if (task_5 - (first_row_6 - first_block_3) * col_blocks_13 < rows_6 * full_cols_8) {
+                                    row_43 = (task_5 - (first_row_6 - first_block_3) * col_blocks_13) % (rows_6 * 8) / 8;
+                                    col_81 = supergroup_8 * 8 + (task_5 - (first_row_6 - first_block_3) * col_blocks_13) % 8;
                                 } else {
-                                    row_43 = (task_4 - (first_row_6 - first_block_3) * col_blocks_13 - rows_6 * full_cols_8) / (col_blocks_13 - full_cols_8);
-                                    col_81 = full_cols_8 + (task_4 - (first_row_6 - first_block_3) * col_blocks_13 - rows_6 * full_cols_8) % (col_blocks_13 - full_cols_8);
+                                    row_43 = (task_5 - (first_row_6 - first_block_3) * col_blocks_13 - rows_6 * full_cols_8) / (col_blocks_13 - full_cols_8);
+                                    col_81 = full_cols_8 + (task_5 - (first_row_6 - first_block_3) * col_blocks_13 - rows_6 * full_cols_8) % (col_blocks_13 - full_cols_8);
                                 }
                                 if ((supergroup_8 & 1) != 0) {
                                     row_43 = rows_6 - row_43 - 1;
                                 }
-                                x_8 = first_row_6 + row_43 - macro_1 * (macro_size / 256);
+                                x_8 = first_row_6 + row_43 - macro_6 * (macro_size / 256);
                                 y_8 = col_81;
                                 expert_8 = index_5;
                             }
                             unsigned int phase_bits_12 = gemm_phase;
                             int has_hi_8 = 0;
                             has_hi_8 = (int)((y_8 * 2 + 1) * 256 < hidden);
-                            int global_mini_10 = macro_1 * (macro_size / mini_size) + mini_1;
-                            int macro_rows_8 = macro_1 * (macro_size / 256);
+                            int global_mini_10 = macro_6 * (macro_size / mini_size) + mini_7;
+                            int macro_rows_8 = macro_6 * (macro_size / 256);
                             int iterations_8 = intermediate / 128 + intermediate / 128;
-                            int macro_k_3 = macro_1 * (macro_size / 128);
+                            int macro_k_3 = macro_6 * (macro_size / 128);
                             if (expert_8 < 0) {
                                 if (tid == 0) {
                                     bool enabled_value_19 = macros > 1;
                                     if (enabled_value_19 != 0) {
-                                        asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_1))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                        asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_6))), "r"(static_cast<unsigned int>(1)) : "memory");
                                     }
                                 }
                             } else if (tid / 32 == 7) {
@@ -11398,7 +11403,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                             }
                                         }
                                         if (tid == 0) {
-                                            int previous_offset_8 = (macro_1 + 1) * macro_size;
+                                            int previous_offset_8 = (macro_6 + 1) * macro_size;
                                             int output_row_6 = x_8 * 256 + cta_rank_0 * 128;
                                             int _min_86 = ((macro_size) < (tokens - previous_offset_8) ? (macro_size) : (tokens - previous_offset_8));
                                             if (output_row_6 < _min_86) {
@@ -11519,7 +11524,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                                         asm volatile("cp.async.bulk.wait_group 0;");
                                                         bool enabled_value_1_3 = 1;
                                                         if (enabled_value_1_3 != 0) {
-                                                            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_1))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                                            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_6))), "r"(static_cast<unsigned int>(1)) : "memory");
                                                         }
                                                     }
                                                     if (has_hi_8 != 0) {
@@ -11536,7 +11541,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                 }
                             }
                             gemm_phase = phase_bits_12;
-                        } else if (kind == 3) {
+                        } else if (kind_4 == 3) {
                             int col_blocks_14 = (macro_size + 512 - 1) / 512;
                             {
                                 col_blocks_14 = (intermediate + 512 - 1) / 512;
@@ -11549,17 +11554,17 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                             int first_9 = 0;
                             int row_blocks_5 = hidden / 256;
                             int expert_idx_3 = 0;
-                            int local_task_3 = task_4;
+                            int local_task_3 = task_5;
                             int _max_23 = ((row_blocks_5 * col_blocks_14) > (intermediate / 256 * ((hidden + 512 - 1) / 512)) ? (row_blocks_5 * col_blocks_14) : (intermediate / 256 * ((hidden + 512 - 1) / 512)));
                             int stride_3 = _max_23;
-                            expert_idx_3 = task_4 / stride_3;
-                            local_task_3 = task_4 % stride_3;
+                            expert_idx_3 = task_5 / stride_3;
+                            local_task_3 = task_5 % stride_3;
                             int offset_20 = counts[experts + expert_idx_3];
                             int real = counts[2 * experts + expert_idx_3];
                             real = (real + 128 - 1) / 128 * 128;
-                            int _max_24 = ((offset_20) > (macro_1 * macro_size) ? (offset_20) : (macro_1 * macro_size));
+                            int _max_24 = ((offset_20) > (macro_6 * macro_size) ? (offset_20) : (macro_6 * macro_size));
                             k_start_9 = _max_24;
-                            int _min_87 = (((macro_1 + 1) * macro_size) < (tokens) ? ((macro_1 + 1) * macro_size) : (tokens));
+                            int _min_87 = (((macro_6 + 1) * macro_size) < (tokens) ? ((macro_6 + 1) * macro_size) : (tokens));
                             int _min_88 = ((offset_20 + real) < (_min_87) ? (offset_20 + real) : (_min_87));
                             k_end_9 = _min_88;
                             first_9 = (int)(k_start_9 == offset_20);
@@ -11585,16 +11590,16 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                             unsigned int phase_bits_13 = gemm_phase;
                             int has_hi_9 = 0;
                             has_hi_9 = (int)((y_9 * 2 + 1) * 256 < intermediate);
-                            int global_mini_11 = macro_1 * (macro_size / mini_size);
-                            int macro_rows_9 = macro_1 * (macro_size / 256);
+                            int global_mini_11 = macro_6 * (macro_size / mini_size);
+                            int macro_rows_9 = macro_6 * (macro_size / 256);
                             int iterations_9 = hidden / 128;
-                            int macro_k_4 = macro_1 * (macro_size / 128);
+                            int macro_k_4 = macro_6 * (macro_size / 128);
                             iterations_9 = (k_end_9 - k_start_9) / 128;
                             if (expert_9 < 0) {
                                 if (tid == 0) {
                                     bool enabled_value_23 = macros > 1;
                                     if (enabled_value_23 != 0) {
-                                        asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_1))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                        asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_6))), "r"(static_cast<unsigned int>(1)) : "memory");
                                     }
                                 }
                             } else if (tid / 32 == 7) {
@@ -11605,7 +11610,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                         for (int idx_22 = 0; idx_22 < iterations_9; idx_22++) {
                                             int token_row_3 = k_start_9 + idx_22 * 128;
                                             if (idx_22 == 0 || token_row_3 % 256 == 0) {
-                                                bool enabled_value_24 = macro_1 > 0;
+                                                bool enabled_value_24 = macro_6 > 0;
                                                 if (enabled_value_24 != 0) {
                                                     int32_t _relaxed_ld_56;
                                                     asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_56) : "l"(replay_h + (token_row_3 / 256)) : "memory");
@@ -11668,7 +11673,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                             for (int idx_23 = 0; idx_23 < iterations_9; idx_23++) {
                                                 int token_row_4 = k_start_9 + idx_23 * 128;
                                                 if (idx_23 == 0 || token_row_4 % 256 == 0) {
-                                                    bool enabled_value_26 = macro_1 > 0;
+                                                    bool enabled_value_26 = macro_6 > 0;
                                                     if (enabled_value_26 != 0) {
                                                         int32_t _relaxed_ld_64;
                                                         asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_64) : "l"(replay_h + (token_row_4 / 256)) : "memory");
@@ -11805,7 +11810,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                             }
                                         }
                                         if (tid == 0) {
-                                            int previous_offset_9 = (macro_1 + 1) * macro_size;
+                                            int previous_offset_9 = (macro_6 + 1) * macro_size;
                                             int output_row_7 = x_9 * 256 + cta_rank_0 * 128;
                                             int _min_93 = ((macro_size) < (tokens - previous_offset_9) ? (macro_size) : (tokens - previous_offset_9));
                                             if (output_row_7 < _min_93) {
@@ -11941,7 +11946,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                                         asm volatile("cp.async.bulk.wait_group 0;");
                                                         bool enabled_value_0_3 = 1;
                                                         if (enabled_value_0_3 != 0) {
-                                                            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_1))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                                            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_6))), "r"(static_cast<unsigned int>(1)) : "memory");
                                                         }
                                                     }
                                                     if (has_hi_9 != 0) {
@@ -11954,7 +11959,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                             }
                             gemm_phase = phase_bits_13;
                         } else {
-                            if (kind == 4) {
+                            if (kind_4 == 4) {
                                 int col_blocks_15 = (macro_size + 512 - 1) / 512;
                                 {
                                     col_blocks_15 = (hidden + 512 - 1) / 512;
@@ -11967,17 +11972,17 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                 int first_10 = 0;
                                 int row_blocks_6 = intermediate / 256;
                                 int expert_idx_4 = 0;
-                                int local_task_4 = task_4;
+                                int local_task_4 = task_5;
                                 int _max_27 = ((row_blocks_6 * col_blocks_15) > (hidden / 256 * ((intermediate + 512 - 1) / 512)) ? (row_blocks_6 * col_blocks_15) : (hidden / 256 * ((intermediate + 512 - 1) / 512)));
                                 int stride_4 = _max_27;
-                                expert_idx_4 = task_4 / stride_4;
-                                local_task_4 = task_4 % stride_4;
+                                expert_idx_4 = task_5 / stride_4;
+                                local_task_4 = task_5 % stride_4;
                                 int offset_21 = counts[experts + expert_idx_4];
                                 int real_1 = counts[2 * experts + expert_idx_4];
                                 real_1 = (real_1 + 128 - 1) / 128 * 128;
-                                int _max_28 = ((offset_21) > (macro_1 * macro_size) ? (offset_21) : (macro_1 * macro_size));
+                                int _max_28 = ((offset_21) > (macro_6 * macro_size) ? (offset_21) : (macro_6 * macro_size));
                                 k_start_10 = _max_28;
-                                int _min_94 = (((macro_1 + 1) * macro_size) < (tokens) ? ((macro_1 + 1) * macro_size) : (tokens));
+                                int _min_94 = (((macro_6 + 1) * macro_size) < (tokens) ? ((macro_6 + 1) * macro_size) : (tokens));
                                 int _min_95 = ((offset_21 + real_1) < (_min_94) ? (offset_21 + real_1) : (_min_94));
                                 k_end_10 = _min_95;
                                 first_10 = (int)(k_start_10 == offset_21);
@@ -12003,16 +12008,16 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                 unsigned int phase_bits_14 = gemm_phase;
                                 int has_hi_10 = 0;
                                 has_hi_10 = (int)((y_10 * 2 + 1) * 256 < hidden);
-                                int global_mini_12 = macro_1 * (macro_size / mini_size);
-                                int macro_rows_10 = macro_1 * (macro_size / 256);
+                                int global_mini_12 = macro_6 * (macro_size / mini_size);
+                                int macro_rows_10 = macro_6 * (macro_size / 256);
                                 int iterations_10 = intermediate / 128;
-                                int macro_k_5 = macro_1 * (macro_size / 128);
+                                int macro_k_5 = macro_6 * (macro_size / 128);
                                 iterations_10 = (k_end_10 - k_start_10) / 128;
                                 if (expert_10 < 0) {
                                     if (tid == 0) {
                                         bool enabled_value_29 = macros > 1;
                                         if (enabled_value_29 != 0) {
-                                            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_1))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_6))), "r"(static_cast<unsigned int>(1)) : "memory");
                                         }
                                     }
                                 } else if (tid / 32 == 7) {
@@ -12042,7 +12047,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                                     int _min_97 = ((mini_size) < (tokens - input_mini_5 * mini_size) ? (mini_size) : (tokens - input_mini_5 * mini_size));
                                                     int input_rows_5 = _min_97;
                                                     int input_count_5 = (input_rows_5 + 127) / 128 * ((hidden + 511) / 512);
-                                                    bool enabled_value_31 = macro_1 > 0;
+                                                    bool enabled_value_31 = macro_6 > 0;
                                                     if (enabled_value_31 != 0) {
                                                         int32_t _relaxed_ld_74;
                                                         asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_74) : "l"(replay_x + input_mini_5) : "memory");
@@ -12105,7 +12110,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                                         int _min_99 = ((mini_size) < (tokens - input_mini_6 * mini_size) ? (mini_size) : (tokens - input_mini_6 * mini_size));
                                                         int input_rows_6 = _min_99;
                                                         int input_count_6 = (input_rows_6 + 127) / 128 * ((hidden + 511) / 512);
-                                                        bool enabled_value_33 = macro_1 > 0;
+                                                        bool enabled_value_33 = macro_6 > 0;
                                                         if (enabled_value_33 != 0) {
                                                             int32_t _relaxed_ld_82;
                                                             asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_82) : "l"(replay_x + input_mini_6) : "memory");
@@ -12223,7 +12228,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                                 }
                                             }
                                             if (tid == 0) {
-                                                int previous_offset_10 = (macro_1 + 1) * macro_size;
+                                                int previous_offset_10 = (macro_6 + 1) * macro_size;
                                                 int output_row_8 = x_10 * 256 + cta_rank_0 * 128;
                                                 int _min_100 = ((macro_size) < (tokens - previous_offset_10) ? (macro_size) : (tokens - previous_offset_10));
                                                 if (output_row_8 < _min_100) {
@@ -12359,7 +12364,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                                             asm volatile("cp.async.bulk.wait_group 0;");
                                                             bool enabled_value_0_4 = 1;
                                                             if (enabled_value_0_4 != 0) {
-                                                                asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_1))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                                                asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_6))), "r"(static_cast<unsigned int>(1)) : "memory");
                                                             }
                                                         }
                                                         if (has_hi_10 != 0) {
@@ -12371,7 +12376,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                     }
                                 }
                                 gemm_phase = phase_bits_14;
-                            } else if (kind == 5) {
+                            } else if (kind_4 == 5) {
                                 int col_blocks_16 = (macro_size + 512 - 1) / 512;
                                 {
                                     col_blocks_16 = (hidden + 512 - 1) / 512;
@@ -12384,17 +12389,17 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                 int first_11 = 0;
                                 int row_blocks_7 = intermediate / 256;
                                 int expert_idx_5 = 0;
-                                int local_task_5 = task_4;
+                                int local_task_5 = task_5;
                                 int _max_31 = ((row_blocks_7 * col_blocks_16) > (hidden / 256 * ((intermediate + 512 - 1) / 512)) ? (row_blocks_7 * col_blocks_16) : (hidden / 256 * ((intermediate + 512 - 1) / 512)));
                                 int stride_5 = _max_31;
-                                expert_idx_5 = task_4 / stride_5;
-                                local_task_5 = task_4 % stride_5;
+                                expert_idx_5 = task_5 / stride_5;
+                                local_task_5 = task_5 % stride_5;
                                 int offset_22 = counts[experts + expert_idx_5];
                                 int real_2 = counts[2 * experts + expert_idx_5];
                                 real_2 = (real_2 + 128 - 1) / 128 * 128;
-                                int _max_32 = ((offset_22) > (macro_1 * macro_size) ? (offset_22) : (macro_1 * macro_size));
+                                int _max_32 = ((offset_22) > (macro_6 * macro_size) ? (offset_22) : (macro_6 * macro_size));
                                 k_start_11 = _max_32;
-                                int _min_101 = (((macro_1 + 1) * macro_size) < (tokens) ? ((macro_1 + 1) * macro_size) : (tokens));
+                                int _min_101 = (((macro_6 + 1) * macro_size) < (tokens) ? ((macro_6 + 1) * macro_size) : (tokens));
                                 int _min_102 = ((offset_22 + real_2) < (_min_101) ? (offset_22 + real_2) : (_min_101));
                                 k_end_11 = _min_102;
                                 first_11 = (int)(k_start_11 == offset_22);
@@ -12420,16 +12425,16 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                 unsigned int phase_bits_15 = gemm_phase;
                                 int has_hi_11 = 0;
                                 has_hi_11 = (int)((y_11 * 2 + 1) * 256 < hidden);
-                                int global_mini_13 = macro_1 * (macro_size / mini_size);
-                                int macro_rows_11 = macro_1 * (macro_size / 256);
+                                int global_mini_13 = macro_6 * (macro_size / mini_size);
+                                int macro_rows_11 = macro_6 * (macro_size / 256);
                                 int iterations_11 = intermediate / 128;
-                                int macro_k_6 = macro_1 * (macro_size / 128);
+                                int macro_k_6 = macro_6 * (macro_size / 128);
                                 iterations_11 = (k_end_11 - k_start_11) / 128;
                                 if (expert_11 < 0) {
                                     if (tid == 0) {
                                         bool enabled_value_35 = macros > 1;
                                         if (enabled_value_35 != 0) {
-                                            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_1))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_6))), "r"(static_cast<unsigned int>(1)) : "memory");
                                         }
                                     }
                                 } else if (tid / 32 == 7) {
@@ -12459,7 +12464,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                                     int _min_104 = ((mini_size) < (tokens - input_mini_7 * mini_size) ? (mini_size) : (tokens - input_mini_7 * mini_size));
                                                     int input_rows_7 = _min_104;
                                                     int input_count_7 = (input_rows_7 + 127) / 128 * ((hidden + 511) / 512);
-                                                    bool enabled_value_37 = macro_1 > 0;
+                                                    bool enabled_value_37 = macro_6 > 0;
                                                     if (enabled_value_37 != 0) {
                                                         int32_t _relaxed_ld_90;
                                                         asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_90) : "l"(replay_x + input_mini_7) : "memory");
@@ -12522,7 +12527,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                                         int _min_106 = ((mini_size) < (tokens - input_mini_8 * mini_size) ? (mini_size) : (tokens - input_mini_8 * mini_size));
                                                         int input_rows_8 = _min_106;
                                                         int input_count_8 = (input_rows_8 + 127) / 128 * ((hidden + 511) / 512);
-                                                        bool enabled_value_39 = macro_1 > 0;
+                                                        bool enabled_value_39 = macro_6 > 0;
                                                         if (enabled_value_39 != 0) {
                                                             int32_t _relaxed_ld_98;
                                                             asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_98) : "l"(replay_x + input_mini_8) : "memory");
@@ -12640,7 +12645,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                                 }
                                             }
                                             if (tid == 0) {
-                                                int previous_offset_11 = (macro_1 + 1) * macro_size;
+                                                int previous_offset_11 = (macro_6 + 1) * macro_size;
                                                 int output_row_9 = x_11 * 256 + cta_rank_0 * 128;
                                                 int _min_107 = ((macro_size) < (tokens - previous_offset_11) ? (macro_size) : (tokens - previous_offset_11));
                                                 if (output_row_9 < _min_107) {
@@ -12776,7 +12781,7 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                                                             asm volatile("cp.async.bulk.wait_group 0;");
                                                             bool enabled_value_0_5 = 1;
                                                             if (enabled_value_0_5 != 0) {
-                                                                asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_1))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                                                asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(buffers_done)) + (macro_6))), "r"(static_cast<unsigned int>(1)) : "memory");
                                                             }
                                                         }
                                                         if (has_hi_11 != 0) {
@@ -12825,91 +12830,96 @@ kernel_cake_mok_backward_mxfp8_clamped(const __grid_constant__ CUtensorMap dy_s,
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                     :: "r"((schedule_finished_addr) & 0xFEFFFFFF) : "memory");
             }
-            int shared_tasks_6 = shared_down + shared_swiglu + shared_dx + 3 * shared_wgrad;
-            int mini_bwd_7 = mini_down + mini_swiglu + mini_dx;
-            int mini_replay_8 = 2 * mini_replay_gate + mini_replay_swiglu;
-            int weight_tasks_9 = experts * routed_wgrad;
+            int shared_tasks_2 = shared_down + shared_swiglu + shared_dx + 3 * shared_wgrad;
+            int mini_bwd_3 = mini_down + mini_swiglu + mini_dx;
+            int mini_replay_4 = 2 * mini_replay_gate + mini_replay_swiglu;
+            int weight_tasks_5 = experts * routed_wgrad;
             int _min_108 = ((tokens) < (macro_size) ? (tokens) : (macro_size));
-            int saved_minis_10 = (_min_108 + mini_size - 1) / mini_size;
-            int saved_tasks_11 = saved_minis_10 * mini_bwd_7 + 3 * weight_tasks_9;
-            int replay_macro_tasks_12 = macro_size / mini_size * (mini_replay_8 + mini_bwd_7) + 3 * weight_tasks_9;
-            int kind_13 = -1;
-            int task_14 = 0;
-            int macro_15 = 0;
-            int mini_16 = 0;
-            int shared_17 = 0;
+            int saved_minis_6 = (_min_108 + mini_size - 1) / mini_size;
+            int saved_tasks_7 = saved_minis_6 * mini_bwd_3 + 3 * weight_tasks_5;
+            int replay_macro_tasks_8 = macro_size / mini_size * (mini_replay_4 + mini_bwd_3) + 3 * weight_tasks_5;
+            int kind_9 = -1;
+            int task_10 = 0;
+            int macro_11 = 0;
+            int mini_12 = 0;
+            int shared_13 = 0;
             if (cluster - comm_clusters >= 0 && true_compute > cluster - comm_clusters) {
-                if (shared_tasks_6 > cluster - comm_clusters) {
-                    shared_17 = 1;
+                if (shared_tasks_2 > cluster - comm_clusters) {
+                    shared_13 = 1;
                     if (shared_down > cluster - comm_clusters) {
-                        kind_13 = 0;
-                        task_14 = cluster - comm_clusters;
+                        kind_9 = 0;
+                        task_10 = cluster - comm_clusters;
                     } else if (cluster - comm_clusters < shared_down + shared_swiglu) {
-                        kind_13 = 1;
-                        task_14 = cluster - comm_clusters - shared_down;
+                        kind_9 = 1;
+                        task_10 = cluster - comm_clusters - shared_down;
                     } else {
                         if (cluster - comm_clusters < shared_down + shared_swiglu + shared_dx) {
-                            kind_13 = 2;
-                            task_14 = cluster - comm_clusters - shared_down - shared_swiglu;
+                            kind_9 = 2;
+                            task_10 = cluster - comm_clusters - shared_down - shared_swiglu;
                         } else {
                             int weight_task_2 = cluster - comm_clusters - shared_down - shared_swiglu - shared_dx;
-                            kind_13 = 3 + weight_task_2 / shared_wgrad;
-                            task_14 = weight_task_2 % shared_wgrad;
+                            kind_9 = 3 + weight_task_2 / shared_wgrad;
+                            task_10 = weight_task_2 % shared_wgrad;
                         }
                     }
                 } else {
-                    int routed_1 = cluster - comm_clusters - shared_tasks_6;
+                    int routed_1 = cluster - comm_clusters - shared_tasks_2;
                     int macro_task_1 = routed_1;
                     int replay_tasks_1 = 0;
-                    if (routed_1 >= saved_tasks_11) {
-                        macro_15 = 1 + (routed_1 - saved_tasks_11) / replay_macro_tasks_12;
-                        macro_task_1 = (routed_1 - saved_tasks_11) % replay_macro_tasks_12;
-                        int _min_109 = ((tokens - macro_15 * macro_size) < (macro_size) ? (tokens - macro_15 * macro_size) : (macro_size));
+                    if (routed_1 >= saved_tasks_7) {
+                        macro_11 = 1 + (routed_1 - saved_tasks_7) / replay_macro_tasks_8;
+                        macro_task_1 = (routed_1 - saved_tasks_7) % replay_macro_tasks_8;
+                        int _min_109 = ((tokens - macro_11 * macro_size) < (macro_size) ? (tokens - macro_11 * macro_size) : (macro_size));
                         int macro_minis_2 = (_min_109 + mini_size - 1) / mini_size;
-                        replay_tasks_1 = macro_minis_2 * mini_replay_8;
+                        replay_tasks_1 = macro_minis_2 * mini_replay_4;
                     }
-                    int _min_110 = ((tokens - macro_15 * macro_size) < (macro_size) ? (tokens - macro_15 * macro_size) : (macro_size));
+                    int _min_110 = ((tokens - macro_11 * macro_size) < (macro_size) ? (tokens - macro_11 * macro_size) : (macro_size));
                     int macro_minis_3 = (_min_110 + mini_size - 1) / mini_size;
                     if (macro_task_1 < replay_tasks_1) {
-                        mini_16 = macro_task_1 / mini_replay_8;
-                        int mini_task_2 = macro_task_1 % mini_replay_8;
+                        mini_12 = macro_task_1 / mini_replay_4;
+                        int mini_task_2 = macro_task_1 % mini_replay_4;
                         if (mini_task_2 < mini_replay_gate) {
-                            kind_13 = 6;
-                            task_14 = mini_task_2;
+                            kind_9 = 6;
+                            task_10 = mini_task_2;
                         } else if (mini_task_2 < 2 * mini_replay_gate) {
-                            kind_13 = 7;
-                            task_14 = mini_task_2 - mini_replay_gate;
+                            kind_9 = 7;
+                            task_10 = mini_task_2 - mini_replay_gate;
                         } else {
-                            kind_13 = 8;
-                            task_14 = mini_task_2 - 2 * mini_replay_gate;
+                            kind_9 = 8;
+                            task_10 = mini_task_2 - 2 * mini_replay_gate;
                         }
                     } else {
                         int bwd_task_1 = macro_task_1 - replay_tasks_1;
-                        if (bwd_task_1 < macro_minis_3 * mini_bwd_7) {
-                            mini_16 = bwd_task_1 / mini_bwd_7;
-                            int mini_task_3 = bwd_task_1 % mini_bwd_7;
+                        if (bwd_task_1 < macro_minis_3 * mini_bwd_3) {
+                            mini_12 = bwd_task_1 / mini_bwd_3;
+                            int mini_task_3 = bwd_task_1 % mini_bwd_3;
                             if (mini_task_3 < mini_down) {
-                                kind_13 = 0;
-                                task_14 = mini_task_3;
+                                kind_9 = 0;
+                                task_10 = mini_task_3;
                             } else if (mini_task_3 < mini_down + mini_swiglu) {
-                                kind_13 = 1;
-                                task_14 = mini_task_3 - mini_down;
+                                kind_9 = 1;
+                                task_10 = mini_task_3 - mini_down;
                             } else {
-                                kind_13 = 2;
-                                task_14 = mini_task_3 - mini_down - mini_swiglu;
+                                kind_9 = 2;
+                                task_10 = mini_task_3 - mini_down - mini_swiglu;
                             }
                         } else {
-                            int weight_task_3 = bwd_task_1 - macro_minis_3 * mini_bwd_7;
-                            kind_13 = 3 + weight_task_3 / weight_tasks_9;
-                            task_14 = weight_task_3 % weight_tasks_9;
+                            int weight_task_3 = bwd_task_1 - macro_minis_3 * mini_bwd_3;
+                            kind_9 = 3 + weight_task_3 / weight_tasks_5;
+                            task_10 = weight_task_3 % weight_tasks_5;
                         }
                     }
                 }
             }
-            if ((kind == 1 || kind == 8) && cluster >= 0 && kind_13 != 1 && kind_13 != 8) {
+            if ((kind_4 == 1 || kind_4 == 8) && cluster >= 0 && kind_9 != 1 && kind_9 != 8) {
                 asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
                 asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
             }
+            kind_4 = kind_9;
+            task_5 = task_10;
+            macro_6 = macro_11;
+            mini_7 = mini_12;
+            shared_8 = shared_13;
             iteration = iteration + 1;
         }
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
