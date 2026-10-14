@@ -59,7 +59,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(128, 4) void
-kernel_cake_kimi_k3_nvfp4_situ_routed_moe_1ba6921046b292c2a98f(uint8_t* __restrict__ expert_output, float* __restrict__ partial_scale, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ token_to_permuted, __nv_bfloat16* __restrict__ out, int M)
+kernel_cake_kimi_k3_nvfp4_situ_routed_moe_c356f590ffd963970de4(uint8_t* __restrict__ expert_output, float* __restrict__ partial_scale, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ token_to_permuted, __nv_bfloat16* __restrict__ out, int M)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);

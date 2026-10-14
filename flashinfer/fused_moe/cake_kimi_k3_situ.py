@@ -46,9 +46,10 @@ _LARGE_C7_TOKENS = (8192, 16384)
 _M1_FUSED_ARCHES = ("sm_100a", "sm_103a")
 # Architectures whose 8192- and 16384-token route runs the FC2 that stores an
 # 8-bit per-tile partial with per-tile FP32 scales and the finalize that
-# consumes it (eight kernels); the others run the pre-shuffled scale-factor
-# route (nine kernels).
-_LARGE_Q8I_ARCHES = ("sm_103a",)
+# consumes it (eight kernels) -- both today; an architecture outside this set
+# would run the pre-shuffled scale-factor route (nine kernels, the "large_c7"
+# selector).
+_LARGE_Q8I_ARCHES = ("sm_100a", "sm_103a")
 # Architectures whose 4096-token route runs the same 8-bit per-tile partial FC2
 # and finalize behind the work5fd FC1 (eight kernels); the 2048-token route
 # keeps the BF16 expert output everywhere.
@@ -67,7 +68,8 @@ _ROUTE_MC_CLUSTER = 8
 _N8_W2A_M16_FC2_GRID_N_SM_FACTOR = 2
 _M64_CLAIM8_FC2_GRID_N = 12
 _N32_CLAIM8_FC2_GRID_N = 7
-# Pre-shuffled FC1 scale factors (the 16384-token route). The tile-N128 FC1
+# Pre-shuffled FC1 scale factors (the ``large_c7`` route, which no delivered
+# architecture selects today). The tile-N128 FC1
 # consumes K in steps of 512 elements; for every (N-tile, K-step) the writer
 # emits the 4096-byte shared-memory image FC1 expects (128 rows x 32 bytes).
 _FC1_K_STEP = 512
@@ -290,8 +292,9 @@ def _workspace_layout(num_tokens, arch=None):
         ("expert_output", torch.bfloat16, (rows, _H), 2),
     )
     # The layout is architecture-independent: a field that any architecture's
-    # selector of this token count needs (the FC2 work counter, the
-    # pre-shuffled scale images) is present on both.
+    # selector of this token count needs (the FC2 work counter; the pre-shuffled
+    # scale images of a ``large_c7`` selector, which no delivered architecture
+    # uses today) is present on both.
     selectors = {_selector(name, num_tokens) for name in ("sm_100a", "sm_103a")}
     if any(_SELECTORS[selector][2] is not None for selector in selectors):
         fields += (("fc2_work_counter", torch.int32, (1,), 4),)
@@ -369,10 +372,10 @@ def _cake_situ_workspace_size(options):
     max_tokens = options["max_num_tokens"]
     # ``_workspace_layout`` is not monotonic in ``num_tokens``: the token counts
     # that force tile-N16 need more scratch rows than the tile-N8 counts that
-    # follow them, and the pre-shuffled scale-factor route carries
-    # ``sfb_shuffled`` (the 8192-token layout is larger than the ordinary
-    # layout up to 8647 tokens), so a maximum-size buffer covers every forced
-    # and pre-shuffled count at or below ``max_num_tokens`` as well as
+    # follow them, and an architecture whose large route is ``large_c7`` would
+    # carry ``sfb_shuffled`` on the 8192- and 16384-token layouts (none of the
+    # delivered architectures does today), so a maximum-size buffer covers
+    # every forced and large count at or below ``max_num_tokens`` as well as
     # ``max_num_tokens`` itself.
     return max(
         _workspace_layout(num_tokens)[1]
