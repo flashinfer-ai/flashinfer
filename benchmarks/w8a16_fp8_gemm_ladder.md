@@ -253,8 +253,25 @@ clock and slightly less power than cuBLAS, so the remaining 2-5% is not the dequ
 energy; it is whatever cuBLAS's tile order still saves in L2 traffic.  Swizzle 16 / 32
 on tp2 (`swzC_*`) is indistinguishable from 8 inside the +-10% single-pass scatter of
 this box (cuBLAS itself read 6912 to 8212 us on tp1 M=44160 across three passes minutes
-apart).  Not pursued further: the candidates left are TMA cache hints (evict-last on the
-weight) and 256 B L2 promotion, each worth a couple of percent at most.
+apart).
+
+TMA L2 eviction hints (`FLASHINFER_W8A16_FP8_L2HINT_SM100`; the forked collective now
+carries `cache_hint_a` / `cache_hint_b` into the A and B TMA loads; `l2hint_p*`): three
+interleaved passes, median kernel / cuBLAS on gate_up tp1 M=44160 / 88320: normal 1.05 /
+1.00, weight evict-last 1.04 / 1.01, activation evict-first 1.31 / 1.29, both 1.34 / 1.28;
+tp2: 1.16 / 1.00, 1.17 / 1.11, 1.14 / 1.13, 1.19 / 1.08; the und.q tp2 control is 0.96 under
+every setting.  Evict-last on the weight buys nothing measurable; evict-first on the
+activation costs 30% on tp1 because, under the swizzle, the activation tile is exactly the
+operand the eight in-flight weight tiles share.  LOSER; the knob stays at `normal`.  What
+is left for those two rows is 256 B L2 promotion on the weight descriptor, untried.
+
+On the "oracle" line of the plots: five interleaved passes of every variant on the und.q
+rows (`undq_p*`) put `auto` at or within 1-2% of the median-best variant on all 18 rows,
+while a single pass of the same kernel on und.q tp4 at M >= 44160 ranges 0.74-1.22 of
+cuBLAS.  The plot's best-variant line was the minimum over six variants of one pass, which
+on such a row always lands under `auto`; the plots now take per-row medians over seven
+passes (`sweepB15m_p*`) for every line, and the best-variant line is the minimum over the
+variant medians.
 
 ### Knobs and the `algo` argument
 

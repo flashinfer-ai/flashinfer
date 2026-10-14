@@ -58,6 +58,15 @@
 namespace cutlass::gemm::collective {
 using namespace cute;
 
+// L2 eviction hint carried as a plain integer and handed to whichever TMA copy traits the
+// variant uses: the 2SM tiles load through SM100_TMA_2SM_LOAD (CacheHintSm100), the 1SM
+// tile through SM90_TMA_LOAD (CacheHintSm90).  Both enums share the same encodings.
+struct W8A16L2Hint {
+  uint64_t v;
+  CUTE_HOST_DEVICE operator cute::TMA::CacheHintSm90() const { return static_cast<cute::TMA::CacheHintSm90>(v); }
+  CUTE_HOST_DEVICE operator cute::TMA::CacheHintSm100() const { return static_cast<cute::TMA::CacheHintSm100>(v); }
+};
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // WarpSpecialized Mainloop for Mixed Input Kernels
@@ -437,6 +446,11 @@ public:
     ElementScale const* ptr_S{nullptr};
     LayoutScale layout_S{};
     ElementZero const* ptr_Z{nullptr};
+    // L2 eviction priority of the A (weight) and B (activation) TMA loads
+    // (cute::TMA::CacheHintSm100 values).  FlashInfer addition: the weight is re-read once
+    // per activation tile, the activation once per weight tile; see W8A16Sm100L2HintEnv.
+    uint64_t cache_hint_a{static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL)};
+    uint64_t cache_hint_b{static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL)};
   };
 
   struct TMAScaleParams {
@@ -492,6 +506,8 @@ public:
     uint32_t tma_transaction_bytes{TmaTransactionBytes};
     SwappedStrideA dA{};
     SwappedStrideB dB{};
+    uint64_t cache_hint_a{static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL)};
+    uint64_t cache_hint_b{static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL)};
   };
 
   CUTLASS_DEVICE
@@ -577,7 +593,8 @@ public:
         tma_load_b_fallback,
         hw_info.cluster_shape_fallback,
         tma_transaction_bytes,
-        args.dA, args.dB };
+        args.dA, args.dB,
+        args.cache_hint_a, args.cache_hint_b };
     }
     else if constexpr (ModeHasScales) {
       ElementScale const* ptr_S = args.ptr_S;
@@ -601,7 +618,8 @@ public:
           tma_load_b_fallback,
           hw_info.cluster_shape_fallback,
           tma_transaction_bytes,
-          args.dA, args.dB };
+          args.dA, args.dB,
+          args.cache_hint_a, args.cache_hint_b };
       }
       else if constexpr(KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor tensor_zero = make_tensor(detail::get_logical_ptr(args.ptr_Z), args.layout_S);
@@ -622,7 +640,8 @@ public:
           tma_load_b_fallback,
           hw_info.cluster_shape_fallback,
           tma_transaction_bytes,
-          args.dA, args.dB };
+          args.dA, args.dB,
+          args.cache_hint_a, args.cache_hint_b };
       }
       else {
         static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in to_underlying_arguments.");
@@ -793,7 +812,9 @@ public:
       load2xform_pipeline_flag = load2xform_pipeline.producer_try_acquire(load2xform_pipeline_state, skip_wait);
 
       // TMA load for A k_tile
-      copy(observed_tma_load_a_->with(*load2xform_tma_barrier, mcast_mask_a), tAgA(_,*k_tile_iter), tAsA(_,tile_A_write_stage));
+      copy(observed_tma_load_a_->with(*load2xform_tma_barrier, mcast_mask_a,
+                                       W8A16L2Hint{params.cache_hint_a}),
+           tAgA(_,*k_tile_iter), tAsA(_,tile_A_write_stage));
 
       if constexpr (ModeHasScales) {
         auto tSgS_mkl = get<0>(extra_input_partitions);
@@ -874,7 +895,9 @@ public:
       load2mma_pipeline_flag = load2mma_pipeline.producer_try_acquire(load2mma_pipeline_state, skip_wait);
 
       // TMA load for B k_tile
-      copy(observed_tma_load_b_->with(*load2mma_tma_barrier, mcast_mask_b), tBgB(_,*k_tile_iter), tBsB(_,tile_B_write_stage));
+      copy(observed_tma_load_b_->with(*load2mma_tma_barrier, mcast_mask_b,
+                                       W8A16L2Hint{params.cache_hint_b}),
+           tBgB(_,*k_tile_iter), tBsB(_,tile_B_write_stage));
 
       ++k_tile_iter;
     }

@@ -57,6 +57,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
@@ -318,6 +319,7 @@ inline cutlass::gemm::kernel::detail::DecompositionMode W8A16Sm100StreamKModeEnv
 inline cutlass::gemm::kernel::detail::ReductionMode W8A16Sm100StreamKReductionEnv();
 inline int W8A16Sm100PickSwizzle(int M, int N, int K);
 inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm100RasterEnv();
+inline uint64_t W8A16Sm100L2HintEnv(bool weight);
 
 template <typename T, typename Cfg, bool kSplitK = false, bool kStreamK = false>
 struct W8A16Sm100Gemm {
@@ -421,6 +423,9 @@ struct W8A16Sm100Gemm {
     // activation band instead of a line of tiles) and which axis walks fastest.
     args.scheduler.max_swizzle_size = W8A16Sm100PickSwizzle(M, N, K);
     args.scheduler.raster_order = W8A16Sm100RasterEnv();
+    // L2 eviction priority of the weight (A) and activation (B) TMA loads; experiment knob.
+    args.mainloop.cache_hint_a = W8A16Sm100L2HintEnv(true);
+    args.mainloop.cache_hint_b = W8A16Sm100L2HintEnv(false);
     if constexpr (kStreamK) {
       // Heuristic: data-parallel for the full waves, stream-K for the tiles of the last
       // (up to two) waves; collapses to plain split-K when the leftover tiles divide the
@@ -561,6 +566,24 @@ inline int W8A16Sm100SwizzleEnv() {
     return v < 0 ? 0 : v;
   }();
   return swizzle;
+}
+
+// FLASHINFER_W8A16_FP8_L2HINT_SM100 = "normal" (default) | "wlast" (weight loads
+// evict-last) | "afirst" (activation loads evict-first) | "wlast_afirst": the L2 eviction
+// priority handed to the TMA loads (cute::TMA::CacheHintSm100).  Experiment of Wed 14 Oct
+// 2026 for the widest rows whose weight fits L2 (mlp.gate_up tp2, 65 MB) but is evicted
+// by the activation stream.  Read once.
+inline uint64_t W8A16Sm100L2HintEnv(bool weight) {
+  using Hint = cute::TMA::CacheHintSm100;
+  static const std::pair<Hint, Hint> hints = [] {
+    const char* s = std::getenv("FLASHINFER_W8A16_FP8_L2HINT_SM100");
+    std::pair<Hint, Hint> h{Hint::EVICT_NORMAL, Hint::EVICT_NORMAL};
+    if (s == nullptr || *s == '\0') return h;
+    if (std::strcmp(s, "wlast") == 0 || std::strcmp(s, "wlast_afirst") == 0) h.first = Hint::EVICT_LAST;
+    if (std::strcmp(s, "afirst") == 0 || std::strcmp(s, "wlast_afirst") == 0) h.second = Hint::EVICT_FIRST;
+    return h;
+  }();
+  return static_cast<uint64_t>(weight ? hints.first : hints.second);
 }
 
 // Version B15 (Wed 14 Oct 2026, B200, free-running clocks).  With a swizzle S the
