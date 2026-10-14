@@ -505,9 +505,11 @@ def test_select_comm_split_decision_table():
     "capability,sm_count,precision,expected",
     [
         ((10, 0), 148, "bf16", (24, 28)),  # B200
-        ((10, 0), 148, "mxfp8", None),
+        ((10, 0), 148, "mxfp8", (44, 36)),
         ((10, 0), 152, "bf16", None),  # GB200: same capability, no measured row
+        ((10, 0), 152, "mxfp8", None),
         ((10, 3), 160, "bf16", None),  # GB300
+        ((10, 3), 160, "mxfp8", None),
         ((10, 7), 160, "bf16", None),
         ((12, 0), 170, "bf16", None),
     ],
@@ -548,18 +550,26 @@ def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
     assert config.imbalance_threshold == 4.0
     facade = inspect.signature(mok.create_mok_bf16_workspace).parameters
     assert facade["imbalance_comm_sms"].default == "auto"
-    assert facade["imbalance_threshold"].default == 4.0
-    # The measured row and threshold (backend README); a change here is a
-    # shipping change.
-    assert mok.IMBALANCE_COMM_SMS == {(10, 0): {148: {"bf16": (24, 28)}}}
-    assert mok.IMBALANCE_THRESHOLD == 4.0
+    assert facade["imbalance_threshold"].default == "auto"
+    # The measured rows and thresholds (backend README); a change here is a
+    # shipping change. The backend default is the BF16 threshold.
+    assert mok.IMBALANCE_COMM_SMS == {
+        (10, 0): {148: {"bf16": (24, 28), "mxfp8": (44, 36)}}
+    }
+    assert mok.IMBALANCE_THRESHOLDS == {"bf16": 4.0, "mxfp8": 2.7}
+    assert mok.resolve_imbalance_threshold("bf16") == config.imbalance_threshold
+    assert mok.resolve_imbalance_threshold("mxfp8") == 2.7
     with pytest.raises(ValueError, match="precision must be one of"):
         mok.resolve_imbalance_comm_sms("fp8")
+    with pytest.raises(ValueError, match="precision must be one of"):
+        mok.resolve_imbalance_threshold("fp8")
     kwargs = dict(
         group=None, device=None, num_local_tokens=512, hidden_size=256, topk=2
     )
     with pytest.raises(ValueError, match='"auto"'):
         mok.create_mok_bf16_workspace(imbalance_comm_sms="fast", **kwargs)
+    with pytest.raises(ValueError, match='"auto"'):
+        mok.create_mok_bf16_workspace(imbalance_threshold="fast", **kwargs)
     with pytest.raises(ValueError, match="pair"):
         mok.create_mok_bf16_workspace(imbalance_comm_sms=(24,), **kwargs)
     with pytest.raises(ValueError, match="precision must be one of"):
