@@ -59,7 +59,7 @@
 # ============================================================================
 
 import math
-from typing import Type, Tuple, Optional
+from typing import Callable, Type, Tuple, Optional
 from types import SimpleNamespace
 
 import cuda.bindings.driver as cuda
@@ -275,6 +275,7 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
         pv_acc_dtype: Optional[Type[cutlass.Numeric]] = None,
         use_fp16_softmax: bool = False,
         force_branch: str = "auto",
+        reducer_max_splits: int = MAX_SPLITS,
     ):
         """Initializes the configuration for a Rubin Multi-Head Latent Attention (MLA) kernel.
 
@@ -300,6 +301,14 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
         :type is_var_split_kv: bool
         """
 
+        if not 1 <= reducer_max_splits <= MAX_SPLITS:
+            raise ValueError(f"reducer_max_splits must be in [1, {MAX_SPLITS}]")
+        if is_var_split_kv and reducer_max_splits != MAX_SPLITS:
+            raise ValueError("variable split-KV requires the generic reducer capacity")
+        # One warp reduces LSE. Round to whole warps while avoiding the full
+        # 256-split register loop when the prepared plan admits fewer splits.
+        self.reducer_max_splits = ceil_div(reducer_max_splits, 32) * 32
+        self.reducer: Optional[Callable] = None
         self.latent_dim = 512
         self.rope_dim = 64
         self.acc_dtype = acc_dtype
@@ -1223,7 +1232,21 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
             stream=stream,
             min_blocks_per_mp=1,
         )
-        if cutlass.const_expr(acc_o is not None):
+        if cutlass.const_expr(acc_o is not None and self.reducer is not None):
+            assert self.reducer is not None
+            self.reducer(
+                o,
+                lse,
+                acc_o,
+                acc_lse,
+                split_kv,
+                cache_seqs,
+                None,
+                block_split_kvs,
+                lse_scale,
+                stream,
+            )
+        elif cutlass.const_expr(acc_o is not None):
             self.reduction_kernel(
                 o,
                 lse,
@@ -1236,7 +1259,7 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
             ).launch(
                 grid=(q_latent.shape[0], q_latent.shape[2], q_latent.shape[3]),
                 block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
-                smem=MAX_SPLITS * self.acc_dtype.width // 8,
+                smem=self.reducer_max_splits * self.acc_dtype.width // 8,
                 stream=stream,
                 min_blocks_per_mp=1,
             )
@@ -2762,15 +2785,19 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
 
         # Alloc shared memory
         smem = cutlass.memory.SmemAllocator()
-        storage = smem.allocate(MAX_SPLITS * self.acc_dtype.width // 8, 16)
+        storage = smem.allocate(self.reducer_max_splits * self.acc_dtype.width // 8, 16)
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
-        smem_lse_scale = cute.make_tensor(lse_scale_ptr, cute.make_layout(MAX_SPLITS))
+        smem_lse_scale = cute.make_tensor(
+            lse_scale_ptr, cute.make_layout(self.reducer_max_splits)
+        )
 
         gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
             # calculate the global lse and exp ^ (local_lse - global_lse)
-            lse_per_thread = cute.ceil_div(MAX_SPLITS, self.threads_per_warp)
+            lse_per_thread = cute.ceil_div(
+                self.reducer_max_splits, self.threads_per_warp
+            )
 
             local_lse = cute.make_rmem_tensor(
                 cute.make_layout(lse_per_thread), self.lse_dtype
