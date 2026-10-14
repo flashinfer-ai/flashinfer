@@ -50,23 +50,6 @@ import cutlass.experimental.primitives as nvvm
 from cutlass._mlir.dialects import llvm
 
 
-@cute.jit
-def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=False):
-    """N-direction super-block rasterization of the (m, n) cgrp-tile coord, for
-    L2 reuse. ``identity=True`` compiles out the general mapping when the caller
-    knows that ``swizzle_w == 1``.
-    """
-    if cutlass.const_expr(identity):
-        return raw_m, raw_n
-    t = raw_n * nt_m + raw_m
-    blk = nt_m * swizzle_w
-    sb = t // blk
-    off = t - sb * blk
-    base_n = sb * swizzle_w
-    cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
-    log_m = off // cur_S
-    log_n = base_n + off - log_m * cur_S
-    return log_m, log_n
 
 
 def epi_subtile_spans(cols, epi_n=32):
@@ -166,19 +149,6 @@ def fence_tensormap_acquire(desc_ptr) -> None:
     )
 
 
-@cute.jit
-def moe_group_at(visit_idx, num_groups, num_experts):
-    """Visitation index -> routed group index.
-
-    ``num_groups == num_experts`` (or a non-multiple) walks groups in order. Batched MoE
-    (``num_groups == B * num_experts``) walks expert-major -- the B groups sharing expert
-    ``g % E`` become consecutive, so the expert weight is fetched once instead of B times.
-    """
-    per_expert = num_groups // cutlass.max(num_experts, cutlass.Int32(1))
-    group = visit_idx
-    if per_expert > 1 and per_expert * num_experts == num_groups:
-        group = (visit_idx % per_expert) * num_experts + (visit_idx // per_expert)
-    return group
 
 
 @cute.jit
@@ -208,30 +178,6 @@ def tcgen05_dealloc(tmem_ptr, num_cols, *, is_exclusive=False, group=None):
         nvvm.tcgen05_dealloc(tmem_ptr, num_cols, group=group)
 
 
-def tcgen05_mma(mma_kind, cta_group, d, a, b, idesc, scale_d, *, collector_op=None, b_collector_op=None):
-    if b_collector_op is None:
-        nvvm.tcgen05_mma(
-            mma_kind,
-            cta_group,
-            d,
-            a,
-            b,
-            idesc,
-            scale_d,
-            collector_op=collector_op,
-        )
-    else:
-        nvvm.tcgen05_mma(
-            mma_kind,
-            cta_group,
-            d,
-            a,
-            b,
-            idesc,
-            scale_d,
-            collector_op=collector_op,
-            b_collector_op=b_collector_op,
-        )
 
 
 def tcgen05_mma_block_scale(mma_kind, cta_group, d, a, b, idesc, *, enable_input_d, scale_a, scale_b, scale_vec_size, collector_op=None, b_collector_op=None):
@@ -373,6 +319,7 @@ def frost_template_kernel(
     out_stride_m_0: cutlass.Int64,
     out_stride_n_0: cutlass.Int64,
     out_stride_l_0: cutlass.Int64,
+    gate_alpha: cute.Tensor,
     scale: cute.Tensor,
     tma_c_desc_0: cutlass.GridConstant[_tma.TensorMap],
 ) -> None:
@@ -1967,6 +1914,8 @@ def frost_template_kernel(
                     row = coord_m + tidx
                     row_active = True
 
+                    _aux_gate_alpha_ptr = gate_alpha.iterator.raw_ptr()
+                    _aux_gate_alpha_pre = (_aux_gate_alpha_ptr + group_idx).load()
                     _aux_scale_ptr = scale.iterator.raw_ptr()
                     _aux_scale_pre = (_aux_scale_ptr + 0).load()
 
@@ -2019,11 +1968,13 @@ def frost_template_kernel(
                         linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
 
                         _c_0_a = (vec_f32).to(cutlass.Float32)
-                        _op_0 = _c_0_a * cute.math.rcp(cutlass.full_like(_c_0_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_0_a * cutlass.full_like(_c_0_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)
+                        _op_0 = _c_0_a * (cutlass.full_like(_c_0_a, _aux_gate_alpha_pre.to(cutlass.Float32)))
                         _c_1_a = (_op_0).to(cutlass.Float32)
-                        _op_1 = _c_1_a * (cutlass.full_like(_c_1_a, _aux_scale_pre.to(cutlass.Float32)))
-                        _r_1 = (_op_1).to(cutlass.BFloat16)
-                        vec_out = (_r_1).to(cutlass.BFloat16)
+                        _op_1 = _c_1_a * cute.math.rcp(cutlass.full_like(_c_1_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_1_a * cutlass.full_like(_c_1_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)
+                        _c_2_a = (_op_1).to(cutlass.Float32)
+                        _op_2 = _c_2_a * (cutlass.full_like(_c_2_a, _aux_scale_pre.to(cutlass.Float32)))
+                        _r_2 = (_op_2).to(cutlass.BFloat16)
+                        vec_out = (_r_2).to(cutlass.BFloat16)
                         
 
                         # @@FROST_TMA_STORE@@
@@ -2055,6 +2006,7 @@ def _host(
     b_0: cute.Tensor,
     sfa_0: cute.Tensor,
     sfb_0: cute.Tensor,
+    gate_alpha: cute.Tensor,
     scale: cute.Tensor,
     c_0: cute.Tensor,
     stream: _cuda.CUstream,
@@ -2164,7 +2116,7 @@ def _host(
                     1,
                     256,
                     cute.assume(256 * rest_k, 8),
-                    cute.assume(256 * rest_k * rest_m, 8),
+                    cute.assume(_sfa_op.stride[2] // 2, 8),
                 ),
             ),
         )
@@ -2224,6 +2176,7 @@ def _host(
         out_stride_m_0,
         out_stride_n_0,
         out_stride_l_0,
+        gate_alpha,
         scale,
         tma_c_desc_list[0],
     ).launch(
@@ -2347,7 +2300,8 @@ def compile() -> Callable:
         sym_out_stride_l_0,
     )
 
+    fake_gate_alpha = cute.runtime.make_fake_tensor(cutlass.Float32, (sym_g, 1, 1), stride=(1, 1, 1), assumed_align=4)
     fake_scale = cute.runtime.make_fake_tensor(cutlass.Float32, (1, 1, 1), stride=(cute.sym_int64(), cute.sym_int64(), cute.sym_int64()), assumed_align=4)
 
     _fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-    return cute.compile(_host, problem_size, fake_first_token_offset, fake_tma_workspace, fake_a_0, fake_b_0, fake_sfa_0, fake_sfb_0, fake_scale, fake_c_0, stream=_fake_stream, options=frost_compile_options)
+    return cute.compile(_host, problem_size, fake_first_token_offset, fake_tma_workspace, fake_a_0, fake_b_0, fake_sfa_0, fake_sfb_0, fake_gate_alpha, fake_scale, fake_c_0, stream=_fake_stream, options=frost_compile_options)

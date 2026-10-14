@@ -34,137 +34,213 @@ from ...jit.core import (
 # runs on, so two architectures never share one cached library.  ``route`` is
 # ``persistent`` (split-KV decode; ``splits`` CTAs per work item, ``tail`` for
 # the last-round-split variant whose ``cluster_capacity`` maps a part's SM
-# count to the CTAs it co-schedules as ``splits``-CTA clusters) or ``short``
+# count to the CTAs it co-schedules as ``splits``-CTA clusters), ``short``
 # (one ``cluster``-CTA cluster per work item of at most ``max_pages`` pages, at
-# most ``max_clusters`` clusters per launch).  ``ARG_PLANS`` lists the host
-# binding's argument order once per route.  Both literals are written by the
-# generated-program export; do not edit by hand.
+# most ``max_clusters`` clusters per launch) or ``union`` (the request-packed
+# program of ``use_cache_hit=True``: ``union_q`` query tokens per request
+# traced into one CTA, ``splits`` CTAs per (request, KV head) unit, ``cluster``
+# true when ``splits > 1`` and the launch is one ``splits``-CTA cluster per
+# unit).  ``ARG_PLANS`` lists the host binding's argument order once per
+# route.  Both literals are written by the generated-program export; do not
+# edit by hand.
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_msa_nvfp4_decode_229d54fc8dddea35a745": {
+    "cake_msa_nvfp4_decode_101dbbbac3c7c2b0929f": {
         "arches": ["sm_100a", "sm_103a"],
-        "route": "persistent",
-        "splits": 8,
-        "tail": False,
+        "route": "union",
+        "union_q": 2,
+        "splits": 1,
+        "cluster": False,
         "sources": [
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_229d54fc8dddea35a745_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_229d54fc8dddea35a745_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_101dbbbac3c7c2b0929f_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_101dbbbac3c7c2b0929f_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+    },
+    "cake_msa_nvfp4_decode_21e04eaff519ea6cd53a": {
+        "arches": ["sm_107a"],
+        "route": "persistent",
+        "splits": 2,
+        "tail": True,
+        "sources": [
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_21e04eaff519ea6cd53a_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_21e04eaff519ea6cd53a_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ctas_per_sm": 1,
+        "cluster_capacity": {"212": 212},
     },
-    "cake_msa_nvfp4_decode_2342d72176334739de30": {
+    "cake_msa_nvfp4_decode_44bc4ca2b8b4088f3deb": {
         "arches": ["sm_100a", "sm_103a"],
+        "route": "union",
+        "union_q": 4,
+        "splits": 8,
+        "cluster": True,
+        "sources": [
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_44bc4ca2b8b4088f3deb_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_44bc4ca2b8b4088f3deb_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+    },
+    "cake_msa_nvfp4_decode_6618d950c63c1f5e1ebe": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "route": "persistent",
         "splits": 4,
         "tail": False,
         "sources": [
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_2342d72176334739de30_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_2342d72176334739de30_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_6618d950c63c1f5e1ebe_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_6618d950c63c1f5e1ebe_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ctas_per_sm": 1,
     },
-    "cake_msa_nvfp4_decode_2fc0d04d28bfa0354349": {
-        "arches": ["sm_107a"],
-        "route": "persistent",
-        "splits": 1,
-        "tail": False,
-        "sources": [
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_2fc0d04d28bfa0354349_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_2fc0d04d28bfa0354349_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ctas_per_sm": 1,
-    },
-    "cake_msa_nvfp4_decode_964bc168196f68c6d253": {
-        "arches": ["sm_100a", "sm_103a"],
-        "route": "persistent",
-        "splits": 1,
-        "tail": False,
-        "sources": [
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_964bc168196f68c6d253_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_964bc168196f68c6d253_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ctas_per_sm": 1,
-    },
-    "cake_msa_nvfp4_decode_97ddd7fd98fe8dfce00c": {
-        "arches": ["sm_107a"],
-        "route": "persistent",
-        "splits": 2,
-        "tail": False,
-        "sources": [
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_97ddd7fd98fe8dfce00c_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_97ddd7fd98fe8dfce00c_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ctas_per_sm": 1,
-    },
-    "cake_msa_nvfp4_decode_ac1f2f3299fa7f8141f1": {
+    "cake_msa_nvfp4_decode_6c186c5235ad08b4ec9f": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "route": "short",
         "splits": 1,
         "tail": False,
         "sources": [
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_ac1f2f3299fa7f8141f1_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_ac1f2f3299fa7f8141f1_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_6c186c5235ad08b4ec9f_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_6c186c5235ad08b4ec9f_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "max_pages": 4,
         "cluster": 8,
         "max_clusters": 16,
     },
-    "cake_msa_nvfp4_decode_b263f585211d72cdf304": {
-        "arches": ["sm_107a"],
-        "route": "persistent",
+    "cake_msa_nvfp4_decode_a779981b54a3d1f15057": {
+        "arches": ["sm_100a", "sm_103a"],
+        "route": "union",
+        "union_q": 4,
         "splits": 2,
-        "tail": True,
+        "cluster": True,
         "sources": [
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_b263f585211d72cdf304_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_b263f585211d72cdf304_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_a779981b54a3d1f15057_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_a779981b54a3d1f15057_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
-        "ctas_per_sm": 1,
-        "cluster_capacity": {"212": 212},
     },
-    "cake_msa_nvfp4_decode_b86d9fd7247676d1c491": {
-        "arches": ["sm_107a"],
-        "route": "persistent",
-        "splits": 4,
-        "tail": False,
-        "sources": [
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_b86d9fd7247676d1c491_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_b86d9fd7247676d1c491_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ctas_per_sm": 1,
-    },
-    "cake_msa_nvfp4_decode_ba3a78ef20ec7066c0c0": {
-        "arches": ["sm_107a"],
+    "cake_msa_nvfp4_decode_aa3e5180abff0afd4101": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "route": "persistent",
         "splits": 8,
         "tail": False,
         "sources": [
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_ba3a78ef20ec7066c0c0_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_ba3a78ef20ec7066c0c0_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_aa3e5180abff0afd4101_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_aa3e5180abff0afd4101_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ctas_per_sm": 1,
     },
-    "cake_msa_nvfp4_decode_df2a726f1b0c11c802eb": {
+    "cake_msa_nvfp4_decode_af2e689ccab0037b5cda": {
         "arches": ["sm_100a", "sm_103a"],
+        "route": "union",
+        "union_q": 2,
+        "splits": 4,
+        "cluster": True,
+        "sources": [
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_af2e689ccab0037b5cda_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_af2e689ccab0037b5cda_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+    },
+    "cake_msa_nvfp4_decode_b1fa7590f47de655145a": {
+        "arches": ["sm_100a", "sm_103a"],
+        "route": "union",
+        "union_q": 2,
+        "splits": 8,
+        "cluster": True,
+        "sources": [
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_b1fa7590f47de655145a_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_b1fa7590f47de655145a_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+    },
+    "cake_msa_nvfp4_decode_cb6eb3a9a43c7f43bab8": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "route": "persistent",
+        "splits": 1,
+        "tail": False,
+        "sources": [
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_cb6eb3a9a43c7f43bab8_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_cb6eb3a9a43c7f43bab8_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ctas_per_sm": 1,
+    },
+    "cake_msa_nvfp4_decode_e52248a9dd736f72904e": {
+        "arches": ["sm_100a", "sm_103a"],
+        "route": "union",
+        "union_q": 2,
+        "splits": 2,
+        "cluster": True,
+        "sources": [
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_e52248a9dd736f72904e_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_e52248a9dd736f72904e_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+    },
+    "cake_msa_nvfp4_decode_e55acc6adbda3b342ca9": {
+        "arches": ["sm_100a", "sm_103a"],
+        "route": "union",
+        "union_q": 4,
+        "splits": 4,
+        "cluster": True,
+        "sources": [
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_e55acc6adbda3b342ca9_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_e55acc6adbda3b342ca9_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+    },
+    "cake_msa_nvfp4_decode_e8432419536e3287998f": {
+        "arches": ["sm_100a", "sm_103a"],
+        "route": "union",
+        "union_q": 4,
+        "splits": 1,
+        "cluster": False,
+        "sources": [
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_e8432419536e3287998f_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_e8432419536e3287998f_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+    },
+    "cake_msa_nvfp4_decode_f789cce307344c958485": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "route": "persistent",
         "splits": 2,
         "tail": False,
         "sources": [
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_df2a726f1b0c11c802eb_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_df2a726f1b0c11c802eb_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_f789cce307344c958485_kernel.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_f789cce307344c958485_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ctas_per_sm": 1,
     },
 }
 ARG_PLANS: dict[str, list[list[str]]] = {
+    "union": [
+        ["tma_buffer", "Q"],
+        ["tma_buffer", "K"],
+        ["tma_buffer", "K_scale"],
+        ["tma_buffer", "V"],
+        ["tma_buffer", "V_scale"],
+        ["buffer", "O"],
+        ["buffer", "msa_lse"],
+        ["buffer", "kv_indices"],
+        ["buffer", "task_kind"],
+        ["buffer", "task_kv_head"],
+        ["parameter", "total_q"],
+        ["parameter", "seqlen_q"],
+        ["parameter", "num_q_heads"],
+        ["parameter", "num_kv_heads"],
+        ["parameter", "softmax_scale_log2"],
+        ["parameter", "output_scale"],
+        ["parameter", "msa_max_pages"],
+        ["parameter", "q2k_token_stride"],
+        ["parameter", "q2k_head_stride"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
     "persistent": [
         ["tma_buffer", "Q"],
         ["tma_buffer", "K"],
@@ -290,6 +366,39 @@ def select_program(arch: str, *, splits: int, tail: bool = False) -> str:
     )
 
 
+def union_programs(arch: str) -> dict[str, dict[str, Any]]:
+    """Request-packed union programs of ``arch`` (``use_cache_hit=True``), by name."""
+    return {
+        name: record
+        for name, record in programs_for(arch).items()
+        if record["route"] == "union"
+    }
+
+
+def registered_union_pairs(arch: str) -> tuple[tuple[int, int], ...]:
+    """``(union_q, splits)`` pairs with a union program for ``arch``, ascending."""
+    return tuple(
+        sorted(
+            (int(record["union_q"]), int(record["splits"]))
+            for record in union_programs(arch).values()
+        )
+    )
+
+
+def select_union_program(arch: str, *, union_q: int, splits: int) -> str:
+    """Name of the union program of ``arch`` for ``union_q`` query tokens and ``splits`` CTAs per unit."""
+    for name, record in union_programs(arch).items():
+        if int(record["union_q"]) == int(union_q) and int(record["splits"]) == int(
+            splits
+        ):
+            return name
+    raise NotImplementedError(
+        "The generated request-packed NVFP4 MSA decode program for "
+        f"{arch} with {union_q} query tokens per request and {splits} CTAs per unit "
+        "is not registered in this checkout"
+    )
+
+
 def short_program(arch: str) -> str | None:
     """Name of the short-item cluster program of ``arch``, or ``None``."""
     names = [
@@ -343,6 +452,23 @@ def gen_program_spec(name: str, arch: str):
     )
 
 
-@functools.cache
+_LOADED: dict[tuple[str, str], Any] = {}
+
+
 def load_program(name: str, arch: str):
-    return gen_program_spec(name, arch).build_and_load()
+    """Build (once per process) and load program ``name`` for ``arch``."""
+    key = (name, arch)
+    module = _LOADED.get(key)
+    if module is None:
+        module = gen_program_spec(name, arch).build_and_load()
+        _LOADED[key] = module
+    return module
+
+
+def program_loaded(name: str, arch: str) -> bool:
+    """True once :func:`load_program` has built and loaded ``(name, arch)`` in this process.
+
+    A first-time JIT build cannot happen inside a CUDA-graph capture; the
+    backend's ``use_cache_hit=True`` arm checks this before binding under capture.
+    """
+    return (name, arch) in _LOADED
