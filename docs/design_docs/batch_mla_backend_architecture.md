@@ -688,6 +688,12 @@ copying, it verifies each reserved buffer's presence, rank where required,
 source-to-target alias safety. If a copy fails, snapshots restore every target
 buffer before the error is re-raised.
 
+Generated-FA wrapper planning validates the native work-item and causal tile
+bounds once per plan request, in preflight. The ensuing backend call reuses that
+validation for the same CSR metadata and plan parameters. Direct backend plans
+still validate by default; no validation state is retained between calls or
+replans.
+
 The reserved `qo_indptr`, `kv_indptr`, and `kv_len_arr` shapes must match the
 new metadata exactly. The reserved `kv_indices` buffer may be larger than its
 active prefix. Generated-FA graph replanning can therefore change the live

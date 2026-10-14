@@ -593,19 +593,21 @@ class _BatchMLAGeneratedFaMechanics:
         q_data_type: torch.dtype,
         kv_data_type: torch.dtype,
         use_profiler: bool,
+        _workload_validated: bool = False,
     ) -> None:
         # ---------------------------------------------------------------------------
         # Build the generated backend plan
         # ---------------------------------------------------------------------------
-        _validate_fa_plan_workload(
-            qo_indptr,
-            kv_len_arr,
-            num_heads,
-            causal,
-            self.device,
-            self._backend,
-            kv_data_type,
-        )
+        if not _workload_validated:
+            _validate_fa_plan_workload(
+                qo_indptr,
+                kv_len_arr,
+                num_heads,
+                causal,
+                self.device,
+                self._backend,
+                kv_data_type,
+            )
         cached_module = module_loader()
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
@@ -872,6 +874,7 @@ class _BatchMLAPagedAttentionFaBackendBase(
         output_dtype: torch.dtype,
         scale_mode: str,
         use_profiler: bool,
+        _workload_validated: bool = False,
     ) -> None:
         raise NotImplementedError
 
@@ -998,6 +1001,9 @@ class _BatchMLAPagedAttentionFaBackendBase(
                 output_dtype=args.output_dtype,
                 scale_mode=args.scale_mode,
                 use_profiler=args.use_profiler,
+                # This call uses the CSR and scalars checked by the preflight
+                # above. Keep this per invocation so direct plans still validate.
+                _workload_validated=True,
             )
             return backend
         except BaseException:

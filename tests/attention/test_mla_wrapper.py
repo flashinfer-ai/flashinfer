@@ -171,6 +171,92 @@ def _patch_fake_fa_module(monkeypatch, fake_module):
     monkeypatch.setattr(fa3_backend, "get_batch_mla_module", lambda *args: fake_module)
 
 
+@pytest.mark.parametrize("backend_name", ["fa2", "fa3"])
+@pytest.mark.parametrize("graph", [False, True])
+def test_fa_wrapper_validates_workload_once_per_replan(
+    monkeypatch, backend_name, graph
+):
+    import flashinfer.mla as mla
+    import flashinfer.mla._batch_mla._backends._fa_common as fa_common
+
+    validate = fa_common._validate_fa_plan_workload
+    native = _FakeBatchMLAModule()
+    _patch_fake_fa_module(monkeypatch, native)
+    calls = []
+
+    def counted(*args):
+        calls.append(args[0].tolist())
+        return validate(*args)
+
+    monkeypatch.setattr(fa_common, "_validate_fa_plan_workload", counted)
+    wrapper = _minimal_uninitialized_wrapper(
+        mla.BatchMLAPagedAttentionWrapper, use_cuda_graph=graph
+    )
+    wrapper._backend = backend_name
+    wrapper._backend_type = _wrapper._BACKEND_TYPES[backend_name]
+    if graph:
+        wrapper._qo_indptr_buf = torch.empty(3, dtype=torch.int32)
+        wrapper._kv_indptr_buf = torch.empty(3, dtype=torch.int32)
+        wrapper._kv_indices_buf = torch.empty(6, dtype=torch.int32)
+        wrapper._kv_len_arr_buf = torch.empty(2, dtype=torch.int32)
+    offsets = torch.tensor([0, 1, 2], dtype=torch.int32)
+    metadata = mla.MLAPlanMetadata.csr(
+        offsets,
+        torch.tensor([0, 3, 6], dtype=torch.int32),
+        torch.arange(6, dtype=torch.int32),
+        torch.tensor([3, 3], dtype=torch.int32),
+    )
+    wrapper.plan(metadata=metadata, **COMMON_PLAN_KWARGS)
+    assert calls == [[0, 1, 2]]
+    offsets[2] = 3
+    wrapper.plan(metadata=metadata, **COMMON_PLAN_KWARGS)
+    assert calls == [[0, 1, 2], [0, 1, 3]]
+    assert len(native.plan_calls) == 2
+
+
+@pytest.mark.parametrize("backend_name", ["fa2", "fa3"])
+@pytest.mark.parametrize("graph", [False, True])
+def test_fa_direct_backend_plan_still_rejects_excess_work(
+    monkeypatch, backend_name, graph
+):
+    import flashinfer.mla as mla
+    import flashinfer.mla._batch_mla._backends._fa_common as fa_common
+
+    validate = fa_common._validate_fa_plan_workload
+    native = _FakeBatchMLAModule()
+    _patch_fake_fa_module(monkeypatch, native)
+    monkeypatch.setattr(fa_common, "_validate_fa_plan_workload", validate)
+    monkeypatch.setattr(fa_common, "get_device_sm_count", lambda device: 132)
+    wrapper = _minimal_uninitialized_wrapper(
+        mla.BatchMLAPagedAttentionWrapper, use_cuda_graph=graph
+    )
+    wrapper._backend = backend_name
+    wrapper._backend_type = _wrapper._BACKEND_TYPES[backend_name]
+    if graph:
+        wrapper._qo_indptr_buf = torch.empty(3, dtype=torch.int32)
+        wrapper._kv_indptr_buf = torch.empty(3, dtype=torch.int32)
+        wrapper._kv_indices_buf = torch.empty(2, dtype=torch.int32)
+        wrapper._kv_len_arr_buf = torch.empty(2, dtype=torch.int32)
+    qo = torch.tensor([0, 1, 2], dtype=torch.int32)
+    kv = torch.tensor([0, 1, 2], dtype=torch.int32)
+    indices = torch.tensor([0, 1], dtype=torch.int32)
+    lengths = torch.tensor([1, 1], dtype=torch.int32)
+    metadata = mla.MLAPlanMetadata.csr(qo, kv, indices, lengths)
+    wrapper.plan(metadata=metadata, **COMMON_PLAN_KWARGS)
+    with pytest.raises(_BackendPlanUnsupportedError, match="work items"):
+        wrapper._planned_backend.plan(
+            qo_indptr=qo,
+            kv_indptr=kv,
+            kv_indices=indices,
+            kv_len_arr=lengths,
+            **{**COMMON_PLAN_KWARGS, "num_heads": 2**21},
+            output_dtype=torch.bfloat16,
+            scale_mode="default",
+            use_profiler=False,
+        )
+    assert len(native.plan_calls) == 1
+
+
 def _patch_fake_cutlass_module(monkeypatch, fake_module):
     import flashinfer.mla._batch_mla._backends.cutlass_backend as cutlass_backend
 
