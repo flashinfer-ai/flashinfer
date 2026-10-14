@@ -71,7 +71,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_blackwell_msa_488f8ef175ca49fa47f6(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int num_requests, int num_q_heads, int num_kv_heads, float softmax_scale_log2, int msa_max_pages)
+kernel_cake_blackwell_msa_0d391c271a9e1dd7de1b(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int num_requests, int num_q_heads, int num_kv_heads, float softmax_scale_log2, int msa_max_pages)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -96,9 +96,10 @@ kernel_cake_blackwell_msa_488f8ef175ca49fa47f6(const __grid_constant__ CUtensorM
     #define s_full_addr (mbar_base + 144)
     #define p_full_addr (mbar_base + 160)
     #define corr_sig_addr (mbar_base + 176)
-    #define corr_done_addr (mbar_base + 192)
-    #define o_full_addr (mbar_base + 208)
-    #define decode_done_addr (mbar_base + 224)
+    #define softmax_done_addr (mbar_base + 192)
+    #define corr_done_addr (mbar_base + 208)
+    #define o_full_addr (mbar_base + 224)
+    #define decode_done_addr (mbar_base + 240)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -133,8 +134,8 @@ kernel_cake_blackwell_msa_488f8ef175ca49fa47f6(const __grid_constant__ CUtensorM
     float* decode_row_sum = reinterpret_cast<float*>(smem_raw + SMEM_DECODE_ROW_SUM_OFF);
     const int decode_row_sum_addr = smem + SMEM_DECODE_ROW_SUM_OFF;
 
-    // Mbarrier init (12 pipeline groups, 0 ordered-sequence groups, 29 barriers)
-    // Mbarriers at smem_raw[0..232)
+    // Mbarrier init (13 pipeline groups, 0 ordered-sequence groups, 31 barriers)
+    // Mbarriers at smem_raw[0..248)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -173,14 +174,17 @@ kernel_cake_blackwell_msa_488f8ef175ca49fa47f6(const __grid_constant__ CUtensorM
             // corr_sig: 2 barriers, init_count=128
             mbarrier_init(smem + 176, 128);
             mbarrier_init(smem + 184, 128);
-            // corr_done: 2 barriers, init_count=128
+            // softmax_done: 2 barriers, init_count=128
             mbarrier_init(smem + 192, 128);
             mbarrier_init(smem + 200, 128);
+            // corr_done: 2 barriers, init_count=128
+            mbarrier_init(smem + 208, 128);
+            mbarrier_init(smem + 216, 128);
             // o_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 208, 1);
-            mbarrier_init(smem + 216, 1);
+            mbarrier_init(smem + 224, 1);
+            mbarrier_init(smem + 232, 1);
             // decode_done: 1 barriers, init_count=128
-            mbarrier_init(smem + 224, 128);
+            mbarrier_init(smem + 240, 128);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -188,9 +192,9 @@ kernel_cake_blackwell_msa_488f8ef175ca49fa47f6(const __grid_constant__ CUtensorM
     __syncwarp();
 
     // TMEM alloc (128 columns, 96 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 232);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 248);
     if (warp == 0) {
-        int _tmem_hold = smem + 232;
+        int _tmem_hold = smem + 248;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -386,9 +390,9 @@ kernel_cake_blackwell_msa_488f8ef175ca49fa47f6(const __grid_constant__ CUtensorM
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
                 }
                 if (is_wg1 != 0) {
-                    mbarrier_arrive(corr_sig_addr + 8);
+                    mbarrier_arrive(softmax_done_addr + 8);
                 } else {
-                    mbarrier_arrive(corr_sig_addr);
+                    mbarrier_arrive(softmax_done_addr);
                 }
             }
         }
@@ -401,6 +405,8 @@ kernel_cake_blackwell_msa_488f8ef175ca49fa47f6(const __grid_constant__ CUtensorM
             unsigned int work_stride_c = gridDim.x * gridDim.y;
             unsigned int _phase_corr_sig_0 = 0;
             unsigned int _phase_corr_sig_1 = 0;
+            unsigned int _phase_softmax_done_0 = 0;
+            unsigned int _phase_softmax_done_1 = 0;
             unsigned int _phase_o_full_0 = 0;
             #pragma unroll 1
             for (unsigned int work_idx_c = first_work_item_c; work_idx_c < total_work_items_c; work_idx_c += work_stride_c) {
@@ -452,10 +458,10 @@ kernel_cake_blackwell_msa_488f8ef175ca49fa47f6(const __grid_constant__ CUtensorM
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(p_full_addr + 8);
                 }
-                mbarrier_wait(corr_sig_addr, _phase_corr_sig_0);
-                _phase_corr_sig_0 ^= 1;
-                mbarrier_wait(corr_sig_addr + 8, _phase_corr_sig_1);
-                _phase_corr_sig_1 ^= 1;
+                mbarrier_wait(softmax_done_addr, _phase_softmax_done_0);
+                _phase_softmax_done_0 ^= 1;
+                mbarrier_wait(softmax_done_addr + 8, _phase_softmax_done_1);
+                _phase_softmax_done_1 ^= 1;
                 float scale0[16];
                 float scale1[16];
                 float final_sum[16];
