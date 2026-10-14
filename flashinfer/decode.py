@@ -3099,6 +3099,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if self._backend == "trtllm-gen":
             q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
 
+        trtllm_gen_bmm2_scale: Optional[Union[float, torch.Tensor]] = None
+
         if self._uses_cudnn:
             if kv_cache_sf is not None:
                 raise NotImplementedError(
@@ -3193,6 +3195,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     sinks=sinks,
                 )
         elif self.use_tensor_cores:
+            # trtllm-gen applies v_scale in-kernel as its bmm2 scale.
+            if (
+                self._backend == "trtllm-gen"
+                and self._jit_module is None
+                and v_scale is not None
+            ):
+                if isinstance(v_scale, (int, float)):
+                    trtllm_gen_bmm2_scale = float(v_scale)
+                elif (
+                    isinstance(v_scale, torch.Tensor)
+                    and v_scale.dtype == torch.float32
+                    and v_scale.numel() == 1
+                    and v_scale.device == q.device
+                ):
+                    trtllm_gen_bmm2_scale = v_scale
             run_args = [self._float_workspace_buffer]
             if self._backend == "trtllm-gen":
                 assert self._trtllm_gen_multi_ctas_kv_counter_buffer is not None
@@ -3242,6 +3259,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     fp8_scale_q = args[0]
                     fp8_scale_k = args[1]
                     fp8_scale_v = args[2]
+                if self._backend == "trtllm-gen":
+                    fp8_scale_v = trtllm_gen_bmm2_scale
                 run_args += [
                     None,  # packed_custom_mask
                     None,  # mask_indptr_buf
@@ -3355,7 +3374,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._cached_module.run(*run_args)
 
         is_float_one = isinstance(v_scale, float) and v_scale == 1.0
-        if v_scale is not None and not is_float_one:
+        if v_scale is not None and not is_float_one and trtllm_gen_bmm2_scale is None:
             # TODO(Zihao): fused into kernel
             if is_float8(out):
                 out = (out.to(torch.float32) * v_scale).to(out.dtype)
@@ -3677,7 +3696,7 @@ def get_trtllm_gen_decode_module(*args):
             kv_lens_buffer,
             max_kv_len,
             sm_scale,
-            1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
+            scale_v if scale_v is not None else 1.0,  # bmm2 scale
             workspace_size,
             window_left,
             enable_pdl,
