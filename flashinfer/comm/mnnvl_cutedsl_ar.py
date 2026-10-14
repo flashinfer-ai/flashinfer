@@ -494,15 +494,16 @@ def _device_scale(
         raise ValueError("FP8 output requires scale_factor")
     if not isinstance(scale_factor, torch.Tensor):
         return torch.tensor([float(scale_factor)], dtype=torch.float32, device=device)
-    if scale_factor.numel() != 1:
+    scale: torch.Tensor = scale_factor
+    if scale.numel() != 1:
         raise ValueError("scale_factor must contain exactly one element")
-    if scale_factor.device != device:
+    if scale.device != device:
         raise ValueError(f"scale_factor must be on {device}")
-    if scale_factor.dtype != torch.float32:
-        scale_factor = scale_factor.to(torch.float32)
+    if scale.dtype != torch.float32:
+        scale = scale.to(torch.float32)
     # reshape() of a one-element tensor is a view, so in-place updates of the
     # caller's tensor stay visible to the kernel.
-    return scale_factor.reshape(1)
+    return scale.reshape(1)
 
 
 def _mnnvl_cutedsl_allreduce_fusion(
