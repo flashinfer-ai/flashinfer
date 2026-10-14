@@ -55,6 +55,7 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_N_STRIDE 32768
 #define SMEM_TOTAL 164864
 #define THREADS 256
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -151,8 +152,8 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 1) void
-kernel_cake_gdn_cp_3c808f2c5dac8046844b(const __grid_constant__ CUtensorMap local_transfer, const __grid_constant__ CUtensorMap local_state, float* __restrict__ initial_state, float* __restrict__ initial_state_workspace, float* __restrict__ fixed_state, float* __restrict__ output_state, long long* __restrict__ cu_seqlens, int chunk_len, int total_cp_chunks, int num_seqs, int num_heads)
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
+kernel_cake_gdn_cp_72564a892ad77a80bc74(const __grid_constant__ CUtensorMap local_transfer, const __grid_constant__ CUtensorMap local_state, float* __restrict__ initial_state, float* __restrict__ initial_state_workspace, float* __restrict__ fixed_state, float* __restrict__ output_state, long long* __restrict__ cu_seqlens, int chunk_len, int total_cp_chunks, int num_seqs, int num_heads)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -183,10 +184,10 @@ kernel_cake_gdn_cp_3c808f2c5dac8046844b(const __grid_constant__ CUtensorMap loca
     const int cta_rank = 0;
 
     // Kernel setup ops
-    float* smem_m = reinterpret_cast<float*>(smem_raw + 1024);
-    const int smem_m_addr = smem + 1024;
-    float* smem_n = reinterpret_cast<float*>(smem_raw + 132096);
-    const int smem_n_addr = smem + 132096;
+    float* smem_m = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_M_OFF);
+    const int smem_m_addr = smem + SMEM_SMEM_M_OFF;
+    float* smem_n = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_N_OFF);
+    const int smem_n_addr = smem + SMEM_SMEM_N_OFF;
 
     // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 10 barriers)
     // Mbarriers at smem_raw[0..80)
