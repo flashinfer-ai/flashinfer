@@ -338,10 +338,13 @@ def test_shell_prints_fallback_summary_for_dependency_setup_failure(
     assert "phase=dependency-setup" in result.stdout
 
 
-@pytest.mark.parametrize("library_path", [None, "", "/existing/lib"])
-def test_shell_passes_nccl_wheel_library_to_test_runner(
-    tmp_path: Path, library_path: str | None
-) -> None:
+def _stage_cuda13_entrypoint(
+    tmp_path: Path, test_path: str, runner_body: str, installer_body: str
+) -> tuple[Path, dict[str, str], Path]:
+    """Stage the entrypoint on a stubbed CUDA 13 image.
+
+    Returns the entrypoint, its environment and the stub NCCL wheel lib dir.
+    """
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     entrypoint = scripts / "task_run_unit_tests.sh"
@@ -351,15 +354,12 @@ def test_shell_passes_nccl_wheel_library_to_test_runner(
     (scripts / "unit_test_runner.py").write_text(
         "import os, sys\n"
         "if sys.argv[1] == '__shell-settings':\n"
-        "    print('run\\ntests/moe_ep'); raise SystemExit(0)\n"
-        "assert os.environ['LD_LIBRARY_PATH'] == os.environ['EXPECTED_LIBRARY_PATH']\n"
-        "print('runner received NCCL library path')\n"
+        f"    print('run\\n' + {test_path!r}); raise SystemExit(0)\n" + runner_body
     )
 
     installer = tmp_path / "docker" / "install" / "build_flashinfer_ep_pytorch.sh"
     installer.parent.mkdir(parents=True)
-    # A child shell's export cannot configure the subsequent test process.
-    installer.write_text("export LD_LIBRARY_PATH=/installer/only\n")
+    installer.write_text(installer_body)
     modules = tmp_path / "modules"
     # Keep installed NVIDIA packages from overriding the NCCL stub.
     for package in ("nvshmem", "nvidia", "nvidia/nccl"):
@@ -370,13 +370,64 @@ def test_shell_passes_nccl_wheel_library_to_test_runner(
     (modules / "torch.py").write_text(
         "from types import SimpleNamespace\nversion = SimpleNamespace(cuda='13.0')\n"
     )
-    wheel_lib = modules / "nvidia" / "nccl" / "lib"
     env = os.environ.copy()
     env.update(
         PYTHONPATH=str(modules),
-        EXPECTED_LIBRARY_PATH=str(wheel_lib)
-        + (f":{library_path}" if library_path else ""),
         PATH=f"{Path(sys.executable).parent}{os.pathsep}{env['PATH']}",
+    )
+    return entrypoint, env, modules / "nvidia" / "nccl" / "lib"
+
+
+@pytest.mark.parametrize(
+    ("test_path", "installs"),
+    [
+        ("tests/moe_ep", True),
+        ("tests/moe_ep/test_sm90_bf16_push_cake_frozen_sources.py", True),
+        ("tests/gemm/test_bmm_fp8.py tests/moe_ep/test_moe_ep.py", True),
+        ("/tmp/flashinfer/tests/moe_ep", True),
+        ("tests/experimental/test_cake_mxfp8_megamoe_ep16.py", False),
+        ("tests/moe_ep_other/test_a.py", False),
+    ],
+)
+def test_shell_installs_moe_ep_stack_only_for_moe_ep_paths(
+    tmp_path: Path, test_path: str, installs: bool
+) -> None:
+    entrypoint, env, _ = _stage_cuda13_entrypoint(
+        tmp_path,
+        test_path,
+        runner_body="print('runner started')\n",
+        installer_body="touch installer-ran\n",
+    )
+    result = subprocess.run(
+        ["bash", str(entrypoint)],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "installer-ran").exists() == installs
+
+
+@pytest.mark.parametrize("library_path", [None, "", "/existing/lib"])
+def test_shell_passes_nccl_wheel_library_to_test_runner(
+    tmp_path: Path, library_path: str | None
+) -> None:
+    entrypoint, env, wheel_lib = _stage_cuda13_entrypoint(
+        tmp_path,
+        "tests/moe_ep",
+        runner_body=(
+            "assert os.environ['LD_LIBRARY_PATH'] == os.environ['EXPECTED_LIBRARY_PATH']\n"
+            "print('runner received NCCL library path')\n"
+        ),
+        # A child shell's export cannot configure the subsequent test process.
+        installer_body="export LD_LIBRARY_PATH=/installer/only\n",
+    )
+    env["EXPECTED_LIBRARY_PATH"] = str(wheel_lib) + (
+        f":{library_path}" if library_path else ""
     )
     if library_path is None:
         env.pop("LD_LIBRARY_PATH", None)
