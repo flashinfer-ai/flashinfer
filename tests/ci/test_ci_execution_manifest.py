@@ -134,6 +134,22 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(result["planRunAttempt"], 2)
         self.assertEqual(result["matrixDigest"], self.plan["matrixDigest"])
 
+    def test_checkout_ignores_inherited_commit_hook_git_overrides(self):
+        foreign = self.root / "foreign-git"
+        shutil.copytree(self.workspace / ".git", foreign)
+        (foreign / "HEAD").write_text(self.base + "\n")
+        with patch.dict(
+            os.environ,
+            {
+                "GIT_DIR": str(foreign),
+                "GIT_WORK_TREE": str(self.root),
+                "GIT_INDEX_FILE": str(foreign / "index"),
+            },
+        ):
+            self.assertEqual(
+                manifest.checkout(self.workspace), (self.merge, [self.base, self.head])
+            )
+
     def test_shallow_checkout_keeps_actual_commit_parents(self):
         (self.workspace / ".git/shallow").write_text(self.merge + "\n")
         self.assertEqual(

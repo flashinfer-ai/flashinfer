@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -232,6 +233,37 @@ class HardwareTests(unittest.TestCase):
         self.assertTrue(reader.seen)
         self.assertIsNone(reader.document)
         execute.assert_called_once_with("/fixture/script", ["/fixture/script", "arg"])
+
+    def test_cpu_probe_ignores_inherited_git_repository_overrides(self):
+        fixture = fixtures.ManifestTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        foreign = fixture.root / "foreign-git"
+        shutil.copytree(fixture.workspace / ".git", foreign)
+        (foreign / "HEAD").write_text(fixture.base + "\n")
+        environment = {
+            **fixture.env,
+            "GIT_DIR": str(foreign),
+            "GIT_WORK_TREE": str(fixture.root),
+        }
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                str(ROOT / "scripts/pr_checks/ci_execution_hardware.py"),
+                "probe",
+                "--kind",
+                "cpu",
+            ],
+            cwd=fixture.workspace,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["testedCheckoutSha"], fixture.merge)
 
     def test_real_cpu_wrapper_and_host_capture_preserve_original_exit(self):
         fixture = fixtures.ManifestTests()

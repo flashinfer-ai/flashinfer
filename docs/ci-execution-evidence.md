@@ -103,6 +103,11 @@ to requested-code jobs.
 
 ## Local verification
 
+The local `ci-request-execution-contracts` pre-commit hook runs this suite in an
+isolated Python environment with pinned PyYAML when its producer/workflow/test
+inputs change. The existing required `pre-commit` workflow executes the hook;
+no branch-protection rule, provider write permission, or GPU CI job is added.
+
 CPU-only fixtures exercise real temporary Git merge objects (including shallow
 checkout headers), actual workflow shell branches with fake Docker entrypoints,
 exit-code preservation, missing/linked/oversized artifacts and attempt identity.

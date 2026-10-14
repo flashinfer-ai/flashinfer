@@ -40,7 +40,11 @@ def unavailable(reason):
 
 def checkout_sha():
     env = {
-        **os.environ,
+        **{
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        },
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_NO_REPLACE_OBJECTS": "1",

@@ -158,6 +158,46 @@ class WorkflowTests(unittest.TestCase):
                     "/watcher-ci-evidence/hardware.py run --kind", step["run"]
                 )
 
+    def test_required_cpu_check_runs_contract_fixtures_in_isolated_python(self):
+        config = yaml.safe_load((ROOT / ".pre-commit-config.yaml").read_text())
+        hooks = [
+            hook
+            for repo in config["repos"]
+            for hook in repo["hooks"]
+            if hook["id"] == "ci-request-execution-contracts"
+        ]
+        self.assertEqual(len(hooks), 1)
+        hook = hooks[0]
+        self.assertEqual(hook["language"], "python")
+        self.assertEqual(hook["additional_dependencies"], ["PyYAML==6.0.2"])
+        self.assertIs(hook["pass_filenames"], False)
+        self.assertIs(hook["require_serial"], True)
+        self.assertEqual(
+            hook["entry"],
+            "python -B -m unittest discover -s tests/ci -p 'test_ci_*.py' -q",
+        )
+        for path in [
+            ".pre-commit-config.yaml",
+            ".github/workflows/pr-test.yml",
+            ".github/workflows/ci-request-receipts.yml",
+            ".github/workflows/ci-bot-commands.yml",
+            "scripts/pr_checks/ci_execution_hardware.py",
+            "scripts/pr_checks/ci_request_producer.py",
+            "tests/ci/test_ci_execution_manifest.py",
+            "scripts/task_jit_run_tests_part1.sh",
+            "ci/docker-tags.yml",
+        ]:
+            self.assertRegex(path, hook["files"])
+        self.assertIsNone(re.search(hook["files"], "tests/moe_ep/test_gpu.py"))
+        workflow_ = workflow("pre-commit.yml")
+        self.assertTrue(
+            any(
+                step.get("uses", "").startswith("pre-commit/action@")
+                for step in workflow_["jobs"]["pre-commit"]["steps"]
+            )
+        )
+        self.assertEqual(workflow_["jobs"]["pre-commit"]["runs-on"], "ubuntu-latest")
+
     def test_dispatch_does_not_also_trigger_a_label_run(self):
         job = self.commands["jobs"]["handle-command"]
         dispatch = step_named(job, "Handle @flashinfer-bot run")

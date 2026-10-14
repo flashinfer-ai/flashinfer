@@ -149,7 +149,16 @@ def scope(value, require_canonical=True):
 
 def checkout(workspace):
     """Read commit headers, including parents missing from a shallow checkout."""
-    env = {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1", "GIT_CONFIG_NOSYSTEM": "1"}
+    env = {
+        **{
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        },
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
     sha = (
         subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=workspace, env=env, timeout=10
