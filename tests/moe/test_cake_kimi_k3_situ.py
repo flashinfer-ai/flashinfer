@@ -21,6 +21,7 @@ asserts the text or structure of a generated source.
 
 import pytest
 import torch
+import tvm_ffi
 
 from flashinfer.fused_moe import (
     QuantConfig,
@@ -49,6 +50,7 @@ from flashinfer.jit.cake_kimi_k3_situ import (
     KERNELS,
     MODULES,
     cake_situ_program,
+    get_cake_situ_module,
 )
 from flashinfer.tllm_enums import ActivationType, RoutingMethodType
 from flashinfer.utils import device_support_pdl
@@ -71,6 +73,13 @@ FUSED_M1_ARCHES = ("sm_100a", "sm_103a")
 # today; an architecture outside this set would run the pre-shuffled
 # scale-factor route (nine kernels, the "large_c7" selector).
 LARGE_Q8I_ARCHES = ("sm_100a", "sm_103a")
+# Architectures and token counts whose large route runs the routing histogram
+# and scatter kernels with per-CTA shared-memory privatization and block
+# reservation (1024 routed pairs per CTA; the "large_q8i_p1024" selector) --
+# the 16384-token row of sm_100a today; every other large row keeps the
+# production routing kernels (256 pairs per CTA).
+LARGE_P1024_ARCHES = ("sm_100a",)
+LARGE_P1024_TOKENS = (16384,)
 # Architectures whose 4096-token route stores the FC2 result as the same 8-bit
 # per-tile partial behind the work5fd FC1; the 2048-token route keeps the BF16
 # expert output everywhere.
@@ -114,6 +123,7 @@ STAGES_BY_SELECTOR = {
     "mid_q8i": GENERIC_STAGES,
     "large_c7": GENERIC_STAGES[:5] + ["sfb_shuffle"] + GENERIC_STAGES[5:],
     "large_q8i": GENERIC_STAGES,
+    "large_q8i_p1024": GENERIC_STAGES,
 }
 
 
@@ -130,6 +140,8 @@ def _tile_bucket(num_tokens):
 def _expected_selector(arch, num_tokens):
     if num_tokens == 1 and arch in FUSED_M1_ARCHES:
         return "m1_s2a"
+    if num_tokens in LARGE_P1024_TOKENS and arch in LARGE_P1024_ARCHES:
+        return "large_q8i_p1024"
     if num_tokens in LARGE_TOKENS and arch in LARGE_Q8I_ARCHES:
         return "large_q8i"
     if num_tokens in MID_Q8I_TOKENS and arch in MID_Q8I_ARCHES:
@@ -687,6 +699,19 @@ def test_cake_situ_every_route_eager_and_external_graph(
         )
         assert bindings["fused_router"]["grid"] == (_ROUTE_MC_CLUSTER, 1, 1)
         assert bindings["fused_router"]["fc2_pool_ctas"] == 196
+    if prepared["selector"] == "large_q8i_p1024":
+        # The per-CTA privatized routing kernels handle 1024 routed pairs per
+        # CTA: a quarter of the production routing grid of the same row.
+        bindings = _cake_situ_stage_bindings(
+            _options(x, ids, route_weights, output, weights, workspace), prepared
+        )
+        for stage in ("route_histogram", "route_scatter"):
+            assert bindings[stage]["grid"] == (
+                (prepared["total_pairs"] + 1023) // 1024,
+                1,
+                1,
+            )
+            assert bindings[stage]["total_pairs"] == prepared["total_pairs"]
     if num_tokens == 1:
         # The single-token route quantizes and routes inside the FC1 prologue on
         # the fused architectures (three launches; the FC1 binding carries the
@@ -712,7 +737,7 @@ def test_cake_situ_every_route_eager_and_external_graph(
             )
         else:
             assert bindings["quant_route"]["x"] is x
-    if prepared["selector"] in ("large_q8i", "mid_q8i"):
+    if prepared["selector"] in ("large_q8i", "large_q8i_p1024", "mid_q8i"):
         # The FC2 stage stores an 8-bit per-tile partial and its per-tile FP32
         # scales inside the BF16 expert-output scratch, and the finalize reads
         # the same two views: no pre-shuffled scale-factor images are bound.
@@ -772,7 +797,7 @@ def test_cake_situ_every_route_eager_and_external_graph(
     default_parameters_output = output.clone()
     output.fill_(float("nan"))
     assert submit(explicit_parameters=True) is output
-    if prepared["selector"] in ("large_q8i", "mid_q8i"):
+    if prepared["selector"] in ("large_q8i", "large_q8i_p1024", "mid_q8i"):
         # The 8-bit FC2 partial of this route carries one FP32 scale per
         # 128x128 tile, and the atomic-counter routing assigns rows to tiles
         # in a call-dependent order, so the tile membership (hence each
@@ -825,3 +850,156 @@ def _submit_prepared(num_tokens, routing, device, weights, workspace):
         output,
         _options(x, ids, route_weights, output, weights, workspace),
     )
+
+
+def _fc1_scales_by_row(views, max_tiles):
+    # FC1 stores its output scale factors in the tile layout FC2 loads: per
+    # tile and per 64 elements of the intermediate size one 512-byte block
+    # whose word (row % 32, row // 32) holds the row's four scale bytes.
+    blocks = views["intermediate_scales"].view(max_tiles, INTERMEDIATE // 64, 32, 4, 4)
+    return blocks.permute(0, 3, 2, 1, 4).reshape(max_tiles * 128, INTERMEDIATE // 16)
+
+
+def _routing_in_pair_order(views, ids, max_tiles):
+    # The routing scatter assigns each (token, expert-slot) pair a row inside
+    # its expert's tiles; the row a pair receives differs between routing
+    # kernels (and from call to call), so the routing tables and the per-row
+    # FC1 scratch are compared in pair order through token_to_permuted (the
+    # map the finalize uses), never by row index.
+    permuted = views["token_to_permuted"].long()
+    total_tiles = int(views["total_tiles"].item())
+    assert permuted.numel() == ids.numel()
+    assert int(permuted.min()) >= 0 and int(permuted.max()) < total_tiles * 128
+    # Every pair's row lies in a tile of the pair's expert, below the tile's
+    # valid-row limit, and no two pairs share a row.
+    tile = permuted // 128
+    assert torch.equal(
+        views["tile_expert"][:total_tiles].long()[tile], ids.view(-1).long()
+    )
+    assert bool((permuted < views["tile_mn_limit"][:total_tiles].long()[tile]).all())
+    assert permuted.unique().numel() == permuted.numel()
+    return {
+        "expert_counts": views["expert_counts"].clone(),
+        "expert_tile_offsets": views["expert_tile_offsets"].clone(),
+        "expert_scatter_offsets": views["expert_scatter_offsets"].clone(),
+        "total_tiles": total_tiles,
+        "tile_expert": views["tile_expert"][:total_tiles].clone(),
+        "tile_mn_limit": views["tile_mn_limit"][:total_tiles].clone(),
+        "rows": permuted.sort().values,
+        "route_map": views["route_map"][permuted].clone(),
+        "intermediate_packed": views["intermediate_packed"][permuted].clone(),
+        "intermediate_scales": _fc1_scales_by_row(views, max_tiles)[permuted].clone(),
+    }
+
+
+def _launch(program, arch, stage_values):
+    # Launch one program alone with the values the host bound for its stage.
+    module = get_cake_situ_module(program, arch)
+    entry = getattr(module, MODULES[program]["ffi_entry"])
+    args = [
+        stage_values["grid"][("grid_x", "grid_y", "grid_z").index(name)]
+        if kind == "grid"
+        else stage_values[name]
+        for kind, name in MODULES[program]["arg_plan"]
+    ]
+    with tvm_ffi.use_torch_stream():
+        entry(*args)
+
+
+@pytest.mark.parametrize(
+    "num_tokens, routing",
+    [(16384, "uniform"), (16384, "skewed")],
+    ids=["m16384_uniform", "m16384_skewed"],
+)
+def test_cake_situ_per_cta_privatized_routing_matches_the_production_routing(
+    num_tokens,
+    routing,
+    cake_situ_device,
+    cake_situ_weights,
+    cake_situ_workspace,
+):
+    # The sm_100a 16384-token route runs the routing histogram and scatter
+    # kernels that privatize the expert histogram in per-CTA shared memory and
+    # reserve a block of rows per CTA (1024 routed pairs per CTA). Their
+    # routing tables, the FC1 scratch of every routed pair and the complete
+    # call are compared, in pair order, with the production routing kernels
+    # (256 pairs per CTA) run on the same workspace, inputs and stage
+    # bindings: expert counts, tile tables and the per-pair expert, row set,
+    # route map and FC1 output must be bitwise identical, and each call's
+    # output must match the reference within the published tolerance. The two
+    # outputs are not compared with each other: they are not bitwise
+    # identical, because the accumulation order of the INT8 per-tile FC2
+    # partial depends on tile membership, which differs between the two
+    # routings; their largest absolute difference is recorded instead.
+    device, weights, workspace = (
+        cake_situ_device,
+        cake_situ_weights,
+        cake_situ_workspace,
+    )
+    arch = _arch(device)
+    if _expected_selector(arch, num_tokens) != "large_q8i_p1024":
+        pytest.skip(
+            f"{arch} routes {num_tokens} tokens to {_expected_selector(arch, num_tokens)}; "
+            "the per-CTA privatized routing programs are not delivered for it"
+        )
+    x, ids, route_weights, output, options = _submit_prepared(
+        num_tokens, routing, device, weights, workspace
+    )
+    prepared = _prepared(workspace, num_tokens)
+    assert prepared["selector"] == "large_q8i_p1024"
+    production = {
+        stage: cake_situ_program(arch, stage)
+        for stage in ("route_histogram", "route_scatter")
+    }
+    for stage, program in production.items():
+        assert prepared["modules"][stage] == cake_situ_program(
+            arch, f"{stage}:n128_p1024"
+        )
+        assert prepared["modules"][stage] != program
+        assert (
+            MODULES[prepared["modules"][stage]]["arg_plan"]
+            == MODULES[program]["arg_plan"]
+        )
+    bindings = _cake_situ_stage_bindings(options, prepared)
+    total_pairs = prepared["total_pairs"]
+    assert total_pairs == num_tokens * TOP_K
+    for stage in production:
+        assert bindings[stage]["grid"] == ((total_pairs + 1023) // 1024, 1, 1)
+        assert bindings[stage]["total_pairs"] == total_pairs
+    expected = _trtllm_reference(x, ids, route_weights, weights)
+    torch.testing.assert_close(output, expected, atol=1.0, rtol=0.1)
+
+    views = _cake_situ_workspace_views(workspace, num_tokens)
+    max_tiles = prepared["max_tiles"]
+    privatized = _routing_in_pair_order(views, ids, max_tiles)
+    privatized_output = output.clone()
+    assert 0 < privatized["total_tiles"] <= max_tiles
+    for name in ("intermediate_packed", "intermediate_scales"):
+        views[name].zero_()
+    views["token_to_permuted"].fill_(-1)
+    views["expert_output"].fill_(float("nan"))
+    output.fill_(float("nan"))
+
+    # The same call with the production routing kernels: every stage of the
+    # route is launched alone with the values the host bound for it, the
+    # histogram and scatter replaced by the production programs on their
+    # 256-pairs-per-CTA grid.
+    production_grid = ((total_pairs + 255) // 256, 1, 1)
+    for stage in prepared["stages"]:
+        if stage in production:
+            _launch(
+                production[stage], arch, {**bindings[stage], "grid": production_grid}
+            )
+        else:
+            _launch(prepared["modules"][stage], arch, bindings[stage])
+    torch.cuda.synchronize(device)
+    reference = _routing_in_pair_order(views, ids, max_tiles)
+    for name, value in privatized.items():
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(reference[name], value), name
+        else:
+            assert reference[name] == value, name
+    torch.testing.assert_close(output, expected, atol=1.0, rtol=0.1)
+    # Recorded, not asserted: the two routings' outputs differ bitwise.
+    recorded = (output.float() - privatized_output.float()).abs().max().item()
+    print(f"largest absolute difference between the two routings' outputs: {recorded}")
