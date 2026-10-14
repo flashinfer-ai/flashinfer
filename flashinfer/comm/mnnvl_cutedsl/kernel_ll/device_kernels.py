@@ -975,6 +975,9 @@ class _LamportResidualRMSNormDeviceKernel:
                 self.warps,
                 self.rank_lanes,
             )
+            # Peer CTAs must exist before accessing their distributed shared memory.
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
             if tidx < self.cluster_size:
                 local_slot = cluster_sums + cluster_rank
                 remote_slot = map_shared_to_peer(local_slot, Int32(tidx))

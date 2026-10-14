@@ -412,9 +412,25 @@ class MoEEpMegaLayer(nn.Module):
             self.forward(
                 t,
                 workspace=workspace,
-                return_workspace_view=self.supports_output_view and t.output is None,
+                return_workspace_view=(
+                    self.supports_output_view
+                    and t.output is None
+                    and getattr(self._megakernel_config, "knobs", None) != "auto"
+                ),
             )
         torch.cuda.synchronize()
+
+    def get_tuned_knobs(self) -> dict[str, Any]:
+        """Return the selected knobs after a successful ``knobs="auto"`` warmup.
+
+        The returned dictionary is a copy and can be passed as ``knobs`` when
+        constructing a fixed layer with the same kernel configuration and
+        capacity. This call does not allocate, tune or read a cache file.
+        It raises if the layer is destroyed or has no automatic tuning result.
+        """
+        if self._destroyed:
+            raise MoEEpConfigError("MegaMoE layer has been destroyed")
+        return self._kernel.get_tuned_knobs()
 
     def _resolve_quantize_input(self, t: "MoEEpTensors") -> bool:
         if not self._mega_config.quantize_input:

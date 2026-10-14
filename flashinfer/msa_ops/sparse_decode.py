@@ -760,6 +760,7 @@ def prepare_msa_nvfp4_sparse_decode(
     softmax_scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
+    use_cache_hit: bool | str = "auto",
     backend: str = "cake",
 ):
     r"""Prepare NVFP4 paged-KV sparse decode with the generated Cake programs (SM100/SM103/SM107).
@@ -770,11 +771,13 @@ def prepare_msa_nvfp4_sparse_decode(
     top-k 16, right-aligned causal decode tokens -- with a persistent kernel
     that keeps the K tiles resident in tensor memory and runs both MMAs in the
     swapped orientation (small batches split each work item across a cluster
-    of CTAs that merge through distributed shared memory) and a short-item
-    cluster program for batches of requests within four pages.  Preparation
-    validates and binds the tensors; the returned runner launches with no
-    allocation and no host synchronization and can be captured into a CUDA
-    Graph.
+    of CTAs that merge through distributed shared memory), a short-item
+    cluster program for batches of requests within four pages, and, on
+    request (``use_cache_hit=True``), a request-packed union program that
+    serves the ``seqlen_q`` tokens of a request from one CTA (or one cluster)
+    and streams every page of their top-k union once.  Preparation validates
+    and binds the tensors; the returned runner launches with no allocation
+    and no host synchronization and can be captured into a CUDA Graph.
 
     Parameters
     ----------
@@ -809,6 +812,20 @@ def prepare_msa_nvfp4_sparse_decode(
     out, lse : Optional[torch.Tensor]
         Optional caller-owned BF16 output ``[batch * seqlen_q, num_q_heads, 128]``
         and float32 natural-log softmax normalizer ``[batch * seqlen_q, num_q_heads]``.
+    use_cache_hit : bool or str
+        Schedule for the ``seqlen_q`` tokens of a request (every token still
+        attends only its own sixteen selected pages).  ``False`` keeps the
+        per-(token, KV head) programs (persistent split-KV or short-item).
+        ``True`` requests the request-packed union program, which packs the
+        tokens of one request into one CTA (or one cluster of CTAs) and
+        streams each page of their top-k union once; it is available for a
+        uniform ``seqlen_q`` in ``[2, 4]`` and raises ``ValueError`` for a
+        larger ``seqlen_q`` (at ``seqlen_q == 1`` the switch is a no-op and the
+        per-token programs run).  ``"auto"`` (default) currently resolves to
+        the ``False`` programs on every shape; a measured device-side policy
+        is future work.  Under CUDA-graph capture ``True`` requires the union
+        program to have been built before capture (prepare the same shape
+        once eagerly first).
     backend : str
         Only ``"cake"`` is supported.
 
@@ -839,5 +856,6 @@ def prepare_msa_nvfp4_sparse_decode(
         softmax_scale=softmax_scale,
         out=out,
         lse=lse,
+        use_cache_hit=use_cache_hit,
         backend="cake",
     )
