@@ -375,6 +375,38 @@ runs them with a 256x256 tile (half our L2 bytes per flop, 125 vs 150-164 GB), a
 because two 256-column accumulator stages fill TMEM.  A 256x224 tile with A in TMEM
 would need a single A stage (2 x 224 + 64 = 512 columns): untried, the next lever.
 
+**Verdict at M=88320** (`b17v_*`, two independent steady-state runs): 21 of 24 rows at or
+under 1.02 x cuBLAS, 15 of them under 0.99 (und.q tp8 0.92, und.kv tp1 0.95, mlp.down
+tp4 0.95, attn.out tp1 0.96, ...).  mlp.down tp2 1.024 / 1.024 and mlp.gate_up tp2 1.022 /
+1.022 in the two-column runs, 1.02-1.03 with every tile in a four-column run: on par
+within the run-to-run band, not under.  attn.out tp8 (N=5120, K=1024): 0.998 / 1.064 in
+the two-column runs, 1.07-1.15 across six columns, best tile the 160-row one at
+1.03-1.13, cuBLAS itself 582-630 us between runs; a 0.6 ms kernel with eight k-steps per
+tile, where the per-tile prologue / epilogue is the whole story.  Open.
+
+What the three are made of (ncu, `--clock-control none`, one launch each, M=88320):
+
+| row | | time | SM clock | SM cycles | DRAM read | instructions |
+|---|---|---|---|---|---|---|
+| attn.out tp8 | cuBLAS 128x256 | 0.556 ms | 1.415 GHz | 0.79 M | 0.25 GB | 0.04 G |
+| | ours 256x160 | 0.578 ms | 1.448 GHz | 0.84 M | 0.19 GB | 0.22 G |
+| mlp.gate_up tp2 | cuBLAS 128x256 | 6.99 ms | 1.373 GHz | 9.59 M | 4.6 GB | 0.20 G |
+| | ours (auto) | 7.25 ms | 1.335 GHz | 9.68 M | 5.9 GB | 2.08 G |
+| mlp.down tp2 | cuBLAS 256x256 | 7.16 ms | 1.386 GHz | 9.92 M | 11.3 GB | 0.10 G |
+| | ours (auto, 192) | 7.24 ms | 1.333 GHz | 9.65 M | 8.3 GB | 1.98 G |
+
+Three different floors.  attn.out tp8 is cycles: 6% more at a higher clock; with eight
+k-steps per tile the transform-to-MMA hand-off at every tile start is not hidden.
+mlp.gate_up tp2 is DRAM (27% more bytes than cuBLAS at M=88320; the band rule was fitted
+at 44160) and clock.  mlp.down tp2 is neither: 3% fewer cycles and 27% fewer DRAM bytes
+than cuBLAS, yet a 4% lower clock, with 20x the instruction count.  That is the
+converter's own energy: the transform warps' instruction stream costs clock on a
+power-capped part even when the memory system is quiet.  Conversions per flop fall with
+the activation tile height, and the measured order on that row follows it exactly (128:
+1.065, 160: 1.033, 192: 1.024), but the 256-row tile pays 7% for its SMEM-staged A.  The
+way through is a 256-row activation tile with A in TMEM (one accumulator stage, or a
+224-row tile with one A stage), a mainloop change, not a knob.
+
 Lesson for the whole line, both arches: on a power-capped part a GEMM at 97% tensor-pipe
 utilisation is not "compute-bound, done"; every DRAM byte costs clock, and cuBLAS's edge on
 the wide rows was never its mainloop but its L2 footprint.
