@@ -11,8 +11,8 @@
 #     pre-commit autoupdate
 #
 # See https://github.com/pre-commit/pre-commit
-# Note the pre-commit hooks shoule only be used for formatting, but not for linting.
-# For linting consider using CI.
+# Most hooks format code; narrowly scoped CPU contract fixtures also run in
+# the existing required pre-commit CI job. GPU validation remains separate.
 # These manifest-authenticated generated sources must remain byte-exact.
 files: ^(?!(?:flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/|csrc/cake_fmha/))
 
@@ -118,3 +118,15 @@ repos:
         language: system
         pass_filenames: false
         files: ^scripts/pr_checks/experimental_test_scope\.py$
+      # Keep the request/receipt and actual-execution contracts in the existing
+      # required CPU check. These fixtures use temporary Git repos and fake
+      # provider/driver boundaries; they never allocate runners or GPUs.
+      - id: ci-request-execution-contracts
+        name: CI request and execution contracts (CPU fixtures)
+        entry: python -B -m unittest discover -s tests/ci -p 'test_ci_*.py' -q
+        language: python
+        additional_dependencies: [PyYAML==6.0.2]
+        pass_filenames: false
+        require_serial: true
+        files: >-
+          ^(?:\.pre-commit-config\.yaml|\.github/workflows/(?:ci-bot-commands|ci-request-receipts|pr-test|pre-commit)\.yml|scripts/pr_checks/(?:ci_request_.*|ci_execution_.*|targeted_lane_scope)\.py|tests/ci/.*\.py|scripts/task_jit_run_tests_(?:part[1-5]|t4)\.sh|ci/(?:docker-tags\.yml|cuda-versions\.json))$

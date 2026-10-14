@@ -1,0 +1,54 @@
+# Trusted default-branch recovery/reporting only. Never check out PR code here.
+name: CI Request Receipts
+on:
+  workflow_run:
+    workflows: [PR Test]
+    types: [requested, in_progress, completed]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  identify:
+    if: github.event.workflow_run.event == 'workflow_dispatch' && startsWith(github.event.workflow_run.display_title, 'fi-ci/')
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.identity.outputs.pr_number }}
+      comment_id: ${{ steps.identity.outputs.comment_id }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - id: identity
+        run: python3 scripts/pr_checks/ci_request_producer.py identify
+  report:
+    needs: identify
+    runs-on: ubuntu-latest
+    concurrency:
+      group: watcher-ci-pr-${{ needs.identify.outputs.pr_number }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Recover exact root and complete receipt
+        env:
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+        run: python3 scripts/pr_checks/ci_request_producer.py recover
+      - name: Mark correlated reruns pending on the requested PR head
+        if: github.event.action != 'completed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/pr_checks/ci_request_producer.py report-progress
+      - name: Report real provider checks on the requested PR head
+        if: github.event.action == 'completed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/pr_checks/ci_request_producer.py report-completed
