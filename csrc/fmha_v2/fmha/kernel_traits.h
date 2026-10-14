@@ -259,6 +259,14 @@ struct Kernel_traits_ {
   // Use MTP (multi-token prediction for MLA kernels) or not.
   enum { IS_MTP = (FLAGS & 0x2000) != 0u };
 
+  // SM120 GLM: write the FP8 MMA fragments directly as BF16/FP16 pairs.
+  enum { DIRECT_16BIT_OUTPUT = (FLAGS & 0x4000u) != 0u };
+  static_assert(!DIRECT_16BIT_OUTPUT ||
+                    (NO_LOOP && !USE_GRANULAR_TILING && !SAGE_ATTENTION && !IS_MTP &&
+                     VALID_D == 256 && VALID_DV == 256 && STEP == 64 && S == 64 && WARPS_M == 4 &&
+                     WARPS_N == 1 && CTAS_PER_HEAD_ == 1),
+                "Direct output requires the full SM120 GLM tile");
+
   // The number of CTAs per head for Cta_tile_p; equivalent to BMM1 split-K
   enum { CTAS_PER_HEAD = CTAS_PER_HEAD_ };
 
@@ -325,21 +333,21 @@ struct Kernel_traits_ {
   enum { BYTES_PER_SMEM_QKV = BYTES_PER_SMEM_QK + BYTES_PER_SMEM_V };
 
   // The amount of shared memory needed to load/store O.
-  enum { BYTES_PER_SMEM_O = Smem_tile_o::BYTES_PER_TILE };
+  enum { BYTES_PER_SMEM_O = DIRECT_16BIT_OUTPUT ? 0 : Smem_tile_o::BYTES_PER_TILE };
 
   // The amount of shared memory needed to load Q and store O.
   enum {
-    BYTES_PER_SMEM_QO =
-        NO_LOOP ? Smem_tile_o::BYTES_PER_TILE : Smem_tile_q::BYTES_PER_TILE + BYTES_PER_SMEM_O
+    BYTES_PER_SMEM_QO = NO_LOOP ? BYTES_PER_SMEM_O : Smem_tile_q::BYTES_PER_TILE + BYTES_PER_SMEM_O
   };
 
   // The amount of shared memory needed for Q, K, V and O.
   enum { BYTES_PER_SMEM = fmha::Max<BYTES_PER_SMEM_QKV, BYTES_PER_SMEM_QO>::VALUE };
 
   // Make sure we have enough shared memory.
-  static_assert((NO_LOOP
-                     ? Smem_tile_o::BYTES_PER_TILE
-                     : Smem_tile_q::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE) <= BYTES_PER_SMEM,
+  static_assert(DIRECT_16BIT_OUTPUT ||
+                    (NO_LOOP ? Smem_tile_o::BYTES_PER_TILE
+                             : Smem_tile_q::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE) <=
+                        BYTES_PER_SMEM,
                 "");
 };
 

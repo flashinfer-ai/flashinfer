@@ -1125,6 +1125,41 @@ struct Gmem_tile_o_16bit {
     }
   }
 
+  // The V load layout interleaves columns from the two m16n8k32 instructions:
+  // registers (0, 4, 1, 5) and (2, 6, 3, 7) are four adjacent output columns.
+  // Store these rows directly: the 64x256 FP32 shared-memory transpose would
+  // otherwise require 64 KiB and restrict SM120 to one resident CTA per SM.
+  template <typename Accumulator, typename Params, typename Block_info, int M, int N>
+  inline __device__ void store_accumulators(Accumulator const (&acc)[M][N], Params const& params,
+                                            Block_info const& binfo, int tidx, int cta_row_offset) {
+    static_assert(Cta_tile::WARPS_M == 4 && Cta_tile::WARPS_N == 1 && Cta_tile::WARPS_K == 1 &&
+                  Cta_tile::M == 64 && Cta_tile::N == 256 && CTAS_PER_HEAD == 1);
+    int const lane = tidx % 32;
+    int const row = cta_row_offset + (tidx / 32) * 16 + lane / 4;
+    int const col = (lane % 4) * 4;
+#pragma unroll
+    for (int mi = 0; mi < M; ++mi) {
+#pragma unroll
+      for (int ri = 0; ri < 2; ++ri) {
+        int const output_row = row + mi * Mma_tile::M_PER_MMA_PER_CTA + ri * 8;
+        if (output_row < binfo.actual_q_seqlen) {
+          char* dst = reinterpret_cast<char*>(params.o_ptr) +
+                      int64_t(output_row) * params.o_stride_in_bytes +
+                      int64_t(binfo.bidx) * params.dv * BYTES_PER_ELEMENT;
+#pragma unroll
+          for (int ni = 0; ni < N; ++ni) {
+            auto const& a = acc[mi][ni];
+            uint4 src =
+                make_uint4(a.reg(ri * 2), a.reg(ri * 2 + 4), a.reg(ri * 2 + 1), a.reg(ri * 2 + 5));
+            uint2 packed = Acc_packer<float, Output_type>::run(this, src);
+            int const offset = (ni * 16 + col) * BYTES_PER_ELEMENT;
+            fmha::stg(dst + offset, packed);
+          }
+        }
+      }
+    }
+  }
+
   // The stride between rows for the QKV matrice.
   int64_t params_o_stride_in_bytes_;
   // The scaling factor to convert to int8.

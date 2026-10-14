@@ -2095,7 +2095,7 @@ def selected_mask_types(kspec: kernel_spec) -> tuple[str, str, str, str]:
 
 def _use_full_glm_tiles(kspec: kernel_spec) -> bool:
     # Keep outer Q tiling, but avoid reloading Q/K in four 64-column pieces.
-    # Full Q/K/V tiles fit within the existing 64 KiB output-staging allocation.
+    # Direct output leaves only the 48 KiB full Q/K/V tiles in shared memory.
     return (
         kspec.sm == 120
         and kspec.dtype == "e4m3_fp32"
@@ -2204,6 +2204,8 @@ def get_kernel_code(kspec: kernel_spec, kname: str, lname: str) -> str | None:
         flags |= 2048
     if kspec.tiled and not _use_full_glm_tiles(kspec):
         flags |= 4096
+    if _use_full_glm_tiles(kspec):
+        flags |= 16384  # Store FP8 MMA accumulators without FP32 shared staging.
     if kspec.is_mtp:
         flags |= 8192
 
@@ -2987,6 +2989,8 @@ def get_kernel_traits_code(specs_names: list[tuple[kernel_spec, str, str, str]])
             flags |= 2048
         if kspec.tiled and not _use_full_glm_tiles(kspec):
             flags |= 4096
+        if _use_full_glm_tiles(kspec):
+            flags |= 16384
         if kspec.is_mtp:
             flags |= 8192
 

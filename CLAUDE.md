@@ -225,12 +225,14 @@ output. Apply RoPE upstream; NoPE and RoPE share the FP8 dtype and scalar
 scale. GLM's fused QK scale is `q_scale * k_scale / 16`.
 
 The SM120 GLM 256/256 specialization keeps 64-token outer Q tiles but uses
-full Q/K head tiles and 64-token PV reduction tiles for FP8-to-BF16/FP16.
-The full operands fit within the existing 64 KiB output-staging allocation.
-Single-buffer K/V reuse includes CTA barriers after each GEMM's final shared
-reads. Other shapes and layouts retain their original tiling. When testing
-source changes, exclude stale prebuilt `data/aot/trtllm_fmha_v2` artifacts so
-they cannot mask the new JIT build.
+full Q/K head tiles and 64-token PV reduction tiles. Its BF16/FP16 epilogue
+writes accumulator fragments directly, reducing dynamic shared memory from
+64 KiB to 48 KiB and permitting two resident CTAs on SM120. Single-buffer K/V
+reuse includes CTA barriers after each GEMM's final shared reads; omitting
+them can produce nondeterministic results when multiple CTAs are resident.
+Other shapes and layouts retain their original tiling and epilogue. When
+testing source changes, ensure a prebuilt `data/aot/trtllm_fmha_v2` artifact
+is not masking the new JIT build.
 
 ## Code Linting
 

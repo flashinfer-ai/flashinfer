@@ -555,26 +555,30 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
   // Wait for last round of LDS K/V to finish
   __syncthreads();
 
+  if constexpr (Kernel_traits::DIRECT_16BIT_OUTPUT) {
+    gmem_o.store_accumulators(acc_o, params, binfo, tidx, q_loop * Gmem_tile_o::ROWS);
+  } else {
 // Loop over MMAS_M.
 #pragma unroll
-  for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii) {
-    // Swizzle the elements and do the final reduction.
-    smem_o.store(acc_o, ii);
+    for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii) {
+      // Swizzle the elements and do the final reduction.
+      smem_o.store(acc_o, ii);
 
-    // Make sure the data is in shared memory.
-    __syncthreads();
-
-    // Load from shared memory.
-    uint4 out[Gmem_tile_o::STGS_PER_LOOP];
-    smem_o.load(out);
-
-    // Make sure the data was read from shared memory.
-    if (ii < Gmem_tile_o::LOOPS - 1) {
+      // Make sure the data is in shared memory.
       __syncthreads();
-    }
 
-    // Output the values.
-    gmem_o.store(out, ii);
+      // Load from shared memory.
+      uint4 out[Gmem_tile_o::STGS_PER_LOOP];
+      smem_o.load(out);
+
+      // Make sure the data was read from shared memory.
+      if (ii < Gmem_tile_o::LOOPS - 1) {
+        __syncthreads();
+      }
+
+      // Output the values.
+      gmem_o.store(out, ii);
+    }
   }
   if (params.softmax_stats_ptr != nullptr) {
     using Mma_tile = typename Traits_p::template Mma_tile<Cta_tile_o>;
