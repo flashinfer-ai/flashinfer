@@ -1061,9 +1061,10 @@ def test_cake_backend_matches_default(
 
 
 # Token counts across the multi-token CTA bands of the Cake backend on compute capability 10.7
-# (one CTA routes 2, 4 or 8 tokens above 848 tokens on the E=256 G=8 topk_group=4 topk=8 route);
+# (one CTA routes 2..8 tokens above 848 tokens on the E=256 G=8 topk_group=4 topk=8 route: the
+# shipped rule picks 2, 4 or 8, the per-band table may pick any rendered member);
 # on other devices the same calls run the one-token kernel, so the test checks every device.
-@pytest.mark.parametrize("num_tokens", [848, 849, 1024, 1696, 1697, 3392, 3393, 4096])
+@pytest.mark.parametrize("num_tokens", [848, 849, 1024, 1696, 1697, 3392, 3393, 4096, 4241])
 @pytest.mark.parametrize("data_type", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("bias_type", [torch.float32, torch.bfloat16])
 def test_dsv3_fused_routing_cake_many_tokens(num_tokens, data_type, bias_type):
