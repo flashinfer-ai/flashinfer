@@ -157,7 +157,7 @@ class _NcclQkvExchange:
         self.h_local = self.num_heads // self.world_size
         self._comm = _Communicator(
             group,
-            max_elems=self.max_tokens * 3 * self.hidden,
+            max_bytes=self.max_tokens * 3 * self.hidden * torch.bfloat16.itemsize,
             dtype=torch.bfloat16,
             backend="nccl",
             device=device,
