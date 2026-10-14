@@ -66,7 +66,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap v, int* __restrict__ scheduler_metadata, int* __restrict__ k2q_row_ptr, int* __restrict__ k2q_qsplit_indices, uint8_t* __restrict__ partial_o, __nv_bfloat16* __restrict__ partial_scale, float* __restrict__ partial_lse, float* __restrict__ partial_temperature_lse, __nv_bfloat16* __restrict__ out, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ q_offsets, int* __restrict__ kv_lens, int* __restrict__ page_table, int q_group_segment_end_128, int q_group_segment_end_64, int q_group_segment_end_32, int q_group_segment_end_16, int q_group_segment_end_8, int q_group_segment_end_4, int q_group_segment_end_2, int total_q, int num_q_heads, int num_kv_heads, int total_rows, int nnz_per_head, int work_capacity, int num_work_items, int topk, int max_pages, int causal, int derive_q_offset, float softmax_scale_log2, float lse_temperature_scale, int return_temperature_lse)
+kernel_cake_blackwell_msa_c3da0a7883053ffdf6fe(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap v, int* __restrict__ scheduler_metadata, int* __restrict__ k2q_row_ptr, int* __restrict__ k2q_qsplit_indices, uint8_t* __restrict__ partial_o, __nv_bfloat16* __restrict__ partial_scale, float* __restrict__ partial_lse, float* __restrict__ partial_temperature_lse, __nv_bfloat16* __restrict__ out, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ q_offsets, int* __restrict__ kv_lens, int* __restrict__ page_table, int q_group_segment_end_128, int q_group_segment_end_64, int q_group_segment_end_32, int q_group_segment_end_16, int q_group_segment_end_8, int q_group_segment_end_4, int q_group_segment_end_2, int total_q, int num_q_heads, int num_kv_heads, int total_rows, int nnz_per_head, int work_capacity, int num_work_items, int topk, int max_pages, int causal, int derive_q_offset, float softmax_scale_log2, float lse_temperature_scale, int return_temperature_lse)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -198,26 +198,20 @@ kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorM
         asm volatile("setmaxnreg.inc.sync.aligned.u32 200;");
         { // softmax_even_main
             int group_count = 1;
-            if (blockIdx.x < q_group_segment_end_16) {
-                if (blockIdx.x < q_group_segment_end_64) {
-                    group_count = ((blockIdx.x < q_group_segment_end_128) ? 128 : 64);
-                } else {
-                    group_count = ((blockIdx.x < q_group_segment_end_32) ? 32 : 16);
-                }
-            } else if (blockIdx.x < q_group_segment_end_4) {
-                group_count = ((blockIdx.x < q_group_segment_end_8) ? 8 : 4);
-            } else {
-                group_count = ((blockIdx.x < q_group_segment_end_2) ? 2 : 1);
+            {
+                int metadata_base = blockIdx.x * 6;
+                int q_count = scheduler_metadata[metadata_base + 3];
+                group_count = (q_count + 16 - 1) / 16;
             }
             int group_count_0 = group_count;
             int work_idx = blockIdx.x;
-            int metadata_base = work_idx * 6;
-            int head_kv = scheduler_metadata[metadata_base];
-            int row_linear = scheduler_metadata[metadata_base + 1];
-            int q_begin = scheduler_metadata[metadata_base + 2];
-            int q_count = scheduler_metadata[metadata_base + 3];
-            int batch = scheduler_metadata[metadata_base + 4];
-            int kv_block = scheduler_metadata[metadata_base + 5];
+            int metadata_base_1 = work_idx * 6;
+            int head_kv = scheduler_metadata[metadata_base_1];
+            int row_linear = scheduler_metadata[metadata_base_1 + 1];
+            int q_begin = scheduler_metadata[metadata_base_1 + 2];
+            int q_count_1 = scheduler_metadata[metadata_base_1 + 3];
+            int batch = scheduler_metadata[metadata_base_1 + 4];
+            int kv_block = scheduler_metadata[metadata_base_1 + 5];
             int row_ptr_base = head_kv * (total_rows + 1) + row_linear;
             int row_start = k2q_row_ptr[row_ptr_base] + q_begin;
             int q_batch_offset = cu_seqlens_q[batch];
@@ -249,12 +243,12 @@ kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorM
                 float score_values[128];
                 int score_base = taddr + (unsigned int)tmem_row_base;
                 if (whole_group_valid != 0) {
-                    token_in_group = my_row / 16;
-                    edge_in_work = group * 8 + token_in_group;
-                    int row_valid = ((edge_in_work < q_count) ? 1 : 0);
-                    int owner_lane = lane / 16 * 16;
+                    token_in_group = my_row / 8;
+                    edge_in_work = group * 16 + token_in_group;
+                    int row_valid = ((edge_in_work < q_count_1) ? 1 : 0);
+                    int owner_lane = lane / 8 * 8;
                     int owned_packed = -1;
-                    if (lane == owner_lane && edge_in_work < q_count) {
+                    if (lane == owner_lane && edge_in_work < q_count_1) {
                         owned_packed = k2q_qsplit_indices[head_kv * nnz_per_head + row_start + edge_in_work];
                     }
                     int _shfl_0 = __shfl_sync(0xFFFFFFFF, owned_packed, owner_lane);
@@ -533,22 +527,25 @@ kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorM
                 mbarrier_arrive(s_empty_addr);
                 mbarrier_wait(o_full_addr, softmax_phase);
                 if (whole_group_valid != 0) {
-                    int q_head_local = my_row - token_in_group * 16;
+                    int q_head_local = my_row - token_in_group * 8;
                     int output_valid = 0;
                     long long partial_row = 0;
                     long long final_row = 0;
                     float inv_sum = 0.0f;
                     int single_split = 0;
-                    if (edge_in_work < q_count) {
+                    if (edge_in_work < q_count_1) {
                         int split_slot = packed_q >> 24 & 15;
                         if (split_slot >= 0 && split_slot < topk) {
                             output_valid = 1;
                             int q_abs = q_batch_offset + q_idx;
-                            int q_head = head_kv * 16 + q_head_local;
+                            int q_head = head_kv * 8 + q_head_local;
                             final_row = (long long)q_abs * (long long)num_q_heads + (long long)q_head;
                             partial_row = (long long)split_slot * (long long)total_q * (long long)num_q_heads + (long long)q_abs * (long long)num_q_heads + (long long)q_head;
                             float _rcp_0 = approx_rcp(row_sum);
                             inv_sum = ((row_sum > 0.0f && row_sum == row_sum) ? _rcp_0 : 0.0f);
+                            {
+                                single_split = packed_q >> 28 & 1;
+                            }
                         }
                     }
                     long long partial_base = partial_row * 128;
@@ -953,26 +950,20 @@ kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorM
         asm volatile("setmaxnreg.inc.sync.aligned.u32 200;");
         { // softmax_odd_main
             int group_count_1 = 1;
-            if (blockIdx.x < q_group_segment_end_16) {
-                if (blockIdx.x < q_group_segment_end_64) {
-                    group_count_1 = ((blockIdx.x < q_group_segment_end_128) ? 128 : 64);
-                } else {
-                    group_count_1 = ((blockIdx.x < q_group_segment_end_32) ? 32 : 16);
-                }
-            } else if (blockIdx.x < q_group_segment_end_4) {
-                group_count_1 = ((blockIdx.x < q_group_segment_end_8) ? 8 : 4);
-            } else {
-                group_count_1 = ((blockIdx.x < q_group_segment_end_2) ? 2 : 1);
+            {
+                int metadata_base_2 = blockIdx.x * 6;
+                int q_count_2 = scheduler_metadata[metadata_base_2 + 3];
+                group_count_1 = (q_count_2 + 16 - 1) / 16;
             }
             int group_count_0_1 = group_count_1;
             int work_idx_1 = blockIdx.x;
-            int metadata_base_1 = work_idx_1 * 6;
-            int head_kv_1 = scheduler_metadata[metadata_base_1];
-            int row_linear_1 = scheduler_metadata[metadata_base_1 + 1];
-            int q_begin_1 = scheduler_metadata[metadata_base_1 + 2];
-            int q_count_1 = scheduler_metadata[metadata_base_1 + 3];
-            int batch_1 = scheduler_metadata[metadata_base_1 + 4];
-            int kv_block_1 = scheduler_metadata[metadata_base_1 + 5];
+            int metadata_base_3 = work_idx_1 * 6;
+            int head_kv_1 = scheduler_metadata[metadata_base_3];
+            int row_linear_1 = scheduler_metadata[metadata_base_3 + 1];
+            int q_begin_1 = scheduler_metadata[metadata_base_3 + 2];
+            int q_count_3 = scheduler_metadata[metadata_base_3 + 3];
+            int batch_1 = scheduler_metadata[metadata_base_3 + 4];
+            int kv_block_1 = scheduler_metadata[metadata_base_3 + 5];
             int row_ptr_base_1 = head_kv_1 * (total_rows + 1) + row_linear_1;
             int row_start_1 = k2q_row_ptr[row_ptr_base_1] + q_begin_1;
             int q_batch_offset_1 = cu_seqlens_q[batch_1];
@@ -1004,12 +995,12 @@ kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorM
                 float score_values_1[128];
                 int score_base_1 = taddr + 128 + (unsigned int)tmem_row_base_1;
                 if (whole_group_valid_1 != 0) {
-                    token_in_group_1 = my_row_1 / 16;
-                    edge_in_work_1 = group_1 * 8 + token_in_group_1;
-                    int row_valid_1 = ((edge_in_work_1 < q_count_1) ? 1 : 0);
-                    int owner_lane_1 = lane / 16 * 16;
+                    token_in_group_1 = my_row_1 / 8;
+                    edge_in_work_1 = group_1 * 16 + token_in_group_1;
+                    int row_valid_1 = ((edge_in_work_1 < q_count_3) ? 1 : 0);
+                    int owner_lane_1 = lane / 8 * 8;
                     int owned_packed_1 = -1;
-                    if (lane == owner_lane_1 && edge_in_work_1 < q_count_1) {
+                    if (lane == owner_lane_1 && edge_in_work_1 < q_count_3) {
                         owned_packed_1 = k2q_qsplit_indices[head_kv_1 * nnz_per_head + row_start_1 + edge_in_work_1];
                     }
                     int _shfl_1 = __shfl_sync(0xFFFFFFFF, owned_packed_1, owner_lane_1);
@@ -1288,22 +1279,25 @@ kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorM
                 mbarrier_arrive(s_empty_addr + 8);
                 mbarrier_wait(o_full_addr + 8, softmax_phase_1);
                 if (whole_group_valid_1 != 0) {
-                    int q_head_local_1 = my_row_1 - token_in_group_1 * 16;
+                    int q_head_local_1 = my_row_1 - token_in_group_1 * 8;
                     int output_valid_1 = 0;
                     long long partial_row_1 = 0;
                     long long final_row_1 = 0;
                     float inv_sum_1 = 0.0f;
                     int single_split_1 = 0;
-                    if (edge_in_work_1 < q_count_1) {
+                    if (edge_in_work_1 < q_count_3) {
                         int split_slot_1 = packed_q_1 >> 24 & 15;
                         if (split_slot_1 >= 0 && split_slot_1 < topk) {
                             output_valid_1 = 1;
                             int q_abs_1 = q_batch_offset_1 + q_idx_1;
-                            int q_head_1 = head_kv_1 * 16 + q_head_local_1;
+                            int q_head_1 = head_kv_1 * 8 + q_head_local_1;
                             final_row_1 = (long long)q_abs_1 * (long long)num_q_heads + (long long)q_head_1;
                             partial_row_1 = (long long)split_slot_1 * (long long)total_q * (long long)num_q_heads + (long long)q_abs_1 * (long long)num_q_heads + (long long)q_head_1;
                             float _rcp_1 = approx_rcp(row_sum_1);
                             inv_sum_1 = ((row_sum_1 > 0.0f && row_sum_1 == row_sum_1) ? _rcp_1 : 0.0f);
+                            {
+                                single_split_1 = packed_q_1 >> 28 & 1;
+                            }
                         }
                     }
                     long long partial_base_1 = partial_row_1 * 128;
@@ -1708,13 +1702,13 @@ kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorM
         asm volatile("setmaxnreg.dec.sync.aligned.u32 64;");
         { // qload_main
             int work_idx_2 = blockIdx.x;
-            int metadata_base_2 = work_idx_2 * 6;
-            int head_kv_2 = scheduler_metadata[metadata_base_2];
-            int row_linear_2 = scheduler_metadata[metadata_base_2 + 1];
-            int q_begin_2 = scheduler_metadata[metadata_base_2 + 2];
-            int q_count_2 = scheduler_metadata[metadata_base_2 + 3];
-            int batch_2 = scheduler_metadata[metadata_base_2 + 4];
-            int kv_block_2 = scheduler_metadata[metadata_base_2 + 5];
+            int metadata_base_4 = work_idx_2 * 6;
+            int head_kv_2 = scheduler_metadata[metadata_base_4];
+            int row_linear_2 = scheduler_metadata[metadata_base_4 + 1];
+            int q_begin_2 = scheduler_metadata[metadata_base_4 + 2];
+            int q_count_4 = scheduler_metadata[metadata_base_4 + 3];
+            int batch_2 = scheduler_metadata[metadata_base_4 + 4];
+            int kv_block_2 = scheduler_metadata[metadata_base_4 + 5];
             int row_ptr_base_2 = head_kv_2 * (total_rows + 1) + row_linear_2;
             int row_start_2 = k2q_row_ptr[row_ptr_base_2] + q_begin_2;
             int q_batch_offset_2 = cu_seqlens_q[batch_2];
@@ -1728,16 +1722,10 @@ kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorM
                 query_offset_2 = kv_len_2 - (cu_seqlens_q[batch_2 + 1] - q_batch_offset_2);
             }
             int group_count_2 = 1;
-            if (blockIdx.x < q_group_segment_end_16) {
-                if (blockIdx.x < q_group_segment_end_64) {
-                    group_count_2 = ((blockIdx.x < q_group_segment_end_128) ? 128 : 64);
-                } else {
-                    group_count_2 = ((blockIdx.x < q_group_segment_end_32) ? 32 : 16);
-                }
-            } else if (blockIdx.x < q_group_segment_end_4) {
-                group_count_2 = ((blockIdx.x < q_group_segment_end_8) ? 8 : 4);
-            } else {
-                group_count_2 = ((blockIdx.x < q_group_segment_end_2) ? 2 : 1);
+            {
+                int metadata_base_0_2 = blockIdx.x * 6;
+                int q_count_1_1 = scheduler_metadata[metadata_base_0_2 + 3];
+                group_count_2 = (q_count_1_1 + 16 - 1) / 16;
             }
             int group_count_0_2 = group_count_2;
             #pragma unroll 1
@@ -1750,26 +1738,28 @@ kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorM
                     int qload_warp = warp - 8;
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(q_full_addr + (q_stage) * 8, 8192);
-                        int token_in_group_2 = qload_warp * 2;
-                        int edge_in_work_2 = group_2 * 8 + token_in_group_2;
-                        int edge_valid = ((edge_in_work_2 < q_count_2) ? 1 : 0);
-                        int safe_edge = ((edge_valid != 0) ? edge_in_work_2 : 0);
-                        int packed_q_2 = k2q_qsplit_indices[head_kv_2 * nnz_per_head + row_start_2 + safe_edge];
-                        int decoded_q_abs = q_batch_offset_2 + (packed_q_2 & 16777215);
-                        int q_abs_2 = ((edge_valid != 0) ? decoded_q_abs : 0);
-                        int dst_offset = token_in_group_2 * 2048;
-                        tma_4d_gmem2smem(q_stage_addr + dst_offset, (&q), 0, head_kv_2 * 16, 0, q_abs_2, q_full_addr + (q_stage) * 8);
-                        tma_4d_gmem2smem(q_stage_addr + 16384 + dst_offset, (&q), 0, head_kv_2 * 16, 1, q_abs_2, q_full_addr + (q_stage) * 8);
-                        int token_in_group_0 = qload_warp * 2 + 1;
-                        int edge_in_work_1_1 = group_2 * 8 + token_in_group_0;
-                        int edge_valid_2 = ((edge_in_work_1_1 < q_count_2) ? 1 : 0);
-                        int safe_edge_3 = ((edge_valid_2 != 0) ? edge_in_work_1_1 : 0);
-                        int packed_q_4 = k2q_qsplit_indices[head_kv_2 * nnz_per_head + row_start_2 + safe_edge_3];
-                        int decoded_q_abs_5 = q_batch_offset_2 + (packed_q_4 & 16777215);
-                        int q_abs_6 = ((edge_valid_2 != 0) ? decoded_q_abs_5 : 0);
-                        int dst_offset_7 = token_in_group_0 * 2048;
-                        tma_4d_gmem2smem(q_stage_addr + dst_offset_7, (&q), 0, head_kv_2 * 16, 0, q_abs_6, q_full_addr + (q_stage) * 8);
-                        tma_4d_gmem2smem(q_stage_addr + 16384 + dst_offset_7, (&q), 0, head_kv_2 * 16, 1, q_abs_6, q_full_addr + (q_stage) * 8);
+                    }
+                    if (elect_sync()) {
+                        const int q_tokens_per_warp = 4;
+                        #pragma unroll
+                        for (int token_in_warp = 0; token_in_warp < q_tokens_per_warp; token_in_warp++) {
+                            int token_in_group_2 = qload_warp * q_tokens_per_warp + token_in_warp;
+                            int edge_in_work_2 = group_2 * 16 + token_in_group_2;
+                            int edge_valid = ((edge_in_work_2 < q_count_4) ? 1 : 0);
+                            int safe_edge = ((edge_valid != 0) ? edge_in_work_2 : 0);
+                            int packed_q_2 = k2q_qsplit_indices[head_kv_2 * nnz_per_head + row_start_2 + safe_edge];
+                            int decoded_q_abs = q_batch_offset_2 + (packed_q_2 & 16777215);
+                            int q_abs_2 = ((edge_valid != 0) ? decoded_q_abs : 0);
+                            int row_base = q_abs_2 * num_q_heads + head_kv_2 * 8;
+                            const int token_stride = 1024;
+                            #pragma unroll
+                            for (int head_group = 0; head_group < 2; head_group++) {
+                                int group_row = row_base + head_group * 4;
+                                int dst_offset = token_in_group_2 * token_stride + head_group * 512;
+                                tma_gather4_gmem2smem(q_stage_addr + dst_offset, (&q), 0, group_row, group_row + 1, group_row + 2, group_row + 3, q_full_addr + (q_stage) * 8);
+                                tma_gather4_gmem2smem(q_stage_addr + 16384 + dst_offset, (&q), 64, group_row, group_row + 1, group_row + 2, group_row + 3, q_full_addr + (q_stage) * 8);
+                            }
+                        }
                     }
                 }
             }
@@ -1779,13 +1769,13 @@ kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorM
     if (warp == 12) {
         { // mma_warp_main
             int work_idx_3 = blockIdx.x;
-            int metadata_base_3 = work_idx_3 * 6;
-            int head_kv_3 = scheduler_metadata[metadata_base_3];
-            int row_linear_3 = scheduler_metadata[metadata_base_3 + 1];
-            int q_begin_3 = scheduler_metadata[metadata_base_3 + 2];
-            int q_count_3 = scheduler_metadata[metadata_base_3 + 3];
-            int batch_3 = scheduler_metadata[metadata_base_3 + 4];
-            int kv_block_3 = scheduler_metadata[metadata_base_3 + 5];
+            int metadata_base_5 = work_idx_3 * 6;
+            int head_kv_3 = scheduler_metadata[metadata_base_5];
+            int row_linear_3 = scheduler_metadata[metadata_base_5 + 1];
+            int q_begin_3 = scheduler_metadata[metadata_base_5 + 2];
+            int q_count_5 = scheduler_metadata[metadata_base_5 + 3];
+            int batch_3 = scheduler_metadata[metadata_base_5 + 4];
+            int kv_block_3 = scheduler_metadata[metadata_base_5 + 5];
             int row_ptr_base_3 = head_kv_3 * (total_rows + 1) + row_linear_3;
             int row_start_3 = k2q_row_ptr[row_ptr_base_3] + q_begin_3;
             int q_batch_offset_3 = cu_seqlens_q[batch_3];
@@ -1799,16 +1789,10 @@ kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorM
                 query_offset_3 = kv_len_3 - (cu_seqlens_q[batch_3 + 1] - q_batch_offset_3);
             }
             int group_count_3 = 1;
-            if (blockIdx.x < q_group_segment_end_16) {
-                if (blockIdx.x < q_group_segment_end_64) {
-                    group_count_3 = ((blockIdx.x < q_group_segment_end_128) ? 128 : 64);
-                } else {
-                    group_count_3 = ((blockIdx.x < q_group_segment_end_32) ? 32 : 16);
-                }
-            } else if (blockIdx.x < q_group_segment_end_4) {
-                group_count_3 = ((blockIdx.x < q_group_segment_end_8) ? 8 : 4);
-            } else {
-                group_count_3 = ((blockIdx.x < q_group_segment_end_2) ? 2 : 1);
+            {
+                int metadata_base_0_3 = blockIdx.x * 6;
+                int q_count_1_2 = scheduler_metadata[metadata_base_0_3 + 3];
+                group_count_3 = (q_count_1_2 + 16 - 1) / 16;
             }
             int group_count_0_3 = group_count_3;
             unsigned int _phase_k_full_0 = 0;
@@ -2123,13 +2107,13 @@ kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorM
     if (warp >= 13 && warp <= 14) {
         { // transform_main
             int work_idx_4 = blockIdx.x;
-            int metadata_base_4 = work_idx_4 * 6;
-            int head_kv_4 = scheduler_metadata[metadata_base_4];
-            int row_linear_4 = scheduler_metadata[metadata_base_4 + 1];
-            int q_begin_4 = scheduler_metadata[metadata_base_4 + 2];
-            int q_count_4 = scheduler_metadata[metadata_base_4 + 3];
-            int batch_4 = scheduler_metadata[metadata_base_4 + 4];
-            int kv_block_4 = scheduler_metadata[metadata_base_4 + 5];
+            int metadata_base_6 = work_idx_4 * 6;
+            int head_kv_4 = scheduler_metadata[metadata_base_6];
+            int row_linear_4 = scheduler_metadata[metadata_base_6 + 1];
+            int q_begin_4 = scheduler_metadata[metadata_base_6 + 2];
+            int q_count_6 = scheduler_metadata[metadata_base_6 + 3];
+            int batch_4 = scheduler_metadata[metadata_base_6 + 4];
+            int kv_block_4 = scheduler_metadata[metadata_base_6 + 5];
             int row_ptr_base_4 = head_kv_4 * (total_rows + 1) + row_linear_4;
             int row_start_4 = k2q_row_ptr[row_ptr_base_4] + q_begin_4;
             int q_batch_offset_4 = cu_seqlens_q[batch_4];
@@ -2151,13 +2135,13 @@ kernel_cake_blackwell_msa_70a89c8d1e7dfa46cd83(const __grid_constant__ CUtensorM
                 asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             }
             int work_idx_5 = blockIdx.x;
-            int metadata_base_5 = work_idx_5 * 6;
-            int head_kv_5 = scheduler_metadata[metadata_base_5];
-            int row_linear_5 = scheduler_metadata[metadata_base_5 + 1];
-            int q_begin_5 = scheduler_metadata[metadata_base_5 + 2];
-            int q_count_5 = scheduler_metadata[metadata_base_5 + 3];
-            int batch_5 = scheduler_metadata[metadata_base_5 + 4];
-            int kv_block_5 = scheduler_metadata[metadata_base_5 + 5];
+            int metadata_base_7 = work_idx_5 * 6;
+            int head_kv_5 = scheduler_metadata[metadata_base_7];
+            int row_linear_5 = scheduler_metadata[metadata_base_7 + 1];
+            int q_begin_5 = scheduler_metadata[metadata_base_7 + 2];
+            int q_count_7 = scheduler_metadata[metadata_base_7 + 3];
+            int batch_5 = scheduler_metadata[metadata_base_7 + 4];
+            int kv_block_5 = scheduler_metadata[metadata_base_7 + 5];
             int row_ptr_base_5 = head_kv_5 * (total_rows + 1) + row_linear_5;
             int row_start_5 = k2q_row_ptr[row_ptr_base_5] + q_begin_5;
             int q_batch_offset_5 = cu_seqlens_q[batch_5];
