@@ -71,7 +71,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_hopper_msa_33585d689aff19fff2a3(unsigned int* __restrict__ S, int* __restrict__ nvp, int* __restrict__ out, int tiles, int total_q, int num_heads, int num_chunks, int fb, int fe)
+kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* __restrict__ nvp, int* __restrict__ out, int tiles, int total_q, int num_heads, int num_chunks, int fb, int fe)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1907,80 +1907,80 @@ kernel_cake_hopper_msa_33585d689aff19fff2a3(unsigned int* __restrict__ S, int* _
     q2[qb + ln] = K;
     q2[qb + 16 + ln] = r_1;
     asm volatile("barrier.sync 8, 32;" ::: "memory");
-    if (tid_1 < 32) {
-        float r2 = neg_inf;
-        float _fmax_231 = fmaxf(r2, q2[cg * 32 + 16 + ln]);
-        r2 = _fmax_231;
-        float _fmax_232 = fmaxf(r2, q2[(1 + cg) * 32 + 16 + ln]);
-        r2 = _fmax_232;
-        float V2[1];
-        float x2 = q2[cg * 32 + ln];
-        float y2 = q2[(1 + cg) * 32 + lnr];
-        float _min_199 = fminf(x2, y2);
-        float lo2 = _min_199;
-        float _fmax_233 = fmaxf(r2, lo2);
-        r2 = _fmax_233;
-        float _fmax_234 = fmaxf(x2, y2);
-        float hi2 = _fmax_234;
-        V2[0] = hi2;
-        K = V2[0];
-        r_1 = r2;
-    }
+    float r2 = neg_inf;
+    float _fmax_231 = fmaxf(r2, q2[cg * 32 + 16 + ln]);
+    r2 = _fmax_231;
+    float _fmax_232 = fmaxf(r2, q2[(1 + cg) * 32 + 16 + ln]);
+    r2 = _fmax_232;
+    float V2[1];
+    float x2 = q2[cg * 32 + ln];
+    float y2 = q2[(1 + cg) * 32 + lnr];
+    float _min_199 = fminf(x2, y2);
+    float lo2 = _min_199;
+    float _fmax_233 = fmaxf(r2, lo2);
+    r2 = _fmax_233;
+    float _fmax_234 = fmaxf(x2, y2);
+    float hi2 = _fmax_234;
+    V2[0] = hi2;
+    K = V2[0];
+    r_1 = r2;
     rr1[0] = r_1;
     int ucol = blockIdx.x + cg;
     int commit = 0;
     if (g < 1 && ucol < total_q) {
         commit = 1;
     }
-    if (tid_1 < 32) {
-        float u16 = K;
-        float cr = rr1[0];
-        float _shfl_xor_67 = __shfl_xor_sync(0xFFFFFFFF, u16, 8);
-        float _min_200 = fminf(u16, _shfl_xor_67);
-        u16 = _min_200;
-        float _shfl_xor_68 = __shfl_xor_sync(0xFFFFFFFF, cr, 8);
-        float _fmax_235 = fmaxf(cr, _shfl_xor_68);
-        cr = _fmax_235;
-        float _shfl_xor_69 = __shfl_xor_sync(0xFFFFFFFF, u16, 4);
-        float _min_201 = fminf(u16, _shfl_xor_69);
-        u16 = _min_201;
-        float _shfl_xor_70 = __shfl_xor_sync(0xFFFFFFFF, cr, 4);
-        float _fmax_236 = fmaxf(cr, _shfl_xor_70);
-        cr = _fmax_236;
-        float _shfl_xor_71 = __shfl_xor_sync(0xFFFFFFFF, u16, 2);
-        float _min_202 = fminf(u16, _shfl_xor_71);
-        u16 = _min_202;
-        float _shfl_xor_72 = __shfl_xor_sync(0xFFFFFFFF, cr, 2);
-        float _fmax_237 = fmaxf(cr, _shfl_xor_72);
-        cr = _fmax_237;
-        float _shfl_xor_73 = __shfl_xor_sync(0xFFFFFFFF, u16, 1);
-        float _min_203 = fminf(u16, _shfl_xor_73);
-        u16 = _min_203;
-        float _shfl_xor_74 = __shfl_xor_sync(0xFFFFFFFF, cr, 1);
-        float _fmax_238 = fmaxf(cr, _shfl_xor_74);
-        cr = _fmax_238;
-        unsigned int u16b = __as_u32(u16);
-        unsigned int c16 = u16b & 4294966784u;
-        unsigned int crb = __as_u32(cr) & 4294966784u;
-        unsigned int q = 4294967295;
-        if (c16 == crb && u16b < 4278190080u && c16 != 2139094528 && commit != 0) {
-            q = c16;
-            if (ln == 0) {
-                flagw[0] = 1;
-            }
-        }
-        if (ln == 0 && g < 1) {
-            qcol[cg] = q;
-        }
+    float u16 = K;
+    float cr = rr1[0];
+    float _shfl_xor_67 = __shfl_xor_sync(0xFFFFFFFF, u16, 8);
+    float _min_200 = fminf(u16, _shfl_xor_67);
+    u16 = _min_200;
+    float _shfl_xor_68 = __shfl_xor_sync(0xFFFFFFFF, cr, 8);
+    float _fmax_235 = fmaxf(cr, _shfl_xor_68);
+    cr = _fmax_235;
+    float _shfl_xor_69 = __shfl_xor_sync(0xFFFFFFFF, u16, 4);
+    float _min_201 = fminf(u16, _shfl_xor_69);
+    u16 = _min_201;
+    float _shfl_xor_70 = __shfl_xor_sync(0xFFFFFFFF, cr, 4);
+    float _fmax_236 = fmaxf(cr, _shfl_xor_70);
+    cr = _fmax_236;
+    float _shfl_xor_71 = __shfl_xor_sync(0xFFFFFFFF, u16, 2);
+    float _min_202 = fminf(u16, _shfl_xor_71);
+    u16 = _min_202;
+    float _shfl_xor_72 = __shfl_xor_sync(0xFFFFFFFF, cr, 2);
+    float _fmax_237 = fmaxf(cr, _shfl_xor_72);
+    cr = _fmax_237;
+    float _shfl_xor_73 = __shfl_xor_sync(0xFFFFFFFF, u16, 1);
+    float _min_203 = fminf(u16, _shfl_xor_73);
+    u16 = _min_203;
+    float _shfl_xor_74 = __shfl_xor_sync(0xFFFFFFFF, cr, 1);
+    float _fmax_238 = fmaxf(cr, _shfl_xor_74);
+    cr = _fmax_238;
+    unsigned int u16b = __as_u32(u16);
+    unsigned int c16 = u16b & 4294966784u;
+    unsigned int crb = __as_u32(cr) & 4294966784u;
+    int gfl5 = 0;
+    if (c16 == crb && u16b < 4278190080u && c16 != 2139094528 && ucol < total_q) {
+        gfl5 = 1;
     }
-    asm volatile("barrier.sync 8, 32;" ::: "memory");
-    unsigned int need2 = flagw[0];
-    unsigned int qc = qcol[c];
+    unsigned int q = 4294967295;
+    if (gfl5 != 0) {
+        q = c16;
+    }
+    unsigned int qo5 = q;
+    unsigned int need2 = 0;
+    if (q != 4294967295u || qo5 != 4294967295u) {
+        need2 = 1;
+    }
+    unsigned int qc = qo5;
+    if (cg == c) {
+        qc = q;
+    }
     int flagged = 0;
     if (qc != 4294967295u) {
         flagged = 1;
     }
-    unsigned int qg = qcol[cg];
+    unsigned int qg = q;
     int gflag = 0;
     if (qg != 4294967295u) {
         gflag = 1;
@@ -1989,7 +1989,7 @@ kernel_cake_hopper_msa_33585d689aff19fff2a3(unsigned int* __restrict__ S, int* _
     if (need2 != 0) {
         unsigned int qv7 = 4294967295;
         if ((tid_1 & 31) < 1) {
-            qv7 = qcol[tid_1 & 31];
+            qv7 = qc;
         }
         unsigned int _vote_0 = __ballot_sync(0xFFFFFFFF, qv7 != 4294967295u);
         unsigned int fm7 = _vote_0;
@@ -2000,7 +2000,7 @@ kernel_cake_hopper_msa_33585d689aff19fff2a3(unsigned int* __restrict__ S, int* _
             int _ffs_0 = __ffs(fm7);
             int fc7 = _ffs_0 - 1;
             fm7 = fm7 & fm7 - 1;
-            unsigned int qf7 = qcol[fc7];
+            unsigned int qf7 = qc;
             float qff = __uint_as_float(qf7);
             int limv = limc[fc7];
             long long cbase2 = (long long)head * (long long)tiles * nq64 + (long long)(blockIdx.x + fc7);
@@ -4920,25 +4920,23 @@ kernel_cake_hopper_msa_33585d689aff19fff2a3(unsigned int* __restrict__ S, int* _
             q2[qb_270 + ln] = K_269;
             q2[qb_270 + 16 + ln] = r_1_1;
             asm volatile("barrier.sync 8, 32;" ::: "memory");
-            if (tid_1 < 32) {
-                float r2_1 = neg_inf;
-                float _fmax_470 = fmaxf(r2_1, q2[cg * 32 + 16 + ln]);
-                r2_1 = _fmax_470;
-                float _fmax_471 = fmaxf(r2_1, q2[(1 + cg) * 32 + 16 + ln]);
-                r2_1 = _fmax_471;
-                float V2_1[1];
-                float x2_1 = q2[cg * 32 + ln];
-                float y2_1 = q2[(1 + cg) * 32 + lnr];
-                float _min_403 = fminf(x2_1, y2_1);
-                float lo2_1 = _min_403;
-                float _fmax_472 = fmaxf(r2_1, lo2_1);
-                r2_1 = _fmax_472;
-                float _fmax_473 = fmaxf(x2_1, y2_1);
-                float hi2_1 = _fmax_473;
-                V2_1[0] = hi2_1;
-                K_269 = V2_1[0];
-                r_1_1 = r2_1;
-            }
+            float r2_271 = neg_inf;
+            float _fmax_470 = fmaxf(r2_271, q2[cg * 32 + 16 + ln]);
+            r2_271 = _fmax_470;
+            float _fmax_471 = fmaxf(r2_271, q2[(1 + cg) * 32 + 16 + ln]);
+            r2_271 = _fmax_471;
+            float V2_272[1];
+            float x2_273 = q2[cg * 32 + ln];
+            float y2_274 = q2[(1 + cg) * 32 + lnr];
+            float _min_403 = fminf(x2_273, y2_274);
+            float lo2_275 = _min_403;
+            float _fmax_472 = fmaxf(r2_271, lo2_275);
+            r2_271 = _fmax_472;
+            float _fmax_473 = fmaxf(x2_273, y2_274);
+            float hi2_276 = _fmax_473;
+            V2_272[0] = hi2_276;
+            K_269 = V2_272[0];
+            r_1_1 = r2_271;
             rr2x[0] = r_1_1;
             K2 = K_269;
         }

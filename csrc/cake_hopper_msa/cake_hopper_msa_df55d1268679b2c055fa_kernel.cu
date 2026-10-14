@@ -68,7 +68,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* __restrict__ nvp, int* __restrict__ out, int tiles, int total_q, int num_heads, int num_chunks, int fb, int fe)
+kernel_cake_hopper_msa_df55d1268679b2c055fa(unsigned int* __restrict__ S, int* __restrict__ nvp, int* __restrict__ out, int tiles, int total_q, int num_heads, int num_chunks, int fb, int fe)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -138,8 +138,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     a[14] = neg_inf;
     a[15] = neg_inf;
     float rej = neg_inf;
-    int R = num_chunks * 32;
-    int tb = w * R;
+    int tb = w;
     unsigned int cbt[32];
     float kbt[32];
     long long p = cbase + (long long)tb * nq64;
@@ -148,128 +147,128 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
         cbt[0] = S[p];
     }
     cbt[1] = 4286578688;
-    if (lim > tb + 1) {
-        cbt[1] = S[p + nq64];
+    if (lim > tb + 16) {
+        cbt[1] = S[p + 16 * nq64];
     }
     cbt[2] = 4286578688;
-    if (lim > tb + 2) {
-        cbt[2] = S[p + 2 * nq64];
+    if (lim > tb + 32) {
+        cbt[2] = S[p + 32 * nq64];
     }
     cbt[3] = 4286578688;
-    if (lim > tb + 3) {
-        cbt[3] = S[p + 3 * nq64];
+    if (lim > tb + 48) {
+        cbt[3] = S[p + 48 * nq64];
     }
     cbt[4] = 4286578688;
-    if (lim > tb + 4) {
-        cbt[4] = S[p + 4 * nq64];
+    if (lim > tb + 64) {
+        cbt[4] = S[p + 64 * nq64];
     }
     cbt[5] = 4286578688;
-    if (lim > tb + 5) {
-        cbt[5] = S[p + 5 * nq64];
+    if (lim > tb + 80) {
+        cbt[5] = S[p + 80 * nq64];
     }
     cbt[6] = 4286578688;
-    if (lim > tb + 6) {
-        cbt[6] = S[p + 6 * nq64];
+    if (lim > tb + 96) {
+        cbt[6] = S[p + 96 * nq64];
     }
     cbt[7] = 4286578688;
-    if (lim > tb + 7) {
-        cbt[7] = S[p + 7 * nq64];
+    if (lim > tb + 112) {
+        cbt[7] = S[p + 112 * nq64];
     }
     cbt[8] = 4286578688;
-    if (lim > tb + 8) {
-        cbt[8] = S[p + 8 * nq64];
+    if (lim > tb + 128) {
+        cbt[8] = S[p + 128 * nq64];
     }
     cbt[9] = 4286578688;
-    if (lim > tb + 9) {
-        cbt[9] = S[p + 9 * nq64];
+    if (lim > tb + 144) {
+        cbt[9] = S[p + 144 * nq64];
     }
     cbt[10] = 4286578688;
-    if (lim > tb + 10) {
-        cbt[10] = S[p + 10 * nq64];
+    if (lim > tb + 160) {
+        cbt[10] = S[p + 160 * nq64];
     }
     cbt[11] = 4286578688;
-    if (lim > tb + 11) {
-        cbt[11] = S[p + 11 * nq64];
+    if (lim > tb + 176) {
+        cbt[11] = S[p + 176 * nq64];
     }
     cbt[12] = 4286578688;
-    if (lim > tb + 12) {
-        cbt[12] = S[p + 12 * nq64];
+    if (lim > tb + 192) {
+        cbt[12] = S[p + 192 * nq64];
     }
     cbt[13] = 4286578688;
-    if (lim > tb + 13) {
-        cbt[13] = S[p + 13 * nq64];
+    if (lim > tb + 208) {
+        cbt[13] = S[p + 208 * nq64];
     }
     cbt[14] = 4286578688;
-    if (lim > tb + 14) {
-        cbt[14] = S[p + 14 * nq64];
+    if (lim > tb + 224) {
+        cbt[14] = S[p + 224 * nq64];
     }
     cbt[15] = 4286578688;
-    if (lim > tb + 15) {
-        cbt[15] = S[p + 15 * nq64];
+    if (lim > tb + 240) {
+        cbt[15] = S[p + 240 * nq64];
     }
     cbt[16] = 4286578688;
-    if (lim > tb + 16) {
-        cbt[16] = S[p + 16 * nq64];
+    if (lim > tb + 256) {
+        cbt[16] = S[p + 256 * nq64];
     }
     cbt[17] = 4286578688;
-    if (lim > tb + 17) {
-        cbt[17] = S[p + 17 * nq64];
+    if (lim > tb + 272) {
+        cbt[17] = S[p + 272 * nq64];
     }
     cbt[18] = 4286578688;
-    if (lim > tb + 18) {
-        cbt[18] = S[p + 18 * nq64];
+    if (lim > tb + 288) {
+        cbt[18] = S[p + 288 * nq64];
     }
     cbt[19] = 4286578688;
-    if (lim > tb + 19) {
-        cbt[19] = S[p + 19 * nq64];
+    if (lim > tb + 304) {
+        cbt[19] = S[p + 304 * nq64];
     }
     cbt[20] = 4286578688;
-    if (lim > tb + 20) {
-        cbt[20] = S[p + 20 * nq64];
+    if (lim > tb + 320) {
+        cbt[20] = S[p + 320 * nq64];
     }
     cbt[21] = 4286578688;
-    if (lim > tb + 21) {
-        cbt[21] = S[p + 21 * nq64];
+    if (lim > tb + 336) {
+        cbt[21] = S[p + 336 * nq64];
     }
     cbt[22] = 4286578688;
-    if (lim > tb + 22) {
-        cbt[22] = S[p + 22 * nq64];
+    if (lim > tb + 352) {
+        cbt[22] = S[p + 352 * nq64];
     }
     cbt[23] = 4286578688;
-    if (lim > tb + 23) {
-        cbt[23] = S[p + 23 * nq64];
+    if (lim > tb + 368) {
+        cbt[23] = S[p + 368 * nq64];
     }
     cbt[24] = 4286578688;
-    if (lim > tb + 24) {
-        cbt[24] = S[p + 24 * nq64];
+    if (lim > tb + 384) {
+        cbt[24] = S[p + 384 * nq64];
     }
     cbt[25] = 4286578688;
-    if (lim > tb + 25) {
-        cbt[25] = S[p + 25 * nq64];
+    if (lim > tb + 400) {
+        cbt[25] = S[p + 400 * nq64];
     }
     cbt[26] = 4286578688;
-    if (lim > tb + 26) {
-        cbt[26] = S[p + 26 * nq64];
+    if (lim > tb + 416) {
+        cbt[26] = S[p + 416 * nq64];
     }
     cbt[27] = 4286578688;
-    if (lim > tb + 27) {
-        cbt[27] = S[p + 27 * nq64];
+    if (lim > tb + 432) {
+        cbt[27] = S[p + 432 * nq64];
     }
     cbt[28] = 4286578688;
-    if (lim > tb + 28) {
-        cbt[28] = S[p + 28 * nq64];
+    if (lim > tb + 448) {
+        cbt[28] = S[p + 448 * nq64];
     }
     cbt[29] = 4286578688;
-    if (lim > tb + 29) {
-        cbt[29] = S[p + 29 * nq64];
+    if (lim > tb + 464) {
+        cbt[29] = S[p + 464 * nq64];
     }
     cbt[30] = 4286578688;
-    if (lim > tb + 30) {
-        cbt[30] = S[p + 30 * nq64];
+    if (lim > tb + 480) {
+        cbt[30] = S[p + 480 * nq64];
     }
     cbt[31] = 4286578688;
-    if (lim > tb + 31) {
-        cbt[31] = S[p + 31 * nq64];
+    if (lim > tb + 496) {
+        cbt[31] = S[p + 496 * nq64];
     }
     float sc = __uint_as_float(cbt[0]);
     float _fmax_0 = fmaxf(sc, -1.7014118346046923e+38f);
@@ -287,7 +286,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_0 = _min_1;
     sc_0 = sc_0;
     float sc1_1 = sc_0;
-    unsigned int key_2 = __as_u32(sc1_1) & 4294966784u | (unsigned int)(tb + 1);
+    unsigned int key_2 = __as_u32(sc1_1) & 4294966784u | (unsigned int)(tb + 16);
     kbt[1] = __uint_as_float(key_2);
     float sc_3 = __uint_as_float(cbt[2]);
     float _fmax_2 = fmaxf(sc_3, -1.7014118346046923e+38f);
@@ -296,7 +295,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_3 = _min_2;
     sc_3 = sc_3;
     float sc1_4 = sc_3;
-    unsigned int key_5 = __as_u32(sc1_4) & 4294966784u | (unsigned int)(tb + 2);
+    unsigned int key_5 = __as_u32(sc1_4) & 4294966784u | (unsigned int)(tb + 32);
     kbt[2] = __uint_as_float(key_5);
     float sc_6 = __uint_as_float(cbt[3]);
     float _fmax_3 = fmaxf(sc_6, -1.7014118346046923e+38f);
@@ -305,7 +304,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_6 = _min_3;
     sc_6 = sc_6;
     float sc1_7 = sc_6;
-    unsigned int key_8 = __as_u32(sc1_7) & 4294966784u | (unsigned int)(tb + 3);
+    unsigned int key_8 = __as_u32(sc1_7) & 4294966784u | (unsigned int)(tb + 48);
     kbt[3] = __uint_as_float(key_8);
     float sc_9 = __uint_as_float(cbt[4]);
     float _fmax_4 = fmaxf(sc_9, -1.7014118346046923e+38f);
@@ -314,7 +313,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_9 = _min_4;
     sc_9 = sc_9;
     float sc1_10 = sc_9;
-    unsigned int key_11 = __as_u32(sc1_10) & 4294966784u | (unsigned int)(tb + 4);
+    unsigned int key_11 = __as_u32(sc1_10) & 4294966784u | (unsigned int)(tb + 64);
     kbt[4] = __uint_as_float(key_11);
     float sc_12 = __uint_as_float(cbt[5]);
     float _fmax_5 = fmaxf(sc_12, -1.7014118346046923e+38f);
@@ -323,7 +322,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_12 = _min_5;
     sc_12 = sc_12;
     float sc1_13 = sc_12;
-    unsigned int key_14 = __as_u32(sc1_13) & 4294966784u | (unsigned int)(tb + 5);
+    unsigned int key_14 = __as_u32(sc1_13) & 4294966784u | (unsigned int)(tb + 80);
     kbt[5] = __uint_as_float(key_14);
     float sc_15 = __uint_as_float(cbt[6]);
     float _fmax_6 = fmaxf(sc_15, -1.7014118346046923e+38f);
@@ -332,7 +331,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_15 = _min_6;
     sc_15 = sc_15;
     float sc1_16 = sc_15;
-    unsigned int key_17 = __as_u32(sc1_16) & 4294966784u | (unsigned int)(tb + 6);
+    unsigned int key_17 = __as_u32(sc1_16) & 4294966784u | (unsigned int)(tb + 96);
     kbt[6] = __uint_as_float(key_17);
     float sc_18 = __uint_as_float(cbt[7]);
     float _fmax_7 = fmaxf(sc_18, -1.7014118346046923e+38f);
@@ -341,7 +340,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_18 = _min_7;
     sc_18 = sc_18;
     float sc1_19 = sc_18;
-    unsigned int key_20 = __as_u32(sc1_19) & 4294966784u | (unsigned int)(tb + 7);
+    unsigned int key_20 = __as_u32(sc1_19) & 4294966784u | (unsigned int)(tb + 112);
     kbt[7] = __uint_as_float(key_20);
     float sc_21 = __uint_as_float(cbt[8]);
     float _fmax_8 = fmaxf(sc_21, -1.7014118346046923e+38f);
@@ -350,7 +349,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_21 = _min_8;
     sc_21 = sc_21;
     float sc1_22 = sc_21;
-    unsigned int key_23 = __as_u32(sc1_22) & 4294966784u | (unsigned int)(tb + 8);
+    unsigned int key_23 = __as_u32(sc1_22) & 4294966784u | (unsigned int)(tb + 128);
     kbt[8] = __uint_as_float(key_23);
     float sc_24 = __uint_as_float(cbt[9]);
     float _fmax_9 = fmaxf(sc_24, -1.7014118346046923e+38f);
@@ -359,7 +358,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_24 = _min_9;
     sc_24 = sc_24;
     float sc1_25 = sc_24;
-    unsigned int key_26 = __as_u32(sc1_25) & 4294966784u | (unsigned int)(tb + 9);
+    unsigned int key_26 = __as_u32(sc1_25) & 4294966784u | (unsigned int)(tb + 144);
     kbt[9] = __uint_as_float(key_26);
     float sc_27 = __uint_as_float(cbt[10]);
     float _fmax_10 = fmaxf(sc_27, -1.7014118346046923e+38f);
@@ -368,7 +367,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_27 = _min_10;
     sc_27 = sc_27;
     float sc1_28 = sc_27;
-    unsigned int key_29 = __as_u32(sc1_28) & 4294966784u | (unsigned int)(tb + 10);
+    unsigned int key_29 = __as_u32(sc1_28) & 4294966784u | (unsigned int)(tb + 160);
     kbt[10] = __uint_as_float(key_29);
     float sc_30 = __uint_as_float(cbt[11]);
     float _fmax_11 = fmaxf(sc_30, -1.7014118346046923e+38f);
@@ -377,7 +376,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_30 = _min_11;
     sc_30 = sc_30;
     float sc1_31 = sc_30;
-    unsigned int key_32 = __as_u32(sc1_31) & 4294966784u | (unsigned int)(tb + 11);
+    unsigned int key_32 = __as_u32(sc1_31) & 4294966784u | (unsigned int)(tb + 176);
     kbt[11] = __uint_as_float(key_32);
     float sc_33 = __uint_as_float(cbt[12]);
     float _fmax_12 = fmaxf(sc_33, -1.7014118346046923e+38f);
@@ -386,7 +385,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_33 = _min_12;
     sc_33 = sc_33;
     float sc1_34 = sc_33;
-    unsigned int key_35 = __as_u32(sc1_34) & 4294966784u | (unsigned int)(tb + 12);
+    unsigned int key_35 = __as_u32(sc1_34) & 4294966784u | (unsigned int)(tb + 192);
     kbt[12] = __uint_as_float(key_35);
     float sc_36 = __uint_as_float(cbt[13]);
     float _fmax_13 = fmaxf(sc_36, -1.7014118346046923e+38f);
@@ -395,7 +394,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_36 = _min_13;
     sc_36 = sc_36;
     float sc1_37 = sc_36;
-    unsigned int key_38 = __as_u32(sc1_37) & 4294966784u | (unsigned int)(tb + 13);
+    unsigned int key_38 = __as_u32(sc1_37) & 4294966784u | (unsigned int)(tb + 208);
     kbt[13] = __uint_as_float(key_38);
     float sc_39 = __uint_as_float(cbt[14]);
     float _fmax_14 = fmaxf(sc_39, -1.7014118346046923e+38f);
@@ -404,7 +403,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_39 = _min_14;
     sc_39 = sc_39;
     float sc1_40 = sc_39;
-    unsigned int key_41 = __as_u32(sc1_40) & 4294966784u | (unsigned int)(tb + 14);
+    unsigned int key_41 = __as_u32(sc1_40) & 4294966784u | (unsigned int)(tb + 224);
     kbt[14] = __uint_as_float(key_41);
     float sc_42 = __uint_as_float(cbt[15]);
     float _fmax_15 = fmaxf(sc_42, -1.7014118346046923e+38f);
@@ -413,7 +412,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_42 = _min_15;
     sc_42 = sc_42;
     float sc1_43 = sc_42;
-    unsigned int key_44 = __as_u32(sc1_43) & 4294966784u | (unsigned int)(tb + 15);
+    unsigned int key_44 = __as_u32(sc1_43) & 4294966784u | (unsigned int)(tb + 240);
     kbt[15] = __uint_as_float(key_44);
     float sc_45 = __uint_as_float(cbt[16]);
     float _fmax_16 = fmaxf(sc_45, -1.7014118346046923e+38f);
@@ -422,7 +421,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_45 = _min_16;
     sc_45 = sc_45;
     float sc1_46 = sc_45;
-    unsigned int key_47 = __as_u32(sc1_46) & 4294966784u | (unsigned int)(tb + 16);
+    unsigned int key_47 = __as_u32(sc1_46) & 4294966784u | (unsigned int)(tb + 256);
     kbt[16] = __uint_as_float(key_47);
     float sc_48 = __uint_as_float(cbt[17]);
     float _fmax_17 = fmaxf(sc_48, -1.7014118346046923e+38f);
@@ -431,7 +430,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_48 = _min_17;
     sc_48 = sc_48;
     float sc1_49 = sc_48;
-    unsigned int key_50 = __as_u32(sc1_49) & 4294966784u | (unsigned int)(tb + 17);
+    unsigned int key_50 = __as_u32(sc1_49) & 4294966784u | (unsigned int)(tb + 272);
     kbt[17] = __uint_as_float(key_50);
     float sc_51 = __uint_as_float(cbt[18]);
     float _fmax_18 = fmaxf(sc_51, -1.7014118346046923e+38f);
@@ -440,7 +439,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_51 = _min_18;
     sc_51 = sc_51;
     float sc1_52 = sc_51;
-    unsigned int key_53 = __as_u32(sc1_52) & 4294966784u | (unsigned int)(tb + 18);
+    unsigned int key_53 = __as_u32(sc1_52) & 4294966784u | (unsigned int)(tb + 288);
     kbt[18] = __uint_as_float(key_53);
     float sc_54 = __uint_as_float(cbt[19]);
     float _fmax_19 = fmaxf(sc_54, -1.7014118346046923e+38f);
@@ -449,7 +448,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_54 = _min_19;
     sc_54 = sc_54;
     float sc1_55 = sc_54;
-    unsigned int key_56 = __as_u32(sc1_55) & 4294966784u | (unsigned int)(tb + 19);
+    unsigned int key_56 = __as_u32(sc1_55) & 4294966784u | (unsigned int)(tb + 304);
     kbt[19] = __uint_as_float(key_56);
     float sc_57 = __uint_as_float(cbt[20]);
     float _fmax_20 = fmaxf(sc_57, -1.7014118346046923e+38f);
@@ -458,7 +457,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_57 = _min_20;
     sc_57 = sc_57;
     float sc1_58 = sc_57;
-    unsigned int key_59 = __as_u32(sc1_58) & 4294966784u | (unsigned int)(tb + 20);
+    unsigned int key_59 = __as_u32(sc1_58) & 4294966784u | (unsigned int)(tb + 320);
     kbt[20] = __uint_as_float(key_59);
     float sc_60 = __uint_as_float(cbt[21]);
     float _fmax_21 = fmaxf(sc_60, -1.7014118346046923e+38f);
@@ -467,7 +466,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_60 = _min_21;
     sc_60 = sc_60;
     float sc1_61 = sc_60;
-    unsigned int key_62 = __as_u32(sc1_61) & 4294966784u | (unsigned int)(tb + 21);
+    unsigned int key_62 = __as_u32(sc1_61) & 4294966784u | (unsigned int)(tb + 336);
     kbt[21] = __uint_as_float(key_62);
     float sc_63 = __uint_as_float(cbt[22]);
     float _fmax_22 = fmaxf(sc_63, -1.7014118346046923e+38f);
@@ -476,7 +475,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_63 = _min_22;
     sc_63 = sc_63;
     float sc1_64 = sc_63;
-    unsigned int key_65 = __as_u32(sc1_64) & 4294966784u | (unsigned int)(tb + 22);
+    unsigned int key_65 = __as_u32(sc1_64) & 4294966784u | (unsigned int)(tb + 352);
     kbt[22] = __uint_as_float(key_65);
     float sc_66 = __uint_as_float(cbt[23]);
     float _fmax_23 = fmaxf(sc_66, -1.7014118346046923e+38f);
@@ -485,7 +484,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_66 = _min_23;
     sc_66 = sc_66;
     float sc1_67 = sc_66;
-    unsigned int key_68 = __as_u32(sc1_67) & 4294966784u | (unsigned int)(tb + 23);
+    unsigned int key_68 = __as_u32(sc1_67) & 4294966784u | (unsigned int)(tb + 368);
     kbt[23] = __uint_as_float(key_68);
     float sc_69 = __uint_as_float(cbt[24]);
     float _fmax_24 = fmaxf(sc_69, -1.7014118346046923e+38f);
@@ -494,7 +493,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_69 = _min_24;
     sc_69 = sc_69;
     float sc1_70 = sc_69;
-    unsigned int key_71 = __as_u32(sc1_70) & 4294966784u | (unsigned int)(tb + 24);
+    unsigned int key_71 = __as_u32(sc1_70) & 4294966784u | (unsigned int)(tb + 384);
     kbt[24] = __uint_as_float(key_71);
     float sc_72 = __uint_as_float(cbt[25]);
     float _fmax_25 = fmaxf(sc_72, -1.7014118346046923e+38f);
@@ -503,7 +502,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_72 = _min_25;
     sc_72 = sc_72;
     float sc1_73 = sc_72;
-    unsigned int key_74 = __as_u32(sc1_73) & 4294966784u | (unsigned int)(tb + 25);
+    unsigned int key_74 = __as_u32(sc1_73) & 4294966784u | (unsigned int)(tb + 400);
     kbt[25] = __uint_as_float(key_74);
     float sc_75 = __uint_as_float(cbt[26]);
     float _fmax_26 = fmaxf(sc_75, -1.7014118346046923e+38f);
@@ -512,7 +511,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_75 = _min_26;
     sc_75 = sc_75;
     float sc1_76 = sc_75;
-    unsigned int key_77 = __as_u32(sc1_76) & 4294966784u | (unsigned int)(tb + 26);
+    unsigned int key_77 = __as_u32(sc1_76) & 4294966784u | (unsigned int)(tb + 416);
     kbt[26] = __uint_as_float(key_77);
     float sc_78 = __uint_as_float(cbt[27]);
     float _fmax_27 = fmaxf(sc_78, -1.7014118346046923e+38f);
@@ -521,7 +520,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_78 = _min_27;
     sc_78 = sc_78;
     float sc1_79 = sc_78;
-    unsigned int key_80 = __as_u32(sc1_79) & 4294966784u | (unsigned int)(tb + 27);
+    unsigned int key_80 = __as_u32(sc1_79) & 4294966784u | (unsigned int)(tb + 432);
     kbt[27] = __uint_as_float(key_80);
     float sc_81 = __uint_as_float(cbt[28]);
     float _fmax_28 = fmaxf(sc_81, -1.7014118346046923e+38f);
@@ -530,7 +529,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_81 = _min_28;
     sc_81 = sc_81;
     float sc1_82 = sc_81;
-    unsigned int key_83 = __as_u32(sc1_82) & 4294966784u | (unsigned int)(tb + 28);
+    unsigned int key_83 = __as_u32(sc1_82) & 4294966784u | (unsigned int)(tb + 448);
     kbt[28] = __uint_as_float(key_83);
     float sc_84 = __uint_as_float(cbt[29]);
     float _fmax_29 = fmaxf(sc_84, -1.7014118346046923e+38f);
@@ -539,7 +538,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_84 = _min_29;
     sc_84 = sc_84;
     float sc1_85 = sc_84;
-    unsigned int key_86 = __as_u32(sc1_85) & 4294966784u | (unsigned int)(tb + 29);
+    unsigned int key_86 = __as_u32(sc1_85) & 4294966784u | (unsigned int)(tb + 464);
     kbt[29] = __uint_as_float(key_86);
     float sc_87 = __uint_as_float(cbt[30]);
     float _fmax_30 = fmaxf(sc_87, -1.7014118346046923e+38f);
@@ -548,7 +547,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_87 = _min_30;
     sc_87 = sc_87;
     float sc1_88 = sc_87;
-    unsigned int key_89 = __as_u32(sc1_88) & 4294966784u | (unsigned int)(tb + 30);
+    unsigned int key_89 = __as_u32(sc1_88) & 4294966784u | (unsigned int)(tb + 480);
     kbt[30] = __uint_as_float(key_89);
     float sc_90 = __uint_as_float(cbt[31]);
     float _fmax_31 = fmaxf(sc_90, -1.7014118346046923e+38f);
@@ -557,7 +556,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
     sc_90 = _min_31;
     sc_90 = sc_90;
     float sc1_91 = sc_90;
-    unsigned int key_92 = __as_u32(sc1_91) & 4294966784u | (unsigned int)(tb + 31);
+    unsigned int key_92 = __as_u32(sc1_91) & 4294966784u | (unsigned int)(tb + 496);
     kbt[31] = __uint_as_float(key_92);
     float rr = rej;
     float _fmax_32 = fmaxf(kbt[0], kbt[13]);
@@ -2621,7 +2620,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_1 = sc_5_1;
                         unsigned int u9_1 = __as_u32(sc_5_1);
                         unsigned int lowb9_1 = (u9_1 ^ (unsigned int)((int)u9_1 >> 31) & 511) & 511;
-                        unsigned int km9_1 = 536870912 | lowb9_1 << 9 | (unsigned int)(tb + 1);
+                        unsigned int km9_1 = 536870912 | lowb9_1 << 9 | (unsigned int)(tb + 16);
                         cbuf[pos9] = km9_1;
                         pos9 = pos9 + 1;
                     }
@@ -2634,7 +2633,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_2 = sc_5_2;
                         unsigned int u9_2 = __as_u32(sc_5_2);
                         unsigned int lowb9_2 = (u9_2 ^ (unsigned int)((int)u9_2 >> 31) & 511) & 511;
-                        unsigned int km9_2 = 536870912 | lowb9_2 << 9 | (unsigned int)(tb + 2);
+                        unsigned int km9_2 = 536870912 | lowb9_2 << 9 | (unsigned int)(tb + 32);
                         cbuf[pos9] = km9_2;
                         pos9 = pos9 + 1;
                     }
@@ -2647,7 +2646,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_3 = sc_5_3;
                         unsigned int u9_3 = __as_u32(sc_5_3);
                         unsigned int lowb9_3 = (u9_3 ^ (unsigned int)((int)u9_3 >> 31) & 511) & 511;
-                        unsigned int km9_3 = 536870912 | lowb9_3 << 9 | (unsigned int)(tb + 3);
+                        unsigned int km9_3 = 536870912 | lowb9_3 << 9 | (unsigned int)(tb + 48);
                         cbuf[pos9] = km9_3;
                         pos9 = pos9 + 1;
                     }
@@ -2660,7 +2659,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_4 = sc_5_4;
                         unsigned int u9_4 = __as_u32(sc_5_4);
                         unsigned int lowb9_4 = (u9_4 ^ (unsigned int)((int)u9_4 >> 31) & 511) & 511;
-                        unsigned int km9_4 = 536870912 | lowb9_4 << 9 | (unsigned int)(tb + 4);
+                        unsigned int km9_4 = 536870912 | lowb9_4 << 9 | (unsigned int)(tb + 64);
                         cbuf[pos9] = km9_4;
                         pos9 = pos9 + 1;
                     }
@@ -2673,7 +2672,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_5 = sc_5_5;
                         unsigned int u9_5 = __as_u32(sc_5_5);
                         unsigned int lowb9_5 = (u9_5 ^ (unsigned int)((int)u9_5 >> 31) & 511) & 511;
-                        unsigned int km9_5 = 536870912 | lowb9_5 << 9 | (unsigned int)(tb + 5);
+                        unsigned int km9_5 = 536870912 | lowb9_5 << 9 | (unsigned int)(tb + 80);
                         cbuf[pos9] = km9_5;
                         pos9 = pos9 + 1;
                     }
@@ -2686,7 +2685,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_6 = sc_5_6;
                         unsigned int u9_6 = __as_u32(sc_5_6);
                         unsigned int lowb9_6 = (u9_6 ^ (unsigned int)((int)u9_6 >> 31) & 511) & 511;
-                        unsigned int km9_6 = 536870912 | lowb9_6 << 9 | (unsigned int)(tb + 6);
+                        unsigned int km9_6 = 536870912 | lowb9_6 << 9 | (unsigned int)(tb + 96);
                         cbuf[pos9] = km9_6;
                         pos9 = pos9 + 1;
                     }
@@ -2699,7 +2698,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_7 = sc_5_7;
                         unsigned int u9_7 = __as_u32(sc_5_7);
                         unsigned int lowb9_7 = (u9_7 ^ (unsigned int)((int)u9_7 >> 31) & 511) & 511;
-                        unsigned int km9_7 = 536870912 | lowb9_7 << 9 | (unsigned int)(tb + 7);
+                        unsigned int km9_7 = 536870912 | lowb9_7 << 9 | (unsigned int)(tb + 112);
                         cbuf[pos9] = km9_7;
                         pos9 = pos9 + 1;
                     }
@@ -2712,7 +2711,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_8 = sc_5_8;
                         unsigned int u9_8 = __as_u32(sc_5_8);
                         unsigned int lowb9_8 = (u9_8 ^ (unsigned int)((int)u9_8 >> 31) & 511) & 511;
-                        unsigned int km9_8 = 536870912 | lowb9_8 << 9 | (unsigned int)(tb + 8);
+                        unsigned int km9_8 = 536870912 | lowb9_8 << 9 | (unsigned int)(tb + 128);
                         cbuf[pos9] = km9_8;
                         pos9 = pos9 + 1;
                     }
@@ -2725,7 +2724,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_9 = sc_5_9;
                         unsigned int u9_9 = __as_u32(sc_5_9);
                         unsigned int lowb9_9 = (u9_9 ^ (unsigned int)((int)u9_9 >> 31) & 511) & 511;
-                        unsigned int km9_9 = 536870912 | lowb9_9 << 9 | (unsigned int)(tb + 9);
+                        unsigned int km9_9 = 536870912 | lowb9_9 << 9 | (unsigned int)(tb + 144);
                         cbuf[pos9] = km9_9;
                         pos9 = pos9 + 1;
                     }
@@ -2738,7 +2737,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_10 = sc_5_10;
                         unsigned int u9_10 = __as_u32(sc_5_10);
                         unsigned int lowb9_10 = (u9_10 ^ (unsigned int)((int)u9_10 >> 31) & 511) & 511;
-                        unsigned int km9_10 = 536870912 | lowb9_10 << 9 | (unsigned int)(tb + 10);
+                        unsigned int km9_10 = 536870912 | lowb9_10 << 9 | (unsigned int)(tb + 160);
                         cbuf[pos9] = km9_10;
                         pos9 = pos9 + 1;
                     }
@@ -2751,7 +2750,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_11 = sc_5_11;
                         unsigned int u9_11 = __as_u32(sc_5_11);
                         unsigned int lowb9_11 = (u9_11 ^ (unsigned int)((int)u9_11 >> 31) & 511) & 511;
-                        unsigned int km9_11 = 536870912 | lowb9_11 << 9 | (unsigned int)(tb + 11);
+                        unsigned int km9_11 = 536870912 | lowb9_11 << 9 | (unsigned int)(tb + 176);
                         cbuf[pos9] = km9_11;
                         pos9 = pos9 + 1;
                     }
@@ -2764,7 +2763,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_12 = sc_5_12;
                         unsigned int u9_12 = __as_u32(sc_5_12);
                         unsigned int lowb9_12 = (u9_12 ^ (unsigned int)((int)u9_12 >> 31) & 511) & 511;
-                        unsigned int km9_12 = 536870912 | lowb9_12 << 9 | (unsigned int)(tb + 12);
+                        unsigned int km9_12 = 536870912 | lowb9_12 << 9 | (unsigned int)(tb + 192);
                         cbuf[pos9] = km9_12;
                         pos9 = pos9 + 1;
                     }
@@ -2777,7 +2776,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_13 = sc_5_13;
                         unsigned int u9_13 = __as_u32(sc_5_13);
                         unsigned int lowb9_13 = (u9_13 ^ (unsigned int)((int)u9_13 >> 31) & 511) & 511;
-                        unsigned int km9_13 = 536870912 | lowb9_13 << 9 | (unsigned int)(tb + 13);
+                        unsigned int km9_13 = 536870912 | lowb9_13 << 9 | (unsigned int)(tb + 208);
                         cbuf[pos9] = km9_13;
                         pos9 = pos9 + 1;
                     }
@@ -2790,7 +2789,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_14 = sc_5_14;
                         unsigned int u9_14 = __as_u32(sc_5_14);
                         unsigned int lowb9_14 = (u9_14 ^ (unsigned int)((int)u9_14 >> 31) & 511) & 511;
-                        unsigned int km9_14 = 536870912 | lowb9_14 << 9 | (unsigned int)(tb + 14);
+                        unsigned int km9_14 = 536870912 | lowb9_14 << 9 | (unsigned int)(tb + 224);
                         cbuf[pos9] = km9_14;
                         pos9 = pos9 + 1;
                     }
@@ -2803,7 +2802,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_15 = sc_5_15;
                         unsigned int u9_15 = __as_u32(sc_5_15);
                         unsigned int lowb9_15 = (u9_15 ^ (unsigned int)((int)u9_15 >> 31) & 511) & 511;
-                        unsigned int km9_15 = 536870912 | lowb9_15 << 9 | (unsigned int)(tb + 15);
+                        unsigned int km9_15 = 536870912 | lowb9_15 << 9 | (unsigned int)(tb + 240);
                         cbuf[pos9] = km9_15;
                         pos9 = pos9 + 1;
                     }
@@ -2816,7 +2815,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_16 = sc_5_16;
                         unsigned int u9_16 = __as_u32(sc_5_16);
                         unsigned int lowb9_16 = (u9_16 ^ (unsigned int)((int)u9_16 >> 31) & 511) & 511;
-                        unsigned int km9_16 = 536870912 | lowb9_16 << 9 | (unsigned int)(tb + 16);
+                        unsigned int km9_16 = 536870912 | lowb9_16 << 9 | (unsigned int)(tb + 256);
                         cbuf[pos9] = km9_16;
                         pos9 = pos9 + 1;
                     }
@@ -2829,7 +2828,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_17 = sc_5_17;
                         unsigned int u9_17 = __as_u32(sc_5_17);
                         unsigned int lowb9_17 = (u9_17 ^ (unsigned int)((int)u9_17 >> 31) & 511) & 511;
-                        unsigned int km9_17 = 536870912 | lowb9_17 << 9 | (unsigned int)(tb + 17);
+                        unsigned int km9_17 = 536870912 | lowb9_17 << 9 | (unsigned int)(tb + 272);
                         cbuf[pos9] = km9_17;
                         pos9 = pos9 + 1;
                     }
@@ -2842,7 +2841,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_18 = sc_5_18;
                         unsigned int u9_18 = __as_u32(sc_5_18);
                         unsigned int lowb9_18 = (u9_18 ^ (unsigned int)((int)u9_18 >> 31) & 511) & 511;
-                        unsigned int km9_18 = 536870912 | lowb9_18 << 9 | (unsigned int)(tb + 18);
+                        unsigned int km9_18 = 536870912 | lowb9_18 << 9 | (unsigned int)(tb + 288);
                         cbuf[pos9] = km9_18;
                         pos9 = pos9 + 1;
                     }
@@ -2855,7 +2854,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_19 = sc_5_19;
                         unsigned int u9_19 = __as_u32(sc_5_19);
                         unsigned int lowb9_19 = (u9_19 ^ (unsigned int)((int)u9_19 >> 31) & 511) & 511;
-                        unsigned int km9_19 = 536870912 | lowb9_19 << 9 | (unsigned int)(tb + 19);
+                        unsigned int km9_19 = 536870912 | lowb9_19 << 9 | (unsigned int)(tb + 304);
                         cbuf[pos9] = km9_19;
                         pos9 = pos9 + 1;
                     }
@@ -2868,7 +2867,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_20 = sc_5_20;
                         unsigned int u9_20 = __as_u32(sc_5_20);
                         unsigned int lowb9_20 = (u9_20 ^ (unsigned int)((int)u9_20 >> 31) & 511) & 511;
-                        unsigned int km9_20 = 536870912 | lowb9_20 << 9 | (unsigned int)(tb + 20);
+                        unsigned int km9_20 = 536870912 | lowb9_20 << 9 | (unsigned int)(tb + 320);
                         cbuf[pos9] = km9_20;
                         pos9 = pos9 + 1;
                     }
@@ -2881,7 +2880,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_21 = sc_5_21;
                         unsigned int u9_21 = __as_u32(sc_5_21);
                         unsigned int lowb9_21 = (u9_21 ^ (unsigned int)((int)u9_21 >> 31) & 511) & 511;
-                        unsigned int km9_21 = 536870912 | lowb9_21 << 9 | (unsigned int)(tb + 21);
+                        unsigned int km9_21 = 536870912 | lowb9_21 << 9 | (unsigned int)(tb + 336);
                         cbuf[pos9] = km9_21;
                         pos9 = pos9 + 1;
                     }
@@ -2894,7 +2893,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_22 = sc_5_22;
                         unsigned int u9_22 = __as_u32(sc_5_22);
                         unsigned int lowb9_22 = (u9_22 ^ (unsigned int)((int)u9_22 >> 31) & 511) & 511;
-                        unsigned int km9_22 = 536870912 | lowb9_22 << 9 | (unsigned int)(tb + 22);
+                        unsigned int km9_22 = 536870912 | lowb9_22 << 9 | (unsigned int)(tb + 352);
                         cbuf[pos9] = km9_22;
                         pos9 = pos9 + 1;
                     }
@@ -2907,7 +2906,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_23 = sc_5_23;
                         unsigned int u9_23 = __as_u32(sc_5_23);
                         unsigned int lowb9_23 = (u9_23 ^ (unsigned int)((int)u9_23 >> 31) & 511) & 511;
-                        unsigned int km9_23 = 536870912 | lowb9_23 << 9 | (unsigned int)(tb + 23);
+                        unsigned int km9_23 = 536870912 | lowb9_23 << 9 | (unsigned int)(tb + 368);
                         cbuf[pos9] = km9_23;
                         pos9 = pos9 + 1;
                     }
@@ -2920,7 +2919,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_24 = sc_5_24;
                         unsigned int u9_24 = __as_u32(sc_5_24);
                         unsigned int lowb9_24 = (u9_24 ^ (unsigned int)((int)u9_24 >> 31) & 511) & 511;
-                        unsigned int km9_24 = 536870912 | lowb9_24 << 9 | (unsigned int)(tb + 24);
+                        unsigned int km9_24 = 536870912 | lowb9_24 << 9 | (unsigned int)(tb + 384);
                         cbuf[pos9] = km9_24;
                         pos9 = pos9 + 1;
                     }
@@ -2933,7 +2932,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_25 = sc_5_25;
                         unsigned int u9_25 = __as_u32(sc_5_25);
                         unsigned int lowb9_25 = (u9_25 ^ (unsigned int)((int)u9_25 >> 31) & 511) & 511;
-                        unsigned int km9_25 = 536870912 | lowb9_25 << 9 | (unsigned int)(tb + 25);
+                        unsigned int km9_25 = 536870912 | lowb9_25 << 9 | (unsigned int)(tb + 400);
                         cbuf[pos9] = km9_25;
                         pos9 = pos9 + 1;
                     }
@@ -2946,7 +2945,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_26 = sc_5_26;
                         unsigned int u9_26 = __as_u32(sc_5_26);
                         unsigned int lowb9_26 = (u9_26 ^ (unsigned int)((int)u9_26 >> 31) & 511) & 511;
-                        unsigned int km9_26 = 536870912 | lowb9_26 << 9 | (unsigned int)(tb + 26);
+                        unsigned int km9_26 = 536870912 | lowb9_26 << 9 | (unsigned int)(tb + 416);
                         cbuf[pos9] = km9_26;
                         pos9 = pos9 + 1;
                     }
@@ -2959,7 +2958,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_27 = sc_5_27;
                         unsigned int u9_27 = __as_u32(sc_5_27);
                         unsigned int lowb9_27 = (u9_27 ^ (unsigned int)((int)u9_27 >> 31) & 511) & 511;
-                        unsigned int km9_27 = 536870912 | lowb9_27 << 9 | (unsigned int)(tb + 27);
+                        unsigned int km9_27 = 536870912 | lowb9_27 << 9 | (unsigned int)(tb + 432);
                         cbuf[pos9] = km9_27;
                         pos9 = pos9 + 1;
                     }
@@ -2972,7 +2971,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_28 = sc_5_28;
                         unsigned int u9_28 = __as_u32(sc_5_28);
                         unsigned int lowb9_28 = (u9_28 ^ (unsigned int)((int)u9_28 >> 31) & 511) & 511;
-                        unsigned int km9_28 = 536870912 | lowb9_28 << 9 | (unsigned int)(tb + 28);
+                        unsigned int km9_28 = 536870912 | lowb9_28 << 9 | (unsigned int)(tb + 448);
                         cbuf[pos9] = km9_28;
                         pos9 = pos9 + 1;
                     }
@@ -2985,7 +2984,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_29 = sc_5_29;
                         unsigned int u9_29 = __as_u32(sc_5_29);
                         unsigned int lowb9_29 = (u9_29 ^ (unsigned int)((int)u9_29 >> 31) & 511) & 511;
-                        unsigned int km9_29 = 536870912 | lowb9_29 << 9 | (unsigned int)(tb + 29);
+                        unsigned int km9_29 = 536870912 | lowb9_29 << 9 | (unsigned int)(tb + 464);
                         cbuf[pos9] = km9_29;
                         pos9 = pos9 + 1;
                     }
@@ -2998,7 +2997,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_30 = sc_5_30;
                         unsigned int u9_30 = __as_u32(sc_5_30);
                         unsigned int lowb9_30 = (u9_30 ^ (unsigned int)((int)u9_30 >> 31) & 511) & 511;
-                        unsigned int km9_30 = 536870912 | lowb9_30 << 9 | (unsigned int)(tb + 30);
+                        unsigned int km9_30 = 536870912 | lowb9_30 << 9 | (unsigned int)(tb + 480);
                         cbuf[pos9] = km9_30;
                         pos9 = pos9 + 1;
                     }
@@ -3011,7 +3010,7 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                         sc_5_31 = sc_5_31;
                         unsigned int u9_31 = __as_u32(sc_5_31);
                         unsigned int lowb9_31 = (u9_31 ^ (unsigned int)((int)u9_31 >> 31) & 511) & 511;
-                        unsigned int km9_31 = 536870912 | lowb9_31 << 9 | (unsigned int)(tb + 31);
+                        unsigned int km9_31 = 536870912 | lowb9_31 << 9 | (unsigned int)(tb + 496);
                         cbuf[pos9] = km9_31;
                         pos9 = pos9 + 1;
                     }
@@ -3080,11 +3079,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_7 = u_6 & 4294966784u;
                 unsigned int key_9 = 0;
                 if (qf < __uint_as_float(cls_7) && cls_7 < 4278190080u) {
-                    key_9 = 1073741824 | (unsigned int)(tb + 1);
+                    key_9 = 1073741824 | (unsigned int)(tb + 16);
                 }
                 if (cls_7 == qc) {
                     unsigned int lowb_1 = (u_6 ^ (unsigned int)((int)u_6 >> 31) & 511) & 511;
-                    key_9 = 536870912 | lowb_1 << 9 | (unsigned int)(tb + 1);
+                    key_9 = 536870912 | lowb_1 << 9 | (unsigned int)(tb + 16);
                 }
                 kbt2[1] = __uint_as_float(key_9);
                 float sc_10_1 = __uint_as_float(cbt[2]);
@@ -3098,11 +3097,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_13 = u_12 & 4294966784u;
                 unsigned int key_15 = 0;
                 if (qf < __uint_as_float(cls_13) && cls_13 < 4278190080u) {
-                    key_15 = 1073741824 | (unsigned int)(tb + 2);
+                    key_15 = 1073741824 | (unsigned int)(tb + 32);
                 }
                 if (cls_13 == qc) {
                     unsigned int lowb_2 = (u_12 ^ (unsigned int)((int)u_12 >> 31) & 511) & 511;
-                    key_15 = 536870912 | lowb_2 << 9 | (unsigned int)(tb + 2);
+                    key_15 = 536870912 | lowb_2 << 9 | (unsigned int)(tb + 32);
                 }
                 kbt2[2] = __uint_as_float(key_15);
                 float sc_16_1 = __uint_as_float(cbt[3]);
@@ -3116,11 +3115,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_19 = u_18 & 4294966784u;
                 unsigned int key_21 = 0;
                 if (qf < __uint_as_float(cls_19) && cls_19 < 4278190080u) {
-                    key_21 = 1073741824 | (unsigned int)(tb + 3);
+                    key_21 = 1073741824 | (unsigned int)(tb + 48);
                 }
                 if (cls_19 == qc) {
                     unsigned int lowb_3 = (u_18 ^ (unsigned int)((int)u_18 >> 31) & 511) & 511;
-                    key_21 = 536870912 | lowb_3 << 9 | (unsigned int)(tb + 3);
+                    key_21 = 536870912 | lowb_3 << 9 | (unsigned int)(tb + 48);
                 }
                 kbt2[3] = __uint_as_float(key_21);
                 float sc_22_1 = __uint_as_float(cbt[4]);
@@ -3134,11 +3133,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_25 = u_24 & 4294966784u;
                 unsigned int key_27 = 0;
                 if (qf < __uint_as_float(cls_25) && cls_25 < 4278190080u) {
-                    key_27 = 1073741824 | (unsigned int)(tb + 4);
+                    key_27 = 1073741824 | (unsigned int)(tb + 64);
                 }
                 if (cls_25 == qc) {
                     unsigned int lowb_4 = (u_24 ^ (unsigned int)((int)u_24 >> 31) & 511) & 511;
-                    key_27 = 536870912 | lowb_4 << 9 | (unsigned int)(tb + 4);
+                    key_27 = 536870912 | lowb_4 << 9 | (unsigned int)(tb + 64);
                 }
                 kbt2[4] = __uint_as_float(key_27);
                 float sc_28_1 = __uint_as_float(cbt[5]);
@@ -3152,11 +3151,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_31 = u_30 & 4294966784u;
                 unsigned int key_33 = 0;
                 if (qf < __uint_as_float(cls_31) && cls_31 < 4278190080u) {
-                    key_33 = 1073741824 | (unsigned int)(tb + 5);
+                    key_33 = 1073741824 | (unsigned int)(tb + 80);
                 }
                 if (cls_31 == qc) {
                     unsigned int lowb_5 = (u_30 ^ (unsigned int)((int)u_30 >> 31) & 511) & 511;
-                    key_33 = 536870912 | lowb_5 << 9 | (unsigned int)(tb + 5);
+                    key_33 = 536870912 | lowb_5 << 9 | (unsigned int)(tb + 80);
                 }
                 kbt2[5] = __uint_as_float(key_33);
                 float sc_34_1 = __uint_as_float(cbt[6]);
@@ -3170,11 +3169,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_37 = u_36 & 4294966784u;
                 unsigned int key_39 = 0;
                 if (qf < __uint_as_float(cls_37) && cls_37 < 4278190080u) {
-                    key_39 = 1073741824 | (unsigned int)(tb + 6);
+                    key_39 = 1073741824 | (unsigned int)(tb + 96);
                 }
                 if (cls_37 == qc) {
                     unsigned int lowb_6 = (u_36 ^ (unsigned int)((int)u_36 >> 31) & 511) & 511;
-                    key_39 = 536870912 | lowb_6 << 9 | (unsigned int)(tb + 6);
+                    key_39 = 536870912 | lowb_6 << 9 | (unsigned int)(tb + 96);
                 }
                 kbt2[6] = __uint_as_float(key_39);
                 float sc_40_1 = __uint_as_float(cbt[7]);
@@ -3188,11 +3187,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_43 = u_42 & 4294966784u;
                 unsigned int key_45 = 0;
                 if (qf < __uint_as_float(cls_43) && cls_43 < 4278190080u) {
-                    key_45 = 1073741824 | (unsigned int)(tb + 7);
+                    key_45 = 1073741824 | (unsigned int)(tb + 112);
                 }
                 if (cls_43 == qc) {
                     unsigned int lowb_7 = (u_42 ^ (unsigned int)((int)u_42 >> 31) & 511) & 511;
-                    key_45 = 536870912 | lowb_7 << 9 | (unsigned int)(tb + 7);
+                    key_45 = 536870912 | lowb_7 << 9 | (unsigned int)(tb + 112);
                 }
                 kbt2[7] = __uint_as_float(key_45);
                 float sc_46_1 = __uint_as_float(cbt[8]);
@@ -3206,11 +3205,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_49 = u_48 & 4294966784u;
                 unsigned int key_51 = 0;
                 if (qf < __uint_as_float(cls_49) && cls_49 < 4278190080u) {
-                    key_51 = 1073741824 | (unsigned int)(tb + 8);
+                    key_51 = 1073741824 | (unsigned int)(tb + 128);
                 }
                 if (cls_49 == qc) {
                     unsigned int lowb_8 = (u_48 ^ (unsigned int)((int)u_48 >> 31) & 511) & 511;
-                    key_51 = 536870912 | lowb_8 << 9 | (unsigned int)(tb + 8);
+                    key_51 = 536870912 | lowb_8 << 9 | (unsigned int)(tb + 128);
                 }
                 kbt2[8] = __uint_as_float(key_51);
                 float sc_52_1 = __uint_as_float(cbt[9]);
@@ -3224,11 +3223,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_55 = u_54 & 4294966784u;
                 unsigned int key_57 = 0;
                 if (qf < __uint_as_float(cls_55) && cls_55 < 4278190080u) {
-                    key_57 = 1073741824 | (unsigned int)(tb + 9);
+                    key_57 = 1073741824 | (unsigned int)(tb + 144);
                 }
                 if (cls_55 == qc) {
                     unsigned int lowb_9 = (u_54 ^ (unsigned int)((int)u_54 >> 31) & 511) & 511;
-                    key_57 = 536870912 | lowb_9 << 9 | (unsigned int)(tb + 9);
+                    key_57 = 536870912 | lowb_9 << 9 | (unsigned int)(tb + 144);
                 }
                 kbt2[9] = __uint_as_float(key_57);
                 float sc_58_1 = __uint_as_float(cbt[10]);
@@ -3242,11 +3241,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_61 = u_60 & 4294966784u;
                 unsigned int key_63 = 0;
                 if (qf < __uint_as_float(cls_61) && cls_61 < 4278190080u) {
-                    key_63 = 1073741824 | (unsigned int)(tb + 10);
+                    key_63 = 1073741824 | (unsigned int)(tb + 160);
                 }
                 if (cls_61 == qc) {
                     unsigned int lowb_10 = (u_60 ^ (unsigned int)((int)u_60 >> 31) & 511) & 511;
-                    key_63 = 536870912 | lowb_10 << 9 | (unsigned int)(tb + 10);
+                    key_63 = 536870912 | lowb_10 << 9 | (unsigned int)(tb + 160);
                 }
                 kbt2[10] = __uint_as_float(key_63);
                 float sc_64_1 = __uint_as_float(cbt[11]);
@@ -3260,11 +3259,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_67 = u_66 & 4294966784u;
                 unsigned int key_69 = 0;
                 if (qf < __uint_as_float(cls_67) && cls_67 < 4278190080u) {
-                    key_69 = 1073741824 | (unsigned int)(tb + 11);
+                    key_69 = 1073741824 | (unsigned int)(tb + 176);
                 }
                 if (cls_67 == qc) {
                     unsigned int lowb_11 = (u_66 ^ (unsigned int)((int)u_66 >> 31) & 511) & 511;
-                    key_69 = 536870912 | lowb_11 << 9 | (unsigned int)(tb + 11);
+                    key_69 = 536870912 | lowb_11 << 9 | (unsigned int)(tb + 176);
                 }
                 kbt2[11] = __uint_as_float(key_69);
                 float sc_70_1 = __uint_as_float(cbt[12]);
@@ -3278,11 +3277,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_73 = u_72 & 4294966784u;
                 unsigned int key_75 = 0;
                 if (qf < __uint_as_float(cls_73) && cls_73 < 4278190080u) {
-                    key_75 = 1073741824 | (unsigned int)(tb + 12);
+                    key_75 = 1073741824 | (unsigned int)(tb + 192);
                 }
                 if (cls_73 == qc) {
                     unsigned int lowb_12 = (u_72 ^ (unsigned int)((int)u_72 >> 31) & 511) & 511;
-                    key_75 = 536870912 | lowb_12 << 9 | (unsigned int)(tb + 12);
+                    key_75 = 536870912 | lowb_12 << 9 | (unsigned int)(tb + 192);
                 }
                 kbt2[12] = __uint_as_float(key_75);
                 float sc_76_1 = __uint_as_float(cbt[13]);
@@ -3296,11 +3295,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_79 = u_78 & 4294966784u;
                 unsigned int key_81 = 0;
                 if (qf < __uint_as_float(cls_79) && cls_79 < 4278190080u) {
-                    key_81 = 1073741824 | (unsigned int)(tb + 13);
+                    key_81 = 1073741824 | (unsigned int)(tb + 208);
                 }
                 if (cls_79 == qc) {
                     unsigned int lowb_13 = (u_78 ^ (unsigned int)((int)u_78 >> 31) & 511) & 511;
-                    key_81 = 536870912 | lowb_13 << 9 | (unsigned int)(tb + 13);
+                    key_81 = 536870912 | lowb_13 << 9 | (unsigned int)(tb + 208);
                 }
                 kbt2[13] = __uint_as_float(key_81);
                 float sc_82_1 = __uint_as_float(cbt[14]);
@@ -3314,11 +3313,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_85 = u_84 & 4294966784u;
                 unsigned int key_87 = 0;
                 if (qf < __uint_as_float(cls_85) && cls_85 < 4278190080u) {
-                    key_87 = 1073741824 | (unsigned int)(tb + 14);
+                    key_87 = 1073741824 | (unsigned int)(tb + 224);
                 }
                 if (cls_85 == qc) {
                     unsigned int lowb_14 = (u_84 ^ (unsigned int)((int)u_84 >> 31) & 511) & 511;
-                    key_87 = 536870912 | lowb_14 << 9 | (unsigned int)(tb + 14);
+                    key_87 = 536870912 | lowb_14 << 9 | (unsigned int)(tb + 224);
                 }
                 kbt2[14] = __uint_as_float(key_87);
                 float sc_88_1 = __uint_as_float(cbt[15]);
@@ -3332,11 +3331,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_91 = u_90 & 4294966784u;
                 unsigned int key_93 = 0;
                 if (qf < __uint_as_float(cls_91) && cls_91 < 4278190080u) {
-                    key_93 = 1073741824 | (unsigned int)(tb + 15);
+                    key_93 = 1073741824 | (unsigned int)(tb + 240);
                 }
                 if (cls_91 == qc) {
                     unsigned int lowb_15 = (u_90 ^ (unsigned int)((int)u_90 >> 31) & 511) & 511;
-                    key_93 = 536870912 | lowb_15 << 9 | (unsigned int)(tb + 15);
+                    key_93 = 536870912 | lowb_15 << 9 | (unsigned int)(tb + 240);
                 }
                 kbt2[15] = __uint_as_float(key_93);
                 float sc_94 = __uint_as_float(cbt[16]);
@@ -3350,11 +3349,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_97 = u_96 & 4294966784u;
                 unsigned int key_98 = 0;
                 if (qf < __uint_as_float(cls_97) && cls_97 < 4278190080u) {
-                    key_98 = 1073741824 | (unsigned int)(tb + 16);
+                    key_98 = 1073741824 | (unsigned int)(tb + 256);
                 }
                 if (cls_97 == qc) {
                     unsigned int lowb_16 = (u_96 ^ (unsigned int)((int)u_96 >> 31) & 511) & 511;
-                    key_98 = 536870912 | lowb_16 << 9 | (unsigned int)(tb + 16);
+                    key_98 = 536870912 | lowb_16 << 9 | (unsigned int)(tb + 256);
                 }
                 kbt2[16] = __uint_as_float(key_98);
                 float sc_99 = __uint_as_float(cbt[17]);
@@ -3368,11 +3367,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_102 = u_101 & 4294966784u;
                 unsigned int key_103 = 0;
                 if (qf < __uint_as_float(cls_102) && cls_102 < 4278190080u) {
-                    key_103 = 1073741824 | (unsigned int)(tb + 17);
+                    key_103 = 1073741824 | (unsigned int)(tb + 272);
                 }
                 if (cls_102 == qc) {
                     unsigned int lowb_17 = (u_101 ^ (unsigned int)((int)u_101 >> 31) & 511) & 511;
-                    key_103 = 536870912 | lowb_17 << 9 | (unsigned int)(tb + 17);
+                    key_103 = 536870912 | lowb_17 << 9 | (unsigned int)(tb + 272);
                 }
                 kbt2[17] = __uint_as_float(key_103);
                 float sc_104 = __uint_as_float(cbt[18]);
@@ -3386,11 +3385,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_107 = u_106 & 4294966784u;
                 unsigned int key_108 = 0;
                 if (qf < __uint_as_float(cls_107) && cls_107 < 4278190080u) {
-                    key_108 = 1073741824 | (unsigned int)(tb + 18);
+                    key_108 = 1073741824 | (unsigned int)(tb + 288);
                 }
                 if (cls_107 == qc) {
                     unsigned int lowb_18 = (u_106 ^ (unsigned int)((int)u_106 >> 31) & 511) & 511;
-                    key_108 = 536870912 | lowb_18 << 9 | (unsigned int)(tb + 18);
+                    key_108 = 536870912 | lowb_18 << 9 | (unsigned int)(tb + 288);
                 }
                 kbt2[18] = __uint_as_float(key_108);
                 float sc_109 = __uint_as_float(cbt[19]);
@@ -3404,11 +3403,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_112 = u_111 & 4294966784u;
                 unsigned int key_113 = 0;
                 if (qf < __uint_as_float(cls_112) && cls_112 < 4278190080u) {
-                    key_113 = 1073741824 | (unsigned int)(tb + 19);
+                    key_113 = 1073741824 | (unsigned int)(tb + 304);
                 }
                 if (cls_112 == qc) {
                     unsigned int lowb_19 = (u_111 ^ (unsigned int)((int)u_111 >> 31) & 511) & 511;
-                    key_113 = 536870912 | lowb_19 << 9 | (unsigned int)(tb + 19);
+                    key_113 = 536870912 | lowb_19 << 9 | (unsigned int)(tb + 304);
                 }
                 kbt2[19] = __uint_as_float(key_113);
                 float sc_114 = __uint_as_float(cbt[20]);
@@ -3422,11 +3421,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_117 = u_116 & 4294966784u;
                 unsigned int key_118 = 0;
                 if (qf < __uint_as_float(cls_117) && cls_117 < 4278190080u) {
-                    key_118 = 1073741824 | (unsigned int)(tb + 20);
+                    key_118 = 1073741824 | (unsigned int)(tb + 320);
                 }
                 if (cls_117 == qc) {
                     unsigned int lowb_20 = (u_116 ^ (unsigned int)((int)u_116 >> 31) & 511) & 511;
-                    key_118 = 536870912 | lowb_20 << 9 | (unsigned int)(tb + 20);
+                    key_118 = 536870912 | lowb_20 << 9 | (unsigned int)(tb + 320);
                 }
                 kbt2[20] = __uint_as_float(key_118);
                 float sc_119 = __uint_as_float(cbt[21]);
@@ -3440,11 +3439,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_122 = u_121 & 4294966784u;
                 unsigned int key_123 = 0;
                 if (qf < __uint_as_float(cls_122) && cls_122 < 4278190080u) {
-                    key_123 = 1073741824 | (unsigned int)(tb + 21);
+                    key_123 = 1073741824 | (unsigned int)(tb + 336);
                 }
                 if (cls_122 == qc) {
                     unsigned int lowb_21 = (u_121 ^ (unsigned int)((int)u_121 >> 31) & 511) & 511;
-                    key_123 = 536870912 | lowb_21 << 9 | (unsigned int)(tb + 21);
+                    key_123 = 536870912 | lowb_21 << 9 | (unsigned int)(tb + 336);
                 }
                 kbt2[21] = __uint_as_float(key_123);
                 float sc_124 = __uint_as_float(cbt[22]);
@@ -3458,11 +3457,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_127 = u_126 & 4294966784u;
                 unsigned int key_128 = 0;
                 if (qf < __uint_as_float(cls_127) && cls_127 < 4278190080u) {
-                    key_128 = 1073741824 | (unsigned int)(tb + 22);
+                    key_128 = 1073741824 | (unsigned int)(tb + 352);
                 }
                 if (cls_127 == qc) {
                     unsigned int lowb_22 = (u_126 ^ (unsigned int)((int)u_126 >> 31) & 511) & 511;
-                    key_128 = 536870912 | lowb_22 << 9 | (unsigned int)(tb + 22);
+                    key_128 = 536870912 | lowb_22 << 9 | (unsigned int)(tb + 352);
                 }
                 kbt2[22] = __uint_as_float(key_128);
                 float sc_129 = __uint_as_float(cbt[23]);
@@ -3476,11 +3475,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_132 = u_131 & 4294966784u;
                 unsigned int key_133 = 0;
                 if (qf < __uint_as_float(cls_132) && cls_132 < 4278190080u) {
-                    key_133 = 1073741824 | (unsigned int)(tb + 23);
+                    key_133 = 1073741824 | (unsigned int)(tb + 368);
                 }
                 if (cls_132 == qc) {
                     unsigned int lowb_23 = (u_131 ^ (unsigned int)((int)u_131 >> 31) & 511) & 511;
-                    key_133 = 536870912 | lowb_23 << 9 | (unsigned int)(tb + 23);
+                    key_133 = 536870912 | lowb_23 << 9 | (unsigned int)(tb + 368);
                 }
                 kbt2[23] = __uint_as_float(key_133);
                 float sc_134 = __uint_as_float(cbt[24]);
@@ -3494,11 +3493,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_137 = u_136 & 4294966784u;
                 unsigned int key_138 = 0;
                 if (qf < __uint_as_float(cls_137) && cls_137 < 4278190080u) {
-                    key_138 = 1073741824 | (unsigned int)(tb + 24);
+                    key_138 = 1073741824 | (unsigned int)(tb + 384);
                 }
                 if (cls_137 == qc) {
                     unsigned int lowb_24 = (u_136 ^ (unsigned int)((int)u_136 >> 31) & 511) & 511;
-                    key_138 = 536870912 | lowb_24 << 9 | (unsigned int)(tb + 24);
+                    key_138 = 536870912 | lowb_24 << 9 | (unsigned int)(tb + 384);
                 }
                 kbt2[24] = __uint_as_float(key_138);
                 float sc_139 = __uint_as_float(cbt[25]);
@@ -3512,11 +3511,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_142 = u_141 & 4294966784u;
                 unsigned int key_143 = 0;
                 if (qf < __uint_as_float(cls_142) && cls_142 < 4278190080u) {
-                    key_143 = 1073741824 | (unsigned int)(tb + 25);
+                    key_143 = 1073741824 | (unsigned int)(tb + 400);
                 }
                 if (cls_142 == qc) {
                     unsigned int lowb_25 = (u_141 ^ (unsigned int)((int)u_141 >> 31) & 511) & 511;
-                    key_143 = 536870912 | lowb_25 << 9 | (unsigned int)(tb + 25);
+                    key_143 = 536870912 | lowb_25 << 9 | (unsigned int)(tb + 400);
                 }
                 kbt2[25] = __uint_as_float(key_143);
                 float sc_144 = __uint_as_float(cbt[26]);
@@ -3530,11 +3529,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_147 = u_146 & 4294966784u;
                 unsigned int key_148 = 0;
                 if (qf < __uint_as_float(cls_147) && cls_147 < 4278190080u) {
-                    key_148 = 1073741824 | (unsigned int)(tb + 26);
+                    key_148 = 1073741824 | (unsigned int)(tb + 416);
                 }
                 if (cls_147 == qc) {
                     unsigned int lowb_26 = (u_146 ^ (unsigned int)((int)u_146 >> 31) & 511) & 511;
-                    key_148 = 536870912 | lowb_26 << 9 | (unsigned int)(tb + 26);
+                    key_148 = 536870912 | lowb_26 << 9 | (unsigned int)(tb + 416);
                 }
                 kbt2[26] = __uint_as_float(key_148);
                 float sc_149 = __uint_as_float(cbt[27]);
@@ -3548,11 +3547,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_152 = u_151 & 4294966784u;
                 unsigned int key_153 = 0;
                 if (qf < __uint_as_float(cls_152) && cls_152 < 4278190080u) {
-                    key_153 = 1073741824 | (unsigned int)(tb + 27);
+                    key_153 = 1073741824 | (unsigned int)(tb + 432);
                 }
                 if (cls_152 == qc) {
                     unsigned int lowb_27 = (u_151 ^ (unsigned int)((int)u_151 >> 31) & 511) & 511;
-                    key_153 = 536870912 | lowb_27 << 9 | (unsigned int)(tb + 27);
+                    key_153 = 536870912 | lowb_27 << 9 | (unsigned int)(tb + 432);
                 }
                 kbt2[27] = __uint_as_float(key_153);
                 float sc_154 = __uint_as_float(cbt[28]);
@@ -3566,11 +3565,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_157 = u_156 & 4294966784u;
                 unsigned int key_158 = 0;
                 if (qf < __uint_as_float(cls_157) && cls_157 < 4278190080u) {
-                    key_158 = 1073741824 | (unsigned int)(tb + 28);
+                    key_158 = 1073741824 | (unsigned int)(tb + 448);
                 }
                 if (cls_157 == qc) {
                     unsigned int lowb_28 = (u_156 ^ (unsigned int)((int)u_156 >> 31) & 511) & 511;
-                    key_158 = 536870912 | lowb_28 << 9 | (unsigned int)(tb + 28);
+                    key_158 = 536870912 | lowb_28 << 9 | (unsigned int)(tb + 448);
                 }
                 kbt2[28] = __uint_as_float(key_158);
                 float sc_159 = __uint_as_float(cbt[29]);
@@ -3584,11 +3583,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_162 = u_161 & 4294966784u;
                 unsigned int key_163 = 0;
                 if (qf < __uint_as_float(cls_162) && cls_162 < 4278190080u) {
-                    key_163 = 1073741824 | (unsigned int)(tb + 29);
+                    key_163 = 1073741824 | (unsigned int)(tb + 464);
                 }
                 if (cls_162 == qc) {
                     unsigned int lowb_29 = (u_161 ^ (unsigned int)((int)u_161 >> 31) & 511) & 511;
-                    key_163 = 536870912 | lowb_29 << 9 | (unsigned int)(tb + 29);
+                    key_163 = 536870912 | lowb_29 << 9 | (unsigned int)(tb + 464);
                 }
                 kbt2[29] = __uint_as_float(key_163);
                 float sc_164 = __uint_as_float(cbt[30]);
@@ -3602,11 +3601,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_167 = u_166 & 4294966784u;
                 unsigned int key_168 = 0;
                 if (qf < __uint_as_float(cls_167) && cls_167 < 4278190080u) {
-                    key_168 = 1073741824 | (unsigned int)(tb + 30);
+                    key_168 = 1073741824 | (unsigned int)(tb + 480);
                 }
                 if (cls_167 == qc) {
                     unsigned int lowb_30 = (u_166 ^ (unsigned int)((int)u_166 >> 31) & 511) & 511;
-                    key_168 = 536870912 | lowb_30 << 9 | (unsigned int)(tb + 30);
+                    key_168 = 536870912 | lowb_30 << 9 | (unsigned int)(tb + 480);
                 }
                 kbt2[30] = __uint_as_float(key_168);
                 float sc_169 = __uint_as_float(cbt[31]);
@@ -3620,11 +3619,11 @@ kernel_cake_hopper_msa_289d6bbc939c9889490a(unsigned int* __restrict__ S, int* _
                 unsigned int cls_172 = u_171 & 4294966784u;
                 unsigned int key_173 = 0;
                 if (qf < __uint_as_float(cls_172) && cls_172 < 4278190080u) {
-                    key_173 = 1073741824 | (unsigned int)(tb + 31);
+                    key_173 = 1073741824 | (unsigned int)(tb + 496);
                 }
                 if (cls_172 == qc) {
                     unsigned int lowb_31 = (u_171 ^ (unsigned int)((int)u_171 >> 31) & 511) & 511;
-                    key_173 = 536870912 | lowb_31 << 9 | (unsigned int)(tb + 31);
+                    key_173 = 536870912 | lowb_31 << 9 | (unsigned int)(tb + 496);
                 }
                 kbt2[31] = __uint_as_float(key_173);
                 float rr_174 = r2o;
