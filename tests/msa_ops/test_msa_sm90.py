@@ -83,6 +83,46 @@ def _decode_inputs(
 # ---------------------------------------------------------------------------
 # correctness
 # ---------------------------------------------------------------------------
+
+
+def _ref_attn_rows(q, kv, idx, page_table, seqused_k, scale, rows, qpos_of):
+    """Dense fp32 reference for selected query rows, vectorised per KV head.
+
+    ``idx`` may repeat a block (the kernels walk the *union* of a tile's selected
+    blocks), so the block list is deduplicated before the softmax -- a reference
+    that counted a repeat twice would disagree with a correct kernel.
+    ``qpos_of(row)`` returns the row's absolute key position, which is
+    right-aligned for prefill: seqused_k - qlen + offset_in_sequence.
+    """
+    total_q, hq, d = q.shape
+    hkv = kv.shape[1]
+    g = hq // hkv
+    out = torch.zeros(len(rows), hq, d, dtype=torch.float32, device=q.device)
+    for i, row in enumerate(rows):
+        b, qpos = qpos_of(row)
+        limit = min(qpos, int(seqused_k[b]) - 1)
+        for kh in range(hkv):
+            blocks = torch.unique(idx[kh, row])
+            blocks = blocks[(blocks >= 0) & (blocks < page_table.shape[1])]
+            if blocks.numel() == 0:
+                continue
+            pages = page_table[b, blocks.long()].long()
+            keys = kv[pages, kh, :, :d].reshape(-1, d).float()
+            vals = kv[pages, kh, :, d:].reshape(-1, d).float()
+            pos = (
+                blocks.long().unsqueeze(1) * BLK_KV
+                + torch.arange(BLK_KV, device=q.device).unsqueeze(0)
+            ).reshape(-1)
+            keep = pos <= limit
+            if not bool(keep.any()):
+                continue
+            heads = list(range(kh * g, (kh + 1) * g))
+            logits = (q[row, heads].float() @ keys.T) * scale
+            logits = logits.masked_fill(~keep.unsqueeze(0), float("-inf"))
+            out[i, heads] = torch.softmax(logits, dim=-1) @ vals
+    return out
+
+
 @sm90_only
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 2), (16, 4), (64, 4)])
 def test_sparse_decode_paged_matches_reference(num_qo_heads, num_kv_heads):
@@ -103,7 +143,19 @@ def test_sparse_decode_paged_matches_reference(num_qo_heads, num_kv_heads):
     )
     assert out.shape == q.shape
     assert out.dtype == q.dtype
-    assert torch.isfinite(out.float()).all()
+    kv = torch.cat([k, v], dim=-1)
+    rows = list(range(q.shape[0]))
+    ref = _ref_attn_rows(
+        q,
+        kv,
+        idx,
+        page_table,
+        seqused_k,
+        scale,
+        rows,
+        lambda r: (r, int(seqused_k[r]) - 1),
+    )
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
 def _ref_sparse_decode(q, kv, idx, page_table, seqused_k, scale):
@@ -198,6 +250,20 @@ def test_sparse_prefill_runs_both_backends(max_k_tiles):
     )
     assert out.shape == q.shape
     assert torch.isfinite(out.float()).all()
+    kv = torch.cat([k, v], dim=-1)
+    prefix = int(seqused_k[0]) - qlen
+    rows = [0, 1, qlen // 2, qlen - 2, qlen - 1]
+    ref = _ref_attn_rows(
+        q,
+        kv,
+        idx,
+        page_table,
+        seqused_k,
+        1.0 / math.sqrt(HEAD_DIM),
+        rows,
+        lambda r: (0, prefix + r),
+    )
+    torch.testing.assert_close(out[rows].float(), ref, atol=3e-2, rtol=3e-2)
 
 
 @sm90_only
@@ -659,6 +725,116 @@ def test_prefill_single_key_window_returns_v_exactly(hq, hkv):
     v0 = kv[0, 0, 0, HEAD_DIM:].float()
     for h in range(hq):
         torch.testing.assert_close(out[0, h], v0, atol=0.0, rtol=0.0)
+
+
+@sm90_only
+@pytest.mark.parametrize("lens", [[128, 128], [128, 128, 128]])
+def test_sparse_prefill_uniform_batch_matches_reference(lens):
+    """Equal-length sequences in one batch, against a dense reference.
+
+    seqused_k equals the query length, so the first rows of every sequence see
+    one- and two-key windows -- the regime where a mis-masked or mis-weighted P
+    is visible before longer windows average it away.
+    """
+    torch.manual_seed(11)
+    mkt, hq, hkv = 8, 8, 1
+    total_q, batch = sum(lens), len(lens)
+    npages = mkt * batch
+    base = (torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    q = (torch.randn(total_q, hq, HEAD_DIM, device="cuda") / 4).to(torch.bfloat16)
+    idx = torch.randint(0, mkt, (hkv, total_q, TOPK), dtype=torch.int32, device="cuda")
+    cu = [0]
+    for length in lens:
+        cu.append(cu[-1] + length)
+    cu_q = torch.tensor(cu, dtype=torch.int32, device="cuda")
+    page_table = torch.randperm(npages, device="cuda").to(torch.int32).view(batch, mkt)
+    seqused_k = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    rowblk = torch.empty(total_q, dtype=torch.int64, device="cuda")
+    for b, length in enumerate(lens):
+        rowblk[cu[b] : cu[b + 1]] = torch.arange(length, device="cuda") // BLK_KV
+    idx[:, :, 0] = rowblk.to(torch.int32)
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=scale,
+    )
+    assert torch.isfinite(out.float()).all()
+    rows = [cu[b] + off for b in range(batch) for off in (0, 1, lens[b] - 1)]
+
+    def qpos_of(row):
+        b = max(i for i in range(batch) if cu[i] <= row)
+        return b, row - cu[b]
+
+    kv = torch.cat([k, v], dim=-1)
+    ref = _ref_attn_rows(q, kv, idx, page_table, seqused_k, scale, rows, qpos_of)
+    torch.testing.assert_close(out[rows].float(), ref, atol=3e-2, rtol=3e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize("lens", [[96, 160], [64, 192, 96], [17, 256, 33, 128]])
+def test_sparse_prefill_ragged_cu_seqlens_matches_reference(lens):
+    """Unequal query lengths in one batch, against a dense reference.
+
+    The union schedule groups nt consecutive tokens of ONE sequence per CTA, so
+    it has to recover the sequence from the CTA index. Dividing by a uniform
+    groups-per-sequence put the first token of sequence 1 on sequence 0's page
+    table at the global row index; walking cu_seqlens_q is what makes unequal
+    lengths land on the right sequence and the right causal position.
+    """
+    torch.manual_seed(11)
+    mkt, hq, hkv = 8, 8, 1
+    total_q, batch = sum(lens), len(lens)
+    npages = mkt * batch
+    base = (torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    q = (torch.randn(total_q, hq, HEAD_DIM, device="cuda") / 4).to(torch.bfloat16)
+    idx = torch.randint(0, mkt, (hkv, total_q, TOPK), dtype=torch.int32, device="cuda")
+    cu = [0]
+    for length in lens:
+        cu.append(cu[-1] + length)
+    cu_q = torch.tensor(cu, dtype=torch.int32, device="cuda")
+    page_table = torch.randperm(npages, device="cuda").to(torch.int32).view(batch, mkt)
+    seqused_k = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    rowblk = torch.empty(total_q, dtype=torch.int64, device="cuda")
+    for b, length in enumerate(lens):
+        rowblk[cu[b] : cu[b + 1]] = torch.arange(length, device="cuda") // BLK_KV
+    idx[:, :, 0] = rowblk.to(torch.int32)
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=scale,
+    )
+    assert torch.isfinite(out.float()).all()
+    # boundary rows of every sequence: first token of a sequence is where a
+    # misattributed CTA shows up before longer windows average it away
+    rows = [cu[b] + off for b in range(batch) for off in (0, 1, lens[b] - 1)]
+
+    def qpos_of(row):
+        b = max(i for i in range(batch) if cu[i] <= row)
+        return b, row - cu[b]
+
+    kv = torch.cat([k, v], dim=-1)
+    ref = _ref_attn_rows(q, kv, idx, page_table, seqused_k, scale, rows, qpos_of)
+    torch.testing.assert_close(out[rows].float(), ref, atol=3e-2, rtol=3e-2)
 
 
 @sm90_only

@@ -243,11 +243,11 @@ class MsaSparseAttnFp8:
         ppt,
         ppfx,
         psk,
+        pcu,
         po,
         tq,
         npg,
-        sq,
-        gps,
+        nb,
         mpg,
         ngrp,
         stream,
@@ -261,6 +261,7 @@ class MsaSparseAttnFp8:
         mPT = _i32t(ppt, (16, mpg), (mpg, 1))
         mPfx = _i32t(ppfx, 16, 1)
         mSeq = _i32t(psk, 16, 1)
+        mCu = _i32t(pcu, 17, 1)
         qk_mma = sm90_utils.make_trivial_tiled_mma(
             f8,
             f8,
@@ -354,8 +355,8 @@ class MsaSparseAttnFp8:
             lK,
             lV,
             lP,
-            sq,
-            gps,
+            mCu,
+            nb,
         ).launch(
             grid=[ngrp, self.hkv, 1],
             block=[NTHR, 1, 1],
@@ -435,8 +436,8 @@ class MsaSparseAttnFp8:
         lK,
         lV,
         lP,
-        sq,
-        gps,
+        mCu,
+        nb,
     ):
         """One CTA per NT-token tile: walk the union of their selected blocks."""
         f8, f32 = self.f8, self.f32
@@ -474,13 +475,36 @@ class MsaSparseAttnFp8:
                     cute.arch.mbarrier_init(mbar + s, 1)
         cute.arch.mbarrier_init_fence()
 
-        # every group lies inside one sequence: cu_seqlens_q is arange(B+1)*sq
-        b = cutlass.Int32(grp) // gps
-        lg = cutlass.Int32(grp) - b * gps
+        # A group is nt consecutive tokens of ONE sequence, so with ragged query
+        # lengths the sequence cannot be recovered by dividing: walk the
+        # cu_seqlens_q prefix instead. `live` latches to zero once grp has been
+        # placed, which stops a later, shorter sequence from advancing b again.
+        gi_grp = cutlass.Int32(grp)
+        b = cutlass.Int32(0)
+        acc = cutlass.Int32(0)
+        live = cutlass.Int32(1)
+        for i in cutlass.range(nb, unroll=1):
+            gi = (mCu[i + 1] - mCu[i] + cutlass.Int32(nt - 1)) // cutlass.Int32(nt)
+            t = (cutlass.Int32(1) if acc + gi <= gi_grp else cutlass.Int32(0)) * live
+            b = b + t
+            acc = acc + t * gi
+            live = live * t
+        # The grid is an upper bound (ceil(tq/nt) + nb) because the exact group
+        # count needs the lengths on the host. A tail CTA that lands past the
+        # last group is clamped onto it: it recomputes that group and stores the
+        # same bytes, which beats a divergent exit this kernel has no idiom for.
+        b = cutlass.min(b, nb - cutlass.Int32(1))
+        qlen = mCu[b + 1] - mCu[b]
+        gb = cutlass.max(
+            (qlen + cutlass.Int32(nt - 1)) // cutlass.Int32(nt), cutlass.Int32(1)
+        )
+        lg = cutlass.min(
+            cutlass.max(gi_grp - acc, cutlass.Int32(0)), gb - cutlass.Int32(1)
+        )
         if cutlass.const_expr(self.reverse):
-            lg = gps - cutlass.Int32(1) - lg
-        tok0 = b * sq + lg * nt
-        nvalid = cutlass.min(cutlass.Int32(nt), sq - lg * nt)
+            lg = gb - cutlass.Int32(1) - lg
+        tok0 = mCu[b] + lg * nt
+        nvalid = cutlass.min(cutlass.Int32(nt), qlen - lg * nt)
         qbase = mPfx[b] + lg * nt
 
         # ---- per-token meta + raw index staging --------------------------
@@ -821,14 +845,23 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
     ppt = _I64(page_table.data_ptr())
     ppfx = _I64(prefix_lens.data_ptr())
     psk = _I64(seqused_k.data_ptr())
+    pcu = _I64(cu_seqlens_q.data_ptr())
     po = _I64(out.data_ptr())
     if plan is None:
         hq, hkv, npg, tq, nb, mpg = (int(v) for v in sig)
+        # nt is a compile-time tile height, so one launch gets one value; the
+        # mean length is the only length-like quantity available without pulling
+        # cu_seqlens_q to the host, and a sync per call would cost more than the
+        # tile choice is worth.
         sq = tq // nb
         nt = _pick_nt(hq, hkv, sq, nb, mpg)
-        gps = (sq + nt - 1) // nt
+        # Groups are per-sequence, so the exact count is sum(ceil(len_b / nt)),
+        # which needs the lengths on the host. Bound it from the shapes instead:
+        # each sequence rounds up by at most one group. Surplus CTAs clamp onto
+        # the last group and recompute it.
+        ngrp = (tq + nt - 1) // nt + nb
         Tq, Npg, Mpg = _I32(tq), _I32(npg), _I32(mpg)
-        Sq, Gps, Ngrp = _I32(sq), _I32(gps), _I32(nb * gps)
+        Nb, Ngrp = _I32(nb), _I32(ngrp)
         vt = torch.empty((npg, hkv, D, PG), dtype=kv.dtype, device=kv.device)
         pvt = _I64(vt.data_ptr())
         key = (hq, hkv, nt)
@@ -843,19 +876,19 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
                 ppt,
                 ppfx,
                 psk,
+                pcu,
                 po,
                 Tq,
                 Npg,
-                Sq,
-                Gps,
+                Nb,
                 Mpg,
                 Ngrp,
                 stream,
             )
             _CACHE[key] = fn
-        plan = (fn, Tq, Npg, Sq, Gps, Mpg, Ngrp, (npg, hkv, D, PG))
+        plan = (fn, Tq, Npg, Nb, Mpg, Ngrp, (npg, hkv, D, PG))
         _PLAN[sig] = plan
-    fn, Tq, Npg, Sq, Gps, Mpg, Ngrp, vshape = plan
+    fn, Tq, Npg, Nb, Mpg, Ngrp, vshape = plan
     vt = torch.empty(vshape, dtype=kv.dtype, device=kv.device)
     fn(
         pq,
@@ -865,11 +898,11 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
         ppt,
         ppfx,
         psk,
+        pcu,
         po,
         Tq,
         Npg,
-        Sq,
-        Gps,
+        Nb,
         Mpg,
         Ngrp,
         stream,

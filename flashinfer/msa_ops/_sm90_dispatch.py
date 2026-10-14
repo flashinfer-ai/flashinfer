@@ -19,6 +19,9 @@ _BLK_KV = 128
 # The campaign dispatcher keyed on TOTAL pages, which is why it routed these
 # shapes into the bad path. 800 keeps margin below the measured cliff.
 _MPG_UNION_MAX = 800
+# Per-sequence metadata (page table, prefix, seqused, cu_seqlens) is read
+# through fixed 16-entry views inside the kernels.
+_MAX_BATCH = 16
 
 
 def _prefix_lens(cu_seqlens_q: torch.Tensor, seqused_k: torch.Tensor) -> torch.Tensor:
@@ -278,6 +281,11 @@ def sparse_prefill_sm90(
     else:
         from .cute_dsl.sparse_prefill_sm90 import run as _prefill
 
+    if int(page_table.shape[0]) > _MAX_BATCH:
+        raise NotImplementedError(
+            f"SM90 MSA prefill indexes per-sequence metadata with a fixed extent "
+            f"of {_MAX_BATCH} sequences, got {int(page_table.shape[0])}"
+        )
     kv = _as_packed_kv(k, v, q.shape[-1])
     q = _fold_scales(q, v_global_scale, softmax_scale, q.shape[-1])
     cu = cu_seqlens_q.to(torch.int32).contiguous()
