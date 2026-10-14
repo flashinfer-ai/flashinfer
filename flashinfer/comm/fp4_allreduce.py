@@ -178,6 +178,7 @@ def window_plan(
             f"of {CAPACITY} rows, got {capacity}"
         )
     table = program_table(world_size, family)
+    regions: tuple[RegionPlan, ...]
     if family == "rmsnorm":
         regions = (_oneshot_region("rmsnorm", world_size, capacity),)
     elif world_size == 2:
