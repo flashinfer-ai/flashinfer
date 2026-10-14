@@ -39,14 +39,16 @@ struct Sm120_tma_params : Params {
 };
 
 template <typename Params>
-inline Sm120_tma_params<Params> make_sm120_tma_params(Params const& params) {
+inline Sm120_tma_params<Params> make_sm120_tma_params(Params const& params, int total_q,
+                                                      int total_kv) {
 #if CUDART_VERSION >= 12080
-  if (!params.is_s_padded || params.d != 256 || params.dv != 256 || params.h_kv != params.h ||
-      params.q_stride_in_bytes != int64_t(params.h) * 256 ||
+  int64_t const row_stride = params.is_s_padded ? int64_t(params.h) * 256 : 256;
+  if (params.d != 256 || params.dv != 256 || params.h_kv != params.h ||
+      params.q_stride_in_bytes != row_stride ||
       params.k_stride_in_bytes != params.q_stride_in_bytes ||
       params.v_stride_in_bytes != params.q_stride_in_bytes) {
     throw std::invalid_argument(
-        "SM120 GLM TMA requires contiguous, padded BSHD Q/K/V with equal heads and D=256");
+        "SM120 GLM TMA requires padded BSHD or packed head-major Q/K/V with D=256");
   }
   Sm120_tma_params<Params> result;
   static_cast<Params&>(result) = params;
@@ -60,18 +62,21 @@ inline Sm120_tma_params<Params> make_sm120_tma_params(Params const& params) {
   }();
   // Split D into two 128-byte halves. The S axis precedes the half axis in
   // shared memory, giving two swizzled 64x128 tiles with one TMA operation.
-  uint64_t dims[5] = {128, uint64_t(params.s), 2, uint64_t(params.h), uint64_t(params.b)};
-  uint64_t strides[4] = {uint64_t(params.h) * 256, 128, 256, uint64_t(params.s) * params.h * 256};
   uint32_t box[5] = {128, 64, 2, 1, 1}, steps[5] = {1, 1, 1, 1, 1};
-  auto set = [&](CUtensorMap& desc, void* ptr) {
+  auto set = [&](CUtensorMap& desc, void* ptr, int total_tokens) {
+    uint64_t const tokens = params.is_s_padded ? params.s : total_tokens;
+    uint64_t dims[5] = {128, tokens, 2, uint64_t(params.h),
+                        uint64_t(params.is_s_padded ? params.b : 1)};
+    uint64_t strides[4] = {uint64_t(row_stride), 128, params.is_s_padded ? 256 : tokens * 256,
+                           tokens * params.h * 256};
     auto status = encode(&desc, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5, ptr, dims, strides, box, steps,
                          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
                          CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     if (status != CUDA_SUCCESS) throw std::runtime_error("SM120 GLM TMA descriptor failed");
   };
-  set(result.glm_q, params.q_ptr);
-  set(result.glm_k, params.k_ptr);
-  set(result.glm_v, params.v_ptr);
+  set(result.glm_q, params.q_ptr, total_q);
+  set(result.glm_k, params.k_ptr, total_kv);
+  set(result.glm_v, params.v_ptr, total_kv);
   return result;
 #else
   throw std::runtime_error("SM120 GLM TMA requires CUDA 12.8 or newer");
@@ -150,9 +155,10 @@ inline __device__ uint32_t glm_tma_elect() {
 struct Sm120_tma_transport {
   Arrive_wait barriers;
   uint32_t base;
-  int head;
-  inline __device__ Sm120_tma_transport(void* smem, uint64_t* bars, int head, bool init = true)
-      : barriers(bars), base(__nvvm_get_smem_pointer(smem)), head(head) {
+  int head, batch;
+  inline __device__ Sm120_tma_transport(void* smem, uint64_t* bars, int head, int batch,
+                                        bool init = true)
+      : barriers(bars), base(__nvvm_get_smem_pointer(smem)), head(head), batch(batch) {
     if (!init) return;
     if (threadIdx.x == 0) {
       bar_create(bars, 1);
@@ -171,8 +177,8 @@ struct Sm120_tma_transport {
           "{ .reg .pred p; setp.ne.u32 p, %6, 0; "
           "@p cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes "
           "[%0], [%1, {0, %2, 0, %3, %4}], [%5]; }" ::"r"(dst),
-          "l"(reinterpret_cast<uint64_t>(&desc)), "r"(row), "r"(head), "r"(int(blockIdx.z)),
-          "r"(barrier), "r"(elected)
+          "l"(reinterpret_cast<uint64_t>(&desc)), "r"(row), "r"(head), "r"(batch), "r"(barrier),
+          "r"(elected)
           : "memory");
 #endif
     }

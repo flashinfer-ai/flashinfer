@@ -7367,6 +7367,70 @@ def _fmha_v2_prefill_sm120_run(
     return out
 
 
+@flashinfer_api
+def fmha_v2_prefill_glm(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_kv: int,
+    *,
+    softmax_scale: float = 1.0 / 16.0,
+    causal: bool = True,
+    out: Optional[torch.Tensor] = None,
+    softmax_stats: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run packed, block-scaled GLM FP8 prefill on SM120 using TMA.
+
+    Q/K/V have logical shape ``[total_tokens, heads, 256]`` and head-major
+    storage (strides ``[256, total_tokens * 256, 1]``), with FP8 E4M3 dtype.
+    Q and KV may have different total lengths. Apply RoPE and concatenate
+    K's NoPE/RoPE components before quantization.
+
+    Each FP32 scale tensor has shape ``[batch, heads, ceil(max_length/64)]``.
+    Scales must be finite and positive, and reconstruct a block as
+    ``x_float = x_fp8 * scale``. Blocks start at each sequence boundary.
+    Q/K scales affect logits; V scales are applied during online accumulation.
+    Quantization itself runs upstream of this attention kernel.
+
+    Cumulative lengths are contiguous CUDA int32 tensors of shape
+    ``[batch + 1]`` starting at zero and ending at the corresponding token
+    count. Every sequence must satisfy ``0 < q_length <= kv_length`` and the
+    supplied maxima. Causal masking is bottom-right aligned for cached prefixes.
+    Device length/scale values are not copied to the host or synchronized;
+    callers must meet these contracts, including during graph replay.
+
+    Output is contiguous ``[total_q, heads, 256]`` BF16 (default) or FP16.
+    Optional ``softmax_stats`` is a contiguous FP32 tensor ``[total_q, heads, 2]``
+    containing row max and scaled exponential sum. Recover logsumexp with
+    ``stats[..., 0] + log(stats[..., 1] / 256)``.
+    """
+    if out is None:
+        out = torch.empty(query.shape, device=query.device, dtype=torch.bfloat16)
+    get_trtllm_fmha_v2_sm120_module().run_glm(
+        query,
+        key,
+        value,
+        out,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        q_scale,
+        k_scale,
+        v_scale,
+        softmax_stats,
+        max_seqlen_q,
+        max_seqlen_kv,
+        softmax_scale,
+        causal,
+    )
+    return out
+
+
 @flashinfer_api(trace=fmha_v2_prefill_sm120_trace)
 def fmha_v2_prefill_sm120(
     query: torch.Tensor,

@@ -234,7 +234,14 @@ The SM120 GLM specialization now uses official 128-byte tensor maps for TMA
 Q/K/V loads (CUDA 12.8+), retaining the original FP8 MMA/softmax arithmetic.
 Causal query tiles run in descending order with heads varying fastest to avoid
 tail imbalance. Two mbarriers add 16 bytes to the 48 KiB shared allocation.
-The TMA launcher requires uniform padded BSHD storage with equal Q/KV heads.
+The scalar-scale API uses uniform padded BSHD storage with equal Q/KV heads.
+`fmha_v2_prefill_glm` additionally accepts packed head-major Q/K/V with
+separate device cumulative Q/KV lengths and per-head/per-64-token scales.
+It computes only real Q rows, using bottom-right causal masks for prefixes.
+The block-scaled entry points reuse the Sage scale parameter storage but
+retain GLM FP8 MMA, including P's existing quantization factor of 256.
+Online O rescaling includes previous/current V scale; the softmax sum must
+not receive this factor. Quantization and K concatenation run upstream.
 Other shapes and layouts retain their original tiling and epilogue. When
 testing source changes, ensure a prebuilt `data/aot/trtllm_fmha_v2` artifact
 is not masking the new JIT build.

@@ -992,6 +992,8 @@ void {custom_mask_kernel_name}_nl_tiled({tiled_params_type} params){{
 
 #endif // custom mask
 
+{block_scaled_kernels}
+
 // Granular tiling
 void {launcher_name}_nl_tiled(
     {const_fused_multihead_attention_params_v2_str} &input_params,
@@ -1004,6 +1006,7 @@ void {launcher_name}_nl_tiled(
   int loop_iters = ( params.s + {noloop_step} - 1 )  / {noloop_step};
   dim3 grid(loop_iters * ctas_per_o_row, params.h, params.b);
   constexpr int smem_size = Kernel_traits_nl_tiled::BYTES_PER_SMEM;
+  {block_scaled_dispatch}
   if( launch_params.attention_mask_type == Attention_mask_type::CAUSAL ) {{
 #if {causal_mask} // causal_mask
     if( smem_size >= 48*1024 ) {{
@@ -2363,10 +2366,33 @@ def get_kernel_code(kspec: kernel_spec, kname: str, lname: str) -> str | None:
         else params_type
     )
     tma_launch_params = (
-        "auto params = fmha::make_sm120_tma_params(input_params);"
+        "auto params = fmha::make_sm120_tma_params(input_params, "
+        "launch_params.total_q_seqlen, launch_params.total_kv_seqlen);"
         if use_sm120_tma
         else "auto const& params = input_params;"
     )
+    # Keep block scaling in separate entry points so the scalar-scale API does
+    # not pay for additional scale registers or branches in the KV loop.
+    block_scaled_kernels = ""
+    block_scaled_dispatch = ""
+    if use_sm120_tma:
+        for name, traits, mask in (
+            (causal_kernel_name, "Kernel_traits_nl_tiled_causal", "CAUSAL"),
+            (kernel_name, "Kernel_traits_nl_tiled", "PADDING"),
+        ):
+            block_scaled_kernels += f"""
+__global__ void {name}_block_scaled({tiled_params_type} params) {{
+  fused_multihead_attention::device_flash_attention_nl_tiled<{traits}, true>(params);
+}}
+"""
+            block_scaled_dispatch += f"""
+  if (params.sage.q.scales && launch_params.attention_mask_type == Attention_mask_type::{mask}) {{
+    FMHA_CHECK_CUDA(cudaFuncSetAttribute({name}_block_scaled,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    {name}_block_scaled<<<grid, {traits}::THREADS, smem_size, stream>>>(params);
+    return;
+  }}
+"""
     tmp = dict(locals(), **kspec._asdict())
 
     if effective_sm < 90:

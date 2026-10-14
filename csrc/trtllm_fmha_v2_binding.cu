@@ -475,4 +475,98 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::TRTLLMFMHAv2Run);
 
+// Packed GLM prefill: logical [tokens, heads, 256], head-major FP8 storage,
+// separate Q/KV cumulative lengths, and per-head/per-64-token dequant scales.
+// Length values must satisfy 0 < q_len <= kv_len and the supplied maxima.
+// They remain on device, including during CUDA graph capture/replay.
+void TRTLLMFMHAv2RunGLM(TensorView q, TensorView k, TensorView v, TensorView o, TensorView cu_q,
+                        TensorView cu_kv, TensorView sq, TensorView sk, TensorView sv,
+                        Optional<TensorView> maybe_lse, int64_t max_q, int64_t max_kv,
+                        double softmax_scale, bool causal) {
+  for (auto x : {q, k, v}) {
+    CHECK_CUDA(x);
+    CHECK_DEVICE(q, x);
+    CHECK_DIM(3, x);
+    CHECK_INPUT_TYPE(x, dl_float8_e4m3fn);
+    TVM_FFI_ICHECK_EQ(x.size(2), 256);
+    TVM_FFI_ICHECK_EQ(x.stride(0), 256);
+    TVM_FFI_ICHECK_EQ(x.stride(1), x.size(0) * 256);
+    TVM_FFI_ICHECK_EQ(x.stride(2), 1);
+    TVM_FFI_ICHECK_GT(x.size(0), 0);
+    TVM_FFI_ICHECK_GT(x.size(1), 0);
+  }
+  CHECK_SHAPE(k, v);
+  TVM_FFI_ICHECK_EQ(q.size(1), k.size(1));
+  CHECK_INPUT(o);
+  CHECK_DEVICE(q, o);
+  CHECK_SHAPE(q, o);
+  TVM_FFI_ICHECK(o.dtype() == dl_bfloat16 || o.dtype() == dl_float16);
+  for (auto x : {cu_q, cu_kv}) {
+    CHECK_INPUT_AND_TYPE(x, dl_int32);
+    CHECK_DEVICE(q, x);
+    CHECK_DIM(1, x);
+  }
+  CHECK_SHAPE(cu_q, cu_kv);
+  int const b = cu_q.size(0) - 1, h = q.size(1);
+  TVM_FFI_ICHECK_GT(b, 0);
+  TVM_FFI_ICHECK_GT(max_q, 0);
+  TVM_FFI_ICHECK_GE(max_kv, max_q);
+  TVM_FFI_ICHECK_LE(max_q, q.size(0));
+  TVM_FFI_ICHECK_LE(max_kv, k.size(0));
+  int const nq = (max_q + 63) / 64, nk = (max_kv + 63) / 64;
+  for (auto x : {sq, sk, sv}) {
+    CHECK_INPUT_AND_TYPE(x, dl_float32);
+    CHECK_DEVICE(q, x);
+    CHECK_DIM(3, x);
+    TVM_FFI_ICHECK_EQ(x.size(0), b);
+    TVM_FFI_ICHECK_EQ(x.size(1), h);
+  }
+  TVM_FFI_ICHECK_EQ(sq.size(2), nq);
+  TVM_FFI_ICHECK_EQ(sk.size(2), nk);
+  CHECK_SHAPE(sk, sv);
+  if (maybe_lse.has_value()) {
+    auto lse = maybe_lse.value();
+    CHECK_INPUT_AND_TYPE(lse, dl_float32);
+    CHECK_DEVICE(q, lse);
+    CHECK_DIM(3, lse);
+    TVM_FFI_ICHECK_EQ(lse.size(0), q.size(0));
+    TVM_FFI_ICHECK_EQ(lse.size(1), h);
+    TVM_FFI_ICHECK_EQ(lse.size(2), 2);
+  }
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
+  CudaDevice device;
+  TVM_FFI_ICHECK_EQ(device.sm, 120) << "GLM block-scaled FMHA requires SM120";
+  cudaStream_t stream = static_cast<cudaStream_t>(get_stream(q.device()));
+  Launch_params launch_params;
+  auto const mask = causal ? Attention_mask_type::CAUSAL : Attention_mask_type::PADDING;
+  auto const layout = Attention_input_layout::SEPARATE_Q_K_V;
+  determine_launch_params(launch_params, DATA_TYPE_E4M3, device.sm, max_q, 256, mask, layout, false,
+                          false, false, false, false, true, false, true, device.props);
+  launch_params.total_q_seqlen = q.size(0);
+  launch_params.total_kv_seqlen = k.size(0);
+  bert::Fused_multihead_attention_params_v2 params;
+  auto const output_dtype = o.dtype() == dl_bfloat16 ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
+  set_params(params, launch_params, DATA_TYPE_E4M3, DATA_TYPE_FP32, output_dtype, layout, b, max_q,
+             max_kv, h, h, 256, 256, q.size(0), 1, INT_MAX, 0, 64, nullptr, q.data_ptr(),
+             k.data_ptr(), v.data_ptr(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+             cu_kv.data_ptr(), cu_q.data_ptr(), o.data_ptr(), nullptr, nullptr,
+             maybe_lse.has_value() ? maybe_lse.value().data_ptr() : nullptr, nullptr, nullptr,
+             float(softmax_scale), 1.f, 1.f, 0.f, false, false, false, false);
+  params.q_stride_in_bytes = params.k_stride_in_bytes = params.v_stride_in_bytes = 256;
+  // Reuse the existing block-scale parameter layout; dispatch stays in the
+  // GLM TMA implementation, not the SageAttention kernel family.
+  params.sage.q = {64, nq, static_cast<float*>(sq.data_ptr())};
+  params.sage.k = {64, nk, static_cast<float*>(sk.data_ptr())};
+  params.sage.v = {64, nk, static_cast<float*>(sv.data_ptr())};
+  if (output_dtype == DATA_TYPE_BF16) {
+    run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_256x256_output_bf16_sm120_nl_tiled(
+        params, launch_params, stream);
+  } else {
+    run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_256x256_output_fp16_sm120_nl_tiled(
+        params, launch_params, stream);
+  }
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_glm, flashinfer::TRTLLMFMHAv2RunGLM);
+
 }  // namespace flashinfer

@@ -1228,7 +1228,11 @@ struct Softmax_qmma<fmha::Ada_qmma_e4m3_fp32_traits, Cta_tile, Kernel_traits>
 
   // Convert from accumulators to floats.
   inline __device__ void unpack(Accumulator const (&acc)[MMAS_M][MMAS_N]) {
-    float const scale = reinterpret_cast<float const&>(params_scale_bmm1_);
+    unpack(acc, reinterpret_cast<float const&>(params_scale_bmm1_));
+  }
+
+  // SM120 block-scaled prefill supplies a different QK scale for each KV tile.
+  inline __device__ void unpack(Accumulator const (&acc)[MMAS_M][MMAS_N], float scale) {
 #pragma unroll
     for (int mi = 0; mi < MMAS_M; ++mi) {
 #pragma unroll
