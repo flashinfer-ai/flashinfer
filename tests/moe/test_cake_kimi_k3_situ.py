@@ -71,6 +71,11 @@ FUSED_M1_ARCHES = ("sm_103a",)
 # 8-bit per-tile partial with per-tile FP32 scales (eight kernels); the others
 # run the pre-shuffled scale-factor route (nine kernels).
 LARGE_Q8I_ARCHES = ("sm_103a",)
+# Architectures whose 4096-token route stores the FC2 result as the same 8-bit
+# per-tile partial behind the work5fd FC1; the 2048-token route keeps the BF16
+# expert output everywhere.
+MID_Q8I_ARCHES = ("sm_103a",)
+MID_Q8I_TOKENS = (4096,)
 # Token counts with a route of their own; every other count runs the generic
 # pipeline of its tile-N bucket (8 / 16 / 32 / 128).
 ROUTED = {
@@ -106,6 +111,7 @@ STAGES_BY_SELECTOR = {
     "m64_claim8": ["quant", "fused_router", "fc1", "fc2", "finalize"],
     "n32_claim8": ["quant", "fused_router", "fc1", "fc2", "finalize"],
     "mid_work5fd": GENERIC_STAGES,
+    "mid_q8i": GENERIC_STAGES,
     "large_c7": GENERIC_STAGES[:5] + ["sfb_shuffle"] + GENERIC_STAGES[5:],
     "large_q8i": GENERIC_STAGES,
 }
@@ -126,6 +132,8 @@ def _expected_selector(arch, num_tokens):
         return "m1_s2a"
     if num_tokens in LARGE_TOKENS and arch in LARGE_Q8I_ARCHES:
         return "large_q8i"
+    if num_tokens in MID_Q8I_TOKENS and arch in MID_Q8I_ARCHES:
+        return "mid_q8i"
     return ROUTED.get(num_tokens, _tile_bucket(num_tokens))
 
 
@@ -581,6 +589,7 @@ def _check_prepared_shape(prepared, arch, num_tokens, device):
         (512, "uniform"),
         (1024, "grouped"),
         (2048, "uniform"),
+        (4096, "skewed"),
         (8192, "uniform"),
         (16384, "uniform"),
         (2, "uniform"),
@@ -597,6 +606,7 @@ def _check_prepared_shape(prepared, arch, num_tokens, device):
         "n32_claim8_m512",
         "n32_claim8_m1024_grouped",
         "mid_work5fd",
+        "mid_m4096",
         "large_m8192",
         "large_m16384",
         "tile8_generic",
@@ -705,7 +715,7 @@ def test_cake_situ_every_route_eager_and_external_graph(
             )
         else:
             assert bindings["quant_route"]["x"] is x
-    if prepared["selector"] == "large_q8i":
+    if prepared["selector"] in ("large_q8i", "mid_q8i"):
         # The FC2 stage stores an 8-bit per-tile partial and its per-tile FP32
         # scales inside the BF16 expert-output scratch, and the finalize reads
         # the same two views: no pre-shuffled scale-factor images are bound.
@@ -765,7 +775,7 @@ def test_cake_situ_every_route_eager_and_external_graph(
     default_parameters_output = output.clone()
     output.fill_(float("nan"))
     assert submit(explicit_parameters=True) is output
-    if prepared["selector"] == "large_q8i":
+    if prepared["selector"] in ("large_q8i", "mid_q8i"):
         # The 8-bit FC2 partial of this route carries one FP32 scale per
         # 128x128 tile, and the atomic-counter routing assigns rows to tiles
         # in a call-dependent order, so the tile membership (hence each
