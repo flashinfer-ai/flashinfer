@@ -1540,9 +1540,10 @@ def chunk_gated_delta_rule(
         # [0, N_pool) makes the kernel read or write past the pool, and the
         # caching allocator normally hides that in a neighbouring
         # sub-allocation rather than faulting, so nothing reports it. The check
-        # runs as a device-side assert and costs no host synchronization;
-        # uniqueness stays a documented caller precondition because checking it
-        # would need one. output_final_state does not gate the final-state
+        # is a device-side assert with no host synchronization, opt-in through
+        # FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1 like the Cake one; uniqueness
+        # stays a documented caller precondition because checking it would
+        # need one. output_final_state does not gate the final-state
         # write, so output_state is part of the check whenever it is given.
         # The cake_gdn non-CP route checks the same ids itself.
         indexed_pools = tuple(

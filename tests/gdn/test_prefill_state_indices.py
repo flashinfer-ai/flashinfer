@@ -759,6 +759,7 @@ def test_prefill_state_indices_out_of_pool_fails_in_isolated_process(case_name):
     env["PYTHONPATH"] = os.pathsep.join(
         [str(repo_root), *([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])]
     )
+    env["FLASHINFER_CAKE_GDN_VALIDATE_SLOTS"] = "1"
     completed = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), "--invalid-slot", case_name],
         capture_output=True,
