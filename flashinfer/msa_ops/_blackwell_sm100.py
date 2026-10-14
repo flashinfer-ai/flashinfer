@@ -161,6 +161,11 @@ _TOPK_BMAX_CHUNK_ITERS = 8
 _TOPK_BMAX_WORDS_PER_CHUNK = 64
 _TOPK_STREAM_MAX_ROWS = 512
 _TOPK_STREAM_MAX_NVP = 1024
+# Lever T11b (MSA ceiling Goal round 7): grids of at most _TOPK_SMALL_GRID_MAX_ROWS rows over at most
+# _TOPK_STREAM_MAX_NVP valid pages whose cost-minimal slice streams plan the stage-only S = _TOPK_SMALL_GRID_SLICES
+# split instead (one single-pass CTA per slice; the streaming rule then does not fire).
+_TOPK_SMALL_GRID_MAX_ROWS = 32
+_TOPK_SMALL_GRID_SLICES = 16
 _TOPK_ROUTE_RADIX = "topk_select"
 _TOPK_ROUTE_STREAMING = "topk_select_streaming"
 # 32-query instance (MSA ceiling Goal lever T4): two queries per lane, u16-packed histogram, 2 CTAs/SM.
@@ -181,7 +186,9 @@ def _topk_grid_plan(
     """Shape-only plan: over ``s in (1,2,4,8,16)`` with ``ceil(nvp / s) >= 32`` (else ``s = 1``), ``S`` minimises
     ``ceil(groups * s / W) * (fixed(s) + ceil(nvp / s) + 112 * s)`` with ``fixed(s) = 1536`` for a slice above the
     candidate cap (multi-pass CTA) and ``512`` for a slice within it (stage-only CTA); ``W`` = 444 for the 16-query
-    program, 296 for the 32-query instance ``qpack = 2``; ties: the larger ``s``; ``bid = (h * S + s) * num_qtiles + qtile``."""
+    program, 296 for the 32-query instance ``qpack = 2``; ties: the larger ``s``.  Lever T11b (16-query plan only):
+    when ``total_q * num_heads <= 32``, ``nvp <= 1024``, the minimiser's slice exceeds the cap and the ``S = 16`` grid
+    fits one wave, ``S = 16`` (stage-only) replaces the minimiser.  ``bid = (h * S + s) * num_qtiles + qtile``."""
     total_q = int(total_q)
     num_heads = int(num_heads)
     num_valid_pages = int(num_valid_pages)
@@ -223,6 +230,21 @@ def _topk_grid_plan(
         if best_cost is None or cost <= best_cost:
             best_cost = cost
             num_slices = candidate
+    # Lever T11b (round 7): a small grid whose cost-minimal slice streams (> cap) over the streaming program's nvp
+    # range takes the stage-only S = 16 plan (duplicated verbatim from the module; see its T11b paragraph).
+    if (
+        qpack == 1
+        and total_q * num_heads <= _TOPK_SMALL_GRID_MAX_ROWS
+        and num_valid_pages <= _TOPK_STREAM_MAX_NVP
+        and -(-num_valid_pages // num_slices) > _TOPK_CAND_CAP
+        and groups * _TOPK_SMALL_GRID_SLICES <= wave_ctas
+    ):
+        # here 513 <= nvp <= 1024, so the slice 33..64 is admitted and stage-only
+        assert (
+            _TOPK_SMALL_GRID_SLICES in fitting
+            and -(-num_valid_pages // _TOPK_SMALL_GRID_SLICES) <= _TOPK_CAND_CAP
+        )
+        num_slices = _TOPK_SMALL_GRID_SLICES
     slice_len = -(-num_valid_pages // num_slices)
     grid = groups * num_slices
     slice_k_tiles = -(-slice_len // 16)
@@ -256,7 +278,9 @@ def _topk_route(
     """Shape-only program choice (duplicated verbatim from
     loom/examples/weave/minimax_sparse_topk_select_v2_sm100.py::topk_route): ``topk_select_streaming`` (the
     one-CTA-per-row program) for small latency-bound multi-pass grids -- at most ``_TOPK_STREAM_MAX_ROWS`` rows,
-    at most ``_TOPK_STREAM_MAX_NVP`` valid pages and a planned slice above the candidate cap; ``topk_select_q32``
+    at most ``_TOPK_STREAM_MAX_NVP`` valid pages and a planned slice above the candidate cap (lever T11b plans the
+    grids of at most ``_TOPK_SMALL_GRID_MAX_ROWS`` rows of that regime stage-only at ``S = 16``, so they never
+    reach the streaming program); ``topk_select_q32``
     (the 32-query instance) for an even ``total_q >= _TOPK_Q32_MIN_Q`` whose 32-query plan has a slice in
     ``[_TOPK_Q32_MIN_SLICE, _TOPK_Q32_MAX_SLICE]``; otherwise one of the query-tiled radix select's two 16-query
     production instances by the planned slice (``_topk_radix_route``): ``topk_select_keq`` for a streamed

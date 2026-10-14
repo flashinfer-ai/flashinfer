@@ -198,6 +198,39 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "closure_sha256": "c7d9b0ed25c9b06367c43a3c6ef74d72540f4cc6852290bef1b1a0c0eaf88e38",
     },
+    "cake_blackwell_msa_090fde3ccd83ac99e97d": {
+        "sources": [
+            "blackwell_msa/cake_blackwell_msa_090fde3ccd83ac99e97d_kernel.cu",
+            "blackwell_msa/cake_blackwell_msa_090fde3ccd83ac99e97d_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "max_score"],
+            ["buffer", "output"],
+            ["parameter", "num_heads"],
+            ["parameter", "max_k_tiles"],
+            ["parameter", "total_q"],
+            ["parameter", "num_valid_pages"],
+            ["parameter", "force_begin_blocks"],
+            ["parameter", "force_end_blocks"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [256, 1, 1],
+            "dynamic_smem_bytes": 33024,
+            "cluster": [1, 1, 1],
+            "cooperative": False,
+            "use_pdl": False,
+            "persistent_ctas_per_sm": 1,
+            "max_persistent_clusters": None,
+            "cluster_scheduling_policy": "spread",
+        },
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "2dcd749136fd99dcb364e69da81c3a65cfa29ed03e283a638ebadf7530629654",
+    },
     "cake_blackwell_msa_0d391c271a9e1dd7de1b": {
         "sources": [
             "blackwell_msa/cake_blackwell_msa_0d391c271a9e1dd7de1b_kernel.cu",
@@ -1134,39 +1167,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "closure_sha256": "06a486ebf19d3f6feb7a98c91f13b0c97d094cde0b1e48650fc20ae6ba4d3151",
     },
-    "cake_blackwell_msa_9b2a4e4b7dfc96f12c9a": {
-        "sources": [
-            "blackwell_msa/cake_blackwell_msa_9b2a4e4b7dfc96f12c9a_kernel.cu",
-            "blackwell_msa/cake_blackwell_msa_9b2a4e4b7dfc96f12c9a_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "max_score"],
-            ["buffer", "output"],
-            ["parameter", "num_heads"],
-            ["parameter", "max_k_tiles"],
-            ["parameter", "total_q"],
-            ["parameter", "num_valid_pages"],
-            ["parameter", "force_begin_blocks"],
-            ["parameter", "force_end_blocks"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "launch": {
-            "block": [256, 1, 1],
-            "dynamic_smem_bytes": 32896,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
-        "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "b688de0c349b00604e18e999ce4cb595dda3755b578a23ad5b8af8c52e438025",
-    },
     "cake_blackwell_msa_9b8df5a0ca9c4ec6c3f4": {
         "sources": [
             "blackwell_msa/cake_blackwell_msa_9b8df5a0ca9c4ec6c3f4_kernel.cu",
@@ -1803,7 +1803,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "topk_select:main": "cake_blackwell_msa_4a11da13a4f9e4a75167",
         "topk_select_keq:main": "cake_blackwell_msa_0301f8d49b7d96d6139e",
         "topk_select_q32:main": "cake_blackwell_msa_fd97fbe191899889e24d",
-        "topk_select_streaming:main": "cake_blackwell_msa_9b2a4e4b7dfc96f12c9a",
+        "topk_select_streaming:main": "cake_blackwell_msa_090fde3ccd83ac99e97d",
     },
     "sm103a": {
         "decode_fp8_q1:q1_flat_xform2:main": "cake_blackwell_msa_2949bc72ee78a52859c9",
@@ -1836,7 +1836,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "topk_select:main": "cake_blackwell_msa_4a11da13a4f9e4a75167",
         "topk_select_keq:main": "cake_blackwell_msa_0301f8d49b7d96d6139e",
         "topk_select_q32:main": "cake_blackwell_msa_fd97fbe191899889e24d",
-        "topk_select_streaming:main": "cake_blackwell_msa_9b2a4e4b7dfc96f12c9a",
+        "topk_select_streaming:main": "cake_blackwell_msa_090fde3ccd83ac99e97d",
     },
 }
 

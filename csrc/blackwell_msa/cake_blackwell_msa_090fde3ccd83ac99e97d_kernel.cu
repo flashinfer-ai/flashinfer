@@ -20,27 +20,27 @@
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_WARP_SCORES_OFF 0
-#define SMEM_WARP_SCORES_STAGE_BYTES 32
-#define SMEM_WARP_SCORES_STRIDE 32
-#define SMEM_WARP_INDICES_OFF 32
-#define SMEM_WARP_INDICES_STAGE_BYTES 32
-#define SMEM_WARP_INDICES_STRIDE 32
-#define SMEM_SELECTED_OFF 64
+#define SMEM_WARP_SCORES_STAGE_BYTES 64
+#define SMEM_WARP_SCORES_STRIDE 64
+#define SMEM_WARP_INDICES_OFF 64
+#define SMEM_WARP_INDICES_STAGE_BYTES 64
+#define SMEM_WARP_INDICES_STRIDE 64
+#define SMEM_SELECTED_OFF 128
 #define SMEM_SELECTED_STAGE_BYTES 64
 #define SMEM_SELECTED_STRIDE 64
-#define SMEM_CANDIDATE_SCORES_OFF 128
+#define SMEM_CANDIDATE_SCORES_OFF 192
 #define SMEM_CANDIDATE_SCORES_STAGE_BYTES 16384
 #define SMEM_CANDIDATE_SCORES_STRIDE 16384
-#define SMEM_CANDIDATE_INDICES_OFF 16512
+#define SMEM_CANDIDATE_INDICES_OFF 16576
 #define SMEM_CANDIDATE_INDICES_STAGE_BYTES 16384
 #define SMEM_CANDIDATE_INDICES_STRIDE 16384
-#define SMEM_TOTAL 32896
+#define SMEM_TOTAL 33024
 #define THREADS 256
 
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_blackwell_msa_9b2a4e4b7dfc96f12c9a(float* __restrict__ max_score, int* __restrict__ output, int num_heads, int max_k_tiles, int total_q, int num_valid_pages, int force_begin_blocks, int force_end_blocks)
+kernel_cake_blackwell_msa_090fde3ccd83ac99e97d(float* __restrict__ max_score, int* __restrict__ output, int num_heads, int max_k_tiles, int total_q, int num_valid_pages, int force_begin_blocks, int force_end_blocks)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -116,7 +116,7 @@ kernel_cake_blackwell_msa_9b2a4e4b7dfc96f12c9a(float* __restrict__ max_score, in
         }
     }
     for (int rank_2 = 0; rank_2 < 16; rank_2++) {
-        int candidate_offset = tid_0 * 16 + rank_2;
+        int candidate_offset = rank_2 * 256 + tid_0;
         candidate_scores[candidate_offset] = local_scores[rank_2];
         candidate_indices[candidate_offset] = local_indices[rank_2];
     }
@@ -124,7 +124,7 @@ kernel_cake_blackwell_msa_9b2a4e4b7dfc96f12c9a(float* __restrict__ max_score, in
     int local_rank = 0;
     for (int slot = 0; slot < 16; slot++) {
         if (forced <= slot) {
-            int candidate_offset_1 = tid_0 * 16 + local_rank;
+            int candidate_offset_1 = local_rank * 256 + tid_0;
             float local_score = ((local_rank < 16) ? candidate_scores[candidate_offset_1] : -CAKE_INF);
             int local_index = ((local_rank < 16) ? candidate_indices[candidate_offset_1] : max_k_tiles);
             float _warp_reduce_0 = local_score;
@@ -139,44 +139,43 @@ kernel_cake_blackwell_msa_9b2a4e4b7dfc96f12c9a(float* __restrict__ max_score, in
             int _warp_redux_i32_0;
             asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_i32_0) : "r"(neg_index_at_warp_score));
             int warp_index = -_warp_redux_i32_0;
+            int parity_base = (slot & 1) * 8;
             if (lane_1 == 0) {
-                warp_scores[warp_2] = _warp_reduce_0;
-                warp_indices[warp_2] = warp_index;
+                warp_scores[parity_base + warp_2] = _warp_reduce_0;
+                warp_indices[parity_base + warp_2] = warp_index;
             }
             __syncthreads();
-            if (warp_2 == 0) {
-                float block_score = -CAKE_INF;
-                int block_index = max_k_tiles;
-                if (lane_1 < 8) {
-                    block_score = warp_scores[lane_1];
-                    block_index = warp_indices[lane_1];
-                }
-                float _warp_reduce_1 = block_score;
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
-                int index_at_best = max_k_tiles;
-                if (block_score == _warp_reduce_1) {
-                    index_at_best = block_index;
-                }
-                int neg_index_at_best = -index_at_best;
-                int _warp_redux_i32_1;
-                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_i32_1) : "r"(neg_index_at_best));
-                int best_index = -_warp_redux_i32_1;
-                if (lane_1 == 0) {
-                    int selected_index = best_index;
-                    if (best_index >= num_valid_pages) {
-                        selected_index = -1;
-                    }
-                    selected[slot] = selected_index;
-                }
+            float block_score = -CAKE_INF;
+            int block_index = max_k_tiles;
+            if (lane_1 < 8) {
+                block_score = warp_scores[parity_base + lane_1];
+                block_index = warp_indices[parity_base + lane_1];
             }
-            __syncthreads();
-            if (local_index == selected[slot]) {
+            float _warp_reduce_1 = block_score;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
+            int index_at_best = max_k_tiles;
+            if (block_score == _warp_reduce_1) {
+                index_at_best = block_index;
+            }
+            int neg_index_at_best = -index_at_best;
+            int _warp_redux_i32_1;
+            asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_i32_1) : "r"(neg_index_at_best));
+            int best_index = -_warp_redux_i32_1;
+            int selected_index = best_index;
+            if (best_index >= num_valid_pages) {
+                selected_index = -1;
+            }
+            if (tid_0 == 0) {
+                selected[slot] = selected_index;
+            }
+            if (local_index == selected_index) {
                 local_rank += 1;
             }
         }
     }
+    __syncthreads();
     if (warp_2 == 0) {
         int value = max_k_tiles;
         if (lane_1 < 16) {
