@@ -326,7 +326,40 @@ M=8192 up, and the remaining 2-19% at smaller M is the wave quantisation of a 12
 that the register-sourced conversion keeps from getting shorter.  The hand kernel is called
 for 8 of the 144 rows (N <= 512, M <= 4096); deleting it would cost those rows 5-30%.
 
-Results: `sweepH3_{rows,ncu}_*` (variants and `auto`), `ncuH3_*` (`--set full` with source
+**Free-running clocks (Wed 14 Oct 2026, a4u8g-0015).**  Everything above was timed by ncu
+at its locked base clock, which is the right tool for counting instructions and finding the
+padding tiles but not the number a user sees: on these shapes the GPU sits on its 700 W cap
+and the SM clock is set by how many joules per flop each kernel spends.  Re-measured the way
+the repo benchmarks measure (CUPTI, L2 flushed, free clocks, `--algo auto hand` back to back
+in one process; `freeH3_r*.csv`), with `nvidia-smi dmon` sampling next to it:
+
+| M | hand (v37) / cuBLAS | H3 auto / cuBLAS | mean cuBLAS TFLOP/s | SM clock, busy samples |
+|---|---|---|---|---|
+| 1024 | 1.27 | 1.15 | 655 | 1980 MHz |
+| 2048 | 1.17 | 1.07 | 711 | |
+| 4096 | 1.06 | 1.03 | 737 | |
+| 8192 | 1.04 | 1.01 | 746 | 1350-1965 |
+| 44160 | 1.03 | 1.05 | 716 | 1260-1935, median 1410 |
+| 88320 | 1.02 | 1.02 | 671 | 1245-1980, median 1395 |
+
+The "TFLOP/s falls at large M" shape of every line in the plots, cuBLAS included, is the
+power cap: from M=8192 up the GPU runs at 1.25-1.5 GHz instead of 1.98, i.e. ~700 of the
+989 TFLOP/s headline.  Whether the in-kernel dequant costs clock was checked directly on
+und.q tp4 M=88320 (each implementation alone for ~4 s, two passes, 20 s cool-down between;
+`clock_*_p{1,2}.txt`): cuBLAS 2545 us at 596-672 W / 1384-1536 MHz, H3 auto 2524-2549 us at
+614-661 W / 1444-1462 MHz, hand 2630 us at 617-622 W / 1421-1512 MHz, CUTLASS 128x256 2549
+us at 675 W / 1369-1384 MHz.  Same power, same clock, same time: the conversion does not
+buy a lower clock.  Row-to-row at M >= 44160 the free-running ratios scatter +-10% (e.g.
+und.q tp4 44160 1.14, 88320 1.00; attn.out tp4 88320 0.92) where the locked-clock sweep had
+them all within 1-3%: that is the cap moving the clock between the back-to-back
+measurements, and the 44160 geomean of 1.05 against 1.01 locked is that noise, not a
+regression.  Rows that are 15% off in a single free-running pass at these sizes should be
+repeated before being believed, in either direction (H1's "hand beats cuBLAS 15% at 88320"
+was one such row).  Hopper plot: `plots/w8a16_h100_tflops_grid.png` now draws this sweep,
+auto (H3) and hand (v37) side by side.
+
+Results: `sweepH3_{rows,ncu}_*` (variants and `auto`), `freeH3_r*.csv` / `freeH3_dmon_*` /
+`clock_*` (free-running validation), `ncuH3_*` (`--set full` with source
 of both kernels on gen.qkv tp8 / mlp.gate_up tp8 / mlp.down tp4 M=88320 / gen.qkv tp1),
 `swz_*` and `swz44_*` (the swizzle / raster probes), all under
 `/home/scratch.ishovkun_gpu/w8a16-results/hopper/`.
