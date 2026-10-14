@@ -48,7 +48,10 @@ def _cache_env(monkeypatch, tmp_path):
         "sm107.next_cutedsl_megamoe",
     ],
 )
-def test_live_tokens_distinguish_workloads(monkeypatch, tmp_path, backend):
+@pytest.mark.parametrize("legacy_full_capacity", [False, True])
+def test_live_tokens_distinguish_workloads(
+    monkeypatch, tmp_path, backend, legacy_full_capacity
+):
     import importlib.util
     import json
     from pathlib import Path
@@ -79,9 +82,16 @@ def test_live_tokens_distinguish_workloads(monkeypatch, tmp_path, backend):
     entries = json.loads(path.read_text())["entries"]
     assert len(entries) == 2
     assert {e["live_tokens"] for e in entries} == {128, 512}
+    if legacy_full_capacity:
+        contents = json.loads(path.read_text())
+        for entry in contents["entries"]:
+            if entry["live_tokens"] == 512:
+                del entry["live_tokens"]
+        path.write_text(json.dumps(contents))
     small = {**_KNOBS, "flag_batch": 4}
     cache.record_knobs(small, live_tokens=128, **key)
     assert len(json.loads(path.read_text())["entries"]) == 2
+    assert cache.lookup_knobs(**key) == _KNOBS
     assert cache.live_token_buckets(**key) == [128, 512]
     assert cache.lookup_knobs(live_tokens=64, **key) == small
     assert cache.lookup_knobs(live_tokens=129, **key) == _KNOBS
