@@ -28,8 +28,8 @@ constexpr int kMultiTokenMembers[] = {2, 3, 4, 5, 6, 7, 8};
 constexpr int kMultiTokenRuleChoices[] = {2, 4, 8};
 
 struct MultiTokenBand {
-  int64_t token_lo;  // inclusive, > kMultiTokenMaxCtas
-  int64_t token_hi;  // inclusive
+  int64_t token_lo;    // inclusive, > kMultiTokenMaxCtas
+  int64_t token_hi;    // inclusive
   int tokens_per_cta;  // one of kMultiTokenMembers
 };
 // Per-band table, checked before the shipped rule; kMultiTokenBandCount entries are live (the
