@@ -675,6 +675,37 @@ def test_sm107a_bodies_are_selected_for_the_measured_bf16_shapes_only():
         cake_bgmv_moe._generic_metadata(32, "bfloat16").body
         == "cake_bgmv_moe_generic_bf16_r32.cu"
     )
+    # The generic bf16 rank-32 record (merge-in-expand) serves on compute capability 10.7 only;
+    # its binding passes the shrink's per-split partials to the expand kernels.
+    generic_sm107a = cake_bgmv_moe._generic_metadata(32, "bfloat16", "sm107a")
+    assert generic_sm107a.body == "cake_bgmv_moe_generic_bf16_r32_sm107a.cu"
+    assert (
+        cake_bgmv_moe._generic_metadata(32, "float16", "sm107a").body
+        == "cake_bgmv_moe_generic_f16_r32.cu"
+    )
+    for rank in (8, 16, 64):
+        assert (
+            cake_bgmv_moe._generic_metadata(rank, "bfloat16", "sm107a").body
+            == f"cake_bgmv_moe_generic_bf16_r{rank}.cu"
+        )
+    for arch in ("sm90a", "sm100a", "sm103a", None):
+        assert (
+            cake_bgmv_moe._generic_metadata(32, "bfloat16", arch).body
+            == "cake_bgmv_moe_generic_bf16_r32.cu"
+        )
+    target = cake_bgmv_moe._check_arch("sm107a")
+    assert "#define CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND 1\n" in (
+        cake_bgmv_moe._generic_binding_source(generic_sm107a, 32, target)
+    )
+    assert "#define CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND 0\n" in (
+        cake_bgmv_moe._generic_binding_source(
+            cake_bgmv_moe._generic_metadata(32, "bfloat16"), 32, target
+        )
+    )
+    generic_body = (csrc_dir / generic_sm107a.body).read_text()
+    for symbol in generic_sm107a[1:]:
+        assert symbol in generic_body
+    assert "sm_107a only" in generic_body
 
     def smem_lines(text):
         return sorted(
