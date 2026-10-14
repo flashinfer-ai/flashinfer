@@ -14,7 +14,7 @@ def select(
     cache: torch.Tensor,
     page_table: torch.Tensor,
     lengths: torch.Tensor,
-    active_width: torch.Tensor,
+    active_width: torch.Tensor | None,
     schedule: torch.Tensor | None,
     scratch: torch.Tensor,
     indices: torch.Tensor,

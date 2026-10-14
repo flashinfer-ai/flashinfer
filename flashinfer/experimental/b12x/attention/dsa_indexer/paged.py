@@ -1032,11 +1032,7 @@ def index_topk_fp8(
         ):
             raise ValueError("paged indexer carry buffers must be contiguous")
 
-    active_width = (
-        binding_active_width
-        if binding_active_width is not None
-        else scratch.get_paged_indexer_active_width_cap()
-    )
+    active_width = binding_active_width
     stream_scorer = bool(getattr(scratch, "stream_scorer", True))
     page_table_for_kernel = metadata.real_page_table
     lengths_for_kernel = metadata.cache_seqlens_int32

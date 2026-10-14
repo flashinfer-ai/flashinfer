@@ -71,7 +71,9 @@ class _DsaIndexerState:
             # Serialized operators may overwrite every byte of shared scratch.
             runtime.scratch.fused_indexer_merge_state.zero_()
             if output_scores is None:
-                output_scores = runtime.scratch.indexer_contiguous_topk_values[:q_fp8.shape[0]]
+                output_scores = runtime.scratch.indexer_contiguous_topk_values[
+                    : q_fp8.shape[0]
+                ]
         return index_topk_fp8(
             q_fp8=q_fp8,
             weights=query_weights,
@@ -362,7 +364,9 @@ def _query(caps, invocation):
     if not isinstance(operands, FrozenMapping):
         raise ValueError("DSA invocation operands must be immutable metadata")
     if caps.cache_format != "mxfp4" and any(
-        name not in operands or operands[name] is None for name in _OPERANDS[:-1]
+        name not in operands or operands[name] is None
+        for name in _OPERANDS
+        if name not in {"active_width", "output_scores"}
     ):
         raise ValueError(
             "DSA FP8 declarations require invocation_from_tensors metadata"

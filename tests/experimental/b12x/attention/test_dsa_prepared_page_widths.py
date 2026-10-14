@@ -15,9 +15,10 @@ from b12x.testing.reference.helpers import require_b12x
 @pytest.mark.parametrize("physical", [False, True])
 @pytest.mark.parametrize("with_scores", [False, True])
 @pytest.mark.parametrize("mode", ["decode", "prefill"])
+@pytest.mark.parametrize("dynamic_width", [False, True])
 @torch.inference_mode()
 def test_prepared_dsa_single_and_multiple_supertiles(
-    physical, with_scores, mode, tmp_path
+    physical, with_scores, mode, dynamic_width, tmp_path
 ):
     device = require_b12x()
     torch.manual_seed(161)
@@ -37,7 +38,11 @@ def test_prepared_dsa_single_and_multiple_supertiles(
         first_page, first_page + max_pages, dtype=torch.int32, device=device
     )[None].repeat(rows, 1)
     lengths = torch.full((rows,), max_pages * 64, dtype=torch.int32, device=device)
-    active = torch.full((1,), max_pages * 64, dtype=torch.int32, device=device)
+    active = (
+        torch.full((1,), max_pages * 64, dtype=torch.int32, device=device)
+        if dynamic_width
+        else None
+    )
     output = torch.empty(rows, topk, dtype=torch.int32, device=device)
     scores = (
         torch.empty(rows, topk, dtype=torch.float32, device=device)
@@ -131,12 +136,14 @@ def test_prepared_dsa_single_and_multiple_supertiles(
         session.freeze()
         for width in (16, 32, 48):
             lengths.fill_(width * 64)
-            active.fill_(width * 64)
+            if active is not None:
+                active.fill_(width * 64)
             binding = dsa.bind(
                 plan,
                 scratch=scratch,
                 **{**operands, "page_table": pages[:, :width].contiguous()},
             )
+            scratch.zero_()
             dsa.run(binding)
             check()
             graph = torch.cuda.CUDAGraph()
@@ -146,6 +153,7 @@ def test_prepared_dsa_single_and_multiple_supertiles(
                 q.copy_((-q.float()).to(q.dtype))
                 lengths[0] -= 128
                 output.fill_(-1)
+                scratch.fill_(255)
                 allocated = torch.cuda.memory_allocated(device)
                 graph.replay()
                 torch.cuda.synchronize(device)

@@ -12,11 +12,13 @@ from ..conftest import require_b12x
 
 
 @pytest.mark.parametrize(
-    "mode,rows", [("decode", 2), ("prefill", 65), ("prefill", 4096)]
+    "mode,rows", [("decode", 2), ("decode", 32), ("prefill", 65), ("prefill", 4096)]
 )
 @pytest.mark.parametrize("with_scores", [False, True])
+@pytest.mark.parametrize("dynamic_width", [False, True])
 @torch.no_grad()
-def test_prepared_indexer_compiled_graph(mode, rows, with_scores):
+def test_prepared_indexer_compiled_graph(mode, rows, with_scores, dynamic_width):
+    torch.compiler.reset()
     device = require_b12x()
     heads, pages, topk = 32, 32, 512
     source = torch.randn((rows, heads, 128), device=device).to(torch.float8_e4m3fn)
@@ -32,7 +34,11 @@ def test_prepared_indexer_compiled_graph(mode, rows, with_scores):
     lengths = (
         torch.arange(rows, dtype=torch.int32, device=device) // 4 + 600
     ).clamp_max(pages * 64)
-    width = torch.tensor([pages * 64], dtype=torch.int32, device=device)
+    width = (
+        torch.tensor([pages * 64], dtype=torch.int32, device=device)
+        if dynamic_width
+        else None
+    )
     indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
     scores = (
         torch.empty((rows, topk), dtype=torch.float32, device=device)
@@ -99,6 +105,15 @@ def test_prepared_indexer_compiled_graph(mode, rows, with_scores):
 
         session.prepare((plan.request(name="indexer", prepare_call=prepare),))
         binding = dsa_indexer.bind(plan, scratch=scratch, **inputs)
+        other_width = (
+            None
+            if dynamic_width
+            else torch.full((1,), pages * 64, dtype=torch.int32, device=device)
+        )
+        with pytest.raises(ValueError, match="presence must match"):
+            dsa_indexer.bind(
+                plan, scratch=scratch, **{**inputs, "active_width": other_width}
+            )
 
         def forward():
             query.copy_(source)
@@ -120,7 +135,7 @@ def test_prepared_indexer_compiled_graph(mode, rows, with_scores):
             compiled()
         session.freeze()
         state = require_prepared(plan, "attention.dsa_indexer", query.device)
-        for count in (256, 1024, pages * 64):
+        for count in (0, 256, 1024, pages * 64):
             source.copy_(torch.randn(source.shape, device=device).to(source.dtype))
             weights.normal_()
             cache_source.copy_(
@@ -134,6 +149,10 @@ def test_prepared_indexer_compiled_graph(mode, rows, with_scores):
                 ).clamp_max(pages * 64)
             )
             lengths[0] = 0
+            if count == 0:
+                lengths.zero_()
+            if width is not None:
+                width.copy_(lengths.amax().reshape(1))
             query.copy_(source)
             query_weights.copy_(weights)
             cache.copy_(cache_source)

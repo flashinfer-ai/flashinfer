@@ -127,7 +127,7 @@ def bind(
     index_k_cache: torch.Tensor,
     page_table: torch.Tensor,
     cache_lengths: torch.Tensor,
-    active_width: torch.Tensor,
+    active_width: torch.Tensor | None = None,
     output_indices: torch.Tensor,
     output_scores: torch.Tensor | None = None,
     candidate_indices: torch.Tensor | None = None,
@@ -136,7 +136,12 @@ def bind(
     candidate_output_lengths: torch.Tensor | None = None,
     score_width: int | None = None,
 ) -> Binding:
-    """Bind real tensors to a prepared FP8 or MXFP4 plan."""
+    """Bind real tensors to a prepared FP8 or MXFP4 plan.
+
+    FP8 selection uses the page-table extent when ``active_width`` is omitted.
+    A supplied device scalar bounds scoring and must cover every row's visible
+    cache length. MXFP4 selection requires the device scalar.
+    """
     if not isinstance(plan, Plan):
         raise TypeError("bind requires a session-prepared Plan")
     device_tensor = q_mxfp4 if q_mxfp4 is not None else q_fp8
@@ -144,6 +149,8 @@ def bind(
         raise ValueError("bind requires q_fp8 or q_mxfp4")
     state = require_prepared(plan, "attention.dsa_indexer", device_tensor.device)
     if isinstance(state, MXFP4PreparedState):
+        if active_width is None:
+            raise ValueError("MXFP4 selection requires active_width")
         if q_fp8 is not None or q_mxfp4 is None or q_scales is None:
             raise ValueError("MXFP4 prepared plan requires q_mxfp4 and q_scales only")
         runtime_binding = state.bind(
@@ -176,6 +183,8 @@ def bind(
         )
     if q_mxfp4 is not None or q_scales is not None:
         raise ValueError("FP8 prepared plan requires q_fp8 only")
+    if (active_width is None) != (plan.query.operands["active_width"] is None):
+        raise ValueError("active_width presence must match the prepared declaration")
     caps = state.layout.caps
     if (
         q_fp8 is None

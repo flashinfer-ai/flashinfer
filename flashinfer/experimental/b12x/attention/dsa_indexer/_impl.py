@@ -632,11 +632,11 @@ def paged_decode_logits(
         )
 
     seqlens_valid = metadata.cache_seqlens_int32.contiguous()
-    if active_width_override is None:
+    if active_width_override is None and binding is None:
         active_width = _make_active_width_tensor(
             seqlens_per_query=seqlens_valid, width=width_tokens
         )
-    else:
+    elif active_width_override is not None:
         if active_width_override.shape != (1,):
             raise ValueError(
                 f"active_width_override must have shape (1,), got {tuple(active_width_override.shape)}"
@@ -652,12 +652,18 @@ def paged_decode_logits(
                 f"{active_width_override.device} does not match q_fp8 device {q_fp8.device}"
             )
         active_width = active_width_override
+    else:
+        active_width = None
 
     validate_page_ids = q_fp8.device.type != "cuda" or (
         _VALIDATE_PAGE_IDS and not _is_cuda_graph_capture_active(q_fp8.device)
     )
     if validate_page_ids:
-        active_width_host = min(width_tokens, int(active_width.item()))
+        active_width_host = (
+            width_tokens
+            if active_width is None
+            else min(width_tokens, int(active_width.item()))
+        )
         if active_width_host > 0:
             max_page_capacity = index_k_cache.shape[0]
             positions = torch.arange(
@@ -888,7 +894,7 @@ def msa_paged_decode_block_scores(
     if use_page_max:
         weights = q_scale[:valid_q_rows].contiguous() * MSA_SM_SCALE
         seqlens_valid = metadata.cache_seqlens_int32.contiguous()
-        if active_width_override is None:
+        if active_width_override is None and binding is None:
             active_width = _make_active_width_tensor(
                 seqlens_per_query=seqlens_valid,
                 width=width_tokens,
