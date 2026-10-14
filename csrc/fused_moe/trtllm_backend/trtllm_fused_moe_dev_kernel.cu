@@ -20,6 +20,7 @@
 #include <cutlass/numeric_types.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
@@ -473,11 +474,16 @@ void run(Data const& data, void* stream) {
 
   if (data.mUseDeepSeekFp8 && data.mDtypeElt == tg::Dtype::E4m3 && data.innerDim % 256 == 0 &&
       data.numTokens >= 1024) {
-    int64_t const numWarps = (int64_t)data.numTokens * data.topK * (data.innerDim / 256);
-    int const numThreads = 256;
-    int const numBlocks = (int)((numWarps * 32 + numThreads - 1) / numThreads);
-    LAUNCH_ACTIVATION(data, activationDeepSeekVectorKernel, 1, numBlocks, numThreads, 0, stream);
-    return;
+    bool const vectorAligned =
+        (reinterpret_cast<std::uintptr_t>(data.inPtr) % alignof(uint32_t) == 0) &&
+        (reinterpret_cast<std::uintptr_t>(data.outPtr) % alignof(uint32_t) == 0);
+    if (vectorAligned) {
+      int64_t const numWarps = (int64_t)data.numTokens * data.topK * (data.innerDim / 256);
+      int const numThreads = 256;
+      int const numBlocks = (int)((numWarps * 32 + numThreads - 1) / numThreads);
+      LAUNCH_ACTIVATION(data, activationDeepSeekVectorKernel, 1, numBlocks, numThreads, 0, stream);
+      return;
+    }
   }
   if (data.mUseDeepSeekFp8) {
     constexpr int NUM_ELTS_PER_LOAD = 1;
