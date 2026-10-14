@@ -140,7 +140,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_qkv_norm_rope_exchange_overlap_ee93eeff8ef51fd85938(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ cos_sin, __nv_bfloat16* __restrict__ q_scale, __nv_bfloat16* __restrict__ k_scale, long long* __restrict__ tiles, long long* __restrict__ dst_ptrs, long long* __restrict__ ready_ptrs, unsigned int* __restrict__ counters, int num_tiles, int M, int K, int S_local, int head_stride, long long batch_stride, long long slot_elem_offset, int pad_base, int num_words, int rank, int world, unsigned int ready_target, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags)
+kernel_cake_qkv_norm_rope_exchange_overlap_433d978ba7ef0b9cb825(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ cos_sin, __nv_bfloat16* __restrict__ q_scale, __nv_bfloat16* __restrict__ k_scale, long long* __restrict__ tiles, long long* __restrict__ dst_ptrs, long long* __restrict__ ready_ptrs, unsigned int* __restrict__ counters, int num_tiles, int M, int K, int S_local, int head_stride, long long batch_stride, long long slot_elem_offset, int pad_base, int num_words, int rank, int world, unsigned int ready_target, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -198,12 +198,6 @@ kernel_cake_qkv_norm_rope_exchange_overlap_ee93eeff8ef51fd85938(const __grid_con
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
     }
-    __syncthreads();
-    // Inc phase consumes the registers released above.
-    if (warp >= 0 && warp <= 7) {
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 232;");
-    }
-    __syncthreads();
 
     // ---- Role: producer ----
     if (warp >= 8 && warp <= 10) {
@@ -255,6 +249,7 @@ kernel_cake_qkv_norm_rope_exchange_overlap_ee93eeff8ef51fd85938(const __grid_con
         }
     // ---- Role: math ----
     } else if (warp <= 7) {
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 232;");
         { // math_main
             unsigned int total_tiles_c = (unsigned int)num_tiles;
             unsigned int num_k_stages_c = (unsigned int)K / 64;

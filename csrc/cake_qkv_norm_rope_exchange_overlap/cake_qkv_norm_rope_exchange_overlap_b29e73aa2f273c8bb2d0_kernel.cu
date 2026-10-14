@@ -26,6 +26,8 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
+template <typename T, int Capacity = 8>
+struct __align__(16) CakePeerPointerTable { T* ptrs[Capacity]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
@@ -138,7 +140,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_qkv_norm_rope_exchange_overlap_849dd94cf08ca290ee35(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ cos_sin, __nv_bfloat16* __restrict__ q_scale, __nv_bfloat16* __restrict__ k_scale, long long* __restrict__ tiles, long long* __restrict__ dst_ptrs, long long* __restrict__ ready_ptrs, unsigned int* __restrict__ counters, int num_tiles, int M, int K, int S_local, int head_stride, long long batch_stride, long long slot_elem_offset, int pad_base, int num_words, int rank, int world, unsigned int ready_target)
+kernel_cake_qkv_norm_rope_exchange_overlap_b29e73aa2f273c8bb2d0(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ cos_sin, __nv_bfloat16* __restrict__ q_scale, __nv_bfloat16* __restrict__ k_scale, long long* __restrict__ tiles, long long* __restrict__ dst_ptrs, long long* __restrict__ ready_ptrs, unsigned int* __restrict__ counters, int num_tiles, int M, int K, int S_local, int head_stride, long long batch_stride, long long slot_elem_offset, int pad_base, int num_words, int rank, int world, unsigned int ready_target, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -196,15 +198,9 @@ kernel_cake_qkv_norm_rope_exchange_overlap_849dd94cf08ca290ee35(const __grid_con
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
     }
-    __syncthreads();
-    // Inc phase consumes the registers released above.
-    if (warp >= 0 && warp <= 7) {
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 232;");
-    }
-    __syncthreads();
 
     // ---- Role: producer ----
-    if (warp >= 8 && warp <= 11) {
+    if (warp >= 8 && warp <= 10) {
         { // producer_main
             unsigned int total_tiles_p = (unsigned int)num_tiles;
             unsigned int num_k_stages_p = (unsigned int)K / 64;
@@ -253,6 +249,7 @@ kernel_cake_qkv_norm_rope_exchange_overlap_849dd94cf08ca290ee35(const __grid_con
         }
     // ---- Role: math ----
     } else if (warp <= 7) {
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 232;");
         { // math_main
             unsigned int total_tiles_c = (unsigned int)num_tiles;
             unsigned int num_k_stages_c = (unsigned int)K / 64;
@@ -1413,6 +1410,27 @@ kernel_cake_qkv_norm_rope_exchange_overlap_849dd94cf08ca290ee35(const __grid_con
                     accum[62] = xs0_250 * cos_v_246 - xs1_251 * sin_v_247;
                     accum[63] = xs1_251 * cos_v_246 + xs0_250 * sin_v_247;
                 }
+                if (it_c == num_k_stages_c) {
+                    unsigned int* arrive_e = reinterpret_cast<unsigned int*>(ready_ptrs[world]);
+                    if (warp == 0) {
+                        #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+                        {
+                        bool _warp_acquire_ready;
+                        do {
+                        _warp_acquire_ready = true;
+                        if (1) {
+                        unsigned int _warp_acquire_observed;
+                        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_warp_acquire_observed) : "l"(reinterpret_cast<unsigned int*>(arrive_e)) : "memory");
+                        _warp_acquire_ready = _warp_acquire_observed == static_cast<unsigned int>(ready_target);
+                        }
+                        } while (!__all_sync(static_cast<unsigned>(4294967295), _warp_acquire_ready));
+                        }
+                        #elif defined(__CUDA_ARCH__)
+                        #error "GlobalWarpWaitAcquire requires SM70 or newer"
+                        #endif
+                    }
+                    asm volatile("barrier.sync 8, 256;" ::: "memory");
+                }
                 __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(dst_ptrs[dest_c]);
                 unsigned int d0 = q_lane * 8;
                 long long col_off = (long long)d0;
@@ -1682,6 +1700,53 @@ kernel_cake_qkv_norm_rope_exchange_overlap_849dd94cf08ca290ee35(const __grid_con
                             asm volatile("st.relaxed.sys.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(ready_dst) + (pad_base_u + word_c))), "r"(static_cast<unsigned int>(ready_target)) : "memory");
                         }
                     }
+                }
+            }
+        }
+    // ---- Role: rendezvous ----
+    } else if (warp == 11) {
+        { // rendezvous_main
+            if (bid == 0) {
+                // nvlink_barrier(pg_flags) phase=1 owner_warp=11
+                {
+                    const int __ws = pg_world;
+                    const int __me = pg_rank;
+                    const int __warp = warp;
+                    const int __lane = lane;
+                    if (__warp == 11) {
+                        unsigned* __local_epoch = pg_flags.ptrs[__me] + 1;
+                        unsigned __previous_epoch;
+                        asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                            : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
+                        const unsigned __epoch = __previous_epoch + 1u;
+                        const int __bank = (int)(__epoch & 1u);
+                        const int __mailbox_base = 2 + (1 * 2 + __bank) * __ws;
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
+                        if (__lane < __ws) {
+                            unsigned* __peer_mailbox = pg_flags.ptrs[__lane] + __mailbox_base + __me;
+                            asm volatile("st.release.sys.global.u32 [%0], %1;"
+                                :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
+                            unsigned* __local_mailbox = pg_flags.ptrs[__me] + __mailbox_base + __lane;
+                            while (true) {
+                                unsigned __v;
+                                asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                                if (__v != __epoch) continue;
+                                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                                if (__v == __epoch) break;
+                            }
+                            asm volatile("fence.proxy.alias;" ::: "memory");
+                        }
+                        __syncwarp();
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
+                        if (__lane == 0) {
+                            asm volatile("st.release.sys.global.u32 [%0], %1;"
+                                :: "l"(__local_epoch), "r"(__epoch) : "memory");
+                        }
+                    }
+                }
+                unsigned int* arrive_r = reinterpret_cast<unsigned int*>(ready_ptrs[world]);
+                if (elect_sync()) {
+                    asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(arrive_r)), "r"(static_cast<unsigned int>(ready_target)) : "memory");
                 }
             }
         }
