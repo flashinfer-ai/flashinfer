@@ -684,8 +684,15 @@ class TllmGenFmhaKernel {
       numCtasPerSeqKv = std::min(
           tunedMaxNumCtasPerSeqKv,
           std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
-      // Clamp >16 splits to 16 so small-batch long-KV decode keeps the CGA reduction.
+      // Clamp >16 splits to 16 so small-batch long-KV decode keeps the CGA reduction: above 16
+      // CTAs per cluster the launch falls back to the slower GmemReduction (atomic counter) path.
+      // The clamp applies only while each CTA walks <= kMaxSeqLenKvPerCtaForCgaClamp (4096) KV
+      // tokens. Measured on SM107 and SM103: within that bound, 16-split CGA beat the >16-split
+      // GMEM path on all tested one-token shapes (one GB300 D256 shape at 0.98x). The gain shrinks
+      // as the per-CTA KV length grows (64/8 heads: ~1.4x at 1K tokens/CTA, ~1.05x at 4K), and at
+      // 8K tokens/CTA the extra CTAs win (0.96x with the clamp), hence the 4096 bound.
       // Multi-token (spec-decode) D256 is excluded: the clamp measured slightly slower there.
+      // If 16-CTA clusters cannot co-reside, run()'s occupancy check still falls back to GMEM.
       if (numCtasPerSeqKv > kMaxCgaSmemReductionCtasPerSeqKv &&
           (params.mMaxSeqLenQ == 1 || params.mHeadDimV != 256) && params.mHeadDimV < 512 &&
           !isDsv3MinLatencyMode && !selectKernelParams.mForceGmemReduction &&
