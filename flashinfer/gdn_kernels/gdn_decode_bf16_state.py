@@ -87,10 +87,21 @@ def _flatten_intermediate_cache_view(
     v_dim: int,
     k_dim: int,
 ) -> tuple[torch.Tensor, int]:
-    """Return a zero-copy flat alias and its physical per-batch capacity."""
-    expected_shape = (batch_size, num_tokens, num_v_heads, v_dim, k_dim)
-    assert tuple(buffer.shape) == expected_shape, (
-        f"intermediate_states_buffer must have logical shape {expected_shape}, "
+    """Return a zero-copy flat alias and its physical per-batch capacity.
+
+    ``buffer`` is ``[B, S, HV, V, K]`` with ``S >= num_tokens``: either a
+    padded allocation passed directly or a leading view ``cache[:, :T]`` of
+    one. Only steps ``[0, num_tokens)`` are written; the physical capacity
+    comes from ``stride(0)`` in both forms.
+    """
+    assert (
+        buffer.dim() == 5
+        and buffer.shape[0] == batch_size
+        and buffer.shape[1] >= num_tokens
+        and tuple(buffer.shape[2:]) == (num_v_heads, v_dim, k_dim)
+    ), (
+        "intermediate_states_buffer must have logical shape "
+        f"[{batch_size}, >={num_tokens}, {num_v_heads}, {v_dim}, {k_dim}], "
         f"got {tuple(buffer.shape)}"
     )
     cache_step_stride = num_v_heads * v_dim * k_dim
@@ -3690,11 +3701,12 @@ def gated_delta_rule_mtp(
         output_state_indices: Optional [B] int32 - indices for writing updated state.
             Defaults to initial_state_indices when None.
         intermediate_states_buffer: Optional
-            [B, T, HV, V, K] bf16. This buffer is BATCH-scoped, not
+            [B, S, HV, V, K] bf16 with S >= T; only the first T steps of each
+            batch row are written. This buffer is BATCH-scoped, not
             pool-scoped — the kernel indexes it by the per-call batch index
             (i_n), not by the pool slot. A leading slice of a larger cache,
-            for example ``cache[:, :T]``, is supported; its batch stride
-            determines the physical cache capacity.
+            for example ``cache[:, :T]``, is also supported; in both forms
+            the batch stride determines the physical cache capacity.
         disable_state_update: bool - if True, don't update initial state
         scale: Optional, default 1/sqrt(K)
         output: Optional pre-allocated output tensor [B, T, HV, V] bf16
@@ -3735,8 +3747,9 @@ def gated_delta_rule_mtp(
     # padded pool) work without a silent .contiguous() clone. See PR #3268.
     h0_source = initial_state_source
 
-    # The public cache shape is [B, T, HV, V, K]. A leading slice of a larger
-    # allocation carries its physical per-batch capacity in stride(0).
+    # The public cache shape is [B, S, HV, V, K] with S >= T (padded buffer
+    # or its leading view `cache[:, :T]`); stride(0) carries the physical
+    # per-batch capacity in either form.
     cache_intermediate_states = intermediate_states_buffer is not None
     cache_steps = T
     if cache_intermediate_states:

@@ -3533,6 +3533,7 @@ def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
 # ==============================================================================
 
 
+@pytest.mark.parametrize("cache_form", ["view", "padded", "offset"])
 @pytest.mark.parametrize(
     "state_dtype,batch_size,num_v_heads,num_tokens",
     [
@@ -3548,12 +3549,18 @@ def test_gdn_decode_mtp_cache_steps_stride(
     batch_size: int,
     num_v_heads: int,
     num_tokens: int,
+    cache_form: str,
 ):
-    """Honor the physical cache stride of ``cache[:, :T]``.
+    """Honor the physical cache stride of a padded cache.
 
-    The old flat index used ``i_n * T * HV`` and ignored the larger batch
-    stride carried by a leading view of reusable backing storage. For B > 1
-    that packed batch 1 into batch 0's trailing slots and left batch 1's
+    ``cache_form="view"`` passes the leading view ``cache[:, :T]``;
+    ``cache_form="padded"`` passes the ``[B, cache_steps, HV, V, K]``
+    allocation directly with ``cache_steps > T``; ``cache_form="offset"``
+    passes ``cache[1:1 + B, :T]`` of a ``B + 1``-row allocation, so the view
+    also carries a non-zero storage offset. The old flat index used
+    ``i_n * T * HV`` and ignored the larger batch stride in both forms (and
+    the BF16 wrappers wrote a non-contiguous view into a throwaway copy). For
+    B > 1 that packed batch 1 into batch 0's trailing slots and left batch 1's
     requested slots unwritten. Compare against an exact-T cache and require
     the hidden trailing slots to remain bit-exact sentinels across every
     FP32/BF16 MTP kernel route.
@@ -3579,13 +3586,30 @@ def test_gdn_decode_mtp_cache_steps_stride(
 
     cache_exact = torch.zeros(B, T, HV, V, K, dtype=state_dtype, device=device)
     sentinel = 7.0
+    extra_rows = 1 if cache_form == "offset" else 0
     cache_backing = torch.full(
-        (B, cache_steps, HV, V, K), sentinel, dtype=state_dtype, device=device
+        (B + extra_rows, cache_steps, HV, V, K),
+        sentinel,
+        dtype=state_dtype,
+        device=device,
     )
-    cache_view = cache_backing[:, :T]
+    # [B, cache_steps, HV, V, K]; a non-zero storage offset when extra_rows.
+    cache_rows = cache_backing[extra_rows:]
+    cache_view = cache_rows[:, :T]
     assert cache_view.shape == cache_exact.shape
     assert cache_view.stride(0) == cache_steps * HV * V * K
     assert not cache_view.is_contiguous()
+    if cache_form == "padded":
+        # Padded allocation passed directly: logical dim 1 exceeds T and only
+        # steps [0, T) of each batch row may be written.
+        cache_under_test = cache_rows
+        assert cache_under_test.shape[1] == cache_steps > T
+        assert cache_under_test.is_contiguous()
+    else:
+        cache_under_test = cache_view
+        assert (
+            cache_under_test.storage_offset() == extra_rows * cache_steps * HV * V * K
+        )
 
     common = dict(
         A_log=A_log,
@@ -3610,7 +3634,7 @@ def test_gdn_decode_mtp_cache_steps_stride(
         out_padded, _ = gated_delta_rule_mtp(
             **common,
             initial_state=initial_state.clone(),
-            intermediate_states_buffer=cache_view,
+            intermediate_states_buffer=cache_under_test,
             use_qk_l2norm=True,
         )
     elif T == 1:
@@ -3623,7 +3647,7 @@ def test_gdn_decode_mtp_cache_steps_stride(
         out_padded = gdn_decode_bf16_state_t1_wide_vec(
             **common,
             initial_state_source=initial_state.clone(),
-            intermediate_states_buffer=cache_view,
+            intermediate_states_buffer=cache_under_test,
             use_qk_l2norm_in_kernel=True,
         )
     else:
@@ -3636,7 +3660,7 @@ def test_gdn_decode_mtp_cache_steps_stride(
         out_padded = gdn_decode_bf16_state_mtp(
             **common,
             initial_state_source=initial_state.clone(),
-            intermediate_states_buffer=cache_view,
+            intermediate_states_buffer=cache_under_test,
             use_qk_l2norm_in_kernel=True,
         )
 
@@ -3644,11 +3668,17 @@ def test_gdn_decode_mtp_cache_steps_stride(
     torch.testing.assert_close(out_padded, out_exact, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(cache_view, cache_exact, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(
-        cache_backing[:, T:],
-        torch.full_like(cache_backing[:, T:], sentinel),
+        cache_rows[:, T:],
+        torch.full_like(cache_rows[:, T:], sentinel),
         atol=0,
         rtol=0,
     )
+    if extra_rows:
+        # Rows before the batch slice must stay untouched.
+        assert torch.equal(
+            cache_backing[:extra_rows],
+            torch.full_like(cache_backing[:extra_rows], sentinel),
+        )
 
 
 def test_gdn_decode_bf16_dense_cache_int64_boundary():

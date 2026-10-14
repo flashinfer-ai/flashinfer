@@ -572,8 +572,10 @@ def gated_delta_rule_decode_pretranspose(
         writes the updated state back to the same slot it read from (i.e.
         ``initial_state_indices``).
     intermediate_states_buffer : torch.Tensor, optional
-        Caller-owned checkpoint buffer of shape ``[B, >=T, HV, V, K]``.
-        Supported only for ``T > 1``; its dtype must match the state dtype.
+        Caller-owned checkpoint buffer of shape ``[B, >=T, HV, V, K]``, or a
+        leading slice ``cache[:, :T]`` of such a buffer; only the first ``T``
+        steps of each batch row are written. Supported only for ``T > 1``;
+        its dtype must match the state dtype.
     disable_state_update : bool
         Skip final-state writeback for verify calls. Supported only for
         ``T > 1``. Default: ``False``.
@@ -1169,11 +1171,13 @@ def gated_delta_rule_mtp(
         Pre-allocated output tensor of shape ``[B, T, HV, V]``.
     intermediate_states_buffer : torch.Tensor, optional
         Buffer for caching intermediate states, shape
-        ``[B, T, HV, V, K]`` (first dim is indexed per-batch, not per-pool
-        slot; must be float32 when provided). A leading slice of a larger
-        cache, for example ``cache[:, :T]``, is supported; its batch stride
-        determines the physical cache capacity. When ``None``, intermediate
-        states are not cached. Mutually exclusive with ``ssm_state_indices``.
+        ``[B, S, HV, V, K]`` with ``S >= T`` (first dim is indexed per-batch,
+        not per-pool slot; must be float32 when provided). Only the first
+        ``T`` steps of each batch row are written. A leading slice of a
+        larger cache, for example ``cache[:, :T]``, is also supported; in
+        both forms the batch stride determines the physical cache capacity.
+        When ``None``, intermediate states are not cached. Mutually exclusive
+        with ``ssm_state_indices``.
     ssm_state_indices : torch.Tensor, optional
         Per-token pool scatter indices of shape ``[B, T]`` and dtype
         ``torch.int32``.  When provided, the kernel writes each intermediate
@@ -1327,10 +1331,11 @@ def gated_delta_rule_mtp(
     else:
         h0_source = initial_state.reshape(pool_size * HV, V, K)
 
-    # Handle intermediate states. The public shape remains [B, T, HV, V, K].
-    # A caller may reuse a [B, cache_steps, ...] allocation by passing the
-    # leading view `buffer[:, :T]`; stride(0), not shape(1), then carries the
-    # physical per-batch capacity used by the kernel's flat addressing.
+    # Handle intermediate states. The public shape is [B, S, HV, V, K] with
+    # S >= T; only steps [0, T) are written. A caller may pass a padded
+    # [B, cache_steps, ...] allocation directly or its leading view
+    # `buffer[:, :T]`; stride(0), not shape(1), carries the physical per-batch
+    # capacity used by the kernel's flat addressing in either form.
     cache_intermediate_states = intermediate_states_buffer is not None
     if cache_intermediate_states:
         buffer_size = intermediate_states_buffer.shape[0]
@@ -1340,9 +1345,13 @@ def gated_delta_rule_mtp(
             f"at least B={B}: the kernel indexes it by batch (i_n in [0, B)), "
             f"so a smaller buffer causes out-of-bounds writes."
         )
-        assert tuple(intermediate_states_buffer.shape[1:]) == (T, HV, V, K), (
+        assert (
+            intermediate_states_buffer.dim() == 5
+            and intermediate_states_buffer.shape[1] >= T
+            and tuple(intermediate_states_buffer.shape[2:]) == (HV, V, K)
+        ), (
             "intermediate_states_buffer must have logical shape "
-            f"[buffer_size, T={T}, HV={HV}, V={V}, K={K}], got "
+            f"[buffer_size, >={T}, HV={HV}, V={V}, K={K}], got "
             f"{tuple(intermediate_states_buffer.shape)}"
         )
         assert intermediate_states_buffer.dtype == torch.float32, (
