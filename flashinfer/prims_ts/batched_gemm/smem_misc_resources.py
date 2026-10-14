@@ -20,7 +20,6 @@ from typing import Any, Optional
 import cutlass
 import cutlass.cute as cute
 from cutlass.experimental import primitives as prims
-from cutlass.utils import WorkTileInfo
 
 from cutlass.experimental.task_scheduling.enums import TileSchedulerType
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
@@ -29,6 +28,7 @@ from cutlass.experimental.task_scheduling.resources import (
     StageInfo,
     TaskLocalVariable,
     WorkQueue,
+    WorkTileInfo,
     consumer_work,
 )
 
@@ -123,6 +123,7 @@ class BatchedGemmWorkQueue(WorkQueue):
             # Decode the physical cluster ordinal as feature-first logical
             # work, preserving both CTA rank and the scheduler validity bit.
             ordinal = n_idx * (grid_m // cluster_m) + m_idx // cluster_m
+            # TS owns this result type, which can differ from the public scheduler's.
             work_tile = WorkTileInfo(
                 (
                     (ordinal // grid_n) * cluster_m + m_idx % cluster_m,
