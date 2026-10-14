@@ -3012,7 +3012,7 @@ def create_correction_task(
                     to.release()
 
                 v0.wait()
-                _, _, vec_row_sum, vec_scale = v0.read_vec(
+                _, vec_new_max, vec_row_sum, vec_scale = v0.read_vec(
                     scale_softmax_log2=scale_softmax_log2,
                     final_stats=True,
                 )
@@ -3027,6 +3027,7 @@ def create_correction_task(
                         vec_row_sum=vec_row_sum,
                         vec_scale=vec_scale,
                         output_scale=output_scale,
+                        vec_new_max=vec_new_max,
                         head_dim_stage_idx=head_dim_stage_idx,
                     )
                     so0.commit()
@@ -3171,7 +3172,7 @@ def create_correction_task(
                 if not release_stats_after_read:
                     v1.release()
                 v0.wait()
-                _, _, vec_row_sum, vec_scale = v0.read_vec(
+                _, vec_new_max, vec_row_sum, vec_scale = v0.read_vec(
                     scale_softmax_log2=scale_softmax_log2_v0,
                     final_stats=True,
                 )
@@ -3186,12 +3187,13 @@ def create_correction_task(
                         vec_row_sum=vec_row_sum,
                         vec_scale=vec_scale,
                         output_scale=output_scale0,
+                        vec_new_max=vec_new_max,
                         head_dim_stage_idx=head_dim_stage_idx,
                     )
                     so0.commit()
                 to.release()
                 v1.wait()
-                _, _, vec_row_sum, vec_scale = v1.read_vec(
+                _, vec_new_max, vec_row_sum, vec_scale = v1.read_vec(
                     scale_softmax_log2=scale_softmax_log2_v1,
                     final_stats=True,
                 )
@@ -3206,6 +3208,7 @@ def create_correction_task(
                         vec_row_sum=vec_row_sum,
                         vec_scale=vec_scale,
                         output_scale=output_scale1,
+                        vec_new_max=vec_new_max,
                         head_dim_stage_idx=head_dim_stage_idx,
                     )
                     so1.commit()

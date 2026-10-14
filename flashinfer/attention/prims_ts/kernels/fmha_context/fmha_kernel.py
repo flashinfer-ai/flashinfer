@@ -675,6 +675,7 @@ def build_context_task_manager(
     variable_window_q_stride: int | Int32 = 0,
     scale_softmax_log2: cute.Tensor | None = None,
     output_scale: cute.Tensor | None = None,
+    lse: cute.Tensor | None = None,
     g_block_tables: cute.Pointer | None = None,
     block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
@@ -1235,6 +1236,8 @@ def build_context_task_manager(
         cfg=cfg,
         stage_idx=0,
         tmem_vec_resource=tmem_vec0,
+        lse=lse,
+        cum_seqlen_q=cum_seqlen_q,
         name="smem_o_0",
     )
     gmem_o_0 = GmemOResource(
@@ -1322,6 +1325,8 @@ def build_context_task_manager(
             cfg=cfg,
             stage_idx=1,
             tmem_vec_resource=tmem_vec1,
+            lse=lse,
+            cum_seqlen_q=cum_seqlen_q,
             name="smem_o_1",
         )
         gmem_o_1 = GmemOResource(
@@ -1987,6 +1992,8 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
                 cfg, is_clc_dynamic=is_clc_dynamic, require_cadence=False
             ),
         )
+        if cfg.kv_ring_stages:
+            n_stages = cfg.kv_ring_stages
         cfg.kv_stage = n_stages
         cfg.kv_stage_k = n_stages
         cfg.kv_stage_v = n_stages
@@ -2024,6 +2031,8 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
             f"VC-Attention-QK16 needs at least 2 stages per K/V ring, but the "
             f"shared-memory budget of {budget_bytes} bytes fits only {n_stages}"
         )
+    if cfg.kv_ring_stages:
+        n_stages = max(cadence, cfg.kv_ring_stages)
     cfg.kv_stage_k = n_stages
     cfg.kv_stage_v = n_stages
 
@@ -2627,6 +2636,7 @@ def build_fmha_task_manager(
     variable_window_q_stride: int | Int32 = 0,
     scale_softmax_log2: cute.Tensor | None = None,
     output_scale: cute.Tensor | None = None,
+    lse: cute.Tensor | None = None,
     q_offset: int | Int32 = 0,
     g_block_tables: cute.Pointer | None = None,
     block_table_row_stride: int | Int32 = 0,
@@ -2724,6 +2734,7 @@ def build_fmha_task_manager(
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
+        lse=lse,
         g_block_tables=g_block_tables,
         block_table_row_stride=block_table_row_stride,
         g_seq_lens_kv=g_seq_lens_kv,
@@ -2837,6 +2848,8 @@ class FmhaTs:
         enable_skip_correction: bool = True,
         uses_ldtm_stat: bool = False,
         fp8_psmem_early_token: bool = False,
+        kv_ring_stages: int = 0,
+        umma_fp8_k64: bool = False,
         two_cta_umma: bool = False,
         use_paged_kv: bool = False,
         num_tokens_per_page: int = 32,
@@ -2941,6 +2954,8 @@ class FmhaTs:
         cfg.vc_seq_len_k = vc_seq_len_k
         cfg.vc_repair_tiles = vc_repair_tiles
         cfg.fp8_psmem_early_token = fp8_psmem_early_token
+        cfg.kv_ring_stages = kv_ring_stages
+        cfg.umma_fp8_k64 = umma_fp8_k64
         self.cfg = cfg
         # Compact Q and staged O fit two resident query tiles plus the K/V
         # ring. Pairing overlaps the two softmax groups with MMA work.
@@ -2978,6 +2993,8 @@ class FmhaTs:
             cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
         cfg.uses_ldtm_stat = uses_ldtm_stat
         cfg.fp8_psmem_early_token = fp8_psmem_early_token
+        cfg.kv_ring_stages = kv_ring_stages
+        cfg.umma_fp8_k64 = umma_fp8_k64
         cfg.qk_acc_dtype = qk_acc_dtype or cutlass.Float32
         cfg.pv_acc_dtype = pv_acc_dtype or cutlass.Float32
 
@@ -3138,6 +3155,7 @@ class FmhaTs:
         vc_q_scale: cute.Tensor | None = None,
         vc_k_scale: cute.Tensor | None = None,
         vc_ctrl: cute.Tensor | None = None,
+        lse: cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
@@ -3481,6 +3499,7 @@ class FmhaTs:
             vc_q_scale,
             vc_k_scale,
             vc_ctrl,
+            lse,
             self.is_persistent,
             self.is_clc_dynamic,
         ).launch(
@@ -3525,6 +3544,7 @@ class FmhaTs:
         vc_q_scale: cute.Tensor | None,
         vc_k_scale: cute.Tensor | None,
         vc_ctrl: cute.Tensor | None,
+        lse: cute.Tensor | None,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
     ) -> None:
@@ -3591,6 +3611,7 @@ class FmhaTs:
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
+            lse=lse,
             q_offset=q_offset,
             tma_mu_desc=tma_mu_desc.get_ptr() if cfg.vc_restores_means else None,
             vc_q_scale=vc_q_scale if cfg.vc_qk8 else None,

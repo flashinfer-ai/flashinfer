@@ -170,6 +170,8 @@ class _ContextPlanState:
     vc_scale_shapes: Optional[dict[str, tuple[int, ...]]] = None
     vc_ctrl_on: Optional[torch.Tensor] = None
     vc_ctrl_off: Optional[torch.Tensor] = None
+    # Zero-row placeholder bound to the LSE slot when a run does not ask for it.
+    empty_lse: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -293,6 +295,8 @@ def _make_context_kernel(
     scheduler: _ContextScheduler,
     uses_ldtm_stat: bool,
     fp8_psmem_early_token: bool = False,
+    kv_ring_stages: int = 0,
+    umma_fp8_k64: bool = False,
     two_cta_umma: bool = False,
     page_size: int | None = None,
     max_kv_len: int | None = None,
@@ -335,6 +339,8 @@ def _make_context_kernel(
         d_v=head_dim_vo,
         is_persistent=is_persistent,
         fp8_psmem_early_token=fp8_psmem_early_token,
+        kv_ring_stages=kv_ring_stages,
+        umma_fp8_k64=umma_fp8_k64,
         two_cta_umma=two_cta_umma,
         is_causal=mask_type == "causal",
         has_variable_window=mask_type == "variable_window",
@@ -558,20 +564,60 @@ def _default_exp2_fma_pairs(device_index: int, cfg) -> int:
     return 2 if cfg.single_qkv_instance else 0
 
 
+def _default_exp2_packed_f16x2(device_index: int, cfg) -> bool:
+    """Packed f16x2 exp2 in the softmax: one MUFU op per score pair. On for the
+    SM107 fp8-V paths; SM100/SM103 split the packed op into two MUFU ops."""
+    return (
+        torch.cuda.get_device_capability(device_index) == (10, 7)
+        and cfg.v_dtype.width == 8
+    )
+
+
+def _default_kv_ring_stages(
+    device_index: int, qk_bits: int, pv_bits: int, vc: bool
+) -> int:
+    """K/V ring depth; 0 keeps the budget-derived depth. The SM107 dense fp8-V
+    paths take the deeper ring their shared memory fits."""
+    if torch.cuda.get_device_capability(device_index) == (10, 7) and (
+        pv_bits == 8 and not vc
+    ):
+        return 6 if qk_bits == 8 else 4
+    return 0
+
+
+def _default_umma_fp8_k64(device_index: int, qk_bits: int) -> bool:
+    """SM107 2xFP8 UMMA form (K=64 per fp8 instruction) for the fp8 PV of the
+    bf16-QK paths; the fp8-QK paths are shared-memory-port bound and keep K=32."""
+    return torch.cuda.get_device_capability(device_index) == (10, 7) and qk_bits == 16
+
+
 def _default_fp8_psmem_early_token(device_index: int) -> bool:
     """Release the S0/S1 token early on the fp8 SMEM-P path, on for SM103."""
     return torch.cuda.get_device_capability(device_index) == (10, 3)
 
 
-def _default_two_cta_umma(device_index: int) -> bool:
+def _default_two_cta_umma(device_index: int, qk_bits: int) -> bool:
     """Two-CTA UMMA for the dense paired D128 context kernel: on for SM103, where the
-    kernel is tensor-pipe bound and halving UMMA issues and K/V traffic per SM pays."""
-    return torch.cuda.get_device_capability(device_index) == (10, 3)
+    kernel is tensor-pipe bound and halving UMMA issues and K/V traffic per SM pays.
+    On SM107 only the bf16-QK paths, which are shared-memory-port bound on operand
+    fetch; fp8 QK is slower with it."""
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability == (10, 3):
+        return True
+    return capability == (10, 7) and qk_bits == 16
 
 
-def _default_uses_ldtm_stat(device_index: int) -> bool:
-    """Enable LDTM.STAT on SM103/SM107 with native or compatibility lowering."""
+def _default_uses_ldtm_stat(
+    device_index: int, qk_bits: int, pv_bits: int, vc: bool
+) -> bool:
+    """Enable LDTM.STAT on SM103/SM107 with native or compatibility lowering.
+    SM107 keeps it off for the dense QK-BF16/PV-FP8 path, which is faster with the
+    register row max; the fp8-QK and VC paths need it."""
     if not _dsl_supports_ldtm_stat():
+        return False
+    if torch.cuda.get_device_capability(device_index) == (10, 7) and (
+        qk_bits == 16 and pv_bits == 8 and not vc
+    ):
         return False
     # tcgen05.ld.red.max (LDTM.STAT) is available on B300 (SM103) and Rubin
     # (SM107), not B200 (SM100).
@@ -1541,7 +1587,12 @@ def _make_context_scheduler_probe(
         has_q_offset=geometry.has_q_offset,
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler="static_persistent",
-        uses_ldtm_stat=_default_uses_ldtm_stat(geometry.device_index),
+        uses_ldtm_stat=_default_uses_ldtm_stat(
+            geometry.device_index,
+            torch.finfo(geometry.qk_dtype).bits,
+            torch.finfo(geometry.pv_dtype).bits,
+            getattr(geometry, "vc", None) is not None,
+        ),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )
@@ -1656,8 +1707,24 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
     # at one CTA and three in the halved form. The VC tail needs two.
     # VC-Attention-QK8 keeps the E4M3 K ring and follows the device default.
     vc_qk16 = geometry.vc is not None and geometry.qk_dtype != torch.float8_e4m3fn
+    two_cta = _default_two_cta_umma(
+        geometry.device_index, torch.finfo(geometry.qk_dtype).bits
+    )
+    if two_cta and torch.cuda.get_device_capability(geometry.device_index) == (10, 7):
+        # Pairs are coarser work units. Keep them only where they fill their
+        # waves at least as well as single CTAs fill theirs.
+        sms = torch.cuda.get_device_properties(
+            geometry.device_index
+        ).multi_processor_count
+        tiles = math.ceil(geometry.max_seq_len_q / (2 * _CONTEXT_TILE_SIZE_Q))
+        heads = geometry.batch_size * geometry.num_qo_heads
+        single_waves = heads * tiles / sms
+        pair_waves = heads * math.ceil(tiles / 2) / (sms // 2)
+        two_cta = pair_waves / math.ceil(pair_waves) >= single_waves / math.ceil(
+            single_waves
+        )
     return (
-        (_default_two_cta_umma(geometry.device_index) or vc_qk16)
+        (two_cta or vc_qk16)
         and geometry.head_dim == 128
         and geometry.head_dim_vo in (None, 128)
         and geometry.mask_type == "dense"
@@ -1859,8 +1926,20 @@ def _get_compiled_context(
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler=scheduler,
         two_cta_umma=two_cta_umma,
-        uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        uses_ldtm_stat=_default_uses_ldtm_stat(
+            device_index,
+            input_qk_dtype.width,
+            input_pv_dtype.width,
+            compile_spec.vc is not None,
+        ),
         fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
+        umma_fp8_k64=_default_umma_fp8_k64(device_index, input_qk_dtype.width),
+        kv_ring_stages=_default_kv_ring_stages(
+            device_index,
+            input_qk_dtype.width,
+            input_pv_dtype.width,
+            compile_spec.vc is not None,
+        ),
         vc_k_block_size=compile_spec.vc.k_block_size if vc_attention else 0,
         vc_num_q_heads=num_qo_heads if vc_attention else 0,
         vc_head_dim_v=head_dim_vo or head_dim,
@@ -1883,6 +1962,7 @@ def _get_compiled_context(
         fmha.cfg.uniform_seq_len_k = max_seq_len_k
     fmha.cfg.has_q_offset = has_q_offset
     fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
+    fmha.cfg.exp2_packed_f16x2 = _default_exp2_packed_f16x2(device_index, fmha.cfg)
     if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
         raise RuntimeError(
             "context packed-K specialization assumes kv_tile_n="
@@ -1910,6 +1990,7 @@ def _get_compiled_context(
         vc_q_scale: cute.Tensor,
         vc_k_scale: cute.Tensor,
         vc_ctrl: cute.Tensor,
+        lse: cute.Tensor,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed: cutlass.Constexpr[bool],
@@ -1939,6 +2020,7 @@ def _get_compiled_context(
                 vc_q_scale=vc_q_scale,
                 vc_k_scale=vc_k_scale,
                 vc_ctrl=vc_ctrl,
+                lse=lse,
             )
         else:
             fmha(
@@ -1957,6 +2039,7 @@ def _get_compiled_context(
                 vc_q_scale=vc_q_scale,
                 vc_k_scale=vc_k_scale,
                 vc_ctrl=vc_ctrl,
+                lse=lse,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -2045,6 +2128,15 @@ def _get_compiled_context(
     vc_q_scale_fake = fake_compact(cutlass.Float32, vc_q_scale_shape, 16)
     vc_k_scale_fake = fake_compact(cutlass.Float32, vc_k_scale_shape, 16)
     vc_ctrl_fake = fake_compact(cutlass.Int32, (1,), 4)
+    # Per-row log2-sum-exp output ([total_q, H] packed, [B, S_q, H] fixed), or a
+    # zero-row placeholder that the store's row guard turns into a no-op.
+    lse_fake = fake_compact(
+        cutlass.Float32,
+        (runtime_total_q, num_qo_heads)
+        if packed
+        else (batch_size, cute.sym_int(), num_qo_heads),
+        4,
+    )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so
@@ -2067,6 +2159,7 @@ def _get_compiled_context(
             vc_q_scale_fake,
             vc_k_scale_fake,
             vc_ctrl_fake,
+            lse_fake,
             stream_fake,
             max_active_clusters,
             packed,
@@ -2139,8 +2232,20 @@ def _get_compiled_paged_context(
         has_q_offset=has_q_offset,
         causal_single_kv_tile=False,
         scheduler=scheduler,
-        uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        uses_ldtm_stat=_default_uses_ldtm_stat(
+            device_index,
+            input_qk_dtype.width,
+            input_pv_dtype.width,
+            False,
+        ),
         fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
+        umma_fp8_k64=_default_umma_fp8_k64(device_index, input_qk_dtype.width),
+        kv_ring_stages=_default_kv_ring_stages(
+            device_index,
+            input_qk_dtype.width,
+            input_pv_dtype.width,
+            False,
+        ),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )
@@ -2151,6 +2256,7 @@ def _get_compiled_paged_context(
         fmha.cfg.uniform_seq_len_k = max_kv_len
     fmha.cfg.has_q_offset = has_q_offset
     fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
+    fmha.cfg.exp2_packed_f16x2 = _default_exp2_packed_f16x2(device_index, fmha.cfg)
     fmha.cfg.paged_v_tail_is_zero = paged_v_tail_is_zero
     if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
         raise RuntimeError(
@@ -2815,6 +2921,11 @@ class BatchPrefillTSWrapper:
             vc_scale_shapes=vc_shapes,
             vc_ctrl_on=torch.ones((1,), dtype=torch.int32, device=geometry.device),
             vc_ctrl_off=torch.zeros((1,), dtype=torch.int32, device=geometry.device),
+            empty_lse=torch.empty(
+                (0, num_qo_heads) if packed else (1, 0, num_qo_heads),
+                dtype=torch.float32,
+                device=geometry.device,
+            ),
         )
 
     @flashinfer_experimental_api
@@ -2834,6 +2945,7 @@ class BatchPrefillTSWrapper:
         output_scale: Optional[torch.Tensor] = None,
         vc: Optional[VCAttentionParams] = None,
         validate: bool = True,
+        lse: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Launch the compiled specialization with per-request tensors.
 
@@ -2880,6 +2992,22 @@ class BatchPrefillTSWrapper:
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
         geometry = state.geometry
+        if lse is not None and validate:
+            lse_shape = (
+                (q.shape[0], geometry.num_qo_heads)
+                if geometry.packed
+                else (
+                    geometry.batch_size,
+                    geometry.max_seq_len_q,
+                    geometry.num_qo_heads,
+                )
+            )
+            if (
+                lse.dtype != torch.float32
+                or not lse.is_contiguous()
+                or tuple(lse.shape) != lse_shape
+            ):
+                raise ValueError(f"lse must be contiguous float32 {list(lse_shape)}")
         if geometry.packed:
             if qo_indptr is None or kv_indptr is None:
                 raise ValueError(
@@ -3012,6 +3140,15 @@ class BatchPrefillTSWrapper:
                 output_dtype=geometry.output_dtype,
                 head_dim_vo=geometry.head_dim_vo,
             )
+        launch_args = (
+            runtime_window_starts,
+            runtime_window_ends,
+            runtime_window_cta_starts,
+            vc_mu,
+            vc_q_scale,
+            vc_k_scale,
+            vc_ctrl,
+        )
         state.compiled(
             q,
             k,
@@ -3021,13 +3158,8 @@ class BatchPrefillTSWrapper:
             output_scale,
             runtime_qo_indptr,
             runtime_kv_indptr,
-            runtime_window_starts,
-            runtime_window_ends,
-            runtime_window_cta_starts,
-            vc_mu,
-            vc_q_scale,
-            vc_k_scale,
-            vc_ctrl,
+            *launch_args,
+            lse if lse is not None else state.empty_lse,
         )
         return out
 

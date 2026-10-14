@@ -891,6 +891,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "output_scale",
         "vc",
         "validate",
+        "lse",
     )
     assert plan_parameters["head_dim_vo"].default is None
     assert run_parameters["qo_indptr"].default is None
@@ -2458,7 +2459,8 @@ def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
 
         expected = expected and hasattr(prims, "tcgen05_ld_red")
     assert (
-        context_module._default_uses_ldtm_stat(torch.cuda.current_device()) is expected
+        context_module._default_uses_ldtm_stat(torch.cuda.current_device(), 8, 8, False)
+        is expected
     )
 
 
