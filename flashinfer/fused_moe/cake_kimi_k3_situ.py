@@ -40,9 +40,10 @@ _N32_CLAIM8_TOKENS = (512, 1024)
 _MID_WORK5FD_TOKENS = (2048, 4096)
 _LARGE_C7_TOKENS = (8192, 16384)
 # Architectures whose single-token route runs the fused quantization + routing
-# FC1 (three kernels: FC1, FC2, finalize); the others launch the separate
-# single-token quantization + router kernel before the FC1 (four kernels).
-_M1_FUSED_ARCHES = ("sm_103a",)
+# FC1 (three kernels: FC1, FC2, finalize) -- both today; an architecture outside
+# this set would launch the separate single-token quantization + router kernel
+# before the FC1 (four kernels, the "m1" selector).
+_M1_FUSED_ARCHES = ("sm_100a", "sm_103a")
 # Architectures whose 8192- and 16384-token route runs the FC2 that stores an
 # 8-bit per-tile partial with per-tile FP32 scales and the finalize that
 # consumes it (eight kernels); the others run the pre-shuffled scale-factor

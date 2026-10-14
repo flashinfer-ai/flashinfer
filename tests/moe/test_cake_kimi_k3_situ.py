@@ -65,8 +65,9 @@ LARGE_TOKENS = (8192, 16384)
 REFERENCE_SM_COUNT = 148
 
 # Architectures whose single-token route is the fused quantization + routing
-# FC1 (three kernels); the others run the separate quantization + router kernel.
-FUSED_M1_ARCHES = ("sm_103a",)
+# FC1 (three kernels) -- both today; an architecture outside this set would run
+# the separate quantization + router kernel (four kernels, the "m1" selector).
+FUSED_M1_ARCHES = ("sm_100a", "sm_103a")
 # Architectures whose 8192- and 16384-token route stores the FC2 result as an
 # 8-bit per-tile partial with per-tile FP32 scales (eight kernels); the others
 # run the pre-shuffled scale-factor route (nine kernels).
