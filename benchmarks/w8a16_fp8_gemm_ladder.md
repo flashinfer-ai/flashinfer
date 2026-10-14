@@ -643,7 +643,45 @@ the dequant is a small share of the work (cast / cuBLAS 1.01-1.02): gen.qkv tp1 
 88320 (1.004 / 1.004), und.kv tp1 88320 (1.015), attn.out tp1 88320 (1.000), mlp.down tp4
 88320 (1.013).  None is a small-N row.
 
-Results: `h5b_*` (cast column), `h5n_*` (ncu reports and extracts), `freeH4_r*.csv` /
+**Does the group size need to scale with K (the Blackwell B15 finding)?**  On B200 the
+last gap on the wide rows was the SM clock following the DRAM bytes under the power cap,
+and the group had to shrink as K grew.  Checked on H100 for the K-extremes of the grouped
+rows, mlp.down tp1 / tp2 (K = 25600 / 12800) and mlp.gate_up tp1 / tp2 (K = 5120), at
+G = 1 / 2 / 4 / 8: ncu with `--clock-control none` (free-running clock, counters only:
+time, DRAM read bytes, `sm__cycles_elapsed.avg.per_second`, cycle count), plus a 5-round
+free-running pass (`h5kg_*`):
+
+| row | cuBLAS | G=1 | G=2 | G=4 | G=8 |
+|---|---|---|---|---|---|
+| mlp.down tp1 44160 | 14.60 ms, 22.0 GB, 1.52 GHz | 14.87, 25.6, 1.49 | 14.65, 22.8, 1.51 | **14.50, 18.3, 1.52** | 14.84, 23.6, 1.49 |
+| mlp.down tp1 88320 | 29.32, 45.9, 1.50 | 29.64, 49.8, 1.48 | 30.39, 38.7, 1.44 | **29.18, 40.5, 1.50** | 29.89, 52.5, 1.47 |
+| mlp.down tp2 44160 | 7.25, 9.9, 1.54 | 7.32, 10.4, 1.53 | 7.24, 9.8, 1.54 | **7.21, 7.8, 1.54** | 7.32, 9.9, 1.52 |
+| mlp.down tp2 88320 | 14.51, 20.7, 1.53 | 14.70, 23.1, 1.51 | 14.54, 21.0, 1.52 | **14.49, 17.0, 1.52** | 14.72, 21.0, 1.50 |
+| mlp.gate_up tp1 44160 | 14.60, 16.4, 1.54 | 14.47, 11.2, 1.55 | 14.74, 19.1, 1.52 | 14.62, 11.9, 1.54 | 14.63, 10.2, 1.54 |
+| mlp.gate_up tp1 88320 | 29.30, 33.9, 1.53 | 29.22, 27.6, 1.53 | 29.70, 39.4, 1.51 | 29.43, 26.4, 1.52 | 29.70, 27.0, 1.51 |
+| mlp.gate_up tp2 44160 | 7.22, 7.5, 1.55 | 7.19, 5.7, 1.56 | 7.28, 8.6, 1.54 | 7.24, 5.8, 1.55 | 7.31, 6.1, 1.55 |
+| mlp.gate_up tp2 88320 | 14.56, 15.6, 1.54 | 14.55, 13.4, 1.54 | 14.72, 18.4, 1.52 | 14.63, 12.6, 1.53 | 14.73, 13.1, 1.52 |
+
+Free-running, 5 rounds, ratio to cuBLAS (G = 1 / 2 / 4 / 8): mlp.down tp1 1.00 / 1.00 /
+1.01 / 1.01 at 44160 and 0.99 / 1.00 / 1.01 / 1.02 at 88320; mlp.down tp2 1.00 / 1.00 / 1.00 /
+1.01 and 1.01 / 1.00 / 1.01 / 1.04; mlp.gate_up tp1 1.08 / 1.02 / 1.02 / 1.03 and 1.07 / 1.05 /
+1.02 / 1.04; mlp.gate_up tp2 1.04 / 1.01 / 1.01 / 1.01 and 1.05 / 1.05 / 1.01 / 1.03.
+
+* The clock does follow the bytes on H100, but weakly: over all 120 launches (bytes and clock
+  normalised per row) the correlation is -0.48 and the slope is -2.7% of clock per doubling of
+  DRAM bytes (bytes range 0.47-1.75x of the row median, clock range 0.92-1.03x).  The cycle
+  count per kernel varies by only +-1.5%, so the time differences are clock differences.
+* At K = 12800 / 25600 the shipped group for mlp.down (G = 2, fewer than 64 weight tiles)
+  is not the byte-minimum: G = 4 reads 18-27% fewer bytes and runs at an equal or higher
+  clock (mlp.down tp1 88320: G = 2 1.44 GHz / 38.7 GB, G = 4 1.50 GHz / 40.5 GB).  In time,
+  though, G = 2 and G = 4 are within 1% at 5 rounds on all four mlp.down rows, so this is not
+  worth changing the rule.  G = 8 is worse everywhere (more bytes, lower clock).
+* So the B15 effect exists on H100 but is about a quarter of its size on B200 (H100 HBM3 at
+  700 W gives the memory a smaller share of the power budget).  The group rule stays K-blind.
+  The G = 1 vs G = 4 gap on mlp.gate_up (2-5% at 5 rounds) is the one place where it shows.
+
+Results: `h5b_*` (cast column), `h5n_*` (ncu reports and extracts), `h5kg_*` (group vs K,
+free-clock ncu and 5-round pass), `freeH4_r*.csv` /
 `freeH4_dmon_r*.txt` (the plot grid; also packed as `../freeH4.tgz`), under
 `/home/scratch.ishovkun_gpu/w8a16-results/hopper/`.
 
