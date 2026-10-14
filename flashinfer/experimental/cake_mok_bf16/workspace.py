@@ -26,8 +26,9 @@ class MoKConfig:
     # ``fwd_num_comm_sms`` / ``bwd_num_comm_sms`` while the hottest rank's load
     # is at least ``imbalance_threshold`` times the mean per-rank load. The
     # recompute launch follows the forward count. The load is observed without
-    # a host synchronization (pinned copy behind a CUDA event) and is identical
-    # on every rank. ``None`` keeps the fixed split; see
+    # a host synchronization (pinned copy behind a CUDA event); the counts are
+    # identical on every rank, the decision is per rank (see
+    # ``MoKFunctional._observe_load``). ``None`` keeps the fixed split; see
     # ``MoKFunctional._comm_split``. The threshold default follows
     # ``flashinfer.mok.IMBALANCE_THRESHOLD``: on B200 BF16 the imbalance split
     # pays from about 5.6x the mean load and shows no gain at 3x.

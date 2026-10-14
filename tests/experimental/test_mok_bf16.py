@@ -446,6 +446,30 @@ def test_count_routed_load_matches_a_reference_count():
     assert loads.tolist() == expected == [2, 3, 1, 4]
     empty = torch.full((6,), -1, dtype=torch.int32)
     assert count_routed_load(empty, ep_size, local_experts).tolist() == [0] * ep_size
+    # Ids exactly at the limit and one owner beyond it (the last histogram bin
+    # and the first value outside the range), more negative padding, and a large
+    # random gather per rank count: all match the reference count exactly.
+    limit = ep_size * local_experts
+    edges = torch.tensor(
+        [limit, limit + local_experts - 1, limit + local_experts, -2, -1000, 0],
+        dtype=torch.int32,
+    )
+    assert count_routed_load(edges, ep_size, local_experts).tolist() == [1, 0, 0, 0]
+    generator = torch.Generator().manual_seed(0)
+    ep_size, local_experts = 64, 4
+    random_routes = torch.randint(
+        -1, ep_size * local_experts + 8, (ep_size, 2048, 8), generator=generator
+    ).to(torch.int32)
+    reference = torch.zeros(ep_size, dtype=torch.int64)
+    valid = (random_routes >= 0) & (random_routes < ep_size * local_experts)
+    reference.index_add_(
+        0,
+        torch.div(random_routes[valid], local_experts, rounding_mode="floor").long(),
+        torch.ones(int(valid.sum()), dtype=torch.int64),
+    )
+    assert torch.equal(
+        count_routed_load(random_routes, ep_size, local_experts), reference
+    )
 
 
 def test_select_comm_split_decision_table():
@@ -478,24 +502,34 @@ def test_select_comm_split_decision_table():
 
 
 @pytest.mark.parametrize(
-    "capability,precision,expected",
+    "capability,sm_count,precision,expected",
     [
-        ((10, 0), "bf16", (24, 28)),
-        ((10, 0), "mxfp8", None),
-        ((10, 3), "bf16", None),
-        ((10, 7), "bf16", None),
-        ((12, 0), "bf16", None),
+        ((10, 0), 148, "bf16", (24, 28)),  # B200
+        ((10, 0), 148, "mxfp8", None),
+        ((10, 0), 152, "bf16", None),  # GB200: same capability, no measured row
+        ((10, 3), 160, "bf16", None),  # GB300
+        ((10, 7), 160, "bf16", None),
+        ((12, 0), 170, "bf16", None),
     ],
 )
-def test_imbalance_comm_sms_auto_follows_the_device_generation(
-    monkeypatch, capability, precision, expected
+def test_imbalance_comm_sms_auto_follows_the_device(
+    monkeypatch, capability, sm_count, precision, expected
 ):
-    """Host-only: ``"auto"`` resolves through the per-generation table; generations
-    and precisions without a measured row keep the fixed split (``None``)."""
+    """Host-only: ``"auto"`` resolves through the per-device table (compute
+    capability and SM count); devices and precisions without a measured row keep
+    the fixed split (``None``)."""
+    from types import SimpleNamespace
+
     from flashinfer import mok
 
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
         torch.cuda, "get_device_capability", lambda device=None: capability
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device=None: SimpleNamespace(multi_processor_count=sm_count),
     )
     assert mok.resolve_imbalance_comm_sms(precision) == expected
 
@@ -517,7 +551,7 @@ def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
     assert facade["imbalance_threshold"].default == 4.0
     # The measured row and threshold (backend README); a change here is a
     # shipping change.
-    assert mok.IMBALANCE_COMM_SMS == {(10, 0): {"bf16": (24, 28)}}
+    assert mok.IMBALANCE_COMM_SMS == {(10, 0): {148: {"bf16": (24, 28)}}}
     assert mok.IMBALANCE_THRESHOLD == 4.0
     with pytest.raises(ValueError, match="precision must be one of"):
         mok.resolve_imbalance_comm_sms("fp8")

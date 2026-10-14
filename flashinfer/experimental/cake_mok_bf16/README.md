@@ -155,17 +155,27 @@ to recreate the workspace.
   Scores are already normalized/scaled by the caller.
 - Logical source token counts may differ across ranks and may be zero. Hidden
   and intermediate widths are positive multiples of 256; MXFP8 also requires a
-  hidden width that is a multiple of 512. Common physical source capacity is
+  hidden width that is a multiple of 512, and its forward and recompute roles
+  need an nvcc of CUDA 13.1 or newer (the 13.0 ptxas rejects
+  `cvt.rn.satfinite.e4m3x2.bf16x2`: "Unexpected instruction types specified for
+  'cvt'"; the backward roles carry a guard and compile with 13.0). Common physical source capacity is
   aligned for tiles/metadata and is at least 512 rows. Communication-SM counts
   are positive and even, leaving compute SMs available.
 - Imbalance-aware split (`MoKConfig.imbalance_comm_sms` / `imbalance_threshold`;
   factory default `imbalance_comm_sms="auto"`, `None` keeps the fixed split): every
-  `build_schedule` counts the gathered expert IDs per owning rank on device and
-  copies the counts into pinned host memory behind a CUDA event (no host
-  synchronization; the gathered IDs are identical on every rank; skipped during
-  graph capture). While the hottest rank's load is at least `imbalance_threshold`
+  `build_schedule` counts the gathered expert IDs per owning rank on device (one
+  `torch.histc` pass, linear in the number of ids) and copies the counts into
+  pinned host memory behind a CUDA event (no host synchronization; skipped during
+  graph capture). The gathered IDs and the counts are identical on every rank;
+  each rank applies its own latest completed observation, so with back-to-back
+  steps a launch may use different splits on different ranks for a step - the
+  split is a per-rank launch parameter and the protocol does not require
+  agreement. While the hottest rank's load is at least `imbalance_threshold`
   (4) x the mean load, the later launches use the (forward, backward) imbalance
-  split; balanced steps are unchanged. Measured row (`IMBALANCE_COMM_SMS`): B200
+  split; balanced steps are unchanged. Measured row (`IMBALANCE_COMM_SMS`, keyed
+  by compute capability and SM count, so B200 at 148 SMs only - GB200 is also
+  (10, 0) at 152 SMs and keeps the fixed split, where the B200 row measured
+  slower under skew at EP16-64): B200
   BF16 24 / 28, from EP8 complete training steps, two rounds on one node, step
   time against the fixed 20 / 24 on this package's backward programs: hottest
   rank at 5.6x / 7.4x the mean routed load -1.0 / -1.7 % and -1.2 / -1.3 %;

@@ -70,16 +70,23 @@ def count_routed_load(routes, ep_size, local_experts):
     beyond the limit are not counted. Returns an int64 tensor of ``ep_size``
     counts on the device of ``routes``.
 
-    Compare-and-reduce rather than ``scatter_add_`` or ``torch.bincount``:
-    ``scatter_add_`` issues one global atomic per id on ``ep_size`` addresses
-    and serialises there, and ``bincount`` sizes its output from ``max()`` on
-    the host, a device synchronization. This form has neither; its transient is
-    an ``ep_size`` x ``ids`` boolean tensor.
+    One ``torch.histc`` pass with explicit bounds: no host synchronization
+    (``torch.bincount`` sizes its output from a device ``max()``), no atomics
+    on ``ep_size`` addresses (``scatter_add_``), and work and transient linear
+    in the number of ids. The earlier compare-and-reduce form built an
+    ``ep_size`` x ``ids`` boolean tensor and cost about 3 ms and 4.6 GB per call
+    at EP64 (measured on GB200 by the FlashInfer reviewers of PR #6439). The
+    owner ranks are histogrammed as float64 over ``[-1, ep_size + 1)`` in unit
+    bins, so the integer bin arithmetic is exact: bin 0 collects the ``-1``
+    padding, the last bin the ids at the limit, values outside the range are
+    dropped, and the ``ep_size`` middle bins are the counts.
     """
     flat = routes.reshape(-1)
     owner = torch.div(flat, local_experts, rounding_mode="floor")
-    ranks = torch.arange(ep_size, device=flat.device, dtype=owner.dtype)
-    return (owner.unsqueeze(0) == ranks.unsqueeze(1)).sum(dim=1)
+    hist = torch.histc(
+        owner.to(torch.float64), bins=ep_size + 2, min=-1, max=ep_size + 1
+    )
+    return hist[1 : ep_size + 1].to(torch.int64)
 
 
 def select_comm_split(loads, base, hot, threshold):
@@ -408,8 +415,14 @@ class MoKFunctional:
         copies the counts into pinned host memory behind a CUDA event: no host
         synchronization. ``_comm_split`` reads the latest completed observation,
         so a split change takes effect from the first later launch whose event
-        has completed. Skipped during CUDA Graph capture: captured launches keep
-        the split in force at capture time.
+        has completed. The gathered IDs, and so the counts, are identical on
+        every rank, but each rank decides from its own latest completed
+        observation: with back-to-back steps a launch may run with different
+        splits on different ranks for a step. The split is a per-rank launch
+        parameter (how many of that rank's SMs run its communication program);
+        the protocol does not require the ranks to agree on it. Skipped during
+        CUDA Graph capture: captured launches keep the split in force at
+        capture time.
         """
         if (
             config.imbalance_comm_sms is None

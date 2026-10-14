@@ -6,9 +6,12 @@ from .api_logging import flashinfer_experimental_api
 
 MOK_PRECISIONS = ("bf16", "mxfp8")
 
-# Imbalance-aware communication split, keyed by device compute capability and
-# routed precision. Only generations with a measured gain have a row; "auto"
-# resolves to None (the fixed split) elsewhere. B200 BF16 row 24 / 28: EP8
+# Imbalance-aware communication split, keyed by device compute capability, SM
+# count and routed precision. Only devices with a measured gain have a row;
+# "auto" resolves to None (the fixed split) elsewhere. The SM count separates
+# B200 (148 SMs) from GB200 (152 SMs, also compute capability (10, 0)), where
+# the B200 row measured slower than the fixed split at 8x skew and above on
+# EP16-64 (GB200 NVL72, FlashInfer PR #6439 review). B200 BF16 row 24 / 28: EP8
 # complete training steps, two rounds on one node, step time against the fixed
 # 20 / 24 on this package's backward programs. Hottest rank at 5.6x / 7.4x the
 # mean routed load: -1.0 / -1.7 % and -1.2 / -1.3 %. Hottest rank at 3.0x (one
@@ -20,7 +23,7 @@ MOK_PRECISIONS = ("bf16", "mxfp8")
 # with 4 ranks the ratio reaches 4 only when one rank carries every routed row.
 # Balanced steps never switch, so the fixed split stays in force for them.
 IMBALANCE_COMM_SMS = {
-    (10, 0): {"bf16": (24, 28)},
+    (10, 0): {148: {"bf16": (24, 28)}},
 }
 IMBALANCE_THRESHOLD = 4.0
 
@@ -28,7 +31,8 @@ IMBALANCE_THRESHOLD = 4.0
 def resolve_imbalance_comm_sms(precision, device=None):
     """(forward, backward) communication-SM split used under imbalanced routing
     for ``precision`` (``"bf16"`` or ``"mxfp8"``) on ``device``, or ``None``
-    when the device generation has no measured row (the fixed split is kept).
+    when the device (compute capability and SM count) has no measured row (the
+    fixed split is kept).
     """
     import torch
 
@@ -36,8 +40,11 @@ def resolve_imbalance_comm_sms(precision, device=None):
         raise ValueError(
             f"precision must be one of {MOK_PRECISIONS}, got {precision!r}"
         )
+    if device is None:
+        device = torch.cuda.current_device()
     capability = tuple(torch.cuda.get_device_capability(device))
-    return IMBALANCE_COMM_SMS.get(capability, {}).get(precision)
+    sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    return IMBALANCE_COMM_SMS.get(capability, {}).get(sm_count, {}).get(precision)
 
 
 @flashinfer_experimental_api
@@ -114,11 +121,13 @@ def create_mok_bf16_workspace(
     ``imbalance_comm_sms`` is the (forward, backward) communication-SM split the
     launches switch to while the hottest rank's routed-row load is at least
     ``imbalance_threshold`` times the mean per-rank load (observed on the
-    gathered expert IDs of each step without a host synchronization; identical
-    on every rank). ``"auto"`` (default) takes the measured row of the device
-    generation for ``precision`` (:func:`resolve_imbalance_comm_sms`; B200 BF16:
-    24 / 28, no row elsewhere, so the fixed split stays in force there), ``None``
-    keeps the fixed split and a pair sets it. ``precision`` only selects that row.
+    gathered expert IDs of each step without a host synchronization; the counts
+    are identical on every rank, each rank applies its own latest completed
+    observation). ``"auto"`` (default) takes the measured row of the device
+    for ``precision`` (:func:`resolve_imbalance_comm_sms`, keyed by compute
+    capability and SM count; B200 BF16: 24 / 28, no row elsewhere - GB200 and
+    GB300 included - so the fixed split stays in force there), ``None`` keeps
+    the fixed split and a pair sets it. ``precision`` only selects that row.
     The default ``imbalance_threshold`` (:data:`IMBALANCE_THRESHOLD`, 4) lies
     between the measured 3x load ratio, where the imbalance split shows no
     gain, and 5.6x, where it gains 1-2 %. Balanced steps never switch.
