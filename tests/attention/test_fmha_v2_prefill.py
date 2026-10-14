@@ -523,7 +523,8 @@ def test_fmha_v2_prefill_deepseek(
 @pytest.mark.parametrize("num_heads", [5, 20])
 @pytest.mark.parametrize("seq_len", [63, 64, 65, 129, 1025])
 @pytest.mark.parametrize("o_dtype", [torch.bfloat16, torch.float16])
-def test_fmha_v2_prefill_sm120_glm_fp8(num_heads, seq_len, o_dtype):
+@pytest.mark.parametrize("causal", [True, False])
+def test_fmha_v2_prefill_sm120_glm_fp8(num_heads, seq_len, o_dtype, causal):
     if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
 
@@ -553,13 +554,23 @@ def test_fmha_v2_prefill_sm120_glm_fp8(num_heads, seq_len, o_dtype):
         return_lse=True,
         lse=lse,
     )
-    out, lse = fmha_v2_prefill_deepseek(q, k, v, out, **kwargs)
+
+    def run():
+        if causal:
+            return fmha_v2_prefill_deepseek(q, k, v, out, **kwargs)
+        # The public DeepSeek/GLM entry point is causal-only. Exercise the
+        # shared native runner's padding-mask variant directly.
+        return flashinfer.prefill._fmha_v2_prefill_sm120_run(
+            q, k, v, out, causal=False, scale_bmm1_d=None, scale_bmm2_d=None, **kwargs
+        )
+
+    out, lse = run()
     if seq_len > 64:
         # Multiple resident CTAs can expose premature reuse of the single K/V
         # buffers. Repeated execution must remain bitwise deterministic.
         expected_out, expected_lse = out.clone(), lse.clone()
         for _ in range(3):
-            fmha_v2_prefill_deepseek(q, k, v, out, **kwargs)
+            run()
             torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
             torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
     out_ref, lse_ref = attention_mla_ref_torch(
@@ -567,7 +578,7 @@ def test_fmha_v2_prefill_sm120_glm_fp8(num_heads, seq_len, o_dtype):
         q.float() * q_scale,
         k.float() * k_scale,
         v.float() * v_scale,
-        causal=True,
+        causal=causal,
         sm_scale=sm_scale,
     )
     lse = lse[..., 0] + torch.log(lse[..., 1] / 256.0)

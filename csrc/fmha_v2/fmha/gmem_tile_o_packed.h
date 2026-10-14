@@ -1129,7 +1129,8 @@ struct Gmem_tile_o_16bit {
   // registers (0, 4, 1, 5) and (2, 6, 3, 7) are four adjacent output columns.
   // Store these rows directly: the 64x256 FP32 shared-memory transpose would
   // otherwise require 64 KiB and restrict SM120 to one resident CTA per SM.
-  template <typename Accumulator, typename Params, typename Block_info, int M, int N>
+  template <bool CANONICAL_N = false, typename Accumulator, typename Params, typename Block_info,
+            int M, int N>
   inline __device__ void store_accumulators(Accumulator const (&acc)[M][N], Params const& params,
                                             Block_info const& binfo, int tidx, int cta_row_offset) {
     static_assert(Cta_tile::WARPS_M == 4 && Cta_tile::WARPS_N == 1 && Cta_tile::WARPS_K == 1 &&
@@ -1149,11 +1150,23 @@ struct Gmem_tile_o_16bit {
 #pragma unroll
           for (int ni = 0; ni < N; ++ni) {
             auto const& a = acc[mi][ni];
-            uint4 src =
-                make_uint4(a.reg(ri * 2), a.reg(ri * 2 + 4), a.reg(ri * 2 + 1), a.reg(ri * 2 + 5));
-            uint2 packed = Acc_packer<float, Output_type>::run(this, src);
-            int const offset = (ni * 16 + col) * BYTES_PER_ELEMENT;
-            fmha::stg(dst + offset, packed);
+            if constexpr (CANONICAL_N) {
+#pragma unroll
+              for (int half = 0; half < 2; ++half) {
+                float2 src = make_float2(a.elt(ri * 2 + half * 4), a.elt(ri * 2 + half * 4 + 1));
+                // Reuse the existing four-value scaling/packing for two adjacent outputs.
+                uint4 values = make_uint4(__float_as_uint(src.x), __float_as_uint(src.y), 0, 0);
+                uint2 packed = Acc_packer<float, Output_type>::run(this, values);
+                int offset = (ni * 16 + (lane % 4) * 2 + half * 8) * BYTES_PER_ELEMENT;
+                fmha::stg(dst + offset, packed.x);
+              }
+            } else {
+              uint4 src = make_uint4(a.reg(ri * 2), a.reg(ri * 2 + 4), a.reg(ri * 2 + 1),
+                                     a.reg(ri * 2 + 5));
+              uint2 packed = Acc_packer<float, Output_type>::run(this, src);
+              int const offset = (ni * 16 + col) * BYTES_PER_ELEMENT;
+              fmha::stg(dst + offset, packed);
+            }
           }
         }
       }

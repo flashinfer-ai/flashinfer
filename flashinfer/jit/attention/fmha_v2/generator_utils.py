@@ -956,7 +956,7 @@ using Kernel_traits_nl_tiled_custom_mask = fmha::{kernel_traits}<
 
 extern "C"
 __global__
-void {kernel_name}_nl_tiled({params_type} params){{
+void {kernel_name}_nl_tiled({tiled_params_type} params){{
   fused_multihead_attention::device_{kernel_variant}_nl_tiled<Kernel_traits_nl_tiled>(params);
 }}
 
@@ -966,7 +966,7 @@ void {kernel_name}_nl_tiled({params_type} params){{
 
 extern "C"
 __global__
-void {causal_kernel_name}_nl_tiled({params_type} params){{
+void {causal_kernel_name}_nl_tiled({tiled_params_type} params){{
   fused_multihead_attention::device_{kernel_variant}_nl_tiled<Kernel_traits_nl_tiled_causal>(params);
 }}
 
@@ -976,7 +976,7 @@ void {causal_kernel_name}_nl_tiled({params_type} params){{
 
 extern "C"
 __global__
-void {sliding_or_chunked_causal_kernel_name}_nl_tiled({params_type} params){{
+void {sliding_or_chunked_causal_kernel_name}_nl_tiled({tiled_params_type} params){{
   fused_multihead_attention::device_{kernel_variant}_nl_tiled<Kernel_traits_nl_tiled_sliding_or_chunked_causal>(params);
 }}
 
@@ -986,7 +986,7 @@ void {sliding_or_chunked_causal_kernel_name}_nl_tiled({params_type} params){{
 
 extern "C"
 __global__
-void {custom_mask_kernel_name}_nl_tiled({params_type} params){{
+void {custom_mask_kernel_name}_nl_tiled({tiled_params_type} params){{
   fused_multihead_attention::device_{kernel_variant}_nl_tiled<Kernel_traits_nl_tiled_custom_mask>(params);
 }}
 
@@ -994,9 +994,10 @@ void {custom_mask_kernel_name}_nl_tiled({params_type} params){{
 
 // Granular tiling
 void {launcher_name}_nl_tiled(
-    {const_fused_multihead_attention_params_v2_str} &params,
+    {const_fused_multihead_attention_params_v2_str} &input_params,
     const Launch_params &launch_params,
     cudaStream_t stream){{
+  {tma_launch_params}
   // runtime q_loop_iters
   using Cta_tile_o = typename Kernel_traits_nl_tiled::Cta_tile_o;
   int ctas_per_o_row = (params.d + Cta_tile_o::N - 1) / Cta_tile_o::N;
@@ -2205,7 +2206,7 @@ def get_kernel_code(kspec: kernel_spec, kname: str, lname: str) -> str | None:
     if kspec.tiled and not _use_full_glm_tiles(kspec):
         flags |= 4096
     if _use_full_glm_tiles(kspec):
-        flags |= 16384  # Store FP8 MMA accumulators without FP32 shared staging.
+        flags |= 16384 | 32768  # Direct output and SM120 TMA transport.
     if kspec.is_mtp:
         flags |= 8192
 
@@ -2223,6 +2224,7 @@ def get_kernel_code(kspec: kernel_spec, kname: str, lname: str) -> str | None:
     else:
         return None
 
+    use_sm120_tma = _use_full_glm_tiles(kspec)
     kernel_flags = "0x{:02x}u".format(flags)
 
     heads_interleaved_flag = pythonBoolean2cpp[kspec.head_interleaved]
@@ -2355,6 +2357,16 @@ def get_kernel_code(kspec: kernel_spec, kname: str, lname: str) -> str | None:
     local_ns_open = ns_open if generate_cu_trtllm else ""
     local_ns_close = ns_close if generate_cu_trtllm else ""
 
+    tiled_params_type = (
+        f"const __grid_constant__ fmha::Sm120_tma_params<{params_type}>"
+        if use_sm120_tma
+        else params_type
+    )
+    tma_launch_params = (
+        "auto params = fmha::make_sm120_tma_params(input_params);"
+        if use_sm120_tma
+        else "auto const& params = input_params;"
+    )
     tmp = dict(locals(), **kspec._asdict())
 
     if effective_sm < 90:
@@ -2990,7 +3002,7 @@ def get_kernel_traits_code(specs_names: list[tuple[kernel_spec, str, str, str]])
         if kspec.tiled and not _use_full_glm_tiles(kspec):
             flags |= 4096
         if _use_full_glm_tiles(kspec):
-            flags |= 16384
+            flags |= 16384 | 32768
         if kspec.is_mtp:
             flags |= 8192
 

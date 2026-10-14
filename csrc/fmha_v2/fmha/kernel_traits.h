@@ -261,6 +261,8 @@ struct Kernel_traits_ {
 
   // SM120 GLM: write the FP8 MMA fragments directly as BF16/FP16 pairs.
   enum { DIRECT_16BIT_OUTPUT = (FLAGS & 0x4000u) != 0u };
+  enum { USE_TMA_GLM = (FLAGS & 0x8000u) != 0u };
+  static_assert(!USE_TMA_GLM || DIRECT_16BIT_OUTPUT, "TMA requires the SM120 GLM tile");
   static_assert(!DIRECT_16BIT_OUTPUT ||
                     (NO_LOOP && !USE_GRANULAR_TILING && !SAGE_ATTENTION && !IS_MTP &&
                      VALID_D == 256 && VALID_DV == 256 && STEP == 64 && S == 64 && WARPS_M == 4 &&
@@ -341,7 +343,10 @@ struct Kernel_traits_ {
   };
 
   // The amount of shared memory needed for Q, K, V and O.
-  enum { BYTES_PER_SMEM = fmha::Max<BYTES_PER_SMEM_QKV, BYTES_PER_SMEM_QO>::VALUE };
+  enum {
+    BYTES_PER_SMEM =
+        fmha::Max<BYTES_PER_SMEM_QKV, BYTES_PER_SMEM_QO>::VALUE + (USE_TMA_GLM ? 16 : 0)
+  };
 
   // Make sure we have enough shared memory.
   static_assert(DIRECT_16BIT_OUTPUT ||
