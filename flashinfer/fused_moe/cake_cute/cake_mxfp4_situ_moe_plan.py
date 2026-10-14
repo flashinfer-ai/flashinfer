@@ -409,6 +409,9 @@ MIXED192_WIDE_RASTER_M_MIN_TOKENS = 8192
 DENSE_DUAL_ALT_PDL = False                  # mxfp4.py:573
 
 
+DENSE_PDL_FILL_IN_ROWS = False
+
+
 MOE_SORT_EXPERT_COUNTS_MIN_TOKENS = 1024    # moe_utils.py:205-227
 
 
@@ -1025,10 +1028,12 @@ def gemm2_dense_form(mma_tiler: tuple[int, int], cluster: tuple[int, int], *, ra
     """Dense grouped GEMM2 finalize launch (hand-written ``blockscaled_contiguous_grouped_gemm_finalize_fusion``).
 
     ``hidden_size`` (the GEMM2 N extent) is required for the cluster (1, 2) tactics: the form
-    (``build_gemm2_dense_finalize_ir(n_tile, cluster_n=2)`` -> ``gemm2_dense_finalize_n<N>_c12``) refuses an odd
-    weight-tile count ``ceil(H / N)`` (the out-of-range rank-1 CTA arm of the hand-written scheduler is untraced), and
-    lays the pair along x: ``cluster_dims (2, 1, 1)``, grid ``(2 * min(cap * ceil(n_tiles / 2), SMs // 2), 1, 1)``
-    (recorded geometry divergence vs the hand-written ``(1, 2, Z)``).
+    (``build_gemm2_dense_finalize_ir(n_tile, cluster_n=2)`` -> ``gemm2_dense_finalize_n<N>_c12``) records the
+    weight-tile count ``ceil(H / N)`` and lays the pair along x: ``cluster_dims (2, 1, 1)``, grid
+    ``(2 * min(cap * ceil(n_tiles / 2), SMs // 2), 1, 1)`` (recorded geometry divergence vs the hand-written
+    ``(1, 2, Z)``).  An odd count (H = 3584: 19 tiles of 192) is served as the hand-written kernel serves it: the
+    last cluster column's rank-1 CTA takes the out-of-range tile (zero-filled B / SFB loads, its multicast half and
+    commit as every CTA's, reduce skipped by ``valid_cols``); the launch table records the parity.
     """
     hw = (f"dense finalize GEMM2 mma_tiler {mma_tiler} cluster {cluster} raster_along_m={raster_along_m} "
           f"swizzle={swizzle} c_stages={c_stages}")
@@ -1049,13 +1054,15 @@ def gemm2_dense_form(mma_tiler: tuple[int, int], cluster: tuple[int, int], *, ra
                            f"row-group cluster forms: {GEMM2_DENSE_ROW_GROUP_CLUSTER_FORMS})")
         elif hidden_size is None:
             raise ValueError("gemm2_dense_form(cluster=(1, 2)) needs hidden_size to resolve the weight-tile count")
-        elif -(-hidden_size // n) % 2:
-            missing.append(f"gemm2_dense (128, {n}) cluster (1, 2): odd weight-tile count {-(-hidden_size // n)} "
-                           f"(H={hidden_size}); the form refuses it (the hand-written scheduler's out-of-range rank-1 "
-                           "CTA arm is untraced)")
         else:
+            n_tiles = -(-hidden_size // n)
             deviations += (f"cluster (1, 2) laid along x: Cake cluster_dims (2, 1, 1), grid (2 * min(cap * "
-                           f"ceil({-(-hidden_size // n)} / 2), SMs // 2), 1, 1) vs hand-written (1, 2, Z) (recorded)",)
+                           f"ceil({n_tiles} / 2), SMs // 2), 1, 1) vs hand-written (1, 2, Z) (recorded)",)
+            if n_tiles % 2:
+                deviations += (f"cluster (1, 2) over {n_tiles} weight tiles (odd): the last cluster column's rank-1 "
+                               f"CTA takes the out-of-range tile {n_tiles} as the hand-written scheduler's does "
+                               "(zero-filled B / SFB loads, multicast half and commit as every CTA's, reduce skipped "
+                               "by valid_cols) (recorded)",)
     elif cta_group == 2 and (mma_tiler, cluster) != ((256, 256), (2, 1)):
         missing.append(f"gemm2_dense 2-CTA form {mma_tiler} / {cluster} (only (256, 256) / (2, 1) traced)")
     elif cta_group == 2 and row_group_list and (n, 2, 1) not in GEMM2_DENSE_ROW_GROUP_CLUSTER_FORMS:
@@ -1857,7 +1864,7 @@ class CakeSwapAbPolicy:
     def _decide_dense(self, T: int) -> PlanDecision:
         """The dense path (``Mxfp4MoEPlan``, mxfp4.py:822-995, ``plan`` :3007-3088, ``_moe_core_impl``)."""
         sel = self.dense_selection(T)
-        pdl = self.enable_pdl                                                                # kwargs enable_pdl
+        pdl = self.enable_pdl or (DENSE_PDL_FILL_IN_ROWS and sel.fill_in_gemm1)              # kwargs enable_pdl
         K = self.top_k
         cap = self.fused_route_cap(T)
         clears = not sel.fill_in_gemm1 and not pdl                                           # :917-920
