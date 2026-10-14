@@ -138,11 +138,34 @@ def test_auto_cudnn_resolution_precedes_cuda_core_validation(monkeypatch, entryp
 
 
 @pytest.mark.parametrize("entrypoint", ["plan", "fast_decode_plan"])
-def test_leaving_auto_cudnn_rechecks_cuda_core_split_flag(monkeypatch, entrypoint):
-    wrapper, calls = _wrapper(monkeypatch, False, False, "auto")
-    wrapper._cudnn_auto = True
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_rejected_replan_preserves_active_cudnn_route(
+    monkeypatch, entrypoint, use_cuda_graph
+):
+    """Reject a CUDA-core replan without invalidating the working cuDNN plan."""
+    wrapper, calls = _wrapper(monkeypatch, False, use_cuda_graph, "auto")
+    monkeypatch.setattr(wrapper, "_auto_prefers_cudnn", lambda *args, **kwargs: True)
+    cudnn_calls = []
+
+    def plan_cudnn(*args):
+        wrapper._cudnn_kv_lens_view = torch.tensor([64], dtype=torch.int32).view(
+            1, 1, 1, 1
+        )
+
+    monkeypatch.setattr(wrapper, "_plan_cudnn", plan_cudnn)
+    monkeypatch.setattr(decode, "_CUDNN_GRAPH_AVAILABLE", False)
+    monkeypatch.setattr(
+        decode,
+        "cudnn_batch_decode_with_kv_cache",
+        lambda *args, **kwargs: cudnn_calls.append(kwargs),
+    )
+    _call(wrapper, "plan", False)
     monkeypatch.setattr(wrapper, "_auto_prefers_cudnn", lambda *args, **kwargs: False)
     with pytest.raises(ValueError, match="disable_split_kv.*CUDA-core decode"):
         _call(wrapper, entrypoint, True)
-    assert not wrapper._cudnn_auto
+    assert wrapper._cudnn_auto
     assert not calls
+    q = torch.zeros(1, 8, 128, dtype=torch.float16)
+    kv = torch.zeros(4, 2, 16, 2, 128, dtype=torch.float16)
+    wrapper.run(q, kv, enable_pdl=False)
+    assert len(cudnn_calls) == 1
