@@ -651,6 +651,9 @@ def _heuristic_func_mm_bf16(
         if "cublaslt" in suitable_backends:
             heuristic_backends.append("cublaslt")
 
+    if "cute-dsl" in suitable_backends:
+        heuristic_backends.append("cute-dsl")
+
     if "tinygemm" in suitable_backends and out_dtype == torch.bfloat16:
         heuristic_backends.append("tinygemm")
 
@@ -731,8 +734,7 @@ def mm_bf16(
             ``bias`` / ``pdl``. Requires SM >= 90.
         ``"cute-dsl"`` uses standalone Blackwell low-M kernels for M <= 32
         (direct, cluster Split-K and warp Split-K) and cuBLASLt above that.
-        It is never auto-selected; serving frameworks must select it
-        explicitly. Without autotuning, M > 32 runs cuBLASLt; below, the
+        Without autotuning, M > 32 runs cuBLASLt; below, the
         direct kernel runs where its shape heuristic applies, otherwise the
         warp Split-K kernel whenever it is eligible (N % 16 == 0, K % 128 == 0
         with at most 64 K tiles; requires CuTe DSL >= 4.7), and
