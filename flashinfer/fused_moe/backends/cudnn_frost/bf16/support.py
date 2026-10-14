@@ -18,7 +18,8 @@ from .....fused_moe.api import (
     SwiGLUStep,
 )
 
-from ..support import shortlisted_moe_geometry
+from ..support import moe_geometry
+from ..activations import activation_name
 
 
 def large_bf16_moe(config, act, arch):
@@ -37,7 +38,11 @@ def large_bf16_moe(config, act, arch):
         config.activation,
         (SwiGLU, GeGLU, GeGLUTanh, SwiGLUStep, SiTU, GELU, Identity, ReLU, ReLU2, SiLU),
     ):
-        return shortlisted_moe_geometry(config, act)
+        try:
+            activation_name(config.activation)
+        except NotImplementedError:
+            return False
+        return moe_geometry(config, act)
     return False
 
 

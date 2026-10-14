@@ -1,5 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
-"""Factorized tuning of the bounded quantized Frost candidate pool."""
+"""Factorized tuning of the bounded Frost candidate pool for every dtype."""
 
 from itertools import product
 
@@ -48,7 +48,13 @@ class _StageRunner(TunableRunner):
         return list(self.plans)
 
     def get_cache_key_extras(self, inputs):
-        return (POLICY_VERSION, self.stage, tuple(self.plans))
+        kernels = self.state.first if self.stage == 1 else self.state.second
+        return (
+            POLICY_VERSION,
+            self.stage,
+            tuple(self.plans),
+            tuple(k.source_sha256 for k in kernels),
+        )
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         if tactic == -1:
@@ -65,12 +71,12 @@ class _StageRunner(TunableRunner):
 
 
 def ranked_tactics(state, inputs, tag):
-    first = tuple(a for a in state.first if not a.quantizes_output)
+    first = tuple(a for a in state.first if not getattr(a, "quantizes_output", False))
     second = state.second
     if len(first) <= 2 and len(second) <= 2:
         # Preserve every offline choice, including its existing fused variants.
         return list(state.launches)
-    fused = tuple(a for a in state.first if a.quantizes_output)
+    fused = tuple(a for a in state.first if getattr(a, "quantizes_output", False))
     tuner = AutoTuner.get()
     if tuner.is_tuning_mode:
         config = TuningConfig(

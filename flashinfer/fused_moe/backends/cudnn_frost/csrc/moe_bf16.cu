@@ -184,11 +184,17 @@ class CudnnFrostMoeRunner final : public tvm::ffi::ModuleObj {
     if (name == "workspace_size")
       return Function::FromTyped(
           [this](int64_t capacity) { return int64_t(make_layout(capacity).bytes); });
-    if (name == "run")
-      return Function::FromTyped(
-          [this](TensorView out, TensorView x, TensorView ids, TensorView scores, TensorView w1,
-                 TensorView w2,
-                 TensorView workspace) { run(out, x, ids, scores, w1, w2, workspace); });
+    // Stage entry points share prepared grouping and intermediate storage.
+    // Modes: 0 = complete pipeline, 1 = prepare + FC1, 2 = FC1, 3 = FC2.
+    if (name == "run" || name == "prepare_stages" || name == "run_fc1" || name == "run_fc2") {
+      int mode =
+          name == "prepare_stages" ? 1 : (name == "run_fc1" ? 2 : (name == "run_fc2" ? 3 : 0));
+      return Function::FromTyped([this, mode](TensorView out, TensorView x, TensorView ids,
+                                              TensorView scores, TensorView w1, TensorView w2,
+                                              TensorView workspace) {
+        run(out, x, ids, scores, w1, w2, workspace, mode);
+      });
+    }
     return Function(nullptr);
   }
 
@@ -249,7 +255,7 @@ class CudnnFrostMoeRunner final : public tvm::ffi::ModuleObj {
   }
 
   void run(TensorView out, TensorView x, TensorView ids, TensorView scores, TensorView w1,
-           TensorView w2, TensorView workspace) const {
+           TensorView w2, TensorView workspace, int mode) const {
     TVM_FFI_ICHECK_EQ(x.ndim(), 2);
     int64_t t = x.size(0);
     Layout layout = make_layout(t);
@@ -266,6 +272,7 @@ class CudnnFrostMoeRunner final : public tvm::ffi::ModuleObj {
     auto stream = get_stream(device_);
     auto base = static_cast<char*>(workspace.data_ptr());
     if (fma_) {
+      TVM_FFI_ICHECK_EQ(mode, 0) << "FMA runners do not materialize grouped stage inputs";
       int64_t shape[]{s, i_}, stride[]{i_, 1};
       DLTensor mid{base + layout.mid, device_, 2, dl_bfloat16, shape, stride, 0};
       fc1_[t - 1](x, w1, ids, TensorView(&mid), static_cast<void*>(stream));
@@ -284,20 +291,22 @@ class CudnnFrostMoeRunner final : public tvm::ffi::ModuleObj {
     auto scale = reinterpret_cast<float*>(base + layout.scale);
     auto scratch = reinterpret_cast<int64_t*>(base + layout.scratch);
     auto expert_ids = static_cast<int32_t*>(ids.data_ptr());
-    if (s <= 512 && e_ <= 256) {
-      route_small<<<std::max(s, e_), 128, 0, stream>>>(
-          static_cast<const __nv_bfloat16*>(x.data_ptr()), expert_ids, offsets, mapping, gx, scale,
-          s, h_, k_, e_);
-    } else {
-      checked(cudaMemsetAsync(counts, 0, e_ * 4, stream));
-      histogram<<<std::min<int64_t>((s + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts, s,
-                                                                              e_);
-      prefix<<<1, 1, 0, stream>>>(counts, offsets, cursors, e_, scale);
-      gather<<<std::min<int64_t>(s, 4096), 128, 0, stream>>>(
-          static_cast<__nv_bfloat16*>(x.data_ptr()), expert_ids, cursors, mapping, gx, s, h_, k_,
-          e_);
+    if (mode < 2) {
+      if (s <= 512 && e_ <= 256) {
+        route_small<<<std::max(s, e_), 128, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data_ptr()), expert_ids, offsets, mapping, gx,
+            scale, s, h_, k_, e_);
+      } else {
+        checked(cudaMemsetAsync(counts, 0, e_ * 4, stream));
+        histogram<<<std::min<int64_t>((s + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts,
+                                                                                s, e_);
+        prefix<<<1, 1, 0, stream>>>(counts, offsets, cursors, e_, scale);
+        gather<<<std::min<int64_t>(s, 4096), 128, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(x.data_ptr()), expert_ids, cursors, mapping, gx, s, h_, k_,
+            e_);
+      }
+      checked(cudaGetLastError());
     }
-    checked(cudaGetLastError());
 
     auto problem1 = make_problem(s, i_, h_, swap1_, gated_);
     auto problem2 = make_problem(s, h_, i_, swap2_, false);
@@ -344,11 +353,19 @@ class CudnnFrostMoeRunner final : public tvm::ffi::ModuleObj {
     for (auto slot : tail_) args[argc++] = tensors[slot + 6];
     args[argc++] = static_cast<void*>(stream);
     tvm::ffi::Any result;
-    fc1_[0].CallPacked(args, argc, &result);
+    if (mode != 3) fc1_[0].CallPacked(args, argc, &result);
+    if (mode == 1 || mode == 2) {
+      checked(cudaGetLastError());
+      return;
+    }
     dshape[0] = scratch2_ / 8;
     fc2_[0](problem2, TensorView(&first), TensorView(&desc), TensorView(swap2_ ? &down : &tm),
             TensorView(swap2_ ? &tm : &down), TensorView(swap2_ ? &ty_sw : &ty),
             static_cast<void*>(stream));
+    if (mode == 3) {
+      checked(cudaGetLastError());
+      return;
+    }
     if (t <= 8) {
       finalize<true><<<std::min<int64_t>(t * ((h_ / 8 + 127) / 128), 4096), 128, 0, stream>>>(
           gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),

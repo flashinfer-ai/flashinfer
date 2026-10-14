@@ -68,14 +68,9 @@ def make_kernel_selector(
     arch,
     name,
     sm_count,
-    *,
-    quantized=False,
 ):
     """Return shape selection over captured catalogs and shortlist profiles."""
-    from .heuristics import select_stages
-    from .shortlist import select_profiles
-
-    dimension_matches = runtime._dimension_matches
+    from .catalog import can_implement, select_kernels as select_catalog
 
     def matching(pool, rows, hidden, intermediate, experts, first):
         n, k = (intermediate, hidden) if first else (hidden, intermediate)
@@ -85,10 +80,7 @@ def make_kernel_selector(
             for kernel in pool
             if kernel.arch == arch
             and (not first or kernel.activation == name)
-            and all(
-                dimension_matches(value, kernel.contract.get(dim))
-                for dim, value in dimensions.items()
-            )
+            and can_implement(kernel, dimensions)
         )
 
     def select_kernels(shape):
@@ -100,34 +92,21 @@ def make_kernel_selector(
             second_catalog, tokens * topk, hidden, intermediate, experts, False
         )
         profiles = tables.get((arch, name, experts, hidden, intermediate, topk))
-        if not quantized:
-            return select_profiles(profiles, tokens, first, second)
-        if not first or not second:
-            return (), ()
         fused = matching(
             fused_catalog, tokens * topk, hidden, intermediate, experts, True
         )
-        if not profiles or tokens > max(profiles):
-            return select_stages(
-                first,
-                second,
-                fused,
-                tokens=tokens,
-                hidden=hidden,
-                intermediate=intermediate,
-                experts=experts,
-                topk=topk,
-                sm_count=sm_count,
-            )
-        bucket = min((n for n in profiles if n >= tokens), default=max(profiles))
-        if any(len(ids) != 2 for ids in profiles[bucket]):
-            return (), ()
-        first, second = select_profiles(profiles, tokens, first, second)
-        tiles = {kernel.tactic_metadata["tile"] for kernel in first}
-        variants = tuple(
-            kernel for kernel in fused if kernel.tactic_metadata["tile"] in tiles
+        return select_catalog(
+            first,
+            second,
+            fused,
+            profiles,
+            tokens=tokens,
+            hidden=hidden,
+            intermediate=intermediate,
+            experts=experts,
+            topk=topk,
+            sm_count=sm_count,
         )
-        return first + variants, second
 
     return select_kernels
 
@@ -286,6 +265,16 @@ class FrostEngine:
         self._select_kernels = selection.select_kernels
         self._select_fma = selection.select_fma
         self._generation += 1
+        device_key = ()
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            from .device import device_facts
+
+            index = (
+                torch.cuda.current_device()
+                if self.device.index is None
+                else self.device.index
+            )
+            device_key = device_facts(index)
         self._snapshot_key = (
             self._generation,
             roots,
@@ -293,6 +282,7 @@ class FrostEngine:
             self.arch,
             self.sm_count,
             digest,
+            device_key,
         )
         self._metadata.clear()
         self.plans.clear()

@@ -598,6 +598,10 @@ def export_task(opts):
 
 def export(args, file):
     import cudnn
+    from flashinfer.fused_moe.backends.cudnn_frost.manifest import (
+        read_manifest,
+        write_manifest,
+    )
 
     source = args.cudnn_frost_source.resolve()
     if not Path(cudnn.__file__).resolve().is_relative_to(source):
@@ -616,11 +620,7 @@ def export(args, file):
     manifest = args.artifacts / "cudnn_frost_selected_kernels.json"
     payload = dict(schema_version=2, producer=dict(name="cudnn_frost"), kernels=[])
     if manifest.exists():
-        payload = json.loads(manifest.read_text())
-        if payload.get("schema_version") != 2:
-            raise ValueError(
-                "Re-export legacy object candidates into a new source directory"
-            )
+        payload = read_manifest(manifest)
     existing = {r["id"] for r in payload["kernels"]}
     failed = set()
     if args.resume:
@@ -707,9 +707,7 @@ def export(args, file):
     args.artifacts.mkdir(parents=True, exist_ok=True)
 
     def save():
-        temporary = manifest.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        temporary.replace(manifest)
+        write_manifest(manifest, payload)
 
     def retain(result):
         if result["kind"] == "exported":
@@ -1154,21 +1152,19 @@ def copy_selected(artifacts, selected_dir, identities, file):
     from flashinfer.fused_moe.backends.cudnn_frost.runtime import (
         _safe_child,
     )
+    from flashinfer.fused_moe.backends.cudnn_frost.manifest import (
+        read_manifest,
+        write_manifest,
+    )
 
-    manifest = json.loads((artifacts / "cudnn_frost_selected_kernels.json").read_text())
-    if manifest.get("schema_version") != 2:
-        raise ValueError(
-            "Selection requires a source manifest; re-export legacy objects"
-        )
+    manifest = read_manifest(artifacts / "cudnn_frost_selected_kernels.json")
     records = {r["id"]: r for r in manifest["kernels"]}
     target_manifest = selected_dir / "cudnn_frost_selected_kernels.json"
     payload = (
-        json.loads(target_manifest.read_text())
+        read_manifest(target_manifest)
         if target_manifest.exists()
         else dict(schema_version=2, producer=dict(name="cudnn_frost"), kernels=[])
     )
-    if payload.get("schema_version") != 2:
-        raise ValueError(f"refusing to update unsupported manifest {target_manifest}")
     previous = {r["id"]: r for r in payload["kernels"]}
     for identity in sorted(identities):
         record = records[identity]
@@ -1192,9 +1188,7 @@ def copy_selected(artifacts, selected_dir, identities, file):
             payload["kernels"].append(record)
             previous[identity] = record
         emit(file, dict(kind="selected", id=identity))
-    temporary = target_manifest.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    temporary.replace(target_manifest)
+    write_manifest(target_manifest, payload)
 
 
 def rank_stage(runs, width):

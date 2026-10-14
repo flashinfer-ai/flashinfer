@@ -15,7 +15,12 @@ from typing import Any
 
 import torch
 
-_MANIFEST = "cudnn_frost_selected_kernels.json"
+from .manifest import MANIFEST_FILENAME, read_manifest
+from .catalog import dimension_matches
+
+_MANIFEST = MANIFEST_FILENAME
+_read_manifest = read_manifest
+_dimension_matches = dimension_matches
 
 
 @functools.cache
@@ -61,21 +66,6 @@ def _arch_for(device: torch.device) -> str:
     return f"sm_{major}{minor}a"
 
 
-def _dimension_matches(value: int, rule: Any) -> bool:
-    if isinstance(rule, int):
-        return value == rule
-    if not isinstance(rule, dict):
-        return False
-    multiple = int(rule.get("multiple_of", 1))
-    if multiple <= 0:
-        raise RuntimeError("cuDNN Frost dimension 'multiple_of' must be positive")
-    return (
-        value >= int(rule.get("min", 0))
-        and ("max" not in rule or value <= int(rule["max"]))
-        and value % multiple == 0
-    )
-
-
 def _read_source(root: Path, raw: dict[str, Any]) -> tuple[Path, str]:
     source = raw.get("source", {})
     path = _safe_child(root, source.get("path", ""))
@@ -109,7 +99,57 @@ def _tactic_digest(source_sha256: str) -> str:
     return _cached_tactic_digest(source_sha256, identity_key())
 
 
+def bind_kernel(kernel, device):
+    """Resolve a dimension-catalog recipe for the preparation device."""
+    from dataclasses import replace
+    from .device import device_facts, specialize_parameters
+    from .source_template import materialize_source
+
+    if hasattr(kernel, "original"):
+        return kernel._replace(original=bind_kernel(kernel.original, device))
+
+    parameters = getattr(kernel, "source_parameters", None)
+    if parameters is None:
+        return kernel
+    device = torch.device(device)
+    if device.type != "cuda":
+        return kernel
+    index = torch.cuda.current_device() if device.index is None else device.index
+    facts = device_facts(index)
+    if facts.arch != kernel.arch:
+        raise ValueError("Frost kernel architecture does not match preparation device")
+    resolved, workspace = specialize_parameters(parameters, facts)
+    path, digest = materialize_source(kernel.template_path, resolved)
+    return replace(
+        kernel, source_path=path, source_sha256=digest, workspace_bytes=workspace
+    )
+
+
+def source_binding(root, raw, digest):
+    parameters = raw["source"].get("parameters", {})
+    if not parameters.get("device_dependent"):
+        return {}
+    return dict(
+        source_parameters=parameters,
+        template_path=_safe_child(root, raw["source"]["path"]),
+        source_identity=digest,
+    )
+
+
+def discovery_binding(kernel):
+    """Keep CPU discovery query-free; bind matching CUDA metadata when available."""
+    if (
+        getattr(kernel, "source_parameters", None) is not None
+        and torch.cuda.is_available()
+    ):
+        device = torch.device("cuda", torch.cuda.current_device())
+        if kernel.arch == _arch_for(device):
+            return bind_kernel(kernel, device)
+    return kernel
+
+
 def _load_kernel(kernel, device: torch.device) -> Any:
+    kernel = bind_kernel(kernel, device)
     with torch.cuda.device(device):
         arch = _arch_for(device)
         if kernel.arch != arch:

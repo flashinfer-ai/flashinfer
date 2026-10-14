@@ -152,9 +152,7 @@ def test_default_frost_shape_policy(dtype, tokens):
         torch.empty(tokens, 6, dtype=torch.float32, device="meta"),
     )
     weights = MoEWeightPack({f"cutlass_{dtype}": {}})
-    assert runner.accepts(act, weights) == (
-        tokens <= (12288 if dtype == "bf16" else 16384)
-    )
+    assert runner.accepts(act, weights) == (tokens <= 16384)
     act.hidden_states_q = torch.empty(tokens, 129, dtype=tensor_dtype, device="meta")
     assert not runner.accepts(act, weights)
 
@@ -627,8 +625,10 @@ def test_quantized_selection_cache(dtype, monkeypatch):
     props = SimpleNamespace(multi_processor_count=128)
     monkeypatch.setattr(moe.common, "_arch_for", lambda _: "sm_107a")
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
-    selection = Mock(wraps=moe.select_stages)
-    monkeypatch.setattr(moe, "select_stages", selection)
+    from flashinfer.fused_moe.backends.cudnn_frost import heuristics
+
+    selection = Mock(wraps=heuristics.select_stages)
+    monkeypatch.setattr(heuristics, "select_stages", selection)
     args = dict(
         tokens=17,
         hidden=2048,
