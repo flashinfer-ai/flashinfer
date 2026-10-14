@@ -132,8 +132,12 @@ def _rescale_factor_min_before_exp(previous_max, next_max, scale):
 
 
 @cute.jit
-def _store_empty_output(mO, mLSE, first_head, rows, query, batch, tidx, threads):
+def _store_empty_output(
+    mO, mLSE, first_head, rows, query, batch, tidx, threads, valid_rows=None
+):
     # Only the correction owner calls this, in the workspace-free K=0 case.
+    if cutlass.const_expr(valid_rows is not None):
+        rows = max(0, min(rows, valid_rows - first_head))
     thread = tidx % threads
     for offset in range(thread, rows * 512, threads):
         mO[first_head + offset // 512, offset % 512, query, batch] = (
@@ -276,6 +280,7 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
         use_fp16_softmax: bool = False,
         force_branch: str = "auto",
         reducer_max_splits: int = MAX_SPLITS,
+        packed_rows: int = 0,
     ):
         """Initializes the configuration for a Rubin Multi-Head Latent Attention (MLA) kernel.
 
@@ -309,6 +314,9 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
         # 256-split register loop when the prepared plan admits fewer splits.
         self.reducer_max_splits = ceil_div(reducer_max_splits, 32) * 32
         self.reducer: Optional[Callable] = None
+        if packed_rows < 0:
+            raise ValueError("packed_rows must be nonnegative")
+        self.packed_rows = packed_rows
         self.latent_dim = 512
         self.rope_dim = 64
         self.acc_dtype = acc_dtype
@@ -650,10 +658,10 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
             raise ValueError("lse must have leading dimension 0")
 
         acc_o, acc_lse = self.initialize_workspace(
-            q_latent.shape[0],
-            q_latent.shape[1],
-            q_latent.shape[2],
-            q_latent.shape[3],
+            o.shape[0],
+            o.shape[1],
+            o.shape[2],
+            o.shape[3],
             split_kv,
             self.acc_dtype,
             workspace,
@@ -1232,11 +1240,44 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
             stream=stream,
             min_blocks_per_mp=1,
         )
+        if cutlass.const_expr(self.packed_rows and self.reducer is None):
+            raise ValueError("native rows require the shared row-aware reducer")
         if cutlass.const_expr(acc_o is not None and self.reducer is not None):
             assert self.reducer is not None
+            reducer_o, reducer_lse = o, lse
+            if cutlass.const_expr(self.packed_rows):
+                # Restore logical head/query modes without exposing padded rows.
+                reducer_o = cute.make_tensor(
+                    o.iterator,
+                    cute.make_layout(
+                        (
+                            self.causal_num_heads,
+                            o.shape[1],
+                            self.causal_seq_len_q,
+                            o.shape[3],
+                        ),
+                        stride=(
+                            o.stride[0],
+                            o.stride[1],
+                            self.causal_num_heads * o.stride[0],
+                            o.stride[3],
+                        ),
+                    ),
+                )
+                reducer_lse = cute.make_tensor(
+                    lse.iterator,
+                    cute.make_layout(
+                        (self.causal_num_heads, self.causal_seq_len_q, lse.shape[2]),
+                        stride=(
+                            lse.stride[0],
+                            self.causal_num_heads * lse.stride[0],
+                            lse.stride[2],
+                        ),
+                    ),
+                )
             self.reducer(
-                o,
-                lse,
+                reducer_o,
+                reducer_lse,
                 acc_o,
                 acc_lse,
                 split_kv,
@@ -2575,7 +2616,9 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
                             mO=mO,
                             K=cache_seqs[role_blk_coord[3]],
                             L=self.latent_dim_per_group,
-                            H=mQL.shape[0],
+                            H=(self.packed_rows - role_blk_coord[2] * 256)
+                            if cutlass.const_expr(self.packed_rows)
+                            else mQL.shape[0],
                             tmem_ptr=tmem_ptr,
                             tidx=tidx,
                             tiled_mma_pv=tiled_mma_pv,
@@ -2613,6 +2656,9 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
                             role_blk_coord[3],
                             tidx,
                             256,
+                            (self.packed_rows - role_blk_coord[2] * 256)
+                            if cutlass.const_expr(self.packed_rows)
+                            else None,
                         )
                     if cutlass.const_expr(self.force_branch == "auto"):
                         # Event 2 remains the work transition, not release time.
@@ -2992,12 +3038,10 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
             cute.group_modes(tSgQR, 0, 3),
         )
 
-        tQLgQL = tQLgQL_mkl[
-            None, None, None, common_params.blk_coord[2], common_params.blk_coord[3]
-        ]
-        tQRgQR = tQRgQR_mkl[
-            None, None, None, common_params.blk_coord[2], common_params.blk_coord[3]
-        ]
+        q_row_tile = common_params.blk_coord[2] if self.packed_rows else 0
+        q_sequence = 0 if self.packed_rows else common_params.blk_coord[2]
+        tQLgQL = tQLgQL_mkl[None, None, None, q_sequence, common_params.blk_coord[3]]
+        tQRgQR = tQRgQR_mkl[None, None, None, q_sequence, common_params.blk_coord[3]]
 
         # set extra params
         common_params.mPT = mPT
@@ -3017,7 +3061,7 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
         for i in cutlass.range_constexpr(self.iterations_qk_rope):
             cute.copy(
                 qk_params.tma_atom_q_rope,
-                qk_params.tQRgQR[None, 0, i],
+                qk_params.tQRgQR[None, q_row_tile, i],
                 qk_params.tQsQ_rope[None, i],
                 tma_bar_ptr=rope_bar_ptr,
             )
@@ -3057,7 +3101,7 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
                 cute.copy(
                     qk_params.tma_atom_q_latent,
                     qk_params.tQLgQL[
-                        None, 0, _h * (self.iterations_qk_latent // 2) + i
+                        None, q_row_tile, _h * (self.iterations_qk_latent // 2) + i
                     ],
                     _tQsQ_h[None, (i, 0)],
                     tma_bar_ptr=half_bar_ptr,
@@ -4388,9 +4432,21 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                 if is_last_tile:
                     q_tok = (
-                        common_params.blk_coord[2] * self.causal_fold_ratio
-                        + (common_params.blk_coord[0] * cta_qk_tiler[0] + tTR_tS[i][0])
+                        (
+                            common_params.blk_coord[2] * 256
+                            + common_params.blk_coord[0] * cta_qk_tiler[0]
+                            + tTR_tS[i][0]
+                        )
                         // self.causal_num_heads
+                        if cutlass.const_expr(self.packed_rows)
+                        else (
+                            common_params.blk_coord[2] * self.causal_fold_ratio
+                            + (
+                                common_params.blk_coord[0] * cta_qk_tiler[0]
+                                + tTR_tS[i][0]
+                            )
+                            // self.causal_num_heads
+                        )
                     )
                     k_bound = common_params.K - self.causal_seq_len_q + 1 + q_tok
                     tTR_rAcc[i] = (
@@ -4437,9 +4493,21 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
             if is_last_tile:
                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                     q_tok = (
-                        common_params.blk_coord[2] * self.causal_fold_ratio
-                        + (common_params.blk_coord[0] * cta_qk_tiler[0] + tTR_tS[i][0])
+                        (
+                            common_params.blk_coord[2] * 256
+                            + common_params.blk_coord[0] * cta_qk_tiler[0]
+                            + tTR_tS[i][0]
+                        )
                         // self.causal_num_heads
+                        if cutlass.const_expr(self.packed_rows)
+                        else (
+                            common_params.blk_coord[2] * self.causal_fold_ratio
+                            + (
+                                common_params.blk_coord[0] * cta_qk_tiler[0]
+                                + tTR_tS[i][0]
+                            )
+                            // self.causal_num_heads
+                        )
                     )
                     k_bound = common_params.K - self.causal_seq_len_q + 1 + q_tok
                     tTR_rAcc[i] = (
@@ -6912,8 +6980,9 @@ class _MixedFallbackPrep(_MixedFallbackBase):
         # blocks) — the baseline's native multi-token form (pure stride
         # re-view; the kernel walk hands pair p the s = p block).
         # Preserve every query while folding each into two half-head blocks.
-        q_latent = self._halve_rows(q_latent, 2)
-        q_rope = self._halve_rows(q_rope, 2)
+        if cutlass.const_expr(not self.packed_rows):
+            q_latent = self._halve_rows(q_latent, 2)
+            q_rope = self._halve_rows(q_rope, 2)
         o = self._halve_rows(o, 2)
         lse = self._halve_rows(lse, 1)
         if cutlass.const_expr(acc_o is not None):
@@ -8153,7 +8222,9 @@ class _MixedFallbackPrep(_MixedFallbackBase):
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
                         L=mCL.shape[1],
-                        H=mQL.shape[0],
+                        H=(self.packed_rows - blk_coord[1] * 128)
+                        if cutlass.const_expr(self.packed_rows)
+                        else mQL.shape[0],
                         tmem_ptr=tmem_ptr,
                         tidx=tidx,
                         tiled_mma_pv=tiled_mma_pv,
@@ -8184,6 +8255,9 @@ class _MixedFallbackPrep(_MixedFallbackBase):
                         blk_coord[2],
                         tidx,
                         128,
+                        (self.packed_rows - blk_coord[1] * 128)
+                        if cutlass.const_expr(self.packed_rows)
+                        else None,
                     )
                 if cutlass.const_expr(self.early_compute_clc):
                     work_tile = next_work_tile
