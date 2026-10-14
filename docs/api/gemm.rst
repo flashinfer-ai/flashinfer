@@ -34,6 +34,19 @@ SVDQuant NVFP4 GEMM (SM100)
     nvfp4_quantize_smooth
     svdquant_linear
 
+Quantized-base GEMM with runtime BF16 LoRA (SM90, SM100, SM103)
+---------------------------------------------------------------
+
+``out = alpha_base * (dequant(a) @ dequant(b)^T) + lora_scale * (d @ lora_b^T) [+ bias]`` with the
+BF16 LoRA factors consumed as given (Cake generated programs). ``lora_scale=None`` disables the
+adapter even if ``d`` / ``lora_b`` are passed; pass a device scalar to apply it.
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_nvfp4_lora
+    mm_fp8_lora
+
 BF16 x FP4 GEMM (W4A16)
 -----------------------
 
