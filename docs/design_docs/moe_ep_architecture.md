@@ -306,6 +306,12 @@ BF16, W4A4, W4A8, and W4A16 are supported through the unified compute path (`MoE
 
 **Mega:** pass `MegaConfig(megakernel=...)`. Weights required as the layer's `weights` argument. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
 
+After an automatic warmup, `layer.get_tuned_knobs()` returns a copy of the
+selected knob dictionary. Pass it as `knobs` when constructing a fixed layer
+with the same kernel configuration and capacity. The getter performs no tuning
+or file access and raises before a successful automatic search or after layer
+destruction. `warmup()` continues to return `None`.
+
 For serving several token capacities with one layer and one transformed weight
 set, allocate explicit profiles before capture:
 
