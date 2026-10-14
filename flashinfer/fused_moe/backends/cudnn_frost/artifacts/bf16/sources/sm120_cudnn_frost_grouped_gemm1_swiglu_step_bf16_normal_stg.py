@@ -151,6 +151,10 @@ def moe_gather_row(token_index, row, group_end, source_rows):
 
 
 
+
+
+
+
 @cute.jit
 def tma_gather4(dst, desc, k, r0, r1, r2, r3, mbar, mask=None, cta_group: cutlass.Constexpr = 1):
     """Gather four rows from a rank-2 tensor map with box_dims[1] == 1.
@@ -237,6 +241,20 @@ from cuda.bindings import driver as _cuda
 
 # @@FROST_GEOMETRY@@
 
+@cute.jit
+def red_part_seed(_red_part):
+    pass
+
+
+@cute.jit
+def red_part_flush_tile(_red_part, lane, M, N, _red_part_ctx, _red_part_args):
+    pass
+
+
+@cute.jit
+def red_part_flush_cta(_red_part, lane, M, N, _red_part_ctx, _red_part_args):
+    pass
+
 if a_is_m_major:
     raise NotImplementedError(f"{__name__}: the MoE token is K-major only (the grouped A walk is a K-major TMA box)")
 
@@ -267,6 +285,8 @@ EPI_SYNC_BAR_ID = 1
 WARPS_M = cta_tile_mnk[0] // (mma_size_m * mma_inst_shape_mnk[0])
 WARPS_N = cta_tile_mnk[1] // (mma_size_n * mma_inst_shape_mnk[1])
 NUM_COMPUTE_WARPS = WARPS_M * WARPS_N
+# GATHER: the token tile's 4-row GATHER4 groups per TMA-warp lane.
+_GATHER_LANE_GROUPS = (cta_tile_mnk[0] // 4 + 31) // 32
 
 TMA_WARP_ID = NUM_COMPUTE_WARPS
 SCHEDULER_WARP_ID = NUM_COMPUTE_WARPS + 1
@@ -320,6 +340,22 @@ _STG_EPI_GROUP_FRAGS = 4  # fragments (= STS batches) per 32-column group
 _STG_EPI_WARP_ELEMS = _STG_EPI_GROUP_FRAGS * _STG_EPI_BATCH_STRIDE  # 528
 _STG_EPI_NGRP = (_N_FRAGS + _STG_EPI_GROUP_FRAGS - 1) // _STG_EPI_GROUP_FRAGS
 _STG_V = (vec_bytes_epi * 8) // cd_dtype.width
+
+# Row-per-lane drain (block-scale quantize chains; the row_per_lane_drain tile
+# constant picks it over the lane-run drain). A 32-row slab is two 16-row m-fragments staged
+# in two sub-passes; a warp tile of one 16-row fragment gives a 16-row slab
+# owned by lanes 0..15.
+_RPL_SUBPASSES = 2 if _M_FRAGS % 2 == 0 else 1
+_RPL_SLABS = _M_FRAGS // _RPL_SUBPASSES
+
+
+def _rpl_swz(r):
+    """XOR key of the 16-byte granules of row-major staging row ``r``: keeps
+    the drain's STS.64 writes and LDS.128 reads of a 16x32 fp32 tile at the
+    two-words-per-bank minimum (an unswizzled tile hits eight)."""
+    rr = r % 8
+    return ((rr & 3) << 1) | (rr >> 2)
+
 
 _STG_EPI_BYTES = 4 * _STG_EPI_WARP_ELEMS * NUM_COMPUTE_WARPS
 # One SMEM tile per DISTINCT operand per stage (multi-GEMM holds several B tiles).
@@ -508,6 +544,7 @@ def frost_template_kernel(
 
     gC_tap_0_ptr = mC_tap_0.iterator.raw_ptr()
     VEC_BYTES_TAP_0 = vec_bytes_tap_0
+    _red_part_args = ()
 
     VEC_BYTES = vec_bytes_epi
     vsize = epi_chunk_elems
@@ -688,6 +725,18 @@ def frost_template_kernel(
                 coord_m = group_begin + tile_m * cgrp_tile_mnk[0]
                 coord_n = tile_n * cgrp_tile_mnk[1]
 
+                if cutlass.const_expr(moe_gather):
+                    # Lane l owns the tile's 4-row GATHER groups l, l + 32, ...:
+                    # it reads their source rows once per tile and issues their
+                    # GATHER4s itself, so no lane holds the whole tile's rows
+                    # (one lane holding them all spilled once the producer warps
+                    # drop to PROD_REG_COUNT registers).
+                    gather_lane = cute.arch.lane_idx()
+                    gather_rows = []
+                    for _lg in cutlass.range_constexpr(_GATHER_LANE_GROUPS):
+                        _row = coord_m + (_lg * 32 + gather_lane) * 4
+                        gather_rows.append([moe_gather_row(token_index, _row + _j, group_end, source_rows) for _j in range(4)])
+
                 for k_tile_idx in range(num_k_tiles):
                     stage = ab_iter % ab_stages
                     if stage == 0 and ab_iter != 0:
@@ -701,23 +750,23 @@ def frost_template_kernel(
                     # the TMA copies deliver exactly num_tma_copy_bytes once.
                     if elect_one:
                         nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
+                    if cutlass.const_expr(moe_gather):
+                        # Every lane's GATHER4 completes on this stage's barrier:
+                        # order them after the elected lane's expect_tx.
+                        nvvm.bar_warp_sync(0xFFFFFFFF)
                     for _ai in cutlass.range_constexpr(num_a_operands):
                         if cutlass.const_expr(moe_gather):
-                            for _am in cutlass.range(cta_tile_mnk[0] // 4, unroll_full=True):
-                                if elect_one:
-                                    row = coord_m + _am * 4
-                                    r0 = moe_gather_row(token_index, row, group_end, source_rows)
-                                    r1 = moe_gather_row(token_index, row + 1, group_end, source_rows)
-                                    r2 = moe_gather_row(token_index, row + 2, group_end, source_rows)
-                                    r3 = moe_gather_row(token_index, row + 3, group_end, source_rows)
+                            for _lg in cutlass.range_constexpr(_GATHER_LANE_GROUPS):
+                                _am = _lg * 32 + gather_lane
+                                if _am < cta_tile_mnk[0] // 4:
                                     tma_gather4(
                                         smem_a_list[_ai].subview(sA_elems * stage + _am * 4 * _CTA_K_ELEMS),
                                         tma_a_descs[_ai].get_ptr(),
                                         coord_k,
-                                        r0,
-                                        r1,
-                                        r2,
-                                        r3,
+                                        gather_rows[_lg][0],
+                                        gather_rows[_lg][1],
+                                        gather_rows[_lg][2],
+                                        gather_rows[_lg][3],
                                         ab_full_mbar_ptr.subview(stage),
                                     )
                         else:
@@ -810,6 +859,13 @@ def frost_template_kernel(
             sched_stage = cutlass.Int32(0)
             sched_full_phase = sched_full_phase ^ 1
 
+        # Tile-invariant (scalar) reductions fold every epilogue vector into one
+        # register slot per thread; the red_part_* helpers, rendered with the tile
+        # constants (empty when the chain has none), seed the slots here and flush
+        # them -- one warp shuffle and one atomic per warp -- after each tile's
+        # drain and after the tile loop, where all 32 lanes are converged.
+        _red_part = cute.make_rmem_tensor(red_part_slots, cutlass.Float32)
+        red_part_seed(_red_part)
         while is_valid != 0:
             coord_m = group_begin + tile_m * cgrp_tile_mnk[0]
             coord_n = tile_n * cgrp_tile_mnk[1]
@@ -954,63 +1010,152 @@ def frost_template_kernel(
             _aux_scale_pre = (_aux_scale_ptr + 0).load()
 
             _stg_stage = smem_stg_epi.subview(warp_idx * _STG_EPI_WARP_ELEMS)
-            for mf in cutlass.range_constexpr(_M_FRAGS):
-                for grp in cutlass.range_constexpr(_STG_EPI_NGRP):
-                    _nf0 = grp * _STG_EPI_GROUP_FRAGS
-                    _grp_frags = min(_STG_EPI_GROUP_FRAGS, _N_FRAGS - _nf0)
-                    # -- STS_128: reg-index-order dump, one batch per fragment; then
-                    # LDS: 16 contiguous elems = both row-halves of one frag. One GEMM
-                    # at a time through the same warp-private buffer (multi-GEMM keeps
-                    # every GEMM's segment in registers, not extra SMEM).
-                    _seg_list = []
-                    for _g in cutlass.range_constexpr(num_gemms):
-                        _acc_g = acc_list[_g]
-                        for b in cutlass.range_constexpr(_grp_frags):
-                            _o = (mf * _N_FRAGS + _nf0 + b) * 4
-                            _s_off = b * _STG_EPI_BATCH_STRIDE + lane * _STG_EPI_LANE_QUAD
-                            (_stg_stage.data_ptr() + _s_off).store(_acc_g[_o:4], alignment=16)
+            if cutlass.const_expr(not row_per_lane_drain):
+                for mf in cutlass.range_constexpr(_M_FRAGS):
+                    for grp in cutlass.range_constexpr(_STG_EPI_NGRP):
+                        _nf0 = grp * _STG_EPI_GROUP_FRAGS
+                        _grp_frags = min(_STG_EPI_GROUP_FRAGS, _N_FRAGS - _nf0)
+                        # -- STS_128: reg-index-order dump, one batch per fragment; then
+                        # LDS: 16 contiguous elems = both row-halves of one frag. One GEMM
+                        # at a time through the same warp-private buffer (multi-GEMM keeps
+                        # every GEMM's segment in registers, not extra SMEM).
+                        _seg_list = []
+                        for _g in cutlass.range_constexpr(num_gemms):
+                            _acc_g = acc_list[_g]
+                            for b in cutlass.range_constexpr(_grp_frags):
+                                _o = (mf * _N_FRAGS + _nf0 + b) * 4
+                                _s_off = b * _STG_EPI_BATCH_STRIDE + lane * _STG_EPI_LANE_QUAD
+                                (_stg_stage.data_ptr() + _s_off).store(_acc_g[_o:4], alignment=16)
+                            nvvm.bar_warp_sync(0xFFFFFFFF)
+                            _seg_list.append((_stg_stage.data_ptr() + lane_mod4 * _STG_EPI_BATCH_STRIDE + lane_div4 * 16).load(alignment=16, count=16))
+                            if cutlass.const_expr(_g + 1 < num_gemms):
+                                nvvm.bar_warp_sync(0xFFFFFFFF)  # every lane has its segment before the buffer is reused
+                        # Short tail group: trailing lanes own no fragment there
+                        # (True at trace time for full groups — no guard emitted).
+                        _lane_active = True if _grp_frags == _STG_EPI_GROUP_FRAGS else lane_mod4 < _grp_frags
+                        if _lane_active:
+                            for half in cutlass.range_constexpr(2):
+                                row_in_cta = warp_row * _WARP_TILE_M + mf * 16 + half * 8 + lane_div4
+                                row = coord_m + row_in_cta
+                                # The ragged tail of a group: rows at or past group_end
+                                # hold the next group's tokens (or zero-fill) and are
+                                # not this expert's output.
+                                if row < group_end:
+                                    _row_list = []
+                                    for _g in cutlass.range_constexpr(num_gemms):
+                                        _seg = _seg_list[_g]
+                                        _row = cutlass.Array(mma_c_dtype, 8, alignment=16)
+                                        for sj in cutlass.range_constexpr(4):
+                                            _row[2 * sj] = _seg[4 * sj + 2 * half]
+                                            _row[2 * sj + 1] = _seg[4 * sj + 2 * half + 1]
+                                        _row_list.append(_row)
+                                    for sv in cutlass.range_constexpr(8 // _STG_V):
+                                        col = coord_n + warp_col * _WARP_TILE_N + (_nf0 + lane_mod4) * 8 + sv * _STG_V
+                                        col_j = col
+                                        if col_j + vsize <= N:
+                                            # One epilogue input vector per GEMM: GEMM 0 is the
+                                            # template's `vec_f32`, GEMMs > 0 are bound as
+                                            # `vec_f32_<g>` by the injected STG bindings below.
+                                            # NB: Array slices are [start:COUNT], not
+                                            # [start:stop] (matches acc[_o:2] above).
+                                            c_rmem_vecs = []
+                                            for _g in cutlass.range_constexpr(num_gemms):
+                                                _vec = _row_list[_g][sv * _STG_V : _STG_V]
+                                                if cutlass.const_expr(acc_widen_to_fp32):
+                                                    _pf = _vec.to(cutlass.Float32)
+                                                    c_rmem_vecs.append(_pf + cutlass.full_like(_pf, 0.0))
+                                                else:
+                                                    c_rmem_vecs.append(_vec)
+                                            vec_f32 = c_rmem_vecs[0]
+                                            # Every store carries its own output's offset: no template-level
+                                            # linear_idx, so a reduction-only chain (no output 0) renders.
+
+                                            vec_f32_1 = c_rmem_vecs[1]
+
+                                            _c_0_a = (vec_f32).to(cutlass.Float32)
+                                            _op_0 = _c_0_a * cute.math.rcp(cutlass.full_like(_c_0_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_0_a * cutlass.full_like(_c_0_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)
+                                            _c_1_a = (_op_0).to(cutlass.Float32)
+                                            _r1 = _c_1_a
+                                            _rk1 = cute.math.max(_r1, cutlass.full_like(_r1, cutlass.Float32(0.0))) + cutlass.full_like(_r1, cutlass.Float32(1.0)) * cute.math.min(_r1, cutlass.full_like(_r1, cutlass.Float32(0.0)))
+                                            _ru1 = cute.math.min(_rk1, cutlass.full_like(_r1, cutlass.Float32(7.0)))
+                                            _op_1 = _ru1
+                                            _c_2_a = (vec_f32_1).to(cutlass.Float32)
+                                            _r2 = _c_2_a
+                                            _rk2 = cute.math.max(_r2, cutlass.full_like(_r2, cutlass.Float32(0.0))) + cutlass.full_like(_r2, cutlass.Float32(1.0)) * cute.math.min(_r2, cutlass.full_like(_r2, cutlass.Float32(0.0)))
+                                            _rl2 = cute.math.max(_rk2, cutlass.full_like(_r2, cutlass.Float32(-7.0)))
+                                            _ru2 = cute.math.min(_rl2, cutlass.full_like(_r2, cutlass.Float32(7.0)))
+                                            _op_2 = _ru2
+                                            _c_3_a = (_op_1).to(cutlass.Float32)
+                                            _c_3_b = (_op_2).to(cutlass.Float32)
+                                            _op_3 = _c_3_a * _c_3_b
+                                            _c_4_a = (_op_3).to(cutlass.Float32)
+                                            _op_4 = _c_4_a * (cutlass.full_like(_c_4_a, _aux_scale_pre.to(cutlass.Float32)))
+                                            _r_4 = (_op_4).to(cutlass.BFloat16)
+                                            _tap_0 = (_r_4).to(cutlass.BFloat16)
+                                            (gC_tap_0_ptr + (row * out_stride_m_0 + col_j)).store(_tap_0, alignment=VEC_BYTES_TAP_0)
                         nvvm.bar_warp_sync(0xFFFFFFFF)
-                        _seg_list.append((_stg_stage.data_ptr() + lane_mod4 * _STG_EPI_BATCH_STRIDE + lane_div4 * 16).load(alignment=16, count=16))
-                        if cutlass.const_expr(_g + 1 < num_gemms):
-                            nvvm.bar_warp_sync(0xFFFFFFFF)  # every lane has its segment before the buffer is reused
-                    # Short tail group: trailing lanes own no fragment there
-                    # (True at trace time for full groups — no guard emitted).
-                    _lane_active = True if _grp_frags == _STG_EPI_GROUP_FRAGS else lane_mod4 < _grp_frags
-                    if _lane_active:
-                        for half in cutlass.range_constexpr(2):
-                            row_in_cta = warp_row * _WARP_TILE_M + mf * 16 + half * 8 + lane_div4
+            else:
+                # Row-per-lane drain: re-read the warp's accumulators row-major through the
+                # warp-private staging buffer so lane l owns row l of a 32-row slab (lanes
+                # 0..15 of a 16-row slab when the warp tile is one m-fragment) and a
+                # contiguous run of the slab's 32-column group -- the sm100 TMEM-drain view
+                # (thread = row, warp = 32 consecutive rows) the block-quantize emitters are
+                # written for. Each 16x32 sub-pass uses 512 of the warp's 528 staging floats.
+                for slab in cutlass.range_constexpr(_RPL_SLABS):
+                    for grp in cutlass.range_constexpr(_STG_EPI_NGRP):
+                        _nf0 = grp * _STG_EPI_GROUP_FRAGS
+                        _grp_frags = min(_STG_EPI_GROUP_FRAGS, _N_FRAGS - _nf0)
+                        _run_list = []
+                        for _g in cutlass.range_constexpr(num_gemms):
+                            _acc_g = acc_list[_g]
+                            _run = cutlass.Array(mma_c_dtype, 32, alignment=16)
+                            for _sp in cutlass.range_constexpr(_RPL_SUBPASSES):
+                                _mf = slab * _RPL_SUBPASSES + _sp
+                                # STS.64: regs (0,1) are row lane//4, regs (2,3) row lane//4 + 8,
+                                # columns 8b + 2*(lane%4) of n-fragment b.
+                                for b in cutlass.range_constexpr(_grp_frags):
+                                    for _hr in cutlass.range_constexpr(2):
+                                        _rr = lane_div4 + 8 * _hr
+                                        _off = _rr * 32 + ((2 * b + lane_mod4 // 2) ^ _rpl_swz(_rr)) * 4 + (lane_mod4 % 2) * 2
+                                        _o = (_mf * _N_FRAGS + _nf0 + b) * 4 + 2 * _hr
+                                        (_stg_stage.data_ptr() + _off).store(_acc_g[_o:2], alignment=8)
+                                nvvm.bar_warp_sync(0xFFFFFFFF)
+                                # LDS.128: lanes 16*_sp .. 16*_sp + 15 take this fragment's rows.
+                                if lane // 16 == _sp:
+                                    _r = lane % 16
+                                    for _j in cutlass.range_constexpr(2 * _grp_frags):
+                                        _run[_j * 4 : 4] = (_stg_stage.data_ptr() + _r * 32 + (_j ^ _rpl_swz(_r)) * 4).load(alignment=16, count=4)
+                                nvvm.bar_warp_sync(0xFFFFFFFF)  # the next sub-pass / GEMM reuses the buffer
+                            _run_list.append(_run)
+                        # Lanes 16..31 own no row when the slab is a single 16-row fragment.
+                        _rows_owned = True if _RPL_SUBPASSES == 2 else lane < 16
+                        if _rows_owned:
+                            row_in_cta = warp_row * _WARP_TILE_M + slab * (16 * _RPL_SUBPASSES) + lane
                             row = coord_m + row_in_cta
-                            # The ragged tail of a group: rows at or past group_end
-                            # hold the next group's tokens (or zero-fill) and are
-                            # not this expert's output.
-                            if row < group_end:
-                                _row_list = []
-                                for _g in cutlass.range_constexpr(num_gemms):
-                                    _seg = _seg_list[_g]
-                                    _row = cutlass.Array(mma_c_dtype, 8, alignment=16)
-                                    for sj in cutlass.range_constexpr(4):
-                                        _row[2 * sj] = _seg[4 * sj + 2 * half]
-                                        _row[2 * sj + 1] = _seg[4 * sj + 2 * half + 1]
-                                    _row_list.append(_row)
-                                for sv in cutlass.range_constexpr(8 // _STG_V):
-                                    col = coord_n + warp_col * _WARP_TILE_N + (_nf0 + lane_mod4) * 8 + sv * _STG_V
+                            # A col quant reduces a block's amax across the lanes of a
+                            # (half-)warp, so under rpl_bounded_rows every lane reaches it:
+                            # the guard is always taken and each store carries
+                            # row < group_end itself (generate(..., bounded_rows=True)).
+                            if cutlass.const_expr(rpl_bounded_rows):
+                                _row_live = True
+                            else:
+                                _row_live = row < group_end
+                            if _row_live:
+                                for _jv in cutlass.range_constexpr((_grp_frags * 8) // vsize):
+                                    col = coord_n + warp_col * _WARP_TILE_N + _nf0 * 8 + _jv * vsize
                                     col_j = col
                                     if col_j + vsize <= N:
-                                        # One epilogue input vector per GEMM: GEMM 0 is the
-                                        # template's `vec_f32`, GEMMs > 0 are bound as
-                                        # `vec_f32_<g>` by the injected STG bindings below.
-                                        # NB: Array slices are [start:COUNT], not
-                                        # [start:stop] (matches acc[_o:2] above).
+                                        # One vsize-wide epilogue vector per GEMM (GEMM 0 is
+                                        # `vec_f32`; the injected bindings name the others).
                                         c_rmem_vecs = []
                                         for _g in cutlass.range_constexpr(num_gemms):
-                                            _vec = _row_list[_g][sv * _STG_V : _STG_V]
+                                            _vec = _run_list[_g][_jv * vsize : vsize]
                                             if cutlass.const_expr(acc_widen_to_fp32):
                                                 _pf = _vec.to(cutlass.Float32)
                                                 c_rmem_vecs.append(_pf + cutlass.full_like(_pf, 0.0))
                                             else:
                                                 c_rmem_vecs.append(_vec)
                                         vec_f32 = c_rmem_vecs[0]
-                                        linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
 
                                         vec_f32_1 = c_rmem_vecs[1]
 
@@ -1035,7 +1180,7 @@ def frost_template_kernel(
                                         _r_4 = (_op_4).to(cutlass.BFloat16)
                                         _tap_0 = (_r_4).to(cutlass.BFloat16)
                                         (gC_tap_0_ptr + (row * out_stride_m_0 + col_j)).store(_tap_0, alignment=VEC_BYTES_TAP_0)
-                    nvvm.bar_warp_sync(0xFFFFFFFF)
+            red_part_flush_tile(_red_part, lane, M, N, (group_idx, group_begin, group_end), _red_part_args)
 
             # Next record.
             while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr.subview(sched_stage), sched_full_phase, time_limit=10_000_000):
@@ -1055,6 +1200,7 @@ def frost_template_kernel(
                 sched_stage = cutlass.Int32(0)
                 sched_full_phase = sched_full_phase ^ 1
 
+        red_part_flush_cta(_red_part, lane, M, N, (group_idx, group_begin, group_end), _red_part_args)
         # No more tiles for this CTA: all its global A/B reads have been issued.
         if cutlass.const_expr(USE_PDL):
             if warp_idx == 0:
@@ -1199,6 +1345,15 @@ def _host(
         block=(threads_per_cta, 1, 1),
         use_pdl=USE_PDL,
         stream=stream,
+        # .minnctapersm 1. With .reqntid alone ptxas cannot tell the register
+        # count at entry, so it drops every setmaxnreg above (C7508): the compute
+        # warps never get EPI_REG_COUNT, and ptxas may also size every warp for
+        # several CTAs per SM (the dual MoE kernels fell to 40 registers). The
+        # SMEM ring is sized to the per-CTA budget, so one CTA per SM is all that
+        # fits anyway -- except the two smallest catalog tiles (32x64 / 64x32 at
+        # a 32-byte K, whose ring caps at 16 stages), which now run one per SM
+        # instead of two.
+        min_blocks_per_mp=1,
     )
 
 

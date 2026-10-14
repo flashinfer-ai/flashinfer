@@ -18,13 +18,13 @@ from .....fused_moe.api import (
     SwiGLUStep,
 )
 
-from ..support import shortlisted_moe_geometry
+from ..support import SUPPORTED_ARCH_NUMBERS, shortlisted_moe_geometry
 
 
 def large_bf16_moe(config, act, arch):
     x = act.hidden_states_q
     compatible = (
-        arch in (107, 120)
+        arch in SUPPORTED_ARCH_NUMBERS
         and config.quant.pair == (QuantFormat.BF16, QuantFormat.BF16)
         and config.quant.output == QuantFormat.BF16
         and act.routing_input_mode == RoutingInputMode.PackedPrecomputed

@@ -71,8 +71,8 @@ are designed to co-exist, and neither supersedes the other.
 cuDNN Frost backend
 ~~~~~~~~~~~~~~~~~~~
 
-Frost is a stable ``MoELayer`` backend on SM107a, with additional BF16 support
-on SM120a. Its four configs are included in the default backend list and can
+Frost is a stable ``MoELayer`` backend on SM107a and SM120a. Its four configs
+are included in the default backend list and can
 also be selected through ``BackendOptions``. Candidates with unavailable weight
 views or unsupported input shapes are skipped. It does not require
 ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS``.
@@ -141,6 +141,8 @@ layer.
 
 The validated SM107 dependency baseline is PyTorch 2.14.1, CuTe DSL 4.8.0, TVM-FFI
 0.1.14.post1, and external PTXAS 13.4.92. CUDA 13.5 PTXAS is also validated.
+The SM120 kernels were validated with PyTorch 2.14.0, CuTe DSL 4.7.1, TVM-FFI
+0.1.13.post3, and CUDA 13.4 with the bundled assembler.
 Runtime checks additionally require the DSL
 primitives and PyTorch CUDA Graph resource-retention APIs used by the backend.
 Older dependencies remain usable by other FlashInfer backends; these requirements
@@ -156,13 +158,13 @@ skips unavailable Frost candidates; explicit selection reports the missing requi
 Both external PTXAS and the bundled assembler must report CUDA 13.4 or newer.
 There is no patch-level minimum.
 Use the latest assembler patch release for SM107 tensor-map updates.
-SM120 BF16 kernels do not update tensor maps and retain capability-based compiler
+SM120 kernels do not update tensor maps and retain capability-based compiler
 admission without this SM107-specific assembler minimum.
 
 Prepare and optionally autotune before CUDA Graph capture. Frozen device sources
 ship in the wheel and are compiled for the requested geometry into the writable
 FlashInfer cache. The four fixed routing/finalize adapters are also registered
-for SM107 AOT builds, and the BF16 adapter is registered for SM120 AOT builds.
+for SM107 and SM120 AOT builds.
 Geometry-specialized DSL kernels retain source/JIT delivery.
 No runtime cuDNN Frontend installation is required.
 

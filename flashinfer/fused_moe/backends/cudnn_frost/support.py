@@ -1,6 +1,11 @@
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
 """Weight-view aliases and input geometry policy for Frost MoELayer candidates."""
 
+# Every dtype packages sources for these exact targets; no other architecture
+# runs them.
+SUPPORTED_ARCHS = ("sm_107a", "sm_120a")
+SUPPORTED_ARCH_NUMBERS = (107, 120)
+
 _SHORTLIST_TOP_K = {
     (12, 7168, 3072): (1, 2, 4),
     (8, 4096, 14336): (2,),

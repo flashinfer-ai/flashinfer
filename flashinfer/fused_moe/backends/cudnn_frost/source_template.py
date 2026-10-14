@@ -176,21 +176,33 @@ def extract_template(source: str, *, swap_ab: bool) -> tuple[str, dict]:
     if end < 0:
         # The block-scale swap-AB template starts its workspace formulas
         # directly, without the dense/normal template's section comment. The
-        # SM120 template first guards its K-major token with an if statement.
+        # SM120 templates first guard their K-major token with an if statement
+        # (on operand A, or on operand B after the swap-AB lowering).
         end = source.index("moe_desc_slots =", begin)
-        guard = source.find("\nif a_is_m_major:", begin, end)
-        if guard >= 0:
-            end = guard + 1
+        guards = [
+            index
+            for index in (
+                source.find(f"\nif {flag}:", begin, end)
+                for flag in ("a_is_m_major", "b_is_n_major")
+            )
+            if index >= 0
+        ]
+        if guards:
+            end = min(guards) + 1
     constants = []
     for statement in ast.parse(source[begin:end]).body:
         # Quantized epilogues can inject conversion helpers before the
-        # workspace formulas. Leave their imports and bodies in the template.
+        # workspace formulas, and SM120 sources inject decorated reduction
+        # hooks. Leave their imports and bodies, decorators included, in the
+        # template.
         if isinstance(statement, (ast.Import, ast.ImportFrom, ast.FunctionDef)):
+            first = min(
+                [statement.lineno]
+                + [d.lineno for d in getattr(statement, "decorator_list", ())]
+            )
             end = begin + sum(
                 len(line)
-                for line in source[begin:end].splitlines(keepends=True)[
-                    : statement.lineno - 1
-                ]
+                for line in source[begin:end].splitlines(keepends=True)[: first - 1]
             )
             break
         if not (

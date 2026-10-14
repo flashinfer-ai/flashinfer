@@ -32,14 +32,12 @@ from ..engine import (
 )
 from ..capabilities import require_compiler
 from ..activations import ACTIVATIONS, activation_name
-from ..support import weight_view
+from ..support import SUPPORTED_ARCHS, weight_view
 from ..compiler import require_moe_assembler
 from ..shortlist import capture_profiles
 
 _WEIGHT_KEYS = frozenset(("fc1_expert_weights", "fc2_expert_weights"))
 _TAG = "cudnn_frost-bf16-moe-v2"
-# Architectures with packaged BF16 sources.
-_SUPPORTED_ARCHS = ("sm_107a", "sm_120a")
 _UNSUPPORTED = "cuDNN Frost BF16 MoE kernels require SM107a or SM120a"
 
 
@@ -273,7 +271,7 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
         if self.device.type != "cuda":
             raise NotImplementedError(_UNSUPPORTED)
         major, minor = get_compute_capability(self.device)
-        if f"sm_{major}{minor}a" not in _SUPPORTED_ARCHS:
+        if f"sm_{major}{minor}a" not in SUPPORTED_ARCHS:
             raise NotImplementedError(_UNSUPPORTED)
         name = activation_name(self.config.activation)
         if not self.config.finalize.do_finalize:
