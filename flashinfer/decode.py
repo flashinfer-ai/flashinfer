@@ -1686,6 +1686,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The fixed split size for FA2 split-kv decode, in pages.
         disable_split_kv : bool
             Whether to disable the split-kv for determinism in CUDA Graph. Defaults to ``False``.
+            CUDA-core decode does not support this option and raises
+            ``ValueError`` when it is ``True``.
         q_len_per_req : int
             The number of query tokens per request. Defaults to ``1``.
 
@@ -1750,6 +1752,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if backend in ("cute-dsl", "trtllm-gen", "cudnn"):
             raise NotImplementedError(
                 f"workspace_size is not available for decode backend {backend!r}"
+            )
+
+        if disable_split_kv and not self.use_tensor_cores:
+            raise ValueError(
+                "disable_split_kv is not supported by CUDA-core decode; "
+                "use use_tensor_cores=True with backend='fa2'."
             )
 
         if fixed_split_size is not None and not self.use_tensor_cores:
@@ -1973,6 +1981,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+            CUDA-core decode does not support this option and raises
+            ``ValueError`` when it is ``True``.
         q_len_per_req : int
             The number of query tokens per request. Defaults to ``1``.
             ``q_len_per_req > 1`` is currently supported on the fa2
@@ -2112,6 +2122,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
+        if (
+            disable_split_kv
+            and not self.use_tensor_cores
+            and not self._uses_cudnn
+            and self._backend != "cutile"
+        ):
+            raise ValueError(
+                "disable_split_kv is not supported by CUDA-core decode; "
+                "use use_tensor_cores=True with backend='fa2'."
+            )
         if self.is_cuda_graph_enabled:
             # The resolved backend is part of the frozen CUDA-graph shape: a
             # captured graph replays the kernels it was captured with, and
@@ -4943,6 +4963,11 @@ def fast_decode_plan(
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
             q_len_per_req=q_len_per_req,
+        )
+    if disable_split_kv and not self.use_tensor_cores:
+        raise ValueError(
+            "disable_split_kv is not supported by CUDA-core decode; "
+            "use use_tensor_cores=True with backend='fa2'."
         )
     if q_len_per_req < 1:
         raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
