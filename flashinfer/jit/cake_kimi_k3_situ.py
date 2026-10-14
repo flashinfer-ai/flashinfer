@@ -139,6 +139,35 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a": "d1df5f44ad0b1609b6ae",
         },
     },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_1ba6921046b292c2a98f": {
+        "role": "kernel",
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_1ba6921046b292c2a98f_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_1ba6921046b292c2a98f_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "binding_style": "prepared_stage",
+        "arg_plan": [
+            ["buffer", "expert_output"],
+            ["buffer", "partial_scale"],
+            ["buffer", "route_weights"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "tma_workspace_bytes": 0,
+        "arches": ["sm_103a"],
+        "closure_sha256": "499127bce03b96d8614bb35e848237a70d99bdfce374a65c2e8cadbafca287a6",
+        "carried": {
+            "export_sha256": "278a866855ec2e2fba8fc8612d999905b9c43c2f0167af746e39945031c5696c",
+            "sm_103a": "1ba6921046b292c2a98f",
+        },
+    },
     "cake_kimi_k3_nvfp4_situ_routed_moe_1dc27deff743b34ea395": {
         "role": "kernel",
         "sources": [
@@ -462,12 +491,11 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "specializations": {},
         "tma_workspace_bytes": 0,
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a"],
         "closure_sha256": "a38a469000b3f9604c84d963a1869c4b285ee2846231eb21284da3fc47be38e1",
         "carried": {
             "target_revision": "f8d3729e9c85d20afdf4a1e672771cdb157e0e33",
             "sm_100a": "79b9dbe1233312e2e015",
-            "sm_103a": "d76afbe143434c6757bd",
         },
     },
     "cake_kimi_k3_nvfp4_situ_routed_moe_8835f78612501d1d1d48": {
@@ -506,12 +534,11 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "specializations": {},
         "tma_workspace_bytes": 0,
-        "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "8efcbe330ef32afb6b415a3c0c08caa77052c3a947c9e11cc06ca3d22610df15",
+        "arches": ["sm_100a"],
+        "closure_sha256": "c20b1f6960134ba51b6e5c3ae73da0b954d2441dd7764ff7a77e76d070035efa",
         "carried": {
             "target_revision": "f8d3729e9c85d20afdf4a1e672771cdb157e0e33",
             "sm_100a": "8835f78612501d1d1d48",
-            "sm_103a": "981d0cee885906e98556",
         },
     },
     "cake_kimi_k3_nvfp4_situ_routed_moe_8adb088a23619bcf252f": {
@@ -822,6 +849,45 @@ MODULES: dict[str, dict[str, Any]] = {
         "carried": {
             "target_revision": "f8d3729e9c85d20afdf4a1e672771cdb157e0e33",
             "sm_100a": "a264957aa770dad84302",
+        },
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_ad5623664c0619d269a9": {
+        "role": "kernel",
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_ad5623664c0619d269a9_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_ad5623664c0619d269a9_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "binding_style": "prepared_stage",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "C"],
+            ["buffer", "scale_c"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "partial_scale"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["buffer", "total_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "tma_workspace_bytes": 0,
+        "arches": ["sm_103a"],
+        "closure_sha256": "e9632a463384ddc719c3b630f32c70e733655b957e54a909139655d566c289d5",
+        "carried": {
+            "export_sha256": "278a866855ec2e2fba8fc8612d999905b9c43c2f0167af746e39945031c5696c",
+            "sm_103a": "ad5623664c0619d269a9",
         },
     },
     "cake_kimi_k3_nvfp4_situ_routed_moe_af08a3678dee668769ef": {
@@ -1375,7 +1441,6 @@ KERNELS: dict[str, dict[str, str]] = {
     },
     "sm_103a": {
         "fc1:n128": "cake_kimi_k3_nvfp4_situ_routed_moe_eca3a107617c19a7c046",
-        "fc1:n128_sfbs": "cake_kimi_k3_nvfp4_situ_routed_moe_8835f78612501d1d1d48",
         "fc1:n128_work5fd": "cake_kimi_k3_nvfp4_situ_routed_moe_f732ff559a0b5d60dbe9",
         "fc1:n16": "cake_kimi_k3_nvfp4_situ_routed_moe_236a65678045e1d2c8eb",
         "fc1:n16_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_1dc27deff743b34ea395",
@@ -1385,6 +1450,7 @@ KERNELS: dict[str, dict[str, str]] = {
         "fc1:n8_s2a": "cake_kimi_k3_nvfp4_situ_routed_moe_8adb088a23619bcf252f",
         "fc1:n8_s3b": "cake_kimi_k3_nvfp4_situ_routed_moe_b2c812c6b0328fbe0449",
         "fc2:n128": "cake_kimi_k3_nvfp4_situ_routed_moe_1b1fd4abd86b36aca7f2",
+        "fc2:n128_q8i": "cake_kimi_k3_nvfp4_situ_routed_moe_ad5623664c0619d269a9",
         "fc2:n16": "cake_kimi_k3_nvfp4_situ_routed_moe_d49ae2797759f6ac37fb",
         "fc2:n16_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_43cac4c0eddfbf24a375",
         "fc2:n32": "cake_kimi_k3_nvfp4_situ_routed_moe_ba7714cb206fc1ad50c2",
@@ -1395,6 +1461,7 @@ KERNELS: dict[str, dict[str, str]] = {
         "fc2:n8_workfeed": "cake_kimi_k3_nvfp4_situ_routed_moe_13ccea112756c78b4f7f",
         "finalize:feature": "cake_kimi_k3_nvfp4_situ_routed_moe_af08a3678dee668769ef",
         "finalize:n128": "cake_kimi_k3_nvfp4_situ_routed_moe_94ed2948cdb1b434548f",
+        "finalize:n128_q8i": "cake_kimi_k3_nvfp4_situ_routed_moe_1ba6921046b292c2a98f",
         "finalize:n16": "cake_kimi_k3_nvfp4_situ_routed_moe_9b180b07b1e91d891258",
         "finalize:n32": "cake_kimi_k3_nvfp4_situ_routed_moe_9b180b07b1e91d891258",
         "finalize:n32_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_920a885b92d4dbd32aaf",
@@ -1408,17 +1475,19 @@ KERNELS: dict[str, dict[str, str]] = {
         "route_prefix": "cake_kimi_k3_nvfp4_situ_routed_moe_50228c4ae81ee9f8d962",
         "route_reset": "cake_kimi_k3_nvfp4_situ_routed_moe_ee6f3fc4b76d21d768a6",
         "route_scatter": "cake_kimi_k3_nvfp4_situ_routed_moe_69614acac074b2501413",
-        "sfb_shuffle:n128": "cake_kimi_k3_nvfp4_situ_routed_moe_79b9dbe1233312e2e015",
     },
 }
 
 # Programs carried from the previous generation of this directory because their
-# producer is not regenerated yet (each record above names the carried source
-# of every architecture it is delivered for under "carried"). Regeneration follow-up; the routes
-# that launch them are covered by the behavioural tests of this backend.
+# producer is not regenerated yet (each record above names the carried source --
+# a revision of this repository or a sealed export -- and the shipped kernel of
+# every architecture it is delivered for under "carried"). Regeneration
+# follow-up; the routes that launch them are covered by the behavioural tests
+# of this backend.
 CARRIED_PROGRAMS: list[str] = [
     "cake_kimi_k3_nvfp4_situ_routed_moe_13ccea112756c78b4f7f",
     "cake_kimi_k3_nvfp4_situ_routed_moe_1b1fd4abd86b36aca7f2",
+    "cake_kimi_k3_nvfp4_situ_routed_moe_1ba6921046b292c2a98f",
     "cake_kimi_k3_nvfp4_situ_routed_moe_1dc27deff743b34ea395",
     "cake_kimi_k3_nvfp4_situ_routed_moe_33aa68fb31dbfec22b5e",
     "cake_kimi_k3_nvfp4_situ_routed_moe_43cac4c0eddfbf24a375",
@@ -1432,6 +1501,7 @@ CARRIED_PROGRAMS: list[str] = [
     "cake_kimi_k3_nvfp4_situ_routed_moe_93e2350178fff1f9c9ac",
     "cake_kimi_k3_nvfp4_situ_routed_moe_94ed2948cdb1b434548f",
     "cake_kimi_k3_nvfp4_situ_routed_moe_a264957aa770dad84302",
+    "cake_kimi_k3_nvfp4_situ_routed_moe_ad5623664c0619d269a9",
     "cake_kimi_k3_nvfp4_situ_routed_moe_af08a3678dee668769ef",
     "cake_kimi_k3_nvfp4_situ_routed_moe_b2c812c6b0328fbe0449",
     "cake_kimi_k3_nvfp4_situ_routed_moe_bbe92c87025334a5d802",
