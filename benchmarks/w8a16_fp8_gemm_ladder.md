@@ -672,10 +672,14 @@ Free-running, 5 rounds, ratio to cuBLAS (G = 1 / 2 / 4 / 8): mlp.down tp1 1.00 /
   DRAM bytes (bytes range 0.47-1.75x of the row median, clock range 0.92-1.03x).  The cycle
   count per kernel varies by only +-1.5%, so the time differences are clock differences.
 * At K = 12800 / 25600 the shipped group for mlp.down (G = 2, fewer than 64 weight tiles)
-  is not the byte-minimum: G = 4 reads 18-27% fewer bytes and runs at an equal or higher
-  clock (mlp.down tp1 88320: G = 2 1.44 GHz / 38.7 GB, G = 4 1.50 GHz / 40.5 GB).  In time,
-  though, G = 2 and G = 4 are within 1% at 5 rounds on all four mlp.down rows, so this is not
-  worth changing the rule.  G = 8 is worse everywhere (more bytes, lower clock).
+  is not the byte-minimum on three of the four rows: G = 4 reads about 20% fewer bytes there
+  (22.8 -> 18.3, 9.8 -> 7.8, 21.0 -> 17.0 GB) and 5% more on mlp.down tp1 88320 (38.7 ->
+  40.5 GB), and its clock is equal or higher on all four (1.44 -> 1.50 GHz on that last
+  row, so the clock there does not follow the bytes).  In time, G = 2 and G = 4 are within
+  1% at 5 rounds on all four mlp.down rows, so this is not worth changing the rule.  G = 8
+  is worse everywhere (more bytes, lower clock).  Single-launch ncu byte counts at G = 1-2
+  scatter by +-20% (which weight slices survive in L2 depends on CTA timing), so only
+  differences larger than that are read here.
 * So the B15 effect exists on H100 but is about a quarter of its size on B200 (H100 HBM3 at
   700 W gives the memory a smaller share of the power budget).  The group rule stays K-blind.
   The G = 1 vs G = 4 gap on mlp.gate_up (2-5% at 5 rounds) is the one place where it shows.
