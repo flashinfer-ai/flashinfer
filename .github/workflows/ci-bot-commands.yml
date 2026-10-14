@@ -1,13 +1,14 @@
 # Bot command handler for CI permissions
 # Authorized users - anyone who can apply the run-ci label to a PR, plus the
 # ci-users team - can comment to control CI:
-#   @flashinfer-bot run [paths]  - Apply run-ci label to start CI on the current
-#                                  commit; needed again after new commits
+#   @flashinfer-bot run [paths]  - Dispatch an exact, correlated PR test request;
+#                                  needed again after new commits
 #   @flashinfer-bot rerun        - Cancel and rerun all workflows
 #   @flashinfer-bot rerun failed - Rerun failed and cancelled jobs
 #   @flashinfer-bot stop         - Cancel all in-progress workflows
 
 name: CI Bot Commands
+run-name: fi-ci-command/${{ github.event.issue.number }}/${{ github.event.comment.id }}
 
 on:
   issue_comment:
@@ -16,6 +17,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  checks: write # marks the existing required Summary pending before dispatch
   statuses: write # publishes the requested test scope (see "Handle @flashinfer-bot run")
   actions: write
 
@@ -28,6 +30,10 @@ jobs:
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '@flashinfer-bot')
     runs-on: ubuntu-latest
+    concurrency:
+      group: watcher-ci-pr-${{ github.event.issue.number }}
+      cancel-in-progress: false
+      queue: max
 
     steps:
       # Base-repo checkout only - never the PR head. This job holds a write token, so
@@ -155,10 +161,8 @@ jobs:
           # GITHUB_TOKEN only -- it does not apply to a PAT -- and the bot PAT has no
           # commit-status permission, so publishing a scope with it fails:
           #     gh: Resource not accessible by personal access token (HTTP 403)
-          # The PAT is still required for the label, because a `labeled` event raised by
-          # GITHUB_TOKEN does not trigger workflows. A status needs to trigger nothing;
-          # pr-test.yml reads it with GITHUB_TOKEN too. So splitting by purpose is safe
-          # and keeps the privileged token's blast radius smaller.
+          # The existing bot PAT issues labels or an explicitly marked dispatch.
+          # The restricted workflow token publishes only commit-status metadata.
           STATUS_TOKEN: ${{ github.token }}
           # Step-level env does not cross steps, so the comment body has to be bound
           # here too -- `Parse command` binding it is not enough. Passed through the
@@ -166,19 +170,14 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           # `@flashinfer-bot run <paths>` mirrors GitLab's `/bot run TEST_PATH`, so the
-          # two systems present one convention. A label carries no payload, so the paths
-          # are parsed HERE - the one place that already parses this comment - and handed
-          # to pr-test.yml as a commit status on the head SHA. pr-test reads that value
-          # verbatim; nothing downstream re-reads comments.
+          # two systems present one convention. Parse/validate scope here, then pass
+          # it explicitly to marked watcher requests. Ordinary human commands retain
+          # their status-chunk/label path; those statuses do not identify a request.
           #
           # Keying on the head SHA makes staleness structural: a new push is a new SHA
           # with no scope status, so an old scope cannot be resurrected by re-labelling.
-          # Guarded: this step runs under `bash -e` and everything below it is
-          # best-effort scope bookkeeping, but `gh pr edit --add-label run-ci` at the
-          # end is THE way CI starts in this repo. An unguarded network call here
-          # means a transient GitHub blip silently starts no CI for whoever typed the
-          # command -- on every PR, not just scoped ones. Publishing the scope may
-          # fail; labelling may not.
+          # The dispatcher rechecks head and immutable merge ancestry. Failed or
+          # ambiguous dispatch attempts cannot silently fall back to label-based CI.
           HEAD_SHA=$(gh pr view ${{ github.event.issue.number }} \
             --repo ${{ github.repository }} --json headRefOid -q .headRefOid) \
             || HEAD_SHA=""
@@ -266,6 +265,25 @@ jobs:
             fi
           fi
 
+          # Only explicit watcher requests use the receipt protocol. Ordinary
+          # human commands retain label-based CI, including authorized draft runs.
+          ROUTE=$(TEST_SCOPE="${SCOPE:-}" python3 scripts/pr_checks/ci_request_producer.py route)
+          if [ "$ROUTE" = watcher ]; then
+            # A label event has no request identifier. Dispatch through the trusted
+            # producer instead: GitHub returns the actual root ID before any job
+            # starts, and PR/head/scope/merge checkout are frozen in its inputs.
+            RESULT=$(TEST_SCOPE="${SCOPE:-}" python3 scripts/pr_checks/ci_request_producer.py dispatch)
+            echo "$RESULT"
+            STATE=$(jq -r .state <<< "$RESULT")
+            REACTION=eyes
+            [ "$STATE" = completed ] && REACTION='+1'
+            [ "$STATE" = no-send ] && REACTION=confused
+            gh api -X POST \
+              "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+              -f content="$REACTION" > /dev/null || true
+            exit 0
+          fi
+
           # There is no DELETE for statuses, but re-posting a context supersedes it, so
           # a scope that shrank has its leftover chunks updated to empty; otherwise
           # pr-test would reassemble stale trailing paths.
@@ -334,6 +352,7 @@ jobs:
         if: steps.check-permission.outputs.authorized == 'true' && steps.parse.outputs.command == 'rerun'
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          STATUS_TOKEN: ${{ github.token }}
         run: |
           echo "Rerunning all jobs for PR #${{ github.event.issue.number }}"
 
@@ -346,10 +365,13 @@ jobs:
 
           # Cancel in-progress and queued runs first
           echo "Cancelling in-progress runs..."
-          gh run list \
-            --repo ${{ github.repository }} \
-            --commit "$PR_SHA" \
-            --json databaseId,status -q '.[] | select(.status == "in_progress" or .status == "queued") | .databaseId' | \
+          {
+            gh run list \
+              --repo ${{ github.repository }} \
+              --commit "$PR_SHA" \
+              --json databaseId,status -q '.[] | select(.status == "in_progress" or .status == "queued") | .databaseId'
+            python3 scripts/pr_checks/ci_request_producer.py run-ids --status "active"
+          } | sort -u | \
           while read -r run_id; do
             if [ -n "$run_id" ]; then
               echo "Cancelling workflow $run_id..."
@@ -362,14 +384,22 @@ jobs:
 
           # Rerun all workflow runs for this commit
           echo "Rerunning all workflows..."
-          gh run list \
-            --repo ${{ github.repository }} \
-            --commit "$PR_SHA" \
-            --json databaseId -q '.[].databaseId' | \
+          {
+            gh run list \
+              --repo ${{ github.repository }} \
+              --commit "$PR_SHA" \
+              --json databaseId -q '.[].databaseId'
+            python3 scripts/pr_checks/ci_request_producer.py run-ids
+          } | sort -u | \
           while read -r run_id; do
             if [ -n "$run_id" ]; then
               echo "Rerunning workflow $run_id..."
-              gh run rerun "$run_id" --repo ${{ github.repository }} || true
+              python3 scripts/pr_checks/ci_request_producer.py prepare-rerun --run-id "$run_id"
+              if ! gh run rerun "$run_id" --repo ${{ github.repository }}; then
+                python3 scripts/pr_checks/ci_request_producer.py rerun-submit-failed --run-id "$run_id"
+                echo "::error::Rerun response unavailable; do not blindly repost"
+                exit 1
+              fi
             fi
           done
 
@@ -385,6 +415,7 @@ jobs:
         if: steps.check-permission.outputs.authorized == 'true' && steps.parse.outputs.command == 'rerun-failed'
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          STATUS_TOKEN: ${{ github.token }}
         run: |
           echo "Rerunning failed/cancelled jobs for PR #${{ github.event.issue.number }}"
 
@@ -398,15 +429,23 @@ jobs:
           # Rerun failed and cancelled workflow runs for this commit
           # (cancelled jobs are common with fail-fast when one job fails)
           for STATUS in failure cancelled; do
-            gh run list \
-              --repo ${{ github.repository }} \
-              --commit "$PR_SHA" \
-              --status "$STATUS" \
-              --json databaseId -q '.[].databaseId' | \
+            {
+              gh run list \
+                --repo ${{ github.repository }} \
+                --commit "$PR_SHA" \
+                --status "$STATUS" \
+                --json databaseId -q '.[].databaseId'
+              python3 scripts/pr_checks/ci_request_producer.py run-ids --status "$STATUS"
+            } | sort -u | \
             while read -r run_id; do
               if [ -n "$run_id" ]; then
                 echo "Rerunning $STATUS workflow $run_id..."
-                gh run rerun "$run_id" --repo ${{ github.repository }} --failed || true
+                python3 scripts/pr_checks/ci_request_producer.py prepare-rerun --run-id "$run_id"
+                if ! gh run rerun "$run_id" --repo ${{ github.repository }} --failed; then
+                  python3 scripts/pr_checks/ci_request_producer.py rerun-submit-failed --run-id "$run_id"
+                  echo "::error::Rerun response unavailable; do not blindly repost"
+                  exit 1
+                fi
               fi
             done
           done
@@ -435,10 +474,13 @@ jobs:
 
           # Cancel all in-progress and queued runs
           CANCEL_COUNT=0
-          gh run list \
-            --repo ${{ github.repository }} \
-            --commit "$PR_SHA" \
-            --json databaseId,status -q '.[] | select(.status == "in_progress" or .status == "queued") | .databaseId' | \
+          {
+            gh run list \
+              --repo ${{ github.repository }} \
+              --commit "$PR_SHA" \
+              --json databaseId,status -q '.[] | select(.status == "in_progress" or .status == "queued") | .databaseId'
+            python3 scripts/pr_checks/ci_request_producer.py run-ids --status "active"
+          } | sort -u | \
           while read -r run_id; do
             if [ -n "$run_id" ]; then
               echo "Cancelling workflow $run_id..."

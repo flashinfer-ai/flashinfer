@@ -18,6 +18,7 @@
 #   in parallel; the matrix exists purely to make the cancellation global.
 
 name: PR Test
+run-name: ${{ inputs.watcher_request_key || github.event.pull_request.title || github.workflow }}
 
 on:
   push:
@@ -27,6 +28,42 @@ on:
     types: [opened, synchronize, reopened, labeled, ready_for_review]
   workflow_dispatch:
     inputs:
+      watcher_request_key:
+        description: Exact immutable CI request key
+        type: string
+        default: ""
+      watcher_pr_number:
+        description: Requested PR number
+        type: string
+        default: ""
+      watcher_trigger_comment_id:
+        description: Original command comment ID
+        type: string
+        default: ""
+      watcher_trigger_comment_url:
+        description: Original command comment URL
+        type: string
+        default: ""
+      watcher_head_sha:
+        description: Requested PR head SHA
+        type: string
+        default: ""
+      watcher_base_sha:
+        description: Frozen integration base SHA
+        type: string
+        default: ""
+      watcher_checkout_sha:
+        description: Verified immutable merge checkout SHA
+        type: string
+        default: ""
+      watcher_scope:
+        description: Normalized requested test paths
+        type: string
+        default: ""
+      watcher_scope_digest:
+        description: Canonical test scope SHA256
+        type: string
+        default: ""
       skip_aot:
         description: 'Skip AOT build tests'
         type: boolean
@@ -39,12 +76,12 @@ on:
 concurrency:
   # A label other than run-ci can never start tests, so it gets its own group and
   # does not cancel - otherwise label churn would discard running GPU jobs.
-  group: pr-test-${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci') && '-noop' || '' }}
+  group: pr-test-${{ inputs.watcher_pr_number && format('refs/pull/{0}/merge', inputs.watcher_pr_number) || github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci') && '-noop' || '' }}
   cancel-in-progress: ${{ !(github.event.action == 'labeled' && github.event.label.name != 'run-ci') }}
 
 permissions:
   contents: read
-  pull-requests: write
+  pull-requests: read
   statuses: read # reads the ci/test-scope status published by ci-bot-commands.yml
   actions: read
 
@@ -61,7 +98,21 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       authorized: ${{ steps.check.outputs.authorized }}
+      request_is_fork: ${{ steps.request.outputs.is_fork }}
     steps:
+      - name: Checkout trusted CI request validator
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-request-trusted
+          persist-credentials: false
+      - name: Validate correlated request
+        id: request
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .ci-request-trusted/scripts/pr_checks/ci_request_producer.py validate-run
       - name: Check authorization
         id: check
         env:
@@ -103,9 +154,11 @@ jobs:
       test_count: ${{ steps.matrix.outputs.count }}
       # Surfaced so the required check can say a green result was scoped.
       test_scope: ${{ steps.scope.outputs.test_path }}
+      request_is_fork: ${{ needs.gate.outputs.request_is_fork }}
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ inputs.watcher_checkout_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -139,14 +192,14 @@ jobs:
       - name: Check Skip Conditions
         id: check
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ -z "${{ inputs.watcher_request_key }}" ]; then
             echo "skip=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
           # Use PR event SHAs for reliable diff (avoids issues with origin refs)
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          BASE_SHA="${{ inputs.watcher_base_sha || github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ inputs.watcher_head_sha || github.event.pull_request.head.sha }}"
           CHANGED=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
           # TODO (yongwww): Add back ^\.github/ before merging to main
           SKIP_PATTERNS="$SKIP_CI_PATTERNS"
@@ -175,21 +228,27 @@ jobs:
       # requested for.
       - name: Read requested test scope
         id: scope
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || inputs.watcher_request_key != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ inputs.watcher_head_sha || github.event.pull_request.head.sha }}
+          REQUEST_KEY: ${{ inputs.watcher_request_key }}
+          EXPLICIT_SCOPE: ${{ inputs.watcher_scope }}
         run: |
           # The combined endpoint (/status, not /statuses) returns one entry per
           # context, already the latest. Using it means re-triggering overwrites
           # cleanly without this step deduplicating by hand, and without depending on
           # the raw list's ordering, which is not a documented guarantee.
-          SCOPE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" --jq '
+          if [ -n "$REQUEST_KEY" ]; then
+            SCOPE="$EXPLICIT_SCOPE"
+          else
+            SCOPE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" --jq '
               .statuses
               | map(select(.context | test("^ci/test-scope-[0-9]+$")))
               | map({n: (.context | sub("^ci/test-scope-"; "") | tonumber),
                      d: (.description // "")})
               | sort_by(.n) | map(.d) | map(select(. != "")) | join(" ")')
+          fi
           if [ -z "$SCOPE" ]; then
             echo "No requested scope for ${HEAD_SHA}; running the full suite"
           else
@@ -392,6 +451,7 @@ jobs:
 
       - uses: actions/checkout@v5
         with:
+          ref: ${{ inputs.watcher_checkout_sha || github.sha }}
           submodules: recursive
           # Self-hosted runners keep the workspace between jobs, so the token
           # must not be left behind in .git/config. Nothing here uses git after
@@ -410,8 +470,8 @@ jobs:
         env:
           SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
           SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ (!inputs.watcher_request_key || needs.setup.outputs.request_is_fork == 'false') && secrets.SCCACHE_AWS_ACCESS_KEY_ID || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ (!inputs.watcher_request_key || needs.setup.outputs.request_is_fork == 'false') && secrets.SCCACHE_AWS_SECRET_ACCESS_KEY || '' }}
         run: |
           if [ "${TEST_SCRIPT}" != "task_test_jit_cache_package_build_import.sh" ]; then
             echo "::error::Unexpected AOT test script: ${TEST_SCRIPT}"
@@ -522,6 +582,7 @@ jobs:
         if: needs.gate.outputs.authorized != 'true'
         uses: actions/checkout@v5
         with:
+          ref: ${{ inputs.watcher_checkout_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -529,13 +590,13 @@ jobs:
         if: needs.gate.outputs.authorized != 'true'
         id: skip-check
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ -z "${{ inputs.watcher_request_key }}" ]; then
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          BASE_SHA="${{ inputs.watcher_base_sha || github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ inputs.watcher_head_sha || github.event.pull_request.head.sha }}"
           CHANGED=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
           SKIP_PATTERNS="$SKIP_CI_PATTERNS"
 
@@ -553,7 +614,7 @@ jobs:
         if: needs.gate.outputs.authorized != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ inputs.watcher_head_sha || github.event.pull_request.head.sha }}
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
 
