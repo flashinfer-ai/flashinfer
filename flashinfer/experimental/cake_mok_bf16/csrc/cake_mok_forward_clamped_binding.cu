@@ -21,7 +21,7 @@
 extern "C" __global__ void kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap x_routed, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wd_shared, const __grid_constant__ CUtensorMap wg_routed, const __grid_constant__ CUtensorMap wu_routed, const __grid_constant__ CUtensorMap wd_routed, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_routed_out, const __grid_constant__ CUtensorMap hidden_shared_in, const __grid_constant__ CUtensorMap hidden_routed_in, const __grid_constant__ CUtensorMap y_shared, const __grid_constant__ CUtensorMap y_routed, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ y_routed_ptr, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ y_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int* __restrict__ y_ready, int* __restrict__ y_done, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit);
 
 
-namespace cake_host_shim_b78c27bf5d6d24fb {
+namespace cake_host_shim_6d5e4dff788b6187 {
 
 using tvm::ffi::TensorView;
 
@@ -1512,6 +1512,6 @@ void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_sha
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_b78c27bf5d6d24fb
+}  // namespace cake_host_shim_6d5e4dff788b6187
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_b78c27bf5d6d24fb::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_6d5e4dff788b6187::Run);

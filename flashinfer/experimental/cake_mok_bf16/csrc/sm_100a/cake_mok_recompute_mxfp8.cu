@@ -2893,10 +2893,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&gate_routed_out)), "r"(0), "r"(x_2 * 256 + cta_rank_0 * 128), "r"(y_2 * 8), "r"(0), "r"(0), "r"(d_smem_addr), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&gate_routed_out), 0, x_2 * 256 + cta_rank_0 * 128, y_2 * 8, 0, 0, d_smem_addr);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -2981,10 +2978,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&gate_routed_out)), "r"(0), "r"(x_2 * 256 + cta_rank_0 * 128), "r"(y_2 * 8 + 1), "r"(0), "r"(0), "r"(d_smem_addr + 8192), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&gate_routed_out), 0, x_2 * 256 + cta_rank_0 * 128, y_2 * 8 + 1, 0, 0, d_smem_addr + 8192);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -3069,10 +3063,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&gate_routed_out)), "r"(0), "r"(x_2 * 256 + cta_rank_0 * 128), "r"(y_2 * 8 + 2), "r"(0), "r"(0), "r"(d_smem_addr), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&gate_routed_out), 0, x_2 * 256 + cta_rank_0 * 128, y_2 * 8 + 2, 0, 0, d_smem_addr);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -3157,10 +3148,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&gate_routed_out)), "r"(0), "r"(x_2 * 256 + cta_rank_0 * 128), "r"(y_2 * 8 + 3), "r"(0), "r"(0), "r"(d_smem_addr + 8192), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&gate_routed_out), 0, x_2 * 256 + cta_rank_0 * 128, y_2 * 8 + 3, 0, 0, d_smem_addr + 8192);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -3248,10 +3236,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&gate_routed_out)), "r"(0), "r"(x_2 * 256 + cta_rank_0 * 128), "r"(y_2 * 8 + 4), "r"(0), "r"(0), "r"(d_smem_addr), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&gate_routed_out), 0, x_2 * 256 + cta_rank_0 * 128, y_2 * 8 + 4, 0, 0, d_smem_addr);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -3336,10 +3321,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&gate_routed_out)), "r"(0), "r"(x_2 * 256 + cta_rank_0 * 128), "r"(y_2 * 8 + 5), "r"(0), "r"(0), "r"(d_smem_addr + 8192), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&gate_routed_out), 0, x_2 * 256 + cta_rank_0 * 128, y_2 * 8 + 5, 0, 0, d_smem_addr + 8192);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -3424,10 +3406,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&gate_routed_out)), "r"(0), "r"(x_2 * 256 + cta_rank_0 * 128), "r"(y_2 * 8 + 6), "r"(0), "r"(0), "r"(d_smem_addr), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&gate_routed_out), 0, x_2 * 256 + cta_rank_0 * 128, y_2 * 8 + 6, 0, 0, d_smem_addr);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -3512,10 +3491,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&gate_routed_out)), "r"(0), "r"(x_2 * 256 + cta_rank_0 * 128), "r"(y_2 * 8 + 7), "r"(0), "r"(0), "r"(d_smem_addr + 8192), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&gate_routed_out), 0, x_2 * 256 + cta_rank_0 * 128, y_2 * 8 + 7, 0, 0, d_smem_addr + 8192);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -3844,10 +3820,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&up_routed_out)), "r"(0), "r"(x_3 * 256 + cta_rank_0 * 128), "r"(y_3 * 8), "r"(0), "r"(0), "r"(d_smem_addr), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&up_routed_out), 0, x_3 * 256 + cta_rank_0 * 128, y_3 * 8, 0, 0, d_smem_addr);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -3932,10 +3905,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&up_routed_out)), "r"(0), "r"(x_3 * 256 + cta_rank_0 * 128), "r"(y_3 * 8 + 1), "r"(0), "r"(0), "r"(d_smem_addr + 8192), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&up_routed_out), 0, x_3 * 256 + cta_rank_0 * 128, y_3 * 8 + 1, 0, 0, d_smem_addr + 8192);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -4020,10 +3990,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&up_routed_out)), "r"(0), "r"(x_3 * 256 + cta_rank_0 * 128), "r"(y_3 * 8 + 2), "r"(0), "r"(0), "r"(d_smem_addr), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&up_routed_out), 0, x_3 * 256 + cta_rank_0 * 128, y_3 * 8 + 2, 0, 0, d_smem_addr);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -4108,10 +4075,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&up_routed_out)), "r"(0), "r"(x_3 * 256 + cta_rank_0 * 128), "r"(y_3 * 8 + 3), "r"(0), "r"(0), "r"(d_smem_addr + 8192), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&up_routed_out), 0, x_3 * 256 + cta_rank_0 * 128, y_3 * 8 + 3, 0, 0, d_smem_addr + 8192);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -4199,10 +4163,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&up_routed_out)), "r"(0), "r"(x_3 * 256 + cta_rank_0 * 128), "r"(y_3 * 8 + 4), "r"(0), "r"(0), "r"(d_smem_addr), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&up_routed_out), 0, x_3 * 256 + cta_rank_0 * 128, y_3 * 8 + 4, 0, 0, d_smem_addr);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -4287,10 +4248,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&up_routed_out)), "r"(0), "r"(x_3 * 256 + cta_rank_0 * 128), "r"(y_3 * 8 + 5), "r"(0), "r"(0), "r"(d_smem_addr + 8192), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&up_routed_out), 0, x_3 * 256 + cta_rank_0 * 128, y_3 * 8 + 5, 0, 0, d_smem_addr + 8192);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -4375,10 +4333,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&up_routed_out)), "r"(0), "r"(x_3 * 256 + cta_rank_0 * 128), "r"(y_3 * 8 + 6), "r"(0), "r"(0), "r"(d_smem_addr), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&up_routed_out), 0, x_3 * 256 + cta_rank_0 * 128, y_3 * 8 + 6, 0, 0, d_smem_addr);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
@@ -4463,10 +4418,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&up_routed_out)), "r"(0), "r"(x_3 * 256 + cta_rank_0 * 128), "r"(y_3 * 8 + 7), "r"(0), "r"(0), "r"(d_smem_addr + 8192), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&up_routed_out), 0, x_3 * 256 + cta_rank_0 * 128, y_3 * 8 + 7, 0, 0, d_smem_addr + 8192);
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("cp.async.bulk.wait_group.read 1;");
                                     }
