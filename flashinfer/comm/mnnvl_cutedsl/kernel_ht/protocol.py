@@ -113,6 +113,22 @@ HT_ALL_REDUCE_GB300_TP4_H5120 = HTAllReduceTuning(
     consumer_threads=128, vectors_per_thread=5, reduction_warps=1
 )
 
+# hidden_size=6144, bf16, top_k 8. The HT shard is consumer_threads * 8 *
+# vectors_per_thread and must divide hidden, so the default 512 threads cannot
+# run here (512 does not divide 768 vectors). Of the seven one-token-shard
+# shapes, 192 x 4 measured fastest on B300 for both patterns at tp=4 and tp=8
+# (~1-2% ahead of 128 x 6); 64 x 12 on the finalize and 768 x 1 on the tp=4
+# all-reduce were 20-50% slower. Unlike hidden 5120, HT is reachable at tp=8,
+# and one preset serves both tp sizes.
+HT_FINALIZE_B300_TP4_H6144_K8 = HTFinalizeTuning(
+    consumer_threads=192, vectors_per_thread=4, reduction_warps=1
+)
+HT_FINALIZE_B300_TP8_H6144_K8 = HT_FINALIZE_B300_TP4_H6144_K8
+HT_ALL_REDUCE_B300_TP4_H6144 = HTAllReduceTuning(
+    consumer_threads=192, vectors_per_thread=4, reduction_warps=1
+)
+HT_ALL_REDUCE_B300_TP8_H6144 = HT_ALL_REDUCE_B300_TP4_H6144
+
 
 @dataclass(slots=True)
 class HTProtocolState:
