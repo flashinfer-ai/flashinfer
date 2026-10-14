@@ -688,6 +688,11 @@ copying, it verifies each reserved buffer's presence, rank where required,
 source-to-target alias safety. If a copy fails, snapshots restore every target
 buffer before the error is re-raised.
 
+For both graph and non-graph plans, generated-FA backends stage pageable CPU
+metadata through per-call PyTorch-owned pinned copies before asynchronous H2D
+transfer. The caching host allocator tracks those copies' asynchronous lifetime,
+so reuse of caller-owned pageable buffers cannot overwrite in-flight staging.
+
 The reserved `qo_indptr`, `kv_indptr`, and `kv_len_arr` shapes must match the
 new metadata exactly. The reserved `kv_indices` buffer may be larger than its
 active prefix. Generated-FA graph replanning can therefore change the live

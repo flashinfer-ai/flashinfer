@@ -538,6 +538,16 @@ class _BatchMLAGeneratedFaMechanics:
                 kv_indices=kv_indices,
                 kv_len_arr=kv_len_arr,
             )
+        if self.device.type == "cuda":
+            # Per-call pinned copies keep caller updates from racing the H2D
+            # transfer; PyTorch's host allocator tracks their async lifetime.
+            qo_indptr, kv_indptr, kv_indices, kv_len_arr = (
+                tensor.pin_memory()
+                if tensor.device.type == "cpu" and not tensor.is_pinned()
+                else tensor
+                for tensor in (qo_indptr, kv_indptr, kv_indices, kv_len_arr)
+            )
+        if self._use_cuda_graph:
             assert self._qo_indptr_buf is not None
             assert self._kv_indptr_buf is not None
             assert self._kv_indices_buf is not None
