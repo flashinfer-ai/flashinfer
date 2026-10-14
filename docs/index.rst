@@ -38,10 +38,12 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
    api/attn_scores
    api/cake_fmha
    api/cake_moe_grouped_gemm
+   api/cake_mxfp4_situ_moe
    api/cake_sampling
    api/gemm
    api/grouped_mm
    api/fused_moe
+   api/megamoe
    api/cascade
    api/comm
    api/sparse

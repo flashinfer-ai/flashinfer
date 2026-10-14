@@ -1164,7 +1164,7 @@ def test_cutlass_rejects_per_token_scale():
         per_token_scale=torch.ones(16, dtype=torch.float32),
     )
     with pytest.raises(ValueError, match="per_token_scale"):
-        runner._validate_activation_scale(act)
+        runner._validate_pack_contract(act)
 
 
 def test_cutlass_act_sf_unit_byte_follows_scale_format():
@@ -1394,6 +1394,9 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
 
         def build(self):
             events.append("build")
+
+        def accepts(self, act_pack, weight_pack):
+            return True
 
         def pack_inputs(self, act_pack, weight_pack):
             events.append("pack_inputs")

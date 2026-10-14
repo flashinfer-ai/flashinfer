@@ -32,7 +32,9 @@ fmha_v2_prefill_sm120_h4_d128.json
 gdn_decode_qk4_v8_d128.json
 gdn_fused_decode_h5120_v48_d128.json
 gdn_mtp_qk4_v8_d128.json
+gdn_replayssm_commit_k2_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
+gdn_prefill_gates_q4_k4_v8_d128.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
@@ -130,6 +132,8 @@ silu_and_mul_nvfp4_quantize_k16384.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
+top_k_varlen_n4096_k512.json
+top_k_varlen_n8192_k1024.json
 top_p_sampling_v128256.json
 top_p_sampling_v151936.json
 trtllm_bf16_moe_topk2_e8_h1024_i512.json
@@ -139,6 +143,10 @@ trtllm_fp8_block_scale_routed_moe_topk2_e8_h1024.json
 trtllm_fp8_per_tensor_scale_moe_topk2_e8_h1024_i512.json
 trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
 trtllm_gen_routing_e256_k8_t8.json
+moe_layer_cudnn_frost_bf16.json
+moe_layer_cudnn_frost_mxfp8.json
+moe_layer_cudnn_frost_nvfp4.json
+moe_layer_cudnn_frost_mxfp8_mxfp4.json
 
 Note: top_p_sampling files appear for vocab_size=151936 because
 top_k_top_p_sampling calls top_p_sampling internally.
@@ -150,6 +158,7 @@ dsv41_fp4_quantize_*_sparse_mla_cache_*.json and dsv41_fp8_quantize_*_sparse_mla
 are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
+top_k_varlen_n4096_k512.json (windowed prefill mode, gvr_2) requires SM100/SM103/SM107 GPUs.
 """
 
 import contextlib
@@ -202,6 +211,10 @@ from flashinfer.prefill import (
     fmha_v2_prefill_sm120,
 )
 from flashinfer.utils import is_sm100a_supported
+from tests.trace.example_moe_layer import generate as generate_moe_layer_traces
+
+# Public MoELayer pack schemas, including all four Frost quantization formats.
+generate_moe_layer_traces(SAVE_DIR)
 
 device = "cuda"
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
@@ -1061,6 +1074,15 @@ with contextlib.suppress(Exception):
         gp_q, gp_k, gp_v, cu_seqlens=cu_seqlens
     )
 
+# ── GDN raw gate fusion (trace-only; no optional cuDNN dependency) ───────────
+from flashinfer.trace.templates.gdn import gdn_prefill_trace
+
+flashinfer.gdn_prefill.chunk_gated_delta_rule.fi_trace(
+    **gdn_prefill_trace(use_gate_in_kernel=True).init(total_seq_len=256, device=device),
+    backend="cudnn",
+    save_dir=SAVE_DIR,
+)
+
 # ── GDN-2 prefill (channel-wise gates, chunk prefill) ────────────────────────
 with contextlib.suppress(Exception):
     import flashinfer.gdn2_prefill  # noqa: PLC0415
@@ -1132,6 +1154,14 @@ b_m = torch.zeros(B, T_mtp, HV, dtype=torch.bfloat16, device=device)
 flashinfer.gdn_decode.gated_delta_rule_mtp(
     q_m, k_m, v_m, init_state, init_idx, A_log_m, a_m, dt_bias_m, b_m
 )
+
+# ── ReplaySSM accepted-prefix commit (SM100/SM103) ────────────────────────
+if torch.cuda.get_device_capability()[0] == 10:
+    from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
+
+    flashinfer.gdn_decode.gated_delta_rule_replayssm_commit(
+        **gdn_replayssm_commit_trace.init(device=device)
+    )
 
 # ── GDN fused decode step (the registry's SM120 geometry, TP=1) ──────────────
 # Suppressed like the other optional-dependency examples: on a non-SM120 card
@@ -2606,6 +2636,15 @@ with contextlib.suppress(Exception):
     _cmk_k_rope = torch.randn(_cmk_T, 1, _cmk_rope, dtype=torch.bfloat16, device=device)
     _concat_mla_k(_cmk_k, _cmk_k_nope, _cmk_k_rope)
 
+# concat_mla_kv_quant_fp8 (MLA context K/V pack + fp8 cast, 12 local heads).
+with contextlib.suppress(Exception):
+    from flashinfer import concat_mla_kv_quant_fp8 as _concat_mla_kv_quant_fp8
+
+    _ckv_T, _ckv_H = 2048, 12
+    _ckv_kv_nope = torch.randn(_ckv_T, _ckv_H, 256, dtype=torch.bfloat16, device=device)
+    _ckv_k_pe = torch.randn(_ckv_T, 64, dtype=torch.bfloat16, device=device)
+    _concat_mla_kv_quant_fp8(_ckv_kv_nope, _ckv_k_pe)
+
 # xqa_batch_decode_with_kv_cache (SM100+ XQA decode wrapper, NHD 5-D cache).
 with contextlib.suppress(Exception):
     import math as _math2
@@ -2943,6 +2982,44 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
+
+# ── top_k_varlen (DeepSeek sparse-attention indexer top-k) ─────────────────
+# decode shape: one row per request, per-request lengths; the radix_cutlass
+# backend runs on any GPU -> top_k_varlen_n8192_k1024.json
+from flashinfer.trace.templates.topk import top_k_varlen_trace as _tkv_trace
+
+_tkv_in = _tkv_trace.init(batch_size=32, max_seq_len=8192, top_k=1024, device=device)
+flashinfer.top_k_varlen(**_tkv_in)
+
+# windowed (prefill) shape: one row per prompt token, every request's keys
+# packed along the column axis, row r ranks [row_starts[r], row_starts[r] +
+# seq_lens[r]) and returns absolute columns; served by the gvr_2 engines
+# (SM100/SM103/SM107) -> top_k_varlen_n4096_k512.json
+_tkv_cc = torch.cuda.get_device_capability()
+if flashinfer.top_k_varlen.is_backend_supported("gvr_2", _tkv_cc[0] * 10 + _tkv_cc[1]):
+    _tkv_R, _tkv_L = 2, 2048  # two 2048-token prompts
+    _tkv_logits = torch.randn(
+        _tkv_R * _tkv_L, _tkv_R * _tkv_L, dtype=torch.float32, device=device
+    )
+    _tkv_starts = torch.tensor(
+        [(r * _tkv_L) for r in range(_tkv_R) for _ in range(_tkv_L)],
+        dtype=torch.int32,
+        device=device,
+    )
+    _tkv_lens = torch.tensor(
+        [i + 1 for _ in range(_tkv_R) for i in range(_tkv_L)],
+        dtype=torch.int32,
+        device=device,
+    )
+    flashinfer.top_k_varlen(
+        _tkv_logits,
+        _tkv_lens,
+        512,
+        row_starts=_tkv_starts,
+        max_window_len=_tkv_L,
+        absolute_indices=True,
+        backend="gvr_2",
+    )
 
 # ── Qwen4Exp quantized sparse attention (QSA) (SM80+) ────────────────────────
 # One QSA step, selection then gated paged attention, traces the scorer, the

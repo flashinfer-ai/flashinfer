@@ -35,7 +35,14 @@ from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
     SUPPORTED_COMPUTE_CAPABILITIES,
     TileTables,
     assign_unit_slots,
+    bf16_attention_stage,
+    bf16_choose_q_splits,
+    bf16_cluster_work,
+    bf16_dyn_sched,
+    bf16_unit_cost,
+    bf16_unit_weights,
     build_bf16_segment_plan,
+    lpt_makespan,
     choose_kv_splits,
     split_chunks,
     build_packed_segment_plan,
@@ -113,18 +120,30 @@ def test_assign_unit_slots_lpt():
 def _decode_unit_table(plan):
     """``(segment, head, cluster, kv_begin, kv_blocks, slot)`` per scheduled unit."""
     table = plan.unit_table.tolist()
-    assert len(table) == UNIT_WORDS * plan.total_tiles
-    return [
-        (
-            table[UNIT_WORDS * u],
-            table[UNIT_WORDS * u + 1] >> 16,
-            table[UNIT_WORDS * u + 1] & 0xFFFF,
-            table[UNIT_WORDS * u + 2] >> 16,
-            table[UNIT_WORDS * u + 2] & 0xFFFF,
-            table[UNIT_WORDS * u + 3],
+    # ``num_clusters`` zero records of padding follow the scheduled units, then
+    # the zero record whose word 0 is the dynamic scheduler's ticket counter.
+    assert len(table) == UNIT_WORDS * (plan.total_tiles + plan.num_clusters + 1)
+    assert table[UNIT_WORDS * plan.total_tiles :] == [0] * (
+        UNIT_WORDS * (plan.num_clusters + 1)
+    )
+    begins = plan.seg_begin.tolist()
+    lens = plan.seg_len.tolist()
+    decoded = []
+    for u in range(plan.total_tiles):
+        record = table[UNIT_WORDS * u : UNIT_WORDS * (u + 1)]
+        seg = begins.index(record[0])
+        assert record[1] == lens[seg] and record[5:] == [0, 0, 0]
+        decoded.append(
+            (
+                seg,
+                record[2] >> 16,
+                record[2] & 0xFFFF,
+                record[3] >> 16,
+                record[3] & 0xFFFF,
+                record[4],
+            )
         )
-        for u in range(plan.total_tiles)
-    ]
+    return decoded
 
 
 def _check_split_units(units, combine, blocks_of, num_partial_slots, num_combine_units):
@@ -178,7 +197,13 @@ def _check_split_units(units, combine, blocks_of, num_partial_slots, num_combine
 @pytest.mark.parametrize("label,cu,heads", SMOKE_ROWS + SEGMENT_ROWS + CENTER_ROWS)
 def test_bf16_segment_plan(label, cu, heads, grid_clusters, kv_splits):
     plan = build_bf16_segment_plan(
-        cu, torch.device("cpu"), heads, num_clusters=grid_clusters, kv_splits=kv_splits
+        cu,
+        torch.device("cpu"),
+        heads,
+        num_clusters=grid_clusters,
+        kv_splits=kv_splits,
+        # The plain enumeration: the tail-round Q-split has its own tests below.
+        q_split=False,
     )
     lengths = [b - a for a, b in zip(cu, cu[1:], strict=False) if b > a]
     clusters = [_ceil_div(n, CLUSTER_Q_ROWS) for n in lengths]
@@ -241,14 +266,18 @@ def test_bf16_segment_plan(label, cu, heads, grid_clusters, kv_splits):
         for k, (s, h, c) in zip(split_of, expected, strict=True)
         for b, n in split_chunks(blocks[s], k)
     ]
-    cost = [n + BF16_UNIT_OVERHEAD_BLOCKS for _key, _b, n in ranges]
+    # Units with at most 256 valid Q rows run one Q stage at a discounted cost.
+    cost = [
+        bf16_unit_cost(n, lengths[s] - c * CLUSTER_Q_ROWS <= CLUSTER_Q_ROWS // 2)
+        for (s, _h, c), _b, n in ranges
+    ]
     slots = assign_unit_slots(cost, plan.num_clusters)
     assert [((s, h, c), b, n) for s, h, c, b, n, _ in decoded] == [
         ranges[u] for u in slots
     ]
     G = plan.num_clusters
     for k in range(plan.total_tiles // G):
-        round_costs = [decoded[k * G + i][4] for i in range(G)]
+        round_costs = [cost[slots[k * G + i]] for i in range(G)]
         assert round_costs == sorted(round_costs)
 
 
@@ -280,6 +309,224 @@ def test_choose_kv_splits_policy():
     assert choose_kv_splits([48] * 84, 74, program_cost=cost) != [1] * 84
     assert split_chunks(10, 4) == [(0, 3), (3, 3), (6, 2), (8, 2)]
     assert split_chunks(2, 8) == [(0, 1), (1, 1)]
+
+
+# center_5s_p2_m19296 / center_10s_p2_m37120 of the Cake BF16 contract: 1064 /
+# 2044 units on the 74-cluster grid.
+Q_SPLIT_CENTER_5S_P2 = ([0, 19296], 28)
+Q_SPLIT_CENTER_10S_P2 = ([0, 37120], 28)
+HALF_UNIT_ROWS = CLUSTER_Q_ROWS // 2
+
+
+def _bf16_records(plan):
+    """The ``total_tiles`` eight-word unit records of a plan; the ``num_clusters + 1`` padding records (prefetch padding and the ticket counter) are zero until an ``attention_dyn`` launch leaves the terminal tickets in word 6 of the padding records."""
+    words = plan.unit_table.tolist()
+    total = int(plan.total_tiles)
+    assert len(words) == UNIT_WORDS * (total + int(plan.num_clusters) + 1)
+    assert all(word == 0 for word in words[UNIT_WORDS * total :])
+    return [
+        tuple(words[i : i + UNIT_WORDS])
+        for i in range(0, UNIT_WORDS * total, UNIT_WORDS)
+    ]
+
+
+def _decode_q_split_record(record):
+    """The kernel's decode of record word 5: ``(head, cluster, unit_row0, two_stages, slot, q_half)``."""
+    _doc_begin, doc_len, packed, _kv_words, slot, q_half, zero_6, zero_7 = record
+    assert (zero_6, zero_7) == (0, 0)
+    head, c = packed >> 16, packed & 0xFFFF
+    unit_row0 = c * CLUSTER_Q_ROWS + (q_half >> 1) * HALF_UNIT_ROWS
+    full_rows = int(doc_len - unit_row0 > HALF_UNIT_ROWS)
+    two_stages = full_rows if q_half == 0 else 0
+    return head, c, unit_row0, two_stages, slot, q_half
+
+
+def _assert_q_split_cover(records, cu, num_heads):
+    """Every segment row of every head is computed and stored by exactly one record."""
+    spans = {}
+    for record in records:
+        doc_begin, doc_len = record[0], record[1]
+        head, _c, unit_row0, two_stages, _slot, _q = _decode_q_split_record(record)
+        rows = CLUSTER_Q_ROWS if two_stages else HALF_UNIT_ROWS
+        spans.setdefault((doc_begin, head), []).append(
+            (unit_row0, min(unit_row0 + rows, doc_len))
+        )
+    segments = {a: b - a for a, b in zip(cu, cu[1:], strict=False) if b > a}
+    assert set(spans) == {
+        (begin, head) for begin in segments for head in range(num_heads)
+    }
+    for (begin, _head), ranges in spans.items():
+        cursor = 0
+        for lo, hi in sorted(ranges):
+            assert lo == cursor and hi > lo, (begin, sorted(ranges))
+            cursor = hi
+        assert cursor == segments[begin], (begin, sorted(ranges))
+
+
+def test_bf16_choose_q_splits_policy():
+    # center_5s_p2 on 74 clusters: 1064 two-stage units of 151 K/V blocks, 28 in
+    # the tail round, 46 idle clusters: the whole tail round is halved.
+    full, half = bf16_unit_cost(151, False), bf16_unit_cost(151, True)
+    assert (full, half) == (153, 93)
+    costs = [full] * 1064
+    flags = bf16_choose_q_splits(costs, [half] * 1064, 74)
+    assert sum(flags) == 28 and all(flags[1036:]) and not any(flags[:1036])
+    assert lpt_makespan(costs, 74) == 15 * full == 2295
+    assert lpt_makespan(costs[:1036] + [half] * 56, 74) == 14 * full + half == 2235
+    # The smallest paying prefix of the most expensive tail units.  Tail round:
+    # 14 x 153, 10 x 100, 4 x 50; halving the 153s alone leaves the 100s as the
+    # tail maximum, halving the 100s too pays, the 50s change nothing.
+    costs = [153] * 1050 + [100] * 10 + [50] * 4
+    halves = [93] * 1050 + [62] * 10 + [32] * 4
+    flags = bf16_choose_q_splits(costs, halves, 74)
+    assert [u for u, flag in enumerate(flags) if flag] == list(range(1036, 1060))
+    sim = costs[:1036] + [93] * 28 + [62] * 20 + [50] * 4
+    assert lpt_makespan(costs, 74) == 2295 and lpt_makespan(sim, 74) == 2235
+    # Single-stage units (no half cost: nothing to halve) and K/V-split ranges
+    # are never halved.  center_10s_p2: 73 clusters per head, the 73rd a 256-row
+    # single-stage unit (cost 176, one half's cost); 46 tail units (18 two-stage
+    # + 28 single-stage) on 28 idle clusters: the two-stage ones are halved.
+    assert (bf16_unit_cost(290, False), bf16_unit_cost(290, True)) == (292, 176)
+    costs = [bf16_unit_cost(290, c == 72) for _head in range(28) for c in range(73)]
+    halves = [
+        bf16_unit_cost(290, True) if c < 72 else None
+        for _head in range(28)
+        for c in range(73)
+    ]
+    flags = bf16_choose_q_splits(costs, halves, 74)
+    assert [u for u, flag in enumerate(flags) if flag] == [
+        27 * 73 + c for c in range(54, 72)
+    ]
+    sim = [292] * 1998 + [176] * 64
+    assert lpt_makespan(costs, 74) == 28 * 292
+    assert lpt_makespan(sim, 74) == 27 * 292 + 176
+    assert not any(bf16_choose_q_splits([153] * 1064, [None] * 1064, 74))
+    # No tail round (nothing idles); 46 uniform tail units on 28 idle clusters
+    # (an unhalved tail unit keeps the makespan); sub-wave plans: 37 units fit
+    # as 74 halves, 70 units leave 4 idle clusters only.
+    assert not any(bf16_choose_q_splits([], [], 74))
+    assert not any(bf16_choose_q_splits([153] * 148, [93] * 148, 74))
+    assert not any(bf16_choose_q_splits([153] * 74, [93] * 74, 74))
+    assert not any(bf16_choose_q_splits([153] * 120, [93] * 120, 74))
+    assert all(bf16_choose_q_splits([153] * 37, [93] * 37, 74))
+    assert not any(bf16_choose_q_splits([153] * 70, [93] * 70, 74))
+    # The makespan is set by clusters without a tail unit (round 5 gives them
+    # 153 while the tail-owning clusters got 42): halving the cheap tail units
+    # cannot shorten it.
+    costs, halves = [153] * 304 + [42] * 80, [93] * 304 + [26] * 80
+    assert not any(bf16_choose_q_splits(costs, halves, 74))
+
+
+def test_bf16_choose_q_splits_min_gain(monkeypatch):
+    # 81 waves: halving the 37 tail units saves 60 of 12393 (0.48 %), below the 0.5 % bar.
+    costs, halves = [153] * (74 * 80 + 37), [93] * (74 * 80 + 37)
+    assert cake_backend.BF16_Q_SPLIT_MIN_GAIN == 0.005
+    assert not any(bf16_choose_q_splits(costs, halves, 74))
+    monkeypatch.setattr(cake_backend, "BF16_Q_SPLIT_MIN_GAIN", 0.0)
+    flags = bf16_choose_q_splits(costs, halves, 74)
+    assert sum(flags) == 37 and all(flags[74 * 80 :])
+    # 61 waves: the same halving saves 60 of 9333 (0.64 %): whole at the 1 % bar, halved at 0.5 %.
+    costs, halves = [153] * (74 * 60 + 37), [93] * (74 * 60 + 37)
+    monkeypatch.setattr(cake_backend, "BF16_Q_SPLIT_MIN_GAIN", 0.01)
+    assert not any(bf16_choose_q_splits(costs, halves, 74))
+    monkeypatch.setattr(cake_backend, "BF16_Q_SPLIT_MIN_GAIN", 0.005)
+    flags = bf16_choose_q_splits(costs, halves, 74)
+    assert sum(flags) == 37 and all(flags[74 * 60 :])
+
+
+def test_bf16_q_split_plan_center_5s_p2():
+    cu, heads = Q_SPLIT_CENTER_5S_P2
+    cpu = torch.device("cpu")
+    plain = build_bf16_segment_plan(cu, cpu, heads, num_clusters=74, q_split=False)
+    assert plain.num_q_split_units == 0 and plain.total_tiles == 1064
+    assert plain.num_clusters == 74
+    records = _bf16_records(plain)
+    # Uniform costs reproduce the plain enumeration (slot k runs unit k, heads
+    # slow); word 5 and the spare words are 0.
+    assert records == [
+        (0, 19296, ((k // 38) << 16) | (k % 38), 151, -1, 0, 0, 0) for k in range(1064)
+    ]
+    _assert_q_split_cover(records, cu, heads)
+    # The default (``BF16_Q_SPLIT_PLAN``) halves the 28 tail-round units: the 14
+    # full rounds are the plain plan's, the tail round holds the 56 halves, each
+    # pair on neighbouring slots.
+    assert cake_backend.BF16_Q_SPLIT_PLAN is True
+    plan = build_bf16_segment_plan(cu, cpu, heads, num_clusters=74)
+    assert plan.num_q_split_units == 28 and plan.total_tiles == 1064 + 28
+    assert plan.num_clusters == 74
+    assert plan.num_partial_slots == 0 and plan.num_combine_units == 0
+    explicit = build_bf16_segment_plan(cu, cpu, heads, num_clusters=74, q_split=True)
+    assert explicit.unit_table.tolist() == plan.unit_table.tolist()
+    split_records = _bf16_records(plan)
+    full_rounds = 14 * 74
+    assert split_records[:full_rounds] == records[:full_rounds]
+    tail = [_decode_q_split_record(record) for record in split_records[full_rounds:]]
+    assert [(head, c, q) for head, c, _u0, _ts, _slot, q in tail] == [
+        (27, c, q) for c in range(10, 38) for q in (1, 2)
+    ]
+    for _head, c, unit_row0, two_stages, slot, q in tail:
+        assert unit_row0 == c * 512 + (q - 1) * 256 and two_stages == 0 and slot == -1
+    # Whole records decode as before: two stages whenever more than 256 rows remain.
+    for record in split_records[:full_rounds]:
+        _head, c, unit_row0, two_stages, _slot, q = _decode_q_split_record(record)
+        assert q == 0 and unit_row0 == c * 512
+        assert two_stages == int(19296 - unit_row0 > 256)
+    _assert_q_split_cover(split_records, cu, heads)
+
+
+def test_bf16_q_split_plan_center_10s_p2():
+    cu, heads = Q_SPLIT_CENTER_10S_P2
+    plan = build_bf16_segment_plan(
+        cu, torch.device("cpu"), heads, num_clusters=74, q_split=True
+    )
+    assert plan.num_q_split_units == 18 and plan.total_tiles == 2044 + 18
+    assert plan.num_clusters == 74
+    records = _bf16_records(plan)
+    tail = [_decode_q_split_record(record) for record in records[27 * 74 :]]
+    assert len(tail) == 64
+    # Stable LPT order on the equal costs: the single-stage last-cluster units of
+    # heads 0..26, the 36 halves of head 27's units 54..71, then head 27's own
+    # single-stage unit.
+    expected = (
+        [(h, 72, 0) for h in range(27)]
+        + [(27, c, q) for c in range(54, 72) for q in (1, 2)]
+        + [(27, 72, 0)]
+    )
+    assert [(head, c, q) for head, c, _u0, _ts, _slot, q in tail] == expected
+    assert all(two_stages == 0 for _h, _c, _u0, two_stages, _s, _q in tail)
+    _assert_q_split_cover(records, cu, heads)
+
+
+def test_bf16_q_split_plan_reads_the_module_option(monkeypatch):
+    cu, heads = Q_SPLIT_CENTER_5S_P2
+    cpu = torch.device("cpu")
+    monkeypatch.setattr(cake_backend, "BF16_Q_SPLIT_PLAN", False)
+    plan = build_bf16_segment_plan(cu, cpu, heads, num_clusters=74)
+    assert plan.num_q_split_units == 0 and plan.total_tiles == 1064
+    forced = build_bf16_segment_plan(cu, cpu, heads, num_clusters=74, q_split=True)
+    assert forced.num_q_split_units == 28 and forced.total_tiles == 1064 + 28
+
+
+def test_bf16_q_split_plan_leaves_full_waves_and_kv_split_plans_alone():
+    cpu = torch.device("cpu")
+    # 28 heads x 37 clusters = 1036 = 14 x 74 units: no tail round, nothing idles.
+    cu, heads = [0, 37 * CLUSTER_Q_ROWS], 28
+    plan = build_bf16_segment_plan(cu, cpu, heads, num_clusters=74)
+    plain = build_bf16_segment_plan(cu, cpu, heads, num_clusters=74, q_split=False)
+    assert plan.num_q_split_units == 0 and plan.total_tiles == 1036
+    assert plan.unit_table.tolist() == plain.unit_table.tolist()
+    # K/V-split ranges are never halved: a forced four-way split plan is
+    # unchanged by the option.
+    cu, heads = [0, 133, 300, 900, 3000], 7
+    base = build_bf16_segment_plan(
+        cu, cpu, heads, num_clusters=74, kv_splits=4, q_split=False
+    )
+    plan = build_bf16_segment_plan(
+        cu, cpu, heads, num_clusters=74, kv_splits=4, q_split=True
+    )
+    assert base.num_partial_slots > 0 and plan.num_q_split_units == 0
+    assert plan.unit_table.tolist() == base.unit_table.tolist()
+    assert plan.combine_table.tolist() == base.combine_table.tolist()
 
 
 @pytest.mark.parametrize("label,cu,heads", SMOKE_ROWS + SEGMENT_ROWS + CENTER_ROWS)
@@ -508,6 +755,47 @@ def _make_inputs(cu, heads, seed, device="cuda"):
     return q, k, v, cu_seqlens
 
 
+def _make_engine_views(cu, heads, seed, layout, device="cuda"):
+    """Q/K/V as the engine's strided ``[T, H, 128]`` views (never copied).
+
+    ``"fused_qkv"``: column chunks of the fused QKV projection ``[T, 3 * H * 128]``
+    (strides ``(3 * H * 128, 128, 1)``).  ``"pack"``: the kind slices of the Cake
+    pre-attention pack ``[T, H, 3, 128]`` (strides ``(H * 384, 384, 1)``).
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    total = cu[-1]
+    if layout == "fused_qkv":
+        qkv = torch.randn(
+            (total, 3 * heads * HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=gen,
+        )
+        width = heads * HEAD_DIM
+        q, k, v = (
+            qkv[:, i * width : (i + 1) * width].view(total, heads, HEAD_DIM)
+            for i in range(3)
+        )
+        expected_strides = (3 * heads * HEAD_DIM, HEAD_DIM, 1)
+    elif layout == "pack":
+        pack = torch.randn(
+            (total, heads, 3, HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=gen,
+        )
+        q, k, v = (pack[:, :, i, :] for i in range(3))
+        expected_strides = (heads * 3 * HEAD_DIM, 3 * HEAD_DIM, 1)
+    else:
+        raise ValueError(layout)
+    for t in (q, k, v):
+        assert tuple(t.shape) == (total, heads, HEAD_DIM)
+        assert t.stride() == expected_strides
+        assert total == 0 or not t.is_contiguous()
+    cu_seqlens = torch.tensor(cu, dtype=torch.int32, device=device)
+    return q, k, v, cu_seqlens
+
+
 def _reference(q, k, v, cu, scale):
     """Per-segment, per-head FP32 oracle with TF32 disabled (chunked rows)."""
     previous = torch.backends.cuda.matmul.allow_tf32
@@ -604,15 +892,338 @@ def test_bf16_zero_tokens():
     assert tuple(out.shape) == (0, 7, HEAD_DIM)
 
 
+def test_bf16_plan_cache_reuses_tables_per_layout_and_stream(monkeypatch):
+    """One-shot calls with one segment layout reuse the cached plan (tables, workspace); a different
+    layout, head count or stream gets its own plan; the cache is bounded and evicts the oldest."""
+    _require_program("bf16")
+    monkeypatch.setattr(cake_backend, "BF16_PLAN_CACHE_CAPACITY", 2)
+    cake_backend._BF16_PLANS.clear()
+    cu, heads = [0, 133, 300, 900], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=11)
+    out = torch.empty_like(q)
+    first = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+    )
+    second = prepare_minimax_h3_varlen_attention(
+        k, v, q, cu_seqlens, out=out, cu_seqlens_host=cu
+    )
+    assert second.plan is first.plan  # same layout, same stream: cached tables
+    assert len(cake_backend._BF16_PLANS) == 1
+    other_heads = prepare_minimax_h3_varlen_attention(
+        q[:, :5], k[:, :5], v[:, :5], cu_seqlens, cu_seqlens_host=cu
+    )
+    assert other_heads.plan is not first.plan
+    assert len(cake_backend._BF16_PLANS) == 2
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        on_stream = prepare_minimax_h3_varlen_attention(
+            q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+        )
+    assert on_stream.plan is not first.plan  # streams never share a plan
+    assert len(cake_backend._BF16_PLANS) == 2  # bounded: the oldest (first) was evicted
+    again = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+    )
+    assert again.plan is not first.plan and len(cake_backend._BF16_PLANS) == 2
+    # The cached plan reproduces the freshly built one table for table.
+    fresh = build_bf16_segment_plan(cu, q.device, heads)
+    for name in ("seg_begin", "seg_len", "unit_table", "combine_table"):
+        assert torch.equal(getattr(again.plan, name), getattr(fresh, name)), name
+    assert again.plan.num_clusters == fresh.num_clusters
+    cake_backend._BF16_PLANS.clear()
+    monkeypatch.undo()
+
+
+def test_bf16_one_shot_repeated_calls_do_not_allocate_or_copy():
+    """After the first call of a segment layout the one-shot entry re-launches with the cached plan:
+    no device allocation (caller-owned ``out``) and no host-to-device copy; the output is bitwise the
+    prepared runner's."""
+    _require_program("bf16")
+    cake_backend._BF16_PLANS.clear()
+    cu, heads = [0, 4310, 4567, 4824], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=12)
+    out = torch.empty_like(q)
+    minimax_h3_varlen_attention(q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu)
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for _ in range(3):
+            minimax_h3_varlen_attention(
+                q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+            )
+        torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == allocated
+    names = [event.name for event in prof.events()]
+    copies = [n for n in names if "Memcpy" in n or "memcpy" in n]
+    syncs = [
+        n for n in names if "Synchronize" in n and "cudaDeviceSynchronize" not in n
+    ]
+    assert not copies, copies
+    assert not syncs, syncs
+    runner = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, cu_seqlens_host=cu
+    )
+    runner()
+    torch.cuda.synchronize()
+    assert torch.equal(runner.out, out)
+    _check(
+        out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), BF16_ATOL, BF16_RTOL
+    )
+
+
+@pytest.mark.parametrize(
+    "label,cu,heads,halved",
+    [
+        ("center_5s_p2_m19296", [0, 19296], 28, {74: 28, 76: 0}),
+        ("subwave_3x512_h12", [0, 512, 1024, 1536], 12, {74: 36, 76: 36}),
+    ],
+)
+def test_bf16_q_split_plan_output_is_bitwise_the_plain_plans(
+    monkeypatch, label, cu, heads, halved
+):
+    """A tail-round Q-split plan (the default) changes only the slot -> rows mapping: each half runs
+    the whole unit's arithmetic over the same K/V range, so the output is bitwise the plain plan's.
+    center_5s_p2 (1064 units) halves the 28 units of its tail round on 74 clusters and has no tail
+    round on 76 (1064 = 14 x 76: the plan is the plain plan); the sub-wave layout (three 512-row
+    segments x 12 heads = 36 two-stage units of four K/V blocks, for which no KV split pays) halves
+    every unit into 72 single-stage halves on any grid of >= 72 clusters.  ``halved`` holds the
+    expected count per grid size; other grids check the plan invariants only."""
+    _require_program("bf16")
+    cake_backend._BF16_PLANS.clear()
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=13)
+    split = prepare_minimax_h3_varlen_attention(q, k, v, cu_seqlens, cu_seqlens_host=cu)
+    capacity = cake_backend.bf16_grid_clusters(q.device)
+    units = split.plan.num_q_split_units
+    if capacity in halved:
+        assert units == halved[capacity], (
+            f"{label}: {units} halved units on {capacity} clusters"
+        )
+    assert split.plan.total_tiles == heads * split.plan.total_clusters + units
+    assert split.route_metadata["q_split_units"] == units
+    halves = split.plan.unit_table[5::UNIT_WORDS].tolist()
+    assert halves.count(1) == halves.count(2) == units
+    out_split = split()
+    torch.cuda.synchronize()
+    monkeypatch.setattr(cake_backend, "BF16_Q_SPLIT_PLAN", False)
+    plain = prepare_minimax_h3_varlen_attention(q, k, v, cu_seqlens, cu_seqlens_host=cu)
+    assert plain.plan is not split.plan  # the plan cache keys the option
+    assert plain.plan.num_q_split_units == 0
+    assert plain.plan.total_tiles == heads * plain.plan.total_clusters
+    assert not any(plain.plan.unit_table[5::UNIT_WORDS].tolist())
+    out_plain = plain()
+    torch.cuda.synchronize()
+    assert torch.equal(out_split, out_plain)
+    _check(
+        out_split,
+        _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)),
+        BF16_ATOL,
+        BF16_RTOL,
+    )
+    cake_backend._BF16_PLANS.clear()
+    monkeypatch.undo()
+
+
+# --- per-plan BF16 program dispatch (round 13: `attention` / `attention_dyn` / `attention_sread`) -------------------
+# 152 SMs: the predicate rows below are stated for this grid (B200: 74 clusters)
+GB300_GRID_CLUSTERS = 76
+DISPATCH_ROWS = {
+    # label: (cu_seqlens, heads, dyn_sched on 76 clusters)
+    # one wave (70 units on 70 clusters): nothing to balance
+    "tail_5s_p8_m4763": ([0, 4763], 7, False),
+    # 4.4 waves of 24-block units: below the per-cluster work floor
+    "short_units_3072x56": ([0, 3072], 56, False),
+    # 56 units per cluster, imbalance == cheapest unit: static is optimal
+    "center_5s_p1_m38592": ([0, 38592], 56, False),
+    # 71 units per cluster
+    "center_6s_p1_m48768": ([0, 48768], 56, True),
+    # 40 units per cluster, imbalance 860 > cheapest unit 430
+    "center_15s_p2_m54976": ([0, 54976], 28, True),
+}
+
+
+def _scheduled_records(plan):
+    return plan.unit_table.tolist()[: UNIT_WORDS * int(plan.total_tiles)]
+
+
+@pytest.mark.parametrize("label", sorted(DISPATCH_ROWS))
+def test_bf16_dyn_sched_predicate(label):
+    cu, heads, expected = DISPATCH_ROWS[label]
+    plan = build_bf16_segment_plan(
+        cu, torch.device("cpu"), heads, num_clusters=GB300_GRID_CLUSTERS
+    )
+    assert (
+        bf16_dyn_sched(_scheduled_records(plan), plan.total_tiles, plan.num_clusters)
+        is expected
+    )
+    assert plan.dyn_sched is expected and plan.sread_unified is (not expected)
+    assert bf16_attention_stage(plan, "sm_100a") == (
+        "attention_dyn" if expected else "attention_sread"
+    )
+    assert bf16_attention_stage(plan, "sm_103a") == (
+        "attention_dyn" if expected else "attention"
+    )
+
+
+def test_bf16_dyn_sched_predicate_numbers():
+    # center_5s_p1 on 76 clusters: 55 whole two-stage units (weight 2 x 302 blocks) and one single-stage
+    # 192-row tail unit (weight 302) per cluster; the imbalance equals the cheapest unit, so the static
+    # LPT order is makespan-optimal and 56 units per cluster are below the unit-count rule.
+    plan = build_bf16_segment_plan(
+        [0, 38592], torch.device("cpu"), 56, num_clusters=GB300_GRID_CLUSTERS
+    )
+    records = _scheduled_records(plan)
+    work = bf16_cluster_work(records, plan.num_clusters)
+    assert plan.total_tiles == 4256 and len(work) == 76
+    assert sum(work) == 2553712 and min(work) == 33522 and max(work) == 33824
+    assert max(work) - min(work) == min(bf16_unit_weights(records)) == 302
+    assert plan.dyn_sched is False
+    # center_15s_p2: 40 units per cluster only, but the LPT order leaves a whole two-stage unit (860)
+    # between the fullest and the lightest cluster while the cheapest unit is a single-stage tail (430).
+    plan = build_bf16_segment_plan(
+        [0, 54976], torch.device("cpu"), 28, num_clusters=GB300_GRID_CLUSTERS
+    )
+    records = _scheduled_records(plan)
+    work = bf16_cluster_work(records, plan.num_clusters)
+    assert -(-plan.total_tiles // plan.num_clusters) == 40
+    assert max(work) - min(work) == 860 > min(bf16_unit_weights(records)) == 430
+    assert plan.dyn_sched is True
+
+
+def test_bf16_unit_table_carries_the_ticket_counter_record():
+    plan = build_bf16_segment_plan(
+        [0, 4763], torch.device("cpu"), 7, num_clusters=GB300_GRID_CLUSTERS
+    )
+    words = plan.unit_table.tolist()
+    assert len(words) == UNIT_WORDS * (plan.total_tiles + plan.num_clusters + 1)
+    assert words[UNIT_WORDS * plan.total_tiles :] == [0] * (
+        UNIT_WORDS * (plan.num_clusters + 1)
+    )
+
+
+@pytest.mark.parametrize(
+    "label,cu,heads,dyn",
+    [
+        ("center_6s_p1_m48768", [0, 48768], 56, True),
+        ("tail_5s_p8_m4763", [0, 4763], 7, False),
+    ],
+)
+def test_bf16_dispatched_program_is_bitwise_the_static_program(
+    monkeypatch, label, cu, heads, dyn
+):
+    """The per-plan dispatch changes which program runs, never the arithmetic: on the same scheduled unit
+    records the dispatched program's output is bitwise the static ``attention`` program's.  The
+    ``attention_dyn`` program owns the padding of ``unit_table`` as launch state: it resets the ticket
+    counter and leaves every cluster's terminal ticket in word 6 of that cluster's padding record;
+    the static programs never write the table."""
+    _require_program("bf16")
+    cake_backend._BF16_PLANS.clear()
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=11)
+    dispatched = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, cu_seqlens_host=cu
+    )
+    sread_arch = dispatched.arch in cake_backend.BF16_SREAD_ARCHES
+    expected = (
+        "attention_dyn" if dyn else ("attention_sread" if sread_arch else "attention")
+    )
+    assert dispatched.plan.dyn_sched is dyn and dispatched.attention_stage == expected
+    assert dispatched.route_metadata["attention_variant"] == expected
+    assert dispatched.route_metadata["dyn_sched"] is dyn
+    assert dispatched.route_metadata["sread_unified"] is ((not dyn) and sread_arch)
+    total = int(dispatched.plan.total_tiles)
+    clusters = int(dispatched.plan.num_clusters)
+    scheduled = UNIT_WORDS * total
+    table_before = dispatched.plan.unit_table.clone()
+    assert table_before.numel() == scheduled + UNIT_WORDS * (clusters + 1)
+    assert not table_before[scheduled:].any()
+    out_dispatched = dispatched().clone()
+    torch.cuda.synchronize()
+    table_after = dispatched.plan.unit_table
+    assert torch.equal(table_after[:scheduled], table_before[:scheduled])
+    padding = table_after[scheduled:].view(clusters + 1, UNIT_WORDS).tolist()
+    # the ticket counter is reset by the last draw
+    assert padding[clusters] == [0] * UNIT_WORDS
+    for record in padding[:clusters]:
+        assert record[:6] == [0] * 6 and record[7] == 0
+    mailboxes = [record[6] for record in padding[:clusters]]
+    if dyn:
+        # Every cluster leaves on a terminal ticket (>= total_tiles) and publishes it to its mailbox.
+        assert all(ticket >= total for ticket in mailboxes)
+    else:
+        assert mailboxes == [0] * clusters
+    # Force the static program: no plan passes the wave floor and the sread arch filter is empty.
+    monkeypatch.setattr(cake_backend, "BF16_DYN_SCHED_MIN_WAVES", 1 << 30)
+    monkeypatch.setattr(cake_backend, "BF16_SREAD_ARCHES", ())
+    cake_backend._BF16_PLANS.clear()
+    static = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, cu_seqlens_host=cu
+    )
+    assert static.attention_stage == "attention" and static.plan.dyn_sched is False
+    assert torch.equal(static.plan.unit_table, table_before)
+    out_static = static().clone()
+    torch.cuda.synchronize()
+    # the static program never writes the table
+    assert torch.equal(static.plan.unit_table, table_before)
+    assert torch.equal(out_dispatched, out_static)
+    cake_backend._BF16_PLANS.clear()
+
+
+ENGINE_VIEW_ROWS = [
+    ("smoke_p8_133_300", [0, 133, 300], 7),
+    ("empty_segments", [0, 0, 640, 640, 1200, 1201], 7),
+    ("seg3_5s_p8", [0, 4310, 4567, 4824], 7),
+    ("seg4_6s_p2", [0, 12285, 16401, 20393, 24384], 28),
+]
+
+
+@pytest.mark.parametrize("layout", ["fused_qkv", "pack"])
+@pytest.mark.parametrize("label,cu,heads", ENGINE_VIEW_ROWS)
+def test_bf16_engine_views_match_fp32_reference(layout, label, cu, heads):
+    """Strided Q/K/V views of the fused QKV projection and of the pre-attention pack are
+    consumed in place (no THD copies) on ragged multi-segment packs."""
+    _require_program("bf16")
+    q, k, v, cu_seqlens = _make_engine_views(cu, heads, seed=6092, layout=layout)
+    out = minimax_h3_varlen_attention(q, k, v, cu_seqlens, cu_seqlens_host=cu)
+    torch.cuda.synchronize()
+    assert out.is_contiguous() and tuple(out.shape) == tuple(q.shape)
+    _check(
+        out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), BF16_ATOL, BF16_RTOL
+    )
+    # The reference on contiguous copies of the same values agrees (the views were read
+    # where they live).
+    contiguous = minimax_h3_varlen_attention(
+        q.contiguous(), k.contiguous(), v.contiguous(), cu_seqlens, cu_seqlens_host=cu
+    )
+    torch.testing.assert_close(out, contiguous, atol=0, rtol=0)
+
+
+def test_bf16_rejects_head_major_view():
+    """``k.transpose(0, 1).contiguous().transpose(0, 1)`` is a head-major ``[T, H, 128]``
+    view with strides ``(128, T * 128, 1)``.  The kernel's operand contract is token-major
+    (token stride at least ``H * head_stride``: the engine's fused-QKV column chunks and
+    pack slices); head-major views are rejected up front rather than encoded into a TMA
+    descriptor with non-ascending strides."""
+    _require_program("bf16")
+    cu, heads = [0, 300], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=3)
+    k_view = k.transpose(0, 1).contiguous().transpose(0, 1)
+    assert k_view.stride() == (HEAD_DIM, cu[-1] * HEAD_DIM, 1)
+    with pytest.raises(ValueError, match="token stride"):
+        minimax_h3_varlen_attention(q, k_view, v, cu_seqlens)
+
+
 def test_bf16_rejects_bad_inputs():
     _require_program("bf16")
     q, k, v, cu_seqlens = _make_inputs([0, 300], 7, seed=3)
     with pytest.raises(ValueError, match="bfloat16"):
         minimax_h3_varlen_attention(q.float(), k, v, cu_seqlens)
-    with pytest.raises(ValueError, match="contiguous"):
-        minimax_h3_varlen_attention(
-            q, k.transpose(0, 1).contiguous().transpose(0, 1), v, cu_seqlens
-        )
+    # A non-unit last stride (every other element of a [T, H, 256] buffer) is rejected.
+    wide = torch.randn((300, 7, 2 * HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+    k_strided = wide[:, :, ::2]
+    assert tuple(k_strided.shape) == (300, 7, HEAD_DIM) and k_strided.stride(2) == 2
+    with pytest.raises(ValueError, match=r"stride|contiguous"):
+        minimax_h3_varlen_attention(q, k_strided, v, cu_seqlens)
     with pytest.raises(ValueError, match="token extent"):
         minimax_h3_varlen_attention(
             q, k, v, torch.tensor([0, 299], dtype=torch.int32, device="cuda")

@@ -236,8 +236,8 @@ def test_cublaslt_bf16_runner_zero_algos():
 @pytest.mark.parametrize("pdl", [False, True])
 def test_mm_bf16_cute_dsl_direct_fallback(pdl: bool):
     """The no-autotune fallback uses direct in its measured crossover band."""
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
-        pytest.skip("CuTeDSL low-M backend requires SM100/SM103.")
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103/SM107.")
 
     from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
@@ -256,8 +256,8 @@ def test_mm_bf16_cute_dsl_direct_fallback(pdl: bool):
 @pytest.mark.parametrize("enable_bias", [False, True])
 def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
     """K=128 exercises the shallow one-stage tensor-core pipeline."""
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
-        pytest.skip("CuTeDSL low-M backend requires SM100/SM103.")
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103/SM107.")
 
     from flashinfer.cute_dsl.utils import is_cute_dsl_available
 

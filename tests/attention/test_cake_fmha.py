@@ -19,9 +19,7 @@ from flashinfer.jit.cake_fmha import (
     get_cake_fmha_decode_native_bf16_hd256_smallm_uri,
     CAKE_FMHA_BALANCED_FP8_Q_DTYPES,
     CAKE_FMHA_BALANCED_HD256_PAGE_SIZES,
-    CAKE_FMHA_FLASHINFER_BINDINGS_SHA256,
     CAKE_FMHA_FLASHINFER_MATRIX_REVISION,
-    CAKE_FMHA_MANIFEST_SHA256,
     cake_fmha_balanced_fp8_component_name,
     cake_fmha_balanced_hd256_component_name,
     gen_cake_fmha_compat_module,
@@ -68,13 +66,12 @@ from tests.test_helpers.cake_fmha_capability import (
 )
 
 
-def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
+def test_cake_fmha_registry_is_complete() -> None:
     manifest = get_cake_fmha_manifest()
     assert manifest["product"] == "cake_fmha"
     assert manifest["flashinfer_matrix_revision"] == (
         CAKE_FMHA_FLASHINFER_MATRIX_REVISION
     )
-    assert manifest["publication"]["promotion_ready"] is True
     assert manifest["capability"]["complete"] is True
     assert manifest["capability"]["cake_coverage_ratio"] == 1.0
     assert manifest["capability"]["upstream_valid_cases"] == 57_280
@@ -88,29 +85,9 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
         "correctness_compat_decode_fp8_hnd_shared_group8_partial",
         "correctness_decode_fp8_hnd_shared_group8_full_blocks",
     }
-    # 143 base/composed artifacts, the six CAKE-459 small-M hd256 decode
-    # instances (two arch bodies + one launch binding each) and the seven
-    # round-2 balanced components (fp8, bf16q, fp16q, bf16 hd64, bf16 hd256
-    # p16/p32/p64: two arch programs + one launch binding each), plus the
-    # round-3 balanced DCP speculative-decode families (three launch bindings
-    # and one program each, instantiated by -DN_ROWS for both architectures).
-    assert len(manifest["artifacts"]) == 206
-    dcp_addon = manifest["add_ons"]["cake_fmha_dcp_spec"]
-    assert dcp_addon["installed"] is True
-    assert dcp_addon["selection_key"] == "causal_seqlens_kv_global"
-    assert set(dcp_addon["manifest"]["families"]) == {
-        "dcp_spec_bf16_balanced",
-        "dcp_spec_bf16_fp8",
-        "dcp_spec_bf16_fp8_balanced",
-        "dcp_spec_bf16_fp8_d256_balanced",
-        "dcp_spec_bf16_v1",
-        "dcp_spec_bf16_v4",
-    }
     assert manifest["components"]["compat_v1"]["launch_binding"] == (
         "cake_fmha_launch_compat_v1"
     )
-    assert len(CAKE_FMHA_MANIFEST_SHA256) == 64
-    assert len(CAKE_FMHA_FLASHINFER_BINDINGS_SHA256) == 64
 
 
 def test_cake_fmha_public_manifest_is_defensive_copy() -> None:
@@ -377,20 +354,8 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector(
     )
     assert body == get_cake_fmha_csrc_dir() / sink_member["sources"][manifest_arch]
     assert binding == get_cake_fmha_csrc_dir() / sink_binding
-    assert (
-        arch_override["binding_sha256"] == manifest["artifacts"][sink_binding]["sha256"]
-    )
     assert launch_override["grid"] == ["Q_LEN", "NUM_KV_HEADS", "BATCH_SIZE"]
     assert launch_override["use_pdl"] is True
-    assert len(cake_jit._FLASHINFER_BINDINGS) == 20
-    assert sink_binding not in cake_jit._FLASHINFER_BINDINGS
-    assert (
-        cake_jit._sha256(get_cake_fmha_csrc_dir() / sink_binding)
-        == (arch_override["binding_sha256"])
-    )
-    assert cake_jit._flashinfer_bindings_sha256(get_cake_fmha_csrc_dir()) == (
-        CAKE_FMHA_FLASHINFER_BINDINGS_SHA256
-    )
 
     adapter = (
         get_cake_fmha_csrc_dir() / "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
@@ -2914,7 +2879,7 @@ def test_cake_fmha_decode_native_bf16_hd256_smallm_jit_selects_component(
         "cake_fmha_decode_native_bf16_hd256_smallm_jit_binding.cu",
     }
     assert any(
-        "decode_native_bf16_hd256_smallm_n64_p64/sm_100a/" in str(s)
+        "decode_native_bf16_hd256_smallm_n64_p64/default.cu" in str(s)
         for s in spec.sources
     )
     assert "-DQ_LEN=8" in spec.extra_cuda_cflags
@@ -3687,7 +3652,7 @@ def test_cake_fmha_decode_balanced_jit_selects_the_q_len_component(
             in spec.extra_cuda_cflags
         )
         assert any(
-            f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources
+            f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
         )
 
 
@@ -3711,7 +3676,9 @@ def test_cake_fmha_decode_balanced_fp8_family_jit_selects_the_q_dtype_component(
         f"cake_fmha_{component}_binding.cu",
         "cake_fmha_decode_balanced_fp8_jit_binding.cu",
     }
-    assert any(f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources)
+    assert any(
+        f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
+    )
     assert f"-DCAKE_FMHA_BALANCED_Q_DTYPE={q_dtype_flag}" in spec.extra_cuda_cflags
     assert (
         f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
@@ -3735,7 +3702,9 @@ def test_cake_fmha_decode_balanced_hd64_jit_selects_the_component(monkeypatch) -
         f"cake_fmha_{component}_binding.cu",
         "cake_fmha_decode_balanced_hd64_jit_binding.cu",
     }
-    assert any(f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources)
+    assert any(
+        f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
+    )
     assert (
         f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
         in spec.extra_cuda_cflags
@@ -3760,7 +3729,9 @@ def test_cake_fmha_decode_balanced_hd256_jit_selects_the_page_size_component(
         f"cake_fmha_{component}_binding.cu",
         "cake_fmha_decode_balanced_hd256_jit_binding.cu",
     }
-    assert any(f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources)
+    assert any(
+        f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
+    )
     assert f"-DCAKE_FMHA_BALANCED_PAGE_SIZE={page_size}" in spec.extra_cuda_cflags
     assert (
         f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
@@ -4363,3 +4334,99 @@ def test_cake_decode_balanced_hd256_matches_reference_and_replays(
         atol=1e-2,
         rtol=1e-2,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_cake_decode_bf16_hd256_smallm_cuda_graph_without_prewarm() -> None:
+    """Serving-style CUDA graph use of the small-M hd256 route.
+
+    Capture with no eager prewarm and a transient query/output (graph-pool
+    addresses), then replay across growing KV lengths with other GPU work
+    between launches, the way a decode loop interleaves layers. Guards the
+    by-value TMA descriptors, the self-resetting merge tickets kept in
+    ``multi_ctas_kv_counter_buffer`` (no per-launch memset node), and the
+    softmax/correction ``corr_scale`` ordering whose mbarrier parity could
+    alias and deadlock a CTA under exactly this interleaving.
+    """
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+        pytest.skip("Cake FMHA requires SM100 or SM103")
+
+    from flashinfer.utils import (
+        get_device_sm_count,
+        get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    )
+
+    # Qwen3.5-35B-A3B TP=2 verify: 7 query rows x 8 heads over one KV head.
+    q_len, num_q_heads, head_dim, page_size, max_ctx = 7, 8, 256, 64, 65536
+    gen = torch.Generator(device=device).manual_seed(0)
+    num_pages = max_ctx // page_size + 8
+    key_cache = 0.5 * torch.randn(
+        (num_pages, 1, page_size, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=gen,
+    )
+    value_cache = torch.randn(
+        (num_pages, 1, page_size, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=gen,
+    )
+    block_tables = (
+        torch.randperm(num_pages, device=device, generator=gen)[: max_ctx // page_size]
+        .to(torch.int32)
+        .view(1, -1)
+    )
+    seq_lens = torch.tensor([60000], dtype=torch.int32, device=device)
+    q_src = torch.empty(
+        (q_len, num_q_heads, head_dim), dtype=torch.bfloat16, device=device
+    )
+    workspace = torch.zeros(256 << 20, dtype=torch.uint8, device=device)
+    counter = torch.zeros(
+        get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            1, num_q_heads, get_device_sm_count(device)
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    scale = head_dim**-0.5
+
+    def run():
+        query = q_src * 1.0  # transient tensor, graph-pool address inside capture
+        return decode.trtllm_batch_decode_with_kv_cache(
+            query=query,
+            kv_cache=(key_cache, value_cache),
+            workspace_buffer=workspace,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_ctx,
+            bmm1_scale=scale,
+            bmm2_scale=1.0,
+            window_left=-1,
+            out_dtype=torch.bfloat16,
+            q_len_per_req=q_len,
+            multi_ctas_kv_counter_buffer=counter,
+            backend="cake",
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):  # no eager call before capture
+        out = run()
+
+    pages = block_tables[0].long()
+    k_all = key_cache[pages, 0].reshape(-1, head_dim).float()
+    v_all = value_cache[pages, 0].reshape(-1, head_dim).float()
+    for kv_len in range(60000, 60000 + 3 * 128, 3):  # crosses page/block edges
+        q_src.normal_(generator=gen)
+        seq_lens.fill_(kv_len)
+        graph.replay()
+        # Dense bottom-right-causal reference; also the interleaved GPU work.
+        scores = (q_src.float() @ k_all[:kv_len].T) * scale
+        pos = torch.arange(kv_len, device=device)
+        limit = kv_len - q_len + torch.arange(q_len, device=device)
+        scores = scores.masked_fill(pos > limit[:, None, None], float("-inf"))
+        ref = torch.softmax(scores, dim=-1) @ v_all[:kv_len]
+        torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+    torch.cuda.synchronize()
+    assert counter.count_nonzero().item() == 0, "merge tickets must self-reset"

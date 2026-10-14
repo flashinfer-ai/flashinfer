@@ -38,6 +38,8 @@ def make_workspace_config(
             rank=rank,
             world_size=world_size,
             quant_kind=quant_kind,
+            kernel_variant=k.kernel_variant,
+            combine_dtype=k.combine_dtype,
             gate_up_clamp=gate_up_clamp,
             activation=k.activation,
             situ_beta=k.situ_beta,

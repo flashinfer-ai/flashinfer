@@ -106,10 +106,9 @@ def cake_sparse_mla_sm120_dsv41_mixed_manifest() -> Dict[str, Any]:
 def gen_cake_sparse_mla_sm120_dsv41_mixed_module() -> JitSpec:
     """JIT spec for the Cake SM120 (GB202 / GB10) DeepSeek-V4.1 mixed-cache sparse-MLA decode family.
 
-    One translation unit per supported head count (single-cache decode, dual-cache decode and
-    split merge kernels for every exported compute precision) plus the TVM-FFI host binding; the
-    module name carries the generated family's identity so a regenerated kernel set never reuses
-    a stale build.
+    The generated decode / merge translation units listed in the manifest plus the TVM-FFI host
+    binding; the module name carries the generated family's identity so a regenerated kernel set
+    never reuses a stale build.
     """
 
     manifest = cake_sparse_mla_sm120_dsv41_mixed_manifest()

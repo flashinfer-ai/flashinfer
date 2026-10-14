@@ -32,7 +32,7 @@ from pathlib import Path
 
 import torch
 
-from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.activations import (
+from flashinfer.fused_moe.backends.cudnn_frost.activations import (
     ACTIVATIONS,
 )
 
@@ -71,6 +71,8 @@ def configure_source_jit():
 
 
 def benchmark(args):
+    from flashinfer.fused_moe import CudnnFrostBf16Config
+
     gpu_uuid = torch.cuda.get_device_properties(torch.cuda.current_device()).uuid
     check_idle_gpu(gpu_uuid)
     torch.manual_seed(args.seed)
@@ -94,7 +96,7 @@ def benchmark(args):
     torch.manual_seed(41)
     e, h, i = args.experts, args.hidden, args.intermediate
     if args.artifact_root is not None:
-        from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
             fc2,
             runtime,
         )
@@ -114,7 +116,8 @@ def benchmark(args):
     eligible = {
         cls: runner
         for cls, runner in _BACKEND_RUNNERS.items()
-        if cls.supported(arch)
+        if not runner.backend_key.startswith("cudnn_frost_")
+        and cls.supported(arch)
         and runner.supports_quant(QuantConfig())
         and isinstance(activation, runner.supported_activation_classes)
     }
@@ -201,10 +204,26 @@ def benchmark(args):
         ids = logits.topk(args.top_k, dim=1).indices.int()
         scores = torch.rand(tokens, args.top_k, device="cuda").softmax(-1)
         act = MoEActivationPack(x, None, ids, scores)
-        layers = {"original": MoELayer(config), "with_cudnn_frost": MoELayer(config)}
+        layers = {
+            "original": MoELayer(config),
+            "with_cudnn_frost": MoELayer(
+                replace(
+                    config,
+                    backend=BackendOptions(
+                        (*config.backend.candidates, CudnnFrostBf16Config())
+                    ),
+                )
+            ),
+        }
         for label, layer in layers.items():
             actual_backends = {runner.backend_key for runner in layer.runners}
-            if actual_backends != expected_backends:
+            allowed = expected_backends | (
+                {"cudnn_frost_bf16"} if label == "with_cudnn_frost" else set()
+            )
+            if (
+                actual_backends - {"cudnn_frost_bf16"} != expected_backends
+                or not actual_backends <= allowed
+            ):
                 raise RuntimeError(
                     f"{label} backend pool mismatch: expected {expected_backends}, "
                     f"got {actual_backends}"
@@ -215,18 +234,14 @@ def benchmark(args):
             ),
             flush=True,
         )
-        # Benchmark-only dispatcher ablation, never a change to an existing runner.
-        layers["original"]._additional_candidates = lambda *args: []
         if args.probe_cudnn_frost:
-            from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16.moe import (
-                CudnnFrostBf16MoeRunner,
+            # Explicit benchmark-only probe outside the normal model shortlist.
+            probe = next(
+                r
+                for r in layers["with_cudnn_frost"].runners
+                if r.backend_key == "cudnn_frost_bf16"
             )
-
-            probe = CudnnFrostBf16MoeRunner(config, x.device)
-            probe.check_support()
-            probe.build()
-            layers["with_cudnn_frost"]._automatic_runners["cudnn_frost_bf16"] = probe
-            layers["with_cudnn_frost"]._additional_candidates = lambda *args: [probe]
+            probe._accepts_shape = lambda act: True
         outputs, graphs, winners = {}, {}, {}
         for label, layer in layers.items():
             with autotune():
@@ -251,7 +266,9 @@ def benchmark(args):
 
         # Measure the best independent cuDNN Frost candidate even if an original backend wins.
         layer = layers["with_cudnn_frost"]
-        cudnn_frost = layer._automatic_runners.get("cudnn_frost_bf16")
+        cudnn_frost = next(
+            (r for r in layer.runners if r.backend_key == "cudnn_frost_bf16"), None
+        )
         if cudnn_frost is not None and (
             args.probe_cudnn_frost or cudnn_frost.accepts(act, weights)
         ):
@@ -503,7 +520,7 @@ def catalog_configs(op, e, n, k, file):
     from cudnn.gemm.frost import tile_config
     from cudnn.gemm.frost.compiler import probe_chain
     from cudnn.gemm.frost.graph_analyzer import analyze
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export import (
+    from flashinfer.fused_moe.backends.cudnn_frost.export import (
         _build_graph,
     )
 
@@ -548,7 +565,7 @@ def catalog_configs(op, e, n, k, file):
 
 def export_task(opts):
     """A CPU compiler worker; no benchmark timing is collected in this phase."""
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export import (
+    from flashinfer.fused_moe.backends.cudnn_frost.export import (
         export_one,
     )
 
@@ -556,7 +573,7 @@ def export_task(opts):
     try:
         kernel = export_one(opts)
         if opts.warm_source_jit:
-            from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+            from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
                 runtime,
             )
 
@@ -774,7 +791,7 @@ def measure_stage(fn, out, ref, args):
 
 
 def sweep(args, file):
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+    from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
         fc2,
         moe,
         runtime,
@@ -1134,7 +1151,7 @@ def copy_selected(artifacts, selected_dir, identities, file):
 
     Packaged records keep their order; new records are appended by identity.
     """
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.runtime import (
+    from flashinfer.fused_moe.backends.cudnn_frost.runtime import (
         _safe_child,
     )
 
@@ -1259,7 +1276,7 @@ def build_shortlist(results, width):
 
 def validate_shortlist(args, entries, file):
     """Check every shortlisted pair as a complete routed MoE and graph replay."""
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+    from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
         fc2,
         moe,
         runtime,

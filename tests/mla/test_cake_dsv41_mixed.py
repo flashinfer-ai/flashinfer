@@ -58,18 +58,22 @@ from flashinfer.mla import (
 from flashinfer.mla._sparse_mla_sm120 import cake_dsv41_mixed as route
 from flashinfer.mla._sparse_mla_sm120.cake_dsv41_mixed import (
     BINDING_PARAMS,
+    CakeDsv41MixedGeometry,
+    DEFAULT_VARIANT,
     EXTRA_BYTES_PER_TOKEN,
     MAIN_BYTES_PER_TOKEN,
-    PROVISIONAL_GEOMETRY,
     cache_page_geometry,
     cake_sparse_mla_sm120_dsv41_mixed_decode,
     cake_sparse_mla_sm120_dsv41_mixed_format_info,
     cake_sparse_mla_sm120_dsv41_mixed_num_chunks,
     cake_sparse_mla_sm120_dsv41_mixed_plan_head_tiles,
     cake_sparse_mla_sm120_dsv41_mixed_plan_splits,
+    cake_sparse_mla_sm120_dsv41_mixed_plan_variant,
     cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes,
     cake_sparse_mla_sm120_dsv41_mixed_supported_heads,
-    get_cake_sparse_mla_sm120_dsv41_mixed_module,
+    cake_sparse_mla_sm120_dsv41_mixed_token_bucket,
+    dispatch_from_manifest,
+    kernel_dispatch,
     kernel_geometry,
     normalize_compute_precision,
 )
@@ -85,28 +89,32 @@ _SM_SCALE = _D**-0.5
 _CPU = torch.device("cpu")
 # Wrapper keywords of the mixed cache; ``backend`` and ``compute_precision`` vary per test.
 _MIXED = dict(kv_cache_format="fp8", kv_scale_format="ue8m0_g32", extra_kv_fp4=True)
-_TOL = {
-    "bf16": dict(atol=1e-2, rtol=1e-2),
-    "fp8": dict(atol=1e-1, rtol=1e-1),
-}
-_LSE_TOL = {
-    "bf16": dict(atol=1e-2, rtol=1e-2),
-    "fp8": dict(atol=1e-1, rtol=1e-1),
-}
+_TOL = {"bf16": dict(atol=1e-2, rtol=1e-2)}
+_LSE_TOL = {"bf16": dict(atol=1e-2, rtol=1e-2)}
 _LAZY_EXPORTS = (
     "cake_sparse_mla_sm120_dsv41_mixed_decode",
     "cake_sparse_mla_sm120_dsv41_mixed_format_info",
     "cake_sparse_mla_sm120_dsv41_mixed_num_chunks",
     "cake_sparse_mla_sm120_dsv41_mixed_plan_head_tiles",
     "cake_sparse_mla_sm120_dsv41_mixed_plan_splits",
+    "cake_sparse_mla_sm120_dsv41_mixed_plan_variant",
     "cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes",
     "cake_sparse_mla_sm120_dsv41_mixed_supported_heads",
 )
-# Geometry with two-tile instances, to exercise the head-tile rules the provisional geometry disables.
-_TWO_TILE_GEOMETRY = dataclasses.replace(
-    PROVISIONAL_GEOMETRY,
+# Planner fixtures: 16-head CTA tiles, 64-candidate chunks for both caches, a 16-chunk index table and head counts 8
+# and every multiple of 16 up to 128, without and with the two-tile instances.
+_ONE_TILE_GEOMETRY = CakeDsv41MixedGeometry(
+    heads_per_block=16,
+    candidates_per_chunk=64,
+    extra_candidates_per_chunk=64,
+    max_chunks_per_block=16,
     head_counts=(8, 16, 32, 48, 64, 80, 96, 112, 128),
-    two_tile_head_counts=(32, 64, 96, 128),
+    two_tile_head_counts=(),
+    precisions=("bf16",),
+    kernel_commit=None,
+)
+_TWO_TILE_GEOMETRY = dataclasses.replace(
+    _ONE_TILE_GEOMETRY, two_tile_head_counts=(32, 64, 96, 128)
 )
 
 
@@ -131,16 +139,14 @@ def test_format_info() -> None:
     assert cake_sparse_mla_sm120_dsv41_mixed_supported_heads() == info["heads"]
     assert set(info["two_tile_heads"]) <= set(info["heads"])
     assert info["default_compute_precision"] == "bf16"
-    assert "bf16" in info["compute_precisions"]
-    assert set(info["compute_precisions"]) <= {"bf16", "fp8"}
-    assert info["kernels_available"] == cake_sparse_mla_sm120_dsv41_mixed_available()
+    assert info["compute_precisions"] == ("bf16",)
     assert info["heads_per_block"] >= 1 and info["max_chunks_per_block"] >= 1
     assert info["chunk_width"] >= 1 and info["extra_chunk_width"] >= 1
 
 
 def test_num_chunks_counts_both_caches() -> None:
     chunks = functools.partial(
-        cake_sparse_mla_sm120_dsv41_mixed_num_chunks, geometry=PROVISIONAL_GEOMETRY
+        cake_sparse_mla_sm120_dsv41_mixed_num_chunks, geometry=_ONE_TILE_GEOMETRY
     )
     assert chunks(128) == 2
     assert chunks(1) == 1
@@ -149,7 +155,7 @@ def test_num_chunks_counts_both_caches() -> None:
     assert chunks(0, 512) == 8
     assert chunks(512, 1024) == 24
     narrow = dataclasses.replace(
-        PROVISIONAL_GEOMETRY, candidates_per_chunk=32, extra_candidates_per_chunk=128
+        _ONE_TILE_GEOMETRY, candidates_per_chunk=32, extra_candidates_per_chunk=128
     )
     assert cake_sparse_mla_sm120_dsv41_mixed_num_chunks(128, 512, geometry=narrow) == 8
     assert cake_sparse_mla_sm120_dsv41_mixed_num_chunks(130, 129, geometry=narrow) == 7
@@ -158,8 +164,7 @@ def test_num_chunks_counts_both_caches() -> None:
 def test_normalize_compute_precision() -> None:
     assert normalize_compute_precision("default") == "bf16"
     assert normalize_compute_precision("bf16") == "bf16"
-    assert normalize_compute_precision("fp8") == "fp8"
-    for bad in ("nvfp4", "auto", "fp16", ""):
+    for bad in ("fp8", "nvfp4", "auto", "fp16", ""):
         with pytest.raises(ValueError, match="compute_precision"):
             normalize_compute_precision(bad)
 
@@ -258,7 +263,7 @@ def test_plan_head_tiles_rules() -> None:
             (16, 64, 128),
         ):
             assert plan(num_tokens=tokens, num_heads=heads, topk=topk, num_sms=sms) == 2
-    # The provisional geometry exports no two-tile instance at all.
+    # A geometry without two-tile instances plans one tile everywhere.
     for heads in (32, 64, 128):
         assert (
             cake_sparse_mla_sm120_dsv41_mixed_plan_head_tiles(
@@ -267,7 +272,7 @@ def test_plan_head_tiles_rules() -> None:
                 topk=512,
                 extra_topk=512,
                 num_sms=188,
-                geometry=PROVISIONAL_GEOMETRY,
+                geometry=_ONE_TILE_GEOMETRY,
             )
             == 1
         )
@@ -318,7 +323,7 @@ _FITTED_PLANS = {
     (128, 32, 128, 512, 170, False): (1, 10),
     (8, 128, 128, 512, 170, False): (5, 2),
     (32, 128, 128, 512, 170, False): (1, 10),
-    (128, 128, 128, 512, 170, False): (1, 10),
+    (128, 128, 128, 512, 170, False): (3, 4),
     (8, 64, 128, 0, 170, False): (2, 1),
     (32, 64, 128, 0, 170, False): (1, 2),
     (128, 64, 128, 0, 170, False): (1, 2),
@@ -343,6 +348,55 @@ _FITTED_PLANS = {
     (32, 64, 128, 0, 48, True): (1, 2),
     (128, 64, 128, 0, 48, True): (1, 2),
 }
+
+
+# Ragged rows (per-token lengths) of the same geometry: the 10-chunk quarter-to-half-SM grid takes four
+# splits on the RTX PRO 6000 only (256 CTAs = 1.36 waves; 1.51 waves on the RTX 5090 keeps three).
+_FITTED_RAGGED_PLANS = {
+    (8, 64, 128, 512, 188, False): (10, 1),
+    (32, 64, 128, 512, 188, False): (4, 3),
+    (128, 64, 128, 512, 188, False): (2, 5),
+    (8, 64, 128, 512, 170, False): (10, 1),
+    (32, 64, 128, 512, 170, False): (3, 4),
+    (128, 64, 128, 512, 170, False): (3, 4),
+    (8, 64, 128, 512, 48, True): (2, 5),
+    (32, 64, 128, 512, 48, True): (2, 5),
+    (128, 64, 128, 512, 48, True): (1, 10),
+}
+
+
+def test_plan_splits_ragged_rows_match_the_fitted_table() -> None:
+    for (
+        tokens,
+        heads,
+        topk,
+        extra_topk,
+        sms,
+        unified,
+    ), expected in _FITTED_RAGGED_PLANS.items():
+        plan = cake_sparse_mla_sm120_dsv41_mixed_plan_splits(
+            num_tokens=tokens,
+            num_heads=heads,
+            topk=topk,
+            extra_topk=extra_topk,
+            num_sms=sms,
+            head_tiles=2,
+            unified_memory=unified,
+            ragged=True,
+            geometry=_FITTED_GEOMETRY,
+        )
+        assert plan == expected, (tokens, heads, topk, extra_topk, sms, unified)
+        dense = cake_sparse_mla_sm120_dsv41_mixed_plan_splits(
+            num_tokens=tokens,
+            num_heads=heads,
+            topk=topk,
+            extra_topk=extra_topk,
+            num_sms=sms,
+            head_tiles=2,
+            unified_memory=unified,
+            geometry=_FITTED_GEOMETRY,
+        )
+        assert dense == _FITTED_PLANS[(tokens, heads, topk, extra_topk, sms, unified)]
 
 
 def test_plan_splits_matches_the_fitted_sweep_table() -> None:
@@ -403,13 +457,47 @@ def test_plan_splits_rules() -> None:
     assert plan(
         num_tokens=32, num_heads=64, topk=128, extra_topk=512, num_sms=170, head_tiles=2
     ) == (3, 4)
-    # ... and otherwise unsplit, except a >= 8-chunk full grid: the smallest of two or three splits whose
-    # grid ends in a half-full wave (256 x 2 = 512 CTAs: 136 of 188 on the PRO 6000, 2 of 170 on the 5090;
-    # 256 x 3 = 768 CTAs: 88 of 170 on the 5090).
+    # ... and otherwise unsplit, except a >= 8-chunk full grid: the smallest of one, two or three splits
+    # whose grid fills its waves to at least 90 % on average (256 CTAs: 1.36 waves on the PRO 6000 -> two
+    # splits = 2.72 waves of 3 = 91 %; 1.51 waves on the 5090 -> three splits = 4.52 of 5 = 90 %; 512 CTAs on
+    # the 5090 = 3.01 waves -> three splits = 9.04 of 10).
     assert plan(num_tokens=128, num_heads=16, topk=512, num_sms=188) == (1, 8)
     assert plan(num_tokens=256, num_heads=16, topk=512, num_sms=188) == (2, 4)
     assert plan(num_tokens=256, num_heads=16, topk=512, num_sms=170) == (3, 3)
-    assert plan(num_tokens=512, num_heads=16, topk=512, num_sms=170) == (1, 8)
+    assert plan(num_tokens=512, num_heads=16, topk=512, num_sms=170) == (3, 3)
+    # Ragged rows: the 10-chunk quarter-to-half-SM grid quadruples only where that stays within 1.4 waves.
+    dense = plan(
+        num_tokens=32, num_heads=64, topk=128, extra_topk=512, num_sms=188, head_tiles=2
+    )
+    assert dense == (3, 4)
+    assert plan(
+        num_tokens=32,
+        num_heads=64,
+        topk=128,
+        extra_topk=512,
+        num_sms=188,
+        head_tiles=2,
+        ragged=True,
+    ) == (4, 3)
+    assert plan(
+        num_tokens=32,
+        num_heads=64,
+        topk=128,
+        extra_topk=512,
+        num_sms=170,
+        head_tiles=2,
+        ragged=True,
+    ) == (3, 4)
+    assert plan(
+        num_tokens=32,
+        num_heads=64,
+        topk=128,
+        extra_topk=512,
+        num_sms=48,
+        head_tiles=2,
+        ragged=True,
+        unified_memory=True,
+    ) == (2, 5)
     # Unified memory (GB10): doubling only while the grid stays small, never one chunk per CTA.
     gb10 = functools.partial(plan, num_sms=48, unified_memory=True)
     assert gb10(num_tokens=1, num_heads=16, topk=512) == (4, 2)
@@ -454,7 +542,7 @@ def test_plan_splits_rules() -> None:
 def test_planners_are_pure_and_bounded() -> None:
     """Same inputs, same plan; every plan honours the index table and covers every chunk."""
 
-    g = PROVISIONAL_GEOMETRY
+    g = _ONE_TILE_GEOMETRY
     grid = itertools.product(
         (1, 5, 8, 32, 128),
         g.head_counts,
@@ -508,7 +596,7 @@ def test_scratch_bytes_formula() -> None:
 
 
 def test_wrapper_accepts_cake_mixed_cache() -> None:
-    for word, expect in (("default", "bf16"), ("bf16", "bf16"), ("fp8", "fp8")):
+    for word, expect in (("default", "bf16"), ("bf16", "bf16")):
         wrapper = SparseMLASm120Wrapper(
             backend="cake", compute_precision=word, device=_CPU, **_MIXED
         )
@@ -540,10 +628,11 @@ def test_wrapper_rejects_incomplete_cake_mixed_cache() -> None:
         )
     with pytest.raises(ValueError, match="d_v"):
         SparseMLASm120Wrapper(backend="cake", d_v=1024, device=_CPU, **_MIXED)
-    with pytest.raises(ValueError, match="nvfp4"):
-        SparseMLASm120Wrapper(
-            backend="cake", compute_precision="nvfp4", device=_CPU, **_MIXED
-        )
+    for word in ("nvfp4", "fp8"):
+        with pytest.raises(ValueError, match=word):
+            SparseMLASm120Wrapper(
+                backend="cake", compute_precision=word, device=_CPU, **_MIXED
+            )
 
 
 def test_wrapper_run_checks_call_shape_before_planning() -> None:
@@ -692,43 +781,369 @@ def test_lazy_exports() -> None:
         getattr(flashinfer.mla, missing)
 
 
-def test_binding_params_are_a_well_formed_contract() -> None:
-    assert len(set(BINDING_PARAMS)) == len(BINDING_PARAMS)
-    assert BINDING_PARAMS[:3] == ("q", "kv_cache", "indices")
-    for name in ("extra_kv_cache", "extra_indices", "mid_out", "mid_lse", "precision"):
-        assert name in BINDING_PARAMS
+# A small manifest with the real tables' shape: two cards, ragged cells, a pre-13.2 fallback, one-tile bodies.
+_SYNTHETIC_MANIFEST = {
+    "dispatch": {
+        "token_buckets": [
+            [4, "t1"],
+            [16, "t8"],
+            [48, "t32"],
+            [96, "t64"],
+            [None, "t128"],
+        ],
+        "unified_memory_sm_count": 48,
+        "rules": [
+            {
+                "sm_count": 188,
+                "dual": True,
+                "heads": 64,
+                "ragged": False,
+                "buckets": {"t1": "t1", "t32": "tl+ip", "t128": "ip+pw"},
+            },
+            {
+                "sm_count": 188,
+                "dual": True,
+                "heads": 64,
+                "ragged": True,
+                "buckets": {"t32": "ip+pw"},
+            },
+            {
+                "sm_count": 188,
+                "dual": True,
+                "heads": 8,
+                "ragged": False,
+                "buckets": {"t32": "ip+mo2"},
+            },
+            {
+                "sm_count": 48,
+                "dual": True,
+                "heads": 64,
+                "ragged": False,
+                "buckets": {"t8": "ip+pw+el"},
+            },
+        ],
+        "fallback_dual_two_tile_variant": "tl+e2f",
+        "pow2_page_only_parts": ["pw"],
+    },
+    "variants": [
+        {"name": "default", "decode": "default", "merge": "default"},
+        {"name": "ip+mo2", "decode": "ip", "merge": "mo2"},
+        {"name": "ip+pw", "decode": "ip+pw", "merge": "default"},
+        {"name": "ip+pw+el", "decode": "ip+pw+el", "merge": "default"},
+        {"name": "t1", "decode": "t1", "merge": "default"},
+        {"name": "tl+e2f", "decode": "tl+e2f", "merge": "default"},
+        {"name": "tl+ip", "decode": "tl+ip", "merge": "default"},
+        # non-power-of-two page fallbacks of the `pw` cells
+        {"name": "ip", "decode": "ip", "merge": "default"},
+        {"name": "ip+el", "decode": "ip+el", "merge": "default"},
+    ],
+    "decode_kernels": [
+        {
+            "heads": 8,
+            "dual": True,
+            "variant": "default",
+            "tiles": 1,
+            "smem_bytes": 96384,
+        },
+        {"heads": 8, "dual": True, "variant": "ip", "tiles": 1, "smem_bytes": 96384},
+        {
+            "heads": 64,
+            "dual": True,
+            "variant": "default",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
+        {"heads": 64, "dual": True, "variant": "t1", "tiles": 1, "smem_bytes": 96384},
+        {
+            "heads": 64,
+            "dual": True,
+            "variant": "tl+ip",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
+        {
+            "heads": 64,
+            "dual": True,
+            "variant": "ip+pw",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
+        {
+            "heads": 64,
+            "dual": True,
+            "variant": "ip+pw+el",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
+        {"heads": 64, "dual": True, "variant": "ip", "tiles": 2, "smem_bytes": 96384},
+        {
+            "heads": 64,
+            "dual": True,
+            "variant": "ip+el",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
+        {
+            "heads": 64,
+            "dual": True,
+            "variant": "tl+e2f",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
+        {
+            "heads": 64,
+            "dual": False,
+            "variant": "default",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
+    ],
+    "merge_kernels": [
+        {"heads": 8, "variant": "default"},
+        {"heads": 8, "variant": "mo2"},
+        {"heads": 64, "variant": "default"},
+    ],
+}
+
+
+def test_plan_variant_rules() -> None:
+    d = dispatch_from_manifest(_SYNTHETIC_MANIFEST)
+    assert d.variants["ip+mo2"].decode == "ip" and d.variants["ip+mo2"].merge == "mo2"
+    # Bodies are addressed by their manifest position (the binding's decode_body / merge_body index).
+    assert d.decode_bodies[(64, True, "t1")] == (3, 1, 96384)
+    assert d.decode_bodies[(64, True, "default")] == (2, 2, 96384)
+    assert d.merge_bodies[(8, "mo2")] == 1
+    pick = functools.partial(
+        cake_sparse_mla_sm120_dsv41_mixed_plan_variant,
+        dispatch=d,
+        geometry=_TWO_TILE_GEOMETRY,
+    )
+    pro = dict(num_sms=188, unified_memory=False, dual=True, num_heads=64)
+    # Token buckets are the nearest measured row (T = 1 | 8 | 32 | 64 | 128); a missing bucket is the plain render.
+    assert pick(num_tokens=1, ragged=False, **pro) == "t1"
+    assert pick(num_tokens=4, ragged=False, **pro) == "t1"
+    assert pick(num_tokens=5, ragged=False, **pro) == DEFAULT_VARIANT  # t8: no cell
+    assert pick(num_tokens=32, ragged=False, **pro) == "tl+ip"
+    assert pick(num_tokens=48, ragged=False, **pro) == "tl+ip"
+    assert pick(num_tokens=49, ragged=False, **pro) == DEFAULT_VARIANT  # t64: no cell
+    assert pick(num_tokens=97, ragged=False, **pro) == "ip+pw"
+    assert pick(num_tokens=4096, ragged=False, **pro) == "ip+pw"
+    # Ragged rows consult their own cells first and fall back to the dense table.
+    assert pick(num_tokens=32, ragged=True, **pro) == "ip+pw"
+    assert pick(num_tokens=128, ragged=True, **pro) == "ip+pw"
+    assert pick(num_tokens=1, ragged=True, **pro) == "t1"
+    # Non-power-of-two page sizes drop the shift-and-mask page resolve (`pw`) and keep the rest of the variant.
+    assert d.pow2_page_only_parts == ("pw",)
+    assert pick(num_tokens=128, ragged=False, pow2_pages=False, **pro) == "ip"
+    assert pick(num_tokens=32, ragged=True, pow2_pages=False, **pro) == "ip"
+    assert pick(num_tokens=32, ragged=False, pow2_pages=False, **pro) == "tl+ip"
+    assert pick(num_tokens=1, ragged=False, pow2_pages=False, **pro) == "t1"
     assert (
-        "head_tiles" not in BINDING_PARAMS
-    )  # no two-tile instance in the mixed-cache family
-    assert BINDING_PARAMS.index("page_size") < BINDING_PARAMS.index("extra_page_size")
-    assert BINDING_PARAMS[-1] == "enable_pdl"  # launch attribute of the split merge
+        pick(
+            num_tokens=8,
+            ragged=False,
+            pow2_pages=False,
+            num_sms=48,
+            unified_memory=True,
+            dual=True,
+            num_heads=64,
+        )
+        == "ip+el"
+    )
+    # Merge-only variants resolve to a decode body of the plain render plus their merge body.
+    assert (
+        pick(
+            num_tokens=32,
+            ragged=False,
+            num_sms=188,
+            unified_memory=False,
+            dual=True,
+            num_heads=8,
+        )
+        == "ip+mo2"
+    )
+    # Unmeasured cards, the main-only layout of a dual-only table and a unified-memory part that is not the GB10
+    # keep the plain render; the GB10 is keyed by its SM count together with unified memory.
+    assert (
+        pick(
+            num_tokens=32,
+            ragged=False,
+            num_sms=170,
+            unified_memory=False,
+            dual=True,
+            num_heads=64,
+        )
+        == DEFAULT_VARIANT
+    )
+    assert (
+        pick(
+            num_tokens=32,
+            ragged=False,
+            num_sms=188,
+            unified_memory=False,
+            dual=False,
+            num_heads=64,
+        )
+        == DEFAULT_VARIANT
+    )
+    assert (
+        pick(
+            num_tokens=8,
+            ragged=False,
+            num_sms=48,
+            unified_memory=True,
+            dual=True,
+            num_heads=64,
+        )
+        == "ip+pw+el"
+    )
+    assert (
+        pick(
+            num_tokens=8,
+            ragged=False,
+            num_sms=48,
+            unified_memory=False,
+            dual=True,
+            num_heads=64,
+        )
+        == DEFAULT_VARIANT
+    )
+    assert (
+        pick(
+            num_tokens=8,
+            ragged=False,
+            num_sms=188,
+            unified_memory=True,
+            dual=True,
+            num_heads=64,
+        )
+        == DEFAULT_VARIANT
+    )
+    # Toolchains without the direct BF16x2 converts (CUDA < 13.2): the fallback body on dual two-tile head
+    # counts of every measured card (SM120 and the GB10 alike), the plain render elsewhere.
+    assert pick(num_tokens=32, ragged=False, direct_cvt=False, **pro) == "tl+e2f"
+    assert (
+        pick(
+            num_tokens=32,
+            ragged=False,
+            direct_cvt=False,
+            num_sms=170,
+            unified_memory=False,
+            dual=True,
+            num_heads=64,
+        )
+        == "tl+e2f"
+    )
+    assert (
+        pick(
+            num_tokens=32,
+            ragged=False,
+            direct_cvt=False,
+            num_sms=188,
+            unified_memory=False,
+            dual=True,
+            num_heads=8,
+        )
+        == DEFAULT_VARIANT
+    )
+    assert (
+        pick(
+            num_tokens=32,
+            ragged=False,
+            direct_cvt=False,
+            num_sms=188,
+            unified_memory=False,
+            dual=False,
+            num_heads=64,
+        )
+        == DEFAULT_VARIANT
+    )
+    assert (
+        pick(
+            num_tokens=8,
+            ragged=False,
+            direct_cvt=False,
+            num_sms=48,
+            unified_memory=True,
+            dual=True,
+            num_heads=64,
+        )
+        == "tl+e2f"
+    )
+    assert (
+        pick(
+            num_tokens=8,
+            ragged=False,
+            direct_cvt=False,
+            num_sms=48,
+            unified_memory=True,
+            dual=True,
+            num_heads=8,
+        )
+        == DEFAULT_VARIANT
+    )
+    with pytest.raises(ValueError, match="num_sms"):
+        pick(
+            num_tokens=8,
+            ragged=False,
+            num_sms=0,
+            unified_memory=False,
+            dual=True,
+            num_heads=64,
+        )
+    assert cake_sparse_mla_sm120_dsv41_mixed_token_bucket(16, dispatch=d) == "t8"
+    assert cake_sparse_mla_sm120_dsv41_mixed_token_bucket(17, dispatch=d) == "t32"
+    assert cake_sparse_mla_sm120_dsv41_mixed_token_bucket(10**6, dispatch=d) == "t128"
 
 
-def test_generated_family_manifest_or_absence() -> None:
-    """Before the export the family is reported absent with a precise error; after it, manifest and host agree."""
+def test_dispatch_from_manifest_rejects_inconsistent_tables() -> None:
+    import copy
 
-    if not cake_sparse_mla_sm120_dsv41_mixed_available():
-        with pytest.raises(
-            FileNotFoundError, match="cake_sparse_mla_dsv41_mixed_manifest.json"
-        ):
-            cake_sparse_mla_sm120_dsv41_mixed_manifest()
-        with pytest.raises(FileNotFoundError):
-            get_cake_sparse_mla_sm120_dsv41_mixed_module()
-        assert kernel_geometry().provisional
-        assert not cake_sparse_mla_sm120_dsv41_mixed_format_info()["kernels_available"]
-        return
+    broken = copy.deepcopy(_SYNTHETIC_MANIFEST)
+    broken["dispatch"]["rules"][0]["buckets"]["t8"] = (
+        "ip+mo2"  # decode body `ip` is not exported for 64 heads
+    )
+    with pytest.raises(ValueError, match="no exported body"):
+        dispatch_from_manifest(broken)
+    reordered = copy.deepcopy(_SYNTHETIC_MANIFEST)
+    reordered["variants"].append(reordered["variants"].pop(0))
+    with pytest.raises(ValueError, match="plain render first"):
+        dispatch_from_manifest(reordered)
+    duplicate = copy.deepcopy(_SYNTHETIC_MANIFEST)
+    duplicate["dispatch"]["rules"].append(duplicate["dispatch"]["rules"][0])
+    with pytest.raises(ValueError, match="duplicate"):
+        dispatch_from_manifest(duplicate)
+    no_fallback = copy.deepcopy(_SYNTHETIC_MANIFEST)
+    no_fallback["decode_kernels"] = [
+        k
+        for k in no_fallback["decode_kernels"]
+        if (k["heads"], k["variant"])
+        != (64, "ip")  # `ip+pw` cells need `ip` for non-power-of-two pages
+    ]
+    with pytest.raises(ValueError, match="non-power-of-two page fallback"):
+        dispatch_from_manifest(no_fallback)
+
+
+def test_generated_family_manifest_matches_the_host() -> None:
+    """The exported manifest and the host agree on the binding ABI, the head counts and the body sources."""
+
     manifest = cake_sparse_mla_sm120_dsv41_mixed_manifest()
     geometry = kernel_geometry()
-    assert not geometry.provisional
     assert tuple(int(h) for h in manifest["head_counts"]) == geometry.head_counts
-    assert tuple(manifest.get("binding_params", BINDING_PARAMS)) == BINDING_PARAMS
-    assert int(manifest["main_bytes_per_token"]) == MAIN_BYTES_PER_TOKEN
-    assert int(manifest["extra_bytes_per_token"]) == EXTRA_BYTES_PER_TOKEN
-    assert "bf16" in manifest["precisions"]
+    assert tuple(manifest["binding_params"]) == BINDING_PARAMS
     assert manifest["entry"] and "nvfp4" not in manifest["entry"]
-    assert manifest["sources"], "the manifest must list the translation units"
-    for name in manifest["sources"]:
-        assert name.endswith((".cu", ".h")) and "nvfp4" not in name, name
+    sources = set(manifest["sources"])
+    for name in sources:
+        assert name.endswith(".cu") and "nvfp4" not in name, name
+    for kernel in manifest["decode_kernels"] + manifest["merge_kernels"]:
+        assert kernel["source"] in sources, kernel
+    # Every head count carries the plain render for both cache layouts (what any unmeasured card runs).
+    dispatch = kernel_dispatch()
+    for heads in geometry.head_counts:
+        for dual in (False, True):
+            _, tiles, _ = dispatch.decode_bodies[(heads, dual, DEFAULT_VARIANT)]
+            assert tiles == (2 if heads in geometry.two_tile_head_counts else 1)
+        assert (heads, DEFAULT_VARIANT) in dispatch.merge_bodies
 
 
 # ---------------------------------------------------------------------------
@@ -980,6 +1395,197 @@ def test_gpu_dual_cache_matches_reference(
         attn_sink=sink,
     )
     _check("bf16", actual, expected)
+
+
+def _exported_variants(dispatch, num_heads: int, *, dual: bool) -> list:
+    """The variants whose decode and merge bodies the export carries for a head count, in manifest order."""
+
+    return [
+        name
+        for name, v in dispatch.variants.items()
+        if (num_heads, dual, v.decode) in dispatch.decode_bodies
+        and (num_heads, v.merge) in dispatch.merge_bodies
+    ]
+
+
+@pytest.mark.parametrize("dual", [False, True])
+@pytest.mark.parametrize("num_heads", [8, 16, 32, 48, 64, 80, 96, 112, 128])
+def test_gpu_every_exported_variant_matches_reference(
+    num_heads: int, dual: bool
+) -> None:
+    """Every exact variant the export carries for a head count and cache layout computes the same attention (the
+    dispatch is a pure performance choice), through the direct epilogue and through the split merge; together the
+    parametrizations run every exported decode and merge body."""
+
+    _require_family()
+    dispatch = kernel_dispatch()
+    torch.manual_seed(20261104 + 2 * num_heads + dual)
+    num_tokens, topk = 8, 128
+    q = _query(num_tokens, num_heads)
+    cache = _main_pool(16, 64)
+    indices = _indices(num_tokens, topk, 16 * 64)
+    lengths = _lengths(num_tokens, topk)
+    sink = torch.randn(num_heads, device="cuda")
+    extra_kwargs: dict = {}
+    reference_kwargs: dict = {}
+    if dual:
+        extra_topk = 512
+        extra = _extra_pool(64, 64)
+        extra_indices = _indices(num_tokens, extra_topk, 64 * 64)
+        extra_lengths = _lengths(num_tokens, extra_topk)
+        extra_kwargs = dict(
+            extra_kv_cache=extra,
+            extra_indices=extra_indices,
+            extra_topk_length=extra_lengths,
+        )
+        reference_kwargs = dict(
+            extra_cache=extra, extra_indices=extra_indices, extra_lengths=extra_lengths
+        )
+    expected = _reference(
+        q, cache, indices, main_lengths=lengths, attn_sink=sink, **reference_kwargs
+    )
+    exported = _exported_variants(dispatch, num_heads, dual=dual)
+    assert exported[0] == DEFAULT_VARIANT
+    mid_out = torch.empty(
+        (num_tokens, num_heads, 2, _D), dtype=torch.bfloat16, device="cuda"
+    )
+    mid_lse = torch.empty(
+        (num_tokens, num_heads, 2), dtype=torch.float32, device="cuda"
+    )
+    for name in exported:
+        for splits in (1, 2):
+            output = torch.empty_like(q)
+            lse = torch.empty(
+                (num_tokens, num_heads), dtype=torch.float32, device="cuda"
+            )
+            plan = cake_sparse_mla_sm120_dsv41_mixed_decode(
+                q,
+                cache,
+                indices,
+                output,
+                lse,
+                _SM_SCALE,
+                topk_length=lengths,
+                attn_sink=sink,
+                mid_out=mid_out,
+                mid_lse=mid_lse,
+                num_splits=splits,
+                variant=name,
+                **extra_kwargs,
+            )
+            assert plan["variant"] == name and plan["num_splits"] == splits
+            assert (
+                plan["head_tiles"]
+                == dispatch.decode_bodies[
+                    (num_heads, dual, dispatch.variants[name].decode)
+                ][1]
+            )
+            _check("bf16", (output, lse), expected)
+    unexported = [name for name in dispatch.variants if name not in exported]
+    if unexported:
+        with pytest.raises(ValueError, match="not exported"):
+            cake_sparse_mla_sm120_dsv41_mixed_decode(
+                q,
+                cache,
+                indices,
+                torch.empty_like(q),
+                torch.empty(
+                    (num_tokens, num_heads), dtype=torch.float32, device="cuda"
+                ),
+                _SM_SCALE,
+                mid_out=mid_out,
+                mid_lse=mid_lse,
+                variant=unexported[0],
+                **extra_kwargs,
+            )
+    with pytest.raises(ValueError, match="unknown exact variant"):
+        cake_sparse_mla_sm120_dsv41_mixed_decode(
+            q,
+            cache,
+            indices,
+            torch.empty_like(q),
+            torch.empty((num_tokens, num_heads), dtype=torch.float32, device="cuda"),
+            _SM_SCALE,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+            variant="no-such-variant",
+            **extra_kwargs,
+        )
+
+
+@pytest.mark.parametrize("num_heads", [8, 64])
+def test_gpu_non_pow2_pages_run_the_generic_page_resolve(num_heads: int) -> None:
+    """Pages of 61 / 53 rows: the dispatch drops the shift-and-mask page resolve (`pw`), a pinned `pw` variant is
+    rejected, and every other exported variant matches the reference on these layouts."""
+
+    _require_family()
+    dispatch = kernel_dispatch()
+    torch.manual_seed(20261105 + num_heads)
+    num_tokens, topk, extra_topk = 8, 128, 512
+    main_page, extra_page = 61, 53
+    main_pages, extra_pages = -(-4096 // main_page), -(-4096 // extra_page)
+    q = _query(num_tokens, num_heads)
+    cache = _main_pool(main_pages, main_page)
+    extra = _extra_pool(extra_pages, extra_page)
+    indices = _indices(num_tokens, topk, main_pages * main_page)
+    extra_indices = _indices(num_tokens, extra_topk, extra_pages * extra_page)
+    lengths = _lengths(num_tokens, topk)
+    extra_lengths = _lengths(num_tokens, extra_topk)
+    sink = torch.randn(num_heads, device="cuda")
+    kwargs = dict(
+        topk_length=lengths,
+        attn_sink=sink,
+        extra_kv_cache=extra,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_lengths,
+    )
+    expected = _reference(
+        q,
+        cache,
+        indices,
+        main_lengths=lengths,
+        extra_cache=extra,
+        extra_indices=extra_indices,
+        extra_lengths=extra_lengths,
+        attn_sink=sink,
+    )
+    chunks = cake_sparse_mla_sm120_dsv41_mixed_num_chunks(topk, extra_topk)
+    mid_out = torch.empty(
+        (num_tokens, num_heads, chunks, _D), dtype=torch.bfloat16, device="cuda"
+    )
+    mid_lse = torch.empty(
+        (num_tokens, num_heads, chunks), dtype=torch.float32, device="cuda"
+    )
+
+    def run(variant):
+        output = torch.empty_like(q)
+        lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device="cuda")
+        plan = cake_sparse_mla_sm120_dsv41_mixed_decode(
+            q,
+            cache,
+            indices,
+            output,
+            lse,
+            _SM_SCALE,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+            variant=variant,
+            **kwargs,
+        )
+        return plan, (output, lse)
+
+    pow2_only = set(dispatch.pow2_page_only_parts)
+    plan, actual = run(None)
+    assert not set(plan["variant"].split("+")) & pow2_only, plan
+    _check("bf16", actual, expected)
+    for name in _exported_variants(dispatch, num_heads, dual=True):
+        if set(name.split("+")) & pow2_only:
+            with pytest.raises(ValueError, match="power-of-two page sizes"):
+                run(name)
+        else:
+            plan, actual = run(name)
+            assert plan["variant"] == name
+            _check("bf16", actual, expected)
 
 
 @pytest.mark.parametrize("length", [0, 1, 63, 65])
