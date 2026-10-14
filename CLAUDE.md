@@ -158,6 +158,42 @@ Run specific test function:
 pytest tests/attention/test_hopper.py::test_single_prefill
 ```
 
+The sharded test runner defaults to one worker per visible GPU. H100 PR CI opts
+into `--workers-per-gpu 2`: eight workers on four GPUs. Other CI lanes retain
+the default. Locally, `scripts/task_run_unit_tests.sh --workers-per-gpu 2` enables
+sharing; `--workers N` sets the total instead. Workers share the existing JIT
+compilation budget.
+
+Scheduling markers apply to the whole source file:
+
+- `node_exclusive`: run alone across the allocation after parallel work, with
+  all GPUs visible. Use for multi-GPU requirements or host-memory OOM risk.
+- `gpu_exclusive`: run alone on the assigned GPU; other GPUs can keep working.
+- `host_memory_heavy`: prioritize this file and serialize its units with other
+  host-heavy work, while lighter files can overlap.
+
+Host and GPU reservations cover setup, execution, and process cleanup, and are
+acquired together. Blocked units stay queued so workers can take runnable work
+from their own queue or steal from another. Pending GPU-exclusive work can
+drain one GPU without reserving the host-heavy slot or blocking other GPUs.
+`RESOURCE WAIT` reports worker idle time of at least one second while work is
+queued but cannot run on that worker's resources.
+
+These markers enforce overlap rules, not memory limits. Most H100 annotations
+use measured peaks above 128 GiB host RSS or 32 GiB GPU memory. Attention sink
+also uses both narrower markers: its single-GPU H100 run peaked at 89.2 GiB host
+RSS and 4.5 GiB GPU memory, and other GPUs can keep working while it runs.
+Cold JIT compilation and other GPU families can change the peaks. Validate
+completion rate, OOM failures, and repeated wall times with matching scope and
+cache conditions when changing a CI lane's concurrency policy.
+
+Capacity reports include the serial floor from host-heavy and node-exclusive
+work. They remain optimistic about GPU contention because the estimator uses
+worker counts without GPU topology or measured memory capacity.
+
+Run the CPU-only coordinator suite with
+`pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
+
 ### Skipping Tests Based on CUDA Architecture
 
 Use `flashinfer.utils` functions to skip tests on unsupported GPU architectures:
