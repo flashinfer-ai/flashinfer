@@ -14,50 +14,18 @@
  * limitations under the License.
  */
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
+// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
+#include "cake_concat_mla_kv_quant_fp8_device_common.cuh"
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 #define LAUNCH_MIN_BLOCKS 3
 
-#include <math_constants.h>
-
 extern "C" {
 
-__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_concat_mla_kv_quant_fp8_982430f4a5a8e3e38334(const __nv_bfloat16* __restrict__ kv_nope, const __nv_bfloat16* __restrict__ k_pe, uint8_t* __restrict__ key, uint8_t* __restrict__ value, int num_tokens, int num_heads, int head_pairs, int warps_per_token, int k_pe_row_stride)
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
+kernel_cake_concat_mla_kv_quant_fp8_8369f9eb1d5046fc3c6e(const __nv_bfloat16* __restrict__ kv_nope, const __nv_bfloat16* __restrict__ k_pe, uint8_t* __restrict__ key, uint8_t* __restrict__ value, int num_tokens, int num_heads, int head_pairs, int warps_per_token, int k_pe_row_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -111,54 +79,22 @@ kernel_cake_concat_mla_kv_quant_fp8_982430f4a5a8e3e38334(const __nv_bfloat16* __
         #pragma unroll
         for (int i_1 = 0; i_1 < 3; i_1++) {
             if (head0 + 2 * i_1 < num_heads) {
-                float _cvt_f32_bf16_0;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_0) : "h"((uint16_t)(words[i_1 * 8] & 65535)));
-                vals[0] = _cvt_f32_bf16_0;
-                float _cvt_f32_bf16_1;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_1) : "h"((uint16_t)(words[i_1 * 8] >> 16)));
-                vals[1] = _cvt_f32_bf16_1;
-                float _cvt_f32_bf16_2;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_2) : "h"((uint16_t)(words[i_1 * 8 + 1] & 65535)));
-                vals[2] = _cvt_f32_bf16_2;
-                float _cvt_f32_bf16_3;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_3) : "h"((uint16_t)(words[i_1 * 8 + 1] >> 16)));
-                vals[3] = _cvt_f32_bf16_3;
-                float _cvt_f32_bf16_4;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_4) : "h"((uint16_t)(words[i_1 * 8 + 2] & 65535)));
-                vals[4] = _cvt_f32_bf16_4;
-                float _cvt_f32_bf16_5;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_5) : "h"((uint16_t)(words[i_1 * 8 + 2] >> 16)));
-                vals[5] = _cvt_f32_bf16_5;
-                float _cvt_f32_bf16_6;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_6) : "h"((uint16_t)(words[i_1 * 8 + 3] & 65535)));
-                vals[6] = _cvt_f32_bf16_6;
-                float _cvt_f32_bf16_7;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_7) : "h"((uint16_t)(words[i_1 * 8 + 3] >> 16)));
-                vals[7] = _cvt_f32_bf16_7;
-                float _cvt_f32_bf16_8;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_8) : "h"((uint16_t)(words[i_1 * 8 + 4] & 65535)));
-                vals[8] = _cvt_f32_bf16_8;
-                float _cvt_f32_bf16_9;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_9) : "h"((uint16_t)(words[i_1 * 8 + 4] >> 16)));
-                vals[9] = _cvt_f32_bf16_9;
-                float _cvt_f32_bf16_10;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_10) : "h"((uint16_t)(words[i_1 * 8 + 5] & 65535)));
-                vals[10] = _cvt_f32_bf16_10;
-                float _cvt_f32_bf16_11;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_11) : "h"((uint16_t)(words[i_1 * 8 + 5] >> 16)));
-                vals[11] = _cvt_f32_bf16_11;
-                float _cvt_f32_bf16_12;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_12) : "h"((uint16_t)(words[i_1 * 8 + 6] & 65535)));
-                vals[12] = _cvt_f32_bf16_12;
-                float _cvt_f32_bf16_13;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_13) : "h"((uint16_t)(words[i_1 * 8 + 6] >> 16)));
-                vals[13] = _cvt_f32_bf16_13;
-                float _cvt_f32_bf16_14;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_14) : "h"((uint16_t)(words[i_1 * 8 + 7] & 65535)));
-                vals[14] = _cvt_f32_bf16_14;
-                float _cvt_f32_bf16_15;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_15) : "h"((uint16_t)(words[i_1 * 8 + 7] >> 16)));
-                vals[15] = _cvt_f32_bf16_15;
+                vals[0] = __uint_as_float(words[i_1 * 8] << 16);
+                vals[1] = __uint_as_float(words[i_1 * 8] & 4294901760u);
+                vals[2] = __uint_as_float(words[i_1 * 8 + 1] << 16);
+                vals[3] = __uint_as_float(words[i_1 * 8 + 1] & 4294901760u);
+                vals[4] = __uint_as_float(words[i_1 * 8 + 2] << 16);
+                vals[5] = __uint_as_float(words[i_1 * 8 + 2] & 4294901760u);
+                vals[6] = __uint_as_float(words[i_1 * 8 + 3] << 16);
+                vals[7] = __uint_as_float(words[i_1 * 8 + 3] & 4294901760u);
+                vals[8] = __uint_as_float(words[i_1 * 8 + 4] << 16);
+                vals[9] = __uint_as_float(words[i_1 * 8 + 4] & 4294901760u);
+                vals[10] = __uint_as_float(words[i_1 * 8 + 5] << 16);
+                vals[11] = __uint_as_float(words[i_1 * 8 + 5] & 4294901760u);
+                vals[12] = __uint_as_float(words[i_1 * 8 + 6] << 16);
+                vals[13] = __uint_as_float(words[i_1 * 8 + 6] & 4294901760u);
+                vals[14] = __uint_as_float(words[i_1 * 8 + 7] << 16);
+                vals[15] = __uint_as_float(words[i_1 * 8 + 7] & 4294901760u);
                 {
                     unsigned int _fp8_pk[4];
                     asm("{\n\t"
@@ -193,54 +129,22 @@ kernel_cake_concat_mla_kv_quant_fp8_982430f4a5a8e3e38334(const __nv_bfloat16* __
                 }
             }
         }
-        float _cvt_f32_bf16_16;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_16) : "h"((uint16_t)(rope_words[0] & 65535)));
-        vals[0] = _cvt_f32_bf16_16;
-        float _cvt_f32_bf16_17;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_17) : "h"((uint16_t)(rope_words[0] >> 16)));
-        vals[1] = _cvt_f32_bf16_17;
-        float _cvt_f32_bf16_18;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_18) : "h"((uint16_t)(rope_words[1] & 65535)));
-        vals[2] = _cvt_f32_bf16_18;
-        float _cvt_f32_bf16_19;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_19) : "h"((uint16_t)(rope_words[1] >> 16)));
-        vals[3] = _cvt_f32_bf16_19;
-        float _cvt_f32_bf16_20;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_20) : "h"((uint16_t)(rope_words[2] & 65535)));
-        vals[4] = _cvt_f32_bf16_20;
-        float _cvt_f32_bf16_21;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_21) : "h"((uint16_t)(rope_words[2] >> 16)));
-        vals[5] = _cvt_f32_bf16_21;
-        float _cvt_f32_bf16_22;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_22) : "h"((uint16_t)(rope_words[3] & 65535)));
-        vals[6] = _cvt_f32_bf16_22;
-        float _cvt_f32_bf16_23;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_23) : "h"((uint16_t)(rope_words[3] >> 16)));
-        vals[7] = _cvt_f32_bf16_23;
-        float _cvt_f32_bf16_24;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_24) : "h"((uint16_t)(rope_words[4] & 65535)));
-        vals[8] = _cvt_f32_bf16_24;
-        float _cvt_f32_bf16_25;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_25) : "h"((uint16_t)(rope_words[4] >> 16)));
-        vals[9] = _cvt_f32_bf16_25;
-        float _cvt_f32_bf16_26;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_26) : "h"((uint16_t)(rope_words[5] & 65535)));
-        vals[10] = _cvt_f32_bf16_26;
-        float _cvt_f32_bf16_27;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_27) : "h"((uint16_t)(rope_words[5] >> 16)));
-        vals[11] = _cvt_f32_bf16_27;
-        float _cvt_f32_bf16_28;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_28) : "h"((uint16_t)(rope_words[6] & 65535)));
-        vals[12] = _cvt_f32_bf16_28;
-        float _cvt_f32_bf16_29;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_29) : "h"((uint16_t)(rope_words[6] >> 16)));
-        vals[13] = _cvt_f32_bf16_29;
-        float _cvt_f32_bf16_30;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_30) : "h"((uint16_t)(rope_words[7] & 65535)));
-        vals[14] = _cvt_f32_bf16_30;
-        float _cvt_f32_bf16_31;
-        asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_31) : "h"((uint16_t)(rope_words[7] >> 16)));
-        vals[15] = _cvt_f32_bf16_31;
+        vals[0] = __uint_as_float(rope_words[0] << 16);
+        vals[1] = __uint_as_float(rope_words[0] & 4294901760u);
+        vals[2] = __uint_as_float(rope_words[1] << 16);
+        vals[3] = __uint_as_float(rope_words[1] & 4294901760u);
+        vals[4] = __uint_as_float(rope_words[2] << 16);
+        vals[5] = __uint_as_float(rope_words[2] & 4294901760u);
+        vals[6] = __uint_as_float(rope_words[3] << 16);
+        vals[7] = __uint_as_float(rope_words[3] & 4294901760u);
+        vals[8] = __uint_as_float(rope_words[4] << 16);
+        vals[9] = __uint_as_float(rope_words[4] & 4294901760u);
+        vals[10] = __uint_as_float(rope_words[5] << 16);
+        vals[11] = __uint_as_float(rope_words[5] & 4294901760u);
+        vals[12] = __uint_as_float(rope_words[6] << 16);
+        vals[13] = __uint_as_float(rope_words[6] & 4294901760u);
+        vals[14] = __uint_as_float(rope_words[7] << 16);
+        vals[15] = __uint_as_float(rope_words[7] & 4294901760u);
         #pragma unroll
         for (int k = 0; k < 1; k++) {
             int slot = k * 4 + rope_slot;
