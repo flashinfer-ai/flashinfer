@@ -316,6 +316,8 @@ using W8A16Sm100Cfg2SM256x160 = W8A16Sm100Cfg<256, 160, 128, 2, true>;
 // scheduler's fixup before the epilogue.  Mutually exclusive with kSplitK.
 inline cutlass::gemm::kernel::detail::DecompositionMode W8A16Sm100StreamKModeEnv();
 inline cutlass::gemm::kernel::detail::ReductionMode W8A16Sm100StreamKReductionEnv();
+inline int W8A16Sm100SwizzleEnv();
+inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm100RasterEnv();
 
 template <typename T, typename Cfg, bool kSplitK = false, bool kStreamK = false>
 struct W8A16Sm100Gemm {
@@ -414,6 +416,11 @@ struct W8A16Sm100Gemm {
       (void)scale;
       (void)bias;
     }
+    // Tile-order knobs of both sm100 schedulers (persistent and stream-K): how many
+    // tiles the in-flight clusters group along the fast axis (L2 reuse of a weight band x
+    // activation band instead of a line of tiles) and which axis walks fastest.
+    args.scheduler.max_swizzle_size = W8A16Sm100SwizzleEnv();
+    args.scheduler.raster_order = W8A16Sm100RasterEnv();
     if constexpr (kStreamK) {
       // Heuristic: data-parallel for the full waves, stream-K for the tiles of the last
       // (up to two) waves; collapses to plain split-K when the leftover tiles divide the
@@ -540,6 +547,38 @@ inline cutlass::gemm::kernel::detail::ReductionMode W8A16Sm100StreamKReductionEn
     return Mode::Deterministic;
   }();
   return mode;
+}
+
+// FLASHINFER_W8A16_FP8_SWIZZLE_SM100 = tile-group size handed to the sm100 schedulers as
+// max_swizzle_size (0 / 1 = plain raster: CUTLASS's default and what every version up to
+// B14 ran).  With S, the in-flight clusters cover S tiles along the fast axis and the
+// rest along the slow one, so a (weight band x activation band) working set stays in L2.
+// Motivation (Wed 14 Oct 2026): mlp.gate_up tp1, N=25600, whose 131 MB fp8 weight
+// overflows L2 and is re-streamed once per activation tile under the plain raster
+// (1080 vs cuBLAS 1390 TFLOP/s at M >= 44160).  Read once.
+inline int W8A16Sm100SwizzleEnv() {
+  static const int swizzle = [] {
+    const char* s = std::getenv("FLASHINFER_W8A16_FP8_SWIZZLE_SM100");
+    if (s == nullptr || *s == '\0') return 0;
+    const int v = std::atoi(s);
+    return v < 0 ? 0 : v;
+  }();
+  return swizzle;
+}
+
+// FLASHINFER_W8A16_FP8_RASTER_SM100 = "heuristic" (default; CUTLASS picks) | "m" (walk
+// the weight tiles fastest; the GEMM's M is the weight's N) | "n" (walk the activation
+// tiles fastest).  Read once.
+inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm100RasterEnv() {
+  using Opt = cutlass::gemm::kernel::detail::RasterOrderOptions;
+  static const Opt opt = [] {
+    const char* s = std::getenv("FLASHINFER_W8A16_FP8_RASTER_SM100");
+    if (s == nullptr || *s == '\0') return Opt::Heuristic;
+    if (std::strcmp(s, "m") == 0) return Opt::AlongM;
+    if (std::strcmp(s, "n") == 0) return Opt::AlongN;
+    return Opt::Heuristic;
+  }();
+  return opt;
 }
 
 // Split count for the 256x128 2SM tile (rung B12).  Two cases split, both from the
