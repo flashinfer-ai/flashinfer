@@ -164,7 +164,14 @@ def w8a16_fp8_gemm(
     weight_prepared: bool = False,
     algo: Optional[str] = None,
 ) -> torch.Tensor:
-    r"""Linear layer with an FP8 e4m3 weight and a 16-bit activation (W8A16).
+    r"""bf16 / fp16 GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
+
+    The math is a plain 16-bit GEMM: the tensor cores run bf16 x bf16 or fp16 x
+    fp16 with fp32 accumulation, and the result is in ``act``'s dtype.  Nothing
+    e4m3 reaches an MMA instruction.  "fp8" in the name says how the weight is
+    *stored* (e4m3 plus one per-tensor scale, as opposed to the int8 of a plain
+    W8A16 scheme); the kernel converts it to the activation dtype on the way from
+    memory to the MMA.  Same reading as vLLM's ``CompressedTensorsW8A16Fp8``.
 
     ``out = act @ (weight.float() * weight_scale).T + bias``, computed with the
     weight dequantized inside the kernel; no 16-bit copy of the weight is
