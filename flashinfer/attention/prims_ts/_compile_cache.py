@@ -81,14 +81,26 @@ def build_and_load_attention_kernel(
     *,
     extra: tuple = (),
 ) -> Any:
-    from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from ...jit.cute_dsl_core import (
+        build_and_load_cute_dsl_kernel,
+        cute_dsl_cache_disabled,
+    )
+
+    if cute_dsl_cache_disabled():
+        return compile_fn()
 
     key = _compile_cache_key(spec, options, extra)
     if key is None:
         return compile_fn()
+    import torch
+
+    # A family target such as sm100f can cover physical GPUs with different
+    # host-selected tuning defaults. The module metadata keys the target;
+    # the specialization must also distinguish the physical capability.
+    major, minor = torch.cuda.get_device_capability()
     return build_and_load_cute_dsl_kernel(
         f"prims_ts_{family}",
-        f"{kind}_{key}",
+        f"{kind}_sm{major}{minor}_{key}",
         compile_fn,
         extra_key_files=_kernel_source_files(),
     )

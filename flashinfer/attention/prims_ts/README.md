@@ -23,8 +23,8 @@ Attention adapters use FlashInfer's persistent CuTe DSL object cache across
 processes, including context, paged decode, MLA, sparse/Sage preparation, and
 sparse metadata inspection. Specializations include compile options and static
 kernel configuration; device indices are excluded so ranks on equivalent GPUs
-can share artifacts. Architecture, installed DSL stack, and attention source
-changes invalidate the cache. Device-specific occupancy probes run once per
+can share artifacts. Physical GPU capability, compile target, installed DSL
+stack, and attention source changes invalidate the cache. Device-specific occupancy probes run once per
 device and cluster size in each process.
 
 Set `FLASHINFER_WORKSPACE_BASE` to select the cache location, or

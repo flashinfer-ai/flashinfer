@@ -95,6 +95,29 @@ def test_unknown_compile_values_bypass_persistence(monkeypatch):
     )
 
 
+def test_family_targets_keep_physical_device_defaults_distinct(monkeypatch):
+    from flashinfer.jit import cute_dsl_core
+
+    names = []
+    capability = [(10, 0)]
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100f")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability[0])
+    monkeypatch.setattr(
+        cute_dsl_core,
+        "build_and_load_cute_dsl_kernel",
+        lambda module, name, *a, **kw: names.append((module, name)),
+    )
+    build_and_load_attention_kernel("context", "main", _Spec(), "", lambda: None)
+    build_and_load_attention_kernel(
+        "context", "main", _Spec(device_index=1), "", lambda: None
+    )
+    capability[0] = (10, 3)
+    build_and_load_attention_kernel("context", "main", _Spec(), "", lambda: None)
+    assert names[0] == names[1]
+    assert names[0] != names[2]
+
+
 def test_source_dependencies_include_shared_attention_code():
     sources = {
         Path(path).relative_to(Path(_hardware.__file__).parent).as_posix()
@@ -197,8 +220,16 @@ def checked_key(*args, **kwargs):
 _compile_cache._compile_cache_key = checked_key
 
 if sys.argv[1] == 'warm':
-    if torch.cuda.device_count() > 1:
-        torch.cuda.set_device(1)
+    current = torch.cuda.current_device()
+    capability = torch.cuda.get_device_capability(current)
+    sm_count = torch.cuda.get_device_properties(current).multi_processor_count
+    for peer in range(torch.cuda.device_count()):
+        if peer != current and (
+            torch.cuda.get_device_capability(peer) == capability
+            and torch.cuda.get_device_properties(peer).multi_processor_count == sm_count
+        ):
+            torch.cuda.set_device(peer)
+            break
     original_build = JitSpecCuteDsl.build
     def no_attention_recompile(self):
         assert not self.module_name.startswith('prims_ts_'), self.name
