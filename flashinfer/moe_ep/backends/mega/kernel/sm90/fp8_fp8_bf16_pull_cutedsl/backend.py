@@ -348,7 +348,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
                 autotune_hopper_fp8_mega_moe,
             )
 
-            autotune_hopper_fp8_mega_moe(
+            self._autotune_winner = autotune_hopper_fp8_mega_moe(
                 output,
                 transformed_weights[0],
                 transformed_weights[1],

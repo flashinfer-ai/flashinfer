@@ -10,6 +10,7 @@
 #   bash tests/moe_ep/run_tests.sh bf16-rank-major # 8x B200 BF16 rank-major GPU regression
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90 pull FP8 + BF16 mega multirank
 #   bash tests/moe_ep/run_tests.sh mega_sm90_mxfp4 # 4-GPU Hopper MXFP4 accuracy
+#   bash tests/moe_ep/run_tests.sh mega_sm120_cake # 4/8-GPU Blackwell-consumer sm120_mxfp4_mxfp8_bf16_cake (NCCL LSA + GIN)
 #   bash tests/moe_ep/run_tests.sh mega_sm107    # Rubin EP2/4/8 (NPROC_MULTIRANK, default 4), all three formats
 #   bash tests/moe_ep/run_tests.sh qualify_sm107 # strict Rubin host/single/multirank suite; rejects skips
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
@@ -33,6 +34,8 @@
 #   - multirank/smoke/correctness: nccl.ep importable (built by the install above)
 #   - multirank/smoke/correctness: >=4 GPUs
 #   - mega: Blackwell (sm_100+), nvshmem, deep_gemm, triton
+#   - mega_sm120_cake: >=4 sm_120 GPUs (NPROC_CAKE_SM120), NCCL 2.30.7 with the
+#     Device API (NCCL_HOME or the nvidia-nccl-cu13==2.30.7 wheel), CUDA 13 nvcc
 #   - bf16-rank-major: one x86_64 node with 8x B200, CUDA 12.8+ nvcc,
 #     cuda-bindings, and PyTorch CUDA symmetric-memory support
 #   - optional NIXL smoke: BUILD_NIXL_EP=1 install
@@ -133,6 +136,9 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_mxfp4_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_sm120_w4a8_cake_mega.py \
+    --ignore=tests/moe_ep/test_moe_ep_sm120_w4a8_cake_tables.py \
+    --ignore=tests/moe_ep/test_moe_ep_sm120_w4a8_cake_eplb.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
@@ -368,6 +374,9 @@ run_oracle_sm107() {
     tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py -v -s \
     tests/moe_ep/test_sm107_kernel_boundaries.py \
     tests/moe_ep/test_sm107_genphase_kernel.py \
+    tests/moe_ep/test_sm107_genphase_cga2_kernel.py \
+    tests/moe_ep/test_sm107_masked_combine.py \
+    tests/moe_ep/test_sm107_routing_graph.py \
     tests/moe_ep/test_sm107_combine_kernel.py \
     -m arch_rubin
 }
@@ -404,6 +413,7 @@ run_mega_sm107() {
   CUTE_DSL_ARCH=sm_107a "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py -v \
+    tests/moe_ep/test_sm107_routing_graph_multirank.py \
     -m "gpu_2 and arch_rubin"
 }
 
@@ -446,6 +456,29 @@ run_mega_sm120() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py -v \
     -m "gpu_4 and arch_sm120"
+}
+
+# 4- or 8-GPU Blackwell-consumer sm120_mxfp4_mxfp8_bf16_cake persistent
+# MegaMoE (hybrid LSA + GIN transport, requires NCCL 2.30.7 with the device
+# API). Own torchrun pytest processes: each layer opens a transport session on
+# the EP process group's communicator and must not share a process with the
+# NVSHMEM-based sm120 CuTeDSL drop; the table-independence test creates and
+# destroys one session per transport table, the EPLB test one per expert placement.
+NPROC_CAKE_SM120="${NPROC_CAKE_SM120:-${NPROC_MULTIRANK}}"
+run_mega_sm120_cake() {
+  local rc=0
+  "${PY}" -m pytest "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm120_w4a8_cake_host.py -v || rc=1
+  local test_file
+  for test_file in \
+    tests/moe_ep/test_moe_ep_sm120_w4a8_cake_mega.py \
+    tests/moe_ep/test_moe_ep_sm120_w4a8_cake_tables.py \
+    tests/moe_ep/test_moe_ep_sm120_w4a8_cake_eplb.py; do
+    "${TORCHRUN}" --nproc_per_node="${NPROC_CAKE_SM120}" -m pytest \
+      "${MOE_EP_PYTEST_FLAGS[@]}" "${test_file}" -v \
+      -m "gpu_4 and arch_sm120" || rc=1
+  done
+  return "${rc}"
 }
 
 # Fault tolerance. Split into a pytest half (a STALLED rank -- every process
@@ -552,6 +585,7 @@ case "${1:-all}" in
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
   bf16-rank-major) run_section "BF16 rank-major GPU regression (8 B200 GPUs)" run_bf16_rank_major; print_summary ;;
+  mega_sm120_cake) run_section "sm120_mxfp4_mxfp8_bf16_cake mega multirank (Blackwell-consumer, NCCL LSA + GIN)" run_mega_sm120_cake; print_summary ;;
   mega_sm90) run_section "sm90 pull FP8 + BF16 mega multirank (Hopper)" run_mega_sm90; print_summary ;;
   mega_sm90_mxfp4) run_section "sm90_fp8_mxfp4_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90_mxfp4; print_summary ;;
   mega_sm120) run_section "sm120_mxfp8_mxfp8_bf16_cutedsl mega multirank (Blackwell-consumer)" run_mega_sm120; print_summary ;;
@@ -562,7 +596,7 @@ case "${1:-all}" in
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm90_mxfp4|oracle_sm107|qualify_sm107|multirank|comm|sm90_push|sm90_bf16_push_cake|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm90_mxfp4|mega_sm120|mega_sm107|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm90_mxfp4|oracle_sm107|qualify_sm107|multirank|comm|sm90_push|sm90_bf16_push_cake|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm90_mxfp4|mega_sm120|mega_sm120_cake|mega_sm107|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

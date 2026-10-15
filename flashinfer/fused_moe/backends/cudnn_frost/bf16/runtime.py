@@ -70,6 +70,11 @@ class CudnnFrostGroupedGemm1Kernel:
 
 
 def _artifact_roots() -> tuple[Path, ...]:
+    return _cached_artifact_roots()
+
+
+@functools.cache
+def _cached_artifact_roots() -> tuple[Path, ...]:
     packaged = artifact_root("bf16")
     return (packaged,) if packaged.is_dir() else ()
 
@@ -144,6 +149,7 @@ def _discover(
 
 
 def clear_artifact_cache() -> None:
+    """Clear shared discovery caches for future builds and explicit refreshes."""
     global _artifact_cache_version
 
     from ..shortlist import _read
@@ -151,6 +157,8 @@ def clear_artifact_cache() -> None:
     from .moe import _selected_kernels_cached
 
     _artifact_cache_version += 1
+    artifact_root.cache_clear()
+    _cached_artifact_roots.cache_clear()
     _discover.cache_clear()
     discover_fc2.cache_clear()
     _selected_kernels_cached.cache_clear()
@@ -199,7 +207,7 @@ def _validate_common(
     if any(not t.is_contiguous() for t in tensors):
         raise ValueError("all grouped GEMM1 tensors must be contiguous")
     if any(t.dtype != torch.bfloat16 for t in tensors[:3]):
-        raise ValueError("the v2 grouped GEMM1 ABI requires BF16 tokens and weights")
+        raise ValueError("the grouped GEMM1 ABI requires BF16 tokens and weights")
     return s, n, k, e, groups
 
 
